@@ -4,7 +4,8 @@ mod common;
 use async_trait::async_trait;
 use common::convergence::wait_until;
 use common::testkit::{ClusterConfig, TestNode};
-use mantissa::runtime::testing::new_in_memory_runtime_backend;
+use mantissa::runtime::set::RuntimeSet;
+use mantissa::runtime::testing::{IN_MEMORY_RUNTIME_BACKEND_KIND, new_in_memory_runtime_backend};
 use mantissa::runtime::types::{
     RuntimeBackend, RuntimeCreateRequest, RuntimeError, RuntimeInfo, RuntimeResult,
     RuntimeStateInfo,
@@ -204,7 +205,10 @@ impl RuntimeBackend for RecordingRuntimeBackend {
 
 fn headless_config_with_in_memory_runtime() -> HeadlessConfig {
     HeadlessConfig {
-        runtime_backend: Some(new_in_memory_runtime_backend()),
+        runtime_set: Some(RuntimeSet::singleton(
+            IN_MEMORY_RUNTIME_BACKEND_KIND,
+            new_in_memory_runtime_backend(),
+        )),
         ..HeadlessConfig::default()
     }
 }
@@ -438,7 +442,10 @@ async fn create_recording_node(
     local_volume_root: PathBuf,
 ) -> HeadlessNode {
     HeadlessNode::new_with_config(HeadlessConfig {
-        runtime_backend: Some(manager),
+        runtime_set: Some(RuntimeSet::singleton(
+            IN_MEMORY_RUNTIME_BACKEND_KIND,
+            manager,
+        )),
         local_volume_root: Some(local_volume_root),
         task_runtime: Some(WorkloadRuntimeConfig {
             reconcile_tick: Duration::from_millis(50),
@@ -463,7 +470,10 @@ async fn create_recording_node_with_parts(
         self_id,
         keys,
         HeadlessConfig {
-            runtime_backend: Some(manager),
+            runtime_set: Some(RuntimeSet::singleton(
+                IN_MEMORY_RUNTIME_BACKEND_KIND,
+                manager,
+            )),
             local_volume_root: Some(local_volume_root),
             task_runtime: Some(WorkloadRuntimeConfig {
                 reconcile_tick: Duration::from_millis(50),

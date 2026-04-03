@@ -12,6 +12,7 @@ use crate::network::types::{
     NetworkPeerState, NetworkPeerStateValue, NetworkSpecDraft, NetworkSpecValue,
 };
 use crate::registry::Registry;
+use crate::runtime::set::RuntimeSet;
 use crate::runtime::types::{
     ResourceLimits, RuntimeAttachOptions, RuntimeAttachmentTarget, RuntimeBackend,
     RuntimeCapabilities, RuntimeConfigInfo, RuntimeCreateRequest, RuntimeError, RuntimeExecOptions,
@@ -864,7 +865,7 @@ async fn setup_manager_with_forwarding(
         local_node_id: actor,
         local_node_name: "local-node".to_string(),
         scheduler: scheduler.clone(),
-        runtime_backend: mock_cm.clone(),
+        runtime_set: RuntimeSet::singleton("mock", mock_cm.clone()),
         registry,
         network_registry: network_registry.clone(),
         volume_registry,
@@ -1379,7 +1380,13 @@ async fn pull_image_for_task_retries_and_tracks_phase_progress() {
     }
 
     manager
-        .pull_image_for_task(spec.id, &spec.image)
+        .pull_image_for_task(
+            spec.id,
+            &spec.image,
+            spec.execution_platform,
+            spec.isolation_mode,
+            spec.isolation_profile.as_deref(),
+        )
         .await
         .expect("pull should succeed after retries");
 
@@ -1615,7 +1622,13 @@ async fn pull_image_for_task_skips_pull_when_image_exists_locally() {
         .insert(spec.image.clone());
 
     manager
-        .pull_image_for_task(spec.id, &spec.image)
+        .pull_image_for_task(
+            spec.id,
+            &spec.image,
+            spec.execution_platform,
+            spec.isolation_mode,
+            spec.isolation_profile.as_deref(),
+        )
         .await
         .expect("pull should be skipped when image exists locally");
 
@@ -4355,6 +4368,21 @@ async fn stream_local_task_logs_forwards_frames_and_options() {
             },
         ],
     );
+    mock_cm.inspect.lock().await.insert(
+        instance_name.clone(),
+        RuntimeInfo {
+            id: instance_name.clone(),
+            name: instance_name.clone(),
+            status: "Up".to_string(),
+            state: RuntimeStateInfo {
+                raw_status: Some("running".to_string()),
+                running: Some(true),
+                pid: Some(1000),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
 
     let options = RuntimeLogsOptions {
         follow: true,
@@ -4683,6 +4711,21 @@ async fn exec_local_task_forwards_input_output_and_options() {
         .lock()
         .await
         .push_back(Ok(RuntimeExecResult { exit_code: Some(0) }));
+    mock_cm.inspect.lock().await.insert(
+        instance_name.clone(),
+        RuntimeInfo {
+            id: instance_name.clone(),
+            name: instance_name.clone(),
+            status: "Up".to_string(),
+            state: RuntimeStateInfo {
+                raw_status: Some("running".to_string()),
+                running: Some(true),
+                pid: Some(1000),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
 
     let options = RuntimeExecOptions {
         command: vec!["sh".to_string(), "-c".to_string(), "echo done".to_string()],
@@ -6732,6 +6775,69 @@ async fn scheduling_retry_limit_override_fast_fails_retryable_errors() {
     .expect_err("network-blocked start should fail");
 
     assert!(workload_start_error_is_retryable(&result));
+}
+
+#[tokio::test]
+async fn workload_start_retryable_includes_capacity_shortage_for_controllers() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 256 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+    let snapshot = scheduler.snapshot().await.expect("scheduler snapshot");
+    scheduler
+        .reserve_slots(
+            snapshot.version,
+            vec![SlotReservationRequest {
+                slot_id: 1,
+                owner: manager.local_node_id,
+                task_id: Some(Uuid::new_v4()),
+            }],
+        )
+        .await
+        .expect("reserve the only slot");
+    let request = WorkloadStartRequest {
+        name: "capacity-blocked".into(),
+        execution: ResolvedExecutionSpec {
+            cpu_millis: 100,
+            memory_bytes: 64 * 1_024 * 1_024,
+            ..empty_resolved_execution("img")
+        },
+        execution_platform: ExecutionPlatform::Oci,
+        isolation_mode: crate::workload::model::IsolationMode::Standard,
+        isolation_profile: None,
+        gpu_device_ids: Vec::new(),
+        id: Some(Uuid::new_v4()),
+        slot_ids: Vec::new(),
+        owner: None,
+        target_node: None,
+    };
+
+    let result = manager
+        .start_workloads_batch(vec![request])
+        .await
+        .expect_err("capacity-blocked start should fail without slots");
+
+    assert!(
+        workload_start_error_is_retryable(&result),
+        "higher-level controllers should keep workloads pending while capacity drains"
+    );
+
+    let cause = result
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<SchedulingError>())
+        .expect("capacity scheduling error");
+    assert!(
+        matches!(
+            cause,
+            SchedulingError::NoCapacityAcrossCluster
+                | SchedulingError::InsufficientCapacityForBatch
+        ),
+        "fully reserved local capacity should surface a concrete capacity scheduling error"
+    );
 }
 
 #[tokio::test]

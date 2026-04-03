@@ -3,9 +3,10 @@ use crate::network::attachment::{AttachmentProvisioner, AttachmentProvisionerApi
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
 use crate::registry::Registry;
+use crate::runtime::set::RuntimeSet;
 use crate::runtime::types::{
-    RuntimeAttachOptions, RuntimeBackend, RuntimeError, RuntimeExecOptions, RuntimeExecResult,
-    RuntimeLogFrame, RuntimeLogsOptions,
+    RuntimeAttachOptions, RuntimeCapabilities, RuntimeError, RuntimeExecOptions, RuntimeExecResult,
+    RuntimeInstanceRef, RuntimeLogFrame, RuntimeLogsOptions,
 };
 use crate::scheduler::{Scheduler, SlotId};
 use crate::secrets::crypto::SecretKeyring;
@@ -216,8 +217,8 @@ struct WorkloadManagerCore {
 
 #[derive(Clone)]
 struct WorkloadManagerRuntime {
-    // Runtime backend used for create/start/stop/inspect/pull flows.
-    runtime_backend: Arc<dyn RuntimeBackend + Send + Sync>,
+    // Runtime registry used for create/start/stop/inspect/pull flows.
+    runtime_set: RuntimeSet,
     // Node-local semaphore that bounds concurrent image pulls.
     pull_limiter: Arc<Semaphore>,
     // Runtime worker cadence configuration (repair/reconcile/debounce ticks).
@@ -226,8 +227,8 @@ struct WorkloadManagerRuntime {
 
 #[derive(Clone)]
 struct WorkloadManagerLocalState {
-    // Best-effort mapping from workload id to current runtime instance identifier.
-    local_instances: Arc<AsyncMutex<HashMap<Uuid, String>>>,
+    // Best-effort mapping from workload id to the current backend-qualified runtime reference.
+    local_instances: Arc<AsyncMutex<HashMap<Uuid, RuntimeInstanceRef>>>,
     // Per-workload decoded spec cache reused while the backing store stays unchanged.
     workload_spec_cache: Arc<StdMutex<HashMap<Uuid, CachedWorkloadSpecEntry>>>,
     // Full workload-store snapshot reused across periodic scans until the store changes.
@@ -353,7 +354,7 @@ pub struct WorkloadManagerConfig {
     pub local_node_id: Uuid,
     pub local_node_name: String,
     pub scheduler: Rc<Scheduler>,
-    pub runtime_backend: Arc<dyn RuntimeBackend + Send + Sync>,
+    pub runtime_set: RuntimeSet,
     pub registry: Registry,
     pub network_registry: NetworkRegistry,
     pub volume_registry: VolumeRegistry,
@@ -375,7 +376,7 @@ impl WorkloadManager {
             local_node_id,
             local_node_name,
             scheduler,
-            runtime_backend,
+            runtime_set,
             registry,
             network_registry,
             volume_registry,
@@ -414,7 +415,7 @@ impl WorkloadManager {
                 scheduler,
             },
             runtime: WorkloadManagerRuntime {
-                runtime_backend,
+                runtime_set,
                 pull_limiter: Arc::new(Semaphore::new(IMAGE_PULL_MAX_CONCURRENCY)),
                 runtime_config: runtime_config.unwrap_or_default(),
             },
@@ -883,6 +884,42 @@ impl WorkloadManager {
         Ok(spec.node_id == self.local_node_id)
     }
 
+    /// Returns the capabilities exposed by the runtime backend selected for one workload spec.
+    fn workload_runtime_capabilities(&self, spec: &WorkloadSpec) -> Option<RuntimeCapabilities> {
+        self.runtime.runtime_set.capabilities_for_requirements(
+            spec.execution_platform,
+            spec.isolation_mode,
+            spec.isolation_profile.as_deref(),
+            &[],
+        )
+    }
+
+    /// Resolves one backend-qualified runtime reference for a locally owned workload.
+    async fn resolve_local_runtime_for_spec(
+        &self,
+        spec: &WorkloadSpec,
+        action: &str,
+    ) -> Result<RuntimeInstanceRef, anyhow::Error> {
+        match self.resolve_live_instance_ref_for_task(spec).await {
+            Ok(Some(runtime)) => {
+                self.local_state
+                    .local_instances
+                    .lock()
+                    .await
+                    .insert(spec.id, runtime.clone());
+                Ok(runtime)
+            }
+            Ok(None) => Err(anyhow!(
+                "workload {} runtime is not present for {action}",
+                spec.id
+            )),
+            Err(err) => Err(anyhow!(
+                "workload {action} preflight failed for {}: {err}",
+                spec.id
+            )),
+        }
+    }
+
     /// Streams log frames for one locally owned workload into the provided bounded channel.
     ///
     /// The RPC layer uses this to connect a local runtime log stream to a Cap'n Proto sink
@@ -893,9 +930,6 @@ impl WorkloadManager {
         options: &RuntimeLogsOptions,
         logs_tx: MpscSender<RuntimeLogFrame>,
     ) -> Result<(), anyhow::Error> {
-        if !self.runtime.runtime_backend.capabilities().logs {
-            return Err(anyhow!("runtime backend does not support log streaming"));
-        }
         let spec = self.load_spec(id).await?;
         if spec.node_id != self.local_node_id {
             return Err(anyhow!(
@@ -903,18 +937,21 @@ impl WorkloadManager {
                 spec.node_id
             ));
         }
+        if !self
+            .workload_runtime_capabilities(&spec)
+            .map(|capabilities| capabilities.logs)
+            .unwrap_or(false)
+        {
+            return Err(anyhow!("runtime backend does not support log streaming"));
+        }
 
-        let instance_identifier = {
-            let guard = self.local_state.local_instances.lock().await;
-            guard
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| format!("mantissa-{id}"))
-        };
+        let runtime = self
+            .resolve_local_runtime_for_spec(&spec, "log streaming")
+            .await?;
 
         self.runtime
-            .runtime_backend
-            .stream_instance_logs(&instance_identifier, options, logs_tx)
+            .runtime_set
+            .stream_instance_logs(&runtime, options, logs_tx)
             .await
             .map_err(|err| anyhow!("workload log stream failed for {id}: {err}"))
     }
@@ -930,11 +967,6 @@ impl WorkloadManager {
         output_tx: MpscSender<RuntimeLogFrame>,
         input_rx: MpscReceiver<Vec<u8>>,
     ) -> Result<(), anyhow::Error> {
-        if !self.runtime.runtime_backend.capabilities().attach {
-            return Err(anyhow!(
-                "runtime backend does not support interactive attach"
-            ));
-        }
         let spec = self.load_spec(id).await?;
         if spec.node_id != self.local_node_id {
             return Err(anyhow!(
@@ -942,19 +974,21 @@ impl WorkloadManager {
                 spec.node_id
             ));
         }
-
-        let instance_identifier = {
-            let guard = self.local_state.local_instances.lock().await;
-            guard
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| format!("mantissa-{id}"))
-        };
+        if !self
+            .workload_runtime_capabilities(&spec)
+            .map(|capabilities| capabilities.attach)
+            .unwrap_or(false)
+        {
+            return Err(anyhow!(
+                "runtime backend does not support interactive attach"
+            ));
+        }
+        let runtime = self.resolve_local_runtime_for_spec(&spec, "attach").await?;
         let mut runtime_options = options.clone();
         let runtime_info = self
             .runtime
-            .runtime_backend
-            .inspect_instance(&instance_identifier)
+            .runtime_set
+            .inspect_instance(&runtime)
             .await
             .map_err(|err| anyhow!("workload attach inspect failed for {id}: {err}"))?;
         let runtime_tty = runtime_info.config.tty.unwrap_or(spec.tty);
@@ -969,8 +1003,8 @@ impl WorkloadManager {
         runtime_options.tty = runtime_tty;
 
         self.runtime
-            .runtime_backend
-            .attach_instance(&instance_identifier, &runtime_options, output_tx, input_rx)
+            .runtime_set
+            .attach_instance(&runtime, &runtime_options, output_tx, input_rx)
             .await
             .map_err(|err| anyhow!("workload attach failed for {id}: {err}"))
     }
@@ -986,11 +1020,6 @@ impl WorkloadManager {
         output_tx: MpscSender<RuntimeLogFrame>,
         input_rx: MpscReceiver<Vec<u8>>,
     ) -> Result<RuntimeExecResult, anyhow::Error> {
-        if !self.runtime.runtime_backend.capabilities().interactive_exec {
-            return Err(anyhow!(
-                "runtime backend does not support interactive exec sessions"
-            ));
-        }
         let spec = self.load_spec(id).await?;
         if spec.node_id != self.local_node_id {
             return Err(anyhow!(
@@ -1004,18 +1033,20 @@ impl WorkloadManager {
                 spec.state
             ));
         }
-
-        let instance_identifier = {
-            let guard = self.local_state.local_instances.lock().await;
-            guard
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| format!("mantissa-{id}"))
-        };
+        if !self
+            .workload_runtime_capabilities(&spec)
+            .map(|capabilities| capabilities.interactive_exec)
+            .unwrap_or(false)
+        {
+            return Err(anyhow!(
+                "runtime backend does not support interactive exec sessions"
+            ));
+        }
+        let runtime = self.resolve_local_runtime_for_spec(&spec, "exec").await?;
 
         self.runtime
-            .runtime_backend
-            .exec_instance_stream(&instance_identifier, options, output_tx, input_rx)
+            .runtime_set
+            .exec_instance_stream(&runtime, options, output_tx, input_rx)
             .await
             .map_err(|err| anyhow!("workload exec failed for {id}: {err}"))
     }
@@ -1045,18 +1076,11 @@ impl WorkloadManager {
             ));
         }
 
-        let instance_identifier = {
-            let guard = self.local_state.local_instances.lock().await;
-            guard
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| format!("mantissa-{id}"))
-        };
-
+        let runtime = self.resolve_local_runtime_for_spec(&spec, action).await?;
         let info = self
             .runtime
-            .runtime_backend
-            .inspect_instance(&instance_identifier)
+            .runtime_set
+            .inspect_instance(&runtime)
             .await
             .map_err(|err| anyhow!("workload {action} preflight failed for {id}: {err}"))?;
         let running = info.state.running.unwrap_or(false);
@@ -1069,7 +1093,12 @@ impl WorkloadManager {
 
     /// Verifies that a locally owned workload still has a running runtime before attach is accepted.
     pub async fn ensure_local_workload_attachable(&self, id: Uuid) -> Result<(), anyhow::Error> {
-        if !self.runtime.runtime_backend.capabilities().attach {
+        let spec = self.load_spec(id).await?;
+        if !self
+            .workload_runtime_capabilities(&spec)
+            .map(|capabilities| capabilities.attach)
+            .unwrap_or(false)
+        {
             return Err(anyhow!(
                 "runtime backend does not support interactive attach"
             ));
@@ -1080,7 +1109,12 @@ impl WorkloadManager {
 
     /// Verifies that a locally owned workload still has a running runtime before exec is accepted.
     pub async fn ensure_local_workload_executable(&self, id: Uuid) -> Result<(), anyhow::Error> {
-        if !self.runtime.runtime_backend.capabilities().interactive_exec {
+        let spec = self.load_spec(id).await?;
+        if !self
+            .workload_runtime_capabilities(&spec)
+            .map(|capabilities| capabilities.interactive_exec)
+            .unwrap_or(false)
+        {
             return Err(anyhow!(
                 "runtime backend does not support interactive exec sessions"
             ));
@@ -1388,9 +1422,24 @@ fn is_retryable_scheduling_error(err: &anyhow::Error) -> bool {
         })
 }
 
-/// Returns true when one task-start failure should be retried by a higher-level controller.
+/// Returns true when one workload-start failure should stay queued at the controller layer.
+///
+/// Higher-level controllers should keep work pending not only for short-lived convergence
+/// failures, but also for pure capacity shortages that may resolve once older workloads drain.
 pub(crate) fn workload_start_error_is_retryable(err: &anyhow::Error) -> bool {
-    is_retryable_scheduling_error(err)
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<SchedulingError>())
+        .is_some_and(|cause| {
+            matches!(
+                cause,
+                SchedulingError::SnapshotMissing
+                    | SchedulingError::NoCapacityAcrossCluster
+                    | SchedulingError::InsufficientCapacityForBatch
+                    | SchedulingError::InsufficientCapacityOnTarget { .. }
+                    | SchedulingError::NetworksBlocked { .. }
+                    | SchedulingError::LocalNetworksBlocked { .. }
+            )
+        })
 }
 
 /// Pick a smaller scheduling retry budget for targeted starts so callers can fall back quickly.

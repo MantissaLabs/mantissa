@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::runtime::types::{
     ResourceLimits, RestartPolicyConfig, RestartPolicyType, RuntimeCreateRequest,
+    RuntimeInstanceRef,
 };
 use crate::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadEnvironmentVariable as TaskEnvironmentVariable,
@@ -49,7 +50,7 @@ impl WorkloadManager {
     pub(super) async fn launch_task_instance(
         &self,
         request: &InstanceLaunchRequest<'_>,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<RuntimeInstanceRef, anyhow::Error> {
         let restart_policy = request.restart_policy.map(restart_policy_to_config);
         let resource_limits =
             ResourceLimits::from_requests(request.cpu_millis, request.memory_bytes);
@@ -170,10 +171,13 @@ impl WorkloadManager {
             gpu_device_ids,
         };
         let retry_create_request = create_request.clone();
+        let execution_platform = request.execution_platform;
+        let isolation_mode = request.isolation_mode;
+        let isolation_profile = request.isolation_profile;
 
         let (instance_id, created_fresh) = match self
             .runtime
-            .runtime_backend
+            .runtime_set
             .create_instance(create_request)
             .await
         {
@@ -181,7 +185,12 @@ impl WorkloadManager {
             Err(err) => {
                 if is_name_conflict(&err) {
                     match self
-                        .resolve_existing_instance_id(request.instance_name)
+                        .resolve_existing_runtime_instance(
+                            request.instance_name,
+                            execution_platform,
+                            isolation_mode,
+                            isolation_profile,
+                        )
                         .await
                     {
                         Ok(Some(existing_id)) => (existing_id, false),
@@ -194,7 +203,7 @@ impl WorkloadManager {
                             );
                             match self
                                 .runtime
-                                .runtime_backend
+                                .runtime_set
                                 .create_instance(retry_create_request)
                                 .await
                             {
@@ -230,33 +239,28 @@ impl WorkloadManager {
             }
         };
 
-        match self
-            .runtime
-            .runtime_backend
-            .start_instance(&instance_id)
-            .await
-        {
+        match self.runtime.runtime_set.start_instance(&instance_id).await {
             Ok(_) => {}
             Err(err) => {
                 if instance_already_running(&err) {
                     debug!(
                         target: "task",
                         "instance {} already running while starting task {}",
-                        instance_id,
+                        instance_id.handle,
                         request.task_id
                     );
                 } else {
                     if created_fresh
                         && let Err(remove_err) = self
                             .runtime
-                            .runtime_backend
+                            .runtime_set
                             .remove_instance(&instance_id, true, true)
                             .await
                     {
                         warn!(
                             target: "task",
                             "failed to remove instance {} after start failure: {remove_err}",
-                            instance_id
+                            instance_id.handle
                         );
                     }
                     return Err(wrap_start_error(request.task_name, err));

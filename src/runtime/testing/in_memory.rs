@@ -13,6 +13,9 @@ use crate::runtime::types::{
 };
 use crate::workload::model::ExecutionPlatform;
 
+/// Canonical backend kind name used when explicitly selecting the in-memory runtime.
+pub const IN_MEMORY_RUNTIME_BACKEND_KIND: &str = "in-memory";
+
 /// Returns whether tests requested the shared in-memory runtime backend through one env override.
 pub fn use_in_memory_runtime_backend_from_env() -> bool {
     std::env::var_os("MANTISSA_TEST_INMEMORY_CONTAINER_MANAGER").is_some()

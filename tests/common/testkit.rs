@@ -2,6 +2,8 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
+use mantissa::runtime::set::RuntimeSet;
+use mantissa::runtime::testing::IN_MEMORY_RUNTIME_BACKEND_KIND;
 pub use mantissa::runtime::testing::InMemoryRuntimeBackend;
 use mantissa::runtime::testing::new_in_memory_runtime_backend;
 use mantissa::runtime::types::RuntimeBackend;
@@ -32,6 +34,10 @@ where
 
 fn default_runtime_backend() -> Arc<dyn RuntimeBackend + Send + Sync> {
     new_in_memory_runtime_backend()
+}
+
+fn runtime_set_from_backend(backend: Arc<dyn RuntimeBackend + Send + Sync>) -> RuntimeSet {
+    RuntimeSet::singleton(IN_MEMORY_RUNTIME_BACKEND_KIND, backend)
 }
 
 #[derive(Clone)]
@@ -112,8 +118,8 @@ pub struct TestNode {
 impl TestNode {
     /// Resolves the runtime to inject into the next headless node this test creates.
     fn apply_test_runtime_backend(mut cfg: HeadlessConfig) -> HeadlessConfig {
-        if cfg.runtime_backend.is_none() {
-            cfg.runtime_backend = Some(runtime_backend_for_next_node());
+        if cfg.runtime_set.is_none() {
+            cfg.runtime_set = Some(runtime_set_from_backend(runtime_backend_for_next_node()));
         }
         cfg
     }
@@ -137,7 +143,7 @@ impl TestNode {
             gossip_fanout,
             gossip_channel_capacity,
             task_runtime,
-            runtime_backend: None,
+            runtime_set: None,
             local_volume_root: None,
         }
     }

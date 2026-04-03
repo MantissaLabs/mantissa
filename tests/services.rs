@@ -25,6 +25,8 @@ use mantissa::network::types::{
     NetworkSpecValue, NetworkStatus,
 };
 use mantissa::node::id::set_node_id;
+use mantissa::runtime::set::RuntimeSet;
+use mantissa::runtime::testing::IN_MEMORY_RUNTIME_BACKEND_KIND;
 use mantissa::runtime::testing::new_in_memory_runtime_backend;
 use mantissa::runtime::types::{
     RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError, RuntimeEvent,
@@ -5226,7 +5228,10 @@ async fn create_restartable_service_node(
             gossip_fanout: None,
             gossip_channel_capacity: None,
             task_runtime: None,
-            runtime_backend: Some(runtime_backend),
+            runtime_set: Some(RuntimeSet::singleton(
+                IN_MEMORY_RUNTIME_BACKEND_KIND,
+                runtime_backend,
+            )),
             local_volume_root: Some(local_volume_root),
         },
     )

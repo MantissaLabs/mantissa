@@ -8,6 +8,8 @@ use ed25519_dalek::SigningKey;
 use mantissa::gossip::Message;
 use mantissa::network::registry::NetworkRegistry;
 use mantissa::registry::Registry;
+use mantissa::runtime::set::RuntimeSet;
+use mantissa::runtime::testing::IN_MEMORY_RUNTIME_BACKEND_KIND;
 use mantissa::runtime::types::{RuntimeBackend, RuntimeCreateRequest, RuntimeError, RuntimeInfo};
 use mantissa::scheduler::Scheduler;
 use mantissa::scheduler::{SlotCapacity, SlotSpec};
@@ -321,7 +323,7 @@ async fn setup_workload_manager() -> TestHarness {
         local_node_id: actor,
         local_node_name: "test-node".to_string(),
         scheduler: scheduler.clone(),
-        runtime_backend: runtime_backend.clone(),
+        runtime_set: RuntimeSet::singleton(IN_MEMORY_RUNTIME_BACKEND_KIND, runtime_backend.clone()),
         registry,
         network_registry: NetworkRegistry::new(
             network_spec_store,

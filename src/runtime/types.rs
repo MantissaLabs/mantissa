@@ -51,6 +51,23 @@ pub type RuntimeResult<T> = Result<T, RuntimeError>;
 /// Stable handle used to address one runtime instance.
 pub type RuntimeHandle = String;
 
+/// Stable backend-qualified reference used to route follow-up operations for one runtime instance.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RuntimeInstanceRef {
+    pub backend_kind: String,
+    pub handle: RuntimeHandle,
+}
+
+impl RuntimeInstanceRef {
+    /// Builds one backend-qualified runtime reference.
+    pub fn new(backend_kind: impl Into<String>, handle: impl Into<RuntimeHandle>) -> Self {
+        Self {
+            backend_kind: backend_kind.into(),
+            handle: handle.into(),
+        }
+    }
+}
+
 /// Exit status returned by a command executed inside one running runtime instance.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeExecResult {
@@ -341,6 +358,74 @@ impl RuntimeCapabilities {
         }
         flags
     }
+
+    /// Returns the union of two backend capability sets.
+    pub fn merged(self, other: Self) -> Self {
+        Self {
+            exec: self.exec || other.exec,
+            interactive_exec: self.interactive_exec || other.interactive_exec,
+            logs: self.logs || other.logs,
+            attach: self.attach || other.attach,
+            lifecycle_events: self.lifecycle_events || other.lifecycle_events,
+        }
+    }
+}
+
+/// Reserved feature-flag prefix used to encode exact runtime support contracts.
+const RUNTIME_SUPPORT_CONTRACT_FLAG_PREFIX: &str = "runtime_contract:";
+
+/// One exact runtime contract advertised by one backend implementation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RuntimeSupportContract {
+    pub execution_platform: ExecutionPlatform,
+    pub isolation_mode: IsolationMode,
+    pub isolation_profile: Option<String>,
+}
+
+impl RuntimeSupportContract {
+    /// Builds one exact runtime contract from the scheduler-visible runtime selectors.
+    pub fn new(
+        execution_platform: ExecutionPlatform,
+        isolation_mode: IsolationMode,
+        isolation_profile: Option<&str>,
+    ) -> Self {
+        Self {
+            execution_platform,
+            isolation_mode,
+            isolation_profile: isolation_profile
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+        }
+    }
+
+    /// Encodes this contract into the reserved runtime-support feature-flag namespace.
+    pub fn feature_flag(&self) -> String {
+        let isolation_profile = self.isolation_profile.as_deref().unwrap_or("_");
+        format!(
+            "{RUNTIME_SUPPORT_CONTRACT_FLAG_PREFIX}{}:{}:{isolation_profile}",
+            self.execution_platform.as_str(),
+            self.isolation_mode.as_str(),
+        )
+    }
+
+    /// Decodes one reserved runtime-support feature flag into an exact contract.
+    pub fn from_feature_flag(value: &str) -> Option<Self> {
+        let encoded = value.strip_prefix(RUNTIME_SUPPORT_CONTRACT_FLAG_PREFIX)?;
+        let mut parts = encoded.splitn(3, ':');
+        let execution_platform = parts.next()?.parse().ok()?;
+        let isolation_mode = parts.next()?.parse().ok()?;
+        let isolation_profile = match parts.next()? {
+            "_" => None,
+            value => Some(value.to_string()),
+        };
+
+        Some(Self {
+            execution_platform,
+            isolation_mode,
+            isolation_profile,
+        })
+    }
 }
 
 /// Cluster-visible runtime support metadata advertised by one node.
@@ -442,6 +527,88 @@ impl RuntimeSupportProfile {
         )
     }
 
+    /// Builds one profile from exact backend contracts while preserving summarized legacy fields.
+    pub fn from_exact_contracts<I, J>(contracts: I, feature_flags: J) -> Self
+    where
+        I: IntoIterator<Item = RuntimeSupportContract>,
+        J: IntoIterator,
+        J::Item: Into<String>,
+    {
+        let mut contracts: Vec<RuntimeSupportContract> = contracts.into_iter().collect();
+        contracts.sort_unstable();
+        contracts.dedup();
+
+        let execution_platforms = contracts.iter().map(|value| value.execution_platform);
+        let isolation_modes = contracts.iter().map(|value| value.isolation_mode);
+        let isolation_profiles = contracts
+            .iter()
+            .filter_map(|value| value.isolation_profile.clone());
+
+        let mut profile = Self::new(
+            execution_platforms,
+            isolation_modes,
+            isolation_profiles,
+            feature_flags,
+        );
+        profile
+            .feature_flags
+            .extend(contracts.into_iter().map(|value| value.feature_flag()));
+        profile.feature_flags.sort_unstable();
+        profile.feature_flags.dedup();
+        profile
+    }
+
+    /// Returns whether this profile carries exact backend contracts.
+    pub fn advertises_exact_contracts(&self) -> bool {
+        self.feature_flags
+            .iter()
+            .any(|value| RuntimeSupportContract::from_feature_flag(value).is_some())
+    }
+
+    /// Returns the feature flags that are not part of the reserved contract namespace.
+    pub fn non_contract_feature_flags(&self) -> Vec<String> {
+        self.feature_flags
+            .iter()
+            .filter(|value| RuntimeSupportContract::from_feature_flag(value).is_none())
+            .cloned()
+            .collect()
+    }
+
+    /// Returns the exact contracts this profile advertises.
+    ///
+    /// Legacy profiles without reserved contract flags are expanded using their
+    /// summarized runtime fields so existing single-backend behavior stays intact.
+    pub fn supported_contracts(&self) -> Vec<RuntimeSupportContract> {
+        let mut contracts = self
+            .feature_flags
+            .iter()
+            .filter_map(|value| RuntimeSupportContract::from_feature_flag(value))
+            .collect::<Vec<_>>();
+
+        if contracts.is_empty() {
+            for execution_platform in &self.execution_platforms {
+                for isolation_mode in &self.isolation_modes {
+                    contracts.push(RuntimeSupportContract::new(
+                        *execution_platform,
+                        *isolation_mode,
+                        None,
+                    ));
+                    for isolation_profile in &self.isolation_profiles {
+                        contracts.push(RuntimeSupportContract::new(
+                            *execution_platform,
+                            *isolation_mode,
+                            Some(isolation_profile),
+                        ));
+                    }
+                }
+            }
+        }
+
+        contracts.sort_unstable();
+        contracts.dedup();
+        contracts
+    }
+
     /// Returns true when this node advertises support for the requested runtime family.
     pub fn supports_execution_platform(&self, execution_platform: ExecutionPlatform) -> bool {
         self.execution_platforms.contains(&execution_platform)
@@ -480,10 +647,17 @@ impl RuntimeSupportProfile {
         isolation_profile: Option<&str>,
         feature_flags: &[String],
     ) -> bool {
-        self.supports_execution_platform(execution_platform)
-            && self.supports_isolation_mode(isolation_mode)
-            && self.supports_isolation_profile(isolation_profile)
-            && self.supports_feature_flags(feature_flags)
+        if self.advertises_exact_contracts() {
+            let requested =
+                RuntimeSupportContract::new(execution_platform, isolation_mode, isolation_profile);
+            self.supported_contracts().contains(&requested)
+                && self.supports_feature_flags(feature_flags)
+        } else {
+            self.supports_execution_platform(execution_platform)
+                && self.supports_isolation_mode(isolation_mode)
+                && self.supports_isolation_profile(isolation_profile)
+                && self.supports_feature_flags(feature_flags)
+        }
     }
 
     /// Selects the more complete runtime profile between two concurrent peer rows.

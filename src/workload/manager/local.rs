@@ -228,7 +228,14 @@ impl WorkloadManager {
     ) -> Result<(), anyhow::Error> {
         for plan in plans.iter_mut() {
             let instance_name = format!("mantissa-{}", plan.id);
-            self.pull_image_for_task(plan.id, &plan.image).await?;
+            self.pull_image_for_task(
+                plan.id,
+                &plan.image,
+                plan.execution_platform,
+                plan.isolation_mode,
+                plan.isolation_profile.as_deref(),
+            )
+            .await?;
             self.update_task_phase(plan.id, WorkloadPhase::Creating, None, None)
                 .await?;
 
@@ -351,7 +358,7 @@ impl WorkloadManager {
             .context("failed to persist committed task specs")?;
 
         for (plan, spec) in plans.iter().zip(specs.iter()) {
-            self.finalize_running_task_post_commit(spec, plan.instance_id.as_deref(), true, true)
+            self.finalize_running_task_post_commit(spec, plan.instance_id.as_ref(), true, true)
                 .await;
         }
 
@@ -402,26 +409,28 @@ impl WorkloadManager {
             if let Some(instance_id) = plan.instance_id.as_ref() {
                 if let Err(err) = self
                     .runtime
-                    .runtime_backend
+                    .runtime_set
                     .stop_instance(instance_id, Some(Duration::from_secs(10)))
                     .await
                 {
                     warn!(
                         target: "task",
-                        "failed to stop instance {instance_id} for task {}: {err}",
+                        "failed to stop instance {} for task {}: {err}",
+                        instance_id.handle,
                         plan.id
                     );
                 }
 
                 if let Err(err) = self
                     .runtime
-                    .runtime_backend
+                    .runtime_set
                     .remove_instance(instance_id, true, true)
                     .await
                 {
                     warn!(
                         target: "task",
-                        "failed to remove instance {instance_id} for task {}: {err}",
+                        "failed to remove instance {} for task {}: {err}",
+                        instance_id.handle,
                         plan.id
                     );
                 }

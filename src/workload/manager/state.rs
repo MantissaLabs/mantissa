@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 use crate::gossip::Message;
 use crate::network::types::{NetworkAttachmentState, NetworkAttachmentValue};
-use crate::runtime::types::{RuntimeError, RuntimeInfo};
+use crate::runtime::set::RuntimeDiscoveredInstance;
+use crate::runtime::types::{RuntimeError, RuntimeInfo, RuntimeInstanceRef};
 use crate::scheduler::{
     GpuReservationRequest, LeaseReservation, SchedulerError, SlotId, SlotReservationRequest,
     SlotState,
@@ -36,8 +37,8 @@ use super::{
 
 /// Snapshot of instances currently known by the local runtime.
 struct RuntimeInventory {
-    task_instances: HashMap<Uuid, String>,
-    instance_ids: HashSet<String>,
+    task_instances: HashMap<Uuid, RuntimeInstanceRef>,
+    instance_ids: HashSet<RuntimeInstanceRef>,
 }
 
 /// Per-attempt timeout applied to one image pull request.
@@ -65,7 +66,7 @@ impl WorkloadManager {
             return Ok(false);
         }
 
-        match self.resolve_live_instance_id_for_task(working).await {
+        match self.resolve_live_instance_ref_for_task(working).await {
             Ok(Some(instance_id)) => {
                 let mut guard = self.local_state.local_instances.lock().await;
                 guard.insert(working.id, instance_id.clone());
@@ -195,7 +196,7 @@ impl WorkloadManager {
     async fn reconcile_liveness_probe(
         &self,
         working: &mut WorkloadSpec,
-        instance_id: &str,
+        instance_id: &RuntimeInstanceRef,
     ) -> Result<bool, anyhow::Error> {
         let Some(probe) = working.liveness.clone() else {
             self.local_state
@@ -371,12 +372,18 @@ impl WorkloadManager {
     async fn execute_liveness_probe(
         &self,
         task_id: Uuid,
-        instance_id: &str,
+        instance_id: &RuntimeInstanceRef,
         probe: &WorkloadLivenessProbe,
     ) -> Result<(), String> {
         match probe.kind {
             WorkloadLivenessProbeKind::Exec => {
-                if !self.runtime.runtime_backend.capabilities().exec {
+                if !self
+                    .runtime
+                    .runtime_set
+                    .capabilities_for_runtime(instance_id)
+                    .map(|capabilities| capabilities.exec)
+                    .unwrap_or(false)
+                {
                     return Err(
                         "runtime backend does not support exec-based liveness probes".to_string(),
                     );
@@ -386,7 +393,7 @@ impl WorkloadManager {
                 }
                 match self
                     .runtime
-                    .runtime_backend
+                    .runtime_set
                     .exec_instance(instance_id, &probe.command, Some(probe.timeout()))
                     .await
                 {
@@ -441,7 +448,7 @@ impl WorkloadManager {
     async fn resolve_liveness_probe_targets(
         &self,
         task_id: Uuid,
-        instance_id: &str,
+        instance_id: &RuntimeInstanceRef,
     ) -> Result<Vec<Ipv4Addr>, String> {
         let mut targets = BTreeSet::new();
         let attachments = self
@@ -469,7 +476,7 @@ impl WorkloadManager {
 
         let inspect = self
             .runtime
-            .runtime_backend
+            .runtime_set
             .inspect_instance(instance_id)
             .await
             .map_err(|err| format!("failed to inspect task instance for liveness probe: {err}"))?;
@@ -1000,8 +1007,16 @@ impl WorkloadManager {
         &self,
         task_id: Uuid,
         image: &str,
+        execution_platform: crate::workload::model::ExecutionPlatform,
+        isolation_mode: crate::workload::model::IsolationMode,
+        isolation_profile: Option<&str>,
     ) -> Result<(), anyhow::Error> {
-        match self.runtime.runtime_backend.image_present(image).await {
+        match self
+            .runtime
+            .runtime_set
+            .image_present(image, execution_platform, isolation_mode, isolation_profile)
+            .await
+        {
             Ok(true) => {
                 debug!(
                     target: "task",
@@ -1044,7 +1059,12 @@ impl WorkloadManager {
 
             match timeout(
                 IMAGE_PULL_TIMEOUT,
-                self.runtime.runtime_backend.pull_image(image),
+                self.runtime.runtime_set.pull_image(
+                    image,
+                    execution_platform,
+                    isolation_mode,
+                    isolation_profile,
+                ),
             )
             .await
             {
@@ -1288,14 +1308,14 @@ impl WorkloadManager {
     /// Stops one runtime instance with a bounded wall-clock timeout so retries are possible.
     async fn stop_instance_bounded(
         &self,
-        instance_identifier: &str,
+        instance_identifier: &RuntimeInstanceRef,
         timeout_budget: Duration,
     ) -> Result<(), anyhow::Error> {
         let timeout_budget = timeout_budget.max(Duration::from_millis(1));
         match timeout(
             timeout_budget,
             self.runtime
-                .runtime_backend
+                .runtime_set
                 .stop_instance(instance_identifier, Some(timeout_budget)),
         )
         .await
@@ -1312,7 +1332,7 @@ impl WorkloadManager {
     /// Removes one runtime instance with a bounded wall-clock timeout so stale stops can retry.
     async fn remove_instance_bounded(
         &self,
-        instance_identifier: &str,
+        instance_identifier: &RuntimeInstanceRef,
         force: bool,
         remove_volumes: bool,
         timeout_budget: Duration,
@@ -1320,11 +1340,9 @@ impl WorkloadManager {
         let timeout_budget = timeout_budget.max(Duration::from_millis(1));
         match timeout(
             timeout_budget,
-            self.runtime.runtime_backend.remove_instance(
-                instance_identifier,
-                force,
-                remove_volumes,
-            ),
+            self.runtime
+                .runtime_set
+                .remove_instance(instance_identifier, force, remove_volumes),
         )
         .await
         {
@@ -1362,7 +1380,32 @@ impl WorkloadManager {
         };
         self.local_state.liveness_probes.lock().await.remove(&id);
 
-        let instance_identifier = identifier_entry.unwrap_or_else(|| format!("mantissa-{id}"));
+        let instance_identifier = match identifier_entry {
+            Some(instance_identifier) => Some(instance_identifier),
+            None => {
+                let instance_name = format!("mantissa-{id}");
+                match self
+                    .resolve_existing_runtime_instance(
+                        &instance_name,
+                        spec.execution_platform,
+                        spec.isolation_mode,
+                        spec.isolation_profile.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(runtime) => runtime,
+                    Err(err) => {
+                        warn!(
+                            target: "task",
+                            task = %id,
+                            instance = %instance_name,
+                            "failed to resolve runtime instance before stop: {err}"
+                        );
+                        None
+                    }
+                }
+            }
+        };
 
         let mut updated = spec.clone();
         if !matches!(spec.state, WorkloadPhase::Stopping) {
@@ -1388,33 +1431,36 @@ impl WorkloadManager {
         // exceeds its configured graceful termination window.
         let stop_deadline =
             Instant::now() + self.effective_task_stop_timeout(spec.termination_grace_period_secs);
-        self.run_pre_stop_hook(&spec, &instance_identifier, stop_deadline)
-            .await;
+        if let Some(instance_identifier) = instance_identifier.as_ref() {
+            self.run_pre_stop_hook(&spec, instance_identifier, stop_deadline)
+                .await;
 
-        match self
-            .stop_instance_bounded(&instance_identifier, remaining_stop_timeout(stop_deadline))
-            .await
-        {
-            Ok(()) => {}
-            Err(err) => {
-                // Keep the task in `Stopping` so the periodic reconcile loop can retry after one
-                // bounded runtime timeout instead of pinning the stop guard forever.
-                return Err(err);
+            match self
+                .stop_instance_bounded(instance_identifier, remaining_stop_timeout(stop_deadline))
+                .await
+            {
+                Ok(()) => {}
+                Err(err) => {
+                    // Keep the task in `Stopping` so the periodic reconcile loop can retry after one
+                    // bounded runtime timeout instead of pinning the stop guard forever.
+                    return Err(err);
+                }
             }
-        }
 
-        self.remove_instance_bounded(
-            &instance_identifier,
-            false,
-            true,
-            remaining_stop_timeout(stop_deadline),
-        )
-        .await
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "failed to remove instance {instance_identifier} while stopping task {id}: {err}"
+            self.remove_instance_bounded(
+                instance_identifier,
+                false,
+                true,
+                remaining_stop_timeout(stop_deadline),
             )
-        })?;
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to remove instance {} while stopping task {id}: {err}",
+                    instance_identifier.handle
+                )
+            })?;
+        }
 
         self.cleanup_secret_artifacts(id).await;
         if let Err(err) = self.unpublish_task_volume_mounts(&spec).await {
@@ -1478,13 +1524,19 @@ impl WorkloadManager {
     async fn run_pre_stop_hook(
         &self,
         spec: &WorkloadSpec,
-        instance_identifier: &str,
+        instance_identifier: &RuntimeInstanceRef,
         stop_deadline: Instant,
     ) {
         let Some(command) = spec.pre_stop_command.as_deref() else {
             return;
         };
-        if !self.runtime.runtime_backend.capabilities().exec {
+        if !self
+            .runtime
+            .runtime_set
+            .capabilities_for_runtime(instance_identifier)
+            .map(|capabilities| capabilities.exec)
+            .unwrap_or(false)
+        {
             warn!(
                 target: "task",
                 task = %spec.id,
@@ -1505,7 +1557,7 @@ impl WorkloadManager {
 
         match self
             .runtime
-            .runtime_backend
+            .runtime_set
             .exec_instance(instance_identifier, command, Some(remaining))
             .await
         {
@@ -1926,85 +1978,81 @@ impl WorkloadManager {
         &self,
         spec: &WorkloadSpec,
     ) -> Result<Option<(i32, Option<String>)>, RuntimeError> {
-        let desired_name = format!("mantissa-{}", spec.id);
-        let candidate = {
-            let guard = self.local_state.local_instances.lock().await;
-            guard
-                .get(&spec.id)
-                .cloned()
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| desired_name.clone())
-        };
-
-        let mut inspect_targets = vec![candidate.clone()];
-        if candidate != desired_name {
-            inspect_targets.push(desired_name);
-        }
-
-        for target in inspect_targets {
-            match self.runtime.runtime_backend.inspect_instance(&target).await {
-                Ok(info) => return Ok(terminal_exit_from_inspect(&info)),
-                Err(RuntimeError::NotFound(_)) => continue,
-                Err(err) => return Err(err),
-            }
+        if let Some(runtime) = self.resolve_live_or_named_runtime_for_task(spec).await? {
+            let info = self.runtime.runtime_set.inspect_instance(&runtime).await?;
+            return Ok(terminal_exit_from_inspect(&info));
         }
 
         Ok(None)
     }
 
-    /// Resolves the live instance identifier for a task from cache and deterministic name.
+    /// Resolves the live backend-qualified runtime reference for a task from cache and name.
     ///
     /// This keeps running-task reconciliation resilient when local in-memory tracking drifts
     /// or the runtime returns canonical ids that differ from Mantissa's deterministic names.
-    pub(super) async fn resolve_live_instance_id_for_task(
+    pub(super) async fn resolve_live_instance_ref_for_task(
         &self,
         spec: &WorkloadSpec,
-    ) -> Result<Option<String>, RuntimeError> {
+    ) -> Result<Option<RuntimeInstanceRef>, RuntimeError> {
+        let Some(runtime) = self.resolve_live_or_named_runtime_for_task(spec).await? else {
+            return Ok(None);
+        };
+        match self.runtime.runtime_set.inspect_instance(&runtime).await {
+            Ok(info) => Ok(resolve_live_runtime_ref(runtime, info)),
+            Err(RuntimeError::NotFound(_)) => {
+                let desired_name = format!("mantissa-{}", spec.id);
+                let discovered = self
+                    .runtime
+                    .runtime_set
+                    .inspect_named_instance(
+                        &desired_name,
+                        spec.execution_platform,
+                        spec.isolation_mode,
+                        spec.isolation_profile.as_deref(),
+                    )
+                    .await?;
+                Ok(discovered
+                    .and_then(|instance| resolve_live_runtime_ref(instance.runtime, instance.info)))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Resolves a cached or named runtime reference for one task without requiring it to be live.
+    async fn resolve_live_or_named_runtime_for_task(
+        &self,
+        spec: &WorkloadSpec,
+    ) -> Result<Option<RuntimeInstanceRef>, RuntimeError> {
         let desired_name = format!("mantissa-{}", spec.id);
         let candidate = {
             let guard = self.local_state.local_instances.lock().await;
-            guard
-                .get(&spec.id)
-                .cloned()
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| desired_name.clone())
+            guard.get(&spec.id).cloned()
         };
 
-        let resolve_id = |fallback: String, info: RuntimeInfo| -> Option<String> {
-            let running = info.state.running.unwrap_or(true);
-            let pid = info.state.pid.unwrap_or(1);
-            if !running || pid == 0 {
-                return None;
+        if let Some(candidate) = candidate {
+            match self.runtime.runtime_set.inspect_instance(&candidate).await {
+                Ok(info) => return Ok(Some(canonicalize_runtime_ref(&candidate, &info))),
+                Err(RuntimeError::NotFound(_)) => {}
+                Err(err) => return Err(err),
             }
-            if info.id.is_empty() {
-                Some(fallback)
-            } else {
-                Some(info.id)
-            }
-        };
+        }
 
         match self
             .runtime
-            .runtime_backend
-            .inspect_instance(&candidate)
+            .runtime_set
+            .inspect_named_instance(
+                &desired_name,
+                spec.execution_platform,
+                spec.isolation_mode,
+                spec.isolation_profile.as_deref(),
+            )
             .await
         {
-            Ok(info) => Ok(resolve_id(candidate, info)),
-            Err(RuntimeError::NotFound(_)) if candidate != desired_name => {
-                match self
-                    .runtime
-                    .runtime_backend
-                    .inspect_instance(&desired_name)
-                    .await
-                {
-                    Ok(info) => Ok(resolve_id(desired_name, info)),
-                    Err(RuntimeError::NotFound(_)) => {
-                        self.find_instance_id_by_name(&desired_name).await
-                    }
-                    Err(err) => Err(err),
-                }
-            }
-            Err(RuntimeError::NotFound(_)) => self.find_instance_id_by_name(&desired_name).await,
+            Ok(Some(discovered)) => Ok(Some(canonicalize_runtime_ref(
+                &discovered.runtime,
+                &discovered.info,
+            ))),
+            Ok(None) => Ok(None),
             Err(err) => Err(err),
         }
     }
@@ -2050,7 +2098,16 @@ impl WorkloadManager {
         working = self.ensure_task_lease_commit(&working).await?;
         self.ensure_task_slot_reservations(&working).await?;
 
-        if let Err(err) = self.pull_image_for_task(working.id, &working.image).await {
+        if let Err(err) = self
+            .pull_image_for_task(
+                working.id,
+                &working.image,
+                working.execution_platform,
+                working.isolation_mode,
+                working.isolation_profile.as_deref(),
+            )
+            .await
+        {
             let err = self.mark_task_failed(working, err).await;
             return Err(err);
         }
@@ -2223,7 +2280,7 @@ impl WorkloadManager {
     pub(super) async fn finalize_running_task_post_commit(
         &self,
         spec: &WorkloadSpec,
-        instance_id: Option<&str>,
+        instance_id: Option<&RuntimeInstanceRef>,
         best_effort_gossip: bool,
         update_instance_cache: bool,
     ) {
@@ -2268,7 +2325,7 @@ impl WorkloadManager {
 
             if update_instance_cache {
                 let mut guard = self.local_state.local_instances.lock().await;
-                guard.insert(spec.id, instance_id.to_string());
+                guard.insert(spec.id, instance_id.clone());
             }
         }
 
@@ -2286,7 +2343,7 @@ impl WorkloadManager {
         &self,
         task_id: Uuid,
         task_name: &str,
-        instance_id: &str,
+        instance_id: &RuntimeInstanceRef,
         networks: &[Uuid],
         service_meta: Option<&WorkloadServiceMetadata>,
     ) -> Result<(), anyhow::Error> {
@@ -2317,14 +2374,18 @@ impl WorkloadManager {
     }
 
     /// Stops and removes a launched runtime instance best-effort when one launch stage must roll back.
-    pub(super) async fn rollback_instance_launch(&self, instance_id: &str, reason: &str) {
+    pub(super) async fn rollback_instance_launch(
+        &self,
+        instance_id: &RuntimeInstanceRef,
+        reason: &str,
+    ) {
         if let Err(stop_err) = self
             .stop_instance_bounded(instance_id, Duration::from_secs(10))
             .await
         {
             warn!(
                 target: "task",
-                instance = %instance_id,
+                instance = %instance_id.handle,
                 reason,
                 "failed to stop runtime instance during launch rollback: {stop_err}"
             );
@@ -2335,7 +2396,7 @@ impl WorkloadManager {
         {
             warn!(
                 target: "task",
-                instance = %instance_id,
+                instance = %instance_id.handle,
                 reason,
                 "failed to remove runtime instance during launch rollback: {remove_err}"
             );
@@ -2343,7 +2404,7 @@ impl WorkloadManager {
     }
 
     /// Best-effort rollback when startup raced with a newer stop/remove intent.
-    async fn abort_launched_instance(&self, task_id: Uuid, instance_id: &str) {
+    async fn abort_launched_instance(&self, task_id: Uuid, instance_id: &RuntimeInstanceRef) {
         self.local_state
             .local_instances
             .lock()
@@ -2359,53 +2420,27 @@ impl WorkloadManager {
     }
 
     /// Resolves an existing instance identifier when a create call hit a name conflict.
-    pub(super) async fn resolve_existing_instance_id(
+    pub(super) async fn resolve_existing_runtime_instance(
         &self,
         instance_name: &str,
-    ) -> Result<Option<String>, RuntimeError> {
-        if let Some(id) = self.find_instance_id_by_name(instance_name).await? {
-            return Ok(Some(id));
-        }
-
-        match self
-            .runtime
-            .runtime_backend
-            .inspect_instance(instance_name)
+        execution_platform: crate::workload::model::ExecutionPlatform,
+        isolation_mode: crate::workload::model::IsolationMode,
+        isolation_profile: Option<&str>,
+    ) -> Result<Option<RuntimeInstanceRef>, RuntimeError> {
+        self.runtime
+            .runtime_set
+            .inspect_named_instance(
+                instance_name,
+                execution_platform,
+                isolation_mode,
+                isolation_profile,
+            )
             .await
-        {
-            Ok(info) => {
-                if info.id.is_empty() {
-                    Ok(Some(instance_name.to_string()))
-                } else {
-                    Ok(Some(info.id))
-                }
-            }
-            Err(RuntimeError::NotFound(_)) => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
-
-    /// Locate a instance id by name using the lightweight list API.
-    async fn find_instance_id_by_name(
-        &self,
-        instance_name: &str,
-    ) -> Result<Option<String>, RuntimeError> {
-        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
-        filters.insert("name".to_string(), vec![instance_name.to_string()]);
-        let candidates = self
-            .runtime
-            .runtime_backend
-            .list_instances(Some(filters))
-            .await?;
-        for candidate in candidates {
-            if candidate.name == instance_name {
-                if !candidate.id.is_empty() {
-                    return Ok(Some(candidate.id));
-                }
-                return Ok(Some(candidate.name));
-            }
-        }
-        Ok(None)
+            .map(|runtime| {
+                runtime.map(|discovered| {
+                    canonicalize_runtime_ref(&discovered.runtime, &discovered.info)
+                })
+            })
     }
 
     /// Ensures that a locally tracked task has completely stopped and released resources.
@@ -2423,25 +2458,29 @@ impl WorkloadManager {
             // before declaring the task instance-less.
             let instance_name = format!("mantissa-{}", spec.id);
             match self
-                .runtime
-                .runtime_backend
-                .inspect_instance(&instance_name)
+                .resolve_existing_runtime_instance(
+                    &instance_name,
+                    spec.execution_platform,
+                    spec.isolation_mode,
+                    spec.isolation_profile.as_deref(),
+                )
                 .await
             {
-                Ok(info) => {
+                Ok(Some(runtime)) => {
+                    let info = self
+                        .runtime
+                        .runtime_set
+                        .inspect_instance(&runtime)
+                        .await
+                        .map_err(anyhow::Error::from)?;
                     let running = info.state.running.unwrap_or(false);
                     if running {
-                        let resolved = if info.id.is_empty() {
-                            instance_name
-                        } else {
-                            info.id
-                        };
                         let mut guard = self.local_state.local_instances.lock().await;
-                        guard.insert(spec.id, resolved);
+                        guard.insert(spec.id, canonicalize_runtime_ref(&runtime, &info));
                         has_instance = true;
                     }
                 }
-                Err(RuntimeError::NotFound(_)) => {}
+                Ok(None) => {}
                 Err(err) => {
                     warn!(
                         target: "task",
@@ -2690,16 +2729,16 @@ impl WorkloadManager {
     pub(super) async fn reconcile_local_runtime_inventory(&self) -> Result<(), anyhow::Error> {
         const UNOWNED_TASK_GRACE_SECS: i64 = 5;
 
-        let instances = self.runtime.runtime_backend.list_instances(None).await?;
+        let instances = self.runtime.runtime_set.list_instances(None).await?;
         let task_index = self.load_workload_value_index().await?;
 
         for instance in instances {
-            let Some(task_id) = Self::runtime_workload_id(&instance) else {
+            let Some(task_id) = Self::runtime_workload_id(&instance.info) else {
                 continue;
             };
 
             let Some(value) = task_index.get(&task_id).cloned() else {
-                self.stop_unowned_instance(task_id, &instance.name, true, None)
+                self.stop_unowned_instance(task_id, &instance, true, None)
                     .await;
                 continue;
             };
@@ -2708,16 +2747,12 @@ impl WorkloadManager {
                 if workload_value_recent(&value, UNOWNED_TASK_GRACE_SECS) {
                     continue;
                 }
-                self.stop_unowned_instance(task_id, &instance.name, false, Some(&value))
+                self.stop_unowned_instance(task_id, &instance, false, Some(&value))
                     .await;
                 continue;
             }
 
-            let instance_id = if instance.id.is_empty() {
-                instance.name.clone()
-            } else {
-                instance.id.clone()
-            };
+            let instance_id = canonicalize_runtime_ref(&instance.runtime, &instance.info);
             {
                 let mut guard = self.local_state.local_instances.lock().await;
                 guard.insert(task_id, instance_id.clone());
@@ -2753,7 +2788,7 @@ impl WorkloadManager {
                 warn!(
                     target: "task",
                     task = %task_id,
-                    instance = %instance_id,
+                    instance = %instance_id.handle,
                     "failed to refresh attachments while adopting runtime instance: {err:#}"
                 );
             }
@@ -2807,16 +2842,10 @@ impl WorkloadManager {
     async fn stop_unowned_instance(
         &self,
         task_id: Uuid,
-        instance_name: &str,
+        runtime: &RuntimeDiscoveredInstance,
         remove_attachments: bool,
         task_value: Option<&WorkloadValue>,
     ) {
-        let identifier = if instance_name.is_empty() {
-            format!("mantissa-{task_id}")
-        } else {
-            instance_name.to_string()
-        };
-
         {
             let mut guard = self.local_state.local_instances.lock().await;
             guard.remove(&task_id);
@@ -2832,7 +2861,7 @@ impl WorkloadManager {
 
         match self
             .stop_instance_bounded(
-                &identifier,
+                &runtime.runtime,
                 self.effective_task_stop_timeout(
                     task_value.and_then(|value| value.termination_grace_period_secs),
                 ),
@@ -2843,18 +2872,20 @@ impl WorkloadManager {
             Err(err) => {
                 warn!(
                     target: "task",
-                    "failed to stop unowned instance {identifier} for task {task_id}: {err}"
+                    "failed to stop unowned instance {} for task {task_id}: {err}",
+                    runtime.runtime.handle
                 );
             }
         }
 
         if let Err(err) = self
-            .remove_instance_bounded(&identifier, false, true, Duration::from_secs(10))
+            .remove_instance_bounded(&runtime.runtime, false, true, Duration::from_secs(10))
             .await
         {
             warn!(
                 target: "task",
-                "failed to remove unowned instance {identifier} for task {task_id}: {err}"
+                "failed to remove unowned instance {} for task {task_id}: {err}",
+                runtime.runtime.handle
             );
         }
 
@@ -2974,7 +3005,7 @@ impl WorkloadManager {
     async fn list_runtime_inventory(&self) -> Result<RuntimeInventory, anyhow::Error> {
         let instances = self
             .runtime
-            .runtime_backend
+            .runtime_set
             .list_instances(None)
             .await
             .map_err(anyhow::Error::from)
@@ -2984,16 +3015,13 @@ impl WorkloadManager {
         let mut instance_ids = HashSet::new();
 
         for instance in instances {
-            if !Self::instance_is_running(&instance) {
+            if !Self::instance_is_running(&instance.info) {
                 continue;
             }
-            let instance_id = Self::instance_identity(&instance);
-            if instance_id.is_empty() {
-                continue;
-            }
+            let instance_id = canonicalize_runtime_ref(&instance.runtime, &instance.info);
             instance_ids.insert(instance_id.clone());
 
-            let Some(task_id) = Self::runtime_workload_id(&instance) else {
+            let Some(task_id) = Self::runtime_workload_id(&instance.info) else {
                 continue;
             };
             task_instances.insert(task_id, instance_id);
@@ -3059,14 +3087,6 @@ impl WorkloadManager {
         }
 
         false
-    }
-
-    /// Resolves the best local identity string for one runtime instance row.
-    fn instance_identity(instance: &RuntimeInfo) -> String {
-        if !instance.id.is_empty() {
-            return instance.id.clone();
-        }
-        instance.name.clone()
     }
 
     /// Extracts the workload identifier published by the runtime instance metadata.
@@ -3664,6 +3684,34 @@ fn should_restart_after_exit(spec: &WorkloadSpec, exit_code: i32) -> bool {
         WorkloadRestartPolicyKind::Always | WorkloadRestartPolicyKind::UnlessStopped => true,
         WorkloadRestartPolicyKind::OnFailure => exit_code != 0,
     }
+}
+
+/// Resolves one stable runtime reference from inspect data and a previously known backend owner.
+fn canonicalize_runtime_ref(
+    runtime: &RuntimeInstanceRef,
+    info: &RuntimeInfo,
+) -> RuntimeInstanceRef {
+    let handle = if info.id.is_empty() {
+        runtime.handle.clone()
+    } else {
+        info.id.clone()
+    };
+
+    RuntimeInstanceRef::new(runtime.backend_kind.clone(), handle)
+}
+
+/// Returns the runtime reference only when inspect confirms the instance is still live.
+fn resolve_live_runtime_ref(
+    runtime: RuntimeInstanceRef,
+    info: RuntimeInfo,
+) -> Option<RuntimeInstanceRef> {
+    let running = info.state.running.unwrap_or(true);
+    let pid = info.state.pid.unwrap_or(1);
+    if !running || pid == 0 {
+        return None;
+    }
+
+    Some(canonicalize_runtime_ref(&runtime, &info))
 }
 
 /// Extracts terminal exit metadata from one Docker inspect response.

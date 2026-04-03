@@ -8,7 +8,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::gpu::gpu_runtime_status;
-use crate::runtime::types::RuntimeSupportProfile;
+use crate::runtime::types::{RuntimeInstanceRef, RuntimeSupportProfile};
 use crate::scheduler::digest::SchedulerDigestValue;
 use crate::scheduler::{
     GpuDeviceReservation, GpuDeviceState, SchedulerSnapshot, SlotCapacity, SlotId, SlotState,
@@ -29,6 +29,12 @@ use super::{WorkloadManager, WorkloadStartRequest};
 pub(super) enum SchedulingError {
     #[error("scheduler snapshot unavailable")]
     SnapshotMissing,
+    #[error("scheduler reservation failed: no available capacity across cluster")]
+    NoCapacityAcrossCluster,
+    #[error("scheduler reservation failed: insufficient capacity for batch")]
+    InsufficientCapacityForBatch,
+    #[error("scheduler reservation failed: insufficient capacity on target node {target_node}")]
+    InsufficientCapacityOnTarget { target_node: Uuid },
     #[error("scheduler reservation failed: networks {networks:?} unavailable on any candidate")]
     NetworksBlocked { networks: Vec<Uuid> },
     #[error("local node lacks required networks for task '{task}'")]
@@ -76,7 +82,7 @@ pub(super) struct BatchStartPlan {
     pub(super) requested_memory_bytes: u64,
     pub(super) requested_gpu_count: u32,
     pub(super) gpu_device_ids: Vec<String>,
-    pub(super) instance_id: Option<String>,
+    pub(super) instance_id: Option<RuntimeInstanceRef>,
     pub(super) created_at: DateTime<Utc>,
     pub(super) index: usize,
     pub(super) preassigned: bool,
@@ -758,7 +764,7 @@ impl WorkloadManager {
             .get(&self.local_node_id)
             .cloned()
             .unwrap_or_else(HashSet::new);
-        let local_runtime_support = self.runtime.runtime_backend.advertised_support();
+        let local_runtime_support = self.runtime.runtime_set.advertised_support();
         let (local_gpu_ready, local_gpu_reason) = gpu_runtime_preflight(&snapshot);
         let (mut assignment, remaining_intents, available_slots, available_gpus) = self
             .seed_local_plans(
@@ -786,9 +792,7 @@ impl WorkloadManager {
             &remaining_intents,
         )?;
         if candidates.is_empty() {
-            return Err(anyhow::anyhow!(
-                "scheduler reservation failed: no available capacity across cluster"
-            ));
+            return Err(SchedulingError::NoCapacityAcrossCluster.into());
         }
 
         self.allocate_remaining(&mut assignment, &mut candidates, remaining_intents)?;
@@ -1103,7 +1107,7 @@ impl WorkloadManager {
     ) -> Result<VecDeque<Candidate>, anyhow::Error> {
         let mut queue = VecDeque::new();
         let mut provided_capacity = CandidateCapacity::default();
-        let local_runtime_support = self.runtime.runtime_backend.advertised_support();
+        let local_runtime_support = self.runtime.runtime_set.advertised_support();
         if self.core.registry.peer_schedulable(self.local_node_id)
             && let Some(local_candidate) = Candidate::new_local(
                 local_slots,
@@ -1165,9 +1169,7 @@ impl WorkloadManager {
     ) -> Result<(CandidateLocation, ResourceAllocation), anyhow::Error> {
         let candidate_count = candidates.len();
         if candidate_count == 0 {
-            return Err(anyhow::anyhow!(
-                "scheduler reservation failed: insufficient capacity for batch"
-            ));
+            return Err(SchedulingError::InsufficientCapacityForBatch.into());
         }
 
         let mut matched: Option<Candidate> = None;
@@ -1218,9 +1220,7 @@ impl WorkloadManager {
         }
 
         candidates.push_back(candidate);
-        Err(anyhow::anyhow!(
-            "scheduler reservation failed: insufficient capacity on target node {target_node}"
-        ))
+        Err(SchedulingError::InsufficientCapacityOnTarget { target_node }.into())
     }
 
     /// Allocate the remaining intents across the candidate queue. The queue is
@@ -1300,9 +1300,7 @@ impl WorkloadManager {
 
             let candidate_count = candidates.len();
             if candidate_count == 0 {
-                return Err(anyhow::anyhow!(
-                    "scheduler reservation failed: insufficient capacity for batch"
-                ));
+                return Err(SchedulingError::InsufficientCapacityForBatch.into());
             }
 
             let mut allocated: Option<(CandidateLocation, ResourceAllocation)> = None;
@@ -1348,9 +1346,7 @@ impl WorkloadManager {
                     }
                     .into());
                 } else {
-                    return Err(anyhow::anyhow!(
-                        "scheduler reservation failed: insufficient capacity for batch"
-                    ));
+                    return Err(SchedulingError::InsufficientCapacityForBatch.into());
                 }
             };
 

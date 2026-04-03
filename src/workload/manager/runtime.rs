@@ -19,7 +19,7 @@ use crate::network::types::{
     compute_network_attachment_id,
 };
 use crate::network::wireguard;
-use crate::runtime::types::{RuntimeAttachmentTarget, RuntimeEvent};
+use crate::runtime::types::{RuntimeAttachmentTarget, RuntimeEvent, RuntimeInstanceRef};
 use crate::workload::model::{
     WorkloadEvent, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStatus,
     compare_workload_causality as compare_task_causality,
@@ -109,63 +109,27 @@ impl WorkloadManager {
                 continue;
             }
 
-            let desired_name = format!("mantissa-{}", spec.id);
-            let mut instance_id = {
-                let guard = self.local_state.local_instances.lock().await;
-                guard
-                    .get(&spec.id)
-                    .cloned()
-                    .filter(|id| !id.is_empty())
-                    .unwrap_or_else(|| attachment.instance_id.clone())
-            };
-            if instance_id.is_empty() {
-                instance_id = desired_name.clone();
-            }
-
-            let inspect = match self
-                .runtime
-                .runtime_backend
-                .inspect_instance(&instance_id)
-                .await
-            {
-                Ok(info) => info,
-                Err(first_err) => {
-                    if instance_id != desired_name {
-                        match self
-                            .runtime
-                            .runtime_backend
-                            .inspect_instance(&desired_name)
-                            .await
-                        {
-                            Ok(info) => info,
-                            Err(err) => {
-                                warn!(
-                                    target: "task",
-                                    task = %attachment.task_id,
-                                    attachment = %attachment.id,
-                                    instance = %instance_id,
-                                    name = %desired_name,
-                                    "skipping repair; inspect failed (by id and name): {first_err:#}; {err:#}"
-                                );
-                                continue;
-                            }
-                        }
-                    } else {
-                        warn!(
-                            target: "task",
-                            task = %attachment.task_id,
-                            attachment = %attachment.id,
-                            instance = %instance_id,
-                            "skipping repair; inspect failed: {first_err:#}"
-                        );
-                        continue;
-                    }
+            let instance_id = match self.resolve_live_instance_ref_for_task(&spec).await {
+                Ok(Some(instance_id)) => instance_id,
+                Ok(None) => {
+                    warn!(
+                        target: "task",
+                        task = %attachment.task_id,
+                        attachment = %attachment.id,
+                        "skipping repair; runtime instance is no longer present"
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    warn!(
+                        target: "task",
+                        task = %attachment.task_id,
+                        attachment = %attachment.id,
+                        "skipping repair; inspect failed: {err:#}"
+                    );
+                    continue;
                 }
             };
-
-            if !inspect.id.is_empty() {
-                instance_id = inspect.id.clone();
-            }
 
             {
                 let mut guard = self.local_state.local_instances.lock().await;
@@ -185,7 +149,7 @@ impl WorkloadManager {
                     target: "task",
                     task = %attachment.task_id,
                     attachment = %attachment.id,
-                    instance = %instance_id,
+                    instance = %instance_id.handle,
                     "failed to repair runtime attachment: {err:#}"
                 );
             }
@@ -231,13 +195,18 @@ impl WorkloadManager {
                 continue;
             }
 
-            let instance_id = {
-                let guard = self.local_state.local_instances.lock().await;
-                guard
-                    .get(&value.id)
-                    .cloned()
-                    .filter(|id| !id.is_empty())
-                    .unwrap_or_else(|| format!("mantissa-{}", value.id))
+            let spec = value_to_spec(value.id, value.clone());
+            let instance_id = match self.resolve_live_instance_ref_for_task(&spec).await {
+                Ok(Some(instance_id)) => instance_id,
+                Ok(None) => continue,
+                Err(err) => {
+                    warn!(
+                        target: "task",
+                        task = %value.id,
+                        "failed to resolve runtime instance while restoring attachments: {err:#}"
+                    );
+                    continue;
+                }
             };
 
             if let Err(err) = self
@@ -252,7 +221,7 @@ impl WorkloadManager {
                 warn!(
                     target: "task",
                     task = %value.id,
-                    instance = %instance_id,
+                    instance = %instance_id.handle,
                     "failed to restore missing attachments for running task: {err:#}"
                 );
             }
@@ -305,8 +274,7 @@ impl WorkloadManager {
         let mut runtime_reconcile_pending = false;
         let mut gossip_flush_pending = false;
         let (runtime_events_tx, mut runtime_events_rx) = unbounded_channel();
-        let mut runtime_events_enabled =
-            self.runtime.runtime_backend.capabilities().lifecycle_events;
+        let mut runtime_events_enabled = self.runtime.runtime_set.capabilities().lifecycle_events;
         if runtime_events_enabled {
             let manager = self.clone();
             tokio::task::spawn_local(async move {
@@ -457,7 +425,7 @@ impl WorkloadManager {
         loop {
             let result = self
                 .runtime
-                .runtime_backend
+                .runtime_set
                 .watch_runtime_events(events_tx.clone())
                 .await;
             if events_tx.is_closed() {
@@ -691,7 +659,7 @@ impl WorkloadManager {
     pub(super) async fn ensure_runtime_attachments(
         &self,
         task_id: Uuid,
-        instance_id: &str,
+        instance_id: &RuntimeInstanceRef,
         network_ids: &[Uuid],
         service_meta: Option<&WorkloadServiceMetadata>,
     ) -> Result<()> {
@@ -722,7 +690,7 @@ impl WorkloadManager {
             warn!(
                 target: "task",
                 task = %task_id,
-                instance = %instance_id,
+                instance = %instance_id.handle,
                 "skipping network attachment because no networks were provided"
             );
             return Ok(());
@@ -773,8 +741,8 @@ impl WorkloadManager {
                         location_changed = true;
                     }
 
-                    if value.instance_id != instance_id {
-                        value.instance_id = instance_id.to_string();
+                    if value.instance_id != instance_id.handle {
+                        value.instance_id = instance_id.handle.clone();
                         location_changed = true;
                     }
 
@@ -811,7 +779,7 @@ impl WorkloadManager {
                         id: compute_network_attachment_id(task_id, *network_id),
                         task_id,
                         node_id: self.local_node_id,
-                        instance_id: instance_id.to_string(),
+                        instance_id: instance_id.handle.clone(),
                         network_id: *network_id,
                         task_updated_at: workload_revision.clone(),
                         requested_ip: None,
@@ -971,16 +939,17 @@ impl WorkloadManager {
     async fn runtime_attachment_target_for_instance(
         &self,
         task_id: Uuid,
-        instance_id: &str,
+        instance_id: &RuntimeInstanceRef,
     ) -> Result<Option<RuntimeAttachmentTarget>> {
         let inspect = self
             .runtime
-            .runtime_backend
+            .runtime_set
             .inspect_instance(instance_id)
             .await
             .with_context(|| {
                 format!(
-                    "inspect runtime instance {instance_id} for network attachment provisioning"
+                    "inspect runtime instance {} for network attachment provisioning",
+                    instance_id.handle
                 )
             })?;
 
@@ -991,7 +960,7 @@ impl WorkloadManager {
             tracing::trace!(
                 target: "task",
                 task = %task_id,
-                instance = %instance_id,
+                instance = %instance_id.handle,
                 running,
                 "skipping attachment provisioning; runtime instance not running yet"
             );
@@ -1002,7 +971,7 @@ impl WorkloadManager {
             tracing::trace!(
                 target: "task",
                 task = %task_id,
-                instance = %instance_id,
+                instance = %instance_id.handle,
                 "skipping attachment provisioning; runtime attachment target unavailable"
             );
             return Ok(None);
@@ -1019,7 +988,7 @@ impl WorkloadManager {
     async fn ensure_runtime_attachment_with_retry(
         &self,
         task_id: Uuid,
-        instance_id: &str,
+        instance_id: &RuntimeInstanceRef,
         network_id: &Uuid,
         attachment_id: &Uuid,
         bridge: &str,
@@ -1060,7 +1029,7 @@ impl WorkloadManager {
                         network_id = %network_id,
                         attachment = %attachment_id,
                         bridge = %bridge,
-                        instance = %instance_id,
+                        instance = %instance_id.handle,
                         attachment_target = ?attachment_target,
                         attempt,
                         max_attempts = ATTACHMENT_PROVISION_MAX_ATTEMPTS,

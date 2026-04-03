@@ -6,6 +6,8 @@ use common::testkit::TestNode;
 use crdt_store::uuid_key::UuidKey;
 use mantissa::cluster::{ClusterId, ClusterViewId};
 use mantissa::node::id::set_node_id;
+use mantissa::runtime::set::RuntimeSet;
+use mantissa::runtime::testing::IN_MEMORY_RUNTIME_BACKEND_KIND;
 use mantissa::runtime::testing::new_in_memory_runtime_backend;
 use mantissa::runtime::types::RuntimeSupportProfile;
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
@@ -70,7 +72,10 @@ async fn cluster_name_for_lineage(
 
 fn headless_config_with_in_memory_runtime() -> HeadlessConfig {
     HeadlessConfig {
-        runtime_backend: Some(new_in_memory_runtime_backend()),
+        runtime_set: Some(RuntimeSet::singleton(
+            IN_MEMORY_RUNTIME_BACKEND_KIND,
+            new_in_memory_runtime_backend(),
+        )),
         ..HeadlessConfig::default()
     }
 }

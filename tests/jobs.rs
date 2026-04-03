@@ -6,6 +6,8 @@ use common::convergence::wait_until;
 use common::testkit::{
     ClusterConfig, InMemoryRuntimeBackend, RuntimeBackendOverrideGuard, TestNode,
 };
+use mantissa::runtime::set::RuntimeSet;
+use mantissa::runtime::testing::IN_MEMORY_RUNTIME_BACKEND_KIND;
 use mantissa::runtime::types::{
     RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError, RuntimeEvent,
     RuntimeInfo,
@@ -802,7 +804,10 @@ async fn create_restartable_job_node(
             gossip_fanout: None,
             gossip_channel_capacity: None,
             task_runtime: None,
-            runtime_backend: Some(runtime_backend),
+            runtime_set: Some(RuntimeSet::singleton(
+                IN_MEMORY_RUNTIME_BACKEND_KIND,
+                runtime_backend,
+            )),
             local_volume_root: Some(local_volume_root),
         },
     )

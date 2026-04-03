@@ -11,7 +11,7 @@ use crate::{
     network::registry::NetworkRegistry,
     node,
     registry::Registry,
-    runtime::types::RuntimeBackend,
+    runtime::set::RuntimeSet,
     scheduler::Scheduler,
     server::{
         RunHandles, Server,
@@ -49,7 +49,7 @@ pub struct HeadlessConfig {
     pub gossip_fanout: Option<usize>,
     pub gossip_channel_capacity: Option<usize>,
     pub task_runtime: Option<WorkloadRuntimeConfig>,
-    pub runtime_backend: Option<Arc<dyn RuntimeBackend + Send + Sync>>,
+    pub runtime_set: Option<RuntimeSet>,
     pub local_volume_root: Option<PathBuf>,
 }
 
@@ -66,7 +66,7 @@ impl Default for HeadlessConfig {
             gossip_fanout: None,
             gossip_channel_capacity: None,
             task_runtime: None,
-            runtime_backend: None,
+            runtime_set: None,
             local_volume_root: None,
         }
     }
@@ -160,7 +160,7 @@ impl HeadlessNode {
             gossip_fanout,
             gossip_channel_capacity,
             task_runtime,
-            runtime_backend,
+            runtime_set,
             local_volume_root,
         } = cfg;
         // Local Node + client
@@ -182,7 +182,7 @@ impl HeadlessNode {
         let defaults = BootstrapOptions::default();
         let options = BootstrapOptions {
             task_runtime,
-            runtime_backend,
+            runtime_set,
             local_volume_root,
             gossip_channel_capacity: gossip_channel_capacity
                 .unwrap_or(defaults.gossip_channel_capacity),
@@ -497,7 +497,7 @@ impl HeadlessNode {
                 gossip_fanout: fanout,
                 gossip_channel_capacity,
                 task_runtime,
-                runtime_backend: None,
+                runtime_set: None,
                 local_volume_root: Some(state.tmp_dir.join("volumes")),
             },
         )
