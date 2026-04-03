@@ -1,9 +1,10 @@
-//! Public standalone-task types.
+//! Public task types.
 //!
-//! The task API is a public standalone-task surface layered on top of the
-//! shared workload layer. These types intentionally expose only
-//! standalone-task fields, while the internal workload model keeps controller
-//! ownership metadata for service replicas, job attempts, and agent runs.
+//! The task API is a public runtime-task surface layered on top of the shared
+//! workload layer. These types intentionally expose only the execution-facing
+//! fields that every runnable workload shares, while the internal workload
+//! model keeps controller ownership metadata for service replicas, job
+//! attempts, and agent runs.
 
 use crate::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec, WorkloadStateFilter,
@@ -11,7 +12,6 @@ use crate::workload::model::{
 };
 use crate::workload::types::{WorkloadLivenessProbe, WorkloadRestartPolicy};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use uuid::Uuid;
 
 pub use crate::workload::model::{
@@ -28,7 +28,7 @@ pub use crate::workload::types::{
 pub type TaskStateFilter = WorkloadStateFilter;
 pub type TaskStateKind = WorkloadStateKind;
 
-/// Standalone-task projection returned by the public task API.
+/// Task projection returned by the public task API.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskSpec {
     pub id: Uuid,
@@ -94,16 +94,9 @@ pub struct TaskSpec {
 }
 
 impl TaskSpec {
-    /// Projects one shared workload row into the public standalone-task view.
-    pub fn try_from_workload_spec(spec: &WorkloadSpec) -> Result<Self, TaskProjectionError> {
-        if spec.owner.is_some() {
-            return Err(TaskProjectionError::NotStandalone {
-                workload_id: spec.id,
-                workload_name: spec.name.clone(),
-            });
-        }
-
-        Ok(Self {
+    /// Projects one shared workload row into the public task view.
+    pub fn from_workload_spec(spec: &WorkloadSpec) -> Self {
+        Self {
             id: spec.id,
             name: spec.name.clone(),
             image: spec.image.clone(),
@@ -139,16 +132,6 @@ impl TaskSpec {
             phase_version: spec.phase_version,
             launch_attempt: spec.launch_attempt,
             last_terminal_observed_launch: spec.last_terminal_observed_launch,
-        })
+        }
     }
-}
-
-/// Error returned when a shared workload row cannot be projected as a standalone task.
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum TaskProjectionError {
-    #[error("workload {workload_name} ({workload_id}) is not a standalone task")]
-    NotStandalone {
-        workload_id: Uuid,
-        workload_name: String,
-    },
 }

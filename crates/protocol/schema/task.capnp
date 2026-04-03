@@ -169,9 +169,10 @@ struct TaskLogFrame {
 }
 
 #
-# `TaskSpec` is the standalone-task projection returned by the public task RPC.
-# It contains only direct-task fields. Shared workload ownership metadata stays in the
-# internal workload schema and is not exposed through the standalone task interface.
+# `TaskSpec` is the task-shaped projection returned by the public task RPC.
+# It contains only the execution-facing fields shared by runnable workloads.
+# Shared ownership metadata stays in the internal workload schema and is not
+# exposed through this task-oriented interface.
 struct TaskSpec {
   id @0 :Data;
   # Task UUID v4 as 16 bytes.

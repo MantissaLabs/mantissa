@@ -3,7 +3,7 @@ use crate::runtime::types::{
     RuntimeAttachOptions, RuntimeExecOptions, RuntimeExecResult, RuntimeLogFrame, RuntimeLogStream,
     RuntimeLogsOptions,
 };
-use crate::task::types::{TaskProjectionError, TaskSpec, TaskStateFilter, TaskStateKind};
+use crate::task::types::{TaskSpec, TaskStateFilter, TaskStateKind};
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
     decode_env_vars, decode_secret_files, decode_task_liveness_probe, decode_task_restart_policy,
@@ -63,16 +63,9 @@ fn state_from_str(input: &str) -> WorkloadPhase {
     }
 }
 
-/// Projects one shared workload row into the public standalone-task view.
-fn project_task_spec(spec: &WorkloadSpec) -> Result<TaskSpec, Error> {
-    TaskSpec::try_from_workload_spec(spec).map_err(|err| match err {
-        TaskProjectionError::NotStandalone {
-            workload_id,
-            workload_name,
-        } => Error::failed(format!(
-            "workload {workload_name} ({workload_id}) is not a standalone task"
-        )),
-    })
+/// Projects one shared workload row into the public task view.
+fn project_task_spec(spec: &WorkloadSpec) -> TaskSpec {
+    TaskSpec::from_workload_spec(spec)
 }
 
 pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
@@ -612,20 +605,18 @@ impl TaskService {
         response.get()?.get_task()
     }
 
-    /// Resolves one operator-provided selector against standalone tasks only.
-    async fn resolve_standalone_task_id(&self, selector: &str) -> Result<Uuid, Error> {
+    /// Resolves one operator-provided selector against the visible task set.
+    async fn resolve_task_id(&self, selector: &str) -> Result<Uuid, Error> {
         let trimmed = selector.trim();
         if trimmed.is_empty() {
             return Err(Error::failed("task id must not be empty".to_string()));
         }
 
         if let Ok(id) = Uuid::parse_str(trimmed) {
-            let spec = self
-                .manager
+            self.manager
                 .inspect_workload(id)
                 .await
                 .map_err(|err| Error::failed(err.to_string()))?;
-            project_task_spec(&spec)?;
             return Ok(id);
         }
 
@@ -634,20 +625,18 @@ impl TaskService {
             .list_workloads(&TaskStateFilter::all())
             .await
             .map_err(|err| Error::failed(err.to_string()))?;
-        let ids = workloads
-            .iter()
-            .filter_map(|spec| TaskSpec::try_from_workload_spec(spec).ok().map(|_| spec.id));
+        let ids = workloads.iter().map(|spec| spec.id);
         match_task_id_prefix(trimmed, ids).map_err(|err| Error::failed(err.to_string()))
     }
 
-    /// Loads one standalone task projection by durable identifier.
-    async fn inspect_standalone_task(&self, id: Uuid) -> Result<TaskSpec, Error> {
+    /// Loads one task projection by durable identifier.
+    async fn inspect_task(&self, id: Uuid) -> Result<TaskSpec, Error> {
         let spec = self
             .manager
             .inspect_workload(id)
             .await
             .map_err(|err| Error::failed(err.to_string()))?;
-        project_task_spec(&spec)
+        Ok(project_task_spec(&spec))
     }
 }
 
@@ -671,7 +660,7 @@ impl task::Server for TaskService {
         let spec = specs
             .pop()
             .ok_or_else(|| Error::failed("start batch returned no spec".to_string()))?;
-        let task_spec = project_task_spec(&spec)?;
+        let task_spec = project_task_spec(&spec);
 
         let mut out = results.get();
         let spec_builder = out.reborrow().init_spec();
@@ -702,7 +691,7 @@ impl task::Server for TaskService {
 
         let mut list_builder = results.get().init_specs(specs.len() as u32);
         for (idx, spec) in specs.iter().enumerate() {
-            let task_spec = project_task_spec(spec)?;
+            let task_spec = project_task_spec(spec);
             let builder = list_builder.reborrow().get(idx as u32);
             write_spec(builder, &task_spec);
         }
@@ -719,16 +708,14 @@ impl task::Server for TaskService {
             .ensure_no_active_cluster_operation("stop tasks")?;
 
         let req = params.get()?.get_request()?;
-        let id = self
-            .resolve_standalone_task_id(req.get_selector()?.to_str()?)
-            .await?;
+        let id = self.resolve_task_id(req.get_selector()?.to_str()?).await?;
 
         let spec = self
             .manager
             .request_workload_stop(id)
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
-        let task_spec = project_task_spec(&spec)?;
+        let task_spec = project_task_spec(&spec);
 
         let mut out = results.get();
         let spec_builder = out.reborrow().init_spec();
@@ -743,11 +730,11 @@ impl task::Server for TaskService {
     ) -> Result<(), Error> {
         let request = params.get()?.get_request()?;
         let id = self
-            .resolve_standalone_task_id(request.get_selector()?.to_str()?)
+            .resolve_task_id(request.get_selector()?.to_str()?)
             .await?;
         let options = read_logs_options(request.get_options()?)?;
         let sink = request.get_sink()?;
-        let spec = self.inspect_standalone_task(id).await?;
+        let spec = self.inspect_task(id).await?;
 
         if spec.node_id != self.manager.local_node_id() {
             let remote = self.remote_task_client(spec.node_id).await?;
@@ -795,11 +782,11 @@ impl task::Server for TaskService {
     ) -> Result<(), Error> {
         let request = params.get()?.get_request()?;
         let id = self
-            .resolve_standalone_task_id(request.get_selector()?.to_str()?)
+            .resolve_task_id(request.get_selector()?.to_str()?)
             .await?;
         let options = read_attach_options(request.get_options()?)?;
         let sink = request.get_sink()?;
-        let spec = self.inspect_standalone_task(id).await?;
+        let spec = self.inspect_task(id).await?;
 
         if spec.node_id != self.manager.local_node_id() {
             let remote = self.remote_task_client(spec.node_id).await?;
@@ -881,11 +868,11 @@ impl task::Server for TaskService {
     ) -> Result<(), Error> {
         let request = params.get()?.get_request()?;
         let id = self
-            .resolve_standalone_task_id(request.get_selector()?.to_str()?)
+            .resolve_task_id(request.get_selector()?.to_str()?)
             .await?;
         let options = read_exec_options(request.get_options()?)?;
         let sink = request.get_sink()?;
-        let spec = self.inspect_standalone_task(id).await?;
+        let spec = self.inspect_task(id).await?;
 
         if spec.node_id != self.manager.local_node_id() {
             let remote = self.remote_task_client(spec.node_id).await?;
@@ -982,10 +969,7 @@ impl task::Server for TaskService {
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
 
-        let task_specs: Vec<TaskSpec> = specs
-            .iter()
-            .filter_map(|spec| TaskSpec::try_from_workload_spec(spec).ok())
-            .collect();
+        let task_specs: Vec<TaskSpec> = specs.iter().map(TaskSpec::from_workload_spec).collect();
 
         let mut list = results.get().init_tasks(task_specs.len() as u32);
         for (idx, spec) in task_specs.iter().enumerate() {
