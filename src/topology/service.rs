@@ -728,6 +728,22 @@ impl Topology {
         }
     }
 
+    /// Clears locally cached peer authentication material after this node leaves a cluster.
+    fn clear_local_cluster_auth_state(&self) {
+        if let Err(err) = self.local_sessions.clear() {
+            warn!(
+                target: "topology",
+                "leave: failed to clear local session tickets: {err}"
+            );
+        }
+        if let Err(err) = self.local_credential_store.clear() {
+            warn!(
+                target: "topology",
+                "leave: failed to clear local credentials: {err}"
+            );
+        }
+    }
+
     /// Resolves the split target index selected for the local node in a split operation.
     fn local_split_target_index(
         &self,
@@ -1670,7 +1686,7 @@ impl topology::Server for Topology {
             }
         });
 
-        self.ensure_periodic_sync();
+        self.ensure_cluster_background_tasks();
         self.sync_once_now();
 
         Ok(())
@@ -1699,10 +1715,11 @@ impl topology::Server for Topology {
         self.broadcast_topology_event_now(&leave_event).await;
         self.gossip_topology_event(leave_event).await?;
 
+        // Stop all background peer contact before clearing local auth state so the
+        // node becomes quiescent immediately after the leave broadcast completes.
+        self.stop_cluster_background_tasks();
         self.registry.clear().await;
-
-        // Stop the loop so this node is quiescent and can rejoin elsewhere
-        self.stop_periodic_sync();
+        self.clear_local_cluster_auth_state();
 
         Ok(())
     }

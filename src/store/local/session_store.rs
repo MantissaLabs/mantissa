@@ -119,6 +119,27 @@ impl LocalSessionStore {
         })
     }
 
+    /// Remove every stored ticket so the node no longer attempts to resume any peer sessions.
+    pub fn clear(&self) -> io::Result<()> {
+        let peers = self
+            .list_records()?
+            .into_iter()
+            .map(|(peer, _)| peer)
+            .collect::<Vec<_>>();
+
+        if peers.is_empty() {
+            return Ok(());
+        }
+
+        with_write_tx(&self.db, |tx| {
+            let mut table = tx.open_table(T_SESS).map_err(into_io)?;
+            for peer in peers {
+                let _ = table.remove(*peer.as_bytes()).map_err(into_io)?;
+            }
+            Ok(())
+        })
+    }
+
     /// List all peers with their ticket bytes (returns even if expired).
     #[allow(dead_code)]
     pub fn list(&self) -> io::Result<Vec<(Uuid, Vec<u8>)>> {

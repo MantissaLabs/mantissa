@@ -390,6 +390,9 @@ pub struct Topology {
     /// Runtime state for background sync loop management.
     sync: SyncState,
 
+    /// Runtime state for the active health probe loop.
+    health_probe: SyncState,
+
     /// Number of peers targeted by the deterministic workload-only repair path on each tick.
     workload_repair_fanout: Arc<Mutex<usize>>,
 
@@ -511,6 +514,7 @@ impl Topology {
             public_key: noise_public_key,
             signing_key,
             sync: SyncState::new(DEFAULT_SYNC_INTERVAL, DEFAULT_SYNC_FANOUT),
+            health_probe: SyncState::new(runtime_health.probe_interval, 0),
             workload_repair_fanout: Arc::new(Mutex::new(DEFAULT_WORKLOAD_REPAIR_FANOUT)),
             workload_repair_cursor: Arc::new(Mutex::new(0)),
             metadata_sync: SyncState::new(
@@ -949,6 +953,12 @@ impl Topology {
 
     /// True if we already have at least one peer (not ourselves) or any stored ticket.
     pub async fn already_joined(&self) -> std::io::Result<bool> {
+        if let Some(local_membership) = self.local_membership()?
+            && !local_membership.is_active()
+        {
+            return Ok(false);
+        }
+
         // any stored ticket?
         if !self.local_sessions.list_records()?.is_empty() {
             return Ok(true);
@@ -962,6 +972,33 @@ impl Topology {
                     .map(|value| value.is_active())
                     .unwrap_or(false)
         }))
+    }
+
+    /// Returns the currently selected membership state for the local peer row, if present.
+    fn local_membership(&self) -> std::io::Result<Option<PeerMembership>> {
+        let snapshot = self
+            .peers
+            .get_snapshot(&UuidKey::from(self.node.id))
+            .map_err(io::Error::other)?;
+        Ok(snapshot
+            .as_ref()
+            .and_then(|values| PeerValue::select(values.as_slice()))
+            .map(|value| value.membership))
+    }
+
+    /// Returns whether this node should originate outbound cluster traffic right now.
+    fn local_allows_outbound_cluster_traffic(&self) -> bool {
+        match self.local_membership() {
+            Ok(Some(membership)) => membership.is_active(),
+            Ok(None) => true,
+            Err(err) => {
+                warn!(
+                    target: "topology",
+                    "failed to resolve local membership for outbound traffic gate: {err}"
+                );
+                false
+            }
+        }
     }
 
     /// Spawns periodic anti-entropy loops (idempotent). Restartable after `stop_periodic_sync()`.
@@ -992,6 +1029,39 @@ impl Topology {
     pub fn stop_periodic_sync(&self) {
         self.sync.stop();
         self.metadata_sync.stop();
+    }
+
+    /// Spawns the active peer-health probe loop when this node is participating in a cluster.
+    pub fn ensure_health_probes(&self) {
+        if self.health_probe.start_if_idle() {
+            let this = self.clone();
+            let interval = this.health_probe.interval();
+            let handle = tokio::task::spawn_local(async move {
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    ticker.tick().await;
+                    this.health_probe_tick().await;
+                }
+            });
+            self.health_probe.store_handle(handle);
+        }
+    }
+
+    /// Abort active peer-health probes so the node stops contacting cluster peers.
+    pub fn stop_health_probes(&self) {
+        self.health_probe.stop();
+    }
+
+    /// Start all leave-sensitive background cluster loops.
+    pub fn ensure_cluster_background_tasks(&self) {
+        self.ensure_periodic_sync();
+        self.ensure_health_probes();
+    }
+
+    /// Stop all leave-sensitive background cluster loops.
+    pub fn stop_cluster_background_tasks(&self) {
+        self.stop_periodic_sync();
+        self.stop_health_probes();
     }
 
     // The run loop receives incoming events from Gossip.
@@ -1327,6 +1397,10 @@ impl Topology {
     /// This keeps a small stable set of peers hot in the capability registry while gradually
     /// rotating new peers through the set so cluster coverage continues to advance over time.
     async fn warm_gossip_peers(&self, fanout_hint: usize) -> Vec<PeerHandle> {
+        if !self.local_allows_outbound_cluster_traffic() {
+            return Vec::new();
+        }
+
         let snapshot = match self.peer_snapshot().await {
             Some(snapshot) => snapshot,
             None => return Vec::new(),
@@ -1450,6 +1524,10 @@ impl Topology {
     ///
     /// This is factored out so tests can drive sync deterministically without timers.
     pub async fn periodic_sync_tick(&self) {
+        if !self.local_allows_outbound_cluster_traffic() {
+            return;
+        }
+
         let snapshot = match self.peer_snapshot().await {
             Some(s) => s,
             None => return,
@@ -1704,6 +1782,10 @@ impl Topology {
     /// This loop uses unscoped sessions and deterministic fanout sweep to guarantee every known
     /// peer is eventually covered even in very large split topologies.
     pub async fn periodic_global_metadata_sync_tick(&self) {
+        if !self.local_allows_outbound_cluster_traffic() {
+            return;
+        }
+
         let snapshot = match self.peer_snapshot().await {
             Some(s) => s,
             None => return,
@@ -1843,6 +1925,10 @@ impl GossipContext for Topology {
     /// Unlike the default `PeerProvider` path this intentionally keeps split-excluded peers
     /// so selected low-rate metadata events can cross view boundaries.
     async fn get_peers_unscoped(&self) -> Vec<PeerHandle> {
+        if !self.local_allows_outbound_cluster_traffic() {
+            return Vec::new();
+        }
+
         let snapshot = match self.peer_snapshot().await {
             Some(snapshot) => snapshot,
             None => return Vec::new(),

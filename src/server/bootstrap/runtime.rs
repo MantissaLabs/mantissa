@@ -908,7 +908,7 @@ async fn spawn_runtime_tasks(
     gossip_fanout: usize,
 ) {
     let RuntimeActors {
-        runtime_health,
+        runtime_health: _runtime_health,
         secret_replicator,
         volume_replicator,
         scheduler_digest_replicator,
@@ -917,7 +917,7 @@ async fn spawn_runtime_tasks(
     } = actors;
 
     let mut topology_runner = components.topology.clone();
-    let topology_sync = components.topology.clone();
+    let topology_lifecycle = components.topology.clone();
     let topology_for_gossip = components.topology.clone();
     let gossip_tick = topology_for_gossip.gossip_interval();
 
@@ -976,26 +976,17 @@ async fn spawn_runtime_tasks(
         topology_runner.run().await;
     });
 
-    if topology_sync.already_joined().await.unwrap_or(false) {
-        topology_sync.ensure_periodic_sync();
+    if topology_lifecycle.already_joined().await.unwrap_or(false) {
+        topology_lifecycle.ensure_cluster_background_tasks();
+
+        let topology_for_boot = components.topology.clone();
+        tokio::task::spawn_local(async move {
+            if let Err(error) = topology_for_boot
+                .connect_known_peers(Some(&signing_key))
+                .await
+            {
+                error!(target: "server", "Startup connect failed: {error}");
+            }
+        });
     }
-
-    let topology_for_boot = components.topology.clone();
-    tokio::task::spawn_local(async move {
-        if let Err(error) = topology_for_boot
-            .connect_known_peers(Some(&signing_key))
-            .await
-        {
-            error!(target: "server", "Startup connect failed: {error}");
-        }
-    });
-
-    let topology_for_health = components.topology.clone();
-    tokio::task::spawn_local(async move {
-        let mut ticker = tokio::time::interval(runtime_health.probe_interval);
-        loop {
-            ticker.tick().await;
-            topology_for_health.health_probe_tick().await;
-        }
-    });
 }

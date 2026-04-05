@@ -1,5 +1,5 @@
 use crate::store::tx::{into_io, with_read_tx, with_write_tx};
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 use std::{io, sync::Arc};
 use uuid::Uuid;
 
@@ -48,6 +48,25 @@ impl LocalCredentialStore {
         with_write_tx(&self.db, |tx| {
             let mut table = tx.open_table(T_CRED).map_err(into_io)?;
             let _ = table.remove(*peer.as_bytes()).map_err(into_io)?;
+            Ok(())
+        })
+    }
+
+    /// Remove every locally cached credential so future peer reconnects require a fresh join path.
+    pub fn clear(&self) -> io::Result<()> {
+        with_write_tx(&self.db, |tx| {
+            let mut table = tx.open_table(T_CRED).map_err(into_io)?;
+            let mut iter = table.iter().map_err(into_io)?;
+            let mut peers = Vec::<[u8; 16]>::new();
+            while let Some(Ok((key, _))) = iter.next() {
+                peers.push(key.value());
+            }
+
+            drop(iter);
+
+            for peer in peers {
+                let _ = table.remove(peer).map_err(into_io)?;
+            }
             Ok(())
         })
     }

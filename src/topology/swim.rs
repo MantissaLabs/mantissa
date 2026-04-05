@@ -61,6 +61,10 @@ impl Topology {
     ///  - transitions local suspicion/down state, and
     ///  - gossips liveness transitions.
     pub async fn health_probe_tick(&self) {
+        if !self.local_allows_outbound_cluster_traffic() {
+            return;
+        }
+
         let candidates = self.swim_probe_candidates().await;
         if candidates.is_empty() {
             return;

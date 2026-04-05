@@ -350,14 +350,14 @@ impl Server {
         Ok(())
     }
 
-    /// Ensures the periodic sync loop is running after the first successful join.
+    /// Ensures background cluster participation loops are running after the first successful join.
     ///
     /// Joining a second node is the earliest point where background sync starts
     /// to matter, so the server kicks it off asynchronously here.
-    fn ensure_periodic_sync_after_join(&self) {
+    fn ensure_cluster_background_tasks_after_join(&self) {
         let topology = self.topology.clone();
         tokio::task::spawn_local(async move {
-            topology.ensure_periodic_sync();
+            topology.ensure_cluster_background_tasks();
         });
     }
 }
@@ -375,7 +375,7 @@ impl protocol::server::Server for Server {
         self.register_join_request(&join_request).await?;
 
         let cluster_session = self.issue_join_session(join_request.joiner_id)?;
-        self.ensure_periodic_sync_after_join();
+        self.ensure_cluster_background_tasks_after_join();
         self.write_join_response(&mut results, &cluster_session)?;
 
         self.topology

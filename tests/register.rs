@@ -192,6 +192,78 @@ local_test!(node_leave_tcp, {
         .expect("roots equal after leave");
 });
 
+// Leaving should clear locally cached peer auth material so the node does not
+// keep reconnecting or auto-resume the old cluster after restart.
+local_test!(node_leave_clears_local_peer_auth_tcp, {
+    let anchor = match TestNode::try_new_tcp_with_tick_ms(100).await {
+        Ok(node) => node,
+        Err(err) => {
+            let msg = err.to_string();
+            if msg.contains("Operation not permitted") {
+                eprintln!("skipping node_leave_clears_local_peer_auth_tcp: {msg}");
+                return;
+            }
+            panic!("failed to create anchor tcp node: {msg}");
+        }
+    };
+
+    let joiner = match TestNode::try_new_tcp_with_tick_ms(100).await {
+        Ok(node) => node,
+        Err(err) => {
+            let msg = err.to_string();
+            if msg.contains("Operation not permitted") {
+                eprintln!("skipping node_leave_clears_local_peer_auth_tcp: {msg}");
+                return;
+            }
+            panic!("failed to create joiner tcp node: {msg}");
+        }
+    };
+
+    joiner.join(&anchor).await.expect("joiner join ok");
+    anchor.assert_cluster_size(2, "anchor sees 2").await;
+    joiner.assert_cluster_size(2, "joiner sees 2").await;
+
+    assert!(
+        !joiner
+            .node
+            .local_sessions
+            .list_records()
+            .expect("list local sessions before leave")
+            .is_empty(),
+        "joiner should persist a peer session ticket before leave"
+    );
+    assert!(
+        joiner
+            .node
+            .local_creds
+            .get(anchor.id())
+            .expect("load local credential before leave")
+            .is_some(),
+        "joiner should persist a peer credential before leave"
+    );
+
+    joiner.leave().await.expect("leave ok");
+
+    assert!(
+        joiner
+            .node
+            .local_sessions
+            .list_records()
+            .expect("list local sessions after leave")
+            .is_empty(),
+        "leave should clear all persisted peer session tickets"
+    );
+    assert!(
+        joiner
+            .node
+            .local_creds
+            .get(anchor.id())
+            .expect("load local credential after leave")
+            .is_none(),
+        "leave should clear persisted peer credentials"
+    );
+});
+
 // Leave → Rejoin → Leave-again flow on TCP transport.
 // Ensures that a node can leave, rejoin (clearing any tombstone),
 // and leave again without causing persistent divergence between peers.

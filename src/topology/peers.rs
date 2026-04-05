@@ -251,6 +251,10 @@ pub struct PeerValue {
 #[async_trait(?Send)]
 impl PeerProvider for Topology {
     async fn get_peers(&self) -> Vec<PeerHandle> {
+        if !self.local_allows_outbound_cluster_traffic() {
+            return Vec::new();
+        }
+
         let snapshot = match self.peer_snapshot().await {
             Some(s) => s,
             None => return Vec::new(),
