@@ -31,9 +31,9 @@ MANTISSA_STRESS_WORKERS=2 \
 MANTISSA_STRESS_MAX_BLOCKING=16 \
 MANTISSA_STRESS_NODE_COUNT=30 \
 MANTISSA_STRESS_TARGET_TASKS=500 \
-MANTISSA_GOSSIP_FANOUT=5 \
-MANTISSA_GOSSIP_TICK_MS=1000 \
-MANTISSA_GOSSIP_CHANNEL_CAPACITY=512 \
+MANTISSA_STRESS_GOSSIP_FANOUT=5 \
+MANTISSA_STRESS_GOSSIP_TICK_MS=1000 \
+MANTISSA_STRESS_GOSSIP_CHANNEL_CAPACITY=512 \
 cargo test --test stress_large_cluster -- --ignored --nocapture
 ```
 
@@ -59,19 +59,29 @@ cargo test --test stress_large_cluster -- --ignored --nocapture
   - `RUST_LOG` passed to each spawned daemon process.
   - Default: `warn`.
 
-### Runtime tuning variables used by spawned daemons
+### Replication tuning variables forwarded to spawned daemons
 
 - `TOKIO_WORKER_THREADS`
   - Controls Tokio worker threads inside each daemon subprocess started by the
     test.
   - Useful to prevent heavy thread oversubscription when running many nodes on
     one machine/VM.
-- `MANTISSA_GOSSIP_FANOUT`
-  - Override outbound gossip fanout.
-- `MANTISSA_GOSSIP_TICK_MS`
-  - Override gossip dispatch tick interval (milliseconds).
-- `MANTISSA_GOSSIP_CHANNEL_CAPACITY`
+- `MANTISSA_STRESS_GOSSIP_CHANNEL_CAPACITY`
   - Override internal gossip/task/service/network/secret queue capacity.
+- `MANTISSA_STRESS_GOSSIP_FANOUT`
+  - Override outbound gossip fanout.
+- `MANTISSA_STRESS_GOSSIP_TICK_MS`
+  - Override gossip dispatch tick interval (milliseconds).
+- `MANTISSA_STRESS_SYNC_TICK_MS`
+  - Override the main periodic sync tick interval (milliseconds).
+- `MANTISSA_STRESS_SYNC_FANOUT`
+  - Override the number of peers sampled by the main periodic sync loop.
+- `MANTISSA_STRESS_GLOBAL_METADATA_SYNC_TICK_MS`
+  - Override the cross-view metadata sync tick interval (milliseconds).
+- `MANTISSA_STRESS_GLOBAL_METADATA_SYNC_FANOUT`
+  - Override the number of peers sampled by the cross-view metadata sync loop.
+- `MANTISSA_STRESS_WORKLOAD_REPAIR_FANOUT`
+  - Override the deterministic workload-only repair fanout per tick.
 - `MANTISSA_GOSSIP_DISPATCH_BATCH_MAX`
   - Max messages processed in one outbound gossip dispatch slice per tick.
 - `MANTISSA_GOSSIP_RPC_BATCH_MAX`
@@ -117,8 +127,8 @@ MANTISSA_STRESS_TARGET_TASKS=4000 \
 MANTISSA_STRESS_WORKERS=2 \
 MANTISSA_STRESS_MAX_BLOCKING=16 \
 TOKIO_WORKER_THREADS=1 \
-MANTISSA_GOSSIP_FANOUT=3 \
-MANTISSA_GOSSIP_TICK_MS=1500 \
+MANTISSA_STRESS_GOSSIP_FANOUT=3 \
+MANTISSA_STRESS_GOSSIP_TICK_MS=1500 \
 cargo test --test stress_large_cluster -- --ignored --nocapture
 ```
 
@@ -131,9 +141,9 @@ MANTISSA_STRESS_TARGET_TASKS=5000 \
 MANTISSA_STRESS_WORKERS=2 \
 MANTISSA_STRESS_MAX_BLOCKING=16 \
 TOKIO_WORKER_THREADS=1 \
-MANTISSA_GOSSIP_FANOUT=3 \
-MANTISSA_GOSSIP_TICK_MS=1500 \
-MANTISSA_GOSSIP_CHANNEL_CAPACITY=256 \
+MANTISSA_STRESS_GOSSIP_FANOUT=3 \
+MANTISSA_STRESS_GOSSIP_TICK_MS=1500 \
+MANTISSA_STRESS_GOSSIP_CHANNEL_CAPACITY=256 \
 cargo test --test stress_large_cluster -- --ignored --nocapture
 ```
 

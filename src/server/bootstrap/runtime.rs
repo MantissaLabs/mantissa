@@ -60,6 +60,7 @@ pub(crate) struct BootstrapOptions {
     pub gossip_fanout: usize,
     pub sync_tick: Option<Duration>,
     pub sync_fanout: Option<usize>,
+    pub workload_repair_fanout: Option<usize>,
     pub global_metadata_sync_tick: Option<Duration>,
     pub global_metadata_sync_fanout: Option<usize>,
     pub gossip_tick: Option<Duration>,
@@ -76,6 +77,7 @@ impl Default for BootstrapOptions {
             gossip_fanout: DEFAULT_FANOUT,
             sync_tick: None,
             sync_fanout: None,
+            workload_repair_fanout: None,
             global_metadata_sync_tick: None,
             global_metadata_sync_fanout: None,
             gossip_tick: None,
@@ -302,6 +304,11 @@ fn apply_runtime_overrides(components: &RuntimeComponents, options: &BootstrapOp
     }
     if let Some(sync_fanout) = options.sync_fanout {
         components.topology.set_sync_fanout(sync_fanout);
+    }
+    if let Some(workload_repair_fanout) = options.workload_repair_fanout {
+        components
+            .topology
+            .set_workload_repair_fanout(workload_repair_fanout);
     }
     if let Some(sync_tick) = options.global_metadata_sync_tick.or(options.sync_tick) {
         components

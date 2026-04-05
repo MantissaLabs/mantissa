@@ -60,6 +60,16 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
     gpu: (
         device_overrides: "uuid:GPU-abc=id:GPU-abc; pci:0000:81:00.0=disable; index:0=id:0",
     ),
+    replication: (
+        gossip_channel_capacity: 128,
+        gossip_fanout: 5,
+        gossip_tick_ms: 1000,
+        sync_tick_ms: 5000,
+        sync_fanout: 8,
+        global_metadata_sync_tick_ms: 5000,
+        global_metadata_sync_fanout: 8,
+        workload_repair_fanout: 1,
+    ),
 )
 ```
 
@@ -82,3 +92,11 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 - `health.indirect_fanout_max`
 - `runtimes.oci.host` (env: `MANTISSA_RUNTIME_OCI_HOST`, falls back to `DOCKER_HOST` when unset)
 - `gpu.device_overrides` (legacy: `MANTISSA_GPU_DEVICE_OVERRIDES`)
+- `replication.gossip_channel_capacity` (legacy: `MANTISSA_GOSSIP_CHANNEL_CAPACITY`)
+- `replication.gossip_fanout` (legacy: `MANTISSA_GOSSIP_FANOUT`)
+- `replication.gossip_tick_ms` (legacy: `MANTISSA_GOSSIP_TICK_MS`)
+- `replication.sync_tick_ms` (legacy: `MANTISSA_SYNC_TICK_MS`)
+- `replication.sync_fanout` (legacy: `MANTISSA_SYNC_FANOUT`)
+- `replication.global_metadata_sync_tick_ms` (legacy: `MANTISSA_GLOBAL_METADATA_SYNC_TICK_MS`)
+- `replication.global_metadata_sync_fanout` (legacy: `MANTISSA_GLOBAL_METADATA_SYNC_FANOUT`)
+- `replication.workload_repair_fanout` (legacy: `MANTISSA_WORKLOAD_REPAIR_FANOUT`)

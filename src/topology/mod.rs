@@ -125,25 +125,6 @@ fn global_metadata_sync_parallelism_from_env(default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Reads the optional metadata sync fanout override from the environment.
-fn global_metadata_sync_fanout_from_env(default: usize) -> usize {
-    std::env::var("MANTISSA_GLOBAL_METADATA_SYNC_FANOUT")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
-}
-
-/// Reads the optional metadata sync tick interval (milliseconds) from the environment.
-fn global_metadata_sync_interval_from_env(default: Duration) -> Duration {
-    std::env::var("MANTISSA_GLOBAL_METADATA_SYNC_TICK_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(default)
-}
-
 /// Bundles the store handles required to construct a `Topology`.
 #[derive(Clone)]
 pub struct TopologyStores {
@@ -409,6 +390,9 @@ pub struct Topology {
     /// Runtime state for background sync loop management.
     sync: SyncState,
 
+    /// Number of peers targeted by the deterministic workload-only repair path on each tick.
+    workload_repair_fanout: Arc<Mutex<usize>>,
+
     /// Rotating cursor used by workload-only repair to deterministically cover all in-view peers.
     workload_repair_cursor: Arc<Mutex<usize>>,
 
@@ -527,10 +511,11 @@ impl Topology {
             public_key: noise_public_key,
             signing_key,
             sync: SyncState::new(DEFAULT_SYNC_INTERVAL, DEFAULT_SYNC_FANOUT),
+            workload_repair_fanout: Arc::new(Mutex::new(DEFAULT_WORKLOAD_REPAIR_FANOUT)),
             workload_repair_cursor: Arc::new(Mutex::new(0)),
             metadata_sync: SyncState::new(
-                global_metadata_sync_interval_from_env(DEFAULT_GLOBAL_METADATA_SYNC_INTERVAL),
-                global_metadata_sync_fanout_from_env(DEFAULT_GLOBAL_METADATA_SYNC_FANOUT),
+                DEFAULT_GLOBAL_METADATA_SYNC_INTERVAL,
+                DEFAULT_GLOBAL_METADATA_SYNC_FANOUT,
             ),
             metadata_sync_cursor: Arc::new(Mutex::new(0)),
             operations: ClusterOperationState::new(),
@@ -830,6 +815,14 @@ impl Topology {
     /// Set the number of peers to sample per sync tick (`0` means sync against all peers).
     pub fn set_sync_fanout(&self, fanout: usize) {
         self.sync.set_fanout(fanout);
+    }
+
+    /// Set the number of peers targeted by the deterministic workload-repair pass (`0` means all peers).
+    pub fn set_workload_repair_fanout(&self, fanout: usize) {
+        *lock_or_recover(
+            &self.workload_repair_fanout,
+            "topology.workload_repair_fanout",
+        ) = fanout;
     }
 
     /// Set the metadata sync interval used by the cross-view cluster metadata loop.
@@ -1533,10 +1526,14 @@ impl Topology {
         entries: &'a [PeerCacheEntry],
         already_selected: &HashSet<Uuid>,
     ) -> Vec<&'a PeerCacheEntry> {
+        let repair_fanout = *lock_or_recover(
+            &self.workload_repair_fanout,
+            "topology.workload_repair_fanout",
+        );
         select_sync_peers_round_robin_for_node(
             self.node.id,
             entries,
-            DEFAULT_WORKLOAD_REPAIR_FANOUT,
+            repair_fanout,
             &self.workload_repair_cursor,
         )
         .into_iter()

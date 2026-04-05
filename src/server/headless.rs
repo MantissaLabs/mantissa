@@ -199,6 +199,7 @@ impl HeadlessNode {
             gossip_fanout: gossip_fanout.unwrap_or(defaults.gossip_fanout),
             sync_tick,
             sync_fanout,
+            workload_repair_fanout: None,
             global_metadata_sync_tick,
             global_metadata_sync_fanout,
             gossip_tick,

@@ -47,6 +47,52 @@ fn env_usize(name: &str) -> Option<usize> {
     if parsed == 0 { None } else { Some(parsed) }
 }
 
+/// Copies one stress-scoped environment override into the spawned daemon command.
+///
+/// This lets the stress harness tune replication loops per run without relying on
+/// shell-global daemon environment variables.
+fn forward_stress_env_override(command: &mut Command, stress_name: &str, daemon_name: &str) {
+    if let Ok(value) = std::env::var(stress_name) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            command.env(daemon_name, trimmed);
+        }
+    }
+}
+
+/// Applies stress-scoped replication overrides to one spawned daemon command.
+///
+/// The stress test keeps its own env namespace so local experiments can tune one
+/// run without affecting unrelated Mantissa commands in the same shell.
+fn apply_stress_replication_env_overrides(command: &mut Command) {
+    const ENV_MAPPINGS: [(&str, &str); 8] = [
+        (
+            "MANTISSA_STRESS_GOSSIP_CHANNEL_CAPACITY",
+            "MANTISSA_GOSSIP_CHANNEL_CAPACITY",
+        ),
+        ("MANTISSA_STRESS_GOSSIP_FANOUT", "MANTISSA_GOSSIP_FANOUT"),
+        ("MANTISSA_STRESS_GOSSIP_TICK_MS", "MANTISSA_GOSSIP_TICK_MS"),
+        ("MANTISSA_STRESS_SYNC_TICK_MS", "MANTISSA_SYNC_TICK_MS"),
+        ("MANTISSA_STRESS_SYNC_FANOUT", "MANTISSA_SYNC_FANOUT"),
+        (
+            "MANTISSA_STRESS_GLOBAL_METADATA_SYNC_TICK_MS",
+            "MANTISSA_GLOBAL_METADATA_SYNC_TICK_MS",
+        ),
+        (
+            "MANTISSA_STRESS_GLOBAL_METADATA_SYNC_FANOUT",
+            "MANTISSA_GLOBAL_METADATA_SYNC_FANOUT",
+        ),
+        (
+            "MANTISSA_STRESS_WORKLOAD_REPAIR_FANOUT",
+            "MANTISSA_WORKLOAD_REPAIR_FANOUT",
+        ),
+    ];
+
+    for (stress_name, daemon_name) in ENV_MAPPINGS {
+        forward_stress_env_override(command, stress_name, daemon_name);
+    }
+}
+
 /// Returns the Tokio worker thread count used by this stress test runtime.
 fn stress_worker_threads() -> usize {
     env_usize("MANTISSA_STRESS_WORKERS")
@@ -368,6 +414,7 @@ impl ProcessNode {
             .env("RUST_LOG", node_rust_log)
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file));
+        apply_stress_replication_env_overrides(&mut command);
 
         let mut child = command
             .spawn()

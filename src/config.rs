@@ -29,6 +29,8 @@ pub struct Config {
     pub runtimes: RuntimeRegistryConfig,
     #[serde(default)]
     pub gpu: GpuConfig,
+    #[serde(default)]
+    pub replication: ReplicationConfig,
 }
 
 /// # Description:
@@ -226,6 +228,82 @@ pub struct GpuConfig {
     pub device_overrides: Option<String>,
 }
 
+/// # Description:
+///
+/// Control-plane gossip and anti-entropy tuning for one Mantissa node.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReplicationConfig {
+    #[serde(default = "default_replication_gossip_channel_capacity")]
+    pub gossip_channel_capacity: usize,
+    #[serde(default = "default_replication_gossip_fanout")]
+    pub gossip_fanout: usize,
+    #[serde(default = "default_replication_gossip_tick_ms")]
+    pub gossip_tick_ms: u64,
+    #[serde(default = "default_replication_sync_tick_ms")]
+    pub sync_tick_ms: u64,
+    #[serde(default = "default_replication_sync_fanout")]
+    pub sync_fanout: usize,
+    #[serde(default = "default_replication_global_metadata_sync_tick_ms")]
+    pub global_metadata_sync_tick_ms: u64,
+    #[serde(default = "default_replication_global_metadata_sync_fanout")]
+    pub global_metadata_sync_fanout: usize,
+    #[serde(default = "default_replication_workload_repair_fanout")]
+    pub workload_repair_fanout: usize,
+}
+
+impl Default for ReplicationConfig {
+    /// # Description:
+    ///
+    /// Returns the default replication settings used when no config is supplied.
+    fn default() -> Self {
+        Self {
+            gossip_channel_capacity: default_replication_gossip_channel_capacity(),
+            gossip_fanout: default_replication_gossip_fanout(),
+            gossip_tick_ms: default_replication_gossip_tick_ms(),
+            sync_tick_ms: default_replication_sync_tick_ms(),
+            sync_fanout: default_replication_sync_fanout(),
+            global_metadata_sync_tick_ms: default_replication_global_metadata_sync_tick_ms(),
+            global_metadata_sync_fanout: default_replication_global_metadata_sync_fanout(),
+            workload_repair_fanout: default_replication_workload_repair_fanout(),
+        }
+    }
+}
+
+/// # Description:
+///
+/// Runtime-friendly replication settings after converting persisted millisecond
+/// values to durations.
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeReplicationConfig {
+    pub gossip_channel_capacity: usize,
+    pub gossip_fanout: usize,
+    pub gossip_tick: Duration,
+    pub sync_tick: Duration,
+    pub sync_fanout: usize,
+    pub global_metadata_sync_tick: Duration,
+    pub global_metadata_sync_fanout: usize,
+    pub workload_repair_fanout: usize,
+}
+
+impl ReplicationConfig {
+    /// # Description:
+    ///
+    /// Converts persisted replication settings into strongly typed runtime
+    /// durations and counters.
+    fn as_runtime(&self) -> RuntimeReplicationConfig {
+        RuntimeReplicationConfig {
+            gossip_channel_capacity: self.gossip_channel_capacity,
+            gossip_fanout: self.gossip_fanout,
+            gossip_tick: Duration::from_millis(self.gossip_tick_ms),
+            sync_tick: Duration::from_millis(self.sync_tick_ms),
+            sync_fanout: self.sync_fanout,
+            global_metadata_sync_tick: Duration::from_millis(self.global_metadata_sync_tick_ms),
+            global_metadata_sync_fanout: self.global_metadata_sync_fanout,
+            workload_repair_fanout: self.workload_repair_fanout,
+        }
+    }
+}
+
 static GLOBAL_CONFIG: Lazy<RwLock<Config>> = Lazy::new(|| RwLock::new(Config::default()));
 static GLOBAL_SOURCE: Lazy<RwLock<ConfigSource>> =
     Lazy::new(|| RwLock::new(ConfigSource::default()));
@@ -342,6 +420,14 @@ pub fn bpf_artifact_dir() -> Option<PathBuf> {
 /// Resolve the peer-health runtime configuration used by liveness probing loops.
 pub fn health_runtime_config() -> RuntimeHealthConfig {
     global_config().health.as_runtime()
+}
+
+/// # Description:
+///
+/// Resolve the control-plane replication runtime configuration used by gossip
+/// and anti-entropy startup paths.
+pub fn replication_runtime_config() -> RuntimeReplicationConfig {
+    global_config().replication.as_runtime()
 }
 
 /// # Description:
@@ -472,6 +558,62 @@ fn default_health_indirect_fanout_min() -> usize {
 /// Returns the maximum adaptive helper fanout for SWIM indirect probes.
 fn default_health_indirect_fanout_max() -> usize {
     32
+}
+
+/// # Description:
+///
+/// Returns the default shared gossip channel capacity used by the daemon path.
+fn default_replication_gossip_channel_capacity() -> usize {
+    128
+}
+
+/// # Description:
+///
+/// Returns the default outbound gossip fanout.
+fn default_replication_gossip_fanout() -> usize {
+    5
+}
+
+/// # Description:
+///
+/// Returns the default gossip dispatch tick interval in milliseconds.
+fn default_replication_gossip_tick_ms() -> u64 {
+    1_000
+}
+
+/// # Description:
+///
+/// Returns the default periodic sync tick interval in milliseconds.
+fn default_replication_sync_tick_ms() -> u64 {
+    5_000
+}
+
+/// # Description:
+///
+/// Returns the default number of peers sampled by the main sync loop.
+fn default_replication_sync_fanout() -> usize {
+    8
+}
+
+/// # Description:
+///
+/// Returns the default cross-view metadata sync tick interval in milliseconds.
+fn default_replication_global_metadata_sync_tick_ms() -> u64 {
+    5_000
+}
+
+/// # Description:
+///
+/// Returns the default cross-view metadata sync fanout.
+fn default_replication_global_metadata_sync_fanout() -> usize {
+    8
+}
+
+/// # Description:
+///
+/// Returns the default deterministic workload-repair fanout.
+fn default_replication_workload_repair_fanout() -> usize {
+    1
 }
 
 /// # Description:
@@ -627,6 +769,37 @@ impl Config {
             self.storage.local_volume_enforce_capacity = true;
         }
 
+        applied |= apply_positive_usize_env_override(
+            "MANTISSA_GOSSIP_CHANNEL_CAPACITY",
+            &mut self.replication.gossip_channel_capacity,
+        );
+        applied |= apply_usize_env_override(
+            "MANTISSA_GOSSIP_FANOUT",
+            &mut self.replication.gossip_fanout,
+        );
+        applied |= apply_positive_u64_env_override(
+            "MANTISSA_GOSSIP_TICK_MS",
+            &mut self.replication.gossip_tick_ms,
+        );
+        applied |= apply_positive_u64_env_override(
+            "MANTISSA_SYNC_TICK_MS",
+            &mut self.replication.sync_tick_ms,
+        );
+        applied |=
+            apply_usize_env_override("MANTISSA_SYNC_FANOUT", &mut self.replication.sync_fanout);
+        applied |= apply_positive_u64_env_override(
+            "MANTISSA_GLOBAL_METADATA_SYNC_TICK_MS",
+            &mut self.replication.global_metadata_sync_tick_ms,
+        );
+        applied |= apply_usize_env_override(
+            "MANTISSA_GLOBAL_METADATA_SYNC_FANOUT",
+            &mut self.replication.global_metadata_sync_fanout,
+        );
+        applied |= apply_usize_env_override(
+            "MANTISSA_WORKLOAD_REPAIR_FANOUT",
+            &mut self.replication.workload_repair_fanout,
+        );
+
         applied
     }
 
@@ -709,8 +882,78 @@ impl Config {
             anyhow::bail!("network.nodeport.enabled requires network.bpf.attach to be true");
         }
 
+        if self.replication.gossip_channel_capacity == 0 {
+            anyhow::bail!("replication.gossip_channel_capacity must be greater than zero");
+        }
+
+        if self.replication.gossip_tick_ms == 0 {
+            anyhow::bail!("replication.gossip_tick_ms must be greater than zero");
+        }
+
+        if self.replication.sync_tick_ms == 0 {
+            anyhow::bail!("replication.sync_tick_ms must be greater than zero");
+        }
+
+        if self.replication.global_metadata_sync_tick_ms == 0 {
+            anyhow::bail!("replication.global_metadata_sync_tick_ms must be greater than zero");
+        }
+
         Ok(())
     }
+}
+
+/// # Description:
+///
+/// Applies one non-negative `usize` environment override into the provided
+/// destination, logging invalid values and returning whether an override was
+/// attempted.
+fn apply_usize_env_override(name: &str, dest: &mut usize) -> bool {
+    let Ok(raw) = std::env::var(name) else {
+        return false;
+    };
+
+    match raw.trim().parse::<usize>() {
+        Ok(value) => *dest = value,
+        Err(_) => warn!(target: "config", "ignoring invalid {name} '{raw}'"),
+    }
+
+    true
+}
+
+/// # Description:
+///
+/// Applies one strictly positive `usize` environment override into the
+/// provided destination, logging invalid values and returning whether an
+/// override was attempted.
+fn apply_positive_usize_env_override(name: &str, dest: &mut usize) -> bool {
+    let Ok(raw) = std::env::var(name) else {
+        return false;
+    };
+
+    match raw.trim().parse::<usize>() {
+        Ok(value) if value > 0 => *dest = value,
+        _ => warn!(target: "config", "ignoring invalid {name} '{raw}'"),
+    }
+
+    true
+}
+
+/// # Description:
+///
+/// Applies one strictly positive `u64` environment override into the provided
+/// destination, logging invalid values and returning whether an override was
+/// attempted.
+fn apply_positive_u64_env_override(name: &str, dest: &mut u64) -> bool {
+    let Ok(raw) = std::env::var(name) else {
+        return false;
+    };
+
+    match raw.trim().parse::<u64>() {
+        Ok(value) if value > 0 => *dest = value,
+        _ => warn!(target: "config", "ignoring invalid {name} '{raw}'"),
+    }
+
+    true
 }
 
 /// # Description:
@@ -925,6 +1168,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_replication_capacity() {
+        let mut config = Config::default();
+        config.replication.gossip_channel_capacity = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_replication_tick() {
+        let mut config = Config::default();
+        config.replication.sync_tick_ms = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn env_overrides_apply_and_validate() {
         unsafe {
             std::env::set_var("MANTISSA_WIREGUARD_DISABLE", "1");
@@ -934,6 +1191,14 @@ mod tests {
             std::env::set_var("MANTISSA_RUNTIME_OCI_HOST", "unix:///var/run/docker.sock");
             std::env::set_var("MANTISSA_GPU_DEVICE_OVERRIDES", "uuid:GPU-abc=id:GPU-abc");
             std::env::set_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY", "1");
+            std::env::set_var("MANTISSA_GOSSIP_CHANNEL_CAPACITY", "256");
+            std::env::set_var("MANTISSA_GOSSIP_FANOUT", "7");
+            std::env::set_var("MANTISSA_GOSSIP_TICK_MS", "200");
+            std::env::set_var("MANTISSA_SYNC_TICK_MS", "300");
+            std::env::set_var("MANTISSA_SYNC_FANOUT", "9");
+            std::env::set_var("MANTISSA_GLOBAL_METADATA_SYNC_TICK_MS", "400");
+            std::env::set_var("MANTISSA_GLOBAL_METADATA_SYNC_FANOUT", "11");
+            std::env::set_var("MANTISSA_WORKLOAD_REPAIR_FANOUT", "3");
         }
 
         let mut config = Config::default();
@@ -953,6 +1218,14 @@ mod tests {
             Some("uuid:GPU-abc=id:GPU-abc")
         );
         assert!(config.storage.local_volume_enforce_capacity);
+        assert_eq!(config.replication.gossip_channel_capacity, 256);
+        assert_eq!(config.replication.gossip_fanout, 7);
+        assert_eq!(config.replication.gossip_tick_ms, 200);
+        assert_eq!(config.replication.sync_tick_ms, 300);
+        assert_eq!(config.replication.sync_fanout, 9);
+        assert_eq!(config.replication.global_metadata_sync_tick_ms, 400);
+        assert_eq!(config.replication.global_metadata_sync_fanout, 11);
+        assert_eq!(config.replication.workload_repair_fanout, 3);
 
         unsafe {
             std::env::remove_var("MANTISSA_WIREGUARD_DISABLE");
@@ -962,6 +1235,14 @@ mod tests {
             std::env::remove_var("MANTISSA_RUNTIME_OCI_HOST");
             std::env::remove_var("MANTISSA_GPU_DEVICE_OVERRIDES");
             std::env::remove_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY");
+            std::env::remove_var("MANTISSA_GOSSIP_CHANNEL_CAPACITY");
+            std::env::remove_var("MANTISSA_GOSSIP_FANOUT");
+            std::env::remove_var("MANTISSA_GOSSIP_TICK_MS");
+            std::env::remove_var("MANTISSA_SYNC_TICK_MS");
+            std::env::remove_var("MANTISSA_SYNC_FANOUT");
+            std::env::remove_var("MANTISSA_GLOBAL_METADATA_SYNC_TICK_MS");
+            std::env::remove_var("MANTISSA_GLOBAL_METADATA_SYNC_FANOUT");
+            std::env::remove_var("MANTISSA_WORKLOAD_REPAIR_FANOUT");
         }
     }
 }
