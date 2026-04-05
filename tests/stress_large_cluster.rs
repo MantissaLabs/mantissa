@@ -30,6 +30,16 @@ const SERVICE_NAME: &str = "mantissa-stress-test";
 const STRESS_TASK_CPU_MILLIS: u64 = 1;
 const STRESS_TASK_MEMORY_MB: u64 = 1;
 
+/// Formats raw digest bytes as lowercase hex for human-readable stress diagnostics.
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
 /// Parses one positive usize from an environment variable.
 fn env_usize(name: &str) -> Option<usize> {
     let raw = std::env::var(name).ok()?;
@@ -493,11 +503,9 @@ impl ProcessNode {
 
         for entry in roots.iter() {
             if matches!(entry.get_domain(), Ok(value) if value == domain) {
-                return entry
-                    .get_root_hex()
-                    .context("read peers root hex")?
-                    .to_string()
-                    .context("decode peers root hex");
+                return Ok(bytes_to_hex(
+                    entry.get_root_digest().context("read peers root digest")?,
+                ));
             }
         }
 

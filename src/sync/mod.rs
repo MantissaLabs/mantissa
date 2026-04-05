@@ -321,9 +321,9 @@ impl DomainStoreRef<'_> {
         format!("{prefix}.{}", self.meta().dump_suffix)
     }
 
-    /// Reads the current MST root hash for this domain.
-    async fn root_hex(&self) -> String {
-        with_domain_store!(self, |store| { store.root_hex().await })
+    /// Reads the current MST root digest for this domain.
+    async fn root_digest(&self) -> [u8; 16] {
+        with_domain_store!(self, |store| { store.root_digest().await })
     }
 
     /// Produces digest ranges for anti-entropy while emitting domain diagnostics.
@@ -390,10 +390,10 @@ impl sync::Server for SyncService {
 
         let mut list = results.get().init_roots(VIEW_SCOPED_DOMAIN_COUNT as u32);
         for (idx, domain) in ALL_DOMAINS.iter().copied().enumerate() {
-            let root_hex = self.domain_store(domain).root_hex().await;
+            let root_digest = self.domain_store(domain).root_digest().await;
             let mut entry = list.reborrow().get(idx as u32);
             entry.set_domain(domain);
-            entry.set_root_hex(&root_hex);
+            entry.set_root_digest(&root_digest);
             active_view.write_capnp(entry.reborrow().init_view());
         }
 

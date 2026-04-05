@@ -93,22 +93,22 @@ impl SyncTraceContext {
 }
 
 impl SyncStores {
-    /// Returns the local MST root hash for one domain so the roots phase can skip matches.
-    async fn root_hex(&self, domain: Domain) -> String {
+    /// Returns the local MST root digest for one domain so the roots phase can skip matches.
+    async fn root_digest(&self, domain: Domain) -> [u8; 16] {
         match domain {
-            Domain::Peers => self.peers.root_hex().await,
-            Domain::Workloads => self.workloads.root_hex().await,
-            Domain::Services => self.services.root_hex().await,
-            Domain::Jobs => self.jobs.root_hex().await,
-            Domain::Agents => self.agents.root_hex().await,
-            Domain::Secrets => self.secrets.root_hex().await,
-            Domain::Networks => self.networks.root_hex().await,
-            Domain::NetworkPeers => self.network_peers.root_hex().await,
-            Domain::NetworkAttachments => self.network_attachments.root_hex().await,
-            Domain::ClusterViews => self.cluster_views.root_hex().await,
-            Domain::Volumes => self.volumes.root_hex().await,
-            Domain::VolumeNodes => self.volume_nodes.root_hex().await,
-            Domain::SchedulerDigests => self.scheduler_digests.root_hex().await,
+            Domain::Peers => self.peers.root_digest().await,
+            Domain::Workloads => self.workloads.root_digest().await,
+            Domain::Services => self.services.root_digest().await,
+            Domain::Jobs => self.jobs.root_digest().await,
+            Domain::Agents => self.agents.root_digest().await,
+            Domain::Secrets => self.secrets.root_digest().await,
+            Domain::Networks => self.networks.root_digest().await,
+            Domain::NetworkPeers => self.network_peers.root_digest().await,
+            Domain::NetworkAttachments => self.network_attachments.root_digest().await,
+            Domain::ClusterViews => self.cluster_views.root_digest().await,
+            Domain::Volumes => self.volumes.root_digest().await,
+            Domain::VolumeNodes => self.volume_nodes.root_digest().await,
+            Domain::SchedulerDigests => self.scheduler_digests.root_digest().await,
         }
     }
 
@@ -541,18 +541,18 @@ pub async fn sync_selected_domains(
             let domain = entry
                 .get_domain()
                 .map_err(|_| capnp::Error::failed("unknown domain".into()))?;
-            let hex = entry.get_root_hex()?.to_string()?;
-            remote_roots.push((domain, hex));
+            let digest = read_root_digest(entry.get_root_digest()?)?;
+            remote_roots.push((domain, digest));
         }
 
         let mut domains_to_sync = Vec::new();
         // Root equality lets us skip the more expensive page-summary walk for matched domains.
         for domain in &requested_domains {
-            let local_root = stores.root_hex(*domain).await;
+            let local_root = stores.root_digest(*domain).await;
             let remote_root = remote_roots
                 .iter()
                 .find(|(candidate, _)| candidate == domain)
-                .map(|(_, hex)| hex.clone())
+                .map(|(_, digest)| *digest)
                 .unwrap_or_default();
             if remote_root != local_root {
                 domains_to_sync.push(*domain);
@@ -657,4 +657,14 @@ pub async fn sync_selected_domains(
 fn is_disconnected_capnp(error: &capnp::Error) -> bool {
     let text = error.to_string();
     text.contains("Disconnected") || text.contains("disconnected")
+}
+
+/// Decodes one fixed-width XXHash128 root digest from the sync wire format.
+fn read_root_digest(bytes: &[u8]) -> Result<[u8; 16], capnp::Error> {
+    bytes.try_into().map_err(|_| {
+        capnp::Error::failed(format!(
+            "invalid sync root digest length: expected 16, got {}",
+            bytes.len()
+        ))
+    })
 }

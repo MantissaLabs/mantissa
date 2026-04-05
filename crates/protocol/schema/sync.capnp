@@ -101,8 +101,8 @@ struct DomainRoot {
   domain  @0 :Domain;
   # Domain identifier.
 
-  rootHex @1 :Text;
-  # Hex-encoded MST root hash.
+  rootDigest @1 :Data;
+  # Raw XXHash128 MST root digest bytes.
 
   view    @2 :ClusterViewId;
   # Cluster view identifier associated with this root.

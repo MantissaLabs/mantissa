@@ -25,6 +25,16 @@ use protocol::secrets::secrets;
 use protocol::sync::Domain;
 use protocol::topology::topology;
 
+/// Formats raw digest bytes as lowercase hex for human-readable test diagnostics.
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
 #[derive(Clone)]
 pub struct HeadlessKeys {
     pub noise: Arc<NoiseKeys>,
@@ -573,9 +583,9 @@ impl HeadlessNode {
                         for idx in 0..list.len() {
                             let entry = list.get(idx);
                             if matches!(entry.get_domain(), Ok(Domain::Peers))
-                                && let Ok(text) = entry.get_root_hex()
+                                && let Ok(digest) = entry.get_root_digest()
                             {
-                                return text.to_string().unwrap_or_default();
+                                return bytes_to_hex(digest);
                             }
                         }
                         String::new()
