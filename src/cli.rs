@@ -105,8 +105,8 @@ pub enum Command {
     /// Get system information on a machine
     Info(InfoArgs),
 
-    /// Link a node to an existing cluster
-    Link(LinkArgs),
+    /// Join a node to an existing cluster
+    Join(JoinArgs),
 
     /// Leave an existing cluster
     Leave(LeaveArgs),
@@ -223,7 +223,7 @@ pub struct InfoArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct LinkArgs {
+pub struct JoinArgs {
     /// Sets the anchor address to join the network of nodes
     #[arg(
         short = 'a',

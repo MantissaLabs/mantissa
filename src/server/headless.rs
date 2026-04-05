@@ -537,12 +537,12 @@ impl HeadlessNode {
 
         let mut msg = capnp::message::Builder::new_default();
         {
-            let mut link = msg.init_root::<crate::topology_capnp::join_request::Builder>();
-            link.set_anchor(anchor_addr);
-            link.set_join_token(join_token);
+            let mut join_request = msg.init_root::<crate::topology_capnp::join_request::Builder>();
+            join_request.set_anchor(anchor_addr);
+            join_request.set_join_token(join_token);
         }
 
-        req.get().set_link(
+        req.get().set_request(
             msg.get_root::<crate::topology_capnp::join_request::Builder>()?
                 .into_reader(),
         )?;

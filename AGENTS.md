@@ -32,7 +32,7 @@ The system needs to be:
 ## Build, Test, and Development Commands
 
 - Build: `cargo build` (requires Cap’n Proto tooling: `capnp`, `libcapnp-dev`).
-- Run CLI: `mantissa init` | `mantissa nodes list` | `mantissa link --anchor 127.0.0.1:6578 --join-token <TOKEN>`
+- Run CLI: `mantissa init` | `mantissa nodes list` | `mantissa join --anchor 127.0.0.1:6578 --join-token <TOKEN>`
 - Tests: `cargo test` (verbose logs: `RUST_LOG=debug cargo test -- --nocapture`).
 
 ## Coding Style & Naming Conventions

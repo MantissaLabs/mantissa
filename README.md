@@ -62,7 +62,7 @@ mantissa token show
 4. Join a second node (replace `<vm1-ip>` and `<TOKEN>`):
 
 ```bash
-mantissa link --anchor <vm1-ip>:6578 --join-token <TOKEN>
+mantissa join --anchor <vm1-ip>:6578 --join-token <TOKEN>
 ```
 
 See `docs/quickstart.md` for the full local and multi-VM workflow.

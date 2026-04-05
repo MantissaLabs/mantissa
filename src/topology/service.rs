@@ -80,7 +80,7 @@ struct JoinInputs {
 
 impl JoinInputs {
     fn from_params(params: topology::JoinParams) -> Result<Self, Error> {
-        let request = params.get()?.get_link()?;
+        let request = params.get()?.get_request()?;
         let anchor = request
             .get_anchor()?
             .to_string()

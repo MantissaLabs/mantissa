@@ -29,7 +29,7 @@ mantissa token show
 3) Join a second node on a different port:
 
 ```bash
-mantissa link \
+mantissa join \
   --anchor 127.0.0.1:6578 \
   --join-token <TOKEN_FROM_STEP_2> \
   --listen 127.0.0.1:6580
@@ -85,7 +85,7 @@ mantissa token show
 4) On VM 2, join the cluster:
 
 ```bash
-mantissa link --anchor <vm1-ip>:6578 --join-token <TOKEN>
+mantissa join --anchor <vm1-ip>:6578 --join-token <TOKEN>
 ```
 
 Use `mantissa nodes list` and `mantissa scheduler slots` to inspect cluster state.

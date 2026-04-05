@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use capnp::message::Builder;
 use protocol::topology::join_request as JoinRequest;
 
-pub async fn link(cfg: &ClientConfig) -> Result<()> {
+pub async fn join(cfg: &ClientConfig) -> Result<()> {
     let client = connection::get_local_session(cfg).await?;
 
     let request = client.get_topology_request();
@@ -16,20 +16,20 @@ pub async fn link(cfg: &ClientConfig) -> Result<()> {
     let anchor = cfg
         .anchor
         .as_deref()
-        .ok_or_else(|| anyhow!("anchor is required to link"))?;
+        .ok_or_else(|| anyhow!("anchor is required to join"))?;
     let join_token = cfg
         .join_token
         .as_deref()
-        .ok_or_else(|| anyhow!("join token is required to link"))?;
+        .ok_or_else(|| anyhow!("join token is required to join"))?;
 
-    // Build link message.
-    let mut link = builder.init_root::<JoinRequest::Builder>();
-    link.set_anchor(anchor);
-    link.set_join_token(join_token);
+    // Build join request payload.
+    let mut join_request = builder.init_root::<JoinRequest::Builder>();
+    join_request.set_anchor(anchor);
+    join_request.set_join_token(join_token);
 
     let _ = request
         .get()
-        .set_link(builder.get_root::<JoinRequest::Builder>()?.into_reader());
+        .set_request(builder.get_root::<JoinRequest::Builder>()?.into_reader());
 
     let response = request.send().promise.await.map_err(|e| {
         let mut msg = e.to_string();

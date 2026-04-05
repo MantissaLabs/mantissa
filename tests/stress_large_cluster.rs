@@ -626,14 +626,14 @@ impl ProcessNode {
         let mut request = topology.join_request();
         let mut message = capnp::message::Builder::new_default();
         {
-            let mut link = message.init_root::<protocol::topology::join_request::Builder>();
-            link.set_anchor(anchor_addr);
-            link.set_join_token(join_token);
+            let mut join_request = message.init_root::<protocol::topology::join_request::Builder>();
+            join_request.set_anchor(anchor_addr);
+            join_request.set_join_token(join_token);
         }
 
         request
             .get()
-            .set_link(
+            .set_request(
                 message
                     .get_root::<protocol::topology::join_request::Builder>()?
                     .into_reader(),

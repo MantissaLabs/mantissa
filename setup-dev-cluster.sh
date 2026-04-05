@@ -371,9 +371,9 @@ Join example:
   # Copy the token
 
   # On mantissa-1 (use DNS name or IP):
-  sudo mantissa link --anchor lima-mantissa-2.internal:6578 --join-token <TOKEN>
+  sudo mantissa join --anchor lima-mantissa-2.internal:6578 --join-token <TOKEN>
   # or:
-  sudo mantissa link --anchor <IP_OF_MANTISSA_2>:6578 --join-token <TOKEN>
+  sudo mantissa join --anchor <IP_OF_MANTISSA_2>:6578 --join-token <TOKEN>
 JOIN
 fi
 

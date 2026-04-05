@@ -10,7 +10,7 @@ interface Topology {
   # Topology defines operations to join or leave a
   # pool of servers.
 
-  join @0 (link :JoinRequest) -> (resp :JoinResponse);
+  join @0 (request :JoinRequest) -> (resp :JoinResponse);
   # Join an existing pool of servers using an anchor address.
   # This method signals the intent to join. The next step is
   # to register the node on the Server interface which is

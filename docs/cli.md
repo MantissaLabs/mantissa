@@ -4,7 +4,7 @@ Common commands:
 
 - `mantissa init` - bootstrap a standalone node (blocking until interrupted)
 - `mantissa token show` / `mantissa token rotate` - view or rotate join tokens
-- `mantissa link --anchor <addr> --join-token <token>` - join an existing cluster
+- `mantissa join --anchor <addr> --join-token <token>` - join an existing cluster
 - `mantissa leave` - gracefully leave the cluster
 - `mantissa nodes list [cluster-id]` - inspect known peers
 - `mantissa nodes drain <node-id> [--reason <text>]` - fence a node and evacuate service work
