@@ -70,6 +70,31 @@ async fn cluster_name_for_lineage(
     None
 }
 
+/// Reads the current cluster view summary rows from one topology client.
+async fn cluster_view_rows(
+    topology: &mantissa::topology_capnp::topology::Client,
+) -> Vec<(ClusterViewId, u32, bool)> {
+    let response = topology
+        .list_cluster_views_request()
+        .send()
+        .promise
+        .await
+        .expect("listClusterViews send");
+    let rows = response
+        .get()
+        .expect("listClusterViews get")
+        .get_views()
+        .expect("cluster view rows");
+    let mut out = Vec::with_capacity(rows.len() as usize);
+    for idx in 0..rows.len() {
+        let row = rows.get(idx);
+        let view =
+            ClusterViewId::from_capnp(row.get_view().expect("row view")).expect("decode row view");
+        out.push((view, row.get_node_count(), row.get_local_active()));
+    }
+    out
+}
+
 fn headless_config_with_in_memory_runtime() -> HeadlessConfig {
     HeadlessConfig {
         runtime_set: Some(RuntimeSet::singleton(
@@ -2442,6 +2467,196 @@ local_test!(cluster_view_merge_after_split_reconnects_partitions, {
     )
     .await;
 });
+
+// Validates cluster view counts track active members after a split peer leaves.
+local_test!(
+    cluster_view_counts_exclude_left_members_after_split_and_merge,
+    {
+        let anchor = TestNode::new_tcp_with_tick_ms(100).await;
+        let joiner_a = TestNode::new_tcp_with_tick_ms(100).await;
+        let joiner_b = TestNode::new_tcp_with_tick_ms(100).await;
+        joiner_a.join(&anchor).await.expect("join A");
+        joiner_b.join(&anchor).await.expect("join B");
+        anchor
+            .assert_cluster_size(3, "cluster size after joins")
+            .await;
+        sleep(Duration::from_millis(600)).await;
+
+        let view_resp = anchor
+            .topology()
+            .get_cluster_view_request()
+            .send()
+            .promise
+            .await
+            .expect("getClusterView send");
+        let source_view = ClusterViewId::from_capnp(
+            view_resp
+                .get()
+                .expect("getClusterView get")
+                .get_view()
+                .expect("source view payload"),
+        )
+        .expect("decode source view");
+
+        let mut split_req = anchor.topology().split_cluster_request();
+        {
+            let mut req = split_req.get().init_req();
+            source_view.write_capnp(req.reborrow().init_source_view());
+
+            let mut targets = req.reborrow().init_targets(2);
+            let mut target_self = targets.reborrow().get(0);
+            target_self.set_name("self-only");
+            let mut selector_self = target_self.reborrow().init_selector();
+            selector_self.reborrow().init_clauses(0);
+            let mut explicit_self = selector_self.reborrow().init_explicit_nodes(1);
+            set_node_id(explicit_self.reborrow().get(0), &anchor.id());
+
+            let mut target_others = targets.reborrow().get(1);
+            target_others.set_name("others");
+            let mut selector_others = target_others.reborrow().init_selector();
+            selector_others.reborrow().init_clauses(0);
+            let mut explicit_others = selector_others.reborrow().init_explicit_nodes(2);
+            set_node_id(explicit_others.reborrow().get(0), &joiner_a.id());
+            set_node_id(explicit_others.reborrow().get(1), &joiner_b.id());
+
+            req.set_dry_run(false);
+        }
+
+        let split_resp = split_req.send().promise.await.expect("splitCluster send");
+        let split_op = split_resp
+            .get()
+            .expect("splitCluster get")
+            .get_op()
+            .expect("split operation");
+        let split_targets = split_op.get_target_views().expect("split target views");
+        let split_source_view =
+            ClusterViewId::from_capnp(split_targets.get(0)).expect("split source");
+        let split_destination_view =
+            ClusterViewId::from_capnp(split_targets.get(1)).expect("split destination");
+        let split_id = split_op.get_id().expect("split operation id").to_vec();
+
+        wait_for_operation_stage(
+            &anchor.topology(),
+            &split_id,
+            ClusterOperationStage::Finalized,
+            Duration::from_secs(5),
+        )
+        .await;
+        wait_for_cluster_view(
+            &joiner_a.topology(),
+            split_destination_view,
+            Duration::from_secs(5),
+        )
+        .await;
+        wait_for_cluster_view(
+            &joiner_b.topology(),
+            split_destination_view,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        joiner_b.leave().await.expect("leave B");
+        joiner_a
+            .assert_cluster_size(1, "local split partition should shrink after leave")
+            .await;
+
+        let rows = cluster_view_rows(&joiner_a.topology()).await;
+        let mut local_count = None::<u32>;
+        let mut remote_count = None::<u32>;
+        for (view, node_count, local_active) in rows {
+            if view == split_destination_view {
+                assert!(
+                    local_active,
+                    "destination split view should remain local active after peer leave"
+                );
+                local_count = Some(node_count);
+            } else if view == split_source_view {
+                assert!(
+                    !local_active,
+                    "source split view should remain remote after peer leave"
+                );
+                remote_count = Some(node_count);
+            }
+        }
+        assert_eq!(
+            local_count,
+            Some(1),
+            "local active split view should exclude the left peer from its node count"
+        );
+        assert_eq!(
+            remote_count,
+            Some(1),
+            "remote split sibling count should stay anchored to the surviving source peer"
+        );
+
+        let mut merge_req = anchor.topology().merge_clusters_request();
+        {
+            let mut req = merge_req.get().init_req();
+            split_source_view.write_capnp(req.reborrow().init_source_view());
+            split_destination_view.write_capnp(req.reborrow().init_destination_view());
+            req.set_dry_run(false);
+        }
+        let merge_resp = merge_req.send().promise.await.expect("mergeClusters send");
+        let merge_op = merge_resp
+            .get()
+            .expect("mergeClusters get")
+            .get_op()
+            .expect("merge operation");
+        let merge_id = merge_op.get_id().expect("merge operation id").to_vec();
+
+        wait_for_operation_stage(
+            &anchor.topology(),
+            &merge_id,
+            ClusterOperationStage::Finalized,
+            Duration::from_secs(5),
+        )
+        .await;
+        wait_for_cluster_view(
+            &anchor.topology(),
+            split_destination_view,
+            Duration::from_secs(5),
+        )
+        .await;
+        wait_for_cluster_view(
+            &joiner_a.topology(),
+            split_destination_view,
+            Duration::from_secs(5),
+        )
+        .await;
+        anchor
+            .assert_cluster_size(
+                2,
+                "merged cluster should only contain surviving active peers",
+            )
+            .await;
+        joiner_a
+            .assert_cluster_size(
+                2,
+                "merged cluster should only contain surviving active peers",
+            )
+            .await;
+
+        let rows = cluster_view_rows(&joiner_a.topology()).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "merged cluster listing should retire the split source view"
+        );
+        let (merged_view, merged_count, merged_local_active) = rows[0];
+        assert_eq!(
+            merged_view, split_destination_view,
+            "merge destination should remain the only listed cluster view"
+        );
+        assert!(
+            merged_local_active,
+            "merge destination should remain locally active on the surviving peer"
+        );
+        assert_eq!(
+            merged_count, 2,
+            "merged cluster count should exclude the peer that left before merge"
+        );
+    }
+);
 
 // Validates split planning accepts a single fallback target and routes unmatched peers into it.
 local_test!(cluster_view_split_selector_with_fallback_target, {

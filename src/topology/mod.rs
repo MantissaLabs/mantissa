@@ -1321,6 +1321,20 @@ impl Topology {
         });
         value.membership = PeerMembership::left(incarnation);
         self.peers.upsert(&UuidKey::from(id), value).await?;
+        if let Err(err) = self.local_sessions.remove(id) {
+            warn!(
+                target: "topology",
+                peer_id = %id,
+                "failed to remove local session ticket for left peer: {err}"
+            );
+        }
+        if let Err(err) = self.local_credential_store.remove(id) {
+            warn!(
+                target: "topology",
+                peer_id = %id,
+                "failed to remove local credential for left peer: {err}"
+            );
+        }
         self.registry.remove_peer(id).await;
         self.health_monitor.remove_peer(id);
         Ok(())

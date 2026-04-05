@@ -2234,7 +2234,7 @@ impl topology::Server for Topology {
             .peers
             .load_all()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        for (key, _snapshot) in actives {
+        for (key, snapshot) in actives {
             let peer_id = key.to_uuid();
             if peer_id == self.node.id {
                 continue;
@@ -2242,6 +2242,11 @@ impl topology::Server for Topology {
             if excluded_peers.contains(&peer_id) {
                 continue;
             }
+            let Some(_selected) =
+                PeerValue::select(snapshot.as_slice()).filter(|value| value.is_active())
+            else {
+                continue;
+            };
 
             // When no cached session is available yet, treat the peer as part of the
             // local active view until a concrete remote view is observed.
@@ -2278,6 +2283,9 @@ impl topology::Server for Topology {
 
             for (idx, view) in operation.target_views.iter().copied().enumerate() {
                 if retired_views.contains(&view) {
+                    continue;
+                }
+                if view == local_view {
                     continue;
                 }
                 let inferred_count = inferred_target_counts.get(idx).copied().unwrap_or_default();

@@ -360,6 +360,25 @@ impl Server {
             topology.ensure_cluster_background_tasks();
         });
     }
+
+    /// Rejects remote cluster-control RPCs once the local node has left the cluster.
+    ///
+    /// A left node may stay online for local CLI access, but it must not mint
+    /// fresh peer sessions or accept new joins into a cluster it no longer
+    /// participates in.
+    fn ensure_local_cluster_membership_active(&self) -> Result<(), capnp::Error> {
+        if self
+            .topology
+            .peer_exists(self.identity.id)
+            .map_err(|error| capnp::Error::failed(error.to_string()))?
+        {
+            Ok(())
+        } else {
+            Err(capnp::Error::failed(
+                "node is not an active cluster member".to_string(),
+            ))
+        }
+    }
 }
 
 impl protocol::server::Server for Server {
@@ -369,6 +388,7 @@ impl protocol::server::Server for Server {
         mut results: protocol::server::RegisterNodeResults,
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
+        self.ensure_local_cluster_membership_active()?;
 
         let join_request = JoinRequest::from_params(params)?;
         self.validate_join_request(&join_request).await?;
@@ -390,6 +410,7 @@ impl protocol::server::Server for Server {
         mut results: protocol::server::GetSessionResults,
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
+        self.ensure_local_cluster_membership_active()?;
 
         let ticket = params.get()?.get_ticket()?;
         let Some(peer_id) = self
@@ -419,6 +440,7 @@ impl protocol::server::Server for Server {
         mut results: protocol::server::GetWithCredentialResults,
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
+        self.ensure_local_cluster_membership_active()?;
 
         let cred_bytes = params.get()?.get_credential()?;
         let cred =
