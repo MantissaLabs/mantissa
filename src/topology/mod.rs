@@ -1131,6 +1131,13 @@ impl Topology {
                                 continue;
                             }
                             self.swim_record_join(id, incarnation);
+                            if let Err(err) = self.publish_local_cluster_node_count().await {
+                                warn!(
+                                    target: "cluster_view",
+                                    peer_id = %id,
+                                    "failed to publish cluster node count after join event: {err}"
+                                );
+                            }
                         }
 
                         TopologyEvent::Leave { id, incarnation } => {
@@ -1337,6 +1344,19 @@ impl Topology {
         }
         self.registry.remove_peer(id).await;
         self.health_monitor.remove_peer(id);
+        if id != self.node.id {
+            match self.publish_local_cluster_node_count().await {
+                Ok(true) => self.sync_once_now(),
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(
+                        target: "cluster_view",
+                        peer_id = %id,
+                        "failed to publish cluster node count after leave event: {err}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

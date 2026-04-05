@@ -2,7 +2,7 @@ use super::{
     CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT, COMMIT_PRECONDITION_FAILURE_PREFIX, Topology,
 };
 use crate::cluster::{ClusterId, ClusterViewId};
-use crate::store::cluster_view_store::ClusterNameRecord;
+use crate::store::cluster_view_store::{ClusterNameRecord, ClusterNodeCountRecord};
 use crate::topology::operation::{
     ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage,
 };
@@ -22,6 +22,35 @@ impl Topology {
             .upsert_cluster_name(cluster_id, record)
             .await
             .map_err(|err| capnp::Error::failed(err.to_string()))
+    }
+
+    /// Applies one conflict-resolved cluster lineage node-count update into durable cluster-view storage.
+    pub(crate) async fn upsert_cluster_node_count_record(
+        &self,
+        cluster_id: ClusterId,
+        record: &ClusterNodeCountRecord,
+    ) -> Result<bool, capnp::Error> {
+        self.cluster_view_store
+            .upsert_cluster_node_count(cluster_id, record)
+            .await
+            .map_err(|err| capnp::Error::failed(err.to_string()))
+    }
+
+    /// Publishes the local active cluster's current member count into the replicated metadata domain.
+    pub(crate) async fn publish_local_cluster_node_count(&self) -> Result<bool, capnp::Error> {
+        if !self.local_allows_outbound_cluster_traffic() {
+            return Ok(false);
+        }
+
+        let local_view = self.active_cluster_view();
+        let node_count = self.local_cluster_view_member_count().await?;
+        let record = ClusterNodeCountRecord {
+            node_count,
+            updated_at_unix_ms: Self::now_unix_ms(),
+            actor_node_id: self.node.id,
+        };
+        self.upsert_cluster_node_count_record(local_view.cluster_id, &record)
+            .await
     }
 
     /// Persists split target names carried by one operation record so cluster lineage labels survive restarts.
@@ -428,6 +457,18 @@ impl Topology {
         self.persist_active_cluster_view(transition.local_target_view)?;
         let previous = self.set_active_cluster_view(transition.local_target_view);
         self.registry.clear().await;
+        match self.publish_local_cluster_node_count().await {
+            Ok(true) => self.sync_once_now(),
+            Ok(false) => {}
+            Err(err) => {
+                warn!(
+                    target: "cluster_view",
+                    operation_id = %transition.operation_id,
+                    target_view = %transition.local_target_view,
+                    "failed to publish cluster node count after committed transition: {err}"
+                );
+            }
+        }
         info!(
             target: "cluster_view",
             operation_id = %transition.operation_id,

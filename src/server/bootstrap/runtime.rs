@@ -738,6 +738,13 @@ async fn hydrate_topology(topology: &Topology) -> BootstrapResult<()> {
         );
     }
 
+    if let Err(error) = topology.publish_local_cluster_node_count().await {
+        tracing::warn!(
+            target: "cluster_view",
+            "failed to publish local cluster node count during startup hydration: {error}"
+        );
+    }
+
     Ok(())
 }
 

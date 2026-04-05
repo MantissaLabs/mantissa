@@ -32,14 +32,17 @@ view to avoid cross-view amplification and semantic conflicts.
 
 ### Cluster metadata
 
-Cluster names are stored in the cluster view domain as conflict-resolved
-records (`ClusterNameRecord`) with deterministic ordering:
+Cluster lineage metadata is stored in the cluster view domain. Names use
+conflict-resolved `ClusterNameRecord` updates, while per-lineage node counts
+use `ClusterNodeCountRecord` updates published from each cluster's local view.
+
+Each metadata field resolves independently with deterministic ordering:
 
 1. `updated_at_unix_ms`
 2. `actor_node_id`
-3. `name`
+3. field value (`name` or `node_count`)
 
-This keeps a single winner across peers.
+This keeps a single winner per metadata field across peers.
 
 ## Why two layers
 
@@ -56,7 +59,7 @@ Combining both gives:
 | Plane | Scope | Current payloads | Goal |
 | --- | --- | --- | --- |
 | View-scoped | Active view only | join/leave/alive/suspect/down, tasks, services, network, secrets | Efficiency and isolation |
-| Global metadata | Cross-view | `TopologyEvent::ClusterNameUpdated` | Cross-boundary metadata convergence |
+| Global metadata | Cross-view | `TopologyEvent::ClusterNameUpdated`, `Domain::ClusterViews` sync | Cross-boundary metadata convergence |
 
 ## High-level topology
 

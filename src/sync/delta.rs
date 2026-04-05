@@ -12,7 +12,7 @@ use crate::scheduler::digest::SchedulerDigestValue;
 use crate::secrets::types::SecretValue;
 use crate::services::types::ServiceSpecValue;
 use crate::store::agent_store::AgentStore;
-use crate::store::cluster_view_store::{ClusterNameRecord, ClusterViewDomainStore};
+use crate::store::cluster_view_store::{ClusterViewDomainStore, ClusterViewMetadataRecord};
 use crate::store::job_store::JobStore;
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
 use crate::store::peer_store::PeersStore;
@@ -253,7 +253,7 @@ impl delta_sink::Server for DeltaSinkImpl {
                 apply_chunk(
                     self.stores.cluster_views.clone(),
                     &chunk,
-                    decode_register::<ClusterNameRecord>,
+                    decode_register::<ClusterViewMetadataRecord>,
                 )
                 .await?
             }
@@ -450,10 +450,10 @@ impl DeltaStore<NetworkAttachmentValue> for NetworkAttachmentStore {
 }
 
 #[async_trait]
-impl DeltaStore<ClusterNameRecord> for ClusterViewDomainStore {
+impl DeltaStore<ClusterViewMetadataRecord> for ClusterViewDomainStore {
     async fn apply_delta(
         self,
-        regs: Vec<(UuidKey, MVReg<ClusterNameRecord, uuid::Uuid>)>,
+        regs: Vec<(UuidKey, MVReg<ClusterViewMetadataRecord, uuid::Uuid>)>,
         tombs: Vec<(UuidKey, u64)>,
     ) -> io::Result<()> {
         self.apply_delta_chunk_update_mst(regs, tombs).await

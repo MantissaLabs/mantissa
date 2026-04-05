@@ -7,7 +7,7 @@ use crate::server::credential::ClusterCredential;
 use crate::topology::TopologyEvent;
 use crate::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue};
 use std::rc::Rc;
-use tracing::debug;
+use tracing::{debug, warn};
 use x25519_dalek::PublicKey;
 
 /// Typed join request assembled from the Cap'n Proto payload.
@@ -302,6 +302,17 @@ impl Server {
             .map_err(|error| capnp::Error::failed(error.to_string()))?;
         self.topology
             .swim_record_join(request.joiner_id, request.incarnation);
+        match self.topology.publish_local_cluster_node_count().await {
+            Ok(true) => self.topology.sync_once_now(),
+            Ok(false) => {}
+            Err(err) => {
+                warn!(
+                    target: "cluster_view",
+                    node_id = %request.joiner_id,
+                    "failed to publish cluster node count after join: {err}"
+                );
+            }
+        }
         Ok(())
     }
 

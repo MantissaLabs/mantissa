@@ -1430,6 +1430,45 @@ impl Topology {
         Self::session_cluster_view(&session).await.ok()
     }
 
+    /// Counts active peers currently believed to belong to the local active cluster view.
+    ///
+    /// This is the authoritative local membership count used for replicated cluster metadata.
+    async fn local_cluster_view_member_count(&self) -> Result<u32, capnp::Error> {
+        let local_view = self.active_cluster_view();
+        let excluded_peers = self.excluded_peers_snapshot().await;
+        let (actives, _) = self
+            .peers
+            .load_all()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+        let mut count = 1u32;
+        for (key, snapshot) in actives {
+            let peer_id = key.to_uuid();
+            if peer_id == self.node.id {
+                continue;
+            }
+            if excluded_peers.contains(&peer_id) {
+                continue;
+            }
+            let Some(_selected) =
+                PeerValue::select(snapshot.as_slice()).filter(|value| value.is_active())
+            else {
+                continue;
+            };
+
+            let view = self
+                .best_known_peer_view(peer_id)
+                .await
+                .unwrap_or(local_view);
+            if view != local_view {
+                continue;
+            }
+            count = count.saturating_add(1);
+        }
+
+        Ok(count)
+    }
+
     /// Decodes one raw Cap'n Proto cluster lineage identifier into internal `ClusterId` bytes.
     fn cluster_id_from_capnp(
         reader: protocol::topology::cluster_id::Reader<'_>,
@@ -1682,6 +1721,12 @@ impl topology::Server for Topology {
                 // if the bootstrap sync observed a stale leave tombstone from another peer.
                 if let Err(err) = topology.persist_local_join_payload(&payload).await {
                     warn!(target: "topology", "join: failed to restore local peer row after bootstrap sync: {err}");
+                }
+                if let Err(err) = topology.publish_local_cluster_node_count().await {
+                    warn!(
+                        target: "cluster_view",
+                        "join: failed to publish local cluster node count after bootstrap sync: {err}"
+                    );
                 }
             }
         });
@@ -2208,6 +2253,7 @@ impl topology::Server for Topology {
         let local_view = self.active_cluster_view();
         let excluded_peers = self.excluded_peers_snapshot().await;
         let operations = self.load_cluster_operations()?;
+        let local_node_count = self.local_cluster_view_member_count().await?;
         let mut retired_views = HashSet::<ClusterViewId>::new();
         for operation in operations.iter() {
             if operation.kind != ClusterOperationKind::Merge
@@ -2228,7 +2274,7 @@ impl topology::Server for Topology {
         }
 
         let mut counts = HashMap::<ClusterViewId, u32>::new();
-        counts.insert(local_view, 1);
+        counts.insert(local_view, local_node_count);
 
         let (actives, _) = self
             .peers
@@ -2254,6 +2300,9 @@ impl topology::Server for Topology {
                 .best_known_peer_view(peer_id)
                 .await
                 .unwrap_or(local_view);
+            if view == local_view {
+                continue;
+            }
             if retired_views.contains(&view) {
                 continue;
             }
@@ -2299,19 +2348,43 @@ impl topology::Server for Topology {
             }
         }
 
-        let cluster_name_rows = self
+        let cluster_metadata_rows = self
             .cluster_view_store
-            .list_cluster_names()
+            .list_cluster_metadata()
             .map_err(|err| capnp::Error::failed(err.to_string()))?;
-        let cluster_names = cluster_name_rows
+        let cluster_names = cluster_metadata_rows
+            .iter()
+            .filter_map(|(cluster_id, record)| {
+                record
+                    .name
+                    .as_ref()
+                    .map(|name| (*cluster_id, name.name.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+        let cluster_node_counts = cluster_metadata_rows
             .into_iter()
-            .map(|(cluster_id, record)| (cluster_id, record.name))
+            .filter_map(|(cluster_id, record)| {
+                record
+                    .node_count
+                    .map(|node_count| (cluster_id, node_count.node_count))
+            })
             .collect::<HashMap<_, _>>();
 
         let mut rows = counts
             .into_iter()
-            .filter(|(view, node_count)| {
-                *node_count > 0 && (*view == local_view || !retired_views.contains(view))
+            .filter_map(|(view, node_count)| {
+                let resolved_count = if view == local_view {
+                    node_count
+                } else {
+                    cluster_node_counts
+                        .get(&view.cluster_id)
+                        .copied()
+                        .unwrap_or(node_count)
+                };
+                if resolved_count == 0 || (view != local_view && retired_views.contains(&view)) {
+                    return None;
+                }
+                Some((view, resolved_count))
             })
             .collect::<Vec<_>>();
         rows.sort_by(|(left, _), (right, _)| {

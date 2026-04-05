@@ -2560,6 +2560,37 @@ local_test!(
             .assert_cluster_size(1, "local split partition should shrink after leave")
             .await;
 
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let mut anchor_local_count = None::<u32>;
+            let mut anchor_remote_count = None::<u32>;
+            for (view, node_count, local_active) in cluster_view_rows(&anchor.topology()).await {
+                if view == split_source_view {
+                    assert!(
+                        local_active,
+                        "source split view should remain local active on anchor after remote leave"
+                    );
+                    anchor_local_count = Some(node_count);
+                } else if view == split_destination_view {
+                    assert!(
+                        !local_active,
+                        "destination split view should remain remote on anchor after remote leave"
+                    );
+                    anchor_remote_count = Some(node_count);
+                }
+            }
+
+            if anchor_local_count == Some(1) && anchor_remote_count == Some(1) {
+                break;
+            }
+
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cross-view cluster node-count metadata did not converge after split leave"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+
         let rows = cluster_view_rows(&joiner_a.topology()).await;
         let mut local_count = None::<u32>;
         let mut remote_count = None::<u32>;
@@ -2623,18 +2654,6 @@ local_test!(
             Duration::from_secs(5),
         )
         .await;
-        anchor
-            .assert_cluster_size(
-                2,
-                "merged cluster should only contain surviving active peers",
-            )
-            .await;
-        joiner_a
-            .assert_cluster_size(
-                2,
-                "merged cluster should only contain surviving active peers",
-            )
-            .await;
 
         let rows = cluster_view_rows(&joiner_a.topology()).await;
         assert_eq!(

@@ -86,7 +86,7 @@ View-scoped sync currently serves these domains in a stable order:
 | `Networks` | network specs |
 | `NetworkPeers` | overlay peer state |
 | `NetworkAttachments` | runtime attachment rows used for routing and discovery |
-| `ClusterViews` | cluster lineage metadata such as cluster names |
+| `ClusterViews` | cluster lineage metadata such as cluster names and per-lineage node counts |
 | `Volumes` | volume specs |
 | `VolumeNodes` | per-node realized volume state |
 | `SchedulerDigests` | coarse scheduling summaries per node |
@@ -202,11 +202,12 @@ For the runtime details of that split behavior, see
 
 `Domain::ClusterViews` is narrower than the name might suggest. In the current
 implementation it stores replicated cluster lineage metadata such as
-human-friendly cluster names.
+human-friendly cluster names and replicated per-lineage node counts.
 
 Durable cluster operation records are separate:
 
-- cluster names are replicated through the `cluster_views` domain,
+- cluster names and per-lineage node counts are replicated through the
+  `cluster_views` domain,
 - merge/split operation records live in `ClusterOperationStore`,
 - startup hydration can rebuild missing cluster names from operation history.
 
