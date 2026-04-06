@@ -136,10 +136,12 @@ This manifest shows the first real agent-shaped `nono` example:
 The example image lives at `examples/images/codex-sandbox/Dockerfile`. It uses
 the official `node:22-bookworm-slim` base, installs a pinned
 `@openai/codex` version, switches to the non-root `node` user, preconfigures
-Codex's writable state under `/var/tmp`, and launches `codex exec` from an
-image entrypoint when Mantissa provides `MANTISSA_AGENT_INPUT`. For a
-multi-node cluster, push the built image to a registry your nodes can pull
-from and update `execution.image` accordingly.
+Codex's writable state under `/var/tmp`, defaults the example to the cheaper
+`gpt-5.4-nano` model, and launches `codex exec` from an image entrypoint when
+Mantissa provides `MANTISSA_AGENT_INPUT`. If you want a different model, set
+`CODEX_MODEL` in the agent manifest environment. For a multi-node cluster,
+push the built image to a registry your nodes can pull from and update
+`execution.image` accordingly.
 
 Once submitted, stay on the agents surface to observe it:
 

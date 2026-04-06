@@ -24,6 +24,7 @@ USER node
 WORKDIR /workspace
 
 ENV CODEX_UNSAFE_ALLOW_NO_SANDBOX=1 \
+    CODEX_MODEL=gpt-5.4-nano \
     HOME=/var/tmp/codex-home \
     XDG_CONFIG_HOME=/var/tmp/codex-config \
     XDG_CACHE_HOME=/var/tmp/codex-cache \
