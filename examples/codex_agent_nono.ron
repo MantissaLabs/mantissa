@@ -24,7 +24,7 @@
         termination_grace_period_secs: Some(30),
         env: [
             (
-                name: "OPENAI_API_KEY",
+                name: "CODEX_API_KEY",
                 value: None,
                 secret: Some((
                     name: "openai-api-key",

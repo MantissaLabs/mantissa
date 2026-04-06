@@ -129,7 +129,7 @@ This manifest shows the first real agent-shaped `nono` example:
 
 - sandboxed OCI execution using the `nono-default` isolation profile
 - one managed workspace volume mounted at `/workspace`
-- secret-backed `OPENAI_API_KEY` injection
+- secret-backed `CODEX_API_KEY` injection
 - a Mantissa-owned Codex image with a pinned CLI version, non-root user, and
   image-owned entrypoint so the manifest does not need a shell command
 

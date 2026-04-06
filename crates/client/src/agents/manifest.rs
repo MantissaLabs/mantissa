@@ -673,7 +673,7 @@ mod tests {
                 termination_grace_period_secs: Some(30),
                 pre_stop_command: None,
                 env: vec![EnvironmentVariable {
-                    name: "OPENAI_API_KEY".to_string(),
+                    name: "CODEX_API_KEY".to_string(),
                     value: None,
                     secret: Some(crate::jobs::manifest::SecretReference {
                         name: "openai-api-key".to_string(),

@@ -67,7 +67,7 @@ If a secret is missing, the deployment fails fast with a descriptive error so yo
 before retrying.
 
 Agent manifests use the same secret reference shape. The bundled
-`examples/codex_agent_nono.ron` injects `OPENAI_API_KEY` into a sandboxed
+`examples/codex_agent_nono.ron` injects `CODEX_API_KEY` into a sandboxed
 Codex session through the agent execution environment:
 
 ```ron
@@ -75,7 +75,7 @@ Codex session through the agent execution environment:
     execution: (
         env: [
             (
-                name: "OPENAI_API_KEY",
+                name: "CODEX_API_KEY",
                 value: None,
                 secret: Some((
                     name: "openai-api-key",
