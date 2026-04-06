@@ -1,6 +1,6 @@
-use crate::jobs::runtime::{
-    DEFAULT_EXECUTION_PLATFORM, DEFAULT_ISOLATION_MODE, normalize_execution_platform,
-    normalize_isolation_mode, normalize_isolation_profile,
+use crate::runtime_contract::{
+    DEFAULT_EXECUTION_PLATFORM, normalize_execution_platform, normalize_isolation_mode,
+    normalize_isolation_profile,
 };
 use crate::workload_submit::{DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec};
 use anyhow::{Context, Result, anyhow};
@@ -567,7 +567,7 @@ fn default_execution_platform() -> String {
 }
 
 fn default_isolation_mode() -> String {
-    DEFAULT_ISOLATION_MODE.to_string()
+    "standard".to_string()
 }
 
 fn default_volume_access_mode() -> VolumeAccessMode {

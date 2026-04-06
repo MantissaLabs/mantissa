@@ -408,9 +408,11 @@ pub enum AgentsCommand {
     #[command(alias = "ls")]
     List,
 
-    /// Submit one durable agent session
-    #[command(alias = "run")]
+    /// Submit one durable agent session from raw CLI flags
     Submit(Box<AgentsSubmitArgs>),
+
+    /// Submit one durable agent session from a manifest
+    Run(AgentsRunArgs),
 
     /// List first-class agent runs
     Runs(AgentsRunsArgs),
@@ -658,6 +660,13 @@ pub struct JobsDeleteArgs {
     /// Durable UUID of the terminal job to delete
     #[arg(index = 1, value_name = "JOB_ID")]
     pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentsRunArgs {
+    /// Path to one agent manifest in RON format
+    #[arg(short = 'f', long = "file", value_name = "PATH")]
+    pub manifest: PathBuf,
 }
 
 #[derive(Args, Debug)]

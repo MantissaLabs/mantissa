@@ -286,6 +286,16 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             AgentsCommand::List => {
                 local.run_until(client::agents::list_sessions(&cfg)).await?;
             }
+            AgentsCommand::Run(args) => {
+                local
+                    .run_until(client::agents::run(
+                        &cfg,
+                        &client::agents::AgentRunOptions {
+                            manifest_path: &args.manifest,
+                        },
+                    ))
+                    .await?;
+            }
             AgentsCommand::Submit(args) => {
                 local
                     .run_until(client::agents::submit(

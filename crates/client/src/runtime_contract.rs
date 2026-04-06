@@ -1,12 +1,9 @@
 use anyhow::{Result, anyhow};
 
-/// Default execution platform used by raw job submissions and manifest parsing.
+/// Default execution platform used by manifest-backed workload submissions.
 pub const DEFAULT_EXECUTION_PLATFORM: &str = "oci";
 
-/// Default isolation mode used by raw job submissions and manifest parsing.
-pub const DEFAULT_ISOLATION_MODE: &str = "standard";
-
-/// Normalizes one execution platform string into the stable jobs API identifier.
+/// Normalizes one execution platform string into the stable workload API identifier.
 pub fn normalize_execution_platform(raw: &str) -> Result<String> {
     let value = raw.trim().to_ascii_lowercase();
     match value.as_str() {
@@ -17,7 +14,7 @@ pub fn normalize_execution_platform(raw: &str) -> Result<String> {
     }
 }
 
-/// Normalizes one isolation mode string into the stable jobs API identifier.
+/// Normalizes one isolation mode string into the stable workload API identifier.
 pub fn normalize_isolation_mode(raw: &str) -> Result<String> {
     let value = raw.trim().to_ascii_lowercase();
     match value.as_str() {
@@ -28,7 +25,7 @@ pub fn normalize_isolation_mode(raw: &str) -> Result<String> {
     }
 }
 
-/// Normalizes one optional isolation profile so empty values do not leak into the jobs API.
+/// Normalizes one optional isolation profile so empty values do not leak into the API.
 pub fn normalize_isolation_profile(raw: Option<&str>) -> Option<String> {
     raw.map(str::trim)
         .filter(|value| !value.is_empty())

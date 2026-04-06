@@ -1,22 +1,23 @@
 use crate::config::ClientConfig;
 use crate::connection;
 use crate::jobs::manifest::{
-    EnvironmentVariable, JobManifest, LivenessKind, LivenessProbe, SecretFileProjection,
-    SecretReference, load_manifest_from_path,
-};
-use crate::jobs::runtime::{
-    normalize_execution_platform, normalize_isolation_mode, normalize_isolation_profile,
+    EnvironmentVariable, JobManifest, LivenessProbe, SecretFileProjection, load_manifest_from_path,
 };
 use crate::output;
+use crate::runtime_contract::{
+    normalize_execution_platform, normalize_isolation_mode, normalize_isolation_profile,
+};
 use crate::tasks::uuid_to_string;
-use crate::volumes::{self, ResolvedVolumeMount};
+use crate::volumes;
 use crate::workload_submit::{
     ResolvedDeclaredVolume, compute_network_id, ensure_declared_volumes, ensure_named_networks,
 };
+use crate::workload_wire::{
+    PreparedVolumeMount, prepared_volume_mount_from_resolved, write_env_vars, write_liveness_probe,
+    write_secret_files, write_volume_mounts,
+};
 use anyhow::{Result, anyhow};
-use capnp::struct_list;
 use protocol::jobs::{job_execution, job_retry_policy, job_submit_spec};
-use protocol::workload::{environment_var, liveness_probe, secret_file, secret_ref, volume_mount};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
@@ -86,14 +87,6 @@ struct PreparedJobExecution {
 struct PreparedJobRetryPolicy {
     max_retries: u32,
     backoff_secs: u32,
-}
-
-/// One prepared named volume mount resolved to the cluster volume identity.
-struct PreparedVolumeMount {
-    volume_id: Uuid,
-    volume_name: String,
-    target: String,
-    read_only: bool,
 }
 
 /// Submits one first-class job through the jobs control-plane capability.
@@ -267,16 +260,6 @@ fn prepared_execution_from_manifest(
     })
 }
 
-/// Rebuilds one resolved CLI volume mount into the generic jobs submit payload shape.
-fn prepared_volume_mount_from_resolved(mount: &ResolvedVolumeMount) -> PreparedVolumeMount {
-    PreparedVolumeMount {
-        volume_id: mount.volume_id,
-        volume_name: mount.volume_name.clone(),
-        target: mount.target.clone(),
-        read_only: mount.read_only,
-    }
-}
-
 /// Encodes one prepared jobs submit payload into the jobs wire builder.
 fn write_job_submit_spec(
     mut builder: job_submit_spec::Builder<'_>,
@@ -319,12 +302,12 @@ fn write_job_execution(
     }
 
     let mut env = builder.reborrow().init_env(execution.env.len() as u32);
-    write_env_vars(&mut env, &execution.env)?;
+    write_env_vars(&mut env, &execution.env);
 
     let mut secret_files = builder
         .reborrow()
         .init_secret_files(execution.secret_files.len() as u32);
-    write_secret_files(&mut secret_files, &execution.secret_files)?;
+    write_secret_files(&mut secret_files, &execution.secret_files);
 
     let mut volumes = builder
         .reborrow()
@@ -352,82 +335,4 @@ fn write_job_retry_policy(
 ) {
     builder.set_max_retries(retry_policy.max_retries);
     builder.set_backoff_secs(retry_policy.backoff_secs);
-}
-
-/// Encodes one manifest secret reference into the workload wire builder.
-fn write_secret_reference(mut builder: secret_ref::Builder<'_>, reference: &SecretReference) {
-    builder.set_name(&reference.name);
-    if let Some(version) = reference.version {
-        builder.set_version_id(version.as_bytes());
-    } else {
-        builder.set_version_id(&[]);
-    }
-}
-
-/// Encodes one manifest environment variable list into the workload wire builder.
-fn write_env_vars(
-    builder: &mut struct_list::Builder<environment_var::Owned>,
-    vars: &[EnvironmentVariable],
-) -> Result<()> {
-    for (index, var) in vars.iter().enumerate() {
-        let mut entry = builder.reborrow().get(index as u32);
-        entry.set_name(&var.name);
-        if let Some(value) = var.value.as_deref() {
-            entry.set_value(value);
-        }
-        if let Some(secret) = var.secret.as_ref() {
-            write_secret_reference(entry.reborrow().init_secret(), secret);
-        }
-    }
-    Ok(())
-}
-
-/// Encodes one manifest secret file list into the workload wire builder.
-fn write_secret_files(
-    builder: &mut struct_list::Builder<secret_file::Owned>,
-    files: &[SecretFileProjection],
-) -> Result<()> {
-    for (index, file) in files.iter().enumerate() {
-        let mut entry = builder.reborrow().get(index as u32);
-        entry.set_path(&file.path);
-        write_secret_reference(entry.reborrow().init_secret(), &file.secret);
-        entry.set_mode(file.mode.unwrap_or(0));
-    }
-    Ok(())
-}
-
-/// Encodes one resolved volume mount list into the workload wire builder.
-fn write_volume_mounts(
-    builder: &mut struct_list::Builder<volume_mount::Owned>,
-    mounts: &[PreparedVolumeMount],
-) {
-    for (index, mount) in mounts.iter().enumerate() {
-        let mut entry = builder.reborrow().get(index as u32);
-        entry.set_volume_id(mount.volume_id.as_bytes());
-        entry.set_volume_name(&mount.volume_name);
-        entry.set_target(&mount.target);
-        entry.set_read_only(mount.read_only);
-    }
-}
-
-/// Encodes one manifest liveness probe into the workload wire builder.
-fn write_liveness_probe(mut builder: liveness_probe::Builder<'_>, probe: &LivenessProbe) {
-    let kind = match probe.kind {
-        LivenessKind::Exec => protocol::workload::LivenessProbeKind::Exec,
-        LivenessKind::Http => protocol::workload::LivenessProbeKind::Http,
-        LivenessKind::Tcp => protocol::workload::LivenessProbeKind::Tcp,
-    };
-    builder.set_kind(kind);
-
-    let mut command = builder.reborrow().init_command(probe.command.len() as u32);
-    for (index, arg) in probe.command.iter().enumerate() {
-        command.set(index as u32, arg);
-    }
-
-    builder.set_port(probe.port);
-    builder.set_path(probe.path.as_deref().unwrap_or(""));
-    builder.set_interval_ms(probe.interval_ms);
-    builder.set_timeout_ms(probe.timeout_ms);
-    builder.set_failure_threshold(probe.failure_threshold);
-    builder.set_start_period_ms(probe.start_period_ms);
 }
