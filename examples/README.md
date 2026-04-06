@@ -1,10 +1,13 @@
 # Examples
 
-Mantissa keeps service and job examples side by side because they exercise
-different controller semantics on top of the same shared workload layer.
+Mantissa keeps service, job, and agent examples side by side because they
+exercise different controller semantics on top of the same shared workload
+layer.
 
 Services keep long-lived replica sets running. Jobs run finite work to a
-terminal result and may launch multiple workload attempts over time.
+terminal result and may launch multiple workload attempts over time. Agent
+sessions keep durable policy and workspace state while launching one or more
+backing workload runs over time.
 
 ## Deploy the replicated service manifest
 
@@ -112,3 +115,37 @@ mantissa jobs delete <JOB_ID>
 For a deeper explanation of how jobs map to workload attempts, how retries
 work, and how the public jobs API relates to tasks and services, see
 `docs/jobs.md`.
+
+## Run a sandboxed Codex agent session
+
+```sh
+mantissa secrets create openai-api-key --value "$OPENAI_API_KEY"
+mantissa agents run --file examples/codex_agent_nono.ron
+```
+
+This manifest shows the first real agent-shaped `nono` example:
+
+- sandboxed OCI execution using the `nono-default` isolation profile
+- one managed workspace volume mounted at `/workspace`
+- secret-backed `OPENAI_API_KEY` injection
+- writable `HOME` and XDG directories redirected into the workspace so Codex
+  can run under Mantissa's write restrictions
+- a real non-interactive Codex run launched through `npx @openai/codex`
+
+The example keeps the container image generic by using `node:22-bookworm-slim`
+and downloading Codex on demand. That is convenient for a demo. In production
+you would typically bake `@openai/codex` into your own image and only keep the
+secret injection, workspace policy, and prompt flow in the manifest.
+
+Once submitted, stay on the agents surface to observe it:
+
+```sh
+mantissa agents list
+mantissa agents inspect <SESSION_ID>
+mantissa agents logs <SESSION_ID> -f
+mantissa agents wait <SESSION_ID>
+```
+
+If `nono-default` is rejected at submission time, the node did not advertise
+the sandboxed Docker contract at startup. See `docs/workloads-and-runtimes.md`
+for the helper discovery requirements behind that profile.

@@ -1,8 +1,8 @@
-# Secrets in Service Manifests
+# Secrets in Manifests
 
-Service manifests can hydrate container environment variables or files with cluster secrets. Before
-deploying a manifest that references secrets, seed them on a node that is already part of the
-cluster:
+Service and agent manifests can hydrate container environment variables or
+files with cluster secrets. Before deploying a manifest that references
+secrets, seed them on a node that is already part of the cluster:
 
 ```bash
 # Generate a random API token and store it
@@ -21,7 +21,8 @@ SECRET_EOF
 mantissa secrets list
 ```
 
-The bundled manifest `examples/replicated_service.ron` shows how those secrets are consumed:
+The bundled service manifest `examples/replicated_service.ron` shows how those
+secrets are consumed:
 
 ```ron
 (
@@ -64,3 +65,33 @@ mantissa tasks list --state running
 
 If a secret is missing, the deployment fails fast with a descriptive error so you can seed it
 before retrying.
+
+Agent manifests use the same secret reference shape. The bundled
+`examples/codex_agent_nono.ron` injects `OPENAI_API_KEY` into a sandboxed
+Codex session through the agent execution environment:
+
+```ron
+(
+    execution: (
+        env: [
+            (
+                name: "OPENAI_API_KEY",
+                value: None,
+                secret: Some((
+                    name: "openai-api-key",
+                    version: None,
+                )),
+            ),
+        ],
+    ),
+)
+```
+
+A complete end-to-end flow for that example looks like this:
+
+```bash
+mantissa secrets create openai-api-key --value "$OPENAI_API_KEY"
+mantissa agents run --file examples/codex_agent_nono.ron
+mantissa agents inspect <SESSION_ID>
+mantissa agents logs <SESSION_ID> -f
+```

@@ -758,4 +758,13 @@ mod tests {
             "unexpected error: {error:#}"
         );
     }
+
+    /// Keeps the repository agent example aligned with the manifest contract.
+    #[test]
+    fn repository_agent_examples_parse() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let path = root.join("codex_agent_nono.ron");
+        load_manifest_from_path(&path)
+            .unwrap_or_else(|error| panic!("failed to parse {}: {error:#}", path.display()));
+    }
 }
