@@ -1,13 +1,20 @@
 pub mod input;
+pub mod inspect;
 pub mod list;
+pub mod logs;
 pub mod manifest;
 pub mod run;
 pub mod runs;
+pub mod snapshot;
 pub mod submit;
+pub mod wait;
 
 pub use input::submit_input;
+pub use inspect::inspect;
 pub use list::list_sessions;
+pub use logs::{AgentLogsOptions, logs};
 pub use manifest::{AgentManifest, load_manifest_from_path};
 pub use run::{AgentRunOptions, run};
 pub use runs::list_runs;
 pub use submit::{AgentSubmitOptions, submit};
+pub use wait::wait;

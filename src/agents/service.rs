@@ -122,6 +122,28 @@ impl agents::Server for AgentsRpc {
             .map_err(|error| Error::failed(error.to_string()))?;
         Ok(())
     }
+
+    /// Loads one durable agent session together with its known run history.
+    async fn inspect(
+        self: Rc<Self>,
+        params: agents::InspectParams,
+        mut results: agents::InspectResults,
+    ) -> Result<(), Error> {
+        let reader = params.get()?;
+        let session_id = read_uuid(reader.get_session_id()?)?;
+        let (session, runs) = self
+            .manager
+            .inspect_session(session_id)
+            .map_err(|error| Error::failed(error.to_string()))?;
+
+        let mut builder = results.get();
+        write_agent_session_spec(builder.reborrow().init_session(), &session)?;
+        let mut list = builder.init_runs(runs.len() as u32);
+        for (index, run) in runs.iter().enumerate() {
+            write_agent_run_spec(list.reborrow().get(index as u32), run)?;
+        }
+        Ok(())
+    }
 }
 
 /// Encodes one agent event into the shared gossip message union payload.

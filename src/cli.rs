@@ -408,6 +408,15 @@ pub enum AgentsCommand {
     #[command(alias = "ls")]
     List,
 
+    /// Inspect one first-class agent session
+    Inspect(AgentsInspectArgs),
+
+    /// Wait until one first-class agent session becomes idle or terminal
+    Wait(AgentsWaitArgs),
+
+    /// Stream logs for the active or last known workload run of one agent session
+    Logs(AgentsLogsArgs),
+
     /// Submit one durable agent session from raw CLI flags
     Submit(Box<AgentsSubmitArgs>),
 
@@ -667,6 +676,61 @@ pub struct AgentsRunArgs {
     /// Path to one agent manifest in RON format
     #[arg(short = 'f', long = "file", value_name = "PATH")]
     pub manifest: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentsInspectArgs {
+    /// Durable UUID of the agent session to inspect
+    #[arg(index = 1, value_name = "SESSION_ID")]
+    pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentsWaitArgs {
+    /// Durable UUID of the agent session to wait for
+    #[arg(index = 1, value_name = "SESSION_ID")]
+    pub id: String,
+
+    /// Optional maximum time to wait before returning an error
+    #[arg(
+        long = "timeout",
+        value_name = "DURATION",
+        value_parser = parse_cli_duration
+    )]
+    pub timeout: Option<Duration>,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentsLogsArgs {
+    /// Durable UUID of the agent session to stream logs for
+    #[arg(index = 1, value_name = "SESSION_ID")]
+    pub id: String,
+
+    /// Follow the log stream until the selected workload attempt exits
+    #[arg(short = 'f', long = "follow", action = ArgAction::SetTrue)]
+    pub follow: bool,
+
+    /// Number of lines to show from the end of the log, or `all`
+    #[arg(
+        short = 'n',
+        long = "tail",
+        value_name = "LINES",
+        default_value = "all",
+        value_parser = parse_log_tail
+    )]
+    pub tail: String,
+
+    /// Include stdout log frames
+    #[arg(long = "stdout", action = ArgAction::SetTrue)]
+    pub stdout: bool,
+
+    /// Include stderr log frames
+    #[arg(long = "stderr", action = ArgAction::SetTrue)]
+    pub stderr: bool,
+
+    /// Prefix log lines with timestamps when the runtime provides them
+    #[arg(long = "timestamps", action = ArgAction::SetTrue)]
+    pub timestamps: bool,
 }
 
 #[derive(Args, Debug)]

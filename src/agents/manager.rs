@@ -183,6 +183,19 @@ impl AgentController {
         self.registry.list_runs(session_id)
     }
 
+    /// Loads one durable agent session together with every run owned by it.
+    pub fn inspect_session(
+        &self,
+        session_id: Uuid,
+    ) -> Result<(AgentSessionSpecValue, Vec<AgentRunSpecValue>)> {
+        let session = self
+            .registry
+            .get_session(session_id)?
+            .ok_or_else(|| anyhow!("agent session {session_id} not found"))?;
+        let runs = self.registry.list_runs(Some(session_id))?;
+        Ok((session, runs))
+    }
+
     /// Applies one inbound agent gossip event to the durable registry.
     async fn handle_event(&self, event: AgentEvent) -> Result<()> {
         match event {

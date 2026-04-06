@@ -93,6 +93,50 @@ local_test!(
     }
 );
 
+local_test!(agents_inspect_returns_session_and_run_history, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let node = TestNode::new().await;
+
+    let session_id = submit_agent_session(
+        &node.node.agents_client,
+        "inspect-agent",
+        Some("summarize the repo"),
+        Some("oci-default"),
+    )
+    .await
+    .expect("submit agent session");
+
+    let (run_id, workload_id) = wait_for_active_run(&node.node.agents_client, session_id).await;
+
+    let mut request = node.node.agents_client.inspect_request();
+    request.get().set_session_id(session_id.as_bytes());
+    let response = request.send().promise.await.expect("inspect agent session");
+    let reader = response.get().expect("inspect agent response");
+    let session = reader.get_session().expect("inspect session payload");
+    let runs = reader.get_runs().expect("inspect run payload");
+
+    assert_eq!(
+        read_uuid(session.get_id().expect("session id")).expect("parse session id"),
+        session_id
+    );
+    assert_eq!(
+        read_optional_uuid(session.get_active_run_id().expect("active run id")),
+        Some(run_id)
+    );
+    assert_eq!(
+        session
+            .get_isolation_profile()
+            .expect("session isolation profile")
+            .to_str()
+            .expect("profile utf8"),
+        "oci-default"
+    );
+    assert!(runs.iter().any(|run| {
+        read_uuid(run.get_id().expect("run id")).expect("parse run id") == run_id
+            && read_optional_uuid(run.get_workload_id().expect("workload id")) == Some(workload_id)
+    }));
+});
+
 local_test!(agents_submit_input_reuses_session_and_starts_new_run, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;

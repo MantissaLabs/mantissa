@@ -286,6 +286,31 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             AgentsCommand::List => {
                 local.run_until(client::agents::list_sessions(&cfg)).await?;
             }
+            AgentsCommand::Inspect(args) => {
+                local
+                    .run_until(client::agents::inspect(&cfg, &args.id))
+                    .await?;
+            }
+            AgentsCommand::Wait(args) => {
+                local
+                    .run_until(client::agents::wait(&cfg, &args.id, args.timeout))
+                    .await?;
+            }
+            AgentsCommand::Logs(args) => {
+                local
+                    .run_until(client::agents::logs(
+                        &cfg,
+                        &args.id,
+                        &client::agents::AgentLogsOptions {
+                            follow: args.follow,
+                            tail: &args.tail,
+                            stdout: args.stdout,
+                            stderr: args.stderr,
+                            timestamps: args.timestamps,
+                        },
+                    ))
+                    .await?;
+            }
             AgentsCommand::Run(args) => {
                 local
                     .run_until(client::agents::run(

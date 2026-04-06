@@ -14,6 +14,9 @@ interface Agents {
 
   submitInput @3 (sessionId :Data, input :Text);
   # Queue one structured user input on a session that currently has no active run.
+
+  inspect @4 (sessionId :Data) -> (session :AgentSessionSpec, runs :List(AgentRunSpec));
+  # Inspect one durable agent session together with its known run history.
 }
 
 struct AgentSessionSpec {
