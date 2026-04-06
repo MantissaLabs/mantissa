@@ -17,7 +17,11 @@ use crate::runtime::types::{
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
 
 use super::conversions::classify_runtime_error;
-use super::{DOCKER_NONO_PROFILE, DOCKER_SANDBOXED_PROFILE, DOCKER_STANDARD_PROFILE};
+use super::sandbox::{parse_sandboxed_container_metadata, resolve_effective_sandbox_command_parts};
+use super::{
+    DOCKER_NONO_PROFILE, DOCKER_SANDBOXED_PROFILE, DOCKER_STANDARD_PROFILE,
+    MANTISSA_NONO_ENABLED_LABEL, MANTISSA_NONO_POLICY_ENV_VAR,
+};
 use super::{DockerRuntimeBackend, DockerRuntimeMode};
 
 #[test]
@@ -52,6 +56,7 @@ fn standard_backend_advertises_only_standard_oci_contracts() {
         docker: Docker::connect_with_http("http://127.0.0.1:1", 120, bollard::API_DEFAULT_VERSION)
             .expect("construct docker http client"),
         mode: DockerRuntimeMode::Standard,
+        nono_helper_host_path: None,
     };
     let support = manager.advertised_support();
 
@@ -81,6 +86,7 @@ fn sandbox_backend_advertises_only_sandboxed_oci_contracts() {
         docker: Docker::connect_with_http("http://127.0.0.1:1", 120, bollard::API_DEFAULT_VERSION)
             .expect("construct docker http client"),
         mode: DockerRuntimeMode::NonoSandbox,
+        nono_helper_host_path: None,
     };
     let support = manager.advertised_support();
 
@@ -108,6 +114,59 @@ fn sandbox_backend_advertises_only_sandboxed_oci_contracts() {
         None,
         &[],
     ));
+}
+
+#[test]
+fn sandbox_command_resolution_uses_requested_cmd_over_image_cmd() {
+    let command = resolve_effective_sandbox_command_parts(
+        "ghcr.io/mantissa/demo-agent:latest",
+        Some(&["/usr/bin/demo-agent".to_string()]),
+        Some(&["serve".to_string()]),
+        Some(&["run".to_string(), "--once".to_string()]),
+    )
+    .expect("requested command should resolve");
+
+    assert_eq!(
+        command,
+        vec![
+            "/usr/bin/demo-agent".to_string(),
+            "run".to_string(),
+            "--once".to_string()
+        ]
+    );
+}
+
+#[test]
+fn sandbox_command_resolution_falls_back_to_image_defaults() {
+    let command = resolve_effective_sandbox_command_parts(
+        "ghcr.io/mantissa/demo-agent:latest",
+        Some(&["/usr/bin/demo-agent".to_string()]),
+        Some(&["serve".to_string()]),
+        None,
+    )
+    .expect("image defaults should resolve");
+
+    assert_eq!(
+        command,
+        vec!["/usr/bin/demo-agent".to_string(), "serve".to_string()]
+    );
+}
+
+#[test]
+fn sandbox_metadata_parser_recovers_policy_and_workdir() {
+    let labels = HashMap::from([(MANTISSA_NONO_ENABLED_LABEL.to_string(), "true".to_string())]);
+    let env = vec![
+        "PATH=/usr/bin:/bin".to_string(),
+        format!("{MANTISSA_NONO_POLICY_ENV_VAR}=encoded-policy"),
+    ];
+
+    let metadata =
+        parse_sandboxed_container_metadata(Some(&labels), Some(&env), Some("/workspace"))
+            .expect("sandbox metadata should parse")
+            .expect("sandbox metadata should be present");
+
+    assert_eq!(metadata.encoded_policy, "encoded-policy");
+    assert_eq!(metadata.working_dir.as_deref(), Some("/workspace"));
 }
 
 #[tokio::test]
@@ -157,6 +216,7 @@ async fn create_instance_preserves_conflict_status_code() {
         docker: Docker::connect_with_http(&endpoint, 120, bollard::API_DEFAULT_VERSION)
             .expect("construct docker http client"),
         mode: DockerRuntimeMode::Standard,
+        nono_helper_host_path: None,
     };
 
     let result = manager
@@ -322,6 +382,7 @@ async fn tty_attach_forwards_initial_prompt_without_waiting_for_newline() {
         docker: Docker::connect_with_http(&endpoint, 120, bollard::API_DEFAULT_VERSION)
             .expect("construct docker http client"),
         mode: DockerRuntimeMode::Standard,
+        nono_helper_host_path: None,
     };
     let options = RuntimeAttachOptions {
         tty: true,

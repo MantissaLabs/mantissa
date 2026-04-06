@@ -516,6 +516,9 @@ impl DockerRuntimeBackend {
 
         self.ensure_container_running_for_stream(container_id)
             .await?;
+        let prepared_exec = self
+            .prepare_sandboxed_exec(container_id, &options.command)
+            .await?;
         let exec_id = self
             .run_runtime_call(
                 container_id,
@@ -527,7 +530,9 @@ impl DockerRuntimeBackend {
                         attach_stderr: Some(options.stderr),
                         tty: Some(options.tty),
                         detach_keys: options.detach_keys.clone(),
-                        cmd: Some(options.command.clone()),
+                        env: prepared_exec.env_vars,
+                        cmd: Some(prepared_exec.command),
+                        working_dir: prepared_exec.working_dir,
                         ..Default::default()
                     },
                 ),
@@ -582,6 +587,7 @@ impl DockerRuntimeBackend {
         container_id: &str,
         command: &[String],
     ) -> RuntimeResult<RuntimeExecResult> {
+        let prepared_exec = self.prepare_sandboxed_exec(container_id, command).await?;
         let exec_id = self
             .run_runtime_call(
                 container_id,
@@ -590,7 +596,9 @@ impl DockerRuntimeBackend {
                     CreateExecOptions::<String> {
                         attach_stdout: Some(true),
                         attach_stderr: Some(true),
-                        cmd: Some(command.to_vec()),
+                        env: prepared_exec.env_vars,
+                        cmd: Some(prepared_exec.command),
+                        working_dir: prepared_exec.working_dir,
                         ..Default::default()
                     },
                 ),

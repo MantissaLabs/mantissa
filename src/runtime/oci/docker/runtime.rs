@@ -47,7 +47,7 @@ impl RuntimeBackend for DockerRuntimeBackend {
             execution_platform: _execution_platform,
             isolation_mode: _isolation_mode,
             isolation_profile: _isolation_profile,
-            sandbox_policy: _sandbox_policy,
+            sandbox_policy,
             labels,
             command,
             tty,
@@ -60,6 +60,9 @@ impl RuntimeBackend for DockerRuntimeBackend {
             dns_servers,
             gpu_device_ids,
         } = request;
+        let prepared_launch = self
+            .prepare_sandboxed_create(&image, command, env_vars, labels, volumes, sandbox_policy)
+            .await?;
 
         // Configure host settings
         let mut host_config = HostConfig::default();
@@ -109,7 +112,7 @@ impl RuntimeBackend for DockerRuntimeBackend {
         }
 
         // Set volumes if provided
-        if let Some(vols) = volumes {
+        if let Some(vols) = prepared_launch.volumes {
             host_config.binds = Some(vols);
         }
 
@@ -126,11 +129,12 @@ impl RuntimeBackend for DockerRuntimeBackend {
         // Create container config
         let config = ContainerCreateBody {
             image: Some(image.clone()),
-            labels,
+            labels: prepared_launch.labels,
             tty: Some(tty),
             open_stdin: Some(open_stdin),
-            env: env_vars,
-            cmd: command,
+            env: prepared_launch.env_vars,
+            cmd: prepared_launch.command,
+            entrypoint: prepared_launch.entrypoint,
             exposed_ports: ports.map(|ports_map| ports_map.into_keys().collect()),
             host_config: Some(host_config),
             ..Default::default()

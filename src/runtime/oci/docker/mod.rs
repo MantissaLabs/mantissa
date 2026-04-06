@@ -5,10 +5,11 @@
 
 use std::env;
 use std::future::Future;
+use std::path::PathBuf;
 
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
-use log::info;
+use log::{info, warn};
 
 use crate::config;
 use crate::runtime::types::{
@@ -20,6 +21,7 @@ mod conversions;
 mod images;
 mod interactive;
 mod runtime;
+mod sandbox;
 #[cfg(test)]
 mod tests;
 
@@ -40,6 +42,15 @@ pub const MANTISSA_NONO_HELPER_BINARY_NAME: &str = "mantissa-nono-init";
 
 /// Environment variable used to pass the serialized sandbox policy to the helper.
 pub const MANTISSA_NONO_POLICY_ENV_VAR: &str = "MANTISSA_NONO_POLICY";
+
+/// Environment variable that overrides the host-side path to the helper binary.
+pub const MANTISSA_NONO_HELPER_HOST_ENV_VAR: &str = "MANTISSA_NONO_HELPER_PATH";
+
+/// Container-local path where the helper binary is bind-mounted for sandboxed workloads.
+pub(super) const MANTISSA_NONO_HELPER_CONTAINER_PATH: &str = "/mantissa-nono-init";
+
+/// Label that marks one container as running through the `nono` helper boundary.
+pub(super) const MANTISSA_NONO_ENABLED_LABEL: &str = "mantissa.nono.enabled";
 
 /// One exact Docker runtime contract exposed through the node-local runtime registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +109,7 @@ impl DockerRuntimeMode {
 pub struct DockerRuntimeBackend {
     docker: Docker,
     mode: DockerRuntimeMode,
+    nono_helper_host_path: Option<PathBuf>,
 }
 
 impl DockerRuntimeBackend {
@@ -124,13 +136,33 @@ impl DockerRuntimeBackend {
 
     /// Builds one Docker runtime backend around one already-verified client.
     fn from_client(docker: Docker, mode: DockerRuntimeMode, endpoint: &str) -> Self {
+        let nono_helper_host_path = Self::resolve_nono_helper_host_path();
         info!(
             target: "task",
             "Connected to Docker endpoint {endpoint} for {:?} OCI backend",
             mode
         );
+        if matches!(mode, DockerRuntimeMode::NonoSandbox) {
+            match nono_helper_host_path.as_ref() {
+                Some(path) => info!(
+                    target: "task",
+                    "Resolved nono helper for sandboxed Docker backend: {}",
+                    path.display()
+                ),
+                None => warn!(
+                    target: "task",
+                    "Sandboxed Docker backend could not resolve helper binary {}; set {} to override",
+                    MANTISSA_NONO_HELPER_BINARY_NAME,
+                    MANTISSA_NONO_HELPER_HOST_ENV_VAR
+                ),
+            }
+        }
 
-        Self { docker, mode }
+        Self {
+            docker,
+            mode,
+            nono_helper_host_path,
+        }
     }
 
     /// Connects to Docker and verifies the daemon is reachable before the backend is registered.
