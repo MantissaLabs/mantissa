@@ -1,10 +1,17 @@
 #[macro_use]
 mod common;
 
+use async_trait::async_trait;
 use chrono::Utc;
 use common::convergence::wait_until;
 use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
 use crdt_store::uuid_key::UuidKey;
+use mantissa::runtime::testing::InMemoryRuntimeBackend;
+use mantissa::runtime::types::{
+    RuntimeAttachOptions, RuntimeBackend, RuntimeCreateRequest, RuntimeEvent, RuntimeExecOptions,
+    RuntimeExecResult, RuntimeInfo, RuntimeLogFrame, RuntimeLogsOptions, RuntimeResult,
+    RuntimeSupportContract, RuntimeSupportProfile,
+};
 use mantissa::task::types::TaskValue;
 use mantissa::workload::model::WorkloadPhase;
 use mantissa::workload::model::WorkloadSpec;
@@ -12,7 +19,12 @@ use mantissa::workload::model::{ExecutionPlatform, IsolationMode};
 use protocol::agents::{
     AgentRunStatus as ProtoAgentRunStatus, AgentSessionStatus as ProtoAgentSessionStatus, agents,
 };
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender};
 use uuid::Uuid;
 
 local_test!(
@@ -146,6 +158,71 @@ local_test!(agents_submit_input_reuses_session_and_starts_new_run, {
     assert_ne!(second_workload_id, first_workload_id);
 });
 
+local_test!(agents_submit_nono_run_projects_runtime_sandbox_policy, {
+    let runtime_backend = Arc::new(RecordingRuntimeBackend::new());
+    let _guard = RuntimeBackendOverrideGuard::install(runtime_backend.clone());
+    let node = TestNode::new().await;
+
+    let session_id = submit_agent_session_with_options(
+        &node.node.agents_client,
+        "nono-agent",
+        AgentSessionSubmitOptions {
+            initial_input: Some("inspect the workspace"),
+            isolation_profile: Some("nono-default"),
+            workspace_directory: Some("/workspace"),
+            allow_network: false,
+            allow_write: true,
+        },
+    )
+    .await
+    .expect("submit nono agent session");
+
+    let (_run_id, workload_id) = wait_for_active_run(&node.node.agents_client, session_id).await;
+    let create_request = wait_for_runtime_create_request(runtime_backend.as_ref()).await;
+
+    assert_eq!(create_request.execution_platform, ExecutionPlatform::Oci);
+    assert_eq!(create_request.isolation_mode, IsolationMode::Sandboxed);
+    assert_eq!(
+        create_request.isolation_profile.as_deref(),
+        Some("nono-default")
+    );
+
+    let policy = create_request
+        .sandbox_policy
+        .expect("nono-backed agent runs should carry a runtime sandbox policy");
+    assert_eq!(
+        policy.working_directory.as_deref(),
+        Some(Path::new("/workspace"))
+    );
+    assert_eq!(
+        policy.network,
+        mantissa::runtime::types::RuntimeSandboxNetworkMode::Blocked
+    );
+    assert!(policy.filesystem.iter().any(|rule| {
+        rule.path == Path::new("/workspace")
+            && rule.access == mantissa::runtime::types::RuntimeSandboxAccessMode::ReadWrite
+    }));
+    assert!(policy.filesystem.iter().any(|rule| {
+        rule.path == Path::new("/tmp")
+            && rule.access == mantissa::runtime::types::RuntimeSandboxAccessMode::ReadWrite
+    }));
+    assert!(policy.filesystem.iter().any(|rule| {
+        rule.path == Path::new("/var/tmp")
+            && rule.access == mantissa::runtime::types::RuntimeSandboxAccessMode::ReadWrite
+    }));
+
+    mark_workload_exited(&node, workload_id, 0).await;
+});
+
+#[derive(Clone, Copy, Default)]
+struct AgentSessionSubmitOptions<'a> {
+    initial_input: Option<&'a str>,
+    isolation_profile: Option<&'a str>,
+    workspace_directory: Option<&'a str>,
+    allow_network: bool,
+    allow_write: bool,
+}
+
 #[derive(Clone, Copy)]
 struct AgentSessionSnapshot {
     id: Uuid,
@@ -162,12 +239,207 @@ struct AgentRunSnapshot {
     exit_code: Option<i32>,
 }
 
+#[derive(Default)]
+struct RecordingRuntimeBackend {
+    inner: Arc<InMemoryRuntimeBackend>,
+    create_requests: Arc<AsyncMutex<Vec<RuntimeCreateRequest>>>,
+}
+
+impl RecordingRuntimeBackend {
+    /// Builds one recording wrapper around the shared in-memory runtime backend.
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(InMemoryRuntimeBackend::default()),
+            create_requests: Arc::new(AsyncMutex::new(Vec::new())),
+        }
+    }
+
+    /// Returns the most recent runtime create request captured by the backend.
+    async fn last_create_request(&self) -> Option<RuntimeCreateRequest> {
+        self.create_requests.lock().await.last().cloned()
+    }
+}
+
+#[async_trait]
+impl RuntimeBackend for RecordingRuntimeBackend {
+    /// Captures one runtime create request before forwarding it to the in-memory backend.
+    async fn create_instance(&self, request: RuntimeCreateRequest) -> RuntimeResult<String> {
+        self.create_requests.lock().await.push(request.clone());
+        self.inner.create_instance(request).await
+    }
+
+    /// Starts one in-memory runtime instance through the wrapped backend.
+    async fn start_instance(&self, runtime_id: &str) -> RuntimeResult<()> {
+        self.inner.start_instance(runtime_id).await
+    }
+
+    /// Stops one in-memory runtime instance through the wrapped backend.
+    async fn stop_instance(
+        &self,
+        runtime_id: &str,
+        timeout: Option<Duration>,
+    ) -> RuntimeResult<()> {
+        self.inner.stop_instance(runtime_id, timeout).await
+    }
+
+    /// Executes one non-interactive command through the wrapped backend.
+    async fn exec_instance(
+        &self,
+        runtime_id: &str,
+        command: &[String],
+        timeout: Option<Duration>,
+    ) -> RuntimeResult<RuntimeExecResult> {
+        self.inner.exec_instance(runtime_id, command, timeout).await
+    }
+
+    /// Executes one streamed command through the wrapped backend.
+    async fn exec_instance_stream(
+        &self,
+        runtime_id: &str,
+        options: &RuntimeExecOptions,
+        output_tx: MpscSender<RuntimeLogFrame>,
+        input_rx: MpscReceiver<Vec<u8>>,
+    ) -> RuntimeResult<RuntimeExecResult> {
+        self.inner
+            .exec_instance_stream(runtime_id, options, output_tx, input_rx)
+            .await
+    }
+
+    /// Streams runtime logs through the wrapped backend.
+    async fn stream_instance_logs(
+        &self,
+        runtime_id: &str,
+        options: &RuntimeLogsOptions,
+        logs_tx: MpscSender<RuntimeLogFrame>,
+    ) -> RuntimeResult<()> {
+        self.inner
+            .stream_instance_logs(runtime_id, options, logs_tx)
+            .await
+    }
+
+    /// Attaches to one running runtime instance through the wrapped backend.
+    async fn attach_instance(
+        &self,
+        runtime_id: &str,
+        options: &RuntimeAttachOptions,
+        output_tx: MpscSender<RuntimeLogFrame>,
+        input_rx: MpscReceiver<Vec<u8>>,
+    ) -> RuntimeResult<()> {
+        self.inner
+            .attach_instance(runtime_id, options, output_tx, input_rx)
+            .await
+    }
+
+    /// Restarts one in-memory runtime instance through the wrapped backend.
+    async fn restart_instance(
+        &self,
+        runtime_id: &str,
+        timeout: Option<Duration>,
+    ) -> RuntimeResult<()> {
+        self.inner.restart_instance(runtime_id, timeout).await
+    }
+
+    /// Removes one in-memory runtime instance through the wrapped backend.
+    async fn remove_instance(
+        &self,
+        runtime_id: &str,
+        force: bool,
+        remove_volumes: bool,
+    ) -> RuntimeResult<()> {
+        self.inner
+            .remove_instance(runtime_id, force, remove_volumes)
+            .await
+    }
+
+    /// Lists in-memory runtime instances through the wrapped backend.
+    async fn list_instances(
+        &self,
+        filters: Option<HashMap<String, Vec<String>>>,
+    ) -> RuntimeResult<Vec<RuntimeInfo>> {
+        self.inner.list_instances(filters).await
+    }
+
+    /// Returns inspect data for one runtime instance through the wrapped backend.
+    async fn inspect_instance(&self, runtime_id: &str) -> RuntimeResult<RuntimeInfo> {
+        self.inner.inspect_instance(runtime_id).await
+    }
+
+    /// Reports image presence using the wrapped in-memory backend.
+    async fn image_present(&self, image: &str) -> RuntimeResult<bool> {
+        self.inner.image_present(image).await
+    }
+
+    /// Treats image pulls as no-ops through the wrapped in-memory backend.
+    async fn pull_image(&self, image: &str) -> RuntimeResult<()> {
+        self.inner.pull_image(image).await
+    }
+
+    /// Reports the wrapped backend capabilities unchanged.
+    fn capabilities(&self) -> mantissa::runtime::types::RuntimeCapabilities {
+        self.inner.capabilities()
+    }
+
+    /// Advertises exact OCI contracts including the `nono-default` sandbox profile.
+    fn advertised_support(&self) -> RuntimeSupportProfile {
+        RuntimeSupportProfile::from_exact_contracts(
+            [
+                RuntimeSupportContract::new(ExecutionPlatform::Oci, IsolationMode::Standard, None),
+                RuntimeSupportContract::new(
+                    ExecutionPlatform::Oci,
+                    IsolationMode::Standard,
+                    Some("default"),
+                ),
+                RuntimeSupportContract::new(ExecutionPlatform::Oci, IsolationMode::Sandboxed, None),
+                RuntimeSupportContract::new(
+                    ExecutionPlatform::Oci,
+                    IsolationMode::Sandboxed,
+                    Some("oci-default"),
+                ),
+                RuntimeSupportContract::new(
+                    ExecutionPlatform::Oci,
+                    IsolationMode::Sandboxed,
+                    Some("nono-default"),
+                ),
+            ],
+            self.capabilities().feature_flags(),
+        )
+    }
+
+    /// Forwards lifecycle watch requests to the wrapped backend.
+    async fn watch_runtime_events(
+        &self,
+        events_tx: UnboundedSender<RuntimeEvent>,
+    ) -> RuntimeResult<()> {
+        self.inner.watch_runtime_events(events_tx).await
+    }
+}
+
 /// Submits one durable agent session with an optional initial input and sandbox profile.
 async fn submit_agent_session(
     client: &agents::Client,
     name: &str,
     initial_input: Option<&str>,
     isolation_profile: Option<&str>,
+) -> Result<Uuid, capnp::Error> {
+    submit_agent_session_with_options(
+        client,
+        name,
+        AgentSessionSubmitOptions {
+            initial_input,
+            isolation_profile,
+            workspace_directory: None,
+            allow_network: false,
+            allow_write: false,
+        },
+    )
+    .await
+}
+
+/// Submits one durable agent session using explicit sandbox policy options.
+async fn submit_agent_session_with_options(
+    client: &agents::Client,
+    name: &str,
+    options: AgentSessionSubmitOptions<'_>,
 ) -> Result<Uuid, capnp::Error> {
     let mut request = client.submit_request();
     {
@@ -178,8 +450,8 @@ async fn submit_agent_session(
         builder.set_cpu_millis(250);
         builder.set_memory_bytes(128 * 1024 * 1024);
         builder.set_gpu_count(0);
-        builder.set_isolation_profile(isolation_profile.unwrap_or_default());
-        builder.set_pending_input(initial_input.unwrap_or_default());
+        builder.set_isolation_profile(options.isolation_profile.unwrap_or_default());
+        builder.set_pending_input(options.initial_input.unwrap_or_default());
         builder.reborrow().init_command(0);
         builder.reborrow().init_env(0);
         builder.reborrow().init_secret_files(0);
@@ -190,14 +462,14 @@ async fn submit_agent_session(
 
         let mut workspace = builder.reborrow().init_workspace();
         workspace.reborrow().init_mount();
-        workspace.set_working_directory("");
+        workspace.set_working_directory(options.workspace_directory.unwrap_or_default());
         workspace.set_persistent(false);
 
         let mut tools = builder.reborrow().init_tools();
         tools.reborrow().init_allowed_tools(0);
-        tools.set_allow_network(false);
+        tools.set_allow_network(options.allow_network);
         tools.set_allow_pty(false);
-        tools.set_allow_write(false);
+        tools.set_allow_write(options.allow_write);
 
         let mut checkpoint = builder.reborrow().init_checkpoint();
         checkpoint.set_enabled(false);
@@ -212,6 +484,24 @@ async fn submit_agent_session(
 
     let response = request.send().promise.await?;
     read_uuid(response.get()?.get_session_id()?)
+}
+
+/// Waits until one runtime create request has been recorded and returns it.
+async fn wait_for_runtime_create_request(
+    backend: &RecordingRuntimeBackend,
+) -> RuntimeCreateRequest {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(request) = backend.last_create_request().await {
+            return request;
+        }
+
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "agent run did not reach runtime create in time"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Queues one operator input on an existing agent session.

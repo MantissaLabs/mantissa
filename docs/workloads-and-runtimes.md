@@ -264,14 +264,51 @@ This table reflects what exists in the repository today.
 
 | Backend | Status | Advertised execution platforms | Isolation modes | Isolation profiles | Exec | Interactive exec | Logs | Attach | Lifecycle events | Primary code |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Docker runtime backend | Production backend | `oci` | `standard`, `sandboxed` | `default`, `oci-default` | Yes | Yes | Yes | Yes | Yes | `src/runtime/oci/docker/` |
+| `docker-standard` backend | Production backend | `oci` | `standard` | `default` | Yes | Yes | Yes | Yes | Yes | `src/runtime/oci/docker/` |
+| `docker-sandboxed` backend | Production backend when `nono` helper is available on the host | `oci` | `sandboxed` | `oci-default`, `nono-default` | Yes | Yes | Yes | Yes | Yes | `src/runtime/oci/docker/` |
 | In-memory runtime backend | Test and local harness backend | `oci` | `standard`, `sandboxed` | `default`, `oci-default` | Yes | Yes | Yes | No | No | `src/runtime/testing/in_memory.rs` |
 | MicroVM backend | Not implemented yet | None in code today | None in code today | None in code today | N/A | N/A | N/A | N/A | N/A | Not present |
 
 The important reading of this table is that support is advertised per backend,
 not implied by the shared model. The presence of `ExecutionPlatform::MicroVm` in the
 model means the scheduler and runtime APIs can express that family; it does not
-mean a MicroVM engine is already wired into the runtime layer.
+mean a MicroVM engine is already wired into the runtime layer. It also means a
+node only advertises `docker-sandboxed` when it can actually honor that
+contract. If the `nono` helper cannot be resolved at startup, the node keeps
+`docker-standard` and does not publish sandboxed OCI support.
+
+### Sandboxed Agents with `nono`
+
+The first real `nono` integration target is agent runs. An agent session can
+request `ExecutionPlatform::Oci`, `IsolationMode::Sandboxed`, and the
+`nono-default` isolation profile without changing the higher-level agent
+controller model.
+
+The split of responsibilities is deliberate:
+
+| Agent controller still owns | Runtime sandbox now owns |
+| --- | --- |
+| Allowed tools, workspace policy, checkpoint policy, interaction rules | Filesystem grants, working directory, and network enforcement |
+
+At launch time the workload manager translates the persisted agent policy into
+`RuntimeSandboxPolicy`. In practice that means:
+
+- `allow_network = false` becomes a blocked runtime network policy.
+- `allow_write` widens access only where Mantissa intends it to: the working
+  directory, writable mounts, `/tmp`, and `/var/tmp`.
+- Secret files, workspace mounts, and checkpoint mounts become explicit
+  filesystem grants instead of remaining env-only hints.
+
+The sandboxed Docker backend keeps using normal Docker create, start, and exec
+operations. It does not introduce a Docker runtime shim. Instead it bind-mounts
+`mantissa-nono-init` into the container, passes the serialized
+`RuntimeSandboxPolicy` through `MANTISSA_NONO_POLICY`, and re-enters through the
+same helper on later `docker exec` calls.
+
+Helper discovery is intentionally simple. Mantissa looks for
+`mantissa-nono-init` next to the main executable by default, and
+`MANTISSA_NONO_HELPER_PATH` overrides the host-side path when packaging or local
+development needs something different.
 
 ## Networking Is Runtime-Neutral
 
