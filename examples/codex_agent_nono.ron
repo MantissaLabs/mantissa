@@ -16,12 +16,7 @@
         ),
     ],
     execution: (
-        image: "node:22-bookworm-slim",
-        command: [
-            "sh",
-            "-lc",
-            "mkdir -p \"$MANTISSA_AGENT_WORKDIR\" \"$HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_CACHE_HOME\" \"$XDG_STATE_HOME\" \"$NPM_CONFIG_CACHE\" && exec npx -y @openai/codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C \"$MANTISSA_AGENT_WORKDIR\" \"$MANTISSA_AGENT_INPUT\"",
-        ],
+        image: "mantissa/codex-sandbox:0.118.0",
         resources: (
             cpu_millis: 1000,
             memory_mb: 1024,
@@ -35,31 +30,6 @@
                     name: "openai-api-key",
                     version: None,
                 )),
-            ),
-            (
-                name: "HOME",
-                value: Some("/workspace/.home"),
-                secret: None,
-            ),
-            (
-                name: "XDG_CONFIG_HOME",
-                value: Some("/workspace/.config"),
-                secret: None,
-            ),
-            (
-                name: "XDG_CACHE_HOME",
-                value: Some("/workspace/.cache"),
-                secret: None,
-            ),
-            (
-                name: "XDG_STATE_HOME",
-                value: Some("/workspace/.local/state"),
-                secret: None,
-            ),
-            (
-                name: "NPM_CONFIG_CACHE",
-                value: Some("/workspace/.npm"),
-                secret: None,
             ),
         ],
     ),

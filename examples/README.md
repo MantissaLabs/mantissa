@@ -119,6 +119,8 @@ work, and how the public jobs API relates to tasks and services, see
 ## Run a sandboxed Codex agent session
 
 ```sh
+docker build -t mantissa/codex-sandbox:0.118.0 \
+  examples/images/codex-sandbox
 mantissa secrets create openai-api-key --value "$OPENAI_API_KEY"
 mantissa agents run --file examples/codex_agent_nono.ron
 ```
@@ -128,14 +130,16 @@ This manifest shows the first real agent-shaped `nono` example:
 - sandboxed OCI execution using the `nono-default` isolation profile
 - one managed workspace volume mounted at `/workspace`
 - secret-backed `OPENAI_API_KEY` injection
-- writable `HOME` and XDG directories redirected into the workspace so Codex
-  can run under Mantissa's write restrictions
-- a real non-interactive Codex run launched through `npx @openai/codex`
+- a Mantissa-owned Codex image with a pinned CLI version, non-root user, and
+  image-owned entrypoint so the manifest does not need a shell command
 
-The example keeps the container image generic by using `node:22-bookworm-slim`
-and downloading Codex on demand. That is convenient for a demo. In production
-you would typically bake `@openai/codex` into your own image and only keep the
-secret injection, workspace policy, and prompt flow in the manifest.
+The example image lives at `examples/images/codex-sandbox/Dockerfile`. It uses
+the official `node:22-bookworm-slim` base, installs a pinned
+`@openai/codex` version, switches to the non-root `node` user, preconfigures
+Codex's writable state under the mounted workspace, and launches `codex exec`
+from an image entrypoint when Mantissa provides `MANTISSA_AGENT_INPUT`. For a
+multi-node cluster, push the built image to a registry your nodes can pull
+from and update `execution.image` accordingly.
 
 Once submitted, stay on the agents surface to observe it:
 
