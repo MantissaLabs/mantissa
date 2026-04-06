@@ -14,18 +14,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && npm install --global "@openai/codex@${CODEX_VERSION}" \
     && npm cache clean --force \
-    && mkdir -p \
-        /workspace \
-        /workspace/.home \
-        /workspace/.config \
-        /workspace/.cache \
-        /workspace/.local/state \
-    && chown -R node:node \
-        /workspace \
-        /workspace/.home \
-        /workspace/.config \
-        /workspace/.cache \
-        /workspace/.local/state
+    && mkdir -p /workspace \
+    && chown -R node:node /workspace
 
 COPY entrypoint.sh /usr/local/bin/mantissa-codex-entrypoint
 RUN chmod 755 /usr/local/bin/mantissa-codex-entrypoint
@@ -34,9 +24,9 @@ USER node
 WORKDIR /workspace
 
 ENV CODEX_UNSAFE_ALLOW_NO_SANDBOX=1 \
-    HOME=/workspace/.home \
-    XDG_CONFIG_HOME=/workspace/.config \
-    XDG_CACHE_HOME=/workspace/.cache \
-    XDG_STATE_HOME=/workspace/.local/state
+    HOME=/var/tmp/codex-home \
+    XDG_CONFIG_HOME=/var/tmp/codex-config \
+    XDG_CACHE_HOME=/var/tmp/codex-cache \
+    XDG_STATE_HOME=/var/tmp/codex-state
 
 ENTRYPOINT ["/usr/local/bin/mantissa-codex-entrypoint"]
