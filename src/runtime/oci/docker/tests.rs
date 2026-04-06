@@ -20,7 +20,7 @@ use super::conversions::classify_runtime_error;
 use super::sandbox::{parse_sandboxed_container_metadata, resolve_effective_sandbox_command_parts};
 use super::{
     DOCKER_NONO_PROFILE, DOCKER_SANDBOXED_PROFILE, DOCKER_STANDARD_PROFILE,
-    MANTISSA_NONO_ENABLED_LABEL, MANTISSA_NONO_POLICY_ENV_VAR,
+    MANTISSA_NONO_ENABLED_LABEL, MANTISSA_NONO_POLICY_ENV_VAR, NonoSandboxBackendAvailability,
 };
 use super::{DockerRuntimeBackend, DockerRuntimeMode};
 
@@ -86,7 +86,7 @@ fn sandbox_backend_advertises_only_sandboxed_oci_contracts() {
         docker: Docker::connect_with_http("http://127.0.0.1:1", 120, bollard::API_DEFAULT_VERSION)
             .expect("construct docker http client"),
         mode: DockerRuntimeMode::NonoSandbox,
-        nono_helper_host_path: None,
+        nono_helper_host_path: Some("/tmp/mantissa-nono-init".into()),
     };
     let support = manager.advertised_support();
 
@@ -114,6 +114,37 @@ fn sandbox_backend_advertises_only_sandboxed_oci_contracts() {
         None,
         &[],
     ));
+}
+
+#[test]
+fn nono_sandbox_availability_rejects_unsupported_hosts() {
+    let availability =
+        NonoSandboxBackendAvailability::from_parts(false, Some("/tmp/mantissa-nono-init".into()));
+
+    assert!(matches!(
+        availability,
+        NonoSandboxBackendAvailability::UnsupportedHost
+    ));
+    assert_eq!(
+        availability.unavailable_reason().as_deref(),
+        Some("sandboxed Docker backend requires a Linux or macOS host")
+    );
+}
+
+#[test]
+fn nono_sandbox_availability_requires_helper_path() {
+    let availability = NonoSandboxBackendAvailability::from_parts(true, None);
+
+    assert!(matches!(
+        availability,
+        NonoSandboxBackendAvailability::MissingHelper
+    ));
+    assert!(
+        availability
+            .unavailable_reason()
+            .expect("missing helper should explain itself")
+            .contains("mantissa-nono-init")
+    );
 }
 
 #[test]

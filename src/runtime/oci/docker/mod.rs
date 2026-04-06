@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
-use log::{info, warn};
+use log::info;
 
 use crate::config;
 use crate::runtime::types::{
@@ -59,6 +59,61 @@ pub enum DockerRuntimeMode {
     Standard,
     /// Dedicated sandboxed OCI execution slot that will be backed by `nono`.
     NonoSandbox,
+}
+
+/// Host-side availability decision for the `nono`-backed Docker sandbox contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NonoSandboxBackendAvailability {
+    /// The host can register the sandboxed Docker backend with the provided helper path.
+    Available(PathBuf),
+    /// The current host platform cannot run the `nono` sandbox contract.
+    UnsupportedHost,
+    /// The sandbox helper binary could not be resolved on an otherwise supported host.
+    MissingHelper,
+}
+
+impl NonoSandboxBackendAvailability {
+    /// Detects whether the current host can advertise the `nono` Docker sandbox contract.
+    fn detect() -> Self {
+        Self::from_parts(
+            DockerRuntimeBackend::host_supports_nono_sandbox(),
+            DockerRuntimeBackend::resolve_nono_helper_host_path(),
+        )
+    }
+
+    /// Collapses host capability and helper discovery into one registration decision.
+    fn from_parts(host_supported: bool, helper_host_path: Option<PathBuf>) -> Self {
+        if !host_supported {
+            return Self::UnsupportedHost;
+        }
+
+        match helper_host_path {
+            Some(path) => Self::Available(path),
+            None => Self::MissingHelper,
+        }
+    }
+
+    /// Returns the helper path when the sandboxed Docker backend can be registered.
+    fn helper_host_path(&self) -> Option<&PathBuf> {
+        match self {
+            Self::Available(path) => Some(path),
+            Self::UnsupportedHost | Self::MissingHelper => None,
+        }
+    }
+
+    /// Returns one operator-facing reason why the sandboxed Docker backend is unavailable.
+    fn unavailable_reason(&self) -> Option<String> {
+        match self {
+            Self::Available(_) => None,
+            Self::UnsupportedHost => {
+                Some("sandboxed Docker backend requires a Linux or macOS host".to_string())
+            }
+            Self::MissingHelper => Some(format!(
+                "sandboxed Docker backend requires helper binary {}; set {} or place it next to the mantissa executable",
+                MANTISSA_NONO_HELPER_BINARY_NAME, MANTISSA_NONO_HELPER_HOST_ENV_VAR
+            )),
+        }
+    }
 }
 
 impl DockerRuntimeMode {
@@ -122,40 +177,82 @@ impl DockerRuntimeBackend {
     /// Creates one Docker-backed runtime backend for the provided exact contract.
     pub async fn new_with_mode(mode: DockerRuntimeMode) -> RuntimeResult<Self> {
         let (docker, endpoint) = Self::connect_verified().await?;
-        Ok(Self::from_client(docker, mode, &endpoint))
-    }
-
-    /// Creates the standard and sandboxed Docker runtime registrations from one verified daemon.
-    pub async fn new_pair() -> RuntimeResult<(Self, Self)> {
-        let (docker, endpoint) = Self::connect_verified().await?;
-        Ok((
-            Self::from_client(docker.clone(), DockerRuntimeMode::Standard, &endpoint),
-            Self::from_client(docker, DockerRuntimeMode::NonoSandbox, &endpoint),
+        let nono_helper_host_path = match mode {
+            DockerRuntimeMode::Standard => None,
+            DockerRuntimeMode::NonoSandbox => {
+                let availability = NonoSandboxBackendAvailability::detect();
+                match availability.helper_host_path() {
+                    Some(path) => Some(path.clone()),
+                    None => {
+                        return Err(RuntimeError::OperationFailed(
+                            availability.unavailable_reason().unwrap_or_else(|| {
+                                "sandboxed Docker backend is unavailable".to_string()
+                            }),
+                        ));
+                    }
+                }
+            }
+        };
+        Ok(Self::from_client(
+            docker,
+            mode,
+            &endpoint,
+            nono_helper_host_path,
         ))
     }
 
+    /// Creates the standard Docker runtime plus the optional sandboxed registration.
+    pub async fn new_pair() -> RuntimeResult<(Self, Option<Self>)> {
+        let (docker, endpoint) = Self::connect_verified().await?;
+        let sandbox_availability = NonoSandboxBackendAvailability::detect();
+        let standard =
+            Self::from_client(docker.clone(), DockerRuntimeMode::Standard, &endpoint, None);
+        let sandboxed = match sandbox_availability.helper_host_path() {
+            Some(path) => Some(Self::from_client(
+                docker,
+                DockerRuntimeMode::NonoSandbox,
+                &endpoint,
+                Some(path.clone()),
+            )),
+            None => {
+                if let Some(reason) = sandbox_availability.unavailable_reason() {
+                    info!(
+                        target: "task",
+                        "Skipping sandboxed Docker backend registration: {reason}"
+                    );
+                }
+                None
+            }
+        };
+
+        Ok((standard, sandboxed))
+    }
+
+    /// Returns whether the current Mantissa host can run `nono`-sandboxed workloads.
+    fn host_supports_nono_sandbox() -> bool {
+        cfg!(any(target_os = "linux", target_os = "macos"))
+    }
+
     /// Builds one Docker runtime backend around one already-verified client.
-    fn from_client(docker: Docker, mode: DockerRuntimeMode, endpoint: &str) -> Self {
-        let nono_helper_host_path = Self::resolve_nono_helper_host_path();
+    fn from_client(
+        docker: Docker,
+        mode: DockerRuntimeMode,
+        endpoint: &str,
+        nono_helper_host_path: Option<PathBuf>,
+    ) -> Self {
         info!(
             target: "task",
             "Connected to Docker endpoint {endpoint} for {:?} OCI backend",
             mode
         );
-        if matches!(mode, DockerRuntimeMode::NonoSandbox) {
-            match nono_helper_host_path.as_ref() {
-                Some(path) => info!(
-                    target: "task",
-                    "Resolved nono helper for sandboxed Docker backend: {}",
-                    path.display()
-                ),
-                None => warn!(
-                    target: "task",
-                    "Sandboxed Docker backend could not resolve helper binary {}; set {} to override",
-                    MANTISSA_NONO_HELPER_BINARY_NAME,
-                    MANTISSA_NONO_HELPER_HOST_ENV_VAR
-                ),
-            }
+        if matches!(mode, DockerRuntimeMode::NonoSandbox)
+            && let Some(path) = nono_helper_host_path.as_ref()
+        {
+            info!(
+                target: "task",
+                "Resolved nono helper for sandboxed Docker backend: {}",
+                path.display()
+            );
         }
 
         Self {
