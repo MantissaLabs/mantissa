@@ -14,9 +14,11 @@ use uuid::Uuid;
 use crate::runtime::types::{
     RuntimeAttachOptions, RuntimeBackend, RuntimeCreateRequest, RuntimeError, RuntimeLogStream,
 };
+use crate::workload::model::{ExecutionPlatform, IsolationMode};
 
-use super::DockerRuntimeBackend;
 use super::conversions::classify_runtime_error;
+use super::{DOCKER_NONO_PROFILE, DOCKER_SANDBOXED_PROFILE, DOCKER_STANDARD_PROFILE};
+use super::{DockerRuntimeBackend, DockerRuntimeMode};
 
 #[test]
 fn classify_runtime_error_maps_404_to_not_found() {
@@ -41,6 +43,70 @@ fn classify_runtime_error_preserves_non_404_backend_status() {
             status_code: Some(409),
             ..
         }
+    ));
+}
+
+#[test]
+fn standard_backend_advertises_only_standard_oci_contracts() {
+    let manager = DockerRuntimeBackend {
+        docker: Docker::connect_with_http("http://127.0.0.1:1", 120, bollard::API_DEFAULT_VERSION)
+            .expect("construct docker http client"),
+        mode: DockerRuntimeMode::Standard,
+    };
+    let support = manager.advertised_support();
+
+    assert!(support.supports_requirements(
+        ExecutionPlatform::Oci,
+        IsolationMode::Standard,
+        None,
+        &[],
+    ));
+    assert!(support.supports_requirements(
+        ExecutionPlatform::Oci,
+        IsolationMode::Standard,
+        Some(DOCKER_STANDARD_PROFILE),
+        &[],
+    ));
+    assert!(!support.supports_requirements(
+        ExecutionPlatform::Oci,
+        IsolationMode::Sandboxed,
+        None,
+        &[],
+    ));
+}
+
+#[test]
+fn sandbox_backend_advertises_only_sandboxed_oci_contracts() {
+    let manager = DockerRuntimeBackend {
+        docker: Docker::connect_with_http("http://127.0.0.1:1", 120, bollard::API_DEFAULT_VERSION)
+            .expect("construct docker http client"),
+        mode: DockerRuntimeMode::NonoSandbox,
+    };
+    let support = manager.advertised_support();
+
+    assert!(support.supports_requirements(
+        ExecutionPlatform::Oci,
+        IsolationMode::Sandboxed,
+        None,
+        &[],
+    ));
+    assert!(support.supports_requirements(
+        ExecutionPlatform::Oci,
+        IsolationMode::Sandboxed,
+        Some(DOCKER_SANDBOXED_PROFILE),
+        &[],
+    ));
+    assert!(support.supports_requirements(
+        ExecutionPlatform::Oci,
+        IsolationMode::Sandboxed,
+        Some(DOCKER_NONO_PROFILE),
+        &[],
+    ));
+    assert!(!support.supports_requirements(
+        ExecutionPlatform::Oci,
+        IsolationMode::Standard,
+        None,
+        &[],
     ));
 }
 
@@ -90,6 +156,7 @@ async fn create_instance_preserves_conflict_status_code() {
     let manager = DockerRuntimeBackend {
         docker: Docker::connect_with_http(&endpoint, 120, bollard::API_DEFAULT_VERSION)
             .expect("construct docker http client"),
+        mode: DockerRuntimeMode::Standard,
     };
 
     let result = manager
@@ -254,6 +321,7 @@ async fn tty_attach_forwards_initial_prompt_without_waiting_for_newline() {
     let manager = DockerRuntimeBackend {
         docker: Docker::connect_with_http(&endpoint, 120, bollard::API_DEFAULT_VERSION)
             .expect("construct docker http client"),
+        mode: DockerRuntimeMode::Standard,
     };
     let options = RuntimeAttachOptions {
         tty: true,

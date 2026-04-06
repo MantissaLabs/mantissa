@@ -28,7 +28,6 @@ use crate::runtime::types::{
     RuntimeCreateRequest, RuntimeError, RuntimeEvent, RuntimeExecOptions, RuntimeExecResult,
     RuntimeInfo, RuntimeLogFrame, RuntimeLogsOptions, RuntimeResult, RuntimeSupportProfile,
 };
-use crate::workload::model::ExecutionPlatform;
 
 use super::conversions::{
     classify_runtime_error, runtime_info_from_inspect, runtime_info_from_list_entry,
@@ -474,17 +473,9 @@ impl RuntimeBackend for DockerRuntimeBackend {
         }
     }
 
-    /// Advertises Docker-backed OCI execution in both standard and sandboxed isolation modes.
+    /// Advertises the exact Docker contract exposed by this backend registration.
     fn advertised_support(&self) -> RuntimeSupportProfile {
-        RuntimeSupportProfile::new(
-            [ExecutionPlatform::Oci],
-            [
-                crate::workload::model::IsolationMode::Standard,
-                crate::workload::model::IsolationMode::Sandboxed,
-            ],
-            ["default", "oci-default"],
-            self.capabilities().feature_flags(),
-        )
+        self.mode.advertised_support(self.capabilities())
     }
 
     /// Watches Docker container events and forwards task-relevant lifecycle
