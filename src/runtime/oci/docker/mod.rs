@@ -35,6 +35,12 @@ pub(super) const DOCKER_SANDBOXED_PROFILE: &str = "oci-default";
 /// Explicit operator-facing profile alias for the future `nono`-backed sandbox contract.
 pub(super) const DOCKER_NONO_PROFILE: &str = "nono-default";
 
+/// Binary name used when Mantissa injects the `nono` init helper into containers.
+pub const MANTISSA_NONO_HELPER_BINARY_NAME: &str = "mantissa-nono-init";
+
+/// Environment variable used to pass the serialized sandbox policy to the helper.
+pub const MANTISSA_NONO_POLICY_ENV_VAR: &str = "MANTISSA_NONO_POLICY";
+
 /// One exact Docker runtime contract exposed through the node-local runtime registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DockerRuntimeMode {

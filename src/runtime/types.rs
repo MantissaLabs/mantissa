@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -191,6 +192,96 @@ impl Default for RuntimeExecOptions {
     }
 }
 
+/// Filesystem access mode carried by one runtime-enforced sandbox policy.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSandboxAccessMode {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+/// Path target kind carried by one runtime-enforced sandbox policy.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSandboxPathKind {
+    #[default]
+    Directory,
+    File,
+}
+
+/// One filesystem grant carried by one runtime-enforced sandbox policy.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeSandboxPathRule {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub kind: RuntimeSandboxPathKind,
+    pub access: RuntimeSandboxAccessMode,
+}
+
+impl RuntimeSandboxPathRule {
+    /// Builds one directory grant for a runtime-enforced sandbox policy.
+    pub fn directory(path: impl Into<PathBuf>, access: RuntimeSandboxAccessMode) -> Self {
+        Self {
+            path: path.into(),
+            kind: RuntimeSandboxPathKind::Directory,
+            access,
+        }
+    }
+
+    /// Builds one file grant for a runtime-enforced sandbox policy.
+    pub fn file(path: impl Into<PathBuf>, access: RuntimeSandboxAccessMode) -> Self {
+        Self {
+            path: path.into(),
+            kind: RuntimeSandboxPathKind::File,
+            access,
+        }
+    }
+}
+
+/// Network mode carried by one runtime-enforced sandbox policy.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSandboxNetworkMode {
+    #[default]
+    AllowAll,
+    Blocked,
+}
+
+/// Structured sandbox policy that one runtime backend can translate into real enforcement.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeSandboxPolicy {
+    #[serde(default)]
+    pub working_directory: Option<PathBuf>,
+    #[serde(default)]
+    pub filesystem: Vec<RuntimeSandboxPathRule>,
+    #[serde(default)]
+    pub network: RuntimeSandboxNetworkMode,
+}
+
+impl RuntimeSandboxPolicy {
+    /// Encodes one sandbox policy into the env-safe transport string used by helper binaries.
+    pub fn encode_env_value(&self) -> Result<String, RuntimeSandboxPolicyCodecError> {
+        ron::ser::to_string(self)
+            .map_err(|err| RuntimeSandboxPolicyCodecError::Encode(err.to_string()))
+    }
+
+    /// Decodes one helper-provided transport string back into a structured sandbox policy.
+    pub fn decode_env_value(value: &str) -> Result<Self, RuntimeSandboxPolicyCodecError> {
+        ron::from_str(value).map_err(|err| RuntimeSandboxPolicyCodecError::Decode(err.to_string()))
+    }
+}
+
+/// Errors returned while transporting one runtime sandbox policy through helper env vars.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum RuntimeSandboxPolicyCodecError {
+    #[error("sandbox policy encode failed: {0}")]
+    Encode(String),
+
+    #[error("sandbox policy decode failed: {0}")]
+    Decode(String),
+}
+
 /// Parameters describing how one backend should create a runtime instance.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeCreateRequest {
@@ -199,6 +290,7 @@ pub struct RuntimeCreateRequest {
     pub execution_platform: ExecutionPlatform,
     pub isolation_mode: IsolationMode,
     pub isolation_profile: Option<String>,
+    pub sandbox_policy: Option<RuntimeSandboxPolicy>,
     pub labels: Option<HashMap<String, String>>,
     pub command: Option<Vec<String>>,
     pub tty: bool,

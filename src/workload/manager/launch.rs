@@ -152,6 +152,7 @@ impl WorkloadManager {
             execution_platform: request.execution_platform,
             isolation_mode: request.isolation_mode,
             isolation_profile: request.isolation_profile.map(str::to_string),
+            sandbox_policy: None,
             labels: Some(labels),
             command: if request.command.is_empty() {
                 None

@@ -47,6 +47,7 @@ impl RuntimeBackend for DockerRuntimeBackend {
             execution_platform: _execution_platform,
             isolation_mode: _isolation_mode,
             isolation_profile: _isolation_profile,
+            sandbox_policy: _sandbox_policy,
             labels,
             command,
             tty,
