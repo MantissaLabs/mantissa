@@ -16,4 +16,4 @@ exec codex exec \
     --skip-git-repo-check \
     --dangerously-bypass-approvals-and-sandbox \
     -C "$workdir" \
-    "$MANTISSA_AGENT_INPUT"
+    "$MANTISSA_AGENT_INPUT" </dev/null
