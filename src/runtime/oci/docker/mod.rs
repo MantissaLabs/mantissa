@@ -52,6 +52,14 @@ pub(super) const MANTISSA_NONO_HELPER_CONTAINER_PATH: &str = "/mantissa-nono-ini
 /// Label that marks one container as running through the `nono` helper boundary.
 pub(super) const MANTISSA_NONO_ENABLED_LABEL: &str = "mantissa.nono.enabled";
 
+/// Optional read-only roots commonly needed so sandboxed OCI images can start.
+///
+/// Some image layouts omit specific entries such as `/lib64`. The helper treats
+/// these as optional bootstrap allowances and skips only the missing ones.
+pub const NONO_EXEC_READONLY_DIRS: &[&str] = &[
+    "/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/dev", "/proc",
+];
+
 /// One exact Docker runtime contract exposed through the node-local runtime registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DockerRuntimeMode {

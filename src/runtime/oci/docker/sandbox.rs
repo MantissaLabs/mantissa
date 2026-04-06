@@ -20,7 +20,7 @@ use crate::runtime::types::{
 use super::{
     DockerRuntimeBackend, DockerRuntimeMode, MANTISSA_NONO_ENABLED_LABEL,
     MANTISSA_NONO_HELPER_BINARY_NAME, MANTISSA_NONO_HELPER_CONTAINER_PATH,
-    MANTISSA_NONO_HELPER_HOST_ENV_VAR, MANTISSA_NONO_POLICY_ENV_VAR,
+    MANTISSA_NONO_HELPER_HOST_ENV_VAR, MANTISSA_NONO_POLICY_ENV_VAR, NONO_EXEC_READONLY_DIRS,
 };
 
 /// Fully prepared Docker create settings after optional `nono` helper injection.
@@ -54,11 +54,6 @@ struct ResolvedSandboxLaunchTarget {
     command: Vec<String>,
     working_dir: Option<String>,
 }
-
-/// Minimal read-only roots required so sandboxed processes can start inside normal OCI images.
-const NONO_EXEC_READONLY_DIRS: &[&str] = &[
-    "/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/dev", "/proc",
-];
 
 impl DockerRuntimeBackend {
     /// Resolves the host-side helper binary path from explicit overrides or nearby binaries.

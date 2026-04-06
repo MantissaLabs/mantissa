@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
 
-use mantissa::runtime::oci::docker::MANTISSA_NONO_POLICY_ENV_VAR;
+use mantissa::runtime::oci::docker::{MANTISSA_NONO_POLICY_ENV_VAR, NONO_EXEC_READONLY_DIRS};
 use mantissa::runtime::types::{
     RuntimeSandboxAccessMode, RuntimeSandboxNetworkMode, RuntimeSandboxPathKind,
     RuntimeSandboxPathRule, RuntimeSandboxPolicy, RuntimeSandboxPolicyCodecError,
@@ -141,6 +141,10 @@ fn add_path_rule(
     capabilities: CapabilitySet,
     rule: &RuntimeSandboxPathRule,
 ) -> Result<CapabilitySet, NonoHelperError> {
+    if !rule.path.exists() && is_optional_bootstrap_rule(rule) {
+        return Ok(capabilities);
+    }
+
     let access = access_mode(rule.access);
     match rule.kind {
         RuntimeSandboxPathKind::Directory => capabilities
@@ -150,6 +154,15 @@ fn add_path_rule(
             .allow_file(&rule.path, access)
             .map_err(Into::into),
     }
+}
+
+/// Returns whether one filesystem rule is an optional bootstrap directory that may be absent.
+fn is_optional_bootstrap_rule(rule: &RuntimeSandboxPathRule) -> bool {
+    rule.kind == RuntimeSandboxPathKind::Directory
+        && rule.access == RuntimeSandboxAccessMode::Read
+        && NONO_EXEC_READONLY_DIRS
+            .iter()
+            .any(|candidate| rule.path == Path::new(candidate))
 }
 
 /// Maps one Mantissa sandbox access mode into the `nono` capability model.
@@ -266,5 +279,19 @@ mod tests {
             error,
             NonoHelperError::WorkingDirectoryNotAllowed(_)
         ));
+    }
+
+    #[test]
+    fn optional_bootstrap_rule_matches_readonly_dir_entries() {
+        let rule = RuntimeSandboxPathRule::directory("/lib64", RuntimeSandboxAccessMode::Read);
+
+        assert!(is_optional_bootstrap_rule(&rule));
+    }
+
+    #[test]
+    fn optional_bootstrap_rule_rejects_non_bootstrap_paths() {
+        let rule = RuntimeSandboxPathRule::directory("/workspace", RuntimeSandboxAccessMode::Read);
+
+        assert!(!is_optional_bootstrap_rule(&rule));
     }
 }
