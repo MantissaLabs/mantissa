@@ -4,6 +4,9 @@ use super::planner::{SchedulingError, StartIntent};
 use super::reservation::{RemotePrepareRejection, RemotePrepareRejectionReason};
 use super::*;
 
+use crate::agents::types::{
+    AGENT_ALLOW_NETWORK_ENV_VAR, AGENT_ALLOW_WRITE_ENV_VAR, AGENT_WORKDIR_ENV_VAR,
+};
 use crate::network::attachment::{AttachmentProvisionerApi, AttachmentProvisioningRequest};
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
@@ -17,7 +20,8 @@ use crate::runtime::types::{
     ResourceLimits, RuntimeAttachOptions, RuntimeAttachmentTarget, RuntimeBackend,
     RuntimeCapabilities, RuntimeConfigInfo, RuntimeCreateRequest, RuntimeError, RuntimeExecOptions,
     RuntimeExecResult, RuntimeInfo, RuntimeLogFrame, RuntimeLogStream, RuntimeLogsOptions,
-    RuntimeResult, RuntimeStateInfo,
+    RuntimeResult, RuntimeSandboxAccessMode, RuntimeSandboxNetworkMode, RuntimeStateInfo,
+    RuntimeSupportContract, RuntimeSupportProfile,
 };
 use crate::scheduler::digest::SchedulerDigestRegistry;
 use crate::scheduler::{SlotCapacity, SlotReservationRequest, SlotSpec, SlotState};
@@ -43,8 +47,8 @@ use crate::volumes::types::{
 };
 use crate::workload::model::select_best_workload_value;
 use crate::workload::model::{
-    ExecutionPlatform, WorkloadOwner, WorkloadServiceMetadata, WorkloadStatus, WorkloadValue,
-    WorkloadValueDraft,
+    ExecutionPlatform, WorkloadAgentRunMetadata, WorkloadOwner, WorkloadServiceMetadata,
+    WorkloadStatus, WorkloadValue, WorkloadValueDraft,
 };
 use crate::workload::types::{
     ResolvedExecutionSpec, WorkloadLivenessProbe, WorkloadLivenessProbeKind,
@@ -73,6 +77,7 @@ type LogCall = (String, RuntimeLogsOptions);
 #[derive(Clone, Default)]
 struct MockRuntimeBackend {
     created: Arc<AsyncMutex<Vec<String>>>,
+    create_requests: Arc<AsyncMutex<Vec<RuntimeCreateRequest>>>,
     create_errors: Arc<AsyncMutex<VecDeque<RuntimeError>>>,
     exec_calls: Arc<AsyncMutex<Vec<ExecCall>>>,
     exec_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
@@ -112,6 +117,7 @@ impl RuntimeBackend for MockRuntimeBackend {
             return Err(err);
         }
 
+        self.create_requests.lock().await.push(request.clone());
         let resource_limits = request.resource_limits;
         let volumes = request.volumes.unwrap_or_default();
         self.open_stdin.lock().await.push(request.open_stdin);
@@ -384,6 +390,26 @@ impl RuntimeBackend for MockRuntimeBackend {
             attach: true,
             lifecycle_events: false,
         }
+    }
+
+    fn advertised_support(&self) -> RuntimeSupportProfile {
+        RuntimeSupportProfile::from_exact_contracts(
+            [
+                RuntimeSupportContract::new(ExecutionPlatform::Oci, IsolationMode::Standard, None),
+                RuntimeSupportContract::new(ExecutionPlatform::Oci, IsolationMode::Sandboxed, None),
+                RuntimeSupportContract::new(
+                    ExecutionPlatform::Oci,
+                    IsolationMode::Sandboxed,
+                    Some("oci-default"),
+                ),
+                RuntimeSupportContract::new(
+                    ExecutionPlatform::Oci,
+                    IsolationMode::Sandboxed,
+                    Some("nono-default"),
+                ),
+            ],
+            self.capabilities().feature_flags(),
+        )
     }
 }
 
@@ -879,6 +905,83 @@ async fn setup_manager_with_forwarding(
     });
 
     (manager, scheduler, mock_cm, network_registry)
+}
+
+#[tokio::test]
+async fn local_agent_launch_builds_runtime_sandbox_policy() {
+    let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
+    let task_id = Uuid::new_v4();
+    let command = vec!["sh".to_string(), "-lc".to_string(), "pwd".to_string()];
+    let gpu_device_ids = Vec::new();
+    let env = vec![
+        crate::workload::model::WorkloadEnvironmentVariable {
+            name: AGENT_ALLOW_NETWORK_ENV_VAR.to_string(),
+            value: Some("false".to_string()),
+            secret: None,
+        },
+        crate::workload::model::WorkloadEnvironmentVariable {
+            name: AGENT_ALLOW_WRITE_ENV_VAR.to_string(),
+            value: Some("false".to_string()),
+            secret: None,
+        },
+        crate::workload::model::WorkloadEnvironmentVariable {
+            name: AGENT_WORKDIR_ENV_VAR.to_string(),
+            value: Some("/workspace".to_string()),
+            secret: None,
+        },
+    ];
+    let owner = WorkloadOwner::AgentRun(WorkloadAgentRunMetadata::new(
+        Uuid::new_v4(),
+        "demo-session",
+        Uuid::new_v4(),
+    ));
+
+    manager
+        .launch_task_instance(&super::launch::InstanceLaunchRequest {
+            task_id,
+            task_name: "demo-agent",
+            instance_name: "mantissa-demo-agent",
+            image: "ghcr.io/mantissa/demo-agent:latest",
+            execution_platform: ExecutionPlatform::Oci,
+            isolation_mode: IsolationMode::Sandboxed,
+            isolation_profile: Some("nono-default"),
+            command: &command,
+            tty: false,
+            cpu_millis: 250,
+            memory_bytes: 128 * 1024 * 1024,
+            gpu_count: 0,
+            gpu_device_ids: &gpu_device_ids,
+            truncate_gpu_device_ids: false,
+            restart_policy: None,
+            env: &env,
+            secret_files: &[],
+            volume_mounts: &[],
+            networks: &[],
+            owner: Some(&owner),
+        })
+        .await
+        .expect("launch agent task");
+
+    let create_request = mock_cm
+        .create_requests
+        .lock()
+        .await
+        .last()
+        .cloned()
+        .expect("captured runtime create request");
+    let policy = create_request
+        .sandbox_policy
+        .expect("agent launch should carry a sandbox policy");
+
+    assert_eq!(policy.network, RuntimeSandboxNetworkMode::Blocked);
+    assert_eq!(
+        policy.working_directory,
+        Some(std::path::PathBuf::from("/workspace"))
+    );
+    assert!(policy.filesystem.iter().any(|rule| {
+        rule.path == std::path::Path::new("/workspace")
+            && rule.access == RuntimeSandboxAccessMode::Read
+    }));
 }
 
 /// Ensures task-manager teardown always removes node-scoped secret staging directories.

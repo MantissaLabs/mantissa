@@ -260,6 +260,7 @@ impl WorkloadManager {
                     secret_files: &plan.secret_files,
                     volume_mounts: &plan.volumes,
                     networks: &plan.networks,
+                    owner: plan.owner.as_ref(),
                 })
                 .await?;
 

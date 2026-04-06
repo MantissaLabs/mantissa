@@ -1,15 +1,20 @@
 use anyhow::anyhow;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use crate::agents::types::{
+    AGENT_ALLOW_NETWORK_ENV_VAR, AGENT_ALLOW_WRITE_ENV_VAR, AGENT_WORKDIR_ENV_VAR,
+};
 use crate::runtime::types::{
     ResourceLimits, RestartPolicyConfig, RestartPolicyType, RuntimeCreateRequest,
-    RuntimeInstanceRef,
+    RuntimeInstanceRef, RuntimeSandboxAccessMode, RuntimeSandboxNetworkMode,
+    RuntimeSandboxPathRule, RuntimeSandboxPolicy,
 };
 use crate::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadEnvironmentVariable as TaskEnvironmentVariable,
-    WorkloadSecretFile, WorkloadVolumeMount as TaskVolumeMount,
+    WorkloadOwner, WorkloadSecretFile, WorkloadVolumeMount as TaskVolumeMount,
 };
 use crate::workload::types::{WorkloadRestartPolicy, WorkloadRestartPolicyKind};
 
@@ -40,6 +45,7 @@ pub(super) struct InstanceLaunchRequest<'a> {
     pub secret_files: &'a [WorkloadSecretFile],
     pub volume_mounts: &'a [TaskVolumeMount],
     pub networks: &'a [Uuid],
+    pub owner: Option<&'a WorkloadOwner>,
 }
 
 impl WorkloadManager {
@@ -152,7 +158,7 @@ impl WorkloadManager {
             execution_platform: request.execution_platform,
             isolation_mode: request.isolation_mode,
             isolation_profile: request.isolation_profile.map(str::to_string),
-            sandbox_policy: None,
+            sandbox_policy: build_runtime_sandbox_policy(request),
             labels: Some(labels),
             command: if request.command.is_empty() {
                 None
@@ -273,6 +279,155 @@ impl WorkloadManager {
     }
 }
 
+/// Builds the runtime-enforced sandbox policy for one launch request when the owner needs it.
+fn build_runtime_sandbox_policy(
+    request: &InstanceLaunchRequest<'_>,
+) -> Option<RuntimeSandboxPolicy> {
+    if request.execution_platform != ExecutionPlatform::Oci
+        || request.isolation_mode != IsolationMode::Sandboxed
+        || !matches!(request.owner, Some(WorkloadOwner::AgentRun(_)))
+    {
+        return None;
+    }
+
+    Some(build_agent_runtime_sandbox_policy(
+        request.env,
+        request.secret_files,
+        request.volume_mounts,
+    ))
+}
+
+/// Translates persisted agent policy hints into the concrete runtime sandbox contract.
+fn build_agent_runtime_sandbox_policy(
+    env: &[TaskEnvironmentVariable],
+    secret_files: &[WorkloadSecretFile],
+    volume_mounts: &[TaskVolumeMount],
+) -> RuntimeSandboxPolicy {
+    let allow_network = lookup_agent_bool_env(env, AGENT_ALLOW_NETWORK_ENV_VAR);
+    let allow_write = lookup_agent_bool_env(env, AGENT_ALLOW_WRITE_ENV_VAR);
+    let working_directory = lookup_agent_path_env(env, AGENT_WORKDIR_ENV_VAR);
+    let mut filesystem = Vec::new();
+
+    for mount in volume_mounts {
+        add_or_widen_sandbox_rule(
+            &mut filesystem,
+            RuntimeSandboxPathRule::directory(
+                mount.target.clone(),
+                sandbox_access_for_mount(mount.read_only, allow_write),
+            ),
+        );
+    }
+
+    for secret in secret_files {
+        add_or_widen_sandbox_rule(
+            &mut filesystem,
+            RuntimeSandboxPathRule::file(secret.path.clone(), RuntimeSandboxAccessMode::Read),
+        );
+    }
+
+    if allow_write {
+        add_or_widen_sandbox_rule(
+            &mut filesystem,
+            RuntimeSandboxPathRule::directory("/tmp", RuntimeSandboxAccessMode::ReadWrite),
+        );
+        add_or_widen_sandbox_rule(
+            &mut filesystem,
+            RuntimeSandboxPathRule::directory("/var/tmp", RuntimeSandboxAccessMode::ReadWrite),
+        );
+    }
+
+    if let Some(path) = working_directory.as_ref() {
+        add_or_widen_sandbox_rule(
+            &mut filesystem,
+            RuntimeSandboxPathRule::directory(
+                path.clone(),
+                if allow_write {
+                    RuntimeSandboxAccessMode::ReadWrite
+                } else {
+                    RuntimeSandboxAccessMode::Read
+                },
+            ),
+        );
+    }
+
+    RuntimeSandboxPolicy {
+        working_directory,
+        filesystem,
+        network: if allow_network {
+            RuntimeSandboxNetworkMode::AllowAll
+        } else {
+            RuntimeSandboxNetworkMode::Blocked
+        },
+    }
+}
+
+/// Returns the effective access mode one mounted path should receive under the sandbox.
+fn sandbox_access_for_mount(read_only: bool, allow_write: bool) -> RuntimeSandboxAccessMode {
+    if read_only || !allow_write {
+        RuntimeSandboxAccessMode::Read
+    } else {
+        RuntimeSandboxAccessMode::ReadWrite
+    }
+}
+
+/// Looks up one agent boolean env var from the execution template using Mantissa semantics.
+fn lookup_agent_bool_env(env: &[TaskEnvironmentVariable], name: &str) -> bool {
+    lookup_agent_env(env, name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Looks up one agent path env var from the execution template after trimming empty values.
+fn lookup_agent_path_env(env: &[TaskEnvironmentVariable], name: &str) -> Option<PathBuf> {
+    lookup_agent_env(env, name).map(PathBuf::from)
+}
+
+/// Returns the last literal env value declared for one agent runtime hint.
+fn lookup_agent_env<'a>(env: &'a [TaskEnvironmentVariable], name: &str) -> Option<&'a str> {
+    env.iter()
+        .rev()
+        .find(|entry| entry.name == name)
+        .and_then(|entry| entry.value.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Adds one path rule to the sandbox policy, widening exact duplicates instead of repeating them.
+fn add_or_widen_sandbox_rule(
+    filesystem: &mut Vec<RuntimeSandboxPathRule>,
+    candidate: RuntimeSandboxPathRule,
+) {
+    if let Some(existing) = filesystem
+        .iter_mut()
+        .find(|rule| rule.kind == candidate.kind && rule.path == candidate.path)
+    {
+        existing.access = widen_sandbox_access(existing.access, candidate.access);
+        return;
+    }
+
+    filesystem.push(candidate);
+}
+
+/// Collapses two access modes so the resulting rule preserves the broadest required permission.
+fn widen_sandbox_access(
+    current: RuntimeSandboxAccessMode,
+    candidate: RuntimeSandboxAccessMode,
+) -> RuntimeSandboxAccessMode {
+    use RuntimeSandboxAccessMode::{Read, ReadWrite, Write};
+
+    match (current, candidate) {
+        (ReadWrite, _) | (_, ReadWrite) => ReadWrite,
+        (Read, Write) | (Write, Read) => ReadWrite,
+        (Write, Write) => Write,
+        _ => Read,
+    }
+}
+
 /// Maps a task restart policy into the runtime restart-policy payload.
 fn restart_policy_to_config(policy: &WorkloadRestartPolicy) -> RestartPolicyConfig {
     RestartPolicyConfig {
@@ -297,5 +452,120 @@ async fn cleanup_launch_artifacts(task_id: Uuid, resolved: &mut ResolvedTaskSecr
             phase,
             "failed to cleanup staged secrets after launch failure: {clean_err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workload::model::{WorkloadSecretReference, WorkloadVolumeMount};
+
+    #[test]
+    fn agent_runtime_sandbox_policy_downscopes_rw_mounts_without_write_access() {
+        let policy = build_agent_runtime_sandbox_policy(
+            &[
+                TaskEnvironmentVariable {
+                    name: AGENT_ALLOW_NETWORK_ENV_VAR.to_string(),
+                    value: Some("false".to_string()),
+                    secret: None,
+                },
+                TaskEnvironmentVariable {
+                    name: AGENT_ALLOW_WRITE_ENV_VAR.to_string(),
+                    value: Some("false".to_string()),
+                    secret: None,
+                },
+                TaskEnvironmentVariable {
+                    name: AGENT_WORKDIR_ENV_VAR.to_string(),
+                    value: Some("/workspace".to_string()),
+                    secret: None,
+                },
+            ],
+            &[WorkloadSecretFile {
+                path: "/run/secrets/token".to_string(),
+                secret: WorkloadSecretReference {
+                    name: "token".to_string(),
+                    version_id: None,
+                },
+                mode: None,
+            }],
+            &[
+                WorkloadVolumeMount {
+                    volume_id: Uuid::new_v4(),
+                    volume_name: "workspace".to_string(),
+                    target: "/workspace".to_string(),
+                    read_only: false,
+                },
+                WorkloadVolumeMount {
+                    volume_id: Uuid::new_v4(),
+                    volume_name: "cache".to_string(),
+                    target: "/cache".to_string(),
+                    read_only: true,
+                },
+            ],
+        );
+
+        assert_eq!(policy.network, RuntimeSandboxNetworkMode::Blocked);
+        assert_eq!(policy.working_directory, Some(PathBuf::from("/workspace")));
+        assert!(policy.filesystem.iter().any(|rule| {
+            rule.path == std::path::Path::new("/workspace")
+                && rule.kind == crate::runtime::types::RuntimeSandboxPathKind::Directory
+                && rule.access == RuntimeSandboxAccessMode::Read
+        }));
+        assert!(policy.filesystem.iter().any(|rule| {
+            rule.path == std::path::Path::new("/cache")
+                && rule.kind == crate::runtime::types::RuntimeSandboxPathKind::Directory
+                && rule.access == RuntimeSandboxAccessMode::Read
+        }));
+        assert!(policy.filesystem.iter().any(|rule| {
+            rule.path == std::path::Path::new("/run/secrets/token")
+                && rule.kind == crate::runtime::types::RuntimeSandboxPathKind::File
+                && rule.access == RuntimeSandboxAccessMode::Read
+        }));
+        assert!(!policy.filesystem.iter().any(|rule| {
+            rule.path == std::path::Path::new("/tmp")
+                && rule.access == RuntimeSandboxAccessMode::ReadWrite
+        }));
+    }
+
+    #[test]
+    fn agent_runtime_sandbox_policy_enables_workdir_and_temp_writes() {
+        let policy = build_agent_runtime_sandbox_policy(
+            &[
+                TaskEnvironmentVariable {
+                    name: AGENT_ALLOW_NETWORK_ENV_VAR.to_string(),
+                    value: Some("true".to_string()),
+                    secret: None,
+                },
+                TaskEnvironmentVariable {
+                    name: AGENT_ALLOW_WRITE_ENV_VAR.to_string(),
+                    value: Some("true".to_string()),
+                    secret: None,
+                },
+                TaskEnvironmentVariable {
+                    name: AGENT_WORKDIR_ENV_VAR.to_string(),
+                    value: Some("/workspace".to_string()),
+                    secret: None,
+                },
+            ],
+            &[],
+            &[],
+        );
+
+        assert_eq!(policy.network, RuntimeSandboxNetworkMode::AllowAll);
+        assert!(policy.filesystem.iter().any(|rule| {
+            rule.path == std::path::Path::new("/workspace")
+                && rule.kind == crate::runtime::types::RuntimeSandboxPathKind::Directory
+                && rule.access == RuntimeSandboxAccessMode::ReadWrite
+        }));
+        assert!(policy.filesystem.iter().any(|rule| {
+            rule.path == std::path::Path::new("/tmp")
+                && rule.kind == crate::runtime::types::RuntimeSandboxPathKind::Directory
+                && rule.access == RuntimeSandboxAccessMode::ReadWrite
+        }));
+        assert!(policy.filesystem.iter().any(|rule| {
+            rule.path == std::path::Path::new("/var/tmp")
+                && rule.kind == crate::runtime::types::RuntimeSandboxPathKind::Directory
+                && rule.access == RuntimeSandboxAccessMode::ReadWrite
+        }));
     }
 }

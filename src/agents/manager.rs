@@ -1,5 +1,6 @@
 use crate::agents::registry::AgentRegistry;
 use crate::agents::types::{
+    AGENT_ALLOW_NETWORK_ENV_VAR, AGENT_ALLOW_WRITE_ENV_VAR, AGENT_WORKDIR_ENV_VAR,
     AgentCheckpointPolicy, AgentEvent, AgentRunSpecValue, AgentRunStatus, AgentSessionSpecValue,
     AgentSessionStatus, AgentToolPolicy, AgentWorkspacePolicy, normalize_optional_text,
 };
@@ -656,7 +657,7 @@ fn build_agent_run_execution(
     );
     append_literal_env(
         &mut execution.env,
-        "MANTISSA_AGENT_ALLOW_NETWORK",
+        AGENT_ALLOW_NETWORK_ENV_VAR,
         bool_to_env(session.tools.allow_network),
     );
     append_literal_env(
@@ -666,7 +667,7 @@ fn build_agent_run_execution(
     );
     append_literal_env(
         &mut execution.env,
-        "MANTISSA_AGENT_ALLOW_WRITE",
+        AGENT_ALLOW_WRITE_ENV_VAR,
         bool_to_env(session.tools.allow_write),
     );
     append_literal_env(
@@ -699,11 +700,7 @@ fn build_agent_run_execution(
         );
     }
     if let Some(working_directory) = session.workspace.working_directory.as_deref() {
-        append_literal_env(
-            &mut execution.env,
-            "MANTISSA_AGENT_WORKDIR",
-            working_directory,
-        );
+        append_literal_env(&mut execution.env, AGENT_WORKDIR_ENV_VAR, working_directory);
     }
     if let Some(prompt) = normalize_optional_text(prompt) {
         append_literal_env(&mut execution.env, "MANTISSA_AGENT_INPUT", prompt);

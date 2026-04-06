@@ -2192,6 +2192,7 @@ impl WorkloadManager {
                 secret_files: &working.secret_files,
                 volume_mounts: &working.volumes,
                 networks: &working.networks,
+                owner: working.owner.as_ref(),
             })
             .await
         {

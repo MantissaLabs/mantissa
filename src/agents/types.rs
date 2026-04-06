@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const MAX_AGENT_EVENTS: usize = 64;
+pub(crate) const AGENT_ALLOW_NETWORK_ENV_VAR: &str = "MANTISSA_AGENT_ALLOW_NETWORK";
+pub(crate) const AGENT_ALLOW_WRITE_ENV_VAR: &str = "MANTISSA_AGENT_ALLOW_WRITE";
+pub(crate) const AGENT_WORKDIR_ENV_VAR: &str = "MANTISSA_AGENT_WORKDIR";
 
 /// Persistent workspace policy owned by one agent session rather than one workload run.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
