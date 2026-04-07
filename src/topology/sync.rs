@@ -1,4 +1,5 @@
 use super::*;
+use parking_lot::Mutex;
 
 impl Topology {
     /// Set the periodic sync interval (useful for tests to speed up convergence).
@@ -13,10 +14,7 @@ impl Topology {
 
     /// Set the number of peers targeted by the deterministic workload-repair pass (`0` means all peers).
     pub fn set_workload_repair_fanout(&self, fanout: usize) {
-        *lock_or_recover(
-            &self.runtime.workload_repair_fanout,
-            "topology.workload_repair_fanout",
-        ) = fanout;
+        *self.runtime.workload_repair_fanout.lock() = fanout;
     }
 
     /// Set the metadata sync interval used by the cross-view cluster metadata loop.
@@ -287,10 +285,7 @@ impl Topology {
         entries: &'a [PeerCacheEntry],
         already_selected: &HashSet<Uuid>,
     ) -> Vec<&'a PeerCacheEntry> {
-        let repair_fanout = *lock_or_recover(
-            &self.runtime.workload_repair_fanout,
-            "topology.workload_repair_fanout",
-        );
+        let repair_fanout = *self.runtime.workload_repair_fanout.lock();
         select_sync_peers_round_robin_for_node(
             self.local.node.id,
             entries,
@@ -706,7 +701,7 @@ fn select_sync_peers_round_robin_for_node<'a>(
         .filter(|entry| entry.peer_id != local_id)
         .collect();
     if candidates.is_empty() {
-        *lock_or_recover(cursor, "topology.metadata_sync_cursor") = 0;
+        *cursor.lock() = 0;
         return Vec::new();
     }
 
@@ -718,11 +713,11 @@ fn select_sync_peers_round_robin_for_node<'a>(
         sync_fanout.min(candidates.len())
     };
     if target >= candidates.len() {
-        *lock_or_recover(cursor, "topology.metadata_sync_cursor") = 0;
+        *cursor.lock() = 0;
         return candidates;
     }
 
-    let mut guard = lock_or_recover(cursor, "topology.metadata_sync_cursor");
+    let mut guard = cursor.lock();
     let start = *guard % candidates.len();
     let mut selected = Vec::with_capacity(target);
     for offset in 0..target {
@@ -834,8 +829,9 @@ mod tests {
         select_sync_peers_round_robin_for_node,
     };
     use crate::runtime::types::RuntimeSupportProfile;
+    use parking_lot::Mutex;
     use std::collections::HashSet;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use uuid::Uuid;
 
     /// Build a synthetic peer cache entry with deterministic placeholder values.

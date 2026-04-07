@@ -1,13 +1,12 @@
 use std::cell::OnceCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::Mutex;
 
 use ed25519_dalek::SigningKey;
+use parking_lot::Mutex;
 use protocol::server::ServerClient;
 use x25519_dalek::PublicKey;
 
-use super::lock_or_recover;
 use crate::cluster::ClusterViewState;
 use crate::node::Node;
 use crate::runtime::types::RuntimeSupportProfile;
@@ -41,23 +40,22 @@ impl AdvertiseState {
 
     /// Records the socket address currently bound by the server listener.
     pub(crate) fn set_bound(&self, addr: SocketAddr) {
-        *lock_or_recover(&self.bound_addr, "topology.bound_addr") = Some(addr);
+        *self.bound_addr.lock() = Some(addr);
     }
 
     /// Replaces the optional advertise override used by tests and inproc transports.
     pub(crate) fn set_override<S: Into<String>>(&self, addr: Option<S>) {
-        *lock_or_recover(&self.advertise_override, "topology.advertise_override") =
-            addr.map(Into::into);
+        *self.advertise_override.lock() = addr.map(Into::into);
     }
 
     /// Returns the current advertise override when one has been configured.
     pub(crate) fn override_addr(&self) -> Option<String> {
-        lock_or_recover(&self.advertise_override, "topology.advertise_override").clone()
+        self.advertise_override.lock().clone()
     }
 
     /// Returns the bound listener address when networking has already started.
     pub(crate) fn bound(&self) -> Option<SocketAddr> {
-        *lock_or_recover(&self.bound_addr, "topology.bound_addr")
+        *self.bound_addr.lock()
     }
 }
 

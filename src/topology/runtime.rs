@@ -2,17 +2,16 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
+use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use super::PeerHandle;
-use super::lock_or_recover;
 use super::peer_cache::{PeerCacheEntry, PeerSnapshotCache};
 use crate::gossip::Message;
 
@@ -51,12 +50,12 @@ impl GossipState {
 
     /// Updates the outer gossip scheduling interval.
     pub(crate) fn set_interval(&self, d: Duration) {
-        *lock_or_recover(&self.interval, "topology.gossip_interval") = d;
+        *self.interval.lock() = d;
     }
 
     /// Returns the current outer gossip scheduling interval.
     pub(crate) fn interval(&self) -> Duration {
-        *lock_or_recover(&self.interval, "topology.gossip_interval")
+        *self.interval.lock()
     }
 }
 
@@ -88,22 +87,22 @@ impl SyncLoopState {
 
     /// Updates the current sync interval.
     pub(crate) fn set_interval(&self, d: Duration) {
-        *lock_or_recover(&self.interval, "topology.sync_interval") = d;
+        *self.interval.lock() = d;
     }
 
     /// Returns the current sync interval.
     pub(crate) fn interval(&self) -> Duration {
-        *lock_or_recover(&self.interval, "topology.sync_interval")
+        *self.interval.lock()
     }
 
     /// Updates the current sync fanout.
     pub(crate) fn set_fanout(&self, fanout: usize) {
-        *lock_or_recover(&self.fanout, "topology.sync_fanout") = fanout;
+        *self.fanout.lock() = fanout;
     }
 
     /// Returns the current sync fanout.
     pub(crate) fn fanout(&self) -> usize {
-        *lock_or_recover(&self.fanout, "topology.sync_fanout")
+        *self.fanout.lock()
     }
 
     /// Marks the loop as started if no instance is already running.
@@ -161,7 +160,7 @@ impl ProbeLoopState {
 
     /// Returns the current health probe interval.
     pub(crate) fn interval(&self) -> Duration {
-        *lock_or_recover(&self.interval, "topology.health_probe_interval")
+        *self.interval.lock()
     }
 
     /// Marks the probe loop as started if no instance is already running.

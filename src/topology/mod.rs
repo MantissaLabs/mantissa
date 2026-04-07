@@ -21,6 +21,7 @@ use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::stream::{FuturesUnordered, StreamExt};
 use net::noise::NoisePeerVerifier;
+use parking_lot::Mutex;
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::server::{self, ServerClient};
 use protocol::sync::Domain;
@@ -28,7 +29,7 @@ use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
@@ -38,16 +39,6 @@ use self::dependencies::TopologyDependencies;
 use self::local_state::LocalNodeState;
 use self::peer_cache::{PeerCacheEntry, PeerSnapshot, PeerSnapshotCache};
 use self::runtime::{GossipWarmSetState, TopologyRuntime};
-
-fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::MutexGuard<'a, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(err) => {
-            error!("{name} mutex poisoned: {err}");
-            err.into_inner()
-        }
-    }
-}
 
 mod cluster_operations;
 mod dependencies;

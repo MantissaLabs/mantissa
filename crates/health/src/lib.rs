@@ -1,10 +1,10 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::warn;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,19 +60,6 @@ pub struct HealthMonitor {
 
 /// # Description:
 ///
-/// Recovers poisoned mutexes so health tracking remains usable after panics in tests or callers.
-fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::MutexGuard<'a, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(err) => {
-            warn!("{name} mutex poisoned: {err}");
-            err.into_inner()
-        }
-    }
-}
-
-/// # Description:
-///
 /// Computes an ordering rank for SWIM statuses when incarnation numbers are equal.
 fn swim_status_rank(status: Status) -> u8 {
     match status {
@@ -117,7 +104,7 @@ impl HealthMonitor {
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
 
-        let mut peers = lock_or_recover(&self.peers, "health.peers");
+        let mut peers = self.peers.lock();
         let state = peers.entry(self.local_id).or_default();
         state.incarnation = state.incarnation.max(next);
         next
@@ -131,7 +118,7 @@ impl HealthMonitor {
             return None;
         }
 
-        let mut cursor = lock_or_recover(&self.probe_cursor, "health.probe_cursor");
+        let mut cursor = self.probe_cursor.lock();
         let index = *cursor % candidates_len;
         *cursor = (*cursor + 1) % candidates_len;
         Some(index)
@@ -149,7 +136,7 @@ impl HealthMonitor {
             incarnation
         };
 
-        let mut peers = lock_or_recover(&self.peers, "health.peers");
+        let mut peers = self.peers.lock();
         let state = peers.entry(id).or_default();
         state.incarnation = state.incarnation.max(known_incarnation);
         state.status = Status::Alive;
@@ -247,7 +234,7 @@ impl HealthMonitor {
         down_after: Duration,
     ) -> Vec<Action> {
         let now = Instant::now();
-        let mut peers = lock_or_recover(&self.peers, "health.peers");
+        let mut peers = self.peers.lock();
         let state = peers.entry(peer_id).or_default();
         if state.incarnation == 0 {
             state.incarnation = 1;
@@ -301,7 +288,7 @@ impl HealthMonitor {
         let now = Instant::now();
         let mut to_down = Vec::new();
         {
-            let mut peers = lock_or_recover(&self.peers, "health.peers");
+            let mut peers = self.peers.lock();
             for (peer_id, state) in peers.iter_mut() {
                 if state.status != Status::Suspect {
                     continue;
@@ -335,14 +322,15 @@ impl HealthMonitor {
     ///
     /// Forgets one peer from the local detector, causing subsequent lookups to resolve to unknown.
     pub fn remove_peer(&self, id: Uuid) {
-        lock_or_recover(&self.peers, "health.peers").remove(&id);
+        self.peers.lock().remove(&id);
     }
 
     /// # Description:
     ///
     /// Returns the last locally selected health status for one peer.
     pub fn status(&self, id: Uuid) -> Status {
-        lock_or_recover(&self.peers, "health.peers")
+        self.peers
+            .lock()
             .get(&id)
             .map(|state| state.status)
             .unwrap_or(Status::Unknown)
@@ -352,7 +340,8 @@ impl HealthMonitor {
     ///
     /// Clones the current peer-health view for consumers that need a stable point-in-time snapshot.
     pub fn snapshot(&self) -> HashMap<Uuid, Status> {
-        lock_or_recover(&self.peers, "health.peers")
+        self.peers
+            .lock()
             .iter()
             .map(|(id, state)| (*id, state.status))
             .collect()
@@ -369,7 +358,7 @@ impl HealthMonitor {
         down_after: Option<Duration>,
     ) -> bool {
         let now = Instant::now();
-        let mut peers = lock_or_recover(&self.peers, "health.peers");
+        let mut peers = self.peers.lock();
         let state = peers.entry(id).or_default();
         if incarnation < state.incarnation {
             return false;
@@ -416,7 +405,7 @@ impl HealthMonitor {
     ///
     /// Clears suspicion timers after one successful observation and optionally emits an alive rumor.
     fn record_success(&self, id: Uuid, emit_gossip: bool) -> Option<SwimEvent> {
-        let mut peers = lock_or_recover(&self.peers, "health.peers");
+        let mut peers = self.peers.lock();
         let state = peers.entry(id).or_default();
         let previous = state.status;
         if state.incarnation == 0 {

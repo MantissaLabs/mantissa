@@ -30,6 +30,7 @@ capnp = "0.25"
 capnp-rpc = "0.25"
 capnp-futures = "0.25"
 capnpc = "0.25"
+parking_lot = "0.12"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
@@ -115,6 +116,7 @@ tracing-subscriber = { version = "0.3.18", features = [
 ] }
 time = { version = "0.3", features = ["local-offset", "macros"] }
 log = "0.4"
+parking_lot = { workspace = true }
 
 once_cell = "1.21.3"
 base64 = "0.22.1"

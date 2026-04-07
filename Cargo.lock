@@ -1680,6 +1680,7 @@ dependencies = [
 name = "health"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
  "tracing",
  "uuid",
 ]
@@ -2350,6 +2351,7 @@ dependencies = [
  "notify",
  "nvml-wrapper",
  "once_cell",
+ "parking_lot",
  "protocol",
  "rand 0.9.2",
  "raw-cpuid",
