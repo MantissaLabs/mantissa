@@ -10,6 +10,7 @@ use crate::workload_submit::{
     DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec, ResolvedDeclaredVolume,
     compute_network_id, ensure_declared_volumes, ensure_named_networks,
 };
+use crate::workload_wire::write_local_volume_ownership;
 use anyhow::{Context, Result, anyhow};
 use capnp::{Error as CapnpError, struct_list};
 use protocol::services::task_template;
@@ -107,6 +108,8 @@ fn write_secret_files(
         );
         write_secret_reference(secret_builder, &file.secret, &context)?;
         entry.set_mode(file.mode.unwrap_or(0));
+        write_local_volume_ownership(entry.reborrow().init_ownership(), &file.ownership);
+        entry.set_path_env_name(file.path_env_name.as_deref().unwrap_or(""));
     }
     Ok(())
 }

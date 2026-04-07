@@ -81,7 +81,9 @@ inside a sandboxed Codex session, and the example image entrypoint exports
                     name: "openai-api-key",
                     version: None,
                 ),
-                mode: Some(0o444),
+                mode: Some(0o400),
+                ownership: user(uid: 1000, gid: 1000),
+                path_env_name: Some("CODEX_API_KEY_PATH"),
             ),
         ],
     ),
@@ -89,7 +91,11 @@ inside a sandboxed Codex session, and the example image entrypoint exports
 ```
 
 This keeps the secret out of Docker environment metadata while still satisfying
-programs that require an environment variable at process start.
+programs that require an environment variable at process start. The
+`path_env_name` helper is the preferred production pattern for tools that
+already support `*_FILE` or equivalent path-based configuration, because
+Mantissa can point the process at the mounted file without projecting the
+secret value into Docker env metadata at all.
 
 A complete end-to-end flow for that example looks like this:
 

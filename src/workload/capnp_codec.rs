@@ -1,3 +1,4 @@
+use crate::volumes::types::LocalVolumeOwnership;
 use crate::workload::model::{
     WorkloadEnvironmentVariable, WorkloadSecretFile, WorkloadSecretReference, WorkloadVolumeMount,
 };
@@ -6,6 +7,7 @@ use crate::workload::types::{
     WorkloadRestartPolicyKind,
 };
 use capnp::{Error, struct_list};
+use protocol::volumes::local_volume_ownership;
 use protocol::workload::{environment_var, secret_file, secret_ref, volume_mount};
 use uuid::Uuid;
 
@@ -92,6 +94,8 @@ pub fn encode_secret_files(
         let secret_builder = entry.reborrow().init_secret();
         encode_secret_ref(secret_builder, &file.secret);
         entry.set_mode(file.mode.unwrap_or(0));
+        write_local_volume_ownership(entry.reborrow().init_ownership(), file.ownership);
+        entry.set_path_env_name(file.path_env_name.as_deref().unwrap_or(""));
     }
 }
 
@@ -107,9 +111,65 @@ pub fn decode_secret_files(
             0 => None,
             value => Some(value),
         };
-        files.push(WorkloadSecretFile { path, secret, mode });
+        let ownership = if entry.has_ownership() {
+            read_local_volume_ownership(entry.get_ownership()?)?
+        } else {
+            LocalVolumeOwnership::Daemon
+        };
+        let path_env_name = if entry.has_path_env_name() {
+            let name = entry.get_path_env_name()?.to_str()?.trim().to_string();
+            (!name.is_empty()).then_some(name)
+        } else {
+            None
+        };
+        files.push(WorkloadSecretFile {
+            path,
+            secret,
+            mode,
+            ownership,
+            path_env_name,
+        });
     }
     Ok(files)
+}
+
+/// Encodes one uid/gid ownership policy into the shared workload wire contract.
+fn write_local_volume_ownership(
+    mut builder: local_volume_ownership::Builder<'_>,
+    ownership: LocalVolumeOwnership,
+) {
+    match ownership {
+        LocalVolumeOwnership::Daemon => {
+            builder.set_daemon(());
+        }
+        LocalVolumeOwnership::User { uid, gid } => {
+            let mut user = builder.reborrow().init_user();
+            user.set_uid(uid);
+            user.set_gid(gid);
+        }
+        LocalVolumeOwnership::FsGroup { gid } => {
+            let mut fs_group = builder.reborrow().init_fs_group();
+            fs_group.set_gid(gid);
+        }
+    }
+}
+
+/// Decodes one uid/gid ownership policy from the shared workload wire contract.
+fn read_local_volume_ownership(
+    reader: local_volume_ownership::Reader<'_>,
+) -> Result<LocalVolumeOwnership, Error> {
+    match reader.which()? {
+        local_volume_ownership::Which::Daemon(()) => Ok(LocalVolumeOwnership::Daemon),
+        local_volume_ownership::Which::User(Ok(user)) => Ok(LocalVolumeOwnership::User {
+            uid: user.get_uid(),
+            gid: user.get_gid(),
+        }),
+        local_volume_ownership::Which::User(Err(err)) => Err(err),
+        local_volume_ownership::Which::FsGroup(Ok(fs_group)) => Ok(LocalVolumeOwnership::FsGroup {
+            gid: fs_group.get_gid(),
+        }),
+        local_volume_ownership::Which::FsGroup(Err(err)) => Err(err),
+    }
 }
 
 /// Encodes task volume mounts into the task schema list.

@@ -1,6 +1,7 @@
 use super::{WorkloadManager, WorkloadStartRequest};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::types::SecretValue;
+use crate::volumes::types::LocalVolumeOwnership;
 use crate::workload::model::{
     WorkloadEnvironmentVariable as TaskEnvironmentVariable, WorkloadSecretFile,
 };
@@ -88,7 +89,7 @@ impl WorkloadManager {
             )?);
         }
 
-        let (mounts, artifacts) = self
+        let (mounts, path_env, artifacts) = self
             .stage_secret_files(
                 task_id,
                 secret_files,
@@ -97,6 +98,7 @@ impl WorkloadManager {
                 &keyring,
             )
             .await?;
+        resolved_env.extend(path_env);
 
         Ok(ResolvedTaskSecrets {
             env: resolved_env,
@@ -171,6 +173,22 @@ impl WorkloadManager {
         }
     }
 
+    /// Constructs one plain environment variable assignment that points at a mounted secret path.
+    fn build_path_env_assignment(&self, name: &str, path: &str) -> Result<String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(anyhow!(
+                "secret file path_env_name cannot be empty when launching task"
+            ));
+        }
+        if name.contains('=') {
+            return Err(anyhow!(
+                "secret file path_env_name '{name}' cannot contain '='"
+            ));
+        }
+        Ok(format!("{name}={path}"))
+    }
+
     /// Stages secret file payloads on disk and builds the bind mount descriptors for Docker.
     async fn stage_secret_files(
         &self,
@@ -179,9 +197,9 @@ impl WorkloadManager {
         value_cache: &mut HashMap<String, SecretValue>,
         plaintext_cache: &mut HashMap<Uuid, Arc<[u8]>>,
         keyring: &SecretKeyring,
-    ) -> Result<(Vec<String>, Option<TaskSecretArtifacts>)> {
+    ) -> Result<(Vec<String>, Vec<String>, Option<TaskSecretArtifacts>)> {
         if files.is_empty() {
-            return Ok((Vec::new(), None));
+            return Ok((Vec::new(), Vec::new(), None));
         }
 
         let root_dir = self.secrets.secret_runtime_root.join(task_id.to_string());
@@ -214,6 +232,7 @@ impl WorkloadManager {
         }
 
         let mut mounts = Vec::with_capacity(files.len());
+        let mut path_env = Vec::new();
 
         for (idx, file) in files.iter().enumerate() {
             let target = file.path.trim();
@@ -230,6 +249,17 @@ impl WorkloadManager {
                     target
                 ));
             }
+            let path_env_assignment = if let Some(name) = file.path_env_name.as_deref() {
+                match self.build_path_env_assignment(name, target) {
+                    Ok(value) => Some(value),
+                    Err(err) => {
+                        cleanup_dir_quietly(&root_dir).await;
+                        return Err(err);
+                    }
+                }
+            } else {
+                None
+            };
 
             let plaintext = match self.decrypt_secret_cached(
                 &file.secret.name,
@@ -297,14 +327,10 @@ impl WorkloadManager {
 
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = file.mode.unwrap_or(0o400);
-                if let Err(err) =
-                    fs::set_permissions(&host_path, std::fs::Permissions::from_mode(mode)).await
-                {
+                if let Err(err) = normalize_staged_secret_file_permissions(&host_path, file) {
                     cleanup_dir_quietly(&root_dir).await;
                     return Err(anyhow!(
-                        "failed to set permissions on {}: {err}",
+                        "failed to apply ownership or permissions on {}: {err}",
                         host_path.display()
                     ));
                 }
@@ -322,9 +348,12 @@ impl WorkloadManager {
             };
 
             mounts.push(format!("{host}:{target}:ro"));
+            if let Some(path_env_assignment) = path_env_assignment {
+                path_env.push(path_env_assignment);
+            }
         }
 
-        Ok((mounts, Some(TaskSecretArtifacts { root_dir })))
+        Ok((mounts, path_env, Some(TaskSecretArtifacts { root_dir })))
     }
 
     /// Loads the current value for a secret by logical name.
@@ -388,5 +417,86 @@ async fn cleanup_dir_quietly(path: &Path) {
                 path.display()
             );
         }
+    }
+}
+
+/// Applies the declared ownership and mode to one staged secret file on Unix hosts.
+#[cfg(unix)]
+fn normalize_staged_secret_file_permissions(path: &Path, file: &WorkloadSecretFile) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = std::fs::metadata(path).with_context(|| {
+        format!(
+            "failed to read staged secret file metadata for {}",
+            path.display()
+        )
+    })?;
+    let (daemon_uid, daemon_gid) = current_process_ids();
+    let (desired_uid, desired_gid) = file.ownership.resolve_ids(daemon_uid, daemon_gid);
+    if metadata.uid() != desired_uid || metadata.gid() != desired_gid {
+        chown_path(path, desired_uid, desired_gid).with_context(|| {
+            format!(
+                "failed to set staged secret file owner {desired_uid}:{desired_gid} on {}",
+                path.display()
+            )
+        })?;
+    }
+
+    let desired_mode = file
+        .mode
+        .unwrap_or(default_secret_file_mode(file.ownership));
+    let current_mode = metadata.permissions().mode() & 0o7777;
+    if current_mode != desired_mode {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(desired_mode))
+            .with_context(|| {
+                format!(
+                    "failed to set staged secret file mode {:o} on {}",
+                    desired_mode,
+                    path.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// Leaves staged secret ownership normalization as a no-op on non-Unix hosts.
+#[cfg(not(unix))]
+fn normalize_staged_secret_file_permissions(
+    _path: &Path,
+    _file: &WorkloadSecretFile,
+) -> Result<()> {
+    Ok(())
+}
+
+/// Returns the default POSIX mode Mantissa should use for one staged secret file.
+fn default_secret_file_mode(ownership: LocalVolumeOwnership) -> u32 {
+    match ownership {
+        LocalVolumeOwnership::Daemon | LocalVolumeOwnership::User { .. } => 0o400,
+        LocalVolumeOwnership::FsGroup { .. } => 0o440,
+    }
+}
+
+/// Returns the uid and gid of the running Mantissa daemon process.
+#[cfg(unix)]
+fn current_process_ids() -> (u32, u32) {
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    (uid, gid)
+}
+
+/// Changes the uid and gid of one staged secret file in place.
+#[cfg(unix)]
+fn chown_path(path: &Path, uid: u32, gid: u32) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| anyhow!("invalid path for chown: {}", path.display()))?;
+    let result = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to chown staged secret file path {}", path.display()))
     }
 }

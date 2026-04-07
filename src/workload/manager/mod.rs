@@ -1533,6 +1533,8 @@ fn resolve_secret_runtime_root(local_node_id: Uuid) -> PathBuf {
 fn secret_runtime_base_candidates() -> Vec<PathBuf> {
     let tmp_root = std::env::temp_dir();
     let mut bases: Vec<PathBuf> = Vec::new();
+    #[cfg(target_os = "linux")]
+    bases.push(PathBuf::from("/dev/shm").join("mantissa").join("secrets"));
     bases.push(tmp_root.join("mantissa").join("secrets"));
     if let Some(user_tag) = temp_user_tag() {
         bases.push(

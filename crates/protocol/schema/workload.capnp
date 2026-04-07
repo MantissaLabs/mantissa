@@ -1,5 +1,7 @@
 @0xbe8f6b7fd1e7ca42;
 
+using VolumeSchema = import "volumes.capnp";
+
 interface Workload {
   stop @0 (request :WorkloadStopRequest) -> (spec :WorkloadSpec);
   # Stop one workload instance identified by its durable UUID.
@@ -35,7 +37,13 @@ struct SecretFile {
   # Secret reference to materialize.
 
   mode @2 :UInt32;
-  # POSIX file mode, 0 = default 0o600.
+  # POSIX file mode, 0 = policy default (0o400, or 0o440 for fsGroup).
+
+  ownership @3 :VolumeSchema.LocalVolumeOwnership;
+  # Ownership policy applied to the staged secret file on the target node.
+
+  pathEnvName @4 :Text;
+  # Optional plain environment variable set to the mounted runtime path.
 }
 
 struct VolumeMount {

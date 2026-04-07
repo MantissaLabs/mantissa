@@ -139,10 +139,12 @@ the official `node:22-bookworm-slim` base, installs a pinned
 Codex's writable state under `/var/tmp`, defaults the example to the cheaper
 `gpt-5.4-nano` model, reads `CODEX_API_KEY` from the mounted secret file when
 present, and launches `codex exec` from an image entrypoint when Mantissa
-provides `MANTISSA_AGENT_INPUT`. If you want a different model, set
-`CODEX_MODEL` in the agent manifest environment. For a multi-node cluster,
-push the built image to a registry your nodes can pull from and update
-`execution.image` accordingly.
+provides `MANTISSA_AGENT_INPUT`. The manifest also sets
+`path_env_name: Some("CODEX_API_KEY_PATH")`, which is the preferred pattern
+when a tool can consume a mounted secret path instead of a plaintext env
+value. If you want a different model, set `CODEX_MODEL` in the agent manifest
+environment. For a multi-node cluster, push the built image to a registry your
+nodes can pull from and update `execution.image` accordingly.
 
 Once submitted, stay on the agents surface to observe it:
 

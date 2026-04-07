@@ -487,6 +487,8 @@ mod tests {
                     version_id: None,
                 },
                 mode: None,
+                ownership: crate::volumes::types::LocalVolumeOwnership::Daemon,
+                path_env_name: None,
             }],
             &[
                 WorkloadVolumeMount {

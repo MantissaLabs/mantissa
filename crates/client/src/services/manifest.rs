@@ -71,6 +71,10 @@ pub struct SecretFileProjection {
     pub secret: SecretReference,
     #[serde(default)]
     pub mode: Option<u32>,
+    #[serde(default)]
+    pub ownership: crate::volumes::LocalVolumeOwnership,
+    #[serde(default)]
+    pub path_env_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -674,6 +678,24 @@ impl ServiceManifest {
                         template.name,
                         file.path
                     ));
+                }
+
+                if let Some(path_env_name) = file.path_env_name.as_deref() {
+                    let trimmed = path_env_name.trim();
+                    if trimmed.is_empty() {
+                        return Err(anyhow!(
+                            "template '{}' secret file '{}' path_env_name cannot be empty",
+                            template.name,
+                            file.path
+                        ));
+                    }
+                    if trimmed.contains('=') {
+                        return Err(anyhow!(
+                            "template '{}' secret file '{}' path_env_name cannot contain '='",
+                            template.name,
+                            file.path
+                        ));
+                    }
                 }
             }
 

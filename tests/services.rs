@@ -183,6 +183,8 @@ local_test!(services_gossip_propagates_across_peers, {
                         path: "/run/secrets/demo-service-secret".into(),
                         secret: secret_ref.clone(),
                         mode: Some(0o440),
+                        ownership: mantissa::volumes::types::LocalVolumeOwnership::Daemon,
+                        path_env_name: None,
                     }],
                     ..empty_service_execution("ghcr.io/mantissa/demo:web")
                 },
@@ -277,6 +279,8 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
                 path: "/run/secrets/ack-demo-secret".into(),
                 secret: secret_ref,
                 mode: Some(0o440),
+                ownership: mantissa::volumes::types::LocalVolumeOwnership::Daemon,
+                path_env_name: None,
             }],
             ..empty_service_execution("ghcr.io/mantissa/demo:web")
         },
@@ -363,6 +367,8 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
                         path: "/run/secrets/capacity-secret".into(),
                         secret: secret_ref,
                         mode: Some(0o440),
+                        ownership: mantissa::volumes::types::LocalVolumeOwnership::Daemon,
+                        path_env_name: None,
                     }],
                     ..empty_service_execution("ghcr.io/mantissa/demo:web")
                 },
@@ -5924,6 +5930,23 @@ fn manifest_to_task_templates(manifest: &ServiceManifest) -> Vec<TaskTemplateSpe
                                 version_id: parse_secret_version(&file.secret),
                             },
                             mode: file.mode,
+                            ownership: match &file.ownership {
+                                client::volumes::LocalVolumeOwnership::Daemon => {
+                                    mantissa::volumes::types::LocalVolumeOwnership::Daemon
+                                }
+                                client::volumes::LocalVolumeOwnership::User { uid, gid } => {
+                                    mantissa::volumes::types::LocalVolumeOwnership::User {
+                                        uid: *uid,
+                                        gid: *gid,
+                                    }
+                                }
+                                client::volumes::LocalVolumeOwnership::FsGroup { gid } => {
+                                    mantissa::volumes::types::LocalVolumeOwnership::FsGroup {
+                                        gid: *gid,
+                                    }
+                                }
+                            },
+                            path_env_name: file.path_env_name.clone(),
                         })
                         .collect(),
                     volumes: Vec::new(),

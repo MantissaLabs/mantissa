@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::volumes::types::LocalVolumeOwnership;
 use crate::workload::types::{WorkloadLivenessProbe, WorkloadRestartPolicy};
 
 /// Internal workload categories supported by the control plane.
@@ -347,6 +348,10 @@ pub struct WorkloadSecretFile {
     pub secret: WorkloadSecretReference,
     #[serde(default)]
     pub mode: Option<u32>,
+    #[serde(default)]
+    pub ownership: LocalVolumeOwnership,
+    #[serde(default)]
+    pub path_env_name: Option<String>,
 }
 
 /// Full persisted workload definition shared by the workload core.

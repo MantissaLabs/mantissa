@@ -914,6 +914,8 @@ mod tests {
                         version_id: Some(secret_version),
                     },
                     mode: Some(0o440),
+                    ownership: crate::volumes::types::LocalVolumeOwnership::Daemon,
+                    path_env_name: None,
                 }],
                 volumes: vec![TaskVolumeMount {
                     volume_id,

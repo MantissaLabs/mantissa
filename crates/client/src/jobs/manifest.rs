@@ -90,6 +90,10 @@ pub struct SecretFileProjection {
     pub secret: SecretReference,
     #[serde(default)]
     pub mode: Option<u32>,
+    #[serde(default)]
+    pub ownership: crate::volumes::LocalVolumeOwnership,
+    #[serde(default)]
+    pub path_env_name: Option<String>,
 }
 
 /// Cluster volume label declared in the manifest.
@@ -463,6 +467,21 @@ fn validate_execution(
                 "job manifest secret file '{}' must set a POSIX mode <= 0o7777",
                 file.path
             ));
+        }
+        if let Some(name) = file.path_env_name.as_deref() {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                return Err(anyhow!(
+                    "job manifest secret file '{}' path_env_name cannot be empty",
+                    file.path
+                ));
+            }
+            if trimmed.contains('=') {
+                return Err(anyhow!(
+                    "job manifest secret file '{}' path_env_name cannot contain '='",
+                    file.path
+                ));
+            }
         }
     }
 

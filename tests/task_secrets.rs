@@ -29,6 +29,7 @@ use mantissa::store::volume_store::{open_volume_node_store, open_volume_spec_sto
 use mantissa::store::workload_store::open_workload_store;
 use mantissa::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
 use mantissa::volumes::VolumeRegistry;
+use mantissa::volumes::types::LocalVolumeOwnership;
 use mantissa::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadStartRequest};
 use mantissa::workload::model::ExecutionPlatform;
 use mantissa::workload::types::ResolvedExecutionSpec;
@@ -159,13 +160,21 @@ impl Drop for SecretRuntimeCleanupGuard {
 fn cleanup_secret_runtime_roots_for_node(node_id: Uuid) {
     let node = node_id.to_string();
     let tmp_root = std::env::temp_dir();
-    let mut roots = vec![
+    let mut roots = Vec::new();
+    #[cfg(target_os = "linux")]
+    roots.push(
+        PathBuf::from("/dev/shm")
+            .join("mantissa")
+            .join("secrets")
+            .join(&node),
+    );
+    roots.extend([
         tmp_root.join("mantissa").join("secrets").join(&node),
         tmp_root
             .join(format!("mantissa-pid-{}", std::process::id()))
             .join("secrets")
             .join(&node),
-    ];
+    ]);
 
     if let Ok(user) = std::env::var("USER").or_else(|_| std::env::var("USERNAME"))
         && !user.is_empty()
@@ -185,6 +194,14 @@ fn cleanup_secret_runtime_roots_for_node(node_id: Uuid) {
     for root in roots {
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+/// Returns the uid and gid of the current test process on Unix hosts.
+#[cfg(unix)]
+fn current_process_ids() -> (u32, u32) {
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    (uid, gid)
 }
 
 async fn setup_workload_manager() -> TestHarness {
@@ -426,7 +443,19 @@ local_test!(workload_manager_stages_secret_env_and_files, {
                     name: secret_name.to_string(),
                     version_id: None,
                 },
-                mode: Some(0o440),
+                mode: None,
+                ownership: {
+                    #[cfg(unix)]
+                    {
+                        let (uid, gid) = current_process_ids();
+                        LocalVolumeOwnership::User { uid, gid }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        LocalVolumeOwnership::Daemon
+                    }
+                },
+                path_env_name: Some("DB_PASSWORD_FILE".into()),
             }],
             volumes: Vec::new(),
             networks: Vec::new(),
@@ -452,8 +481,9 @@ local_test!(workload_manager_stages_secret_env_and_files, {
         .last_env()
         .await
         .expect("captured env variables");
-    assert_eq!(env.len(), 1);
+    assert_eq!(env.len(), 2);
     assert_eq!(env[0], "DB_PASSWORD=super-secret");
+    assert_eq!(env[1], "DB_PASSWORD_FILE=/run/secrets/db-password");
 
     let mounts = runtime_backend
         .last_volumes()
@@ -482,6 +512,19 @@ local_test!(workload_manager_stages_secret_env_and_files, {
 
     let data = fs::read(&host_path).await.expect("read staged secret");
     assert_eq!(data, secret_plaintext);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let metadata = std::fs::metadata(&host_path).expect("stat staged secret");
+        let mode = metadata.permissions().mode() & 0o7777;
+        let (uid, gid) = current_process_ids();
+
+        assert_eq!(mode, 0o400);
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(metadata.gid(), gid);
+    }
 
     let staging_dir = host_path
         .parent()

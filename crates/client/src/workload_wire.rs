@@ -1,8 +1,10 @@
 use crate::jobs::manifest::{
     EnvironmentVariable, LivenessKind, LivenessProbe, SecretFileProjection, SecretReference,
 };
+use crate::volumes::LocalVolumeOwnership;
 use crate::volumes::ResolvedVolumeMount;
 use capnp::struct_list;
+use protocol::volumes::local_volume_ownership;
 use protocol::workload::{environment_var, liveness_probe, secret_file, secret_ref, volume_mount};
 use uuid::Uuid;
 
@@ -67,6 +69,29 @@ pub(crate) fn write_secret_files(
         entry.set_path(&file.path);
         write_secret_reference(entry.reborrow().init_secret(), &file.secret);
         entry.set_mode(file.mode.unwrap_or(0));
+        write_local_volume_ownership(entry.reborrow().init_ownership(), &file.ownership);
+        entry.set_path_env_name(file.path_env_name.as_deref().unwrap_or(""));
+    }
+}
+
+/// Encodes one managed-filesystem ownership policy into the shared workload wire builder.
+pub(crate) fn write_local_volume_ownership(
+    mut builder: local_volume_ownership::Builder<'_>,
+    ownership: &LocalVolumeOwnership,
+) {
+    match ownership {
+        LocalVolumeOwnership::Daemon => {
+            builder.set_daemon(());
+        }
+        LocalVolumeOwnership::User { uid, gid } => {
+            let mut user = builder.reborrow().init_user();
+            user.set_uid(*uid);
+            user.set_gid(*gid);
+        }
+        LocalVolumeOwnership::FsGroup { gid } => {
+            let mut fs_group = builder.reborrow().init_fs_group();
+            fs_group.set_gid(*gid);
+        }
     }
 }
 
