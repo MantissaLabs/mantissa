@@ -42,8 +42,9 @@ use crate::topology::peers::PeerSchedulingState;
 use crate::volumes::VolumeRegistry;
 use crate::volumes::local::managed_volume_data_path;
 use crate::volumes::types::{
-    LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
-    VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue, VolumeStatus,
+    LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode,
+    VolumeDriver, VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
+    VolumeStatus,
 };
 use crate::workload::model::select_best_workload_value;
 use crate::workload::model::{
@@ -1139,6 +1140,7 @@ async fn create_managed_local_volume(
         name: name.to_string(),
         driver: VolumeDriver::Local(LocalVolumeSpec {
             source: LocalVolumeSource::Managed,
+            ownership: LocalVolumeOwnership::Daemon,
         }),
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode,

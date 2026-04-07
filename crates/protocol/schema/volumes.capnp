@@ -103,6 +103,35 @@ struct LocalVolumeSpec {
 
   importedPath @1 :Text;
   # Imported host path when sourceKind=importedPath, empty otherwise.
+
+  ownership @2 :LocalVolumeOwnership;
+  # Ownership and permission policy for Mantissa-managed local directories.
+}
+
+struct LocalVolumeUserOwnership {
+  uid @0 :UInt32;
+  # Filesystem owner uid applied to the managed directory.
+
+  gid @1 :UInt32;
+  # Filesystem owner gid applied to the managed directory.
+}
+
+struct LocalVolumeFsGroupOwnership {
+  gid @0 :UInt32;
+  # Filesystem group id applied to the managed directory.
+}
+
+struct LocalVolumeOwnership {
+  union {
+    daemon @0 :Void;
+    # Keep the directory owned by the Mantissa daemon uid/gid on the target node.
+
+    user @1 :LocalVolumeUserOwnership;
+    # Reassign the directory to one explicit uid/gid pair.
+
+    fsGroup @2 :LocalVolumeFsGroupOwnership;
+    # Keep the daemon uid as owner while granting one explicit writable group.
+  }
 }
 
 struct ExternalVolumeSpec {

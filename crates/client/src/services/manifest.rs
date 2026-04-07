@@ -102,6 +102,8 @@ pub enum VolumeReclaimPolicy {
 #[derive(Debug, Deserialize, Clone)]
 pub struct LocalVolumeSpec {
     pub source: LocalVolumeSource,
+    #[serde(default)]
+    pub ownership: crate::volumes::LocalVolumeOwnership,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -359,7 +361,8 @@ impl ServiceManifest {
                 && matches!(
                     volume.driver,
                     VolumeDriver::Local(LocalVolumeSpec {
-                        source: LocalVolumeSource::Managed
+                        source: LocalVolumeSource::Managed,
+                        ..
                     })
                 )
             {
@@ -373,11 +376,24 @@ impl ServiceManifest {
             if matches!(
                 volume.driver,
                 VolumeDriver::Local(LocalVolumeSpec {
-                    source: LocalVolumeSource::ImportedPath(_)
+                    source: LocalVolumeSource::ImportedPath(_),
+                    ownership: crate::volumes::LocalVolumeOwnership::Daemon,
                 })
             ) {
                 return Err(anyhow!(
                     "volume '{}' cannot use imported_path in a service manifest; import host paths ahead of deployment through `mantissa volumes import`",
+                    volume.name
+                ));
+            }
+            if matches!(
+                volume.driver,
+                VolumeDriver::Local(LocalVolumeSpec {
+                    source: LocalVolumeSource::ImportedPath(_),
+                    ..
+                })
+            ) {
+                return Err(anyhow!(
+                    "volume '{}' cannot override ownership for imported_path; import host paths ahead of deployment through `mantissa volumes import`",
                     volume.name
                 ));
             }
@@ -965,7 +981,8 @@ mod tests {
         assert!(matches!(
             manifest.volumes[0].driver,
             VolumeDriver::Local(LocalVolumeSpec {
-                source: LocalVolumeSource::Managed
+                source: LocalVolumeSource::Managed,
+                ..
             })
         ));
     }
@@ -1167,6 +1184,7 @@ mod tests {
                 name: "pgdata".into(),
                 driver: VolumeDriver::Local(LocalVolumeSpec {
                     source: LocalVolumeSource::Managed,
+                    ownership: crate::volumes::LocalVolumeOwnership::Daemon,
                 }),
                 access_mode: VolumeAccessMode::ReadWriteOnce,
                 binding_mode: VolumeBindingMode::WaitForFirstConsumer,

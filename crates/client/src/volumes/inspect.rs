@@ -28,6 +28,16 @@ pub async fn inspect(cfg: &ClientConfig, selector: &str) -> Result<()> {
     writeln!(&mut rendered, "  ID: {}", volume.spec.id)?;
     writeln!(&mut rendered, "  Name: {}", volume.spec.name)?;
     writeln!(&mut rendered, "  Driver: {}", volume.spec.driver)?;
+    writeln!(
+        &mut rendered,
+        "  Ownership: {}",
+        volume
+            .spec
+            .local_ownership
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "-".to_string())
+    )?;
     writeln!(&mut rendered, "  Access: {}", volume.spec.access_mode)?;
     writeln!(&mut rendered, "  Binding: {}", volume.spec.binding_mode)?;
     writeln!(&mut rendered, "  Reclaim: {}", volume.spec.reclaim_policy)?;

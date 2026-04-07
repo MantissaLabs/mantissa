@@ -178,10 +178,47 @@ pub enum LocalVolumeSource {
     ImportedPath(String),
 }
 
+/// Explicit ownership policy applied to Mantissa-managed local volume directories.
+#[derive(
+    Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalVolumeOwnership {
+    #[default]
+    Daemon,
+    User {
+        uid: u32,
+        gid: u32,
+    },
+    FsGroup {
+        gid: u32,
+    },
+}
+
+impl LocalVolumeOwnership {
+    /// Resolves the uid and gid Mantissa should apply on the bound node for one managed volume.
+    pub fn resolve_ids(self, daemon_uid: u32, daemon_gid: u32) -> (u32, u32) {
+        match self {
+            Self::Daemon => (daemon_uid, daemon_gid),
+            Self::User { uid, gid } => (uid, gid),
+            Self::FsGroup { gid } => (daemon_uid, gid),
+        }
+    }
+
+    /// Returns the directory mode Mantissa applies to the managed volume root for this policy.
+    pub fn directory_mode(self) -> u32 {
+        match self {
+            Self::Daemon | Self::User { .. } => 0o750,
+            Self::FsGroup { .. } => 0o2770,
+        }
+    }
+}
+
 /// Built-in local driver specification stored on one volume object.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LocalVolumeSpec {
     pub source: LocalVolumeSource,
+    pub ownership: LocalVolumeOwnership,
 }
 
 /// Future external driver specification stored on one volume object.
@@ -229,6 +266,7 @@ impl VolumeSpecValue {
             (
                 VolumeDriver::Local(LocalVolumeSpec {
                     source: LocalVolumeSource::ImportedPath(_),
+                    ..
                 }),
                 Some(_),
             ) => VolumeStatus::Ready,

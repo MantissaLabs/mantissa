@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use client::config::ClientConfig;
 use std::path::Path;
@@ -19,6 +19,27 @@ pub async fn run_cli() -> Result<()> {
 
     let args = MantissaCli::parse();
     run_cli_with_args(args).await
+}
+
+/// Resolves one CLI volume ownership flag set into the client-facing ownership contract.
+fn resolve_local_volume_ownership(
+    uid: Option<u32>,
+    gid: Option<u32>,
+    fs_group: Option<u32>,
+) -> Result<client::volumes::LocalVolumeOwnership> {
+    if let Some(fs_group) = fs_group {
+        if uid.is_some() || gid.is_some() {
+            return Err(anyhow!("--fs-group cannot be combined with --uid or --gid"));
+        }
+        return Ok(client::volumes::LocalVolumeOwnership::FsGroup { gid: fs_group });
+    }
+
+    match (uid, gid) {
+        (None, None) => Ok(client::volumes::LocalVolumeOwnership::Daemon),
+        (Some(uid), Some(gid)) => Ok(client::volumes::LocalVolumeOwnership::User { uid, gid }),
+        (Some(_), None) => Err(anyhow!("--uid requires --gid")),
+        (None, Some(_)) => Err(anyhow!("--gid requires --uid")),
+    }
 }
 
 /// Executes the CLI command dispatcher for pre-parsed arguments.
@@ -556,6 +577,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
 
         Command::Volumes { cmd } => match cmd {
             VolumesCommand::Create(args) => {
+                let ownership = resolve_local_volume_ownership(args.uid, args.gid, args.fs_group)?;
                 let binding = match args.binding {
                     VolumeBindingOpt::Immediate => client::volumes::VolumeBindingMode::Immediate,
                     VolumeBindingOpt::WaitForFirstConsumer => {
@@ -569,12 +591,18 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                 local
                     .run_until(client::volumes::create(
                         &cfg,
-                        &args.name,
-                        binding,
-                        reclaim,
-                        args.capacity_mb,
+                        client::volumes::VolumeCreateRequest {
+                            name: args.name,
+                            ownership,
+                            binding_mode: binding,
+                            reclaim_policy: reclaim,
+                            requested_bytes: args
+                                .capacity_mb
+                                .map(|value| value.saturating_mul(1_048_576)),
+                            labels: Vec::new(),
+                            node_selector: args.node,
+                        },
                         &args.labels,
-                        args.node,
                     ))
                     .await?;
             }

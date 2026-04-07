@@ -8,6 +8,7 @@
             name: "workspace",
             driver: local((
                 source: managed,
+                ownership: user(uid: 1000, gid: 1000),
             )),
             access_mode: read_write_once,
             binding_mode: wait_for_first_consumer,

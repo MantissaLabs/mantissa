@@ -1350,6 +1350,18 @@ pub struct VolumesCreateArgs {
     #[arg(long = "name", value_name = "NAME")]
     pub name: String,
 
+    /// Explicit uid ownership for managed volumes; requires --gid
+    #[arg(long = "uid", value_name = "UID")]
+    pub uid: Option<u32>,
+
+    /// Explicit gid ownership for managed volumes; requires --uid
+    #[arg(long = "gid", value_name = "GID")]
+    pub gid: Option<u32>,
+
+    /// Group-writable ownership for managed volumes without changing the daemon uid
+    #[arg(long = "fs-group", value_name = "GID")]
+    pub fs_group: Option<u32>,
+
     /// Volume binding policy
     #[arg(
         long = "binding",

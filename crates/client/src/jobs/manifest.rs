@@ -126,6 +126,8 @@ pub enum VolumeReclaimPolicy {
 #[derive(Debug, Deserialize, Clone)]
 pub struct LocalVolumeSpec {
     pub source: LocalVolumeSource,
+    #[serde(default)]
+    pub ownership: crate::volumes::LocalVolumeOwnership,
 }
 
 /// Local volume source declared in the manifest.
@@ -268,6 +270,13 @@ impl JobManifest {
                     },
                     VolumeDriver::External(_) => DeclaredVolumeDriverKind::External,
                 },
+                local_ownership: match &volume.driver {
+                    VolumeDriver::Local(local) => match &local.source {
+                        LocalVolumeSource::Managed => Some(local.ownership.clone()),
+                        LocalVolumeSource::ImportedPath(_) => None,
+                    },
+                    VolumeDriver::External(_) => None,
+                },
                 access_mode: match volume.access_mode {
                     VolumeAccessMode::ReadWriteOnce => {
                         crate::volumes::VolumeAccessMode::ReadWriteOnce
@@ -341,7 +350,8 @@ fn validate_declared_volumes(volumes: &[JobVolumeSpec]) -> Result<HashSet<String
             && matches!(
                 volume.driver,
                 VolumeDriver::Local(LocalVolumeSpec {
-                    source: LocalVolumeSource::Managed
+                    source: LocalVolumeSource::Managed,
+                    ..
                 })
             )
         {
@@ -353,11 +363,24 @@ fn validate_declared_volumes(volumes: &[JobVolumeSpec]) -> Result<HashSet<String
         if matches!(
             volume.driver,
             VolumeDriver::Local(LocalVolumeSpec {
-                source: LocalVolumeSource::ImportedPath(_)
+                source: LocalVolumeSource::ImportedPath(_),
+                ownership: crate::volumes::LocalVolumeOwnership::Daemon,
             })
         ) {
             return Err(anyhow!(
                 "volume '{}' cannot use imported_path in a job manifest; import host paths ahead of submission through `mantissa volumes import`",
+                volume.name
+            ));
+        }
+        if matches!(
+            volume.driver,
+            VolumeDriver::Local(LocalVolumeSpec {
+                source: LocalVolumeSource::ImportedPath(_),
+                ..
+            })
+        ) {
+            return Err(anyhow!(
+                "volume '{}' cannot override ownership for imported_path; import host paths ahead of submission through `mantissa volumes import`",
                 volume.name
             ));
         }
@@ -612,6 +635,7 @@ mod tests {
                 name: "workspace".to_string(),
                 driver: VolumeDriver::Local(LocalVolumeSpec {
                     source: LocalVolumeSource::Managed,
+                    ownership: crate::volumes::LocalVolumeOwnership::Daemon,
                 }),
                 access_mode: VolumeAccessMode::ReadWriteOnce,
                 binding_mode: VolumeBindingMode::WaitForFirstConsumer,

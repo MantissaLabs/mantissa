@@ -2477,8 +2477,8 @@ mod tests {
     use crate::services::types::TaskTemplateNetworkRequirement;
     use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
     use crate::volumes::types::{
-        LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
-        VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
+        LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode,
+        VolumeBindingMode, VolumeDriver, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
     };
     use crate::workload::model::{ExecutionPlatform, WorkloadOwner, WorkloadServiceMetadata};
     use crate::workload::types::{ExecutionSpec, ResolvedExecutionSpec};
@@ -2519,6 +2519,7 @@ mod tests {
             name: name.to_string(),
             driver: VolumeDriver::Local(LocalVolumeSpec {
                 source: LocalVolumeSource::Managed,
+                ownership: LocalVolumeOwnership::Daemon,
             }),
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: if bound_node_id.is_some() {

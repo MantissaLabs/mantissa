@@ -19,9 +19,9 @@ pub use inspect::{inspect, inspect_raw};
 pub use list::{list, list_raw};
 pub use status::{status, status_raw};
 pub use types::{
-    VolumeAccessMode, VolumeBindingMode, VolumeDeleteResult, VolumeDriver, VolumeInspect,
-    VolumeLabel, VolumeNodeState, VolumeNodeStatus, VolumeReclaimPolicy, VolumeSpec, VolumeStatus,
-    VolumeSummary, format_bytes,
+    LocalVolumeOwnership, VolumeAccessMode, VolumeBindingMode, VolumeDeleteResult, VolumeDriver,
+    VolumeInspect, VolumeLabel, VolumeNodeState, VolumeNodeStatus, VolumeReclaimPolicy, VolumeSpec,
+    VolumeStatus, VolumeSummary, format_bytes,
 };
 
 /// Resolved form of one CLI volume mount after selector lookup and normalization.

@@ -15,8 +15,9 @@ use mantissa::store::volume_store::{open_volume_node_store, open_volume_spec_sto
 use mantissa::task::types::TaskVolumeMount;
 use mantissa::volumes::registry::VolumeRegistry;
 use mantissa::volumes::types::{
-    LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
-    VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue, VolumeStatus,
+    LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode,
+    VolumeDriver, VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
+    VolumeStatus,
 };
 use mantissa::workload::manager::{WorkloadRuntimeConfig, WorkloadStartRequest};
 use mantissa::workload::model::ExecutionPlatform;
@@ -665,7 +666,8 @@ local_test!(volumes_import_binds_immediately_to_selected_node, {
     assert!(matches!(
         spec.driver,
         VolumeDriver::Local(LocalVolumeSpec {
-            source: LocalVolumeSource::ImportedPath(_)
+            source: LocalVolumeSource::ImportedPath(_),
+            ..
         })
     ));
 
@@ -834,6 +836,7 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
         name: "left".to_string(),
         driver: VolumeDriver::Local(LocalVolumeSpec {
             source: LocalVolumeSource::Managed,
+            ownership: LocalVolumeOwnership::Daemon,
         }),
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode: VolumeBindingMode::Immediate,
@@ -847,6 +850,7 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
         name: "right".to_string(),
         driver: VolumeDriver::Local(LocalVolumeSpec {
             source: LocalVolumeSource::Managed,
+            ownership: LocalVolumeOwnership::Daemon,
         }),
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode: VolumeBindingMode::Immediate,

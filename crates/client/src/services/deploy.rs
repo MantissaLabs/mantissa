@@ -146,6 +146,15 @@ pub async fn deploy_manifest(
                         DeclaredVolumeDriverKind::External
                     }
                 },
+                local_ownership: match &volume.driver {
+                    super::manifest::VolumeDriver::Local(local) => match &local.source {
+                        super::manifest::LocalVolumeSource::Managed => {
+                            Some(local.ownership.clone())
+                        }
+                        super::manifest::LocalVolumeSource::ImportedPath(_) => None,
+                    },
+                    super::manifest::VolumeDriver::External(_) => None,
+                },
                 access_mode: match volume.access_mode {
                     super::manifest::VolumeAccessMode::ReadWriteOnce => {
                         volumes::VolumeAccessMode::ReadWriteOnce

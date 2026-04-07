@@ -3,16 +3,17 @@ use crate::topology::Topology;
 use crate::volumes::gossip::VolumeReplicator;
 use crate::volumes::registry::VolumeRegistry;
 use crate::volumes::types::{
-    ExternalVolumeSpec, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode,
-    VolumeDriver, VolumeEvent, VolumeLabel, VolumeNodeState, VolumeNodeStateValue,
-    VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
+    ExternalVolumeSpec, LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode,
+    VolumeBindingMode, VolumeDriver, VolumeEvent, VolumeLabel, VolumeNodeState,
+    VolumeNodeStateValue, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
 };
 use anyhow::Result;
 use capnp::Error;
 use capnp::struct_list;
 use protocol::volumes::{
-    LocalVolumeSourceKind, local_volume_spec, volume_driver_spec, volume_event, volume_inspect,
-    volume_label, volume_node_status, volume_spec, volume_summary, volumes,
+    LocalVolumeSourceKind, local_volume_ownership, local_volume_spec, volume_driver_spec,
+    volume_event, volume_inspect, volume_label, volume_node_status, volume_spec, volume_summary,
+    volumes,
 };
 use std::fs;
 use std::path::Path;
@@ -184,6 +185,28 @@ fn write_local_volume_spec(mut builder: local_volume_spec::Builder<'_>, spec: &L
             builder.set_imported_path(path);
         }
     }
+    write_local_volume_ownership(builder.reborrow().init_ownership(), spec.ownership);
+}
+
+/// Serializes one managed-volume ownership policy into the Cap'n Proto wire representation.
+fn write_local_volume_ownership(
+    mut builder: local_volume_ownership::Builder<'_>,
+    ownership: LocalVolumeOwnership,
+) {
+    match ownership {
+        LocalVolumeOwnership::Daemon => {
+            builder.set_daemon(());
+        }
+        LocalVolumeOwnership::User { uid, gid } => {
+            let mut user = builder.reborrow().init_user();
+            user.set_uid(uid);
+            user.set_gid(gid);
+        }
+        LocalVolumeOwnership::FsGroup { gid } => {
+            let mut fs_group = builder.reborrow().init_fs_group();
+            fs_group.set_gid(gid);
+        }
+    }
 }
 
 /// Deserializes one volume driver configuration from the Cap'n Proto wire representation.
@@ -222,7 +245,33 @@ fn read_local_volume_spec(reader: local_volume_spec::Reader<'_>) -> Result<Local
             LocalVolumeSource::ImportedPath(path)
         }
     };
-    Ok(LocalVolumeSpec { source })
+    let ownership = read_local_volume_ownership(reader.get_ownership()?)?;
+    if matches!(source, LocalVolumeSource::ImportedPath(_))
+        && !matches!(ownership, LocalVolumeOwnership::Daemon)
+    {
+        return Err(Error::failed(
+            "imported local volumes cannot override ownership".to_string(),
+        ));
+    }
+    Ok(LocalVolumeSpec { source, ownership })
+}
+
+/// Deserializes one managed-volume ownership policy from the Cap'n Proto wire representation.
+fn read_local_volume_ownership(
+    reader: local_volume_ownership::Reader<'_>,
+) -> Result<LocalVolumeOwnership, Error> {
+    match reader.which()? {
+        local_volume_ownership::Which::Daemon(()) => Ok(LocalVolumeOwnership::Daemon),
+        local_volume_ownership::Which::User(Ok(user)) => Ok(LocalVolumeOwnership::User {
+            uid: user.get_uid(),
+            gid: user.get_gid(),
+        }),
+        local_volume_ownership::Which::User(Err(err)) => Err(err),
+        local_volume_ownership::Which::FsGroup(Ok(fs_group)) => Ok(LocalVolumeOwnership::FsGroup {
+            gid: fs_group.get_gid(),
+        }),
+        local_volume_ownership::Which::FsGroup(Err(err)) => Err(err),
+    }
 }
 
 /// Serializes one persisted volume specification into the Cap'n Proto wire representation.
@@ -458,9 +507,11 @@ impl volumes::Server for VolumesRpc {
         match &driver {
             VolumeDriver::Local(LocalVolumeSpec {
                 source: LocalVolumeSource::Managed,
+                ..
             }) => {}
             VolumeDriver::Local(LocalVolumeSpec {
                 source: LocalVolumeSource::ImportedPath(_),
+                ..
             }) => {
                 return Err(Error::failed(
                     "use 'mantissa volumes import' for imported host paths".to_string(),
@@ -591,6 +642,7 @@ impl volumes::Server for VolumesRpc {
         let labels = read_labels(request.get_labels()?)?;
         let driver = VolumeDriver::Local(LocalVolumeSpec {
             source: LocalVolumeSource::ImportedPath(path.clone()),
+            ownership: LocalVolumeOwnership::Daemon,
         });
         let mut spec = VolumeSpecValue::new(VolumeSpecDraft {
             name,
@@ -666,6 +718,7 @@ impl volumes::Server for VolumesRpc {
             (
                 VolumeDriver::Local(LocalVolumeSpec {
                     source: LocalVolumeSource::Managed,
+                    ..
                 }),
                 VolumeReclaimPolicy::Delete,
             )
@@ -690,6 +743,7 @@ impl volumes::Server for VolumesRpc {
                     (
                         VolumeDriver::Local(LocalVolumeSpec {
                             source: LocalVolumeSource::Managed,
+                            ..
                         }),
                         VolumeReclaimPolicy::Delete,
                     ) => {

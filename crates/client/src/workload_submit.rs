@@ -26,6 +26,7 @@ pub(crate) struct DeclaredVolumeLabel {
 pub(crate) struct DeclaredVolumeSpec {
     pub name: String,
     pub driver_kind: DeclaredVolumeDriverKind,
+    pub local_ownership: Option<volumes::LocalVolumeOwnership>,
     pub access_mode: volumes::VolumeAccessMode,
     pub binding_mode: volumes::VolumeBindingMode,
     pub reclaim_policy: volumes::VolumeReclaimPolicy,
@@ -141,6 +142,7 @@ pub(crate) async fn ensure_declared_volumes(
                 cfg,
                 &volumes::VolumeCreateRequest {
                     name: volume.name.clone(),
+                    ownership: volume.local_ownership.clone().unwrap_or_default(),
                     binding_mode: volume.binding_mode,
                     reclaim_policy: volume.reclaim_policy,
                     requested_bytes: volume
@@ -195,6 +197,13 @@ fn validate_declared_volume_compatibility(
     if existing.access_mode != declared.access_mode {
         return Err(anyhow!(
             "existing volume '{}' does not match the manifest access_mode",
+            declared.name
+        ));
+    }
+
+    if existing.local_ownership != declared.local_ownership {
+        return Err(anyhow!(
+            "existing volume '{}' does not match the manifest local ownership policy",
             declared.name
         ));
     }

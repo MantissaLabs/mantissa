@@ -1,5 +1,6 @@
 use super::{
-    VolumeBindingMode, VolumeLabel, VolumeSpec, parse_volume_labels, resolve_node_selector,
+    LocalVolumeOwnership, VolumeBindingMode, VolumeLabel, VolumeSpec, parse_volume_labels,
+    resolve_node_selector,
 };
 use crate::config::ClientConfig;
 use crate::connection;
@@ -10,6 +11,7 @@ use anyhow::{Context, Result, anyhow};
 #[derive(Debug, Clone)]
 pub struct VolumeCreateRequest {
     pub name: String,
+    pub ownership: LocalVolumeOwnership,
     pub binding_mode: VolumeBindingMode,
     pub reclaim_policy: super::VolumeReclaimPolicy,
     pub requested_bytes: Option<u64>,
@@ -37,6 +39,20 @@ pub async fn create_raw(cfg: &ClientConfig, request: &VolumeCreateRequest) -> Re
         let mut local = driver.reborrow().init_local();
         local.set_source_kind(protocol::volumes::LocalVolumeSourceKind::Managed);
         local.set_imported_path("");
+        match &request.ownership {
+            LocalVolumeOwnership::Daemon => {
+                local.reborrow().init_ownership().set_daemon(());
+            }
+            LocalVolumeOwnership::User { uid, gid } => {
+                let mut user = local.reborrow().init_ownership().init_user();
+                user.set_uid(*uid);
+                user.set_gid(*gid);
+            }
+            LocalVolumeOwnership::FsGroup { gid } => {
+                let mut fs_group = local.reborrow().init_ownership().init_fs_group();
+                fs_group.set_gid(*gid);
+            }
+        }
         inner.set_access_mode(protocol::volumes::VolumeAccessMode::ReadWriteOnce);
         inner.set_binding_mode(match request.binding_mode {
             VolumeBindingMode::Immediate => protocol::volumes::VolumeBindingMode::Immediate,
@@ -74,24 +90,18 @@ pub async fn create_raw(cfg: &ClientConfig, request: &VolumeCreateRequest) -> Re
 /// Creates one managed local volume and renders the result for CLI usage.
 pub async fn create(
     cfg: &ClientConfig,
-    name: &str,
-    binding_mode: VolumeBindingMode,
-    reclaim_policy: super::VolumeReclaimPolicy,
-    capacity_mb: Option<u64>,
+    request: VolumeCreateRequest,
     labels: &[String],
-    node_selector: Option<String>,
 ) -> Result<()> {
-    if matches!(binding_mode, VolumeBindingMode::Immediate) && node_selector.is_none() {
+    if matches!(request.binding_mode, VolumeBindingMode::Immediate)
+        && request.node_selector.is_none()
+    {
         return Err(anyhow!("immediate local volumes require --node"));
     }
 
     let request = VolumeCreateRequest {
-        name: name.to_string(),
-        binding_mode,
-        reclaim_policy,
-        requested_bytes: capacity_mb.map(|value| value.saturating_mul(1_048_576)),
         labels: parse_volume_labels(labels)?,
-        node_selector,
+        ..request
     };
     let volume = create_raw(cfg, &request).await?;
     output::emit_line(format!(

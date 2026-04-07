@@ -251,8 +251,8 @@ mod tests {
     use super::*;
     use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
     use crate::volumes::types::{
-        LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
-        VolumeReclaimPolicy, VolumeSpecDraft, VolumeStatus,
+        LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode,
+        VolumeBindingMode, VolumeDriver, VolumeReclaimPolicy, VolumeSpecDraft, VolumeStatus,
     };
     use async_channel::bounded;
     use std::sync::Arc;
@@ -295,6 +295,7 @@ mod tests {
             name: name.to_string(),
             driver: VolumeDriver::Local(LocalVolumeSpec {
                 source: LocalVolumeSource::Managed,
+                ownership: LocalVolumeOwnership::Daemon,
             }),
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::Immediate,

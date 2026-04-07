@@ -3,8 +3,10 @@ use protocol::volumes::{
     LocalVolumeSourceKind, VolumeAccessMode as ProtoVolumeAccessMode,
     VolumeBindingMode as ProtoVolumeBindingMode, VolumeNodeState as ProtoVolumeNodeState,
     VolumeReclaimPolicy as ProtoVolumeReclaimPolicy, VolumeStatus as ProtoVolumeStatus,
-    volume_driver_spec, volume_inspect, volume_node_status, volume_spec, volume_summary,
+    local_volume_ownership, volume_driver_spec, volume_inspect, volume_node_status, volume_spec,
+    volume_summary,
 };
+use serde::Deserialize;
 use std::fmt;
 use uuid::Uuid;
 
@@ -13,6 +15,32 @@ use uuid::Uuid;
 pub struct VolumeLabel {
     pub key: String,
     pub value: String,
+}
+
+/// Client-side ownership policy for one Mantissa-managed local volume.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalVolumeOwnership {
+    #[default]
+    Daemon,
+    User {
+        uid: u32,
+        gid: u32,
+    },
+    FsGroup {
+        gid: u32,
+    },
+}
+
+impl fmt::Display for LocalVolumeOwnership {
+    /// Renders the ownership policy in one compact operator-facing form.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Daemon => f.write_str("daemon"),
+            Self::User { uid, gid } => write!(f, "user(uid={uid},gid={gid})"),
+            Self::FsGroup { gid } => write!(f, "fs_group(gid={gid})"),
+        }
+    }
 }
 
 /// Client-side representation of one volume driver.
@@ -196,6 +224,7 @@ pub struct VolumeSummary {
     pub id: Uuid,
     pub name: String,
     pub driver: VolumeDriver,
+    pub local_ownership: Option<LocalVolumeOwnership>,
     pub access_mode: VolumeAccessMode,
     pub binding_mode: VolumeBindingMode,
     pub reclaim_policy: VolumeReclaimPolicy,
@@ -214,6 +243,7 @@ pub struct VolumeSpec {
     pub id: Uuid,
     pub name: String,
     pub driver: VolumeDriver,
+    pub local_ownership: Option<LocalVolumeOwnership>,
     pub access_mode: VolumeAccessMode,
     pub binding_mode: VolumeBindingMode,
     pub reclaim_policy: VolumeReclaimPolicy,
@@ -263,10 +293,12 @@ pub struct VolumeDeleteResult {
 impl VolumeSummary {
     /// Decodes one list summary row from the protocol payload.
     pub fn from_reader(reader: volume_summary::Reader<'_>) -> Result<Self> {
+        let (driver, local_ownership) = parse_driver(reader.get_driver()?)?;
         Ok(Self {
             id: read_uuid(reader.get_id()?, "volume id")?,
             name: reader.get_name()?.to_str()?.to_string(),
-            driver: parse_driver(reader.get_driver()?)?,
+            driver,
+            local_ownership,
             access_mode: VolumeAccessMode::from_proto(reader.get_access_mode()?),
             binding_mode: VolumeBindingMode::from_proto(reader.get_binding_mode()?),
             reclaim_policy: VolumeReclaimPolicy::from_proto(reader.get_reclaim_policy()?),
@@ -284,6 +316,7 @@ impl VolumeSummary {
 impl VolumeSpec {
     /// Decodes one canonical volume spec from the protocol payload.
     pub fn from_reader(reader: volume_spec::Reader<'_>) -> Result<Self> {
+        let (driver, local_ownership) = parse_driver(reader.get_driver()?)?;
         let mut labels = Vec::new();
         for entry in reader.get_labels()?.iter() {
             labels.push(VolumeLabel {
@@ -296,7 +329,8 @@ impl VolumeSpec {
         Ok(Self {
             id: read_uuid(reader.get_id()?, "volume id")?,
             name: reader.get_name()?.to_str()?.to_string(),
-            driver: parse_driver(reader.get_driver()?)?,
+            driver,
+            local_ownership,
             access_mode: VolumeAccessMode::from_proto(reader.get_access_mode()?),
             binding_mode: VolumeBindingMode::from_proto(reader.get_binding_mode()?),
             reclaim_policy: VolumeReclaimPolicy::from_proto(reader.get_reclaim_policy()?),
@@ -425,21 +459,50 @@ fn empty_text(value: &str) -> Option<String> {
 }
 
 /// Decodes one volume driver payload from the protocol response.
-fn parse_driver(reader: volume_driver_spec::Reader<'_>) -> Result<VolumeDriver> {
+fn parse_driver(
+    reader: volume_driver_spec::Reader<'_>,
+) -> Result<(VolumeDriver, Option<LocalVolumeOwnership>)> {
     match reader.which()? {
         volume_driver_spec::Which::Local(Ok(local_reader)) => {
             match local_reader.get_source_kind()? {
-                LocalVolumeSourceKind::Managed => Ok(VolumeDriver::LocalManaged),
-                LocalVolumeSourceKind::ImportedPath => Ok(VolumeDriver::LocalImportedPath(
-                    local_reader.get_imported_path()?.to_str()?.to_string(),
+                LocalVolumeSourceKind::Managed => Ok((
+                    VolumeDriver::LocalManaged,
+                    Some(parse_local_volume_ownership(local_reader.get_ownership()?)?),
+                )),
+                LocalVolumeSourceKind::ImportedPath => Ok((
+                    VolumeDriver::LocalImportedPath(
+                        local_reader.get_imported_path()?.to_str()?.to_string(),
+                    ),
+                    None,
                 )),
             }
         }
         volume_driver_spec::Which::Local(Err(err)) => Err(anyhow!(err.to_string())),
-        volume_driver_spec::Which::External(Ok(external_reader)) => Ok(VolumeDriver::External {
-            driver_name: external_reader.get_driver_name()?.to_str()?.to_string(),
-            handle: external_reader.get_handle()?.to_str()?.to_string(),
-        }),
+        volume_driver_spec::Which::External(Ok(external_reader)) => Ok((
+            VolumeDriver::External {
+                driver_name: external_reader.get_driver_name()?.to_str()?.to_string(),
+                handle: external_reader.get_handle()?.to_str()?.to_string(),
+            },
+            None,
+        )),
         volume_driver_spec::Which::External(Err(err)) => Err(anyhow!(err.to_string())),
+    }
+}
+
+/// Decodes one managed-volume ownership payload from the protocol response.
+fn parse_local_volume_ownership(
+    reader: local_volume_ownership::Reader<'_>,
+) -> Result<LocalVolumeOwnership> {
+    match reader.which()? {
+        local_volume_ownership::Which::Daemon(()) => Ok(LocalVolumeOwnership::Daemon),
+        local_volume_ownership::Which::User(Ok(user)) => Ok(LocalVolumeOwnership::User {
+            uid: user.get_uid(),
+            gid: user.get_gid(),
+        }),
+        local_volume_ownership::Which::User(Err(err)) => Err(anyhow!(err.to_string())),
+        local_volume_ownership::Which::FsGroup(Ok(fs_group)) => Ok(LocalVolumeOwnership::FsGroup {
+            gid: fs_group.get_gid(),
+        }),
+        local_volume_ownership::Which::FsGroup(Err(err)) => Err(anyhow!(err.to_string())),
     }
 }
