@@ -11,6 +11,7 @@ edition = "2024"
 
 [workspace]
 members = [
+    "crates/sandbox",
     "crates/crdt_store",
     "crates/protocol",
     "crates/net",
@@ -19,6 +20,7 @@ members = [
     "crates/ui",
     "crates/network-ebpf",
 ]
+default-members = [".", "crates/sandbox"]
 
 [workspace.package]
 license = "Apache-2.0"
@@ -70,8 +72,6 @@ getrandom = "0.2"
 
 # Container / MicroVMs / Task management
 bollard = "0.20.2"
-nono = "0.29.1"
-keyring = { version = "3.6.3", default-features = false, features = ["vendored"] }
 
 # used to fetch cpu system level information.
 raw-cpuid = "11.5.0"

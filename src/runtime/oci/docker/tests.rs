@@ -20,7 +20,8 @@ use super::conversions::classify_runtime_error;
 use super::sandbox::{parse_sandboxed_container_metadata, resolve_effective_sandbox_command_parts};
 use super::{
     DOCKER_NONO_PROFILE, DOCKER_SANDBOXED_PROFILE, DOCKER_STANDARD_PROFILE,
-    MANTISSA_NONO_ENABLED_LABEL, MANTISSA_NONO_POLICY_ENV_VAR, NonoSandboxBackendAvailability,
+    MANTISSA_SANDBOX_ENABLED_LABEL, MANTISSA_SANDBOX_POLICY_ENV_VAR,
+    NonoSandboxBackendAvailability,
 };
 use super::{DockerRuntimeBackend, DockerRuntimeMode};
 
@@ -86,7 +87,7 @@ fn sandbox_backend_advertises_only_sandboxed_oci_contracts() {
         docker: Docker::connect_with_http("http://127.0.0.1:1", 120, bollard::API_DEFAULT_VERSION)
             .expect("construct docker http client"),
         mode: DockerRuntimeMode::NonoSandbox,
-        nono_helper_host_path: Some("/tmp/mantissa-nono-init".into()),
+        nono_helper_host_path: Some("/tmp/mantissa-sandbox-init".into()),
     };
     let support = manager.advertised_support();
 
@@ -118,8 +119,10 @@ fn sandbox_backend_advertises_only_sandboxed_oci_contracts() {
 
 #[test]
 fn nono_sandbox_availability_rejects_unsupported_hosts() {
-    let availability =
-        NonoSandboxBackendAvailability::from_parts(false, Some("/tmp/mantissa-nono-init".into()));
+    let availability = NonoSandboxBackendAvailability::from_parts(
+        false,
+        Some("/tmp/mantissa-sandbox-init".into()),
+    );
 
     assert!(matches!(
         availability,
@@ -143,7 +146,7 @@ fn nono_sandbox_availability_requires_helper_path() {
         availability
             .unavailable_reason()
             .expect("missing helper should explain itself")
-            .contains("mantissa-nono-init")
+            .contains("mantissa-sandbox-init")
     );
 }
 
@@ -185,10 +188,13 @@ fn sandbox_command_resolution_falls_back_to_image_defaults() {
 
 #[test]
 fn sandbox_metadata_parser_recovers_policy_and_workdir() {
-    let labels = HashMap::from([(MANTISSA_NONO_ENABLED_LABEL.to_string(), "true".to_string())]);
+    let labels = HashMap::from([(
+        MANTISSA_SANDBOX_ENABLED_LABEL.to_string(),
+        "true".to_string(),
+    )]);
     let env = vec![
         "PATH=/usr/bin:/bin".to_string(),
-        format!("{MANTISSA_NONO_POLICY_ENV_VAR}=encoded-policy"),
+        format!("{MANTISSA_SANDBOX_POLICY_ENV_VAR}=encoded-policy"),
     ];
 
     let metadata =

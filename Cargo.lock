@@ -2339,7 +2339,6 @@ dependencies = [
  "hickory-proto",
  "hkdf",
  "iptables",
- "keyring",
  "libc",
  "log",
  "merkle-search-tree",
@@ -2348,7 +2347,6 @@ dependencies = [
  "netlink-packet-route 0.19.0",
  "netlink-packet-utils 0.5.2",
  "nix 0.29.0",
- "nono",
  "notify",
  "nvml-wrapper",
  "once_cell",
@@ -2375,6 +2373,18 @@ dependencies = [
  "twox-hash",
  "uuid",
  "x25519-dalek",
+]
+
+[[package]]
+name = "mantissa-sandbox"
+version = "0.1.0"
+dependencies = [
+ "keyring",
+ "libc",
+ "mantissa",
+ "nono",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

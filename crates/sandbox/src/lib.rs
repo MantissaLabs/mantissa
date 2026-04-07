@@ -1,9 +1,8 @@
 use std::env;
 use std::ffi::OsString;
 use std::path::Path;
-use std::process::ExitCode;
 
-use mantissa::runtime::oci::docker::{MANTISSA_NONO_POLICY_ENV_VAR, NONO_EXEC_READONLY_DIRS};
+use mantissa::runtime::oci::docker::{MANTISSA_SANDBOX_POLICY_ENV_VAR, NONO_EXEC_READONLY_DIRS};
 use mantissa::runtime::types::{
     RuntimeSandboxAccessMode, RuntimeSandboxNetworkMode, RuntimeSandboxPathKind,
     RuntimeSandboxPathRule, RuntimeSandboxPolicy, RuntimeSandboxPolicyCodecError,
@@ -13,20 +12,9 @@ use nono::sandbox::SeccompNetFallback;
 use nono::{AccessMode, CapabilitySet, Sandbox};
 use thiserror::Error;
 
-/// Enters the `nono` sandbox and then replaces itself with the target workload command.
-fn main() -> ExitCode {
-    match run_nono_helper(std::env::args_os().skip(1)) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("mantissa-nono-init: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// Errors returned by the helper while it translates one Mantissa policy into `nono`.
+/// Errors returned while the sandbox helper translates one Mantissa policy into active isolation.
 #[derive(Debug, Error)]
-enum NonoHelperError {
+pub enum SandboxInitError {
     #[error("sandbox policy environment variable {env_var} is missing")]
     MissingPolicyEnv { env_var: &'static str },
 
@@ -52,12 +40,16 @@ enum NonoHelperError {
     Io(#[from] std::io::Error),
 
     #[cfg(target_os = "linux")]
-    #[error("proxy-only network fallback is not supported by mantissa's nono helper")]
+    #[error("proxy-only network fallback is not supported by the mantissa sandbox helper")]
     UnsupportedProxyFallback,
 }
 
-/// Runs the full helper flow: decode policy, apply `nono`, and `exec` the target command.
-fn run_nono_helper<I>(args: I) -> Result<(), NonoHelperError>
+/// Runs the generic Mantissa sandbox helper entry flow for one target command.
+///
+/// Today this translates Mantissa's runtime sandbox contract into `nono`, but
+/// the process boundary and transport are intentionally generic so the helper
+/// crate can grow other sandbox-entry paths later.
+pub fn run_sandbox_init<I>(args: I) -> Result<(), SandboxInitError>
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -73,44 +65,44 @@ where
 }
 
 /// Loads one serialized runtime sandbox policy from the helper environment.
-fn load_runtime_sandbox_policy_from_env() -> Result<RuntimeSandboxPolicy, NonoHelperError> {
-    let encoded = match env::var(MANTISSA_NONO_POLICY_ENV_VAR) {
+fn load_runtime_sandbox_policy_from_env() -> Result<RuntimeSandboxPolicy, SandboxInitError> {
+    let encoded = match env::var(MANTISSA_SANDBOX_POLICY_ENV_VAR) {
         Ok(value) => value,
         Err(env::VarError::NotPresent) => {
-            return Err(NonoHelperError::MissingPolicyEnv {
-                env_var: MANTISSA_NONO_POLICY_ENV_VAR,
+            return Err(SandboxInitError::MissingPolicyEnv {
+                env_var: MANTISSA_SANDBOX_POLICY_ENV_VAR,
             });
         }
         Err(env::VarError::NotUnicode(_)) => {
-            return Err(NonoHelperError::InvalidPolicyEnv {
-                env_var: MANTISSA_NONO_POLICY_ENV_VAR,
+            return Err(SandboxInitError::InvalidPolicyEnv {
+                env_var: MANTISSA_SANDBOX_POLICY_ENV_VAR,
             });
         }
     };
 
-    RuntimeSandboxPolicy::decode_env_value(&encoded).map_err(NonoHelperError::from)
+    RuntimeSandboxPolicy::decode_env_value(&encoded).map_err(SandboxInitError::from)
 }
 
 /// Resolves the workload command that the helper must `exec` after sandboxing.
-fn resolve_target_command_from_args<I>(args: I) -> Result<Vec<OsString>, NonoHelperError>
+fn resolve_target_command_from_args<I>(args: I) -> Result<Vec<OsString>, SandboxInitError>
 where
     I: IntoIterator<Item = OsString>,
 {
     let command = args.into_iter().collect::<Vec<_>>();
     if command.is_empty() {
-        return Err(NonoHelperError::MissingCommand);
+        return Err(SandboxInitError::MissingCommand);
     }
     Ok(command)
 }
 
-/// Applies one structured runtime sandbox policy through `nono`.
-fn apply_runtime_sandbox_policy(policy: &RuntimeSandboxPolicy) -> Result<(), NonoHelperError> {
+/// Applies one structured runtime sandbox policy through the current backend implementation.
+fn apply_runtime_sandbox_policy(policy: &RuntimeSandboxPolicy) -> Result<(), SandboxInitError> {
     let capabilities = build_capability_set(policy)?;
 
     #[cfg(target_os = "linux")]
     match Sandbox::apply(&capabilities)? {
         SeccompNetFallback::None | SeccompNetFallback::BlockAll => Ok(()),
-        SeccompNetFallback::ProxyOnly { .. } => Err(NonoHelperError::UnsupportedProxyFallback),
+        SeccompNetFallback::ProxyOnly { .. } => Err(SandboxInitError::UnsupportedProxyFallback),
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -120,8 +112,8 @@ fn apply_runtime_sandbox_policy(policy: &RuntimeSandboxPolicy) -> Result<(), Non
     }
 }
 
-/// Builds one `nono` capability set from one runtime sandbox policy.
-fn build_capability_set(policy: &RuntimeSandboxPolicy) -> Result<CapabilitySet, NonoHelperError> {
+/// Builds one runtime backend capability set from one structured sandbox policy.
+fn build_capability_set(policy: &RuntimeSandboxPolicy) -> Result<CapabilitySet, SandboxInitError> {
     let mut capabilities = CapabilitySet::new();
     for rule in &policy.filesystem {
         capabilities = add_path_rule(capabilities, rule)?;
@@ -136,11 +128,11 @@ fn build_capability_set(policy: &RuntimeSandboxPolicy) -> Result<CapabilitySet, 
     Ok(capabilities)
 }
 
-/// Adds one declared filesystem rule to the accumulating `nono` capability set.
+/// Adds one declared filesystem rule to the accumulating sandbox capability set.
 fn add_path_rule(
     capabilities: CapabilitySet,
     rule: &RuntimeSandboxPathRule,
-) -> Result<CapabilitySet, NonoHelperError> {
+) -> Result<CapabilitySet, SandboxInitError> {
     if !rule.path.exists() && is_optional_bootstrap_rule(rule) {
         return Ok(capabilities);
     }
@@ -165,7 +157,7 @@ fn is_optional_bootstrap_rule(rule: &RuntimeSandboxPathRule) -> bool {
             .any(|candidate| rule.path == Path::new(candidate))
 }
 
-/// Maps one Mantissa sandbox access mode into the `nono` capability model.
+/// Maps one Mantissa sandbox access mode into the current helper backend model.
 fn access_mode(mode: RuntimeSandboxAccessMode) -> AccessMode {
     match mode {
         RuntimeSandboxAccessMode::Read => AccessMode::Read,
@@ -178,14 +170,14 @@ fn access_mode(mode: RuntimeSandboxAccessMode) -> AccessMode {
 fn validate_working_directory(
     policy: &RuntimeSandboxPolicy,
     capabilities: &CapabilitySet,
-) -> Result<(), NonoHelperError> {
+) -> Result<(), SandboxInitError> {
     let Some(working_directory) = policy.working_directory.as_ref() else {
         return Ok(());
     };
 
     let resolved = working_directory.canonicalize()?;
     if !resolved.is_dir() {
-        return Err(NonoHelperError::WorkingDirectoryNotDirectory(
+        return Err(SandboxInitError::WorkingDirectoryNotDirectory(
             resolved.display().to_string(),
         ));
     }
@@ -194,20 +186,20 @@ fn validate_working_directory(
         return Ok(());
     }
 
-    Err(NonoHelperError::WorkingDirectoryNotAllowed(
+    Err(SandboxInitError::WorkingDirectoryNotAllowed(
         resolved.display().to_string(),
     ))
 }
 
 /// Replaces the helper process with the real workload command after sandboxing.
-fn exec_target_command(command: &[OsString]) -> Result<(), NonoHelperError> {
+fn exec_target_command(command: &[OsString]) -> Result<(), SandboxInitError> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
 
         let mut process = std::process::Command::new(&command[0]);
         process.args(&command[1..]);
-        Err(NonoHelperError::Io(process.exec()))
+        Err(SandboxInitError::Io(process.exec()))
     }
 
     #[cfg(not(unix))]
@@ -218,7 +210,7 @@ fn exec_target_command(command: &[OsString]) -> Result<(), NonoHelperError> {
         if status.success() {
             Ok(())
         } else {
-            Err(NonoHelperError::Io(std::io::Error::other(format!(
+            Err(SandboxInitError::Io(std::io::Error::other(format!(
                 "sandboxed command exited with status {status}"
             ))))
         }
@@ -235,7 +227,7 @@ mod tests {
     fn resolve_target_command_from_args_rejects_empty_input() {
         let error = resolve_target_command_from_args(Vec::<OsString>::new())
             .expect_err("helper should reject empty commands");
-        assert!(matches!(error, NonoHelperError::MissingCommand));
+        assert!(matches!(error, SandboxInitError::MissingCommand));
     }
 
     #[test]
@@ -260,38 +252,36 @@ mod tests {
     fn build_capability_set_rejects_working_directory_outside_policy() {
         let temp_dir = tempdir().expect("create temp dir");
         let workspace = temp_dir.path().join("workspace");
-        let other_dir = temp_dir.path().join("other");
         std::fs::create_dir(&workspace).expect("create workspace");
-        std::fs::create_dir(&other_dir).expect("create other dir");
+        let denied = temp_dir.path().join("denied");
+        std::fs::create_dir(&denied).expect("create denied dir");
 
         let policy = RuntimeSandboxPolicy {
-            working_directory: Some(workspace.clone()),
+            working_directory: Some(denied.clone()),
             filesystem: vec![RuntimeSandboxPathRule::directory(
-                other_dir,
+                workspace,
                 RuntimeSandboxAccessMode::ReadWrite,
             )],
-            network: RuntimeSandboxNetworkMode::AllowAll,
+            network: RuntimeSandboxNetworkMode::Blocked,
         };
 
-        let error = build_capability_set(&policy)
-            .expect_err("helper should reject a workdir outside the policy");
+        let error = build_capability_set(&policy).expect_err("helper should reject denied workdir");
         assert!(matches!(
             error,
-            NonoHelperError::WorkingDirectoryNotAllowed(_)
+            SandboxInitError::WorkingDirectoryNotAllowed(path)
+            if path == denied.display().to_string()
         ));
     }
 
     #[test]
     fn optional_bootstrap_rule_matches_readonly_dir_entries() {
         let rule = RuntimeSandboxPathRule::directory("/lib64", RuntimeSandboxAccessMode::Read);
-
         assert!(is_optional_bootstrap_rule(&rule));
     }
 
     #[test]
     fn optional_bootstrap_rule_rejects_non_bootstrap_paths() {
         let rule = RuntimeSandboxPathRule::directory("/workspace", RuntimeSandboxAccessMode::Read);
-
         assert!(!is_optional_bootstrap_rule(&rule));
     }
 }

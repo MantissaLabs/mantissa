@@ -37,20 +37,20 @@ pub(super) const DOCKER_SANDBOXED_PROFILE: &str = "oci-default";
 /// Explicit operator-facing profile alias for the future `nono`-backed sandbox contract.
 pub(super) const DOCKER_NONO_PROFILE: &str = "nono-default";
 
-/// Binary name used when Mantissa injects the `nono` init helper into containers.
-pub const MANTISSA_NONO_HELPER_BINARY_NAME: &str = "mantissa-nono-init";
+/// Binary name used when Mantissa injects the sandbox init helper into containers.
+pub const MANTISSA_SANDBOX_HELPER_BINARY_NAME: &str = "mantissa-sandbox-init";
 
 /// Environment variable used to pass the serialized sandbox policy to the helper.
-pub const MANTISSA_NONO_POLICY_ENV_VAR: &str = "MANTISSA_NONO_POLICY";
+pub const MANTISSA_SANDBOX_POLICY_ENV_VAR: &str = "MANTISSA_SANDBOX_POLICY";
 
 /// Environment variable that overrides the host-side path to the helper binary.
-pub const MANTISSA_NONO_HELPER_HOST_ENV_VAR: &str = "MANTISSA_NONO_HELPER_PATH";
+pub const MANTISSA_SANDBOX_HELPER_HOST_ENV_VAR: &str = "MANTISSA_SANDBOX_HELPER_PATH";
 
 /// Container-local path where the helper binary is bind-mounted for sandboxed workloads.
-pub(super) const MANTISSA_NONO_HELPER_CONTAINER_PATH: &str = "/mantissa-nono-init";
+pub(super) const MANTISSA_SANDBOX_HELPER_CONTAINER_PATH: &str = "/mantissa-sandbox-init";
 
 /// Label that marks one container as running through the `nono` helper boundary.
-pub(super) const MANTISSA_NONO_ENABLED_LABEL: &str = "mantissa.nono.enabled";
+pub(super) const MANTISSA_SANDBOX_ENABLED_LABEL: &str = "mantissa.sandbox.enabled";
 
 /// Optional read-only roots commonly needed so sandboxed OCI images can start.
 ///
@@ -118,7 +118,7 @@ impl NonoSandboxBackendAvailability {
             }
             Self::MissingHelper => Some(format!(
                 "sandboxed Docker backend requires helper binary {}; set {} or place it next to the mantissa executable",
-                MANTISSA_NONO_HELPER_BINARY_NAME, MANTISSA_NONO_HELPER_HOST_ENV_VAR
+                MANTISSA_SANDBOX_HELPER_BINARY_NAME, MANTISSA_SANDBOX_HELPER_HOST_ENV_VAR
             )),
         }
     }
@@ -258,7 +258,7 @@ impl DockerRuntimeBackend {
         {
             info!(
                 target: "task",
-                "Resolved nono helper for sandboxed Docker backend: {}",
+                "Resolved sandbox helper for sandboxed Docker backend: {}",
                 path.display()
             );
         }

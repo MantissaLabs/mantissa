@@ -301,14 +301,17 @@ At launch time the workload manager translates the persisted agent policy into
 
 The sandboxed Docker backend keeps using normal Docker create, start, and exec
 operations. It does not introduce a Docker runtime shim. Instead it bind-mounts
-`mantissa-nono-init` into the container, passes the serialized
-`RuntimeSandboxPolicy` through `MANTISSA_NONO_POLICY`, and re-enters through the
-same helper on later `docker exec` calls.
+`mantissa-sandbox-init` into the container, passes the serialized
+`RuntimeSandboxPolicy` through `MANTISSA_SANDBOX_POLICY`, and re-enters through
+the same helper on later `docker exec` calls.
 
 Helper discovery is intentionally simple. Mantissa looks for
-`mantissa-nono-init` next to the main executable by default, and
-`MANTISSA_NONO_HELPER_PATH` overrides the host-side path when packaging or local
-development needs something different.
+`mantissa-sandbox-init` next to the main executable by default, and
+`MANTISSA_SANDBOX_HELPER_PATH` overrides the host-side path when packaging or local
+development needs something different. When you build Mantissa from the
+repository root with a plain `cargo build`, the workspace default members now
+emit both binaries into the shared `target/<profile>/` directory so the helper
+is colocated with the daemon automatically.
 
 ## Networking Is Runtime-Neutral
 

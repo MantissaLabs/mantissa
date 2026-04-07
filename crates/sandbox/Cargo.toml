@@ -1,0 +1,27 @@
+[package]
+name = "mantissa-sandbox"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mantissa = { path = "../.." }
+nono = "0.29.1"
+keyring = { version = "3.6.3", default-features = false, features = ["vendored"] }
+thiserror = "2.0.12"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "mantissa-sandbox-init"
+path = "src/bin/mantissa-sandbox-init.rs"
+test = false
+bench = false

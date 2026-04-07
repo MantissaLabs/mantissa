@@ -1,10 +1,10 @@
-//! Docker-side helper wiring for `nono` sandbox launches.
+//! Docker-side helper wiring for sandboxed Docker launches.
 //!
 //! This module stays on the Mantissa side of the boundary. It never applies
-//! `nono` directly. Instead, it resolves the host helper path, rewrites Docker
-//! create and exec requests to enter through the helper, and persists the
-//! serialized sandbox policy on the container so later `docker exec` calls can
-//! use the same kernel policy.
+//! `nono` directly. Instead, it resolves the host sandbox-helper path,
+//! rewrites Docker create and exec requests to enter through that helper, and
+//! persists the serialized sandbox policy on the container so later
+//! `docker exec` calls can use the same kernel policy.
 
 use std::collections::HashMap;
 use std::env;
@@ -18,9 +18,9 @@ use crate::runtime::types::{
 };
 
 use super::{
-    DockerRuntimeBackend, DockerRuntimeMode, MANTISSA_NONO_ENABLED_LABEL,
-    MANTISSA_NONO_HELPER_BINARY_NAME, MANTISSA_NONO_HELPER_CONTAINER_PATH,
-    MANTISSA_NONO_HELPER_HOST_ENV_VAR, MANTISSA_NONO_POLICY_ENV_VAR, NONO_EXEC_READONLY_DIRS,
+    DockerRuntimeBackend, DockerRuntimeMode, MANTISSA_SANDBOX_ENABLED_LABEL,
+    MANTISSA_SANDBOX_HELPER_BINARY_NAME, MANTISSA_SANDBOX_HELPER_CONTAINER_PATH,
+    MANTISSA_SANDBOX_HELPER_HOST_ENV_VAR, MANTISSA_SANDBOX_POLICY_ENV_VAR, NONO_EXEC_READONLY_DIRS,
 };
 
 /// Fully prepared Docker create settings after optional `nono` helper injection.
@@ -59,18 +59,18 @@ impl DockerRuntimeBackend {
     /// Resolves the host-side helper binary path from explicit overrides or nearby binaries.
     pub(super) fn resolve_nono_helper_host_path() -> Option<PathBuf> {
         let mut candidates = Vec::new();
-        if let Ok(path) = env::var(MANTISSA_NONO_HELPER_HOST_ENV_VAR) {
+        if let Ok(path) = env::var(MANTISSA_SANDBOX_HELPER_HOST_ENV_VAR) {
             candidates.push(PathBuf::from(path));
         }
 
         if let Ok(current_exe) = env::current_exe() {
-            candidates.push(current_exe.with_file_name(MANTISSA_NONO_HELPER_BINARY_NAME));
+            candidates.push(current_exe.with_file_name(MANTISSA_SANDBOX_HELPER_BINARY_NAME));
             if let Some(parent) = current_exe.parent() {
-                candidates.push(parent.join(MANTISSA_NONO_HELPER_BINARY_NAME));
+                candidates.push(parent.join(MANTISSA_SANDBOX_HELPER_BINARY_NAME));
                 if parent.file_name().and_then(|value| value.to_str()) == Some("deps")
                     && let Some(grandparent) = parent.parent()
                 {
-                    candidates.push(grandparent.join(MANTISSA_NONO_HELPER_BINARY_NAME));
+                    candidates.push(grandparent.join(MANTISSA_SANDBOX_HELPER_BINARY_NAME));
                 }
             }
         }
@@ -123,22 +123,22 @@ impl DockerRuntimeBackend {
         .map_err(|err| RuntimeError::OperationFailed(err.to_string()))?;
 
         Ok(PreparedSandboxedCreate {
-            entrypoint: Some(vec![MANTISSA_NONO_HELPER_CONTAINER_PATH.to_string()]),
+            entrypoint: Some(vec![MANTISSA_SANDBOX_HELPER_CONTAINER_PATH.to_string()]),
             command: Some(launch_target.command),
             env_vars: Some(merge_env_var(
                 env_vars.unwrap_or_default(),
-                MANTISSA_NONO_POLICY_ENV_VAR,
+                MANTISSA_SANDBOX_POLICY_ENV_VAR,
                 encoded_policy,
             )),
             labels: Some(merge_label(
                 labels.unwrap_or_default(),
-                MANTISSA_NONO_ENABLED_LABEL,
+                MANTISSA_SANDBOX_ENABLED_LABEL,
                 "true",
             )),
             volumes: Some(merge_bind_mount(
                 volumes.unwrap_or_default(),
                 helper_path,
-                MANTISSA_NONO_HELPER_CONTAINER_PATH,
+                MANTISSA_SANDBOX_HELPER_CONTAINER_PATH,
             )),
         })
     }
@@ -169,13 +169,13 @@ impl DockerRuntimeBackend {
         };
 
         let mut wrapped_command = Vec::with_capacity(command.len() + 1);
-        wrapped_command.push(MANTISSA_NONO_HELPER_CONTAINER_PATH.to_string());
+        wrapped_command.push(MANTISSA_SANDBOX_HELPER_CONTAINER_PATH.to_string());
         wrapped_command.extend_from_slice(command);
 
         Ok(PreparedSandboxedExec {
             command: wrapped_command,
             env_vars: Some(vec![format!(
-                "{MANTISSA_NONO_POLICY_ENV_VAR}={}",
+                "{MANTISSA_SANDBOX_POLICY_ENV_VAR}={}",
                 metadata.encoded_policy
             )]),
             working_dir: metadata.working_dir,
@@ -187,8 +187,8 @@ impl DockerRuntimeBackend {
         self.nono_helper_host_path.as_deref().ok_or_else(|| {
             RuntimeError::OperationFailed(format!(
                 "sandboxed docker backend requires helper binary {}; set {} or place it next to the mantissa executable",
-                MANTISSA_NONO_HELPER_BINARY_NAME,
-                MANTISSA_NONO_HELPER_HOST_ENV_VAR
+                MANTISSA_SANDBOX_HELPER_BINARY_NAME,
+                MANTISSA_SANDBOX_HELPER_HOST_ENV_VAR
             ))
         })
     }
@@ -307,17 +307,17 @@ pub(super) fn parse_sandboxed_container_metadata(
     working_dir: Option<&str>,
 ) -> RuntimeResult<Option<SandboxedContainerMetadata>> {
     if labels
-        .and_then(|entries| entries.get(MANTISSA_NONO_ENABLED_LABEL))
+        .and_then(|entries| entries.get(MANTISSA_SANDBOX_ENABLED_LABEL))
         .map(String::as_str)
         != Some("true")
     {
         return Ok(None);
     }
 
-    let Some(encoded_policy) = find_env_var(env_vars, MANTISSA_NONO_POLICY_ENV_VAR) else {
+    let Some(encoded_policy) = find_env_var(env_vars, MANTISSA_SANDBOX_POLICY_ENV_VAR) else {
         return Err(RuntimeError::OperationFailed(format!(
             "sandboxed container is missing {} in its persisted environment",
-            MANTISSA_NONO_POLICY_ENV_VAR
+            MANTISSA_SANDBOX_POLICY_ENV_VAR
         )));
     };
 
