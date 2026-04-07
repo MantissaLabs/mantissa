@@ -24,7 +24,7 @@ use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
 use crate::sync::{SyncService, SyncStores};
 use crate::task::service::TaskService;
-use crate::topology::{Keys, Topology, TopologyConfig, TopologyStores};
+use crate::topology::{Keys, Topology, TopologyConfig, TopologyStorage};
 use crate::volumes::{VolumeController, VolumeRegistry, VolumeReplicator, VolumesRpc};
 use crate::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadRuntimeConfig};
 use crate::workload::service::WorkloadService;
@@ -253,7 +253,7 @@ struct TopologyBuildInputs<'a> {
     cluster_view: ClusterViewState,
     topology_rx: Receiver<Message>,
     gossip_tx: Sender<Message>,
-    topology_stores: TopologyStores,
+    topology_stores: TopologyStorage,
     registry: Registry,
     scheduler: Rc<Scheduler>,
     health_monitor: Arc<health::HealthMonitor>,
@@ -582,13 +582,13 @@ async fn build_runtime_components(
 ///
 /// This keeps the conversion from bootstrap stores to topology stores local to
 /// the runtime assembly instead of repeating the field mapping elsewhere.
-fn build_topology_stores(stores: &BootstrapStores) -> TopologyStores {
-    TopologyStores {
-        credentials: stores.local_creds.clone(),
-        sessions: stores.local_sessions.clone(),
+fn build_topology_stores(stores: &BootstrapStores) -> TopologyStorage {
+    TopologyStorage {
+        local_credential_store: stores.local_creds.clone(),
+        local_sessions: stores.local_sessions.clone(),
         peers: stores.peers.clone(),
         cluster_operations: stores.cluster_operations.clone(),
-        cluster_view: stores.cluster_view.clone(),
+        cluster_view_store: stores.cluster_view.clone(),
         token_store: stores.token_store.clone(),
         secret_master_store: stores.secret_master_store.clone(),
         workloads: stores.workloads.clone(),
@@ -755,7 +755,7 @@ async fn hydrate_topology(topology: &Topology) -> BootstrapResult<()> {
 fn build_sync_client(
     cluster_view: ClusterViewState,
     stores: &BootstrapStores,
-    topology_stores: &TopologyStores,
+    topology_stores: &TopologyStorage,
 ) -> protocol::sync::sync::Client {
     let sync_service = SyncService::new(
         cluster_view,
@@ -931,7 +931,7 @@ async fn spawn_runtime_tasks(
         network_gossiper,
     } = actors;
 
-    let mut topology_runner = components.topology.clone();
+    let topology_runner = components.topology.clone();
     let topology_lifecycle = components.topology.clone();
     let topology_for_gossip = components.topology.clone();
     let gossip_tick = topology_for_gossip.gossip_interval();

@@ -1,5 +1,5 @@
 use crate::cluster::ClusterViewId;
-use crate::topology::operation::SplitNodeAssignment;
+use crate::cluster::operations::SplitNodeAssignment;
 use capnp::Error;
 use protocol::topology::split_selector_clause::Operator as SplitOperator;
 use std::collections::HashSet;
@@ -7,39 +7,39 @@ use uuid::Uuid;
 
 /// Parsed split selector clause used to evaluate one node attribute predicate.
 #[derive(Clone, Debug)]
-pub(super) struct SplitSelectorClauseSpec {
-    pub(super) key: String,
-    pub(super) op: SplitOperator,
-    pub(super) value: String,
+pub(crate) struct SplitSelectorClauseSpec {
+    pub(crate) key: String,
+    pub(crate) op: SplitOperator,
+    pub(crate) value: String,
 }
 
 /// Parsed split target with selector clauses and explicit node overrides.
 #[derive(Clone, Debug)]
-pub(super) struct SplitTargetSpec {
-    pub(super) name: String,
-    pub(super) clauses: Vec<SplitSelectorClauseSpec>,
-    pub(super) explicit_nodes: HashSet<Uuid>,
+pub(crate) struct SplitTargetSpec {
+    pub(crate) name: String,
+    pub(crate) clauses: Vec<SplitSelectorClauseSpec>,
+    pub(crate) explicit_nodes: HashSet<Uuid>,
 }
 
 /// Candidate node attributes used during split target selection and assignment.
 #[derive(Clone, Debug)]
-pub(super) struct SplitNodeCandidate {
-    pub(super) node_id: Uuid,
-    pub(super) hostname: String,
-    pub(super) address: String,
-    pub(super) wireguard_enabled: bool,
-    pub(super) cpu_vendor: Option<String>,
-    pub(super) cpu_brand: Option<String>,
-    pub(super) cpu_logical: Option<u64>,
-    pub(super) cpu_cores: Option<u64>,
-    pub(super) memory_total_kb: Option<u64>,
-    pub(super) gpu_vendor: Option<String>,
-    pub(super) gpu_count: Option<u64>,
-    pub(super) gpu_models: Vec<String>,
+pub(crate) struct SplitNodeCandidate {
+    pub(crate) node_id: Uuid,
+    pub(crate) hostname: String,
+    pub(crate) address: String,
+    pub(crate) wireguard_enabled: bool,
+    pub(crate) cpu_vendor: Option<String>,
+    pub(crate) cpu_brand: Option<String>,
+    pub(crate) cpu_logical: Option<u64>,
+    pub(crate) cpu_cores: Option<u64>,
+    pub(crate) memory_total_kb: Option<u64>,
+    pub(crate) gpu_vendor: Option<String>,
+    pub(crate) gpu_count: Option<u64>,
+    pub(crate) gpu_models: Vec<String>,
 }
 
 /// Computes deterministic split assignments and validates selector coverage for all nodes.
-pub(super) fn build_split_assignments_for_nodes(
+pub(crate) fn build_split_assignments_for_nodes(
     source_view: ClusterViewId,
     targets: &[SplitTargetSpec],
     nodes: &[SplitNodeCandidate],

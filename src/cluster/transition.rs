@@ -1,5 +1,5 @@
 use crate::cluster::ClusterViewId;
-use crate::topology::operation::{
+use crate::cluster::operations::{
     ClusterOperationKind, ClusterOperationRecord, MergeServicePolicy, SplitNetworkPolicy,
     SplitServicePolicy,
 };

@@ -1,11 +1,11 @@
-use super::Topology;
-use super::split_selector::{SplitSelectorClauseSpec, SplitTargetSpec};
+use crate::cluster::operations::{
+    ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage, MergeServicePolicy,
+    SplitNetworkPolicy, SplitNodeAssignment, SplitSelectorClauseSpec, SplitServicePolicy,
+    SplitTargetSpec,
+};
 use crate::cluster::{ClusterId, ClusterViewId};
 use crate::node::id::read_node_id;
-use crate::topology::operation::{
-    ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage, MergeServicePolicy,
-    SplitNetworkPolicy, SplitNodeAssignment, SplitServicePolicy,
-};
+use crate::topology::Topology;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tracing::warn;
@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type ParsedSplitTargets = (Vec<SplitTargetSpec>, Vec<ClusterViewId>, Vec<String>);
 
-pub(super) struct SplitOperationBuildInput<'a> {
+pub(crate) struct SplitOperationBuildInput<'a> {
     pub source_view: ClusterViewId,
     pub dry_run: bool,
     pub split_service_policy: SplitServicePolicy,
@@ -26,7 +26,7 @@ pub(super) struct SplitOperationBuildInput<'a> {
 
 impl Topology {
     /// Converts the merge request policy from the Cap'n Proto enum into local durable policy state.
-    pub(super) fn merge_service_policy_from_capnp(
+    pub(in crate::topology) fn merge_service_policy_from_capnp(
         policy: protocol::topology::MergeServicePolicy,
     ) -> MergeServicePolicy {
         match policy {
@@ -36,7 +36,7 @@ impl Topology {
     }
 
     /// Converts the split request service policy into local durable policy state.
-    pub(super) fn split_service_policy_from_capnp(
+    pub(in crate::topology) fn split_service_policy_from_capnp(
         policy: protocol::topology::SplitServicePolicy,
     ) -> SplitServicePolicy {
         match policy {
@@ -46,7 +46,7 @@ impl Topology {
     }
 
     /// Converts the split request network policy into local durable policy state.
-    pub(super) fn split_network_policy_from_capnp(
+    pub(in crate::topology) fn split_network_policy_from_capnp(
         policy: protocol::topology::SplitNetworkPolicy,
     ) -> SplitNetworkPolicy {
         match policy {
@@ -56,7 +56,7 @@ impl Topology {
     }
 
     /// Parses split target selectors and derives deterministic target view ids from target names.
-    pub(super) fn parse_split_target_specs(
+    pub(in crate::topology) fn parse_split_target_specs(
         &self,
         source_view: ClusterViewId,
         targets: capnp::struct_list::Reader<'_, protocol::topology::split_target::Owned>,
@@ -142,7 +142,7 @@ impl Topology {
     }
 
     /// Builds the durable merge operation record after request validation and policy parsing.
-    pub(super) fn build_merge_operation_record(
+    pub(in crate::topology) fn build_merge_operation_record(
         &self,
         source_view: ClusterViewId,
         destination_view: ClusterViewId,
@@ -169,7 +169,7 @@ impl Topology {
     }
 
     /// Builds the durable split operation record including assignment coverage diagnostics.
-    pub(super) fn build_split_operation_record(
+    pub(in crate::topology) fn build_split_operation_record(
         &self,
         input: SplitOperationBuildInput<'_>,
     ) -> ClusterOperationRecord {
@@ -221,7 +221,7 @@ impl Topology {
     }
 
     /// Persists one operation and triggers broadcast/progression side effects for non-dry-run requests.
-    pub(super) async fn persist_and_dispatch_operation(
+    pub(in crate::topology) async fn persist_and_dispatch_operation(
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
@@ -234,7 +234,7 @@ impl Topology {
     }
 
     /// Applies one relayed operation payload and triggers local progression when stage requires it.
-    pub(super) async fn accept_submitted_cluster_operation(
+    pub(in crate::topology) async fn accept_submitted_cluster_operation(
         &self,
         operation_id: Uuid,
         payload: &[u8],

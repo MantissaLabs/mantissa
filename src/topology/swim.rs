@@ -10,26 +10,26 @@ impl Topology {
     ///
     /// Returns the local SWIM incarnation used when refuting stale suspect/down rumors.
     pub fn swim_local_incarnation(&self) -> u64 {
-        self.health_monitor.local_incarnation()
+        self.deps.health_monitor.local_incarnation()
     }
 
     /// Advances the local incarnation for one explicit membership transition.
     pub fn swim_advance_local_incarnation(&self) -> u64 {
-        self.health_monitor.advance_local_incarnation()
+        self.deps.health_monitor.advance_local_incarnation()
     }
 
     /// # Description:
     ///
     /// Records that a peer joined the membership and seeds detector state as alive.
     pub fn swim_record_join(&self, id: Uuid, incarnation: u64) {
-        self.health_monitor.record_join(id, incarnation);
+        self.deps.health_monitor.record_join(id, incarnation);
     }
 
     /// # Description:
     ///
     /// Applies an `alive` SWIM update and refreshes local detector state for the subject peer.
     pub(super) async fn handle_alive_event(&self, id: Uuid, incarnation: u64) {
-        self.apply_health_actions(self.health_monitor.handle_alive_event(id, incarnation))
+        self.apply_health_actions(self.deps.health_monitor.handle_alive_event(id, incarnation))
             .await;
     }
 
@@ -37,10 +37,10 @@ impl Topology {
     ///
     /// Applies a `suspect` SWIM update, or emits an immediate alive refutation when we are the target.
     pub(super) async fn handle_suspect_event(&self, id: Uuid, incarnation: u64) {
-        self.apply_health_actions(self.health_monitor.handle_suspect_event(
+        self.apply_health_actions(self.deps.health_monitor.handle_suspect_event(
             id,
             incarnation,
-            self.runtime_health.down_after,
+            self.deps.runtime_health.down_after,
         ))
         .await;
     }
@@ -49,7 +49,7 @@ impl Topology {
     ///
     /// Applies a `down` SWIM update, or emits an immediate alive refutation when we are the target.
     pub(super) async fn handle_down_event(&self, id: Uuid, incarnation: u64) {
-        self.apply_health_actions(self.health_monitor.handle_down_event(id, incarnation))
+        self.apply_health_actions(self.deps.health_monitor.handle_down_event(id, incarnation))
             .await;
     }
 
@@ -71,8 +71,8 @@ impl Topology {
         }
 
         let cluster_view = self.active_cluster_view();
-        let timeout = self.runtime_health.probe_timeout;
-        let Some(target_index) = self.health_monitor.next_probe_index(candidates.len()) else {
+        let timeout = self.deps.runtime_health.probe_timeout;
+        let Some(target_index) = self.deps.health_monitor.next_probe_index(candidates.len()) else {
             return;
         };
         let target = candidates[target_index];
@@ -89,20 +89,20 @@ impl Topology {
         };
 
         if indirect_ok {
-            if let Some(event) = self.health_monitor.record_probe_success(target) {
+            if let Some(event) = self.deps.health_monitor.record_probe_success(target) {
                 self.apply_health_actions(vec![HealthAction::Gossip(event)])
                     .await;
             }
         } else {
-            self.apply_health_actions(self.health_monitor.record_probe_failure(
+            self.apply_health_actions(self.deps.health_monitor.record_probe_failure(
                 target,
-                self.runtime_health.suspect_after,
-                self.runtime_health.down_after,
+                self.deps.runtime_health.suspect_after,
+                self.deps.runtime_health.down_after,
             ))
             .await;
         }
 
-        self.apply_health_actions(self.health_monitor.expire_suspicions())
+        self.apply_health_actions(self.deps.health_monitor.expire_suspicions())
             .await;
     }
 
@@ -120,7 +120,7 @@ impl Topology {
             .entries
             .iter()
             .filter_map(|entry| {
-                if entry.peer_id == self.node.id || excluded.contains(&entry.peer_id) {
+                if entry.peer_id == self.local.node.id || excluded.contains(&entry.peer_id) {
                     None
                 } else {
                     Some(entry.peer_id)
@@ -139,6 +139,7 @@ impl Topology {
         timeout: Duration,
     ) -> Result<bool, capnp::Error> {
         let Some(health_cap) = self
+            .deps
             .registry
             .fetch_health_capability(peer_id, cluster_view)
             .await?
@@ -155,12 +156,18 @@ impl Topology {
             Ok(Ok(_)) => Ok(true),
             Ok(Err(err)) => {
                 debug!(target: "health", peer = %peer_id, "direct ping failed: {err}");
-                self.registry.invalidate_peer_capabilities(peer_id).await;
+                self.deps
+                    .registry
+                    .invalidate_peer_capabilities(peer_id)
+                    .await;
                 Ok(false)
             }
             Err(_) => {
                 debug!(target: "health", peer = %peer_id, "direct ping timed out");
-                self.registry.invalidate_peer_capabilities(peer_id).await;
+                self.deps
+                    .registry
+                    .invalidate_peer_capabilities(peer_id)
+                    .await;
                 Ok(false)
             }
         }
@@ -197,14 +204,15 @@ impl Topology {
         // keeping an operator-provided floor via `health.probe_fanout` and configured bounds.
         let adaptive_floor = (helper_population.max(1)).ilog2() as usize + 1;
         let adaptive_floor = adaptive_floor.clamp(
-            self.runtime_health.indirect_fanout_min,
-            self.runtime_health.indirect_fanout_max,
+            self.deps.runtime_health.indirect_fanout_min,
+            self.deps.runtime_health.indirect_fanout_max,
         );
         let helper_budget = self
+            .deps
             .runtime_health
             .probe_fanout
             .max(adaptive_floor)
-            .min(self.runtime_health.indirect_fanout_max)
+            .min(self.deps.runtime_health.indirect_fanout_max)
             .min(helper_population);
 
         let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
@@ -219,6 +227,7 @@ impl Topology {
 
         for helper_id in helpers.into_iter().take(helper_budget) {
             let helper_cap = match self
+                .deps
                 .registry
                 .fetch_health_capability(helper_id, cluster_view)
                 .await
@@ -270,7 +279,10 @@ impl Topology {
                         .await;
                 }
                 HealthAction::InvalidatePeer(peer_id) => {
-                    self.registry.invalidate_peer_capabilities(peer_id).await;
+                    self.deps
+                        .registry
+                        .invalidate_peer_capabilities(peer_id)
+                        .await;
                 }
             }
         }

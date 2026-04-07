@@ -4,6 +4,10 @@ mod common;
 use common::convergence::{current_cluster_view, wait_for_cluster_view, wait_for_operation_stage};
 use common::testkit::TestNode;
 use crdt_store::uuid_key::UuidKey;
+use mantissa::cluster::operations::{
+    ClusterOperationKind as StoredOperationKind, ClusterOperationRecord,
+    ClusterOperationStage as StoredOperationStage, SplitNodeAssignment,
+};
 use mantissa::cluster::{ClusterId, ClusterViewId};
 use mantissa::node::id::set_node_id;
 use mantissa::runtime::set::RuntimeSet;
@@ -15,10 +19,6 @@ use mantissa::store::cluster_operation_store::ClusterOperationStore;
 use mantissa::store::cluster_view_store::ClusterViewStore;
 use mantissa::store::peer_store::open_peers_store;
 use mantissa::sync::VIEW_SCOPED_DOMAIN_COUNT;
-use mantissa::topology::operation::{
-    ClusterOperationKind as StoredOperationKind, ClusterOperationRecord,
-    ClusterOperationStage as StoredOperationStage, SplitNodeAssignment,
-};
 use mantissa::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue};
 use net::noise::NoiseKeys;
 use protocol::topology::{ClusterOperationKind, ClusterOperationStage, NodeDrainState};

@@ -1,9 +1,8 @@
-use super::Topology;
-use super::split_selector::{
-    SplitNodeCandidate, SplitTargetSpec, build_split_assignments_for_nodes,
-};
 use crate::cluster::ClusterViewId;
-use crate::topology::operation::SplitNodeAssignment;
+use crate::cluster::operations::{
+    SplitNodeAssignment, SplitNodeCandidate, SplitTargetSpec, build_split_assignments_for_nodes,
+};
+use crate::topology::Topology;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -67,11 +66,12 @@ impl Topology {
     }
 
     /// Collects a deterministic snapshot of nodes eligible for split partition assignment.
-    pub(super) async fn collect_split_node_candidates(
+    pub(in crate::topology) async fn collect_split_node_candidates(
         &self,
         source_view: ClusterViewId,
     ) -> Result<Vec<SplitNodeCandidate>, capnp::Error> {
         let (actives, _) = self
+            .stores
             .peers
             .load_all()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -107,31 +107,33 @@ impl Topology {
             );
         }
 
-        let self_entry = candidates
-            .entry(self.node.id)
-            .or_insert_with(|| SplitNodeCandidate {
-                node_id: self.node.id,
-                hostname: self
-                    .node
-                    .system_info
-                    .info
-                    .hostname
-                    .clone()
-                    .unwrap_or_default(),
-                address: self
-                    .compute_advertise_addr()
-                    .unwrap_or_else(|_| String::new()),
-                wireguard_enabled: false,
-                cpu_vendor: None,
-                cpu_brand: None,
-                cpu_logical: None,
-                cpu_cores: None,
-                memory_total_kb: None,
-                gpu_vendor: None,
-                gpu_count: None,
-                gpu_models: Vec::new(),
-            });
-        if let Some(cpu) = self.node.system_info.info.cpu_info.as_ref() {
+        let self_entry =
+            candidates
+                .entry(self.local.node.id)
+                .or_insert_with(|| SplitNodeCandidate {
+                    node_id: self.local.node.id,
+                    hostname: self
+                        .local
+                        .node
+                        .system_info
+                        .info
+                        .hostname
+                        .clone()
+                        .unwrap_or_default(),
+                    address: self
+                        .compute_advertise_addr()
+                        .unwrap_or_else(|_| String::new()),
+                    wireguard_enabled: false,
+                    cpu_vendor: None,
+                    cpu_brand: None,
+                    cpu_logical: None,
+                    cpu_cores: None,
+                    memory_total_kb: None,
+                    gpu_vendor: None,
+                    gpu_count: None,
+                    gpu_models: Vec::new(),
+                });
+        if let Some(cpu) = self.local.node.system_info.info.cpu_info.as_ref() {
             self_entry.cpu_vendor = cpu.vendor.clone();
             self_entry.cpu_brand = cpu.brand.clone();
             if cpu.num_logical_cpus > 0 {
@@ -141,12 +143,12 @@ impl Topology {
                 self_entry.cpu_cores = Some(cpu.num_cores as u64);
             }
         }
-        if let Some(memory) = self.node.system_info.info.mem_info.as_ref()
+        if let Some(memory) = self.local.node.system_info.info.mem_info.as_ref()
             && memory.total > 0
         {
             self_entry.memory_total_kb = Some(memory.total);
         }
-        if let Some(gpu) = self.node.system_info.info.gpu_info.as_ref() {
+        if let Some(gpu) = self.local.node.system_info.info.gpu_info.as_ref() {
             if !gpu.vendor.is_empty() {
                 self_entry.gpu_vendor = Some(gpu.vendor.clone());
             }
@@ -163,17 +165,18 @@ impl Topology {
         let mut values = candidates
             .into_values()
             .filter(|candidate| {
-                candidate.node_id == self.node.id || !excluded_peers.contains(&candidate.node_id)
+                candidate.node_id == self.local.node.id
+                    || !excluded_peers.contains(&candidate.node_id)
             })
             .collect::<Vec<_>>();
         values.sort_by_key(|candidate| candidate.node_id);
 
         for candidate in &mut values {
-            if candidate.node_id == self.node.id {
+            if candidate.node_id == self.local.node.id {
                 continue;
             }
 
-            let Some(session) = self.registry.session_for_peer(candidate.node_id).await else {
+            let Some(session) = self.deps.registry.session_for_peer(candidate.node_id).await else {
                 continue;
             };
             let peer_view = match Self::session_cluster_view(&session).await {
@@ -196,7 +199,7 @@ impl Topology {
     }
 
     /// Computes deterministic split assignments and validates selector coverage for all nodes.
-    pub(super) async fn build_split_assignments(
+    pub(in crate::topology) async fn build_split_assignments(
         &self,
         source_view: ClusterViewId,
         targets: &[SplitTargetSpec],

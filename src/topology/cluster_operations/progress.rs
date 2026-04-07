@@ -1,10 +1,11 @@
-use super::{
-    CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT, COMMIT_PRECONDITION_FAILURE_PREFIX, Topology,
+use crate::cluster::operations::{
+    ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage,
 };
 use crate::cluster::{ClusterId, ClusterViewId};
 use crate::store::cluster_view_store::{ClusterNameRecord, ClusterNodeCountRecord};
-use crate::topology::operation::{
-    ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage,
+use crate::topology::Topology;
+use crate::topology::cluster_operations::{
+    CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT, COMMIT_PRECONDITION_FAILURE_PREFIX,
 };
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,7 +19,8 @@ impl Topology {
         cluster_id: ClusterId,
         record: &ClusterNameRecord,
     ) -> Result<bool, capnp::Error> {
-        self.cluster_view_store
+        self.stores
+            .cluster_view_store
             .upsert_cluster_name(cluster_id, record)
             .await
             .map_err(|err| capnp::Error::failed(err.to_string()))
@@ -30,7 +32,8 @@ impl Topology {
         cluster_id: ClusterId,
         record: &ClusterNodeCountRecord,
     ) -> Result<bool, capnp::Error> {
-        self.cluster_view_store
+        self.stores
+            .cluster_view_store
             .upsert_cluster_node_count(cluster_id, record)
             .await
             .map_err(|err| capnp::Error::failed(err.to_string()))
@@ -47,7 +50,7 @@ impl Topology {
         let record = ClusterNodeCountRecord {
             node_count,
             updated_at_unix_ms: Self::now_unix_ms(),
-            actor_node_id: self.node.id,
+            actor_node_id: self.local.node.id,
         };
         self.upsert_cluster_node_count_record(local_view.cluster_id, &record)
             .await
@@ -137,7 +140,7 @@ impl Topology {
     }
 
     /// Maps operation stage values into a monotonic ordering used for conflict resolution.
-    pub(super) fn stage_rank(stage: ClusterOperationStage) -> u8 {
+    pub(in crate::topology) fn stage_rank(stage: ClusterOperationStage) -> u8 {
         match stage {
             ClusterOperationStage::Proposed => 0,
             ClusterOperationStage::Prepared => 1,
@@ -148,7 +151,7 @@ impl Topology {
     }
 
     /// Returns the current UNIX timestamp in milliseconds for durable operation metadata updates.
-    pub(super) fn now_unix_ms() -> u64 {
+    pub(in crate::topology) fn now_unix_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
@@ -286,23 +289,25 @@ impl Topology {
 
     /// Persists the active cluster view durably so finalized operations survive process restarts.
     fn persist_active_cluster_view(&self, view: ClusterViewId) -> Result<(), capnp::Error> {
-        self.cluster_view_store
+        self.stores
+            .cluster_view_store
             .write_active_view(view)
             .map_err(|err| capnp::Error::failed(err.to_string()))
     }
 
     /// Returns true when an error represents a stale commit precondition mismatch.
-    pub(super) fn is_commit_precondition_failure(err: &capnp::Error) -> bool {
+    pub(in crate::topology) fn is_commit_precondition_failure(err: &capnp::Error) -> bool {
         err.to_string().contains(COMMIT_PRECONDITION_FAILURE_PREFIX)
     }
 
     /// Persists a cluster operation record in the local durable operation store.
-    pub(super) async fn persist_cluster_operation(
+    pub(in crate::topology) async fn persist_cluster_operation(
         &self,
         op: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
         let encoded = bincode::serialize(op).map_err(|e| capnp::Error::failed(e.to_string()))?;
-        self.cluster_operations
+        self.stores
+            .cluster_operations
             .put(op.id, &encoded)
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         if !op.dry_run {
@@ -312,11 +317,12 @@ impl Topology {
     }
 
     /// Loads a cluster operation record by id from the local durable operation store.
-    pub(super) fn load_cluster_operation(
+    pub(in crate::topology) fn load_cluster_operation(
         &self,
         id: Uuid,
     ) -> Result<Option<ClusterOperationRecord>, capnp::Error> {
         let bytes = self
+            .stores
             .cluster_operations
             .get(id)
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -329,10 +335,11 @@ impl Topology {
     }
 
     /// Loads all operation records from the local durable store, skipping malformed rows.
-    pub(super) fn load_cluster_operations(
+    pub(in crate::topology) fn load_cluster_operations(
         &self,
     ) -> Result<Vec<ClusterOperationRecord>, capnp::Error> {
         let encoded_rows = self
+            .stores
             .cluster_operations
             .list()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -366,7 +373,7 @@ impl Topology {
     }
 
     /// Parses a cluster operation id from raw RPC bytes, enforcing UUID byte length.
-    pub(super) fn operation_id_from_data(
+    pub(in crate::topology) fn operation_id_from_data(
         data: capnp::data::Reader<'_>,
     ) -> Result<Uuid, capnp::Error> {
         let id_bytes: [u8; 16] = data
@@ -391,7 +398,9 @@ impl Topology {
     }
 
     /// Removes old terminal operations so the durable operation table stays bounded over long runtimes.
-    pub(super) fn garbage_collect_cluster_operations(&self) -> Result<usize, capnp::Error> {
+    pub(in crate::topology) fn garbage_collect_cluster_operations(
+        &self,
+    ) -> Result<usize, capnp::Error> {
         let mut terminal = self
             .load_cluster_operations()?
             .into_iter()
@@ -420,6 +429,7 @@ impl Topology {
             .map(|operation| operation.id)
             .collect::<Vec<_>>();
         let removed = self
+            .stores
             .cluster_operations
             .delete_many(&to_delete)
             .map_err(|err| capnp::Error::failed(err.to_string()))?;
@@ -436,7 +446,7 @@ impl Topology {
     }
 
     /// Applies local side effects for a committed operation, including active view switch.
-    pub(super) async fn apply_committed_operation_side_effects(
+    pub(in crate::topology) async fn apply_committed_operation_side_effects(
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
@@ -456,7 +466,7 @@ impl Topology {
 
         self.persist_active_cluster_view(transition.local_target_view)?;
         let previous = self.set_active_cluster_view(transition.local_target_view);
-        self.registry.clear().await;
+        self.deps.registry.clear().await;
         match self.publish_local_cluster_node_count().await {
             Ok(true) => self.sync_once_now(),
             Ok(false) => {}
@@ -481,7 +491,11 @@ impl Topology {
     }
 
     /// Starts asynchronous local progression for a cluster operation if it is not a dry run.
-    pub(super) fn trigger_operation_progress(&self, operation_id: Uuid, dry_run: bool) {
+    pub(in crate::topology) fn trigger_operation_progress(
+        &self,
+        operation_id: Uuid,
+        dry_run: bool,
+    ) {
         if dry_run {
             return;
         }
@@ -500,7 +514,7 @@ impl Topology {
 
     /// Progresses one operation forward based on its current persisted stage.
     async fn progress_cluster_operation(&self, operation_id: Uuid) -> Result<(), capnp::Error> {
-        let _guard = self.operations.gate.lock().await;
+        let _guard = self.runtime.cluster_operation_gate.gate.lock().await;
 
         let mut operation = self.load_cluster_operation(operation_id)?.ok_or_else(|| {
             capnp::Error::failed(format!("cluster operation not found: {operation_id}"))
@@ -722,7 +736,7 @@ impl Topology {
         }
 
         self.set_excluded_peers(excluded.clone()).await;
-        self.registry.set_excluded_peers(excluded.clone());
+        self.deps.registry.set_excluded_peers(excluded.clone());
 
         let excluded_count = excluded.len();
         info!(

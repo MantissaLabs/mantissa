@@ -1,5 +1,9 @@
-use super::{Topology, types::TopologyEvent};
+use super::{Topology, TopologyEvent};
 use crate::cluster::coordinator::ClusterTransitionCoordinator;
+use crate::cluster::operations::{
+    ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage, MergeServicePolicy,
+    SplitNetworkPolicy, SplitServicePolicy,
+};
 use crate::cluster::participant::{ClusterParticipantReport, ClusterTransitionParticipant};
 use crate::cluster::transition::ClusterTransition;
 use crate::cluster::{ClusterId, ClusterViewId};
@@ -18,10 +22,6 @@ use crate::store::local::{LocalCredentialStore, LocalSessionStore, MasterKeyReco
 use crate::store::peer_store::PeersStore;
 use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains};
 use crate::topology::health::status_to_node_status;
-use crate::topology::operation::{
-    ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage, MergeServicePolicy,
-    SplitNetworkPolicy, SplitServicePolicy,
-};
 use crate::topology::peers::{
     PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
     write_runtime_support_to_node_info,
@@ -42,21 +42,7 @@ use std::rc::Rc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-/// Prefix used when commit-time active-view precondition checks reject stale operations.
-const COMMIT_PRECONDITION_FAILURE_PREFIX: &str = "cluster operation commit precondition failed";
-/// Number of finalized/aborted operation rows retained durably before old rows are garbage-collected.
-const CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT: usize = 512;
-
-#[path = "assignment.rs"]
-mod assignment;
-#[path = "operation_progress.rs"]
-mod operation_progress;
-#[path = "operation_rpc.rs"]
-mod operation_rpc;
-#[path = "split_selector.rs"]
-mod split_selector;
-
-use self::operation_rpc::SplitOperationBuildInput;
+use super::cluster_operations::SplitOperationBuildInput;
 
 #[derive(Clone)]
 struct JoinPayload {
@@ -293,11 +279,11 @@ impl ClusterTransitionParticipant for PeerScopeParticipant {
 
             if !transition
                 .retained_node_ids
-                .contains(&self.topology.node.id)
+                .contains(&self.topology.local.node.id)
             {
                 return Err(capnp::Error::failed(format!(
                     "split operation {} local target {} does not retain local node {}",
-                    transition.operation_id, local_target_index, self.topology.node.id
+                    transition.operation_id, local_target_index, self.topology.local.node.id
                 )));
             }
 
@@ -311,7 +297,7 @@ impl ClusterTransitionParticipant for PeerScopeParticipant {
             let mut removed_sessions = 0usize;
             let mut removed_credentials = 0usize;
             for peer_id in evicted.iter().copied() {
-                match self.topology.local_sessions.remove(peer_id) {
+                match self.topology.stores.local_sessions.remove(peer_id) {
                     Ok(()) => removed_sessions = removed_sessions.saturating_add(1),
                     Err(err) => {
                         warn!(
@@ -323,7 +309,7 @@ impl ClusterTransitionParticipant for PeerScopeParticipant {
                     }
                 }
 
-                match self.topology.local_credential_store.remove(peer_id) {
+                match self.topology.stores.local_credential_store.remove(peer_id) {
                     Ok(()) => removed_credentials = removed_credentials.saturating_add(1),
                     Err(err) => {
                         warn!(
@@ -335,13 +321,14 @@ impl ClusterTransitionParticipant for PeerScopeParticipant {
                     }
                 }
 
-                self.topology.registry.remove_peer(peer_id).await;
+                self.topology.deps.registry.remove_peer(peer_id).await;
             }
 
             self.topology
                 .set_excluded_peers(transition.evicted_node_ids.clone())
                 .await;
             self.topology
+                .deps
                 .registry
                 .set_excluded_peers(transition.evicted_node_ids.clone());
 
@@ -362,7 +349,10 @@ impl ClusterTransitionParticipant for PeerScopeParticipant {
 
         if transition.is_merge() {
             self.topology.set_excluded_peers(HashSet::new()).await;
-            self.topology.registry.set_excluded_peers(HashSet::new());
+            self.topology
+                .deps
+                .registry
+                .set_excluded_peers(HashSet::new());
             report = report.add_detail("excluded_peers_reset", "true");
         }
 
@@ -477,6 +467,7 @@ impl Topology {
         let preferred_wireguard_port = extract_port(&advertise_addr).ok();
 
         let hostname = self
+            .local
             .node
             .system_info
             .info
@@ -517,22 +508,22 @@ impl Topology {
         };
 
         Ok(JoinPayload {
-            id: self.node.id,
+            id: self.local.node.id,
             hostname,
             advertise_addr,
             incarnation: self.swim_local_incarnation(),
             server_handle,
-            public_key: self.public_key.to_bytes(),
-            signing_key: self.signing_key.verifying_key().to_bytes(),
+            public_key: self.local.public_key.to_bytes(),
+            signing_key: self.local.signing_key.verifying_key().to_bytes(),
             identity_sig: crate::node::identity::sign_peer_identity(
-                &self.signing_key,
-                &self.node.id,
-                &self.public_key.to_bytes(),
-                &self.signing_key.verifying_key().to_bytes(),
+                &self.local.signing_key,
+                &self.local.node.id,
+                &self.local.public_key.to_bytes(),
+                &self.local.signing_key.verifying_key().to_bytes(),
             ),
             wireguard,
             scheduling: self.current_scheduling_state(),
-            runtime_support: self.runtime_support.clone(),
+            runtime_support: self.local.runtime_support.clone(),
         })
     }
 
@@ -632,10 +623,11 @@ impl Topology {
     /// Restores this node's own peer row after a successful join so rejoin does not depend on
     /// remote gossip to clear the self tombstone created by `leave()`.
     async fn persist_local_join_payload(&self, payload: &JoinPayload) -> Result<(), Error> {
-        let current = self.registry.peer_value_unscoped(payload.id);
+        let current = self.deps.registry.peer_value_unscoped(payload.id);
         let local_peer_value =
             restored_local_peer_value(current.as_ref(), peer_value_from_join_payload(payload));
-        self.peers
+        self.stores
+            .peers
             .upsert(&UuidKey::from(payload.id), local_peer_value)
             .await
             .map_err(|err| Error::failed(format!("local join upsert failed: {err}")))?;
@@ -669,12 +661,13 @@ impl Topology {
         let record = MasterKeyRecord::new(version, key)
             .map_err(|e| Error::failed(format!("invalid master key payload: {e}")))?;
 
-        self.secret_master_store
+        self.stores
+            .secret_master_store
             .import_current(&record)
             .map_err(|e| Error::failed(format!("failed to persist master key: {e}")))?;
 
         {
-            let guard = self.secret_keyring.write().await;
+            let guard = self.stores.secret_keyring.write().await;
             guard.install_current(record);
         }
 
@@ -689,11 +682,12 @@ impl Topology {
         let cluster_view = self.active_cluster_view();
 
         for entry in snapshot.entries.iter() {
-            if entry.peer_id == self.node.id {
+            if entry.peer_id == self.local.node.id {
                 continue;
             }
 
             let gossip_cap = match self
+                .deps
                 .registry
                 .gossip_client_for(entry.peer_id, cluster_view)
                 .await
@@ -730,13 +724,13 @@ impl Topology {
 
     /// Clears locally cached peer authentication material after this node leaves a cluster.
     fn clear_local_cluster_auth_state(&self) {
-        if let Err(err) = self.local_sessions.clear() {
+        if let Err(err) = self.stores.local_sessions.clear() {
             warn!(
                 target: "topology",
                 "leave: failed to clear local session tickets: {err}"
             );
         }
-        if let Err(err) = self.local_credential_store.clear() {
+        if let Err(err) = self.stores.local_credential_store.clear() {
             warn!(
                 target: "topology",
                 "leave: failed to clear local credentials: {err}"
@@ -752,18 +746,18 @@ impl Topology {
         operation
             .split_assignments
             .iter()
-            .find(|assignment| assignment.node_id == self.node.id)
+            .find(|assignment| assignment.node_id == self.local.node.id)
             .map(|assignment| assignment.target_index)
             .ok_or_else(|| {
                 capnp::Error::failed(format!(
                     "split operation {} has no assignment for local node {}",
-                    operation.id, self.node.id
+                    operation.id, self.local.node.id
                 ))
             })
     }
 
     /// Resolves the target view this node should activate when committing the operation.
-    fn local_target_view_for_operation(
+    pub(super) fn local_target_view_for_operation(
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<ClusterViewId, capnp::Error> {
@@ -778,24 +772,25 @@ impl Topology {
     }
 
     /// Builds a canonical local transition snapshot from one durable operation record.
-    fn transition_for_operation(
+    pub(super) fn transition_for_operation(
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<ClusterTransition, capnp::Error> {
         let (actives, _) = self
+            .stores
             .peers
             .load_all()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         let known_peers = actives
             .into_iter()
             .map(|(key, _)| key.to_uuid())
-            .filter(|peer_id| *peer_id != self.node.id)
+            .filter(|peer_id| *peer_id != self.local.node.id)
             .collect::<HashSet<_>>();
-        ClusterTransition::from_operation(operation, self.node.id, &known_peers)
+        ClusterTransition::from_operation(operation, self.local.node.id, &known_peers)
     }
 
     /// Runs all registered transition participants for commit-time side effects.
-    async fn run_transition_commit_hooks(
+    pub(super) async fn run_transition_commit_hooks(
         &self,
         transition: &ClusterTransition,
     ) -> Result<Vec<ClusterParticipantReport>, capnp::Error> {
@@ -822,6 +817,7 @@ impl Topology {
         evicted: &HashSet<Uuid>,
     ) -> Result<usize, capnp::Error> {
         let (actives, _) = self
+            .stores
             .workloads
             .load_all()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -837,7 +833,8 @@ impl Topology {
 
             // Split pruning is view-scoped, not a global delete. Purge locally so merge/sync
             // can repopulate rows from the other partition.
-            self.workloads
+            self.stores
+                .workloads
                 .purge_local(&UuidKey::from(key.to_uuid()))
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -853,6 +850,7 @@ impl Topology {
         evicted: &HashSet<Uuid>,
     ) -> Result<(usize, usize), capnp::Error> {
         let (peer_rows, _) = self
+            .stores
             .network_peers
             .load_all()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -866,7 +864,8 @@ impl Topology {
             }
 
             // Keep split prune reversible: do not leave durable tombstones that block merge replay.
-            self.network_peers
+            self.stores
+                .network_peers
                 .purge_local(&UuidKey::from(key.to_uuid()))
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -874,6 +873,7 @@ impl Topology {
         }
 
         let (attachment_rows, _) = self
+            .stores
             .network_attachments
             .load_all()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -887,7 +887,8 @@ impl Topology {
             }
 
             // Keep split prune reversible: do not leave durable tombstones that block merge replay.
-            self.network_attachments
+            self.stores
+                .network_attachments
                 .purge_local(&UuidKey::from(key.to_uuid()))
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -900,6 +901,7 @@ impl Topology {
     /// Touches active service specs after merge so controllers promptly rebalance replicas cluster-wide.
     async fn nudge_running_services_for_merge_rebalance(&self) -> Result<usize, capnp::Error> {
         let (actives, _) = self
+            .stores
             .services
             .load_all()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -918,7 +920,8 @@ impl Topology {
 
             let mut next = current.clone();
             next.touch();
-            self.services
+            self.stores
+                .services
                 .upsert(&UuidKey::from(key.to_uuid()), next)
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -937,6 +940,7 @@ impl Topology {
         node_id: Uuid,
     ) -> Result<Vec<WorkloadValue>, capnp::Error> {
         let (entries, _) = self
+            .stores
             .workloads
             .load_all()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -964,7 +968,10 @@ impl Topology {
         node_id: Uuid,
         tasks: &[WorkloadValue],
     ) -> Result<Vec<LocalVolumeDrainBlocker>, capnp::Error> {
-        let volumes = VolumeRegistry::new(self.volumes.clone(), self.volume_nodes.clone());
+        let volumes = VolumeRegistry::new(
+            self.stores.volumes.clone(),
+            self.stores.volume_nodes.clone(),
+        );
         let mut seen = HashSet::new();
         let mut blockers = Vec::new();
 
@@ -1026,16 +1033,19 @@ impl Topology {
     /// The first evacuation cut does not perform deep capacity simulation, but it must reject
     /// drains that have no possible landing node at all.
     fn has_schedulable_replacement_node(&self, drained_node_id: Uuid) -> bool {
-        if self.node.id != drained_node_id && self.registry.peer_schedulable(self.node.id) {
+        if self.local.node.id != drained_node_id
+            && self.deps.registry.peer_schedulable(self.local.node.id)
+        {
             return true;
         }
 
-        self.registry
+        self.deps
+            .registry
             .known_peers()
             .unwrap_or_default()
             .into_iter()
             .filter(|peer_id| *peer_id != drained_node_id)
-            .any(|peer_id| self.registry.peer_schedulable(peer_id))
+            .any(|peer_id| self.deps.registry.peer_schedulable(peer_id))
     }
 
     /// Rejects drain requests that the current service/task control plane cannot evacuate safely.
@@ -1044,7 +1054,7 @@ impl Topology {
     /// metadata, and service shutdown workflows still fail fast so operators do not strand work on
     /// a fenced node while the cluster is trying to stop it.
     fn validate_node_drain_request(&self, node_id: Uuid) -> Result<(), capnp::Error> {
-        if self.registry.peer_value_unscoped(node_id).is_none() {
+        if self.deps.registry.peer_value_unscoped(node_id).is_none() {
             return Err(capnp::Error::failed(format!("unknown node {node_id}")));
         }
 
@@ -1073,7 +1083,7 @@ impl Topology {
             )));
         }
 
-        let service_registry = ServiceRegistry::new(self.services.clone());
+        let service_registry = ServiceRegistry::new(self.stores.services.clone());
         let services = service_registry
             .list()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -1118,15 +1128,16 @@ impl Topology {
         node_id: Uuid,
         include_details: bool,
     ) -> Result<SchedulerSummary, capnp::Error> {
-        if node_id == self.node.id {
-            let snapshot = self.scheduler.snapshot().await;
+        if node_id == self.local.node.id {
+            let snapshot = self.deps.scheduler.snapshot().await;
             let node_name = self
+                .local
                 .node
                 .system_info
                 .info
                 .hostname
                 .clone()
-                .unwrap_or_else(|| self.networking.configured().to_string());
+                .unwrap_or_else(|| self.local.advertise.configured().to_string());
             return Ok(SchedulerSummary::from_snapshot(
                 node_id,
                 &node_name,
@@ -1135,7 +1146,8 @@ impl Topology {
             ));
         }
 
-        self.scheduler
+        self.deps
+            .scheduler
             .fetch_remote_summary(node_id, include_details)
             .await
     }
@@ -1143,12 +1155,14 @@ impl Topology {
     /// Returns the best-effort set of schedulable nodes that could receive evacuated work.
     fn schedulable_replacement_nodes(&self, drained_node_id: Uuid) -> Vec<Uuid> {
         let mut candidates = Vec::new();
-        if self.node.id != drained_node_id && self.registry.peer_schedulable(self.node.id) {
-            candidates.push(self.node.id);
+        if self.local.node.id != drained_node_id
+            && self.deps.registry.peer_schedulable(self.local.node.id)
+        {
+            candidates.push(self.local.node.id);
         }
 
-        for peer_id in self.registry.known_peers().unwrap_or_default() {
-            if peer_id == drained_node_id || !self.registry.peer_schedulable(peer_id) {
+        for peer_id in self.deps.registry.known_peers().unwrap_or_default() {
+            if peer_id == drained_node_id || !self.deps.registry.peer_schedulable(peer_id) {
                 continue;
             }
             candidates.push(peer_id);
@@ -1253,6 +1267,7 @@ impl Topology {
         node_id: Uuid,
     ) -> Result<NodeDrainStatusSnapshot, capnp::Error> {
         let peer = self
+            .deps
             .registry
             .peer_value_unscoped(node_id)
             .ok_or_else(|| capnp::Error::failed(format!("unknown node {node_id}")))?;
@@ -1299,7 +1314,7 @@ impl Topology {
             .collect();
         let remaining_service_tasks = service_tasks.len() as u32;
 
-        let service_registry = ServiceRegistry::new(self.services.clone());
+        let service_registry = ServiceRegistry::new(self.stores.services.clone());
         let services = service_registry
             .list()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -1410,7 +1425,7 @@ impl Topology {
     }
 
     /// Reads the cluster view currently bound to a session for operation relay validation.
-    async fn session_cluster_view(
+    pub(super) async fn session_cluster_view(
         session: &cluster_session::Client,
     ) -> Result<ClusterViewId, capnp::Error> {
         let request = session.get_cluster_view_request();
@@ -1420,23 +1435,24 @@ impl Topology {
 
     /// Resolves the best-known cluster view for one peer session, if available.
     async fn best_known_peer_view(&self, peer_id: Uuid) -> Option<ClusterViewId> {
-        if peer_id == self.node.id {
+        if peer_id == self.local.node.id {
             return Some(self.active_cluster_view());
         }
 
         // Keep list/split introspection side-effect free: do not force session bootstrap
         // from read-only view probes.
-        let session = self.registry.cached_session_for(peer_id).await?;
+        let session = self.deps.registry.cached_session_for(peer_id).await?;
         Self::session_cluster_view(&session).await.ok()
     }
 
     /// Counts active peers currently believed to belong to the local active cluster view.
     ///
     /// This is the authoritative local membership count used for replicated cluster metadata.
-    async fn local_cluster_view_member_count(&self) -> Result<u32, capnp::Error> {
+    pub(super) async fn local_cluster_view_member_count(&self) -> Result<u32, capnp::Error> {
         let local_view = self.active_cluster_view();
         let excluded_peers = self.excluded_peers_snapshot().await;
         let (actives, _) = self
+            .stores
             .peers
             .load_all()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
@@ -1444,7 +1460,7 @@ impl Topology {
         let mut count = 1u32;
         for (key, snapshot) in actives {
             let peer_id = key.to_uuid();
-            if peer_id == self.node.id {
+            if peer_id == self.local.node.id {
                 continue;
             }
             if excluded_peers.contains(&peer_id) {
@@ -1510,7 +1526,7 @@ impl Topology {
     }
 
     /// Best-effort relay of one operation record to peers in the operation's relay scope.
-    async fn broadcast_cluster_operation(
+    pub(super) async fn broadcast_cluster_operation(
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<usize, capnp::Error> {
@@ -1542,14 +1558,14 @@ impl Topology {
 
         for entry in snapshot.entries.iter() {
             let peer_id = entry.peer_id;
-            if peer_id == self.node.id {
+            if peer_id == self.local.node.id {
                 continue;
             }
 
             let session = if operation.kind == ClusterOperationKind::Merge {
-                self.registry.session_for_peer_unscoped(peer_id).await
+                self.deps.registry.session_for_peer_unscoped(peer_id).await
             } else {
-                self.registry.session_for_peer(peer_id).await
+                self.deps.registry.session_for_peer(peer_id).await
             };
             let Some(session) = session else {
                 continue;
@@ -1618,7 +1634,7 @@ impl topology::Server for Topology {
     ) -> Result<(), Error> {
         let payload = self.build_join_payload()?;
 
-        let self_addr = self.networking.configured().to_string();
+        let self_addr = self.local.advertise.configured().to_string();
 
         let inputs = JoinInputs::from_params(params)?;
 
@@ -1626,7 +1642,7 @@ impl topology::Server for Topology {
             return Err(capnp::Error::failed("cannot join own address".to_string()));
         }
 
-        let noise_keys = self.registry.noise_keys();
+        let noise_keys = self.deps.registry.noise_keys();
         let client = client::connection::get_client_secure_join_with_keys(
             &inputs.anchor,
             &inputs.join_token,
@@ -1665,9 +1681,9 @@ impl topology::Server for Topology {
         self.persist_local_join_payload(&payload).await?;
 
         Topology::persist_join_state(
-            &self.peers,
-            &self.local_sessions,
-            &self.local_credential_store,
+            &self.stores.peers,
+            &self.stores.local_sessions,
+            &self.stores.local_credential_store,
             peer_id,
             &peer_value,
             &ticket,
@@ -1690,19 +1706,19 @@ impl topology::Server for Topology {
         };
 
         let sync_stores = SyncStores {
-            peers: self.peers.clone(),
-            workloads: self.workloads.clone(),
-            jobs: self.jobs.clone(),
-            agents: self.agents.clone(),
-            services: self.services.clone(),
-            secrets: self.secrets.clone(),
-            networks: self.networks.clone(),
-            network_peers: self.network_peers.clone(),
-            network_attachments: self.network_attachments.clone(),
-            cluster_views: self.cluster_view_store.cluster_view_domain_store(),
-            volumes: self.volumes.clone(),
-            volume_nodes: self.volume_nodes.clone(),
-            scheduler_digests: self.scheduler_digests.clone(),
+            peers: self.stores.peers.clone(),
+            workloads: self.stores.workloads.clone(),
+            jobs: self.stores.jobs.clone(),
+            agents: self.stores.agents.clone(),
+            services: self.stores.services.clone(),
+            secrets: self.stores.secrets.clone(),
+            networks: self.stores.networks.clone(),
+            network_peers: self.stores.network_peers.clone(),
+            network_attachments: self.stores.network_attachments.clone(),
+            cluster_views: self.stores.cluster_view_store.cluster_view_domain_store(),
+            volumes: self.stores.volumes.clone(),
+            volume_nodes: self.stores.volume_nodes.clone(),
+            scheduler_digests: self.stores.scheduler_digests.clone(),
         };
 
         let sync_trace = SyncTraceContext::peer(peer_id, peer_value.address.clone(), "join");
@@ -1744,11 +1760,11 @@ impl topology::Server for Topology {
         _params: topology::LeaveParams,
         _results: topology::LeaveResults,
     ) -> Result<(), capnp::Error> {
-        if !self.sync.is_running() {
+        if !self.runtime.sync.is_running() {
             return Err(capnp::Error::failed("node is not part of a cluster".into()));
         }
 
-        let self_id = self.node.id;
+        let self_id = self.local.node.id;
         let leave_incarnation = self.swim_advance_local_incarnation();
         self.mark_peer_left(self_id, leave_incarnation)
             .await
@@ -1763,7 +1779,7 @@ impl topology::Server for Topology {
         // Stop all background peer contact before clearing local auth state so the
         // node becomes quiescent immediately after the leave broadcast completes.
         self.stop_cluster_background_tasks();
-        self.registry.clear().await;
+        self.deps.registry.clear().await;
         self.clear_local_cluster_auth_state();
 
         Ok(())
@@ -1778,8 +1794,8 @@ impl topology::Server for Topology {
     ) -> Result<(), Error> {
         info!(target: "topology", "Listing nodes");
 
-        let peers = self.peers.clone();
-        let health_snapshot = self.health_monitor.snapshot();
+        let peers = self.stores.peers.clone();
+        let health_snapshot = self.deps.health_monitor.snapshot();
 
         let (actives, _) = peers
             .load_all()
@@ -1797,7 +1813,7 @@ impl topology::Server for Topology {
             if excluded_peers.contains(&id) {
                 continue;
             }
-            let candidate_view = if id == self.node.id {
+            let candidate_view = if id == self.local.node.id {
                 Some(local_view)
             } else {
                 Some(self.best_known_peer_view(id).await.unwrap_or(local_view))
@@ -1875,7 +1891,7 @@ impl topology::Server for Topology {
         _params: topology::ShowTokenParams,
         mut results: topology::ShowTokenResults,
     ) -> Result<(), Error> {
-        let token = self.token_store.current_token().await;
+        let token = self.stores.token_store.current_token().await;
         results.get().set_token(&token);
         Ok(())
     }
@@ -1886,7 +1902,7 @@ impl topology::Server for Topology {
         _params: topology::RotateTokenParams,
         mut results: topology::RotateTokenResults,
     ) -> Result<(), Error> {
-        let new_token = self.token_store.rotate_and_persist().await?;
+        let new_token = self.stores.token_store.rotate_and_persist().await?;
         results.get().set_token(&new_token);
         Ok(())
     }
@@ -1918,7 +1934,7 @@ impl topology::Server for Topology {
         }
 
         let candidates = self.collect_split_node_candidates(source_view).await?;
-        let health_snapshot = self.health_monitor.snapshot();
+        let health_snapshot = self.deps.health_monitor.snapshot();
         let mut list = results.get().init_nodes(candidates.len() as u32);
         for (idx, candidate) in candidates.into_iter().enumerate() {
             let mut row = list.reborrow().get(idx as u32);
@@ -1975,7 +1991,7 @@ impl topology::Server for Topology {
         let cluster_id = Self::cluster_id_from_capnp(request.get_cluster_id()?)?;
         let name = request.get_name()?.to_string()?;
         let updated_at_unix_ms = Self::now_unix_ms();
-        let actor_node_id = self.node.id;
+        let actor_node_id = self.local.node.id;
         let changed = self
             .apply_cluster_name_update(cluster_id, &name, updated_at_unix_ms, actor_node_id)
             .await?;
@@ -2028,7 +2044,7 @@ impl topology::Server for Topology {
             schedulable: false,
             drain_requested: true,
             updated_at_unix_ms: Topology::now_unix_ms(),
-            actor_node_id: self.node.id,
+            actor_node_id: self.local.node.id,
             reason: {
                 let trimmed = reason.trim();
                 if trimmed.is_empty() {
@@ -2064,7 +2080,7 @@ impl topology::Server for Topology {
             schedulable: true,
             drain_requested: false,
             updated_at_unix_ms: Topology::now_unix_ms(),
-            actor_node_id: self.node.id,
+            actor_node_id: self.local.node.id,
             reason: None,
             drain_task_stop_timeout_secs: None,
         };
@@ -2277,12 +2293,13 @@ impl topology::Server for Topology {
         counts.insert(local_view, local_node_count);
 
         let (actives, _) = self
+            .stores
             .peers
             .load_all()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         for (key, snapshot) in actives {
             let peer_id = key.to_uuid();
-            if peer_id == self.node.id {
+            if peer_id == self.local.node.id {
                 continue;
             }
             if excluded_peers.contains(&peer_id) {
@@ -2349,6 +2366,7 @@ impl topology::Server for Topology {
         }
 
         let cluster_metadata_rows = self
+            .stores
             .cluster_view_store
             .list_cluster_metadata()
             .map_err(|err| capnp::Error::failed(err.to_string()))?;
