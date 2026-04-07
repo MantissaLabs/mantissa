@@ -20,24 +20,37 @@ Each replicated domain has the same basic shape:
 
 ```mermaid
 flowchart LR
-    subgraph LocalNode[One node]
+    subgraph LocalNode[Local node]
+        direction TB
         W[Controller write]
-        DB[(Redb values + tombstones)]
-        MST[In-memory MST]
-        G[Gossip event]
-        S[Periodic sync]
+        DB[(Redb registers + tombstones)]
+        MST[Derived in-memory MST]
+
+        subgraph LocalReplication[Replication outputs]
+            direction LR
+            G[Gossip event]
+            S[Periodic sync]
+        end
+
+        W --> DB
+        DB --> MST
+        W --> G
+        DB --> S
+        MST --> S
     end
 
-    subgraph RemoteNode[Peer]
-        RG[Apply gossip]
+    subgraph RemoteNode[Peer node]
+        direction TB
+        RG[Apply gossip event]
         RS[Apply streamed delta]
+        RDB[(Redb registers + tombstones)]
+        RMST[Derived in-memory MST]
+
+        RG --> RDB
+        RS --> RDB
+        RDB --> RMST
     end
 
-    W --> DB
-    W --> MST
-    W --> G
-    S --> MST
-    S --> DB
     G --> RG
     S --> RS
 ```
