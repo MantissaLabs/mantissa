@@ -211,7 +211,8 @@ pub fn compare_agent_runs(left: &AgentRunSpecValue, right: &AgentRunSpecValue) -
 
 fn session_status_rank(status: AgentSessionStatus) -> u8 {
     match status {
-        AgentSessionStatus::Closed => 5,
+        AgentSessionStatus::Closed => 6,
+        AgentSessionStatus::Closing => 5,
         AgentSessionStatus::Failed => 4,
         AgentSessionStatus::Running => 3,
         AgentSessionStatus::Queued => 2,

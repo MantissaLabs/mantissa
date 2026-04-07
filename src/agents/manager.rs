@@ -26,6 +26,14 @@ use uuid::Uuid;
 
 /// Periodic reconciliation cadence for the first-class agent controller.
 const AGENT_RECONCILE_TICK_SECS: u64 = 2;
+/// Stable detail recorded when one active agent run is being cancelled by the operator.
+const AGENT_RUN_CANCEL_REQUESTED_DETAIL: &str = "sandbox run cancellation requested";
+/// Stable detail recorded when one active agent session is being closed by the operator.
+const AGENT_SESSION_CLOSE_REQUESTED_DETAIL: &str = "agent session close requested";
+/// Terminal detail recorded once one run is observed as cancelled.
+const AGENT_RUN_CANCELLED_DETAIL: &str = "sandbox run cancelled";
+/// Terminal detail recorded once one session is closed.
+const AGENT_SESSION_CLOSED_DETAIL: &str = "agent session closed";
 
 /// Submission result returned by the first-class agent API.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,6 +181,91 @@ impl AgentController {
         Ok(())
     }
 
+    /// Requests cancellation for one active or queued agent session run and keeps the session reusable.
+    pub async fn cancel_session(&self, session_id: Uuid) -> Result<AgentSessionSpecValue> {
+        let session = self
+            .registry
+            .get_session(session_id)?
+            .ok_or_else(|| anyhow!("agent session {session_id} not found"))?;
+        if session.is_terminal() {
+            return Err(anyhow!("agent session {session_id} is closed"));
+        }
+        if session.status == AgentSessionStatus::Closing {
+            return Err(anyhow!("agent session {session_id} is closing"));
+        }
+
+        if let Some(run_id) = session.active_run_id {
+            let run = self
+                .registry
+                .get_run(run_id)?
+                .ok_or_else(|| anyhow!("agent run {run_id} for session {session_id} not found"))?;
+            return self.cancel_session_run(session, run).await;
+        }
+
+        if session.pending_input.is_some() {
+            let mut idle = session.clone();
+            idle.cancel_pending_input(Some("queued input cancelled".to_string()));
+            self.apply_session(idle.clone()).await?;
+            self.broadcast(AgentEvent::UpsertSession(Box::new(idle.clone())))
+                .await?;
+            return Ok(idle);
+        }
+
+        Err(anyhow!(
+            "agent session {session_id} has no active or queued run to cancel"
+        ))
+    }
+
+    /// Closes one durable agent session, cancelling any active run before terminalizing it.
+    pub async fn close_session(&self, session_id: Uuid) -> Result<AgentSessionSpecValue> {
+        let session = self
+            .registry
+            .get_session(session_id)?
+            .ok_or_else(|| anyhow!("agent session {session_id} not found"))?;
+        if session.is_terminal() {
+            return Ok(session);
+        }
+
+        if let Some(run_id) = session.active_run_id {
+            let run = self
+                .registry
+                .get_run(run_id)?
+                .ok_or_else(|| anyhow!("agent run {run_id} for session {session_id} not found"))?;
+            return self.close_session_run(session, run).await;
+        }
+
+        let mut closed = session.clone();
+        closed.close(Some(AGENT_SESSION_CLOSED_DETAIL.to_string()));
+        self.apply_session(closed.clone()).await?;
+        self.broadcast(AgentEvent::UpsertSession(Box::new(closed.clone())))
+            .await?;
+        Ok(closed)
+    }
+
+    /// Deletes one previously closed session together with its retained run history.
+    pub async fn delete_session(&self, session_id: Uuid) -> Result<AgentSessionSpecValue> {
+        let session = self
+            .registry
+            .get_session(session_id)?
+            .ok_or_else(|| anyhow!("agent session {session_id} not found"))?;
+        if !session.is_terminal() {
+            return Err(anyhow!(
+                "agent session {} ({session_id}) is not closed; close it and wait for the current run to finish before deleting",
+                session.name
+            ));
+        }
+
+        let runs = self.registry.list_runs(Some(session_id))?;
+        for run in runs {
+            self.apply_remove(run.id).await?;
+            self.broadcast(AgentEvent::Remove { id: run.id }).await?;
+        }
+        self.apply_remove(session_id).await?;
+        self.broadcast(AgentEvent::Remove { id: session_id })
+            .await?;
+        Ok(session)
+    }
+
     /// Lists the canonical current session value for every replicated identifier.
     pub fn list_sessions(&self) -> Result<Vec<AgentSessionSpecValue>> {
         self.registry.list_sessions()
@@ -210,10 +303,15 @@ impl AgentController {
                 self.maybe_spawn_reconcile_for_session(session_id).await;
             }
             AgentEvent::Remove { id } => {
-                self.registry.remove_by_id(id).await?;
+                self.apply_remove(id).await?;
             }
         }
         Ok(())
+    }
+
+    /// Removes one agent session or run record from the durable registry.
+    async fn apply_remove(&self, id: Uuid) -> Result<()> {
+        self.registry.remove_by_id(id).await
     }
 
     /// Persists one session update into the durable registry.
@@ -312,10 +410,9 @@ impl AgentController {
 
         if let Some(run_id) = session.active_run_id {
             let Some(run) = self.registry.get_run(run_id)? else {
-                let mut failed = session.clone();
-                failed.mark_failed(run_id, Some("active run metadata disappeared".to_string()));
-                self.apply_session(failed.clone()).await?;
-                self.broadcast(AgentEvent::UpsertSession(Box::new(failed)))
+                let updated_session = finalize_missing_run_session_state(session.clone(), run_id);
+                self.apply_session(updated_session.clone()).await?;
+                self.broadcast(AgentEvent::UpsertSession(Box::new(updated_session)))
                     .await?;
                 return Ok(());
             };
@@ -362,6 +459,7 @@ impl AgentController {
                 return Ok(());
             }
         };
+        let shutdown_intent = run_shutdown_intent(&session, &run);
 
         match spec.state {
             WorkloadPhase::Pending
@@ -369,6 +467,9 @@ impl AgentController {
             | WorkloadPhase::Creating
             | WorkloadPhase::VolumeUnavailable => Ok(()),
             WorkloadPhase::Running | WorkloadPhase::Paused => {
+                if !matches!(shutdown_intent, RunShutdownIntent::None) {
+                    return Ok(());
+                }
                 if run.status != AgentRunStatus::Running
                     || session.status != AgentSessionStatus::Running
                 {
@@ -388,39 +489,111 @@ impl AgentController {
                 Ok(())
             }
             WorkloadPhase::Exited(exit_code) => {
-                if exit_code == 0 {
-                    let mut finished_run = run.clone();
-                    finished_run.mark_succeeded(
-                        Some(exit_code),
-                        Some("sandbox run completed successfully".to_string()),
-                    );
-                    let mut waiting_session = session.clone();
-                    waiting_session.mark_waiting_input(
-                        run.id,
-                        Some("sandbox run completed successfully".to_string()),
-                    );
-                    self.persist_run_and_session(&finished_run, &waiting_session)
-                        .await?;
-                } else {
-                    let mut failed_run = run.clone();
-                    failed_run.mark_failed(
-                        Some(exit_code),
-                        Some(format!("sandbox task exited with status code {exit_code}")),
-                    );
-                    let mut failed_session = session.clone();
-                    failed_session.mark_failed(
-                        run.id,
-                        Some(format!("sandbox task exited with status code {exit_code}")),
-                    );
-                    self.persist_run_and_session(&failed_run, &failed_session)
-                        .await?;
+                match shutdown_intent {
+                    RunShutdownIntent::Close => {
+                        let mut cancelled_run = run.clone();
+                        cancelled_run.mark_cancelled(
+                            Some(exit_code),
+                            Some(AGENT_SESSION_CLOSED_DETAIL.to_string()),
+                        );
+                        let mut closed_session = session.clone();
+                        closed_session.mark_cancelled_closed(
+                            run.id,
+                            Some(AGENT_SESSION_CLOSED_DETAIL.to_string()),
+                        );
+                        self.persist_run_and_session(&cancelled_run, &closed_session)
+                            .await?;
+                    }
+                    RunShutdownIntent::Cancel => {
+                        let mut cancelled_run = run.clone();
+                        cancelled_run.mark_cancelled(
+                            Some(exit_code),
+                            Some(AGENT_RUN_CANCELLED_DETAIL.to_string()),
+                        );
+                        let mut waiting_session = session.clone();
+                        waiting_session.mark_cancelled_waiting_input(
+                            run.id,
+                            Some(AGENT_RUN_CANCELLED_DETAIL.to_string()),
+                        );
+                        self.persist_run_and_session(&cancelled_run, &waiting_session)
+                            .await?;
+                    }
+                    RunShutdownIntent::None if exit_code == 0 => {
+                        let mut finished_run = run.clone();
+                        finished_run.mark_succeeded(
+                            Some(exit_code),
+                            Some("sandbox run completed successfully".to_string()),
+                        );
+                        let mut waiting_session = session.clone();
+                        waiting_session.mark_waiting_input(
+                            run.id,
+                            Some("sandbox run completed successfully".to_string()),
+                        );
+                        self.persist_run_and_session(&finished_run, &waiting_session)
+                            .await?;
+                    }
+                    RunShutdownIntent::None => {
+                        let mut failed_run = run.clone();
+                        failed_run.mark_failed(
+                            Some(exit_code),
+                            Some(format!("sandbox task exited with status code {exit_code}")),
+                        );
+                        let mut failed_session = session.clone();
+                        failed_session.mark_failed(
+                            run.id,
+                            Some(format!("sandbox task exited with status code {exit_code}")),
+                        );
+                        self.persist_run_and_session(&failed_run, &failed_session)
+                            .await?;
+                    }
                 }
                 Ok(())
             }
-            WorkloadPhase::Failed
-            | WorkloadPhase::Stopping
-            | WorkloadPhase::Stopped
-            | WorkloadPhase::Unknown => {
+            WorkloadPhase::Stopping => Ok(()),
+            WorkloadPhase::Stopped => {
+                match shutdown_intent {
+                    RunShutdownIntent::Close => {
+                        let mut cancelled_run = run.clone();
+                        cancelled_run
+                            .mark_cancelled(None, Some(AGENT_SESSION_CLOSED_DETAIL.to_string()));
+                        let mut closed_session = session.clone();
+                        closed_session.mark_cancelled_closed(
+                            run.id,
+                            Some(AGENT_SESSION_CLOSED_DETAIL.to_string()),
+                        );
+                        self.persist_run_and_session(&cancelled_run, &closed_session)
+                            .await?;
+                    }
+                    RunShutdownIntent::Cancel => {
+                        let mut cancelled_run = run.clone();
+                        cancelled_run
+                            .mark_cancelled(None, Some(AGENT_RUN_CANCELLED_DETAIL.to_string()));
+                        let mut waiting_session = session.clone();
+                        waiting_session.mark_cancelled_waiting_input(
+                            run.id,
+                            Some(AGENT_RUN_CANCELLED_DETAIL.to_string()),
+                        );
+                        self.persist_run_and_session(&cancelled_run, &waiting_session)
+                            .await?;
+                    }
+                    RunShutdownIntent::None => {
+                        let mut failed_run = run.clone();
+                        failed_run.mark_failed(
+                            None,
+                            Some("sandbox task stopped unexpectedly".to_string()),
+                        );
+                        let mut failed_session = session.clone();
+                        failed_session.mark_failed(
+                            run.id,
+                            Some("sandbox task stopped unexpectedly".to_string()),
+                        );
+                        self.persist_run_and_session(&failed_run, &failed_session)
+                            .await?;
+                    }
+                }
+                Ok(())
+            }
+            WorkloadPhase::Failed | WorkloadPhase::Unknown => {
                 let mut failed_run = run.clone();
                 failed_run
                     .mark_failed(None, Some(format!("sandbox task entered {:?}", spec.state)));
@@ -529,6 +702,87 @@ impl AgentController {
         }
     }
 
+    /// Cancels one concrete agent run and requests workload shutdown when it already launched.
+    async fn cancel_session_run(
+        &self,
+        session: AgentSessionSpecValue,
+        run: AgentRunSpecValue,
+    ) -> Result<AgentSessionSpecValue> {
+        if let Some(workload_id) = run.workload_id {
+            let mut requested_run = run.clone();
+            requested_run.request_cancel(Some(AGENT_RUN_CANCEL_REQUESTED_DETAIL.to_string()));
+            let mut requested_session = session.clone();
+            requested_session
+                .mark_cancel_requested(run.id, Some(AGENT_RUN_CANCEL_REQUESTED_DETAIL.to_string()));
+            self.persist_run_and_session(&requested_run, &requested_session)
+                .await?;
+            self.request_run_stop(requested_session.id, workload_id)
+                .await;
+            Ok(requested_session)
+        } else {
+            let mut cancelled_run = run.clone();
+            cancelled_run.mark_cancelled(
+                None,
+                Some("sandbox run cancelled before workload start".to_string()),
+            );
+            let mut waiting_session = session.clone();
+            waiting_session.mark_cancelled_waiting_input(
+                run.id,
+                Some("sandbox run cancelled before workload start".to_string()),
+            );
+            self.persist_run_and_session(&cancelled_run, &waiting_session)
+                .await?;
+            Ok(waiting_session)
+        }
+    }
+
+    /// Closes one concrete agent run and requests workload shutdown when it already launched.
+    async fn close_session_run(
+        &self,
+        session: AgentSessionSpecValue,
+        run: AgentRunSpecValue,
+    ) -> Result<AgentSessionSpecValue> {
+        if let Some(workload_id) = run.workload_id {
+            let mut requested_run = run.clone();
+            requested_run.request_cancel(Some(AGENT_SESSION_CLOSE_REQUESTED_DETAIL.to_string()));
+            let mut closing_session = session.clone();
+            closing_session.request_close(Some(AGENT_SESSION_CLOSE_REQUESTED_DETAIL.to_string()));
+            self.persist_run_and_session(&requested_run, &closing_session)
+                .await?;
+            self.request_run_stop(closing_session.id, workload_id).await;
+            Ok(closing_session)
+        } else {
+            let mut cancelled_run = run.clone();
+            cancelled_run.mark_cancelled(
+                None,
+                Some("agent session closed before sandbox workload start".to_string()),
+            );
+            let mut closed_session = session.clone();
+            closed_session
+                .mark_cancelled_closed(run.id, Some(AGENT_SESSION_CLOSED_DETAIL.to_string()));
+            self.persist_run_and_session(&cancelled_run, &closed_session)
+                .await?;
+            Ok(closed_session)
+        }
+    }
+
+    /// Requests runtime shutdown for one launched agent workload and schedules follow-up reconciliation.
+    async fn request_run_stop(&self, session_id: Uuid, workload_id: Uuid) {
+        if let Err(error) = self
+            .workload_manager
+            .request_workload_stop(workload_id)
+            .await
+        {
+            warn!(
+                target: "agents",
+                session_id = %session_id,
+                workload_id = %workload_id,
+                "failed to request workload stop while updating agent session: {error:#}",
+            );
+        }
+        self.maybe_spawn_reconcile_for_session(session_id).await;
+    }
+
     /// Persists and broadcasts one run/session pair after one lifecycle transition.
     async fn persist_run_and_session(
         &self,
@@ -589,7 +843,7 @@ fn session_needs_reconcile(session: &AgentSessionSpecValue) -> bool {
         || session.pending_input.is_some()
         || matches!(
             session.status,
-            AgentSessionStatus::Queued | AgentSessionStatus::Running
+            AgentSessionStatus::Queued | AgentSessionStatus::Running | AgentSessionStatus::Closing
         )
 }
 
@@ -760,6 +1014,50 @@ fn merge_mount(targets: &mut Vec<WorkloadVolumeMount>, mount: Option<&WorkloadVo
 /// Normalizes one boolean into the environment-variable values used by agent sandboxes.
 fn bool_to_env(value: bool) -> &'static str {
     if value { "true" } else { "false" }
+}
+
+/// Run-shutdown intent tracked on the durable session while a workload is being stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunShutdownIntent {
+    None,
+    Cancel,
+    Close,
+}
+
+/// Returns the requested shutdown intent for one active run based on the durable session state.
+fn run_shutdown_intent(
+    session: &AgentSessionSpecValue,
+    run: &AgentRunSpecValue,
+) -> RunShutdownIntent {
+    if session.status == AgentSessionStatus::Closing && session.active_run_id == Some(run.id) {
+        return RunShutdownIntent::Close;
+    }
+    if session.status_detail.as_deref() == Some(AGENT_RUN_CANCEL_REQUESTED_DETAIL)
+        && session.active_run_id == Some(run.id)
+    {
+        return RunShutdownIntent::Cancel;
+    }
+    RunShutdownIntent::None
+}
+
+/// Repairs one session whose active run record disappeared before the controller could finish it.
+fn finalize_missing_run_session_state(
+    mut session: AgentSessionSpecValue,
+    run_id: Uuid,
+) -> AgentSessionSpecValue {
+    match session.status {
+        AgentSessionStatus::Closing => {
+            session.mark_cancelled_closed(run_id, Some(AGENT_SESSION_CLOSED_DETAIL.to_string()));
+        }
+        _ if session.status_detail.as_deref() == Some(AGENT_RUN_CANCEL_REQUESTED_DETAIL) => {
+            session
+                .mark_cancelled_waiting_input(run_id, Some(AGENT_RUN_CANCELLED_DETAIL.to_string()));
+        }
+        _ => {
+            session.mark_failed(run_id, Some("active run metadata disappeared".to_string()));
+        }
+    }
+    session
 }
 
 /// Builds the deterministic workload name used for one sandbox-backed agent run.

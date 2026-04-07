@@ -78,6 +78,7 @@ pub enum AgentEventKind {
     RunStarted,
     RunCompleted,
     RunFailed,
+    RunCancelled,
     ToolCall,
     ToolResult,
     CheckpointSaved,
@@ -111,6 +112,7 @@ pub enum AgentSessionStatus {
     Queued,
     Running,
     Failed,
+    Closing,
     Closed,
 }
 
@@ -322,6 +324,90 @@ impl AgentSessionSpecValue {
         self.touch();
     }
 
+    /// Marks one queued or active run as cancellation-requested while preserving controller ownership.
+    pub fn mark_cancel_requested(&mut self, run_id: Uuid, detail: Option<String>) {
+        self.phase_version = self.phase_version.saturating_add(1);
+        if !matches!(self.status, AgentSessionStatus::Running) {
+            self.status = AgentSessionStatus::Queued;
+        }
+        self.status_detail = normalize_optional_text(detail);
+        self.active_run_id = Some(run_id);
+        self.last_run_id = Some(run_id);
+        self.pending_input = None;
+        self.touch();
+    }
+
+    /// Cancels one run and returns the session to input-waiting state for another turn.
+    pub fn mark_cancelled_waiting_input(&mut self, run_id: Uuid, detail: Option<String>) {
+        self.phase_version = self.phase_version.saturating_add(1);
+        self.status = AgentSessionStatus::WaitingInput;
+        self.status_detail = normalize_optional_text(detail);
+        self.active_run_id = None;
+        self.last_run_id = Some(run_id);
+        self.pending_input = None;
+        self.push_event(
+            AgentEventKind::RunCancelled,
+            Some(run_id),
+            self.status_detail.clone(),
+            None,
+        );
+        self.push_event(
+            AgentEventKind::NeedInput,
+            None,
+            Some("agent session is waiting for more input".to_string()),
+            None,
+        );
+        self.touch();
+    }
+
+    /// Cancels one run while closing the session so future input is rejected.
+    pub fn mark_cancelled_closed(&mut self, run_id: Uuid, detail: Option<String>) {
+        self.phase_version = self.phase_version.saturating_add(1);
+        self.status = AgentSessionStatus::Closed;
+        self.status_detail = normalize_optional_text(detail);
+        self.active_run_id = None;
+        self.last_run_id = Some(run_id);
+        self.pending_input = None;
+        self.push_event(
+            AgentEventKind::RunCancelled,
+            Some(run_id),
+            self.status_detail.clone(),
+            None,
+        );
+        self.push_event(
+            AgentEventKind::SessionClosed,
+            None,
+            self.status_detail.clone(),
+            None,
+        );
+        self.touch();
+    }
+
+    /// Cancels one queued input before it ever launches a run and returns the session to idle.
+    pub fn cancel_pending_input(&mut self, detail: Option<String>) {
+        self.phase_version = self.phase_version.saturating_add(1);
+        self.status = AgentSessionStatus::WaitingInput;
+        self.status_detail = normalize_optional_text(detail);
+        self.active_run_id = None;
+        self.pending_input = None;
+        self.push_event(
+            AgentEventKind::NeedInput,
+            None,
+            Some("agent session is waiting for more input".to_string()),
+            None,
+        );
+        self.touch();
+    }
+
+    /// Marks the session as closing while any active run is being stopped.
+    pub fn request_close(&mut self, detail: Option<String>) {
+        self.phase_version = self.phase_version.saturating_add(1);
+        self.status = AgentSessionStatus::Closing;
+        self.status_detail = normalize_optional_text(detail);
+        self.pending_input = None;
+        self.touch();
+    }
+
     /// Closes the session and records the terminal structured lifecycle event.
     pub fn close(&mut self, detail: Option<String>) {
         self.phase_version = self.phase_version.saturating_add(1);
@@ -479,6 +565,23 @@ impl AgentRunSpecValue {
     pub fn mark_failed(&mut self, exit_code: Option<i32>, detail: Option<String>) {
         self.phase_version = self.phase_version.saturating_add(1);
         self.status = AgentRunStatus::Failed;
+        self.status_detail = normalize_optional_text(detail);
+        self.exit_code = exit_code;
+        self.finished_at = Some(current_timestamp());
+        self.touch();
+    }
+
+    /// Records one cancellation request without yet marking the run terminal.
+    pub fn request_cancel(&mut self, detail: Option<String>) {
+        self.phase_version = self.phase_version.saturating_add(1);
+        self.status_detail = normalize_optional_text(detail);
+        self.touch();
+    }
+
+    /// Marks the run as cancelled and records the observed exit code when known.
+    pub fn mark_cancelled(&mut self, exit_code: Option<i32>, detail: Option<String>) {
+        self.phase_version = self.phase_version.saturating_add(1);
+        self.status = AgentRunStatus::Cancelled;
         self.status_detail = normalize_optional_text(detail);
         self.exit_code = exit_code;
         self.finished_at = Some(current_timestamp());

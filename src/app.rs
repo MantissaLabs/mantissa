@@ -371,6 +371,21 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     ))
                     .await?;
             }
+            AgentsCommand::Cancel(args) => {
+                local
+                    .run_until(client::agents::cancel(&cfg, &args.id))
+                    .await?;
+            }
+            AgentsCommand::Close(args) => {
+                local
+                    .run_until(client::agents::close(&cfg, &args.id))
+                    .await?;
+            }
+            AgentsCommand::Delete(args) => {
+                local
+                    .run_until(client::agents::delete(&cfg, &args.id))
+                    .await?;
+            }
         },
 
         Command::Scheduler { cmd } => match cmd {

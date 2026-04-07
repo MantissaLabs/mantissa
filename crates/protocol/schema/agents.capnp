@@ -17,6 +17,15 @@ interface Agents {
 
   inspect @4 (sessionId :Data) -> (session :AgentSessionSpec, runs :List(AgentRunSpec));
   # Inspect one durable agent session together with its known run history.
+
+  cancel @5 (sessionId :Data) -> (session :AgentSessionSpec);
+  # Request cancellation for one active or queued durable agent session run.
+
+  close @6 (sessionId :Data) -> (session :AgentSessionSpec);
+  # Close one durable agent session and reject future input, cancelling any active run.
+
+  delete @7 (sessionId :Data) -> (session :AgentSessionSpec);
+  # Delete one previously closed durable agent session and its retained run history.
 }
 
 struct AgentSessionSpec {
@@ -284,7 +293,8 @@ enum AgentSessionStatus {
   queued @1;
   running @2;
   failed @3;
-  closed @4;
+  closing @4;
+  closed @5;
 }
 
 enum AgentRunStatus {
@@ -307,6 +317,7 @@ enum AgentEventKind {
   checkpointSaved @8;
   sessionOpened @9;
   sessionClosed @10;
+  runCancelled @11;
 }
 
 struct AgentEvent {

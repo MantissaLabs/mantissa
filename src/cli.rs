@@ -428,6 +428,16 @@ pub enum AgentsCommand {
 
     /// Queue one user input on an existing session
     Input(AgentsInputArgs),
+
+    /// Request cancellation for the active or queued run of one agent session
+    Cancel(AgentsCancelArgs),
+
+    /// Close one durable agent session and reject future input
+    Close(AgentsCloseArgs),
+
+    /// Delete one previously closed agent session
+    #[command(alias = "rm")]
+    Delete(AgentsDeleteArgs),
 }
 
 #[derive(Args, Debug)]
@@ -868,6 +878,27 @@ pub struct AgentsInputArgs {
     /// Input text to queue on the session
     #[arg(index = 2, value_name = "TEXT")]
     pub input: String,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentsCancelArgs {
+    /// Identifier of the session to cancel
+    #[arg(index = 1, value_name = "SESSION-ID")]
+    pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentsCloseArgs {
+    /// Identifier of the session to close
+    #[arg(index = 1, value_name = "SESSION-ID")]
+    pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentsDeleteArgs {
+    /// Identifier of the session to delete
+    #[arg(index = 1, value_name = "SESSION-ID")]
+    pub id: String,
 }
 
 #[derive(Args, Debug)]

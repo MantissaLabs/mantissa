@@ -77,6 +77,7 @@ impl AgentSessionRow {
                 ProtoAgentSessionStatus::Queued => "queued",
                 ProtoAgentSessionStatus::Running => "running",
                 ProtoAgentSessionStatus::Failed => "failed",
+                ProtoAgentSessionStatus::Closing => "closing",
                 ProtoAgentSessionStatus::Closed => "closed",
             },
             active_run_id: {

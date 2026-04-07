@@ -144,6 +144,66 @@ impl agents::Server for AgentsRpc {
         }
         Ok(())
     }
+
+    /// Requests cancellation for one queued or active agent run and returns the updated session.
+    async fn cancel(
+        self: Rc<Self>,
+        params: agents::CancelParams,
+        mut results: agents::CancelResults,
+    ) -> Result<(), Error> {
+        self.topology
+            .ensure_no_active_cluster_operation("cancel agent sessions")?;
+
+        let reader = params.get()?;
+        let session_id = read_uuid(reader.get_session_id()?)?;
+        let session = self
+            .manager
+            .cancel_session(session_id)
+            .await
+            .map_err(|error| Error::failed(error.to_string()))?;
+        write_agent_session_spec(results.get().init_session(), &session)?;
+        Ok(())
+    }
+
+    /// Closes one agent session and returns the updated session snapshot.
+    async fn close(
+        self: Rc<Self>,
+        params: agents::CloseParams,
+        mut results: agents::CloseResults,
+    ) -> Result<(), Error> {
+        self.topology
+            .ensure_no_active_cluster_operation("close agent sessions")?;
+
+        let reader = params.get()?;
+        let session_id = read_uuid(reader.get_session_id()?)?;
+        let session = self
+            .manager
+            .close_session(session_id)
+            .await
+            .map_err(|error| Error::failed(error.to_string()))?;
+        write_agent_session_spec(results.get().init_session(), &session)?;
+        Ok(())
+    }
+
+    /// Deletes one closed agent session and returns the removed session snapshot.
+    async fn delete(
+        self: Rc<Self>,
+        params: agents::DeleteParams,
+        mut results: agents::DeleteResults,
+    ) -> Result<(), Error> {
+        self.topology
+            .ensure_no_active_cluster_operation("delete agent sessions")?;
+
+        let reader = params.get()?;
+        let session_id = read_uuid(reader.get_session_id()?)?;
+        let session = self
+            .manager
+            .delete_session(session_id)
+            .await
+            .map_err(|error| Error::failed(error.to_string()))?;
+        write_agent_session_spec(results.get().init_session(), &session)?;
+        Ok(())
+    }
 }
 
 /// Encodes one agent event into the shared gossip message union payload.
@@ -692,6 +752,7 @@ fn agent_session_status_to_proto(
         AgentSessionStatus::Queued => protocol::agents::AgentSessionStatus::Queued,
         AgentSessionStatus::Running => protocol::agents::AgentSessionStatus::Running,
         AgentSessionStatus::Failed => protocol::agents::AgentSessionStatus::Failed,
+        AgentSessionStatus::Closing => protocol::agents::AgentSessionStatus::Closing,
         AgentSessionStatus::Closed => protocol::agents::AgentSessionStatus::Closed,
     }
 }
@@ -704,6 +765,7 @@ fn proto_to_agent_session_status(
         protocol::agents::AgentSessionStatus::Queued => AgentSessionStatus::Queued,
         protocol::agents::AgentSessionStatus::Running => AgentSessionStatus::Running,
         protocol::agents::AgentSessionStatus::Failed => AgentSessionStatus::Failed,
+        protocol::agents::AgentSessionStatus::Closing => AgentSessionStatus::Closing,
         protocol::agents::AgentSessionStatus::Closed => AgentSessionStatus::Closed,
     }
 }
@@ -736,6 +798,7 @@ fn agent_event_kind_to_proto(kind: AgentEventKind) -> protocol::agents::AgentEve
         AgentEventKind::RunStarted => protocol::agents::AgentEventKind::RunStarted,
         AgentEventKind::RunCompleted => protocol::agents::AgentEventKind::RunCompleted,
         AgentEventKind::RunFailed => protocol::agents::AgentEventKind::RunFailed,
+        AgentEventKind::RunCancelled => protocol::agents::AgentEventKind::RunCancelled,
         AgentEventKind::ToolCall => protocol::agents::AgentEventKind::ToolCall,
         AgentEventKind::ToolResult => protocol::agents::AgentEventKind::ToolResult,
         AgentEventKind::CheckpointSaved => protocol::agents::AgentEventKind::CheckpointSaved,
@@ -752,6 +815,7 @@ fn proto_to_agent_event_kind(kind: protocol::agents::AgentEventKind) -> AgentEve
         protocol::agents::AgentEventKind::RunStarted => AgentEventKind::RunStarted,
         protocol::agents::AgentEventKind::RunCompleted => AgentEventKind::RunCompleted,
         protocol::agents::AgentEventKind::RunFailed => AgentEventKind::RunFailed,
+        protocol::agents::AgentEventKind::RunCancelled => AgentEventKind::RunCancelled,
         protocol::agents::AgentEventKind::ToolCall => AgentEventKind::ToolCall,
         protocol::agents::AgentEventKind::ToolResult => AgentEventKind::ToolResult,
         protocol::agents::AgentEventKind::CheckpointSaved => AgentEventKind::CheckpointSaved,

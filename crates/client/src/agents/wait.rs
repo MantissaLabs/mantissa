@@ -33,7 +33,9 @@ pub async fn wait(cfg: &ClientConfig, id: &str, timeout: Option<Duration>) -> Re
                 ));
                 return Err(anyhow!(wait_failure_message(&detail)));
             }
-            AgentSessionStatusView::Queued | AgentSessionStatusView::Running => {}
+            AgentSessionStatusView::Queued
+            | AgentSessionStatusView::Running
+            | AgentSessionStatusView::Closing => {}
         }
 
         if let Some(timeout) = timeout

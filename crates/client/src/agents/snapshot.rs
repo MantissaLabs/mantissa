@@ -20,6 +20,7 @@ pub enum AgentSessionStatusView {
     Queued,
     Running,
     Failed,
+    Closing,
     Closed,
 }
 
@@ -31,13 +32,14 @@ impl AgentSessionStatusView {
             Self::Queued => "queued",
             Self::Running => "running",
             Self::Failed => "failed",
+            Self::Closing => "closing",
             Self::Closed => "closed",
         }
     }
 
     /// Returns whether the session still has queued or active execution work.
     pub fn is_active(self) -> bool {
-        matches!(self, Self::Queued | Self::Running)
+        matches!(self, Self::Queued | Self::Running | Self::Closing)
     }
 
     /// Returns whether the session already reached one stable non-executing state.
@@ -187,6 +189,7 @@ impl AgentSessionSnapshotView {
                 ProtoAgentSessionStatus::Queued => AgentSessionStatusView::Queued,
                 ProtoAgentSessionStatus::Running => AgentSessionStatusView::Running,
                 ProtoAgentSessionStatus::Failed => AgentSessionStatusView::Failed,
+                ProtoAgentSessionStatus::Closing => AgentSessionStatusView::Closing,
                 ProtoAgentSessionStatus::Closed => AgentSessionStatusView::Closed,
             },
             status_detail: read_optional_text(reader.get_status_detail()?),
@@ -341,6 +344,48 @@ pub async fn inspect_session_detail(
     });
 
     Ok(AgentSessionDetailView { snapshot, runs })
+}
+
+/// Requests cancellation for one agent session and returns the updated public snapshot.
+pub async fn cancel_session_snapshot(
+    cfg: &ClientConfig,
+    session_id: Uuid,
+) -> Result<AgentSessionSnapshotView> {
+    let session = connection::get_local_session(cfg).await?;
+    let request = session.get_agents_request();
+    let agents = request.send().pipeline.get_agents();
+    let mut request = agents.cancel_request();
+    request.get().set_session_id(session_id.as_bytes());
+    let response = request.send().promise.await?;
+    AgentSessionSnapshotView::from_reader(response.get()?.get_session()?).map_err(Into::into)
+}
+
+/// Requests session closure and returns the updated public snapshot.
+pub async fn close_session_snapshot(
+    cfg: &ClientConfig,
+    session_id: Uuid,
+) -> Result<AgentSessionSnapshotView> {
+    let session = connection::get_local_session(cfg).await?;
+    let request = session.get_agents_request();
+    let agents = request.send().pipeline.get_agents();
+    let mut request = agents.close_request();
+    request.get().set_session_id(session_id.as_bytes());
+    let response = request.send().promise.await?;
+    AgentSessionSnapshotView::from_reader(response.get()?.get_session()?).map_err(Into::into)
+}
+
+/// Deletes one closed agent session and returns the removed public snapshot.
+pub async fn delete_session_snapshot(
+    cfg: &ClientConfig,
+    session_id: Uuid,
+) -> Result<AgentSessionSnapshotView> {
+    let session = connection::get_local_session(cfg).await?;
+    let request = session.get_agents_request();
+    let agents = request.send().pipeline.get_agents();
+    let mut request = agents.delete_request();
+    request.get().set_session_id(session_id.as_bytes());
+    let response = request.send().promise.await?;
+    AgentSessionSnapshotView::from_reader(response.get()?.get_session()?).map_err(Into::into)
 }
 
 /// Renders one detailed public agent session snapshot.
@@ -642,6 +687,7 @@ fn agent_event_kind_label(kind: ProtoAgentEventKind) -> &'static str {
         ProtoAgentEventKind::RunStarted => "run_started",
         ProtoAgentEventKind::RunCompleted => "run_completed",
         ProtoAgentEventKind::RunFailed => "run_failed",
+        ProtoAgentEventKind::RunCancelled => "run_cancelled",
         ProtoAgentEventKind::ToolCall => "tool_call",
         ProtoAgentEventKind::ToolResult => "tool_result",
         ProtoAgentEventKind::CheckpointSaved => "checkpoint_saved",
@@ -746,5 +792,12 @@ mod tests {
     fn queued_sessions_remain_active() {
         assert!(AgentSessionStatusView::Queued.is_active());
         assert!(!AgentSessionStatusView::Queued.is_stable());
+    }
+
+    /// Marks closing sessions as active so `agents wait` continues polling.
+    #[test]
+    fn closing_sessions_remain_active() {
+        assert!(AgentSessionStatusView::Closing.is_active());
+        assert!(!AgentSessionStatusView::Closing.is_stable());
     }
 }

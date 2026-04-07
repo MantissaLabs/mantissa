@@ -258,6 +258,145 @@ local_test!(agents_submit_nono_run_projects_runtime_sandbox_policy, {
     mark_workload_exited(&node, workload_id, 0).await;
 });
 
+local_test!(agents_cancel_active_run_returns_session_to_waiting_input, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let node = TestNode::new().await;
+
+    let session_id = submit_agent_session(
+        &node.node.agents_client,
+        "cancel-agent",
+        Some("cancel this run"),
+        None,
+    )
+    .await
+    .expect("submit cancellable agent session");
+
+    let (run_id, workload_id) = wait_for_active_run(&node.node.agents_client, session_id).await;
+    cancel_agent_session(&node.node.agents_client, session_id)
+        .await
+        .expect("cancel active agent session");
+    mark_workload_phase(&node, workload_id, WorkloadPhase::Stopped).await;
+
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+            let client = node.node.agents_client.clone();
+            async move {
+                let sessions = list_sessions(&client).await.expect("list agent sessions");
+                let runs = list_runs(&client, Some(session_id))
+                    .await
+                    .expect("list agent runs");
+                sessions.iter().any(|session| {
+                    session.id == session_id
+                        && session.status == ProtoAgentSessionStatus::WaitingInput
+                        && session.active_run_id.is_none()
+                        && session.last_run_id == Some(run_id)
+                }) && runs.iter().any(|run| {
+                    run.id == run_id
+                        && run.status == ProtoAgentRunStatus::Cancelled
+                        && run.workload_id == Some(workload_id)
+                })
+            }
+        })
+        .await,
+        "cancelled agent run should return the session to waiting_input"
+    );
+});
+
+local_test!(agents_close_active_run_transitions_to_closed, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let node = TestNode::new().await;
+
+    let session_id = submit_agent_session(
+        &node.node.agents_client,
+        "close-agent",
+        Some("close this session"),
+        None,
+    )
+    .await
+    .expect("submit closable agent session");
+
+    let (run_id, workload_id) = wait_for_active_run(&node.node.agents_client, session_id).await;
+    close_agent_session(&node.node.agents_client, session_id)
+        .await
+        .expect("close active agent session");
+
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+            let client = node.node.agents_client.clone();
+            async move {
+                list_sessions(&client)
+                    .await
+                    .expect("list agent sessions")
+                    .into_iter()
+                    .any(|session| {
+                        session.id == session_id
+                            && session.status == ProtoAgentSessionStatus::Closing
+                            && session.active_run_id == Some(run_id)
+                    })
+            }
+        })
+        .await,
+        "closing an active session should expose the closing intermediary state"
+    );
+
+    mark_workload_phase(&node, workload_id, WorkloadPhase::Stopped).await;
+
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+            let client = node.node.agents_client.clone();
+            async move {
+                let sessions = list_sessions(&client).await.expect("list agent sessions");
+                let runs = list_runs(&client, Some(session_id))
+                    .await
+                    .expect("list agent runs");
+                sessions.iter().any(|session| {
+                    session.id == session_id
+                        && session.status == ProtoAgentSessionStatus::Closed
+                        && session.active_run_id.is_none()
+                        && session.last_run_id == Some(run_id)
+                }) && runs.iter().any(|run| {
+                    run.id == run_id
+                        && run.status == ProtoAgentRunStatus::Cancelled
+                        && run.workload_id == Some(workload_id)
+                })
+            }
+        })
+        .await,
+        "closed agent session should retain the cancelled last run"
+    );
+});
+
+local_test!(agents_delete_closed_session_removes_session_and_runs, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let node = TestNode::new().await;
+
+    let session_id = submit_agent_session(&node.node.agents_client, "delete-agent", None, None)
+        .await
+        .expect("submit deletable agent session");
+
+    close_agent_session(&node.node.agents_client, session_id)
+        .await
+        .expect("close idle agent session");
+    delete_agent_session(&node.node.agents_client, session_id)
+        .await
+        .expect("delete closed agent session");
+
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+            let client = node.node.agents_client.clone();
+            async move {
+                let sessions = list_sessions(&client).await.expect("list agent sessions");
+                let runs = list_runs(&client, Some(session_id))
+                    .await
+                    .expect("list agent runs");
+                sessions.into_iter().all(|session| session.id != session_id) && runs.is_empty()
+            }
+        })
+        .await,
+        "deleted agent sessions should disappear together with their run history"
+    );
+});
+
 #[derive(Clone, Copy, Default)]
 struct AgentSessionSubmitOptions<'a> {
     initial_input: Option<&'a str>,
@@ -564,6 +703,39 @@ async fn submit_agent_input(
     Ok(())
 }
 
+/// Requests cancellation for one active or queued agent session.
+async fn cancel_agent_session(
+    client: &agents::Client,
+    session_id: Uuid,
+) -> Result<(), capnp::Error> {
+    let mut request = client.cancel_request();
+    request.get().set_session_id(session_id.as_bytes());
+    request.send().promise.await?;
+    Ok(())
+}
+
+/// Requests closure for one agent session.
+async fn close_agent_session(
+    client: &agents::Client,
+    session_id: Uuid,
+) -> Result<(), capnp::Error> {
+    let mut request = client.close_request();
+    request.get().set_session_id(session_id.as_bytes());
+    request.send().promise.await?;
+    Ok(())
+}
+
+/// Deletes one previously closed agent session.
+async fn delete_agent_session(
+    client: &agents::Client,
+    session_id: Uuid,
+) -> Result<(), capnp::Error> {
+    let mut request = client.delete_request();
+    request.get().set_session_id(session_id.as_bytes());
+    request.send().promise.await?;
+    Ok(())
+}
+
 /// Lists the current replicated agent sessions exposed by the agents capability.
 async fn list_sessions(client: &agents::Client) -> Result<Vec<AgentSessionSnapshot>, capnp::Error> {
     let response = client.list_sessions_request().send().promise.await?;
@@ -636,13 +808,18 @@ async fn wait_for_active_run(client: &agents::Client, session_id: Uuid) -> (Uuid
 
 /// Marks one persisted workload as exited so the agent controller can observe completion.
 async fn mark_workload_exited(node: &TestNode, workload_id: Uuid, exit_code: i32) {
+    mark_workload_phase(node, workload_id, WorkloadPhase::Exited(exit_code)).await;
+}
+
+/// Marks one persisted workload with an arbitrary phase so the agent controller can observe it.
+async fn mark_workload_phase(node: &TestNode, workload_id: Uuid, phase: WorkloadPhase) {
     let mut task = node
         .node
         .workload_manager
         .inspect_workload(workload_id)
         .await
         .expect("inspect agent workload");
-    task.state = WorkloadPhase::Exited(exit_code);
+    task.state = phase;
     task.updated_at = Utc::now().to_rfc3339();
     node.node
         .workloads
