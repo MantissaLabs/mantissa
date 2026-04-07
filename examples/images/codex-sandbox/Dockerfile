@@ -14,7 +14,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && npm install --global "@openai/codex@${CODEX_VERSION}" \
     && npm cache clean --force \
-    && mkdir -p /workspace \
+    && mkdir -p /workspace /run/secrets \
     && chown -R node:node /workspace
 
 COPY entrypoint.sh /usr/local/bin/mantissa-codex-entrypoint

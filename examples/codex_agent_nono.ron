@@ -23,14 +23,14 @@
             memory_mb: 1024,
         ),
         termination_grace_period_secs: Some(30),
-        env: [
+        secret_files: [
             (
-                name: "CODEX_API_KEY",
-                value: None,
-                secret: Some((
+                path: "/run/secrets/codex-api-key",
+                secret: (
                     name: "openai-api-key",
                     version: None,
-                )),
+                ),
+                mode: Some(0o444),
             ),
         ],
     ),

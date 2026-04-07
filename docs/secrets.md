@@ -67,25 +67,29 @@ If a secret is missing, the deployment fails fast with a descriptive error so yo
 before retrying.
 
 Agent manifests use the same secret reference shape. The bundled
-`examples/codex_agent_nono.ron` injects `CODEX_API_KEY` into a sandboxed
-Codex session through the agent execution environment:
+`examples/codex_agent_nono.ron` projects the OpenAI API key as a secret file
+inside a sandboxed Codex session, and the example image entrypoint exports
+`CODEX_API_KEY` from that file right before launching Codex:
 
 ```ron
 (
     execution: (
-        env: [
+        secret_files: [
             (
-                name: "CODEX_API_KEY",
-                value: None,
-                secret: Some((
+                path: "/run/secrets/codex-api-key",
+                secret: (
                     name: "openai-api-key",
                     version: None,
-                )),
+                ),
+                mode: Some(0o444),
             ),
         ],
     ),
 )
 ```
+
+This keeps the secret out of Docker environment metadata while still satisfying
+programs that require an environment variable at process start.
 
 A complete end-to-end flow for that example looks like this:
 

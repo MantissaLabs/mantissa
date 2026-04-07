@@ -129,7 +129,7 @@ This manifest shows the first real agent-shaped `nono` example:
 
 - sandboxed OCI execution using the `nono-default` isolation profile
 - one managed workspace volume mounted at `/workspace`
-- secret-backed `CODEX_API_KEY` injection
+- file-backed OpenAI API key projection at `/run/secrets/codex-api-key`
 - a Mantissa-owned Codex image with a pinned CLI version, non-root user, and
   image-owned entrypoint so the manifest does not need a shell command
 
@@ -137,8 +137,9 @@ The example image lives at `examples/images/codex-sandbox/Dockerfile`. It uses
 the official `node:22-bookworm-slim` base, installs a pinned
 `@openai/codex` version, switches to the non-root `node` user, preconfigures
 Codex's writable state under `/var/tmp`, defaults the example to the cheaper
-`gpt-5.4-nano` model, and launches `codex exec` from an image entrypoint when
-Mantissa provides `MANTISSA_AGENT_INPUT`. If you want a different model, set
+`gpt-5.4-nano` model, reads `CODEX_API_KEY` from the mounted secret file when
+present, and launches `codex exec` from an image entrypoint when Mantissa
+provides `MANTISSA_AGENT_INPUT`. If you want a different model, set
 `CODEX_MODEL` in the agent manifest environment. For a multi-node cluster,
 push the built image to a registry your nodes can pull from and update
 `execution.image` accordingly.
