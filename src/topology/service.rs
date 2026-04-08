@@ -1,3 +1,9 @@
+use super::builders::{
+    ClusterViewSummaryRow, DrainStatusState, JoinPayload, ListedNodeRow, NodeDrainStatusSnapshot,
+    SplitCandidateRow, add_event, drain_state_from_scheduling, write_cluster_view_summary_row,
+    write_join_payload_to_node_info, write_listed_node_row, write_node_drain_status,
+    write_split_candidate_row,
+};
 use super::{Topology, TopologyEvent};
 use crate::cluster::coordinator::ClusterTransitionCoordinator;
 use crate::cluster::operations::{
@@ -9,7 +15,7 @@ use crate::cluster::transition::ClusterTransition;
 use crate::cluster::{ClusterId, ClusterViewId};
 use crate::config;
 use crate::node::address::extract_port;
-use crate::node::id::{read_node_id, set_node_id};
+use crate::node::id::read_node_id;
 use crate::node::identity::pubkey_from_slice;
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::scheduler::SlotCapacity;
@@ -22,10 +28,7 @@ use crate::store::local::{LocalCredentialStore, LocalSessionStore, MasterKeyReco
 use crate::store::peer_store::PeersStore;
 use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains};
 use crate::topology::health::status_to_node_status;
-use crate::topology::peers::{
-    PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
-    write_runtime_support_to_node_info,
-};
+use crate::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue};
 use crate::volumes::registry::VolumeRegistry;
 use crate::volumes::types::VolumeDriver;
 use crate::workload::model::{WorkloadPhase, WorkloadValue, select_best_workload_value};
@@ -34,7 +37,6 @@ use capnp::Error;
 use capnp::data;
 use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::VerifyingKey;
-use protocol::gossip::gossip_message;
 use protocol::server::{self, cluster_session};
 use protocol::topology::{topology, topology_event};
 use std::collections::{HashMap, HashSet};
@@ -43,21 +45,6 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::cluster_operations::SplitOperationBuildInput;
-
-#[derive(Clone)]
-struct JoinPayload {
-    id: Uuid,
-    hostname: String,
-    advertise_addr: String,
-    incarnation: u64,
-    server_handle: server::Client,
-    public_key: [u8; 32],
-    signing_key: [u8; 32],
-    identity_sig: [u8; 64],
-    wireguard: Option<WireGuardPeerValue>,
-    scheduling: PeerSchedulingState,
-    runtime_support: RuntimeSupportProfile,
-}
 
 struct JoinInputs {
     anchor: String,
@@ -125,45 +112,6 @@ struct JoinResponse {
     ticket: Vec<u8>,
     credential: Vec<u8>,
     session: cluster_session::Client,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DrainStatusState {
-    Open,
-    Fenced,
-    Draining,
-    Drained,
-    Blocked,
-}
-
-impl DrainStatusState {
-    /// Converts the internal drain state into the Cap'n Proto enum used by RPC clients.
-    fn as_capnp(self) -> protocol::topology::NodeDrainState {
-        match self {
-            DrainStatusState::Open => protocol::topology::NodeDrainState::Open,
-            DrainStatusState::Fenced => protocol::topology::NodeDrainState::Fenced,
-            DrainStatusState::Draining => protocol::topology::NodeDrainState::Draining,
-            DrainStatusState::Drained => protocol::topology::NodeDrainState::Drained,
-            DrainStatusState::Blocked => protocol::topology::NodeDrainState::Blocked,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct NodeDrainStatusSnapshot {
-    node_id: Uuid,
-    schedulable: bool,
-    drain_requested: bool,
-    task_stop_timeout_secs: Option<u32>,
-    state: DrainStatusState,
-    remaining_service_tasks: u32,
-    blocking_standalone_tasks: u32,
-    remaining_reserved_slots: u32,
-    remaining_reserved_gpus: u32,
-    scheduler_summary_known: bool,
-    reason: Option<String>,
-    message: String,
-    last_scheduling_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -534,42 +482,7 @@ impl Topology {
         join_token: &str,
     ) -> Result<JoinResponse, Error> {
         let mut request = client.register_node_request();
-
-        let mut info = request.get().init_info();
-        set_node_id(info.reborrow().init_id(), &payload.id);
-        cluster_view.write_capnp(info.reborrow().init_active_cluster_view());
-        info.set_hostname(&payload.hostname);
-        info.set_addr(&payload.advertise_addr);
-        info.set_handle(payload.server_handle.clone());
-        info.set_public_key(&payload.public_key);
-        info.set_signing_key(&payload.signing_key);
-        info.set_identity_sig(&payload.identity_sig);
-        info.set_incarnation(payload.incarnation);
-        info.set_schedulable(payload.scheduling.schedulable);
-        info.set_drain_requested(payload.scheduling.drain_requested);
-        info.set_drain_state(if payload.scheduling.schedulable {
-            protocol::topology::NodeDrainState::Open
-        } else {
-            protocol::topology::NodeDrainState::Fenced
-        });
-        info.set_drain_task_stop_timeout_secs(
-            payload.scheduling.drain_task_stop_timeout_secs.unwrap_or(0),
-        );
-        info.set_scheduling_updated_at_unix_ms(payload.scheduling.updated_at_unix_ms);
-        set_node_id(
-            info.reborrow().init_scheduling_actor_node_id(),
-            &payload.scheduling.actor_node_id,
-        );
-        if let Some(reason) = payload.scheduling.reason.as_deref() {
-            info.set_scheduling_reason(reason);
-        }
-        write_runtime_support_to_node_info(info.reborrow(), &payload.runtime_support);
-        if let Some(wg) = payload.wireguard.as_ref() {
-            info.set_wireguard_public_key(&wg.public_key);
-            info.set_wireguard_port(wg.port);
-            info.set_wireguard_enabled(wg.enabled);
-        }
-
+        write_join_payload_to_node_info(request.get().init_info(), payload, cluster_view);
         request.get().set_token(join_token);
 
         let response = request.send().promise.await?;
@@ -1803,10 +1716,7 @@ impl topology::Server for Topology {
 
         let local_view = self.active_cluster_view();
         let excluded_peers = self.excluded_peers_snapshot().await;
-        let mut scoped_nodes =
-            Vec::<(Uuid, Option<PeerValue>, protocol::health::NodeStatus)>::with_capacity(
-                actives.len(),
-            );
+        let mut scoped_nodes = Vec::<ListedNodeRow>::with_capacity(actives.len());
 
         for (k, snap) in actives.into_iter() {
             let id = k.to_uuid();
@@ -1828,57 +1738,28 @@ impl topology::Server for Topology {
                 .cloned()
                 .unwrap_or(::health::Status::Unknown);
             let node_status = status_to_node_status(health_status);
-            let Some(selected) =
-                PeerValue::select(snap.as_slice()).filter(|value| value.is_active())
+            let Some(value) = PeerValue::select(snap.as_slice()).filter(|value| value.is_active())
             else {
                 continue;
             };
-            scoped_nodes.push((id, Some(selected), node_status));
+            let drain_state = if value.scheduling.drain_requested {
+                self.build_node_drain_status(id).await?.state.as_capnp()
+            } else {
+                drain_state_from_scheduling(&value.scheduling)
+            };
+            scoped_nodes.push(ListedNodeRow {
+                id,
+                value,
+                health: node_status,
+                drain_state,
+            });
         }
 
-        scoped_nodes.sort_by_key(|(id, _, _)| *id);
+        scoped_nodes.sort_by_key(|row| row.id);
         let list_builder = results.get().init_nodes();
         let mut node_list = list_builder.init_nodes(scoped_nodes.len() as u32);
-        for (index, (id, value, node_status)) in scoped_nodes.into_iter().enumerate() {
-            let mut node = node_list.reborrow().get(index as u32);
-            set_node_id(node.reborrow().init_id(), &id);
-            local_view.write_capnp(node.reborrow().init_active_cluster_view());
-            let mut drain_state = protocol::topology::NodeDrainState::Open;
-
-            if let Some(val) = value {
-                node.set_addr(&val.address);
-                node.set_hostname(&val.hostname);
-                node.set_public_key(&val.noise_static_pub);
-                node.set_signing_key(&val.signing_pub);
-                node.set_schedulable(val.scheduling.schedulable);
-                node.set_drain_requested(val.scheduling.drain_requested);
-                drain_state = if val.scheduling.drain_requested {
-                    self.build_node_drain_status(id).await?.state.as_capnp()
-                } else if val.scheduling.schedulable {
-                    protocol::topology::NodeDrainState::Open
-                } else {
-                    protocol::topology::NodeDrainState::Fenced
-                };
-                node.set_drain_task_stop_timeout_secs(
-                    val.scheduling.drain_task_stop_timeout_secs.unwrap_or(0),
-                );
-                node.set_scheduling_updated_at_unix_ms(val.scheduling.updated_at_unix_ms);
-                set_node_id(
-                    node.reborrow().init_scheduling_actor_node_id(),
-                    &val.scheduling.actor_node_id,
-                );
-                if let Some(reason) = val.scheduling.reason.as_deref() {
-                    node.set_scheduling_reason(reason);
-                }
-                write_runtime_support_to_node_info(node.reborrow(), &val.runtime_support);
-                if let Some(wg) = val.wireguard.as_ref() {
-                    node.set_wireguard_public_key(&wg.public_key);
-                    node.set_wireguard_port(wg.port);
-                    node.set_wireguard_enabled(wg.enabled);
-                }
-            }
-            node.set_drain_state(drain_state);
-            node.set_health(node_status);
+        for (index, row) in scoped_nodes.into_iter().enumerate() {
+            write_listed_node_row(node_list.reborrow().get(index as u32), &row, local_view);
         }
 
         Ok(())
@@ -1935,47 +1816,27 @@ impl topology::Server for Topology {
 
         let candidates = self.collect_split_node_candidates(source_view).await?;
         let health_snapshot = self.deps.health_monitor.snapshot();
-        let mut list = results.get().init_nodes(candidates.len() as u32);
-        for (idx, candidate) in candidates.into_iter().enumerate() {
-            let mut row = list.reborrow().get(idx as u32);
-            set_node_id(row.reborrow().init_node_id(), &candidate.node_id);
-            row.set_hostname(&candidate.hostname);
-            row.set_addr(&candidate.address);
-            row.set_wireguard_enabled(candidate.wireguard_enabled);
-            row.set_health(status_to_node_status(
-                health_snapshot
-                    .get(&candidate.node_id)
-                    .cloned()
-                    .unwrap_or(::health::Status::Unknown),
-            ));
-
-            let view = self
+        let mut rows = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let active_cluster_view = self
                 .best_known_peer_view(candidate.node_id)
                 .await
                 .unwrap_or(local_view);
-            view.write_capnp(row.reborrow().init_active_cluster_view());
+            rows.push(SplitCandidateRow {
+                health: status_to_node_status(
+                    health_snapshot
+                        .get(&candidate.node_id)
+                        .cloned()
+                        .unwrap_or(::health::Status::Unknown),
+                ),
+                active_cluster_view,
+                candidate,
+            });
+        }
 
-            if let Some(cpu_vendor) = candidate.cpu_vendor.as_deref() {
-                row.set_cpu_vendor(cpu_vendor);
-            }
-            if let Some(cpu_brand) = candidate.cpu_brand.as_deref() {
-                row.set_cpu_brand(cpu_brand);
-            }
-            row.set_cpu_logical(candidate.cpu_logical.unwrap_or_default());
-            row.set_cpu_cores(candidate.cpu_cores.unwrap_or_default());
-            row.set_memory_total_kb(candidate.memory_total_kb.unwrap_or_default());
-
-            if let Some(gpu_vendor) = candidate.gpu_vendor.as_deref() {
-                row.set_gpu_vendor(gpu_vendor);
-            }
-            row.set_gpu_count(candidate.gpu_count.unwrap_or_default());
-
-            let mut gpu_models = row
-                .reborrow()
-                .init_gpu_models(candidate.gpu_models.len() as u32);
-            for (gpu_idx, model) in candidate.gpu_models.iter().enumerate() {
-                gpu_models.set(gpu_idx as u32, model);
-            }
+        let mut list = results.get().init_nodes(rows.len() as u32);
+        for (idx, row) in rows.iter().enumerate() {
+            write_split_candidate_row(list.reborrow().get(idx as u32), row);
         }
 
         Ok(())
@@ -2106,23 +1967,7 @@ impl topology::Server for Topology {
         let request = params.get()?;
         let node_id = read_node_id(request.get_node_id()?)?;
         let status = self.build_node_drain_status(node_id).await?;
-
-        let mut builder = results.get().init_status();
-        set_node_id(builder.reborrow().init_node_id(), &status.node_id);
-        builder.set_schedulable(status.schedulable);
-        builder.set_drain_requested(status.drain_requested);
-        builder.set_task_stop_timeout_secs(status.task_stop_timeout_secs.unwrap_or(0));
-        builder.set_state(status.state.as_capnp());
-        builder.set_remaining_service_tasks(status.remaining_service_tasks);
-        builder.set_blocking_standalone_tasks(status.blocking_standalone_tasks);
-        builder.set_remaining_reserved_slots(status.remaining_reserved_slots);
-        builder.set_remaining_reserved_gpus(status.remaining_reserved_gpus);
-        builder.set_scheduler_summary_known(status.scheduler_summary_known);
-        builder.set_reason(status.reason.as_deref().unwrap_or_default());
-        builder.set_message(&status.message);
-        builder
-            .set_last_scheduling_error(status.last_scheduling_error.as_deref().unwrap_or_default());
-
+        write_node_drain_status(results.get().init_status(), &status);
         Ok(())
     }
 
@@ -2402,25 +2247,25 @@ impl topology::Server for Topology {
                 if resolved_count == 0 || (view != local_view && retired_views.contains(&view)) {
                     return None;
                 }
-                Some((view, resolved_count))
+                Some(ClusterViewSummaryRow {
+                    view,
+                    node_count: resolved_count,
+                    local_active: view == local_view,
+                    cluster_name: cluster_names.get(&view.cluster_id).cloned(),
+                })
             })
             .collect::<Vec<_>>();
-        rows.sort_by(|(left, _), (right, _)| {
-            left.cluster_id
+        rows.sort_by(|left, right| {
+            left.view
+                .cluster_id
                 .as_bytes()
-                .cmp(right.cluster_id.as_bytes())
-                .then(left.epoch.cmp(&right.epoch))
+                .cmp(right.view.cluster_id.as_bytes())
+                .then(left.view.epoch.cmp(&right.view.epoch))
         });
 
         let mut list = results.get().init_views(rows.len() as u32);
-        for (idx, (view, node_count)) in rows.into_iter().enumerate() {
-            let mut row = list.reborrow().get(idx as u32);
-            view.write_capnp(row.reborrow().init_view());
-            row.set_node_count(node_count);
-            row.set_local_active(view == local_view);
-            if let Some(name) = cluster_names.get(&view.cluster_id) {
-                row.set_cluster_name(name);
-            }
+        for (idx, row) in rows.iter().enumerate() {
+            write_cluster_view_summary_row(list.reborrow().get(idx as u32), row);
         }
 
         Ok(())
@@ -2674,145 +2519,6 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
     };
 
     Ok(event)
-}
-
-pub fn add_event(
-    list: &mut capnp::struct_list::Builder<gossip_message::Owned>,
-    index: u32,
-    event: &TopologyEvent,
-    cluster_view: ClusterViewId,
-) {
-    let msg = list.reborrow().get(index);
-
-    match event {
-        TopologyEvent::Join {
-            id,
-            hostname,
-            address,
-            root_hash,
-            incarnation,
-            client,
-            noise_static_pub,
-            signing_pub,
-            identity_sig,
-            wireguard,
-            scheduling,
-            runtime_support,
-        } => {
-            let mut topo = msg.init_topology();
-
-            topo.set_event(topology_event::EventType::Add);
-            let mut node = topo.init_node();
-
-            set_node_id(node.reborrow().init_id(), id);
-            cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
-            node.set_hostname(hostname);
-            node.set_addr(address);
-            node.set_root_hash(root_hash);
-            node.set_public_key(&noise_static_pub.to_bytes());
-            node.set_signing_key(&signing_pub.to_bytes());
-            node.set_identity_sig(identity_sig);
-            node.set_incarnation(*incarnation);
-            node.set_schedulable(scheduling.schedulable);
-            node.set_drain_requested(scheduling.drain_requested);
-            node.set_drain_task_stop_timeout_secs(
-                scheduling.drain_task_stop_timeout_secs.unwrap_or(0),
-            );
-            node.set_scheduling_updated_at_unix_ms(scheduling.updated_at_unix_ms);
-            set_node_id(
-                node.reborrow().init_scheduling_actor_node_id(),
-                &scheduling.actor_node_id,
-            );
-            if let Some(reason) = scheduling.reason.as_deref() {
-                node.set_scheduling_reason(reason);
-            }
-            write_runtime_support_to_node_info(node.reborrow(), runtime_support.as_ref());
-            if let Some(wg) = wireguard.as_ref() {
-                node.set_wireguard_public_key(&wg.public_key);
-                node.set_wireguard_port(wg.port);
-                node.set_wireguard_enabled(wg.enabled);
-            }
-
-            if let Some(client) = client {
-                // Only embed our own handle; forwarding a capability learned from another peer
-                // can’t be re-exported on this connection safely.
-                // Set the handle as a Cap’n Proto client only when available locally.
-                node.set_handle(client.clone());
-            }
-        }
-
-        TopologyEvent::Leave { id, incarnation } => {
-            let mut topo = msg.init_topology();
-            topo.set_event(topology_event::EventType::Remove);
-            let mut node = topo.init_node();
-            set_node_id(node.reborrow().init_id(), id);
-            cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
-            node.set_incarnation(*incarnation);
-        }
-
-        TopologyEvent::Alive { id, incarnation } => {
-            let mut topo = msg.init_topology();
-            topo.set_event(topology_event::EventType::Alive);
-            let mut node = topo.init_node();
-            set_node_id(node.reborrow().init_id(), id);
-            cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
-            node.set_incarnation(*incarnation);
-        }
-
-        TopologyEvent::Suspect { id, incarnation } => {
-            let mut topo = msg.init_topology();
-            topo.set_event(topology_event::EventType::Suspect);
-            let mut node = topo.init_node();
-            set_node_id(node.reborrow().init_id(), id);
-            cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
-            node.set_incarnation(*incarnation);
-        }
-
-        TopologyEvent::Down { id, incarnation } => {
-            let mut topo = msg.init_topology();
-            topo.set_event(topology_event::EventType::Down);
-            let mut node = topo.init_node();
-            set_node_id(node.reborrow().init_id(), id);
-            cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
-            node.set_incarnation(*incarnation);
-        }
-
-        TopologyEvent::ClusterNameUpdated {
-            cluster_id,
-            name,
-            updated_at_unix_ms,
-            actor_node_id,
-        } => {
-            let mut topo = msg.init_topology();
-            topo.set_event(topology_event::EventType::ClusterNameUpdated);
-            topo.reborrow()
-                .init_cluster_id()
-                .set_value(cluster_id.as_bytes());
-            topo.set_cluster_name(name);
-            topo.set_updated_at_unix_ms(*updated_at_unix_ms);
-            set_node_id(topo.init_actor_node_id(), actor_node_id);
-        }
-        TopologyEvent::NodeSchedulingUpdated { id, scheduling } => {
-            let mut topo = msg.init_topology();
-            topo.set_event(topology_event::EventType::NodeSchedulingUpdated);
-            let mut node = topo.init_node();
-            set_node_id(node.reborrow().init_id(), id);
-            cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
-            node.set_schedulable(scheduling.schedulable);
-            node.set_drain_requested(scheduling.drain_requested);
-            node.set_drain_task_stop_timeout_secs(
-                scheduling.drain_task_stop_timeout_secs.unwrap_or(0),
-            );
-            node.set_scheduling_updated_at_unix_ms(scheduling.updated_at_unix_ms);
-            set_node_id(
-                node.reborrow().init_scheduling_actor_node_id(),
-                &scheduling.actor_node_id,
-            );
-            if let Some(reason) = scheduling.reason.as_deref() {
-                node.set_scheduling_reason(reason);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

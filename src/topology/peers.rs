@@ -474,40 +474,6 @@ impl PeerValue {
     }
 }
 
-/// Writes one runtime support profile into the topology `NodeInfo` builder.
-pub fn write_runtime_support_to_node_info(
-    mut info: node_info_capnp::Builder<'_>,
-    runtime_support: &RuntimeSupportProfile,
-) {
-    let mut execution_platforms = info
-        .reborrow()
-        .init_execution_platforms(runtime_support.execution_platforms.len() as u32);
-    for (idx, execution_platform) in runtime_support.execution_platforms.iter().enumerate() {
-        execution_platforms.set(idx as u32, execution_platform.as_str());
-    }
-
-    let mut isolation_modes = info
-        .reborrow()
-        .init_isolation_modes(runtime_support.isolation_modes.len() as u32);
-    for (idx, isolation_mode) in runtime_support.isolation_modes.iter().enumerate() {
-        isolation_modes.set(idx as u32, isolation_mode.as_str());
-    }
-
-    let mut isolation_profiles = info
-        .reborrow()
-        .init_isolation_profiles(runtime_support.isolation_profiles.len() as u32);
-    for (idx, isolation_profile) in runtime_support.isolation_profiles.iter().enumerate() {
-        isolation_profiles.set(idx as u32, isolation_profile);
-    }
-
-    let mut feature_flags = info
-        .reborrow()
-        .init_runtime_feature_flags(runtime_support.feature_flags.len() as u32);
-    for (idx, feature_flag) in runtime_support.feature_flags.iter().enumerate() {
-        feature_flags.set(idx as u32, feature_flag);
-    }
-}
-
 /// Decodes one runtime support profile from the topology `NodeInfo` reader.
 fn runtime_support_from_node_info(
     ni: node_info_capnp::Reader<'_>,

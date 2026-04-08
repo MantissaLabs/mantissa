@@ -10,9 +10,7 @@ use crate::runtime::types::RuntimeSupportProfile;
 use crate::scheduler::Scheduler;
 use crate::store::cluster_view_store::ClusterNameRecord;
 use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains, sync_selected_domains};
-use crate::topology::peers::{
-    PeerMembership, PeerSchedulingState, PeerValue, write_runtime_support_to_node_info,
-};
+use crate::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue};
 use ::health::HealthMonitor;
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
@@ -35,11 +33,16 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
+use self::builders::{
+    drain_state_from_scheduling, write_runtime_support_to_node_info,
+    write_scheduling_fields_to_node_info, write_wireguard_to_node_info,
+};
 use self::dependencies::TopologyDependencies;
 use self::local_state::LocalNodeState;
 use self::peer_cache::{PeerCacheEntry, PeerSnapshot, PeerSnapshotCache};
 use self::runtime::{GossipWarmSetState, TopologyRuntime};
 
+mod builders;
 mod cluster_operations;
 mod dependencies;
 mod event;
@@ -60,7 +63,8 @@ mod sync;
 
 pub use self::event::TopologyEvent;
 pub use self::peer_handle::PeerHandle;
-pub use service::{add_event, read_topology_event};
+pub use builders::add_event;
+pub use service::read_topology_event;
 pub use storage::TopologyStorage;
 
 /// Default anti-entropy interval for periodic sync loops.

@@ -254,22 +254,8 @@ impl Topology {
         info.set_identity_sig(&identity_sig);
         info.set_incarnation(self.swim_local_incarnation());
         let scheduling = self.current_scheduling_state();
-        info.set_schedulable(scheduling.schedulable);
-        info.set_drain_requested(scheduling.drain_requested);
-        info.set_drain_state(if scheduling.schedulable {
-            protocol::topology::NodeDrainState::Open
-        } else {
-            protocol::topology::NodeDrainState::Fenced
-        });
-        info.set_drain_task_stop_timeout_secs(scheduling.drain_task_stop_timeout_secs.unwrap_or(0));
-        info.set_scheduling_updated_at_unix_ms(scheduling.updated_at_unix_ms);
-        set_node_id(
-            info.reborrow().init_scheduling_actor_node_id(),
-            &scheduling.actor_node_id,
-        );
-        if let Some(reason) = scheduling.reason.as_deref() {
-            info.set_scheduling_reason(reason);
-        }
+        write_scheduling_fields_to_node_info(info.reborrow(), &scheduling);
+        info.set_drain_state(drain_state_from_scheduling(&scheduling));
         write_runtime_support_to_node_info(info.reborrow(), &self.local.runtime_support);
 
         if config::wireguard_enabled() && net::paths::running_as_root() {
@@ -288,9 +274,14 @@ impl Topology {
                                 .peer_wireguard(self.local.node.id)
                                 .map(|wg| wg.enabled)
                                 .unwrap_or(false);
-                            info.set_wireguard_public_key(&keys.public_bytes());
-                            info.set_wireguard_port(port);
-                            info.set_wireguard_enabled(enabled);
+                            write_wireguard_to_node_info(
+                                info.reborrow(),
+                                Some(&WireGuardPeerValue {
+                                    public_key: keys.public_bytes(),
+                                    port,
+                                    enabled,
+                                }),
+                            );
                         }
                         Err(err) => {
                             tracing::warn!(
