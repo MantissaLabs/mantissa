@@ -7,6 +7,8 @@ use crate::topology::Topology;
 use crate::topology::cluster_operations::{
     CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT, COMMIT_PRECONDITION_FAILURE_PREFIX,
 };
+use crate::topology::peers::PeerValue;
+use protocol::server::cluster_session;
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
@@ -156,6 +158,209 @@ impl Topology {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or_default()
+    }
+
+    /// Reads the cluster view currently bound to a session for operation relay validation.
+    pub(in crate::topology) async fn session_cluster_view(
+        session: &cluster_session::Client,
+    ) -> Result<ClusterViewId, capnp::Error> {
+        let request = session.get_cluster_view_request();
+        let response = request.send().promise.await?;
+        ClusterViewId::from_capnp(response.get()?.get_view()?).map_err(capnp::Error::failed)
+    }
+
+    /// Resolves the best-known cluster view for one peer session, if available.
+    pub(in crate::topology) async fn best_known_peer_view(
+        &self,
+        peer_id: Uuid,
+    ) -> Option<ClusterViewId> {
+        if peer_id == self.local.node.id {
+            return Some(self.active_cluster_view());
+        }
+
+        // Keep list/split introspection side-effect free: do not force session bootstrap
+        // from read-only view probes.
+        let session = self.deps.registry.cached_session_for(peer_id).await?;
+        Self::session_cluster_view(&session).await.ok()
+    }
+
+    /// Counts active peers currently believed to belong to the local active cluster view.
+    ///
+    /// This is the authoritative local membership count used for replicated cluster metadata.
+    pub(in crate::topology) async fn local_cluster_view_member_count(
+        &self,
+    ) -> Result<u32, capnp::Error> {
+        let local_view = self.active_cluster_view();
+        let excluded_peers = self.excluded_peers_snapshot().await;
+        let (actives, _) = self
+            .stores
+            .peers
+            .load_all()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+        let mut count = 1u32;
+        for (key, snapshot) in actives {
+            let peer_id = key.to_uuid();
+            if peer_id == self.local.node.id {
+                continue;
+            }
+            if excluded_peers.contains(&peer_id) {
+                continue;
+            }
+            let Some(_selected) =
+                PeerValue::select(snapshot.as_slice()).filter(|value| value.is_active())
+            else {
+                continue;
+            };
+
+            let view = self
+                .best_known_peer_view(peer_id)
+                .await
+                .unwrap_or(local_view);
+            if view != local_view {
+                continue;
+            }
+            count = count.saturating_add(1);
+        }
+
+        Ok(count)
+    }
+
+    /// Decodes one raw Cap'n Proto cluster lineage identifier into internal `ClusterId` bytes.
+    pub(in crate::topology) fn cluster_id_from_capnp(
+        reader: protocol::topology::cluster_id::Reader<'_>,
+    ) -> Result<ClusterId, capnp::Error> {
+        let value = reader.get_value()?;
+        if value.len() != 16 {
+            return Err(capnp::Error::failed(format!(
+                "cluster id must be exactly 16 bytes, got {}",
+                value.len()
+            )));
+        }
+
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(value);
+        Ok(ClusterId::from_bytes(bytes))
+    }
+
+    /// Applies one local cluster lineage name update with deterministic last-writer conflict resolution.
+    pub(in crate::topology) async fn apply_cluster_name_update(
+        &self,
+        cluster_id: ClusterId,
+        name: &str,
+        updated_at_unix_ms: u64,
+        actor_node_id: Uuid,
+    ) -> Result<bool, capnp::Error> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(capnp::Error::failed(
+                "cluster name must not be empty".to_string(),
+            ));
+        }
+
+        let record = ClusterNameRecord {
+            name: trimmed.to_string(),
+            updated_at_unix_ms,
+            actor_node_id,
+        };
+        self.upsert_cluster_name_record(cluster_id, &record).await
+    }
+
+    /// Best-effort relay of one operation record to peers in the operation's relay scope.
+    pub(in crate::topology) async fn broadcast_cluster_operation(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<usize, capnp::Error> {
+        let relay_views = match operation.kind {
+            ClusterOperationKind::Split => {
+                let source_view = operation.source_views.first().copied().ok_or_else(|| {
+                    capnp::Error::failed("split operation missing source view".to_string())
+                })?;
+                HashSet::from([source_view])
+            }
+            ClusterOperationKind::Merge => {
+                let source_view = operation.source_views.first().copied().ok_or_else(|| {
+                    capnp::Error::failed("merge operation missing source view".to_string())
+                })?;
+                let mut views = HashSet::from([source_view]);
+                for target in operation.target_views.iter().copied() {
+                    views.insert(target);
+                }
+                views
+            }
+        };
+        let snapshot = match self.peer_snapshot().await {
+            Some(snapshot) => snapshot,
+            None => return Ok(0),
+        };
+        let payload =
+            bincode::serialize(operation).map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let mut relayed = 0usize;
+
+        for entry in snapshot.entries.iter() {
+            let peer_id = entry.peer_id;
+            if peer_id == self.local.node.id {
+                continue;
+            }
+
+            let session = if operation.kind == ClusterOperationKind::Merge {
+                self.deps.registry.session_for_peer_unscoped(peer_id).await
+            } else {
+                self.deps.registry.session_for_peer(peer_id).await
+            };
+            let Some(session) = session else {
+                continue;
+            };
+            let peer_view = match Self::session_cluster_view(&session).await {
+                Ok(view) => view,
+                Err(err) => {
+                    warn!(
+                        target: "cluster_view",
+                        operation_id = %operation.id,
+                        peer_id = %peer_id,
+                        "failed to read peer session view for operation relay: {err}"
+                    );
+                    continue;
+                }
+            };
+            if !relay_views.contains(&peer_view) {
+                continue;
+            }
+
+            let topology = session
+                .get_topology_request()
+                .send()
+                .pipeline
+                .get_topology();
+            let mut relay = topology.submit_cluster_operation_request();
+            relay.get().set_id(operation.id.as_bytes());
+            relay.get().set_payload(&payload);
+            match relay.send().promise.await {
+                Ok(_) => {
+                    relayed = relayed.saturating_add(1);
+                }
+                Err(err) => {
+                    warn!(
+                        target: "cluster_view",
+                        operation_id = %operation.id,
+                        peer_id = %peer_id,
+                        "failed to relay cluster operation: {err}"
+                    );
+                }
+            }
+        }
+
+        if relayed > 0 {
+            info!(
+                target: "cluster_view",
+                operation_id = %operation.id,
+                relayed,
+                relay_view_count = relay_views.len(),
+                "relayed cluster operation to peers"
+            );
+        }
+
+        Ok(relayed)
     }
 
     /// Resolves the active-view set accepted for commit-time side effects on this operation.

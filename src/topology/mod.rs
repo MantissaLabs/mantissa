@@ -45,6 +45,7 @@ use self::runtime::{GossipWarmSetState, TopologyRuntime};
 mod builders;
 mod cluster_operations;
 mod dependencies;
+mod drain;
 mod event;
 mod gossip;
 pub mod health;
