@@ -5,35 +5,18 @@
 //! stream missing CRDT fragments back into the local stores.
 
 use super::{ALL_DOMAINS, SyncStores};
-use crate::agents::types::AgentRecordValue;
 use crate::cluster::ClusterViewId;
-use crate::jobs::types::JobSpecValue;
-use crate::network::types::{NetworkAttachmentValue, NetworkPeerStateValue, NetworkSpecValue};
-use crate::scheduler::digest::SchedulerDigestValue;
-use crate::secrets::types::SecretValue;
-use crate::services::types::ServiceSpecValue;
-use crate::store::agent_store::AgentStore;
-use crate::store::cluster_view_store::{ClusterViewDomainStore, ClusterViewMetadataRecord};
-use crate::store::job_store::JobStore;
-use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
-use crate::store::peer_store::PeersStore;
-use crate::store::scheduler_digest_store::SchedulerDigestStore;
-use crate::store::secret_store::SecretStore;
-use crate::store::service_store::ServiceStore;
-use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
-use crate::store::workload_store::WorkloadStore;
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
-use crate::topology::peers::PeerValue;
-use crate::volumes::types::{VolumeNodeStateValue, VolumeSpecValue};
-use crate::workload::model::WorkloadValue;
-use async_trait::async_trait;
 use bincode;
 use capnp_rpc::new_client;
-use crdt_store::{PageDigestRange, compute_want_from_have, uuid_key::UuidKey};
+use crdt_store::adapter::RegAdapter;
+use crdt_store::mst_store::CrdtMstStore;
+use crdt_store::{Entry, PageDigestRange, TableSet, compute_want_from_have, uuid_key::UuidKey};
 use crdts::MVReg;
+use merkle_search_tree::digest::Hasher as MstHasher;
 use protocol::sync::{self, Domain, delta_chunk, delta_sink};
-use std::io;
 use std::rc::Rc;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 type RegisterDelta<V> = Vec<(UuidKey, MVReg<V, uuid::Uuid>)>;
@@ -159,6 +142,20 @@ impl DeltaSinkImpl {
     }
 }
 
+// Expands one explicit `Domain -> SyncStores field` mapping into the async dispatch that
+// feeds the incoming chunk into the correct replicated store. Keeping the mapping local
+// preserves a readable domain switch without repeating the same `apply_chunk(...).await?`
+// boilerplate for every sync domain.
+macro_rules! apply_domain_chunk {
+    ($stores:expr, $chunk:expr, $domain:expr, {
+        $($variant:ident => $field:ident),+ $(,)?
+    }) => {
+        match $domain {
+            $(Domain::$variant => apply_chunk($stores.$field.clone(), $chunk).await?,)+
+        }
+    };
+}
+
 impl delta_sink::Server for DeltaSinkImpl {
     async fn push_chunk(
         self: Rc<Self>,
@@ -183,113 +180,22 @@ impl delta_sink::Server for DeltaSinkImpl {
             "received delta chunk"
         );
 
-        // Each domain uses the same transport format but deserializes into a different value type.
-        match domain {
-            Domain::Peers => {
-                apply_chunk(
-                    self.stores.peers.clone(),
-                    &chunk,
-                    decode_register::<PeerValue>,
-                )
-                .await?
-            }
-            Domain::Workloads => {
-                apply_chunk(
-                    self.stores.workloads.clone(),
-                    &chunk,
-                    decode_register::<WorkloadValue>,
-                )
-                .await?
-            }
-            Domain::Jobs => {
-                apply_chunk(
-                    self.stores.jobs.clone(),
-                    &chunk,
-                    decode_register::<JobSpecValue>,
-                )
-                .await?
-            }
-            Domain::Agents => {
-                apply_chunk(
-                    self.stores.agents.clone(),
-                    &chunk,
-                    decode_register::<AgentRecordValue>,
-                )
-                .await?
-            }
-            Domain::Services => {
-                apply_chunk(
-                    self.stores.services.clone(),
-                    &chunk,
-                    decode_register::<ServiceSpecValue>,
-                )
-                .await?
-            }
-            Domain::Secrets => {
-                apply_chunk(
-                    self.stores.secrets.clone(),
-                    &chunk,
-                    decode_register::<SecretValue>,
-                )
-                .await?
-            }
-            Domain::Networks => {
-                apply_chunk(
-                    self.stores.networks.clone(),
-                    &chunk,
-                    decode_register::<NetworkSpecValue>,
-                )
-                .await?
-            }
-            Domain::NetworkPeers => {
-                apply_chunk(
-                    self.stores.network_peers.clone(),
-                    &chunk,
-                    decode_register::<NetworkPeerStateValue>,
-                )
-                .await?
-            }
-            Domain::NetworkAttachments => {
-                apply_chunk(
-                    self.stores.network_attachments.clone(),
-                    &chunk,
-                    decode_register::<NetworkAttachmentValue>,
-                )
-                .await?
-            }
-            Domain::ClusterViews => {
-                apply_chunk(
-                    self.stores.cluster_views.clone(),
-                    &chunk,
-                    decode_register::<ClusterViewMetadataRecord>,
-                )
-                .await?
-            }
-            Domain::Volumes => {
-                apply_chunk(
-                    self.stores.volumes.clone(),
-                    &chunk,
-                    decode_register::<VolumeSpecValue>,
-                )
-                .await?
-            }
-            Domain::VolumeNodes => {
-                apply_chunk(
-                    self.stores.volume_nodes.clone(),
-                    &chunk,
-                    decode_register::<VolumeNodeStateValue>,
-                )
-                .await?
-            }
-            Domain::SchedulerDigests => {
-                apply_chunk(
-                    self.stores.scheduler_digests.clone(),
-                    &chunk,
-                    decode_register::<SchedulerDigestValue>,
-                )
-                .await?
-            }
-        }
+        // Domain dispatch stays explicit, but the store itself now carries the decoded value type.
+        apply_domain_chunk!(self.stores, &chunk, domain, {
+            Peers => peers,
+            Workloads => workloads,
+            Jobs => jobs,
+            Agents => agents,
+            Services => services,
+            Secrets => secrets,
+            Networks => networks,
+            NetworkPeers => network_peers,
+            NetworkAttachments => network_attachments,
+            ClusterViews => cluster_views,
+            Volumes => volumes,
+            VolumeNodes => volume_nodes,
+            SchedulerDigests => scheduler_digests,
+        });
 
         Ok(())
     }
@@ -304,20 +210,42 @@ impl delta_sink::Server for DeltaSinkImpl {
     }
 }
 
-/// Decodes one streamed chunk and merges it into the destination store.
-async fn apply_chunk<V, F>(
-    store: impl DeltaStore<V>,
+/// Decodes one streamed chunk and merges it into one typed MST-backed replicated store.
+///
+/// All replicated sync domains in Mantissa are backed by `Arc<CrdtMstStore<...>>` with the
+/// same delta-apply entrypoint, but with different value types and table sets. This helper
+/// targets that shared storage abstraction directly so the delta sink can reuse one generic
+/// path for every domain instead of carrying one wrapper trait impl per store alias.
+///
+/// In the larger sync flow, `push_chunk()` has already validated the chunk's cluster view and
+/// selected the destination store for the reported domain. `apply_chunk()` is the narrow step
+/// that turns the wire payload into typed register/tombstone batches and hands them to the
+/// store's incremental MST update path.
+async fn apply_chunk<C, H, T, V>(
+    store: Arc<CrdtMstStore<C, H, T>>,
     chunk: &delta_chunk::Reader<'_>,
-    decode: F,
 ) -> Result<(), capnp::Error>
 where
-    V: Clone + Send + Sync + 'static,
-    F: Fn(&delta_chunk::Reader<'_>) -> Result<RegisterDelta<V>, capnp::Error>,
+    C: RegAdapter<Key = UuidKey, Actor = uuid::Uuid, Reg = MVReg<V, uuid::Uuid>, Value = V>,
+    V: Clone + Send + Sync + for<'de> serde::Deserialize<'de> + 'static,
+    H: MstHasher<16, C::Key>
+        + MstHasher<16, Entry<C::Snapshot>>
+        + Default
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    T: TableSet,
 {
-    let regs = decode(chunk)?;
+    // Registers and tombstones share the same chunk envelope, but the register payload must be
+    // deserialized into the value type carried by the destination store's CRDT adapter.
+    let regs = decode_register::<V>(chunk)?;
     let tombs = collect_tombstones(chunk)?;
 
-    store.apply_delta(regs, tombs).await.map_err(to_capnp)
+    store
+        .apply_delta_chunk_update_mst(regs, tombs)
+        .await
+        .map_err(to_capnp)
 }
 
 /// Extracts tombstone rows from a wire chunk.
@@ -350,155 +278,6 @@ where
 /// Normalizes storage/runtime errors into Cap'n Proto failures for RPC propagation.
 fn to_capnp<E: std::fmt::Display>(e: E) -> capnp::Error {
     capnp::Error::failed(e.to_string())
-}
-
-/// Small abstraction over replicated stores that can consume streamed anti-entropy chunks.
-#[async_trait]
-trait DeltaStore<V>: Clone + Send + Sync + 'static {
-    async fn apply_delta(self, regs: RegisterDelta<V>, tombs: TombstoneDelta) -> io::Result<()>;
-}
-
-#[async_trait]
-impl DeltaStore<PeerValue> for PeersStore {
-    async fn apply_delta(
-        self,
-        regs: Vec<(UuidKey, MVReg<PeerValue, uuid::Uuid>)>,
-        tombs: Vec<(UuidKey, u64)>,
-    ) -> io::Result<()> {
-        self.apply_delta_chunk_update_mst(regs, tombs).await
-    }
-}
-
-#[async_trait]
-impl DeltaStore<WorkloadValue> for WorkloadStore {
-    async fn apply_delta(
-        self,
-        regs: Vec<(UuidKey, MVReg<WorkloadValue, uuid::Uuid>)>,
-        tombs: Vec<(UuidKey, u64)>,
-    ) -> io::Result<()> {
-        self.apply_delta_chunk_update_mst(regs, tombs).await
-    }
-}
-
-#[async_trait]
-impl DeltaStore<ServiceSpecValue> for ServiceStore {
-    async fn apply_delta(
-        self,
-        regs: Vec<(UuidKey, MVReg<ServiceSpecValue, uuid::Uuid>)>,
-        tombs: Vec<(UuidKey, u64)>,
-    ) -> io::Result<()> {
-        self.apply_delta_chunk_update_mst(regs, tombs).await
-    }
-}
-
-#[async_trait]
-impl DeltaStore<JobSpecValue> for JobStore {
-    async fn apply_delta(
-        self,
-        regs: Vec<(UuidKey, MVReg<JobSpecValue, uuid::Uuid>)>,
-        tombs: Vec<(UuidKey, u64)>,
-    ) -> io::Result<()> {
-        self.apply_delta_chunk_update_mst(regs, tombs).await
-    }
-}
-
-#[async_trait]
-impl DeltaStore<AgentRecordValue> for AgentStore {
-    async fn apply_delta(
-        self,
-        regs: Vec<(UuidKey, MVReg<AgentRecordValue, uuid::Uuid>)>,
-        tombs: Vec<(UuidKey, u64)>,
-    ) -> io::Result<()> {
-        self.apply_delta_chunk_update_mst(regs, tombs).await
-    }
-}
-
-#[async_trait]
-impl DeltaStore<SecretValue> for SecretStore {
-    async fn apply_delta(
-        self,
-        regs: Vec<(UuidKey, MVReg<SecretValue, uuid::Uuid>)>,
-        tombs: Vec<(UuidKey, u64)>,
-    ) -> io::Result<()> {
-        self.apply_delta_chunk_update_mst(regs, tombs).await
-    }
-}
-
-#[async_trait]
-impl DeltaStore<NetworkSpecValue> for NetworkSpecStore {
-    async fn apply_delta(
-        self,
-        regs: Vec<(UuidKey, MVReg<NetworkSpecValue, uuid::Uuid>)>,
-        tombs: Vec<(UuidKey, u64)>,
-    ) -> io::Result<()> {
-        self.apply_delta_chunk_update_mst(regs, tombs).await
-    }
-}
-
-#[async_trait]
-impl DeltaStore<NetworkPeerStateValue> for NetworkPeerStore {
-    async fn apply_delta(
-        self,
-        regs: Vec<(UuidKey, MVReg<NetworkPeerStateValue, uuid::Uuid>)>,
-        tombs: Vec<(UuidKey, u64)>,
-    ) -> io::Result<()> {
-        self.apply_delta_chunk_update_mst(regs, tombs).await
-    }
-}
-
-#[async_trait]
-impl DeltaStore<NetworkAttachmentValue> for NetworkAttachmentStore {
-    async fn apply_delta(
-        self,
-        regs: Vec<(UuidKey, MVReg<NetworkAttachmentValue, uuid::Uuid>)>,
-        tombs: Vec<(UuidKey, u64)>,
-    ) -> io::Result<()> {
-        self.apply_delta_chunk_update_mst(regs, tombs).await
-    }
-}
-
-#[async_trait]
-impl DeltaStore<ClusterViewMetadataRecord> for ClusterViewDomainStore {
-    async fn apply_delta(
-        self,
-        regs: Vec<(UuidKey, MVReg<ClusterViewMetadataRecord, uuid::Uuid>)>,
-        tombs: Vec<(UuidKey, u64)>,
-    ) -> io::Result<()> {
-        self.apply_delta_chunk_update_mst(regs, tombs).await
-    }
-}
-
-#[async_trait]
-impl DeltaStore<VolumeSpecValue> for VolumeSpecStore {
-    async fn apply_delta(
-        self,
-        regs: Vec<(UuidKey, MVReg<VolumeSpecValue, uuid::Uuid>)>,
-        tombs: Vec<(UuidKey, u64)>,
-    ) -> io::Result<()> {
-        self.apply_delta_chunk_update_mst(regs, tombs).await
-    }
-}
-
-#[async_trait]
-impl DeltaStore<VolumeNodeStateValue> for VolumeNodeStore {
-    async fn apply_delta(
-        self,
-        regs: Vec<(UuidKey, MVReg<VolumeNodeStateValue, uuid::Uuid>)>,
-        tombs: Vec<(UuidKey, u64)>,
-    ) -> io::Result<()> {
-        self.apply_delta_chunk_update_mst(regs, tombs).await
-    }
-}
-
-#[async_trait]
-impl DeltaStore<SchedulerDigestValue> for SchedulerDigestStore {
-    async fn apply_delta(
-        self,
-        regs: Vec<(UuidKey, MVReg<SchedulerDigestValue, uuid::Uuid>)>,
-        tombs: Vec<(UuidKey, u64)>,
-    ) -> io::Result<()> {
-        self.apply_delta_chunk_update_mst(regs, tombs).await
-    }
 }
 
 /// Runs anti-entropy for one caller-selected domain subset against one peer view.
