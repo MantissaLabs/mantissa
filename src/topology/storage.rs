@@ -6,7 +6,6 @@ use crate::secrets::crypto::SecretKeyring;
 use crate::store::cluster_operation_store::ClusterOperationStore;
 use crate::store::cluster_view_store::ClusterViewStore;
 use crate::store::local::{LocalCredentialStore, LocalSessionStore, SecretMasterStore};
-use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore};
 use crate::store::peer_store::PeersStore;
 use crate::store::service_store::ServiceStore;
 use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
@@ -25,8 +24,6 @@ pub struct TopologyStorage {
     pub secret_master_store: SecretMasterStore,
     pub workloads: WorkloadStore,
     pub services: ServiceStore,
-    pub network_peers: NetworkPeerStore,
-    pub network_attachments: NetworkAttachmentStore,
     pub volumes: VolumeSpecStore,
     pub volume_nodes: VolumeNodeStore,
     pub secret_keyring: Arc<RwLock<SecretKeyring>>,

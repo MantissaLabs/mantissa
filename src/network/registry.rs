@@ -297,6 +297,31 @@ impl NetworkRegistry {
         Ok(())
     }
 
+    /// Purges the local replica of peer-state rows owned by the provided peers without tombstones.
+    ///
+    /// Split-time isolation uses this to drop out-of-scope runtime state reversibly so later
+    /// merge or anti-entropy can rehydrate the rows from the retained partition.
+    pub async fn purge_local_peer_states_for_peers(
+        &self,
+        peer_ids: &HashSet<Uuid>,
+    ) -> Result<usize> {
+        let states = self.list_peer_states(None)?;
+        let mut removed = 0usize;
+        for state in states {
+            if !peer_ids.contains(&state.peer_id) {
+                continue;
+            }
+
+            self.peers
+                .purge_local(&UuidKey::from(state.id))
+                .await
+                .map_err(|e| anyhow!("network peer state purge_local failed: {e}"))?;
+            removed = removed.saturating_add(1);
+        }
+
+        Ok(removed)
+    }
+
     /// List peer state entries, optionally filtered by a specific network identifier.
     pub fn list_peer_states(
         &self,
@@ -358,6 +383,31 @@ impl NetworkRegistry {
             self.remove_attachment(attachment.id).await?;
         }
         Ok(())
+    }
+
+    /// Purges the local replica of attachment rows owned by the provided nodes without tombstones.
+    ///
+    /// Split-time isolation uses this to drop out-of-scope attachment state reversibly so later
+    /// merge or anti-entropy can restore those rows from the retained partition.
+    pub async fn purge_local_attachments_for_nodes(
+        &self,
+        node_ids: &HashSet<Uuid>,
+    ) -> Result<usize> {
+        let attachments = self.list_attachments(None)?;
+        let mut removed = 0usize;
+        for attachment in attachments {
+            if !node_ids.contains(&attachment.node_id) {
+                continue;
+            }
+
+            self.attachments
+                .purge_local(&UuidKey::from(attachment.id))
+                .await
+                .map_err(|e| anyhow!("network attachment purge_local failed: {e}"))?;
+            removed = removed.saturating_add(1);
+        }
+
+        Ok(removed)
     }
 
     /// List attachment entries, optionally filtered by network identifier.
@@ -568,6 +618,25 @@ fn collect_shared_ready_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::network_store::{
+        open_network_attachment_store, open_network_peer_store, open_network_spec_store,
+    };
+    use redb::Database;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    /// Builds one temporary registry so tests can exercise store-backed registry behavior.
+    fn temp_registry() -> NetworkRegistry {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("network-registry.redb");
+        let db = Arc::new(Database::create(path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let specs = open_network_spec_store(db.clone(), actor).expect("open network spec store");
+        let peers = open_network_peer_store(db.clone(), actor).expect("open network peer store");
+        let attachments =
+            open_network_attachment_store(db, actor).expect("open network attachment store");
+        NetworkRegistry::new(specs, peers, attachments)
+    }
 
     /// Ensure the selector returns the entry with the most recent timestamp so readiness counts do
     /// not regress when older MVReg values remain in the snapshot.
@@ -743,5 +812,113 @@ mod tests {
         assert!(peers.contains(&peer_a));
         assert!(peers.contains(&peer_b));
         assert!(!peers.contains(&peer_c));
+    }
+
+    /// Split pruning should purge only the peer-state rows for evicted peers and keep others.
+    #[tokio::test]
+    async fn purge_local_peer_states_for_peers_keeps_retained_rows() {
+        let registry = temp_registry();
+        let network_id = Uuid::new_v4();
+        let evicted_peer = Uuid::new_v4();
+        let retained_peer = Uuid::new_v4();
+
+        registry
+            .upsert_peer_state(NetworkPeerStateValue::new(
+                network_id,
+                evicted_peer,
+                "evicted",
+                NetworkPeerState::Ready,
+                None,
+            ))
+            .await
+            .expect("upsert evicted peer state");
+        registry
+            .upsert_peer_state(NetworkPeerStateValue::new(
+                network_id,
+                retained_peer,
+                "retained",
+                NetworkPeerState::Ready,
+                None,
+            ))
+            .await
+            .expect("upsert retained peer state");
+
+        let removed = registry
+            .purge_local_peer_states_for_peers(&HashSet::from([evicted_peer]))
+            .await
+            .expect("purge local peer states");
+
+        assert_eq!(removed, 1);
+        let remaining = registry.list_peer_states(None).expect("list peer states");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].peer_id, retained_peer);
+    }
+
+    /// Split pruning should purge only the attachment rows for evicted nodes and keep others.
+    #[tokio::test]
+    async fn purge_local_attachments_for_nodes_keeps_retained_rows() {
+        let registry = temp_registry();
+        let network_id = Uuid::new_v4();
+        let evicted_node = Uuid::new_v4();
+        let retained_node = Uuid::new_v4();
+
+        registry
+            .upsert_attachment(NetworkAttachmentValue::new(
+                crate::network::types::NetworkAttachmentDraft {
+                    id: crate::network::types::compute_network_attachment_id(
+                        Uuid::new_v4(),
+                        network_id,
+                    ),
+                    task_id: Uuid::new_v4(),
+                    node_id: evicted_node,
+                    instance_id: "instance-a".to_string(),
+                    network_id,
+                    task_updated_at: None,
+                    requested_ip: None,
+                    assigned_ip: None,
+                    mac: None,
+                    state: crate::network::types::NetworkAttachmentState::Ready,
+                    error: None,
+                    traffic_published: false,
+                    service_name: None,
+                    template_name: None,
+                },
+            ))
+            .await
+            .expect("upsert evicted attachment");
+        registry
+            .upsert_attachment(NetworkAttachmentValue::new(
+                crate::network::types::NetworkAttachmentDraft {
+                    id: crate::network::types::compute_network_attachment_id(
+                        Uuid::new_v4(),
+                        network_id,
+                    ),
+                    task_id: Uuid::new_v4(),
+                    node_id: retained_node,
+                    instance_id: "instance-b".to_string(),
+                    network_id,
+                    task_updated_at: None,
+                    requested_ip: None,
+                    assigned_ip: None,
+                    mac: None,
+                    state: crate::network::types::NetworkAttachmentState::Ready,
+                    error: None,
+                    traffic_published: false,
+                    service_name: None,
+                    template_name: None,
+                },
+            ))
+            .await
+            .expect("upsert retained attachment");
+
+        let removed = registry
+            .purge_local_attachments_for_nodes(&HashSet::from([evicted_node]))
+            .await
+            .expect("purge local attachments");
+
+        assert_eq!(removed, 1);
+        let remaining = registry.list_attachments(None).expect("list attachments");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].node_id, retained_node);
     }
 }

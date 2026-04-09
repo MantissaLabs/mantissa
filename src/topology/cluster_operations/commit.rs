@@ -1,11 +1,11 @@
 use crate::cluster::ClusterViewId;
 use crate::cluster::coordinator::ClusterTransitionCoordinator;
 use crate::cluster::operations::{
-    ClusterOperationKind, ClusterOperationRecord, MergeServicePolicy, SplitNetworkPolicy,
-    SplitServicePolicy,
+    ClusterOperationKind, ClusterOperationRecord, MergeServicePolicy, SplitServicePolicy,
 };
 use crate::cluster::participant::{ClusterParticipantReport, ClusterTransitionParticipant};
 use crate::cluster::transition::ClusterTransition;
+use crate::network::transition::SplitNetworkRuntimeParticipant;
 use crate::services::types::ServiceStatus;
 use crate::topology::Topology;
 use async_trait::async_trait;
@@ -152,42 +152,6 @@ impl ClusterTransitionParticipant for SplitTaskRuntimeParticipant {
     }
 }
 
-struct SplitNetworkRuntimeParticipant {
-    topology: Topology,
-}
-
-#[async_trait(?Send)]
-impl ClusterTransitionParticipant for SplitNetworkRuntimeParticipant {
-    /// Returns the participant identifier used by transition diagnostics.
-    fn name(&self) -> &'static str {
-        "split_network_runtime"
-    }
-
-    /// Prunes out-of-scope network runtime rows when split policy requests network isolation.
-    async fn on_commit(
-        &self,
-        transition: &ClusterTransition,
-    ) -> Result<ClusterParticipantReport, capnp::Error> {
-        let mut report = ClusterParticipantReport::new(self.name());
-        if transition.is_split() && transition.split_network_policy == SplitNetworkPolicy::Isolate {
-            let (removed_peer_states, removed_attachments) = self
-                .topology
-                .prune_split_network_runtime_state(&transition.evicted_node_ids)
-                .await?;
-            report = report
-                .add_detail(
-                    "removed_network_peer_states",
-                    removed_peer_states.to_string(),
-                )
-                .add_detail(
-                    "removed_network_attachments",
-                    removed_attachments.to_string(),
-                );
-        }
-        Ok(report)
-    }
-}
-
 struct MergeServiceParticipant {
     topology: Topology,
 }
@@ -281,9 +245,9 @@ impl Topology {
             Box::new(SplitTaskRuntimeParticipant {
                 topology: self.clone(),
             }),
-            Box::new(SplitNetworkRuntimeParticipant {
-                topology: self.clone(),
-            }),
+            Box::new(SplitNetworkRuntimeParticipant::new(
+                self.deps.network_registry.clone(),
+            )),
             Box::new(MergeServiceParticipant {
                 topology: self.clone(),
             }),
@@ -322,60 +286,6 @@ impl Topology {
         }
 
         Ok(removed)
-    }
-
-    /// Removes out-of-scope overlay peer/attachment rows after split to isolate data-plane state.
-    async fn prune_split_network_runtime_state(
-        &self,
-        evicted: &HashSet<Uuid>,
-    ) -> Result<(usize, usize), capnp::Error> {
-        let (peer_rows, _) = self
-            .stores
-            .network_peers
-            .load_all()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        let mut removed_peer_states = 0usize;
-        for (key, snapshot) in peer_rows {
-            let Some(peer_state) = snapshot.as_slice().last() else {
-                continue;
-            };
-            if !evicted.contains(&peer_state.peer_id) {
-                continue;
-            }
-
-            // Keep split prune reversible: do not leave durable tombstones that block merge replay.
-            self.stores
-                .network_peers
-                .purge_local(&UuidKey::from(key.to_uuid()))
-                .await
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
-            removed_peer_states = removed_peer_states.saturating_add(1);
-        }
-
-        let (attachment_rows, _) = self
-            .stores
-            .network_attachments
-            .load_all()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        let mut removed_attachments = 0usize;
-        for (key, snapshot) in attachment_rows {
-            let Some(attachment) = snapshot.as_slice().last() else {
-                continue;
-            };
-            if !evicted.contains(&attachment.node_id) {
-                continue;
-            }
-
-            // Keep split prune reversible: do not leave durable tombstones that block merge replay.
-            self.stores
-                .network_attachments
-                .purge_local(&UuidKey::from(key.to_uuid()))
-                .await
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
-            removed_attachments = removed_attachments.saturating_add(1);
-        }
-
-        Ok((removed_peer_states, removed_attachments))
     }
 
     /// Touches active service specs after merge so controllers promptly rebalance replicas cluster-wide.

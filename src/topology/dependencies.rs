@@ -4,6 +4,7 @@ use std::sync::Arc;
 use ::health::HealthMonitor;
 
 use crate::config;
+use crate::network::registry::NetworkRegistry;
 use crate::registry::Registry;
 use crate::scheduler::Scheduler;
 use crate::sync::SyncRunner;
@@ -12,6 +13,7 @@ use crate::sync::SyncRunner;
 #[derive(Clone)]
 pub(crate) struct TopologyDependencies {
     pub(crate) registry: Registry,
+    pub(crate) network_registry: NetworkRegistry,
     pub(crate) scheduler: Rc<Scheduler>,
     pub(crate) sync: SyncRunner,
     pub(crate) health_monitor: Arc<HealthMonitor>,

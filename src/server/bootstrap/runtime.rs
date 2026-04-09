@@ -256,6 +256,7 @@ struct TopologyBuildInputs<'a> {
     topology_stores: TopologyStorage,
     sync: SyncRunner,
     registry: Registry,
+    network_registry: NetworkRegistry,
     scheduler: Rc<Scheduler>,
     health_monitor: Arc<health::HealthMonitor>,
     runtime_health: config::RuntimeHealthConfig,
@@ -370,6 +371,11 @@ async fn build_runtime_components(
     let topology_stores = build_topology_stores(stores);
     let sync_stores = build_sync_stores(stores);
     let sync_runner = SyncRunner::new(sync_stores.clone());
+    let network_registry = NetworkRegistry::new(
+        stores.networks.clone(),
+        stores.network_peers.clone(),
+        stores.network_attachments.clone(),
+    );
     let registry = build_registry(ctx, stores, health_monitor.clone());
     let scheduler = build_scheduler(ctx, stores, registry.clone()).await?;
     let runtime_set = build_runtime_set(options).await?;
@@ -382,6 +388,7 @@ async fn build_runtime_components(
         topology_stores: topology_stores.clone(),
         sync: sync_runner.clone(),
         registry: registry.clone(),
+        network_registry: network_registry.clone(),
         scheduler: scheduler.clone(),
         health_monitor: health_monitor.clone(),
         runtime_health,
@@ -412,11 +419,6 @@ async fn build_runtime_components(
         config::local_volume_enforce_capacity(),
     );
 
-    let network_registry = NetworkRegistry::new(
-        stores.networks.clone(),
-        stores.network_peers.clone(),
-        stores.network_attachments.clone(),
-    );
     let job_registry = JobRegistry::new(stores.jobs.clone());
     let agent_registry = AgentRegistry::new(stores.agents.clone());
     let service_registry = services::ServiceRegistry::new(stores.services.clone());
@@ -597,8 +599,6 @@ fn build_topology_stores(stores: &BootstrapStores) -> TopologyStorage {
         secret_master_store: stores.secret_master_store.clone(),
         workloads: stores.workloads.clone(),
         services: stores.services.clone(),
-        network_peers: stores.network_peers.clone(),
-        network_attachments: stores.network_attachments.clone(),
         volumes: stores.volumes.clone(),
         volume_nodes: stores.volume_nodes.clone(),
         secret_keyring: stores.secret_keyring.clone(),
@@ -711,6 +711,7 @@ fn build_topology(inputs: TopologyBuildInputs<'_>) -> BootstrapResult<Topology> 
         stores: inputs.topology_stores,
         crypto: keys,
         registry: inputs.registry,
+        network_registry: inputs.network_registry,
         scheduler: inputs.scheduler,
         sync: inputs.sync,
         health_monitor: inputs.health_monitor,

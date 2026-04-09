@@ -9,5 +9,6 @@ pub mod lb;
 pub mod nodeport;
 pub mod registry;
 pub mod service;
+pub mod transition;
 pub mod types;
 pub mod wireguard;

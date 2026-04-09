@@ -1,6 +1,7 @@
 use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::config;
 use crate::gossip::{GossipContext, Message};
+use crate::network::registry::NetworkRegistry;
 use crate::node::Node;
 use crate::node::address::compute_advertise_ip;
 use crate::node::address::extract_port;
@@ -139,6 +140,7 @@ pub struct TopologyConfig {
     pub stores: TopologyStorage,
     pub crypto: Keys,
     pub registry: Registry,
+    pub network_registry: NetworkRegistry,
     pub scheduler: Rc<Scheduler>,
     pub sync: SyncRunner,
     pub health_monitor: Arc<HealthMonitor>,
@@ -157,6 +159,7 @@ impl Topology {
             stores,
             crypto,
             registry,
+            network_registry,
             scheduler,
             sync,
             health_monitor,
@@ -196,6 +199,7 @@ impl Topology {
             },
             deps: TopologyDependencies {
                 registry,
+                network_registry,
                 scheduler,
                 sync,
                 health_monitor,
