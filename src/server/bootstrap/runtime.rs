@@ -24,7 +24,7 @@ use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
 use crate::sync::{SyncRunner, SyncService, SyncStores};
 use crate::task::service::TaskService;
-use crate::topology::{Keys, Topology, TopologyConfig, TopologyStorage};
+use crate::topology::{Keys, Topology, TopologyConfig, TopologyDependencies, TopologyStorage};
 use crate::volumes::{VolumeController, VolumeRegistry, VolumeReplicator, VolumesRpc};
 use crate::workload::WorkloadRegistry;
 use crate::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadRuntimeConfig};
@@ -255,15 +255,7 @@ struct TopologyBuildInputs<'a> {
     topology_rx: Receiver<Message>,
     gossip_tx: Sender<Message>,
     topology_stores: TopologyStorage,
-    sync: SyncRunner,
-    registry: Registry,
-    network_registry: NetworkRegistry,
-    workload_registry: WorkloadRegistry,
-    service_registry: services::ServiceRegistry,
-    volume_registry: VolumeRegistry,
-    scheduler: Rc<Scheduler>,
-    health_monitor: Arc<health::HealthMonitor>,
-    runtime_health: config::RuntimeHealthConfig,
+    deps: TopologyDependencies,
     runtime_support: crate::runtime::types::RuntimeSupportProfile,
 }
 
@@ -393,15 +385,17 @@ async fn build_runtime_components(
         topology_rx,
         gossip_tx: gossip_tx.clone(),
         topology_stores: topology_stores.clone(),
-        sync: sync_runner.clone(),
-        registry: registry.clone(),
-        network_registry: network_registry.clone(),
-        workload_registry: workload_registry.clone(),
-        service_registry: service_registry.clone(),
-        volume_registry: volume_registry.clone(),
-        scheduler: scheduler.clone(),
-        health_monitor: health_monitor.clone(),
-        runtime_health,
+        deps: TopologyDependencies {
+            registry: registry.clone(),
+            network_registry: network_registry.clone(),
+            workload_registry: workload_registry.clone(),
+            service_registry: service_registry.clone(),
+            volume_registry: volume_registry.clone(),
+            scheduler: scheduler.clone(),
+            sync: sync_runner.clone(),
+            health_monitor: health_monitor.clone(),
+            runtime_health,
+        },
         runtime_support,
     })?;
     hydrate_topology(&topology).await?;
@@ -714,15 +708,7 @@ fn build_topology(inputs: TopologyBuildInputs<'_>) -> BootstrapResult<Topology> 
         cluster_view: inputs.cluster_view,
         stores: inputs.topology_stores,
         crypto: keys,
-        registry: inputs.registry,
-        network_registry: inputs.network_registry,
-        workload_registry: inputs.workload_registry,
-        service_registry: inputs.service_registry,
-        volume_registry: inputs.volume_registry,
-        scheduler: inputs.scheduler,
-        sync: inputs.sync,
-        health_monitor: inputs.health_monitor,
-        runtime_health: inputs.runtime_health,
+        deps: inputs.deps,
         runtime_support: inputs.runtime_support,
     })
     .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })

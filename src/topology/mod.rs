@@ -48,14 +48,12 @@ use self::builders::{
     drain_state_from_scheduling, write_runtime_support_to_node_info,
     write_scheduling_fields_to_node_info, write_wireguard_to_node_info,
 };
-use self::dependencies::TopologyDependencies;
 use self::local_state::LocalNodeState;
 use self::peer_cache::{PeerCacheEntry, PeerSnapshot, PeerSnapshotCache};
 use self::runtime::{GossipWarmSetState, TopologyRuntime};
 
 mod builders;
 mod cluster_operations;
-mod dependencies;
 mod drain;
 mod event;
 mod gossip;
@@ -147,15 +145,7 @@ pub struct TopologyConfig {
     pub cluster_view: ClusterViewState,
     pub stores: TopologyStorage,
     pub crypto: Keys,
-    pub registry: Registry,
-    pub network_registry: NetworkRegistry,
-    pub workload_registry: WorkloadRegistry,
-    pub service_registry: ServiceRegistry,
-    pub volume_registry: VolumeRegistry,
-    pub scheduler: Rc<Scheduler>,
-    pub sync: SyncRunner,
-    pub health_monitor: Arc<HealthMonitor>,
-    pub runtime_health: config::RuntimeHealthConfig,
+    pub deps: TopologyDependencies,
     pub runtime_support: RuntimeSupportProfile,
 }
 
@@ -172,6 +162,20 @@ pub struct TopologyStorage {
     pub secret_keyring: Arc<RwLock<SecretKeyring>>,
 }
 
+/// Runtime collaborators used by topology but owned outside its durable stores.
+#[derive(Clone)]
+pub struct TopologyDependencies {
+    pub registry: Registry,
+    pub network_registry: NetworkRegistry,
+    pub workload_registry: WorkloadRegistry,
+    pub service_registry: ServiceRegistry,
+    pub volume_registry: VolumeRegistry,
+    pub scheduler: Rc<Scheduler>,
+    pub sync: SyncRunner,
+    pub health_monitor: Arc<HealthMonitor>,
+    pub runtime_health: config::RuntimeHealthConfig,
+}
+
 impl Topology {
     pub fn new(config: TopologyConfig) -> Result<Self, Error> {
         let TopologyConfig {
@@ -182,21 +186,14 @@ impl Topology {
             cluster_view,
             stores,
             crypto,
-            registry,
-            network_registry,
-            workload_registry,
-            service_registry,
-            volume_registry,
-            scheduler,
-            sync,
-            health_monitor,
-            runtime_health,
+            deps,
             runtime_support,
         } = config;
         let Keys {
             noise_public_key,
             signing_key,
         } = crypto;
+        let probe_interval = deps.runtime_health.probe_interval;
         let topology = Self {
             local: LocalNodeState {
                 node,
@@ -214,7 +211,7 @@ impl Topology {
                 gossip_warm_set: Arc::new(tokio::sync::Mutex::new(GossipWarmSetState::default())),
                 excluded_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
                 sync: runtime::SyncLoopState::new(DEFAULT_SYNC_INTERVAL, DEFAULT_SYNC_FANOUT),
-                health_probe: runtime::ProbeLoopState::new(runtime_health.probe_interval),
+                health_probe: runtime::ProbeLoopState::new(probe_interval),
                 workload_repair_fanout: Arc::new(Mutex::new(DEFAULT_WORKLOAD_REPAIR_FANOUT)),
                 workload_repair_cursor: Arc::new(Mutex::new(0)),
                 metadata_sync: runtime::SyncLoopState::new(
@@ -224,17 +221,7 @@ impl Topology {
                 metadata_sync_cursor: Arc::new(Mutex::new(0)),
                 cluster_operation_gate: runtime::ClusterOperationGate::new(),
             },
-            deps: TopologyDependencies {
-                registry,
-                network_registry,
-                workload_registry,
-                service_registry,
-                volume_registry,
-                scheduler,
-                sync,
-                health_monitor,
-                runtime_health,
-            },
+            deps,
         };
 
         info!(
@@ -265,12 +252,12 @@ impl Topology {
     }
 
     /// Returns a snapshot of peers currently excluded from active control-plane loops.
-    pub(crate) async fn excluded_peers_snapshot(&self) -> HashSet<Uuid> {
+    pub async fn excluded_peers_snapshot(&self) -> HashSet<Uuid> {
         self.runtime.excluded_peers.lock().await.clone()
     }
 
     /// Replaces the excluded-peer set used to scope active control-plane loops.
-    pub(crate) async fn set_excluded_peers(&self, excluded: HashSet<Uuid>) {
+    pub async fn set_excluded_peers(&self, excluded: HashSet<Uuid>) {
         *self.runtime.excluded_peers.lock().await = excluded;
     }
 }
