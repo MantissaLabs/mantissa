@@ -1,12 +1,10 @@
 use crate::scheduler::SlotCapacity;
 use crate::scheduler::summary::{SchedulerGpuState, SchedulerSlotState, SchedulerSummary};
-use crate::services::registry::ServiceRegistry;
 use crate::services::types::{ServiceSpecValue, ServiceStatus};
 use crate::topology::Topology;
 use crate::topology::builders::{DrainStatusState, NodeDrainStatusSnapshot};
-use crate::volumes::registry::VolumeRegistry;
 use crate::volumes::types::VolumeDriver;
-use crate::workload::model::{WorkloadPhase, WorkloadValue, select_best_workload_value};
+use crate::workload::model::{WorkloadPhase, WorkloadValue};
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
 use uuid::Uuid;
@@ -106,24 +104,15 @@ impl Topology {
         &self,
         node_id: Uuid,
     ) -> Result<Vec<WorkloadValue>, capnp::Error> {
-        let (entries, _) = self
-            .stores
-            .workloads
-            .load_all()
+        let tasks = self
+            .deps
+            .workload_registry
+            .list_values_on_node(node_id)
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-        let mut tasks = Vec::new();
-        for (_key, snapshot) in entries {
-            let Some(value) = select_best_workload_value(snapshot.as_slice()) else {
-                continue;
-            };
-            if value.node_id != node_id || !task_blocks_node_drain(&value.state) {
-                continue;
-            }
-            tasks.push(value);
-        }
-
-        Ok(tasks)
+        Ok(tasks
+            .into_iter()
+            .filter(|value| task_blocks_node_drain(&value.state))
+            .collect())
     }
 
     /// Returns active tasks on the target node that still depend on node-local volume data.
@@ -135,16 +124,14 @@ impl Topology {
         node_id: Uuid,
         tasks: &[WorkloadValue],
     ) -> Result<Vec<LocalVolumeDrainBlocker>, capnp::Error> {
-        let volumes = VolumeRegistry::new(
-            self.stores.volumes.clone(),
-            self.stores.volume_nodes.clone(),
-        );
         let mut seen = HashSet::new();
         let mut blockers = Vec::new();
 
         for task in tasks {
             for mount in &task.volumes {
-                let Some(spec) = volumes
+                let Some(spec) = self
+                    .deps
+                    .volume_registry
                     .get_spec(mount.volume_id)
                     .map_err(|e| capnp::Error::failed(e.to_string()))?
                 else {
@@ -253,8 +240,9 @@ impl Topology {
             )));
         }
 
-        let service_registry = ServiceRegistry::new(self.stores.services.clone());
-        let services = service_registry
+        let services = self
+            .deps
+            .service_registry
             .list()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         let service_by_name: HashMap<_, _> = services
@@ -484,8 +472,9 @@ impl Topology {
             .collect();
         let remaining_service_tasks = service_tasks.len() as u32;
 
-        let service_registry = ServiceRegistry::new(self.stores.services.clone());
-        let services = service_registry
+        let services = self
+            .deps
+            .service_registry
             .list()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         let service_by_name: HashMap<_, _> = services

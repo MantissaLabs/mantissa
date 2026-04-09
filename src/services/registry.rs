@@ -1,5 +1,5 @@
 use crate::services::ordering::compare_service_specs;
-use crate::services::types::{ServiceSpecValue, compute_service_id};
+use crate::services::types::{ServiceSpecValue, ServiceStatus, compute_service_id};
 use crate::store::service_store::ServiceStore;
 use anyhow::{Result, anyhow};
 use crdt_store::uuid_key::UuidKey;
@@ -68,6 +68,37 @@ impl ServiceRegistry {
         values.sort_by(|a, b| a.service_name.cmp(&b.service_name));
 
         Ok(values)
+    }
+
+    /// Touches running and deploying services so controllers promptly rebalance after merge.
+    pub async fn touch_running_for_merge_rebalance(&self) -> Result<usize> {
+        let (actives, _) = self
+            .store
+            .load_all()
+            .map_err(|e| anyhow!("service store load_all failed: {e}"))?;
+
+        let mut updated = 0usize;
+        for (key, snapshot) in actives {
+            let Some(current) = select_best_service_spec(snapshot.as_slice()) else {
+                continue;
+            };
+            if !matches!(
+                current.status,
+                ServiceStatus::Running | ServiceStatus::Deploying
+            ) {
+                continue;
+            }
+
+            let mut next = current.clone();
+            next.touch();
+            self.store
+                .upsert(&UuidKey::from(key.to_uuid()), next)
+                .await
+                .map_err(|e| anyhow!("service upsert failed: {e}"))?;
+            updated = updated.saturating_add(1);
+        }
+
+        Ok(updated)
     }
 
     #[allow(dead_code)]
@@ -198,6 +229,61 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].task_templates[0].image, "ghcr.io/demo/web:v2");
         assert_eq!(listed[0].task_templates[0].replicas, 3);
+    }
+
+    /// Merge rebalance touch should update only running or deploying service rows.
+    #[tokio::test]
+    async fn touch_running_for_merge_rebalance_updates_active_services_only() {
+        let store = temp_store();
+        let registry = ServiceRegistry::new(store);
+
+        let mut running = build_service_value(
+            Uuid::new_v4(),
+            ServiceStatus::Running,
+            Utc::now(),
+            vec![Uuid::new_v4()],
+        );
+        running.service_name = "running".into();
+        running.id = compute_service_id(&running.service_name);
+        let running_before = running.updated_at.clone();
+
+        let mut stopped = build_service_value(
+            Uuid::new_v4(),
+            ServiceStatus::Stopped,
+            Utc::now(),
+            Vec::new(),
+        );
+        stopped.service_name = "stopped".into();
+        stopped.id = compute_service_id(&stopped.service_name);
+        let stopped_before = stopped.updated_at.clone();
+
+        registry
+            .upsert(running.clone())
+            .await
+            .expect("upsert running");
+        registry
+            .upsert(stopped.clone())
+            .await
+            .expect("upsert stopped");
+
+        let updated = registry
+            .touch_running_for_merge_rebalance()
+            .await
+            .expect("touch running services");
+        assert_eq!(updated, 1);
+
+        let listed = registry.list().expect("list services");
+        let running_after = listed
+            .iter()
+            .find(|value| value.service_name == "running")
+            .expect("running service");
+        let stopped_after = listed
+            .iter()
+            .find(|value| value.service_name == "stopped")
+            .expect("stopped service");
+
+        assert_ne!(running_after.updated_at, running_before);
+        assert_eq!(stopped_after.updated_at, stopped_before);
     }
 
     /// Builds a service value with explicit lifecycle metadata for preference tests.

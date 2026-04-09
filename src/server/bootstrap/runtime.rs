@@ -26,6 +26,7 @@ use crate::sync::{SyncRunner, SyncService, SyncStores};
 use crate::task::service::TaskService;
 use crate::topology::{Keys, Topology, TopologyConfig, TopologyStorage};
 use crate::volumes::{VolumeController, VolumeRegistry, VolumeReplicator, VolumesRpc};
+use crate::workload::WorkloadRegistry;
 use crate::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadRuntimeConfig};
 use crate::workload::service::WorkloadService;
 use crate::{config, gossip, services};
@@ -257,6 +258,9 @@ struct TopologyBuildInputs<'a> {
     sync: SyncRunner,
     registry: Registry,
     network_registry: NetworkRegistry,
+    workload_registry: WorkloadRegistry,
+    service_registry: services::ServiceRegistry,
+    volume_registry: VolumeRegistry,
     scheduler: Rc<Scheduler>,
     health_monitor: Arc<health::HealthMonitor>,
     runtime_health: config::RuntimeHealthConfig,
@@ -376,6 +380,9 @@ async fn build_runtime_components(
         stores.network_peers.clone(),
         stores.network_attachments.clone(),
     );
+    let workload_registry = WorkloadRegistry::new(stores.workloads.clone());
+    let service_registry = services::ServiceRegistry::new(stores.services.clone());
+    let volume_registry = VolumeRegistry::new(stores.volumes.clone(), stores.volume_nodes.clone());
     let registry = build_registry(ctx, stores, health_monitor.clone());
     let scheduler = build_scheduler(ctx, stores, registry.clone()).await?;
     let runtime_set = build_runtime_set(options).await?;
@@ -389,6 +396,9 @@ async fn build_runtime_components(
         sync: sync_runner.clone(),
         registry: registry.clone(),
         network_registry: network_registry.clone(),
+        workload_registry: workload_registry.clone(),
+        service_registry: service_registry.clone(),
+        volume_registry: volume_registry.clone(),
         scheduler: scheduler.clone(),
         health_monitor: health_monitor.clone(),
         runtime_health,
@@ -406,7 +416,6 @@ async fn build_runtime_components(
         secret_rx,
     );
 
-    let volume_registry = VolumeRegistry::new(stores.volumes.clone(), stores.volume_nodes.clone());
     let volume_replicator =
         VolumeReplicator::new(volume_registry.clone(), gossip_tx.clone(), volume_rx);
     let local_volume_root = resolve_local_volume_root(options)?;
@@ -421,7 +430,6 @@ async fn build_runtime_components(
 
     let job_registry = JobRegistry::new(stores.jobs.clone());
     let agent_registry = AgentRegistry::new(stores.agents.clone());
-    let service_registry = services::ServiceRegistry::new(stores.services.clone());
     let (forwarding_tx, forwarding_rx) = mpsc::unbounded_channel();
     let network_controller = NetworkController::new(
         network_registry.clone(),
@@ -597,10 +605,6 @@ fn build_topology_stores(stores: &BootstrapStores) -> TopologyStorage {
         cluster_view_store: stores.cluster_view.clone(),
         token_store: stores.token_store.clone(),
         secret_master_store: stores.secret_master_store.clone(),
-        workloads: stores.workloads.clone(),
-        services: stores.services.clone(),
-        volumes: stores.volumes.clone(),
-        volume_nodes: stores.volume_nodes.clone(),
         secret_keyring: stores.secret_keyring.clone(),
     }
 }
@@ -712,6 +716,9 @@ fn build_topology(inputs: TopologyBuildInputs<'_>) -> BootstrapResult<Topology> 
         crypto: keys,
         registry: inputs.registry,
         network_registry: inputs.network_registry,
+        workload_registry: inputs.workload_registry,
+        service_registry: inputs.service_registry,
+        volume_registry: inputs.volume_registry,
         scheduler: inputs.scheduler,
         sync: inputs.sync,
         health_monitor: inputs.health_monitor,

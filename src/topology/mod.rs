@@ -9,9 +9,18 @@ use crate::node::id::set_node_id;
 use crate::registry::Registry;
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::scheduler::Scheduler;
+use crate::secrets::crypto::SecretKeyring;
+use crate::services::ServiceRegistry;
+use crate::store::cluster_operation_store::ClusterOperationStore;
 use crate::store::cluster_view_store::ClusterNameRecord;
+use crate::store::cluster_view_store::ClusterViewStore;
+use crate::store::local::{LocalCredentialStore, LocalSessionStore, SecretMasterStore};
+use crate::store::peer_store::PeersStore;
 use crate::sync::{SyncRunner, SyncTraceContext};
+use crate::token::TokenStore;
 use crate::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue};
+use crate::volumes::VolumeRegistry;
+use crate::workload::WorkloadRegistry;
 use ::health::HealthMonitor;
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
@@ -30,6 +39,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
@@ -59,7 +69,6 @@ pub mod peer_provider;
 pub mod peers;
 mod runtime;
 mod service;
-mod storage;
 mod swim;
 mod sync;
 
@@ -67,7 +76,6 @@ pub use self::event::TopologyEvent;
 pub use self::peer_handle::PeerHandle;
 pub use builders::add_event;
 pub use service::read_topology_event;
-pub use storage::TopologyStorage;
 
 /// Default anti-entropy interval for periodic sync loops.
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
@@ -141,11 +149,27 @@ pub struct TopologyConfig {
     pub crypto: Keys,
     pub registry: Registry,
     pub network_registry: NetworkRegistry,
+    pub workload_registry: WorkloadRegistry,
+    pub service_registry: ServiceRegistry,
+    pub volume_registry: VolumeRegistry,
     pub scheduler: Rc<Scheduler>,
     pub sync: SyncRunner,
     pub health_monitor: Arc<HealthMonitor>,
     pub runtime_health: config::RuntimeHealthConfig,
     pub runtime_support: RuntimeSupportProfile,
+}
+
+/// Bundles the store handles required to construct and operate a `Topology`.
+#[derive(Clone)]
+pub struct TopologyStorage {
+    pub local_credential_store: LocalCredentialStore,
+    pub local_sessions: LocalSessionStore,
+    pub peers: PeersStore,
+    pub cluster_operations: ClusterOperationStore,
+    pub cluster_view_store: ClusterViewStore,
+    pub token_store: TokenStore,
+    pub secret_master_store: SecretMasterStore,
+    pub secret_keyring: Arc<RwLock<SecretKeyring>>,
 }
 
 impl Topology {
@@ -160,6 +184,9 @@ impl Topology {
             crypto,
             registry,
             network_registry,
+            workload_registry,
+            service_registry,
+            volume_registry,
             scheduler,
             sync,
             health_monitor,
@@ -200,6 +227,9 @@ impl Topology {
             deps: TopologyDependencies {
                 registry,
                 network_registry,
+                workload_registry,
+                service_registry,
+                volume_registry,
                 scheduler,
                 sync,
                 health_monitor,

@@ -6,13 +6,12 @@ use crate::cluster::operations::{
 use crate::cluster::participant::{ClusterParticipantReport, ClusterTransitionParticipant};
 use crate::cluster::transition::ClusterTransition;
 use crate::network::transition::SplitNetworkRuntimeParticipant;
-use crate::services::types::ServiceStatus;
+use crate::services::ServiceRegistry;
 use crate::topology::Topology;
+use crate::workload::WorkloadRegistry;
 use async_trait::async_trait;
-use crdt_store::uuid_key::UuidKey;
 use std::collections::HashSet;
 use tracing::warn;
-use uuid::Uuid;
 
 struct PeerScopeParticipant {
     topology: Topology,
@@ -123,7 +122,7 @@ impl ClusterTransitionParticipant for PeerScopeParticipant {
 }
 
 struct SplitTaskRuntimeParticipant {
-    topology: Topology,
+    workloads: WorkloadRegistry,
 }
 
 #[async_trait(?Send)]
@@ -143,9 +142,10 @@ impl ClusterTransitionParticipant for SplitTaskRuntimeParticipant {
             && transition.split_service_policy == SplitServicePolicy::Partitioned
         {
             let removed = self
-                .topology
-                .prune_split_task_runtime_state(&transition.evicted_node_ids)
-                .await?;
+                .workloads
+                .purge_local_for_nodes(&transition.evicted_node_ids)
+                .await
+                .map_err(|err| capnp::Error::failed(err.to_string()))?;
             report = report.add_detail("removed_tasks", removed.to_string());
         }
         Ok(report)
@@ -153,7 +153,7 @@ impl ClusterTransitionParticipant for SplitTaskRuntimeParticipant {
 }
 
 struct MergeServiceParticipant {
-    topology: Topology,
+    services: ServiceRegistry,
 }
 
 #[async_trait(?Send)]
@@ -172,9 +172,10 @@ impl ClusterTransitionParticipant for MergeServiceParticipant {
         if transition.is_merge() && transition.merge_service_policy == MergeServicePolicy::Rebalance
         {
             let nudged = self
-                .topology
-                .nudge_running_services_for_merge_rebalance()
-                .await?;
+                .services
+                .touch_running_for_merge_rebalance()
+                .await
+                .map_err(|err| capnp::Error::failed(err.to_string()))?;
             report = report.add_detail("nudged_services", nudged.to_string());
         }
         Ok(report)
@@ -243,81 +244,15 @@ impl Topology {
                 topology: self.clone(),
             }),
             Box::new(SplitTaskRuntimeParticipant {
-                topology: self.clone(),
+                workloads: self.deps.workload_registry.clone(),
             }),
             Box::new(SplitNetworkRuntimeParticipant::new(
                 self.deps.network_registry.clone(),
             )),
             Box::new(MergeServiceParticipant {
-                topology: self.clone(),
+                services: self.deps.service_registry.clone(),
             }),
         ]);
         coordinator.on_commit(transition).await
-    }
-
-    /// Removes out-of-scope task runtime rows after split so each partition reconciles services locally.
-    async fn prune_split_task_runtime_state(
-        &self,
-        evicted: &HashSet<Uuid>,
-    ) -> Result<usize, capnp::Error> {
-        let (actives, _) = self
-            .stores
-            .workloads
-            .load_all()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-        let mut removed = 0usize;
-        for (key, snapshot) in actives {
-            let Some(task) = snapshot.as_slice().last() else {
-                continue;
-            };
-            if !evicted.contains(&task.node_id) {
-                continue;
-            }
-
-            // Split pruning is view-scoped, not a global delete. Purge locally so merge/sync
-            // can repopulate rows from the other partition.
-            self.stores
-                .workloads
-                .purge_local(&UuidKey::from(key.to_uuid()))
-                .await
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
-            removed = removed.saturating_add(1);
-        }
-
-        Ok(removed)
-    }
-
-    /// Touches active service specs after merge so controllers promptly rebalance replicas cluster-wide.
-    async fn nudge_running_services_for_merge_rebalance(&self) -> Result<usize, capnp::Error> {
-        let (actives, _) = self
-            .stores
-            .services
-            .load_all()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-        let mut updated = 0usize;
-        for (key, snapshot) in actives {
-            let Some(current) = snapshot.as_slice().last().cloned() else {
-                continue;
-            };
-            if !matches!(
-                current.status,
-                ServiceStatus::Running | ServiceStatus::Deploying
-            ) {
-                continue;
-            }
-
-            let mut next = current.clone();
-            next.touch();
-            self.stores
-                .services
-                .upsert(&UuidKey::from(key.to_uuid()), next)
-                .await
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
-            updated = updated.saturating_add(1);
-        }
-
-        Ok(updated)
     }
 }
