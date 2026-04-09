@@ -44,6 +44,7 @@ pub struct SplitCandidate {
     pub gpu_count: Option<u64>,
     pub gpu_models: Vec<String>,
     pub wireguard_enabled: bool,
+    pub labels: Vec<String>,
 }
 
 /// Snapshot used by interactive split planners to display candidate nodes.
@@ -321,6 +322,19 @@ pub async fn list_split_candidates(
             }
         }
 
+        let labels_reader = row.get_labels().context("split candidate missing labels")?;
+        let mut labels = Vec::with_capacity(labels_reader.len() as usize);
+        for label_idx in 0..labels_reader.len() {
+            let label = labels_reader
+                .get(label_idx)
+                .context("split candidate label missing")?
+                .to_string()
+                .context("split candidate label invalid utf8")?;
+            if !label.trim().is_empty() {
+                labels.push(label);
+            }
+        }
+
         candidates.push(SplitCandidate {
             node_id,
             hostname,
@@ -348,6 +362,7 @@ pub async fn list_split_candidates(
             },
             gpu_models,
             wireguard_enabled: row.get_wireguard_enabled(),
+            labels,
         });
     }
 

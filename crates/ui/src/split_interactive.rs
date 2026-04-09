@@ -33,6 +33,7 @@ pub struct SplitCandidate {
     pub gpu_count: Option<u64>,
     pub gpu_models: Vec<String>,
     pub wireguard_enabled: bool,
+    pub labels: Vec<String>,
 }
 
 /// Payload rendered by the split planner UI.
@@ -147,6 +148,7 @@ impl SplitPlannerApp {
                     .cpu_vendor
                     .clone()
                     .unwrap_or_else(|| String::from("-")),
+                candidate.labels.join(","),
             ];
             if fields
                 .iter()
@@ -671,7 +673,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut SplitPlannerApp) {
 
     let details = if let Some(candidate) = app.selected_candidate() {
         format!(
-            "Node: {}\nHostname: {}\nAddress: {}\nHealth: {}\nActive view: {}\nWireGuard: {}\nCPU vendor: {}\nCPU brand: {}\nCPU cores/logical: {}/{}\nMemory: {}\nGPU vendor: {}\nGPU count: {}\nGPU models: {}",
+            "Node: {}\nHostname: {}\nAddress: {}\nHealth: {}\nActive view: {}\nWireGuard: {}\nLabels: {}\nCPU vendor: {}\nCPU brand: {}\nCPU cores/logical: {}/{}\nMemory: {}\nGPU vendor: {}\nGPU count: {}\nGPU models: {}",
             candidate.node_id,
             candidate.hostname,
             candidate.address,
@@ -682,6 +684,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut SplitPlannerApp) {
             } else {
                 "disabled"
             },
+            format_candidate_labels(candidate),
             candidate.cpu_vendor.as_deref().unwrap_or("-"),
             candidate.cpu_brand.as_deref().unwrap_or("-"),
             candidate
@@ -778,6 +781,15 @@ fn format_gpu(candidate: &SplitCandidate) -> String {
 
     let vendor = candidate.gpu_vendor.as_deref().unwrap_or("gpu");
     format!("{}:{count}", truncate(vendor, 10))
+}
+
+/// Formats one split candidate label list for the node-details pane.
+fn format_candidate_labels(candidate: &SplitCandidate) -> String {
+    if candidate.labels.is_empty() {
+        String::from("-")
+    } else {
+        candidate.labels.join(", ")
+    }
 }
 
 /// Returns a stable short ID for compact list rows.

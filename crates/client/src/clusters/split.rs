@@ -258,6 +258,7 @@ fn to_ui_candidate(candidate: ClientSplitCandidate) -> UiSplitCandidate {
         gpu_count: candidate.gpu_count,
         gpu_models: candidate.gpu_models,
         wireguard_enabled: candidate.wireguard_enabled,
+        labels: candidate.labels,
     }
 }
 

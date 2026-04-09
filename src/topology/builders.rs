@@ -268,6 +268,13 @@ pub(super) fn write_split_candidate_row(
     for (gpu_idx, model) in candidate.candidate.gpu_models.iter().enumerate() {
         gpu_models.set(gpu_idx as u32, model);
     }
+
+    let mut labels = row
+        .reborrow()
+        .init_labels(candidate.candidate.labels.len() as u32);
+    for (label_idx, label) in candidate.candidate.labels.iter().enumerate() {
+        labels.set(label_idx as u32, label.format_assignment());
+    }
 }
 
 /// Writes one derived drain-status snapshot into the RPC response payload.

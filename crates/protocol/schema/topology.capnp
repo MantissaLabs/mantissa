@@ -360,6 +360,9 @@ struct SplitCandidate {
 
   wireguardEnabled @13 :Bool;
   # Whether this node has WireGuard dataplane enabled.
+
+  labels @14 :List(Text);
+  # Operator-managed node labels encoded as `key=value` assignments.
 }
 
 enum ClusterOperationKind {

@@ -119,6 +119,37 @@ async fn node_labels_from_list(
     None
 }
 
+/// Reads operator labels for one node from the split-candidate planning response.
+async fn split_candidate_labels(
+    topology: &mantissa::topology_capnp::topology::Client,
+    source_view: ClusterViewId,
+    node_id: Uuid,
+) -> Option<Vec<String>> {
+    let mut request = topology.list_split_candidates_request();
+    source_view.write_capnp(request.get().init_source_view());
+    let response = request.send().promise.await.ok()?;
+    let rows = response.get().ok()?.get_nodes().ok()?;
+    for idx in 0..rows.len() {
+        let row = rows.get(idx);
+        let listed_id = Uuid::from_slice(row.get_node_id().ok()?.get_bytes().ok()?).ok()?;
+        if listed_id != node_id {
+            continue;
+        }
+
+        let labels = row.get_labels().ok()?;
+        let mut out = Vec::with_capacity(labels.len() as usize);
+        for label in labels.iter() {
+            let text = label.ok()?.to_str().ok()?.trim().to_string();
+            if !text.is_empty() {
+                out.push(text);
+            }
+        }
+        return Some(out);
+    }
+
+    None
+}
+
 /// Reads the current cluster view summary rows from one topology client.
 async fn cluster_view_rows(
     topology: &mantissa::topology_capnp::topology::Client,
@@ -2362,6 +2393,59 @@ local_test!(cluster_view_lists_split_candidates, {
         saw_anchor,
         "split candidates should include the joined peer"
     );
+});
+
+// Validates split candidate listing includes replicated operator labels for interactive planning.
+local_test!(cluster_view_split_candidates_include_labels, {
+    let anchor = TestNode::new_tcp_with_tick_ms(100).await;
+    let joiner = TestNode::new_tcp_with_tick_ms(100).await;
+    joiner.join(&anchor).await.expect("join");
+    anchor
+        .assert_cluster_size(2, "cluster size after join")
+        .await;
+
+    set_node_labels(
+        &joiner.topology(),
+        joiner.id(),
+        &["topology.zone=west", "rack=r2"],
+        true,
+    )
+    .await;
+
+    let view_resp = anchor
+        .topology()
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let source_view = ClusterViewId::from_capnp(
+        view_resp
+            .get()
+            .expect("getClusterView get")
+            .get_view()
+            .expect("source view payload"),
+    )
+    .expect("decode source view");
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let labels = split_candidate_labels(&anchor.topology(), source_view, joiner.id()).await;
+            if labels
+                .as_ref()
+                .is_some_and(|value| value.iter().any(|label| label == "topology.zone=west"))
+                && labels
+                    .as_ref()
+                    .is_some_and(|value| value.iter().any(|label| label == "rack=r2"))
+            {
+                break;
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("split candidate labels should propagate");
 });
 
 // Validates finalized split scopes node listing to local active view and omits empty legacy rows.
