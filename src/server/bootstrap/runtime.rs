@@ -680,12 +680,13 @@ async fn build_scheduler(
     stores: &BootstrapStores,
     registry: Registry,
 ) -> BootstrapResult<Rc<Scheduler>> {
+    let runtime_config = config::scheduler_runtime_config();
     let scheduler = Rc::new(
         Scheduler::new(stores.scheduler_store.clone(), registry, ctx.self_id)
             .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?,
     );
     scheduler
-        .initialize_with_node(&ctx.node)
+        .initialize_with_node(&ctx.node, runtime_config)
         .await
         .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
     Ok(scheduler)

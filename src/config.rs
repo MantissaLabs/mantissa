@@ -30,6 +30,8 @@ pub struct Config {
     #[serde(default)]
     pub gpu: GpuConfig,
     #[serde(default)]
+    pub scheduler: SchedulerConfig,
+    #[serde(default)]
     pub replication: ReplicationConfig,
 }
 
@@ -230,6 +232,50 @@ pub struct GpuConfig {
 
 /// # Description:
 ///
+/// Scheduler capacity reserves kept back from workload placement on each node.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct SchedulerConfig {
+    #[serde(default = "default_scheduler_reserved_cpu_millis")]
+    pub reserved_cpu_millis: u64,
+    #[serde(default = "default_scheduler_reserved_memory_bytes")]
+    pub reserved_memory_bytes: u64,
+}
+
+impl Default for SchedulerConfig {
+    /// # Description:
+    ///
+    /// Returns baseline scheduler reserves so Mantissa keeps modest local headroom by default.
+    fn default() -> Self {
+        Self {
+            reserved_cpu_millis: default_scheduler_reserved_cpu_millis(),
+            reserved_memory_bytes: default_scheduler_reserved_memory_bytes(),
+        }
+    }
+}
+
+/// # Description:
+///
+/// Runtime-friendly scheduler reserve settings used during slot derivation.
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeSchedulerConfig {
+    pub reserved_cpu_millis: u64,
+    pub reserved_memory_bytes: u64,
+}
+
+impl SchedulerConfig {
+    /// # Description:
+    ///
+    /// Converts persisted scheduler reserve settings into the runtime form used by bootstrap.
+    fn as_runtime(&self) -> RuntimeSchedulerConfig {
+        RuntimeSchedulerConfig {
+            reserved_cpu_millis: self.reserved_cpu_millis,
+            reserved_memory_bytes: self.reserved_memory_bytes,
+        }
+    }
+}
+
+/// # Description:
+///
 /// Control-plane gossip and anti-entropy tuning for one Mantissa node.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReplicationConfig {
@@ -417,6 +463,13 @@ pub fn bpf_artifact_dir() -> Option<PathBuf> {
 
 /// # Description:
 ///
+/// Resolve the scheduler reserve configuration used while deriving allocatable capacity.
+pub fn scheduler_runtime_config() -> RuntimeSchedulerConfig {
+    global_config().scheduler.as_runtime()
+}
+
+/// # Description:
+///
 /// Resolve the peer-health runtime configuration used by liveness probing loops.
 pub fn health_runtime_config() -> RuntimeHealthConfig {
     global_config().health.as_runtime()
@@ -558,6 +611,20 @@ fn default_health_indirect_fanout_min() -> usize {
 /// Returns the maximum adaptive helper fanout for SWIM indirect probes.
 fn default_health_indirect_fanout_max() -> usize {
     32
+}
+
+/// # Description:
+///
+/// Returns the default CPU reserve kept for Mantissa and system activity on each node.
+fn default_scheduler_reserved_cpu_millis() -> u64 {
+    250
+}
+
+/// # Description:
+///
+/// Returns the default memory reserve kept for Mantissa and system activity on each node.
+fn default_scheduler_reserved_memory_bytes() -> u64 {
+    256 * 1024 * 1024
 }
 
 /// # Description:
@@ -769,6 +836,15 @@ impl Config {
             self.storage.local_volume_enforce_capacity = true;
         }
 
+        applied |= apply_u64_env_override(
+            "MANTISSA_SCHEDULER_RESERVED_CPU_MILLIS",
+            &mut self.scheduler.reserved_cpu_millis,
+        );
+        applied |= apply_u64_env_override(
+            "MANTISSA_SCHEDULER_RESERVED_MEMORY_BYTES",
+            &mut self.scheduler.reserved_memory_bytes,
+        );
+
         applied |= apply_positive_usize_env_override(
             "MANTISSA_GOSSIP_CHANNEL_CAPACITY",
             &mut self.replication.gossip_channel_capacity,
@@ -940,6 +1016,24 @@ fn apply_positive_usize_env_override(name: &str, dest: &mut usize) -> bool {
 
 /// # Description:
 ///
+/// Applies one non-negative `u64` environment override into the provided
+/// destination, logging invalid values and returning whether an override was
+/// attempted.
+fn apply_u64_env_override(name: &str, dest: &mut u64) -> bool {
+    let Ok(raw) = std::env::var(name) else {
+        return false;
+    };
+
+    match raw.trim().parse::<u64>() {
+        Ok(value) => *dest = value,
+        Err(_) => warn!(target: "config", "ignoring invalid {name} '{raw}'"),
+    }
+
+    true
+}
+
+/// # Description:
+///
 /// Applies one strictly positive `u64` environment override into the provided
 /// destination, logging invalid values and returning whether an override was
 /// attempted.
@@ -1063,6 +1157,14 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
 
     if old.storage.local_volume_enforce_capacity != new.storage.local_volume_enforce_capacity {
         changes.push("storage.local_volume_enforce_capacity".to_string());
+    }
+
+    if old.scheduler.reserved_cpu_millis != new.scheduler.reserved_cpu_millis {
+        changes.push("scheduler.reserved_cpu_millis".to_string());
+    }
+
+    if old.scheduler.reserved_memory_bytes != new.scheduler.reserved_memory_bytes {
+        changes.push("scheduler.reserved_memory_bytes".to_string());
     }
 
     if old.network.nodeport.enabled != new.network.nodeport.enabled {
@@ -1191,6 +1293,8 @@ mod tests {
             std::env::set_var("MANTISSA_RUNTIME_OCI_HOST", "unix:///var/run/docker.sock");
             std::env::set_var("MANTISSA_GPU_DEVICE_OVERRIDES", "uuid:GPU-abc=id:GPU-abc");
             std::env::set_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY", "1");
+            std::env::set_var("MANTISSA_SCHEDULER_RESERVED_CPU_MILLIS", "750");
+            std::env::set_var("MANTISSA_SCHEDULER_RESERVED_MEMORY_BYTES", "134217728");
             std::env::set_var("MANTISSA_GOSSIP_CHANNEL_CAPACITY", "256");
             std::env::set_var("MANTISSA_GOSSIP_FANOUT", "7");
             std::env::set_var("MANTISSA_GOSSIP_TICK_MS", "200");
@@ -1218,6 +1322,8 @@ mod tests {
             Some("uuid:GPU-abc=id:GPU-abc")
         );
         assert!(config.storage.local_volume_enforce_capacity);
+        assert_eq!(config.scheduler.reserved_cpu_millis, 750);
+        assert_eq!(config.scheduler.reserved_memory_bytes, 134_217_728);
         assert_eq!(config.replication.gossip_channel_capacity, 256);
         assert_eq!(config.replication.gossip_fanout, 7);
         assert_eq!(config.replication.gossip_tick_ms, 200);
@@ -1235,6 +1341,8 @@ mod tests {
             std::env::remove_var("MANTISSA_RUNTIME_OCI_HOST");
             std::env::remove_var("MANTISSA_GPU_DEVICE_OVERRIDES");
             std::env::remove_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY");
+            std::env::remove_var("MANTISSA_SCHEDULER_RESERVED_CPU_MILLIS");
+            std::env::remove_var("MANTISSA_SCHEDULER_RESERVED_MEMORY_BYTES");
             std::env::remove_var("MANTISSA_GOSSIP_CHANNEL_CAPACITY");
             std::env::remove_var("MANTISSA_GOSSIP_FANOUT");
             std::env::remove_var("MANTISSA_GOSSIP_TICK_MS");
@@ -1244,5 +1352,28 @@ mod tests {
             std::env::remove_var("MANTISSA_GLOBAL_METADATA_SYNC_FANOUT");
             std::env::remove_var("MANTISSA_WORKLOAD_REPAIR_FANOUT");
         }
+    }
+
+    #[test]
+    fn scheduler_reserve_changes_require_restart() {
+        let old = Config::default();
+        let mut new = Config::default();
+        new.scheduler.reserved_cpu_millis = old.scheduler.reserved_cpu_millis.saturating_add(250);
+        new.scheduler.reserved_memory_bytes = old
+            .scheduler
+            .reserved_memory_bytes
+            .saturating_add(128 * 1024 * 1024);
+
+        let changes = restart_required_changes(&old, &new);
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "scheduler.reserved_cpu_millis")
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "scheduler.reserved_memory_bytes")
+        );
     }
 }

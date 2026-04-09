@@ -759,9 +759,14 @@ impl Scheduler {
         }
     }
 
-    /// Derives the initial slot specifications from the node system information so that the scheduler
-    /// can initialise its slot table with reasonable CPU and memory allocations.
-    pub fn derive_slot_specs(node: &crate::node::Node) -> Vec<SlotSpec> {
+    /// Derives the initial slot specifications from allocatable node resources after reserve.
+    ///
+    /// Bootstrap subtracts a small per-node CPU and memory reserve before materializing slots so
+    /// control-plane and system work retain headroom even when user workloads fill the scheduler.
+    pub fn derive_slot_specs(
+        node: &crate::node::Node,
+        runtime_config: crate::config::RuntimeSchedulerConfig,
+    ) -> Vec<SlotSpec> {
         let info = &node.system_info.info;
 
         const MIN_SLOT_MEMORY_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
@@ -774,27 +779,32 @@ impl Scheduler {
             .unwrap_or(1);
 
         let total_memory = info.mem_info.as_ref().map(|mem| mem.total).unwrap_or(0);
+        let total_cpu_millis = logical_cpus.saturating_mul(1_000);
+        let allocatable_cpu_millis =
+            total_cpu_millis.saturating_sub(runtime_config.reserved_cpu_millis);
+        let allocatable_memory = total_memory.saturating_sub(runtime_config.reserved_memory_bytes);
 
-        let mut slot_count = if total_memory > 0 {
-            total_memory.div_ceil(MIN_SLOT_MEMORY_BYTES).max(1)
-        } else {
+        let mut slot_count = if allocatable_memory > 0 {
+            allocatable_memory.div_ceil(MIN_SLOT_MEMORY_BYTES).max(1)
+        } else if allocatable_cpu_millis > 0 {
             logical_cpus.max(1)
+        } else {
+            0
         };
 
         if slot_count == 0 {
-            slot_count = 1;
+            return Vec::new();
         }
 
         slot_count = slot_count.min(MAX_SLOTS.max(1));
 
-        let total_cpu_millis = logical_cpus.saturating_mul(1_000);
-        let mut remaining_cpu = total_cpu_millis;
-        let mut remaining_memory = total_memory;
+        let mut remaining_cpu = allocatable_cpu_millis;
+        let mut remaining_memory = allocatable_memory;
         let mut specs = Vec::with_capacity(slot_count as usize);
         for slot_idx in 0..slot_count {
             let slots_left = slot_count - slot_idx;
 
-            let memory_bytes = if total_memory == 0 || remaining_memory == 0 {
+            let memory_bytes = if allocatable_memory == 0 || remaining_memory == 0 {
                 0
             } else if slots_left == 1 {
                 let mem = remaining_memory;
@@ -806,7 +816,7 @@ impl Scheduler {
                 chunk
             };
 
-            let cpu_millis = if total_cpu_millis == 0 || remaining_cpu == 0 {
+            let cpu_millis = if allocatable_cpu_millis == 0 || remaining_cpu == 0 {
                 0
             } else {
                 let slots_left_cpu = slots_left;
@@ -827,8 +837,11 @@ impl Scheduler {
             ));
         }
 
-        if specs.is_empty() {
-            specs.push(SlotSpec::new(0, SlotCapacity::new(1_000, total_memory, 0)));
+        if specs.is_empty() && (allocatable_cpu_millis > 0 || allocatable_memory > 0) {
+            specs.push(SlotSpec::new(
+                0,
+                SlotCapacity::new(allocatable_cpu_millis, allocatable_memory, 0),
+            ));
         }
 
         specs
@@ -905,12 +918,14 @@ impl Scheduler {
         specs
     }
 
-    /// Initializes the scheduler for the provided node by computing the slot specifications
-    /// and invoking `init_slots` if required, returning the active snapshot either way so
-    /// bootstrap callers can proceed with a consistent view.
+    /// Initializes the scheduler for the provided node using allocatable capacity after reserve.
+    ///
+    /// Returning the active snapshot either way keeps bootstrap callers on one consistent view
+    /// whether initialization happened in this process or a previous one already persisted it.
     pub async fn initialize_with_node(
         &self,
         node: &crate::node::Node,
+        runtime_config: crate::config::RuntimeSchedulerConfig,
     ) -> Result<SchedulerSnapshot, SchedulerError> {
         if let Some(snapshot) = self.snapshot().await {
             if snapshot.gpu_devices.is_empty() {
@@ -927,7 +942,10 @@ impl Scheduler {
         }
 
         match self
-            .init_resources(Self::derive_slot_specs(node), Self::derive_gpu_specs(node))
+            .init_resources(
+                Self::derive_slot_specs(node, runtime_config),
+                Self::derive_gpu_specs(node),
+            )
             .await
         {
             Ok(snapshot) => Ok(snapshot),
@@ -1790,6 +1808,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::config::RuntimeSchedulerConfig;
+    use crate::node::info::{Cpu, Memory};
     use crate::store::local::LocalSessionStore;
     use crate::store::peer_store::open_peers_store;
     use crate::store::scheduler_store::open_scheduler_store;
@@ -1797,6 +1817,35 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use net::noise::NoiseKeys;
     use tempfile::tempdir;
+
+    /// Builds one synthetic node with fixed CPU and memory capacity so slot
+    /// derivation tests can assert allocatable scheduler output precisely.
+    fn make_test_node(logical_cpus: i32, memory_bytes: u64) -> crate::node::Node {
+        let mut node = crate::node::Node::default();
+        node.system_info.info.cpu_info = Some(Cpu {
+            vendor: None,
+            brand: None,
+            codename: None,
+            frequency: None,
+            num_cores: logical_cpus,
+            num_logical_cpus: logical_cpus,
+            total_logical_cpus: Some(logical_cpus),
+            l1_data_cache: None,
+            l1_instruction_cache: None,
+            l2_cache: None,
+            l3_cache: None,
+        });
+        node.system_info.info.mem_info = Some(Memory {
+            total: memory_bytes,
+            free: memory_bytes,
+            available: memory_bytes,
+            used: 0,
+            swap_total: 0,
+            swap_used: 0,
+            swap_free: 0,
+        });
+        node
+    }
 
     async fn make_scheduler() -> (Scheduler, tempfile::TempDir) {
         let dir = tempdir().expect("tempdir");
@@ -1836,6 +1885,49 @@ mod tests {
         let scheduler = Scheduler::new(scheduler_store, registry, actor).expect("scheduler init");
 
         (scheduler, dir)
+    }
+
+    #[test]
+    fn derive_slot_specs_applies_scheduler_reserve() {
+        let node = make_test_node(4, 512 * 1024 * 1024);
+        let specs = Scheduler::derive_slot_specs(
+            &node,
+            RuntimeSchedulerConfig {
+                reserved_cpu_millis: 500,
+                reserved_memory_bytes: 128 * 1024 * 1024,
+            },
+        );
+
+        assert_eq!(specs.len(), 3);
+        assert_eq!(
+            specs
+                .iter()
+                .map(|slot| slot.capacity.cpu_millis)
+                .sum::<u64>(),
+            3_500
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .map(|slot| slot.capacity.memory_bytes)
+                .sum::<u64>(),
+            384 * 1024 * 1024
+        );
+        assert!(specs.iter().all(|slot| slot.capacity.memory_bytes > 0));
+    }
+
+    #[test]
+    fn derive_slot_specs_returns_empty_when_reserve_consumes_capacity() {
+        let node = make_test_node(1, 128 * 1024 * 1024);
+        let specs = Scheduler::derive_slot_specs(
+            &node,
+            RuntimeSchedulerConfig {
+                reserved_cpu_millis: 2_000,
+                reserved_memory_bytes: 256 * 1024 * 1024,
+            },
+        );
+
+        assert!(specs.is_empty());
     }
 
     #[tokio::test]
