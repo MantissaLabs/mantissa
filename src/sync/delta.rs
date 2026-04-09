@@ -4,7 +4,7 @@
 //! capability and exposes `DeltaSinkImpl`, the local sink used by the remote peer to
 //! stream missing CRDT fragments back into the local stores.
 
-use super::SyncStores;
+use super::{ALL_DOMAINS, SyncStores};
 use crate::agents::types::AgentRecordValue;
 use crate::cluster::ClusterViewId;
 use crate::jobs::types::JobSpecValue;
@@ -38,23 +38,6 @@ use tracing::{debug, warn};
 
 type RegisterDelta<V> = Vec<(UuidKey, MVReg<V, uuid::Uuid>)>;
 type TombstoneDelta = Vec<(UuidKey, u64)>;
-
-/// Same domain ordering as the server, used when a caller wants a full peer reconciliation.
-const ALL_SYNC_DOMAINS: [Domain; 13] = [
-    Domain::Peers,
-    Domain::Workloads,
-    Domain::Services,
-    Domain::Jobs,
-    Domain::Agents,
-    Domain::Secrets,
-    Domain::Networks,
-    Domain::NetworkPeers,
-    Domain::NetworkAttachments,
-    Domain::ClusterViews,
-    Domain::Volumes,
-    Domain::VolumeNodes,
-    Domain::SchedulerDigests,
-];
 
 /// Carries one peer-scoped context for anti-entropy diagnostics.
 #[derive(Clone, Debug)]
@@ -97,7 +80,7 @@ impl SyncRunner {
         cluster_view: ClusterViewId,
         trace: Option<SyncTraceContext>,
     ) {
-        self.sync_selected_domains(sync_cap, cluster_view, &ALL_SYNC_DOMAINS, trace)
+        self.sync_selected_domains(sync_cap, cluster_view, &ALL_DOMAINS, trace)
             .await;
     }
 

@@ -37,7 +37,7 @@ type EncodedRegisters = Vec<EncodedRegister>;
 type EncodedTombstone = (Vec<u8>, u64);
 type EncodedTombstones = Vec<EncodedTombstone>;
 
-/// Stable ordering of every replicated domain exposed through sync.
+/// Canonical full-sync domain set shared by both client and server sync paths.
 ///
 /// Both client and server treat an empty domain list as "all domains in this order".
 const ALL_DOMAINS: [Domain; 13] = [
@@ -58,7 +58,6 @@ const ALL_DOMAINS: [Domain; 13] = [
 
 /// Number of replicated domains exposed through view-scoped sync RPCs.
 pub const VIEW_SCOPED_DOMAIN_COUNT: usize = ALL_DOMAINS.len();
-
 /// Default max entries per streamed delta chunk.
 pub const DEFAULT_DELTA_CHUNK_MAX: usize = 2048;
 /// Default approximate payload target per streamed delta chunk.
@@ -176,14 +175,6 @@ enum DomainStoreRef<'a> {
     SchedulerDigests(&'a SchedulerDigestStore),
 }
 
-/// Static diagnostic metadata associated with one replicated sync domain.
-#[derive(Clone, Copy)]
-struct DomainDebugMeta {
-    domain: Domain,
-    log_label: &'static str,
-    dump_suffix: &'static str,
-}
-
 macro_rules! with_domain_store {
     ($domain_store:expr, |$store:ident| $body:block) => {
         match $domain_store {
@@ -205,85 +196,28 @@ macro_rules! with_domain_store {
 }
 
 impl DomainStoreRef<'_> {
-    /// Returns the static metadata used by protocol responses and sync diagnostics.
-    fn meta(&self) -> DomainDebugMeta {
-        match self {
-            Self::Peers(_) => DomainDebugMeta {
-                domain: Domain::Peers,
-                log_label: "peers",
-                dump_suffix: "peers",
-            },
-            Self::Workloads(_) => DomainDebugMeta {
-                domain: Domain::Workloads,
-                log_label: "workloads",
-                dump_suffix: "workloads",
-            },
-            Self::Services(_) => DomainDebugMeta {
-                domain: Domain::Services,
-                log_label: "services",
-                dump_suffix: "services",
-            },
-            Self::Jobs(_) => DomainDebugMeta {
-                domain: Domain::Jobs,
-                log_label: "jobs",
-                dump_suffix: "jobs",
-            },
-            Self::Agents(_) => DomainDebugMeta {
-                domain: Domain::Agents,
-                log_label: "agents",
-                dump_suffix: "agents",
-            },
-            Self::Secrets(_) => DomainDebugMeta {
-                domain: Domain::Secrets,
-                log_label: "secrets",
-                dump_suffix: "secrets",
-            },
-            Self::Networks(_) => DomainDebugMeta {
-                domain: Domain::Networks,
-                log_label: "networks",
-                dump_suffix: "networks",
-            },
-            Self::NetworkPeers(_) => DomainDebugMeta {
-                domain: Domain::NetworkPeers,
-                log_label: "network peers",
-                dump_suffix: "network_peers",
-            },
-            Self::NetworkAttachments(_) => DomainDebugMeta {
-                domain: Domain::NetworkAttachments,
-                log_label: "network attachments",
-                dump_suffix: "network_attachments",
-            },
-            Self::ClusterViews(_) => DomainDebugMeta {
-                domain: Domain::ClusterViews,
-                log_label: "cluster views",
-                dump_suffix: "cluster_views",
-            },
-            Self::Volumes(_) => DomainDebugMeta {
-                domain: Domain::Volumes,
-                log_label: "volumes",
-                dump_suffix: "volumes",
-            },
-            Self::VolumeNodes(_) => DomainDebugMeta {
-                domain: Domain::VolumeNodes,
-                log_label: "volume nodes",
-                dump_suffix: "volume_nodes",
-            },
-            Self::SchedulerDigests(_) => DomainDebugMeta {
-                domain: Domain::SchedulerDigests,
-                log_label: "scheduler digests",
-                dump_suffix: "scheduler_digests",
-            },
-        }
-    }
-
     /// Returns the protocol domain represented by this store reference.
     fn domain(&self) -> Domain {
-        self.meta().domain
+        match self {
+            Self::Peers(_) => Domain::Peers,
+            Self::Workloads(_) => Domain::Workloads,
+            Self::Services(_) => Domain::Services,
+            Self::Jobs(_) => Domain::Jobs,
+            Self::Agents(_) => Domain::Agents,
+            Self::Secrets(_) => Domain::Secrets,
+            Self::Networks(_) => Domain::Networks,
+            Self::NetworkPeers(_) => Domain::NetworkPeers,
+            Self::NetworkAttachments(_) => Domain::NetworkAttachments,
+            Self::ClusterViews(_) => Domain::ClusterViews,
+            Self::Volumes(_) => Domain::Volumes,
+            Self::VolumeNodes(_) => Domain::VolumeNodes,
+            Self::SchedulerDigests(_) => Domain::SchedulerDigests,
+        }
     }
 
     /// Builds the diagnostic label used when dumping MST state for one sync phase.
     fn dump_label(&self, prefix: &str) -> String {
-        format!("{prefix}.{}", self.meta().dump_suffix)
+        format!("{prefix}.{}", domain_debug_label(self.domain()))
     }
 
     /// Reads the current MST root digest for this domain.
@@ -293,8 +227,11 @@ impl DomainStoreRef<'_> {
 
     /// Produces digest ranges for anti-entropy while emitting domain diagnostics.
     async fn page_range_summary(&self) -> Result<Vec<crdt_store::PageDigestRange>, capnp::Error> {
-        let meta = self.meta();
-        debug!("getRangesForView: received ({})", meta.log_label);
+        let domain = self.domain();
+        debug!(
+            "getRangesForView: received ({})",
+            domain_debug_label(domain)
+        );
         let dump_label = self.dump_label("server.before.get_ranges");
         with_domain_store!(self, |store| {
             store.debug_dump_root(&dump_label).await;
@@ -321,11 +258,11 @@ impl DomainStoreRef<'_> {
 
     /// Dumps domain-specific diagnostics for an incoming delta request.
     async fn debug_dump_delta_state(&self) {
-        let meta = self.meta();
+        let domain = self.domain();
         debug!(
             target: "delta",
             "open_delta_for_view: received ({})",
-            meta.log_label
+            domain_debug_label(domain)
         );
         let dump_label = self.dump_label("server.before.open_delta");
         with_domain_store!(self, |store| {
@@ -627,6 +564,25 @@ async fn send_chunks(
     }
 
     Ok(true)
+}
+
+/// Returns the debug label associated with one sync domain.
+fn domain_debug_label(domain: Domain) -> &'static str {
+    match domain {
+        Domain::Peers => "peers",
+        Domain::Workloads => "workloads",
+        Domain::Services => "services",
+        Domain::Jobs => "jobs",
+        Domain::Agents => "agents",
+        Domain::Secrets => "secrets",
+        Domain::Networks => "networks",
+        Domain::NetworkPeers => "network peers",
+        Domain::NetworkAttachments => "network attachments",
+        Domain::ClusterViews => "cluster views",
+        Domain::Volumes => "volumes",
+        Domain::VolumeNodes => "volume nodes",
+        Domain::SchedulerDigests => "scheduler digests",
+    }
 }
 
 #[cfg(test)]
