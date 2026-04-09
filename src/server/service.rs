@@ -6,7 +6,7 @@ use crate::node::identity::{pubkey_from_slice, verify_peer_identity};
 use crate::server::credential::ClusterCredential;
 use crate::topology::TopologyEvent;
 use crate::topology::peers::{
-    PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
+    PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue, labels_from_node_info,
     runtime_support_from_node_info,
 };
 use std::rc::Rc;
@@ -89,6 +89,7 @@ impl JoinRequest {
                     value => Some(value),
                 },
             ),
+            labels: labels_from_node_info(info)?,
             runtime_support: runtime_support_from_node_info(info)?,
             membership: PeerMembership::active(info.get_incarnation()),
         };
@@ -197,6 +198,7 @@ impl JoinRequest {
             identity_sig: self.identity_sig.clone(),
             wireguard: self.peer.wireguard.clone(),
             scheduling: Box::new(self.peer.scheduling.clone()),
+            labels: Box::new(self.peer.labels.clone()),
             runtime_support: Box::new(self.peer.runtime_support.clone()),
         }
     }

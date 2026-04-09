@@ -872,6 +872,7 @@ mod tests {
             wireguard,
             runtime_support: RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(Uuid::nil()),
+            labels: crate::topology::peers::PeerLabelState::default(),
             membership: PeerMembership::active(1),
         }
     }

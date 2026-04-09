@@ -1,5 +1,6 @@
 use crate::cluster::ClusterViewId;
 use crate::cluster::operations::SplitNodeAssignment;
+use crate::topology::peers::PeerLabel;
 use capnp::Error;
 use protocol::topology::split_selector_clause::Operator as SplitOperator;
 use std::collections::HashSet;
@@ -28,6 +29,7 @@ pub struct SplitNodeCandidate {
     pub(crate) hostname: String,
     pub(crate) address: String,
     pub(crate) wireguard_enabled: bool,
+    pub(crate) labels: Vec<PeerLabel>,
     pub(crate) cpu_vendor: Option<String>,
     pub(crate) cpu_brand: Option<String>,
     pub(crate) cpu_logical: Option<u64>,
@@ -194,6 +196,27 @@ fn evaluate_split_clause(
     node: &SplitNodeCandidate,
     clause: &SplitSelectorClauseSpec,
 ) -> Result<bool, Error> {
+    if let Some(key) = clause
+        .key
+        .strip_prefix("node.labels.")
+        .or_else(|| clause.key.strip_prefix("labels."))
+    {
+        return match clause.op {
+            SplitOperator::Eq => Ok(node
+                .labels
+                .iter()
+                .any(|label| label.key == key && label.value == clause.value)),
+            SplitOperator::Ne => Ok(node
+                .labels
+                .iter()
+                .all(|label| label.key != key || label.value != clause.value)),
+            _ => Err(Error::failed(format!(
+                "label selector '{}' supports only eq/ne operators",
+                clause.key
+            ))),
+        };
+    }
+
     match clause.key.as_str() {
         "node.id" => match clause.op {
             SplitOperator::Eq => Ok(node.node_id.to_string() == clause.value),

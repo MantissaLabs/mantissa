@@ -9,6 +9,14 @@ impl Topology {
             .unwrap_or_else(|| PeerSchedulingState::schedulable_default(self.local.node.id))
     }
 
+    /// Returns the current converged label state for the local node.
+    pub(super) fn current_label_state(&self) -> crate::topology::peers::PeerLabelState {
+        self.deps
+            .registry
+            .peer_labels(self.local.node.id)
+            .unwrap_or_default()
+    }
+
     /// Returns the capability registry used by topology-owned integrations.
     pub fn registry(&self) -> Registry {
         self.deps.registry.clone()
@@ -158,6 +166,7 @@ impl Topology {
             identity_sig: identity_sig.to_vec(),
             wireguard,
             scheduling: self.current_scheduling_state(),
+            labels: self.current_label_state(),
             runtime_support: self.local.runtime_support.clone(),
             membership: PeerMembership::active(self.swim_local_incarnation()),
         })
@@ -256,6 +265,8 @@ impl Topology {
         let scheduling = self.current_scheduling_state();
         write_scheduling_fields_to_node_info(info.reborrow(), &scheduling);
         info.set_drain_state(drain_state_from_scheduling(&scheduling));
+        let labels = self.current_label_state();
+        super::builders::write_labels_to_node_info(info.reborrow(), &labels);
         write_runtime_support_to_node_info(info.reborrow(), &self.local.runtime_support);
 
         if config::wireguard_enabled() && net::paths::running_as_root() {

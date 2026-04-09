@@ -2,7 +2,7 @@ use crate::cluster::operations::SplitNodeCandidate;
 use crate::cluster::{ClusterId, ClusterViewId};
 use crate::node::id::set_node_id;
 use crate::runtime::types::RuntimeSupportProfile;
-use crate::topology::peers::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
+use crate::topology::peers::{PeerLabelState, PeerSchedulingState, PeerValue, WireGuardPeerValue};
 use protocol::gossip::gossip_message;
 use protocol::server;
 use protocol::topology::{
@@ -26,6 +26,7 @@ pub(super) struct JoinPayload {
     pub(super) identity_sig: [u8; 64],
     pub(super) wireguard: Option<WireGuardPeerValue>,
     pub(super) scheduling: PeerSchedulingState,
+    pub(super) labels: PeerLabelState,
     pub(super) runtime_support: RuntimeSupportProfile,
 }
 
@@ -174,6 +175,22 @@ pub(super) fn write_wireguard_to_node_info(
     }
 }
 
+/// Writes replicated node labels into the topology `NodeInfo` builder.
+pub(super) fn write_labels_to_node_info(
+    mut info: node_info_capnp::Builder<'_>,
+    labels: &PeerLabelState,
+) {
+    let mut entries = info.reborrow().init_labels(labels.labels.len() as u32);
+    for (idx, label) in labels.labels.iter().enumerate() {
+        entries.set(idx as u32, label.format_assignment());
+    }
+    info.set_labels_updated_at_unix_ms(labels.updated_at_unix_ms);
+    set_node_id(
+        info.reborrow().init_labels_actor_node_id(),
+        &labels.actor_node_id,
+    );
+}
+
 /// Writes one join payload into the topology `NodeInfo` request sent to the anchor.
 pub(super) fn write_join_payload_to_node_info(
     mut info: node_info_capnp::Builder<'_>,
@@ -191,6 +208,7 @@ pub(super) fn write_join_payload_to_node_info(
     info.set_incarnation(payload.incarnation);
     write_scheduling_fields_to_node_info(info.reborrow(), &payload.scheduling);
     info.set_drain_state(drain_state_from_scheduling(&payload.scheduling));
+    write_labels_to_node_info(info.reborrow(), &payload.labels);
     write_runtime_support_to_node_info(info.reborrow(), &payload.runtime_support);
     write_wireguard_to_node_info(info.reborrow(), payload.wireguard.as_ref());
 }
@@ -209,6 +227,7 @@ pub(super) fn write_listed_node_row(
     node.set_signing_key(&row.value.signing_pub);
     write_scheduling_fields_to_node_info(node.reborrow(), &row.value.scheduling);
     node.set_drain_state(row.drain_state);
+    write_labels_to_node_info(node.reborrow(), &row.value.labels);
     write_runtime_support_to_node_info(node.reborrow(), &row.value.runtime_support);
     write_wireguard_to_node_info(node.reborrow(), row.value.wireguard.as_ref());
     node.set_health(row.health);
@@ -317,6 +336,7 @@ fn write_join_event(
         identity_sig,
         wireguard,
         scheduling,
+        labels,
         runtime_support,
     } = event
     else {
@@ -332,6 +352,7 @@ fn write_join_event(
     node.set_identity_sig(identity_sig);
     node.set_incarnation(*incarnation);
     write_scheduling_fields_to_node_info(node.reborrow(), scheduling.as_ref());
+    write_labels_to_node_info(node.reborrow(), labels.as_ref());
     write_runtime_support_to_node_info(node.reborrow(), runtime_support.as_ref());
     write_wireguard_to_node_info(node.reborrow(), wireguard.as_ref());
 
@@ -389,6 +410,22 @@ fn write_node_scheduling_updated_event(
     write_scheduling_fields_to_node_info(node.reborrow(), scheduling);
 }
 
+/// Writes one label-update event into a gossip message builder.
+fn write_node_labels_updated_event(
+    msg: gossip_message::Builder<'_>,
+    id: &Uuid,
+    labels: &PeerLabelState,
+    cluster_view: ClusterViewId,
+) {
+    let mut node = init_topology_event_node(
+        msg,
+        topology_event::EventType::NodeLabelsUpdated,
+        id,
+        cluster_view,
+    );
+    write_labels_to_node_info(node.reborrow(), labels);
+}
+
 /// Writes one topology event into the outbound gossip message list.
 pub fn add_event(
     list: &mut capnp::struct_list::Builder<gossip_message::Owned>,
@@ -442,6 +479,9 @@ pub fn add_event(
         ),
         TopologyEvent::NodeSchedulingUpdated { id, scheduling } => {
             write_node_scheduling_updated_event(msg, id, scheduling, cluster_view)
+        }
+        TopologyEvent::NodeLabelsUpdated { id, labels } => {
+            write_node_labels_updated_event(msg, id, labels, cluster_view)
         }
     }
 }

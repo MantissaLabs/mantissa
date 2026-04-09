@@ -1012,6 +1012,7 @@ fn message_for_forwarding(message: &Message) -> Option<Message> {
                     identity_sig,
                     wireguard,
                     scheduling,
+                    labels,
                     runtime_support,
                 } => TopologyEvent::Join {
                     id: *peer_id,
@@ -1025,6 +1026,7 @@ fn message_for_forwarding(message: &Message) -> Option<Message> {
                     identity_sig: identity_sig.clone(),
                     wireguard: wireguard.clone(),
                     scheduling: scheduling.clone(),
+                    labels: labels.clone(),
                     runtime_support: runtime_support.clone(),
                 },
                 other => other.clone(),
@@ -1213,7 +1215,8 @@ fn message_targets_peer(message: &Message, peer_id: Uuid) -> bool {
             | TopologyEvent::Alive { id, .. }
             | TopologyEvent::Suspect { id, .. }
             | TopologyEvent::Down { id, .. }
-            | TopologyEvent::NodeSchedulingUpdated { id, .. } => *id == peer_id,
+            | TopologyEvent::NodeSchedulingUpdated { id, .. }
+            | TopologyEvent::NodeLabelsUpdated { id, .. } => *id == peer_id,
             TopologyEvent::ClusterNameUpdated { .. } => false,
         },
         // Task updates replicate to every peer regardless of assignment so keep them.
@@ -1391,6 +1394,7 @@ mod tests {
                 scheduling: Box::new(
                     crate::topology::peers::PeerSchedulingState::schedulable_default(Uuid::new_v4()),
                 ),
+                labels: Box::new(crate::topology::peers::PeerLabelState::default()),
                 runtime_support: Box::new(crate::runtime::types::RuntimeSupportProfile::default()),
             },
         };

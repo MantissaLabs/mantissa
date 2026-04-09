@@ -69,6 +69,7 @@ impl Topology {
                             ref identity_sig,
                             ref wireguard,
                             ref scheduling,
+                            ref labels,
                             ref runtime_support,
                         } => {
                             info!(target: "topology", "Node joined: {id} at {address}");
@@ -94,6 +95,7 @@ impl Topology {
                                 identity_sig: identity_sig.clone(),
                                 wireguard: wireguard.clone(),
                                 scheduling: scheduling.as_ref().clone(),
+                                labels: labels.as_ref().clone(),
                                 runtime_support: runtime_support.as_ref().clone(),
                                 membership: PeerMembership::active(incarnation),
                             };
@@ -180,6 +182,18 @@ impl Topology {
                                 continue;
                             }
                         }
+                        TopologyEvent::NodeLabelsUpdated { id, ref labels } => {
+                            if let Err(err) =
+                                self.apply_peer_labels_update(id, labels.clone()).await
+                            {
+                                warn!(
+                                    target: "topology",
+                                    node_id = %id,
+                                    "failed to apply gossiped label update: {err}"
+                                );
+                                continue;
+                            }
+                        }
                     }
 
                     let event_clone = match event.clone() {
@@ -195,6 +209,7 @@ impl Topology {
                             identity_sig,
                             wireguard,
                             scheduling,
+                            labels,
                             runtime_support,
                         } => {
                             let client = if id == self.local.node.id {
@@ -214,6 +229,7 @@ impl Topology {
                                 identity_sig,
                                 wireguard,
                                 scheduling,
+                                labels,
                                 runtime_support,
                             }
                         }

@@ -2,7 +2,7 @@ use crate::cluster::ClusterViewId;
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::store::local::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
-use crate::topology::peers::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
+use crate::topology::peers::{PeerLabelState, PeerSchedulingState, PeerValue, WireGuardPeerValue};
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
 use ::health::HealthMonitor;
 use anyhow::{Result as AnyResult, anyhow};
@@ -466,6 +466,12 @@ impl Registry {
             .map(|value| value.scheduling)
     }
 
+    /// Returns the converged node-label metadata for one peer, if known locally.
+    pub fn peer_labels(&self, peer_id: Uuid) -> Option<PeerLabelState> {
+        self.peer_latest_value_unscoped(peer_id)
+            .map(|value| value.labels)
+    }
+
     /// Returns the converged runtime support metadata for one peer, if known locally.
     pub fn peer_runtime_support(&self, peer_id: Uuid) -> Option<RuntimeSupportProfile> {
         self.peer_latest_value_unscoped(peer_id)
@@ -685,6 +691,7 @@ impl Registry {
                 identity_sig: Vec::new(),
                 wireguard: None,
                 scheduling: PeerSchedulingState::schedulable_default(self.node_id),
+                labels: PeerLabelState::default(),
                 runtime_support: RuntimeSupportProfile::default(),
                 membership: crate::topology::peers::PeerMembership::active(0),
             }

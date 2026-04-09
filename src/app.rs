@@ -106,6 +106,17 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     .run_until(client::node::resume(&cfg, args.node_id))
                     .await?;
             }
+            NodesCommand::Labels(args) => {
+                local
+                    .run_until(client::node::labels(
+                        &cfg,
+                        args.node_id,
+                        &args.labels,
+                        &args.remove,
+                        args.replace,
+                    ))
+                    .await?;
+            }
         },
 
         Command::Clusters { cmd } => match cmd {

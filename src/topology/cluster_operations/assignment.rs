@@ -95,6 +95,7 @@ impl Topology {
                     hostname: value.hostname.clone(),
                     address: value.address.clone(),
                     wireguard_enabled,
+                    labels: value.labels.labels.clone(),
                     cpu_vendor: None,
                     cpu_brand: None,
                     cpu_logical: None,
@@ -124,6 +125,7 @@ impl Topology {
                         .compute_advertise_addr()
                         .unwrap_or_else(|_| String::new()),
                     wireguard_enabled: false,
+                    labels: self.current_label_state().labels,
                     cpu_vendor: None,
                     cpu_brand: None,
                     cpu_logical: None,

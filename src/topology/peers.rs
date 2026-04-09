@@ -6,6 +6,7 @@ use capnp::text_list;
 use ed25519_dalek::VerifyingKey;
 use protocol::node::node_id as node_id_capnp;
 use protocol::topology::node_info as node_info_capnp;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
@@ -121,6 +122,133 @@ impl PeerSchedulingState {
             right.clone()
         }
     }
+}
+
+/// One operator-managed label attached to a peer entry.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
+pub struct PeerLabel {
+    pub key: String,
+    pub value: String,
+}
+
+impl PeerLabel {
+    /// Parses one `key=value` label assignment from operator or wire input.
+    pub fn parse_assignment(raw: &str) -> Result<Self, String> {
+        let Some((key_raw, value_raw)) = raw.split_once('=') else {
+            return Err(format!("label '{raw}' must be formatted as key=value"));
+        };
+
+        let key = key_raw.trim();
+        if key.is_empty() {
+            return Err("label key must not be empty".to_string());
+        }
+
+        let value = value_raw.trim();
+        if value.is_empty() {
+            return Err(format!("label '{key}' must have a non-empty value"));
+        }
+
+        Ok(Self {
+            key: key.to_string(),
+            value: value.to_string(),
+        })
+    }
+
+    /// Formats one label entry into the wire representation used by Cap'n Proto lists.
+    pub fn format_assignment(&self) -> String {
+        format!("{}={}", self.key, self.value)
+    }
+}
+
+/// Cluster-visible node labels attached to one peer entry.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
+pub struct PeerLabelState {
+    #[serde(default)]
+    pub labels: Vec<PeerLabel>,
+
+    #[serde(default)]
+    pub updated_at_unix_ms: u64,
+
+    #[serde(default = "Uuid::nil")]
+    pub actor_node_id: Uuid,
+}
+
+impl Default for PeerLabelState {
+    /// Builds the empty default label state used when nodes have not been labelled yet.
+    fn default() -> Self {
+        Self {
+            labels: Vec::new(),
+            updated_at_unix_ms: 0,
+            actor_node_id: Uuid::nil(),
+        }
+    }
+}
+
+impl PeerLabelState {
+    /// Builds one normalized label state from parsed label entries and LWW metadata.
+    pub fn new(labels: Vec<PeerLabel>, updated_at_unix_ms: u64, actor_node_id: Uuid) -> Self {
+        Self {
+            labels: normalize_peer_labels(labels),
+            updated_at_unix_ms,
+            actor_node_id,
+        }
+    }
+
+    /// Parses label assignments from topology `NodeInfo` fields.
+    pub fn from_node_info(
+        raw_labels: Vec<String>,
+        updated_at_unix_ms: u64,
+        actor_node_id: Option<Uuid>,
+    ) -> Result<Self, String> {
+        let mut labels = Vec::with_capacity(raw_labels.len());
+        for raw in raw_labels {
+            labels.push(PeerLabel::parse_assignment(&raw)?);
+        }
+
+        Ok(Self::new(
+            labels,
+            updated_at_unix_ms,
+            actor_node_id.unwrap_or(Uuid::nil()),
+        ))
+    }
+
+    /// Returns the deterministic conflict-resolution key for one label update.
+    fn precedence_key(&self) -> (u64, Uuid, &[PeerLabel]) {
+        (
+            self.updated_at_unix_ms,
+            self.actor_node_id,
+            self.labels.as_slice(),
+        )
+    }
+
+    /// Selects the converged winner between two label states.
+    pub fn merge(left: &Self, right: &Self) -> Self {
+        if left.precedence_key() >= right.precedence_key() {
+            left.clone()
+        } else {
+            right.clone()
+        }
+    }
+
+    /// Returns the label value stored under one key, if present.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.labels
+            .iter()
+            .find(|label| label.key == key)
+            .map(|label| label.value.as_str())
+    }
+}
+
+/// Normalizes label entries into a stable unique key ordering while letting later values win.
+fn normalize_peer_labels(labels: Vec<PeerLabel>) -> Vec<PeerLabel> {
+    let mut map = BTreeMap::new();
+    for label in labels {
+        map.insert(label.key, label.value);
+    }
+
+    map.into_iter()
+        .map(|(key, value)| PeerLabel { key, value })
+        .collect()
 }
 
 /// WireGuard configuration advertised by a peer for encrypting the VXLAN underlay.
@@ -239,6 +367,10 @@ pub struct PeerValue {
     #[serde(default)]
     pub scheduling: PeerSchedulingState,
 
+    /// Operator-managed node labels used by split selectors and future placement controls.
+    #[serde(default)]
+    pub labels: PeerLabelState,
+
     /// Cluster-visible runtime support metadata used by workload placement.
     #[serde(default)]
     pub runtime_support: RuntimeSupportProfile,
@@ -316,6 +448,7 @@ impl PeerValue {
         let mut identity_sig: Option<Vec<u8>> = None;
         let mut wireguard: Option<WireGuardPeerValue> = None;
         let mut scheduling: Option<PeerSchedulingState> = None;
+        let mut labels: Option<PeerLabelState> = None;
         let mut runtime_support: Option<RuntimeSupportProfile> = None;
 
         for value in values {
@@ -360,6 +493,10 @@ impl PeerValue {
                 None => value.scheduling.clone(),
                 Some(current) => PeerSchedulingState::merge(current, &value.scheduling),
             });
+            labels = Some(match labels.as_ref() {
+                None => value.labels.clone(),
+                Some(current) => PeerLabelState::merge(current, &value.labels),
+            });
             runtime_support = RuntimeSupportProfile::preferred(
                 runtime_support.as_ref(),
                 Some(&value.runtime_support),
@@ -374,6 +511,7 @@ impl PeerValue {
             identity_sig: identity_sig.unwrap_or_default(),
             wireguard,
             scheduling: scheduling.unwrap_or_default(),
+            labels: labels.unwrap_or_default(),
             runtime_support: runtime_support.unwrap_or_default(),
             membership: winning_membership,
         })
@@ -458,6 +596,7 @@ impl PeerValue {
                 value => Some(value),
             },
         );
+        let labels = labels_from_node_info(ni)?;
         let runtime_support = runtime_support_from_node_info(ni)?;
 
         Ok(PeerValue {
@@ -468,6 +607,7 @@ impl PeerValue {
             identity_sig: identity_sig.to_vec(),
             wireguard,
             scheduling,
+            labels,
             runtime_support,
             membership: PeerMembership::active(ni.get_incarnation()),
         })
@@ -504,6 +644,18 @@ pub(crate) fn runtime_support_from_node_info(
     ))
 }
 
+/// Decodes one label-state payload from the topology `NodeInfo` reader.
+pub(crate) fn labels_from_node_info(
+    ni: node_info_capnp::Reader<'_>,
+) -> Result<PeerLabelState, CapnpError> {
+    PeerLabelState::from_node_info(
+        read_text_list(ni.get_labels()?)?,
+        ni.get_labels_updated_at_unix_ms(),
+        read_optional_node_id_capnp(ni.get_labels_actor_node_id()?)?,
+    )
+    .map_err(CapnpError::failed)
+}
+
 /// Reads one Cap'n Proto text list into owned Rust strings.
 fn read_text_list(list: text_list::Reader<'_>) -> Result<Vec<String>, CapnpError> {
     let mut values = Vec::with_capacity(list.len() as usize);
@@ -529,7 +681,7 @@ fn read_optional_node_id_capnp(
 
 #[cfg(test)]
 mod tests {
-    use super::{PeerSchedulingState, PeerValue, WireGuardPeerValue};
+    use super::{PeerLabel, PeerLabelState, PeerSchedulingState, PeerValue, WireGuardPeerValue};
     use uuid::Uuid;
 
     /// Legacy nodes without scheduling metadata should default to schedulable.
@@ -565,6 +717,7 @@ mod tests {
                 reason: None,
                 drain_task_stop_timeout_secs: None,
             },
+            labels: PeerLabelState::default(),
             membership: super::PeerMembership::active(10),
         };
         let mut newer = older.clone();
@@ -584,6 +737,46 @@ mod tests {
         assert!(selected.scheduling.drain_requested);
         assert_eq!(selected.scheduling.reason.as_deref(), Some("maintenance"));
         assert_eq!(selected.scheduling.drain_task_stop_timeout_secs, Some(15));
+        assert_eq!(selected.address, "127.0.0.1:7000");
+    }
+
+    /// Later label updates must win peer selection across concurrent values.
+    #[test]
+    fn peer_select_prefers_latest_labels() {
+        let node_id = Uuid::from_bytes([4u8; 16]);
+        let mut older = PeerValue {
+            address: "127.0.0.1:7000".to_string(),
+            hostname: "node-a".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: None,
+            runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
+            scheduling: PeerSchedulingState::schedulable_default(node_id),
+            labels: PeerLabelState::new(
+                vec![PeerLabel {
+                    key: "topology.zone".to_string(),
+                    value: "east".to_string(),
+                }],
+                10,
+                node_id,
+            ),
+            membership: super::PeerMembership::active(10),
+        };
+        let mut newer = older.clone();
+        newer.labels = PeerLabelState::new(
+            vec![PeerLabel {
+                key: "topology.zone".to_string(),
+                value: "west".to_string(),
+            }],
+            20,
+            node_id,
+        );
+        older.address = String::new();
+
+        let selected = PeerValue::select(&[older, newer]).expect("selected peer value");
+
+        assert_eq!(selected.labels.get("topology.zone"), Some("west"));
         assert_eq!(selected.address, "127.0.0.1:7000");
     }
 
@@ -622,6 +815,7 @@ mod tests {
             wireguard: None,
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(node_id),
+            labels: PeerLabelState::default(),
             membership: super::PeerMembership::active(42),
         };
         let mut left = active.clone();

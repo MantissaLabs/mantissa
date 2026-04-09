@@ -121,6 +121,7 @@ pub struct SplitCommandRequest {
     pub interactive: bool,
     pub filter_per_gpu: Vec<String>,
     pub filter: Option<SplitFilterKind>,
+    pub label_key: Option<String>,
     pub values: Vec<String>,
     pub remainder_name: String,
     pub left_name: String,
@@ -312,6 +313,20 @@ pub async fn split(cfg: &ClientConfig, request: &SplitCommandRequest) -> Result<
         .await;
     }
 
+    if let Some(label_key) = request.label_key.as_deref() {
+        return split_by_label(
+            cfg,
+            request.source_cluster_id.as_deref(),
+            label_key,
+            &request.values,
+            &request.remainder_name,
+            request.dry_run,
+            request.service_policy,
+            request.network_policy,
+        )
+        .await;
+    }
+
     let (filter, values) = if !request.filter_per_gpu.is_empty() {
         (SplitFilterKind::GpuVendor, request.filter_per_gpu.clone())
     } else {
@@ -332,30 +347,23 @@ pub async fn split(cfg: &ClientConfig, request: &SplitCommandRequest) -> Result<
     .await
 }
 
-/// Submits a split request derived from a simple filter and value list.
-#[allow(clippy::too_many_arguments)]
-pub async fn split_by_filter(
-    cfg: &ClientConfig,
-    source_cluster_id: Option<&str>,
-    filter: SplitFilterKind,
+/// Builds one simple value-split target list from a selector key and operator-provided values.
+fn build_value_split_targets(
+    selector_key: &str,
+    target_prefix: &str,
     values: &[String],
+    expects_numeric_values: bool,
     remainder_name: &str,
-    dry_run: bool,
-    service_policy: SplitServicePolicy,
-    network_policy: SplitNetworkPolicy,
-) -> Result<()> {
-    let source_view = resolve_source_view(cfg, source_cluster_id).await?;
-    let selector_key = filter.selector_key();
-    let value_list = normalize_split_values(values, filter.expects_numeric_value())?;
-
+) -> Result<Vec<SplitTargetSpec>> {
+    let value_list = normalize_split_values(values, expects_numeric_values)?;
     let mut targets = Vec::with_capacity(value_list.len() + 1);
     let mut names = HashSet::<String>::new();
     for value in value_list {
         let suffix = slugify_split_value(&value);
         let preferred = if suffix.is_empty() {
-            format!("{}-value", filter.target_prefix())
+            format!("{target_prefix}-value")
         } else {
-            format!("{}-{suffix}", filter.target_prefix())
+            format!("{target_prefix}-{suffix}")
         };
         let name = reserve_unique_name(&mut names, preferred);
         targets.push(SplitTargetSpec {
@@ -382,6 +390,65 @@ pub async fn split_by_filter(
         explicit_nodes: Vec::new(),
     });
 
+    Ok(targets)
+}
+
+/// Submits a split request derived from a simple filter and value list.
+#[allow(clippy::too_many_arguments)]
+pub async fn split_by_filter(
+    cfg: &ClientConfig,
+    source_cluster_id: Option<&str>,
+    filter: SplitFilterKind,
+    values: &[String],
+    remainder_name: &str,
+    dry_run: bool,
+    service_policy: SplitServicePolicy,
+    network_policy: SplitNetworkPolicy,
+) -> Result<()> {
+    let source_view = resolve_source_view(cfg, source_cluster_id).await?;
+    let targets = build_value_split_targets(
+        filter.selector_key(),
+        filter.target_prefix(),
+        values,
+        filter.expects_numeric_value(),
+        remainder_name,
+    )?;
+
+    let summary = submit_split_request(
+        cfg,
+        source_view,
+        &targets,
+        dry_run,
+        service_policy,
+        network_policy,
+    )
+    .await?;
+    emit_operation_summary(&summary);
+    Ok(())
+}
+
+/// Submits a split request driven by one dynamic node-label key and value list.
+#[allow(clippy::too_many_arguments)]
+async fn split_by_label(
+    cfg: &ClientConfig,
+    source_cluster_id: Option<&str>,
+    label_key: &str,
+    values: &[String],
+    remainder_name: &str,
+    dry_run: bool,
+    service_policy: SplitServicePolicy,
+    network_policy: SplitNetworkPolicy,
+) -> Result<()> {
+    let source_view = resolve_source_view(cfg, source_cluster_id).await?;
+    let normalized_key = label_key.trim();
+    if normalized_key.is_empty() {
+        return Err(anyhow!("--by-label must not be empty"));
+    }
+
+    let selector_key = format!("node.labels.{normalized_key}");
+    let target_prefix = format!("label-{}", slugify_split_value(normalized_key));
+    let targets =
+        build_value_split_targets(&selector_key, &target_prefix, values, false, remainder_name)?;
     let summary = submit_split_request(
         cfg,
         source_view,

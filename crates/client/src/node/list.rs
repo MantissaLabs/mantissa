@@ -20,7 +20,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "ID\tHOSTNAME\tENDPOINT\tHEALTH\tSCHED\tDRAIN\tREASON"
+        "ID\tHOSTNAME\tENDPOINT\tHEALTH\tSCHED\tDRAIN\tLABELS\tREASON"
     )?;
 
     let mut list: Vec<NodeInfo> = reader.get_nodes()?.iter().collect();
@@ -29,13 +29,14 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     for n in &list {
         writeln!(
             &mut tw,
-            "{}\t{}\t{}\t{:?}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}",
             id_string(n)?,
             n.get_hostname()?.to_str()?,
             n.get_addr()?.to_str()?,
             n.get_health()?,
             sched_label(n),
             drain_label(n)?,
+            labels_label(n)?,
             reason_label(n)?,
         )?;
     }
@@ -93,5 +94,27 @@ fn reason_label(n: &NodeInfo) -> anyhow::Result<String> {
         Ok("-".to_string())
     } else {
         Ok(reason)
+    }
+}
+
+#[inline]
+fn labels_label(n: &NodeInfo) -> anyhow::Result<String> {
+    let labels = n.get_labels()?;
+    if labels.is_empty() {
+        return Ok("-".to_string());
+    }
+
+    let mut out = Vec::with_capacity(labels.len() as usize);
+    for label in labels.iter() {
+        let text = label?.to_str()?.trim().to_string();
+        if !text.is_empty() {
+            out.push(text);
+        }
+    }
+
+    if out.is_empty() {
+        Ok("-".to_string())
+    } else {
+        Ok(out.join(","))
     }
 }

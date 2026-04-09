@@ -72,6 +72,14 @@ interface Topology {
 
   getNodeDrainStatus @16 (nodeId :Node.NodeId) -> (status :NodeDrainStatus);
   # Returns the best-known drain progress and diagnostics for one node.
+
+  setNodeLabels @17 (
+    nodeId :Node.NodeId,
+    labels :List(Text),
+    removeKeys :List(Text),
+    replace :Bool
+  ) -> ();
+  # Applies node labels to one peer entry and relays the converged update through topology gossip.
 }
 
 enum NodeDrainState {
@@ -165,6 +173,7 @@ struct TopologyEvent {
       down @4;
       clusterNameUpdated @5;
       nodeSchedulingUpdated @6;
+      nodeLabelsUpdated @7;
   }
 }
 
@@ -266,6 +275,15 @@ struct NodeInfo {
 
   runtimeFeatureFlags @25 :List(Text);
   # Runtime-specific feature flags such as "exec" or "lifecycle_events".
+
+  labels @26 :List(Text);
+  # Operator-supplied node labels encoded as `key=value` assignments.
+
+  labelsUpdatedAtUnixMs @27 :UInt64;
+  # Last-writer timestamp for label-state convergence.
+
+  labelsActorNodeId @28 :Node.NodeId;
+  # Actor node id used to resolve label-state conflicts deterministically.
 }
 
 struct NodeList {

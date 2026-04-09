@@ -49,6 +49,38 @@ impl Topology {
         Ok(true)
     }
 
+    /// Applies one node-label update to the peer store using deterministic convergence.
+    pub(super) async fn apply_peer_labels_update(
+        &self,
+        node_id: Uuid,
+        labels: crate::topology::peers::PeerLabelState,
+    ) -> Result<bool, capnp::Error> {
+        let Some(mut current) = self.deps.registry.peer_value_unscoped(node_id) else {
+            return Err(capnp::Error::failed(format!(
+                "node '{}' not found",
+                node_id
+            )));
+        };
+
+        let merged = crate::topology::peers::PeerLabelState::merge(&current.labels, &labels);
+        if current.labels == merged {
+            return Ok(false);
+        }
+
+        current.labels = merged;
+        self.stores
+            .peers
+            .upsert(&UuidKey::from(node_id), current)
+            .await
+            .map_err(|err| {
+                capnp::Error::failed(format!(
+                    "failed to persist label update for node '{}': {err}",
+                    node_id
+                ))
+            })?;
+        Ok(true)
+    }
+
     /// Restores the peers MST from durable storage after process startup.
     #[allow(dead_code)]
     pub async fn restore_peers(&self) -> std::io::Result<()> {
@@ -109,6 +141,7 @@ impl Topology {
             identity_sig: Vec::new(),
             wireguard: None,
             scheduling: PeerSchedulingState::schedulable_default(id),
+            labels: crate::topology::peers::PeerLabelState::default(),
             runtime_support: RuntimeSupportProfile::default(),
             membership: PeerMembership::left(incarnation),
         });

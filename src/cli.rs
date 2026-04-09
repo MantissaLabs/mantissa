@@ -263,6 +263,9 @@ pub enum NodesCommand {
 
     /// Clear maintenance fencing for one node
     Resume(NodesResumeArgs),
+
+    /// Apply or remove operator-managed labels on one node
+    Labels(NodesLabelsArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -332,6 +335,25 @@ pub struct NodesResumeArgs {
     /// Identifier of the node to resume
     #[arg(index = 1, value_name = "NODE-ID")]
     pub node_id: Uuid,
+}
+
+#[derive(Args, Debug)]
+pub struct NodesLabelsArgs {
+    /// Identifier of the node to label
+    #[arg(index = 1, value_name = "NODE-ID")]
+    pub node_id: Uuid,
+
+    /// Label assignment in `key=value` form (repeat flag to set multiple labels)
+    #[arg(long = "label", value_name = "KEY=VALUE", action = ArgAction::Append)]
+    pub labels: Vec<String>,
+
+    /// Label key to remove (repeat flag to remove multiple labels)
+    #[arg(long = "remove", value_name = "KEY", action = ArgAction::Append)]
+    pub remove: Vec<String>,
+
+    /// Replace the full label set instead of patching the existing one
+    #[arg(long = "replace", action = ArgAction::SetTrue)]
+    pub replace: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1487,7 +1509,7 @@ pub struct SplitArgs {
     #[arg(
         long = "interactive",
         action = ArgAction::SetTrue,
-        conflicts_with_all = ["filter_per_gpu", "by", "values", "remainder_name"]
+        conflicts_with_all = ["filter_per_gpu", "by", "by_label", "values", "remainder_name"]
     )]
     pub interactive: bool,
 
@@ -1497,7 +1519,7 @@ pub struct SplitArgs {
         value_name = "VENDORS",
         value_delimiter = ',',
         num_args = 1..,
-        conflicts_with_all = ["by", "values", "interactive"]
+        conflicts_with_all = ["by", "by_label", "values", "interactive"]
     )]
     pub filter_per_gpu: Vec<String>,
 
@@ -1506,9 +1528,17 @@ pub struct SplitArgs {
         long = "by",
         value_enum,
         value_name = "FILTER",
-        required_unless_present_any = ["filter_per_gpu", "interactive"]
+        required_unless_present_any = ["filter_per_gpu", "interactive", "by_label"]
     )]
     pub by: Option<SplitFilterOpt>,
+
+    /// Dynamic node label key matched by `--values` (example: --by-label topology.zone).
+    #[arg(
+        long = "by-label",
+        value_name = "KEY",
+        conflicts_with_all = ["filter_per_gpu", "by", "interactive"]
+    )]
+    pub by_label: Option<String>,
 
     /// Comma-separated selector values matched by `--by` (example: --values Intel,AMD).
     #[arg(
@@ -1624,6 +1654,7 @@ impl From<SplitArgs> for client::clusters::SplitCommandRequest {
             interactive: value.interactive,
             filter_per_gpu: value.filter_per_gpu,
             filter: value.by.map(Into::into),
+            label_key: value.by_label,
             values: value.values,
             remainder_name: value.remainder_name,
             left_name: value.left_name,

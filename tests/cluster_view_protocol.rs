@@ -70,6 +70,55 @@ async fn cluster_name_for_lineage(
     None
 }
 
+async fn set_node_labels(
+    topology: &mantissa::topology_capnp::topology::Client,
+    node_id: Uuid,
+    labels: &[&str],
+    replace: bool,
+) {
+    let mut request = topology.set_node_labels_request();
+    {
+        let mut params = request.get();
+        params
+            .reborrow()
+            .init_node_id()
+            .set_bytes(node_id.as_bytes());
+        let mut entries = params.reborrow().init_labels(labels.len() as u32);
+        for (idx, label) in labels.iter().enumerate() {
+            entries.set(idx as u32, label);
+        }
+        params.reborrow().init_remove_keys(0);
+        params.set_replace(replace);
+    }
+    request.send().promise.await.expect("setNodeLabels send");
+}
+
+async fn node_labels_from_list(
+    topology: &mantissa::topology_capnp::topology::Client,
+    node_id: Uuid,
+) -> Option<Vec<String>> {
+    let response = topology.list_request().send().promise.await.ok()?;
+    let rows = response.get().ok()?.get_nodes().ok()?.get_nodes().ok()?;
+    for row in rows.iter() {
+        let listed_id = Uuid::from_slice(row.get_id().ok()?.get_bytes().ok()?).ok()?;
+        if listed_id != node_id {
+            continue;
+        }
+
+        let labels = row.get_labels().ok()?;
+        let mut out = Vec::with_capacity(labels.len() as usize);
+        for label in labels.iter() {
+            let text = label.ok()?.to_str().ok()?.trim().to_string();
+            if !text.is_empty() {
+                out.push(text);
+            }
+        }
+        return Some(out);
+    }
+
+    None
+}
+
 /// Reads the current cluster view summary rows from one topology client.
 async fn cluster_view_rows(
     topology: &mantissa::topology_capnp::topology::Client,
@@ -830,6 +879,181 @@ local_test!(cluster_view_split_resource_selector_assigns_peers, {
     .await;
 });
 
+// Validates node-label updates replicate through topology gossip and surface in node listings.
+local_test!(node_labels_replicate_and_list_across_cluster, {
+    let anchor = TestNode::new_with_tick_ms(100).await;
+    let joiner = TestNode::new_with_tick_ms(100).await;
+    joiner.join(&anchor).await.expect("join cluster");
+    anchor
+        .assert_cluster_size(2, "anchor should observe both nodes")
+        .await;
+    joiner
+        .assert_cluster_size(2, "joiner should observe both nodes")
+        .await;
+
+    set_node_labels(
+        &joiner.topology(),
+        joiner.id(),
+        &["disk=ssd", "topology.zone=west"],
+        true,
+    )
+    .await;
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let labels = node_labels_from_list(&anchor.topology(), joiner.id()).await;
+            if labels
+                == Some(vec![
+                    "disk=ssd".to_string(),
+                    "topology.zone=west".to_string(),
+                ])
+            {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("label gossip should converge to anchor listing");
+});
+
+// Validates split selectors can target nodes by replicated operator labels.
+local_test!(cluster_view_split_label_selector_assigns_peers, {
+    let anchor = TestNode::new_with_tick_ms(100).await;
+    let joiner = TestNode::new_with_tick_ms(100).await;
+    joiner.join(&anchor).await.expect("join cluster");
+    anchor
+        .assert_cluster_size(2, "anchor should observe both nodes")
+        .await;
+    joiner
+        .assert_cluster_size(2, "joiner should observe both nodes")
+        .await;
+
+    set_node_labels(
+        &joiner.topology(),
+        anchor.id(),
+        &["topology.zone=east"],
+        true,
+    )
+    .await;
+    set_node_labels(
+        &joiner.topology(),
+        joiner.id(),
+        &["topology.zone=west"],
+        true,
+    )
+    .await;
+
+    let view_resp = joiner
+        .topology()
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    let initial_view = view_resp
+        .get()
+        .expect("getClusterView get")
+        .get_view()
+        .expect("view payload");
+    let cluster_id = initial_view
+        .get_cluster_id()
+        .expect("cluster id")
+        .get_value()
+        .expect("cluster id bytes")
+        .to_vec();
+    let epoch = initial_view.get_epoch();
+
+    let mut split_req = joiner.topology().split_cluster_request();
+    {
+        let mut req = split_req.get().init_req();
+        let mut src = req.reborrow().init_source_view();
+        src.reborrow().init_cluster_id().set_value(&cluster_id);
+        src.set_epoch(epoch);
+
+        let mut targets = req.reborrow().init_targets(2);
+
+        let mut target_a = targets.reborrow().get(0);
+        target_a.set_name("east");
+        let mut selector_a = target_a.reborrow().init_selector();
+        let mut clauses_a = selector_a.reborrow().init_clauses(1);
+        let mut clause_a = clauses_a.reborrow().get(0);
+        clause_a.set_key("node.labels.topology.zone");
+        clause_a.set_op(protocol::topology::split_selector_clause::Operator::Eq);
+        clause_a.set_value("east");
+        selector_a.reborrow().init_explicit_nodes(0);
+
+        let mut target_b = targets.reborrow().get(1);
+        target_b.set_name("west");
+        let mut selector_b = target_b.reborrow().init_selector();
+        let mut clauses_b = selector_b.reborrow().init_clauses(1);
+        let mut clause_b = clauses_b.reborrow().get(0);
+        clause_b.set_key("node.labels.topology.zone");
+        clause_b.set_op(protocol::topology::split_selector_clause::Operator::Eq);
+        clause_b.set_value("west");
+        selector_b.reborrow().init_explicit_nodes(0);
+
+        req.set_dry_run(false);
+    }
+
+    let split_resp = split_req.send().promise.await.expect("splitCluster send");
+    let split_op = split_resp
+        .get()
+        .expect("splitCluster get")
+        .get_op()
+        .expect("split op");
+    let target_views = split_op.get_target_views().expect("split target views");
+    let anchor_target = target_views.get(0);
+    let joiner_target = target_views.get(1);
+    let expected_anchor_view = ClusterViewId::new(
+        mantissa::cluster::ClusterId::from_uuid(
+            Uuid::from_slice(
+                anchor_target
+                    .get_cluster_id()
+                    .expect("anchor cluster id")
+                    .get_value()
+                    .expect("anchor cluster id bytes"),
+            )
+            .expect("anchor cluster uuid"),
+        ),
+        anchor_target.get_epoch(),
+    );
+    let expected_joiner_view = ClusterViewId::new(
+        mantissa::cluster::ClusterId::from_uuid(
+            Uuid::from_slice(
+                joiner_target
+                    .get_cluster_id()
+                    .expect("joiner cluster id")
+                    .get_value()
+                    .expect("joiner cluster id bytes"),
+            )
+            .expect("joiner cluster uuid"),
+        ),
+        joiner_target.get_epoch(),
+    );
+    let split_id = split_op.get_id().expect("split id").to_vec();
+
+    wait_for_operation_stage(
+        &joiner.topology(),
+        &split_id,
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_cluster_view(
+        &joiner.topology(),
+        expected_joiner_view,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_cluster_view(
+        &anchor.topology(),
+        expected_anchor_view,
+        Duration::from_secs(5),
+    )
+    .await;
+});
+
 // Validates startup replay resumes non-finalized durable operations and applies their commit side effects.
 local_test!(cluster_view_replays_pending_operation_on_startup, {
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -962,6 +1186,7 @@ local_test!(cluster_view_startup_restores_split_peer_scope, {
         wireguard: None,
         runtime_support: RuntimeSupportProfile::default(),
         scheduling: PeerSchedulingState::schedulable_default(self_id),
+        labels: mantissa::topology::peers::PeerLabelState::default(),
         membership: PeerMembership::active(1),
     };
     peers
@@ -1093,6 +1318,7 @@ local_test!(cluster_view_startup_preserves_persisted_self_drain_fence, {
                 wireguard: None,
                 runtime_support: RuntimeSupportProfile::default(),
                 scheduling: persisted_scheduling,
+                labels: mantissa::topology::peers::PeerLabelState::default(),
                 membership: PeerMembership::active(1),
             },
         )

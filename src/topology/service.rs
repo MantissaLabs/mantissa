@@ -17,8 +17,8 @@ use crate::store::peer_store::PeersStore;
 use crate::sync::SyncTraceContext;
 use crate::topology::health::status_to_node_status;
 use crate::topology::peers::{
-    PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
-    runtime_support_from_node_info,
+    PeerLabel, PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
+    labels_from_node_info, runtime_support_from_node_info,
 };
 use capnp::Error;
 use capnp::data;
@@ -26,7 +26,7 @@ use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::VerifyingKey;
 use protocol::server::{self, cluster_session};
 use protocol::topology::{topology, topology_event};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -67,6 +67,7 @@ fn peer_value_from_join_payload(payload: &JoinPayload) -> PeerValue {
         identity_sig: payload.identity_sig.to_vec(),
         wireguard: payload.wireguard.clone(),
         scheduling: payload.scheduling.clone(),
+        labels: payload.labels.clone(),
         runtime_support: payload.runtime_support.clone(),
         membership: PeerMembership::active(payload.incarnation),
     }
@@ -83,6 +84,7 @@ fn restored_local_peer_value(current: Option<&PeerValue>, mut restored: PeerValu
         restored.wireguard =
             WireGuardPeerValue::preferred(current.wireguard.as_ref(), restored.wireguard.as_ref());
         restored.scheduling = PeerSchedulingState::merge(&restored.scheduling, &current.scheduling);
+        restored.labels = PeerLabelState::merge(&restored.labels, &current.labels);
         restored.runtime_support = RuntimeSupportProfile::preferred(
             Some(&restored.runtime_support),
             Some(&current.runtime_support),
@@ -169,6 +171,7 @@ impl Topology {
             ),
             wireguard,
             scheduling: self.current_scheduling_state(),
+            labels: self.current_label_state(),
             runtime_support: self.local.runtime_support.clone(),
         })
     }
@@ -743,6 +746,76 @@ impl topology::Server for Topology {
         Ok(())
     }
 
+    /// Applies operator-managed labels to one node and relays the converged update through gossip.
+    async fn set_node_labels(
+        self: Rc<Self>,
+        params: topology::SetNodeLabelsParams,
+        _results: topology::SetNodeLabelsResults,
+    ) -> Result<(), capnp::Error> {
+        let request = params.get()?;
+        let node_id = read_node_id(request.get_node_id()?)?;
+        let replace = request.get_replace();
+        let Some(current) = self.deps.registry.peer_value_unscoped(node_id) else {
+            return Err(capnp::Error::failed(format!(
+                "node '{}' not found",
+                node_id
+            )));
+        };
+
+        let labels_reader = request.get_labels()?;
+        let remove_reader = request.get_remove_keys()?;
+        if !replace && labels_reader.is_empty() && remove_reader.is_empty() {
+            return Err(capnp::Error::failed(
+                "label update requires at least one label assignment or removal".to_string(),
+            ));
+        }
+
+        let mut labels = if replace {
+            BTreeMap::new()
+        } else {
+            current
+                .labels
+                .labels
+                .into_iter()
+                .map(|label| (label.key, label.value))
+                .collect::<BTreeMap<_, _>>()
+        };
+
+        for raw in labels_reader.iter() {
+            let parsed =
+                PeerLabel::parse_assignment(raw?.to_str()?).map_err(capnp::Error::failed)?;
+            labels.insert(parsed.key, parsed.value);
+        }
+
+        for raw in remove_reader.iter() {
+            let key = raw?.to_str()?.trim().to_string();
+            if key.is_empty() {
+                return Err(capnp::Error::failed(
+                    "label remove key must not be empty".to_string(),
+                ));
+            }
+            labels.remove(&key);
+        }
+
+        let next = PeerLabelState::new(
+            labels
+                .into_iter()
+                .map(|(key, value)| PeerLabel { key, value })
+                .collect(),
+            Topology::now_unix_ms(),
+            self.local.node.id,
+        );
+        let changed = self.apply_peer_labels_update(node_id, next.clone()).await?;
+        if changed {
+            self.gossip_topology_event(TopologyEvent::NodeLabelsUpdated {
+                id: node_id,
+                labels: next,
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Returns a derived drain progress snapshot for one node so operators can wait safely.
     async fn get_node_drain_status(
         self: Rc<Self>,
@@ -1161,6 +1234,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                 identity_sig: identity_sig.to_vec(),
                 wireguard,
                 scheduling: Box::new(scheduling),
+                labels: Box::new(labels_from_node_info(node)?),
                 runtime_support: Box::new(runtime_support_from_node_info(node)?),
             }
         }
@@ -1232,6 +1306,14 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                 ),
             }
         }
+        EventType::NodeLabelsUpdated => {
+            let node = reader.get_node()?;
+            let id = read_node_id(node.get_id()?)?;
+            TopologyEvent::NodeLabelsUpdated {
+                id,
+                labels: labels_from_node_info(node)?,
+            }
+        }
     };
 
     Ok(event)
@@ -1242,7 +1324,8 @@ mod tests {
     use super::restored_local_peer_value;
     use crate::runtime::types::RuntimeSupportProfile;
     use crate::topology::peers::{
-        PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
+        PeerLabel, PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue,
+        WireGuardPeerValue,
     };
     use uuid::Uuid;
 
@@ -1269,6 +1352,7 @@ mod tests {
                 reason: None,
                 drain_task_stop_timeout_secs: None,
             },
+            labels: PeerLabelState::default(),
             membership: PeerMembership::active(10),
         }
     }
@@ -1311,6 +1395,7 @@ mod tests {
                 reason: Some("maintenance".to_string()),
                 drain_task_stop_timeout_secs: Some(30),
             },
+            labels: PeerLabelState::default(),
             membership: PeerMembership::active(20),
         };
 
@@ -1322,5 +1407,25 @@ mod tests {
         assert!(restored.scheduling.drain_requested);
         assert_eq!(restored.scheduling.reason.as_deref(), Some("maintenance"));
         assert_eq!(restored.scheduling.drain_task_stop_timeout_secs, Some(30));
+    }
+
+    /// Restoring the self row should preserve later local label updates over stale join data.
+    #[test]
+    fn restored_local_peer_value_keeps_newer_labels() {
+        let node_id = Uuid::from_bytes([9u8; 16]);
+        let payload = test_join_peer_value();
+        let mut current = payload.clone();
+        current.labels = PeerLabelState::new(
+            vec![PeerLabel {
+                key: "topology.zone".to_string(),
+                value: "west".to_string(),
+            }],
+            30,
+            node_id,
+        );
+
+        let restored = restored_local_peer_value(Some(&current), payload);
+
+        assert_eq!(restored.labels.get("topology.zone"), Some("west"));
     }
 }
