@@ -5659,6 +5659,82 @@ async fn next_epoch_after_remove_without_watermark_uses_tombstone_floor() {
 }
 
 #[tokio::test]
+async fn next_epoch_after_conflicting_concurrent_assignment_uses_snapshot_max() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let task_id = Uuid::new_v4();
+    let mut local = test_task_spec(&manager, "svc");
+    local.id = task_id;
+    local.state = WorkloadPhase::Running;
+    local.slot_ids = vec![11];
+    local.slot_id = Some(11);
+    local.task_epoch = 7;
+    local.phase_version = 1;
+    local.updated_at = (Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+    manager
+        .persist_spec(&local)
+        .await
+        .expect("persist local task");
+
+    let mut remote = build_remote_task_spec(
+        task_id,
+        Uuid::nil(),
+        WorkloadPhase::Running,
+        7,
+        1,
+        Utc::now().to_rfc3339(),
+    );
+    remote.slot_ids = vec![22];
+    remote.slot_id = Some(22);
+
+    let (remote_db, _remote_dir) = temp_db("tasks-concurrent-epoch");
+    let remote_store =
+        open_workload_store(remote_db, Uuid::new_v4()).expect("open remote workload store");
+    remote_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild remote workload store");
+    remote_store
+        .upsert(&UuidKey::from(task_id), spec_to_value(&remote))
+        .await
+        .expect("persist remote concurrent task");
+
+    let remote_ranges = remote_store
+        .page_range_summary()
+        .await
+        .expect("remote page ranges");
+    let (regs, tombs) = remote_store
+        .export_page_ranges_delta(&remote_ranges)
+        .expect("export remote delta");
+    manager
+        .core
+        .store
+        .apply_delta_chunk_update_mst(regs, tombs)
+        .await
+        .expect("apply remote concurrent delta");
+
+    let snapshot = manager
+        .core
+        .store
+        .get_snapshot(&UuidKey::from(task_id))
+        .expect("load concurrent snapshot")
+        .expect("task snapshot should exist");
+    assert!(
+        snapshot.as_slice().len() >= 2,
+        "split-style concurrent assignments should retain both values before cutover"
+    );
+
+    let next = manager
+        .next_task_epoch_for_assignment(task_id, manager.local_node_id, &[11])
+        .await
+        .expect("next epoch");
+    assert_eq!(
+        next, 8,
+        "conflicting concurrent assignments should force a fresh cutover epoch"
+    );
+}
+
+#[tokio::test]
 async fn stale_remove_event_does_not_delete_active_local_task() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 

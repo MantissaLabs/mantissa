@@ -5134,6 +5134,9 @@ async fn wait_for_service_task_count_all(
     .await
 }
 
+type ServiceTaskPlacementRow = (Uuid, Uuid, Vec<u64>, WorkloadPhase);
+type ServiceTaskPlacementSnapshot = Vec<ServiceTaskPlacementRow>;
+
 /// Waits until every node reports the same stable set of running tasks for the service.
 async fn wait_for_service_running_tasks_stable_all(
     cluster: &[TestNode],
@@ -5144,11 +5147,12 @@ async fn wait_for_service_running_tasks_stable_all(
 ) -> bool {
     let deadline = Instant::now() + timeout;
     let mut stable_rounds = 0usize;
-    let mut previous: Option<Vec<Vec<(Uuid, Uuid, WorkloadPhase)>>> = None;
+    let mut previous: Option<Vec<ServiceTaskPlacementSnapshot>> = None;
 
     while Instant::now() < deadline {
         let mut snapshot = Vec::with_capacity(cluster.len());
         let mut healthy = true;
+        let mut canonical: Option<ServiceTaskPlacementSnapshot> = None;
 
         for node in cluster {
             let mut tasks =
@@ -5162,12 +5166,22 @@ async fn wait_for_service_running_tasks_stable_all(
                 healthy = false;
             }
 
-            snapshot.push(
-                tasks
-                    .into_iter()
-                    .map(|task| (task.id, task.node_id, task.state))
-                    .collect(),
-            );
+            // Merge regressions can keep every node at the expected replica count while different
+            // nodes still disagree on which owner/slot set wins for the same task id. Compare the
+            // exact placement rows so this helper only succeeds once the whole cluster agrees.
+            let task_rows: ServiceTaskPlacementSnapshot = tasks
+                .into_iter()
+                .map(|task| (task.id, task.node_id, task.slot_ids, task.state))
+                .collect();
+            if let Some(reference) = canonical.as_ref() {
+                if reference != &task_rows {
+                    healthy = false;
+                }
+            } else {
+                canonical = Some(task_rows.clone());
+            }
+
+            snapshot.push(task_rows);
         }
 
         if healthy && previous.as_ref() == Some(&snapshot) {

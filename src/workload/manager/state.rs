@@ -834,11 +834,24 @@ impl WorkloadManager {
         let Some(current) = select_best_workload_value(snapshot.as_slice()) else {
             return Ok(0);
         };
+        let max_epoch = snapshot
+            .as_slice()
+            .iter()
+            .map(|value| value.task_epoch)
+            .max()
+            .unwrap_or(current.task_epoch);
 
-        if current.node_id != node_id || current.slot_ids.as_slice() != slot_ids {
-            Ok(current.task_epoch.saturating_add(1))
+        // Split/merge can leave concurrent values for the same task id on different owners.
+        // Reusing the selected winner's epoch would let stale owners keep publishing status for
+        // the same task id, so any conflicting assignment in the full snapshot forces a cutover.
+        if snapshot
+            .as_slice()
+            .iter()
+            .any(|value| value.node_id != node_id || value.slot_ids.as_slice() != slot_ids)
+        {
+            Ok(max_epoch.saturating_add(1))
         } else {
-            Ok(current.task_epoch)
+            Ok(max_epoch)
         }
     }
 
