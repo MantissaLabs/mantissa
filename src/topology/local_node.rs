@@ -2,7 +2,7 @@ use super::*;
 
 impl Topology {
     /// Returns the current converged scheduling state for the local node.
-    pub(in crate::topology) fn current_scheduling_state(&self) -> PeerSchedulingState {
+    pub(super) fn current_scheduling_state(&self) -> PeerSchedulingState {
         self.deps
             .registry
             .peer_scheduling(self.local.node.id)
@@ -324,7 +324,7 @@ impl Topology {
     }
 
     /// Returns the currently selected membership state for the local peer row, if present.
-    pub(in crate::topology) fn local_membership(&self) -> std::io::Result<Option<PeerMembership>> {
+    pub(super) fn local_membership(&self) -> std::io::Result<Option<PeerMembership>> {
         let snapshot = self
             .stores
             .peers
@@ -337,7 +337,7 @@ impl Topology {
     }
 
     /// Returns whether this node should originate outbound cluster traffic right now.
-    pub(in crate::topology) fn local_allows_outbound_cluster_traffic(&self) -> bool {
+    pub(super) fn local_allows_outbound_cluster_traffic(&self) -> bool {
         match self.local_membership() {
             Ok(Some(membership)) => membership.is_active(),
             Ok(None) => true,

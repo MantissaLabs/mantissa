@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 /// Parsed split selector clause used to evaluate one node attribute predicate.
 #[derive(Clone, Debug)]
-pub(crate) struct SplitSelectorClauseSpec {
+pub struct SplitSelectorClauseSpec {
     pub(crate) key: String,
     pub(crate) op: SplitOperator,
     pub(crate) value: String,
@@ -15,7 +15,7 @@ pub(crate) struct SplitSelectorClauseSpec {
 
 /// Parsed split target with selector clauses and explicit node overrides.
 #[derive(Clone, Debug)]
-pub(crate) struct SplitTargetSpec {
+pub struct SplitTargetSpec {
     pub(crate) name: String,
     pub(crate) clauses: Vec<SplitSelectorClauseSpec>,
     pub(crate) explicit_nodes: HashSet<Uuid>,
@@ -23,7 +23,7 @@ pub(crate) struct SplitTargetSpec {
 
 /// Candidate node attributes used during split target selection and assignment.
 #[derive(Clone, Debug)]
-pub(crate) struct SplitNodeCandidate {
+pub struct SplitNodeCandidate {
     pub(crate) node_id: Uuid,
     pub(crate) hostname: String,
     pub(crate) address: String,
@@ -39,7 +39,7 @@ pub(crate) struct SplitNodeCandidate {
 }
 
 /// Computes deterministic split assignments and validates selector coverage for all nodes.
-pub(crate) fn build_split_assignments_for_nodes(
+pub fn build_split_assignments_for_nodes(
     source_view: ClusterViewId,
     targets: &[SplitTargetSpec],
     nodes: &[SplitNodeCandidate],

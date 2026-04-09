@@ -37,7 +37,7 @@ impl From<UuidKeyParseError> for io::Error {
 }
 
 /// MVReg adapter with a canonical (sorted) snapshot (requires Value: Ord).
-pub struct MvRegAdapterSorted<K, V, A>(pub(crate) std::marker::PhantomData<(K, V, A)>);
+pub struct MvRegAdapterSorted<K, V, A>(std::marker::PhantomData<(K, V, A)>);
 
 impl<V, A> RegAdapter for MvRegAdapterSorted<UuidKey, V, A>
 where

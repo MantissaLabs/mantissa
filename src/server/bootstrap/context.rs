@@ -12,7 +12,7 @@ use uuid::Uuid;
 ///
 /// This contains the durable identity and base process resources that are
 /// discovered before stores and runtime actors are wired together.
-pub(crate) struct BootstrapContext {
+pub struct BootstrapContext {
     pub listen_addr: String,
     pub self_id: Uuid,
     pub noise_keys: Arc<NoiseKeys>,
@@ -27,7 +27,7 @@ impl BootstrapContext {
     ///
     /// Headless tests use this to reuse the production boot flow while
     /// supplying their own database, keys, and local node capability.
-    pub(crate) fn from_parts(
+    pub fn from_parts(
         listen_addr: String,
         self_id: Uuid,
         noise_keys: Arc<NoiseKeys>,
@@ -51,7 +51,7 @@ impl BootstrapContext {
     ///
     /// This is the first phase of daemon startup and produces the immutable
     /// context consumed by later store and runtime assembly.
-    pub(crate) async fn init_base(listen_addr: String) -> BootstrapResult<Self> {
+    pub(super) async fn init_base(listen_addr: String) -> BootstrapResult<Self> {
         let keys_path = resolve_noise_key_path()?;
         let noise_keys = Arc::new(load_or_generate_noise_keys(keys_path)?);
 

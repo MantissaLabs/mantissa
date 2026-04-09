@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 type ParsedSplitTargets = (Vec<SplitTargetSpec>, Vec<ClusterViewId>, Vec<String>);
 
-pub(crate) struct SplitOperationBuildInput<'a> {
+pub(in crate::topology) struct SplitOperationBuildInput<'a> {
     pub source_view: ClusterViewId,
     pub dry_run: bool,
     pub split_service_policy: SplitServicePolicy,

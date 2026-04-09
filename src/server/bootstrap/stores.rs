@@ -37,7 +37,7 @@ fn store_error(context: &str, error: impl std::fmt::Display) -> Box<dyn std::err
 ///
 /// This groups the persistent state needed by topology, scheduling, secrets,
 /// services, networks, and volumes before the runtime actors are assembled.
-pub(crate) struct BootstrapStores {
+pub struct BootstrapStores {
     pub peers: PeersStore,
     pub cluster_operations: ClusterOperationStore,
     pub cluster_view: ClusterViewStore,
@@ -66,7 +66,7 @@ impl BootstrapStores {
     ///
     /// This isolates storage concerns from runtime assembly so later bootstrap
     /// phases can work with a fully prepared persistent state view.
-    pub(crate) async fn open(ctx: &BootstrapContext) -> BootstrapResult<Self> {
+    pub(super) async fn open(ctx: &BootstrapContext) -> BootstrapResult<Self> {
         let peers = open_peers_store(ctx.db.clone(), ctx.self_id)?;
         peers.rebuild_mst_from_disk().await?;
 
@@ -158,7 +158,7 @@ impl BootstrapStores {
     ///
     /// The runtime uses this to rebuild cluster-scoped services before any
     /// network traffic is accepted.
-    pub(crate) fn restore_active_view(&self) -> BootstrapResult<ClusterViewState> {
+    pub(super) fn restore_active_view(&self) -> BootstrapResult<ClusterViewState> {
         let persisted_active_view = self
             .cluster_view
             .read_active_view()

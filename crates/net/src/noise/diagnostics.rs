@@ -3,7 +3,7 @@ use std::io;
 use tracing::{debug, warn};
 
 /// Returns true when one I/O error kind maps to an expected disconnect path.
-pub(crate) fn is_expected_disconnect(kind: io::ErrorKind) -> bool {
+pub(super) fn is_expected_disconnect(kind: io::ErrorKind) -> bool {
     matches!(
         kind,
         io::ErrorKind::UnexpectedEof
@@ -19,7 +19,7 @@ pub(crate) fn is_expected_disconnect(kind: io::ErrorKind) -> bool {
 /// The transport code uses this helper instead of logging ad hoc warnings so
 /// profiling and cluster-wide disconnect analysis can filter on stable targets
 /// and stage names.
-pub(crate) fn log_transport_io(stage: &'static str, direction: &'static str, err: &io::Error) {
+pub(super) fn log_transport_io(stage: &'static str, direction: &'static str, err: &io::Error) {
     if is_expected_disconnect(err.kind()) {
         debug!(
             target: "diag.transport",

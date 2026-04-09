@@ -75,7 +75,7 @@ async fn wait_for_drain_completion(
         if Instant::now() >= deadline {
             return Err(anyhow!(
                 "node {node_id} drain timed out after {timeout:?}; node remains unschedulable: {}",
-                status.message
+                status.message()
             ));
         }
 

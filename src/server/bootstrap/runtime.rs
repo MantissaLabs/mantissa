@@ -53,7 +53,7 @@ use tracing::{error, info};
 /// Production and headless startup both construct this type so they can share
 /// one boot sequence while still customizing timing and runtime dependencies.
 #[derive(Clone)]
-pub(crate) struct BootstrapOptions {
+pub struct BootstrapOptions {
     pub task_runtime: Option<WorkloadRuntimeConfig>,
     pub runtime_set: Option<RuntimeSet>,
     pub local_volume_root: Option<PathBuf>,
@@ -91,7 +91,7 @@ impl Default for BootstrapOptions {
 ///
 /// Headless tests inspect these handles directly while the daemon path mostly
 /// uses them indirectly through the exported `Server` capability.
-pub(crate) struct RuntimeComponents {
+pub struct RuntimeComponents {
     gossip_client: GossipClient,
     pub topology: Topology,
     pub topology_client: TopologyClient,
@@ -120,7 +120,7 @@ pub(crate) struct RuntimeComponents {
 ///
 /// This is the single result of the boot pipeline: stores are open, runtime
 /// actors are spawned, and the `Server` capability is fully wired.
-pub(crate) struct BootedRuntime {
+pub struct BootedRuntime {
     pub stores: BootstrapStores,
     pub components: RuntimeComponents,
     pub server: Server,
@@ -263,7 +263,7 @@ struct TopologyBuildInputs<'a> {
 ///
 /// This is the shared startup pipeline used by both the daemon and headless
 /// nodes so assembly order only lives in one place.
-pub(crate) async fn boot(
+pub async fn boot(
     ctx: BootstrapContext,
     options: BootstrapOptions,
 ) -> BootstrapResult<BootedRuntime> {

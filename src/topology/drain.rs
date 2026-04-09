@@ -207,10 +207,7 @@ impl Topology {
     /// Milestone 2 supports service-managed evacuation only. Standalone tasks, orphaned service
     /// metadata, and service shutdown workflows still fail fast so operators do not strand work on
     /// a fenced node while the cluster is trying to stop it.
-    pub(in crate::topology) fn validate_node_drain_request(
-        &self,
-        node_id: Uuid,
-    ) -> Result<(), capnp::Error> {
+    pub(super) fn validate_node_drain_request(&self, node_id: Uuid) -> Result<(), capnp::Error> {
         if self.deps.registry.peer_value_unscoped(node_id).is_none() {
             return Err(capnp::Error::failed(format!("unknown node {node_id}")));
         }
@@ -420,7 +417,7 @@ impl Topology {
     }
 
     /// Derives the operator-facing drain progress snapshot for one node from converged cluster state.
-    pub(in crate::topology) async fn build_node_drain_status(
+    pub(super) async fn build_node_drain_status(
         &self,
         node_id: Uuid,
     ) -> Result<NodeDrainStatusSnapshot, capnp::Error> {

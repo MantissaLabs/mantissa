@@ -15,23 +15,23 @@ use super::TopologyEvent;
 
 /// Join registration payload sent to the anchor and reused for local self-row restoration.
 #[derive(Clone)]
-pub(in crate::topology) struct JoinPayload {
-    pub(in crate::topology) id: Uuid,
-    pub(in crate::topology) hostname: String,
-    pub(in crate::topology) advertise_addr: String,
-    pub(in crate::topology) incarnation: u64,
-    pub(in crate::topology) server_handle: server::Client,
-    pub(in crate::topology) public_key: [u8; 32],
-    pub(in crate::topology) signing_key: [u8; 32],
-    pub(in crate::topology) identity_sig: [u8; 64],
-    pub(in crate::topology) wireguard: Option<WireGuardPeerValue>,
-    pub(in crate::topology) scheduling: PeerSchedulingState,
-    pub(in crate::topology) runtime_support: RuntimeSupportProfile,
+pub(super) struct JoinPayload {
+    pub(super) id: Uuid,
+    pub(super) hostname: String,
+    pub(super) advertise_addr: String,
+    pub(super) incarnation: u64,
+    pub(super) server_handle: server::Client,
+    pub(super) public_key: [u8; 32],
+    pub(super) signing_key: [u8; 32],
+    pub(super) identity_sig: [u8; 64],
+    pub(super) wireguard: Option<WireGuardPeerValue>,
+    pub(super) scheduling: PeerSchedulingState,
+    pub(super) runtime_support: RuntimeSupportProfile,
 }
 
 /// Internal drain state used while deriving the operator-facing drain status response.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::topology) enum DrainStatusState {
+pub(super) enum DrainStatusState {
     Open,
     Fenced,
     Draining,
@@ -41,7 +41,7 @@ pub(in crate::topology) enum DrainStatusState {
 
 impl DrainStatusState {
     /// Converts the internal drain state into the Cap'n Proto enum used by RPC clients.
-    pub(in crate::topology) fn as_capnp(self) -> protocol::topology::NodeDrainState {
+    pub(super) fn as_capnp(self) -> protocol::topology::NodeDrainState {
         match self {
             DrainStatusState::Open => protocol::topology::NodeDrainState::Open,
             DrainStatusState::Fenced => protocol::topology::NodeDrainState::Fenced,
@@ -54,53 +54,53 @@ impl DrainStatusState {
 
 /// Derived drain-status snapshot detached from the response builder surface.
 #[derive(Clone, Debug)]
-pub(in crate::topology) struct NodeDrainStatusSnapshot {
-    pub(in crate::topology) node_id: Uuid,
-    pub(in crate::topology) schedulable: bool,
-    pub(in crate::topology) drain_requested: bool,
-    pub(in crate::topology) task_stop_timeout_secs: Option<u32>,
-    pub(in crate::topology) state: DrainStatusState,
-    pub(in crate::topology) remaining_service_tasks: u32,
-    pub(in crate::topology) blocking_standalone_tasks: u32,
-    pub(in crate::topology) remaining_reserved_slots: u32,
-    pub(in crate::topology) remaining_reserved_gpus: u32,
-    pub(in crate::topology) scheduler_summary_known: bool,
-    pub(in crate::topology) reason: Option<String>,
-    pub(in crate::topology) message: String,
-    pub(in crate::topology) last_scheduling_error: Option<String>,
+pub(super) struct NodeDrainStatusSnapshot {
+    pub(super) node_id: Uuid,
+    pub(super) schedulable: bool,
+    pub(super) drain_requested: bool,
+    pub(super) task_stop_timeout_secs: Option<u32>,
+    pub(super) state: DrainStatusState,
+    pub(super) remaining_service_tasks: u32,
+    pub(super) blocking_standalone_tasks: u32,
+    pub(super) remaining_reserved_slots: u32,
+    pub(super) remaining_reserved_gpus: u32,
+    pub(super) scheduler_summary_known: bool,
+    pub(super) reason: Option<String>,
+    pub(super) message: String,
+    pub(super) last_scheduling_error: Option<String>,
 }
 
 /// Prepared list row for one visible peer after filtering and live status derivation.
 #[derive(Clone, Debug)]
-pub(in crate::topology) struct ListedNodeRow {
-    pub(in crate::topology) id: Uuid,
-    pub(in crate::topology) value: PeerValue,
-    pub(in crate::topology) health: protocol::health::NodeStatus,
-    pub(in crate::topology) drain_state: protocol::topology::NodeDrainState,
+pub(super) struct ListedNodeRow {
+    pub(super) id: Uuid,
+    pub(super) value: PeerValue,
+    pub(super) health: protocol::health::NodeStatus,
+    pub(super) drain_state: protocol::topology::NodeDrainState,
 }
 
 /// Prepared split-candidate row after attaching health and best-known view metadata.
 #[derive(Clone, Debug)]
-pub(in crate::topology) struct SplitCandidateRow {
-    pub(in crate::topology) candidate: SplitNodeCandidate,
-    pub(in crate::topology) health: protocol::health::NodeStatus,
-    pub(in crate::topology) active_cluster_view: ClusterViewId,
+pub(super) struct SplitCandidateRow {
+    pub(super) candidate: SplitNodeCandidate,
+    pub(super) health: protocol::health::NodeStatus,
+    pub(super) active_cluster_view: ClusterViewId,
 }
 
 /// Prepared cluster-view summary row detached from the Cap'n Proto builder surface.
 #[derive(Clone, Debug)]
-pub(in crate::topology) struct ClusterViewSummaryRow {
-    pub(in crate::topology) view: ClusterViewId,
-    pub(in crate::topology) node_count: u32,
-    pub(in crate::topology) local_active: bool,
-    pub(in crate::topology) cluster_name: Option<String>,
+pub(super) struct ClusterViewSummaryRow {
+    pub(super) view: ClusterViewId,
+    pub(super) node_count: u32,
+    pub(super) local_active: bool,
+    pub(super) cluster_name: Option<String>,
 }
 
 /// Converts one scheduling snapshot into the conservative drain state used on wire snapshots.
 ///
 /// This helper is used when the caller only knows the persisted scheduling fence and has not
 /// derived a live drain-progress view.
-pub(in crate::topology) fn drain_state_from_scheduling(
+pub(super) fn drain_state_from_scheduling(
     scheduling: &PeerSchedulingState,
 ) -> protocol::topology::NodeDrainState {
     if scheduling.schedulable {
@@ -111,7 +111,7 @@ pub(in crate::topology) fn drain_state_from_scheduling(
 }
 
 /// Writes one runtime support profile into the topology `NodeInfo` builder.
-pub(in crate::topology) fn write_runtime_support_to_node_info(
+pub(super) fn write_runtime_support_to_node_info(
     mut info: node_info_capnp::Builder<'_>,
     runtime_support: &RuntimeSupportProfile,
 ) {
@@ -145,7 +145,7 @@ pub(in crate::topology) fn write_runtime_support_to_node_info(
 }
 
 /// Writes the scheduling-related `NodeInfo` fields shared by join, list, and gossip payloads.
-pub(in crate::topology) fn write_scheduling_fields_to_node_info(
+pub(super) fn write_scheduling_fields_to_node_info(
     mut info: node_info_capnp::Builder<'_>,
     scheduling: &PeerSchedulingState,
 ) {
@@ -163,7 +163,7 @@ pub(in crate::topology) fn write_scheduling_fields_to_node_info(
 }
 
 /// Writes the optional WireGuard endpoint fields carried by one peer snapshot.
-pub(in crate::topology) fn write_wireguard_to_node_info(
+pub(super) fn write_wireguard_to_node_info(
     mut info: node_info_capnp::Builder<'_>,
     wireguard: Option<&WireGuardPeerValue>,
 ) {
@@ -175,7 +175,7 @@ pub(in crate::topology) fn write_wireguard_to_node_info(
 }
 
 /// Writes one join payload into the topology `NodeInfo` request sent to the anchor.
-pub(in crate::topology) fn write_join_payload_to_node_info(
+pub(super) fn write_join_payload_to_node_info(
     mut info: node_info_capnp::Builder<'_>,
     payload: &JoinPayload,
     cluster_view: ClusterViewId,
@@ -196,7 +196,7 @@ pub(in crate::topology) fn write_join_payload_to_node_info(
 }
 
 /// Writes one prepared node-list row into the `list` RPC response.
-pub(in crate::topology) fn write_listed_node_row(
+pub(super) fn write_listed_node_row(
     mut node: node_info_capnp::Builder<'_>,
     row: &ListedNodeRow,
     cluster_view: ClusterViewId,
@@ -215,7 +215,7 @@ pub(in crate::topology) fn write_listed_node_row(
 }
 
 /// Writes one prepared split-candidate row into the planning RPC response.
-pub(in crate::topology) fn write_split_candidate_row(
+pub(super) fn write_split_candidate_row(
     mut row: split_candidate::Builder<'_>,
     candidate: &SplitCandidateRow,
 ) {
@@ -252,7 +252,7 @@ pub(in crate::topology) fn write_split_candidate_row(
 }
 
 /// Writes one derived drain-status snapshot into the RPC response payload.
-pub(in crate::topology) fn write_node_drain_status(
+pub(super) fn write_node_drain_status(
     mut builder: node_drain_status::Builder<'_>,
     status: &NodeDrainStatusSnapshot,
 ) {
@@ -272,7 +272,7 @@ pub(in crate::topology) fn write_node_drain_status(
 }
 
 /// Writes one cluster-view summary row after the discovery logic has already resolved counts.
-pub(in crate::topology) fn write_cluster_view_summary_row(
+pub(super) fn write_cluster_view_summary_row(
     mut row: cluster_view_summary::Builder<'_>,
     summary: &ClusterViewSummaryRow,
 ) {

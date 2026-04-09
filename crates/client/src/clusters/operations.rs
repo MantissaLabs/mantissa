@@ -15,7 +15,7 @@ pub struct ClusterViewSpec {
 
 impl ClusterViewSpec {
     /// Encodes this view into a Cap'n Proto builder for topology RPC requests.
-    pub(crate) fn write_capnp(self, mut builder: topology::cluster_view_id::Builder<'_>) {
+    pub(super) fn write_capnp(self, mut builder: topology::cluster_view_id::Builder<'_>) {
         builder
             .reborrow()
             .init_cluster_id()
@@ -24,7 +24,7 @@ impl ClusterViewSpec {
     }
 
     /// Decodes one view from a topology Cap'n Proto response payload.
-    pub(crate) fn from_capnp(reader: topology::cluster_view_id::Reader<'_>) -> Result<Self> {
+    pub(super) fn from_capnp(reader: topology::cluster_view_id::Reader<'_>) -> Result<Self> {
         let cluster_bytes = reader
             .get_cluster_id()
             .context("cluster view missing cluster id")?
@@ -65,7 +65,7 @@ pub struct ClusterOperationSummary {
 
 impl ClusterOperationSummary {
     /// Converts a topology `ClusterOperation` reader into a client-facing summary.
-    pub(crate) fn from_capnp(reader: topology::cluster_operation::Reader<'_>) -> Result<Self> {
+    pub(super) fn from_capnp(reader: topology::cluster_operation::Reader<'_>) -> Result<Self> {
         let id = reader.get_id().context("operation id missing")?.to_vec();
         if id.len() != 16 {
             return Err(anyhow!("operation id must be 16 bytes, got {}", id.len()));
@@ -113,7 +113,7 @@ impl ClusterOperationSummary {
 }
 
 /// Render a cluster operation summary for CLI usage so command handlers stay orchestration-only.
-pub(crate) fn emit_operation_summary(summary: &ClusterOperationSummary) {
+pub(super) fn emit_operation_summary(summary: &ClusterOperationSummary) {
     output::emit_line(format!("operation {}", summary.id));
     output::emit_line(format!("kind: {}", summary.kind));
     output::emit_line(format!("stage: {}", summary.stage));
@@ -137,7 +137,7 @@ pub(crate) fn emit_operation_summary(summary: &ClusterOperationSummary) {
 }
 
 /// Returns the topology capability from the local session for cluster orchestration RPCs.
-pub(crate) async fn topology_capability(cfg: &ClientConfig) -> Result<topology::Client> {
+pub(super) async fn topology_capability(cfg: &ClientConfig) -> Result<topology::Client> {
     let session = connection::get_local_session(cfg).await?;
     Ok(session
         .get_topology_request()
@@ -147,6 +147,6 @@ pub(crate) async fn topology_capability(cfg: &ClientConfig) -> Result<topology::
 }
 
 /// Parses a cluster UUID from CLI input and emits a contextual error on malformed values.
-pub(crate) fn parse_cluster_id(input: &str, field: &str) -> Result<Uuid> {
+pub(super) fn parse_cluster_id(input: &str, field: &str) -> Result<Uuid> {
     Uuid::parse_str(input).with_context(|| format!("invalid {field}: {input}"))
 }

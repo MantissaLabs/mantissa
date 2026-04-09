@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 impl Topology {
     /// Applies one conflict-resolved cluster lineage name update into durable cluster-view storage.
-    pub(crate) async fn upsert_cluster_name_record(
+    pub(in crate::topology) async fn upsert_cluster_name_record(
         &self,
         cluster_id: ClusterId,
         record: &ClusterNameRecord,
@@ -29,7 +29,7 @@ impl Topology {
     }
 
     /// Applies one conflict-resolved cluster lineage node-count update into durable cluster-view storage.
-    pub(crate) async fn upsert_cluster_node_count_record(
+    pub(in crate::topology) async fn upsert_cluster_node_count_record(
         &self,
         cluster_id: ClusterId,
         record: &ClusterNodeCountRecord,
@@ -404,7 +404,7 @@ impl Topology {
     }
 
     /// Returns the most recently updated non-finalized cluster operation, if any.
-    pub(crate) fn active_cluster_operation(
+    pub(in crate::topology) fn active_cluster_operation(
         &self,
     ) -> Result<Option<ClusterOperationRecord>, capnp::Error> {
         let mut active = self
@@ -432,7 +432,7 @@ impl Topology {
     }
 
     /// Returns the most recent non-finalized operation excluding one specific id.
-    pub(crate) fn active_cluster_operation_excluding(
+    pub(in crate::topology) fn active_cluster_operation_excluding(
         &self,
         excluded_operation_id: Uuid,
     ) -> Result<Option<ClusterOperationRecord>, capnp::Error> {

@@ -5,7 +5,7 @@ use crate::config;
 ///
 /// Headless startup constructs the same option type directly so both code paths
 /// converge on one shared bootstrap pipeline.
-pub(crate) fn daemon_bootstrap_options() -> BootstrapOptions {
+pub(super) fn daemon_bootstrap_options() -> BootstrapOptions {
     let replication = config::replication_runtime_config();
     BootstrapOptions {
         gossip_channel_capacity: replication.gossip_channel_capacity,

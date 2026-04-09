@@ -12,7 +12,7 @@ use crate::node::Node;
 use crate::runtime::types::RuntimeSupportProfile;
 
 #[derive(Clone)]
-pub(crate) struct AdvertiseState {
+pub(super) struct AdvertiseState {
     /// Address string as configured on startup. Used as last-resort advertise addr.
     configured_addr: String,
 
@@ -25,7 +25,7 @@ pub(crate) struct AdvertiseState {
 
 impl AdvertiseState {
     /// Creates advertise-state tracking for one topology instance.
-    pub(crate) fn new(configured_addr: String) -> Self {
+    pub(super) fn new(configured_addr: String) -> Self {
         Self {
             configured_addr,
             bound_addr: std::sync::Arc::new(Mutex::new(None)),
@@ -34,52 +34,52 @@ impl AdvertiseState {
     }
 
     /// Returns the configured address fallback used before the listener binds.
-    pub(crate) fn configured(&self) -> &str {
+    pub(super) fn configured(&self) -> &str {
         &self.configured_addr
     }
 
     /// Records the socket address currently bound by the server listener.
-    pub(crate) fn set_bound(&self, addr: SocketAddr) {
+    pub(super) fn set_bound(&self, addr: SocketAddr) {
         *self.bound_addr.lock() = Some(addr);
     }
 
     /// Replaces the optional advertise override used by tests and inproc transports.
-    pub(crate) fn set_override<S: Into<String>>(&self, addr: Option<S>) {
+    pub(super) fn set_override<S: Into<String>>(&self, addr: Option<S>) {
         *self.advertise_override.lock() = addr.map(Into::into);
     }
 
     /// Returns the current advertise override when one has been configured.
-    pub(crate) fn override_addr(&self) -> Option<String> {
+    pub(super) fn override_addr(&self) -> Option<String> {
         self.advertise_override.lock().clone()
     }
 
     /// Returns the bound listener address when networking has already started.
-    pub(crate) fn bound(&self) -> Option<SocketAddr> {
+    pub(super) fn bound(&self) -> Option<SocketAddr> {
         *self.bound_addr.lock()
     }
 }
 
 /// Groups local node state that topology publishes and mutates at runtime.
 #[derive(Clone)]
-pub(crate) struct LocalNodeState {
+pub(super) struct LocalNodeState {
     /// Snapshot of the local node (id, host info, capabilities).
-    pub(crate) node: Node,
+    pub(super) node: Node,
 
     /// Shared active cluster view identifier for control-plane observability.
-    pub(crate) cluster_view: ClusterViewState,
+    pub(super) cluster_view: ClusterViewState,
 
     /// Addresses and advertise decision logic for the local node.
-    pub(crate) advertise: AdvertiseState,
+    pub(super) advertise: AdvertiseState,
 
     /// OnceCell holding the Cap'n Proto server capability exported to peers.
-    pub(crate) server_handle: Rc<OnceCell<ServerClient>>,
+    pub(super) server_handle: Rc<OnceCell<ServerClient>>,
 
     /// Local node Noise static public key used during handshakes.
-    pub(crate) public_key: PublicKey,
+    pub(super) public_key: PublicKey,
 
     /// Ed25519 signing key used to mint cluster credentials.
-    pub(crate) signing_key: SigningKey,
+    pub(super) signing_key: SigningKey,
 
     /// Cluster-visible runtime support metadata published for this node.
-    pub(crate) runtime_support: RuntimeSupportProfile,
+    pub(super) runtime_support: RuntimeSupportProfile,
 }

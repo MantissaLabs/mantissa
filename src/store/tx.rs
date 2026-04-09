@@ -2,12 +2,12 @@ use redb::{Database, ReadTransaction, ReadableDatabase, WriteTransaction};
 use std::io;
 
 /// Maps Redb and serialization errors into `io::Error` for store APIs.
-pub(crate) fn into_io<E: std::error::Error>(err: E) -> io::Error {
+pub(super) fn into_io<E: std::error::Error>(err: E) -> io::Error {
     io::Error::other(err.to_string())
 }
 
 /// Opens a read transaction and executes `op` within that transaction scope.
-pub(crate) fn with_read_tx<T>(
+pub(super) fn with_read_tx<T>(
     db: &Database,
     op: impl FnOnce(&ReadTransaction) -> io::Result<T>,
 ) -> io::Result<T> {
@@ -16,7 +16,7 @@ pub(crate) fn with_read_tx<T>(
 }
 
 /// Opens a write transaction, executes `op`, and commits if `op` succeeded.
-pub(crate) fn with_write_tx<T>(
+pub(super) fn with_write_tx<T>(
     db: &Database,
     op: impl FnOnce(&WriteTransaction) -> io::Result<T>,
 ) -> io::Result<T> {

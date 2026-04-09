@@ -98,7 +98,7 @@ impl Topology {
     }
 
     /// Obtains a cached snapshot of peers without hitting storage on every tick.
-    pub(in crate::topology) async fn peer_snapshot(&self) -> Option<PeerSnapshot> {
+    pub(super) async fn peer_snapshot(&self) -> Option<PeerSnapshot> {
         let mut cache = self.runtime.peer_snapshot_cache.lock().await;
         match cache.snapshot(&self.stores.peers) {
             Ok(snapshot) => Some(snapshot),

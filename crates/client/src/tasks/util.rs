@@ -28,7 +28,7 @@ pub fn uuid_short(data: capnp::data::Reader) -> Result<String, CapnpError> {
 }
 
 /// Writes one streamed task output frame to stdout or stderr without reformatting the payload.
-pub(crate) fn write_frame(stream: TaskLogStream, bytes: &[u8]) -> Result<(), CapnpError> {
+pub(super) fn write_frame(stream: TaskLogStream, bytes: &[u8]) -> Result<(), CapnpError> {
     match stream {
         TaskLogStream::Stdout | TaskLogStream::Console => {
             let mut stdout = io::stdout();

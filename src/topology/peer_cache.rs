@@ -7,18 +7,18 @@ use uuid::Uuid;
 
 /// Cached representation of a peer entry so control-plane loops avoid repeated deserialisation.
 #[derive(Clone)]
-pub(crate) struct PeerCacheEntry {
-    pub(crate) peer_id: Uuid,
-    pub(crate) value: Arc<PeerValue>,
+pub(super) struct PeerCacheEntry {
+    pub(super) peer_id: Uuid,
+    pub(super) value: Arc<PeerValue>,
 }
 
 /// Immutable snapshot of known peers.
-pub(crate) struct PeerSnapshot {
-    pub(crate) entries: Arc<Vec<PeerCacheEntry>>,
+pub(super) struct PeerSnapshot {
+    pub(super) entries: Arc<Vec<PeerCacheEntry>>,
 }
 
 /// Maintains a reusable peer snapshot to minimise Redb scans in hot paths.
-pub(crate) struct PeerSnapshotCache {
+pub(super) struct PeerSnapshotCache {
     last_generation: u64,
     entries: Arc<Vec<PeerCacheEntry>>,
     /// Reusable vectors backing snapshot extraction to avoid per-tick allocations.
@@ -28,7 +28,7 @@ pub(crate) struct PeerSnapshotCache {
 
 impl PeerSnapshotCache {
     /// Create an empty cache ready to serve snapshots.
-    pub(crate) fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             last_generation: 0,
             entries: Arc::new(Vec::new()),
@@ -38,7 +38,7 @@ impl PeerSnapshotCache {
     }
 
     /// Return a cached snapshot, refreshing from the store when the change clock advanced.
-    pub(crate) fn snapshot(&mut self, store: &PeersStore) -> crdt_store::Result<PeerSnapshot> {
+    pub(super) fn snapshot(&mut self, store: &PeersStore) -> crdt_store::Result<PeerSnapshot> {
         let current_generation = store.change_clock();
         if current_generation == self.last_generation {
             return Ok(PeerSnapshot {

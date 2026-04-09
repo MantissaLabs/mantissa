@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use std::cmp::Ordering;
 
 /// Compares two service specs and returns which one should win CRDT selection.
-pub(crate) fn compare_service_specs(left: &ServiceSpecValue, right: &ServiceSpecValue) -> Ordering {
+pub(super) fn compare_service_specs(left: &ServiceSpecValue, right: &ServiceSpecValue) -> Ordering {
     if left.manifest_id == right.manifest_id {
         if let Some(ordering) = compare_same_generation_terminal_preference(left, right) {
             return ordering;
@@ -15,7 +15,7 @@ pub(crate) fn compare_service_specs(left: &ServiceSpecValue, right: &ServiceSpec
 }
 
 /// Returns true when the incoming spec should replace the current one.
-pub(crate) fn should_accept_service_update(
+pub(super) fn should_accept_service_update(
     current: Option<&ServiceSpecValue>,
     incoming: &ServiceSpecValue,
 ) -> bool {

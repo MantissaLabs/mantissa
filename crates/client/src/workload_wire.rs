@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 /// One prepared named volume mount resolved to the cluster volume identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PreparedVolumeMount {
+pub struct PreparedVolumeMount {
     pub volume_id: Uuid,
     pub volume_name: String,
     pub target: String,
@@ -18,9 +18,7 @@ pub(crate) struct PreparedVolumeMount {
 }
 
 /// Rebuilds one resolved CLI volume mount into the generic workload submit payload shape.
-pub(crate) fn prepared_volume_mount_from_resolved(
-    mount: &ResolvedVolumeMount,
-) -> PreparedVolumeMount {
+pub fn prepared_volume_mount_from_resolved(mount: &ResolvedVolumeMount) -> PreparedVolumeMount {
     PreparedVolumeMount {
         volume_id: mount.volume_id,
         volume_name: mount.volume_name.clone(),
@@ -30,10 +28,7 @@ pub(crate) fn prepared_volume_mount_from_resolved(
 }
 
 /// Encodes one manifest secret reference into the workload wire builder.
-pub(crate) fn write_secret_reference(
-    mut builder: secret_ref::Builder<'_>,
-    reference: &SecretReference,
-) {
+pub fn write_secret_reference(mut builder: secret_ref::Builder<'_>, reference: &SecretReference) {
     builder.set_name(&reference.name);
     if let Some(version) = reference.version {
         builder.set_version_id(version.as_bytes());
@@ -43,7 +38,7 @@ pub(crate) fn write_secret_reference(
 }
 
 /// Encodes one manifest environment variable list into the workload wire builder.
-pub(crate) fn write_env_vars(
+pub fn write_env_vars(
     builder: &mut struct_list::Builder<environment_var::Owned>,
     vars: &[EnvironmentVariable],
 ) {
@@ -60,7 +55,7 @@ pub(crate) fn write_env_vars(
 }
 
 /// Encodes one manifest secret file list into the workload wire builder.
-pub(crate) fn write_secret_files(
+pub fn write_secret_files(
     builder: &mut struct_list::Builder<secret_file::Owned>,
     files: &[SecretFileProjection],
 ) {
@@ -75,7 +70,7 @@ pub(crate) fn write_secret_files(
 }
 
 /// Encodes one managed-filesystem ownership policy into the shared workload wire builder.
-pub(crate) fn write_local_volume_ownership(
+pub fn write_local_volume_ownership(
     mut builder: local_volume_ownership::Builder<'_>,
     ownership: &LocalVolumeOwnership,
 ) {
@@ -96,7 +91,7 @@ pub(crate) fn write_local_volume_ownership(
 }
 
 /// Encodes one resolved volume mount list into the workload wire builder.
-pub(crate) fn write_volume_mounts(
+pub fn write_volume_mounts(
     builder: &mut struct_list::Builder<volume_mount::Owned>,
     mounts: &[PreparedVolumeMount],
 ) {
@@ -110,7 +105,7 @@ pub(crate) fn write_volume_mounts(
 }
 
 /// Writes one optional single mount into the workspace or checkpoint payload.
-pub(crate) fn write_optional_volume_mount(
+pub fn write_optional_volume_mount(
     builder: volume_mount::Builder<'_>,
     mount: Option<&PreparedVolumeMount>,
 ) {
@@ -133,10 +128,7 @@ pub(crate) fn write_optional_volume_mount(
 }
 
 /// Encodes one manifest liveness probe into the workload wire builder.
-pub(crate) fn write_liveness_probe(
-    mut builder: liveness_probe::Builder<'_>,
-    probe: &LivenessProbe,
-) {
+pub fn write_liveness_probe(mut builder: liveness_probe::Builder<'_>, probe: &LivenessProbe) {
     let kind = match probe.kind {
         LivenessKind::Exec => protocol::workload::LivenessProbeKind::Exec,
         LivenessKind::Http => protocol::workload::LivenessProbeKind::Http,

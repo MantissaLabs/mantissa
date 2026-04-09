@@ -2,7 +2,7 @@ use super::*;
 
 impl Topology {
     /// Clears locally cached peer authentication material after this node leaves a cluster.
-    pub(in crate::topology) fn clear_local_cluster_auth_state(&self) {
+    pub(super) fn clear_local_cluster_auth_state(&self) {
         if let Err(err) = self.stores.local_sessions.clear() {
             warn!(
                 target: "topology",
@@ -18,7 +18,7 @@ impl Topology {
     }
 
     /// Applies one scheduling-state update to the peer store using deterministic convergence.
-    pub(in crate::topology) async fn apply_peer_scheduling_update(
+    pub(super) async fn apply_peer_scheduling_update(
         &self,
         node_id: Uuid,
         scheduling: PeerSchedulingState,

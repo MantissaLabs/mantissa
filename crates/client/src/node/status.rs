@@ -6,20 +6,20 @@ use protocol::topology::{self, NodeDrainState, node_drain_status};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DrainStatusView {
-    pub(crate) node_id: Uuid,
-    pub(crate) schedulable: bool,
-    pub(crate) drain_requested: bool,
-    pub(crate) task_stop_timeout_secs: Option<u32>,
-    pub(crate) state: NodeDrainState,
-    pub(crate) remaining_service_tasks: u32,
-    pub(crate) blocking_standalone_tasks: u32,
-    pub(crate) remaining_reserved_slots: u32,
-    pub(crate) remaining_reserved_gpus: u32,
-    pub(crate) scheduler_summary_known: bool,
-    pub(crate) reason: Option<String>,
-    pub(crate) message: String,
-    pub(crate) last_scheduling_error: Option<String>,
+pub(super) struct DrainStatusView {
+    node_id: Uuid,
+    schedulable: bool,
+    drain_requested: bool,
+    task_stop_timeout_secs: Option<u32>,
+    state: NodeDrainState,
+    remaining_service_tasks: u32,
+    blocking_standalone_tasks: u32,
+    remaining_reserved_slots: u32,
+    remaining_reserved_gpus: u32,
+    scheduler_summary_known: bool,
+    reason: Option<String>,
+    message: String,
+    last_scheduling_error: Option<String>,
 }
 
 impl DrainStatusView {
@@ -63,12 +63,12 @@ impl DrainStatusView {
     }
 
     /// Returns true when the node drain has completed fully.
-    pub(crate) fn is_drained(&self) -> bool {
+    pub(super) fn is_drained(&self) -> bool {
         self.state == NodeDrainState::Drained
     }
 
     /// Renders one compact line used by the blocking drain poller.
-    pub(crate) fn compact_progress_line(&self) -> String {
+    pub(super) fn compact_progress_line(&self) -> String {
         let mut line = format!("node {}: {}", self.node_id, drain_state_label(self.state));
         if !self.message.trim().is_empty() {
             line.push_str(" - ");
@@ -76,10 +76,15 @@ impl DrainStatusView {
         }
         line
     }
+
+    /// Returns the operator-facing status message embedded in the drain snapshot.
+    pub(super) fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 /// Fetches one drain-status snapshot directly from a topology capability.
-pub(crate) async fn fetch_drain_status_via_topology(
+pub(super) async fn fetch_drain_status_via_topology(
     topology: &topology::topology::Client,
     node_id: Uuid,
 ) -> Result<DrainStatusView> {

@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 /// Driver families accepted by shared manifest-side volume provisioning helpers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DeclaredVolumeDriverKind {
+pub enum DeclaredVolumeDriverKind {
     LocalManaged,
     LocalImportedPath,
     External,
@@ -16,14 +16,14 @@ pub(crate) enum DeclaredVolumeDriverKind {
 
 /// One manifest-facing volume label normalized for shared provisioning.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DeclaredVolumeLabel {
+pub struct DeclaredVolumeLabel {
     pub key: String,
     pub value: String,
 }
 
 /// One manifest-declared volume normalized for shared provisioning helpers.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DeclaredVolumeSpec {
+pub struct DeclaredVolumeSpec {
     pub name: String,
     pub driver_kind: DeclaredVolumeDriverKind,
     pub local_ownership: Option<volumes::LocalVolumeOwnership>,
@@ -36,13 +36,13 @@ pub(crate) struct DeclaredVolumeSpec {
 
 /// Resolved volume identity returned after manifest-side auto-provisioning.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ResolvedDeclaredVolume {
+pub struct ResolvedDeclaredVolume {
     pub volume_id: Uuid,
     pub volume_name: String,
 }
 
 /// Derive the canonical network UUID from the manifest-facing network name.
-pub(crate) fn compute_network_id(name: &str) -> Uuid {
+pub fn compute_network_id(name: &str) -> Uuid {
     let mut hasher = Hasher::new();
     hasher.update(name.as_bytes());
     let digest = hasher.finalize();
@@ -52,7 +52,7 @@ pub(crate) fn compute_network_id(name: &str) -> Uuid {
 }
 
 /// Ensure every referenced manifest network exists before submission.
-pub(crate) async fn ensure_named_networks(
+pub async fn ensure_named_networks(
     cfg: &ClientConfig,
     required_networks: impl IntoIterator<Item = String>,
 ) -> Result<()> {
@@ -102,7 +102,7 @@ pub(crate) async fn ensure_named_networks(
 }
 
 /// Ensure every declared manifest volume exists as a cluster volume object.
-pub(crate) async fn ensure_declared_volumes(
+pub async fn ensure_declared_volumes(
     cfg: &ClientConfig,
     declared_volumes: &[DeclaredVolumeSpec],
 ) -> Result<HashMap<String, ResolvedDeclaredVolume>> {
