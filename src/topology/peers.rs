@@ -475,7 +475,7 @@ impl PeerValue {
 }
 
 /// Decodes one runtime support profile from the topology `NodeInfo` reader.
-fn runtime_support_from_node_info(
+pub(crate) fn runtime_support_from_node_info(
     ni: node_info_capnp::Reader<'_>,
 ) -> Result<RuntimeSupportProfile, CapnpError> {
     let execution_platforms = read_text_list(ni.get_execution_platforms()?)?;

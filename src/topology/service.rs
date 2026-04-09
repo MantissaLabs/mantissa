@@ -16,7 +16,10 @@ use crate::store::local::{LocalCredentialStore, LocalSessionStore, MasterKeyReco
 use crate::store::peer_store::PeersStore;
 use crate::sync::SyncTraceContext;
 use crate::topology::health::status_to_node_status;
-use crate::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue};
+use crate::topology::peers::{
+    PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
+    runtime_support_from_node_info,
+};
 use capnp::Error;
 use capnp::data;
 use crdt_store::uuid_key::UuidKey;
@@ -1158,50 +1161,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                 identity_sig: identity_sig.to_vec(),
                 wireguard,
                 scheduling: Box::new(scheduling),
-                runtime_support: Box::new(RuntimeSupportProfile::new(
-                    node.get_execution_platforms()?
-                        .iter()
-                        .filter_map(|value| {
-                            value
-                                .ok()
-                                .and_then(|value| value.to_str().ok())
-                                .and_then(|value| {
-                                    value
-                                        .parse::<crate::workload::model::ExecutionPlatform>()
-                                        .ok()
-                                })
-                        })
-                        .collect::<Vec<_>>(),
-                    node.get_isolation_modes()?
-                        .iter()
-                        .filter_map(|value| {
-                            value
-                                .ok()
-                                .and_then(|value| value.to_str().ok())
-                                .and_then(|value| {
-                                    value.parse::<crate::workload::model::IsolationMode>().ok()
-                                })
-                        })
-                        .collect::<Vec<_>>(),
-                    node.get_isolation_profiles()?
-                        .iter()
-                        .filter_map(|value| {
-                            value
-                                .ok()
-                                .and_then(|value| value.to_str().ok())
-                                .map(str::to_string)
-                        })
-                        .collect::<Vec<_>>(),
-                    node.get_runtime_feature_flags()?
-                        .iter()
-                        .filter_map(|value| {
-                            value
-                                .ok()
-                                .and_then(|value| value.to_str().ok())
-                                .map(str::to_string)
-                        })
-                        .collect::<Vec<_>>(),
-                )),
+                runtime_support: Box::new(runtime_support_from_node_info(node)?),
             }
         }
         EventType::Remove => {

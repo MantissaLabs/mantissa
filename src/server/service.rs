@@ -5,7 +5,10 @@ use crate::node::id;
 use crate::node::identity::{pubkey_from_slice, verify_peer_identity};
 use crate::server::credential::ClusterCredential;
 use crate::topology::TopologyEvent;
-use crate::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue};
+use crate::topology::peers::{
+    PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
+    runtime_support_from_node_info,
+};
 use std::rc::Rc;
 use tracing::{debug, warn};
 use x25519_dalek::PublicKey;
@@ -86,50 +89,7 @@ impl JoinRequest {
                     value => Some(value),
                 },
             ),
-            runtime_support: crate::runtime::types::RuntimeSupportProfile::new(
-                info.get_execution_platforms()?
-                    .iter()
-                    .filter_map(|value| {
-                        value
-                            .ok()
-                            .and_then(|value| value.to_str().ok())
-                            .and_then(|value| {
-                                value
-                                    .parse::<crate::workload::model::ExecutionPlatform>()
-                                    .ok()
-                            })
-                    })
-                    .collect::<Vec<_>>(),
-                info.get_isolation_modes()?
-                    .iter()
-                    .filter_map(|value| {
-                        value
-                            .ok()
-                            .and_then(|value| value.to_str().ok())
-                            .and_then(|value| {
-                                value.parse::<crate::workload::model::IsolationMode>().ok()
-                            })
-                    })
-                    .collect::<Vec<_>>(),
-                info.get_isolation_profiles()?
-                    .iter()
-                    .filter_map(|value| {
-                        value
-                            .ok()
-                            .and_then(|value| value.to_str().ok())
-                            .map(str::to_string)
-                    })
-                    .collect::<Vec<_>>(),
-                info.get_runtime_feature_flags()?
-                    .iter()
-                    .filter_map(|value| {
-                        value
-                            .ok()
-                            .and_then(|value| value.to_str().ok())
-                            .map(str::to_string)
-                    })
-                    .collect::<Vec<_>>(),
-            ),
+            runtime_support: runtime_support_from_node_info(info)?,
             membership: PeerMembership::active(info.get_incarnation()),
         };
 
