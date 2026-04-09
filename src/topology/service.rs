@@ -14,7 +14,7 @@ use crate::runtime::types::RuntimeSupportProfile;
 use crate::server::credential::ClusterCredential;
 use crate::store::local::{LocalCredentialStore, LocalSessionStore, MasterKeyRecord};
 use crate::store::peer_store::PeersStore;
-use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains};
+use crate::sync::SyncTraceContext;
 use crate::topology::health::status_to_node_status;
 use crate::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue};
 use capnp::Error;
@@ -413,33 +413,20 @@ impl topology::Server for Topology {
             resp.get()?.get_sync()?
         };
 
-        let sync_stores = SyncStores {
-            peers: self.stores.peers.clone(),
-            workloads: self.stores.workloads.clone(),
-            jobs: self.stores.jobs.clone(),
-            agents: self.stores.agents.clone(),
-            services: self.stores.services.clone(),
-            secrets: self.stores.secrets.clone(),
-            networks: self.stores.networks.clone(),
-            network_peers: self.stores.network_peers.clone(),
-            network_attachments: self.stores.network_attachments.clone(),
-            cluster_views: self.stores.cluster_view_store.cluster_view_domain_store(),
-            volumes: self.stores.volumes.clone(),
-            volume_nodes: self.stores.volume_nodes.clone(),
-            scheduler_digests: self.stores.scheduler_digests.clone(),
-        };
-
         let sync_trace = SyncTraceContext::peer(peer_id, peer_value.address.clone(), "join");
         tokio::task::spawn_local({
             let topology = self.clone();
-            let stores = sync_stores;
             let cluster_view = self.active_cluster_view();
             let trace = sync_trace;
             let payload = payload.clone();
             async move {
                 // Bootstrap immediately from the anchor session so the join path does not wait
                 // for the next periodic tick before the new node has a converged view.
-                sync_all_domains(stores, sync_cap, cluster_view, Some(trace)).await;
+                topology
+                    .deps
+                    .sync
+                    .sync_all_domains(sync_cap, cluster_view, Some(trace))
+                    .await;
 
                 // A successful rejoin must end with the local node's own peer row restored even
                 // if the bootstrap sync observed a stale leave tombstone from another peer.

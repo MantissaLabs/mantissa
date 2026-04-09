@@ -4,6 +4,7 @@
 //! capability and exposes `DeltaSinkImpl`, the local sink used by the remote peer to
 //! stream missing CRDT fragments back into the local stores.
 
+use super::SyncStores;
 use crate::agents::types::AgentRecordValue;
 use crate::cluster::ClusterViewId;
 use crate::jobs::types::JobSpecValue;
@@ -55,24 +56,6 @@ const ALL_SYNC_DOMAINS: [Domain; 13] = [
     Domain::SchedulerDigests,
 ];
 
-#[derive(Clone)]
-/// Local replicated stores that can participate in one anti-entropy pass.
-pub struct SyncStores {
-    pub peers: PeersStore,
-    pub workloads: WorkloadStore,
-    pub jobs: JobStore,
-    pub agents: AgentStore,
-    pub services: ServiceStore,
-    pub secrets: SecretStore,
-    pub networks: NetworkSpecStore,
-    pub network_peers: NetworkPeerStore,
-    pub network_attachments: NetworkAttachmentStore,
-    pub cluster_views: ClusterViewDomainStore,
-    pub volumes: VolumeSpecStore,
-    pub volume_nodes: VolumeNodeStore,
-    pub scheduler_digests: SchedulerDigestStore,
-}
-
 /// Carries one peer-scoped context for anti-entropy diagnostics.
 #[derive(Clone, Debug)]
 pub struct SyncTraceContext {
@@ -89,6 +72,48 @@ impl SyncTraceContext {
             peer_addr: peer_addr.into(),
             reason,
         }
+    }
+}
+
+#[derive(Clone)]
+/// Client-side anti-entropy runner that owns the local replicated domain stores.
+///
+/// Topology depends on this runner rather than rebuilding ad hoc sync store bundles
+/// every time it opens a delta exchange against a remote peer.
+pub struct SyncRunner {
+    stores: SyncStores,
+}
+
+impl SyncRunner {
+    /// Builds one anti-entropy runner over the provided local replicated stores.
+    pub fn new(stores: SyncStores) -> Self {
+        Self { stores }
+    }
+
+    /// Runs anti-entropy for every replicated domain against one peer.
+    pub async fn sync_all_domains(
+        &self,
+        sync_cap: sync::Client,
+        cluster_view: ClusterViewId,
+        trace: Option<SyncTraceContext>,
+    ) {
+        self.sync_selected_domains(sync_cap, cluster_view, &ALL_SYNC_DOMAINS, trace)
+            .await;
+    }
+
+    /// Runs anti-entropy for one caller-selected domain subset against one peer view.
+    ///
+    /// This is used by the global metadata loop to sync only `cluster_views` across split
+    /// boundaries while keeping heavy domains view-scoped.
+    pub async fn sync_selected_domains(
+        &self,
+        sync_cap: sync::Client,
+        cluster_view: ClusterViewId,
+        domains: &[Domain],
+        trace: Option<SyncTraceContext>,
+    ) {
+        sync_selected_domains_with_stores(&self.stores, sync_cap, cluster_view, domains, trace)
+            .await;
     }
 }
 
@@ -493,22 +518,12 @@ impl DeltaStore<SchedulerDigestValue> for SchedulerDigestStore {
     }
 }
 
-/// Runs anti-entropy for every replicated domain against one peer.
-pub async fn sync_all_domains(
-    stores: SyncStores,
-    sync_cap: sync::Client,
-    cluster_view: ClusterViewId,
-    trace: Option<SyncTraceContext>,
-) {
-    sync_selected_domains(stores, sync_cap, cluster_view, &ALL_SYNC_DOMAINS, trace).await;
-}
-
 /// Runs anti-entropy for one caller-selected domain subset against one peer view.
 ///
-/// This is used by the global metadata loop to sync only `cluster_views` across split
-/// boundaries while keeping heavy domains view-scoped.
-pub async fn sync_selected_domains(
-    stores: SyncStores,
+/// The runner keeps ownership of the local store handles; this helper only borrows them so
+/// topology does not have to rebuild one store bundle for every sync attempt.
+async fn sync_selected_domains_with_stores(
+    stores: &SyncStores,
     sync_cap: sync::Client,
     cluster_view: ClusterViewId,
     domains: &[Domain],

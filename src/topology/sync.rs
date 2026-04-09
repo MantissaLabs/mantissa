@@ -336,24 +336,11 @@ impl Topology {
             }
         };
 
-        let stores = SyncStores {
-            peers: self.stores.peers.clone(),
-            workloads: self.stores.workloads.clone(),
-            jobs: self.stores.jobs.clone(),
-            agents: self.stores.agents.clone(),
-            services: self.stores.services.clone(),
-            secrets: self.stores.secrets.clone(),
-            networks: self.stores.networks.clone(),
-            network_peers: self.stores.network_peers.clone(),
-            network_attachments: self.stores.network_attachments.clone(),
-            cluster_views: self.stores.cluster_view_store.cluster_view_domain_store(),
-            volumes: self.stores.volumes.clone(),
-            volume_nodes: self.stores.volume_nodes.clone(),
-            scheduler_digests: self.stores.scheduler_digests.clone(),
-        };
-
         let trace = SyncTraceContext::peer(peer_id, value.address.clone(), "periodic");
-        sync_all_domains(stores, sync_cap, cluster_view, Some(trace)).await;
+        self.deps
+            .sync
+            .sync_all_domains(sync_cap, cluster_view, Some(trace))
+            .await;
     }
 
     /// Executes one targeted workload-only repair exchange against a selected peer.
@@ -378,31 +365,16 @@ impl Topology {
             }
         };
 
-        let stores = SyncStores {
-            peers: self.stores.peers.clone(),
-            workloads: self.stores.workloads.clone(),
-            jobs: self.stores.jobs.clone(),
-            agents: self.stores.agents.clone(),
-            services: self.stores.services.clone(),
-            secrets: self.stores.secrets.clone(),
-            networks: self.stores.networks.clone(),
-            network_peers: self.stores.network_peers.clone(),
-            network_attachments: self.stores.network_attachments.clone(),
-            cluster_views: self.stores.cluster_view_store.cluster_view_domain_store(),
-            volumes: self.stores.volumes.clone(),
-            volume_nodes: self.stores.volume_nodes.clone(),
-            scheduler_digests: self.stores.scheduler_digests.clone(),
-        };
-
         let trace = SyncTraceContext::peer(peer_id, value.address.clone(), "periodic-task-repair");
-        sync_selected_domains(
-            stores,
-            sync_cap,
-            cluster_view,
-            &WORKLOAD_REPAIR_SYNC_DOMAINS,
-            Some(trace),
-        )
-        .await;
+        self.deps
+            .sync
+            .sync_selected_domains(
+                sync_cap,
+                cluster_view,
+                &WORKLOAD_REPAIR_SYNC_DOMAINS,
+                Some(trace),
+            )
+            .await;
     }
 
     /// Runs one unscoped metadata anti-entropy exchange against a peer.
@@ -433,32 +405,17 @@ impl Topology {
             }
         };
 
-        let stores = SyncStores {
-            peers: self.stores.peers.clone(),
-            workloads: self.stores.workloads.clone(),
-            jobs: self.stores.jobs.clone(),
-            agents: self.stores.agents.clone(),
-            services: self.stores.services.clone(),
-            secrets: self.stores.secrets.clone(),
-            networks: self.stores.networks.clone(),
-            network_peers: self.stores.network_peers.clone(),
-            network_attachments: self.stores.network_attachments.clone(),
-            cluster_views: self.stores.cluster_view_store.cluster_view_domain_store(),
-            volumes: self.stores.volumes.clone(),
-            volume_nodes: self.stores.volume_nodes.clone(),
-            scheduler_digests: self.stores.scheduler_digests.clone(),
-        };
-
         let trace =
             SyncTraceContext::peer(peer_id, value.address.clone(), "periodic-global-metadata");
-        sync_selected_domains(
-            stores,
-            sync_cap,
-            peer_view,
-            &GLOBAL_METADATA_SYNC_DOMAINS,
-            Some(trace),
-        )
-        .await;
+        self.deps
+            .sync
+            .sync_selected_domains(
+                sync_cap,
+                peer_view,
+                &GLOBAL_METADATA_SYNC_DOMAINS,
+                Some(trace),
+            )
+            .await;
     }
 
     /// Run one cross-view metadata sync tick.

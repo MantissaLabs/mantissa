@@ -30,6 +30,8 @@ use tracing::{debug, trace};
 pub mod delta;
 pub mod ranges;
 
+pub use delta::{SyncRunner, SyncTraceContext};
+
 type EncodedRegister = (Vec<u8>, Vec<u8>);
 type EncodedRegisters = Vec<EncodedRegister>;
 type EncodedTombstone = (Vec<u8>, u64);
@@ -89,19 +91,7 @@ fn delta_chunk_target_bytes() -> usize {
 /// Cap'n Proto server that exposes all replicated stores through one sync interface.
 pub struct SyncService {
     cluster_view: ClusterViewState,
-    peers: PeersStore,
-    workloads: WorkloadStore,
-    jobs: JobStore,
-    agents: AgentStore,
-    services: ServiceStore,
-    secrets: SecretStore,
-    networks: NetworkSpecStore,
-    network_peers: NetworkPeerStore,
-    network_attachments: NetworkAttachmentStore,
-    cluster_views: ClusterViewDomainStore,
-    volumes: VolumeSpecStore,
-    volume_nodes: VolumeNodeStore,
-    scheduler_digests: SchedulerDigestStore,
+    stores: SyncStores,
 }
 
 #[derive(Clone)]
@@ -128,36 +118,9 @@ pub struct SyncStores {
 impl SyncService {
     /// Builds a sync service bound to the provided cluster view state and domain stores.
     pub fn new(cluster_view: ClusterViewState, stores: SyncStores) -> Self {
-        let SyncStores {
-            peers,
-            workloads,
-            jobs,
-            agents,
-            services,
-            secrets,
-            networks,
-            network_peers,
-            network_attachments,
-            cluster_views,
-            volumes,
-            volume_nodes,
-            scheduler_digests,
-        } = stores;
         Self {
             cluster_view,
-            peers,
-            workloads,
-            jobs,
-            agents,
-            services,
-            secrets,
-            networks,
-            network_peers,
-            network_attachments,
-            cluster_views,
-            volumes,
-            volume_nodes,
-            scheduler_digests,
+            stores,
         }
     }
 
@@ -175,21 +138,23 @@ impl SyncService {
     /// Resolves a sync domain to its backing replicated store handle.
     fn domain_store(&self, domain: Domain) -> DomainStoreRef<'_> {
         match domain {
-            Domain::Peers => DomainStoreRef::Peers(&self.peers),
-            Domain::Workloads => DomainStoreRef::Workloads(&self.workloads),
-            Domain::Services => DomainStoreRef::Services(&self.services),
-            Domain::Jobs => DomainStoreRef::Jobs(&self.jobs),
-            Domain::Agents => DomainStoreRef::Agents(&self.agents),
-            Domain::Secrets => DomainStoreRef::Secrets(&self.secrets),
-            Domain::Networks => DomainStoreRef::Networks(&self.networks),
-            Domain::NetworkPeers => DomainStoreRef::NetworkPeers(&self.network_peers),
+            Domain::Peers => DomainStoreRef::Peers(&self.stores.peers),
+            Domain::Workloads => DomainStoreRef::Workloads(&self.stores.workloads),
+            Domain::Services => DomainStoreRef::Services(&self.stores.services),
+            Domain::Jobs => DomainStoreRef::Jobs(&self.stores.jobs),
+            Domain::Agents => DomainStoreRef::Agents(&self.stores.agents),
+            Domain::Secrets => DomainStoreRef::Secrets(&self.stores.secrets),
+            Domain::Networks => DomainStoreRef::Networks(&self.stores.networks),
+            Domain::NetworkPeers => DomainStoreRef::NetworkPeers(&self.stores.network_peers),
             Domain::NetworkAttachments => {
-                DomainStoreRef::NetworkAttachments(&self.network_attachments)
+                DomainStoreRef::NetworkAttachments(&self.stores.network_attachments)
             }
-            Domain::ClusterViews => DomainStoreRef::ClusterViews(&self.cluster_views),
-            Domain::Volumes => DomainStoreRef::Volumes(&self.volumes),
-            Domain::VolumeNodes => DomainStoreRef::VolumeNodes(&self.volume_nodes),
-            Domain::SchedulerDigests => DomainStoreRef::SchedulerDigests(&self.scheduler_digests),
+            Domain::ClusterViews => DomainStoreRef::ClusterViews(&self.stores.cluster_views),
+            Domain::Volumes => DomainStoreRef::Volumes(&self.stores.volumes),
+            Domain::VolumeNodes => DomainStoreRef::VolumeNodes(&self.stores.volume_nodes),
+            Domain::SchedulerDigests => {
+                DomainStoreRef::SchedulerDigests(&self.stores.scheduler_digests)
+            }
         }
     }
 }

@@ -22,7 +22,7 @@ use crate::scheduler::service::SchedulerService;
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
-use crate::sync::{SyncService, SyncStores};
+use crate::sync::{SyncRunner, SyncService, SyncStores};
 use crate::task::service::TaskService;
 use crate::topology::{Keys, Topology, TopologyConfig, TopologyStorage};
 use crate::volumes::{VolumeController, VolumeRegistry, VolumeReplicator, VolumesRpc};
@@ -254,6 +254,7 @@ struct TopologyBuildInputs<'a> {
     topology_rx: Receiver<Message>,
     gossip_tx: Sender<Message>,
     topology_stores: TopologyStorage,
+    sync: SyncRunner,
     registry: Registry,
     scheduler: Rc<Scheduler>,
     health_monitor: Arc<health::HealthMonitor>,
@@ -367,6 +368,8 @@ async fn build_runtime_components(
     let runtime_health = config::health_runtime_config();
     let health_monitor = health::HealthMonitor::new(ctx.self_id);
     let topology_stores = build_topology_stores(stores);
+    let sync_stores = build_sync_stores(stores);
+    let sync_runner = SyncRunner::new(sync_stores.clone());
     let registry = build_registry(ctx, stores, health_monitor.clone());
     let scheduler = build_scheduler(ctx, stores, registry.clone()).await?;
     let runtime_set = build_runtime_set(options).await?;
@@ -377,6 +380,7 @@ async fn build_runtime_components(
         topology_rx,
         gossip_tx: gossip_tx.clone(),
         topology_stores: topology_stores.clone(),
+        sync: sync_runner.clone(),
         registry: registry.clone(),
         scheduler: scheduler.clone(),
         health_monitor: health_monitor.clone(),
@@ -385,7 +389,7 @@ async fn build_runtime_components(
     })?;
     hydrate_topology(&topology).await?;
     let topology_client = capnp_rpc::new_client(topology.clone());
-    let sync_client = build_sync_client(cluster_view, stores, &topology_stores);
+    let sync_client = build_sync_client(cluster_view, sync_stores);
 
     let local_node_name = resolve_local_node_name(ctx);
     let secret_registry = crate::secrets::registry::SecretRegistry::new(stores.secrets.clone());
@@ -592,6 +596,23 @@ fn build_topology_stores(stores: &BootstrapStores) -> TopologyStorage {
         token_store: stores.token_store.clone(),
         secret_master_store: stores.secret_master_store.clone(),
         workloads: stores.workloads.clone(),
+        services: stores.services.clone(),
+        network_peers: stores.network_peers.clone(),
+        network_attachments: stores.network_attachments.clone(),
+        volumes: stores.volumes.clone(),
+        volume_nodes: stores.volume_nodes.clone(),
+        secret_keyring: stores.secret_keyring.clone(),
+    }
+}
+
+/// Builds the replicated store bundle owned by the sync subsystem.
+///
+/// Sync serves and reconciles every replicated domain, so bootstrap assembles
+/// that store set once and hands it to the sync server and client-side runner.
+fn build_sync_stores(stores: &BootstrapStores) -> SyncStores {
+    SyncStores {
+        peers: stores.peers.clone(),
+        workloads: stores.workloads.clone(),
         jobs: stores.jobs.clone(),
         agents: stores.agents.clone(),
         services: stores.services.clone(),
@@ -599,10 +620,10 @@ fn build_topology_stores(stores: &BootstrapStores) -> TopologyStorage {
         networks: stores.networks.clone(),
         network_peers: stores.network_peers.clone(),
         network_attachments: stores.network_attachments.clone(),
+        cluster_views: stores.cluster_view.cluster_view_domain_store(),
         volumes: stores.volumes.clone(),
         volume_nodes: stores.volume_nodes.clone(),
         scheduler_digests: stores.scheduler_digests.clone(),
-        secret_keyring: stores.secret_keyring.clone(),
     }
 }
 
@@ -691,6 +712,7 @@ fn build_topology(inputs: TopologyBuildInputs<'_>) -> BootstrapResult<Topology> 
         crypto: keys,
         registry: inputs.registry,
         scheduler: inputs.scheduler,
+        sync: inputs.sync,
         health_monitor: inputs.health_monitor,
         runtime_health: inputs.runtime_health,
         runtime_support: inputs.runtime_support,
@@ -754,27 +776,9 @@ async fn hydrate_topology(topology: &Topology) -> BootstrapResult<()> {
 /// assembled once the stores and active cluster view are known.
 fn build_sync_client(
     cluster_view: ClusterViewState,
-    stores: &BootstrapStores,
-    topology_stores: &TopologyStorage,
+    stores: SyncStores,
 ) -> protocol::sync::sync::Client {
-    let sync_service = SyncService::new(
-        cluster_view,
-        SyncStores {
-            peers: topology_stores.peers.clone(),
-            workloads: stores.workloads.clone(),
-            jobs: stores.jobs.clone(),
-            agents: stores.agents.clone(),
-            services: stores.services.clone(),
-            secrets: stores.secrets.clone(),
-            networks: stores.networks.clone(),
-            network_peers: stores.network_peers.clone(),
-            network_attachments: stores.network_attachments.clone(),
-            cluster_views: stores.cluster_view.cluster_view_domain_store(),
-            volumes: stores.volumes.clone(),
-            volume_nodes: stores.volume_nodes.clone(),
-            scheduler_digests: stores.scheduler_digests.clone(),
-        },
-    );
+    let sync_service = SyncService::new(cluster_view, stores);
     capnp_rpc::new_client(sync_service)
 }
 

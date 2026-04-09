@@ -9,7 +9,7 @@ use crate::registry::Registry;
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::scheduler::Scheduler;
 use crate::store::cluster_view_store::ClusterNameRecord;
-use crate::sync::delta::{SyncStores, SyncTraceContext, sync_all_domains, sync_selected_domains};
+use crate::sync::{SyncRunner, SyncTraceContext};
 use crate::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue};
 use ::health::HealthMonitor;
 use async_channel::{Receiver, Sender};
@@ -140,6 +140,7 @@ pub struct TopologyConfig {
     pub crypto: Keys,
     pub registry: Registry,
     pub scheduler: Rc<Scheduler>,
+    pub sync: SyncRunner,
     pub health_monitor: Arc<HealthMonitor>,
     pub runtime_health: config::RuntimeHealthConfig,
     pub runtime_support: RuntimeSupportProfile,
@@ -157,6 +158,7 @@ impl Topology {
             crypto,
             registry,
             scheduler,
+            sync,
             health_monitor,
             runtime_health,
             runtime_support,
@@ -195,6 +197,7 @@ impl Topology {
             deps: TopologyDependencies {
                 registry,
                 scheduler,
+                sync,
                 health_monitor,
                 runtime_health,
             },
