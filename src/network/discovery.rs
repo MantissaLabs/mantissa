@@ -37,6 +37,19 @@ const SERVICE_TTL_SECS: u32 = 5;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 // Keep cached health around for roughly one DNS TTL to avoid stale blackholes.
 const HEALTH_CACHE_STALE_AFTER: Duration = Duration::from_secs(SERVICE_TTL_SECS as u64);
+/// Bound how many active readiness probes one node performs per service on one refresh tick.
+///
+/// Discovery already filters hard failures through node health, running-task state, and published
+/// attachment state. Readiness probing remains useful for "alive but should not receive traffic"
+/// cases, but sampling a small subset per refresh keeps the steady-state cost proportional to
+/// service churn rather than cluster size.
+const MAX_READINESS_PROBES_PER_REFRESH: usize = 2;
+/// Slow down steady-state rechecks for backends that are already known healthy.
+///
+/// Once a backend is admitted into discovery, local liveness and peer health cover the common hard
+/// failure cases. Discovery readiness only needs to spot softer "temporarily not ready" conditions,
+/// so healthy endpoints are spot-checked on a much slower cadence.
+const HEALTHY_READINESS_RECHECK_FLOOR: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct ServiceDiscovery {
@@ -1075,6 +1088,13 @@ struct HealthEntry {
     consecutive_failures: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ProbePriority {
+    Unknown = 0,
+    Unhealthy = 1,
+    Healthy = 2,
+}
+
 /// Computes the next cached backend readiness state after one active probe attempt.
 fn next_health_entry(
     previous: Option<HealthEntry>,
@@ -1108,6 +1128,81 @@ fn next_health_entry(
         checked_at,
         consecutive_failures: failures,
     }
+}
+
+/// Returns how long discovery should trust the cached readiness state before actively probing again.
+///
+/// Healthy backends are rechecked much more slowly than unknown or unhealthy ones so steady-state
+/// clusters do not keep probing every replica on every node.
+fn readiness_recheck_after(entry: Option<HealthEntry>, probe: &ServiceReadinessProbe) -> Duration {
+    match entry
+        .map(|value| value.state)
+        .unwrap_or(HealthState::Unknown)
+    {
+        HealthState::Healthy => probe.interval().max(HEALTHY_READINESS_RECHECK_FLOOR),
+        HealthState::Unknown | HealthState::Unhealthy => probe.interval(),
+    }
+}
+
+/// Classifies which stale backends discovery should actively probe first on one refresh cycle.
+///
+/// Unknown and unhealthy backends are checked ahead of healthy ones so discovery converges quickly
+/// on new or recovering replicas while steady-state healthy replicas are only spot-checked.
+fn probe_priority(entry: Option<HealthEntry>) -> ProbePriority {
+    match entry
+        .map(|value| value.state)
+        .unwrap_or(HealthState::Unknown)
+    {
+        HealthState::Unknown => ProbePriority::Unknown,
+        HealthState::Unhealthy => ProbePriority::Unhealthy,
+        HealthState::Healthy => ProbePriority::Healthy,
+    }
+}
+
+/// Selects the bounded subset of backends that should receive active readiness probes on this tick.
+///
+/// The selection prefers stale unknown and unhealthy backends, then rotates through stale healthy
+/// backends by oldest observation first. This keeps readiness traffic bounded without pinning the
+/// same healthy replicas forever.
+fn select_backends_for_active_probe(
+    health: &BackendHealth,
+    network_id: Uuid,
+    service_name: &str,
+    backends: &[BackendAddress],
+    probe: &ServiceReadinessProbe,
+) -> Vec<BackendAddress> {
+    let now = Instant::now();
+    let mut candidates = Vec::new();
+    for backend in backends {
+        let entry = health.get_entry(network_id, service_name, backend.ip);
+        let recheck_after = readiness_recheck_after(entry, probe);
+        let checked_at = entry.map(|value| value.checked_at);
+        let is_stale = checked_at
+            .map(|instant| now.saturating_duration_since(instant) >= recheck_after)
+            .unwrap_or(true);
+        if !is_stale {
+            continue;
+        }
+
+        candidates.push((
+            probe_priority(entry),
+            checked_at,
+            backend.ip,
+            backend.clone(),
+        ));
+    }
+
+    candidates.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    candidates
+        .into_iter()
+        .take(MAX_READINESS_PROBES_PER_REFRESH)
+        .map(|(_, _, _, backend)| backend)
+        .collect()
 }
 
 /// Filter candidate backends using cached health without performing probes.
@@ -1186,7 +1281,8 @@ fn normalize_backend_selection(
     selected
 }
 
-/// Actively probe candidate backends so the cached health state and dataplane MACs stay fresh.
+/// Actively probe a bounded subset of candidate backends so cached readiness and dataplane MACs
+/// stay fresh without turning steady-state discovery into a full cluster-wide sweep.
 async fn evaluate_backend_health(
     health: &Arc<AsyncMutex<BackendHealth>>,
     registry: &NetworkRegistry,
@@ -1199,35 +1295,19 @@ async fn evaluate_backend_health(
     // all backends derived from ready attachments.
     let Some(probe) = probe else { return backends };
 
-    let mut healthy = Vec::with_capacity(backends.len());
-    for backend in backends {
+    let mut refreshed_macs = HashMap::new();
+    let active_probes = {
+        let guard = health.lock().await;
+        select_backends_for_active_probe(&guard, network_id, service_name, &backends, &probe)
+    };
+    for backend in active_probes {
         let entry = {
             let guard = health.lock().await;
             guard.get_entry(network_id, service_name, backend.ip)
         };
-        let now = Instant::now();
-        let state = entry
+        let previous_state = entry
             .map(|value| value.state)
             .unwrap_or(HealthState::Unknown);
-        let checked_at = entry.map(|value| value.checked_at).unwrap_or(now);
-        let recheck_after = entry
-            .map(|_| probe.interval())
-            .unwrap_or(Duration::from_secs(0));
-        let is_stale = now.saturating_duration_since(checked_at) >= recheck_after;
-
-        // Respect cached readiness until the configured recheck interval expires.
-        if matches!(state, HealthState::Healthy) && !is_stale {
-            healthy.push(backend);
-            continue;
-        }
-        if matches!(state, HealthState::Unhealthy) && !is_stale {
-            continue;
-        }
-        if matches!(state, HealthState::Unknown) && !is_stale {
-            continue;
-        }
-
-        let mut backend = backend;
         let probe_ok = probe_backend(&backend.ip, &probe).await;
         let refreshed_mac = if probe_ok {
             refresh_backend_mac(registry, network_id, backend.ip).await
@@ -1237,27 +1317,35 @@ async fn evaluate_backend_health(
         let next_entry = next_health_entry(entry, &probe, probe_ok);
         let mut guard = health.lock().await;
         guard.set_entry(network_id, service_name, backend.ip, next_entry);
-        if matches!(next_entry.state, HealthState::Healthy) {
-            if let Some(mac) = refreshed_mac {
-                backend.mac = mac;
-            }
-            healthy.push(backend);
-        } else {
+        if !matches!(next_entry.state, HealthState::Healthy) {
             tracing::debug!(
                 target: "network",
                 network = %network_id,
                 service = %service_name,
                 backend = %backend.ip,
-                state = ?state,
-                stale = is_stale,
+                state = ?previous_state,
                 failures = next_entry.consecutive_failures,
                 threshold = probe.failure_threshold(),
                 "backend failed readiness probe"
             );
         }
+
+        if let Some(mac) = refreshed_mac {
+            refreshed_macs.insert(backend.ip, mac);
+        }
     }
 
-    healthy
+    let backends = backends
+        .into_iter()
+        .map(|mut backend| {
+            if let Some(mac) = refreshed_macs.get(&backend.ip) {
+                backend.mac = *mac;
+            }
+            backend
+        })
+        .collect();
+    let guard = health.lock().await;
+    filter_cached_backends(&guard, network_id, service_name, backends)
 }
 
 /// Refresh the MAC address stored for a backend by querying kernel neighbour tables and persisting
@@ -2035,6 +2123,162 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].ip, unhealthy_ip);
+    }
+
+    #[test]
+    fn readiness_recheck_after_slows_healthy_backends() {
+        let probe = ServiceReadinessProbe {
+            kind: ServiceReadinessProbeKind::Http,
+            port: 8_000,
+            path: Some("/healthz".to_string()),
+            interval_ms: 2_000,
+            timeout_ms: 300,
+            failure_threshold: 1,
+        };
+        let healthy = Some(HealthEntry {
+            state: HealthState::Healthy,
+            checked_at: Instant::now(),
+            consecutive_failures: 0,
+        });
+        let unhealthy = Some(HealthEntry {
+            state: HealthState::Unhealthy,
+            checked_at: Instant::now(),
+            consecutive_failures: 1,
+        });
+
+        assert_eq!(
+            readiness_recheck_after(healthy, &probe),
+            HEALTHY_READINESS_RECHECK_FLOOR
+        );
+        assert_eq!(readiness_recheck_after(unhealthy, &probe), probe.interval());
+        assert_eq!(readiness_recheck_after(None, &probe), probe.interval());
+    }
+
+    #[test]
+    fn select_backends_for_active_probe_prioritizes_unknown_and_unhealthy() {
+        let network_id = Uuid::new_v4();
+        let service = "backend";
+        let probe = ServiceReadinessProbe {
+            kind: ServiceReadinessProbeKind::Http,
+            port: 8_000,
+            path: Some("/healthz".to_string()),
+            interval_ms: 2_000,
+            timeout_ms: 300,
+            failure_threshold: 1,
+        };
+        let mut health = BackendHealth::default();
+        let key = (network_id, service.to_string());
+        health.statuses.entry(key).or_default().insert(
+            Ipv4Addr::new(10, 42, 1, 11),
+            HealthEntry {
+                state: HealthState::Healthy,
+                checked_at: Instant::now()
+                    - HEALTHY_READINESS_RECHECK_FLOOR
+                    - Duration::from_secs(5),
+                consecutive_failures: 0,
+            },
+        );
+        health
+            .statuses
+            .get_mut(&(network_id, service.to_string()))
+            .expect("service health entry")
+            .insert(
+                Ipv4Addr::new(10, 42, 1, 12),
+                HealthEntry {
+                    state: HealthState::Unhealthy,
+                    checked_at: Instant::now() - probe.interval() - Duration::from_millis(1),
+                    consecutive_failures: 1,
+                },
+            );
+
+        let selected = select_backends_for_active_probe(
+            &health,
+            network_id,
+            service,
+            &[
+                backend([10, 42, 1, 10], [0x02, 0, 0, 0, 0, 1]),
+                backend([10, 42, 1, 11], [0x02, 0, 0, 0, 0, 2]),
+                backend([10, 42, 1, 12], [0x02, 0, 0, 0, 0, 3]),
+            ],
+            &probe,
+        );
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].ip, Ipv4Addr::new(10, 42, 1, 10));
+        assert_eq!(selected[1].ip, Ipv4Addr::new(10, 42, 1, 12));
+    }
+
+    #[test]
+    fn select_backends_for_active_probe_rotates_oldest_healthy_entries() {
+        let network_id = Uuid::new_v4();
+        let service = "backend";
+        let probe = ServiceReadinessProbe {
+            kind: ServiceReadinessProbeKind::Http,
+            port: 8_000,
+            path: Some("/healthz".to_string()),
+            interval_ms: 2_000,
+            timeout_ms: 300,
+            failure_threshold: 1,
+        };
+        let mut health = BackendHealth::default();
+        let key = (network_id, service.to_string());
+        let mut entries = HashMap::new();
+        entries.insert(
+            Ipv4Addr::new(10, 42, 1, 10),
+            HealthEntry {
+                state: HealthState::Healthy,
+                checked_at: Instant::now()
+                    - HEALTHY_READINESS_RECHECK_FLOOR
+                    - Duration::from_secs(30),
+                consecutive_failures: 0,
+            },
+        );
+        entries.insert(
+            Ipv4Addr::new(10, 42, 1, 11),
+            HealthEntry {
+                state: HealthState::Healthy,
+                checked_at: Instant::now()
+                    - HEALTHY_READINESS_RECHECK_FLOOR
+                    - Duration::from_secs(20),
+                consecutive_failures: 0,
+            },
+        );
+        entries.insert(
+            Ipv4Addr::new(10, 42, 1, 12),
+            HealthEntry {
+                state: HealthState::Healthy,
+                checked_at: Instant::now()
+                    - HEALTHY_READINESS_RECHECK_FLOOR
+                    - Duration::from_secs(10),
+                consecutive_failures: 0,
+            },
+        );
+        entries.insert(
+            Ipv4Addr::new(10, 42, 1, 13),
+            HealthEntry {
+                state: HealthState::Healthy,
+                checked_at: Instant::now(),
+                consecutive_failures: 0,
+            },
+        );
+        health.statuses.insert(key, entries);
+
+        let selected = select_backends_for_active_probe(
+            &health,
+            network_id,
+            service,
+            &[
+                backend([10, 42, 1, 10], [0x02, 0, 0, 0, 0, 1]),
+                backend([10, 42, 1, 11], [0x02, 0, 0, 0, 0, 2]),
+                backend([10, 42, 1, 12], [0x02, 0, 0, 0, 0, 3]),
+                backend([10, 42, 1, 13], [0x02, 0, 0, 0, 0, 4]),
+            ],
+            &probe,
+        );
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].ip, Ipv4Addr::new(10, 42, 1, 10));
+        assert_eq!(selected[1].ip, Ipv4Addr::new(10, 42, 1, 11));
     }
 
     struct CatalogHarness {
