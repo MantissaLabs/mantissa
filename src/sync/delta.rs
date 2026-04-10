@@ -17,6 +17,7 @@ use merkle_search_tree::digest::Hasher as MstHasher;
 use protocol::sync::{self, Domain, delta_chunk, delta_sink};
 use std::rc::Rc;
 use std::sync::Arc;
+use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 type RegisterDelta<V> = Vec<(UuidKey, MVReg<V, uuid::Uuid>)>;
@@ -48,12 +49,16 @@ impl SyncTraceContext {
 /// every time it opens a delta exchange against a remote peer.
 pub struct SyncRunner {
     stores: SyncStores,
+    attachment_sync_notify: Option<Arc<Notify>>,
 }
 
 impl SyncRunner {
     /// Builds one anti-entropy runner over the provided local replicated stores.
-    pub fn new(stores: SyncStores) -> Self {
-        Self { stores }
+    pub fn new(stores: SyncStores, attachment_sync_notify: Option<Arc<Notify>>) -> Self {
+        Self {
+            stores,
+            attachment_sync_notify,
+        }
     }
 
     /// Runs anti-entropy for every replicated domain against one peer.
@@ -78,8 +83,15 @@ impl SyncRunner {
         domains: &[Domain],
         trace: Option<SyncTraceContext>,
     ) {
-        sync_selected_domains_with_stores(&self.stores, sync_cap, cluster_view, domains, trace)
-            .await;
+        sync_selected_domains_with_stores(
+            &self.stores,
+            sync_cap,
+            cluster_view,
+            domains,
+            trace,
+            self.attachment_sync_notify.clone(),
+        )
+        .await;
     }
 }
 
@@ -290,6 +302,7 @@ async fn sync_selected_domains_with_stores(
     cluster_view: ClusterViewId,
     domains: &[Domain],
     trace: Option<SyncTraceContext>,
+    attachment_sync_notify: Option<Arc<Notify>>,
 ) {
     if domains.is_empty() {
         return;
@@ -404,6 +417,14 @@ async fn sync_selected_domains_with_stores(
             "opening selective delta stream"
         );
         od.send().promise.await?;
+        if should_notify_network_attachment_sync(&domains_wants)
+            && let Some(notify) = attachment_sync_notify.as_ref()
+        {
+            // Remote nodes otherwise only notice replicated attachment changes on the slow
+            // attachment-refresh poll. Wake the network controller immediately so forwarding
+            // catches up as soon as anti-entropy applies the attachment delta locally.
+            notify.notify_one();
+        }
         Ok(())
     }
     .await;
@@ -436,6 +457,16 @@ fn is_disconnected_capnp(error: &capnp::Error) -> bool {
     text.contains("Disconnected") || text.contains("disconnected")
 }
 
+/// Returns true when a completed delta stream included replicated attachment changes.
+///
+/// Attachment deltas require a follow-up forwarding refresh on the receiving node so the local
+/// VXLAN FDB catches up before clients try to send traffic to newly replicated remote backends.
+fn should_notify_network_attachment_sync(domains_wants: &[(Domain, Vec<PageDigestRange>)]) -> bool {
+    domains_wants
+        .iter()
+        .any(|(domain, _)| *domain == Domain::NetworkAttachments)
+}
+
 /// Decodes one fixed-width XXHash128 root digest from the sync wire format.
 fn read_root_digest(bytes: &[u8]) -> Result<[u8; 16], capnp::Error> {
     bytes.try_into().map_err(|_| {
@@ -444,4 +475,30 @@ fn read_root_digest(bytes: &[u8]) -> Result<[u8; 16], capnp::Error> {
             bytes.len()
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_notify_network_attachment_sync;
+    use crdt_store::PageDigestRange;
+    use protocol::sync::Domain;
+
+    /// Attachment deltas should wake the network controller on the receiving node immediately.
+    #[test]
+    fn attachment_domain_requests_forwarding_refresh_notification() {
+        let wants = vec![(Domain::NetworkAttachments, Vec::<PageDigestRange>::new())];
+
+        assert!(should_notify_network_attachment_sync(&wants));
+    }
+
+    /// Non-attachment deltas must not trigger unnecessary forwarding refresh work.
+    #[test]
+    fn non_attachment_domains_skip_forwarding_refresh_notification() {
+        let wants = vec![
+            (Domain::Workloads, Vec::<PageDigestRange>::new()),
+            (Domain::Services, Vec::<PageDigestRange>::new()),
+        ];
+
+        assert!(!should_notify_network_attachment_sync(&wants));
+    }
 }

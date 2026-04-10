@@ -20,6 +20,7 @@ use async_channel::Sender;
 use aya::{programs::ProgramError, sys::SyscallError};
 use blake3::Hasher;
 use std::collections::{HashMap, HashSet};
+use std::future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc::UnboundedReceiver};
@@ -60,6 +61,7 @@ struct NetworkControllerInner {
     wireguard: AsyncMutex<WireGuardUnderlayState>,
     wireguard_last_reconcile: AsyncMutex<Option<std::time::Instant>>,
     attachments_root: AsyncMutex<Option<String>>,
+    attachment_sync_notify: Option<Arc<Notify>>,
     wake: Notify,
     gossip_tx: Sender<Message>,
 }
@@ -110,6 +112,7 @@ impl NetworkController {
         node_name: String,
         gossip_tx: Sender<Message>,
         forwarding_events: Option<UnboundedReceiver<ForwardingEvent>>,
+        attachment_sync_notify: Option<Arc<Notify>>,
     ) -> Result<Self> {
         let provisioner = platform::NetworkProvisioner::new()?;
         let attachment = PlatformAttachmentProvisioner::new().unwrap_or_else(|err| {
@@ -149,6 +152,7 @@ impl NetworkController {
                 wireguard: AsyncMutex::new(WireGuardUnderlayState::default()),
                 wireguard_last_reconcile: AsyncMutex::new(None),
                 attachments_root: AsyncMutex::new(None),
+                attachment_sync_notify,
                 wake: Notify::new(),
                 gossip_tx,
             }),
@@ -405,6 +409,24 @@ impl NetworkController {
                         warn!(
                             target: "network",
                             "attachment forwarding refresh failed: {err:#}"
+                        );
+                    }
+                }
+                _ = async {
+                    if let Some(notify) = self.inner.attachment_sync_notify.as_ref() {
+                        notify.notified().await;
+                    } else {
+                        future::pending::<()>().await;
+                    }
+                } => {
+                    // Anti-entropy can apply remote attachment rows long before the periodic
+                    // attachment refresh would notice them. Refresh forwarding immediately so
+                    // first traffic to those newly replicated backends does not wait on the
+                    // slow poll cadence.
+                    if let Err(err) = self.refresh_forwarding_from_attachments().await {
+                        warn!(
+                            target: "network",
+                            "attachment forwarding refresh after sync failed: {err:#}"
                         );
                     }
                 }

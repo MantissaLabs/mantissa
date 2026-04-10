@@ -45,7 +45,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tracing::{error, info};
 
 /// Overrides applied to the shared bootstrap pipeline.
@@ -366,7 +366,8 @@ async fn build_runtime_components(
     let health_monitor = health::HealthMonitor::new(ctx.self_id);
     let topology_stores = build_topology_stores(stores);
     let sync_stores = build_sync_stores(stores);
-    let sync_runner = SyncRunner::new(sync_stores.clone());
+    let attachment_sync_notify = Arc::new(Notify::new());
+    let sync_runner = SyncRunner::new(sync_stores.clone(), Some(attachment_sync_notify.clone()));
     let network_registry = NetworkRegistry::new(
         stores.networks.clone(),
         stores.network_peers.clone(),
@@ -434,6 +435,7 @@ async fn build_runtime_components(
         local_node_name.clone(),
         gossip_tx.clone(),
         Some(forwarding_rx),
+        Some(attachment_sync_notify),
     )
     .map_err(|error| -> Box<dyn std::error::Error> {
         Box::new(std::io::Error::other(error.to_string()))
