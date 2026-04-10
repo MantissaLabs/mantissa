@@ -1,6 +1,7 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use uuid::Uuid;
 
 /// Supported overlay driver for network provisioning.
@@ -462,7 +463,7 @@ impl NetworkAttachmentState {
 }
 
 /// Attachment intent/state replicated for workloads connected to overlay networks.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NetworkAttachmentValue {
     pub id: Uuid,
     pub task_id: Uuid,
@@ -488,6 +489,84 @@ pub struct NetworkAttachmentValue {
     pub service_name: Option<String>,
     #[serde(default)]
     pub template_name: Option<String>,
+}
+
+impl NetworkAttachmentValue {
+    /// Returns true when two attachment values carry the same replicated attachment state.
+    ///
+    /// Attachment `created_at` and `updated_at` timestamps are observability metadata. They must
+    /// not participate in CRDT identity because independent partitions can legitimately rebuild the
+    /// same attachment row with different local timestamps, and those timestamp-only variants would
+    /// otherwise keep the attachment MVReg and MST root divergent forever after merge.
+    fn semantically_equals(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.task_id == other.task_id
+            && self.node_id == other.node_id
+            && self.instance_id == other.instance_id
+            && self.network_id == other.network_id
+            && self.task_updated_at == other.task_updated_at
+            && self.requested_ip == other.requested_ip
+            && self.assigned_ip == other.assigned_ip
+            && self.mac == other.mac
+            && self.state == other.state
+            && self.error == other.error
+            && self.traffic_published == other.traffic_published
+            && self.service_name == other.service_name
+            && self.template_name == other.template_name
+    }
+}
+
+impl PartialEq for NetworkAttachmentValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.semantically_equals(other)
+    }
+}
+
+impl Eq for NetworkAttachmentValue {}
+
+impl PartialOrd for NetworkAttachmentValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NetworkAttachmentValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.id
+            .cmp(&other.id)
+            .then(self.task_id.cmp(&other.task_id))
+            .then(self.node_id.cmp(&other.node_id))
+            .then(self.instance_id.cmp(&other.instance_id))
+            .then(self.network_id.cmp(&other.network_id))
+            .then(self.task_updated_at.cmp(&other.task_updated_at))
+            .then(self.requested_ip.cmp(&other.requested_ip))
+            .then(self.assigned_ip.cmp(&other.assigned_ip))
+            .then(self.mac.cmp(&other.mac))
+            .then(self.state.cmp(&other.state))
+            .then(self.error.cmp(&other.error))
+            .then(self.traffic_published.cmp(&other.traffic_published))
+            .then(self.service_name.cmp(&other.service_name))
+            .then(self.template_name.cmp(&other.template_name))
+    }
+}
+
+impl Hash for NetworkAttachmentValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.task_id.hash(state);
+        self.node_id.hash(state);
+        self.instance_id.hash(state);
+        self.network_id.hash(state);
+        self.task_updated_at.hash(state);
+        self.requested_ip.hash(state);
+        self.assigned_ip.hash(state);
+        self.mac.hash(state);
+        self.state.hash(state);
+        self.error.hash(state);
+        self.traffic_published.hash(state);
+        self.service_name.hash(state);
+        self.template_name.hash(state);
+    }
 }
 
 /// Parameters captured when creating a new network attachment record.

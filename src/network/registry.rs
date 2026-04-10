@@ -722,6 +722,63 @@ mod tests {
         assert!(chosen.traffic_published);
     }
 
+    /// Attachment MST roots must ignore timestamp-only variants so split/merge anti-entropy can
+    /// converge once the replicated attachment state matches semantically.
+    #[tokio::test]
+    async fn attachment_root_ignores_timestamp_only_variants() {
+        let left = temp_registry();
+        let right = temp_registry();
+        let task_id = Uuid::new_v4();
+        let network_id = Uuid::new_v4();
+        let node_id = Uuid::new_v4();
+        let attachment_id =
+            crate::network::types::compute_network_attachment_id(task_id, network_id);
+
+        let mut first =
+            NetworkAttachmentValue::new(crate::network::types::NetworkAttachmentDraft {
+                id: attachment_id,
+                task_id,
+                node_id,
+                instance_id: "container-a".to_string(),
+                network_id,
+                task_updated_at: Some("2026-04-10T00:00:00Z".to_string()),
+                requested_ip: Some("10.0.0.2".to_string()),
+                assigned_ip: Some("10.0.0.2".to_string()),
+                mac: Some("02:11:22:33:44:55".to_string()),
+                state: crate::network::types::NetworkAttachmentState::Ready,
+                error: None,
+                traffic_published: true,
+                service_name: Some("svc".to_string()),
+                template_name: Some("backend".to_string()),
+            });
+        first.created_at = "2026-04-10T00:00:01Z".to_string();
+        first.updated_at = "2026-04-10T00:00:02Z".to_string();
+
+        let mut second = first.clone();
+        second.created_at = "2026-04-10T00:00:11Z".to_string();
+        second.updated_at = "2026-04-10T00:00:12Z".to_string();
+
+        left.attachments
+            .upsert(&UuidKey::from(attachment_id), first)
+            .await
+            .expect("upsert left attachment");
+        right
+            .attachments
+            .upsert(&UuidKey::from(attachment_id), second)
+            .await
+            .expect("upsert right attachment");
+
+        assert_eq!(
+            left.attachments_root_hex()
+                .await
+                .expect("left attachment root"),
+            right
+                .attachments_root_hex()
+                .await
+                .expect("right attachment root")
+        );
+    }
+
     /// Ensure overlapping Ready networks collapse into one scoped WireGuard peer set.
     #[test]
     fn collects_ready_peers_sharing_local_networks() {
