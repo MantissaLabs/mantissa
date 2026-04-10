@@ -277,7 +277,7 @@ impl NetworkController {
     /// When WireGuard is enabled, a network may not advance to `Ready` until its scoped encrypted
     /// underlay is available. Any failure here is surfaced through per-network error state instead
     /// of silently falling back to plaintext.
-    async fn reconcile_wireguard_underlay(&self) -> Result<()> {
+    async fn reconcile_wireguard_underlay(&self) -> Result<bool> {
         // WireGuard provisioning is expensive (it rewrites interface + routes). The main network
         // reconciliation loop can invoke this helper multiple times per tick (pending specs,
         // pending forwarding, periodic sweep). Debounce here so we only touch kernel WireGuard once
@@ -288,7 +288,7 @@ impl NetworkController {
             if let Some(last) = *guard
                 && now.saturating_duration_since(last) < WIREGUARD_RECONCILE_DEBOUNCE
             {
-                return Ok(());
+                return Ok(false);
             }
             *guard = Some(now);
         }
@@ -313,12 +313,12 @@ impl NetworkController {
         {
             Ok(state) => {
                 let mut guard = self.inner.wireguard.lock().await;
-                if guard.underlay_active != state.underlay_active
+                let changed = guard.underlay_active != state.underlay_active
                     || guard.required_peer_count != state.required_peer_count
                     || guard.tunnel_ip != state.tunnel_ip
                     || guard.ifname != state.ifname
-                    || guard.configured_peer_ids != state.configured_peer_ids
-                {
+                    || guard.configured_peer_ids != state.configured_peer_ids;
+                if changed {
                     debug!(
                         target: "network",
                         underlay_active = state.underlay_active,
@@ -330,7 +330,7 @@ impl NetworkController {
                     );
                 }
                 *guard = state;
-                Ok(())
+                Ok(changed)
             }
             Err(err) => {
                 warn!(
@@ -342,6 +342,31 @@ impl NetworkController {
                 Err(err.context("reconcile mandatory wireguard underlay"))
             }
         }
+    }
+
+    /// Queue every active network for a full reconcile.
+    ///
+    /// WireGuard underlay transitions can change the required VXLAN device shape without any
+    /// accompanying spec update. Scheduling active networks here forces an immediate interface
+    /// rebuild instead of waiting for the slow drift sweep to notice the mismatch.
+    async fn schedule_active_network_reconcile(&self) -> Result<()> {
+        let active = self.active_network_ids()?;
+        if active.is_empty() {
+            return Ok(());
+        }
+
+        let mut pending = self.inner.pending_specs.lock().await;
+        let mut inserted = false;
+        for network_id in active {
+            inserted |= pending.insert(network_id);
+        }
+        drop(pending);
+
+        if inserted {
+            self.inner.wake.notify_one();
+        }
+
+        Ok(())
     }
 
     fn spawn_forwarding_listener(&self) {
@@ -407,7 +432,7 @@ impl NetworkController {
             return Ok(());
         }
 
-        self.reconcile_wireguard_underlay().await?;
+        let _ = self.reconcile_wireguard_underlay().await?;
 
         for network_id in pending {
             let spec_opt = self.inner.registry.get_spec(network_id)?;
@@ -438,7 +463,7 @@ impl NetworkController {
             return Ok(());
         }
 
-        self.reconcile_wireguard_underlay().await?;
+        let _ = self.reconcile_wireguard_underlay().await?;
 
         for network_id in queued {
             match self.inner.registry.get_spec(network_id) {
@@ -490,7 +515,14 @@ impl NetworkController {
         *guard = Some(root);
         drop(guard);
 
-        self.reconcile_wireguard_underlay().await?;
+        if self.reconcile_wireguard_underlay().await? {
+            debug!(
+                target: "network",
+                "wireguard underlay changed during attachment refresh; scheduling full network reconcile"
+            );
+            self.schedule_active_network_reconcile().await?;
+            return Ok(());
+        }
 
         let specs = self
             .inner
@@ -543,7 +575,7 @@ impl NetworkController {
     }
 
     async fn reconcile_once(&self) -> Result<()> {
-        self.reconcile_wireguard_underlay().await?;
+        let _ = self.reconcile_wireguard_underlay().await?;
 
         let specs = self
             .inner
