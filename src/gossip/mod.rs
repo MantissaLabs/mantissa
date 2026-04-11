@@ -21,6 +21,7 @@ use crate::secrets::service::{read_secret_event, write_secret_event};
 use crate::secrets::types::SecretEvent;
 use crate::services::service::{read_service_event, write_service_event};
 use crate::services::types::ServiceEvent;
+use crate::timing::jittered_interval;
 use crate::topology;
 use crate::topology::TopologyEvent;
 use crate::topology::peer_provider::PeerProvider;
@@ -771,6 +772,7 @@ pub(crate) async fn start<C>(
                     // runs on a separate loop, and anti-entropy sync already guarantees
                     // convergence without per-tick heartbeat payloads.
                     buffer = pending;
+                    ticker.reset_after(jittered_interval(tick));
                     continue;
                 }
 
@@ -824,6 +826,7 @@ pub(crate) async fn start<C>(
                     options,
                 )
                 .await;
+                ticker.reset_after(jittered_interval(tick));
                 buffer = Vec::new();
             }
 

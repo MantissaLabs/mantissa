@@ -485,7 +485,7 @@ impl Topology {
     /// Periodically call [`periodic_sync_tick`] every few seconds.
     pub async fn periodic_sync_loop(&self) {
         loop {
-            let d = self.runtime.sync.interval();
+            let d = crate::timing::jittered_interval(self.runtime.sync.interval());
             tokio::time::sleep(d).await;
             self.periodic_sync_tick().await;
         }
@@ -494,7 +494,7 @@ impl Topology {
     /// Periodically call [`periodic_global_metadata_sync_tick`] every few seconds.
     pub async fn periodic_global_metadata_sync_loop(&self) {
         loop {
-            let d = self.runtime.metadata_sync.interval();
+            let d = crate::timing::jittered_interval(self.runtime.metadata_sync.interval());
             tokio::time::sleep(d).await;
             self.periodic_global_metadata_sync_tick().await;
         }

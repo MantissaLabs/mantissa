@@ -20,6 +20,7 @@ use crate::network::types::{
 };
 use crate::network::wireguard;
 use crate::runtime::types::{RuntimeAttachmentTarget, RuntimeEvent, RuntimeInstanceRef};
+use crate::timing::jittered_interval;
 use crate::workload::model::{
     WorkloadEvent, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStatus,
     compare_workload_causality as compare_task_causality,
@@ -295,11 +296,16 @@ impl WorkloadManager {
                     if let Err(err) = self.repair_runtime_attachments().await {
                         warn!(target: "task", "failed to repair runtime attachments: {err:#}");
                     }
+                    repair_tick
+                        .reset_after(jittered_interval(self.runtime.runtime_config.repair_tick));
                 }
                 _ = reconcile_tick.tick() => {
                     if let Err(err) = self.reconcile_local_tasks().await {
                         warn!(target: "task", "failed to reconcile local tasks: {err:#}");
                     }
+                    reconcile_tick.reset_after(jittered_interval(
+                        self.runtime.runtime_config.reconcile_tick,
+                    ));
                 }
                 _ = self.local_state.dirty_gossip_notify.notified() => {
                     gossip_flush_pending = true;
