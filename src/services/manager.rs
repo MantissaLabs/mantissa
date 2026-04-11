@@ -7,9 +7,9 @@ use crate::services::reconcile::{
 };
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
-    ServiceEvent, ServicePreviousGeneration, ServiceRolloutOrder, ServiceRolloutPhase,
-    ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy,
-    TaskTemplateSpecValue, compute_service_id,
+    ServiceEvent, ServicePortProtocol, ServicePreviousGeneration, ServiceRolloutOrder,
+    ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue, ServiceStatus,
+    ServiceUpdateStrategy, TaskTemplateSpecValue, compute_service_id,
 };
 use crate::task::types::TaskStateFilter;
 use crate::volumes::types::VolumeDriver;
@@ -305,6 +305,8 @@ impl ServiceController {
                 service_name
             )
         })?;
+        let desired_public_claims =
+            collect_public_port_claims(&service_name, task_templates.as_slice())?;
         let service_id = compute_service_id(&service_name);
 
         if let Some(existing) = self.registry.get(service_id)? {
@@ -341,6 +343,12 @@ impl ServiceController {
                     outcome: ServiceDeploymentOutcome::Unchanged,
                 });
             }
+
+            self.ensure_public_port_claims_available(
+                service_id,
+                &service_name,
+                desired_public_claims.as_slice(),
+            )?;
 
             if matches!(
                 existing.status(),
@@ -411,6 +419,12 @@ impl ServiceController {
             });
         }
 
+        self.ensure_public_port_claims_available(
+            service_id,
+            &service_name,
+            desired_public_claims.as_slice(),
+        )?;
+
         let mut pending_spec = ServiceSpecValue::new(
             manifest_id,
             manifest_name.clone(),
@@ -430,6 +444,53 @@ impl ServiceController {
             service_id,
             outcome: ServiceDeploymentOutcome::Accepted,
         })
+    }
+
+    /// Validates that the incoming public endpoint claims do not overlap an existing service.
+    fn ensure_public_port_claims_available(
+        &self,
+        service_id: Uuid,
+        service_name: &str,
+        desired_claims: &[PublicPortClaim],
+    ) -> anyhow::Result<()> {
+        if desired_claims.is_empty() {
+            return Ok(());
+        }
+
+        let existing_specs = self.registry.list()?;
+        for existing in existing_specs {
+            if existing.id == service_id || !service_reserves_public_ports(existing.status()) {
+                continue;
+            }
+
+            let existing_claims = collect_public_port_claims(
+                &existing.service_name,
+                existing.task_templates.as_slice(),
+            )
+            .map_err(|err| {
+                anyhow!(
+                    "existing service '{}' has invalid public endpoint metadata: {err}",
+                    existing.service_name
+                )
+            })?;
+
+            for desired in desired_claims {
+                if let Some(conflict) = existing_claims
+                    .iter()
+                    .find(|existing_claim| existing_claim.selector == desired.selector)
+                {
+                    return Err(anyhow!(
+                        "service '{service_name}' template '{}' cannot claim public port {} because service '{}' template '{}' already reserves it",
+                        desired.template_name,
+                        desired.selector,
+                        existing.service_name,
+                        conflict.template_name
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn handle_event(&self, event: ServiceEvent) -> anyhow::Result<()> {
@@ -2094,6 +2155,90 @@ fn is_running_deployment_noop(
         && existing.update_strategy == *update_strategy
 }
 
+/// Identifies one externally visible public endpoint by port and transport protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct PublicPortSelector {
+    port: u16,
+    protocol: ServicePortProtocol,
+}
+
+impl std::fmt::Display for PublicPortSelector {
+    /// Formats one selector as `port/protocol` for operator-facing conflict errors.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}/{}",
+            self.port,
+            public_port_protocol_label(self.protocol)
+        )
+    }
+}
+
+/// Captures one template-level public endpoint claim extracted from a service manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublicPortClaim {
+    selector: PublicPortSelector,
+    template_name: String,
+}
+
+/// Expands one deployment manifest into its concrete public endpoint claims.
+///
+/// Validation happens here so deploy-time admission and runtime store scans use the same
+/// definition of a legal public endpoint declaration.
+fn collect_public_port_claims(
+    service_name: &str,
+    task_templates: &[TaskTemplateSpecValue],
+) -> anyhow::Result<Vec<PublicPortClaim>> {
+    let mut seen = HashMap::new();
+    let mut claims = Vec::new();
+
+    for template in task_templates {
+        let Some(port) = template.public_port() else {
+            continue;
+        };
+        if template.required_network_ids().len() != 1 {
+            return Err(anyhow!(
+                "service '{}' template '{}' must attach to exactly one network when public_port is set",
+                service_name,
+                template.name
+            ));
+        }
+
+        for protocol in template.public_protocols() {
+            let selector = PublicPortSelector { port, protocol };
+            if let Some(existing_template) = seen.insert(selector, template.name.clone()) {
+                return Err(anyhow!(
+                    "service '{}' declares duplicate public port {} on templates '{}' and '{}'",
+                    service_name,
+                    selector,
+                    existing_template,
+                    template.name
+                ));
+            }
+            claims.push(PublicPortClaim {
+                selector,
+                template_name: template.name.clone(),
+            });
+        }
+    }
+
+    Ok(claims)
+}
+
+/// Returns whether a service state still reserves its declared public endpoint claims.
+fn service_reserves_public_ports(status: ServiceStatus) -> bool {
+    !matches!(status, ServiceStatus::Stopping | ServiceStatus::Stopped)
+}
+
+/// Renders one public endpoint protocol label used in validation and conflict messages.
+fn public_port_protocol_label(protocol: ServicePortProtocol) -> &'static str {
+    match protocol {
+        ServicePortProtocol::Tcp => "tcp",
+        ServicePortProtocol::Udp => "udp",
+        ServicePortProtocol::TcpUdp => "tcp+udp",
+    }
+}
+
 struct ServiceDeploymentJob {
     manifest_id: Uuid,
     manifest_name: String,
@@ -2486,6 +2631,43 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    /// Builds one template with an optional public endpoint for deploy-admission tests.
+    fn make_public_template(
+        name: &str,
+        network_count: usize,
+        public_port: Option<u16>,
+        public_protocol: Option<ServicePortProtocol>,
+    ) -> TaskTemplateSpecValue {
+        TaskTemplateSpecValue {
+            name: name.to_string(),
+            execution: ExecutionSpec {
+                image: "ghcr.io/demo/web:latest".to_string(),
+                command: Vec::new(),
+                tty: false,
+                cpu_millis: 100,
+                memory_bytes: 64 * 1024 * 1024,
+                gpu_count: 0,
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                liveness: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: (0..network_count)
+                    .map(|idx| {
+                        TaskTemplateNetworkRequirement::new(format!("net-{idx}"), Uuid::new_v4())
+                    })
+                    .collect(),
+            },
+            depends_on: Vec::new(),
+            replicas: 1,
+            readiness: None,
+            public_port,
+            public_protocol,
+        }
+    }
+
     struct TestVolumeRegistry {
         registry: VolumeRegistry,
         _dir: TempDir,
@@ -2511,6 +2693,54 @@ mod tests {
             registry: VolumeRegistry::new(spec_store, node_store),
             _dir: dir,
         }
+    }
+
+    /// Public endpoints must stay unambiguous inside a single manifest.
+    #[test]
+    fn collect_public_port_claims_rejects_duplicate_template_claims() {
+        let err = collect_public_port_claims(
+            "demo-service",
+            &[
+                make_public_template("api", 1, Some(443), Some(ServicePortProtocol::Tcp)),
+                make_public_template("metrics", 1, Some(443), Some(ServicePortProtocol::Tcp)),
+            ],
+        )
+        .expect_err("duplicate public port should fail");
+
+        assert!(
+            err.to_string()
+                .contains("declares duplicate public port 443/tcp")
+        );
+    }
+
+    /// Public endpoints must stay pinned to exactly one network to keep NodePort ownership simple.
+    #[test]
+    fn collect_public_port_claims_requires_exactly_one_network() {
+        let err = collect_public_port_claims(
+            "demo-service",
+            &[make_public_template(
+                "api",
+                2,
+                Some(443),
+                Some(ServicePortProtocol::Tcp),
+            )],
+        )
+        .expect_err("multiple networks should fail");
+
+        assert!(
+            err.to_string()
+                .contains("must attach to exactly one network when public_port is set")
+        );
+    }
+
+    /// Services in non-terminal states should keep exclusive ownership of their declared ports.
+    #[test]
+    fn service_reserves_public_ports_until_stop_finishes() {
+        assert!(service_reserves_public_ports(ServiceStatus::Running));
+        assert!(service_reserves_public_ports(ServiceStatus::Deploying));
+        assert!(service_reserves_public_ports(ServiceStatus::Failed));
+        assert!(!service_reserves_public_ports(ServiceStatus::Stopping));
+        assert!(!service_reserves_public_ports(ServiceStatus::Stopped));
     }
 
     /// Builds one simple local volume spec for fallback-policy tests.

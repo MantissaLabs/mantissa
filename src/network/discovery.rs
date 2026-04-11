@@ -10,6 +10,7 @@ use crate::network::types::{
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
     ServicePortProtocol, ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceSpecValue,
+    ServiceStatus,
 };
 use crate::store::workload_store::WorkloadStore;
 use crate::workload::model::WorkloadPhase;
@@ -87,12 +88,29 @@ struct NetworkBackendCatalog {
 /// One service entry in the backend catalog.
 #[derive(Clone)]
 struct ServiceBackendCatalogEntry {
+    service_id: Uuid,
+    template_name: String,
     service_name: String,
     candidates: Vec<BackendAddress>,
     readiness: Option<ServiceReadinessProbe>,
     expose_to_host: bool,
     public_port: Option<u16>,
     public_protocols: Vec<NodePortProtocol>,
+}
+
+/// Refresh result for one discoverable service label, including public endpoint status.
+struct ServiceRefreshResult {
+    nodeport_mappings: Vec<NodePortMapping>,
+    public_endpoint: Option<PublicEndpointObservation>,
+}
+
+/// Observed public endpoint state for one template during the current refresh tick.
+#[derive(Clone, Debug)]
+struct PublicEndpointObservation {
+    service_id: Uuid,
+    template_name: String,
+    port: u16,
+    detail: Option<String>,
 }
 
 impl ServiceDiscovery {
@@ -1476,52 +1494,6 @@ async fn probe_backend(ip: &Ipv4Addr, probe: &ServiceReadinessProbe) -> bool {
     }
 }
 
-/// Resolves one service's readiness probe configuration from the current service specs.
-fn service_readiness_probe(
-    service_specs: &[ServiceSpecValue],
-    service_name: &str,
-) -> Option<ServiceReadinessProbe> {
-    for spec in service_specs {
-        for template in &spec.task_templates {
-            if template.name.eq_ignore_ascii_case(service_name) {
-                return template.readiness().cloned();
-            }
-        }
-    }
-    None
-}
-
-/// Resolve the public nodeport requested by one task template, if any.
-fn service_public_port(service_specs: &[ServiceSpecValue], service_name: &str) -> Option<u16> {
-    for spec in service_specs {
-        for template in &spec.task_templates {
-            if template.name.eq_ignore_ascii_case(service_name) {
-                return template.public_port();
-            }
-        }
-    }
-    None
-}
-
-/// Resolve the transport protocols to expose when a service declares a public port.
-fn service_public_protocols(
-    service_specs: &[ServiceSpecValue],
-    service_name: &str,
-) -> Vec<NodePortProtocol> {
-    for spec in service_specs {
-        for template in &spec.task_templates {
-            if template.name.eq_ignore_ascii_case(service_name) {
-                return template
-                    .public_protocols()
-                    .into_iter()
-                    .map(nodeport_protocol)
-                    .collect();
-            }
-        }
-    }
-    vec![NodePortProtocol::Tcp]
-}
-
 /// Convert a service protocol descriptor into a nodeport transport selector.
 fn nodeport_protocol(protocol: ServicePortProtocol) -> NodePortProtocol {
     match protocol {
@@ -1601,39 +1573,53 @@ async fn refresh_backend_catalog_if_needed(
         .list()
         .context("load service specs for backend catalog refresh")?;
     let template_index = build_task_template_index(&service_specs);
-    let service_names = services_for_network(&service_specs, network_id);
-    let mut next_services = HashMap::with_capacity(service_names.len());
-    for service_name in service_names {
-        let candidates = resolve_service_backends(
-            registry,
-            workloads,
-            &template_index,
-            network_id,
-            &service_name,
-            health_snapshot,
-        )
-        .await?;
-        let readiness = service_readiness_probe(&service_specs, &service_name);
-        let public_port = service_public_port(&service_specs, &service_name);
-        let public_protocols = if public_port.is_some() {
-            service_public_protocols(&service_specs, &service_name)
-        } else {
-            Vec::new()
-        };
-        let expose_to_host = service_is_public(&service_specs, network_id, &service_name);
-        let service_key = service_name.to_ascii_lowercase();
+    let mut next_services = HashMap::new();
+    for spec in &service_specs {
+        for template in &spec.task_templates {
+            if !template
+                .networks
+                .iter()
+                .any(|net| net.network_id == network_id)
+            {
+                continue;
+            }
 
-        next_services.insert(
-            service_key,
-            ServiceBackendCatalogEntry {
-                service_name,
-                candidates,
-                readiness,
-                expose_to_host,
-                public_port,
-                public_protocols,
-            },
-        );
+            let service_name = template.name.clone();
+            let candidates = resolve_service_backends(
+                registry,
+                workloads,
+                &template_index,
+                network_id,
+                &service_name,
+                health_snapshot,
+            )
+            .await?;
+            let public_port = template.public_port();
+            let public_protocols = if public_port.is_some() {
+                template
+                    .public_protocols()
+                    .into_iter()
+                    .map(nodeport_protocol)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let service_key = service_name.to_ascii_lowercase();
+
+            next_services.insert(
+                service_key,
+                ServiceBackendCatalogEntry {
+                    service_id: spec.id,
+                    template_name: template.name.clone(),
+                    service_name,
+                    candidates,
+                    readiness: template.readiness().cloned(),
+                    expose_to_host: public_port.is_some(),
+                    public_port,
+                    public_protocols,
+                },
+            );
+        }
     }
 
     let mut guard = backend_catalog.lock().await;
@@ -1706,39 +1692,37 @@ async fn refresh_network_services(
         guard.services.values().cloned().collect()
     };
     let mut nodeport_entries = Vec::new();
+    let mut public_endpoint_observations = Vec::new();
 
     for entry in entries {
-        let mappings = refresh_single_service(
+        let result = refresh_single_service(
             registry, bpf, network_id, &entry, health, bpf_lb, lb_missing,
         )
         .await?;
-        nodeport_entries.extend(mappings);
-    }
-
-    nodeport
-        .sync_ports(network_id, &nodeport_entries)
-        .await
-        .context("sync nodeport mappings")?;
-
-    Ok(())
-}
-
-/// Determine all service labels that attach to the provided network based on declared task network
-/// requirements so we can refresh health and load balancer state without waiting on DNS requests.
-fn services_for_network(service_specs: &[ServiceSpecValue], network_id: Uuid) -> HashSet<String> {
-    let mut services = HashSet::new();
-    for spec in service_specs {
-        for template in &spec.task_templates {
-            if template
-                .networks
-                .iter()
-                .any(|net| net.network_id == network_id)
-            {
-                services.insert(template.name.clone());
-            }
+        nodeport_entries.extend(result.nodeport_mappings);
+        if let Some(observation) = result.public_endpoint {
+            public_endpoint_observations.push(observation);
         }
     }
-    services
+
+    if let Err(err) = nodeport.sync_ports(network_id, &nodeport_entries).await {
+        for observation in &mut public_endpoint_observations {
+            if observation.detail.is_none() {
+                observation.detail = Some(format!(
+                    "template '{}' public port {} could not publish NodePort: {err:#}",
+                    observation.template_name, observation.port
+                ));
+            }
+        }
+        warn!(
+            target: "network",
+            network = %network_id,
+            "failed to sync public nodeport mappings: {err:#}"
+        );
+    }
+    apply_public_endpoint_observations(services, public_endpoint_observations.as_slice()).await?;
+
+    Ok(())
 }
 
 /// Refresh healthy backend list and VIP programming for a single service so clients connected via
@@ -1754,7 +1738,7 @@ async fn refresh_single_service(
     health: &Arc<AsyncMutex<BackendHealth>>,
     bpf_lb: &BpfLoadBalancer,
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
-) -> Result<Vec<NodePortMapping>> {
+) -> Result<ServiceRefreshResult> {
     let service_name = service.service_name.as_str();
     let candidates = service.candidates.clone();
     let mut backends = evaluate_backend_health(
@@ -1788,10 +1772,21 @@ async fn refresh_single_service(
             service.expose_to_host,
         )
         .await?;
-        return Ok(Vec::new());
+        return Ok(ServiceRefreshResult {
+            nodeport_mappings: Vec::new(),
+            public_endpoint: service.public_port.map(|port| PublicEndpointObservation {
+                service_id: service.service_id,
+                template_name: service.template_name.clone(),
+                port,
+                detail: Some(format!(
+                    "template '{}' public port {} has no healthy backends",
+                    service.template_name, port
+                )),
+            }),
+        });
     }
 
-    if let Some((vip, _)) = sync_service_vip_for_backends(
+    if let Some((vip, programmed)) = sync_service_vip_for_backends(
         bpf_lb,
         bpf,
         lb_missing,
@@ -1804,6 +1799,21 @@ async fn refresh_single_service(
     .await?
         && let Some(port) = service.public_port
     {
+        if !programmed {
+            return Ok(ServiceRefreshResult {
+                nodeport_mappings: Vec::new(),
+                public_endpoint: Some(PublicEndpointObservation {
+                    service_id: service.service_id,
+                    template_name: service.template_name.clone(),
+                    port,
+                    detail: Some(format!(
+                        "template '{}' public port {} lost VIP programming; internal discovery is still available",
+                        service.template_name, port
+                    )),
+                }),
+            });
+        }
+
         let mut mappings = Vec::new();
         for protocol in service.public_protocols.clone() {
             mappings.push(NodePortMapping {
@@ -1813,10 +1823,93 @@ async fn refresh_single_service(
                 protocol,
             });
         }
-        return Ok(mappings);
+        return Ok(ServiceRefreshResult {
+            nodeport_mappings: mappings,
+            public_endpoint: Some(PublicEndpointObservation {
+                service_id: service.service_id,
+                template_name: service.template_name.clone(),
+                port,
+                detail: None,
+            }),
+        });
     }
 
-    Ok(Vec::new())
+    Ok(ServiceRefreshResult {
+        nodeport_mappings: Vec::new(),
+        public_endpoint: service.public_port.map(|port| PublicEndpointObservation {
+            service_id: service.service_id,
+            template_name: service.template_name.clone(),
+            port,
+            detail: Some(format!(
+                "template '{}' public port {} could not assign a stable service VIP",
+                service.template_name, port
+            )),
+        }),
+    })
+}
+
+/// Persists the current public endpoint outcome back into the replicated service row.
+///
+/// Public ingress is a user-visible contract. When NodePort or VIP programming degrades, the
+/// owning service should expose that explicitly instead of silently presenting internal DNS
+/// fallback as success.
+async fn apply_public_endpoint_observations(
+    services: &ServiceRegistry,
+    observations: &[PublicEndpointObservation],
+) -> Result<()> {
+    let mut issues_by_service: HashMap<Uuid, Vec<String>> = HashMap::new();
+    let mut service_ids = HashSet::new();
+    for observation in observations {
+        service_ids.insert(observation.service_id);
+        let issues = issues_by_service.entry(observation.service_id).or_default();
+        if let Some(detail) = observation.detail.as_ref() {
+            issues.push(detail.clone());
+        }
+    }
+
+    for service_id in service_ids {
+        let Some(mut spec) = services.get(service_id)? else {
+            continue;
+        };
+        if spec.status() != ServiceStatus::Running {
+            continue;
+        }
+
+        let next_detail = issues_by_service
+            .get(&service_id)
+            .filter(|issues| !issues.is_empty())
+            .map(|issues| summarize_public_endpoint_issues(issues));
+        let current_detail = spec.public_endpoint_detail().map(str::to_string);
+
+        if current_detail == next_detail {
+            continue;
+        }
+        if next_detail.is_none() && spec.public_endpoint_detail().is_none() {
+            continue;
+        }
+
+        spec.set_public_endpoint_detail(next_detail);
+        services
+            .upsert(spec)
+            .await
+            .context("persist public endpoint service detail")?;
+    }
+
+    Ok(())
+}
+
+/// Compresses one service's public endpoint issues into the single lifecycle detail field.
+fn summarize_public_endpoint_issues(issues: &[String]) -> String {
+    let Some(first) = issues.first() else {
+        return String::new();
+    };
+    if issues.len() == 1 {
+        return first.clone();
+    }
+    format!(
+        "{first}; +{} more public endpoint issue(s)",
+        issues.len() - 1
+    )
 }
 
 /// Compute and synchronize one service VIP for the provided backend set.
@@ -1920,27 +2013,6 @@ async fn program_service_vip(
             false
         }
     }
-}
-
-/// Return true if one task template declares a public port for the given network.
-///
-/// This is used to decide whether Mantissa should proactively program host neighbour entries for
-/// VIPs, enabling `curl http://<vip>:<port>` from the node without relying on ARP synthesis.
-fn service_is_public(
-    service_specs: &[ServiceSpecValue],
-    network_id: Uuid,
-    service_name: &str,
-) -> bool {
-    service_specs.iter().any(|spec| {
-        spec.task_templates.iter().any(|template| {
-            template.name.eq_ignore_ascii_case(service_name)
-                && template.public_port().is_some()
-                && template
-                    .networks
-                    .iter()
-                    .any(|net| net.network_id == network_id)
-        })
-    })
 }
 
 /// Ensure the local host has a stable neighbour entry for a service VIP.
@@ -2457,6 +2529,26 @@ mod tests {
         replica_ids: Vec<Uuid>,
         readiness: Option<ServiceReadinessProbe>,
     ) {
+        upsert_catalog_service_with_public_port(
+            services,
+            service_name,
+            network_id,
+            replica_ids,
+            readiness,
+            None,
+        )
+        .await;
+    }
+
+    /// Writes one task template with optional readiness and public NodePort metadata.
+    async fn upsert_catalog_service_with_public_port(
+        services: &ServiceRegistry,
+        service_name: &str,
+        network_id: Uuid,
+        replica_ids: Vec<Uuid>,
+        readiness: Option<ServiceReadinessProbe>,
+        public_port: Option<u16>,
+    ) {
         let service = ServiceSpecValue::new(
             Uuid::new_v4(),
             "catalog-test-manifest",
@@ -2482,7 +2574,7 @@ mod tests {
                 depends_on: Vec::new(),
                 replicas: replica_ids.len() as u16,
                 readiness,
-                public_port: None,
+                public_port,
                 public_protocol: None,
             }],
             replica_ids,
@@ -2658,6 +2750,70 @@ mod tests {
         assert_eq!(readiness.port, 8_000);
         assert_eq!(readiness.path.as_deref(), Some("/healthz"));
         assert_eq!(readiness.failure_threshold, 2);
+    }
+
+    /// Public endpoint observations should set and later clear the replicated service detail.
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_endpoint_observations_update_running_service_detail() {
+        let harness = setup_catalog_harness().await;
+        upsert_catalog_service_with_public_port(
+            &harness.services,
+            "public-service",
+            harness.network.id,
+            vec![Uuid::new_v4()],
+            None,
+            Some(443),
+        )
+        .await;
+
+        let service = harness
+            .services
+            .list()
+            .expect("list services")
+            .into_iter()
+            .find(|spec| spec.service_name == "public-service")
+            .expect("public service");
+
+        apply_public_endpoint_observations(
+            &harness.services,
+            &[PublicEndpointObservation {
+                service_id: service.id,
+                template_name: "backend".to_string(),
+                port: 443,
+                detail: Some("template 'backend' public port 443 has no healthy backends".into()),
+            }],
+        )
+        .await
+        .expect("persist degraded detail");
+
+        let degraded = harness
+            .services
+            .get(service.id)
+            .expect("load degraded service")
+            .expect("service row");
+        assert_eq!(
+            degraded.public_endpoint_detail(),
+            Some("template 'backend' public port 443 has no healthy backends")
+        );
+
+        apply_public_endpoint_observations(
+            &harness.services,
+            &[PublicEndpointObservation {
+                service_id: service.id,
+                template_name: "backend".to_string(),
+                port: 443,
+                detail: None,
+            }],
+        )
+        .await
+        .expect("clear degraded detail");
+
+        let recovered = harness
+            .services
+            .get(service.id)
+            .expect("load recovered service")
+            .expect("service row");
+        assert!(recovered.public_endpoint_detail().is_none());
     }
 
     #[test]

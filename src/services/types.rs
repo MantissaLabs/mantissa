@@ -16,6 +16,9 @@ pub use crate::workload::types::{
     WorkloadRestartPolicyKind as TaskTemplateRestartPolicyKind,
 };
 
+/// Prefix used when the service lifecycle detail is specifically describing public endpoint state.
+pub const SERVICE_PUBLIC_ENDPOINT_DETAIL_PREFIX: &str = "public endpoint: ";
+
 /// Value stored in the replicated service store describing desired service state.
 ///
 /// A service is a controller-level object that owns rollout, readiness, and desired replica
@@ -118,6 +121,36 @@ impl ServiceSpecValue {
         }
         self.status_detail = detail;
         self.touch();
+    }
+
+    /// Returns the public-endpoint specific lifecycle detail without its stable display prefix.
+    pub fn public_endpoint_detail(&self) -> Option<&str> {
+        self.status_detail
+            .as_deref()
+            .and_then(|detail| detail.strip_prefix(SERVICE_PUBLIC_ENDPOINT_DETAIL_PREFIX))
+            .map(str::trim)
+            .filter(|detail| !detail.is_empty())
+    }
+
+    /// Updates only the public-endpoint lifecycle detail while preserving unrelated status text.
+    pub fn set_public_endpoint_detail(&mut self, detail: Option<String>) {
+        let detail = detail.and_then(|detail| {
+            let trimmed = detail.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+
+        match detail {
+            Some(detail) => {
+                self.set_status_detail(Some(format!(
+                    "{SERVICE_PUBLIC_ENDPOINT_DETAIL_PREFIX}{detail}"
+                )));
+            }
+            None => {
+                if self.public_endpoint_detail().is_some() {
+                    self.set_status_detail(None);
+                }
+            }
+        }
     }
 
     /// Updates rollout progress metadata and advances causal ordering when values change.
@@ -549,7 +582,12 @@ pub fn compute_service_id(service_name: &str) -> Uuid {
 
 #[cfg(test)]
 mod tests {
-    use super::compute_service_id;
+    use super::{
+        SERVICE_PUBLIC_ENDPOINT_DETAIL_PREFIX, ServiceSpecValue, TaskTemplateSpecValue,
+        compute_service_id,
+    };
+    use crate::workload::types::ExecutionSpec;
+    use uuid::Uuid;
 
     #[test]
     fn service_id_deterministic() {
@@ -559,5 +597,62 @@ mod tests {
 
         let other = compute_service_id("beta-web");
         assert_ne!(first, other);
+    }
+
+    /// Public-endpoint detail helpers should round-trip the prefixed lifecycle text cleanly.
+    #[test]
+    fn public_endpoint_detail_round_trips_through_status_detail() {
+        let mut spec = ServiceSpecValue::new(
+            Uuid::new_v4(),
+            "manifest",
+            "demo-service",
+            vec![TaskTemplateSpecValue {
+                name: "web".into(),
+                execution: ExecutionSpec {
+                    image: "ghcr.io/demo/web:latest".into(),
+                    command: Vec::new(),
+                    tty: false,
+                    cpu_millis: 0,
+                    memory_bytes: 0,
+                    gpu_count: 0,
+                    restart_policy: None,
+                    termination_grace_period_secs: None,
+                    pre_stop_command: None,
+                    liveness: None,
+                    env: Vec::new(),
+                    secret_files: Vec::new(),
+                    volumes: Vec::new(),
+                    networks: Vec::new(),
+                },
+                depends_on: Vec::new(),
+                replicas: 1,
+                readiness: None,
+                public_port: Some(443),
+                public_protocol: None,
+            }],
+            Vec::new(),
+        );
+
+        spec.set_public_endpoint_detail(Some("template 'web' public port 443 is degraded".into()));
+        assert_eq!(
+            spec.public_endpoint_detail(),
+            Some("template 'web' public port 443 is degraded")
+        );
+        assert_eq!(
+            spec.status_detail.as_deref(),
+            Some("public endpoint: template 'web' public port 443 is degraded")
+        );
+
+        spec.set_public_endpoint_detail(None);
+        assert!(spec.public_endpoint_detail().is_none());
+        assert!(spec.status_detail.is_none());
+
+        spec.status_detail = Some(format!(
+            "{SERVICE_PUBLIC_ENDPOINT_DETAIL_PREFIX}template 'web' public port 443 is ready"
+        ));
+        assert_eq!(
+            spec.public_endpoint_detail(),
+            Some("template 'web' public port 443 is ready")
+        );
     }
 }

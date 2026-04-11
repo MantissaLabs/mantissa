@@ -307,12 +307,21 @@ mod platform {
             network_id: Uuid,
             entries: &[NodePortMapping],
         ) -> Result<()> {
+            let wants_mappings = !entries.is_empty();
             if !self.desired_enabled {
                 self.set_runtime_status(
                     NodePortRuntimeState::Disabled,
                     self.last_error.clone(),
                     "nodeport runtime disabled",
                 );
+                if wants_mappings {
+                    return Err(anyhow!(
+                        "{}",
+                        self.last_error
+                            .clone()
+                            .unwrap_or_else(|| "nodeport runtime disabled".to_string())
+                    ));
+                }
                 return Ok(());
             }
             let had_ports = self
@@ -324,6 +333,14 @@ mod platform {
                 return Ok(());
             }
             if !self.ensure_runtime_capable().await? {
+                if wants_mappings {
+                    return Err(anyhow!(
+                        "{}",
+                        self.last_error
+                            .clone()
+                            .unwrap_or_else(|| { "nodeport runtime preflight failed".to_string() })
+                    ));
+                }
                 return Ok(());
             }
             if let Err(err) = self.ensure_attached().await {
@@ -331,17 +348,30 @@ mod platform {
                     format!("nodeport attach failed: {err:#}"),
                     "nodeport runtime degraded",
                 );
+                if wants_mappings {
+                    return Err(anyhow!(
+                        "{}",
+                        self.last_error
+                            .clone()
+                            .unwrap_or_else(|| format!("nodeport attach failed: {err:#}"))
+                    ));
+                }
                 return Ok(());
             }
             self.set_runtime_status(NodePortRuntimeState::Ready, None, "nodeport runtime ready");
-            if !entries.is_empty()
-                && let Err(err) = self.ensure_host_ingress(network_id).await
-            {
+            if wants_mappings && let Err(err) = self.ensure_host_ingress(network_id).await {
                 self.degrade_runtime(
                     format!("nodeport host-access attach failed for network {network_id}: {err:#}"),
                     "nodeport runtime degraded",
                 );
-                return Ok(());
+                return Err(anyhow!(
+                    "{}",
+                    self.last_error.clone().unwrap_or_else(|| {
+                        format!(
+                            "nodeport host-access attach failed for network {network_id}: {err:#}"
+                        )
+                    })
+                ));
             }
 
             let node_ip = self
@@ -353,6 +383,27 @@ mod platform {
                 Some(overlay_ifindex(network_id)?)
             };
             let mut desired_ports = HashSet::new();
+            for entry in entries {
+                let selector = NodePortSelector::new(entry.port, entry.protocol);
+                if !desired_ports.insert(selector) {
+                    return Err(anyhow!(
+                        "nodeport {} {} is declared more than once for network {}",
+                        entry.port,
+                        entry.protocol,
+                        network_id
+                    ));
+                }
+                if let Some(owner) = self.port_owner.get(&selector)
+                    && *owner != network_id
+                {
+                    return Err(anyhow!(
+                        "nodeport {} {} is already owned by network {}",
+                        entry.port,
+                        entry.protocol,
+                        owner
+                    ));
+                }
+            }
             let base = map_pin_dir()?;
             let vip_map = open_map(&base, "NODEPORT_VIPS").context("open NODEPORT_VIPS map")?;
             let vip_fd = vip_map.fd().as_fd().as_raw_fd();
@@ -384,21 +435,6 @@ mod platform {
 
             for entry in entries {
                 let selector = NodePortSelector::new(entry.port, entry.protocol);
-                desired_ports.insert(selector);
-                if let Some(owner) = self.port_owner.get(&selector)
-                    && *owner != network_id
-                {
-                    warn!(
-                        target: "network",
-                        port = entry.port,
-                        protocol = %entry.protocol,
-                        existing = %owner,
-                        requested = %network_id,
-                        "nodeport conflict; keeping existing owner"
-                    );
-                    continue;
-                }
-
                 let key = NodePortKey {
                     port: entry.port.to_be(),
                     proto: entry.protocol.number(),
