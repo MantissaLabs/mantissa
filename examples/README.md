@@ -15,7 +15,7 @@ backing workload runs over time.
 mantissa services run examples/replicated_service.ron
 ```
 
-This manifest defines two services:
+This manifest defines two task entries:
 - `echo` runs two replicas of a simple Alpine container emitting log lines with a 500m CPU / 128MiB request.
 - `api` runs a single nginx replica requesting 300m CPU / 256MiB of memory.
 

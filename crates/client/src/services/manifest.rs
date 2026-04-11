@@ -6,11 +6,12 @@ use std::path::Path;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceManifest {
     pub name: String,
     #[serde(default)]
     pub volumes: Vec<VolumeSpec>,
-    #[serde(default)]
+    #[serde(default, rename = "tasks")]
     pub task_templates: Vec<TaskTemplateSpec>,
     #[serde(default)]
     pub update: ServiceUpdateStrategy,
@@ -959,6 +960,47 @@ mod tests {
         assert_eq!(manifest.update.rolling.monitor_secs, 1);
         assert_eq!(manifest.update.rolling.max_failures, 1);
         assert!(manifest.update.rolling.auto_rollback);
+    }
+
+    #[test]
+    fn service_manifest_deserializes_tasks_field() {
+        let manifest: ServiceManifest = ron::from_str(
+            r#"
+            (
+                name: "demo",
+                tasks: [
+                    (
+                        name: "api",
+                        image: "ghcr.io/demo/api:latest",
+                    ),
+                ],
+            )
+            "#,
+        )
+        .expect("manifest");
+
+        assert_eq!(manifest.task_templates.len(), 1);
+        assert_eq!(manifest.task_templates[0].name, "api");
+    }
+
+    #[test]
+    fn service_manifest_rejects_legacy_task_templates_field() {
+        let error = ron::from_str::<ServiceManifest>(
+            r#"
+            (
+                name: "demo",
+                task_templates: [
+                    (
+                        name: "api",
+                        image: "ghcr.io/demo/api:latest",
+                    ),
+                ],
+            )
+            "#,
+        )
+        .expect_err("legacy field must be rejected");
+
+        assert!(error.to_string().contains("task_templates"));
     }
 
     #[test]

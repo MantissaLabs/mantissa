@@ -27,7 +27,7 @@ secrets are consumed:
 ```ron
 (
     name: "demo-service",
-    task_templates: [
+    tasks: [
         (
             name: "echo",
             env: [

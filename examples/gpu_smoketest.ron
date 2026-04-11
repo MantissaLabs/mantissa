@@ -1,6 +1,6 @@
 (
     name: "gpu-smoke",
-    task_templates: [
+    tasks: [
         (
             name: "nvidia-smi",
             image: "nvidia/cuda:12.4.0-base-ubuntu22.04",

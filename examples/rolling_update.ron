@@ -11,7 +11,7 @@
             auto_rollback: true,
         ),
     ),
-    task_templates: [
+    tasks: [
         (
             name: "api",
             image: "hashicorp/http-echo:1.0.0",

@@ -5,7 +5,7 @@
     // Typing `exit` exits the shell entrypoint itself, so the task stops and is later
     // reconciled back by the service controller, matching `docker attach` semantics.
     name: "attach-shell-demo",
-    task_templates: [
+    tasks: [
         (
             name: "shell",
             image: "busybox:1.36",
