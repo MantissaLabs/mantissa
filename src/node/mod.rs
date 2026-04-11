@@ -1,9 +1,12 @@
 use crate::info_capnp::info as SystemInfo;
+use crate::network::nodeport::NodePortManager;
 use crate::node::id::new_node_id_v7;
 use crate::node::info::NodeInfo;
 use capnp::Error;
 use capnp::message::Builder;
 use protocol::node;
+use std::cell::RefCell;
+use std::rc::Rc;
 use tracing::info;
 
 pub mod address;
@@ -15,11 +18,22 @@ pub type NodeId = uuid::Uuid;
 
 /// This structure defines the delegate in charge of booking slots
 /// running tasks on the machine.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Node {
     pub id: NodeId,
     pub system_info: NodeInfo,
+    nodeport: Rc<RefCell<Option<NodePortManager>>>,
     // engine: Rc<Engine>,
+}
+
+impl std::fmt::Debug for Node {
+    /// Render the node without expanding shared runtime handles that are only used for diagnostics.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Node")
+            .field("id", &self.id)
+            .field("system_info", &self.system_info)
+            .finish()
+    }
 }
 
 impl Default for Node {
@@ -27,6 +41,7 @@ impl Default for Node {
         Node {
             id: new_node_id_v7(),
             system_info: NodeInfo::new(),
+            nodeport: Rc::new(RefCell::new(None)),
         }
     }
 }
@@ -41,6 +56,11 @@ impl Node {
     pub fn collect_system_info(&mut self) -> &mut Node {
         self.system_info.collect();
         self
+    }
+
+    /// Store the live NodePort manager so node-local diagnostics can report public ingress state.
+    pub fn set_nodeport_manager(&self, nodeport: NodePortManager) {
+        *self.nodeport.borrow_mut() = Some(nodeport);
     }
 }
 
@@ -59,6 +79,11 @@ impl node::Server for Node {
         let mut builder = Builder::new_default();
 
         let info = self.system_info.info.clone();
+        let nodeport = self.nodeport.borrow().clone();
+        let nodeport_status = match nodeport {
+            Some(manager) => Some(manager.status().await),
+            None => None,
+        };
 
         {
             let builder = &mut builder;
@@ -155,6 +180,49 @@ impl node::Server for Node {
                     gpu.reborrow().init_devices(0);
                 }
             }
+
+            // NodePort
+            {
+                let mut nodeport = system.reborrow().init_nodeport();
+                if let Some(status) = nodeport_status {
+                    nodeport.set_desired_enabled(status.desired_enabled);
+                    let state = status.state.to_string();
+                    nodeport.set_state(state);
+                    nodeport.set_resolved_iface(status.resolved_iface.as_deref().unwrap_or(""));
+                    let resolved_node_ip = status
+                        .resolved_node_ip
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_default();
+                    nodeport.set_resolved_node_ip(&resolved_node_ip);
+                    nodeport.set_active_networks(usize_to_u32(status.active_networks));
+                    nodeport.set_active_ports(usize_to_u32(status.active_ports));
+                    nodeport.set_active_host_networks(usize_to_u32(status.active_host_networks));
+                    nodeport.set_vip_capacity(usize_to_u32(status.vip_capacity));
+                    nodeport.set_host_capacity(usize_to_u32(status.host_capacity));
+                    nodeport.set_flow_capacity(usize_to_u32(status.flow_capacity));
+                    nodeport.set_last_error(status.last_error.as_deref().unwrap_or(""));
+                    nodeport.set_stats_error(status.stats_error.as_deref().unwrap_or(""));
+
+                    let mut ingress = nodeport.reborrow().init_ingress();
+                    if let Some(stats) = status.ingress_stats {
+                        ingress.set_packets(stats.packets);
+                        ingress.set_bytes(stats.bytes);
+                        ingress.set_drops(stats.drops);
+                    }
+
+                    let mut egress = nodeport.reborrow().init_egress();
+                    if let Some(stats) = status.egress_stats {
+                        egress.set_packets(stats.packets);
+                        egress.set_bytes(stats.bytes);
+                        egress.set_drops(stats.drops);
+                    }
+                } else {
+                    nodeport.set_state("unavailable");
+                    nodeport.set_last_error("nodeport manager not wired");
+                    nodeport.reborrow().init_ingress();
+                    nodeport.reborrow().init_egress();
+                }
+            }
         }
 
         match builder.get_root::<SystemInfo::Builder>() {
@@ -165,4 +233,9 @@ impl node::Server for Node {
             Err(e) => Err(e),
         }
     }
+}
+
+/// Convert one local count into the wire format used by node diagnostics without panicking on large values.
+fn usize_to_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }

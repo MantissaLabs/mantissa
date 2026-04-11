@@ -440,6 +440,8 @@ async fn build_runtime_components(
     .map_err(|error| -> Box<dyn std::error::Error> {
         Box::new(std::io::Error::other(error.to_string()))
     })?;
+    ctx.node
+        .set_nodeport_manager(network_controller.nodeport_manager());
     let network_gossiper = NetworkGossiper::new(
         network_registry.clone(),
         network_controller.clone(),

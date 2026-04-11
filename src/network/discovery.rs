@@ -152,6 +152,11 @@ impl ServiceDiscovery {
         }
     }
 
+    /// Return the shared NodePort manager used by discovery so other local diagnostics can inspect it.
+    pub fn nodeport_manager(&self) -> NodePortManager {
+        self.nodeport.clone()
+    }
+
     pub async fn ensure_network(
         &self,
         spec: &NetworkSpecValue,

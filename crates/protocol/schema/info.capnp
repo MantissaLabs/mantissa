@@ -21,6 +21,9 @@ struct Info {
 
   gpu @6 :GpuInfo;
   # GPU inventory and capabilities (empty when no GPU is detected).
+
+  nodeport @7 :NodePortInfo;
+  # Local NodePort runtime state and dataplane counters.
 }
 
 struct Cpu {
@@ -144,4 +147,59 @@ struct GpuDevice {
 
   pciBusId @6 :Text;
   # PCI bus identifier (empty when unavailable).
+}
+
+struct NodePortInfo {
+  desiredEnabled @0 :Bool;
+  # Whether the operator intends NodePort to be enabled on this node.
+
+  state @1 :Text;
+  # Current NodePort runtime state label.
+
+  resolvedIface @2 :Text;
+  # External interface currently selected for NodePort attach.
+
+  resolvedNodeIp @3 :Text;
+  # External IPv4 address currently advertised for NodePort traffic.
+
+  activeNetworks @4 :UInt32;
+  # Number of networks that currently publish at least one public service on this node.
+
+  activePorts @5 :UInt32;
+  # Number of distinct NodePort selectors currently programmed on this node.
+
+  activeHostNetworks @6 :UInt32;
+  # Number of host-access interfaces with NodePort ingress handling attached.
+
+  vipCapacity @7 :UInt32;
+  # Maximum number of VIP selectors the pinned NodePort map can hold.
+
+  hostCapacity @8 :UInt32;
+  # Maximum number of host-access network entries the pinned NodePort map can hold.
+
+  flowCapacity @9 :UInt32;
+  # Maximum number of tracked NodePort NAT flows in each pinned LRU map.
+
+  ingress @10 :PacketCounters;
+  # Aggregated ingress packet counters from the NodePort tc dataplane.
+
+  egress @11 :PacketCounters;
+  # Aggregated egress packet counters from the NodePort tc dataplane.
+
+  lastError @12 :Text;
+  # Last runtime capability or programming error observed by the NodePort manager.
+
+  statsError @13 :Text;
+  # Last error encountered while reading NodePort dataplane counters.
+}
+
+struct PacketCounters {
+  packets @0 :UInt64;
+  # Number of packets processed.
+
+  bytes @1 :UInt64;
+  # Number of bytes processed.
+
+  drops @2 :UInt64;
+  # Number of packets dropped by the dataplane path.
 }

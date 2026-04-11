@@ -5,6 +5,7 @@ use crate::network::attachment::PlatformAttachmentProvisioner;
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
 use crate::network::discovery::ServiceDiscovery;
 use crate::network::events::ForwardingEvent;
+use crate::network::nodeport::NodePortManager;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
     BpfAttachPoint, BpfProgramSpec, NetworkAttachmentState, NetworkEvent, NetworkPeerState,
@@ -176,6 +177,11 @@ impl NetworkController {
         if inserted {
             self.inner.wake.notify_one();
         }
+    }
+
+    /// Return the local NodePort manager used by network discovery and public-service publication.
+    pub fn nodeport_manager(&self) -> NodePortManager {
+        self.inner.discovery.nodeport_manager()
     }
 
     async fn send_event(&self, event: NetworkEvent) {

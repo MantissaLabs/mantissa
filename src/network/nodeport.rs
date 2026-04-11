@@ -6,6 +6,12 @@ use uuid::Uuid;
 
 const NODEPORT_PROTO_TCP: u8 = 6;
 const NODEPORT_PROTO_UDP: u8 = 17;
+/// Keep the userspace capacity checks aligned with the pinned VIP map size in the tc ingress program.
+const NODEPORT_VIP_CAPACITY: usize = 1024;
+/// Keep the userspace capacity checks aligned with the pinned NAT flow maps in the tc programs.
+const NODEPORT_FLOW_CAPACITY: usize = 2048;
+/// Keep the userspace capacity checks aligned with the pinned host-access map size in the tc ingress program.
+const NODEPORT_HOST_CAPACITY: usize = 256;
 
 /// Declarative nodeport mapping that connects an external port to an overlay VIP.
 #[derive(Clone, Debug)]
@@ -42,6 +48,15 @@ pub enum NodePortRuntimeState {
     Degraded,
 }
 
+/// Aggregated packet counters read from the pinned NodePort eBPF stats maps.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NodePortPacketCounters {
+    pub packets: u64,
+    pub bytes: u64,
+    pub drops: u64,
+}
+
 /// Snapshot of node-local nodeport capability and resolved external identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodePortStatus {
@@ -51,7 +66,26 @@ pub struct NodePortStatus {
     pub resolved_node_ip: Option<Ipv4Addr>,
     pub active_networks: usize,
     pub active_ports: usize,
+    pub active_host_networks: usize,
+    pub vip_capacity: usize,
+    pub host_capacity: usize,
+    pub flow_capacity: usize,
+    pub ingress_stats: Option<NodePortPacketCounters>,
+    pub egress_stats: Option<NodePortPacketCounters>,
     pub last_error: Option<String>,
+    pub stats_error: Option<String>,
+}
+
+impl std::fmt::Display for NodePortRuntimeState {
+    /// Render a stable, human-readable runtime state label for diagnostics and RPC output.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodePortRuntimeState::Disabled => f.write_str("disabled"),
+            NodePortRuntimeState::Pending => f.write_str("pending"),
+            NodePortRuntimeState::Ready => f.write_str("ready"),
+            NodePortRuntimeState::Degraded => f.write_str("degraded"),
+        }
+    }
 }
 
 /// # Description:
@@ -76,6 +110,37 @@ fn configured_node_ip_from_sources(
     advertise_addr: Option<&str>,
 ) -> Option<Ipv4Addr> {
     configured_node_ip.or_else(|| advertise_addr.and_then(resolve_advertise_ipv4))
+}
+
+/// Project the active-public-network count after one NodePort sync applies.
+fn projected_active_networks_after_sync(
+    current_active_networks: usize,
+    had_ports: bool,
+    wants_mappings: bool,
+) -> usize {
+    match (had_ports, wants_mappings) {
+        (true, false) => current_active_networks.saturating_sub(1),
+        (false, true) => current_active_networks + 1,
+        _ => current_active_networks,
+    }
+}
+
+/// Return the first fixed-capacity violation that would make one NodePort sync unsafe to apply.
+fn nodeport_capacity_error(
+    projected_active_ports: usize,
+    projected_active_networks: usize,
+) -> Option<String> {
+    if projected_active_ports > NODEPORT_VIP_CAPACITY {
+        return Some(format!(
+            "nodeport VIP capacity exceeded: requested {projected_active_ports} active ports, limit {NODEPORT_VIP_CAPACITY}"
+        ));
+    }
+    if projected_active_networks > NODEPORT_HOST_CAPACITY {
+        return Some(format!(
+            "nodeport host-access capacity exceeded: requested {projected_active_networks} active public networks, limit {NODEPORT_HOST_CAPACITY}"
+        ));
+    }
+    None
 }
 
 impl std::fmt::Display for NodePortProtocol {
@@ -145,7 +210,14 @@ impl PlatformNodePortManager {
             resolved_node_ip: None,
             active_networks: 0,
             active_ports: 0,
+            active_host_networks: 0,
+            vip_capacity: NODEPORT_VIP_CAPACITY,
+            host_capacity: NODEPORT_HOST_CAPACITY,
+            flow_capacity: NODEPORT_FLOW_CAPACITY,
+            ingress_stats: None,
+            egress_stats: None,
             last_error: Some("nodeport is only available on linux".to_string()),
+            stats_error: None,
         }
     }
 }
@@ -153,15 +225,17 @@ impl PlatformNodePortManager {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{
-        NodePortMapping, NodePortProtocol, NodePortRuntimeState, NodePortStatus,
-        configured_node_ip_from_sources,
+        NODEPORT_FLOW_CAPACITY, NODEPORT_HOST_CAPACITY, NODEPORT_VIP_CAPACITY, NodePortMapping,
+        NodePortPacketCounters, NodePortProtocol, NodePortRuntimeState, NodePortStatus,
+        configured_node_ip_from_sources, nodeport_capacity_error,
+        projected_active_networks_after_sync,
     };
     use crate::config;
     use crate::network::attachment::host_access_host_iface_name;
     use crate::network::wireguard::MANTISSA_WIREGUARD_IFNAME;
     use anyhow::{Context, Result, anyhow};
     use aya::Pod;
-    use aya::maps::MapData;
+    use aya::maps::{Map, MapData, PerCpuArray};
     use aya::programs::ProgramError;
     use aya::programs::tc::{
         SchedClassifier, TcAttachType, qdisc_add_clsact, qdisc_detach_program,
@@ -214,6 +288,7 @@ mod platform {
         host_ip: u32,
     }
     unsafe impl Pod for NodePortHost {}
+    unsafe impl Pod for NodePortPacketCounters {}
 
     /// Uniquely identify a nodeport binding by port and transport protocol.
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -332,6 +407,8 @@ mod platform {
             if entries.is_empty() && !had_ports {
                 return Ok(());
             }
+            let desired_ports = self.collect_desired_ports(network_id, entries)?;
+            self.ensure_sync_capacity(network_id, had_ports, &desired_ports)?;
             if !self.ensure_runtime_capable().await? {
                 if wants_mappings {
                     return Err(anyhow!(
@@ -358,7 +435,6 @@ mod platform {
                 }
                 return Ok(());
             }
-            self.set_runtime_status(NodePortRuntimeState::Ready, None, "nodeport runtime ready");
             if wants_mappings && let Err(err) = self.ensure_host_ingress(network_id).await {
                 self.degrade_runtime(
                     format!("nodeport host-access attach failed for network {network_id}: {err:#}"),
@@ -373,6 +449,7 @@ mod platform {
                     })
                 ));
             }
+            self.set_runtime_status(NodePortRuntimeState::Ready, None, "nodeport runtime ready");
 
             let node_ip = self
                 .node_ip
@@ -382,28 +459,6 @@ mod platform {
             } else {
                 Some(overlay_ifindex(network_id)?)
             };
-            let mut desired_ports = HashSet::new();
-            for entry in entries {
-                let selector = NodePortSelector::new(entry.port, entry.protocol);
-                if !desired_ports.insert(selector) {
-                    return Err(anyhow!(
-                        "nodeport {} {} is declared more than once for network {}",
-                        entry.port,
-                        entry.protocol,
-                        network_id
-                    ));
-                }
-                if let Some(owner) = self.port_owner.get(&selector)
-                    && *owner != network_id
-                {
-                    return Err(anyhow!(
-                        "nodeport {} {} is already owned by network {}",
-                        entry.port,
-                        entry.protocol,
-                        owner
-                    ));
-                }
-            }
             let base = map_pin_dir()?;
             let vip_map = open_map(&base, "NODEPORT_VIPS").context("open NODEPORT_VIPS map")?;
             let vip_fd = vip_map.fd().as_fd().as_raw_fd();
@@ -474,9 +529,89 @@ mod platform {
             Ok(())
         }
 
+        /// Collect the desired port selectors for one network and reject duplicate or conflicting claims.
+        fn collect_desired_ports(
+            &self,
+            network_id: Uuid,
+            entries: &[NodePortMapping],
+        ) -> Result<HashSet<NodePortSelector>> {
+            let mut desired_ports = HashSet::new();
+            for entry in entries {
+                let selector = NodePortSelector::new(entry.port, entry.protocol);
+                if !desired_ports.insert(selector) {
+                    return Err(anyhow!(
+                        "nodeport {} {} is declared more than once for network {}",
+                        entry.port,
+                        entry.protocol,
+                        network_id
+                    ));
+                }
+                if let Some(owner) = self.port_owner.get(&selector)
+                    && *owner != network_id
+                {
+                    return Err(anyhow!(
+                        "nodeport {} {} is already owned by network {}",
+                        entry.port,
+                        entry.protocol,
+                        owner
+                    ));
+                }
+            }
+            Ok(desired_ports)
+        }
+
+        /// Fail fast when the requested sync would exceed the fixed NodePort map capacities.
+        fn ensure_sync_capacity(
+            &mut self,
+            network_id: Uuid,
+            had_ports: bool,
+            desired_ports: &HashSet<NodePortSelector>,
+        ) -> Result<()> {
+            let current_ports = self
+                .ports_by_network
+                .get(&network_id)
+                .map(HashSet::len)
+                .unwrap_or(0);
+            let projected_active_ports =
+                self.port_owner.len() - current_ports + desired_ports.len();
+            let current_active_networks = self
+                .ports_by_network
+                .values()
+                .filter(|ports| !ports.is_empty())
+                .count();
+            let projected_active_networks = projected_active_networks_after_sync(
+                current_active_networks,
+                had_ports,
+                !desired_ports.is_empty(),
+            );
+            if let Some(error) =
+                nodeport_capacity_error(projected_active_ports, projected_active_networks)
+            {
+                self.degrade_runtime(error.clone(), "nodeport runtime degraded");
+                return Err(anyhow!(error));
+            }
+
+            Ok(())
+        }
+
         /// Return the current runtime snapshot for diagnostics and future status plumbing.
         pub(super) fn status(&self) -> NodePortStatus {
-            self.status_snapshot()
+            let mut status = self.status_snapshot();
+            if self.attachment.is_none() {
+                return status;
+            }
+
+            match self.read_dataplane_counters() {
+                Ok((ingress, egress)) => {
+                    status.ingress_stats = Some(ingress);
+                    status.egress_stats = Some(egress);
+                }
+                Err(err) => {
+                    status.stats_error = Some(err.to_string());
+                }
+            }
+
+            status
         }
 
         /// Build one status snapshot from the manager's current resolved identity and state.
@@ -493,8 +628,25 @@ mod platform {
                 resolved_node_ip: self.node_ip,
                 active_networks,
                 active_ports: self.port_owner.len(),
+                active_host_networks: self.host_ingress_attached.len(),
+                vip_capacity: NODEPORT_VIP_CAPACITY,
+                host_capacity: NODEPORT_HOST_CAPACITY,
+                flow_capacity: NODEPORT_FLOW_CAPACITY,
+                ingress_stats: None,
+                egress_stats: None,
                 last_error: self.last_error.clone(),
+                stats_error: None,
             }
+        }
+
+        /// Read and aggregate the ingress and egress packet counters from the pinned NodePort stats maps.
+        fn read_dataplane_counters(
+            &self,
+        ) -> Result<(NodePortPacketCounters, NodePortPacketCounters)> {
+            Ok((
+                read_counter_map("NODEPORT_TC_INGRESS_STATS")?,
+                read_counter_map("NODEPORT_TC_EGRESS_STATS")?,
+            ))
         }
 
         /// Record one runtime state transition and log it only when the visible snapshot changed.
@@ -777,14 +929,11 @@ mod platform {
             let ifindex = match ifindex(&iface) {
                 Ok(index) => index,
                 Err(err) => {
-                    debug!(
-                        target: "network",
-                        iface = %iface,
-                        "nodeport host-access interface not ready: {err:#}"
-                    );
                     self.host_ingress_attached.remove(&network_id);
                     self.host_ingress_ifindex.remove(&network_id);
-                    return Ok(());
+                    return Err(err).with_context(|| {
+                        format!("nodeport host-access interface {iface} is unavailable")
+                    });
                 }
             };
 
@@ -795,13 +944,8 @@ mod platform {
             }
 
             ensure_clsact(&iface)?;
-            if let Err(err) = configure_host_access_sysctls(&iface) {
-                warn!(
-                    target: "network",
-                    iface = %iface,
-                    "nodeport host-access sysctls could not be applied: {err:#}"
-                );
-            }
+            configure_host_access_sysctls(&iface)
+                .with_context(|| format!("configure nodeport host-access sysctls on {iface}"))?;
             attach_tc(
                 &mut attachment.egress,
                 &iface,
@@ -1233,6 +1377,26 @@ mod platform {
         Ok(path)
     }
 
+    /// Read one pinned per-CPU stats map and aggregate its counters across every CPU slot.
+    fn read_counter_map(name: &str) -> Result<NodePortPacketCounters> {
+        let base = map_pin_dir()?;
+        let map = open_map(&base, name).with_context(|| format!("open {name}"))?;
+        let array = PerCpuArray::<_, NodePortPacketCounters>::try_from(Map::PerCpuArray(map))
+            .with_context(|| format!("interpret {name} as per-cpu stats array"))?;
+        let values = array
+            .get(&0, 0)
+            .with_context(|| format!("read counter slot from {name}"))?;
+
+        let mut counters = NodePortPacketCounters::default();
+        for value in values.iter().copied() {
+            counters.packets += value.packets;
+            counters.bytes += value.bytes;
+            counters.drops += value.drops;
+        }
+
+        Ok(counters)
+    }
+
     /// Remove pinned nodeport maps so new layouts can be loaded atomically.
     fn reset_nodeport_maps(root: &Path) -> Result<()> {
         let maps = [
@@ -1375,8 +1539,10 @@ use platform::PlatformNodePortManager;
 #[cfg(test)]
 mod tests {
     use super::{
-        NodePortRuntimeState, NodePortStatus, configured_node_ip_from_sources,
-        resolve_advertise_ipv4,
+        NODEPORT_FLOW_CAPACITY, NODEPORT_HOST_CAPACITY, NODEPORT_VIP_CAPACITY,
+        NodePortPacketCounters, NodePortRuntimeState, NodePortStatus,
+        configured_node_ip_from_sources, nodeport_capacity_error,
+        projected_active_networks_after_sync, resolve_advertise_ipv4,
     };
     use std::net::Ipv4Addr;
 
@@ -1421,11 +1587,56 @@ mod tests {
             resolved_node_ip: Some(Ipv4Addr::new(10, 0, 0, 4)),
             active_networks: 2,
             active_ports: 3,
+            active_host_networks: 2,
+            vip_capacity: NODEPORT_VIP_CAPACITY,
+            host_capacity: NODEPORT_HOST_CAPACITY,
+            flow_capacity: NODEPORT_FLOW_CAPACITY,
+            ingress_stats: Some(NodePortPacketCounters {
+                packets: 10,
+                bytes: 2048,
+                drops: 1,
+            }),
+            egress_stats: None,
             last_error: None,
+            stats_error: None,
         };
 
         assert_eq!(status.active_networks, 2);
         assert_eq!(status.active_ports, 3);
+        assert_eq!(status.active_host_networks, 2);
+        assert_eq!(status.vip_capacity, NODEPORT_VIP_CAPACITY);
+        assert_eq!(
+            status.ingress_stats,
+            Some(NodePortPacketCounters {
+                packets: 10,
+                bytes: 2048,
+                drops: 1,
+            })
+        );
         assert_eq!(status.state, NodePortRuntimeState::Pending);
+    }
+
+    #[test]
+    fn projected_active_networks_adds_new_public_network() {
+        assert_eq!(projected_active_networks_after_sync(3, false, true), 4);
+    }
+
+    #[test]
+    fn projected_active_networks_removes_empty_public_network() {
+        assert_eq!(projected_active_networks_after_sync(3, true, false), 2);
+    }
+
+    #[test]
+    fn nodeport_capacity_error_reports_vip_limit() {
+        let error = nodeport_capacity_error(NODEPORT_VIP_CAPACITY + 1, 1)
+            .expect("expected vip capacity error");
+        assert!(error.contains("VIP capacity exceeded"));
+    }
+
+    #[test]
+    fn nodeport_capacity_error_reports_host_limit() {
+        let error = nodeport_capacity_error(1, NODEPORT_HOST_CAPACITY + 1)
+            .expect("expected host capacity error");
+        assert!(error.contains("host-access capacity exceeded"));
     }
 }

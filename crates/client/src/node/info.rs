@@ -95,5 +95,53 @@ pub async fn info(cfg: &ClientConfig) -> Result<()> {
         }
     }
 
+    let nodeport = info.get_nodeport()?;
+    let nodeport_state = nodeport.get_state()?.to_str()?.to_string();
+    let resolved_iface = nodeport.get_resolved_iface()?.to_str()?.to_string();
+    let resolved_node_ip = nodeport.get_resolved_node_ip()?.to_str()?.to_string();
+    let last_error = nodeport.get_last_error()?.to_str()?.to_string();
+    let stats_error = nodeport.get_stats_error()?.to_str()?.to_string();
+    let ingress = nodeport.get_ingress()?;
+    let egress = nodeport.get_egress()?;
+
+    println!("NodePort:");
+    println!("  desired_enabled: {}", nodeport.get_desired_enabled());
+    if !nodeport_state.is_empty() {
+        println!("  state: {nodeport_state}");
+    }
+    if !resolved_iface.is_empty() {
+        println!("  resolved_iface: {resolved_iface}");
+    }
+    if !resolved_node_ip.is_empty() {
+        println!("  resolved_node_ip: {resolved_node_ip}");
+    }
+    println!("  active_networks: {}", nodeport.get_active_networks());
+    println!("  active_ports: {}", nodeport.get_active_ports());
+    println!(
+        "  active_host_networks: {}",
+        nodeport.get_active_host_networks()
+    );
+    println!("  vip_capacity: {}", nodeport.get_vip_capacity());
+    println!("  host_capacity: {}", nodeport.get_host_capacity());
+    println!("  flow_capacity: {}", nodeport.get_flow_capacity());
+    println!(
+        "  ingress: packets={} bytes={} drops={}",
+        ingress.get_packets(),
+        ingress.get_bytes(),
+        ingress.get_drops(),
+    );
+    println!(
+        "  egress: packets={} bytes={} drops={}",
+        egress.get_packets(),
+        egress.get_bytes(),
+        egress.get_drops(),
+    );
+    if !last_error.is_empty() {
+        println!("  last_error: {last_error}");
+    }
+    if !stats_error.is_empty() {
+        println!("  stats_error: {stats_error}");
+    }
+
     Ok(())
 }
