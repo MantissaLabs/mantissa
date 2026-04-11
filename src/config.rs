@@ -1,5 +1,5 @@
 use std::fs;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{
     RwLock,
@@ -51,6 +51,8 @@ pub struct StorageConfig {
 /// Network subsystem configuration for WireGuard, BPF, and nodeport.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct NetworkConfig {
+    #[serde(default)]
+    pub advertise_addr: Option<String>,
     #[serde(default)]
     pub wireguard: WireguardConfig,
     #[serde(default)]
@@ -449,6 +451,13 @@ pub fn nodeport_enabled() -> bool {
 
 /// # Description:
 ///
+/// Resolve the operator-configured advertise address, if one has been supplied.
+pub fn advertise_addr() -> Option<String> {
+    global_config().network.advertise_addr
+}
+
+/// # Description:
+///
 /// Resolve the configured BPF attachment toggle.
 pub fn bpf_attach_enabled() -> bool {
     global_config().network.bpf.attach
@@ -555,6 +564,28 @@ pub fn spawn_config_watcher() -> Option<std::thread::JoinHandle<()>> {
     let source = global_config_source();
     let path = source.path?;
     Some(start_config_watch_thread(path))
+}
+
+/// # Description:
+///
+/// Validate one operator-supplied advertise address before startup publishes it to peers.
+fn validate_advertise_addr(raw: &str) -> Result<()> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("network.advertise_addr cannot be empty");
+    }
+
+    let _ = crate::node::address::extract_port(trimmed).with_context(|| {
+        format!("network.advertise_addr must include a concrete port (got '{trimmed}')")
+    })?;
+
+    if let Ok(socket_addr) = trimmed.parse::<SocketAddr>()
+        && socket_addr.ip().is_unspecified()
+    {
+        anyhow::bail!("network.advertise_addr must not use an unspecified IP (got '{trimmed}')");
+    }
+
+    Ok(())
 }
 
 /// # Description:
@@ -807,6 +838,14 @@ impl Config {
             }
         }
 
+        if let Ok(addr) = std::env::var("MANTISSA_ADVERTISE_ADDR") {
+            applied = true;
+            let addr = addr.trim();
+            if !addr.is_empty() {
+                self.network.advertise_addr = Some(addr.to_string());
+            }
+        }
+
         if let Ok(host) = std::env::var("MANTISSA_RUNTIME_OCI_HOST") {
             applied = true;
             let host = host.trim();
@@ -893,6 +932,10 @@ impl Config {
             && ip.parse::<Ipv4Addr>().is_err()
         {
             anyhow::bail!("network.nodeport.ip must be a valid IPv4 address (got '{ip}')");
+        }
+
+        if let Some(ref addr) = self.network.advertise_addr {
+            validate_advertise_addr(addr)?;
         }
 
         if let Some(ref host) = self.runtimes.oci.host
@@ -1179,6 +1222,10 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
         changes.push("network.nodeport.ip".to_string());
     }
 
+    if old.network.advertise_addr != new.network.advertise_addr {
+        changes.push("network.advertise_addr".to_string());
+    }
+
     if old.network.wireguard.port != new.network.wireguard.port {
         changes.push("network.wireguard.port".to_string());
     }
@@ -1239,6 +1286,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_advertise_addr() {
+        let mut config = Config::default();
+        config.network.advertise_addr = Some("10.0.0.10".to_string());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unspecified_socket_advertise_addr() {
+        let mut config = Config::default();
+        config.network.advertise_addr = Some("0.0.0.0:6578".to_string());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn rejects_nodeport_without_bpf() {
         let mut config = Config::default();
         config.network.nodeport.enabled = true;
@@ -1290,6 +1351,7 @@ mod tests {
             std::env::set_var("MANTISSA_WIREGUARD_PORT", "51820");
             std::env::set_var("MANTISSA_BPF_NO_ATTACH", "1");
             std::env::set_var("MANTISSA_NODEPORT_IFACE", "eth0");
+            std::env::set_var("MANTISSA_ADVERTISE_ADDR", "node-1.example.com:6578");
             std::env::set_var("MANTISSA_RUNTIME_OCI_HOST", "unix:///var/run/docker.sock");
             std::env::set_var("MANTISSA_GPU_DEVICE_OVERRIDES", "uuid:GPU-abc=id:GPU-abc");
             std::env::set_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY", "1");
@@ -1313,6 +1375,10 @@ mod tests {
         assert!(!config.network.bpf.attach);
         assert!(!config.network.nodeport.enabled);
         assert_eq!(config.network.nodeport.iface.as_deref(), Some("eth0"));
+        assert_eq!(
+            config.network.advertise_addr.as_deref(),
+            Some("node-1.example.com:6578")
+        );
         assert_eq!(
             config.runtimes.oci.host.as_deref(),
             Some("unix:///var/run/docker.sock")
@@ -1338,6 +1404,7 @@ mod tests {
             std::env::remove_var("MANTISSA_WIREGUARD_PORT");
             std::env::remove_var("MANTISSA_BPF_NO_ATTACH");
             std::env::remove_var("MANTISSA_NODEPORT_IFACE");
+            std::env::remove_var("MANTISSA_ADVERTISE_ADDR");
             std::env::remove_var("MANTISSA_RUNTIME_OCI_HOST");
             std::env::remove_var("MANTISSA_GPU_DEVICE_OVERRIDES");
             std::env::remove_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY");
@@ -1374,6 +1441,20 @@ mod tests {
             changes
                 .iter()
                 .any(|change| change == "scheduler.reserved_memory_bytes")
+        );
+    }
+
+    #[test]
+    fn advertise_addr_change_requires_restart() {
+        let old = Config::default();
+        let mut new = Config::default();
+        new.network.advertise_addr = Some("node-1.example.com:6578".to_string());
+
+        let changes = restart_required_changes(&old, &new);
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "network.advertise_addr")
         );
     }
 }

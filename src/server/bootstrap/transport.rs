@@ -5,7 +5,7 @@ use crate::config;
 ///
 /// Headless startup constructs the same option type directly so both code paths
 /// converge on one shared bootstrap pipeline.
-pub(super) fn daemon_bootstrap_options() -> BootstrapOptions {
+pub(super) fn daemon_bootstrap_options(advertise_override: Option<String>) -> BootstrapOptions {
     let replication = config::replication_runtime_config();
     BootstrapOptions {
         gossip_channel_capacity: replication.gossip_channel_capacity,
@@ -16,6 +16,7 @@ pub(super) fn daemon_bootstrap_options() -> BootstrapOptions {
         global_metadata_sync_tick: Some(replication.global_metadata_sync_tick),
         global_metadata_sync_fanout: Some(replication.global_metadata_sync_fanout),
         gossip_tick: Some(replication.gossip_tick),
+        advertise_override,
         ..BootstrapOptions::default()
     }
 }

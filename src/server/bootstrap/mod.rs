@@ -17,11 +17,12 @@ pub(crate) type BootstrapResult<T> = Result<T, Box<dyn std::error::Error>>;
 /// split into explicit phases shared by both production and headless startup.
 pub async fn start(
     listen_addr: String,
+    advertise_addr: Option<String>,
     mode: server::RunMode,
     enable_unix_socket: bool,
 ) -> BootstrapResult<Option<server::RunHandles>> {
     let ctx = BootstrapContext::init_base(listen_addr).await?;
-    let runtime = boot(ctx, transport::daemon_bootstrap_options()).await?;
+    let runtime = boot(ctx, transport::daemon_bootstrap_options(advertise_addr)).await?;
     match mode {
         server::RunMode::Blocking => {
             runtime.server.run_blocking(enable_unix_socket).await?;

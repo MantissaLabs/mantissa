@@ -17,6 +17,7 @@ override the config for backwards compatibility.
 - `mantissa config show` prints the resolved configuration.
 - `mantissa config validate` validates the resolved configuration and exits.
 - `mantissa config path` prints the config file path in use (or `<default>`).
+- `mantissa init --advertise <host:port>` overrides `network.advertise_addr` for that daemon start.
 
 ## Hot reload
 
@@ -28,6 +29,7 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 ```ron
 (
     network: (
+        advertise_addr: "node-1.example.com:6578",
         wireguard: (
             enabled: true,
             port: 51820,
@@ -75,6 +77,7 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 
 ## Config keys (and legacy env vars)
 
+- `network.advertise_addr` (env: `MANTISSA_ADVERTISE_ADDR`)
 - `network.wireguard.enabled` (legacy: `MANTISSA_WIREGUARD_DISABLE`)
 - `network.wireguard.port` (legacy: `MANTISSA_WIREGUARD_PORT`)
 - `network.wireguard.manage_firewall` (legacy: `MANTISSA_WIREGUARD_NO_FIREWALL`)

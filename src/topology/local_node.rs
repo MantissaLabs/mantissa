@@ -48,7 +48,7 @@ impl Topology {
         self.local.node.id
     }
 
-    /// Overrides the published advertise address, mainly for tests and inproc transports.
+    /// Overrides the published advertise address with an operator- or test-supplied value.
     pub fn set_advertise_override<S: Into<String>>(&self, s: Option<S>) {
         self.local.advertise.set_override(s);
     }
@@ -174,7 +174,7 @@ impl Topology {
 
     /// Computes what we publish in NodeInfo.addr / PeerValue.address.
     /// Order of precedence:
-    /// 1) explicit override (e.g., "inproc://<uuid>" for inproc tests)
+    /// 1) explicit override (e.g., operator-configured public address or "inproc://<uuid>")
     /// 2) actual bound addr (if known) — if ip is 0.0.0.0, replace ip but keep the bound port
     /// 3) configured addr (initial value) — if ip is 0.0.0.0, compute a best-effort ip but keep its port
     pub fn compute_advertise_addr(&self) -> io::Result<String> {

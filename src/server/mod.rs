@@ -303,6 +303,8 @@ impl Server {
             .await
             .map_err(|error| std::io::Error::other(error.to_string()))?;
 
+        self.refresh_bound_addr(bound).await?;
+
         let unix_task = if enable_unix_socket {
             let local_session = self.sessions.new_client();
             Some(tokio::task::spawn_local(async move {

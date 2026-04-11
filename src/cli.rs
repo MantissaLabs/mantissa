@@ -213,6 +213,10 @@ pub struct InitArgs {
     /// Print debug information verbosely
     #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub debug: bool,
+
+    /// Publish this address to peers instead of inferring it from local routing
+    #[arg(long = "advertise", value_name = "HOST:PORT")]
+    pub advertise: Option<String>,
 }
 
 #[derive(Args, Debug)]

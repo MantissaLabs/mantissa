@@ -64,10 +64,12 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
     let mut cfg = ClientConfig::default();
 
     match cmd {
-        Command::Init(_init) => {
+        Command::Init(init) => {
+            let advertise_addr = init.advertise.or_else(config::advertise_addr);
             local
                 .run_until(crate::server::bootstrap::start(
                     listen,
+                    advertise_addr,
                     RunMode::Blocking,
                     true,
                 ))
