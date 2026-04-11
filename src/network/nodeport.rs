@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
@@ -31,6 +31,51 @@ impl NodePortProtocol {
             NodePortProtocol::Udp => NODEPORT_PROTO_UDP,
         }
     }
+}
+
+/// Runtime lifecycle for the local nodeport dataplane manager.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodePortRuntimeState {
+    Disabled,
+    Pending,
+    Ready,
+    Degraded,
+}
+
+/// Snapshot of node-local nodeport capability and resolved external identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodePortStatus {
+    pub desired_enabled: bool,
+    pub state: NodePortRuntimeState,
+    pub resolved_iface: Option<String>,
+    pub resolved_node_ip: Option<Ipv4Addr>,
+    pub active_networks: usize,
+    pub active_ports: usize,
+    pub last_error: Option<String>,
+}
+
+/// # Description:
+///
+/// Resolve an IPv4 address from one operator-configured advertise address when
+/// the address is expressed as a literal socket or a resolvable hostname.
+fn resolve_advertise_ipv4(addr: &str) -> Option<Ipv4Addr> {
+    addr.to_socket_addrs()
+        .ok()?
+        .find_map(|socket| match socket.ip() {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        })
+}
+
+/// # Description:
+///
+/// Pick the configured NodePort IPv4 identity, preferring the explicit
+/// `network.nodeport.ip` override over the advertise address when both exist.
+fn configured_node_ip_from_sources(
+    configured_node_ip: Option<Ipv4Addr>,
+    advertise_addr: Option<&str>,
+) -> Option<Ipv4Addr> {
+    configured_node_ip.or_else(|| advertise_addr.and_then(resolve_advertise_ipv4))
 }
 
 impl std::fmt::Display for NodePortProtocol {
@@ -68,6 +113,12 @@ impl NodePortManager {
         let mut guard = self.inner.lock().await;
         guard.sync_ports(network_id, entries).await
     }
+
+    /// Return the current node-local nodeport runtime status for diagnostics.
+    pub async fn status(&self) -> NodePortStatus {
+        let guard = self.inner.lock().await;
+        guard.status()
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -84,15 +135,30 @@ impl PlatformNodePortManager {
     async fn sync_ports(&mut self, _network_id: Uuid, _entries: &[NodePortMapping]) -> Result<()> {
         Ok(())
     }
+
+    /// Return a disabled runtime snapshot on unsupported platforms.
+    fn status(&self) -> NodePortStatus {
+        NodePortStatus {
+            desired_enabled: false,
+            state: NodePortRuntimeState::Disabled,
+            resolved_iface: None,
+            resolved_node_ip: None,
+            active_networks: 0,
+            active_ports: 0,
+            last_error: Some("nodeport is only available on linux".to_string()),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{NodePortMapping, NodePortProtocol};
+    use super::{
+        NodePortMapping, NodePortProtocol, NodePortRuntimeState, NodePortStatus,
+        configured_node_ip_from_sources,
+    };
     use crate::config;
     use crate::network::attachment::host_access_host_iface_name;
     use crate::network::wireguard::MANTISSA_WIREGUARD_IFNAME;
-    use crate::node::address::compute_advertise_ip;
     use anyhow::{Context, Result, anyhow};
     use aya::Pod;
     use aya::maps::MapData;
@@ -170,71 +236,69 @@ mod platform {
 
     /// Linux implementation that loads nodeport tc programs and keeps their maps synchronized.
     pub(super) struct PlatformNodePortManager {
-        enabled: bool,
+        desired_enabled: bool,
+        configured_iface: Option<String>,
+        configured_node_ip: Option<Ipv4Addr>,
+        configured_advertise_addr: Option<String>,
         iface: Option<String>,
         node_ip: Option<Ipv4Addr>,
+        attached_iface: Option<String>,
+        attached_node_ip: Option<Ipv4Addr>,
         attachment: Option<NodePortAttachment>,
         ports_by_network: HashMap<Uuid, HashSet<NodePortSelector>>,
         port_owner: HashMap<NodePortSelector, Uuid>,
         host_ingress_attached: HashSet<Uuid>,
         host_ingress_ifindex: HashMap<Uuid, u32>,
+        runtime_state: NodePortRuntimeState,
+        last_error: Option<String>,
     }
 
     impl PlatformNodePortManager {
         /// Capture nodeport configuration from the global config for later attachment.
         pub(super) fn new() -> Self {
-            let iface = config::nodeport_iface();
-            let node_ip = config::nodeport_ip().or_else(|| {
-                compute_advertise_ip(None, None)
-                    .ok()
-                    .and_then(|ip| match ip {
-                        IpAddr::V4(v4) => Some(v4),
-                        _ => None,
-                    })
-            });
-            let mut enabled = config::nodeport_enabled();
-            if enabled && !config::bpf_attach_enabled() {
+            let configured_iface = config::nodeport_iface();
+            let configured_node_ip = config::nodeport_ip();
+            let configured_advertise_addr = config::advertise_addr();
+            let mut desired_enabled = config::nodeport_enabled();
+            let initial_error = if desired_enabled && !config::bpf_attach_enabled() {
                 debug!(
                     target: "network",
                     "nodeport disabled because bpf attachment is disabled"
                 );
-                enabled = false;
-            }
-
-            if enabled {
-                info!(
-                    target: "network",
-                    iface = ?iface,
-                    node_ip = ?node_ip,
-                    "nodeport external load balancer enabled"
-                );
-                if iface.is_none() || node_ip.is_none() {
-                    debug!(
-                        target: "network",
-                        iface = ?iface,
-                        node_ip = ?node_ip,
-                        "nodeport will auto-detect missing interface settings"
-                    );
-                }
+                desired_enabled = false;
+                Some("nodeport disabled because bpf attachment is disabled".to_string())
             } else {
-                debug!(
-                    target: "network",
-                    iface = ?iface,
-                    node_ip = ?node_ip,
-                    "nodeport external load balancer disabled"
-                );
-            }
+                None
+            };
 
-            Self {
-                enabled,
-                iface,
-                node_ip,
+            let mut manager = Self {
+                desired_enabled,
+                configured_iface: configured_iface.clone(),
+                configured_node_ip,
+                configured_advertise_addr,
+                iface: configured_iface,
+                node_ip: configured_node_ip,
+                attached_iface: None,
+                attached_node_ip: None,
                 attachment: None,
                 ports_by_network: HashMap::new(),
                 port_owner: HashMap::new(),
                 host_ingress_attached: HashSet::new(),
                 host_ingress_ifindex: HashMap::new(),
-            }
+                runtime_state: if desired_enabled {
+                    NodePortRuntimeState::Pending
+                } else {
+                    NodePortRuntimeState::Disabled
+                },
+                last_error: None,
+            };
+
+            manager.set_runtime_status(
+                manager.runtime_state,
+                initial_error,
+                "nodeport runtime initialized",
+            );
+            manager
         }
 
         /// Sync the nodeport map to match the declared mappings for a network.
@@ -243,7 +307,12 @@ mod platform {
             network_id: Uuid,
             entries: &[NodePortMapping],
         ) -> Result<()> {
-            if !self.enabled {
+            if !self.desired_enabled {
+                self.set_runtime_status(
+                    NodePortRuntimeState::Disabled,
+                    self.last_error.clone(),
+                    "nodeport runtime disabled",
+                );
                 return Ok(());
             }
             let had_ports = self
@@ -254,12 +323,25 @@ mod platform {
             if entries.is_empty() && !had_ports {
                 return Ok(());
             }
-            self.ensure_attached().await?;
-            if !self.enabled {
+            if !self.ensure_runtime_capable().await? {
                 return Ok(());
             }
-            if !entries.is_empty() {
-                self.ensure_host_ingress(network_id).await?;
+            if let Err(err) = self.ensure_attached().await {
+                self.degrade_runtime(
+                    format!("nodeport attach failed: {err:#}"),
+                    "nodeport runtime degraded",
+                );
+                return Ok(());
+            }
+            self.set_runtime_status(NodePortRuntimeState::Ready, None, "nodeport runtime ready");
+            if !entries.is_empty()
+                && let Err(err) = self.ensure_host_ingress(network_id).await
+            {
+                self.degrade_runtime(
+                    format!("nodeport host-access attach failed for network {network_id}: {err:#}"),
+                    "nodeport runtime degraded",
+                );
+                return Ok(());
             }
 
             let node_ip = self
@@ -356,37 +438,197 @@ mod platform {
             Ok(())
         }
 
-        /// Attach nodeport programs to the configured external interface if not already attached.
-        async fn ensure_attached(&mut self) -> Result<()> {
-            if self.attachment.is_some() {
-                return Ok(());
+        /// Return the current runtime snapshot for diagnostics and future status plumbing.
+        pub(super) fn status(&self) -> NodePortStatus {
+            self.status_snapshot()
+        }
+
+        /// Build one status snapshot from the manager's current resolved identity and state.
+        fn status_snapshot(&self) -> NodePortStatus {
+            let active_networks = self
+                .ports_by_network
+                .values()
+                .filter(|ports| !ports.is_empty())
+                .count();
+            NodePortStatus {
+                desired_enabled: self.desired_enabled,
+                state: self.runtime_state,
+                resolved_iface: self.iface.clone(),
+                resolved_node_ip: self.node_ip,
+                active_networks,
+                active_ports: self.port_owner.len(),
+                last_error: self.last_error.clone(),
             }
-            if (self.iface.is_none() || self.node_ip.is_none())
-                && let Err(err) = self.autodetect_iface().await
-            {
-                warn!(
-                    target: "network",
-                    "nodeport interface autodetection failed: {err:#}"
-                );
+        }
+
+        /// Record one runtime state transition and log it only when the visible snapshot changed.
+        fn set_runtime_status(
+            &mut self,
+            state: NodePortRuntimeState,
+            last_error: Option<String>,
+            message: &'static str,
+        ) {
+            let previous = self.status_snapshot();
+            self.runtime_state = state;
+            self.last_error = last_error;
+            let current = self.status_snapshot();
+            if current == previous {
+                return;
             }
 
-            let Some(iface) = self.iface.clone() else {
-                warn!(
-                    target: "network",
-                    "nodeport interface missing; disable nodeport or set network.nodeport.iface in config"
-                );
-                self.enabled = false;
+            match current.state {
+                NodePortRuntimeState::Disabled | NodePortRuntimeState::Pending => {
+                    debug!(
+                        target: "network",
+                        desired_enabled = current.desired_enabled,
+                        state = ?current.state,
+                        iface = ?current.resolved_iface,
+                        node_ip = ?current.resolved_node_ip,
+                        last_error = ?current.last_error,
+                        active_networks = current.active_networks,
+                        active_ports = current.active_ports,
+                        "{message}"
+                    );
+                }
+                NodePortRuntimeState::Ready => {
+                    info!(
+                        target: "network",
+                        desired_enabled = current.desired_enabled,
+                        state = ?current.state,
+                        iface = ?current.resolved_iface,
+                        node_ip = ?current.resolved_node_ip,
+                        active_networks = current.active_networks,
+                        active_ports = current.active_ports,
+                        "{message}"
+                    );
+                }
+                NodePortRuntimeState::Degraded => {
+                    warn!(
+                        target: "network",
+                        desired_enabled = current.desired_enabled,
+                        state = ?current.state,
+                        iface = ?current.resolved_iface,
+                        node_ip = ?current.resolved_node_ip,
+                        last_error = ?current.last_error,
+                        active_networks = current.active_networks,
+                        active_ports = current.active_ports,
+                        "{message}"
+                    );
+                }
+            }
+        }
+
+        /// Record one runtime degradation while preserving the current desired config and identity.
+        fn degrade_runtime(&mut self, error: impl Into<String>, message: &'static str) {
+            self.set_runtime_status(NodePortRuntimeState::Degraded, Some(error.into()), message);
+        }
+
+        /// Re-resolve the runtime iface and node IP from explicit config before any fallback.
+        async fn refresh_runtime_identity(&mut self) -> Result<()> {
+            self.iface = self.configured_iface.clone();
+            self.node_ip = configured_node_ip_from_sources(
+                self.configured_node_ip,
+                self.configured_advertise_addr.as_deref(),
+            );
+
+            if let Some(iface) = self.iface.clone() {
+                if self.node_ip.is_none() {
+                    self.node_ip = detect_iface_ip(&iface).await?;
+                }
                 return Ok(());
+            }
+
+            if let Some(node_ip) = self.node_ip {
+                self.iface = detect_iface_for_ip(node_ip).await?;
+                return Ok(());
+            }
+
+            if let Some((iface, ip)) = detect_default_iface().await? {
+                self.iface = Some(iface);
+                self.node_ip = Some(ip);
+            }
+
+            Ok(())
+        }
+
+        /// Check whether nodeport has enough local capability to attempt program attachment.
+        async fn ensure_runtime_capable(&mut self) -> Result<bool> {
+            self.refresh_runtime_identity().await?;
+
+            let Some(iface) = self.iface.clone() else {
+                self.degrade_runtime(
+                    "nodeport interface missing; set network.nodeport.iface or configure a reachable advertise address",
+                    "nodeport runtime degraded",
+                );
+                return Ok(false);
+            };
+            if self.node_ip.is_none() {
+                self.degrade_runtime(
+                    format!(
+                        "nodeport IPv4 address missing for interface {iface}; set network.nodeport.ip or a concrete advertise address"
+                    ),
+                    "nodeport runtime degraded",
+                );
+                return Ok(false);
+            }
+
+            if let Err(err) = ifindex(&iface) {
+                self.degrade_runtime(
+                    format!("nodeport interface {iface} is unavailable: {err:#}"),
+                    "nodeport runtime degraded",
+                );
+                return Ok(false);
+            }
+
+            let resolver = ArtifactResolver::new();
+            for name in ["nodeport_tc_ingress", "nodeport_tc_egress"] {
+                if let Err(err) = resolver.resolve(name) {
+                    self.degrade_runtime(
+                        format!("nodeport artifact {name} missing: {err:#}"),
+                        "nodeport runtime degraded",
+                    );
+                    return Ok(false);
+                }
+            }
+
+            if let Err(err) = map_pin_dir() {
+                self.degrade_runtime(
+                    format!("nodeport bpffs setup failed: {err:#}"),
+                    "nodeport runtime degraded",
+                );
+                return Ok(false);
+            }
+
+            self.set_runtime_status(
+                if self.attachment.is_some() {
+                    NodePortRuntimeState::Ready
+                } else {
+                    NodePortRuntimeState::Pending
+                },
+                None,
+                "nodeport runtime preflight passed",
+            );
+            Ok(true)
+        }
+
+        /// Attach nodeport programs to the configured external interface if not already attached.
+        async fn ensure_attached(&mut self) -> Result<()> {
+            let Some(iface) = self.iface.clone() else {
+                return Err(anyhow!("nodeport interface missing after preflight"));
             };
             let Some(node_ip) = self.node_ip else {
-                warn!(
-                    target: "network",
-                    iface = %iface,
-                    "nodeport IP missing; disable nodeport or set network.nodeport.ip in config"
-                );
-                self.enabled = false;
-                return Ok(());
+                return Err(anyhow!("nodeport IP missing after preflight"));
             };
+            if self.attachment.is_some()
+                && self.attached_iface.as_deref() == Some(iface.as_str())
+                && self.attached_node_ip == Some(node_ip)
+            {
+                return Ok(());
+            }
+
+            if self.attachment.is_some() {
+                self.detach_attachment().await?;
+            }
             let ifindex = ifindex(&iface)?;
             ensure_clsact(&iface)?;
 
@@ -445,15 +687,21 @@ mod platform {
                 _ingress: ingress,
                 egress,
             });
+            self.attached_iface = Some(iface.clone());
+            self.attached_node_ip = Some(node_ip);
             Ok(())
         }
 
-        /// Detach nodeport programs when no mappings remain to avoid side effects on loopback.
-        async fn detach_if_idle(&mut self) -> Result<()> {
-            let Some(iface) = self.iface.clone() else {
+        /// Detach one active attachment so nodeport can reattach to a new external identity.
+        async fn detach_attachment(&mut self) -> Result<()> {
+            let Some(iface) = self.attached_iface.clone() else {
+                self.attachment = None;
+                self.attached_node_ip = None;
                 return Ok(());
             };
             let Some(_attachment) = self.attachment.take() else {
+                self.attached_iface = None;
+                self.attached_node_ip = None;
                 return Ok(());
             };
 
@@ -463,6 +711,23 @@ mod platform {
 
             self.host_ingress_attached.clear();
             self.host_ingress_ifindex.clear();
+            self.attached_iface = None;
+            self.attached_node_ip = None;
+            Ok(())
+        }
+
+        /// Detach nodeport programs when no mappings remain to avoid side effects on loopback.
+        async fn detach_if_idle(&mut self) -> Result<()> {
+            if self.attachment.is_none() {
+                return Ok(());
+            }
+
+            self.detach_attachment().await?;
+            self.set_runtime_status(
+                NodePortRuntimeState::Pending,
+                None,
+                "nodeport runtime detached while idle",
+            );
             Ok(())
         }
 
@@ -517,69 +782,6 @@ mod platform {
             );
             self.host_ingress_attached.insert(network_id);
             self.host_ingress_ifindex.insert(network_id, ifindex);
-            Ok(())
-        }
-
-        /// Attempt to find a usable interface when one is not configured explicitly.
-        async fn autodetect_iface(&mut self) -> Result<()> {
-            if self.iface.is_some() && self.node_ip.is_some() {
-                return Ok(());
-            }
-
-            if let Some(iface) = self.iface.clone()
-                && self.node_ip.is_none()
-            {
-                match detect_iface_ip(&iface).await? {
-                    Some(ip) => {
-                        info!(
-                            target: "network",
-                            iface = %iface,
-                            node_ip = %ip,
-                            "nodeport selected IP on configured interface"
-                        );
-                        self.node_ip = Some(ip);
-                    }
-                    None => {
-                        warn!(
-                            target: "network",
-                            iface = %iface,
-                            "nodeport could not find IPv4 address for configured interface"
-                        );
-                    }
-                }
-                return Ok(());
-            }
-
-            if let Some(node_ip) = self.node_ip {
-                if let Some(iface) = detect_iface_for_ip(node_ip).await? {
-                    info!(
-                        target: "network",
-                        iface = %iface,
-                        node_ip = %node_ip,
-                        "nodeport selected interface matching advertise IP"
-                    );
-                    self.iface = Some(iface);
-                    return Ok(());
-                }
-                warn!(
-                    target: "network",
-                    node_ip = %node_ip,
-                    "nodeport could not find interface matching node IP"
-                );
-                return Ok(());
-            }
-
-            if let Some((iface, ip)) = detect_default_iface().await? {
-                info!(
-                    target: "network",
-                    iface = %iface,
-                    node_ip = %ip,
-                    "nodeport selected default interface"
-                );
-                self.iface = Some(iface);
-                self.node_ip = Some(ip);
-            }
-
             Ok(())
         }
     }
@@ -1133,3 +1335,61 @@ mod platform {
 
 #[cfg(target_os = "linux")]
 use platform::PlatformNodePortManager;
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        NodePortRuntimeState, NodePortStatus, configured_node_ip_from_sources,
+        resolve_advertise_ipv4,
+    };
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn resolve_advertise_ipv4_accepts_literal_ipv4_socket() {
+        assert_eq!(
+            resolve_advertise_ipv4("192.168.10.4:6578"),
+            Some(Ipv4Addr::new(192, 168, 10, 4))
+        );
+    }
+
+    #[test]
+    fn resolve_advertise_ipv4_ignores_ipv6_only_socket() {
+        assert_eq!(resolve_advertise_ipv4("[::1]:6578"), None);
+    }
+
+    #[test]
+    fn configured_node_ip_prefers_explicit_override() {
+        let configured = Some(Ipv4Addr::new(10, 20, 30, 40));
+        let advertise = Some("192.168.10.4:6578");
+
+        assert_eq!(
+            configured_node_ip_from_sources(configured, advertise),
+            Some(Ipv4Addr::new(10, 20, 30, 40))
+        );
+    }
+
+    #[test]
+    fn configured_node_ip_uses_advertise_addr_when_override_absent() {
+        assert_eq!(
+            configured_node_ip_from_sources(None, Some("192.168.10.4:6578")),
+            Some(Ipv4Addr::new(192, 168, 10, 4))
+        );
+    }
+
+    #[test]
+    fn nodeport_status_tracks_active_counts() {
+        let status = NodePortStatus {
+            desired_enabled: true,
+            state: NodePortRuntimeState::Pending,
+            resolved_iface: Some("eth0".to_string()),
+            resolved_node_ip: Some(Ipv4Addr::new(10, 0, 0, 4)),
+            active_networks: 2,
+            active_ports: 3,
+            last_error: None,
+        };
+
+        assert_eq!(status.active_networks, 2);
+        assert_eq!(status.active_ports, 3);
+        assert_eq!(status.state, NodePortRuntimeState::Pending);
+    }
+}
