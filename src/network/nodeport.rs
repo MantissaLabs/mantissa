@@ -12,6 +12,8 @@ const NODEPORT_VIP_CAPACITY: usize = 1024;
 const NODEPORT_FLOW_CAPACITY: usize = 2048;
 /// Keep the userspace capacity checks aligned with the pinned host-access map size in the tc ingress program.
 const NODEPORT_HOST_CAPACITY: usize = 256;
+/// Keep the userspace readers aligned with the ingress drop-reason map size in the tc ingress program.
+const NODEPORT_INGRESS_DROP_REASON_COUNT: usize = 6;
 
 /// Declarative nodeport mapping that connects an external port to an overlay VIP.
 #[derive(Clone, Debug)]
@@ -57,6 +59,17 @@ pub struct NodePortPacketCounters {
     pub drops: u64,
 }
 
+/// Breakdown of the ingress drop paths currently tracked by the NodePort tc program.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NodePortIngressDropReasons {
+    pub oversize_frames: u64,
+    pub invalid_ipv4_headers: u64,
+    pub invalid_l4_headers: u64,
+    pub missing_host_entries: u64,
+    pub nat_insert_failures: u64,
+    pub rewrite_failures: u64,
+}
+
 /// Snapshot of node-local nodeport capability and resolved external identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodePortStatus {
@@ -71,6 +84,7 @@ pub struct NodePortStatus {
     pub host_capacity: usize,
     pub flow_capacity: usize,
     pub ingress_stats: Option<NodePortPacketCounters>,
+    pub ingress_drop_reasons: Option<NodePortIngressDropReasons>,
     pub egress_stats: Option<NodePortPacketCounters>,
     pub last_error: Option<String>,
     pub stats_error: Option<String>,
@@ -215,6 +229,7 @@ impl PlatformNodePortManager {
             host_capacity: NODEPORT_HOST_CAPACITY,
             flow_capacity: NODEPORT_FLOW_CAPACITY,
             ingress_stats: None,
+            ingress_drop_reasons: None,
             egress_stats: None,
             last_error: Some("nodeport is only available on linux".to_string()),
             stats_error: None,
@@ -225,10 +240,10 @@ impl PlatformNodePortManager {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{
-        NODEPORT_FLOW_CAPACITY, NODEPORT_HOST_CAPACITY, NODEPORT_VIP_CAPACITY, NodePortMapping,
-        NodePortPacketCounters, NodePortProtocol, NodePortRuntimeState, NodePortStatus,
-        configured_node_ip_from_sources, nodeport_capacity_error,
-        projected_active_networks_after_sync,
+        NODEPORT_FLOW_CAPACITY, NODEPORT_HOST_CAPACITY, NODEPORT_INGRESS_DROP_REASON_COUNT,
+        NODEPORT_VIP_CAPACITY, NodePortIngressDropReasons, NodePortMapping, NodePortPacketCounters,
+        NodePortProtocol, NodePortRuntimeState, NodePortStatus, configured_node_ip_from_sources,
+        nodeport_capacity_error, projected_active_networks_after_sync,
     };
     use crate::config;
     use crate::network::attachment::host_access_host_iface_name;
@@ -608,6 +623,16 @@ mod platform {
                 }
                 Err(err) => {
                     status.stats_error = Some(err.to_string());
+                    return status;
+                }
+            }
+
+            match self.read_ingress_drop_reasons() {
+                Ok(reasons) => {
+                    status.ingress_drop_reasons = Some(reasons);
+                }
+                Err(err) => {
+                    status.stats_error = Some(err.to_string());
                 }
             }
 
@@ -633,6 +658,7 @@ mod platform {
                 host_capacity: NODEPORT_HOST_CAPACITY,
                 flow_capacity: NODEPORT_FLOW_CAPACITY,
                 ingress_stats: None,
+                ingress_drop_reasons: None,
                 egress_stats: None,
                 last_error: self.last_error.clone(),
                 stats_error: None,
@@ -647,6 +673,22 @@ mod platform {
                 read_counter_map("NODEPORT_TC_INGRESS_STATS")?,
                 read_counter_map("NODEPORT_TC_EGRESS_STATS")?,
             ))
+        }
+
+        /// Read the per-reason ingress drop counters from the pinned NodePort diagnostics map.
+        fn read_ingress_drop_reasons(&self) -> Result<NodePortIngressDropReasons> {
+            let values = read_u64_percpu_array(
+                "NODEPORT_TC_INGRESS_DROP_REASONS",
+                NODEPORT_INGRESS_DROP_REASON_COUNT,
+            )?;
+            Ok(NodePortIngressDropReasons {
+                oversize_frames: values[0],
+                invalid_ipv4_headers: values[1],
+                invalid_l4_headers: values[2],
+                missing_host_entries: values[3],
+                nat_insert_failures: values[4],
+                rewrite_failures: values[5],
+            })
         }
 
         /// Record one runtime state transition and log it only when the visible snapshot changed.
@@ -1401,6 +1443,24 @@ mod platform {
         Ok(counters)
     }
 
+    /// Read one pinned per-CPU `u64` array and aggregate each index across every CPU slot.
+    fn read_u64_percpu_array(name: &str, entries: usize) -> Result<Vec<u64>> {
+        let base = map_pin_dir()?;
+        let map = open_map(&base, name).with_context(|| format!("open {name}"))?;
+        let array = PerCpuArray::<_, u64>::try_from(Map::PerCpuArray(map))
+            .with_context(|| format!("interpret {name} as per-cpu u64 array"))?;
+        let mut totals = vec![0u64; entries];
+        for (index, total) in totals.iter_mut().enumerate() {
+            let values = array
+                .get(&(index as u32), 0)
+                .with_context(|| format!("read counter slot {index} from {name}"))?;
+            for value in values.iter().copied() {
+                *total += value;
+            }
+        }
+        Ok(totals)
+    }
+
     /// Remove pinned nodeport maps so new layouts can be loaded atomically.
     fn reset_nodeport_maps(root: &Path) -> Result<()> {
         let maps = [
@@ -1409,6 +1469,7 @@ mod platform {
             "NODEPORT_VIPS",
             "NODEPORT_HOST",
             "NODEPORT_TC_INGRESS_STATS",
+            "NODEPORT_TC_INGRESS_DROP_REASONS",
             "NODEPORT_TC_EGRESS_STATS",
         ];
 
@@ -1602,6 +1663,7 @@ mod tests {
                 bytes: 2048,
                 drops: 1,
             }),
+            ingress_drop_reasons: None,
             egress_stats: None,
             last_error: None,
             stats_error: None,

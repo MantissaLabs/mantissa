@@ -18,11 +18,22 @@ use network_ebpf::{
     stats::{self, PacketStats},
 };
 
-const MAX_FRAME_LEN: usize = 1600;
 const ETH_P_IPV4: u16 = 0x0800;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 const LOOPBACK_HDR_LEN: usize = 4;
+const NODEPORT_INGRESS_DROP_REASON_COUNT: u32 = 6;
+
+#[repr(u32)]
+#[derive(Clone, Copy)]
+enum IngressDropReason {
+    OversizeFrame = 0,
+    InvalidIpv4Header = 1,
+    InvalidL4Header = 2,
+    MissingHostEntry = 3,
+    NatInsertFailure = 4,
+    RewriteFailure = 5,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -62,6 +73,10 @@ struct NodePortNat {
 #[map(name = "NODEPORT_TC_INGRESS_STATS")]
 static mut NODEPORT_TC_INGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::pinned(1, 0);
 
+#[map(name = "NODEPORT_TC_INGRESS_DROP_REASONS")]
+static mut NODEPORT_TC_INGRESS_DROP_REASONS: PerCpuArray<u64> =
+    PerCpuArray::pinned(NODEPORT_INGRESS_DROP_REASON_COUNT, 0);
+
 #[map(name = "NODEPORT_VIPS")]
 static mut NODEPORT_VIPS: HashMap<NodePortKey, NodePortEntry> = HashMap::pinned(1024, 0);
 
@@ -77,11 +92,9 @@ static mut NODEPORT_HOST: HashMap<u32, NodePortHost> = HashMap::pinned(256, 0);
 /// Intercept external nodeport traffic and redirect it into the overlay dataplane.
 #[classifier]
 pub fn nodeport_tc_ingress(mut ctx: TcContext) -> i32 {
+    // GRO can present large skbs on the physical ingress path, so we classify
+    // first instead of dropping by skb length before we know it is a NodePort flow.
     let len = ctx.len() as usize;
-    if len > MAX_FRAME_LEN {
-        unsafe { stats::record_drop(core::ptr::addr_of_mut!(NODEPORT_TC_INGRESS_STATS), len) };
-        return TC_ACT_SHOT;
-    }
 
     match handle_packet(&mut ctx) {
         Ok(TC_ACT_OK) => unsafe {
@@ -92,18 +105,24 @@ pub fn nodeport_tc_ingress(mut ctx: TcContext) -> i32 {
             stats::record_pass(core::ptr::addr_of_mut!(NODEPORT_TC_INGRESS_STATS), len);
             action
         },
-        Err(_) => unsafe {
+        Err(reason) => unsafe {
             stats::record_drop(core::ptr::addr_of_mut!(NODEPORT_TC_INGRESS_STATS), len);
+            stats::increment_reason(
+                core::ptr::addr_of_mut!(NODEPORT_TC_INGRESS_DROP_REASONS),
+                reason as u32,
+            );
             TC_ACT_SHOT
         },
     }
 }
 
 /// Parse a packet, rewrite it to a VIP, and redirect into the host-access bridge port.
-fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
+fn handle_packet(ctx: &mut TcContext) -> Result<i32, IngressDropReason> {
     let data = ctx.data();
     let data_end = ctx.data_end();
-    let Some((ip_offset, ip)) = locate_ipv4_header(ctx, data, data_end)? else {
+    let Some((ip_offset, ip)) = locate_ipv4_header(ctx, data, data_end)
+        .map_err(|_| IngressDropReason::InvalidIpv4Header)?
+    else {
         return Ok(TC_ACT_OK);
     };
     let ip_hdr = unsafe { &mut *ip };
@@ -112,7 +131,7 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
     }
     let ihl = ip_hdr.header_len();
     if ihl < 20 {
-        return Err(());
+        return Err(IngressDropReason::InvalidIpv4Header);
     }
 
     let l4_offset = ip_offset + ihl;
@@ -121,7 +140,8 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
         return Ok(TC_ACT_OK);
     }
 
-    let (src_port, dst_port) = parse_ports(data, data_end, l4_offset, proto)?;
+    let (src_port, dst_port) = parse_ports(data, data_end, l4_offset, proto)
+        .map_err(|_| IngressDropReason::InvalidL4Header)?;
     let key = NodePortKey {
         port: dst_port,
         proto,
@@ -136,12 +156,17 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
         return Ok(TC_ACT_OK);
     }
 
-    let host = unsafe { NODEPORT_HOST.get(&entry.overlay_ifindex).ok_or(())? };
+    let host = unsafe {
+        NODEPORT_HOST
+            .get(&entry.overlay_ifindex)
+            .ok_or(IngressDropReason::MissingHostEntry)?
+    };
     let original_src = ip_hdr.src;
     let snat_src = host.host_ip;
     if snat_src != 0 && original_src != snat_src {
         // Rewrite external traffic into the overlay's host-access source so replies are routable.
-        rewrite_source(ctx, ip_offset, l4_offset, proto, original_src, snat_src)?;
+        rewrite_source(ctx, ip_offset, l4_offset, proto, original_src, snat_src)
+            .map_err(|_| IngressDropReason::RewriteFailure)?;
     }
     let flow_src = if snat_src != 0 {
         snat_src
@@ -176,14 +201,17 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
 
     unsafe {
         if NODEPORT_FWD.get(&client_flow).is_none() {
-            NODEPORT_FWD.insert(&client_flow, &nat, 0).map_err(|_| ())?;
+            NODEPORT_FWD
+                .insert(&client_flow, &nat, 0)
+                .map_err(|_| IngressDropReason::NatInsertFailure)?;
             NODEPORT_REV
                 .insert(&reverse_flow, &nat, 0)
-                .map_err(|_| ())?;
+                .map_err(|_| IngressDropReason::NatInsertFailure)?;
         }
     }
 
-    rewrite_destination(ctx, ip_offset, l4_offset, proto, entry)?;
+    rewrite_destination(ctx, ip_offset, l4_offset, proto, entry)
+        .map_err(|_| IngressDropReason::RewriteFailure)?;
     if ensure_ethernet(ctx, ip_offset, host).is_err() {
         return Ok(TC_ACT_OK);
     }

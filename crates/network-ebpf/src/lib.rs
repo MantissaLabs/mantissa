@@ -45,6 +45,19 @@ pub mod stats {
     }
 
     #[inline(always)]
+    /// Increment one reason counter in a per-CPU `u64` array.
+    ///
+    /// # Safety
+    /// Caller must pass a valid pointer to a `PerCpuArray<u64>` and a valid in-bounds index.
+    pub unsafe fn increment_reason(map: *mut PerCpuArray<u64>, index: u32) {
+        let map_ref = &*map;
+        if let Some(ptr) = map_ref.get_ptr_mut(index) {
+            let counter = &mut *ptr;
+            *counter += 1;
+        }
+    }
+
+    #[inline(always)]
     /// Shared counter update helper.
     ///
     /// # Safety

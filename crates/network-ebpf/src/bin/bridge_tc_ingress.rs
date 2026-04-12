@@ -30,7 +30,6 @@ struct ArpHeader {
     tpa: u32,
 }
 
-const MAX_FRAME_LEN: usize = 1600;
 const ETH_P_IPV4: u16 = 0x0800;
 const ETH_P_ARP: u16 = 0x0806;
 const ARP_HTYPE_ETHERNET: u16 = 1;
@@ -57,11 +56,9 @@ static mut LB_REV: LruHashMap<Flow4, NatEntry> = LruHashMap::pinned(1024, 0);
 
 #[classifier]
 pub fn bridge_tc_ingress(ctx: TcContext) -> i32 {
+    // GRO can coalesce ingress traffic into skbs larger than the interface MTU,
+    // so we must not drop by length before deciding whether the frame matches a VIP path.
     let len = ctx.len() as usize;
-    if len > MAX_FRAME_LEN {
-        unsafe { stats::record_drop(core::ptr::addr_of_mut!(BRIDGE_TC_INGRESS_STATS), len) };
-        return TC_ACT_SHOT;
-    }
 
     match handle_packet(&ctx) {
         Ok(TC_ACT_OK) => unsafe {

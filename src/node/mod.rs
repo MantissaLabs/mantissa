@@ -209,6 +209,15 @@ impl node::Server for Node {
                         ingress.set_bytes(stats.bytes);
                         ingress.set_drops(stats.drops);
                     }
+                    let mut ingress_drop_reasons = nodeport.reborrow().init_ingress_drop_reasons();
+                    if let Some(reasons) = status.ingress_drop_reasons {
+                        ingress_drop_reasons.set_oversize_frames(reasons.oversize_frames);
+                        ingress_drop_reasons.set_invalid_ipv4_headers(reasons.invalid_ipv4_headers);
+                        ingress_drop_reasons.set_invalid_l4_headers(reasons.invalid_l4_headers);
+                        ingress_drop_reasons.set_missing_host_entries(reasons.missing_host_entries);
+                        ingress_drop_reasons.set_nat_insert_failures(reasons.nat_insert_failures);
+                        ingress_drop_reasons.set_rewrite_failures(reasons.rewrite_failures);
+                    }
 
                     let mut egress = nodeport.reborrow().init_egress();
                     if let Some(stats) = status.egress_stats {
@@ -220,6 +229,7 @@ impl node::Server for Node {
                     nodeport.set_state("unavailable");
                     nodeport.set_last_error("nodeport manager not wired");
                     nodeport.reborrow().init_ingress();
+                    nodeport.reborrow().init_ingress_drop_reasons();
                     nodeport.reborrow().init_egress();
                 }
             }

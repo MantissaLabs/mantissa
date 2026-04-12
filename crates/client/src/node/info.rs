@@ -1,6 +1,38 @@
 use crate::{config::ClientConfig, connection};
 use anyhow::Result;
 
+/// Render the non-zero NodePort ingress drop reasons so operators can distinguish malformed traffic from dataplane bugs.
+fn nodeport_drop_reason_fields(
+    reasons: protocol::info_capnp::node_port_ingress_drop_reasons::Reader<'_>,
+) -> Result<Vec<String>> {
+    let mut fields = Vec::new();
+    let oversize_frames = reasons.get_oversize_frames();
+    if oversize_frames > 0 {
+        fields.push(format!("oversize_frames={oversize_frames}"));
+    }
+    let invalid_ipv4_headers = reasons.get_invalid_ipv4_headers();
+    if invalid_ipv4_headers > 0 {
+        fields.push(format!("invalid_ipv4_headers={invalid_ipv4_headers}"));
+    }
+    let invalid_l4_headers = reasons.get_invalid_l4_headers();
+    if invalid_l4_headers > 0 {
+        fields.push(format!("invalid_l4_headers={invalid_l4_headers}"));
+    }
+    let missing_host_entries = reasons.get_missing_host_entries();
+    if missing_host_entries > 0 {
+        fields.push(format!("missing_host_entries={missing_host_entries}"));
+    }
+    let nat_insert_failures = reasons.get_nat_insert_failures();
+    if nat_insert_failures > 0 {
+        fields.push(format!("nat_insert_failures={nat_insert_failures}"));
+    }
+    let rewrite_failures = reasons.get_rewrite_failures();
+    if rewrite_failures > 0 {
+        fields.push(format!("rewrite_failures={rewrite_failures}"));
+    }
+    Ok(fields)
+}
+
 pub async fn info(cfg: &ClientConfig) -> Result<()> {
     let client = connection::get_local_session(cfg).await?;
 
@@ -102,6 +134,7 @@ pub async fn info(cfg: &ClientConfig) -> Result<()> {
     let last_error = nodeport.get_last_error()?.to_str()?.to_string();
     let stats_error = nodeport.get_stats_error()?.to_str()?.to_string();
     let ingress = nodeport.get_ingress()?;
+    let ingress_drop_reasons = nodeport.get_ingress_drop_reasons()?;
     let egress = nodeport.get_egress()?;
 
     println!("NodePort:");
@@ -130,6 +163,13 @@ pub async fn info(cfg: &ClientConfig) -> Result<()> {
         ingress.get_bytes(),
         ingress.get_drops(),
     );
+    let ingress_drop_reason_fields = nodeport_drop_reason_fields(ingress_drop_reasons)?;
+    if !ingress_drop_reason_fields.is_empty() {
+        println!(
+            "  ingress_drop_reasons: {}",
+            ingress_drop_reason_fields.join(" ")
+        );
+    }
     println!(
         "  egress: packets={} bytes={} drops={}",
         egress.get_packets(),
