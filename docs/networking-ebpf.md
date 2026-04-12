@@ -134,13 +134,39 @@ This “backends first + optional VIP” ordering is deliberate: clients that al
   - If the candidate VIP collides with an existing backend IP, it walks forward.
 - A deterministic locally administered VIP MAC (`02:...`), also derived from the hash.
 
-### Public endpoints (“host reachable”)
+### Public endpoints (NodePort contract)
 
-Services opt into host exposure per task template via `public_port` in the RON manifest (see `examples/service_discovery_demo.ron`).
+Services opt into external exposure per task template via `public_port` in the
+RON manifest (see `examples/service_discovery_demo.ron`).
 
-When a service template is public, Mantissa additionally programs a *permanent* neighbour entry on `mnhost-*` mapping `VIP → VIP_MAC` (see `ensure_host_vip_neighbor` in `src/network/discovery.rs`). This avoids relying on ARP resolution from the host to reach the VIP and prevents the neighbour cache getting stuck in `FAILED`.
+When a template declares `public_port`, Mantissa keeps two related datapaths in
+sync:
 
-Important: “public endpoint” currently means “reachable from the host namespace of a node that runs Mantissa”, not “Internet routable”. It’s analogous to a node-local way to reach a service inside the overlay.
+- The overlay VIP used for internal discovery and backend load balancing.
+- A NodePort listener on each capable node at `node_ip:public_port`.
+
+`node_ip` is resolved in this order:
+
+- `network.nodeport.ip`
+- the IPv4 component of `network.advertise_addr`
+- best-effort interface autodetection
+
+For production, set `network.nodeport.iface` explicitly and prefer an explicit
+`network.nodeport.ip` on multihomed, NATed, or policy-routed hosts.
+
+Protocol scope:
+
+- `public_protocol` defaults to `tcp`
+- `udp` and `tcp_udp` are also supported
+- `tcp_udp` reserves both concrete protocol claims
+
+Port ownership is cluster-global in this release. A given `public_port +
+protocol` can only be owned by one service at a time, and overlapping claims
+are rejected during deployment admission.
+
+Important: Mantissa publishes `node_ip:public_port`, but it does not make that
+socket Internet-routable by itself. Routing, firewall openings, and any
+upstream load balancer configuration remain operator responsibilities.
 
 ## eBPF datapath (VIP load balancing)
 
@@ -156,23 +182,38 @@ Compiled BPF objects live under `target/bpf/*.bpf.o` (built automatically on Lin
 | `bridge_xdp` | XDP on `mnt-br-*` | L2 sanity checks for bridged traffic. | `BRIDGE_XDP_STATS` |
 | `bridge_tc_ingress` | TC ingress on `mnhp-*` (fallback: `mnt-br-*`) | VIP ARP responder + DNAT (VIP→backend) + flow-cache seeding for TCP/UDP. | `BRIDGE_TC_INGRESS_STATS`, `LB_VIPS`, `LB_BACKENDS`, `LB_FWD`, `LB_REV` |
 | `bridge_tc_egress` | TC egress on `mnhp-*` (fallback: `mnt-br-*`) | SNAT return path (backend→VIP) using cached reverse mapping. | `BRIDGE_TC_EGRESS_STATS`, `LB_REV` |
+| `nodeport_tc_ingress` | TC ingress on `network.nodeport.iface` and `lo` | Matches `node_ip:public_port`, rewrites to the service VIP, seeds NodePort NAT state, and redirects into the per-network host-access path. | `NODEPORT_TC_INGRESS_STATS`, `NODEPORT_VIPS`, `NODEPORT_FWD`, `NODEPORT_REV`, `NODEPORT_HOST` |
+| `nodeport_tc_egress` | TC egress on `network.nodeport.iface` and TC ingress on `mnhost-*` | Rewrites return traffic back to `node_ip:public_port` for external and host-local clients. | `NODEPORT_TC_EGRESS_STATS`, `NODEPORT_REV` |
 
 The “attach to `mnhp-*`” choice is what makes host-originated `curl http://<vip>:<port>` go through the eBPF load balancer reliably: it is the bridge port where host traffic enters/exits the overlay bridge.
 
 ### Map pinning and sharing
 
-Maps are pinned under:
+Overlay LB maps are pinned under:
 
 ```
 /sys/fs/bpf/mantissa/<network-uuid>/
+```
+
+NodePort maps are pinned under:
+
+```
+/sys/fs/bpf/mantissa/nodeport/
 ```
 
 Pinning is important because:
 
 - Both TC programs (ingress and egress) must share the same NAT state maps (`LB_FWD`, `LB_REV`).
 - Userspace must write VIPs/backends into the exact same map instances the kernel programs read.
+- NodePort diagnostics read the pinned per-CPU stats maps from bpffs instead of
+  relying on in-process loader state.
 
-Mantissa uses `EbpfLoader::map_pin_path(...)` and additionally pins the LB maps by name (see `ensure_lb_maps_pinned` in `src/network/bpf/mod.rs`). Userspace opens pinned maps with a small set of fallback paths because some kernels/Aya configurations pin TC maps under `tc/globals` (see `open_map` in `src/network/lb.rs`).
+Mantissa uses `EbpfLoader::map_pin_path(...)` and additionally pins the LB maps
+by name (see `ensure_lb_maps_pinned` in `src/network/bpf/mod.rs`). NodePort uses
+the same bpffs approach for `NODEPORT_*` maps under the fixed node-local pin
+directory. Userspace opens pinned maps with a small set of fallback paths
+because some kernels/Aya configurations pin TC maps under `tc/globals` (see
+`open_map` in `src/network/lb.rs` and `src/network/nodeport.rs`).
 
 ### LB maps (layout)
 
@@ -236,21 +277,52 @@ It also contains a VIP ARP responder that synthesizes ARP replies for configured
 - Writes/updates `LB_VIPS` and `LB_BACKENDS`.
 - Does not clear `LB_FWD` / `LB_REV` during normal VIP refreshes (so existing connections keep working).
 
-## Packet flow: host “public endpoint” curl
+## Failure semantics and diagnostics
 
-This is the path you exercise with `curl http://<vip>:<public_port>` on a node.
+Declaring `public_port` is a real contract, not best-effort wiring.
 
-1. Host routing chooses the per-network host interface:
-   - `ip route get <vip>` → `dev mnhost-<net>`
-2. The host neighbour table resolves the VIP MAC:
-   - For public services, Mantissa programs a permanent entry: `ip neigh get <vip> dev mnhost-<net>` shows `PERMANENT`.
-3. The Ethernet frame enters the bridge via `mnhp-<net>`.
-4. `bridge_tc_ingress` on `mnhp-<net>` DNATs the packet to a chosen backend (possibly on a remote node) and sets `eth.dst` to the backend’s MAC.
-5. The bridge forwards the rewritten frame:
-   - locally to a `mnth-*` port, or
-   - to `mvx-*` if the backend MAC is remote (FDB entry points to the remote node IP).
-6. Return traffic comes back from the backend to the host and exits via `mnhp-<net>`.
-7. `bridge_tc_egress` SNATs the reply back to the VIP identity so the host socket sees a consistent peer.
+- If a service loses healthy backends, its public endpoint is degraded and the
+  replicated service row records a `public endpoint: ...` lifecycle detail.
+- If VIP programming fails, internal DNS/backend discovery can still continue,
+  but the public endpoint is marked degraded instead of silently treated as
+  healthy.
+- If NodePort attach, host-access setup, or map programming fails on a node,
+  the NodePort runtime moves to `degraded` and the service refresh records an
+  explicit public-endpoint failure.
+- Admission rejects conflicting `public_port + protocol` claims before a new
+  deployment can race an existing owner.
+
+The node-local runtime view is exposed through:
+
+```bash
+mantissa info
+```
+
+The `NodePort:` section shows whether the runtime is `disabled`, `pending`,
+`ready`, or `degraded`, plus the resolved iface/IP, active port counts,
+capacity limits, last error, and packet counters.
+
+## Packet flow: NodePort curl
+
+This is the path you exercise with `curl http://<node_ip>:<public_port>`.
+
+1. Traffic arrives on the configured external interface, or on `lo` for a
+   host-local curl.
+2. `nodeport_tc_ingress` matches `dst=node_ip` and `dst_port=public_port`.
+3. The program looks up the configured service VIP, rewrites the destination to
+   the VIP and service port, records reverse NAT state, and redirects the
+   packet into the network's host-access path.
+4. The packet then traverses the existing overlay VIP datapath:
+   - `bridge_tc_ingress` DNATs VIP traffic to a chosen backend
+   - the bridge forwards locally or over VXLAN to a remote node
+5. Replies traverse the reverse path:
+   - `bridge_tc_egress` restores the VIP identity inside the overlay path
+   - `nodeport_tc_egress` restores the original `node_ip:public_port` view for
+     the external client
+
+For host-local loopback curls, Mantissa also configures the host-access
+interface with `accept_local=1`, `route_localnet=1`, and `rp_filter=0` so the
+kernel accepts loopback-backed NodePort replies.
 
 ## Running the service discovery + public endpoint demo
 
@@ -272,43 +344,73 @@ Prerequisites: Linux host, kernel with XDP+TC and BPF enabled, and `bpf-linker` 
    mantissa services run examples/service_discovery_demo.ron
    mantissa services list
    ```
-   The `PUBLIC` column shows the host-reachable endpoint, e.g. `backend=<vip>:8000`.
-3. From the host namespace, curl the VIP:
+   The `PUBLIC` column currently shows the internal VIP used behind the public
+   dataplane, not the final NodePort socket.
+3. Pick one node IP:
+   - `network.nodeport.ip` if set
+   - otherwise the IPv4 from `network.advertise_addr`
+4. From another host or from the node itself, curl the published NodePort:
    ```bash
-   curl -sS http://<vip>:8000
+   curl -sS http://<node_ip>:8000
    ```
-4. Confirm eBPF load-balancing is active (repeat a few times; each new TCP connection should spread across replicas):
+5. Confirm eBPF load-balancing is active (repeat a few times; each new TCP connection should spread across replicas):
    ```bash
-   for i in $(seq 1 10); do curl -sS http://<vip>:8000; echo; done
+   for i in $(seq 1 10); do curl -sS http://<node_ip>:8000; echo; done
    ```
 
 ## Debugging cookbook
 
+- Check the node-local NodePort runtime:
+  - `mantissa info`
 - Verify kernel interfaces exist and are up:
-  - `ip link show mnt-br-<net> mvx-<net> mnhost-<net> mnhp-<net>`
-- Verify routing from host to VIP:
-  - `ip route get <vip>`
-- Verify neighbour resolution for public VIPs:
-  - `ip neigh get <vip> dev mnhost-<net>`
+  - `ip link show <external-iface> lo mnt-br-<net> mvx-<net> mnhost-<net> mnhp-<net>`
+- Verify the published socket resolves to the expected node:
+  - `ip addr show <external-iface>`
+  - `ip route get <node_ip>`
 - Verify TC attachments:
+  - `sudo tc filter show dev <external-iface> ingress`
+  - `sudo tc filter show dev <external-iface> egress`
+  - `sudo tc filter show dev lo ingress`
+  - `sudo tc filter show dev mnhost-<net> ingress`
   - `sudo tc filter show dev mnhp-<net> ingress`
   - `sudo tc filter show dev mnhp-<net> egress`
-- Inspect pinned maps:
+- Inspect pinned overlay maps:
   - `sudo ls -la /sys/fs/bpf/mantissa/<network-uuid>/`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/<network-uuid>/LB_VIPS`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/<network-uuid>/LB_BACKENDS`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/<network-uuid>/LB_FWD`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/<network-uuid>/LB_REV`
+- Inspect pinned NodePort maps:
+  - `sudo ls -la /sys/fs/bpf/mantissa/nodeport/`
+  - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_VIPS`
+  - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_FWD`
+  - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_REV`
+  - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_HOST`
 - Inspect stats (sanity check that packets hit the programs):
+  - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_TC_INGRESS_STATS`
+  - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_TC_EGRESS_STATS`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/<network-uuid>/BRIDGE_TC_INGRESS_STATS`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/<network-uuid>/BRIDGE_TC_EGRESS_STATS`
 - Verify VXLAN forwarding entries:
   - `bridge fdb show dev mvx-<net>`
 
-## Current limits and considerations
+## Supported scope, limits, and non-goals
 
-- IPv4-only VIP/NAT datapath; IPv6 is not load-balanced.
-- NAT currently handles TCP/UDP and skips fragmented IPv4.
-- Public endpoints are “host reachable” via `mnhost-*` and VIPs inside the overlay subnet; they are not automatically Internet-exposed.
-- Static sizing: `MAX_VIPS = 4096`, `MAX_BACKENDS_PER_VIP = 1024`, and 1024-entry LRU flow caches in each direction.
-- Security hardening (policy enforcement, deeper conntrack validation) is not yet part of the datapath; XDP programs mainly perform sanity filtering.
+- NodePort is IPv4-only in this release.
+- Public traffic supports TCP, UDP, and `tcp_udp`; `tcp` is the default when
+  `public_protocol` is omitted.
+- Fragmented IPv4 is not handled by the VIP or NodePort NAT datapaths.
+- `public_port + protocol` ownership is cluster-global while a service is still
+  reserving that endpoint.
+- Public reachability depends on node capability, routing, and operator-managed
+  firewall policy.
+- Static sizing remains fixed for now: `MAX_VIPS = 4096`,
+  `MAX_BACKENDS_PER_VIP = 1024`, and 1024-entry LRU flow caches in each
+  direction for the overlay LB, plus the fixed NodePort capacities exposed by
+  `mantissa info`.
+- Mantissa does not currently provide IPv6 load balancing, fragmented IPv4
+  support, source-IP preservation guarantees for external clients, cloud load
+  balancer integration, or full network policy enforcement.
+- Security hardening remains intentionally minimal: XDP programs mainly perform
+  sanity filtering, and deeper conntrack validation is not part of the first
+  production NodePort release.

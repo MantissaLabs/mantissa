@@ -103,3 +103,58 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 - `replication.global_metadata_sync_tick_ms` (legacy: `MANTISSA_GLOBAL_METADATA_SYNC_TICK_MS`)
 - `replication.global_metadata_sync_fanout` (legacy: `MANTISSA_GLOBAL_METADATA_SYNC_FANOUT`)
 - `replication.workload_repair_fanout` (legacy: `MANTISSA_WORKLOAD_REPAIR_FANOUT`)
+
+## NodePort guidance
+
+Use the NodePort settings to define the externally visible socket Mantissa
+publishes for services with `public_port`.
+
+- `network.nodeport.iface`
+  Set this explicitly in production. It should be the host interface that
+  receives external traffic for `node_ip:public_port`. Do not rely on
+  autodetection on multihomed hosts, and do not use `lo` outside of local
+  privileged tests.
+- `network.nodeport.ip`
+  This is the IPv4 address Mantissa publishes for public services. When set, it
+  wins over every other source. On multihomed, NATed, or policy-routed hosts,
+  set it explicitly.
+- `network.advertise_addr`
+  This is the peer address published to the cluster. When `network.nodeport.ip`
+  is unset, Mantissa reuses the IPv4 portion of `network.advertise_addr` for
+  NodePort. If neither value is set, Mantissa falls back to best-effort local
+  interface detection.
+
+Recommended production pattern:
+
+```ron
+(
+    network: (
+        advertise_addr: "node-1.example.com:6578",
+        nodeport: (
+            enabled: true,
+            iface: "eth0",
+            ip: "203.0.113.10",
+        ),
+    ),
+)
+```
+
+If the address used for peer traffic and the address used for public service
+traffic are the same, you can omit `network.nodeport.ip` and rely on
+`network.advertise_addr` instead.
+
+## NodePort contract and caveats
+
+- NodePort requires Linux and `network.bpf.attach = true`.
+- Public traffic is IPv4-only in this release.
+- `public_protocol` supports `tcp`, `udp`, and `tcp_udp`. If omitted, the
+  default is `tcp`.
+- Fragmented IPv4 is not supported by the current datapath.
+- `public_port + protocol` is cluster-global unique while a service still
+  reserves that endpoint.
+- Mantissa manages the TC/eBPF attachments and the host-access sysctls needed
+  for local hairpin handling, but it does not open host firewall rules for
+  arbitrary public ports and it does not provision upstream load balancers.
+- A node can keep internal discovery healthy while its public NodePort path is
+  degraded. Check `mantissa info` for the node-local NodePort runtime state and
+  inspect the service lifecycle detail for `public endpoint: ...` errors.
