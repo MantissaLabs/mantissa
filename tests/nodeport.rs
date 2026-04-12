@@ -23,6 +23,8 @@ use uuid::Uuid;
 
 const NODEPORT_HTTP_PORT: u16 = 18080;
 const NODEPORT_RESPONSE: &str = "hello from nodeport privileged test";
+const NODEPORT_CONFLICT_RESPONSE: &str = "hello from nodeport owner";
+const NODEPORT_DEGRADED_RESPONSE: &str = "hello from degraded nodeport service";
 
 /// Resolve the compiled NodePort dataplane artifacts for the privileged validation lane.
 fn privileged_nodeport_artifact_dir() -> Option<std::path::PathBuf> {
@@ -33,16 +35,20 @@ fn privileged_nodeport_artifact_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Builds one real TCP echo service attached to the test overlay and published through NodePort.
-fn privileged_nodeport_task_template(network_id: Uuid) -> TaskTemplateSpecValue {
+fn privileged_nodeport_task_template(
+    network_id: Uuid,
+    template_name: &str,
+    response: &str,
+) -> TaskTemplateSpecValue {
     TaskTemplateSpecValue {
-        name: "echo".to_string(),
+        name: template_name.to_string(),
         execution: ExecutionSpec {
             image: "hashicorp/http-echo:1.0.0".to_string(),
             command: vec![
                 "-listen".to_string(),
                 format!(":{NODEPORT_HTTP_PORT}"),
                 "-text".to_string(),
-                NODEPORT_RESPONSE.to_string(),
+                response.to_string(),
             ],
             tty: false,
             cpu_millis: 200,
@@ -63,6 +69,27 @@ fn privileged_nodeport_task_template(network_id: Uuid) -> TaskTemplateSpecValue 
         public_port: Some(NODEPORT_HTTP_PORT),
         public_protocol: Some(ServicePortProtocol::Tcp),
     }
+}
+
+/// Submit one privileged NodePort deployment through the real service controller surface.
+async fn deploy_privileged_nodeport_service(
+    manager: &ServiceController,
+    service_name: &str,
+    network_id: Uuid,
+    response: &str,
+) -> anyhow::Result<Uuid> {
+    manager
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![privileged_nodeport_task_template(
+                network_id,
+                service_name,
+                response,
+            )],
+        )
+        .await
 }
 
 /// Waits until the replicated service reaches the expected lifecycle status.
@@ -141,7 +168,11 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
             Uuid::new_v4(),
             "nodeport-privileged",
             "nodeport-privileged",
-            vec![privileged_nodeport_task_template(network_id)],
+            vec![privileged_nodeport_task_template(
+                network_id,
+                "echo",
+                NODEPORT_RESPONSE,
+            )],
         )
         .await
         .expect("submit privileged NodePort deployment");
@@ -276,3 +307,221 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
     delete_privileged_network(&node, network_id).await;
     force_cleanup_privileged_network_links(network_id).await;
 });
+
+local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
+    let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
+        return;
+    };
+
+    let _config = PrivilegedTestGuard::apply(|config| {
+        config.network.wireguard.enabled = false;
+        config.network.wireguard.manage_firewall = false;
+        config.network.bpf.attach = true;
+        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        config.network.nodeport.enabled = true;
+        config.network.nodeport.iface = Some("lo".to_string());
+        config.network.nodeport.ip = Some("127.0.0.1".to_string());
+        config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+    });
+    let node = create_privileged_node().await;
+    let network = create_privileged_network(
+        &node,
+        privileged_test_network(
+            "nodeport-conflict",
+            "privileged nodeport conflict test network",
+            "10.47.0.0/24",
+            1450,
+            Vec::new(),
+        ),
+        mantissa::network::types::NetworkStatus::Ready,
+    )
+    .await;
+    let network_id = network.id;
+
+    let owner_service_id = deploy_privileged_nodeport_service(
+        &node.service_controller,
+        "nodeport-owner",
+        network_id,
+        NODEPORT_CONFLICT_RESPONSE,
+    )
+    .await
+    .expect("submit owner NodePort deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.service_controller,
+            owner_service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(180),
+        )
+        .await,
+        "owner public service should reach running state"
+    );
+
+    assert!(
+        wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+            || async {
+                let status = node.network_controller.nodeport_manager().status().await;
+                status.state == NodePortRuntimeState::Ready && status.active_ports == 1
+            }
+        )
+        .await,
+        "owner service should publish the first NodePort mapping"
+    );
+
+    let conflict = deploy_privileged_nodeport_service(
+        &node.service_controller,
+        "nodeport-conflict",
+        network_id,
+        "this service should never own the public port",
+    )
+    .await
+    .expect_err("conflicting NodePort claim should be rejected");
+    let conflict_text = conflict.to_string();
+    assert!(
+        conflict_text.contains("cannot claim public port 18080")
+            && conflict_text.contains("already reserves it"),
+        "conflicting deployment should expose a clear ownership error: {conflict_text}"
+    );
+
+    let status = node.network_controller.nodeport_manager().status().await;
+    assert_eq!(
+        status.active_ports, 1,
+        "rejecting a conflicting deployment should keep the original NodePort owner intact"
+    );
+
+    let response = http_get(&format!("127.0.0.1:{NODEPORT_HTTP_PORT}"))
+        .await
+        .expect("owner NodePort should still accept traffic after a conflict");
+    assert!(
+        response.contains(NODEPORT_CONFLICT_RESPONSE),
+        "conflict rejection should not steal traffic away from the original service: {response}"
+    );
+
+    remove_service_via_rpc(&node.services_client, owner_service_id).await;
+    delete_privileged_network(&node, network_id).await;
+    force_cleanup_privileged_network_links(network_id).await;
+});
+
+local_test!(
+    nodeport_runtime_degradation_surfaces_public_endpoint_detail,
+    {
+        let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
+            return;
+        };
+
+        let missing_iface = "mantissa-nodeport-missing0";
+        let _config = PrivilegedTestGuard::apply(|config| {
+            config.network.wireguard.enabled = false;
+            config.network.wireguard.manage_firewall = false;
+            config.network.bpf.attach = true;
+            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            config.network.nodeport.enabled = true;
+            config.network.nodeport.iface = Some(missing_iface.to_string());
+            config.network.nodeport.ip = Some("127.0.0.1".to_string());
+            config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+        });
+        let node = create_privileged_node().await;
+        let network = create_privileged_network(
+            &node,
+            privileged_test_network(
+                "nodeport-degraded",
+                "privileged nodeport degraded test network",
+                "10.48.0.0/24",
+                1450,
+                Vec::new(),
+            ),
+            mantissa::network::types::NetworkStatus::Ready,
+        )
+        .await;
+        let network_id = network.id;
+
+        let service_id = deploy_privileged_nodeport_service(
+            &node.service_controller,
+            "nodeport-degraded",
+            network_id,
+            NODEPORT_DEGRADED_RESPONSE,
+        )
+        .await
+        .expect("submit degraded NodePort deployment");
+
+        assert!(
+            wait_for_service_status(
+                &node.service_controller,
+                service_id,
+                ServiceStatus::Running,
+                Duration::from_secs(180),
+            )
+            .await,
+            "service should still reach running even when public exposure degrades"
+        );
+
+        assert!(
+            wait_until(
+                Duration::from_secs(60),
+                Duration::from_millis(100),
+                || async {
+                    let status = node.network_controller.nodeport_manager().status().await;
+                    let service = node
+                        .service_controller
+                        .registry()
+                        .get(service_id)
+                        .expect("read degraded public service")
+                        .expect("degraded public service should still exist");
+                    status.state == NodePortRuntimeState::Degraded
+                        && status
+                            .last_error
+                            .as_deref()
+                            .is_some_and(|error| error.contains(missing_iface))
+                        && service
+                            .public_endpoint_detail()
+                            .is_some_and(|detail| detail.contains("could not publish NodePort"))
+                }
+            )
+            .await,
+            "degraded NodePort state should propagate into the service public endpoint detail"
+        );
+
+        let degraded_status = node.network_controller.nodeport_manager().status().await;
+        let degraded_service = node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("read degraded NodePort service after status propagation")
+            .expect("degraded NodePort service should remain present");
+        let detail = degraded_service
+            .public_endpoint_detail()
+            .expect("degraded public service should expose a detail");
+        assert!(
+            detail.contains("could not publish NodePort") && detail.contains(missing_iface),
+            "degraded service should report the NodePort runtime failure: {detail}"
+        );
+        assert!(
+            degraded_status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains(missing_iface)),
+            "NodePort runtime should report the missing interface in its local status: {degraded_status:?}"
+        );
+
+        assert!(
+            wait_until(
+                Duration::from_secs(10),
+                Duration::from_millis(100),
+                || async {
+                    TcpStream::connect(format!("127.0.0.1:{NODEPORT_HTTP_PORT}"))
+                        .await
+                        .is_err()
+                }
+            )
+            .await,
+            "degraded NodePort should not expose the public port on loopback"
+        );
+
+        remove_service_via_rpc(&node.services_client, service_id).await;
+        delete_privileged_network(&node, network_id).await;
+        force_cleanup_privileged_network_links(network_id).await;
+    }
+);

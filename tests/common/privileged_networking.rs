@@ -145,8 +145,8 @@ pub fn privileged_artifact_dir(label: &str, required_artifacts: &[&str]) -> Opti
 }
 
 /// Start one real headless node with fast control-plane ticks for privileged dataplane tests.
-pub async fn create_privileged_node() -> HeadlessNode {
-    HeadlessNode::new_with_config(HeadlessConfig {
+pub fn privileged_headless_config() -> HeadlessConfig {
+    HeadlessConfig {
         listen_addr: "127.0.0.1:0".to_string(),
         transport: HeadlessTransport::Inproc,
         sync_tick: Some(Duration::from_millis(100)),
@@ -159,9 +159,14 @@ pub async fn create_privileged_node() -> HeadlessNode {
         task_runtime: None,
         runtime_set: None,
         local_volume_root: None,
-    })
-    .await
-    .expect("start privileged networking node")
+    }
+}
+
+/// Start one real headless node with fast control-plane ticks for privileged dataplane tests.
+pub async fn create_privileged_node() -> HeadlessNode {
+    HeadlessNode::new_with_config(privileged_headless_config())
+        .await
+        .expect("start privileged networking node")
 }
 
 /// Build one VXLAN network spec for privileged dataplane validation.
