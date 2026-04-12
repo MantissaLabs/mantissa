@@ -181,10 +181,10 @@ struct NodePortInfo {
   # Maximum number of tracked NodePort NAT flows in each pinned LRU map.
 
   ingress @10 :PacketCounters;
-  # Aggregated ingress packet counters from the NodePort tc dataplane.
+  # Aggregated ingress counters for packets that matched one published NodePort selector.
 
   egress @11 :PacketCounters;
-  # Aggregated egress packet counters from the NodePort tc dataplane.
+  # Aggregated return-path counters for packets that matched tracked NodePort NAT state.
 
   lastError @12 :Text;
   # Last runtime capability or programming error observed by the NodePort manager.
@@ -198,10 +198,10 @@ struct NodePortInfo {
 
 struct PacketCounters {
   packets @0 :UInt64;
-  # Number of packets processed.
+  # Number of packets that matched the dataplane path.
 
   bytes @1 :UInt64;
-  # Number of bytes processed.
+  # Number of bytes for matched packets.
 
   drops @2 :UInt64;
   # Number of packets dropped by the dataplane path.

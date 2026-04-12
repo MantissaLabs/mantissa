@@ -50,7 +50,7 @@ pub enum NodePortRuntimeState {
     Degraded,
 }
 
-/// Aggregated packet counters read from the pinned NodePort eBPF stats maps.
+/// Aggregated packet counters for packets that matched the published NodePort dataplane path.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NodePortPacketCounters {
@@ -665,7 +665,7 @@ mod platform {
             }
         }
 
-        /// Read and aggregate the ingress and egress packet counters from the pinned NodePort stats maps.
+        /// Read and aggregate the matched ingress and egress NodePort packet counters from the pinned stats maps.
         fn read_dataplane_counters(
             &self,
         ) -> Result<(NodePortPacketCounters, NodePortPacketCounters)> {

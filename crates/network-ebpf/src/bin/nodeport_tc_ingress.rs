@@ -35,6 +35,12 @@ enum IngressDropReason {
     RewriteFailure = 5,
 }
 
+#[derive(Clone, Copy)]
+enum IngressOutcome {
+    Ignored,
+    Redirected,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct NodePortKey {
@@ -97,13 +103,10 @@ pub fn nodeport_tc_ingress(mut ctx: TcContext) -> i32 {
     let len = ctx.len() as usize;
 
     match handle_packet(&mut ctx) {
-        Ok(TC_ACT_OK) => unsafe {
+        Ok(IngressOutcome::Ignored) => TC_ACT_OK,
+        Ok(IngressOutcome::Redirected) => unsafe {
             stats::record_pass(core::ptr::addr_of_mut!(NODEPORT_TC_INGRESS_STATS), len);
-            TC_ACT_OK
-        },
-        Ok(action) => unsafe {
-            stats::record_pass(core::ptr::addr_of_mut!(NODEPORT_TC_INGRESS_STATS), len);
-            action
+            TC_ACT_SHOT
         },
         Err(reason) => unsafe {
             stats::record_drop(core::ptr::addr_of_mut!(NODEPORT_TC_INGRESS_STATS), len);
@@ -117,17 +120,17 @@ pub fn nodeport_tc_ingress(mut ctx: TcContext) -> i32 {
 }
 
 /// Parse a packet, rewrite it to a VIP, and redirect into the host-access bridge port.
-fn handle_packet(ctx: &mut TcContext) -> Result<i32, IngressDropReason> {
+fn handle_packet(ctx: &mut TcContext) -> Result<IngressOutcome, IngressDropReason> {
     let data = ctx.data();
     let data_end = ctx.data_end();
     let Some((ip_offset, ip)) = locate_ipv4_header(ctx, data, data_end)
         .map_err(|_| IngressDropReason::InvalidIpv4Header)?
     else {
-        return Ok(TC_ACT_OK);
+        return Ok(IngressOutcome::Ignored);
     };
     let ip_hdr = unsafe { &mut *ip };
     if ip_hdr.version() != 4 || ip_hdr.is_fragmented() {
-        return Ok(TC_ACT_OK);
+        return Ok(IngressOutcome::Ignored);
     }
     let ihl = ip_hdr.header_len();
     if ihl < 20 {
@@ -137,7 +140,7 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, IngressDropReason> {
     let l4_offset = ip_offset + ihl;
     let proto = ip_hdr.protocol;
     if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
-        return Ok(TC_ACT_OK);
+        return Ok(IngressOutcome::Ignored);
     }
 
     let (src_port, dst_port) = parse_ports(data, data_end, l4_offset, proto)
@@ -149,11 +152,11 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, IngressDropReason> {
     };
 
     let Some(entry) = (unsafe { NODEPORT_VIPS.get(&key) }) else {
-        return Ok(TC_ACT_OK);
+        return Ok(IngressOutcome::Ignored);
     };
 
     if entry.node_ip != ip_hdr.dst || entry.overlay_ifindex == 0 {
-        return Ok(TC_ACT_OK);
+        return Ok(IngressOutcome::Ignored);
     }
 
     let host = unsafe {
@@ -213,13 +216,13 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, IngressDropReason> {
     rewrite_destination(ctx, ip_offset, l4_offset, proto, entry)
         .map_err(|_| IngressDropReason::RewriteFailure)?;
     if ensure_ethernet(ctx, ip_offset, host).is_err() {
-        return Ok(TC_ACT_OK);
+        return Ok(IngressOutcome::Ignored);
     }
     if ctx.clone_redirect(entry.overlay_ifindex, 0).is_ok() {
-        return Ok(TC_ACT_SHOT);
+        return Ok(IngressOutcome::Redirected);
     }
 
-    Ok(TC_ACT_OK)
+    Ok(IngressOutcome::Ignored)
 }
 
 /// Locate the IPv4 header offset, accounting for both Ethernet and loopback layouts.

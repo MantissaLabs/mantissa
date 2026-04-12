@@ -39,13 +39,10 @@ pub fn nodeport_tc_egress(mut ctx: TcContext) -> i32 {
     let len = ctx.len() as usize;
 
     match handle_packet(&mut ctx) {
-        Ok(TC_ACT_OK) => unsafe {
+        Ok(false) => TC_ACT_OK,
+        Ok(true) => unsafe {
             stats::record_pass(core::ptr::addr_of_mut!(NODEPORT_TC_EGRESS_STATS), len);
             TC_ACT_OK
-        },
-        Ok(action) => unsafe {
-            stats::record_pass(core::ptr::addr_of_mut!(NODEPORT_TC_EGRESS_STATS), len);
-            action
         },
         Err(_) => unsafe {
             stats::record_drop(core::ptr::addr_of_mut!(NODEPORT_TC_EGRESS_STATS), len);
@@ -55,14 +52,14 @@ pub fn nodeport_tc_egress(mut ctx: TcContext) -> i32 {
 }
 
 /// Apply SNAT on return packets that match a tracked nodeport flow.
-fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
+fn handle_packet(ctx: &mut TcContext) -> Result<bool, ()> {
     let data = ctx.data();
     let data_end = ctx.data_end();
 
     let eth: *mut EthernetHeader = unsafe { net::mut_ptr_at(data, data_end, 0).map_err(|_| ())? };
     let eth_hdr = unsafe { &mut *eth };
     if eth_hdr.protocol() != ETH_P_IPV4 {
-        return Ok(TC_ACT_OK);
+        return Ok(false);
     }
 
     let ip_offset = net::ETH_HDR_LEN;
@@ -70,7 +67,7 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
         unsafe { net::mut_ptr_at(data, data_end, ip_offset).map_err(|_| ())? };
     let ip_hdr = unsafe { &mut *ip };
     if ip_hdr.version() != 4 || ip_hdr.is_fragmented() {
-        return Ok(TC_ACT_OK);
+        return Ok(false);
     }
     let ihl = ip_hdr.header_len();
     if ihl < 20 {
@@ -80,7 +77,7 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
     let l4_offset = ip_offset + ihl;
     let proto = ip_hdr.protocol;
     if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
-        return Ok(TC_ACT_OK);
+        return Ok(false);
     }
 
     let (src_port, dst_port) = parse_ports(data, data_end, l4_offset, proto)?;
@@ -95,13 +92,13 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
     };
 
     let Some(entry) = (unsafe { NODEPORT_REV.get(&key) }) else {
-        return Ok(TC_ACT_OK);
+        return Ok(false);
     };
 
     rewrite_destination(ctx, ip_offset, l4_offset, proto, entry)?;
     rewrite_source(ctx, ip_offset, l4_offset, proto, entry)?;
 
-    Ok(TC_ACT_OK)
+    Ok(true)
 }
 
 /// Parse the L4 header ports so we can match return flows.
