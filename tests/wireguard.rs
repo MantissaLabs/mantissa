@@ -70,7 +70,7 @@ async fn upsert_remote_wireguard_peer(
 fn cleanup_wireguard_interface() {
     let _ = Command::new("ip")
         .args(["link", "delete", "dev", MANTISSA_WIREGUARD_IFNAME])
-        .status();
+        .output();
 }
 
 local_test!(wireguard_scoped_peer_gate_blocks_until_peer_enabled, {

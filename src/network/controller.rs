@@ -37,6 +37,7 @@ pub(crate) const DEFAULT_MTU: u32 = 1450;
 #[cfg(target_os = "linux")]
 const VXLAN_PORT: u16 = 4789;
 const WIREGUARD_RECONCILE_DEBOUNCE: Duration = Duration::from_secs(1);
+const WIREGUARD_RECONCILE_RETRY_LIMIT: usize = 3;
 
 #[derive(Clone)]
 pub struct NetworkController {
@@ -61,6 +62,7 @@ struct NetworkControllerInner {
     pending_specs: AsyncMutex<HashSet<Uuid>>,
     wireguard: AsyncMutex<WireGuardUnderlayState>,
     wireguard_last_reconcile: AsyncMutex<Option<std::time::Instant>>,
+    wireguard_retry_scheduled: AsyncMutex<bool>,
     attachments_root: AsyncMutex<Option<String>>,
     attachment_sync_notify: Option<Arc<Notify>>,
     wake: Notify,
@@ -152,6 +154,7 @@ impl NetworkController {
                 pending_specs: AsyncMutex::new(HashSet::new()),
                 wireguard: AsyncMutex::new(WireGuardUnderlayState::default()),
                 wireguard_last_reconcile: AsyncMutex::new(None),
+                wireguard_retry_scheduled: AsyncMutex::new(false),
                 attachments_root: AsyncMutex::new(None),
                 attachment_sync_notify,
                 wake: Notify::new(),
@@ -296,8 +299,10 @@ impl NetworkController {
         {
             let mut guard = self.inner.wireguard_last_reconcile.lock().await;
             if let Some(last) = *guard
-                && now.saturating_duration_since(last) < WIREGUARD_RECONCILE_DEBOUNCE
+                && let Some(remaining) =
+                    WIREGUARD_RECONCILE_DEBOUNCE.checked_sub(now.saturating_duration_since(last))
             {
+                self.schedule_wireguard_retry(remaining).await;
                 return Ok(false);
             }
             *guard = Some(now);
@@ -352,6 +357,48 @@ impl NetworkController {
                 Err(err.context("reconcile mandatory wireguard underlay"))
             }
         }
+    }
+
+    /// Requeue network reconciliation after the WireGuard debounce window elapses.
+    ///
+    /// Peer metadata can become ready immediately after a failed underlay reconcile. Without a
+    /// delayed requeue, the controller would keep the stale underlay state until the slow drift
+    /// sweep fires, which unnecessarily delays network readiness by up to one minute. We keep the
+    /// retry bounded so persistent kernel/configuration failures still fall back to the normal
+    /// periodic sweep instead of spinning forever.
+    async fn schedule_wireguard_retry(&self, delay: Duration) {
+        let mut guard = self.inner.wireguard_retry_scheduled.lock().await;
+        if *guard {
+            return;
+        }
+        *guard = true;
+        drop(guard);
+
+        let controller = self.clone();
+        tokio::task::spawn_local(async move {
+            let mut next_delay = delay;
+            for _ in 0..WIREGUARD_RECONCILE_RETRY_LIMIT {
+                tokio::time::sleep(next_delay).await;
+
+                if let Err(err) = controller.schedule_active_network_reconcile().await {
+                    warn!(
+                        target: "network",
+                        "failed to requeue network reconcile after wireguard debounce: {err:#}"
+                    );
+                    break;
+                }
+
+                let state = { controller.inner.wireguard.lock().await.clone() };
+                if state.underlay_active || state.required_peer_count == 0 {
+                    break;
+                }
+
+                next_delay = WIREGUARD_RECONCILE_DEBOUNCE;
+            }
+
+            let mut guard = controller.inner.wireguard_retry_scheduled.lock().await;
+            *guard = false;
+        });
     }
 
     /// Queue every active network for a full reconcile.
