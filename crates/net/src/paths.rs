@@ -12,6 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 const SYSTEM_STATE_DIR: &str = "/var/lib/mantissa";
 const USER_STATE_SUBDIR: &str = ".mantissa";
 const MANTISSA_GROUP: &str = "mantissa";
+pub const STATE_DIR_ENV: &str = "MANTISSA_STATE_DIR";
 
 /// Returns true when the effective uid has root privileges.
 pub fn running_as_root() -> bool {
@@ -28,14 +29,17 @@ pub fn running_as_root() -> bool {
 /// Resolve the persistent state directory and ensure it exists with useful permissions.
 /// Root uses `/var/lib/mantissa`; unprivileged users fall back to `~/.mantissa`.
 pub fn ensure_state_dir() -> io::Result<PathBuf> {
-    let path = if running_as_root() {
-        PathBuf::from(SYSTEM_STATE_DIR)
-    } else {
-        let home = env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
-        home.join(USER_STATE_SUBDIR)
-    };
+    let path =
+        if let Some(override_dir) = env::var_os(STATE_DIR_ENV).filter(|value| !value.is_empty()) {
+            PathBuf::from(override_dir)
+        } else if running_as_root() {
+            PathBuf::from(SYSTEM_STATE_DIR)
+        } else {
+            let home = env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
+            home.join(USER_STATE_SUBDIR)
+        };
 
     fs::create_dir_all(&path)?;
 

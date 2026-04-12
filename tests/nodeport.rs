@@ -4,218 +4,32 @@
 mod common;
 
 use common::convergence::wait_until;
-use mantissa::config::{
-    Config, ConfigSource, global_config, global_config_source, set_global_config_with_source,
+use common::privileged_networking::{
+    PrivilegedTestGuard, create_privileged_network, create_privileged_node,
+    delete_privileged_network, force_cleanup_privileged_network_links, privileged_artifact_dir,
+    privileged_test_network,
 };
 use mantissa::network::nodeport::NodePortRuntimeState;
-use mantissa::network::types::{NetworkDriver, NetworkSpecDraft, NetworkSpecValue, NetworkStatus};
-use mantissa::server::headless::{HeadlessConfig, HeadlessNode, HeadlessTransport};
 use mantissa::services::ServiceController;
 use mantissa::services::types::{
     ServicePortProtocol, ServiceStatus, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
 };
 use mantissa::workload::types::ExecutionSpec;
 use protocol::services::services;
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
-const ENABLE_ENV: &str = "MANTISSA_RUN_PRIVILEGED_NODEPORT_TESTS";
 const NODEPORT_HTTP_PORT: u16 = 18080;
 const NODEPORT_RESPONSE: &str = "hello from nodeport privileged test";
 
-/// Restores the global Mantissa config after a test-scoped privileged override.
-struct ConfigOverrideGuard {
-    previous: Config,
-    source: ConfigSource,
-    _lock: MutexGuard<'static, ()>,
-}
-
-/// Returns the global mutex used to serialize privileged config overrides.
-fn config_override_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-impl ConfigOverrideGuard {
-    /// Forces the current process into a real NodePort-capable configuration for privileged tests.
-    fn privileged_nodeport(artifact_dir: &Path) -> Self {
-        let lock = config_override_lock()
-            .lock()
-            .expect("config override lock should not be poisoned");
-        let previous = global_config();
-        let source = global_config_source();
-
-        let mut config = previous.clone();
-        config.network.wireguard.enabled = false;
-        config.network.wireguard.manage_firewall = false;
-        config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
-        config.network.nodeport.enabled = true;
-        config.network.nodeport.iface = Some("lo".to_string());
-        config.network.nodeport.ip = Some("127.0.0.1".to_string());
-        config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
-
-        let mut override_source = source.clone();
-        override_source.env_overrides = true;
-        set_global_config_with_source(config, override_source);
-
-        Self {
-            previous,
-            source,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for ConfigOverrideGuard {
-    fn drop(&mut self) {
-        set_global_config_with_source(self.previous.clone(), self.source.clone());
-    }
-}
-
-/// Returns the compiled BPF artifact directory when the privileged NodePort lane is enabled.
-fn privileged_nodeport_artifact_dir() -> Option<PathBuf> {
-    if std::env::var_os(ENABLE_ENV).is_none() {
-        eprintln!("skipping privileged NodePort tests; {ENABLE_ENV} is not set");
-        return None;
-    }
-
-    assert!(
-        unsafe { libc::geteuid() } == 0,
-        "{ENABLE_ENV} requires root privileges so tc, bpffs, and veth setup can run"
-    );
-
-    let artifact_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/bpf");
-    assert!(
-        artifact_dir.join("nodeport_tc_ingress.bpf.o").exists(),
-        "missing nodeport ingress artifact at {}",
-        artifact_dir.join("nodeport_tc_ingress.bpf.o").display()
-    );
-    assert!(
-        artifact_dir.join("nodeport_tc_egress.bpf.o").exists(),
-        "missing nodeport egress artifact at {}",
-        artifact_dir.join("nodeport_tc_egress.bpf.o").display()
-    );
-
-    Some(artifact_dir)
-}
-
-/// Starts one real headless node using the production Docker runtime path and fast control-plane ticks.
-async fn create_privileged_node() -> HeadlessNode {
-    HeadlessNode::new_with_config(HeadlessConfig {
-        listen_addr: "127.0.0.1:0".to_string(),
-        transport: HeadlessTransport::Inproc,
-        sync_tick: Some(Duration::from_millis(100)),
-        sync_fanout: None,
-        global_metadata_sync_tick: Some(Duration::from_millis(100)),
-        global_metadata_sync_fanout: None,
-        gossip_tick: Some(Duration::from_millis(100)),
-        gossip_fanout: None,
-        gossip_channel_capacity: None,
-        task_runtime: None,
-        runtime_set: None,
-        local_volume_root: None,
-    })
-    .await
-    .expect("start privileged NodePort node")
-}
-
-/// Creates one logical overlay network and waits until the local controller reports it ready.
-async fn create_privileged_test_network(node: &HeadlessNode) -> Uuid {
-    let network = NetworkSpecValue::new(NetworkSpecDraft {
-        name: format!("nodeport-test-{}", Uuid::new_v4()),
-        description: "privileged nodeport integration test network".to_string(),
-        driver: NetworkDriver::Vxlan,
-        subnet_cidr: "10.44.0.0/24".to_string(),
-        vni: ((Uuid::new_v4().as_u128() % 16_000_000) as u32).max(1),
-        mtu: 1450,
-        sealed: false,
-        bpf_programs: Vec::new(),
-    });
-
-    node.network_registry
-        .upsert_spec(network.clone())
-        .await
-        .expect("upsert privileged NodePort test network");
-    node.network_controller
-        .schedule_spec_change(network.id)
-        .await;
-
-    assert!(
-        wait_until(
-            Duration::from_secs(60),
-            Duration::from_millis(100),
-            || async {
-                matches!(
-                    node.network_registry.get_spec(network.id),
-                    Ok(Some(spec)) if spec.status == NetworkStatus::Ready
-                )
-            }
-        )
-        .await,
-        "network {} should become ready before deploying a public service",
-        network.id
-    );
-
-    network.id
-}
-
-/// Returns the deterministic kernel link names provisioned for one overlay network.
-fn privileged_network_interfaces(network_id: Uuid) -> [String; 4] {
-    let suffix: String = network_id.simple().to_string().chars().take(8).collect();
-    [
-        format!("mvx-{suffix}"),
-        format!("mnt-br-{suffix}"),
-        format!("mnhp-{suffix}"),
-        format!("mnhost-{suffix}"),
-    ]
-}
-
-/// Returns true when the kernel still exposes the named network device.
-fn link_exists(iface: &str) -> bool {
-    Path::new("/sys/class/net").join(iface).exists()
-}
-
-/// Deletes the privileged test overlay and waits until the kernel dataplane devices are gone.
-async fn delete_privileged_test_network(node: &HeadlessNode, network_id: Uuid) {
-    let Some(mut spec) = node
-        .network_registry
-        .get_spec(network_id)
-        .expect("load privileged NodePort test network before delete")
-    else {
-        return;
-    };
-
-    spec.mark_deleted();
-    node.network_registry
-        .upsert_spec(spec)
-        .await
-        .expect("mark privileged NodePort test network deleted");
-    node.network_controller
-        .schedule_spec_change(network_id)
-        .await;
-    node.network_registry
-        .remove_peer_states_for_network(network_id)
-        .await
-        .expect("remove privileged NodePort peer states");
-    node.network_registry
-        .remove_attachments_for_network(network_id)
-        .await
-        .expect("remove privileged NodePort attachments");
-
-    let interfaces = privileged_network_interfaces(network_id);
-    assert!(
-        wait_until(Duration::from_secs(60), Duration::from_millis(100), || {
-            let interfaces = interfaces.clone();
-            async move { interfaces.iter().all(|iface| !link_exists(iface)) }
-        })
-        .await,
-        "privileged NodePort test network {network_id} should tear down kernel interfaces: {interfaces:?}"
-    );
+/// Resolve the compiled NodePort dataplane artifacts for the privileged validation lane.
+fn privileged_nodeport_artifact_dir() -> Option<std::path::PathBuf> {
+    privileged_artifact_dir(
+        "NodePort",
+        &["nodeport_tc_ingress.bpf.o", "nodeport_tc_egress.bpf.o"],
+    )
 }
 
 /// Builds one real TCP echo service attached to the test overlay and published through NodePort.
@@ -296,9 +110,30 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
         return;
     };
 
-    let _config = ConfigOverrideGuard::privileged_nodeport(&artifact_dir);
+    let _config = PrivilegedTestGuard::apply(|config| {
+        config.network.wireguard.enabled = false;
+        config.network.wireguard.manage_firewall = false;
+        config.network.bpf.attach = true;
+        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        config.network.nodeport.enabled = true;
+        config.network.nodeport.iface = Some("lo".to_string());
+        config.network.nodeport.ip = Some("127.0.0.1".to_string());
+        config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+    });
     let node = create_privileged_node().await;
-    let network_id = create_privileged_test_network(&node).await;
+    let network = create_privileged_network(
+        &node,
+        privileged_test_network(
+            "nodeport-test",
+            "privileged nodeport integration test network",
+            "10.44.0.0/24",
+            1450,
+            Vec::new(),
+        ),
+        mantissa::network::types::NetworkStatus::Ready,
+    )
+    .await;
+    let network_id = network.id;
 
     let service_id = node
         .service_controller
@@ -438,5 +273,6 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
         "public port should stop accepting traffic after service deletion"
     );
 
-    delete_privileged_test_network(&node, network_id).await;
+    delete_privileged_network(&node, network_id).await;
+    force_cleanup_privileged_network_links(network_id).await;
 });
