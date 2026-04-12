@@ -60,8 +60,7 @@ struct NodePortNat {
 }
 
 #[map(name = "NODEPORT_TC_INGRESS_STATS")]
-static mut NODEPORT_TC_INGRESS_STATS: PerCpuArray<PacketStats> =
-    PerCpuArray::with_max_entries(1, 0);
+static mut NODEPORT_TC_INGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::pinned(1, 0);
 
 #[map(name = "NODEPORT_VIPS")]
 static mut NODEPORT_VIPS: HashMap<NodePortKey, NodePortEntry> = HashMap::pinned(1024, 0);

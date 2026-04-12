@@ -28,7 +28,7 @@ struct NodePortNat {
 }
 
 #[map(name = "NODEPORT_TC_EGRESS_STATS")]
-static mut NODEPORT_TC_EGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_entries(1, 0);
+static mut NODEPORT_TC_EGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::pinned(1, 0);
 
 #[map(name = "NODEPORT_REV")]
 static mut NODEPORT_REV: LruHashMap<Flow4, NodePortNat> = LruHashMap::pinned(2048, 0);

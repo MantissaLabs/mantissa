@@ -1245,6 +1245,10 @@ mod platform {
         // Hairpin replies arrive on the host-access veth with a local source, so we must
         // explicitly accept local sources and disable strict reverse-path filtering there.
         write_ipv4_sysctl(iface, "accept_local", "1").context("set nodeport accept_local")?;
+        // Loopback-backed NodePort tests and local curls can route 127/8 over the host-access
+        // veth after eBPF rewrites, which Linux rejects unless route_localnet is enabled on the
+        // receiving interface.
+        write_ipv4_sysctl(iface, "route_localnet", "1").context("set nodeport route_localnet")?;
         write_ipv4_sysctl(iface, "rp_filter", "0").context("disable nodeport rp_filter")?;
         Ok(())
     }
@@ -1404,6 +1408,8 @@ mod platform {
             "NODEPORT_REV",
             "NODEPORT_VIPS",
             "NODEPORT_HOST",
+            "NODEPORT_TC_INGRESS_STATS",
+            "NODEPORT_TC_EGRESS_STATS",
         ];
 
         for name in maps {
