@@ -164,6 +164,60 @@ async fn create_privileged_test_network(node: &HeadlessNode) -> Uuid {
     network.id
 }
 
+/// Returns the deterministic kernel link names provisioned for one overlay network.
+fn privileged_network_interfaces(network_id: Uuid) -> [String; 4] {
+    let suffix: String = network_id.simple().to_string().chars().take(8).collect();
+    [
+        format!("mvx-{suffix}"),
+        format!("mnt-br-{suffix}"),
+        format!("mnhp-{suffix}"),
+        format!("mnhost-{suffix}"),
+    ]
+}
+
+/// Returns true when the kernel still exposes the named network device.
+fn link_exists(iface: &str) -> bool {
+    Path::new("/sys/class/net").join(iface).exists()
+}
+
+/// Deletes the privileged test overlay and waits until the kernel dataplane devices are gone.
+async fn delete_privileged_test_network(node: &HeadlessNode, network_id: Uuid) {
+    let Some(mut spec) = node
+        .network_registry
+        .get_spec(network_id)
+        .expect("load privileged NodePort test network before delete")
+    else {
+        return;
+    };
+
+    spec.mark_deleted();
+    node.network_registry
+        .upsert_spec(spec)
+        .await
+        .expect("mark privileged NodePort test network deleted");
+    node.network_controller
+        .schedule_spec_change(network_id)
+        .await;
+    node.network_registry
+        .remove_peer_states_for_network(network_id)
+        .await
+        .expect("remove privileged NodePort peer states");
+    node.network_registry
+        .remove_attachments_for_network(network_id)
+        .await
+        .expect("remove privileged NodePort attachments");
+
+    let interfaces = privileged_network_interfaces(network_id);
+    assert!(
+        wait_until(Duration::from_secs(60), Duration::from_millis(100), || {
+            let interfaces = interfaces.clone();
+            async move { interfaces.iter().all(|iface| !link_exists(iface)) }
+        })
+        .await,
+        "privileged NodePort test network {network_id} should tear down kernel interfaces: {interfaces:?}"
+    );
+}
+
 /// Builds one real TCP echo service attached to the test overlay and published through NodePort.
 fn privileged_nodeport_task_template(network_id: Uuid) -> TaskTemplateSpecValue {
     TaskTemplateSpecValue {
@@ -383,4 +437,6 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
         .await,
         "public port should stop accepting traffic after service deletion"
     );
+
+    delete_privileged_test_network(&node, network_id).await;
 });
