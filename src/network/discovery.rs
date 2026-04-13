@@ -102,6 +102,7 @@ struct ServiceBackendCatalogEntry {
 struct ServiceRefreshResult {
     nodeport_mappings: Vec<NodePortMapping>,
     public_endpoint: Option<PublicEndpointObservation>,
+    host_vip: Option<Ipv4Addr>,
 }
 
 /// Observed public endpoint state for one template during the current refresh tick.
@@ -1692,6 +1693,7 @@ async fn refresh_network_services(
     };
     let mut nodeport_entries = Vec::new();
     let mut public_endpoint_observations = Vec::new();
+    let mut host_vips = HashSet::new();
 
     for entry in entries {
         let result = refresh_single_service(
@@ -1701,6 +1703,9 @@ async fn refresh_network_services(
         nodeport_entries.extend(result.nodeport_mappings);
         if let Some(observation) = result.public_endpoint {
             public_endpoint_observations.push(observation);
+        }
+        if let Some(vip) = result.host_vip {
+            host_vips.insert(vip);
         }
     }
 
@@ -1717,6 +1722,13 @@ async fn refresh_network_services(
             target: "network",
             network = %network_id,
             "failed to sync public nodeport mappings: {err:#}"
+        );
+    }
+    if let Err(err) = reconcile_host_vip_neighbors(network_id, &host_vips).await {
+        warn!(
+            target: "network",
+            network = %network_id,
+            "failed to reconcile host vip neighbours: {err:#}"
         );
     }
     apply_public_endpoint_observations(services, public_endpoint_observations.as_slice()).await?;
@@ -1782,6 +1794,8 @@ async fn refresh_single_service(
                     service.template_name, port
                 )),
             }),
+            // Only keep the host VIP neighbour alive while at least one backend is published.
+            host_vip: None,
         });
     }
 
@@ -1810,6 +1824,7 @@ async fn refresh_single_service(
                         service.template_name, port
                     )),
                 }),
+                host_vip: service.expose_to_host.then_some(vip),
             });
         }
 
@@ -1830,6 +1845,7 @@ async fn refresh_single_service(
                 port,
                 detail: None,
             }),
+            host_vip: service.expose_to_host.then_some(vip),
         });
     }
 
@@ -1844,6 +1860,7 @@ async fn refresh_single_service(
                 service.template_name, port
             )),
         }),
+        host_vip: None,
     })
 }
 
@@ -2071,6 +2088,92 @@ async fn ensure_host_vip_neighbor(network_id: Uuid, vip: Ipv4Addr, vip_mac: [u8;
             .execute()
             .await
             .with_context(|| format!("program vip neighbour entry for {vip} on {host_ifname}"))?;
+
+        Ok(())
+    }
+}
+
+/// Remove stale permanent host VIP neighbours that no longer belong to any published service.
+async fn reconcile_host_vip_neighbors(
+    network_id: Uuid,
+    desired_vips: &HashSet<Ipv4Addr>,
+) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (network_id, desired_vips);
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use futures::{StreamExt, TryStreamExt};
+        use rtnetlink::packet_core::{NLM_F_ACK, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload};
+        use rtnetlink::packet_route::neighbour::{
+            NeighbourAddress, NeighbourAttribute, NeighbourMessage, NeighbourState,
+        };
+        use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
+
+        let (conn, handle, _) = rtnetlink::new_connection()
+            .context("open rtnetlink connection for vip neighbour gc")?;
+        tokio::spawn(conn);
+
+        let host_ifname = host_access_host_iface_name(network_id);
+        let host_index = match handle
+            .link()
+            .get()
+            .match_name(host_ifname.clone())
+            .execute()
+            .try_next()
+            .await
+        {
+            Ok(Some(msg)) => msg.header.index,
+            Ok(None) => return Ok(()),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("lookup host access interface {host_ifname} for vip neighbour gc")
+                });
+            }
+        };
+
+        let mut stale_vips = Vec::new();
+        let mut neighs = handle.neighbours().get().execute();
+        while let Ok(Some(msg)) = neighs.try_next().await {
+            if msg.header.ifindex != host_index || msg.header.state != NeighbourState::Permanent {
+                continue;
+            }
+
+            let vip = msg.attributes.iter().find_map(|attr| match attr {
+                NeighbourAttribute::Destination(NeighbourAddress::Inet(v4)) => Some(*v4),
+                _ => None,
+            });
+            if let Some(vip) = vip
+                && !desired_vips.contains(&vip)
+            {
+                stale_vips.push(vip);
+            }
+        }
+
+        for vip in stale_vips {
+            let mut message = NeighbourMessage::default();
+            message.header.family = AddressFamily::Inet;
+            message.header.ifindex = host_index;
+            message
+                .attributes
+                .push(NeighbourAttribute::Destination(NeighbourAddress::Inet(vip)));
+
+            let mut request = NetlinkMessage::from(RouteNetlinkMessage::DelNeighbour(message));
+            request.header.flags = NLM_F_REQUEST | NLM_F_ACK;
+            let mut responses = handle.clone().request(request).with_context(|| {
+                format!("submit vip neighbour delete for {vip} on {host_ifname}")
+            })?;
+            while let Some(message) = responses.next().await {
+                if let NetlinkPayload::Error(err) = message.payload {
+                    return Err(rtnetlink::Error::NetlinkError(err)).with_context(|| {
+                        format!("delete stale host vip neighbour {vip} on {host_ifname}")
+                    });
+                }
+            }
+        }
 
         Ok(())
     }

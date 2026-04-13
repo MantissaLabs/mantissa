@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 const EBPF_HTTP_PORT: u16 = 18081;
 const EBPF_HTTP_RESPONSE: &str = "hello from ebpf overlay privileged test";
+const HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Resolve the compiled overlay dataplane artifacts for the privileged eBPF validation lane.
 fn privileged_ebpf_artifact_dir() -> Option<PathBuf> {
@@ -132,11 +133,21 @@ async fn remove_service_via_rpc(client: &services::Client, service_id: Uuid) {
 
 /// Perform one HTTP GET against the supplied address and return the raw response bytes as UTF-8.
 async fn http_get(addr: &str) -> anyhow::Result<String> {
-    let mut stream = TcpStream::connect(addr).await?;
+    let mut stream = tokio::time::timeout(HTTP_PROBE_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .with_context(|| format!("connect to {addr} timed out after {HTTP_PROBE_TIMEOUT:?}"))??;
     let request = format!("GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await?;
+    tokio::time::timeout(HTTP_PROBE_TIMEOUT, stream.write_all(request.as_bytes()))
+        .await
+        .with_context(|| {
+            format!("write request to {addr} timed out after {HTTP_PROBE_TIMEOUT:?}")
+        })??;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).await?;
+    tokio::time::timeout(HTTP_PROBE_TIMEOUT, stream.read_to_end(&mut response))
+        .await
+        .with_context(|| {
+            format!("read response from {addr} timed out after {HTTP_PROBE_TIMEOUT:?}")
+        })??;
     Ok(String::from_utf8_lossy(&response).into_owned())
 }
 
@@ -548,6 +559,159 @@ local_test!(ebpf_overlay_host_vip_reaches_service_from_host_access, {
     delete_privileged_network(&node, network_id).await;
     force_cleanup_privileged_network_links(network_id).await;
 });
+
+local_test!(
+    ebpf_overlay_service_delete_removes_dns_and_host_vip_neighbor,
+    {
+        let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {
+            return;
+        };
+
+        let _config = PrivilegedTestGuard::apply(|config| {
+            config.network.wireguard.enabled = false;
+            config.network.wireguard.manage_firewall = false;
+            config.network.bpf.attach = true;
+            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            config.network.nodeport.enabled = false;
+            config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+        });
+
+        let node = create_privileged_node().await;
+        let subnet = privileged_test_subnet();
+        let network = create_privileged_network(
+            &node,
+            privileged_test_network(
+                "ebpf-delete-service",
+                "privileged ebpf service delete cleanup test network",
+                &subnet,
+                1450,
+                Vec::new(),
+            ),
+            NetworkStatus::Ready,
+        )
+        .await;
+        let network_id = network.id;
+        let pin_dir = pinned_lb_map_dir(network_id);
+
+        let service_id = node
+            .service_controller
+            .submit_deployment(
+                Uuid::new_v4(),
+                "ebpf-delete-service",
+                "ebpf-delete-service",
+                vec![privileged_http_service_task_template(network_id, 1)],
+            )
+            .await
+            .expect("submit privileged eBPF delete-service deployment");
+
+        assert!(
+            wait_for_service_status(
+                &node.service_controller,
+                service_id,
+                ServiceStatus::Running,
+                Duration::from_secs(180),
+            )
+            .await,
+            "eBPF delete-service deployment should reach running state"
+        );
+
+        let backend_ips = wait_for_backend_ips(&node, network_id, 1, Duration::from_secs(60)).await;
+        let [
+            _vxlan_ifname,
+            _bridge_ifname,
+            _host_peer_ifname,
+            host_ifname,
+        ] = privileged_network_interfaces(network_id);
+        let resolver_ip = interface_ipv4(&host_ifname);
+        let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+        let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
+            .await
+            .expect("discover VIP for delete-service cleanup test");
+        let vip_addr = format!("{vip}:{EBPF_HTTP_PORT}");
+
+        assert!(
+            common::convergence::wait_until(
+                Duration::from_secs(30),
+                Duration::from_millis(100),
+                || async {
+                    matches!(
+                        http_get(&vip_addr).await,
+                        Ok(response) if response.contains(EBPF_HTTP_RESPONSE)
+                    )
+                }
+            )
+            .await,
+            "host-access traffic should reach the service VIP before service deletion"
+        );
+
+        let neighbour = command_stdout(
+            "ip",
+            &["neigh", "show", "to", &vip.to_string(), "dev", &host_ifname],
+        );
+        assert!(
+            neighbour.contains("PERMANENT"),
+            "host-access interface should keep a permanent neighbour entry before service deletion: {neighbour}"
+        );
+
+        remove_service_via_rpc(&node.services_client, service_id).await;
+
+        assert!(
+            common::convergence::wait_until(
+                Duration::from_secs(30),
+                Duration::from_millis(100),
+                || async {
+                    match query_a_records(resolver_ip, &fqdn).await {
+                        Ok((_code, answers)) => answers
+                            .iter()
+                            .all(|answer| *answer != vip && !backend_ips.contains(answer)),
+                        Err(_) => false,
+                    }
+                }
+            )
+            .await,
+            "service deletion should remove dns answers for the service vip and backend attachment"
+        );
+
+        assert!(
+            common::convergence::wait_until(
+                Duration::from_secs(30),
+                Duration::from_millis(100),
+                || async {
+                    let neighbour = command_stdout(
+                        "ip",
+                        &["neigh", "show", "to", &vip.to_string(), "dev", &host_ifname],
+                    );
+                    neighbour.trim().is_empty()
+                }
+            )
+            .await,
+            "service deletion should remove the permanent host vip neighbour entry"
+        );
+
+        assert!(
+            common::convergence::wait_until(
+                Duration::from_secs(10),
+                Duration::from_millis(100),
+                || async { http_get(&vip_addr).await.is_err() }
+            )
+            .await,
+            "service deletion should stop the host from reaching the stale service vip"
+        );
+
+        assert!(
+            pin_dir.exists(),
+            "service deletion should keep the per-network LB pin directory while the network itself remains active: {}",
+            pin_dir.display()
+        );
+        assert!(
+            link_exists(&host_ifname),
+            "service deletion should not tear down the host-access interface while the network is still active: {host_ifname}"
+        );
+
+        delete_privileged_network(&node, network_id).await;
+        force_cleanup_privileged_network_links(network_id).await;
+    }
+);
 
 local_test!(
     ebpf_overlay_delete_keeps_lb_pins_absent_after_stability_window,
