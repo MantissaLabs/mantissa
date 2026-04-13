@@ -371,6 +371,9 @@ mod platform {
         /// deletion leaks kernel memory even when no userspace process is holding the maps open.
         fn remove_map_pin_dir(network_id: Uuid) -> Result<()> {
             let path = Self::map_pin_path(network_id);
+            if !path.exists() {
+                return Ok(());
+            }
             match fs::remove_dir_all(&path) {
                 Ok(()) => {
                     debug!(
@@ -381,7 +384,12 @@ mod platform {
                     );
                     Ok(())
                 }
-                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(err)
+                    if err.kind() == io::ErrorKind::NotFound
+                        || (err.kind() == io::ErrorKind::PermissionDenied && !path.exists()) =>
+                {
+                    Ok(())
+                }
                 Err(err) => Err(err)
                     .with_context(|| format!("remove pinned bpf map directory {}", path.display())),
             }
@@ -1236,9 +1244,92 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::config::{
+            Config, ConfigSource, global_config, global_config_source, load_config_with_source,
+            set_global_config_with_source,
+        };
+        use crate::network::bpf::NetworkBpfManager;
+        use crate::network::types::{NetworkDriver, NetworkSpecDraft, NetworkSpecValue};
+        use std::ffi::OsString;
         use std::fs;
+        use std::sync::{Mutex, MutexGuard, OnceLock};
         use tempfile::TempDir;
         use uuid::Uuid;
+
+        /// Restores one process-global environment override after a unit test-scoped mutation.
+        struct EnvOverrideGuard {
+            key: &'static str,
+            previous: Option<OsString>,
+        }
+
+        impl EnvOverrideGuard {
+            /// Apply one temporary environment override and remember the prior value.
+            fn set(key: &'static str, value: impl Into<OsString>) -> Self {
+                let previous = std::env::var_os(key);
+                unsafe {
+                    std::env::set_var(key, value.into());
+                }
+                Self { key, previous }
+            }
+        }
+
+        impl Drop for EnvOverrideGuard {
+            /// Restore the previous environment value after the scoped override ends.
+            fn drop(&mut self) {
+                match &self.previous {
+                    Some(value) => unsafe {
+                        std::env::set_var(self.key, value);
+                    },
+                    None => unsafe {
+                        std::env::remove_var(self.key);
+                    },
+                }
+            }
+        }
+
+        /// Restores the global Mantissa config after a unit test-scoped override.
+        struct ConfigOverrideGuard {
+            previous: Config,
+            source: ConfigSource,
+            _lock: MutexGuard<'static, ()>,
+        }
+
+        /// Return the global mutex used to serialize config and env overrides in BPF unit tests.
+        fn config_override_lock() -> &'static Mutex<()> {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            LOCK.get_or_init(|| Mutex::new(()))
+        }
+
+        impl ConfigOverrideGuard {
+            /// Replace the global config for one test and restore it afterward.
+            fn with_mutator(mutator: impl FnOnce(&mut Config)) -> Self {
+                let lock = config_override_lock()
+                    .lock()
+                    .expect("bpf test config override lock should not be poisoned");
+                let previous = global_config();
+                let source = global_config_source();
+
+                let mut config = previous.clone();
+                mutator(&mut config);
+
+                let mut override_source = source.clone();
+                override_source.env_overrides = true;
+                set_global_config_with_source(config, override_source);
+
+                Self {
+                    previous,
+                    source,
+                    _lock: lock,
+                }
+            }
+        }
+
+        impl Drop for ConfigOverrideGuard {
+            /// Restore the previous global config snapshot after the unit test completes.
+            fn drop(&mut self) {
+                set_global_config_with_source(self.previous.clone(), self.source.clone());
+            }
+        }
 
         #[test]
         fn resolves_artifact_from_config_directory() -> Result<()> {
@@ -1250,6 +1341,25 @@ mod platform {
             config.network.bpf.artifact_dir = Some(dir.path().to_string_lossy().to_string());
             let resolver = ArtifactResolver::new_with_config(&config);
             let spec = BpfProgramSpec::new("resolver-example");
+            let resolved = resolver.resolve(&spec)?;
+            assert_eq!(resolved, artifact_path);
+
+            Ok(())
+        }
+
+        #[test]
+        fn resolves_artifact_from_env_directory() -> Result<()> {
+            let _lock = config_override_lock()
+                .lock()
+                .expect("bpf test config override lock should not be poisoned");
+            let dir = TempDir::new().context("create temp dir")?;
+            let artifact_path = dir.path().join("resolver-env-example.bpf.o");
+            fs::write(&artifact_path, b"test").context("write artifact stub")?;
+            let _env_guard = EnvOverrideGuard::set("MANTISSA_BPF_DIR", dir.path().as_os_str());
+
+            let (config, _) = load_config_with_source(None)?;
+            let resolver = ArtifactResolver::new_with_config(&config);
+            let spec = BpfProgramSpec::new("resolver-env-example");
             let resolved = resolver.resolve(&spec)?;
             assert_eq!(resolved, artifact_path);
 
@@ -1290,6 +1400,31 @@ mod platform {
             ];
 
             manager.validate_programs(&programs, &ctx)?;
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn ensure_network_skips_when_bpf_attachment_disabled() -> Result<()> {
+            let _guard = ConfigOverrideGuard::with_mutator(|config| {
+                config.network.bpf.attach = false;
+                config.network.nodeport.enabled = false;
+            });
+
+            let manager = NetworkBpfManager::new()?;
+            let spec = NetworkSpecValue::new(NetworkSpecDraft {
+                name: "test-vxlan-xdp".to_string(),
+                description: String::new(),
+                driver: NetworkDriver::Vxlan,
+                subnet_cidr: "10.200.0.0/24".to_string(),
+                vni: 42,
+                mtu: 1400,
+                sealed: false,
+                bpf_programs: vec![BpfProgramSpec::new("vxlan_xdp")],
+            });
+            let ctx = NetworkInterfaceContext::new(Uuid::new_v4(), "lo", "lo");
+
+            manager.ensure_network(&spec, &ctx).await?;
+            manager.teardown_network(&ctx).await?;
             Ok(())
         }
     }
