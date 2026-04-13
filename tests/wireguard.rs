@@ -8,7 +8,7 @@ use common::privileged_networking::{
     PrivilegedTestGuard, command_stdout, create_privileged_network, create_privileged_node,
     delete_privileged_network, force_cleanup_privileged_network_links, link_exists,
     privileged_headless_config, privileged_network_interfaces, privileged_networking_enabled,
-    privileged_test_network,
+    privileged_test_network, privileged_test_subnet,
 };
 use crdt_store::uuid_key::UuidKey;
 use futures::TryStreamExt;
@@ -156,10 +156,11 @@ local_test!(wireguard_scoped_peer_gate_blocks_until_peer_enabled, {
     cleanup_wireguard_interface().await;
 
     let node = create_privileged_node().await;
+    let subnet = privileged_test_subnet();
     let network = privileged_test_network(
         "wireguard-test",
         "privileged wireguard integration test network",
-        "10.45.0.0/24",
+        &subnet,
         1450,
         Vec::new(),
     );
@@ -314,12 +315,13 @@ local_test!(wireguard_disabled_keeps_plaintext_overlay_path, {
     cleanup_wireguard_interface().await;
 
     let node = create_privileged_node().await;
+    let subnet = privileged_test_subnet();
     let network = create_privileged_network(
         &node,
         privileged_test_network(
             "wireguard-plaintext",
             "privileged plaintext wireguard test network",
-            "10.49.0.0/24",
+            &subnet,
             1450,
             Vec::new(),
         ),
@@ -378,7 +380,7 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
     let network = privileged_test_network(
         "wireguard-restart",
         "privileged wireguard restart persistence network",
-        "10.50.0.0/24",
+        &privileged_test_subnet(),
         1450,
         Vec::new(),
     );

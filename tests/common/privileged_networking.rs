@@ -190,6 +190,14 @@ pub fn privileged_test_network(
     })
 }
 
+/// Generate one randomized private `/24` subnet so failed test cleanup cannot poison later runs.
+pub fn privileged_test_subnet() -> String {
+    let bytes = Uuid::new_v4().into_bytes();
+    let octet_b = (bytes[0] % 254).saturating_add(1);
+    let octet_c = (bytes[1] % 254).saturating_add(1);
+    format!("10.{octet_b}.{octet_c}.0/24")
+}
+
 /// Persist one overlay network and wait until it reaches the expected local lifecycle state.
 pub async fn create_privileged_network(
     node: &HeadlessNode,
