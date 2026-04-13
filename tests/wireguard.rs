@@ -11,6 +11,7 @@ use common::privileged_networking::{
     privileged_test_network,
 };
 use crdt_store::uuid_key::UuidKey;
+use futures::TryStreamExt;
 use mantissa::network::types::{NetworkPeerState, NetworkStatus};
 use mantissa::network::wireguard::{MANTISSA_WIREGUARD_IFNAME, MANTISSA_WIREGUARD_VXLAN_MTU};
 use mantissa::runtime::types::RuntimeSupportProfile;
@@ -18,7 +19,6 @@ use mantissa::server::headless::{HeadlessKeys, HeadlessNode};
 use mantissa::topology::peers::{
     PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
 };
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -69,11 +69,58 @@ async fn upsert_remote_wireguard_peer(
         .await;
 }
 
+/// Best-effort delete one kernel link by name through rtnetlink.
+async fn delete_link_if_exists(ifname: &str) {
+    let Ok((conn, handle, _)) = rtnetlink::new_connection() else {
+        return;
+    };
+    tokio::spawn(conn);
+
+    let Ok(Some(link)) = handle
+        .link()
+        .get()
+        .match_name(ifname.to_string())
+        .execute()
+        .try_next()
+        .await
+    else {
+        return;
+    };
+
+    let _ = handle.link().del(link.header.index).execute().await;
+}
+
 /// Delete the Mantissa-managed WireGuard link if a previous failed test left it behind.
-fn cleanup_wireguard_interface() {
-    let _ = Command::new("ip")
-        .args(["link", "delete", "dev", MANTISSA_WIREGUARD_IFNAME])
-        .output();
+async fn cleanup_wireguard_interface() {
+    delete_link_if_exists(MANTISSA_WIREGUARD_IFNAME).await;
+}
+
+/// Require that the current host can create kernel WireGuard interfaces.
+///
+/// When the privileged networking suite is explicitly enabled, WireGuard being unavailable is a
+/// real test-environment failure and must not silently degrade into an `ok` result.
+async fn require_wireguard_kernel_support() {
+    // Linux interface names are capped at 15 visible bytes, so keep the probe short.
+    const PROBE_IFNAME: &str = "mnwg-probe";
+
+    delete_link_if_exists(PROBE_IFNAME).await;
+
+    let create = tokio::task::spawn_blocking(|| {
+        use defguard_wireguard_rs::{Kernel, WGApi, WireguardInterfaceApi};
+
+        let mut wgapi = WGApi::<Kernel>::new(PROBE_IFNAME).map_err(|err| err.to_string())?;
+        wgapi.create_interface().map_err(|err| err.to_string())
+    })
+    .await
+    .expect("probe WireGuard kernel support task should not panic");
+    if let Err(err) = create {
+        panic!(
+            "privileged WireGuard tests require kernel WireGuard interface creation via \
+             defguard_wireguard_rs, but the probe failed: {err}"
+        );
+    }
+
+    delete_link_if_exists(PROBE_IFNAME).await;
 }
 
 /// Wait until the local node publishes its WireGuard advertisement and the managed link exists.
@@ -97,8 +144,6 @@ local_test!(wireguard_scoped_peer_gate_blocks_until_peer_enabled, {
         return;
     }
 
-    cleanup_wireguard_interface();
-
     let _config = PrivilegedTestGuard::apply(|config| {
         config.network.wireguard.enabled = true;
         config.network.wireguard.manage_firewall = false;
@@ -107,6 +152,8 @@ local_test!(wireguard_scoped_peer_gate_blocks_until_peer_enabled, {
         config.network.nodeport.enabled = false;
         config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
     });
+    require_wireguard_kernel_support().await;
+    cleanup_wireguard_interface().await;
 
     let node = create_privileged_node().await;
     let network = privileged_test_network(
@@ -124,25 +171,39 @@ local_test!(wireguard_scoped_peer_gate_blocks_until_peer_enabled, {
     let remote_peer_id = Uuid::new_v4();
     upsert_remote_wireguard_peer(&node, network.id, remote_peer_id, false).await;
 
-    assert!(
-        wait_until(
-            Duration::from_secs(30),
-            Duration::from_millis(100),
-            || async {
-                matches!(
-                    node.network_registry.get_peer_state(network.id, node.id),
-                    Ok(Some(state))
-                        if state.state == NetworkPeerState::Error
-                            && state
-                                .error
-                                .as_deref()
-                                .is_some_and(|error| error.contains("wireguard underlay required"))
-                )
-            }
-        )
-        .await,
-        "network should stay blocked until the scoped WireGuard peer marks itself enabled"
-    );
+    let blocked = wait_until(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        || async {
+            matches!(
+                node.network_registry.get_peer_state(network.id, node.id),
+                Ok(Some(state))
+                    if state.state == NetworkPeerState::Error
+                        && state
+                            .error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("wireguard underlay required"))
+            )
+        },
+    )
+    .await;
+    if !blocked {
+        let spec = node
+            .network_registry
+            .get_spec(network.id)
+            .expect("load wireguard network after blocked wait");
+        let peer_state = node
+            .network_registry
+            .get_peer_state(network.id, node.id)
+            .expect("load local peer state after blocked wait");
+        let visible_peers = node
+            .registry
+            .peer_values_snapshot()
+            .expect("load visible peers after blocked wait");
+        panic!(
+            "network should stay blocked until the scoped WireGuard peer marks itself enabled; spec={spec:?}; peer_state={peer_state:?}; visible_peers={visible_peers:?}"
+        );
+    }
 
     let blocked_spec = node
         .network_registry
@@ -233,15 +294,13 @@ local_test!(wireguard_scoped_peer_gate_blocks_until_peer_enabled, {
 
     delete_privileged_network(&node, network.id).await;
     force_cleanup_privileged_network_links(network.id).await;
-    cleanup_wireguard_interface();
+    cleanup_wireguard_interface().await;
 });
 
 local_test!(wireguard_disabled_keeps_plaintext_overlay_path, {
     if !privileged_networking_enabled("WireGuard") {
         return;
     }
-
-    cleanup_wireguard_interface();
 
     let _config = PrivilegedTestGuard::apply(|config| {
         config.network.wireguard.enabled = false;
@@ -251,6 +310,8 @@ local_test!(wireguard_disabled_keeps_plaintext_overlay_path, {
         config.network.nodeport.enabled = false;
         config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
     });
+    require_wireguard_kernel_support().await;
+    cleanup_wireguard_interface().await;
 
     let node = create_privileged_node().await;
     let network = create_privileged_network(
@@ -289,15 +350,13 @@ local_test!(wireguard_disabled_keeps_plaintext_overlay_path, {
 
     delete_privileged_network(&node, network.id).await;
     force_cleanup_privileged_network_links(network.id).await;
-    cleanup_wireguard_interface();
+    cleanup_wireguard_interface().await;
 });
 
 local_test!(wireguard_restart_reuses_persisted_identity, {
     if !privileged_networking_enabled("WireGuard") {
         return;
     }
-
-    cleanup_wireguard_interface();
 
     let _config = PrivilegedTestGuard::apply(|config| {
         config.network.wireguard.enabled = true;
@@ -307,6 +366,8 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
         config.network.nodeport.enabled = false;
         config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
     });
+    require_wireguard_kernel_support().await;
+    cleanup_wireguard_interface().await;
 
     let temp_dir = tempdir().expect("create tempdir for persisted wireguard test database");
     let db_path = temp_dir.path().join("wireguard-restart.redb");
@@ -339,10 +400,23 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
         .schedule_spec_change(network.id)
         .await;
 
-    assert!(
-        wait_for_local_wireguard_publication(&node, network.id, Duration::from_secs(60)).await,
-        "first start should publish the local WireGuard identity and create mnwg0"
-    );
+    let published_first =
+        wait_for_local_wireguard_publication(&node, network.id, Duration::from_secs(60)).await;
+    if !published_first {
+        let spec = node
+            .network_registry
+            .get_spec(network.id)
+            .expect("load persisted wireguard network after first publication wait");
+        let peer_state = node
+            .network_registry
+            .get_peer_state(network.id, node.id)
+            .expect("load persisted wireguard peer state after first publication wait");
+        let published_self = node.registry.peer_wireguard(node.id);
+        panic!(
+            "first start should publish the local WireGuard identity and create mnwg0; spec={spec:?}; peer_state={peer_state:?}; published_self={published_self:?}; mnwg0_exists={}",
+            link_exists(MANTISSA_WIREGUARD_IFNAME)
+        );
+    }
 
     let published_before = node
         .registry
@@ -369,10 +443,23 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
     .await
     .expect("restart persisted WireGuard node");
 
-    assert!(
-        wait_for_local_wireguard_publication(&restarted, network.id, Duration::from_secs(60)).await,
-        "restart should reuse the persisted WireGuard identity and recreate mnwg0"
-    );
+    let published_restarted =
+        wait_for_local_wireguard_publication(&restarted, network.id, Duration::from_secs(60)).await;
+    if !published_restarted {
+        let spec = restarted
+            .network_registry
+            .get_spec(network.id)
+            .expect("load persisted wireguard network after restart publication wait");
+        let peer_state = restarted
+            .network_registry
+            .get_peer_state(network.id, restarted.id)
+            .expect("load persisted wireguard peer state after restart publication wait");
+        let published_self = restarted.registry.peer_wireguard(restarted.id);
+        panic!(
+            "restart should reuse the persisted WireGuard identity and recreate mnwg0; spec={spec:?}; peer_state={peer_state:?}; published_self={published_self:?}; mnwg0_exists={}",
+            link_exists(MANTISSA_WIREGUARD_IFNAME)
+        );
+    }
 
     let published_after = restarted
         .registry
@@ -408,5 +495,5 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
 
     delete_privileged_network(&restarted, network.id).await;
     force_cleanup_privileged_network_links(network.id).await;
-    cleanup_wireguard_interface();
+    cleanup_wireguard_interface().await;
 });

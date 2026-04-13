@@ -75,9 +75,10 @@ impl PrivilegedTestGuard {
     where
         F: FnOnce(&mut Config),
     {
-        let lock = privileged_override_lock()
-            .lock()
-            .expect("privileged override lock should not be poisoned");
+        let lock = match privileged_override_lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let previous = global_config();
         let source = global_config_source();
         let state_dir = tempfile::tempdir().expect("create privileged test state dir");
@@ -257,15 +258,24 @@ fn force_delete_privileged_network_links(interfaces: &[String; 4]) {
 /// Force-remove leftover overlay links for one network id and wait until the host is clean.
 pub async fn force_cleanup_privileged_network_links(network_id: Uuid) {
     let interfaces = privileged_network_interfaces(network_id);
+    let pin_dir = privileged_network_bpf_pin_dir(network_id);
     force_delete_privileged_network_links(&interfaces);
+    let _ = std::fs::remove_dir_all(&pin_dir);
     assert!(
         wait_until(Duration::from_secs(5), Duration::from_millis(100), || {
             let interfaces = interfaces.clone();
-            async move { interfaces.iter().all(|iface| !link_exists(iface)) }
+            let pin_dir = pin_dir.clone();
+            async move { interfaces.iter().all(|iface| !link_exists(iface)) && !pin_dir.exists() }
         })
         .await,
-        "forced cleanup should remove leftover privileged test network links: {interfaces:?}"
+        "forced cleanup should remove leftover privileged test network state: interfaces={interfaces:?} pin_dir={}",
+        pin_dir.display()
     );
+}
+
+/// Return the bpffs directory where one privileged test network pins its eBPF state.
+fn privileged_network_bpf_pin_dir(network_id: Uuid) -> PathBuf {
+    PathBuf::from("/sys/fs/bpf/mantissa").join(network_id.to_string())
 }
 
 /// Delete one privileged test overlay and wait until its kernel links disappear.
@@ -286,34 +296,74 @@ pub async fn delete_privileged_network(node: &HeadlessNode, network_id: Uuid) {
     node.network_controller
         .schedule_spec_change(network_id)
         .await;
-    node.network_registry
-        .remove_peer_states_for_network(network_id)
-        .await
-        .expect("remove privileged test network peer states");
-    node.network_registry
-        .remove_attachments_for_network(network_id)
-        .await
-        .expect("remove privileged test network attachments");
 
     let interfaces = privileged_network_interfaces(network_id);
+    let pin_dir = privileged_network_bpf_pin_dir(network_id);
     let cleaned_by_controller =
         wait_until(Duration::from_secs(15), Duration::from_millis(100), || {
             let interfaces = interfaces.clone();
-            async move { interfaces.iter().all(|iface| !link_exists(iface)) }
+            let pin_dir = pin_dir.clone();
+            async move {
+                let peer_states_gone = node
+                    .network_registry
+                    .list_peer_states(Some(network_id))
+                    .map(|states| states.is_empty())
+                    .unwrap_or(false);
+                let attachments_gone = node
+                    .network_registry
+                    .list_attachments(Some(network_id))
+                    .map(|attachments| attachments.is_empty())
+                    .unwrap_or(false);
+                interfaces.iter().all(|iface| !link_exists(iface))
+                    && !pin_dir.exists()
+                    && peer_states_gone
+                    && attachments_gone
+            }
         })
         .await;
 
     if !cleaned_by_controller {
         force_delete_privileged_network_links(&interfaces);
+        let _ = std::fs::remove_dir_all(&pin_dir);
+        let _ = node
+            .network_registry
+            .remove_peer_states_for_network(network_id)
+            .await;
+        let _ = node
+            .network_registry
+            .remove_attachments_for_network(network_id)
+            .await;
     }
 
     assert!(
         wait_until(Duration::from_secs(5), Duration::from_millis(100), || {
             let interfaces = interfaces.clone();
-            async move { interfaces.iter().all(|iface| !link_exists(iface)) }
+            let pin_dir = pin_dir.clone();
+            async move {
+                let peer_states_gone = node
+                    .network_registry
+                    .list_peer_states(Some(network_id))
+                    .map(|states| states.is_empty())
+                    .unwrap_or(false);
+                let attachments_gone = node
+                    .network_registry
+                    .list_attachments(Some(network_id))
+                    .map(|attachments| attachments.is_empty())
+                    .unwrap_or(false);
+                interfaces.iter().all(|iface| !link_exists(iface))
+                    && !pin_dir.exists()
+                    && peer_states_gone
+                    && attachments_gone
+            }
         })
         .await,
-        "privileged test network {network_id} should tear down kernel interfaces: {interfaces:?}"
+        "privileged test network {network_id} should tear down kernel state: interfaces={interfaces:?} pin_dir={}",
+        pin_dir.display()
+    );
+    assert!(
+        cleaned_by_controller,
+        "privileged test network {network_id} required forced cleanup; interfaces={interfaces:?} pin_dir={}",
+        pin_dir.display()
     );
 }
 

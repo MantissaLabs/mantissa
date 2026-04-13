@@ -236,7 +236,7 @@ mod platform {
             self.validate_programs(programs, interfaces)?;
 
             let network_id = interfaces.network_id();
-            let map_pin_path = map_pin_dir(network_id)?;
+            let map_pin_path = Self::map_pin_dir(network_id)?;
             {
                 let guard = self.loaded.lock().await;
                 if let Some(existing) = guard.get(&network_id)
@@ -337,22 +337,74 @@ mod platform {
             let network = guard.remove(&interfaces.network_id());
             drop(guard);
 
-            if let Some(network) = network {
-                network.teardown()?;
-                info!(
-                    target: "network",
-                    network = %interfaces.network_id(),
-                    "detached bpf programs"
-                );
+            let network_id = interfaces.network_id();
+            let detach_result = if let Some(network) = network {
+                let result = network.teardown();
+                if result.is_ok() {
+                    info!(
+                        target: "network",
+                        network = %network_id,
+                        "detached bpf programs"
+                    );
+                }
+                result
             } else {
                 debug!(
                     target: "network",
-                    network = %interfaces.network_id(),
+                    network = %network_id,
                     "no bpf programs recorded for teardown"
                 );
-            }
+                Ok(())
+            };
 
+            let cleanup_result = Self::remove_map_pin_dir(network_id);
+
+            detach_result?;
+            cleanup_result?;
             Ok(())
+        }
+
+        /// Remove the pinned bpffs directory for one network once no live dataplane references
+        /// should remain.
+        ///
+        /// The pinned load-balancer maps are large, so leaving the directory behind after network
+        /// deletion leaks kernel memory even when no userspace process is holding the maps open.
+        fn remove_map_pin_dir(network_id: Uuid) -> Result<()> {
+            let path = Self::map_pin_path(network_id);
+            match fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    debug!(
+                        target: "network",
+                        network = %network_id,
+                        path = %path.display(),
+                        "removed pinned bpf map directory"
+                    );
+                    Ok(())
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err)
+                    .with_context(|| format!("remove pinned bpf map directory {}", path.display())),
+            }
+        }
+
+        /// Return the stable bpffs pin directory for one overlay network.
+        ///
+        /// Keeping path construction separate from directory creation lets teardown remove stale
+        /// pins without accidentally recreating the mount subtree during cleanup.
+        fn map_pin_path(network_id: Uuid) -> PathBuf {
+            PathBuf::from("/sys/fs/bpf/mantissa").join(network_id.to_string())
+        }
+
+        /// Ensure the per-network bpffs directory exists before Aya attempts to pin shared maps.
+        ///
+        /// This path is used during attach and reload only; teardown must use `map_pin_path`
+        /// directly so cleanup never recreates an otherwise deleted pin directory.
+        fn map_pin_dir(network_id: Uuid) -> Result<PathBuf> {
+            ensure_bpffs().context("prepare bpffs mount")?;
+            let path = Self::map_pin_path(network_id);
+            fs::create_dir_all(&path)
+                .with_context(|| format!("create map pin directory {}", path.display()))?;
+            Ok(path)
         }
 
         fn validate_programs(
@@ -685,14 +737,6 @@ mod platform {
             PinError::SyscallError(sys)
                 if matches!(sys.io_error.raw_os_error(), Some(code) if code == libc::EEXIST)
         )
-    }
-
-    fn map_pin_dir(network_id: Uuid) -> Result<PathBuf> {
-        ensure_bpffs().context("prepare bpffs mount")?;
-        let path = PathBuf::from("/sys/fs/bpf/mantissa").join(network_id.to_string());
-        fs::create_dir_all(&path)
-            .with_context(|| format!("create map pin directory {}", path.display()))?;
-        Ok(path)
     }
 
     fn detach_xdp(interface: &str) -> Result<()> {
