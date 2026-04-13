@@ -219,15 +219,9 @@ impl ServiceDiscovery {
             if let Some(tx) = handle.shutdown.take() {
                 let _ = tx.send(true);
             }
-            tokio::spawn(async move {
-                if let Err(err) = handle.task.await {
-                    warn!(
-                        target: "network",
-                        network = %network_id,
-                        "service discovery loop exited with error: {err:#}"
-                    );
-                }
-            });
+            handle.task.await.with_context(|| {
+                format!("wait for service discovery listener shutdown for network {network_id}")
+            })?;
         }
 
         Ok(())

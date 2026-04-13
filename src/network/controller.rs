@@ -839,6 +839,15 @@ impl NetworkController {
         for id in stale {
             let plan = NetworkPlan::from_id(id);
             let interface_ctx: NetworkInterfaceContext = (&plan).into();
+            // Stop the discovery loop before detaching dataplane state so periodic VIP refreshes
+            // cannot race teardown and try to heal maps that are intentionally being removed.
+            if let Err(err) = self.inner.discovery.teardown_network(id).await {
+                warn!(
+                    target: "network",
+                    network = %id,
+                    "failed to tear down discovery service: {err:#}"
+                );
+            }
             if let Err(err) = self.inner.bpf.teardown_network(&interface_ctx).await {
                 warn!(
                     target: "network",
@@ -851,13 +860,6 @@ impl NetworkController {
                     target: "network",
                     "failed to tear down network {}: {err:#}",
                     id
-                );
-            }
-            if let Err(err) = self.inner.discovery.teardown_network(id).await {
-                warn!(
-                    target: "network",
-                    network = %id,
-                    "failed to tear down discovery service: {err:#}"
                 );
             }
 
@@ -896,6 +898,15 @@ impl NetworkController {
 
         let plan = NetworkPlan::from_id(spec.id);
         let interface_ctx: NetworkInterfaceContext = (&plan).into();
+        // Stop the discovery loop before detaching dataplane state so periodic VIP refreshes
+        // cannot race teardown and try to heal maps that are intentionally being removed.
+        if let Err(err) = self.inner.discovery.teardown_network(spec.id).await {
+            warn!(
+                target: "network",
+                network = %spec.id,
+                "failed to tear down discovery service for deleted network: {err:#}"
+            );
+        }
         if let Err(err) = self.inner.bpf.teardown_network(&interface_ctx).await {
             warn!(
                 target: "network",
@@ -908,13 +919,6 @@ impl NetworkController {
                 target: "network",
                 "failed to tear down deleted network {}: {err:#}",
                 spec.id
-            );
-        }
-        if let Err(err) = self.inner.discovery.teardown_network(spec.id).await {
-            warn!(
-                target: "network",
-                network = %spec.id,
-                "failed to tear down discovery service for deleted network: {err:#}"
             );
         }
 
