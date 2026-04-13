@@ -1,0 +1,39 @@
+name: Merge CI
+
+on:
+  push:
+    branches:
+      - master
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: merge-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Rust project - master
+    runs-on:
+      group: mantissa
+      labels: mantissa-linux-x64-8-core
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      - name: Install eBPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm pkg-config libelf-dev zlib1g-dev
+          rustup toolchain install nightly --component rust-src --component llvm-tools-preview
+          cargo install bpf-linker --locked
+      - name: Install Cap'n Proto
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y capnproto libcapnp-dev
+      - name: Test
+        env:
+          MANTISSA_BPF_TOOLCHAIN: nightly
+          CARGO_BUILD_JOBS: 1
+          CARGO_INCREMENTAL: 0
+        run: cargo test --workspace --lib --bins --tests --examples --features testkit
