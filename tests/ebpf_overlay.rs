@@ -23,13 +23,17 @@ use protocol::services::services;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
 const EBPF_HTTP_PORT: u16 = 18081;
+const EBPF_UDP_PORT: u16 = 18083;
 const EBPF_HTTP_RESPONSE: &str = "hello from ebpf overlay privileged test";
+const EBPF_UDP_RESPONSE: &str = "hello from ebpf overlay privileged udp test";
 const HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Resolve the compiled overlay dataplane artifacts for the privileged eBPF validation lane.
@@ -101,6 +105,76 @@ fn privileged_http_service_task_template(network_id: Uuid, replicas: u16) -> Tas
     }
 }
 
+/// Build one HTTP service whose response body includes the container hostname so local replica
+/// load-balancing can be observed through distinct responses.
+fn privileged_http_hostname_task_template(
+    network_id: Uuid,
+    replicas: u16,
+) -> TaskTemplateSpecValue {
+    TaskTemplateSpecValue {
+        name: "backend".to_string(),
+        execution: ExecutionSpec {
+            image: "busybox:1.36".to_string(),
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "mkdir -p /www && hostname >/www/index.html && exec httpd -f -p {EBPF_HTTP_PORT} -h /www"
+                ),
+            ],
+            tty: false,
+            cpu_millis: 200,
+            memory_bytes: 64 * 1024 * 1024,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: vec![TaskTemplateNetworkRequirement::new("default", network_id)],
+        },
+        depends_on: Vec::new(),
+        replicas,
+        readiness: None,
+        public_port: Some(EBPF_HTTP_PORT),
+        public_protocol: Some(ServicePortProtocol::Tcp),
+    }
+}
+
+/// Build one UDP echo service template published on the overlay host-access VIP path.
+fn privileged_udp_service_task_template(network_id: Uuid) -> TaskTemplateSpecValue {
+    TaskTemplateSpecValue {
+        name: "backend".to_string(),
+        execution: ExecutionSpec {
+            image: "busybox:1.36".to_string(),
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("exec nc -u -lk -p {EBPF_UDP_PORT} -e cat"),
+            ],
+            tty: false,
+            cpu_millis: 200,
+            memory_bytes: 64 * 1024 * 1024,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: vec![TaskTemplateNetworkRequirement::new("default", network_id)],
+        },
+        depends_on: Vec::new(),
+        replicas: 1,
+        readiness: None,
+        public_port: Some(EBPF_UDP_PORT),
+        public_protocol: Some(ServicePortProtocol::Udp),
+    }
+}
+
 /// Wait until the replicated service reaches the expected lifecycle state.
 async fn wait_for_service_status(
     manager: &ServiceController,
@@ -149,6 +223,72 @@ async fn http_get(addr: &str) -> anyhow::Result<String> {
             format!("read response from {addr} timed out after {HTTP_PROBE_TIMEOUT:?}")
         })??;
     Ok(String::from_utf8_lossy(&response).into_owned())
+}
+
+/// Extract the HTTP response body so replica-specific handlers can be compared directly.
+fn http_body(response: &str) -> &str {
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or(response)
+}
+
+/// Send one UDP datagram to the supplied address and return the echoed reply bytes.
+async fn udp_echo(addr: &str, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    socket.send_to(payload, addr).await?;
+    let mut response = [0u8; 2048];
+    let (len, _) = tokio::time::timeout(HTTP_PROBE_TIMEOUT, socket.recv_from(&mut response))
+        .await
+        .with_context(|| {
+            format!("receive udp reply from {addr} timed out after {HTTP_PROBE_TIMEOUT:?}")
+        })??;
+    Ok(response[..len].to_vec())
+}
+
+/// Capture one tcpdump line on the host-access interface so tests can assert the response source
+/// address that leaves the eBPF return-path NAT.
+async fn capture_tcpdump_line(
+    iface: &str,
+    filter: &str,
+    trigger_addr: &str,
+) -> anyhow::Result<String> {
+    let mut child = TokioCommand::new("tcpdump")
+        .args(["-nn", "-l", "-U", "-i", iface, "-c", "1", filter])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn tcpdump on {iface} with filter '{filter}'"))?;
+    let mut stdout = child.stdout.take().context("take tcpdump stdout")?;
+    let mut stderr = child.stderr.take().context("take tcpdump stderr")?;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _ = http_get(trigger_addr).await?;
+
+    let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(status) => status.with_context(|| format!("wait for tcpdump on {iface}"))?,
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!("tcpdump on {iface} timed out while waiting for '{filter}'");
+        }
+    };
+    let mut output = Vec::new();
+    stdout
+        .read_to_end(&mut output)
+        .await
+        .context("read tcpdump stdout")?;
+    let mut errors = Vec::new();
+    stderr
+        .read_to_end(&mut errors)
+        .await
+        .context("read tcpdump stderr")?;
+    if !status.success() {
+        anyhow::bail!(
+            "tcpdump on {iface} failed: {}",
+            String::from_utf8_lossy(&errors).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output).trim().to_string())
 }
 
 /// Read the first IPv4 address currently assigned to one host interface.
@@ -554,6 +694,291 @@ local_test!(ebpf_overlay_host_vip_reaches_service_from_host_access, {
         neighbour.contains("PERMANENT"),
         "host-access interface should keep a permanent neighbour entry for the published VIP: {neighbour}"
     );
+
+    remove_service_via_rpc(&node.services_client, service_id).await;
+    delete_privileged_network(&node, network_id).await;
+    force_cleanup_privileged_network_links(network_id).await;
+});
+
+local_test!(ebpf_overlay_vip_load_balances_across_local_replicas, {
+    let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {
+        return;
+    };
+
+    let _config = PrivilegedTestGuard::apply(|config| {
+        config.network.wireguard.enabled = false;
+        config.network.wireguard.manage_firewall = false;
+        config.network.bpf.attach = true;
+        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        config.network.nodeport.enabled = false;
+        config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+    });
+
+    let node = create_privileged_node().await;
+    let subnet = privileged_test_subnet();
+    let network = create_privileged_network(
+        &node,
+        privileged_test_network(
+            "ebpf-vip-lb",
+            "privileged ebpf local replica load-balancing test network",
+            &subnet,
+            1450,
+            Vec::new(),
+        ),
+        NetworkStatus::Ready,
+    )
+    .await;
+    let network_id = network.id;
+
+    let service_id = node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            "ebpf-vip-lb-service",
+            "ebpf-vip-lb-service",
+            vec![privileged_http_hostname_task_template(network_id, 2)],
+        )
+        .await
+        .expect("submit privileged eBPF local load-balancing deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.service_controller,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(180),
+        )
+        .await,
+        "eBPF local load-balancing service should reach running state"
+    );
+
+    let backend_ips = wait_for_backend_ips(&node, network_id, 2, Duration::from_secs(60)).await;
+    let [
+        _vxlan_ifname,
+        _bridge_ifname,
+        _host_peer_ifname,
+        host_ifname,
+    ] = privileged_network_interfaces(network_id);
+    let resolver_ip = interface_ipv4(&host_ifname);
+    let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+    let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
+        .await
+        .expect("discover VIP for local load-balancing test");
+    let vip_addr = format!("{vip}:{EBPF_HTTP_PORT}");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut responses = BTreeSet::new();
+    let mut last_response = None;
+    while Instant::now() < deadline && responses.len() < 2 {
+        match http_get(&vip_addr).await {
+            Ok(response) => {
+                responses.insert(http_body(&response).trim().to_string());
+                last_response = Some(response);
+            }
+            Err(err) => {
+                last_response = Some(err.to_string());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        responses.len() >= 2,
+        "host-access VIP should spread requests across at least two local replicas; vip={vip}; backend_ips={backend_ips:?}; observed_responses={responses:?}; last_observation={last_response:?}"
+    );
+
+    remove_service_via_rpc(&node.services_client, service_id).await;
+    delete_privileged_network(&node, network_id).await;
+    force_cleanup_privileged_network_links(network_id).await;
+});
+
+local_test!(ebpf_overlay_return_path_preserves_vip_identity, {
+    let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {
+        return;
+    };
+
+    let _config = PrivilegedTestGuard::apply(|config| {
+        config.network.wireguard.enabled = false;
+        config.network.wireguard.manage_firewall = false;
+        config.network.bpf.attach = true;
+        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        config.network.nodeport.enabled = false;
+        config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+    });
+
+    let node = create_privileged_node().await;
+    let subnet = privileged_test_subnet();
+    let network = create_privileged_network(
+        &node,
+        privileged_test_network(
+            "ebpf-return-vip",
+            "privileged ebpf return-path identity test network",
+            &subnet,
+            1450,
+            Vec::new(),
+        ),
+        NetworkStatus::Ready,
+    )
+    .await;
+    let network_id = network.id;
+
+    let service_id = node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            "ebpf-return-vip-service",
+            "ebpf-return-vip-service",
+            vec![privileged_http_service_task_template(network_id, 1)],
+        )
+        .await
+        .expect("submit privileged eBPF return-path deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.service_controller,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(180),
+        )
+        .await,
+        "eBPF return-path service should reach running state"
+    );
+
+    let backend_ips = wait_for_backend_ips(&node, network_id, 1, Duration::from_secs(60)).await;
+    let backend_ip = backend_ips[0];
+    let [
+        _vxlan_ifname,
+        _bridge_ifname,
+        _host_peer_ifname,
+        host_ifname,
+    ] = privileged_network_interfaces(network_id);
+    let resolver_ip = interface_ipv4(&host_ifname);
+    let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+    let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
+        .await
+        .expect("discover VIP for return-path identity test");
+    let vip_addr = format!("{vip}:{EBPF_HTTP_PORT}");
+
+    let capture = capture_tcpdump_line(
+        &host_ifname,
+        &format!("src host {vip} and dst host {resolver_ip} and tcp src port {EBPF_HTTP_PORT}"),
+        &vip_addr,
+    )
+    .await
+    .expect("capture return-path packet for VIP response identity");
+
+    assert!(
+        capture.contains(&format!("IP {vip}.{EBPF_HTTP_PORT} > {resolver_ip}.")),
+        "host-access response packet should preserve the VIP source identity on the return path: {capture}"
+    );
+    assert!(
+        !capture.contains(&format!(
+            "IP {backend_ip}.{EBPF_HTTP_PORT} > {resolver_ip}."
+        )),
+        "host-access response packet should not expose the backend source identity on the return path: {capture}"
+    );
+
+    remove_service_via_rpc(&node.services_client, service_id).await;
+    delete_privileged_network(&node, network_id).await;
+    force_cleanup_privileged_network_links(network_id).await;
+});
+
+local_test!(ebpf_overlay_udp_service_reaches_host_access_vip, {
+    let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {
+        return;
+    };
+
+    let _config = PrivilegedTestGuard::apply(|config| {
+        config.network.wireguard.enabled = false;
+        config.network.wireguard.manage_firewall = false;
+        config.network.bpf.attach = true;
+        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        config.network.nodeport.enabled = false;
+        config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+    });
+
+    let node = create_privileged_node().await;
+    let subnet = privileged_test_subnet();
+    let network = create_privileged_network(
+        &node,
+        privileged_test_network(
+            "ebpf-udp-vip",
+            "privileged ebpf udp host-access vip test network",
+            &subnet,
+            1450,
+            Vec::new(),
+        ),
+        NetworkStatus::Ready,
+    )
+    .await;
+    let network_id = network.id;
+
+    let service_id = node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            "ebpf-udp-vip-service",
+            "ebpf-udp-vip-service",
+            vec![privileged_udp_service_task_template(network_id)],
+        )
+        .await
+        .expect("submit privileged eBPF UDP overlay deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.service_controller,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(180),
+        )
+        .await,
+        "eBPF UDP overlay service should reach running state"
+    );
+
+    let backend_ips = wait_for_backend_ips(&node, network_id, 1, Duration::from_secs(60)).await;
+    let [
+        _vxlan_ifname,
+        _bridge_ifname,
+        _host_peer_ifname,
+        host_ifname,
+    ] = privileged_network_interfaces(network_id);
+    let resolver_ip = interface_ipv4(&host_ifname);
+    let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+    let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
+        .await
+        .expect("discover VIP for UDP host-access test");
+    let vip_addr = format!("{vip}:{EBPF_UDP_PORT}");
+    let payload = EBPF_UDP_RESPONSE.as_bytes();
+
+    let udp_ready = common::convergence::wait_until(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        || async {
+            matches!(udp_echo(&vip_addr, payload).await, Ok(response) if response == payload)
+        },
+    )
+    .await;
+    if !udp_ready {
+        let (last_dns_code, last_dns_answers) = query_a_records(resolver_ip, &fqdn)
+            .await
+            .expect("query dns after udp vip timeout");
+        let neighbour = command_stdout(
+            "ip",
+            &["neigh", "show", "to", &vip.to_string(), "dev", &host_ifname],
+        );
+        let last_udp_error = udp_echo(&vip_addr, payload)
+            .await
+            .map(|response| {
+                format!(
+                    "unexpected udp response: {:?}",
+                    String::from_utf8_lossy(&response)
+                )
+            })
+            .unwrap_or_else(|err| err.to_string());
+        panic!(
+            "host-access UDP traffic should reach the service VIP through the bridge tc datapath; vip={vip}; backend_ips={backend_ips:?}; last_dns_code={last_dns_code:?}; last_dns_answers={last_dns_answers:?}; neighbour={neighbour:?}; last_udp_error={last_udp_error}"
+        );
+    }
 
     remove_service_via_rpc(&node.services_client, service_id).await;
     delete_privileged_network(&node, network_id).await;

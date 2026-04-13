@@ -26,6 +26,23 @@ use uuid::Uuid;
 
 const REMOTE_RPC_ADDR: &str = "192.0.2.10:61234";
 const REMOTE_WIREGUARD_PORT: u16 = 61235;
+const VXLAN_UDP_PORT: u16 = 4789;
+
+/// Restores the host firewall state after the WireGuard manage-firewall smoke test completes.
+struct WireGuardFirewallRestoreGuard {
+    input_rule: String,
+    output_rule: String,
+    input_was_present: bool,
+    output_was_present: bool,
+}
+
+impl Drop for WireGuardFirewallRestoreGuard {
+    /// Restore the original ip6tables rule presence snapshot for the managed WireGuard VXLAN rules.
+    fn drop(&mut self) {
+        set_ip6tables_rule_presence("INPUT", &self.input_rule, self.input_was_present);
+        set_ip6tables_rule_presence("OUTPUT", &self.output_rule, self.output_was_present);
+    }
+}
 
 /// Build one minimal peer row that is sufficient for WireGuard underlay planning.
 fn test_peer_value(address: &str, wireguard: WireGuardPeerValue) -> PeerValue {
@@ -121,6 +138,43 @@ async fn require_wireguard_kernel_support() {
     }
 
     delete_link_if_exists(PROBE_IFNAME).await;
+}
+
+/// Build the INPUT chain rule Mantissa manages for VXLAN-over-WireGuard traffic.
+fn wireguard_input_firewall_rule(ifname: &str) -> String {
+    format!("-i {ifname} -p udp --dport {VXLAN_UDP_PORT} -j ACCEPT")
+}
+
+/// Build the OUTPUT chain rule Mantissa manages for VXLAN-over-WireGuard traffic.
+fn wireguard_output_firewall_rule(ifname: &str) -> String {
+    format!("-o {ifname} -p udp --sport {VXLAN_UDP_PORT} -j ACCEPT")
+}
+
+/// Return whether one ip6tables filter rule currently exists.
+fn ip6tables_rule_exists(chain: &str, rule: &str) -> bool {
+    let client = iptables::new(true)
+        .unwrap_or_else(|err| panic!("create ip6tables client for {chain} '{rule}': {err}"));
+    client
+        .exists("filter", chain, rule)
+        .unwrap_or_else(|err| panic!("check ip6tables {chain} rule '{rule}': {err}"))
+}
+
+/// Ensure one ip6tables filter rule is either present or absent so tests can restore host state.
+fn set_ip6tables_rule_presence(chain: &str, rule: &str, present: bool) {
+    let client = iptables::new(true)
+        .unwrap_or_else(|err| panic!("create ip6tables client for {chain} '{rule}': {err}"));
+    let exists = client
+        .exists("filter", chain, rule)
+        .unwrap_or_else(|err| panic!("check ip6tables {chain} rule '{rule}': {err}"));
+    if present && !exists {
+        client
+            .insert("filter", chain, rule, 1)
+            .unwrap_or_else(|err| panic!("insert ip6tables {chain} rule '{rule}': {err}"));
+    } else if !present && exists {
+        client
+            .delete("filter", chain, rule)
+            .unwrap_or_else(|err| panic!("delete ip6tables {chain} rule '{rule}': {err}"));
+    }
 }
 
 /// Wait until the local node publishes its WireGuard advertisement and the managed link exists.
@@ -496,6 +550,78 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
     );
 
     delete_privileged_network(&restarted, network.id).await;
+    force_cleanup_privileged_network_links(network.id).await;
+    cleanup_wireguard_interface().await;
+});
+
+local_test!(wireguard_manage_firewall_installs_vxlan_rules, {
+    if !privileged_networking_enabled("WireGuard") {
+        return;
+    }
+
+    let _config = PrivilegedTestGuard::apply(|config| {
+        config.network.wireguard.enabled = true;
+        config.network.wireguard.manage_firewall = true;
+        config.network.bpf.attach = false;
+        config.network.bpf.artifact_dir = None;
+        config.network.nodeport.enabled = false;
+        config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+    });
+    require_wireguard_kernel_support().await;
+    cleanup_wireguard_interface().await;
+
+    let input_rule = wireguard_input_firewall_rule(MANTISSA_WIREGUARD_IFNAME);
+    let output_rule = wireguard_output_firewall_rule(MANTISSA_WIREGUARD_IFNAME);
+    let input_was_present = ip6tables_rule_exists("INPUT", &input_rule);
+    let output_was_present = ip6tables_rule_exists("OUTPUT", &output_rule);
+    let _firewall_restore = WireGuardFirewallRestoreGuard {
+        input_rule: input_rule.clone(),
+        output_rule: output_rule.clone(),
+        input_was_present,
+        output_was_present,
+    };
+
+    // Remove any pre-existing Mantissa-specific rules first so this test proves the managed
+    // firewall path installs them when WireGuard becomes ready.
+    set_ip6tables_rule_presence("INPUT", &input_rule, false);
+    set_ip6tables_rule_presence("OUTPUT", &output_rule, false);
+
+    let node = create_privileged_node().await;
+    let subnet = privileged_test_subnet();
+    let network = privileged_test_network(
+        "wireguard-firewall",
+        "privileged wireguard firewall smoke test network",
+        &subnet,
+        1450,
+        Vec::new(),
+    );
+    node.network_registry
+        .upsert_spec(network.clone())
+        .await
+        .expect("upsert privileged WireGuard firewall network");
+
+    let remote_peer_id = Uuid::new_v4();
+    upsert_remote_wireguard_peer(&node, network.id, remote_peer_id, true).await;
+
+    assert!(
+        wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+            || async {
+                matches!(
+                    node.network_registry.get_spec(network.id),
+                    Ok(Some(spec)) if spec.status == NetworkStatus::Ready
+                ) && node.registry.peer_wireguard(node.id).is_some()
+                    && link_exists(MANTISSA_WIREGUARD_IFNAME)
+                    && ip6tables_rule_exists("INPUT", &input_rule)
+                    && ip6tables_rule_exists("OUTPUT", &output_rule)
+            }
+        )
+        .await,
+        "wireguard manage_firewall should install the vxlan INPUT and OUTPUT allow rules"
+    );
+
+    delete_privileged_network(&node, network.id).await;
     force_cleanup_privileged_network_links(network.id).await;
     cleanup_wireguard_interface().await;
 });
