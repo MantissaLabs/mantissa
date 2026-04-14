@@ -26,7 +26,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang llvm pkg-config libelf-dev zlib1g-dev
           rustup toolchain install nightly --component rust-src --component llvm-tools-preview
-          cargo install bpf-linker --locked
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: merge-linux-x64
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
       - name: Install Cap'n Proto
         run: |
           sudo apt-get update
@@ -34,6 +39,4 @@ jobs:
       - name: Test
         env:
           MANTISSA_BPF_TOOLCHAIN: nightly
-          CARGO_BUILD_JOBS: 1
-          CARGO_INCREMENTAL: 0
         run: cargo test --workspace --lib --bins --tests --examples --features testkit
