@@ -818,9 +818,10 @@ fn rotate_gossip_warm_set(
 mod tests {
     use super::{
         PeerCacheEntry, PeerHandle, PeerSchedulingState, PeerValue, gossip_warm_target,
-        rebuild_gossip_warm_set, refill_gossip_warm_set, rotate_gossip_warm_set,
-        select_sync_peers_round_robin_for_node,
+        negotiated_sync_root_schema_version, rebuild_gossip_warm_set, refill_gossip_warm_set,
+        rotate_gossip_warm_set, select_sync_peers_round_robin_for_node,
     };
+    use crate::cluster::RootSchemaInfo;
     use crate::runtime::types::RuntimeSupportProfile;
     use parking_lot::Mutex;
     use std::collections::HashSet;
@@ -858,6 +859,24 @@ mod tests {
             noise_static_pub: x25519_dalek::PublicKey::from([idx as u8; 32]),
             root_hash: Default::default(),
         }
+    }
+
+    /// Negotiation must pick the highest version shared by both peers.
+    #[test]
+    fn negotiated_sync_root_schema_version_prefers_highest_common_version() {
+        let local = RootSchemaInfo::new(1, 3, 10).expect("local root schema");
+        let peer = RootSchemaInfo::new(2, 4, 20).expect("peer root schema");
+
+        assert_eq!(negotiated_sync_root_schema_version(local, peer), Some(3));
+    }
+
+    /// Negotiation must fail fast when peers do not share any root schema version.
+    #[test]
+    fn negotiated_sync_root_schema_version_returns_none_without_overlap() {
+        let local = RootSchemaInfo::new(1, 1, 10).expect("local root schema");
+        let peer = RootSchemaInfo::new(2, 2, 20).expect("peer root schema");
+
+        assert_eq!(negotiated_sync_root_schema_version(local, peer), None);
     }
 
     /// `fanout = 0` should keep legacy behavior: return every peer except self.

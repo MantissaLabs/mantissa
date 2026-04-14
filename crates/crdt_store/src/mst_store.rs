@@ -1321,7 +1321,11 @@ mod tests {
     use super::*;
     use crate::adapter::{MvRegAdapterSorted, RegAdapter};
     use crate::hash::XXHash128;
+    use crate::mvreg::MvRegSnapshot;
     use crate::uuid_key::UuidKey;
+    use crdts::ctx::ReadCtx;
+    use crdts::{CmRDT, CvRDT, MVReg};
+    use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -1336,6 +1340,76 @@ mod tests {
     }
 
     type Adapter = MvRegAdapterSorted<UuidKey, String, u8>;
+
+    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+    struct VersionedValue {
+        name: String,
+        alias: String,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+    struct VersionedProjection {
+        name: String,
+        alias: Option<String>,
+    }
+
+    struct VersionedAdapter;
+
+    impl RegAdapter for VersionedAdapter {
+        type Key = UuidKey;
+        type Actor = u8;
+        type Reg = MVReg<VersionedValue, u8>;
+        type Value = VersionedValue;
+        type Snapshot = MvRegSnapshot<VersionedProjection>;
+
+        fn upsert_reg(
+            current: Option<Self::Reg>,
+            actor: &Self::Actor,
+            v: Self::Value,
+        ) -> Self::Reg {
+            let mut reg = current.unwrap_or_default();
+            let rc: ReadCtx<Vec<VersionedValue>, u8> = reg.read();
+            let add = rc.derive_add_ctx(*actor);
+            let op = reg.write(v, add);
+            reg.apply(op);
+            reg
+        }
+
+        fn snapshot_reg(reg: &Self::Reg) -> Self::Snapshot {
+            Self::snapshot_reg_at_version(reg, 1)
+        }
+
+        fn snapshot_reg_at_version(reg: &Self::Reg, root_schema_version: u32) -> Self::Snapshot {
+            let rc: ReadCtx<Vec<VersionedValue>, u8> = reg.read();
+            let values = rc
+                .val
+                .into_iter()
+                .map(|value| VersionedProjection {
+                    name: value.name,
+                    alias: (root_schema_version >= 2).then_some(value.alias),
+                })
+                .collect::<Vec<_>>();
+            MvRegSnapshot::from_unsorted(values)
+        }
+
+        fn key_to_bytes(k: &Self::Key) -> Vec<u8> {
+            k.as_ref().to_vec()
+        }
+
+        fn key_from_bytes(b: &[u8]) -> std::io::Result<Self::Key> {
+            UuidKey::try_from(b).map_err(Into::into)
+        }
+
+        fn merge_regs(current: Option<Self::Reg>, incoming: Self::Reg) -> Self::Reg {
+            match current {
+                Some(mut current) => {
+                    current.merge(incoming);
+                    current
+                }
+                None => incoming,
+            }
+        }
+    }
 
     fn temp_db() -> (TempDir, Arc<redb::Database>) {
         let dir = tempfile::tempdir().unwrap();
@@ -1621,5 +1695,60 @@ mod tests {
 
         // No finalize call; roots should already match
         assert_eq!(src.root_hex().await, dst.root_hex().await);
+    }
+
+    #[tokio::test]
+    async fn root_schema_versions_change_snapshot_projection_without_losing_raw_registers() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<VersionedAdapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, 1u8).unwrap();
+
+        let k = key(7);
+        store
+            .upsert(
+                &k,
+                VersionedValue {
+                    name: "alpha".to_string(),
+                    alias: "v2-visible".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let snapshot_v1 = store.get_snapshot(&k).unwrap().unwrap();
+        assert_eq!(
+            snapshot_v1.as_slice(),
+            &[VersionedProjection {
+                name: "alpha".to_string(),
+                alias: None,
+            }]
+        );
+
+        let root_v1 = store.root_digest_at_version(1).await.unwrap();
+        let root_v2 = store.root_digest_at_version(2).await.unwrap();
+        assert_ne!(root_v1, root_v2);
+
+        let ranges_v1 = store.page_range_summary_at_version(1).await.unwrap();
+        let ranges_v2 = store.page_range_summary_at_version(2).await.unwrap();
+        assert_ne!(ranges_v1, ranges_v2);
+
+        let raw_reg = store.get_reg(&k).unwrap().unwrap();
+        assert_eq!(
+            raw_reg.read().val,
+            vec![VersionedValue {
+                name: "alpha".to_string(),
+                alias: "v2-visible".to_string(),
+            }]
+        );
+
+        store.rebuild_mst_from_disk_at_version(2).await.unwrap();
+        let snapshot_v2 = store.get_snapshot(&k).unwrap().unwrap();
+        assert_eq!(
+            snapshot_v2.as_slice(),
+            &[VersionedProjection {
+                name: "alpha".to_string(),
+                alias: Some("v2-visible".to_string()),
+            }]
+        );
     }
 }

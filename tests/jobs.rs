@@ -795,6 +795,7 @@ async fn create_restartable_job_node(
         HeadlessConfig {
             listen_addr: "127.0.0.1:0".to_string(),
             transport: HeadlessTransport::Inproc,
+            root_schema_override: None,
             sync_tick: Some(Duration::from_millis(100)),
             sync_fanout: None,
             global_metadata_sync_tick: Some(Duration::from_millis(100)),

@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     agents::AgentController,
-    cluster::ClusterViewId,
+    cluster::{ClusterViewId, RootSchemaState},
     jobs::JobController,
     network::controller::NetworkController,
     network::registry::NetworkRegistry,
@@ -51,6 +51,7 @@ impl HeadlessKeys {
 pub struct HeadlessConfig {
     pub listen_addr: String,
     pub transport: HeadlessTransport,
+    pub root_schema_override: Option<RootSchemaState>,
     pub sync_tick: Option<Duration>,
     pub sync_fanout: Option<usize>,
     pub global_metadata_sync_tick: Option<Duration>,
@@ -68,6 +69,7 @@ impl Default for HeadlessConfig {
         Self {
             listen_addr: "127.0.0.1:0".to_string(),
             transport: HeadlessTransport::Inproc,
+            root_schema_override: None,
             sync_tick: None,
             sync_fanout: None,
             global_metadata_sync_tick: None,
@@ -115,6 +117,7 @@ pub struct HeadlessNode {
     pub network_controller: NetworkController,
     pub registry: Registry,
     pub scheduler: Rc<Scheduler>,
+    topology_runtime: crate::topology::Topology,
 
     // Stores (optional inspection in tests)
     pub peers: crate::store::peer_store::PeersStore,
@@ -163,6 +166,7 @@ impl HeadlessNode {
         let HeadlessConfig {
             listen_addr,
             transport,
+            root_schema_override,
             sync_tick,
             sync_fanout,
             global_metadata_sync_tick,
@@ -194,6 +198,7 @@ impl HeadlessNode {
         let options = BootstrapOptions {
             task_runtime,
             runtime_set,
+            root_schema_override,
             local_volume_root,
             gossip_channel_capacity: gossip_channel_capacity
                 .unwrap_or(defaults.gossip_channel_capacity),
@@ -269,6 +274,7 @@ impl HeadlessNode {
             network_controller: comps.network_controller.clone(),
             registry: comps.registry.clone(),
             scheduler: comps.scheduler.clone(),
+            topology_runtime: comps.topology.clone(),
             peers: stores.peers.clone(),
             workloads: stores.workloads.clone(),
             jobs: stores.jobs.clone(),
@@ -503,6 +509,7 @@ impl HeadlessNode {
             HeadlessConfig {
                 listen_addr: "127.0.0.1:0".to_string(),
                 transport: HeadlessTransport::Inproc,
+                root_schema_override: None,
                 sync_tick,
                 sync_fanout: None,
                 global_metadata_sync_tick: sync_tick,
@@ -623,6 +630,21 @@ impl HeadlessNode {
                 Ok(())
             }
         }
+    }
+
+    /// Stops the periodic cluster loops so tests can simulate a fully idle/offline node.
+    pub fn stop_cluster_background_tasks(&self) {
+        self.topology_runtime.stop_cluster_background_tasks();
+    }
+
+    /// Restarts the periodic cluster loops after a test paused them.
+    pub fn ensure_cluster_background_tasks(&self) {
+        self.topology_runtime.ensure_cluster_background_tasks();
+    }
+
+    /// Triggers one immediate sync tick for deterministic test convergence.
+    pub fn sync_once_now(&self) {
+        self.topology_runtime.sync_once_now();
     }
 
     /// Start (or restart) the listener.

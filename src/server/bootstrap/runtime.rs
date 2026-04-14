@@ -57,6 +57,7 @@ use tracing::{error, info};
 pub struct BootstrapOptions {
     pub task_runtime: Option<WorkloadRuntimeConfig>,
     pub runtime_set: Option<RuntimeSet>,
+    pub root_schema_override: Option<RootSchemaState>,
     pub local_volume_root: Option<PathBuf>,
     pub gossip_channel_capacity: usize,
     pub gossip_fanout: usize,
@@ -74,6 +75,7 @@ impl Default for BootstrapOptions {
         Self {
             task_runtime: None,
             runtime_set: None,
+            root_schema_override: None,
             local_volume_root: None,
             gossip_channel_capacity: 128,
             gossip_fanout: DEFAULT_FANOUT,
@@ -398,7 +400,7 @@ async fn build_runtime_components(
     } = channels;
 
     let cluster_view = stores.restore_active_view()?;
-    let root_schema = stores.restore_root_schema_state()?;
+    let root_schema = stores.restore_root_schema_state(options.root_schema_override)?;
     let (gossip_client, gossip_dedupe) = build_gossip_client(&cluster_view, &gossip_routes);
 
     let runtime_health = config::health_runtime_config();

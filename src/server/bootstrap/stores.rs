@@ -178,7 +178,20 @@ impl BootstrapStores {
     }
 
     /// Builds the local semantic root schema support range advertised at startup.
-    pub(super) fn restore_root_schema_state(&self) -> BootstrapResult<RootSchemaState> {
+    pub(super) fn restore_root_schema_state(
+        &self,
+        override_state: Option<RootSchemaState>,
+    ) -> BootstrapResult<RootSchemaState> {
+        if let Some(root_schema) = override_state {
+            info!(
+                target: "sync",
+                minimum_root_schema_version = root_schema.minimum_supported_version(),
+                supported_root_schema_version = root_schema.supported_version(),
+                "initialized overridden local root schema support range during startup"
+            );
+            return Ok(root_schema);
+        }
+
         info!(
             target: "sync",
             minimum_root_schema_version = MIN_SUPPORTED_ROOT_SCHEMA_VERSION,

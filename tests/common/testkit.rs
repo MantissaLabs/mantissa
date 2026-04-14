@@ -135,6 +135,7 @@ impl TestNode {
         HeadlessConfig {
             listen_addr: "127.0.0.1:0".to_string(),
             transport: HeadlessTransport::Inproc,
+            root_schema_override: None,
             sync_tick,
             sync_fanout: None,
             global_metadata_sync_tick: sync_tick,
