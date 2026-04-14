@@ -44,11 +44,16 @@ impl RegAdapter for PeerRegAdapter {
 
     /// Projects one peer register into the root-visible snapshot used by the MST.
     fn snapshot_reg(reg: &Self::Reg) -> Self::Snapshot {
+        Self::snapshot_reg_at_version(reg, crate::cluster::SUPPORTED_ROOT_SCHEMA_VERSION)
+    }
+
+    /// Projects one peer register into the requested semantic root snapshot used by the MST.
+    fn snapshot_reg_at_version(reg: &Self::Reg, root_schema_version: u32) -> Self::Snapshot {
         let rc: ReadCtx<Vec<PeerValue>, Uuid> = reg.read();
         let values = rc
             .val
             .iter()
-            .map(PeerRootSnapshot::from)
+            .map(|value| PeerRootSnapshot::from_value_at_version(value, root_schema_version))
             .collect::<Vec<_>>();
         MvRegSnapshot::from_unsorted(values)
     }

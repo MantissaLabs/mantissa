@@ -8,8 +8,10 @@ use mantissa::cluster::{ClusterViewId, RootSchemaState};
 use mantissa::runtime::set::RuntimeSet;
 use mantissa::runtime::testing::IN_MEMORY_RUNTIME_BACKEND_KIND;
 use mantissa::runtime::testing::new_in_memory_runtime_backend;
+use mantissa::runtime::types::RuntimeSupportProfile;
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode, HeadlessTransport};
-use mantissa::topology::peers::PeerValue;
+use mantissa::topology::peers::{PeerSchedulingState, PeerValue};
+use mantissa::workload::model::{ExecutionPlatform, IsolationMode};
 use net::noise::NoiseKeys;
 use protocol::sync::Domain;
 use std::path::PathBuf;
@@ -42,10 +44,7 @@ fn headless_config_with_root_schema(
         sync_tick: Some(Duration::from_millis(100)),
         global_metadata_sync_tick: Some(Duration::from_millis(100)),
         gossip_tick: Some(Duration::from_millis(100)),
-        runtime_set: Some(RuntimeSet::singleton(
-            IN_MEMORY_RUNTIME_BACKEND_KIND,
-            new_in_memory_runtime_backend(),
-        )),
+        runtime_set: Some(default_test_runtime_set()),
         ..HeadlessConfig::default()
     }
 }
@@ -95,15 +94,20 @@ async fn create_restartable_node_with_root_schema(
             gossip_fanout: None,
             gossip_channel_capacity: None,
             task_runtime: None,
-            runtime_set: Some(RuntimeSet::singleton(
-                IN_MEMORY_RUNTIME_BACKEND_KIND,
-                new_in_memory_runtime_backend(),
-            )),
+            runtime_set: Some(default_test_runtime_set()),
             local_volume_root: Some(local_volume_root),
         },
     )
     .await
     .expect("restartable root schema node")
+}
+
+/// Builds the default runtime set used by headless root-schema tests.
+fn default_test_runtime_set() -> RuntimeSet {
+    RuntimeSet::singleton(
+        IN_MEMORY_RUNTIME_BACKEND_KIND,
+        new_in_memory_runtime_backend(),
+    )
 }
 
 /// Reads the best-known root schema support range for one peer from the local peer store.
@@ -119,6 +123,42 @@ fn stored_peer_root_schema(node: &TestNode, peer_id: Uuid) -> (u32, u32) {
         value.root_schema.minimum_supported_version,
         value.root_schema.supported_version,
     )
+}
+
+/// Reads the converged scheduling state for one peer row from the local peer store.
+fn stored_peer_scheduling(node: &TestNode, peer_id: Uuid) -> Option<PeerSchedulingState> {
+    let reg = node.node.peers.get_reg(&UuidKey::from(peer_id)).ok()??;
+    let value = PeerValue::select_reg(&reg)?;
+    Some(value.scheduling)
+}
+
+/// Reads the converged runtime support profile for one peer row from the local peer store.
+fn stored_peer_runtime_support(node: &TestNode, peer_id: Uuid) -> Option<RuntimeSupportProfile> {
+    let reg = node.node.peers.get_reg(&UuidKey::from(peer_id)).ok()??;
+    let value = PeerValue::select_reg(&reg)?;
+    Some(value.runtime_support)
+}
+
+/// Mutates one local peer row directly so sync can exercise a runtime-support-only root change.
+async fn update_peer_runtime_support(
+    node: &TestNode,
+    target: Uuid,
+    runtime_support: RuntimeSupportProfile,
+) {
+    let key = UuidKey::from(target);
+    let reg = node
+        .node
+        .peers
+        .get_reg(&key)
+        .expect("read peer register")
+        .expect("peer register present");
+    let mut value = PeerValue::select_reg(&reg).expect("resolved peer value");
+    value.runtime_support = runtime_support;
+    node.node
+        .peers
+        .upsert(&key, value)
+        .await
+        .expect("update peer runtime support");
 }
 
 /// Reads the peer-domain root digest served by one node for the requested schema version.
@@ -156,48 +196,29 @@ async fn peers_root_hex_at_version(
     ))
 }
 
-/// Applies one label set to the selected node through the real topology RPC.
-async fn set_node_labels(node: &TestNode, target: Uuid, labels: &[&str]) {
-    let mut request = node.topology().set_node_labels_request();
+/// Marks one node drained through the real topology RPC with an optional stop-timeout override.
+async fn drain_node_with_timeout(
+    node: &TestNode,
+    target: Uuid,
+    reason: &str,
+    task_stop_timeout_secs: Option<u32>,
+) {
+    let mut request = node.topology().drain_node_request();
     {
         let mut params = request.get();
         params
             .reborrow()
             .init_node_id()
             .set_bytes(target.as_bytes());
-        let mut entries = params.reborrow().init_labels(labels.len() as u32);
-        for (idx, label) in labels.iter().enumerate() {
-            entries.set(idx as u32, label);
-        }
-        params.reborrow().init_remove_keys(0);
-        params.set_replace(true);
+        params.set_reason(reason);
+        params.set_task_stop_timeout_secs(task_stop_timeout_secs.unwrap_or(0));
     }
-    request.send().promise.await.expect("setNodeLabels send");
+    request.send().promise.await.expect("drainNode send");
 }
 
-/// Reads the labels exposed by `Topology.list` for one node id.
-async fn listed_node_labels(node: &TestNode, target: Uuid) -> Option<Vec<String>> {
-    let response = node.topology().list_request().send().promise.await.ok()?;
-    let rows = response.get().ok()?.get_nodes().ok()?.get_nodes().ok()?;
-    for row in rows.iter() {
-        let listed_id = Uuid::from_slice(row.get_id().ok()?.get_bytes().ok()?).ok()?;
-        if listed_id != target {
-            continue;
-        }
-
-        let labels = row.get_labels().ok()?;
-        let mut out = Vec::with_capacity(labels.len() as usize);
-        for label in labels.iter() {
-            let text = label.ok()?.to_str().ok()?.trim().to_string();
-            if !text.is_empty() {
-                out.push(text);
-            }
-        }
-        out.sort();
-        return Some(out);
-    }
-
-    None
+/// Marks one node drained through the real topology RPC so sync exercises a root-visible field.
+async fn drain_node(node: &TestNode, target: Uuid, reason: &str) {
+    drain_node_with_timeout(node, target, reason, None).await;
 }
 
 // Validates that peers with no root schema overlap cannot join the same cluster.
@@ -246,7 +267,7 @@ local_test!(root_schema_upgrade_overlap_recovers_missed_updates, {
     upgraded.node.stop_cluster_background_tasks();
     upgraded.stop().await.expect("stop upgraded peer");
 
-    set_node_labels(&anchor, anchor.id(), &["upgrade=ready"]).await;
+    drain_node(&anchor, anchor.id(), "upgrade-root-schema").await;
 
     upgraded
         .start()
@@ -260,14 +281,19 @@ local_test!(root_schema_upgrade_overlap_recovers_missed_updates, {
         Duration::from_secs(10),
         Duration::from_millis(50),
         || async {
-            listed_node_labels(&upgraded, anchor.id()).await
-                == Some(vec!["upgrade=ready".to_string()])
+            stored_peer_scheduling(&upgraded, anchor.id())
+                .map(|state| {
+                    !state.schedulable
+                        && state.drain_requested
+                        && state.reason.as_deref() == Some("upgrade-root-schema")
+                })
+                .unwrap_or(false)
         },
     )
     .await;
     assert!(
         converged,
-        "upgraded peer did not recover missed label update through mixed-version sync"
+        "upgraded peer did not recover missed scheduling update through mixed-version sync"
     );
 });
 
@@ -302,7 +328,7 @@ local_test!(root_schema_downgrade_overlap_recovers_missed_updates, {
     downgraded.node.stop_cluster_background_tasks();
     downgraded.stop().await.expect("stop downgraded peer");
 
-    set_node_labels(&anchor, anchor.id(), &["downgrade=ready"]).await;
+    drain_node(&anchor, anchor.id(), "downgrade-root-schema").await;
 
     downgraded
         .start()
@@ -316,14 +342,19 @@ local_test!(root_schema_downgrade_overlap_recovers_missed_updates, {
         Duration::from_secs(10),
         Duration::from_millis(50),
         || async {
-            listed_node_labels(&downgraded, anchor.id()).await
-                == Some(vec!["downgrade=ready".to_string()])
+            stored_peer_scheduling(&downgraded, anchor.id())
+                .map(|state| {
+                    !state.schedulable
+                        && state.drain_requested
+                        && state.reason.as_deref() == Some("downgrade-root-schema")
+                })
+                .unwrap_or(false)
         },
     )
     .await;
     assert!(
         converged,
-        "downgraded peer did not recover missed label update through overlap-version sync"
+        "downgraded peer did not recover missed scheduling update through overlap-version sync"
     );
 });
 
@@ -361,6 +392,69 @@ local_test!(root_schema_all_upgraded_peers_serve_latest_projection, {
         "fully upgraded peers did not converge on a shared v2 root projection"
     );
 });
+
+// Validates a real production peer-domain subfield stays root-neutral in v1 and root-visible in v2.
+local_test!(
+    root_schema_peer_runtime_support_only_affects_v2_projection,
+    {
+        let anchor = new_node_with_root_schema(1, 2).await;
+
+        let anchor_root_v1_before = peers_root_hex_at_version(&anchor, 1)
+            .await
+            .expect("anchor serves v1 roots");
+        let anchor_root_v2_before = peers_root_hex_at_version(&anchor, 2)
+            .await
+            .expect("anchor serves v2 roots");
+
+        anchor.node.stop_cluster_background_tasks();
+        update_peer_runtime_support(
+            &anchor,
+            anchor.id(),
+            RuntimeSupportProfile::new(
+                [ExecutionPlatform::Oci],
+                [IsolationMode::Standard, IsolationMode::Sandboxed],
+                ["default", "oci-default"],
+                [
+                    "exec",
+                    "interactive_exec",
+                    "logs",
+                    "runtime.feature.root-schema-v2",
+                ],
+            ),
+        )
+        .await;
+
+        let updated_support =
+            stored_peer_runtime_support(&anchor, anchor.id()).expect("updated local runtime support");
+        assert!(
+            updated_support
+                .feature_flags
+                .iter()
+                .any(|flag| flag == "runtime.feature.root-schema-v2"),
+            "local runtime support update should persist before root comparison"
+        );
+
+        let anchor_root_v1_after = peers_root_hex_at_version(&anchor, 1)
+            .await
+            .expect("anchor serves v1 roots after runtime support update");
+        let anchor_root_v2_after = peers_root_hex_at_version(&anchor, 2)
+            .await
+            .expect("anchor serves v2 roots after runtime support update");
+
+        assert_eq!(
+            anchor_root_v1_before, anchor_root_v1_after,
+            "v1 peer roots should ignore runtime-support-only updates"
+        );
+        assert_ne!(
+            anchor_root_v2_before, anchor_root_v2_after,
+            "v2 peer roots should include runtime support updates"
+        );
+        assert_ne!(
+            anchor_root_v1_after, anchor_root_v2_after,
+            "v1 and v2 roots should diverge once runtime support becomes root-visible"
+        );
+    }
+);
 
 // Validates a same-identity restart can change the advertised root schema range cleanly.
 local_test!(

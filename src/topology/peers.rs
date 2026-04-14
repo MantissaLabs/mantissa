@@ -407,9 +407,19 @@ pub struct PeerRootSnapshot {
     pub membership: PeerMembership,
 }
 
-impl From<&PeerValue> for PeerRootSnapshot {
-    /// Projects one full peer row into the subset that participates in root hashing.
-    fn from(value: &PeerValue) -> Self {
+impl PeerRootSnapshot {
+    /// Builds one peer-domain root snapshot for the requested semantic root schema version.
+    ///
+    /// Runtime support metadata becomes root-visible starting at v2 so newer binaries can
+    /// validate one concrete production projection split end-to-end while older projections
+    /// continue to converge during rolling upgrades.
+    pub fn from_value_at_version(value: &PeerValue, root_schema_version: u32) -> Self {
+        let runtime_support = if root_schema_version >= 2 {
+            value.runtime_support.clone()
+        } else {
+            RuntimeSupportProfile::default()
+        };
+
         Self {
             address: value.address.clone(),
             hostname: value.hostname.clone(),
@@ -419,9 +429,16 @@ impl From<&PeerValue> for PeerRootSnapshot {
             wireguard: value.wireguard.clone(),
             scheduling: value.scheduling.clone(),
             labels: value.labels.clone(),
-            runtime_support: value.runtime_support.clone(),
+            runtime_support,
             membership: value.membership,
         }
+    }
+}
+
+impl From<&PeerValue> for PeerRootSnapshot {
+    /// Projects one full peer row into the subset that participates in root hashing.
+    fn from(value: &PeerValue) -> Self {
+        Self::from_value_at_version(value, crate::cluster::SUPPORTED_ROOT_SCHEMA_VERSION)
     }
 }
 
@@ -776,6 +793,7 @@ mod tests {
         PeerLabel, PeerLabelState, PeerRootSnapshot, PeerSchedulingState, PeerValue,
         WireGuardPeerValue,
     };
+    use crate::runtime::types::RuntimeSupportProfile;
     use uuid::Uuid;
 
     /// Legacy nodes without scheduling metadata should default to schedulable.
@@ -956,5 +974,35 @@ mod tests {
         let after = PeerRootSnapshot::from(&upgraded);
 
         assert_eq!(before, after);
+    }
+
+    /// Runtime support remains root-neutral in v1 and becomes root-visible at v2.
+    #[test]
+    fn peer_root_snapshot_versions_gate_runtime_support_hashing() {
+        let peer = PeerValue {
+            address: "127.0.0.1:7000".to_string(),
+            hostname: "node-a".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: None,
+            runtime_support: RuntimeSupportProfile::new(
+                [crate::workload::model::ExecutionPlatform::Oci],
+                [crate::workload::model::IsolationMode::Sandboxed],
+                ["nono"],
+                ["runtime.feature.demo"],
+            ),
+            scheduling: PeerSchedulingState::schedulable_default(Uuid::from_bytes([7u8; 16])),
+            labels: PeerLabelState::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
+            membership: super::PeerMembership::active(7),
+        };
+
+        let legacy = PeerRootSnapshot::from_value_at_version(&peer, 1);
+        let evolved = PeerRootSnapshot::from_value_at_version(&peer, 2);
+
+        assert_eq!(legacy.runtime_support, RuntimeSupportProfile::default());
+        assert_eq!(evolved.runtime_support, peer.runtime_support);
+        assert_ne!(legacy, evolved);
     }
 }
