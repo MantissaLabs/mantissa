@@ -73,6 +73,7 @@ impl Topology {
                             ref scheduling,
                             ref labels,
                             ref runtime_support,
+                            root_schema,
                         } => {
                             info!(target: "topology", "Node joined: {id} at {address}");
 
@@ -101,6 +102,7 @@ impl Topology {
                                 scheduling: scheduling.as_ref().clone(),
                                 labels: labels.as_ref().clone(),
                                 runtime_support: runtime_support.as_ref().clone(),
+                                root_schema,
                                 membership: PeerMembership::active(incarnation),
                             };
 
@@ -217,6 +219,7 @@ impl Topology {
                             scheduling,
                             labels,
                             runtime_support,
+                            root_schema,
                         } => {
                             let client = if id == self.local.node.id {
                                 client
@@ -239,6 +242,7 @@ impl Topology {
                                 scheduling,
                                 labels,
                                 runtime_support,
+                                root_schema,
                             }
                         }
                         evt => evt,

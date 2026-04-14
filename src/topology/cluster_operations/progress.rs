@@ -8,6 +8,7 @@ use crate::topology::cluster_operations::{
     CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT, COMMIT_PRECONDITION_FAILURE_PREFIX,
 };
 use crate::topology::peers::PeerValue;
+use crdt_store::codec;
 use protocol::server::cluster_session;
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -195,11 +196,11 @@ impl Topology {
         let (actives, _) = self
             .stores
             .peers
-            .load_all()
+            .load_all_regs()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
         let mut count = 1u32;
-        for (key, snapshot) in actives {
+        for (key, reg) in actives {
             let peer_id = key.to_uuid();
             if peer_id == self.local.node.id {
                 continue;
@@ -207,8 +208,7 @@ impl Topology {
             if excluded_peers.contains(&peer_id) {
                 continue;
             }
-            let Some(_selected) =
-                PeerValue::select(snapshot.as_slice()).filter(|value| value.is_active())
+            let Some(_selected) = PeerValue::select_reg(&reg).filter(|value| value.is_active())
             else {
                 continue;
             };
@@ -293,8 +293,7 @@ impl Topology {
             Some(snapshot) => snapshot,
             None => return Ok(0),
         };
-        let payload =
-            bincode::serialize(operation).map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let payload = codec::encode(operation).map_err(|e| capnp::Error::failed(e.to_string()))?;
         let mut relayed = 0usize;
 
         for entry in snapshot.entries.iter() {
@@ -510,7 +509,7 @@ impl Topology {
         &self,
         op: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
-        let encoded = bincode::serialize(op).map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let encoded = codec::encode(op).map_err(|e| capnp::Error::failed(e.to_string()))?;
         self.stores
             .cluster_operations
             .put(op.id, &encoded)
@@ -535,7 +534,7 @@ impl Topology {
             return Ok(None);
         };
         let decoded: ClusterOperationRecord =
-            bincode::deserialize(&bytes).map_err(|e| capnp::Error::failed(e.to_string()))?;
+            codec::decode(&bytes).map_err(|e| capnp::Error::failed(e.to_string()))?;
         Ok(Some(decoded))
     }
 
@@ -551,7 +550,7 @@ impl Topology {
         let mut operations = Vec::with_capacity(encoded_rows.len());
 
         for (operation_id, payload) in encoded_rows {
-            match bincode::deserialize::<ClusterOperationRecord>(&payload) {
+            match codec::decode::<ClusterOperationRecord>(&payload) {
                 Ok(operation) => {
                     if operation.id != operation_id {
                         warn!(

@@ -58,6 +58,7 @@ fn test_peer_value(address: &str, wireguard: WireGuardPeerValue) -> PeerValue {
         scheduling: PeerSchedulingState::schedulable_default(Uuid::nil()),
         labels: PeerLabelState::default(),
         runtime_support: RuntimeSupportProfile::default(),
+        root_schema: mantissa::cluster::RootSchemaInfo::default(),
         membership: PeerMembership::active(1),
     }
 }

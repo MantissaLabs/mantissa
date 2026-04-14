@@ -1019,6 +1019,7 @@ fn message_for_forwarding(message: &Message) -> Option<Message> {
                     scheduling,
                     labels,
                     runtime_support,
+                    root_schema,
                 } => TopologyEvent::Join {
                     id: *peer_id,
                     hostname: hostname.clone(),
@@ -1035,6 +1036,7 @@ fn message_for_forwarding(message: &Message) -> Option<Message> {
                     scheduling: scheduling.clone(),
                     labels: labels.clone(),
                     runtime_support: runtime_support.clone(),
+                    root_schema: *root_schema,
                 },
                 other => other.clone(),
             };
@@ -1405,6 +1407,7 @@ mod tests {
                 ),
                 labels: Box::new(crate::topology::peers::PeerLabelState::default()),
                 runtime_support: Box::new(crate::runtime::types::RuntimeSupportProfile::default()),
+                root_schema: crate::cluster::RootSchemaInfo::default(),
             },
         };
 

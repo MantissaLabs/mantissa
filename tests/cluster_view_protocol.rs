@@ -3,6 +3,7 @@ mod common;
 
 use common::convergence::{current_cluster_view, wait_for_cluster_view, wait_for_operation_stage};
 use common::testkit::TestNode;
+use crdt_store::codec;
 use crdt_store::uuid_key::UuidKey;
 use mantissa::cluster::operations::{
     ClusterOperationKind as StoredOperationKind, ClusterOperationRecord,
@@ -31,7 +32,7 @@ async fn submit_cluster_operation_record(
     topology: &mantissa::topology_capnp::topology::Client,
     operation: &ClusterOperationRecord,
 ) {
-    let payload = bincode::serialize(operation).expect("serialize cluster operation");
+    let payload = codec::encode(operation).expect("encode cluster operation");
     let mut request = topology.submit_cluster_operation_request();
     request.get().set_id(operation.id.as_bytes());
     request.get().set_payload(&payload);
@@ -1110,7 +1111,7 @@ local_test!(cluster_view_replays_pending_operation_on_startup, {
         details: "replay test operation".to_string(),
     };
 
-    let payload = bincode::serialize(&operation).expect("serialize operation");
+    let payload = codec::encode(&operation).expect("encode operation");
     operation_store
         .put(operation.id, &payload)
         .expect("persist operation");
@@ -1202,7 +1203,7 @@ local_test!(cluster_view_startup_restores_split_peer_scope, {
         updated_at_unix_ms: 42,
         details: "startup split scope restore".to_string(),
     };
-    let payload = bincode::serialize(&split).expect("serialize split operation");
+    let payload = codec::encode(&split).expect("encode split operation");
     operation_store
         .put(split.id, &payload)
         .expect("persist split operation");
@@ -1220,6 +1221,7 @@ local_test!(cluster_view_startup_restores_split_peer_scope, {
         runtime_support: RuntimeSupportProfile::default(),
         scheduling: PeerSchedulingState::schedulable_default(self_id),
         labels: mantissa::topology::peers::PeerLabelState::default(),
+        root_schema: mantissa::cluster::RootSchemaInfo::default(),
         membership: PeerMembership::active(1),
     };
     peers
@@ -1354,6 +1356,7 @@ local_test!(cluster_view_startup_preserves_persisted_self_drain_fence, {
                 runtime_support: RuntimeSupportProfile::default(),
                 scheduling: persisted_scheduling,
                 labels: mantissa::topology::peers::PeerLabelState::default(),
+                root_schema: mantissa::cluster::RootSchemaInfo::default(),
                 membership: PeerMembership::active(1),
             },
         )
@@ -1474,7 +1477,7 @@ local_test!(cluster_view_startup_replay_skips_dry_run_operation, {
         details: "dry-run replay test operation".to_string(),
     };
 
-    let payload = bincode::serialize(&operation).expect("serialize operation");
+    let payload = codec::encode(&operation).expect("encode operation");
     operation_store
         .put(operation.id, &payload)
         .expect("persist operation");
@@ -1559,7 +1562,7 @@ local_test!(cluster_view_startup_restores_persisted_active_view, {
         details: "finalized startup restore operation".to_string(),
     };
 
-    let payload = bincode::serialize(&operation).expect("serialize operation");
+    let payload = codec::encode(&operation).expect("encode operation");
     operation_store
         .put(operation.id, &payload)
         .expect("persist finalized operation");
@@ -1637,7 +1640,7 @@ local_test!(cluster_view_startup_restores_persisted_split_view, {
     operation_store
         .put(
             operation.id,
-            &bincode::serialize(&operation).expect("serialize split operation"),
+            &codec::encode(&operation).expect("encode split operation"),
         )
         .expect("persist finalized split operation");
     view_store
@@ -1727,13 +1730,13 @@ local_test!(
         operation_store
             .put(
                 first_operation.id,
-                &bincode::serialize(&first_operation).expect("serialize first operation"),
+                &codec::encode(&first_operation).expect("encode first operation"),
             )
             .expect("persist first operation");
         operation_store
             .put(
                 second_operation.id,
-                &bincode::serialize(&second_operation).expect("serialize second operation"),
+                &codec::encode(&second_operation).expect("encode second operation"),
             )
             .expect("persist second operation");
 
@@ -1820,7 +1823,7 @@ local_test!(cluster_view_startup_gc_prunes_terminal_operations, {
         operation_store
             .put(
                 operation.id,
-                &bincode::serialize(&operation).expect("serialize gc operation"),
+                &codec::encode(&operation).expect("encode gc operation"),
             )
             .expect("persist gc operation");
     }
@@ -1851,7 +1854,7 @@ local_test!(cluster_view_startup_gc_prunes_terminal_operations, {
     let mut min_updated_at = u64::MAX;
     for (_, payload) in persisted {
         let operation: ClusterOperationRecord =
-            bincode::deserialize(&payload).expect("decode gc-retained operation");
+            codec::decode(&payload).expect("decode gc-retained operation");
         min_updated_at = min_updated_at.min(operation.updated_at_unix_ms);
     }
 

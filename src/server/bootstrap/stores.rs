@@ -1,5 +1,8 @@
 use super::{BootstrapContext, BootstrapResult};
-use crate::cluster::{ClusterViewId, ClusterViewState};
+use crate::cluster::{
+    ClusterViewId, ClusterViewState, MIN_SUPPORTED_ROOT_SCHEMA_VERSION, RootSchemaState,
+    SUPPORTED_ROOT_SCHEMA_VERSION,
+};
 use crate::secrets::crypto::SecretKeyring;
 use crate::server::auth::AuthStore;
 use crate::store::agent_store::{AgentStore, open_agent_store};
@@ -172,5 +175,21 @@ impl BootstrapStores {
             );
         }
         Ok(ClusterViewState::new(active_view))
+    }
+
+    /// Builds the local semantic root schema support range advertised at startup.
+    pub(super) fn restore_root_schema_state(&self) -> BootstrapResult<RootSchemaState> {
+        info!(
+            target: "sync",
+            minimum_root_schema_version = MIN_SUPPORTED_ROOT_SCHEMA_VERSION,
+            supported_root_schema_version = SUPPORTED_ROOT_SCHEMA_VERSION,
+            "initialized local root schema support range during startup"
+        );
+
+        RootSchemaState::new(
+            MIN_SUPPORTED_ROOT_SCHEMA_VERSION,
+            SUPPORTED_ROOT_SCHEMA_VERSION,
+        )
+        .map_err(|error| store_error("build root schema state", error))
     }
 }

@@ -2,13 +2,9 @@ use super::Server;
 use crate::cluster::ClusterViewId;
 use crate::crypto::rand;
 use crate::node::id;
-use crate::node::identity::{pubkey_from_slice, verify_peer_identity};
 use crate::server::credential::ClusterCredential;
 use crate::topology::TopologyEvent;
-use crate::topology::peers::{
-    PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue, labels_from_node_info,
-    runtime_support_from_node_info,
-};
+use crate::topology::peers::PeerValue;
 use std::rc::Rc;
 use tracing::{debug, warn};
 use x25519_dalek::PublicKey;
@@ -45,8 +41,6 @@ impl JoinRequest {
         let active_view = ClusterViewId::from_capnp(info.get_active_cluster_view()?)
             .map_err(capnp::Error::failed)?;
 
-        let hostname = info.get_hostname()?.to_string()?;
-        let address = info.get_addr()?.to_string()?;
         let root_hash = info
             .get_root_hash()
             .ok()
@@ -54,47 +48,11 @@ impl JoinRequest {
             .unwrap_or_default()
             .to_string();
 
-        let noise_static_pub = pubkey_from_slice(info.get_public_key()?)
+        let peer = PeerValue::from_node_info(joiner_id, info)?;
+        let noise_static_pub = PublicKey::from(peer.noise_static_pub);
+        let signing_vk = ed25519_dalek::VerifyingKey::from_bytes(&peer.signing_pub)
             .map_err(|error| capnp::Error::failed(error.to_string()))?;
-        let signing_vk = Self::parse_signing_verifying_key(info.get_signing_key()?)?;
-        let identity_sig = Self::parse_identity_signature(info.get_identity_sig()?)?;
-        verify_peer_identity(
-            &signing_vk,
-            &joiner_id,
-            &noise_static_pub.to_bytes(),
-            &identity_sig,
-        )
-        .map_err(|error| capnp::Error::failed(error.to_string()))?;
-
-        let peer = PeerValue {
-            address,
-            hostname,
-            platform_os: info.get_platform_os()?.to_string()?,
-            platform_arch: info.get_platform_arch()?.to_string()?,
-            noise_static_pub: noise_static_pub.to_bytes(),
-            signing_pub: signing_vk.to_bytes(),
-            identity_sig: identity_sig.clone(),
-            wireguard: Self::parse_wireguard(
-                info.get_wireguard_public_key()?,
-                info.get_wireguard_port(),
-                info.get_wireguard_enabled(),
-            )?,
-            scheduling: PeerSchedulingState::from_node_info(
-                joiner_id,
-                info.get_schedulable(),
-                info.get_drain_requested(),
-                info.get_scheduling_updated_at_unix_ms(),
-                Self::parse_scheduling_actor(info.get_scheduling_actor_node_id()?.get_bytes()?)?,
-                Some(info.get_scheduling_reason()?.to_string()?),
-                match info.get_drain_task_stop_timeout_secs() {
-                    0 => None,
-                    value => Some(value),
-                },
-            ),
-            labels: labels_from_node_info(info)?,
-            runtime_support: runtime_support_from_node_info(info)?,
-            membership: PeerMembership::active(info.get_incarnation()),
-        };
+        let identity_sig = peer.identity_sig.clone();
 
         Ok(Self {
             join_token,
@@ -109,80 +67,6 @@ impl JoinRequest {
             incarnation: info.get_incarnation(),
         })
     }
-
-    /// Parses the peer signing key advertised in the join request.
-    ///
-    /// Join validation uses the verifying key to bind the peer id to its noise
-    /// key before the node is accepted into topology state.
-    fn parse_signing_verifying_key(
-        bytes: &[u8],
-    ) -> Result<ed25519_dalek::VerifyingKey, capnp::Error> {
-        let key_bytes: [u8; 32] = bytes.try_into().map_err(|_| {
-            capnp::Error::failed("signing key must be exactly 32 bytes".to_string())
-        })?;
-        ed25519_dalek::VerifyingKey::from_bytes(&key_bytes)
-            .map_err(|error| capnp::Error::failed(error.to_string()))
-    }
-
-    /// Parses and validates the peer identity signature.
-    ///
-    /// This keeps the join parser responsible for static wire validation rather
-    /// than leaving signature shape checks spread across the RPC method.
-    fn parse_identity_signature(bytes: &[u8]) -> Result<Vec<u8>, capnp::Error> {
-        if bytes.is_empty() {
-            return Err(capnp::Error::failed(
-                "identitySig must be set for peer identity verification".to_string(),
-            ));
-        }
-        if bytes.len() != 64 {
-            return Err(capnp::Error::failed(
-                "identitySig must be exactly 64 bytes".to_string(),
-            ));
-        }
-        Ok(bytes.to_vec())
-    }
-
-    /// Parses the optional WireGuard peer payload from the join request.
-    ///
-    /// The wire format allows the key to be absent, so the parser keeps that
-    /// optionality localized here instead of in the main RPC flow.
-    fn parse_wireguard(
-        bytes: &[u8],
-        port: u16,
-        enabled: bool,
-    ) -> Result<Option<WireGuardPeerValue>, capnp::Error> {
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-        if bytes.len() != 32 {
-            return Err(capnp::Error::failed(
-                "wireguardPublicKey must be exactly 32 bytes".to_string(),
-            ));
-        }
-
-        let mut public_key = [0u8; 32];
-        public_key.copy_from_slice(bytes);
-        Ok(Some(WireGuardPeerValue {
-            public_key,
-            port,
-            enabled,
-        }))
-    }
-
-    /// Parses the optional scheduling actor UUID carried in `NodeInfo`.
-    ///
-    /// Scheduling metadata belongs to the peer value, but the conversion from
-    /// Cap'n Proto bytes to `Uuid` is clearer when kept near the join parser.
-    fn parse_scheduling_actor(bytes: &[u8]) -> Result<Option<uuid::Uuid>, capnp::Error> {
-        if bytes.is_empty() {
-            Ok(None)
-        } else {
-            uuid::Uuid::from_slice(bytes)
-                .map(Some)
-                .map_err(|error| capnp::Error::failed(error.to_string()))
-        }
-    }
-
     /// Converts the parsed join request into the relayed topology event.
     ///
     /// Registering the peer and gossiping its join now share one authoritative
@@ -204,6 +88,7 @@ impl JoinRequest {
             scheduling: Box::new(self.peer.scheduling.clone()),
             labels: Box::new(self.peer.labels.clone()),
             runtime_support: Box::new(self.peer.runtime_support.clone()),
+            root_schema: self.peer.root_schema,
         }
     }
 }
@@ -248,6 +133,17 @@ impl Server {
             .map_err(|error| capnp::Error::failed(error.to_string()))?;
         if exists {
             return Err(capnp::Error::failed("node already registered".to_string()));
+        }
+
+        if crate::cluster::RootSchemaInfo::highest_common_version(
+            self.topology.root_schema_info(),
+            request.peer.root_schema,
+        )
+        .is_none()
+        {
+            return Err(capnp::Error::failed(
+                "register_node root schema mismatch: no compatible version overlap".to_string(),
+            ));
         }
 
         Ok(())
@@ -406,7 +302,6 @@ impl protocol::server::Server for Server {
         {
             return Err(capnp::Error::failed("peer not registered".to_string()));
         }
-
         results.get().set_session(self.sessions.new_client());
         Ok(())
     }
@@ -432,7 +327,6 @@ impl protocol::server::Server for Server {
                 "peer not registered on this node".to_string(),
             ));
         }
-
         if let Some(expected_vk) = self.topology.signing_vk_for(cred.subject) {
             if expected_vk != cred.issuer {
                 debug!(target: "server", subject=%cred.subject, "issuer mismatch for");

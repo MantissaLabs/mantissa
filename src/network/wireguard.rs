@@ -887,6 +887,7 @@ mod tests {
             runtime_support: RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(Uuid::nil()),
             labels: crate::topology::peers::PeerLabelState::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
             membership: PeerMembership::active(1),
         }
     }

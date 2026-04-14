@@ -1,8 +1,10 @@
+use crate::cluster::RootSchemaInfo;
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::topology::{PeerHandle, Topology, peer_provider::PeerProvider};
 use async_trait::async_trait;
 use capnp::Error as CapnpError;
 use capnp::text_list;
+use crdts::MVReg;
 use ed25519_dalek::VerifyingKey;
 use protocol::node::node_id as node_id_capnp;
 use protocol::topology::node_info as node_info_capnp;
@@ -377,9 +379,50 @@ pub struct PeerValue {
     #[serde(default)]
     pub runtime_support: RuntimeSupportProfile,
 
+    /// Root-schema support metadata used to negotiate sync projections per peer.
+    #[serde(default)]
+    pub root_schema: RootSchemaInfo,
+
     /// Membership state used to causally order graceful leave and rejoin for one node identity.
     #[serde(default)]
     pub membership: PeerMembership,
+}
+
+/// Peer snapshot projection used by the peer-domain MST.
+///
+/// Root-schema support metadata is intentionally excluded here so peers can
+/// advertise sync compatibility without changing the peer-domain Merkle
+/// contract.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
+pub struct PeerRootSnapshot {
+    pub address: String,
+    pub hostname: String,
+    pub noise_static_pub: [u8; 32],
+    pub signing_pub: [u8; 32],
+    pub identity_sig: Vec<u8>,
+    pub wireguard: Option<WireGuardPeerValue>,
+    pub scheduling: PeerSchedulingState,
+    pub labels: PeerLabelState,
+    pub runtime_support: RuntimeSupportProfile,
+    pub membership: PeerMembership,
+}
+
+impl From<&PeerValue> for PeerRootSnapshot {
+    /// Projects one full peer row into the subset that participates in root hashing.
+    fn from(value: &PeerValue) -> Self {
+        Self {
+            address: value.address.clone(),
+            hostname: value.hostname.clone(),
+            noise_static_pub: value.noise_static_pub,
+            signing_pub: value.signing_pub,
+            identity_sig: value.identity_sig.clone(),
+            wireguard: value.wireguard.clone(),
+            scheduling: value.scheduling.clone(),
+            labels: value.labels.clone(),
+            runtime_support: value.runtime_support.clone(),
+            membership: value.membership,
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -423,6 +466,12 @@ impl PeerValue {
         self.membership.is_active()
     }
 
+    /// Selects one deterministic winner from the concurrent values stored in one raw MVReg.
+    pub fn select_reg(reg: &MVReg<PeerValue, Uuid>) -> Option<PeerValue> {
+        let values = reg.read().val;
+        Self::select(values.as_slice())
+    }
+
     /// Selects one deterministic winner from the concurrent values stored for one peer row.
     pub fn select(values: &[PeerValue]) -> Option<PeerValue> {
         if values.is_empty() {
@@ -454,6 +503,7 @@ impl PeerValue {
         let mut scheduling: Option<PeerSchedulingState> = None;
         let mut labels: Option<PeerLabelState> = None;
         let mut runtime_support: Option<RuntimeSupportProfile> = None;
+        let mut root_schema: Option<RootSchemaInfo> = None;
 
         for value in values {
             if value.membership != winning_membership {
@@ -519,6 +569,10 @@ impl PeerValue {
                 runtime_support.as_ref(),
                 Some(&value.runtime_support),
             );
+            root_schema = Some(match root_schema {
+                Some(current) => RootSchemaInfo::merge(current, value.root_schema),
+                None => value.root_schema,
+            });
         }
 
         Some(PeerValue {
@@ -533,6 +587,7 @@ impl PeerValue {
             scheduling: scheduling.unwrap_or_default(),
             labels: labels.unwrap_or_default(),
             runtime_support: runtime_support.unwrap_or_default(),
+            root_schema: root_schema.unwrap_or_default(),
             membership: winning_membership,
         })
     }
@@ -618,6 +673,7 @@ impl PeerValue {
         );
         let labels = labels_from_node_info(ni)?;
         let runtime_support = runtime_support_from_node_info(ni)?;
+        let root_schema = root_schema_from_node_info(ni)?;
 
         Ok(PeerValue {
             address,
@@ -631,9 +687,22 @@ impl PeerValue {
             scheduling,
             labels,
             runtime_support,
+            root_schema,
             membership: PeerMembership::active(ni.get_incarnation()),
         })
     }
+}
+
+/// Decodes one peer root-schema support snapshot from the topology `NodeInfo` reader.
+pub(crate) fn root_schema_from_node_info(
+    ni: node_info_capnp::Reader<'_>,
+) -> Result<RootSchemaInfo, CapnpError> {
+    RootSchemaInfo::new(
+        ni.get_minimum_root_schema_version(),
+        ni.get_supported_root_schema_version(),
+        ni.get_root_schema_updated_at_unix_ms(),
+    )
+    .map_err(CapnpError::failed)
 }
 
 /// Decodes one runtime support profile from the topology `NodeInfo` reader.
@@ -703,7 +772,10 @@ fn read_optional_node_id_capnp(
 
 #[cfg(test)]
 mod tests {
-    use super::{PeerLabel, PeerLabelState, PeerSchedulingState, PeerValue, WireGuardPeerValue};
+    use super::{
+        PeerLabel, PeerLabelState, PeerRootSnapshot, PeerSchedulingState, PeerValue,
+        WireGuardPeerValue,
+    };
     use uuid::Uuid;
 
     /// Legacy nodes without scheduling metadata should default to schedulable.
@@ -742,6 +814,7 @@ mod tests {
                 drain_task_stop_timeout_secs: None,
             },
             labels: PeerLabelState::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
             membership: super::PeerMembership::active(10),
         };
         let mut newer = older.clone();
@@ -787,6 +860,7 @@ mod tests {
                 10,
                 node_id,
             ),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
             membership: super::PeerMembership::active(10),
         };
         let mut newer = older.clone();
@@ -844,6 +918,7 @@ mod tests {
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(node_id),
             labels: PeerLabelState::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
             membership: super::PeerMembership::active(42),
         };
         let mut left = active.clone();
@@ -852,5 +927,34 @@ mod tests {
         let selected = PeerValue::select(&[left, active.clone()]).expect("selected peer value");
         assert!(selected.is_active());
         assert_eq!(selected.membership, active.membership);
+    }
+
+    /// Root-schema support metadata must not perturb the peer-domain MST snapshot.
+    #[test]
+    fn peer_root_snapshot_excludes_root_schema_metadata() {
+        let peer = PeerValue {
+            address: "127.0.0.1:7000".to_string(),
+            hostname: "node-a".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: Some(WireGuardPeerValue {
+                public_key: [4u8; 32],
+                port: 51820,
+                enabled: true,
+            }),
+            runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
+            scheduling: PeerSchedulingState::schedulable_default(Uuid::from_bytes([6u8; 16])),
+            labels: PeerLabelState::default(),
+            root_schema: crate::cluster::RootSchemaInfo::new(1, 2, 10).expect("root schema"),
+            membership: super::PeerMembership::active(7),
+        };
+        let mut upgraded = peer.clone();
+        upgraded.root_schema = crate::cluster::RootSchemaInfo::new(1, 4, 20).expect("root schema");
+
+        let before = PeerRootSnapshot::from(&peer);
+        let after = PeerRootSnapshot::from(&upgraded);
+
+        assert_eq!(before, after);
     }
 }

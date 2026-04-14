@@ -3,6 +3,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit},
 };
+use crdt_store::codec;
 use hkdf::Hkdf;
 use net::noise::NoiseKeys;
 use redb::{Database, ReadableTable, TableDefinition};
@@ -166,7 +167,7 @@ impl LocalSessionStore {
             expires_at,
             note,
         };
-        let plain = bincode::serialize(&rec).map_err(into_io)?;
+        let plain = codec::encode(&rec).map_err(into_io)?;
         let blob = seal(&self.kek, &plain)?;
 
         with_write_tx(&self.db, |tx| {
@@ -186,7 +187,7 @@ impl LocalSessionStore {
                 Some(guard) => {
                     let blob = guard.value();
                     let pt = open(&self.kek, blob)?;
-                    let rec: TicketRecord = bincode::deserialize(&pt).map_err(into_io)?;
+                    let rec: TicketRecord = codec::decode(&pt).map_err(into_io)?;
                     Some(rec)
                 }
                 None => None,
@@ -233,7 +234,7 @@ impl LocalSessionStore {
                 let peer = Uuid::from_bytes(key.value());
                 let blob = value.value();
                 let pt = open(&self.kek, blob)?;
-                let rec: TicketRecord = bincode::deserialize(&pt).map_err(into_io)?;
+                let rec: TicketRecord = codec::decode(&pt).map_err(into_io)?;
                 out.push((peer, rec));
             }
             Ok(out)

@@ -95,6 +95,9 @@ struct DeltaChunk {
 
   view   @3 :ClusterViewId;
   # Cluster view identifier associated with this delta.
+
+  rootSchemaVersion @4 :UInt32 = 1;
+  # Semantic root schema version associated with this delta.
 }
 
 struct DomainRoot {
@@ -106,6 +109,9 @@ struct DomainRoot {
 
   view    @2 :ClusterViewId;
   # Cluster view identifier associated with this root.
+
+  rootSchemaVersion @3 :UInt32 = 1;
+  # Semantic root schema version associated with this root.
 }
 
 struct DomainRangeSummary {
@@ -117,6 +123,9 @@ struct DomainRangeSummary {
 
   view    @2 :ClusterViewId;
   # Cluster view identifier associated with this range summary.
+
+  rootSchemaVersion @3 :UInt32 = 1;
+  # Semantic root schema version associated with this range summary.
 }
 
 struct DomainWant {
@@ -128,6 +137,9 @@ struct DomainWant {
 
   view   @2 :ClusterViewId;
   # Cluster view identifier expected by the requester.
+
+  rootSchemaVersion @3 :UInt32 = 1;
+  # Semantic root schema version expected by the requester.
 }
 
 struct RegItem {
@@ -149,6 +161,9 @@ struct TombItem {
 struct ViewRequest {
   view @0 :ClusterViewId;
   # Requested cluster view identifier.
+
+  rootSchemaVersion @1 :UInt32 = 1;
+  # Requested semantic root schema version expected by the requester.
 }
 
 struct ViewRangesRequest {
@@ -157,6 +172,9 @@ struct ViewRangesRequest {
 
   domains @1 :List(Domain);
   # Domains to summarize.
+
+  rootSchemaVersion @2 :UInt32 = 1;
+  # Requested semantic root schema version expected by the requester.
 }
 
 struct ViewOpenDeltaRequest {
@@ -168,4 +186,7 @@ struct ViewOpenDeltaRequest {
 
   sink  @2 :DeltaSink;
   # Sink receiving the streamed delta.
+
+  rootSchemaVersion @3 :UInt32 = 1;
+  # Requested semantic root schema version expected by the requester.
 }

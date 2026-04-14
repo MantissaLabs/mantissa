@@ -2,6 +2,7 @@ use crate::cluster::{ClusterId, ClusterViewId};
 use crate::store::open::open_arc_store;
 use crate::store::tx::{into_io, with_read_tx, with_write_tx};
 use crdt_store::adapter::MvRegAdapterSorted;
+use crdt_store::codec;
 use crdt_store::hash::XXHash128;
 use crdt_store::mst_store::CrdtMstStore;
 use crdt_store::mvreg::MvRegSnapshot;
@@ -259,14 +260,14 @@ impl ClusterViewStore {
                 return Ok(None);
             };
 
-            let view: ClusterViewId = bincode::deserialize(payload.value()).map_err(into_io)?;
+            let view: ClusterViewId = codec::decode(payload.value()).map_err(into_io)?;
             Ok(Some(view))
         })
     }
 
     /// Persists the provided active cluster view atomically.
     pub fn write_active_view(&self, view: ClusterViewId) -> io::Result<()> {
-        let payload = bincode::serialize(&view).map_err(into_io)?;
+        let payload = codec::encode(&view).map_err(into_io)?;
         with_write_tx(&self.db, |tx| {
             let mut table = tx.open_table(T_ACTIVE_CLUSTER_VIEW).map_err(into_io)?;
             table

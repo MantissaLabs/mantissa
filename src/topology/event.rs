@@ -3,7 +3,7 @@ use protocol::server;
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
-use crate::cluster::ClusterId;
+use crate::cluster::{ClusterId, RootSchemaInfo};
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::topology::peers::{PeerLabelState, PeerSchedulingState, WireGuardPeerValue};
 
@@ -36,6 +36,7 @@ pub enum TopologyEvent {
         scheduling: Box<PeerSchedulingState>,
         labels: Box<PeerLabelState>,
         runtime_support: Box<RuntimeSupportProfile>,
+        root_schema: RootSchemaInfo,
     },
     Leave {
         id: Uuid,

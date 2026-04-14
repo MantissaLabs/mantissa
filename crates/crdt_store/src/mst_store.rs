@@ -14,14 +14,18 @@ use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::{hash::Hash, io, sync::Arc};
 use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::adapter::RegAdapter;
+use crate::codec;
 use crate::error::Error;
 use crate::table_set::TableSet;
+
+/// Default semantic root-schema version used until the caller commits a newer one.
+const DEFAULT_ROOT_SCHEMA_VERSION: u32 = 1;
 
 /// Value stored in each MST leaf.
 /// Active leaves carry a CRDT snapshot; Deleted leaves carry a tombstone sequence.
@@ -106,6 +110,7 @@ where
     db: Arc<redb::Database>,
     actor: C::Actor,
     mst: SharedInMemoryMerkleSearchTree<C, H>,
+    root_schema_version: AtomicU32,
     change_clock: AtomicU64,
     preserve_local_tombs: bool,
     _tables: std::marker::PhantomData<T>,
@@ -168,12 +173,12 @@ where
 
     #[inline]
     fn encode_reg(r: &C::Reg) -> crate::Result<Vec<u8>> {
-        bincode::serialize(r).map_err(into_err)
+        codec::encode(r)
     }
 
     #[inline]
     fn decode_reg(bytes: &[u8]) -> crate::Result<C::Reg> {
-        bincode::deserialize(bytes).map_err(into_err)
+        codec::decode(bytes)
     }
 
     #[inline]
@@ -186,20 +191,34 @@ where
         C::key_from_bytes(bytes).map_err(into_err)
     }
 
-    /// Rebuild the in-memory MST from durable registers + tombstones.
-    pub async fn rebuild_mst_from_disk(&self) -> crate::Result<()> {
+    /// Returns the semantic root-schema version represented by the in-memory MST.
+    #[inline]
+    fn current_root_schema_version(&self) -> u32 {
+        self.root_schema_version.load(Ordering::Acquire)
+    }
+
+    /// Builds one snapshot using the current in-memory MST's semantic version.
+    #[inline]
+    fn snapshot_reg_for_current_version(&self, reg: &C::Reg) -> C::Snapshot {
+        C::snapshot_reg_at_version(reg, self.current_root_schema_version())
+    }
+
+    /// Rebuilds an ephemeral MST from durable storage for the requested semantic version.
+    fn build_tree_from_disk_at_version(
+        &self,
+        root_schema_version: u32,
+    ) -> crate::Result<InMemoryMerkleSearchTree<C, H>> {
         let r = self.db.begin_read().map_err(into_err)?;
         let values = r.open_table(T::values()).map_err(into_err)?;
         let tombs = r.open_table(T::tombs()).map_err(into_err)?;
 
-        // Collect snapshots
         let mut actives: Vec<(C::Key, C::Snapshot)> = {
             let mut out = Vec::new();
             let mut it = values.iter().map_err(into_err)?;
             while let Some(Ok((k_guard, v_guard))) = it.next() {
                 let key = Self::decode_key(k_guard.value())?;
                 let reg = Self::decode_reg(v_guard.value())?;
-                out.push((key, C::snapshot_reg(&reg)));
+                out.push((key, C::snapshot_reg_at_version(&reg, root_schema_version)));
             }
             out
         };
@@ -215,7 +234,6 @@ where
         };
         tomb_list.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
 
-        // Rebuild
         let mut tree = Builder::default().with_hasher(H::default()).build();
         for (k, snap) in actives {
             tree.upsert(k, &Entry::Active(snap));
@@ -224,7 +242,25 @@ where
             tree.upsert(k, &Entry::Deleted { ts });
         }
 
+        Ok(tree)
+    }
+
+    /// Rebuild the in-memory MST from durable registers + tombstones.
+    pub async fn rebuild_mst_from_disk(&self) -> crate::Result<()> {
+        let tree = self.build_tree_from_disk_at_version(self.current_root_schema_version())?;
         *self.mst.write().await = tree;
+        Ok(())
+    }
+
+    /// Rebuilds the in-memory MST using the requested semantic root-schema version.
+    pub async fn rebuild_mst_from_disk_at_version(
+        &self,
+        root_schema_version: u32,
+    ) -> crate::Result<()> {
+        let tree = self.build_tree_from_disk_at_version(root_schema_version)?;
+        *self.mst.write().await = tree;
+        self.root_schema_version
+            .store(root_schema_version, Ordering::Release);
         Ok(())
     }
 
@@ -259,6 +295,22 @@ where
         out
     }
 
+    /// Binary root digest of the MST for one semantic root-schema version.
+    pub async fn root_digest_at_version(
+        &self,
+        root_schema_version: u32,
+    ) -> crate::Result<[u8; 16]> {
+        if root_schema_version == self.current_root_schema_version() {
+            return Ok(self.root_digest().await);
+        }
+
+        let mut tree = self.build_tree_from_disk_at_version(root_schema_version)?;
+        let digest = tree.root_hash();
+        let mut out = [0u8; 16];
+        out.copy_from_slice(digest.as_ref());
+        Ok(out)
+    }
+
     /// Advance the internal monotonic change counter after a successful write.
     #[inline]
     fn bump_change_clock(&self) {
@@ -283,7 +335,7 @@ where
         };
 
         let new_reg = C::upsert_reg(current, &self.actor, v);
-        let snap = C::snapshot_reg(&new_reg);
+        let snap = self.snapshot_reg_for_current_version(&new_reg);
 
         // Persist: write register + clear tombstone
         let w = self.db.begin_write().map_err(into_err)?;
@@ -367,7 +419,7 @@ where
 
         let mut tree = self.mst.write().await;
         for (key, reg) in &merged {
-            let snap = C::snapshot_reg(reg);
+            let snap = self.snapshot_reg_for_current_version(reg);
             tree.upsert(key.clone(), &Entry::Active(snap));
         }
 
@@ -480,7 +532,7 @@ where
 
         // Merge and persist
         let merged = C::merge_regs(current, incoming.clone());
-        let snap = C::snapshot_reg(&merged);
+        let snap = self.snapshot_reg_for_current_version(&merged);
 
         let w = self.db.begin_write().map_err(into_err)?;
         {
@@ -632,7 +684,7 @@ where
         {
             let mut t = self.mst.write().await;
             for (k, reg) in &merged_regs {
-                let snap = C::snapshot_reg(reg);
+                let snap = self.snapshot_reg_for_current_version(reg);
                 t.upsert(k.clone(), &Entry::Active(snap));
             }
             for (k, ts) in merged_tombs {
@@ -775,6 +827,17 @@ where
         Ok((actives, tombs))
     }
 
+    /// Dump durable raw registers and tombstones.
+    ///
+    /// This is reserved for callers that need access to full concurrent values
+    /// instead of the MST snapshot projection derived from them.
+    pub fn load_all_regs(&self) -> crate::Result<RegistersAndTombs<C::Key, C::Reg>> {
+        let mut actives = Vec::new();
+        let mut tombs = Vec::new();
+        self.load_all_regs_into(&mut actives, &mut tombs)?;
+        Ok((actives, tombs))
+    }
+
     /// Populate caller-provided buffers with all durable snapshots and tombstones so hot loops can reuse allocations.
     pub fn load_all_into(
         &self,
@@ -793,7 +856,46 @@ where
             while let Some(Ok((k, v))) = it.next() {
                 let key = Self::decode_key(k.value())?;
                 let reg = Self::decode_reg(v.value())?;
-                actives.push((key, C::snapshot_reg(&reg)));
+                actives.push((
+                    key,
+                    C::snapshot_reg_at_version(&reg, self.current_root_schema_version()),
+                ));
+            }
+        }
+
+        {
+            let mut it = tomb_table.iter().map_err(into_err)?;
+            while let Some(Ok((k, ts))) = it.next() {
+                tombs.push((Self::decode_key(k.value())?, ts.value()));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Populate caller-provided buffers with all raw registers and tombstones.
+    ///
+    /// Peer metadata uses this path so operational-only fields can remain
+    /// available to topology code without becoming part of the MST snapshot
+    /// hash contract.
+    pub fn load_all_regs_into(
+        &self,
+        actives: &mut Vec<(C::Key, C::Reg)>,
+        tombs: &mut Vec<(C::Key, u64)>,
+    ) -> crate::Result<()> {
+        actives.clear();
+        tombs.clear();
+
+        let r = self.db.begin_read().map_err(into_err)?;
+        let values = r.open_table(T::values()).map_err(into_err)?;
+        let tomb_table = r.open_table(T::tombs()).map_err(into_err)?;
+
+        {
+            let mut it = values.iter().map_err(into_err)?;
+            while let Some(Ok((k, v))) = it.next() {
+                let key = Self::decode_key(k.value())?;
+                let reg = Self::decode_reg(v.value())?;
+                actives.push((key, reg));
             }
         }
 
@@ -818,7 +920,10 @@ where
         while let Some(Ok((k, v))) = it.next() {
             let key = Self::decode_key(k.value())?;
             let reg = Self::decode_reg(v.value())?;
-            f(key, C::snapshot_reg(&reg));
+            f(
+                key,
+                C::snapshot_reg_at_version(&reg, self.current_root_schema_version()),
+            );
         }
         Ok(())
     }
@@ -845,8 +950,25 @@ where
         match t.get(kb.as_slice()).map_err(into_err)? {
             Some(v) => {
                 let reg = Self::decode_reg(v.value())?;
-                Ok(Some(C::snapshot_reg(&reg)))
+                Ok(Some(C::snapshot_reg_at_version(
+                    &reg,
+                    self.current_root_schema_version(),
+                )))
             }
+            None => Ok(None),
+        }
+    }
+
+    /// Reads the current raw register for key `k`, if present.
+    ///
+    /// This is the escape hatch used by peer metadata code that must inspect
+    /// values omitted from the MST snapshot projection.
+    pub fn get_reg(&self, k: &C::Key) -> crate::Result<Option<C::Reg>> {
+        let r = self.db.begin_read().map_err(into_err)?;
+        let t = r.open_table(T::values()).map_err(into_err)?;
+        let kb = Self::encode_key(k);
+        match t.get(kb.as_slice()).map_err(into_err)? {
+            Some(v) => Ok(Some(Self::decode_reg(v.value())?)),
             None => Ok(None),
         }
     }
@@ -857,6 +979,30 @@ where
         // Ensure root is computed
         let _ = t.root_hash();
         let prs = t.serialise_page_ranges().unwrap_or_default();
+
+        let out: Vec<PageDigestRange> = prs
+            .into_iter()
+            .map(|pr| PageDigestRange {
+                start: C::key_to_bytes(pr.start()),
+                end: C::key_to_bytes(pr.end()),
+                hash: pr.hash().as_ref().to_vec(),
+            })
+            .collect();
+        Ok(out)
+    }
+
+    /// Return page summaries for one semantic root-schema version.
+    pub async fn page_range_summary_at_version(
+        &self,
+        root_schema_version: u32,
+    ) -> crate::Result<Vec<PageDigestRange>> {
+        if root_schema_version == self.current_root_schema_version() {
+            return self.page_range_summary().await;
+        }
+
+        let mut tree = self.build_tree_from_disk_at_version(root_schema_version)?;
+        let _ = tree.root_hash();
+        let prs = tree.serialise_page_ranges().unwrap_or_default();
 
         let out: Vec<PageDigestRange> = prs
             .into_iter()
@@ -1058,6 +1204,7 @@ where
             db: self.db,
             actor: self.actor,
             mst,
+            root_schema_version: AtomicU32::new(DEFAULT_ROOT_SCHEMA_VERSION),
             change_clock: AtomicU64::new(1),
             preserve_local_tombs: self.preserve_local_tombs,
             _tables: std::marker::PhantomData,

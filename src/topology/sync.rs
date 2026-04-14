@@ -1,6 +1,17 @@
 use super::*;
 use parking_lot::Mutex;
 
+/// Chooses the root schema version to use for one peer sync session.
+///
+/// Sync uses the highest projection version both peers can serve so rolling
+/// upgrades naturally converge on newer projections as nodes restart.
+pub(super) fn negotiated_sync_root_schema_version(
+    local_root_schema: RootSchemaInfo,
+    peer_root_schema: RootSchemaInfo,
+) -> Option<u32> {
+    RootSchemaInfo::highest_common_version(local_root_schema, peer_root_schema)
+}
+
 impl Topology {
     /// Set the periodic sync interval (useful for tests to speed up convergence).
     pub fn set_sync_interval(&self, d: Duration) {
@@ -321,6 +332,19 @@ impl Topology {
     async fn sync_with_peer(&self, entry: &PeerCacheEntry, cluster_view: ClusterViewId) {
         let peer_id = entry.peer_id;
         let value = entry.value.as_ref();
+        let Some(root_schema_version) =
+            negotiated_sync_root_schema_version(self.root_schema_info(), value.root_schema)
+        else {
+            warn!(
+                target: "sync",
+                peer = %peer_id,
+                addr = %value.address,
+                local_root_schema = %self.root_schema_info(),
+                peer_root_schema = %value.root_schema,
+                "skipping sync with peer because no common root schema version exists"
+            );
+            return;
+        };
 
         let sync_cap = match self
             .deps
@@ -339,7 +363,7 @@ impl Topology {
         let trace = SyncTraceContext::peer(peer_id, value.address.clone(), "periodic");
         self.deps
             .sync
-            .sync_all_domains(sync_cap, cluster_view, Some(trace))
+            .sync_all_domains(sync_cap, cluster_view, root_schema_version, Some(trace))
             .await;
     }
 
@@ -350,6 +374,11 @@ impl Topology {
     async fn sync_workloads_with_peer(&self, entry: &PeerCacheEntry, cluster_view: ClusterViewId) {
         let peer_id = entry.peer_id;
         let value = entry.value.as_ref();
+        let Some(root_schema_version) =
+            negotiated_sync_root_schema_version(self.root_schema_info(), value.root_schema)
+        else {
+            return;
+        };
 
         let sync_cap = match self
             .deps
@@ -371,6 +400,7 @@ impl Topology {
             .sync_selected_domains(
                 sync_cap,
                 cluster_view,
+                root_schema_version,
                 &WORKLOAD_REPAIR_SYNC_DOMAINS,
                 Some(trace),
             )
@@ -385,6 +415,11 @@ impl Topology {
     async fn sync_metadata_with_peer(&self, entry: &PeerCacheEntry) {
         let peer_id = entry.peer_id;
         let value = entry.value.as_ref();
+        let Some(root_schema_version) =
+            negotiated_sync_root_schema_version(self.root_schema_info(), value.root_schema)
+        else {
+            return;
+        };
 
         let (sync_cap, peer_view) = match self
             .deps
@@ -412,6 +447,7 @@ impl Topology {
             .sync_selected_domains(
                 sync_cap,
                 peer_view,
+                root_schema_version,
                 &GLOBAL_METADATA_SYNC_DOMAINS,
                 Some(trace),
             )
@@ -807,6 +843,7 @@ mod tests {
                 runtime_support: RuntimeSupportProfile::default(),
                 scheduling: PeerSchedulingState::schedulable_default(peer_id),
                 labels: crate::topology::peers::PeerLabelState::default(),
+                root_schema: crate::cluster::RootSchemaInfo::default(),
                 membership: crate::topology::peers::PeerMembership::active(1),
             }),
         }

@@ -145,6 +145,7 @@ impl Topology {
             scheduling: PeerSchedulingState::schedulable_default(id),
             labels: crate::topology::peers::PeerLabelState::default(),
             runtime_support: RuntimeSupportProfile::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
             membership: PeerMembership::left(incarnation),
         });
         value.membership = PeerMembership::left(incarnation);
@@ -183,14 +184,14 @@ impl Topology {
 
     /// Return true if the peer `id` currently exists as an active member.
     pub fn peer_exists(&self, id: Uuid) -> io::Result<bool> {
-        let snapshot = self
+        let reg = self
             .stores
             .peers
-            .get_snapshot(&UuidKey::from(id))
+            .get_reg(&UuidKey::from(id))
             .map_err(io::Error::other)?;
-        Ok(snapshot
+        Ok(reg
             .as_ref()
-            .and_then(|values| PeerValue::select(values.as_slice()))
+            .and_then(PeerValue::select_reg)
             .map(|value| value.is_active())
             .unwrap_or(false))
     }
@@ -244,10 +245,10 @@ impl Topology {
     /// Return the stored ed25519 verifying key for `peer_id` if we have it locally.
     /// This is used to verify self-signed short-lived credentials in getWithCredential.
     pub fn signing_vk_for(&self, peer_id: Uuid) -> Option<VerifyingKey> {
-        let (actives, _tombs) = self.stores.peers.load_all().ok()?;
+        let (actives, _tombs) = self.stores.peers.load_all_regs().ok()?;
 
-        let snap = actives.into_iter().find(|(k, _)| k.to_uuid() == peer_id)?.1;
-        let last = PeerValue::select(snap.as_slice()).filter(|value| value.is_active())?;
+        let reg = actives.into_iter().find(|(k, _)| k.to_uuid() == peer_id)?.1;
+        let last = PeerValue::select_reg(&reg).filter(|value| value.is_active())?;
 
         let arr: [u8; 32] = last.signing_pub.as_slice().try_into().ok()?;
         VerifyingKey::from_bytes(&arr).ok()

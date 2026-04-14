@@ -171,6 +171,7 @@ impl Topology {
             scheduling: self.current_scheduling_state(),
             labels: self.current_label_state(),
             runtime_support: self.local.runtime_support.clone(),
+            root_schema: self.root_schema_info(),
             membership: PeerMembership::active(self.swim_local_incarnation()),
         })
     }
@@ -247,6 +248,7 @@ impl Topology {
     /// Populate a NodeInfo builder with this node's identity and addresses.
     pub fn populate_self_node_info(&self, mut info: crate::topology_capnp::node_info::Builder) {
         let cluster_view = self.active_cluster_view();
+        let root_schema = self.root_schema_info();
 
         set_node_id(info.reborrow().init_id(), &self.local.node.id);
         cluster_view.write_capnp(info.reborrow().init_active_cluster_view());
@@ -295,6 +297,7 @@ impl Topology {
         let labels = self.current_label_state();
         super::builders::write_labels_to_node_info(info.reborrow(), &labels);
         write_runtime_support_to_node_info(info.reborrow(), &self.local.runtime_support);
+        super::builders::write_root_schema_to_node_info(info.reborrow(), root_schema);
 
         if config::wireguard_enabled() && net::paths::running_as_root() {
             match net::wireguard::resolve_wireguard_key_path()
@@ -351,11 +354,11 @@ impl Topology {
             return Ok(true);
         }
 
-        let (actives, _) = self.stores.peers.load_all()?;
+        let (actives, _) = self.stores.peers.load_all_regs()?;
         let me = self.local.node.id;
-        Ok(actives.iter().any(|(k, snapshot)| {
+        Ok(actives.iter().any(|(k, reg)| {
             k.to_uuid() != me
-                && PeerValue::select(snapshot.as_slice())
+                && PeerValue::select_reg(reg)
                     .map(|value| value.is_active())
                     .unwrap_or(false)
         }))
@@ -363,14 +366,14 @@ impl Topology {
 
     /// Returns the currently selected membership state for the local peer row, if present.
     pub(super) fn local_membership(&self) -> std::io::Result<Option<PeerMembership>> {
-        let snapshot = self
+        let reg = self
             .stores
             .peers
-            .get_snapshot(&UuidKey::from(self.local.node.id))
+            .get_reg(&UuidKey::from(self.local.node.id))
             .map_err(io::Error::other)?;
-        Ok(snapshot
+        Ok(reg
             .as_ref()
-            .and_then(|values| PeerValue::select(values.as_slice()))
+            .and_then(PeerValue::select_reg)
             .map(|value| value.membership))
     }
 

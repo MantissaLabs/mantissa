@@ -8,6 +8,7 @@
 //! - Maintains an in-memory Merkle Search Tree to power fast anti-entropy.
 
 pub mod adapter;
+pub mod codec;
 pub mod error;
 pub mod hash;
 pub mod mst_store;

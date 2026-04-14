@@ -23,6 +23,14 @@ pub trait RegAdapter {
     /// Deterministic snapshot from a register (for MST hashing).
     fn snapshot_reg(reg: &Self::Reg) -> Self::Snapshot;
 
+    /// Deterministic snapshot from a register for one semantic root-schema version.
+    ///
+    /// Adapters that do not version their hash projection can keep the default
+    /// implementation, which reuses the unversioned snapshot.
+    fn snapshot_reg_at_version(reg: &Self::Reg, _root_schema_version: u32) -> Self::Snapshot {
+        Self::snapshot_reg(reg)
+    }
+
     fn key_to_bytes(k: &Self::Key) -> Vec<u8>;
     fn key_from_bytes(b: &[u8]) -> io::Result<Self::Key>;
 

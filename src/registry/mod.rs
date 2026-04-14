@@ -614,17 +614,15 @@ impl Registry {
 
         let (actives, _) = self
             .peers
-            .load_all()
+            .load_all_regs()
             .map_err(|e| anyhow!("failed to load peer store: {e}"))?;
 
         let mut active_peer_ids = Vec::with_capacity(actives.len());
         let mut peer_values = Vec::with_capacity(actives.len());
         let mut values_by_peer = HashMap::with_capacity(actives.len());
-        for (key, snapshot) in actives {
+        for (key, reg) in actives {
             let peer_id = key.to_uuid();
-            if let Some(value) =
-                PeerValue::select(snapshot.as_slice()).filter(|value| value.is_active())
-            {
+            if let Some(value) = PeerValue::select_reg(&reg).filter(|value| value.is_active()) {
                 active_peer_ids.push(peer_id);
                 values_by_peer.insert(peer_id, value.clone());
                 peer_values.push((peer_id, value));
@@ -697,6 +695,7 @@ impl Registry {
                 scheduling: PeerSchedulingState::schedulable_default(self.node_id),
                 labels: PeerLabelState::default(),
                 runtime_support: RuntimeSupportProfile::default(),
+                root_schema: crate::cluster::RootSchemaInfo::default(),
                 membership: crate::topology::peers::PeerMembership::active(0),
             }
         };
@@ -754,7 +753,7 @@ impl Registry {
     pub async fn connect_known_peers(&self, allow_credentials: bool) -> Result<(), capnp::Error> {
         let (actives, _tombs) = self
             .peers
-            .load_all()
+            .load_all_regs()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
         let strategy = if allow_credentials {
@@ -763,7 +762,7 @@ impl Registry {
             SessionStrategy::TicketOnly
         };
 
-        for (k, snap) in actives {
+        for (k, reg) in actives {
             let peer_id = k.to_uuid();
 
             if peer_id == self.node_id {
@@ -777,8 +776,7 @@ impl Registry {
                 continue;
             }
 
-            let Some(val) = PeerValue::select(snap.as_slice()).filter(|value| value.is_active())
-            else {
+            let Some(val) = PeerValue::select_reg(&reg).filter(|value| value.is_active()) else {
                 continue;
             };
             let addr = val.address.clone();
@@ -814,17 +812,15 @@ impl Registry {
         println!("Resuming sessions with peers...");
 
         let mut addr_map = HashMap::<Uuid, (String, [u8; 32])>::new();
-        if let Ok((actives, _tombs)) = self.peers.load_all() {
-            for (k, snap) in actives {
+        if let Ok((actives, _tombs)) = self.peers.load_all_regs() {
+            for (k, reg) in actives {
                 let id = k.to_uuid();
 
                 if id == self.node_id {
                     continue;
                 }
 
-                if let Some(val) =
-                    PeerValue::select(snap.as_slice()).filter(|value| value.is_active())
-                {
+                if let Some(val) = PeerValue::select_reg(&reg).filter(|value| value.is_active()) {
                     if val.address == local_addr {
                         continue;
                     }

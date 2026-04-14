@@ -18,7 +18,7 @@ use crate::sync::SyncTraceContext;
 use crate::topology::health::status_to_node_status;
 use crate::topology::peers::{
     PeerLabel, PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
-    labels_from_node_info, runtime_support_from_node_info,
+    labels_from_node_info, root_schema_from_node_info, runtime_support_from_node_info,
 };
 use capnp::Error;
 use capnp::data;
@@ -71,6 +71,7 @@ fn peer_value_from_join_payload(payload: &JoinPayload) -> PeerValue {
         scheduling: payload.scheduling.clone(),
         labels: payload.labels.clone(),
         runtime_support: payload.runtime_support.clone(),
+        root_schema: payload.root_schema,
         membership: PeerMembership::active(payload.incarnation),
     }
 }
@@ -93,6 +94,8 @@ fn restored_local_peer_value(current: Option<&PeerValue>, mut restored: PeerValu
             WireGuardPeerValue::preferred(current.wireguard.as_ref(), restored.wireguard.as_ref());
         restored.scheduling = PeerSchedulingState::merge(&restored.scheduling, &current.scheduling);
         restored.labels = PeerLabelState::merge(&restored.labels, &current.labels);
+        restored.root_schema =
+            crate::cluster::RootSchemaInfo::merge(restored.root_schema, current.root_schema);
         restored.runtime_support = RuntimeSupportProfile::preferred(
             Some(&restored.runtime_support),
             Some(&current.runtime_support),
@@ -183,6 +186,7 @@ impl Topology {
             scheduling: self.current_scheduling_state(),
             labels: self.current_label_state(),
             runtime_support: self.local.runtime_support.clone(),
+            root_schema: self.root_schema_info(),
         })
     }
 
@@ -401,6 +405,13 @@ impl topology::Server for Topology {
             credential,
             session,
         } = response;
+        let root_schema_version = super::sync::negotiated_sync_root_schema_version(
+            self.root_schema_info(),
+            peer_value.root_schema,
+        )
+        .ok_or_else(|| {
+            Error::failed("anchor and joiner do not share a compatible root schema version".into())
+        })?;
 
         self.persist_local_join_payload(&payload).await?;
 
@@ -441,7 +452,7 @@ impl topology::Server for Topology {
                 topology
                     .deps
                     .sync
-                    .sync_all_domains(sync_cap, cluster_view, Some(trace))
+                    .sync_all_domains(sync_cap, cluster_view, root_schema_version, Some(trace))
                     .await;
 
                 // A successful rejoin must end with the local node's own peer row restored even
@@ -509,14 +520,14 @@ impl topology::Server for Topology {
         let health_snapshot = self.deps.health_monitor.snapshot();
 
         let (actives, _) = peers
-            .load_all()
+            .load_all_regs()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
         let local_view = self.active_cluster_view();
         let excluded_peers = self.excluded_peers_snapshot().await;
         let mut scoped_nodes = Vec::<ListedNodeRow>::with_capacity(actives.len());
 
-        for (k, snap) in actives.into_iter() {
+        for (k, reg) in actives.into_iter() {
             let id = k.to_uuid();
             if excluded_peers.contains(&id) {
                 continue;
@@ -536,8 +547,7 @@ impl topology::Server for Topology {
                 .cloned()
                 .unwrap_or(::health::Status::Unknown);
             let node_status = status_to_node_status(health_status);
-            let Some(value) = PeerValue::select(snap.as_slice()).filter(|value| value.is_active())
-            else {
+            let Some(value) = PeerValue::select_reg(&reg).filter(|value| value.is_active()) else {
                 continue;
             };
             let drain_state = if value.scheduling.drain_requested {
@@ -1008,9 +1018,9 @@ impl topology::Server for Topology {
         let (actives, _) = self
             .stores
             .peers
-            .load_all()
+            .load_all_regs()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        for (key, snapshot) in actives {
+        for (key, reg) in actives {
             let peer_id = key.to_uuid();
             if peer_id == self.local.node.id {
                 continue;
@@ -1018,8 +1028,7 @@ impl topology::Server for Topology {
             if excluded_peers.contains(&peer_id) {
                 continue;
             }
-            let Some(_selected) =
-                PeerValue::select(snapshot.as_slice()).filter(|value| value.is_active())
+            let Some(_selected) = PeerValue::select_reg(&reg).filter(|value| value.is_active())
             else {
                 continue;
             };
@@ -1248,6 +1257,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                 scheduling: Box::new(scheduling),
                 labels: Box::new(labels_from_node_info(node)?),
                 runtime_support: Box::new(runtime_support_from_node_info(node)?),
+                root_schema: root_schema_from_node_info(node)?,
             }
         }
         EventType::Remove => {
@@ -1367,6 +1377,7 @@ mod tests {
                 drain_task_stop_timeout_secs: None,
             },
             labels: PeerLabelState::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
             membership: PeerMembership::active(10),
         }
     }
@@ -1412,6 +1423,7 @@ mod tests {
                 drain_task_stop_timeout_secs: Some(30),
             },
             labels: PeerLabelState::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
             membership: PeerMembership::active(20),
         };
 

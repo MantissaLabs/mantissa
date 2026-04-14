@@ -1,7 +1,7 @@
 use crate::store::peer_store::PeersStore;
 use crate::topology::peers::PeerValue;
-use crdt_store::mvreg::MvRegSnapshot;
 use crdt_store::uuid_key::UuidKey;
+use crdts::MVReg;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -22,7 +22,7 @@ pub(super) struct PeerSnapshotCache {
     last_generation: u64,
     entries: Arc<Vec<PeerCacheEntry>>,
     /// Reusable vectors backing snapshot extraction to avoid per-tick allocations.
-    actives: Vec<(UuidKey, MvRegSnapshot<PeerValue>)>,
+    actives: Vec<(UuidKey, MVReg<PeerValue, Uuid>)>,
     tombstones: Vec<(UuidKey, u64)>,
 }
 
@@ -46,13 +46,11 @@ impl PeerSnapshotCache {
             });
         }
 
-        store.load_all_into(&mut self.actives, &mut self.tombstones)?;
+        store.load_all_regs_into(&mut self.actives, &mut self.tombstones)?;
 
         let mut fresh_entries = Vec::with_capacity(self.actives.len());
-        for (key, snapshot) in &self.actives {
-            if let Some(value) =
-                PeerValue::select(snapshot.as_slice()).filter(|value| value.is_active())
-            {
+        for (key, reg) in &self.actives {
+            if let Some(value) = PeerValue::select_reg(reg).filter(|value| value.is_active()) {
                 fresh_entries.push(PeerCacheEntry {
                     peer_id: key.to_uuid(),
                     value: Arc::new(value),

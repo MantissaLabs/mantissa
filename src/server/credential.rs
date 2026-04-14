@@ -1,3 +1,4 @@
+use crdt_store::codec;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -67,12 +68,12 @@ impl ClusterCredential {
 
     /// Serialize to bytes (bincode).
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
-        bincode::serialize(self).map_err(|e| e.to_string())
+        codec::encode(self).map_err(|e| e.to_string())
     }
 
     /// Parse from bytes then verify.
     pub fn from_bytes_verified(b: &[u8]) -> Result<Self, String> {
-        let cred: Self = bincode::deserialize(b).map_err(|e| e.to_string())?;
+        let cred: Self = codec::decode(b).map_err(|e| e.to_string())?;
         cred.verify()?;
         Ok(cred)
     }

@@ -1,6 +1,6 @@
 use super::{BootstrapContext, BootstrapResult, stores::BootstrapStores};
 use crate::agents::{AgentController, AgentControllerConfig, AgentRegistry, AgentsRpc};
-use crate::cluster::ClusterViewState;
+use crate::cluster::{ClusterViewState, RootSchemaState};
 use crate::gossip::{DEFAULT_FANOUT, DedupeStateHandle, Message};
 use crate::jobs::{JobController, JobControllerConfig, JobRegistry, JobsRpc};
 use crate::network::controller::NetworkController;
@@ -288,6 +288,7 @@ impl RuntimeChannels {
 struct TopologyBuildInputs<'a> {
     ctx: &'a BootstrapContext,
     cluster_view: ClusterViewState,
+    root_schema: RootSchemaState,
     topology_rx: Receiver<Message>,
     gossip_tx: Sender<Message>,
     topology_stores: TopologyStorage,
@@ -397,14 +398,23 @@ async fn build_runtime_components(
     } = channels;
 
     let cluster_view = stores.restore_active_view()?;
+    let root_schema = stores.restore_root_schema_state()?;
     let (gossip_client, gossip_dedupe) = build_gossip_client(&cluster_view, &gossip_routes);
 
     let runtime_health = config::health_runtime_config();
     let health_monitor = health::HealthMonitor::new(ctx.self_id);
     let topology_stores = build_topology_stores(stores);
     let sync_stores = build_sync_stores(stores);
+    sync_stores
+        .rebuild_msts_for_root_schema_version(root_schema.supported_version())
+        .await
+        .map_err(|error| std::io::Error::other(format!("rebuild sync MSTs: {error}")))?;
     let attachment_sync_notify = Arc::new(Notify::new());
-    let sync_runner = SyncRunner::new(sync_stores.clone(), Some(attachment_sync_notify.clone()));
+    let sync_runner = SyncRunner::new(
+        sync_stores.clone(),
+        root_schema,
+        Some(attachment_sync_notify.clone()),
+    );
     let network_registry = NetworkRegistry::new(
         stores.networks.clone(),
         stores.network_peers.clone(),
@@ -420,6 +430,7 @@ async fn build_runtime_components(
     let topology = build_topology(TopologyBuildInputs {
         ctx,
         cluster_view: cluster_view.clone(),
+        root_schema,
         topology_rx,
         gossip_tx: gossip_tx.clone(),
         topology_stores: topology_stores.clone(),
@@ -438,7 +449,7 @@ async fn build_runtime_components(
     })?;
     hydrate_topology(&topology).await?;
     let topology_client = capnp_rpc::new_client(topology.clone());
-    let sync_client = build_sync_client(cluster_view, sync_stores);
+    let sync_client = build_sync_client(cluster_view, root_schema, sync_stores);
 
     let local_node_name = resolve_local_node_name(ctx);
     let secret_registry = crate::secrets::registry::SecretRegistry::new(stores.secrets.clone());
@@ -749,6 +760,7 @@ fn build_topology(inputs: TopologyBuildInputs<'_>) -> BootstrapResult<Topology> 
         gossip_sender: inputs.gossip_tx,
         node: inputs.ctx.node.clone(),
         cluster_view: inputs.cluster_view,
+        root_schema: inputs.root_schema,
         stores: inputs.topology_stores,
         crypto: keys,
         deps: inputs.deps,
@@ -813,9 +825,10 @@ async fn hydrate_topology(topology: &Topology) -> BootstrapResult<()> {
 /// assembled once the stores and active cluster view are known.
 fn build_sync_client(
     cluster_view: ClusterViewState,
+    root_schema: RootSchemaState,
     stores: SyncStores,
 ) -> protocol::sync::sync::Client {
-    let sync_service = SyncService::new(cluster_view, stores);
+    let sync_service = SyncService::new(cluster_view, root_schema, stores);
     capnp_rpc::new_client(sync_service)
 }
 

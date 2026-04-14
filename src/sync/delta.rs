@@ -5,11 +5,11 @@
 //! stream missing CRDT fragments back into the local stores.
 
 use super::{ALL_DOMAINS, SyncStores};
-use crate::cluster::ClusterViewId;
+use crate::cluster::{ClusterViewId, RootSchemaState};
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
-use bincode;
 use capnp_rpc::new_client;
 use crdt_store::adapter::RegAdapter;
+use crdt_store::codec;
 use crdt_store::mst_store::CrdtMstStore;
 use crdt_store::{Entry, PageDigestRange, TableSet, compute_want_from_have, uuid_key::UuidKey};
 use crdts::MVReg;
@@ -49,14 +49,20 @@ impl SyncTraceContext {
 /// every time it opens a delta exchange against a remote peer.
 pub struct SyncRunner {
     stores: SyncStores,
+    root_schema: RootSchemaState,
     attachment_sync_notify: Option<Arc<Notify>>,
 }
 
 impl SyncRunner {
     /// Builds one anti-entropy runner over the provided local replicated stores.
-    pub fn new(stores: SyncStores, attachment_sync_notify: Option<Arc<Notify>>) -> Self {
+    pub fn new(
+        stores: SyncStores,
+        root_schema: RootSchemaState,
+        attachment_sync_notify: Option<Arc<Notify>>,
+    ) -> Self {
         Self {
             stores,
+            root_schema,
             attachment_sync_notify,
         }
     }
@@ -66,10 +72,17 @@ impl SyncRunner {
         &self,
         sync_cap: sync::Client,
         cluster_view: ClusterViewId,
+        root_schema_version: u32,
         trace: Option<SyncTraceContext>,
     ) {
-        self.sync_selected_domains(sync_cap, cluster_view, &ALL_DOMAINS, trace)
-            .await;
+        self.sync_selected_domains(
+            sync_cap,
+            cluster_view,
+            root_schema_version,
+            &ALL_DOMAINS,
+            trace,
+        )
+        .await;
     }
 
     /// Runs anti-entropy for one caller-selected domain subset against one peer view.
@@ -80,6 +93,7 @@ impl SyncRunner {
         &self,
         sync_cap: sync::Client,
         cluster_view: ClusterViewId,
+        root_schema_version: u32,
         domains: &[Domain],
         trace: Option<SyncTraceContext>,
     ) {
@@ -87,51 +101,218 @@ impl SyncRunner {
             &self.stores,
             sync_cap,
             cluster_view,
+            root_schema_version,
             domains,
             trace,
             self.attachment_sync_notify.clone(),
         )
         .await;
     }
+
+    /// Rebuilds the local in-memory MSTs for one selected semantic root schema.
+    pub async fn rebuild_msts_for_root_schema_version(
+        &self,
+        root_schema_version: u32,
+    ) -> crdt_store::Result<()> {
+        if !self.root_schema.supports(root_schema_version) {
+            return Err(Box::new(crdt_store::error::Error::Other(format!(
+                "unsupported root schema version {root_schema_version}"
+            ))));
+        }
+        self.stores
+            .rebuild_msts_for_root_schema_version(root_schema_version)
+            .await
+    }
 }
 
 impl SyncStores {
     /// Returns the local MST root digest for one domain so the roots phase can skip matches.
-    async fn root_digest(&self, domain: Domain) -> [u8; 16] {
+    async fn root_digest(
+        &self,
+        domain: Domain,
+        root_schema_version: u32,
+    ) -> crdt_store::Result<[u8; 16]> {
         match domain {
-            Domain::Peers => self.peers.root_digest().await,
-            Domain::Workloads => self.workloads.root_digest().await,
-            Domain::Services => self.services.root_digest().await,
-            Domain::Jobs => self.jobs.root_digest().await,
-            Domain::Agents => self.agents.root_digest().await,
-            Domain::Secrets => self.secrets.root_digest().await,
-            Domain::Networks => self.networks.root_digest().await,
-            Domain::NetworkPeers => self.network_peers.root_digest().await,
-            Domain::NetworkAttachments => self.network_attachments.root_digest().await,
-            Domain::ClusterViews => self.cluster_views.root_digest().await,
-            Domain::Volumes => self.volumes.root_digest().await,
-            Domain::VolumeNodes => self.volume_nodes.root_digest().await,
-            Domain::SchedulerDigests => self.scheduler_digests.root_digest().await,
+            Domain::Peers => self.peers.root_digest_at_version(root_schema_version).await,
+            Domain::Workloads => {
+                self.workloads
+                    .root_digest_at_version(root_schema_version)
+                    .await
+            }
+            Domain::Services => {
+                self.services
+                    .root_digest_at_version(root_schema_version)
+                    .await
+            }
+            Domain::Jobs => self.jobs.root_digest_at_version(root_schema_version).await,
+            Domain::Agents => {
+                self.agents
+                    .root_digest_at_version(root_schema_version)
+                    .await
+            }
+            Domain::Secrets => {
+                self.secrets
+                    .root_digest_at_version(root_schema_version)
+                    .await
+            }
+            Domain::Networks => {
+                self.networks
+                    .root_digest_at_version(root_schema_version)
+                    .await
+            }
+            Domain::NetworkPeers => {
+                self.network_peers
+                    .root_digest_at_version(root_schema_version)
+                    .await
+            }
+            Domain::NetworkAttachments => {
+                self.network_attachments
+                    .root_digest_at_version(root_schema_version)
+                    .await
+            }
+            Domain::ClusterViews => {
+                self.cluster_views
+                    .root_digest_at_version(root_schema_version)
+                    .await
+            }
+            Domain::Volumes => {
+                self.volumes
+                    .root_digest_at_version(root_schema_version)
+                    .await
+            }
+            Domain::VolumeNodes => {
+                self.volume_nodes
+                    .root_digest_at_version(root_schema_version)
+                    .await
+            }
+            Domain::SchedulerDigests => {
+                self.scheduler_digests
+                    .root_digest_at_version(root_schema_version)
+                    .await
+            }
         }
     }
 
     /// Returns the local digest summary for one domain used to compute missing pages.
-    async fn page_range_summary(&self, domain: Domain) -> crdt_store::Result<Vec<PageDigestRange>> {
+    async fn page_range_summary(
+        &self,
+        domain: Domain,
+        root_schema_version: u32,
+    ) -> crdt_store::Result<Vec<PageDigestRange>> {
         match domain {
-            Domain::Peers => self.peers.page_range_summary().await,
-            Domain::Workloads => self.workloads.page_range_summary().await,
-            Domain::Services => self.services.page_range_summary().await,
-            Domain::Jobs => self.jobs.page_range_summary().await,
-            Domain::Agents => self.agents.page_range_summary().await,
-            Domain::Secrets => self.secrets.page_range_summary().await,
-            Domain::Networks => self.networks.page_range_summary().await,
-            Domain::NetworkPeers => self.network_peers.page_range_summary().await,
-            Domain::NetworkAttachments => self.network_attachments.page_range_summary().await,
-            Domain::ClusterViews => self.cluster_views.page_range_summary().await,
-            Domain::Volumes => self.volumes.page_range_summary().await,
-            Domain::VolumeNodes => self.volume_nodes.page_range_summary().await,
-            Domain::SchedulerDigests => self.scheduler_digests.page_range_summary().await,
+            Domain::Peers => {
+                self.peers
+                    .page_range_summary_at_version(root_schema_version)
+                    .await
+            }
+            Domain::Workloads => {
+                self.workloads
+                    .page_range_summary_at_version(root_schema_version)
+                    .await
+            }
+            Domain::Services => {
+                self.services
+                    .page_range_summary_at_version(root_schema_version)
+                    .await
+            }
+            Domain::Jobs => {
+                self.jobs
+                    .page_range_summary_at_version(root_schema_version)
+                    .await
+            }
+            Domain::Agents => {
+                self.agents
+                    .page_range_summary_at_version(root_schema_version)
+                    .await
+            }
+            Domain::Secrets => {
+                self.secrets
+                    .page_range_summary_at_version(root_schema_version)
+                    .await
+            }
+            Domain::Networks => {
+                self.networks
+                    .page_range_summary_at_version(root_schema_version)
+                    .await
+            }
+            Domain::NetworkPeers => {
+                self.network_peers
+                    .page_range_summary_at_version(root_schema_version)
+                    .await
+            }
+            Domain::NetworkAttachments => {
+                self.network_attachments
+                    .page_range_summary_at_version(root_schema_version)
+                    .await
+            }
+            Domain::ClusterViews => {
+                self.cluster_views
+                    .page_range_summary_at_version(root_schema_version)
+                    .await
+            }
+            Domain::Volumes => {
+                self.volumes
+                    .page_range_summary_at_version(root_schema_version)
+                    .await
+            }
+            Domain::VolumeNodes => {
+                self.volume_nodes
+                    .page_range_summary_at_version(root_schema_version)
+                    .await
+            }
+            Domain::SchedulerDigests => {
+                self.scheduler_digests
+                    .page_range_summary_at_version(root_schema_version)
+                    .await
+            }
         }
+    }
+
+    /// Rebuilds every in-memory domain MST using one selected semantic root schema.
+    pub async fn rebuild_msts_for_root_schema_version(
+        &self,
+        root_schema_version: u32,
+    ) -> crdt_store::Result<()> {
+        self.peers
+            .rebuild_mst_from_disk_at_version(root_schema_version)
+            .await?;
+        self.workloads
+            .rebuild_mst_from_disk_at_version(root_schema_version)
+            .await?;
+        self.jobs
+            .rebuild_mst_from_disk_at_version(root_schema_version)
+            .await?;
+        self.agents
+            .rebuild_mst_from_disk_at_version(root_schema_version)
+            .await?;
+        self.services
+            .rebuild_mst_from_disk_at_version(root_schema_version)
+            .await?;
+        self.secrets
+            .rebuild_mst_from_disk_at_version(root_schema_version)
+            .await?;
+        self.networks
+            .rebuild_mst_from_disk_at_version(root_schema_version)
+            .await?;
+        self.network_peers
+            .rebuild_mst_from_disk_at_version(root_schema_version)
+            .await?;
+        self.network_attachments
+            .rebuild_mst_from_disk_at_version(root_schema_version)
+            .await?;
+        self.cluster_views
+            .rebuild_mst_from_disk_at_version(root_schema_version)
+            .await?;
+        self.volumes
+            .rebuild_mst_from_disk_at_version(root_schema_version)
+            .await?;
+        self.volume_nodes
+            .rebuild_mst_from_disk_at_version(root_schema_version)
+            .await?;
+        self.scheduler_digests
+            .rebuild_mst_from_disk_at_version(root_schema_version)
+            .await?;
+        Ok(())
     }
 }
 
@@ -142,14 +323,20 @@ impl SyncStores {
 pub struct DeltaSinkImpl {
     stores: SyncStores,
     expected_view: ClusterViewId,
+    expected_root_schema_version: u32,
 }
 
 impl DeltaSinkImpl {
     /// Builds a sink bound to the local stores and the cluster view negotiated for this sync.
-    pub fn new(stores: SyncStores, expected_view: ClusterViewId) -> Self {
+    pub fn new(
+        stores: SyncStores,
+        expected_view: ClusterViewId,
+        expected_root_schema_version: u32,
+    ) -> Self {
         Self {
             stores,
             expected_view,
+            expected_root_schema_version,
         }
     }
 }
@@ -185,10 +372,18 @@ impl delta_sink::Server for DeltaSinkImpl {
                 self.expected_view, chunk_view
             )));
         }
+        if chunk.get_root_schema_version() != self.expected_root_schema_version {
+            return Err(capnp::Error::failed(format!(
+                "delta chunk root schema mismatch: expected {}, got {}",
+                self.expected_root_schema_version,
+                chunk.get_root_schema_version()
+            )));
+        }
         debug!(
             target: "delta",
             cluster_view = %chunk_view,
             ?domain,
+            root_schema_version = self.expected_root_schema_version,
             "received delta chunk"
         );
 
@@ -280,8 +475,8 @@ where
     for entry in chunk.get_regs()?.iter() {
         let key =
             UuidKey::try_from(entry.get_key()?).map_err(|e| capnp::Error::failed(e.to_string()))?;
-        let register: MVReg<V, uuid::Uuid> = bincode::deserialize(entry.get_reg()?)
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let register: MVReg<V, uuid::Uuid> =
+            codec::decode(entry.get_reg()?).map_err(|e| capnp::Error::failed(e.to_string()))?;
         regs.push((key, register));
     }
     Ok(regs)
@@ -300,6 +495,7 @@ async fn sync_selected_domains_with_stores(
     stores: &SyncStores,
     sync_cap: sync::Client,
     cluster_view: ClusterViewId,
+    root_schema_version: u32,
     domains: &[Domain],
     trace: Option<SyncTraceContext>,
     attachment_sync_notify: Option<Arc<Notify>>,
@@ -314,6 +510,7 @@ async fn sync_selected_domains_with_stores(
         {
             let mut req = roots_req.get().init_req();
             cluster_view.write_capnp(req.reborrow().init_view());
+            req.set_root_schema_version(root_schema_version);
         }
         let roots_resp = roots_req.send().promise.await?;
         let roots_reader = roots_resp.get()?.get_roots()?;
@@ -328,6 +525,12 @@ async fn sync_selected_domains_with_stores(
                     "sync roots view mismatch: expected {cluster_view}, got {root_view}"
                 )));
             }
+            if entry.get_root_schema_version() != root_schema_version {
+                return Err(capnp::Error::failed(format!(
+                    "sync roots root schema mismatch: expected {root_schema_version}, got {}",
+                    entry.get_root_schema_version()
+                )));
+            }
             let domain = entry
                 .get_domain()
                 .map_err(|_| capnp::Error::failed("unknown domain".into()))?;
@@ -338,7 +541,10 @@ async fn sync_selected_domains_with_stores(
         let mut domains_to_sync = Vec::new();
         // Root equality lets us skip the more expensive page-summary walk for matched domains.
         for domain in &requested_domains {
-            let local_root = stores.root_digest(*domain).await;
+            let local_root = stores
+                .root_digest(*domain, root_schema_version)
+                .await
+                .map_err(to_capnp)?;
             let remote_root = remote_roots
                 .iter()
                 .find(|(candidate, _)| candidate == domain)
@@ -357,6 +563,7 @@ async fn sync_selected_domains_with_stores(
         {
             let mut req = ranges_req.get().init_req();
             cluster_view.write_capnp(req.reborrow().init_view());
+            req.set_root_schema_version(root_schema_version);
             let mut list = req.reborrow().init_domains(domains_to_sync.len() as u32);
             for (idx, domain) in domains_to_sync.iter().enumerate() {
                 list.set(idx as u32, *domain);
@@ -375,12 +582,21 @@ async fn sync_selected_domains_with_stores(
                     "sync ranges view mismatch: expected {cluster_view}, got {summary_view}"
                 )));
             }
+            if summary.get_root_schema_version() != root_schema_version {
+                return Err(capnp::Error::failed(format!(
+                    "sync ranges root schema mismatch: expected {root_schema_version}, got {}",
+                    summary.get_root_schema_version()
+                )));
+            }
             let domain = summary
                 .get_domain()
                 .map_err(|_| capnp::Error::failed("unknown domain".into()))?;
             let remote_summary = summary.get_summary()?;
             let remote_ranges = page_ranges_from_capnp(remote_summary)?;
-            let local_ranges = stores.page_range_summary(domain).await.map_err(to_capnp)?;
+            let local_ranges = stores
+                .page_range_summary(domain, root_schema_version)
+                .await
+                .map_err(to_capnp)?;
             // Ask the peer only for pages present in its summary but missing locally.
             let want = compute_want_from_have(&remote_ranges, &local_ranges);
             if !want.is_empty() {
@@ -392,12 +608,17 @@ async fn sync_selected_domains_with_stores(
             return Ok(());
         }
 
-        let sink_client = new_client(DeltaSinkImpl::new(stores.clone(), cluster_view));
+        let sink_client = new_client(DeltaSinkImpl::new(
+            stores.clone(),
+            cluster_view,
+            root_schema_version,
+        ));
 
         let mut od = sync_cap.open_delta_for_view_request();
         {
             let mut req = od.get().init_req();
             cluster_view.write_capnp(req.reborrow().init_view());
+            req.set_root_schema_version(root_schema_version);
             let mut wants_builder = req.reborrow().init_wants(domains_wants.len() as u32);
             for (idx, (domain, want_ranges)) in domains_wants.iter().enumerate() {
                 let mut entry = wants_builder.reborrow().get(idx as u32);
@@ -405,6 +626,7 @@ async fn sync_selected_domains_with_stores(
                 let summary_builder = entry.reborrow().init_want();
                 capnp_fill_ranges(want_ranges, summary_builder)?;
                 cluster_view.write_capnp(entry.reborrow().init_view());
+                entry.set_root_schema_version(root_schema_version);
             }
             req.set_sink(sink_client);
         }

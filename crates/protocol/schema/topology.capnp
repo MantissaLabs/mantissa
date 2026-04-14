@@ -290,6 +290,15 @@ struct NodeInfo {
 
   platformArch @30 :Text;
   # Canonical scheduler-visible architecture identifier for placement selectors.
+
+  minimumRootSchemaVersion @31 :UInt32 = 1;
+  # Lowest semantic root schema version this node binary still serves.
+
+  supportedRootSchemaVersion @32 :UInt32 = 1;
+  # Highest semantic root schema version this node binary can serve.
+
+  rootSchemaUpdatedAtUnixMs @33 :UInt64;
+  # Last publication time for this node's root-schema support range.
 }
 
 struct NodeList {

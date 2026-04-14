@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use protocol::server::ServerClient;
 use x25519_dalek::PublicKey;
 
-use crate::cluster::ClusterViewState;
+use crate::cluster::{ClusterViewState, RootSchemaState};
 use crate::node::Node;
 use crate::runtime::types::RuntimeSupportProfile;
 
@@ -67,6 +67,9 @@ pub(super) struct LocalNodeState {
 
     /// Shared active cluster view identifier for control-plane observability.
     pub(super) cluster_view: ClusterViewState,
+
+    /// Shared root schema support range advertised and used for sync negotiation.
+    pub(super) root_schema: RootSchemaState,
 
     /// Addresses and advertise decision logic for the local node.
     pub(super) advertise: AdvertiseState,

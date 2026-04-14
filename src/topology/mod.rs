@@ -1,4 +1,4 @@
-use crate::cluster::{ClusterViewId, ClusterViewState};
+use crate::cluster::{ClusterViewId, ClusterViewState, RootSchemaInfo, RootSchemaState};
 use crate::config;
 use crate::gossip::{GossipContext, Message};
 use crate::network::registry::NetworkRegistry;
@@ -143,6 +143,7 @@ pub struct TopologyConfig {
     pub gossip_sender: Sender<Message>,
     pub node: Node,
     pub cluster_view: ClusterViewState,
+    pub root_schema: RootSchemaState,
     pub stores: TopologyStorage,
     pub crypto: Keys,
     pub deps: TopologyDependencies,
@@ -184,6 +185,7 @@ impl Topology {
             gossip_sender,
             node,
             cluster_view,
+            root_schema,
             stores,
             crypto,
             deps,
@@ -198,6 +200,7 @@ impl Topology {
             local: LocalNodeState {
                 node,
                 cluster_view,
+                root_schema,
                 advertise: local_state::AdvertiseState::new(addr),
                 server_handle: Rc::new(std::cell::OnceCell::new()),
                 public_key: noise_public_key,
@@ -236,6 +239,21 @@ impl Topology {
     /// Returns the currently active cluster view identifier.
     pub fn active_cluster_view(&self) -> ClusterViewId {
         self.local.cluster_view.active_view()
+    }
+
+    /// Returns the highest semantic root schema version this binary supports.
+    pub fn supported_root_schema_version(&self) -> u32 {
+        self.local.root_schema.supported_version()
+    }
+
+    /// Returns the lowest semantic root schema version this binary still serves.
+    pub fn minimum_root_schema_version(&self) -> u32 {
+        self.local.root_schema.minimum_supported_version()
+    }
+
+    /// Returns the root-schema support metadata currently advertised by this node.
+    pub fn root_schema_info(&self) -> RootSchemaInfo {
+        self.local.root_schema.info()
     }
 
     /// Replaces the active cluster view identifier and returns the previous value.

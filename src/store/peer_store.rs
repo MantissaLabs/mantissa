@@ -1,18 +1,17 @@
 use crate::store::open::open_arc_store;
+use crate::topology::peers::{PeerRootSnapshot, PeerValue};
+use crdt_store::adapter::RegAdapter;
 use crdt_store::mst_store::CrdtMstStore;
+use crdt_store::mvreg::MvRegSnapshot;
 use crdt_store::table_set::TableSet;
 use crdt_store::uuid_key::UuidKey;
+use crdts::ctx::ReadCtx;
+use crdts::{CmRDT, CvRDT, MVReg};
 use std::sync::Arc;
 use uuid::Uuid;
 
 // Hasher for MST leaves/keys (your existing implementation)
 use crdt_store::hash::XXHash128;
-
-// Adapter = MVReg<V,A> with sorted snapshot
-use crdt_store::adapter::MvRegAdapterSorted;
-
-// What a peer stores
-use crate::topology::peers::PeerValue;
 
 // The tables for the peer store.
 pub struct PeerTables;
@@ -23,9 +22,61 @@ impl TableSet for PeerTables {
     const META: &'static str = "peer_meta";
 }
 
+/// Peer-specific MVReg adapter that excludes sync-support metadata from MST snapshots.
+pub struct PeerRegAdapter;
+
+impl RegAdapter for PeerRegAdapter {
+    type Key = UuidKey;
+    type Actor = Uuid;
+    type Reg = MVReg<PeerValue, Uuid>;
+    type Value = PeerValue;
+    type Snapshot = MvRegSnapshot<PeerRootSnapshot>;
+
+    /// Produces the next peer register value after one local upsert.
+    fn upsert_reg(current: Option<Self::Reg>, actor: &Self::Actor, v: Self::Value) -> Self::Reg {
+        let mut reg = current.unwrap_or_default();
+        let rc: ReadCtx<Vec<PeerValue>, Uuid> = reg.read();
+        let add = rc.derive_add_ctx(*actor);
+        let op = reg.write(v, add);
+        reg.apply(op);
+        reg
+    }
+
+    /// Projects one peer register into the root-visible snapshot used by the MST.
+    fn snapshot_reg(reg: &Self::Reg) -> Self::Snapshot {
+        let rc: ReadCtx<Vec<PeerValue>, Uuid> = reg.read();
+        let values = rc
+            .val
+            .iter()
+            .map(PeerRootSnapshot::from)
+            .collect::<Vec<_>>();
+        MvRegSnapshot::from_unsorted(values)
+    }
+
+    /// Encodes one peer key into the Redb/MST byte form.
+    fn key_to_bytes(k: &Self::Key) -> Vec<u8> {
+        k.as_ref().to_vec()
+    }
+
+    /// Decodes one peer key from raw Redb bytes.
+    fn key_from_bytes(b: &[u8]) -> std::io::Result<Self::Key> {
+        UuidKey::try_from(b).map_err(Into::into)
+    }
+
+    /// Merges local and incoming peer registers for anti-entropy application.
+    fn merge_regs(current: Option<Self::Reg>, incoming: Self::Reg) -> Self::Reg {
+        match current {
+            Some(mut current) => {
+                current.merge(incoming);
+                current
+            }
+            None => incoming,
+        }
+    }
+}
+
 // PeersStore = generic CRDT+MST store specialized for peers
-pub type PeersStoreInner =
-    CrdtMstStore<MvRegAdapterSorted<UuidKey, PeerValue, Uuid>, XXHash128, PeerTables>;
+pub type PeersStoreInner = CrdtMstStore<PeerRegAdapter, XXHash128, PeerTables>;
 
 pub type PeersStore = Arc<PeersStoreInner>;
 

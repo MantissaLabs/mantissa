@@ -1,5 +1,5 @@
 use crate::cluster::operations::SplitNodeCandidate;
-use crate::cluster::{ClusterId, ClusterViewId};
+use crate::cluster::{ClusterId, ClusterViewId, RootSchemaInfo};
 use crate::node::id::set_node_id;
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::topology::peers::{PeerLabelState, PeerSchedulingState, PeerValue, WireGuardPeerValue};
@@ -30,6 +30,7 @@ pub(super) struct JoinPayload {
     pub(super) scheduling: PeerSchedulingState,
     pub(super) labels: PeerLabelState,
     pub(super) runtime_support: RuntimeSupportProfile,
+    pub(super) root_schema: RootSchemaInfo,
 }
 
 /// Writes the scheduler-visible platform selectors into the topology `NodeInfo` builder.
@@ -187,6 +188,16 @@ pub(super) fn write_wireguard_to_node_info(
     }
 }
 
+/// Writes root-schema support metadata into the topology `NodeInfo` builder.
+pub(super) fn write_root_schema_to_node_info(
+    mut info: node_info_capnp::Builder<'_>,
+    root_schema: RootSchemaInfo,
+) {
+    info.set_minimum_root_schema_version(root_schema.minimum_supported_version);
+    info.set_supported_root_schema_version(root_schema.supported_version);
+    info.set_root_schema_updated_at_unix_ms(root_schema.updated_at_unix_ms);
+}
+
 /// Writes replicated node labels into the topology `NodeInfo` builder.
 pub(super) fn write_labels_to_node_info(
     mut info: node_info_capnp::Builder<'_>,
@@ -228,6 +239,7 @@ pub(super) fn write_join_payload_to_node_info(
     write_labels_to_node_info(info.reborrow(), &payload.labels);
     write_runtime_support_to_node_info(info.reborrow(), &payload.runtime_support);
     write_wireguard_to_node_info(info.reborrow(), payload.wireguard.as_ref());
+    write_root_schema_to_node_info(info.reborrow(), payload.root_schema);
 }
 
 /// Writes one prepared node-list row into the `list` RPC response.
@@ -252,6 +264,7 @@ pub(super) fn write_listed_node_row(
     write_labels_to_node_info(node.reborrow(), &row.value.labels);
     write_runtime_support_to_node_info(node.reborrow(), &row.value.runtime_support);
     write_wireguard_to_node_info(node.reborrow(), row.value.wireguard.as_ref());
+    write_root_schema_to_node_info(node.reborrow(), row.value.root_schema);
     node.set_health(row.health);
 }
 
@@ -369,6 +382,7 @@ fn write_join_event(
         scheduling,
         labels,
         runtime_support,
+        root_schema,
     } = event
     else {
         unreachable!("write_join_event must only be called with join events");
@@ -387,6 +401,7 @@ fn write_join_event(
     write_labels_to_node_info(node.reborrow(), labels.as_ref());
     write_runtime_support_to_node_info(node.reborrow(), runtime_support.as_ref());
     write_wireguard_to_node_info(node.reborrow(), wireguard.as_ref());
+    write_root_schema_to_node_info(node.reborrow(), *root_schema);
 
     if let Some(client) = client.as_ref() {
         // Only embed our own handle; forwarding a capability learned from another peer

@@ -9,7 +9,7 @@
 //! All sync traffic is scoped to an explicit `ClusterViewId` so anti-entropy stays
 //! inside one control-plane lineage.
 
-use crate::cluster::{ClusterViewId, ClusterViewState};
+use crate::cluster::{ClusterViewId, ClusterViewState, RootSchemaState};
 use crate::store::agent_store::AgentStore;
 use crate::store::cluster_view_store::ClusterViewDomainStore;
 use crate::store::job_store::JobStore;
@@ -21,6 +21,7 @@ use crate::store::service_store::ServiceStore;
 use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
 use crate::store::workload_store::WorkloadStore;
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
+use crdt_store::codec;
 use crdt_store::mst_store::{Registers, Tombstones};
 use crdt_store::uuid_key::UuidKey;
 use protocol::sync::{Domain, delta_sink, sync};
@@ -90,6 +91,7 @@ fn delta_chunk_target_bytes() -> usize {
 /// Cap'n Proto server that exposes all replicated stores through one sync interface.
 pub struct SyncService {
     cluster_view: ClusterViewState,
+    root_schema: RootSchemaState,
     stores: SyncStores,
 }
 
@@ -116,9 +118,14 @@ pub struct SyncStores {
 
 impl SyncService {
     /// Builds a sync service bound to the provided cluster view state and domain stores.
-    pub fn new(cluster_view: ClusterViewState, stores: SyncStores) -> Self {
+    pub fn new(
+        cluster_view: ClusterViewState,
+        root_schema: RootSchemaState,
+        stores: SyncStores,
+    ) -> Self {
         Self {
             cluster_view,
+            root_schema,
             stores,
         }
     }
@@ -132,6 +139,17 @@ impl SyncService {
             )));
         }
         Ok(active)
+    }
+
+    /// Validates that the requested semantic root schema is supported by this binary.
+    fn require_supported_root_schema_version(&self, requested: u32) -> Result<u32, capnp::Error> {
+        if !self.root_schema.supports(requested) {
+            return Err(capnp::Error::failed(format!(
+                "root schema version {requested} is unsupported; local binary supports up to {}",
+                self.root_schema.supported_version()
+            )));
+        }
+        Ok(requested)
     }
 
     /// Resolves a sync domain to its backing replicated store handle.
@@ -220,13 +238,21 @@ impl DomainStoreRef<'_> {
         format!("{prefix}.{}", domain_debug_label(self.domain()))
     }
 
-    /// Reads the current MST root digest for this domain.
-    async fn root_digest(&self) -> [u8; 16] {
-        with_domain_store!(self, |store| { store.root_digest().await })
+    /// Reads the current MST root digest for this domain at one semantic version.
+    async fn root_digest(&self, root_schema_version: u32) -> Result<[u8; 16], capnp::Error> {
+        with_domain_store!(self, |store| {
+            store
+                .root_digest_at_version(root_schema_version)
+                .await
+                .map_err(|e| capnp::Error::failed(e.to_string()))
+        })
     }
 
     /// Produces digest ranges for anti-entropy while emitting domain diagnostics.
-    async fn page_range_summary(&self) -> Result<Vec<crdt_store::PageDigestRange>, capnp::Error> {
+    async fn page_range_summary(
+        &self,
+        root_schema_version: u32,
+    ) -> Result<Vec<crdt_store::PageDigestRange>, capnp::Error> {
         let domain = self.domain();
         debug!(
             "getRangesForView: received ({})",
@@ -237,7 +263,7 @@ impl DomainStoreRef<'_> {
             store.debug_dump_root(&dump_label).await;
             store.debug_dump_ranges(&dump_label, 5).await;
             store
-                .page_range_summary()
+                .page_range_summary_at_version(root_schema_version)
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()))
         })
@@ -283,20 +309,27 @@ impl sync::Server for SyncService {
         let requested_view =
             ClusterViewId::from_capnp(req.get_view()?).map_err(capnp::Error::failed)?;
         let active_view = self.require_active_view(requested_view)?;
+        let requested_root_schema_version =
+            self.require_supported_root_schema_version(req.get_root_schema_version())?;
         trace!(
             target: "sync",
             requested_view = %requested_view,
             active_view = %active_view,
+            root_schema_version = requested_root_schema_version,
             "get_roots_for_view request received"
         );
 
         let mut list = results.get().init_roots(VIEW_SCOPED_DOMAIN_COUNT as u32);
         for (idx, domain) in ALL_DOMAINS.iter().copied().enumerate() {
-            let root_digest = self.domain_store(domain).root_digest().await;
+            let root_digest = self
+                .domain_store(domain)
+                .root_digest(requested_root_schema_version)
+                .await?;
             let mut entry = list.reborrow().get(idx as u32);
             entry.set_domain(domain);
             entry.set_root_digest(&root_digest);
             active_view.write_capnp(entry.reborrow().init_view());
+            entry.set_root_schema_version(requested_root_schema_version);
         }
 
         Ok(())
@@ -312,10 +345,13 @@ impl sync::Server for SyncService {
         let requested_view =
             ClusterViewId::from_capnp(req.get_view()?).map_err(capnp::Error::failed)?;
         let active_view = self.require_active_view(requested_view)?;
+        let requested_root_schema_version =
+            self.require_supported_root_schema_version(req.get_root_schema_version())?;
         trace!(
             target: "sync",
             requested_view = %requested_view,
             active_view = %active_view,
+            root_schema_version = requested_root_schema_version,
             "get_ranges_for_view request received"
         );
 
@@ -335,12 +371,15 @@ impl sync::Server for SyncService {
         let mut list = results.get().init_ranges(requested_domains.len() as u32);
         for (idx, domain) in requested_domains.iter().copied().enumerate() {
             let store = self.domain_store(domain);
-            let ranges = store.page_range_summary().await?;
+            let ranges = store
+                .page_range_summary(requested_root_schema_version)
+                .await?;
             let mut entry = list.reborrow().get(idx as u32);
             entry.set_domain(store.domain());
             let summary = entry.reborrow().init_summary();
             capnp_fill_ranges(&ranges, summary)?;
             active_view.write_capnp(entry.reborrow().init_view());
+            entry.set_root_schema_version(requested_root_schema_version);
         }
 
         Ok(())
@@ -356,10 +395,13 @@ impl sync::Server for SyncService {
         let requested_view =
             ClusterViewId::from_capnp(req.get_view()?).map_err(capnp::Error::failed)?;
         let active_view = self.require_active_view(requested_view)?;
+        let requested_root_schema_version =
+            self.require_supported_root_schema_version(req.get_root_schema_version())?;
         debug!(
             target: "delta",
             requested_view = %requested_view,
             active_view = %active_view,
+            root_schema_version = requested_root_schema_version,
             "open_delta_for_view request received"
         );
 
@@ -383,6 +425,12 @@ impl sync::Server for SyncService {
                     "domain want view mismatch: expected {active_view}, got {want_view}"
                 )));
             }
+            if want.get_root_schema_version() != requested_root_schema_version {
+                return Err(capnp::Error::failed(format!(
+                    "domain want root schema mismatch: expected {requested_root_schema_version}, got {}",
+                    want.get_root_schema_version()
+                )));
+            }
 
             let domain = want
                 .get_domain()
@@ -396,7 +444,16 @@ impl sync::Server for SyncService {
             let store = self.domain_store(domain);
             store.debug_dump_delta_state().await;
             let (regs, tombs) = store.export_delta_encoded(&want_ranges)?;
-            if send_chunks(domain, regs, tombs, active_view, &sink).await? {
+            if send_chunks(
+                domain,
+                regs,
+                tombs,
+                active_view,
+                requested_root_schema_version,
+                &sink,
+            )
+            .await?
+            {
                 sent_chunks = true;
             }
         }
@@ -419,7 +476,7 @@ where
     let mut out = EncodedRegisters::with_capacity(regs.len());
     for (k, r) in regs {
         let key_bytes = k.as_ref().to_vec();
-        let reg_bytes = bincode::serialize(&r).map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let reg_bytes = codec::encode(&r).map_err(|e| capnp::Error::failed(e.to_string()))?;
         out.push((key_bytes, reg_bytes));
     }
     Ok(out)
@@ -507,6 +564,7 @@ async fn send_chunks(
     regs_wire: EncodedRegisters,
     tombs_wire: EncodedTombstones,
     cluster_view: ClusterViewId,
+    root_schema_version: u32,
     sink: &delta_sink::Client,
 ) -> Result<bool, capnp::Error> {
     let chunk_max = delta_chunk_max();
@@ -540,6 +598,7 @@ async fn send_chunks(
             let mut chunk_builder = req.get().init_chunk();
             chunk_builder.set_domain(domain);
             cluster_view.write_capnp(chunk_builder.reborrow().init_view());
+            chunk_builder.set_root_schema_version(root_schema_version);
 
             let mut regs_builder = chunk_builder.reborrow().init_regs(regs_chunk.len() as u32);
             for (idx, (key, reg)) in regs_chunk.iter().enumerate() {
