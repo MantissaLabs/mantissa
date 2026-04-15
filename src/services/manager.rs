@@ -1,6 +1,6 @@
 use crate::gossip::Message;
 use crate::registry::Registry;
-use crate::scheduler::placement::PlacementNode;
+use crate::scheduler::placement::{PlacementNode, PlacementPreferenceInventory};
 use crate::services::dependencies::{TemplateDependencyStage, build_template_dependency_stages};
 use crate::services::ordering::should_accept_service_update;
 use crate::services::reconcile::{
@@ -628,6 +628,12 @@ impl ServiceController {
                         .peer_address(node_id)
                         .unwrap_or_default(),
                     self.cluster_registry
+                        .peer_platform_os(node_id)
+                        .unwrap_or_default(),
+                    self.cluster_registry
+                        .peer_platform_arch(node_id)
+                        .unwrap_or_default(),
+                    self.cluster_registry
                         .peer_labels(node_id)
                         .map(|labels| labels.labels)
                         .unwrap_or_default(),
@@ -819,12 +825,15 @@ impl ServiceController {
         let service_id = compute_service_id(&service_name);
         let eligible_nodes = self.collect_eligible_nodes();
         let placement_nodes = self.placement_nodes_for(&eligible_nodes);
+        let preference_inventory =
+            build_placement_preference_inventory(&self.workload_manager).await?;
         let requests = build_start_requests(
             &service_name,
             service_id,
             &task_templates,
             &eligible_nodes,
             &placement_nodes,
+            &preference_inventory,
             &self.volume_registry,
         )?;
 
@@ -1082,11 +1091,15 @@ impl ServiceController {
         }
 
         let placement_nodes = self.placement_nodes_for(&eligible_nodes);
+        let preference_inventory =
+            build_placement_preference_inventory(&self.workload_manager).await?;
         let slot_targets = compute_effective_slot_targets(
+            &service_name,
             service_id,
             &task_templates,
             &eligible_nodes,
             &placement_nodes,
+            &preference_inventory,
             &self.volume_registry,
         )?;
 
@@ -2396,13 +2409,16 @@ fn build_start_requests(
     task_templates: &[TaskTemplateSpecValue],
     eligible_nodes: &[Uuid],
     placement_nodes: &[PlacementNode],
+    preference_inventory: &PlacementPreferenceInventory,
     volume_registry: &VolumeRegistry,
 ) -> anyhow::Result<Vec<WorkloadStartRequest>> {
     let slot_targets = compute_effective_slot_targets(
+        service_name,
         service_id,
         task_templates,
         eligible_nodes,
         placement_nodes,
+        preference_inventory,
         volume_registry,
     )?;
     let mut requests = Vec::new();
@@ -2452,17 +2468,21 @@ fn build_missing_template_requests(
 
 /// Computes effective slot targets after applying any hard local-volume locality overrides.
 fn compute_effective_slot_targets(
+    service_name: &str,
     service_id: Uuid,
     task_templates: &[TaskTemplateSpecValue],
     eligible_nodes: &[Uuid],
     placement_nodes: &[PlacementNode],
+    preference_inventory: &PlacementPreferenceInventory,
     volume_registry: &VolumeRegistry,
 ) -> anyhow::Result<HashMap<SlotKey, Uuid>> {
     let mut targets = compute_slot_targets_with_placement(
         service_id,
+        service_name,
         task_templates,
         eligible_nodes,
         placement_nodes,
+        preference_inventory,
     )?;
     for template in task_templates {
         let Some(target_node) = resolve_template_volume_target(volume_registry, &template.volumes)?
@@ -2477,6 +2497,26 @@ fn compute_effective_slot_targets(
         }
     }
     Ok(targets)
+}
+
+/// Builds the active service-replica inventory used by soft affinity and anti-affinity hints.
+///
+/// Only non-terminal workloads are counted so stale history does not bias future placement.
+async fn build_placement_preference_inventory(
+    workload_manager: &WorkloadManager,
+) -> anyhow::Result<PlacementPreferenceInventory> {
+    let active_filter = TaskStateFilter::active_only();
+    let workloads = workload_manager.list_workloads(&active_filter).await?;
+    let mut inventory = PlacementPreferenceInventory::default();
+
+    for workload in workloads {
+        let Some(owner) = workload.service_owner() else {
+            continue;
+        };
+        inventory.record_service_replica(workload.node_id, &owner.service_name, &owner.template);
+    }
+
+    Ok(inventory)
 }
 
 /// Resolves one hard target node for a template when all mounted local volumes are already bound.

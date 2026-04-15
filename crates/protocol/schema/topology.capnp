@@ -284,6 +284,12 @@ struct NodeInfo {
 
   labelsActorNodeId @28 :Node.NodeId;
   # Actor node id used to resolve label-state conflicts deterministically.
+
+  platformOs @29 :Text;
+  # Canonical scheduler-visible operating-system identifier for placement selectors.
+
+  platformArch @30 :Text;
+  # Canonical scheduler-visible architecture identifier for placement selectors.
 }
 
 struct NodeList {

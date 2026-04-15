@@ -19,6 +19,8 @@ pub(super) struct JoinPayload {
     pub(super) id: Uuid,
     pub(super) hostname: String,
     pub(super) advertise_addr: String,
+    pub(super) platform_os: String,
+    pub(super) platform_arch: String,
     pub(super) incarnation: u64,
     pub(super) server_handle: server::Client,
     pub(super) public_key: [u8; 32],
@@ -28,6 +30,16 @@ pub(super) struct JoinPayload {
     pub(super) scheduling: PeerSchedulingState,
     pub(super) labels: PeerLabelState,
     pub(super) runtime_support: RuntimeSupportProfile,
+}
+
+/// Writes the scheduler-visible platform selectors into the topology `NodeInfo` builder.
+pub(super) fn write_platform_fields_to_node_info(
+    mut info: node_info_capnp::Builder<'_>,
+    platform_os: &str,
+    platform_arch: &str,
+) {
+    info.set_platform_os(platform_os);
+    info.set_platform_arch(platform_arch);
 }
 
 /// Internal drain state used while deriving the operator-facing drain status response.
@@ -201,6 +213,11 @@ pub(super) fn write_join_payload_to_node_info(
     cluster_view.write_capnp(info.reborrow().init_active_cluster_view());
     info.set_hostname(&payload.hostname);
     info.set_addr(&payload.advertise_addr);
+    write_platform_fields_to_node_info(
+        info.reborrow(),
+        &payload.platform_os,
+        &payload.platform_arch,
+    );
     info.set_handle(payload.server_handle.clone());
     info.set_public_key(&payload.public_key);
     info.set_signing_key(&payload.signing_key);
@@ -223,6 +240,11 @@ pub(super) fn write_listed_node_row(
     cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
     node.set_addr(&row.value.address);
     node.set_hostname(&row.value.hostname);
+    write_platform_fields_to_node_info(
+        node.reborrow(),
+        &row.value.platform_os,
+        &row.value.platform_arch,
+    );
     node.set_public_key(&row.value.noise_static_pub);
     node.set_signing_key(&row.value.signing_pub);
     write_scheduling_fields_to_node_info(node.reborrow(), &row.value.scheduling);
@@ -335,6 +357,8 @@ fn write_join_event(
         id,
         hostname,
         address,
+        platform_os,
+        platform_arch,
         root_hash,
         incarnation,
         client,
@@ -353,6 +377,7 @@ fn write_join_event(
     let mut node = init_topology_event_node(msg, topology_event::EventType::Add, id, cluster_view);
     node.set_hostname(hostname);
     node.set_addr(address);
+    write_platform_fields_to_node_info(node.reborrow(), platform_os, platform_arch);
     node.set_root_hash(root_hash);
     node.set_public_key(&noise_static_pub.to_bytes());
     node.set_signing_key(&signing_pub.to_bytes());

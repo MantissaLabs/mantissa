@@ -798,6 +798,8 @@ mod tests {
             value: Arc::new(PeerValue {
                 address: format!("127.0.0.1:{}", 10_000 + idx),
                 hostname: format!("peer-{idx}"),
+                platform_os: String::new(),
+                platform_arch: String::new(),
                 noise_static_pub: [idx as u8; 32],
                 signing_pub: [idx as u8; 32],
                 identity_sig: Vec::new(),

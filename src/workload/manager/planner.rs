@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::anyhow;
@@ -10,13 +11,17 @@ use uuid::Uuid;
 use crate::gpu::gpu_runtime_status;
 use crate::runtime::types::{RuntimeInstanceRef, RuntimeSupportProfile};
 use crate::scheduler::digest::SchedulerDigestValue;
-use crate::scheduler::placement::{PlacementNode, PlacementPolicy, PlacementStrategy};
+use crate::scheduler::placement::{
+    PlacementNode, PlacementPolicy, PlacementPreferenceCounts, PlacementPreferenceInventory,
+    PlacementStrategy, compare_placement_preference_counts,
+};
 use crate::scheduler::{
     GpuDeviceReservation, GpuDeviceState, SchedulerSnapshot, SlotCapacity, SlotId, SlotState,
 };
 use crate::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadEnvironmentVariable as TaskEnvironmentVariable,
-    WorkloadOwner, WorkloadSecretFile, WorkloadVolumeMount as TaskVolumeMount,
+    WorkloadOwner, WorkloadPhase, WorkloadSecretFile, WorkloadValue,
+    WorkloadVolumeMount as TaskVolumeMount,
 };
 use crate::workload::types::{WorkloadLivenessProbe, WorkloadRestartPolicy};
 
@@ -554,6 +559,13 @@ struct BinpackScore {
     free_gpu_count: u32,
 }
 
+/// Service ownership context required to evaluate soft affinity hints for one intent.
+#[derive(Clone, Copy)]
+struct PreferenceContext<'a> {
+    service_name: &'a str,
+    template_name: &'a str,
+}
+
 impl CandidateCapacity {
     /// Adds one hydrated candidate's free capacity into the running aggregate.
     fn add_candidate(&mut self, candidate: &Candidate) {
@@ -608,6 +620,138 @@ fn prefers_binpack_score(left: BinpackScore, right: BinpackScore) -> bool {
     }
 
     false
+}
+
+/// Returns true when a spread candidate should replace the current best untargeted choice.
+///
+/// Operator-declared preferences win first. When preferences tie, the earlier queue position keeps
+/// the ring rotation stable, and the lower node id is only a deterministic last-resort tie-break.
+fn prefers_spread_candidate(
+    preference_cmp: Ordering,
+    candidate_index: usize,
+    best_index: usize,
+    candidate_node_id: Uuid,
+    best_node_id: Uuid,
+) -> bool {
+    let has_better_preferences = preference_cmp.is_gt();
+    if has_better_preferences {
+        return true;
+    }
+
+    let preferences_tie = preference_cmp == Ordering::Equal;
+    if !preferences_tie {
+        return false;
+    }
+
+    let appears_earlier_in_ring = candidate_index < best_index;
+    if appears_earlier_in_ring {
+        return true;
+    }
+
+    let shares_same_ring_position = candidate_index == best_index;
+    if !shares_same_ring_position {
+        return false;
+    }
+
+    candidate_node_id < best_node_id
+}
+
+/// Returns true when a binpack candidate should replace the current best untargeted choice.
+///
+/// Explicit preferences still outrank raw packing density. Once preferences tie, the tighter
+/// binpack score wins, and the lower node id only resolves perfectly identical candidates.
+fn prefers_binpack_candidate(
+    preference_cmp: Ordering,
+    candidate_score: BinpackScore,
+    best_score: BinpackScore,
+    candidate_node_id: Uuid,
+    best_node_id: Uuid,
+) -> bool {
+    let has_better_preferences = preference_cmp.is_gt();
+    if has_better_preferences {
+        return true;
+    }
+
+    let preferences_tie = preference_cmp == Ordering::Equal;
+    if !preferences_tie {
+        return false;
+    }
+
+    let has_tighter_binpack_score = prefers_binpack_score(candidate_score, best_score);
+    if has_tighter_binpack_score {
+        return true;
+    }
+
+    let has_same_binpack_score = candidate_score == best_score;
+    if !has_same_binpack_score {
+        return false;
+    }
+
+    candidate_node_id < best_node_id
+}
+
+/// Returns the service ownership metadata needed to evaluate placement preferences for an intent.
+fn preference_context(intent: &StartIntent) -> Option<PreferenceContext<'_>> {
+    let owner = intent.owner.as_ref()?.as_service_replica()?;
+    Some(PreferenceContext {
+        service_name: owner.service_name.as_str(),
+        template_name: owner.template.as_str(),
+    })
+}
+
+/// Returns true when the workload should influence future affinity and anti-affinity decisions.
+fn workload_counts_toward_preferences(workload: &WorkloadValue) -> bool {
+    matches!(
+        workload.state,
+        WorkloadPhase::Pending
+            | WorkloadPhase::Pulling
+            | WorkloadPhase::Creating
+            | WorkloadPhase::VolumeUnavailable
+            | WorkloadPhase::Running
+            | WorkloadPhase::Stopping
+    )
+}
+
+/// Builds the current service-replica inventory used by soft placement preferences.
+fn build_preference_inventory(
+    workloads: &HashMap<Uuid, WorkloadValue>,
+) -> PlacementPreferenceInventory {
+    let mut inventory = PlacementPreferenceInventory::default();
+
+    for workload in workloads.values() {
+        if !workload_counts_toward_preferences(workload) {
+            continue;
+        }
+
+        let Some(owner) = workload
+            .owner
+            .as_ref()
+            .and_then(WorkloadOwner::as_service_replica)
+        else {
+            continue;
+        };
+
+        inventory.record_service_replica(workload.node_id, &owner.service_name, &owner.template);
+    }
+
+    inventory
+}
+
+/// Returns the preference counts visible on one candidate for the provided scheduling intent.
+fn candidate_preference_counts(
+    inventory: &PlacementPreferenceInventory,
+    candidate_node_id: Uuid,
+    context: Option<PreferenceContext<'_>>,
+) -> PlacementPreferenceCounts {
+    let Some(context) = context else {
+        return PlacementPreferenceCounts::default();
+    };
+
+    inventory.counts_for(
+        candidate_node_id,
+        context.service_name,
+        context.template_name,
+    )
 }
 
 /// Returns true when the digest can plausibly host the intent without fetching slot details.
@@ -849,6 +993,8 @@ impl WorkloadManager {
 
         let local_version = snapshot.version;
         let readiness_map = self.collect_network_readiness()?;
+        let workload_values = self.load_workload_value_index().await?;
+        let mut preference_inventory = build_preference_inventory(workload_values.as_ref());
         let local_ready = readiness_map
             .get(&self.local_node_id)
             .cloned()
@@ -884,7 +1030,12 @@ impl WorkloadManager {
             return Err(SchedulingError::NoCapacityAcrossCluster.into());
         }
 
-        self.allocate_remaining(&mut assignment, &mut candidates, remaining_intents)?;
+        self.allocate_remaining(
+            &mut assignment,
+            &mut candidates,
+            remaining_intents,
+            &mut preference_inventory,
+        )?;
         assignment.local.sort_by_key(|plan| plan.index);
         assignment.remote.sort_by_key(|plan| plan.index);
         Ok(assignment)
@@ -1159,6 +1310,14 @@ impl WorkloadManager {
                 self.core.registry.peer_address(peer_id).unwrap_or_default(),
                 self.core
                     .registry
+                    .peer_platform_os(peer_id)
+                    .unwrap_or_default(),
+                self.core
+                    .registry
+                    .peer_platform_arch(peer_id)
+                    .unwrap_or_default(),
+                self.core
+                    .registry
                     .peer_labels(peer_id)
                     .map(|labels| labels.labels)
                     .unwrap_or_default(),
@@ -1228,6 +1387,14 @@ impl WorkloadManager {
                 .unwrap_or_default(),
             self.core
                 .registry
+                .peer_platform_os(self.local_node_id)
+                .unwrap_or_default(),
+            self.core
+                .registry
+                .peer_platform_arch(self.local_node_id)
+                .unwrap_or_default(),
+            self.core
+                .registry
                 .peer_labels(self.local_node_id)
                 .map(|labels| labels.labels)
                 .unwrap_or_default(),
@@ -1273,6 +1440,14 @@ impl WorkloadManager {
                 self.core
                     .registry
                     .peer_address(hint.peer_id)
+                    .unwrap_or_default(),
+                self.core
+                    .registry
+                    .peer_platform_os(hint.peer_id)
+                    .unwrap_or_default(),
+                self.core
+                    .registry
+                    .peer_platform_arch(hint.peer_id)
                     .unwrap_or_default(),
                 self.core
                     .registry
@@ -1371,81 +1546,129 @@ impl WorkloadManager {
         Err(SchedulingError::InsufficientCapacityOnTarget { target_node }.into())
     }
 
-    /// Allocates one untargeted intent by rotating the shared candidate ring to spread replicas.
+    /// Allocates one untargeted intent by preferring the best spread candidate in the ring.
+    ///
+    /// The queue order still defines the baseline spread behavior. Soft preferences are evaluated
+    /// first, and when they tie the candidate closest to the front of the ring wins so repeated
+    /// allocations continue to rotate naturally across the cluster.
     fn allocate_spread_intent(
         &self,
         candidates: &mut VecDeque<Candidate>,
         intent: &StartIntent,
-    ) -> Result<(CandidateLocation, ResourceAllocation), anyhow::Error> {
-        let candidate_count = candidates.len();
-        if candidate_count == 0 {
-            return Err(SchedulingError::InsufficientCapacityForBatch.into());
-        }
-
-        let mut skipped_for_constraints = false;
-        let mut skipped_for_networks = false;
-        let mut skipped_for_runtime = false;
-        for _ in 0..candidate_count {
-            let mut candidate = candidates
-                .pop_front()
-                .expect("candidate deque should not be empty");
-
-            if !candidate.matches_placement(intent) {
-                skipped_for_constraints = true;
-                candidates.push_back(candidate);
-                continue;
-            }
-
-            if !candidate.supports_runtime_requirements(intent) {
-                skipped_for_runtime = true;
-                candidates.push_back(candidate);
-                continue;
-            }
-
-            if !candidate.can_host(&intent.networks) {
-                skipped_for_networks = true;
-                candidates.push_back(candidate);
-                continue;
-            }
-
-            if let Some(allocation) =
-                candidate.allocate(intent.cpu_millis, intent.memory_bytes, intent.gpu_count)
-            {
-                let location = candidate.location.clone();
-                if !candidate.is_empty() {
-                    candidates.push_back(candidate);
-                }
-                return Ok((location, allocation));
-            }
-
-            candidates.push_back(candidate);
-        }
-
-        if skipped_for_constraints {
-            Err(intent.placement_error().into())
-        } else if skipped_for_runtime {
-            Err(intent.runtime_requirements_error().into())
-        } else if skipped_for_networks {
-            Err(SchedulingError::NetworksBlocked {
-                networks: intent.networks.clone(),
-            }
-            .into())
-        } else {
-            Err(SchedulingError::InsufficientCapacityForBatch.into())
-        }
-    }
-
-    /// Allocates one untargeted intent by preferring the tightest viable candidate.
-    fn allocate_binpack_intent(
-        &self,
-        candidates: &mut VecDeque<Candidate>,
-        intent: &StartIntent,
+        preference_inventory: &PlacementPreferenceInventory,
     ) -> Result<(CandidateLocation, ResourceAllocation), anyhow::Error> {
         if candidates.is_empty() {
             return Err(SchedulingError::InsufficientCapacityForBatch.into());
         }
 
-        let mut best: Option<(usize, BinpackScore, Uuid)> = None;
+        let preference_context = preference_context(intent);
+        let mut best_index: Option<usize> = None;
+        let mut best_node_id = Uuid::nil();
+        let mut best_preference_counts = PlacementPreferenceCounts::default();
+        let mut skipped_for_constraints = false;
+        let mut skipped_for_networks = false;
+        let mut skipped_for_runtime = false;
+
+        for (idx, candidate) in candidates.iter().enumerate() {
+            let node_id = candidate.node_id(self.local_node_id);
+
+            if !candidate.matches_placement(intent) {
+                skipped_for_constraints = true;
+                continue;
+            }
+
+            if !candidate.supports_runtime_requirements(intent) {
+                skipped_for_runtime = true;
+                continue;
+            }
+
+            if !candidate.can_host(&intent.networks) {
+                skipped_for_networks = true;
+                continue;
+            }
+
+            if candidate
+                .clone()
+                .allocate(intent.cpu_millis, intent.memory_bytes, intent.gpu_count)
+                .is_none()
+            {
+                continue;
+            }
+
+            let preference_counts =
+                candidate_preference_counts(preference_inventory, node_id, preference_context);
+
+            match best_index {
+                None => {
+                    best_index = Some(idx);
+                    best_node_id = node_id;
+                    best_preference_counts = preference_counts;
+                }
+                Some(current_best_index) => {
+                    let preference_cmp = compare_placement_preference_counts(
+                        intent.placement.preferences.as_slice(),
+                        preference_counts,
+                        best_preference_counts,
+                    );
+                    if prefers_spread_candidate(
+                        preference_cmp,
+                        idx,
+                        current_best_index,
+                        node_id,
+                        best_node_id,
+                    ) {
+                        best_index = Some(idx);
+                        best_node_id = node_id;
+                        best_preference_counts = preference_counts;
+                    }
+                }
+            }
+        }
+
+        let Some(best_index) = best_index else {
+            if skipped_for_constraints {
+                return Err(intent.placement_error().into());
+            } else if skipped_for_runtime {
+                return Err(intent.runtime_requirements_error().into());
+            } else if skipped_for_networks {
+                return Err(SchedulingError::NetworksBlocked {
+                    networks: intent.networks.clone(),
+                }
+                .into());
+            } else {
+                return Err(SchedulingError::InsufficientCapacityForBatch.into());
+            }
+        };
+
+        let mut candidate = candidates
+            .remove(best_index)
+            .expect("selected spread candidate index should remain valid");
+        let allocation = candidate
+            .allocate(intent.cpu_millis, intent.memory_bytes, intent.gpu_count)
+            .expect("spread candidate should allocate after preflight");
+        let location = candidate.location.clone();
+        if !candidate.is_empty() {
+            candidates.push_back(candidate);
+        }
+        Ok((location, allocation))
+    }
+
+    /// Allocates one untargeted intent by preferring the tightest viable candidate.
+    ///
+    /// Soft preferences can still override the raw binpack score when operators explicitly ask
+    /// for affinity or anti-affinity behavior.
+    fn allocate_binpack_intent(
+        &self,
+        candidates: &mut VecDeque<Candidate>,
+        intent: &StartIntent,
+        preference_inventory: &PlacementPreferenceInventory,
+    ) -> Result<(CandidateLocation, ResourceAllocation), anyhow::Error> {
+        if candidates.is_empty() {
+            return Err(SchedulingError::InsufficientCapacityForBatch.into());
+        }
+
+        let preference_context = preference_context(intent);
+        let mut best: Option<(usize, PlacementPreferenceCounts, BinpackScore, Uuid)> = None;
         let mut skipped_for_constraints = false;
         let mut skipped_for_networks = false;
         let mut skipped_for_runtime = false;
@@ -1470,19 +1693,30 @@ impl WorkloadManager {
                 continue;
             };
             let node_id = candidate.node_id(self.local_node_id);
+            let preference_counts =
+                candidate_preference_counts(preference_inventory, node_id, preference_context);
             match best {
-                None => best = Some((idx, score, node_id)),
-                Some((_, best_score, best_node_id))
-                    if prefers_binpack_score(score, best_score)
-                        || (score == best_score && node_id < best_node_id) =>
-                {
-                    best = Some((idx, score, node_id));
+                None => best = Some((idx, preference_counts, score, node_id)),
+                Some((_, best_preference_counts, best_score, best_node_id)) => {
+                    let preference_cmp = compare_placement_preference_counts(
+                        intent.placement.preferences.as_slice(),
+                        preference_counts,
+                        best_preference_counts,
+                    );
+                    if prefers_binpack_candidate(
+                        preference_cmp,
+                        score,
+                        best_score,
+                        node_id,
+                        best_node_id,
+                    ) {
+                        best = Some((idx, preference_counts, score, node_id));
+                    }
                 }
-                _ => {}
             }
         }
 
-        let Some((best_index, _, _)) = best else {
+        let Some((best_index, _, _, _)) = best else {
             if skipped_for_constraints {
                 return Err(intent.placement_error().into());
             } else if skipped_for_runtime {
@@ -1584,18 +1818,36 @@ impl WorkloadManager {
         assignment: &mut Assignment,
         candidates: &mut VecDeque<Candidate>,
         intents: Vec<&StartIntent>,
+        preference_inventory: &mut PlacementPreferenceInventory,
     ) -> Result<(), anyhow::Error> {
         for intent in intents {
             let (location, allocation) = if let Some(target_node) = intent.target_node {
                 self.allocate_targeted_intent(candidates, intent, target_node)?
             } else {
                 match intent.placement.strategy {
-                    PlacementStrategy::Spread => self.allocate_spread_intent(candidates, intent)?,
+                    PlacementStrategy::Spread => {
+                        self.allocate_spread_intent(candidates, intent, preference_inventory)?
+                    }
                     PlacementStrategy::Binpack => {
-                        self.allocate_binpack_intent(candidates, intent)?
+                        self.allocate_binpack_intent(candidates, intent, preference_inventory)?
                     }
                 }
             };
+            let assigned_node_id = match &location {
+                CandidateLocation::Local => self.local_node_id,
+                CandidateLocation::Remote { peer_id } => *peer_id,
+            };
+            if let Some(owner) = intent
+                .owner
+                .as_ref()
+                .and_then(WorkloadOwner::as_service_replica)
+            {
+                preference_inventory.record_service_replica(
+                    assigned_node_id,
+                    &owner.service_name,
+                    &owner.template,
+                );
+            }
             self.push_assignment(assignment, intent, location, allocation);
         }
 

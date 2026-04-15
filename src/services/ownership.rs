@@ -1,6 +1,10 @@
-use crate::scheduler::placement::{PlacementNode, PlacementStrategy};
+use crate::scheduler::placement::{
+    PlacementNode, PlacementPreference, PlacementPreferenceCounts, PlacementPreferenceInventory,
+    PlacementStrategy, compare_placement_preference_counts,
+};
 use crate::services::types::{ServiceSpecValue, TaskTemplateSpecValue};
 use anyhow::anyhow;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -58,16 +62,25 @@ pub(super) fn compute_slot_targets(
     task_templates: &[TaskTemplateSpecValue],
     eligible_nodes: &[Uuid],
 ) -> HashMap<SlotKey, Uuid> {
-    compute_slot_targets_with_placement(service_id, task_templates, eligible_nodes, &[])
-        .unwrap_or_default()
+    compute_slot_targets_with_placement(
+        service_id,
+        "service",
+        task_templates,
+        eligible_nodes,
+        &[],
+        &PlacementPreferenceInventory::default(),
+    )
+    .unwrap_or_default()
 }
 
 /// Computes deterministic target nodes while honoring each template's hard placement policy.
 pub(super) fn compute_slot_targets_with_placement(
     service_id: Uuid,
+    service_name: &str,
     task_templates: &[TaskTemplateSpecValue],
     eligible_nodes: &[Uuid],
     placement_nodes: &[PlacementNode],
+    existing_preferences: &PlacementPreferenceInventory,
 ) -> anyhow::Result<HashMap<SlotKey, Uuid>> {
     let mut targets = HashMap::new();
     if eligible_nodes.is_empty() {
@@ -103,7 +116,7 @@ pub(super) fn compute_slot_targets_with_placement(
         };
         if candidates.is_empty() {
             return Err(anyhow!(
-                "service template '{}' placement constraints exclude every eligible node",
+                "task template '{}' placement constraints exclude every eligible node",
                 template.name
             ));
         }
@@ -120,6 +133,7 @@ pub(super) fn compute_slot_targets_with_placement(
 
     let mut total_counts: HashMap<Uuid, usize> = HashMap::new();
     let mut template_counts: HashMap<(Uuid, String), usize> = HashMap::new();
+    let mut preference_inventory = existing_preferences.clone();
 
     for (template, replica) in slots {
         let key = SlotKey::new(service_id, &template.name, replica);
@@ -129,25 +143,31 @@ pub(super) fn compute_slot_targets_with_placement(
             .unwrap_or(eligible_nodes);
         let ranked = rank_nodes_for_slot(service_id, &template.name, replica, candidates);
         let strategy = template.placement().strategy;
-        let Some(node_id) = choose_slot_target(
-            &template.name,
-            strategy,
-            &ranked,
+        let context = SlotTargetingContext {
+            service_name,
+            template_name: &template.name,
+            preferences: template.placement().preferences.as_slice(),
+            total_counts: &total_counts,
+            template_counts: &template_counts,
+            preference_inventory: &preference_inventory,
+        };
+        let spread_limits = SpreadLimits {
             service_max,
-            template_caps
+            template_cap: template_caps
                 .get(&template.name)
                 .copied()
                 .unwrap_or(service_max),
-            &total_counts,
-            &template_counts,
-        )
-        .or_else(|| ranked.first().copied()) else {
+        };
+        let Some(node_id) = choose_slot_target(&context, strategy, &ranked, spread_limits)
+            .or_else(|| ranked.first().copied())
+        else {
             continue;
         };
 
         *total_counts.entry(node_id).or_insert(0) += 1;
         let template_key = (node_id, template.name.clone());
         *template_counts.entry(template_key).or_insert(0) += 1;
+        preference_inventory.record_service_replica(node_id, service_name, &template.name);
         targets.insert(key, node_id);
     }
 
@@ -156,27 +176,150 @@ pub(super) fn compute_slot_targets_with_placement(
 
 /// Chooses one deterministic target node for a slot using the template's ranking strategy.
 fn choose_slot_target(
-    template_name: &str,
+    context: &SlotTargetingContext<'_>,
     strategy: PlacementStrategy,
     ranked: &[Uuid],
-    service_max: usize,
-    template_cap: usize,
-    total_counts: &HashMap<Uuid, usize>,
-    template_counts: &HashMap<(Uuid, String), usize>,
+    spread_limits: SpreadLimits,
 ) -> Option<Uuid> {
     match strategy {
-        PlacementStrategy::Spread => choose_spread_slot_target(
-            template_name,
-            ranked,
-            service_max,
-            template_cap,
-            total_counts,
-            template_counts,
-        ),
-        PlacementStrategy::Binpack => {
-            choose_binpack_slot_target(template_name, ranked, total_counts, template_counts)
-        }
+        PlacementStrategy::Spread => choose_spread_slot_target(context, ranked, spread_limits),
+        PlacementStrategy::Binpack => choose_binpack_slot_target(context, ranked),
     }
+}
+
+/// Ranked metadata snapshot for one candidate node while choosing a service replica slot.
+#[derive(Clone, Copy, Debug)]
+struct SlotTargetCandidate {
+    node_id: Uuid,
+    rank_idx: usize,
+    total_count: usize,
+    template_count: usize,
+    preference_counts: PlacementPreferenceCounts,
+}
+
+/// Shared immutable inputs reused while evaluating one replica slot target.
+struct SlotTargetingContext<'a> {
+    service_name: &'a str,
+    template_name: &'a str,
+    preferences: &'a [PlacementPreference],
+    total_counts: &'a HashMap<Uuid, usize>,
+    template_counts: &'a HashMap<(Uuid, String), usize>,
+    preference_inventory: &'a PlacementPreferenceInventory,
+}
+
+/// Spread-specific balancing bounds for one candidate set.
+#[derive(Clone, Copy)]
+struct SpreadLimits {
+    service_max: usize,
+    template_cap: usize,
+}
+
+/// Builds the candidate metadata needed by spread and binpack slot selection.
+fn slot_target_candidate(
+    context: &SlotTargetingContext<'_>,
+    node_id: Uuid,
+    rank_idx: usize,
+) -> SlotTargetCandidate {
+    SlotTargetCandidate {
+        node_id,
+        rank_idx,
+        total_count: context.total_counts.get(&node_id).copied().unwrap_or(0),
+        template_count: context
+            .template_counts
+            .get(&(node_id, context.template_name.to_string()))
+            .copied()
+            .unwrap_or(0),
+        preference_counts: context.preference_inventory.counts_for(
+            node_id,
+            context.service_name,
+            context.template_name,
+        ),
+    }
+}
+
+/// Compares two candidate snapshots according to the declared soft placement preferences.
+fn preference_ordering(
+    preferences: &[PlacementPreference],
+    left: SlotTargetCandidate,
+    right: SlotTargetCandidate,
+) -> Ordering {
+    compare_placement_preference_counts(
+        preferences,
+        left.preference_counts,
+        right.preference_counts,
+    )
+}
+
+/// Returns true when the new spread candidate is preferable to the current best candidate.
+///
+/// Spread first honors explicit soft preferences, then keeps the service-wide replica count low,
+/// then keeps the template-local count low, and finally falls back to rendezvous rank to keep
+/// ownership deterministic.
+fn spread_prefers_candidate(
+    preferences: &[PlacementPreference],
+    candidate: SlotTargetCandidate,
+    best: SlotTargetCandidate,
+) -> bool {
+    let preference_cmp = preference_ordering(preferences, candidate, best);
+    if preference_cmp != Ordering::Equal {
+        return preference_cmp.is_gt();
+    }
+
+    let spreads_service_more_evenly = candidate.total_count < best.total_count;
+    if spreads_service_more_evenly {
+        return true;
+    }
+    let has_same_service_load = candidate.total_count == best.total_count;
+    if !has_same_service_load {
+        return false;
+    }
+
+    let spreads_template_more_evenly = candidate.template_count < best.template_count;
+    if spreads_template_more_evenly {
+        return true;
+    }
+    let has_same_template_load = candidate.template_count == best.template_count;
+    if !has_same_template_load {
+        return false;
+    }
+
+    candidate.rank_idx < best.rank_idx
+}
+
+/// Returns true when the new binpack candidate is preferable to the current best candidate.
+///
+/// Binpack still lets explicit soft preferences win first. Once two candidates are equally
+/// preferred, it chooses the node that is already the fullest for this service, then for this
+/// template, and finally uses rendezvous rank as the deterministic tie-breaker.
+fn binpack_prefers_candidate(
+    preferences: &[PlacementPreference],
+    candidate: SlotTargetCandidate,
+    best: SlotTargetCandidate,
+) -> bool {
+    let preference_cmp = preference_ordering(preferences, candidate, best);
+    if preference_cmp != Ordering::Equal {
+        return preference_cmp.is_gt();
+    }
+
+    let packs_more_service_replicas = candidate.total_count > best.total_count;
+    if packs_more_service_replicas {
+        return true;
+    }
+    let has_same_service_load = candidate.total_count == best.total_count;
+    if !has_same_service_load {
+        return false;
+    }
+
+    let packs_more_template_replicas = candidate.template_count > best.template_count;
+    if packs_more_template_replicas {
+        return true;
+    }
+    let has_same_template_load = candidate.template_count == best.template_count;
+    if !has_same_template_load {
+        return false;
+    }
+
+    candidate.rank_idx < best.rank_idx
 }
 
 /// Chooses one slot target while keeping both service-wide and template-local replica counts even.
@@ -186,42 +329,66 @@ fn choose_slot_target(
 /// those two goals conflict, service-wide balance wins because it affects the
 /// entire deployment shape rather than a single template slice.
 fn choose_spread_slot_target(
-    template_name: &str,
+    context: &SlotTargetingContext<'_>,
     ranked: &[Uuid],
-    service_max: usize,
-    template_cap: usize,
-    total_counts: &HashMap<Uuid, usize>,
-    template_counts: &HashMap<(Uuid, String), usize>,
+    limits: SpreadLimits,
 ) -> Option<Uuid> {
-    let template_name = template_name.to_string();
+    if !context.preferences.is_empty() {
+        // Explicit soft preferences should outrank spread's balancing caps. The spread
+        // comparator still uses service/template load as a secondary signal, so this path
+        // keeps the deployment stable without forcing operators to switch strategies just
+        // to co-locate or separate replicas deliberately.
+        let mut best: Option<SlotTargetCandidate> = None;
 
-    // First pass: keep both the global service cap and the template-local cap intact.
-    // This is the ideal spread outcome because it avoids both service-level skew and
-    // template-level hotspots on the same node.
-    for node_id in ranked {
-        let total = total_counts.get(node_id).copied().unwrap_or(0);
-        let template_key = (*node_id, template_name.clone());
-        let template_total = template_counts.get(&template_key).copied().unwrap_or(0);
-        let service_has_capacity = total < service_max;
-        let template_has_capacity = template_total < template_cap;
+        for (rank_idx, node_id) in ranked.iter().copied().enumerate() {
+            let candidate = slot_target_candidate(context, node_id, rank_idx);
+
+            match best {
+                None => best = Some(candidate),
+                Some(current_best)
+                    if spread_prefers_candidate(context.preferences, candidate, current_best) =>
+                {
+                    best = Some(candidate);
+                }
+                _ => {}
+            }
+        }
+
+        return best.map(|candidate| candidate.node_id);
+    }
+
+    let mut best_with_template_capacity: Option<SlotTargetCandidate> = None;
+    let mut best_with_service_capacity: Option<SlotTargetCandidate> = None;
+
+    for (rank_idx, node_id) in ranked.iter().copied().enumerate() {
+        let candidate = slot_target_candidate(context, node_id, rank_idx);
+        let service_has_capacity = candidate.total_count < limits.service_max;
+        let template_has_capacity = candidate.template_count < limits.template_cap;
+
+        if service_has_capacity {
+            match best_with_service_capacity {
+                None => best_with_service_capacity = Some(candidate),
+                Some(best) if spread_prefers_candidate(context.preferences, candidate, best) => {
+                    best_with_service_capacity = Some(candidate);
+                }
+                _ => {}
+            }
+        }
 
         if service_has_capacity && template_has_capacity {
-            return Some(*node_id);
+            match best_with_template_capacity {
+                None => best_with_template_capacity = Some(candidate),
+                Some(best) if spread_prefers_candidate(context.preferences, candidate, best) => {
+                    best_with_template_capacity = Some(candidate);
+                }
+                _ => {}
+            }
         }
     }
 
-    // Second pass: if every candidate would exceed the template-local cap, still keep the
-    // overall service balanced. This preserves the wider spread guarantee and only relaxes
-    // the narrower per-template preference when no perfect placement remains.
-    for node_id in ranked {
-        let total = total_counts.get(node_id).copied().unwrap_or(0);
-        let service_has_capacity = total < service_max;
-        if service_has_capacity {
-            return Some(*node_id);
-        }
-    }
-
-    None
+    best_with_template_capacity
+        .or(best_with_service_capacity)
+        .map(|candidate| candidate.node_id)
 }
 
 /// Chooses one slot target by reusing the fullest matching node before opening a new node.
@@ -230,51 +397,24 @@ fn choose_spread_slot_target(
 /// that already carries the most replicas for this service, then the most
 /// replicas for this template, and only falls back to rendezvous rank when the
 /// current packing level is identical.
-fn choose_binpack_slot_target(
-    template_name: &str,
-    ranked: &[Uuid],
-    total_counts: &HashMap<Uuid, usize>,
-    template_counts: &HashMap<(Uuid, String), usize>,
-) -> Option<Uuid> {
-    let template_name = template_name.to_string();
-    let mut best: Option<(Uuid, usize, usize, usize)> = None;
+fn choose_binpack_slot_target(context: &SlotTargetingContext<'_>, ranked: &[Uuid]) -> Option<Uuid> {
+    let mut best: Option<SlotTargetCandidate> = None;
 
-    for (rank_idx, node_id) in ranked.iter().enumerate() {
-        let total = total_counts.get(node_id).copied().unwrap_or(0);
-        let template_total = template_counts
-            .get(&(*node_id, template_name.clone()))
-            .copied()
-            .unwrap_or(0);
+    for (rank_idx, node_id) in ranked.iter().copied().enumerate() {
+        let candidate = slot_target_candidate(context, node_id, rank_idx);
 
         match best {
-            None => {
-                best = Some((*node_id, total, template_total, rank_idx));
+            None => best = Some(candidate),
+            Some(current_best)
+                if binpack_prefers_candidate(context.preferences, candidate, current_best) =>
+            {
+                best = Some(candidate);
             }
-            Some((_, best_total, best_template_total, best_rank_idx)) => {
-                // Prefer the node that is already the most "full" from this service's point
-                // of view. If service-level packing is tied, keep the same template packed
-                // together as well. If both counts tie, preserve the deterministic rendezvous
-                // ordering that ranked candidates for this replica slot.
-                let packs_more_service_replicas = total > best_total;
-                let same_service_replica_count = total == best_total;
-                let packs_more_template_replicas = template_total > best_template_total;
-                let same_template_replica_count = template_total == best_template_total;
-                let has_better_rank = rank_idx < best_rank_idx;
-
-                let should_replace_best = packs_more_service_replicas
-                    || (same_service_replica_count && packs_more_template_replicas)
-                    || (same_service_replica_count
-                        && same_template_replica_count
-                        && has_better_rank);
-
-                if should_replace_best {
-                    best = Some((*node_id, total, template_total, rank_idx));
-                }
-            }
+            _ => {}
         }
     }
 
-    best.map(|(node_id, _, _, _)| node_id)
+    best.map(|candidate| candidate.node_id)
 }
 
 /// Produces a stable ordering of candidate nodes for a replica slot using rendezvous hashing.
@@ -422,7 +562,8 @@ fn generation_owner_score(service_id: Uuid, service_epoch: u64, node_id: Uuid) -
 mod tests {
     use super::{SlotKey, compute_slot_targets_with_placement};
     use crate::scheduler::placement::{
-        PlacementConstraint, PlacementNode, PlacementPolicy, PlacementStrategy,
+        PlacementConstraint, PlacementNode, PlacementPolicy, PlacementPreference,
+        PlacementPreferenceInventory, PlacementStrategy,
     };
     use crate::services::types::TaskTemplateSpecValue;
     use crate::topology::peers::PeerLabel;
@@ -439,9 +580,11 @@ mod tests {
             template_with_constraints("backend", 1, vec!["node.labels.topology.zone == west"]);
         let targets = compute_slot_targets_with_placement(
             service_id,
+            "demo-service",
             &[template],
             &[east, west],
             &[placement_node(east, "east"), placement_node(west, "west")],
+            &PlacementPreferenceInventory::default(),
         )
         .expect("placement-filtered slot targets should build");
 
@@ -460,9 +603,11 @@ mod tests {
             template_with_constraints("backend", 1, vec!["node.labels.topology.zone == west"]);
         let err = compute_slot_targets_with_placement(
             service_id,
+            "demo-service",
             &[template],
             &[east],
             &[placement_node(east, "east")],
+            &PlacementPreferenceInventory::default(),
         )
         .expect_err("unsatisfied placement constraints should fail");
 
@@ -503,6 +648,7 @@ mod tests {
                                 .expect("placement constraint should parse")
                         })
                         .collect(),
+                    preferences: vec![PlacementPreference::ServiceAffinity],
                     strategy: PlacementStrategy::Spread,
                 },
             },
@@ -520,6 +666,8 @@ mod tests {
             node_id,
             format!("worker-{zone}"),
             "10.0.0.1:7000",
+            "linux",
+            "amd64",
             vec![PeerLabel {
                 key: "topology.zone".to_string(),
                 value: zone.to_string(),

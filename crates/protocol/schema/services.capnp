@@ -83,6 +83,9 @@ struct TaskTemplate {
 
   placementStrategy @21 :PlacementStrategy;
   # Candidate ranking strategy used after hard constraints pass.
+
+  placementPreferences @22 :List(PlacementPreference);
+  # Soft best-effort hints evaluated before the strategy breaks ties.
 }
 
 struct TaskTemplateNetwork {
@@ -175,6 +178,20 @@ enum PlacementStrategy {
 
   binpack @1;
   # Prefer reusing the fullest matching node before expanding onto more peers.
+}
+
+enum PlacementPreference {
+  serviceAffinity @0;
+  # Prefer nodes that already run replicas from the same service.
+
+  serviceAntiAffinity @1;
+  # Prefer nodes that currently run fewer replicas from the same service.
+
+  taskAffinity @2;
+  # Prefer nodes that already run replicas from the same task template.
+
+  taskAntiAffinity @3;
+  # Prefer nodes that currently run fewer replicas from the same task template.
 }
 
 enum RestartPolicyName {

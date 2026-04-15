@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +16,8 @@ use crate::topology::peers::PeerLabel;
 pub struct PlacementPolicy {
     #[serde(default)]
     pub constraints: Vec<PlacementConstraint>,
+    #[serde(default)]
+    pub preferences: Vec<PlacementPreference>,
     #[serde(default)]
     pub strategy: PlacementStrategy,
 }
@@ -38,6 +42,23 @@ impl PlacementPolicy {
             .map(PlacementConstraint::render_expression)
             .collect()
     }
+}
+
+/// Best-effort scheduler hints evaluated after hard constraints pass.
+///
+/// These preferences currently rely on service ownership metadata, so they are most useful for
+/// service-managed workloads whose replicas already advertise stable `(service, template)` labels.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementPreference {
+    /// Prefer nodes that already run replicas from the same service.
+    ServiceAffinity,
+    /// Prefer nodes that currently run fewer replicas from the same service.
+    ServiceAntiAffinity,
+    /// Prefer nodes that already run replicas from the same task template.
+    TaskAffinity,
+    /// Prefer nodes that currently run fewer replicas from the same task template.
+    TaskAntiAffinity,
 }
 
 /// Candidate ranking mode applied after hard placement filters pass.
@@ -151,6 +172,8 @@ pub struct PlacementNode {
     pub node_id: Uuid,
     pub hostname: String,
     pub address: String,
+    pub platform_os: String,
+    pub platform_arch: String,
     pub labels: Vec<PeerLabel>,
 }
 
@@ -160,12 +183,16 @@ impl PlacementNode {
         node_id: Uuid,
         hostname: impl Into<String>,
         address: impl Into<String>,
+        platform_os: impl Into<String>,
+        platform_arch: impl Into<String>,
         labels: Vec<PeerLabel>,
     ) -> Self {
         Self {
             node_id,
             hostname: hostname.into(),
             address: address.into(),
+            platform_os: platform_os.into(),
+            platform_arch: platform_arch.into(),
             labels,
         }
     }
@@ -204,7 +231,7 @@ pub enum PlacementConstraintParseError {
     EmptyValue { expression: String },
 
     #[error(
-        "unsupported placement constraint key '{key}'; supported keys are node.id, node.hostname, node.ip, node.address, and node.labels.<key>"
+        "unsupported placement constraint key '{key}'; supported keys are node.id, node.hostname, node.ip, node.address, node.platform.os, node.platform.arch, and node.labels.<key>"
     )]
     UnsupportedKey { key: String },
 
@@ -218,6 +245,8 @@ enum PlacementSelector {
     Hostname,
     Ip,
     Address,
+    PlatformOs,
+    PlatformArch,
     Label(String),
 }
 
@@ -241,6 +270,8 @@ impl PlacementSelector {
             "node.hostname" => Ok(Self::Hostname),
             "node.ip" => Ok(Self::Ip),
             "node.address" => Ok(Self::Address),
+            "node.platform.os" => Ok(Self::PlatformOs),
+            "node.platform.arch" => Ok(Self::PlatformArch),
             _ => Err(PlacementConstraintParseError::UnsupportedKey {
                 key: raw.to_string(),
             }),
@@ -265,6 +296,8 @@ impl PlacementSelector {
             Self::Id => node.node_id.to_string() == expected,
             Self::Hostname => node.hostname == expected,
             Self::Address => node.address == expected,
+            Self::PlatformOs => platform_os_matches_value(&node.platform_os, expected),
+            Self::PlatformArch => platform_arch_matches_value(&node.platform_arch, expected),
             Self::Label(key) => node.label_value(key) == Some(expected),
             Self::Ip => node
                 .ip_addr()
@@ -272,6 +305,121 @@ impl PlacementSelector {
                 .unwrap_or(false),
         }
     }
+}
+
+/// Per-node service-placement counts used to evaluate soft affinity preferences deterministically.
+#[derive(Clone, Debug, Default)]
+pub struct PlacementPreferenceInventory {
+    service_counts: HashMap<Uuid, HashMap<String, usize>>,
+    template_counts: HashMap<Uuid, HashMap<String, HashMap<String, usize>>>,
+}
+
+impl PlacementPreferenceInventory {
+    /// Records one visible service replica on the provided node so future placements can score it.
+    pub fn record_service_replica(
+        &mut self,
+        node_id: Uuid,
+        service_name: &str,
+        template_name: &str,
+    ) {
+        *self
+            .service_counts
+            .entry(node_id)
+            .or_default()
+            .entry(service_name.to_string())
+            .or_insert(0) += 1;
+        *self
+            .template_counts
+            .entry(node_id)
+            .or_default()
+            .entry(service_name.to_string())
+            .or_default()
+            .entry(template_name.to_string())
+            .or_insert(0) += 1;
+    }
+
+    /// Returns the visible same-service and same-template replica counts for one candidate node.
+    pub fn counts_for(
+        &self,
+        node_id: Uuid,
+        service_name: &str,
+        template_name: &str,
+    ) -> PlacementPreferenceCounts {
+        PlacementPreferenceCounts {
+            same_service_count: self
+                .service_counts
+                .get(&node_id)
+                .and_then(|counts| counts.get(service_name))
+                .copied()
+                .unwrap_or(0),
+            same_template_count: self
+                .template_counts
+                .get(&node_id)
+                .and_then(|services| services.get(service_name))
+                .and_then(|templates| templates.get(template_name))
+                .copied()
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// Preference-relevant replica counts already visible on one candidate node.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlacementPreferenceCounts {
+    pub same_service_count: usize,
+    pub same_template_count: usize,
+}
+
+impl PlacementPreference {
+    /// Returns the per-node count this preference reads when comparing two candidates.
+    fn relevant_count(self, counts: PlacementPreferenceCounts) -> usize {
+        match self {
+            PlacementPreference::ServiceAffinity | PlacementPreference::ServiceAntiAffinity => {
+                counts.same_service_count
+            }
+            PlacementPreference::TaskAffinity | PlacementPreference::TaskAntiAffinity => {
+                counts.same_template_count
+            }
+        }
+    }
+
+    /// Compares two candidate count snapshots according to this individual preference.
+    fn compare_counts(
+        self,
+        left: PlacementPreferenceCounts,
+        right: PlacementPreferenceCounts,
+    ) -> Ordering {
+        let left_count = self.relevant_count(left);
+        let right_count = self.relevant_count(right);
+
+        match self {
+            PlacementPreference::ServiceAffinity | PlacementPreference::TaskAffinity => {
+                left_count.cmp(&right_count)
+            }
+            PlacementPreference::ServiceAntiAffinity | PlacementPreference::TaskAntiAffinity => {
+                right_count.cmp(&left_count)
+            }
+        }
+    }
+}
+
+/// Compares two candidate preference snapshots using the policy's declared preference order.
+///
+/// The first preference that distinguishes the candidates wins, which keeps operator intent
+/// explicit and easy to reason about when multiple soft hints are present.
+pub fn compare_placement_preference_counts(
+    preferences: &[PlacementPreference],
+    left: PlacementPreferenceCounts,
+    right: PlacementPreferenceCounts,
+) -> Ordering {
+    for preference in preferences {
+        let ordering = preference.compare_counts(left, right);
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+
+    Ordering::Equal
 }
 
 /// Returns true when the text encodes either one concrete IP address or one CIDR prefix.
@@ -334,13 +482,43 @@ fn ip_in_cidr(actual: IpAddr, network: IpAddr, prefix: u8) -> bool {
     }
 }
 
+/// Returns true when the candidate platform OS matches the requested operand after alias folding.
+fn platform_os_matches_value(actual: &str, expected: &str) -> bool {
+    normalize_platform_os(actual) == normalize_platform_os(expected)
+}
+
+/// Returns true when the candidate platform architecture matches the requested operand alias.
+fn platform_arch_matches_value(actual: &str, expected: &str) -> bool {
+    normalize_platform_arch(actual) == normalize_platform_arch(expected)
+}
+
+/// Folds common platform OS aliases into one stable scheduler comparison key.
+fn normalize_platform_os(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "macos" | "osx" => "darwin".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Folds common architecture aliases into one stable scheduler comparison key.
+fn normalize_platform_arch(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "x86_64" | "x64" => "amd64".to_string(),
+        "aarch64" => "arm64".to_string(),
+        "x86" | "i386" => "386".to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         PlacementConstraint, PlacementConstraintOperator, PlacementNode, PlacementPolicy,
-        PlacementStrategy,
+        PlacementPreference, PlacementPreferenceCounts, PlacementStrategy,
+        compare_placement_preference_counts,
     };
     use crate::topology::peers::PeerLabel;
+    use std::cmp::Ordering;
     use uuid::Uuid;
 
     /// Constraint parsing should accept the Swarm-style equality operator.
@@ -365,6 +543,8 @@ mod tests {
             Uuid::new_v4(),
             "worker-west-1",
             "10.0.0.22:7000",
+            "linux",
+            "amd64",
             vec![PeerLabel {
                 key: "zone".into(),
                 value: "west".into(),
@@ -377,6 +557,7 @@ mod tests {
                 PlacementConstraint::parse_expression("node.labels.zone == west")
                     .expect("label constraint"),
             ],
+            preferences: Vec::new(),
             strategy: PlacementStrategy::Spread,
         };
 
@@ -386,12 +567,20 @@ mod tests {
     /// IP constraints should support CIDR prefixes so address ranges can be targeted cleanly.
     #[test]
     fn policy_matches_node_ip_cidr() {
-        let node = PlacementNode::new(Uuid::new_v4(), "worker-a", "10.42.7.9:7000", Vec::new());
+        let node = PlacementNode::new(
+            Uuid::new_v4(),
+            "worker-a",
+            "10.42.7.9:7000",
+            "linux",
+            "amd64",
+            Vec::new(),
+        );
         let policy = PlacementPolicy {
             constraints: vec![
                 PlacementConstraint::parse_expression("node.ip == 10.42.0.0/16")
                     .expect("cidr constraint"),
             ],
+            preferences: Vec::new(),
             strategy: PlacementStrategy::Spread,
         };
 
@@ -405,5 +594,54 @@ mod tests {
             .expect_err("invalid node.ip value must fail");
 
         assert!(error.to_string().contains("node.ip"));
+    }
+
+    /// Platform selectors should accept common OS and architecture aliases used by operators.
+    #[test]
+    fn policy_matches_platform_aliases() {
+        let node = PlacementNode::new(
+            Uuid::new_v4(),
+            "worker-a",
+            "10.42.7.9:7000",
+            "macos",
+            "x86_64",
+            Vec::new(),
+        );
+        let policy = PlacementPolicy {
+            constraints: vec![
+                PlacementConstraint::parse_expression("node.platform.os == darwin")
+                    .expect("platform os constraint"),
+                PlacementConstraint::parse_expression("node.platform.arch == amd64")
+                    .expect("platform arch constraint"),
+            ],
+            preferences: Vec::new(),
+            strategy: PlacementStrategy::Spread,
+        };
+
+        assert!(policy.matches(&node));
+    }
+
+    /// Preference comparison should follow the declared list order so operators can break ties.
+    #[test]
+    fn preference_comparison_respects_declared_order() {
+        let left = PlacementPreferenceCounts {
+            same_service_count: 1,
+            same_template_count: 3,
+        };
+        let right = PlacementPreferenceCounts {
+            same_service_count: 2,
+            same_template_count: 0,
+        };
+
+        let ordering = compare_placement_preference_counts(
+            &[
+                PlacementPreference::TaskAffinity,
+                PlacementPreference::ServiceAntiAffinity,
+            ],
+            left,
+            right,
+        );
+
+        assert_eq!(ordering, Ordering::Greater);
     }
 }

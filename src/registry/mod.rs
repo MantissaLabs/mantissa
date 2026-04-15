@@ -450,6 +450,24 @@ impl Registry {
             .map(|value| value.address.clone())
     }
 
+    /// Returns the last recorded scheduler-visible platform OS for the provided `peer_id`.
+    pub fn peer_platform_os(&self, peer_id: Uuid) -> Option<String> {
+        if self.peer_is_excluded(peer_id) {
+            return None;
+        }
+        self.peer_latest_value(peer_id)
+            .map(|value| value.platform_os.clone())
+    }
+
+    /// Returns the last recorded scheduler-visible platform architecture for the provided `peer_id`.
+    pub fn peer_platform_arch(&self, peer_id: Uuid) -> Option<String> {
+        if self.peer_is_excluded(peer_id) {
+            return None;
+        }
+        self.peer_latest_value(peer_id)
+            .map(|value| value.platform_arch.clone())
+    }
+
     /// Returns the last recorded WireGuard underlay configuration for the provided `peer_id`, if
     /// available.
     pub fn peer_wireguard(&self, peer_id: Uuid) -> Option<WireGuardPeerValue> {
@@ -686,6 +704,8 @@ impl Registry {
             PeerValue {
                 address: String::new(),
                 hostname: String::new(),
+                platform_os: String::new(),
+                platform_arch: String::new(),
                 noise_static_pub: self.noise_keys.public_bytes(),
                 signing_pub: signing_key.verifying_key().to_bytes(),
                 identity_sig: Vec::new(),

@@ -1211,6 +1211,8 @@ local_test!(cluster_view_startup_restores_split_peer_scope, {
     let peer_value = |address: &str, hostname: &str| PeerValue {
         address: address.to_string(),
         hostname: hostname.to_string(),
+        platform_os: "linux".to_string(),
+        platform_arch: "amd64".to_string(),
         noise_static_pub: [0x11; 32],
         signing_pub: [0x22; 32],
         identity_sig: vec![0x33; 64],
@@ -1343,6 +1345,8 @@ local_test!(cluster_view_startup_preserves_persisted_self_drain_fence, {
             PeerValue {
                 address: "127.0.0.1:6578".to_string(),
                 hostname: "local-node".to_string(),
+                platform_os: "linux".to_string(),
+                platform_arch: "amd64".to_string(),
                 noise_static_pub: [0x11; 32],
                 signing_pub: [0x22; 32],
                 identity_sig: vec![0x33; 64],

@@ -136,6 +136,8 @@ impl Topology {
         let mut value = current.unwrap_or_else(|| PeerValue {
             address: String::new(),
             hostname: String::new(),
+            platform_os: String::new(),
+            platform_arch: String::new(),
             noise_static_pub: [0u8; 32],
             signing_pub: [0u8; 32],
             identity_sig: Vec::new(),

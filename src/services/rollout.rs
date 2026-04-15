@@ -54,6 +54,17 @@ struct RolloutArtifacts {
     rollback_old_tasks: HashMap<Uuid, RollbackTaskRecord>,
 }
 
+/// Immutable scheduler inputs reused while building one rollout's replacement requests.
+struct ReplacementRequestContext<'a> {
+    service_name: &'a str,
+    service_id: Uuid,
+    task_templates: &'a [TaskTemplateSpecValue],
+    eligible_nodes: &'a [Uuid],
+    placement_nodes: &'a [PlacementNode],
+    preference_inventory: &'a PlacementPreferenceInventory,
+    volume_registry: &'a VolumeRegistry,
+}
+
 /// Immutable rollout metadata shared across replacement and removal helpers.
 #[derive(Clone, Copy)]
 struct RolloutRunContext<'a> {
@@ -266,28 +277,29 @@ impl RolloutTemplateGraph {
 
 /// Builds replacement start requests in replica order so step outcomes map deterministically.
 fn build_replacement_requests(
-    service_name: &str,
-    service_id: Uuid,
-    task_templates: &[TaskTemplateSpecValue],
+    context: ReplacementRequestContext<'_>,
     replacements: &[ReplicaReplacement],
-    eligible_nodes: &[Uuid],
-    placement_nodes: &[PlacementNode],
-    volume_registry: &VolumeRegistry,
 ) -> anyhow::Result<Vec<WorkloadStartRequest>> {
     let slot_targets = compute_effective_slot_targets(
-        service_id,
-        task_templates,
-        eligible_nodes,
-        placement_nodes,
-        volume_registry,
+        context.service_name,
+        context.service_id,
+        context.task_templates,
+        context.eligible_nodes,
+        context.placement_nodes,
+        context.preference_inventory,
+        context.volume_registry,
     )?;
     Ok(replacements
         .iter()
         .map(|replacement| {
-            let key = SlotKey::new(service_id, &replacement.template.name, replacement.replica);
+            let key = SlotKey::new(
+                context.service_id,
+                &replacement.template.name,
+                replacement.replica,
+            );
             let target_node = slot_targets.get(&key).copied();
             replacement.template.replica_start_request(
-                service_name,
+                context.service_name,
                 replacement.replica,
                 replacement.desired_id,
                 target_node,
@@ -377,13 +389,15 @@ impl ServiceController {
         )
         .await;
 
-        let mut artifacts = self.build_rollout_artifacts(
-            &service_name,
-            &current_spec,
-            &task_templates,
-            &current_assignments,
-            &replace,
-        )?;
+        let mut artifacts = self
+            .build_rollout_artifacts(
+                &service_name,
+                &current_spec,
+                &task_templates,
+                &current_assignments,
+                &replace,
+            )
+            .await?;
         let mut rollout_error = self
             .run_replacement_phase(&replacement_phase, &mut progress, &mut artifacts)
             .await;
@@ -487,7 +501,7 @@ impl ServiceController {
     }
 
     /// Builds mutable rollout bookkeeping used across replacement and removal phases.
-    fn build_rollout_artifacts(
+    async fn build_rollout_artifacts(
         &self,
         service_name: &str,
         current_spec: &ServiceSpecValue,
@@ -497,14 +511,19 @@ impl ServiceController {
     ) -> anyhow::Result<RolloutArtifacts> {
         let eligible_nodes = self.collect_eligible_nodes();
         let placement_nodes = self.placement_nodes_for(&eligible_nodes);
+        let preference_inventory =
+            build_placement_preference_inventory(&self.workload_manager).await?;
         let replacement_requests = build_replacement_requests(
-            service_name,
-            current_spec.id,
-            task_templates,
+            ReplacementRequestContext {
+                service_name,
+                service_id: current_spec.id,
+                task_templates,
+                eligible_nodes: &eligible_nodes,
+                placement_nodes: &placement_nodes,
+                preference_inventory: &preference_inventory,
+                volume_registry: &self.volume_registry,
+            },
             replace,
-            &eligible_nodes,
-            &placement_nodes,
-            &self.volume_registry,
         )?;
         let mut assignment_index: BTreeMap<(String, u16), Uuid> = BTreeMap::new();
         for assignment in current_assignments {
@@ -1252,11 +1271,15 @@ impl ServiceController {
         // converges the same way as regular reconciliation after membership changes.
         let eligible_nodes = self.collect_eligible_nodes();
         let placement_nodes = self.placement_nodes_for(&eligible_nodes);
+        let preference_inventory =
+            build_placement_preference_inventory(&self.workload_manager).await?;
         let slot_targets = compute_effective_slot_targets(
+            service_name,
             current_spec.id,
             &current_spec.task_templates,
             &eligible_nodes,
             &placement_nodes,
+            &preference_inventory,
             &self.volume_registry,
         )?;
 

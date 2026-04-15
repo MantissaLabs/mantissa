@@ -49,6 +49,8 @@ fn test_peer_value(address: &str, wireguard: WireGuardPeerValue) -> PeerValue {
     PeerValue {
         address: address.to_string(),
         hostname: "remote-peer".to_string(),
+        platform_os: "linux".to_string(),
+        platform_arch: "amd64".to_string(),
         noise_static_pub: [1u8; 32],
         signing_pub: [2u8; 32],
         identity_sig: vec![3u8; 64],

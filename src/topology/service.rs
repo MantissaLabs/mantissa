@@ -62,6 +62,8 @@ fn peer_value_from_join_payload(payload: &JoinPayload) -> PeerValue {
     PeerValue {
         address: payload.advertise_addr.clone(),
         hostname: payload.hostname.clone(),
+        platform_os: payload.platform_os.clone(),
+        platform_arch: payload.platform_arch.clone(),
         noise_static_pub: payload.public_key,
         signing_pub: payload.signing_key,
         identity_sig: payload.identity_sig.to_vec(),
@@ -81,6 +83,12 @@ fn peer_value_from_join_payload(payload: &JoinPayload) -> PeerValue {
 /// already won the local MVReg register.
 fn restored_local_peer_value(current: Option<&PeerValue>, mut restored: PeerValue) -> PeerValue {
     if let Some(current) = current {
+        if restored.platform_os.is_empty() && !current.platform_os.is_empty() {
+            restored.platform_os = current.platform_os.clone();
+        }
+        if restored.platform_arch.is_empty() && !current.platform_arch.is_empty() {
+            restored.platform_arch = current.platform_arch.clone();
+        }
         restored.wireguard =
             WireGuardPeerValue::preferred(current.wireguard.as_ref(), restored.wireguard.as_ref());
         restored.scheduling = PeerSchedulingState::merge(&restored.scheduling, &current.scheduling);
@@ -159,6 +167,8 @@ impl Topology {
             id: self.local.node.id,
             hostname,
             advertise_addr,
+            platform_os: std::env::consts::OS.to_string(),
+            platform_arch: std::env::consts::ARCH.to_string(),
             incarnation: self.swim_local_incarnation(),
             server_handle,
             public_key: self.local.public_key.to_bytes(),
@@ -1226,6 +1236,8 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                 id,
                 hostname: node.get_hostname()?.to_str()?.to_string(),
                 address: node.get_addr()?.to_str()?.to_string(),
+                platform_os: node.get_platform_os()?.to_str()?.to_string(),
+                platform_arch: node.get_platform_arch()?.to_str()?.to_string(),
                 root_hash: node.get_root_hash()?.to_str()?.to_string(),
                 incarnation: node.get_incarnation(),
                 client,
@@ -1335,6 +1347,8 @@ mod tests {
         PeerValue {
             address: "127.0.0.1:7000".to_string(),
             hostname: "node-a".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "amd64".to_string(),
             noise_static_pub: [1u8; 32],
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
@@ -1382,6 +1396,8 @@ mod tests {
         let current = PeerValue {
             address: "127.0.0.1:7999".to_string(),
             hostname: "node-newer".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "amd64".to_string(),
             noise_static_pub: [8u8; 32],
             signing_pub: [7u8; 32],
             identity_sig: vec![6u8; 64],

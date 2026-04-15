@@ -10,12 +10,18 @@ use crate::topology::peers::{PeerLabelState, PeerSchedulingState, WireGuardPeerV
 /// Actions to apply to the memberlist.
 ///
 /// These actions could apply to one or many nodes.
+///
+/// Join events intentionally carry a full peer advertisement so forwarded gossip can replay one
+/// lossless membership update without rehydrating extra state from elsewhere.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum TopologyEvent {
     Join {
         id: Uuid,
         hostname: String,
         address: String,
+        platform_os: String,
+        platform_arch: String,
         root_hash: String,
         incarnation: u64,
         /// Server capability exported by the node that originated the gossip message.

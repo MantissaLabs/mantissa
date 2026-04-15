@@ -1,8 +1,8 @@
 use super::manifest::{
-    EnvironmentVariable, LivenessKind, LivenessProbe, PlacementStrategy, ReadinessKind,
-    ReadinessProbe, RestartPolicyName, RolloutOrder, SecretFileProjection, SecretReference,
-    ServiceManifest, ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskTemplateSpec,
-    VolumeMount,
+    EnvironmentVariable, LivenessKind, LivenessProbe, PlacementPreference, PlacementStrategy,
+    ReadinessKind, ReadinessProbe, RestartPolicyName, RolloutOrder, SecretFileProjection,
+    SecretReference, ServiceManifest, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
+    TaskTemplateSpec, VolumeMount,
 };
 use crate::config::ClientConfig;
 use crate::connection;
@@ -363,6 +363,26 @@ fn write_task_template(
         PlacementStrategy::Binpack => protocol::services::PlacementStrategy::Binpack,
     };
     builder.set_placement_strategy(placement_strategy);
+    let mut placement_preferences = builder
+        .reborrow()
+        .init_placement_preferences(template.placement.preferences.len() as u32);
+    for (idx, preference) in template.placement.preferences.iter().enumerate() {
+        let encoded = match preference {
+            PlacementPreference::ServiceAffinity => {
+                protocol::services::PlacementPreference::ServiceAffinity
+            }
+            PlacementPreference::ServiceAntiAffinity => {
+                protocol::services::PlacementPreference::ServiceAntiAffinity
+            }
+            PlacementPreference::TaskAffinity => {
+                protocol::services::PlacementPreference::TaskAffinity
+            }
+            PlacementPreference::TaskAntiAffinity => {
+                protocol::services::PlacementPreference::TaskAntiAffinity
+            }
+        };
+        placement_preferences.set(idx as u32, encoded);
+    }
 
     let mut files_builder = builder
         .reborrow()

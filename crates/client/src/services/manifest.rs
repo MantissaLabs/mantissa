@@ -243,10 +243,21 @@ pub enum PlacementStrategy {
     Binpack,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementPreference {
+    ServiceAffinity,
+    ServiceAntiAffinity,
+    TaskAffinity,
+    TaskAntiAffinity,
+}
+
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct PlacementSpec {
     #[serde(default)]
     pub constraints: Vec<String>,
+    #[serde(default)]
+    pub preferences: Vec<PlacementPreference>,
     #[serde(default)]
     pub strategy: PlacementStrategy,
 }

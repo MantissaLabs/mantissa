@@ -1,4 +1,5 @@
 use super::*;
+use crate::topology::builders::write_platform_fields_to_node_info;
 
 impl Topology {
     /// Returns the current converged scheduling state for the local node.
@@ -161,6 +162,8 @@ impl Topology {
         Ok(PeerValue {
             address: advertise,
             hostname: host,
+            platform_os: std::env::consts::OS.to_string(),
+            platform_arch: std::env::consts::ARCH.to_string(),
             noise_static_pub: public_key,
             signing_pub,
             identity_sig: identity_sig.to_vec(),
@@ -248,6 +251,11 @@ impl Topology {
             .unwrap_or_else(|_| String::new());
         let preferred_wireguard_port = extract_port(&addr).ok();
         info.set_addr(&addr);
+        write_platform_fields_to_node_info(
+            info.reborrow(),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        );
 
         let noise_pub = self.local.public_key.to_bytes();
         let signing_pub = self.local.signing_key.verifying_key().to_bytes();

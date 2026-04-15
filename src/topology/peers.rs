@@ -349,6 +349,8 @@ impl PeerMembership {
 pub struct PeerValue {
     pub address: String,
     pub hostname: String,
+    pub platform_os: String,
+    pub platform_arch: String,
     pub noise_static_pub: [u8; 32],
 
     /// Verifying key for cluster credentials signing.
@@ -443,6 +445,8 @@ impl PeerValue {
 
         let mut address: Option<&str> = None;
         let mut hostname: Option<&str> = None;
+        let mut platform_os: Option<&str> = None;
+        let mut platform_arch: Option<&str> = None;
         let mut noise_static_pub: Option<[u8; 32]> = None;
         let mut signing_pub: Option<[u8; 32]> = None;
         let mut identity_sig: Option<Vec<u8>> = None;
@@ -467,6 +471,20 @@ impl PeerValue {
                 hostname = match hostname {
                     None => Some(value.hostname.as_str()),
                     Some(current) => Some(std::cmp::max(current, value.hostname.as_str())),
+                };
+            }
+
+            if !value.platform_os.is_empty() {
+                platform_os = match platform_os {
+                    None => Some(value.platform_os.as_str()),
+                    Some(current) => Some(std::cmp::max(current, value.platform_os.as_str())),
+                };
+            }
+
+            if !value.platform_arch.is_empty() {
+                platform_arch = match platform_arch {
+                    None => Some(value.platform_arch.as_str()),
+                    Some(current) => Some(std::cmp::max(current, value.platform_arch.as_str())),
                 };
             }
 
@@ -506,6 +524,8 @@ impl PeerValue {
         Some(PeerValue {
             address: address.unwrap_or_default().to_string(),
             hostname: hostname.unwrap_or_default().to_string(),
+            platform_os: platform_os.unwrap_or_default().to_string(),
+            platform_arch: platform_arch.unwrap_or_default().to_string(),
             noise_static_pub: noise_static_pub.unwrap_or_default(),
             signing_pub: signing_pub.unwrap_or_default(),
             identity_sig: identity_sig.unwrap_or_default(),
@@ -602,6 +622,8 @@ impl PeerValue {
         Ok(PeerValue {
             address,
             hostname,
+            platform_os: ni.get_platform_os()?.to_string()?,
+            platform_arch: ni.get_platform_arch()?.to_string()?,
             noise_static_pub,
             signing_pub,
             identity_sig: identity_sig.to_vec(),
@@ -704,6 +726,8 @@ mod tests {
         let mut older = PeerValue {
             address: "127.0.0.1:7000".to_string(),
             hostname: "node-a".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "amd64".to_string(),
             noise_static_pub: [1u8; 32],
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
@@ -747,6 +771,8 @@ mod tests {
         let mut older = PeerValue {
             address: "127.0.0.1:7000".to_string(),
             hostname: "node-a".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "amd64".to_string(),
             noise_static_pub: [1u8; 32],
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
@@ -809,6 +835,8 @@ mod tests {
         let active = PeerValue {
             address: "127.0.0.1:7000".to_string(),
             hostname: "node-a".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "amd64".to_string(),
             noise_static_pub: [1u8; 32],
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],

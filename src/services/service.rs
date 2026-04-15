@@ -1,5 +1,6 @@
 use crate::scheduler::placement::{
-    PlacementConstraint, PlacementPolicy, PlacementStrategy as SchedulerPlacementStrategy,
+    PlacementConstraint, PlacementPolicy, PlacementPreference as SchedulerPlacementPreference,
+    PlacementStrategy as SchedulerPlacementStrategy,
 };
 use crate::services::manager::{ServiceController, ServiceDeploymentOutcome};
 use crate::services::types::{
@@ -424,6 +425,46 @@ fn placement_strategy_to_proto(
     }
 }
 
+/// Decodes one soft placement preference stored in the wire payload.
+fn placement_preference_from_proto(
+    preference: protocol::services::PlacementPreference,
+) -> SchedulerPlacementPreference {
+    match preference {
+        protocol::services::PlacementPreference::ServiceAffinity => {
+            SchedulerPlacementPreference::ServiceAffinity
+        }
+        protocol::services::PlacementPreference::ServiceAntiAffinity => {
+            SchedulerPlacementPreference::ServiceAntiAffinity
+        }
+        protocol::services::PlacementPreference::TaskAffinity => {
+            SchedulerPlacementPreference::TaskAffinity
+        }
+        protocol::services::PlacementPreference::TaskAntiAffinity => {
+            SchedulerPlacementPreference::TaskAntiAffinity
+        }
+    }
+}
+
+/// Encodes one internal soft placement preference into the replicated wire enum.
+fn placement_preference_to_proto(
+    preference: SchedulerPlacementPreference,
+) -> protocol::services::PlacementPreference {
+    match preference {
+        SchedulerPlacementPreference::ServiceAffinity => {
+            protocol::services::PlacementPreference::ServiceAffinity
+        }
+        SchedulerPlacementPreference::ServiceAntiAffinity => {
+            protocol::services::PlacementPreference::ServiceAntiAffinity
+        }
+        SchedulerPlacementPreference::TaskAffinity => {
+            protocol::services::PlacementPreference::TaskAffinity
+        }
+        SchedulerPlacementPreference::TaskAntiAffinity => {
+            protocol::services::PlacementPreference::TaskAntiAffinity
+        }
+    }
+}
+
 fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateSpecValue, Error> {
     let mut command = Vec::new();
     for arg in reader.get_command()?.iter() {
@@ -539,6 +580,12 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
         Ok(strategy) => placement_strategy_from_proto(strategy),
         Err(_) => SchedulerPlacementStrategy::Spread,
     };
+    let mut placement_preferences = Vec::new();
+    if let Ok(preferences) = reader.get_placement_preferences() {
+        for entry in preferences.iter() {
+            placement_preferences.push(placement_preference_from_proto(entry?));
+        }
+    }
 
     Ok(TaskTemplateSpecValue {
         name: reader.get_name()?.to_str()?.to_string(),
@@ -562,6 +609,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
             networks,
             placement: PlacementPolicy {
                 constraints: placement_constraints,
+                preferences: placement_preferences,
                 strategy: placement_strategy,
             },
         },
@@ -806,6 +854,12 @@ fn write_task_template(
         placement_constraints.set(idx as u32, constraint);
     }
     builder.set_placement_strategy(placement_strategy_to_proto(template.placement().strategy));
+    let mut placement_preferences = builder
+        .reborrow()
+        .init_placement_preferences(template.placement().preferences.len() as u32);
+    for (idx, preference) in template.placement().preferences.iter().enumerate() {
+        placement_preferences.set(idx as u32, placement_preference_to_proto(*preference));
+    }
 
     Ok(())
 }
@@ -852,7 +906,9 @@ fn read_uuid(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
 #[cfg(test)]
 mod tests {
     use super::{read_service_spec, read_task_template, write_service_spec, write_task_template};
-    use crate::scheduler::placement::{PlacementConstraint, PlacementPolicy, PlacementStrategy};
+    use crate::scheduler::placement::{
+        PlacementConstraint, PlacementPolicy, PlacementPreference, PlacementStrategy,
+    };
     use crate::services::types::{
         ServiceLivenessProbe, ServiceLivenessProbeKind, ServicePortProtocol,
         ServicePreviousGeneration, ServiceReadinessProbe, ServiceReadinessProbeKind,
@@ -896,6 +952,7 @@ mod tests {
                         PlacementConstraint::parse_expression("node.labels.zone == west")
                             .expect("constraint should parse"),
                     ],
+                    preferences: vec![PlacementPreference::ServiceAffinity],
                     strategy: PlacementStrategy::Spread,
                 },
             },

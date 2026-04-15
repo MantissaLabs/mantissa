@@ -866,6 +866,8 @@ mod tests {
         PeerValue {
             address: address.to_string(),
             hostname: "peer".to_string(),
+            platform_os: String::new(),
+            platform_arch: String::new(),
             noise_static_pub: [1u8; 32],
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],

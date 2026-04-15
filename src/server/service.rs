@@ -69,6 +69,8 @@ impl JoinRequest {
         let peer = PeerValue {
             address,
             hostname,
+            platform_os: info.get_platform_os()?.to_string()?,
+            platform_arch: info.get_platform_arch()?.to_string()?,
             noise_static_pub: noise_static_pub.to_bytes(),
             signing_pub: signing_vk.to_bytes(),
             identity_sig: identity_sig.clone(),
@@ -190,6 +192,8 @@ impl JoinRequest {
             id: self.joiner_id,
             hostname: self.peer.hostname.clone(),
             address: self.peer.address.clone(),
+            platform_os: self.peer.platform_os.clone(),
+            platform_arch: self.peer.platform_arch.clone(),
             root_hash: self.root_hash.clone(),
             incarnation: self.incarnation,
             client: Some(self.server_handle.clone()),

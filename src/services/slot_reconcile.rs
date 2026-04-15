@@ -4,8 +4,9 @@ use super::ownership::{
 use super::{
     SERVICE_ENABLE_PROACTIVE_REBALANCE, SERVICE_REBALANCE_COOLDOWN_SECS,
     SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController, ServiceReplicaSnapshot, TaskInventory,
-    compute_effective_slot_targets, deploying_assignment_incomplete, expected_task_id_count,
-    is_local_volume_unavailable_error, mounted_local_volumes_require_pinned_target, node_is_down,
+    build_placement_preference_inventory, compute_effective_slot_targets,
+    deploying_assignment_incomplete, expected_task_id_count, is_local_volume_unavailable_error,
+    mounted_local_volumes_require_pinned_target, node_is_down,
     should_restart_missing_slot_immediately, task_age_allows_cleanup, task_age_allows_rebalance,
     task_state_healthy, task_state_rebalanceable,
 };
@@ -55,11 +56,15 @@ impl ServiceController {
 
         let slots = build_replica_slots(&spec);
         let placement_nodes = self.placement_nodes_for(eligible_nodes);
+        let preference_inventory =
+            build_placement_preference_inventory(&self.workload_manager).await?;
         let slot_targets = compute_effective_slot_targets(
+            &spec.service_name,
             spec.id,
             &spec.task_templates,
             eligible_nodes,
             &placement_nodes,
+            &preference_inventory,
             &self.volume_registry,
         )?;
         let desired_ids: HashSet<Uuid> = slots.iter().filter_map(|slot| slot.replica_id).collect();

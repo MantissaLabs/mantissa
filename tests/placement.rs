@@ -5,7 +5,7 @@ use common::convergence::wait_until;
 use common::testkit::{ClusterConfig, RuntimeBackendOverrideGuard, TestNode};
 use mantissa::node::id::set_node_id;
 use mantissa::registry::Registry;
-use mantissa::scheduler::placement::{PlacementConstraint, PlacementStrategy};
+use mantissa::scheduler::placement::{PlacementConstraint, PlacementPreference, PlacementStrategy};
 use mantissa::services::ServiceController;
 use mantissa::services::types::{
     ServiceStatus, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
@@ -13,7 +13,10 @@ use mantissa::services::types::{
 use mantissa::task::types::TaskStateFilter;
 use mantissa::topology_capnp::topology;
 use mantissa::workload::manager::{WorkloadManager, WorkloadStartRequest};
-use mantissa::workload::model::{ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec};
+use mantissa::workload::model::{
+    ExecutionPlatform, IsolationMode, WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata,
+    WorkloadSpec,
+};
 use mantissa::workload::types::{ExecutionSpec, ResolvedExecutionSpec};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -179,6 +182,111 @@ local_test!(services_placement_constraints_honor_node_id, {
         tasks[0].node_id,
         cluster[1].id(),
         "node.id constraint should place the replica on the requested node"
+    );
+});
+
+local_test!(
+    services_placement_constraints_honor_node_platform_os_arch,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+
+        let cfg = ClusterConfig {
+            sync_tick_ms: Some(100),
+            gossip_tick_ms: Some(100),
+            gossip_fanout: Some(2),
+            ..ClusterConfig::default()
+        };
+        let cluster = TestNode::new_cluster_inproc_with_config(2, cfg)
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes")
+            .await;
+
+        let service_name = "placement-constraints-platform";
+        let mut template = demo_backend_task_template("backend", 1);
+        template.execution.placement.constraints = vec![
+            PlacementConstraint::parse_expression(&format!(
+                "node.platform.os == {}",
+                std::env::consts::OS
+            ))
+            .expect("platform os constraint should parse"),
+            PlacementConstraint::parse_expression(&format!(
+                "node.platform.arch == {}",
+                std::env::consts::ARCH
+            ))
+            .expect("platform arch constraint should parse"),
+        ];
+
+        let service_id = cluster[0]
+            .node
+            .service_controller
+            .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
+            .await
+            .expect("submit platform-constrained deployment");
+
+        assert!(
+            wait_for_service_status(
+                &cluster[0].node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "service should reach running under matching platform constraints"
+        );
+        assert!(
+            wait_for_service_running_tasks_stable_all(
+                &cluster,
+                service_name,
+                1,
+                4,
+                Duration::from_secs(15)
+            )
+            .await,
+            "platform-constrained service should converge consistently across the cluster"
+        );
+    }
+);
+
+local_test!(services_placement_constraints_reject_unknown_platform, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(2, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes").await;
+
+    let service_name = "placement-constraints-bad-platform";
+    let mut template = demo_backend_task_template("backend", 1);
+    template.execution.placement.constraints = vec![
+        PlacementConstraint::parse_expression("node.platform.os == definitely-not-a-real-os")
+            .expect("platform os constraint should parse"),
+    ];
+
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
+        .await
+        .expect("submit blocked platform deployment");
+
+    assert!(
+        wait_for_service_status_detail(
+            &cluster[0].node.service_controller,
+            service_id,
+            "exclude every eligible node"
+        )
+        .await,
+        "service should surface the blocked platform-placement reason"
+    );
+    assert!(
+        wait_for_service_task_count_all(&cluster, service_name, 0, Duration::from_secs(10)).await,
+        "unknown platform constraint should block task creation on every node"
     );
 });
 
@@ -397,6 +505,218 @@ local_test!(
     }
 );
 
+local_test!(services_placement_service_affinity_overrides_spread, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes").await;
+
+    let service_name = "placement-preference-service-affinity";
+    let mut template = demo_backend_task_template("backend", 2);
+    template.execution.placement.strategy = PlacementStrategy::Spread;
+    template.execution.placement.preferences = vec![PlacementPreference::ServiceAffinity];
+
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
+        .await
+        .expect("submit service-affinity deployment");
+
+    assert!(
+        wait_for_service_status(
+            &cluster[0].node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "service-affinity deployment should reach running"
+    );
+    assert!(
+        wait_for_service_running_tasks_stable_all(
+            &cluster,
+            service_name,
+            2,
+            4,
+            Duration::from_secs(15)
+        )
+        .await,
+        "service-affinity deployment should converge consistently across the cluster"
+    );
+
+    let tasks = list_active_service_tasks(&cluster[0].node.workload_manager, service_name).await;
+    let unique_nodes: HashSet<Uuid> = tasks.iter().map(|task| task.node_id).collect();
+
+    assert_eq!(
+        tasks.len(),
+        2,
+        "service-affinity deployment should keep two tasks"
+    );
+    assert_eq!(
+        unique_nodes.len(),
+        1,
+        "service affinity should keep both replicas on the same node even under spread"
+    );
+});
+
+local_test!(
+    services_placement_service_anti_affinity_overrides_binpack,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+
+        let cfg = ClusterConfig {
+            sync_tick_ms: Some(100),
+            gossip_tick_ms: Some(100),
+            gossip_fanout: Some(2),
+            ..ClusterConfig::default()
+        };
+        let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes")
+            .await;
+
+        let service_name = "placement-preference-service-anti-affinity";
+        let mut template = demo_backend_task_template("backend", 2);
+        template.execution.placement.strategy = PlacementStrategy::Binpack;
+        template.execution.placement.preferences = vec![PlacementPreference::ServiceAntiAffinity];
+
+        let service_id = cluster[0]
+            .node
+            .service_controller
+            .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
+            .await
+            .expect("submit service-anti-affinity deployment");
+
+        assert!(
+            wait_for_service_status(
+                &cluster[0].node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "service-anti-affinity deployment should reach running"
+        );
+        assert!(
+            wait_for_service_running_tasks_stable_all(
+                &cluster,
+                service_name,
+                2,
+                4,
+                Duration::from_secs(15)
+            )
+            .await,
+            "service-anti-affinity deployment should converge consistently across the cluster"
+        );
+
+        let tasks =
+            list_active_service_tasks(&cluster[0].node.workload_manager, service_name).await;
+        let unique_nodes: HashSet<Uuid> = tasks.iter().map(|task| task.node_id).collect();
+
+        assert_eq!(
+            tasks.len(),
+            2,
+            "service-anti-affinity deployment should keep two tasks"
+        );
+        assert_eq!(
+            unique_nodes.len(),
+            2,
+            "service anti-affinity should spread replicas even when binpack would reuse one node"
+        );
+    }
+);
+
+local_test!(services_placement_task_affinity_packs_matching_template, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes").await;
+
+    let service_name = "placement-preference-task-affinity";
+    let mut api = demo_backend_task_template("api", 2);
+    api.execution.placement.strategy = PlacementStrategy::Spread;
+    api.execution.placement.preferences = vec![PlacementPreference::TaskAffinity];
+    let worker = demo_backend_task_template("worker", 2);
+
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![api, worker],
+        )
+        .await
+        .expect("submit task-affinity deployment");
+
+    assert!(
+        wait_for_service_status(
+            &cluster[0].node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "task-affinity deployment should reach running"
+    );
+    assert!(
+        wait_for_service_running_tasks_stable_all(
+            &cluster,
+            service_name,
+            4,
+            4,
+            Duration::from_secs(15)
+        )
+        .await,
+        "task-affinity deployment should converge consistently across the cluster"
+    );
+
+    let tasks = list_active_service_tasks(&cluster[0].node.workload_manager, service_name).await;
+    let api_nodes: HashSet<Uuid> = tasks
+        .iter()
+        .filter(|task| {
+            task.service_owner()
+                .map(|owner| owner.template == "api")
+                .unwrap_or(false)
+        })
+        .map(|task| task.node_id)
+        .collect();
+    let api_count = tasks
+        .iter()
+        .filter(|task| {
+            task.service_owner()
+                .map(|owner| owner.template == "api")
+                .unwrap_or(false)
+        })
+        .count();
+
+    assert_eq!(
+        api_count, 2,
+        "api template should keep both replicas active"
+    );
+    assert_eq!(
+        api_nodes.len(),
+        1,
+        "task affinity should pack only the matching template's replicas together"
+    );
+});
+
 local_test!(services_placement_binpack_reuses_matching_node, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
 
@@ -541,6 +861,79 @@ local_test!(
     }
 );
 
+local_test!(
+    workloads_placement_service_anti_affinity_spreads_owned_batch,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+
+        let cfg = ClusterConfig {
+            sync_tick_ms: Some(100),
+            gossip_tick_ms: Some(100),
+            gossip_fanout: Some(2),
+            ..ClusterConfig::default()
+        };
+        let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes")
+            .await;
+
+        let specs = cluster[0]
+            .node
+            .workload_manager
+            .start_workloads_batch(vec![
+                demo_owned_preference_workload_request(
+                    "owned-batch-a",
+                    "owned-batch-service",
+                    "backend",
+                    PlacementStrategy::Binpack,
+                    vec![PlacementPreference::ServiceAntiAffinity],
+                ),
+                demo_owned_preference_workload_request(
+                    "owned-batch-b",
+                    "owned-batch-service",
+                    "backend",
+                    PlacementStrategy::Binpack,
+                    vec![PlacementPreference::ServiceAntiAffinity],
+                ),
+            ])
+            .await
+            .expect("start owned anti-affinity batch");
+        let workload_ids: HashSet<Uuid> = specs.iter().map(|spec| spec.id).collect();
+
+        assert_eq!(
+            workload_ids.len(),
+            2,
+            "owned anti-affinity batch should return one workload id per request"
+        );
+        assert!(
+            wait_for_workloads_running_stable_all(
+                &cluster,
+                &workload_ids,
+                4,
+                Duration::from_secs(15)
+            )
+            .await,
+            "owned anti-affinity batch should converge consistently across the cluster"
+        );
+
+        let tasks =
+            list_active_workloads_by_ids(&cluster[0].node.workload_manager, &workload_ids).await;
+        let unique_nodes: HashSet<Uuid> = tasks.iter().map(|task| task.node_id).collect();
+
+        assert_eq!(
+            tasks.len(),
+            2,
+            "owned anti-affinity batch should keep every workload active"
+        );
+        assert_eq!(
+            unique_nodes.len(),
+            2,
+            "untargeted planner placement should honor service anti-affinity across the batch"
+        );
+    }
+);
+
 /// Builds an execution shape shared by the placement-focused service templates in this test file.
 fn empty_service_execution(image: &str) -> ExecutionSpec<TaskTemplateNetworkRequirement> {
     ExecutionSpec {
@@ -631,6 +1024,45 @@ fn demo_binpack_workload_request(name: &str) -> WorkloadStartRequest {
         id: None,
         slot_ids: Vec::new(),
         owner: None,
+        target_node: None,
+    }
+}
+
+/// Builds one untargeted service-owned workload request to exercise planner-only preferences.
+fn demo_owned_preference_workload_request(
+    name: &str,
+    service_name: &str,
+    template_name: &str,
+    strategy: PlacementStrategy,
+    preferences: Vec<PlacementPreference>,
+) -> WorkloadStartRequest {
+    let mut execution = ResolvedExecutionSpec {
+        command: vec![
+            "-listen".to_string(),
+            ":8000".to_string(),
+            "-text".to_string(),
+            format!("hello from {name}"),
+        ],
+        cpu_millis: 200,
+        memory_bytes: 64 * 1024 * 1024,
+        ..empty_workload_execution("hashicorp/http-echo:1.0.0")
+    };
+    execution.placement.strategy = strategy;
+    execution.placement.preferences = preferences;
+
+    WorkloadStartRequest {
+        name: name.to_string(),
+        execution,
+        execution_platform: ExecutionPlatform::Oci,
+        isolation_mode: IsolationMode::Standard,
+        isolation_profile: None,
+        gpu_device_ids: Vec::new(),
+        id: None,
+        slot_ids: Vec::new(),
+        owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
+            service_name,
+            template_name,
+        ))),
         target_node: None,
     }
 }
