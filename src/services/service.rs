@@ -1,5 +1,6 @@
 use crate::scheduler::placement::{
-    PlacementConstraint, PlacementPolicy, PlacementPreference as SchedulerPlacementPreference,
+    PlacementConstraint, PlacementConstraintOperator, PlacementConstraintSelector, PlacementPolicy,
+    PlacementPreference as SchedulerPlacementPreference,
     PlacementStrategy as SchedulerPlacementStrategy,
 };
 use crate::services::manager::{ServiceController, ServiceDeploymentOutcome};
@@ -18,7 +19,10 @@ use crate::workload::capnp_codec::{
 };
 use crate::workload::types::ExecutionSpec;
 use capnp::Error;
-use protocol::services::{service_event, service_spec, services, task_template};
+use protocol::services::{
+    placement_constraint, placement_constraint_selector, service_event, service_spec, services,
+    task_template,
+};
 use std::collections::HashSet;
 use std::rc::Rc;
 use tracing::warn;
@@ -425,6 +429,95 @@ fn placement_strategy_to_proto(
     }
 }
 
+/// Decodes the placement comparison operator stored in the wire payload.
+fn placement_constraint_operator_from_proto(
+    operator: protocol::services::PlacementConstraintOperator,
+) -> PlacementConstraintOperator {
+    match operator {
+        protocol::services::PlacementConstraintOperator::Eq => PlacementConstraintOperator::Eq,
+        protocol::services::PlacementConstraintOperator::Ne => PlacementConstraintOperator::Ne,
+    }
+}
+
+/// Encodes the internal placement comparison operator into the replicated wire enum.
+fn placement_constraint_operator_to_proto(
+    operator: PlacementConstraintOperator,
+) -> protocol::services::PlacementConstraintOperator {
+    match operator {
+        PlacementConstraintOperator::Eq => protocol::services::PlacementConstraintOperator::Eq,
+        PlacementConstraintOperator::Ne => protocol::services::PlacementConstraintOperator::Ne,
+    }
+}
+
+/// Decodes one typed placement selector stored in the wire payload.
+fn placement_constraint_selector_from_proto(
+    reader: placement_constraint_selector::Reader<'_>,
+) -> Result<PlacementConstraintSelector, Error> {
+    match reader.which()? {
+        placement_constraint_selector::Which::NodeId(()) => Ok(PlacementConstraintSelector::NodeId),
+        placement_constraint_selector::Which::NodeHostname(()) => {
+            Ok(PlacementConstraintSelector::NodeHostname)
+        }
+        placement_constraint_selector::Which::NodeIp(()) => Ok(PlacementConstraintSelector::NodeIp),
+        placement_constraint_selector::Which::NodeAddress(()) => {
+            Ok(PlacementConstraintSelector::NodeAddress)
+        }
+        placement_constraint_selector::Which::NodePlatformOs(()) => {
+            Ok(PlacementConstraintSelector::NodePlatformOs)
+        }
+        placement_constraint_selector::Which::NodePlatformArch(()) => {
+            Ok(PlacementConstraintSelector::NodePlatformArch)
+        }
+        placement_constraint_selector::Which::NodeLabel(Ok(key)) => Ok(
+            PlacementConstraintSelector::node_label(key.to_str()?.to_string()),
+        ),
+        placement_constraint_selector::Which::NodeLabel(Err(err)) => Err(err),
+    }
+}
+
+/// Encodes one internal placement selector into the replicated wire union.
+fn write_placement_constraint_selector(
+    mut builder: placement_constraint_selector::Builder<'_>,
+    selector: &PlacementConstraintSelector,
+) {
+    match selector {
+        PlacementConstraintSelector::NodeId => builder.set_node_id(()),
+        PlacementConstraintSelector::NodeHostname => builder.set_node_hostname(()),
+        PlacementConstraintSelector::NodeIp => builder.set_node_ip(()),
+        PlacementConstraintSelector::NodeAddress => builder.set_node_address(()),
+        PlacementConstraintSelector::NodePlatformOs => builder.set_node_platform_os(()),
+        PlacementConstraintSelector::NodePlatformArch => builder.set_node_platform_arch(()),
+        PlacementConstraintSelector::NodeLabel { key } => builder.set_node_label(key),
+    }
+}
+
+/// Decodes one hard placement constraint stored in the wire payload.
+fn read_placement_constraint(
+    reader: placement_constraint::Reader<'_>,
+) -> Result<PlacementConstraint, Error> {
+    let selector = placement_constraint_selector_from_proto(reader.get_selector()?)?;
+    let operator = match reader.get_operator() {
+        Ok(operator) => placement_constraint_operator_from_proto(operator),
+        Err(_) => PlacementConstraintOperator::Eq,
+    };
+    let value = reader.get_value()?.to_str()?.to_string();
+
+    PlacementConstraint::new(selector, operator, value)
+        .map_err(|err| Error::failed(err.to_string()))
+}
+
+/// Encodes one hard placement constraint into the replicated wire payload.
+fn write_placement_constraint(
+    mut builder: placement_constraint::Builder<'_>,
+    constraint: &PlacementConstraint,
+) {
+    write_placement_constraint_selector(builder.reborrow().init_selector(), constraint.selector());
+    builder.set_operator(placement_constraint_operator_to_proto(
+        constraint.operator(),
+    ));
+    builder.set_value(constraint.value());
+}
+
 /// Decodes one soft placement preference stored in the wire payload.
 fn placement_preference_from_proto(
     preference: protocol::services::PlacementPreference,
@@ -566,15 +659,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
     };
     let mut placement_constraints = Vec::new();
     for entry in reader.get_placement_constraints()?.iter() {
-        let raw = entry?.to_str()?.trim().to_string();
-        if raw.is_empty() {
-            return Err(Error::failed(
-                "placement constraints must be non-empty".to_string(),
-            ));
-        }
-        let parsed = PlacementConstraint::parse_expression(&raw)
-            .map_err(|err| Error::failed(err.to_string()))?;
-        placement_constraints.push(parsed);
+        placement_constraints.push(read_placement_constraint(entry)?);
     }
     let placement_strategy = match reader.get_placement_strategy() {
         Ok(strategy) => placement_strategy_from_proto(strategy),
@@ -846,12 +931,12 @@ fn write_task_template(
     };
     builder.set_public_protocol(proto);
     builder.set_tty(template.tty);
-    let rendered_constraints = template.placement().rendered_constraints();
     let mut placement_constraints = builder
         .reborrow()
-        .init_placement_constraints(rendered_constraints.len() as u32);
-    for (idx, constraint) in rendered_constraints.iter().enumerate() {
-        placement_constraints.set(idx as u32, constraint);
+        .init_placement_constraints(template.placement().constraints.len() as u32);
+    for (idx, constraint) in template.placement().constraints.iter().enumerate() {
+        let builder = placement_constraints.reborrow().get(idx as u32);
+        write_placement_constraint(builder, constraint);
     }
     builder.set_placement_strategy(placement_strategy_to_proto(template.placement().strategy));
     let mut placement_preferences = builder
@@ -907,7 +992,8 @@ fn read_uuid(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
 mod tests {
     use super::{read_service_spec, read_task_template, write_service_spec, write_task_template};
     use crate::scheduler::placement::{
-        PlacementConstraint, PlacementPolicy, PlacementPreference, PlacementStrategy,
+        PlacementConstraint, PlacementConstraintSelector, PlacementPolicy, PlacementPreference,
+        PlacementStrategy,
     };
     use crate::services::types::{
         ServiceLivenessProbe, ServiceLivenessProbeKind, ServicePortProtocol,
@@ -949,8 +1035,11 @@ mod tests {
                 networks: vec![TaskTemplateNetworkRequirement::new("default", network_id)],
                 placement: PlacementPolicy {
                     constraints: vec![
-                        PlacementConstraint::parse_expression("node.labels.zone == west")
-                            .expect("constraint should parse"),
+                        PlacementConstraint::eq(
+                            PlacementConstraintSelector::node_label("zone"),
+                            "west",
+                        )
+                        .expect("constraint should parse"),
                     ],
                     preferences: vec![PlacementPreference::ServiceAffinity],
                     strategy: PlacementStrategy::Spread,

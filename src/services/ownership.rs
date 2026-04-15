@@ -562,8 +562,8 @@ fn generation_owner_score(service_id: Uuid, service_epoch: u64, node_id: Uuid) -
 mod tests {
     use super::{SlotKey, compute_slot_targets_with_placement};
     use crate::scheduler::placement::{
-        PlacementConstraint, PlacementNode, PlacementPolicy, PlacementPreference,
-        PlacementPreferenceInventory, PlacementStrategy,
+        PlacementConstraint, PlacementConstraintSelector, PlacementNode, PlacementPolicy,
+        PlacementPreference, PlacementPreferenceInventory, PlacementStrategy,
     };
     use crate::services::types::TaskTemplateSpecValue;
     use crate::topology::peers::PeerLabel;
@@ -576,8 +576,17 @@ mod tests {
         let service_id = Uuid::new_v4();
         let east = Uuid::new_v4();
         let west = Uuid::new_v4();
-        let template =
-            template_with_constraints("backend", 1, vec!["node.labels.topology.zone == west"]);
+        let template = template_with_constraints(
+            "backend",
+            1,
+            vec![
+                PlacementConstraint::eq(
+                    PlacementConstraintSelector::node_label("topology.zone"),
+                    "west",
+                )
+                .expect("west label constraint"),
+            ],
+        );
         let targets = compute_slot_targets_with_placement(
             service_id,
             "demo-service",
@@ -599,8 +608,17 @@ mod tests {
     fn slot_targets_reject_unsatisfied_template_constraints() {
         let service_id = Uuid::new_v4();
         let east = Uuid::new_v4();
-        let template =
-            template_with_constraints("backend", 1, vec!["node.labels.topology.zone == west"]);
+        let template = template_with_constraints(
+            "backend",
+            1,
+            vec![
+                PlacementConstraint::eq(
+                    PlacementConstraintSelector::node_label("topology.zone"),
+                    "west",
+                )
+                .expect("west label constraint"),
+            ],
+        );
         let err = compute_slot_targets_with_placement(
             service_id,
             "demo-service",
@@ -621,7 +639,7 @@ mod tests {
     fn template_with_constraints(
         name: &str,
         replicas: u16,
-        constraints: Vec<&str>,
+        constraints: Vec<PlacementConstraint>,
     ) -> TaskTemplateSpecValue {
         TaskTemplateSpecValue {
             name: name.to_string(),
@@ -641,13 +659,7 @@ mod tests {
                 volumes: Vec::new(),
                 networks: Vec::new(),
                 placement: PlacementPolicy {
-                    constraints: constraints
-                        .into_iter()
-                        .map(|expression| {
-                            PlacementConstraint::parse_expression(expression)
-                                .expect("placement constraint should parse")
-                        })
-                        .collect(),
+                    constraints,
                     preferences: vec![PlacementPreference::ServiceAffinity],
                     strategy: PlacementStrategy::Spread,
                 },

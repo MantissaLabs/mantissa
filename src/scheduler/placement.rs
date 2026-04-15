@@ -77,17 +77,70 @@ pub enum PlacementStrategy {
 /// One hard placement predicate interpreted against a candidate node.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PlacementConstraint {
-    pub key: String,
-    pub op: PlacementConstraintOperator,
-    pub value: String,
+    selector: PlacementConstraintSelector,
+    operator: PlacementConstraintOperator,
+    value: String,
 }
 
 impl PlacementConstraint {
+    /// Builds one validated hard placement predicate from typed selector data.
+    pub fn new(
+        selector: PlacementConstraintSelector,
+        operator: PlacementConstraintOperator,
+        value: impl Into<String>,
+    ) -> Result<Self, PlacementConstraintError> {
+        let selector = selector.normalized()?;
+        let value = value.into().trim().to_string();
+        if value.is_empty() {
+            return Err(PlacementConstraintError::EmptyConstraintValue {
+                selector: selector.render_key(),
+            });
+        }
+        selector.validate_value(&value)?;
+
+        Ok(Self {
+            selector,
+            operator,
+            value,
+        })
+    }
+
+    /// Builds one equality predicate from typed selector data.
+    pub fn eq(
+        selector: PlacementConstraintSelector,
+        value: impl Into<String>,
+    ) -> Result<Self, PlacementConstraintError> {
+        Self::new(selector, PlacementConstraintOperator::Eq, value)
+    }
+
+    /// Builds one inequality predicate from typed selector data.
+    pub fn ne(
+        selector: PlacementConstraintSelector,
+        value: impl Into<String>,
+    ) -> Result<Self, PlacementConstraintError> {
+        Self::new(selector, PlacementConstraintOperator::Ne, value)
+    }
+
+    /// Returns the typed selector evaluated by this hard placement predicate.
+    pub fn selector(&self) -> &PlacementConstraintSelector {
+        &self.selector
+    }
+
+    /// Returns the comparison operator evaluated by this hard placement predicate.
+    pub const fn operator(&self) -> PlacementConstraintOperator {
+        self.operator
+    }
+
+    /// Returns the normalized operand value evaluated by this hard placement predicate.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
     /// Parses one Swarm-style constraint expression such as `node.hostname == worker-a`.
-    pub fn parse_expression(raw: &str) -> Result<Self, PlacementConstraintParseError> {
+    pub fn parse_expression(raw: &str) -> Result<Self, PlacementConstraintError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return Err(PlacementConstraintParseError::EmptyExpression);
+            return Err(PlacementConstraintError::EmptyExpression);
         }
 
         let (operator, parts) = if let Some(parts) = trimmed.split_once("!=") {
@@ -95,7 +148,7 @@ impl PlacementConstraint {
         } else if let Some(parts) = trimmed.split_once("==") {
             (PlacementConstraintOperator::Eq, parts)
         } else {
-            return Err(PlacementConstraintParseError::MissingOperator {
+            return Err(PlacementConstraintError::MissingOperator {
                 expression: trimmed.to_string(),
             });
         };
@@ -103,45 +156,34 @@ impl PlacementConstraint {
         let key = parts.0.trim();
         let value = parts.1.trim();
         if key.is_empty() {
-            return Err(PlacementConstraintParseError::EmptyKey {
+            return Err(PlacementConstraintError::EmptyKey {
                 expression: trimmed.to_string(),
             });
         }
         if value.is_empty() {
-            return Err(PlacementConstraintParseError::EmptyValue {
+            return Err(PlacementConstraintError::EmptyValue {
                 expression: trimmed.to_string(),
             });
         }
 
-        Self::new(key.to_string(), operator, value.to_string())
-    }
-
-    /// Builds one validated placement constraint from its already split components.
-    pub fn new(
-        key: String,
-        op: PlacementConstraintOperator,
-        value: String,
-    ) -> Result<Self, PlacementConstraintParseError> {
-        let key = key.trim().to_string();
-        let value = value.trim().to_string();
-        let selector = PlacementSelector::parse(&key)?;
-        selector.validate_value(&value)?;
-
-        Ok(Self { key, op, value })
+        let selector = PlacementConstraintSelector::parse(key)?;
+        Self::new(selector, operator, value.to_string())
     }
 
     /// Renders this constraint into the stable Swarm-style operator string.
     pub fn render_expression(&self) -> String {
-        format!("{} {} {}", self.key, self.op.as_str(), self.value)
+        format!(
+            "{} {} {}",
+            self.selector.render_key(),
+            self.operator.as_str(),
+            self.value
+        )
     }
 
     /// Returns true when this single hard predicate matches the candidate node.
     pub fn matches(&self, node: &PlacementNode) -> bool {
-        let Ok(selector) = PlacementSelector::parse(&self.key) else {
-            return false;
-        };
-        let matched = selector.matches(node, &self.value);
-        match self.op {
+        let matched = self.selector.matches(node, &self.value);
+        match self.operator {
             PlacementConstraintOperator::Eq => matched,
             PlacementConstraintOperator::Ne => !matched,
         }
@@ -149,9 +191,12 @@ impl PlacementConstraint {
 }
 
 /// Supported comparison operators for placement constraints.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PlacementConstraintOperator {
+    #[default]
     Eq,
     Ne,
 }
@@ -215,9 +260,108 @@ impl PlacementNode {
     }
 }
 
-/// Placement-constraint parse failures surfaced during manifest and RPC validation.
+/// Strongly typed selector used by one hard placement predicate.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementConstraintSelector {
+    NodeId,
+    NodeHostname,
+    NodeIp,
+    NodeAddress,
+    NodePlatformOs,
+    NodePlatformArch,
+    NodeLabel { key: String },
+}
+
+impl PlacementConstraintSelector {
+    /// Builds one node-label selector from the provided label key.
+    pub fn node_label(key: impl Into<String>) -> Self {
+        Self::NodeLabel { key: key.into() }
+    }
+
+    /// Parses one Swarm-style selector key into its normalized internal representation.
+    fn parse(raw: &str) -> Result<Self, PlacementConstraintError> {
+        if let Some(key) = raw
+            .strip_prefix("node.labels.")
+            .or_else(|| raw.strip_prefix("labels."))
+        {
+            return Self::node_label(key).normalized();
+        }
+
+        match raw {
+            "node.id" => Ok(Self::NodeId),
+            "node.hostname" => Ok(Self::NodeHostname),
+            "node.ip" => Ok(Self::NodeIp),
+            "node.address" => Ok(Self::NodeAddress),
+            "node.platform.os" => Ok(Self::NodePlatformOs),
+            "node.platform.arch" => Ok(Self::NodePlatformArch),
+            _ => Err(PlacementConstraintError::UnsupportedKey {
+                key: raw.to_string(),
+            }),
+        }
+    }
+
+    /// Returns the stable Swarm-style selector key rendered for operators and diagnostics.
+    pub fn render_key(&self) -> String {
+        match self {
+            Self::NodeId => "node.id".to_string(),
+            Self::NodeHostname => "node.hostname".to_string(),
+            Self::NodeIp => "node.ip".to_string(),
+            Self::NodeAddress => "node.address".to_string(),
+            Self::NodePlatformOs => "node.platform.os".to_string(),
+            Self::NodePlatformArch => "node.platform.arch".to_string(),
+            Self::NodeLabel { key } => format!("node.labels.{key}"),
+        }
+    }
+
+    /// Normalizes typed selector data so callers store canonical keys.
+    fn normalized(self) -> Result<Self, PlacementConstraintError> {
+        match self {
+            Self::NodeLabel { key } => {
+                let key = key.trim();
+                if key.is_empty() {
+                    return Err(PlacementConstraintError::EmptyLabelKey);
+                }
+                Ok(Self::NodeLabel {
+                    key: key.to_string(),
+                })
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Validates the operand value for this selector before the constraint is accepted.
+    fn validate_value(&self, value: &str) -> Result<(), PlacementConstraintError> {
+        if matches!(self, Self::NodeIp) && !is_valid_ip_or_cidr(value) {
+            return Err(PlacementConstraintError::InvalidIpValue {
+                selector: self.render_key(),
+                value: value.to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Returns true when the candidate node matches this selector/value pair.
+    fn matches(&self, node: &PlacementNode, expected: &str) -> bool {
+        match self {
+            Self::NodeId => node.node_id.to_string() == expected,
+            Self::NodeHostname => node.hostname == expected,
+            Self::NodeAddress => node.address == expected,
+            Self::NodePlatformOs => platform_os_matches_value(&node.platform_os, expected),
+            Self::NodePlatformArch => platform_arch_matches_value(&node.platform_arch, expected),
+            Self::NodeLabel { key } => node.label_value(key) == Some(expected),
+            Self::NodeIp => node
+                .ip_addr()
+                .map(|actual| ip_matches_value(actual, expected))
+                .unwrap_or(false),
+        }
+    }
+}
+
+/// Placement-constraint parse or validation failures surfaced during manifest and RPC validation.
 #[derive(Debug, Error)]
-pub enum PlacementConstraintParseError {
+pub enum PlacementConstraintError {
     #[error("placement constraint must not be empty")]
     EmptyExpression,
 
@@ -230,81 +374,21 @@ pub enum PlacementConstraintParseError {
     #[error("placement constraint '{expression}' must include a non-empty value")]
     EmptyValue { expression: String },
 
+    #[error("placement constraint for selector '{selector}' must include a non-empty value")]
+    EmptyConstraintValue { selector: String },
+
+    #[error("placement constraint node_label selector requires a non-empty key")]
+    EmptyLabelKey,
+
     #[error(
         "unsupported placement constraint key '{key}'; supported keys are node.id, node.hostname, node.ip, node.address, node.platform.os, node.platform.arch, and node.labels.<key>"
     )]
     UnsupportedKey { key: String },
 
-    #[error("placement constraint key '{key}' requires an IP address or CIDR value, got '{value}'")]
-    InvalidIpValue { key: String, value: String },
-}
-
-/// One normalized selector extracted from a placement-constraint key.
-enum PlacementSelector {
-    Id,
-    Hostname,
-    Ip,
-    Address,
-    PlatformOs,
-    PlatformArch,
-    Label(String),
-}
-
-impl PlacementSelector {
-    /// Parses one placement-selector key into its normalized internal representation.
-    fn parse(raw: &str) -> Result<Self, PlacementConstraintParseError> {
-        if let Some(key) = raw
-            .strip_prefix("node.labels.")
-            .or_else(|| raw.strip_prefix("labels."))
-        {
-            if key.trim().is_empty() {
-                return Err(PlacementConstraintParseError::UnsupportedKey {
-                    key: raw.to_string(),
-                });
-            }
-            return Ok(Self::Label(key.to_string()));
-        }
-
-        match raw {
-            "node.id" => Ok(Self::Id),
-            "node.hostname" => Ok(Self::Hostname),
-            "node.ip" => Ok(Self::Ip),
-            "node.address" => Ok(Self::Address),
-            "node.platform.os" => Ok(Self::PlatformOs),
-            "node.platform.arch" => Ok(Self::PlatformArch),
-            _ => Err(PlacementConstraintParseError::UnsupportedKey {
-                key: raw.to_string(),
-            }),
-        }
-    }
-
-    /// Validates the operand value for this selector before the constraint is accepted.
-    fn validate_value(&self, value: &str) -> Result<(), PlacementConstraintParseError> {
-        if matches!(self, Self::Ip) && !is_valid_ip_or_cidr(value) {
-            return Err(PlacementConstraintParseError::InvalidIpValue {
-                key: "node.ip".to_string(),
-                value: value.to_string(),
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Returns true when the candidate node matches this selector/value pair.
-    fn matches(&self, node: &PlacementNode, expected: &str) -> bool {
-        match self {
-            Self::Id => node.node_id.to_string() == expected,
-            Self::Hostname => node.hostname == expected,
-            Self::Address => node.address == expected,
-            Self::PlatformOs => platform_os_matches_value(&node.platform_os, expected),
-            Self::PlatformArch => platform_arch_matches_value(&node.platform_arch, expected),
-            Self::Label(key) => node.label_value(key) == Some(expected),
-            Self::Ip => node
-                .ip_addr()
-                .map(|actual| ip_matches_value(actual, expected))
-                .unwrap_or(false),
-        }
-    }
+    #[error(
+        "placement constraint selector '{selector}' requires an IP address or CIDR value, got '{value}'"
+    )]
+    InvalidIpValue { selector: String, value: String },
 }
 
 /// Per-node service-placement counts used to evaluate soft affinity preferences deterministically.
@@ -513,9 +597,9 @@ fn normalize_platform_arch(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PlacementConstraint, PlacementConstraintOperator, PlacementNode, PlacementPolicy,
-        PlacementPreference, PlacementPreferenceCounts, PlacementStrategy,
-        compare_placement_preference_counts,
+        PlacementConstraint, PlacementConstraintOperator, PlacementConstraintSelector,
+        PlacementNode, PlacementPolicy, PlacementPreference, PlacementPreferenceCounts,
+        PlacementStrategy, compare_placement_preference_counts,
     };
     use crate::topology::peers::PeerLabel;
     use std::cmp::Ordering;
@@ -527,9 +611,12 @@ mod tests {
         let parsed = PlacementConstraint::parse_expression("node.labels.zone == west")
             .expect("placement constraint should parse");
 
-        assert_eq!(parsed.key, "node.labels.zone");
-        assert_eq!(parsed.op, PlacementConstraintOperator::Eq);
-        assert_eq!(parsed.value, "west");
+        assert_eq!(
+            parsed.selector(),
+            &PlacementConstraintSelector::node_label("zone")
+        );
+        assert_eq!(parsed.operator(), PlacementConstraintOperator::Eq);
+        assert_eq!(parsed.value(), "west");
         assert_eq!(
             parsed.render_expression(),
             "node.labels.zone == west".to_string()
@@ -552,9 +639,9 @@ mod tests {
         );
         let policy = PlacementPolicy {
             constraints: vec![
-                PlacementConstraint::parse_expression("node.hostname == worker-west-1")
+                PlacementConstraint::eq(PlacementConstraintSelector::NodeHostname, "worker-west-1")
                     .expect("hostname constraint"),
-                PlacementConstraint::parse_expression("node.labels.zone == west")
+                PlacementConstraint::eq(PlacementConstraintSelector::node_label("zone"), "west")
                     .expect("label constraint"),
             ],
             preferences: Vec::new(),
@@ -577,7 +664,7 @@ mod tests {
         );
         let policy = PlacementPolicy {
             constraints: vec![
-                PlacementConstraint::parse_expression("node.ip == 10.42.0.0/16")
+                PlacementConstraint::eq(PlacementConstraintSelector::NodeIp, "10.42.0.0/16")
                     .expect("cidr constraint"),
             ],
             preferences: Vec::new(),
@@ -609,9 +696,9 @@ mod tests {
         );
         let policy = PlacementPolicy {
             constraints: vec![
-                PlacementConstraint::parse_expression("node.platform.os == darwin")
+                PlacementConstraint::eq(PlacementConstraintSelector::NodePlatformOs, "darwin")
                     .expect("platform os constraint"),
-                PlacementConstraint::parse_expression("node.platform.arch == amd64")
+                PlacementConstraint::eq(PlacementConstraintSelector::NodePlatformArch, "amd64")
                     .expect("platform arch constraint"),
             ],
             preferences: Vec::new(),

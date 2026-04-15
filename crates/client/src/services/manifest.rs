@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::net::IpAddr;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -243,6 +244,74 @@ pub enum PlacementStrategy {
     Binpack,
 }
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementConstraintSelector {
+    NodeId,
+    NodeHostname,
+    NodeIp,
+    NodeAddress,
+    NodePlatformOs,
+    NodePlatformArch,
+    NodeLabel { key: String },
+}
+
+impl PlacementConstraintSelector {
+    /// Builds one typed node-label selector for manifest authors constructing constraints in code.
+    pub fn node_label(key: impl Into<String>) -> Self {
+        Self::NodeLabel { key: key.into() }
+    }
+
+    /// Returns the stable operator-facing selector key for diagnostics and validation errors.
+    fn render_key(&self) -> String {
+        match self {
+            Self::NodeId => "node.id".to_string(),
+            Self::NodeHostname => "node.hostname".to_string(),
+            Self::NodeIp => "node.ip".to_string(),
+            Self::NodeAddress => "node.address".to_string(),
+            Self::NodePlatformOs => "node.platform.os".to_string(),
+            Self::NodePlatformArch => "node.platform.arch".to_string(),
+            Self::NodeLabel { key } => format!("node.labels.{key}"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementConstraintOperator {
+    #[default]
+    Eq,
+    Ne,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash)]
+pub struct PlacementConstraint {
+    pub selector: PlacementConstraintSelector,
+    #[serde(default)]
+    pub operator: PlacementConstraintOperator,
+    pub value: String,
+}
+
+impl PlacementConstraint {
+    /// Builds one typed equality constraint for callers constructing manifests in code.
+    pub fn eq(selector: PlacementConstraintSelector, value: impl Into<String>) -> Self {
+        Self {
+            selector,
+            operator: PlacementConstraintOperator::Eq,
+            value: value.into(),
+        }
+    }
+
+    /// Builds one typed inequality constraint for callers constructing manifests in code.
+    pub fn ne(selector: PlacementConstraintSelector, value: impl Into<String>) -> Self {
+        Self {
+            selector,
+            operator: PlacementConstraintOperator::Ne,
+            value: value.into(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum PlacementPreference {
@@ -255,7 +324,7 @@ pub enum PlacementPreference {
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct PlacementSpec {
     #[serde(default)]
-    pub constraints: Vec<String>,
+    pub constraints: Vec<PlacementConstraint>,
     #[serde(default)]
     pub preferences: Vec<PlacementPreference>,
     #[serde(default)]
@@ -918,8 +987,8 @@ fn validate_template_dependencies(task_templates: &[TaskTemplateSpec]) -> Result
 
 /// Validates one task template placement section before the manifest is submitted.
 fn validate_template_placement(template: &TaskTemplateSpec) -> Result<()> {
-    for raw in &template.placement.constraints {
-        validate_constraint_expression(raw).map_err(|message| {
+    for constraint in &template.placement.constraints {
+        validate_constraint(constraint).map_err(|message| {
             anyhow!(
                 "template '{}' defines an invalid placement constraint: {message}",
                 template.name
@@ -930,35 +999,55 @@ fn validate_template_placement(template: &TaskTemplateSpec) -> Result<()> {
     Ok(())
 }
 
-/// Performs lightweight local validation for one Swarm-style placement constraint expression.
-fn validate_constraint_expression(raw: &str) -> std::result::Result<(), String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err("constraint must not be empty".to_string());
-    }
-
-    let (key, value) = if let Some(parts) = trimmed.split_once("!=") {
-        parts
-    } else if let Some(parts) = trimmed.split_once("==") {
-        parts
-    } else {
+/// Performs lightweight local validation for one typed placement constraint.
+fn validate_constraint(constraint: &PlacementConstraint) -> std::result::Result<(), String> {
+    let selector_key = constraint.selector.render_key();
+    let value = constraint.value.trim();
+    if value.is_empty() {
         return Err(format!(
-            "constraint '{trimmed}' must use either '==' or '!='"
-        ));
-    };
-
-    if key.trim().is_empty() {
-        return Err(format!(
-            "constraint '{trimmed}' must include a non-empty key"
+            "constraint for selector '{}' must include a non-empty value",
+            selector_key
         ));
     }
-    if value.trim().is_empty() {
-        return Err(format!(
-            "constraint '{trimmed}' must include a non-empty value"
-        ));
+
+    match &constraint.selector {
+        PlacementConstraintSelector::NodeLabel { key } => {
+            if key.trim().is_empty() {
+                return Err("node_label selector requires a non-empty key".to_string());
+            }
+        }
+        PlacementConstraintSelector::NodeIp if !is_valid_ip_or_cidr(value) => {
+            return Err(format!(
+                "selector '{}' requires an IP address or CIDR value, got '{}'",
+                selector_key, constraint.value
+            ));
+        }
+        _ => {}
     }
 
     Ok(())
+}
+
+/// Returns true when the provided string encodes either one IP address or one CIDR prefix.
+fn is_valid_ip_or_cidr(value: &str) -> bool {
+    if value.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+
+    parse_cidr(value).is_some()
+}
+
+/// Parses one CIDR string into a network IP and prefix length.
+fn parse_cidr(value: &str) -> Option<(IpAddr, u8)> {
+    let (network_text, prefix_text) = value.split_once('/')?;
+    let network = network_text.parse::<IpAddr>().ok()?;
+    let prefix = prefix_text.parse::<u8>().ok()?;
+    let max_prefix = match network {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+
+    (prefix <= max_prefix).then_some((network, prefix))
 }
 
 pub fn load_manifest_from_path(path: &Path) -> Result<ServiceManifest> {
@@ -1077,6 +1166,52 @@ mod tests {
         .expect_err("legacy field must be rejected");
 
         assert!(error.to_string().contains("task_templates"));
+    }
+
+    #[test]
+    fn service_manifest_deserializes_typed_placement_constraints() {
+        let manifest: ServiceManifest = ron::from_str(
+            r#"
+            (
+                name: "demo",
+                tasks: [
+                    (
+                        name: "api",
+                        image: "ghcr.io/demo/api:latest",
+                        placement: (
+                            constraints: [
+                                (
+                                    selector: node_label(key: "topology.zone"),
+                                    operator: eq,
+                                    value: "west",
+                                ),
+                                (
+                                    selector: node_platform_arch,
+                                    operator: ne,
+                                    value: "arm64",
+                                ),
+                            ],
+                        ),
+                    ),
+                ],
+            )
+            "#,
+        )
+        .expect("manifest");
+
+        assert_eq!(manifest.task_templates.len(), 1);
+        assert_eq!(manifest.task_templates[0].placement.constraints.len(), 2);
+        assert_eq!(
+            manifest.task_templates[0].placement.constraints[0],
+            PlacementConstraint::eq(
+                PlacementConstraintSelector::node_label("topology.zone"),
+                "west",
+            )
+        );
+        assert_eq!(
+            manifest.task_templates[0].placement.constraints[1],
+            PlacementConstraint::ne(PlacementConstraintSelector::NodePlatformArch, "arm64")
+        );
     }
 
     #[test]
@@ -1318,6 +1453,47 @@ mod tests {
                 .to_string()
                 .contains("references undeclared volume 'pgdata'")
         );
+    }
+
+    #[test]
+    fn manifest_rejects_invalid_typed_node_ip_constraint() {
+        let manifest = ServiceManifest {
+            name: "demo".into(),
+            volumes: Vec::new(),
+            task_templates: vec![TaskTemplateSpec {
+                name: "api".into(),
+                image: "ghcr.io/demo/api:latest".into(),
+                command: Vec::new(),
+                depends_on: Vec::new(),
+                replicas: 1,
+                resources: TaskTemplateResources::default(),
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: Vec::new(),
+                readiness: None,
+                liveness: None,
+                public_port: None,
+                tty: false,
+                placement: PlacementSpec {
+                    constraints: vec![PlacementConstraint::eq(
+                        PlacementConstraintSelector::NodeIp,
+                        "definitely-not-an-ip",
+                    )],
+                    preferences: Vec::new(),
+                    strategy: PlacementStrategy::Spread,
+                },
+            }],
+            update: ServiceUpdateStrategy::default(),
+        };
+
+        let error = manifest
+            .validate()
+            .expect_err("invalid node.ip constraint must fail");
+        assert!(error.to_string().contains("requires an IP address or CIDR"));
     }
 
     #[test]

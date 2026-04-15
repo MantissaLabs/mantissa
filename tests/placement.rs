@@ -5,7 +5,9 @@ use common::convergence::wait_until;
 use common::testkit::{ClusterConfig, RuntimeBackendOverrideGuard, TestNode};
 use mantissa::node::id::set_node_id;
 use mantissa::registry::Registry;
-use mantissa::scheduler::placement::{PlacementConstraint, PlacementPreference, PlacementStrategy};
+use mantissa::scheduler::placement::{
+    PlacementConstraint, PlacementConstraintSelector, PlacementPreference, PlacementStrategy,
+};
 use mantissa::services::ServiceController;
 use mantissa::services::types::{
     ServiceStatus, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
@@ -78,8 +80,11 @@ local_test!(services_placement_constraints_honor_node_labels, {
     let service_name = "placement-constraints-labels";
     let mut template = demo_backend_task_template("backend", 1);
     template.execution.placement.constraints = vec![
-        PlacementConstraint::parse_expression("node.labels.topology.zone == west")
-            .expect("placement constraint should parse"),
+        PlacementConstraint::eq(
+            PlacementConstraintSelector::node_label("topology.zone"),
+            "west",
+        )
+        .expect("placement constraint should parse"),
     ];
 
     let service_id = cluster[0]
@@ -140,8 +145,11 @@ local_test!(services_placement_constraints_honor_node_id, {
     let service_name = "placement-constraints-node-id";
     let mut template = demo_backend_task_template("backend", 1);
     template.execution.placement.constraints = vec![
-        PlacementConstraint::parse_expression(&format!("node.id == {}", cluster[1].id()))
-            .expect("node id placement constraint should parse"),
+        PlacementConstraint::eq(
+            PlacementConstraintSelector::NodeId,
+            cluster[1].id().to_string(),
+        )
+        .expect("node id placement constraint should parse"),
     ];
 
     let service_id = cluster[0]
@@ -205,15 +213,15 @@ local_test!(
         let service_name = "placement-constraints-platform";
         let mut template = demo_backend_task_template("backend", 1);
         template.execution.placement.constraints = vec![
-            PlacementConstraint::parse_expression(&format!(
-                "node.platform.os == {}",
-                std::env::consts::OS
-            ))
+            PlacementConstraint::eq(
+                PlacementConstraintSelector::NodePlatformOs,
+                std::env::consts::OS,
+            )
             .expect("platform os constraint should parse"),
-            PlacementConstraint::parse_expression(&format!(
-                "node.platform.arch == {}",
-                std::env::consts::ARCH
-            ))
+            PlacementConstraint::eq(
+                PlacementConstraintSelector::NodePlatformArch,
+                std::env::consts::ARCH,
+            )
             .expect("platform arch constraint should parse"),
         ];
 
@@ -264,8 +272,11 @@ local_test!(services_placement_constraints_reject_unknown_platform, {
     let service_name = "placement-constraints-bad-platform";
     let mut template = demo_backend_task_template("backend", 1);
     template.execution.placement.constraints = vec![
-        PlacementConstraint::parse_expression("node.platform.os == definitely-not-a-real-os")
-            .expect("platform os constraint should parse"),
+        PlacementConstraint::eq(
+            PlacementConstraintSelector::NodePlatformOs,
+            "definitely-not-a-real-os",
+        )
+        .expect("platform os constraint should parse"),
     ];
 
     let service_id = cluster[0]
@@ -345,8 +356,11 @@ local_test!(services_placement_constraints_recover_after_label_change, {
     let service_name = "placement-constraints-recover";
     let mut template = demo_backend_task_template("backend", 1);
     template.execution.placement.constraints = vec![
-        PlacementConstraint::parse_expression("node.labels.topology.zone == west")
-            .expect("placement constraint should parse"),
+        PlacementConstraint::eq(
+            PlacementConstraintSelector::node_label("topology.zone"),
+            "west",
+        )
+        .expect("placement constraint should parse"),
     ];
 
     let service_id = cluster[0]
@@ -445,8 +459,11 @@ local_test!(
         let service_name = "placement-strategy-spread";
         let mut template = demo_backend_task_template("backend", 2);
         template.execution.placement.constraints = vec![
-            PlacementConstraint::parse_expression("node.labels.topology.zone == west")
-                .expect("west placement constraint should parse"),
+            PlacementConstraint::eq(
+                PlacementConstraintSelector::node_label("topology.zone"),
+                "west",
+            )
+            .expect("west placement constraint should parse"),
         ];
         template.execution.placement.strategy = PlacementStrategy::Spread;
 
@@ -736,8 +753,11 @@ local_test!(services_placement_binpack_reuses_matching_node, {
     let service_name = "placement-strategy-binpack";
     let mut template = demo_backend_task_template("backend", 2);
     template.execution.placement.constraints = vec![
-        PlacementConstraint::parse_expression("node.labels.topology.zone == west")
-            .expect("west placement constraint should parse"),
+        PlacementConstraint::eq(
+            PlacementConstraintSelector::node_label("topology.zone"),
+            "west",
+        )
+        .expect("west placement constraint should parse"),
     ];
     template.execution.placement.strategy = PlacementStrategy::Binpack;
 

@@ -1,8 +1,9 @@
 use super::manifest::{
-    EnvironmentVariable, LivenessKind, LivenessProbe, PlacementPreference, PlacementStrategy,
-    ReadinessKind, ReadinessProbe, RestartPolicyName, RolloutOrder, SecretFileProjection,
-    SecretReference, ServiceManifest, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
-    TaskTemplateSpec, VolumeMount,
+    EnvironmentVariable, LivenessKind, LivenessProbe, PlacementConstraint,
+    PlacementConstraintOperator, PlacementConstraintSelector, PlacementPreference,
+    PlacementStrategy, ReadinessKind, ReadinessProbe, RestartPolicyName, RolloutOrder,
+    SecretFileProjection, SecretReference, ServiceManifest, ServiceUpdateStrategy,
+    ServiceUpdateStrategyMode, TaskTemplateSpec, VolumeMount,
 };
 use crate::config::ClientConfig;
 use crate::connection;
@@ -14,7 +15,7 @@ use crate::workload_submit::{
 use crate::workload_wire::write_local_volume_ownership;
 use anyhow::{Context, Result, anyhow};
 use capnp::{Error as CapnpError, struct_list};
-use protocol::services::task_template;
+use protocol::services::{placement_constraint, placement_constraint_selector, task_template};
 use protocol::workload::{environment_var, secret_file, secret_ref, volume_mount};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -356,7 +357,8 @@ fn write_task_template(
         .reborrow()
         .init_placement_constraints(template.placement.constraints.len() as u32);
     for (idx, constraint) in template.placement.constraints.iter().enumerate() {
-        placement_constraints.set(idx as u32, constraint.trim());
+        let builder = placement_constraints.reborrow().get(idx as u32);
+        write_placement_constraint(builder, constraint);
     }
     let placement_strategy = match template.placement.strategy {
         PlacementStrategy::Spread => protocol::services::PlacementStrategy::Spread,
@@ -399,6 +401,36 @@ fn write_task_template(
     )?;
 
     Ok(())
+}
+
+/// Writes one typed placement constraint into the service deployment payload.
+fn write_placement_constraint(
+    mut builder: placement_constraint::Builder<'_>,
+    constraint: &PlacementConstraint,
+) {
+    write_placement_constraint_selector(builder.reborrow().init_selector(), &constraint.selector);
+    let operator = match constraint.operator {
+        PlacementConstraintOperator::Eq => protocol::services::PlacementConstraintOperator::Eq,
+        PlacementConstraintOperator::Ne => protocol::services::PlacementConstraintOperator::Ne,
+    };
+    builder.set_operator(operator);
+    builder.set_value(constraint.value.trim());
+}
+
+/// Writes one typed placement selector into the service deployment payload.
+fn write_placement_constraint_selector(
+    mut builder: placement_constraint_selector::Builder<'_>,
+    selector: &PlacementConstraintSelector,
+) {
+    match selector {
+        PlacementConstraintSelector::NodeId => builder.set_node_id(()),
+        PlacementConstraintSelector::NodeHostname => builder.set_node_hostname(()),
+        PlacementConstraintSelector::NodeIp => builder.set_node_ip(()),
+        PlacementConstraintSelector::NodeAddress => builder.set_node_address(()),
+        PlacementConstraintSelector::NodePlatformOs => builder.set_node_platform_os(()),
+        PlacementConstraintSelector::NodePlatformArch => builder.set_node_platform_arch(()),
+        PlacementConstraintSelector::NodeLabel { key } => builder.set_node_label(key.trim()),
+    }
 }
 
 /// Writes one readiness probe into the service deployment payload.

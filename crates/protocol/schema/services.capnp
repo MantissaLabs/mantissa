@@ -78,8 +78,8 @@ struct TaskTemplate {
   tty @19 :Bool;
   # Allocate a terminal for the replica entrypoint.
 
-  placementConstraints @20 :List(Text);
-  # Hard scheduler constraints encoded as Swarm-style expressions such as `node.labels.zone == west`.
+  placementConstraints @20 :List(PlacementConstraint);
+  # Hard scheduler constraints evaluated as typed selector/operator/value predicates.
 
   placementStrategy @21 :PlacementStrategy;
   # Candidate ranking strategy used after hard constraints pass.
@@ -94,6 +94,50 @@ struct TaskTemplateNetwork {
 
   networkId @1 :Data;
   # Required overlay network UUID as a 16-byte binary identifier.
+}
+
+struct PlacementConstraint {
+  selector @0 :PlacementConstraintSelector;
+  # Typed selector evaluated against the candidate node.
+
+  operator @1 :PlacementConstraintOperator;
+  # Comparison applied between the selector value and the expected operand.
+
+  value @2 :Text;
+  # Expected operand compared against the selector value.
+}
+
+struct PlacementConstraintSelector {
+  union {
+    nodeId @0 :Void;
+    # Match the candidate node UUID.
+
+    nodeHostname @1 :Void;
+    # Match the candidate node hostname.
+
+    nodeIp @2 :Void;
+    # Match the candidate node IP address or one CIDR operand.
+
+    nodeAddress @3 :Void;
+    # Match the advertised node address exactly.
+
+    nodePlatformOs @4 :Void;
+    # Match the scheduler-visible operating-system identifier.
+
+    nodePlatformArch @5 :Void;
+    # Match the scheduler-visible architecture identifier.
+
+    nodeLabel @6 :Text;
+    # Match one node label by key.
+  }
+}
+
+enum PlacementConstraintOperator {
+  eq @0;
+  # Require the selector value to equal the expected operand.
+
+  ne @1;
+  # Require the selector value to differ from the expected operand.
 }
 
 enum ReadinessProbeKind {
