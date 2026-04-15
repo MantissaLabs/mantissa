@@ -46,8 +46,11 @@ impl PlacementPolicy {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum PlacementStrategy {
+    /// Prefer even task distribution across the eligible candidate set.
     #[default]
     Spread,
+    /// Prefer reusing the fullest matching node before expanding onto more peers.
+    Binpack,
 }
 
 /// One hard placement predicate interpreted against a candidate node.

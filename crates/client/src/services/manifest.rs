@@ -240,6 +240,7 @@ pub enum LivenessKind {
 pub enum PlacementStrategy {
     #[default]
     Spread,
+    Binpack,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]

@@ -410,6 +410,7 @@ fn placement_strategy_from_proto(
 ) -> SchedulerPlacementStrategy {
     match strategy {
         protocol::services::PlacementStrategy::Spread => SchedulerPlacementStrategy::Spread,
+        protocol::services::PlacementStrategy::Binpack => SchedulerPlacementStrategy::Binpack,
     }
 }
 
@@ -419,6 +420,7 @@ fn placement_strategy_to_proto(
 ) -> protocol::services::PlacementStrategy {
     match strategy {
         SchedulerPlacementStrategy::Spread => protocol::services::PlacementStrategy::Spread,
+        SchedulerPlacementStrategy::Binpack => protocol::services::PlacementStrategy::Binpack,
     }
 }
 

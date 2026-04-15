@@ -172,6 +172,9 @@ enum PublicProtocol {
 enum PlacementStrategy {
   spread @0;
   # Prefer even task distribution across matching nodes.
+
+  binpack @1;
+  # Prefer reusing the fullest matching node before expanding onto more peers.
 }
 
 enum RestartPolicyName {

@@ -360,6 +360,7 @@ fn write_task_template(
     }
     let placement_strategy = match template.placement.strategy {
         PlacementStrategy::Spread => protocol::services::PlacementStrategy::Spread,
+        PlacementStrategy::Binpack => protocol::services::PlacementStrategy::Binpack,
     };
     builder.set_placement_strategy(placement_strategy);
 

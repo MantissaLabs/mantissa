@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::gpu::gpu_runtime_status;
 use crate::runtime::types::{RuntimeInstanceRef, RuntimeSupportProfile};
 use crate::scheduler::digest::SchedulerDigestValue;
-use crate::scheduler::placement::{PlacementNode, PlacementPolicy};
+use crate::scheduler::placement::{PlacementNode, PlacementPolicy, PlacementStrategy};
 use crate::scheduler::{
     GpuDeviceReservation, GpuDeviceState, SchedulerSnapshot, SlotCapacity, SlotId, SlotState,
 };
@@ -198,6 +198,7 @@ enum CandidateLocation {
 
 /// Wrapper for a node's free slots together with the metadata needed to build
 /// either a local or remote plan once a slot is assigned.
+#[derive(Clone)]
 struct Candidate {
     location: CandidateLocation,
     placement: PlacementNode,
@@ -489,6 +490,27 @@ impl Candidate {
             free_gpu_count: self.free_gpu_count,
         }
     }
+
+    /// Returns the scheduler-visible node id behind this candidate for stable tie-breaking.
+    fn node_id(&self, local_node_id: Uuid) -> Uuid {
+        match self.location {
+            CandidateLocation::Local => local_node_id,
+            CandidateLocation::Remote { peer_id } => peer_id,
+        }
+    }
+
+    /// Simulates one allocation to score how tightly this candidate can pack the intent.
+    fn binpack_score(&self, intent: &StartIntent) -> Option<BinpackScore> {
+        let mut simulated = self.clone();
+        simulated.allocate(intent.cpu_millis, intent.memory_bytes, intent.gpu_count)?;
+        let remaining = simulated.capacity();
+        Some(BinpackScore {
+            free_slot_count: remaining.free_slot_count,
+            free_cpu_millis: remaining.free_cpu_millis,
+            free_memory_bytes: remaining.free_memory_bytes,
+            free_gpu_count: remaining.free_gpu_count,
+        })
+    }
 }
 
 /// Aggregate lower-bound demand for the intents that still need placement.
@@ -523,6 +545,15 @@ struct CandidateCapacity {
     free_gpu_count: u32,
 }
 
+/// Residual capacity score used to prefer the tightest viable binpack candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BinpackScore {
+    free_slot_count: u32,
+    free_cpu_millis: u64,
+    free_memory_bytes: u64,
+    free_gpu_count: u32,
+}
+
 impl CandidateCapacity {
     /// Adds one hydrated candidate's free capacity into the running aggregate.
     fn add_candidate(&mut self, candidate: &Candidate) {
@@ -546,6 +577,37 @@ fn capacity_covers_workload(available: CandidateCapacity, demand: WorkloadDemand
         && available.free_cpu_millis >= demand.cpu_millis
         && available.free_memory_bytes >= demand.memory_bytes
         && available.free_gpu_count >= demand.gpu_count
+}
+
+/// Returns true when the left residual-capacity score packs more tightly than the right score.
+///
+/// Binpack prefers the candidate that leaves the least residual capacity after
+/// simulating the placement. The dimensions are ordered intentionally: first
+/// by free slot count, then remaining CPU, then memory, then GPUs. That keeps
+/// the primary signal close to "how many more tasks can this node still hold"
+/// and only uses raw resource totals to break ties inside the same slot budget.
+fn prefers_binpack_score(left: BinpackScore, right: BinpackScore) -> bool {
+    let leaves_fewer_slots = left.free_slot_count.cmp(&right.free_slot_count);
+    if leaves_fewer_slots != std::cmp::Ordering::Equal {
+        return leaves_fewer_slots.is_lt();
+    }
+
+    let leaves_less_cpu = left.free_cpu_millis.cmp(&right.free_cpu_millis);
+    if leaves_less_cpu != std::cmp::Ordering::Equal {
+        return leaves_less_cpu.is_lt();
+    }
+
+    let leaves_less_memory = left.free_memory_bytes.cmp(&right.free_memory_bytes);
+    if leaves_less_memory != std::cmp::Ordering::Equal {
+        return leaves_less_memory.is_lt();
+    }
+
+    let leaves_fewer_gpus = left.free_gpu_count.cmp(&right.free_gpu_count);
+    if leaves_fewer_gpus != std::cmp::Ordering::Equal {
+        return leaves_fewer_gpus.is_lt();
+    }
+
+    false
 }
 
 /// Returns true when the digest can plausibly host the intent without fetching slot details.
@@ -1309,9 +1371,214 @@ impl WorkloadManager {
         Err(SchedulingError::InsufficientCapacityOnTarget { target_node }.into())
     }
 
-    /// Allocate the remaining intents across the candidate queue. The queue is
-    /// treated as a ring: after examining a candidate we move it to the back so
-    /// subsequent intents see a rotated view, which naturally spreads replicas.
+    /// Allocates one untargeted intent by rotating the shared candidate ring to spread replicas.
+    fn allocate_spread_intent(
+        &self,
+        candidates: &mut VecDeque<Candidate>,
+        intent: &StartIntent,
+    ) -> Result<(CandidateLocation, ResourceAllocation), anyhow::Error> {
+        let candidate_count = candidates.len();
+        if candidate_count == 0 {
+            return Err(SchedulingError::InsufficientCapacityForBatch.into());
+        }
+
+        let mut skipped_for_constraints = false;
+        let mut skipped_for_networks = false;
+        let mut skipped_for_runtime = false;
+        for _ in 0..candidate_count {
+            let mut candidate = candidates
+                .pop_front()
+                .expect("candidate deque should not be empty");
+
+            if !candidate.matches_placement(intent) {
+                skipped_for_constraints = true;
+                candidates.push_back(candidate);
+                continue;
+            }
+
+            if !candidate.supports_runtime_requirements(intent) {
+                skipped_for_runtime = true;
+                candidates.push_back(candidate);
+                continue;
+            }
+
+            if !candidate.can_host(&intent.networks) {
+                skipped_for_networks = true;
+                candidates.push_back(candidate);
+                continue;
+            }
+
+            if let Some(allocation) =
+                candidate.allocate(intent.cpu_millis, intent.memory_bytes, intent.gpu_count)
+            {
+                let location = candidate.location.clone();
+                if !candidate.is_empty() {
+                    candidates.push_back(candidate);
+                }
+                return Ok((location, allocation));
+            }
+
+            candidates.push_back(candidate);
+        }
+
+        if skipped_for_constraints {
+            Err(intent.placement_error().into())
+        } else if skipped_for_runtime {
+            Err(intent.runtime_requirements_error().into())
+        } else if skipped_for_networks {
+            Err(SchedulingError::NetworksBlocked {
+                networks: intent.networks.clone(),
+            }
+            .into())
+        } else {
+            Err(SchedulingError::InsufficientCapacityForBatch.into())
+        }
+    }
+
+    /// Allocates one untargeted intent by preferring the tightest viable candidate.
+    fn allocate_binpack_intent(
+        &self,
+        candidates: &mut VecDeque<Candidate>,
+        intent: &StartIntent,
+    ) -> Result<(CandidateLocation, ResourceAllocation), anyhow::Error> {
+        if candidates.is_empty() {
+            return Err(SchedulingError::InsufficientCapacityForBatch.into());
+        }
+
+        let mut best: Option<(usize, BinpackScore, Uuid)> = None;
+        let mut skipped_for_constraints = false;
+        let mut skipped_for_networks = false;
+        let mut skipped_for_runtime = false;
+
+        for (idx, candidate) in candidates.iter().enumerate() {
+            if !candidate.matches_placement(intent) {
+                skipped_for_constraints = true;
+                continue;
+            }
+
+            if !candidate.supports_runtime_requirements(intent) {
+                skipped_for_runtime = true;
+                continue;
+            }
+
+            if !candidate.can_host(&intent.networks) {
+                skipped_for_networks = true;
+                continue;
+            }
+
+            let Some(score) = candidate.binpack_score(intent) else {
+                continue;
+            };
+            let node_id = candidate.node_id(self.local_node_id);
+            match best {
+                None => best = Some((idx, score, node_id)),
+                Some((_, best_score, best_node_id))
+                    if prefers_binpack_score(score, best_score)
+                        || (score == best_score && node_id < best_node_id) =>
+                {
+                    best = Some((idx, score, node_id));
+                }
+                _ => {}
+            }
+        }
+
+        let Some((best_index, _, _)) = best else {
+            if skipped_for_constraints {
+                return Err(intent.placement_error().into());
+            } else if skipped_for_runtime {
+                return Err(intent.runtime_requirements_error().into());
+            } else if skipped_for_networks {
+                return Err(SchedulingError::NetworksBlocked {
+                    networks: intent.networks.clone(),
+                }
+                .into());
+            } else {
+                return Err(SchedulingError::InsufficientCapacityForBatch.into());
+            }
+        };
+
+        let mut candidate = candidates
+            .remove(best_index)
+            .expect("selected candidate index should remain valid");
+        let allocation = candidate
+            .allocate(intent.cpu_millis, intent.memory_bytes, intent.gpu_count)
+            .expect("binpack candidate should allocate after scoring");
+        let location = candidate.location.clone();
+        if !candidate.is_empty() {
+            candidates.push_back(candidate);
+        }
+        Ok((location, allocation))
+    }
+
+    /// Records one completed candidate allocation into the assignment plan that will be persisted.
+    fn push_assignment(
+        &self,
+        assignment: &mut Assignment,
+        intent: &StartIntent,
+        location: CandidateLocation,
+        allocation: ResourceAllocation,
+    ) {
+        match location {
+            CandidateLocation::Local => {
+                assignment.local.push(BatchStartPlan {
+                    id: intent.id,
+                    name: intent.name.clone(),
+                    image: intent.image.clone(),
+                    execution_platform: intent.execution_platform,
+                    isolation_mode: intent.isolation_mode,
+                    isolation_profile: intent.isolation_profile.clone(),
+                    command: intent.command.clone(),
+                    tty: intent.tty,
+                    slots: allocation.slots,
+                    requested_cpu_millis: intent.cpu_millis,
+                    requested_memory_bytes: intent.memory_bytes,
+                    requested_gpu_count: intent.gpu_count,
+                    gpu_device_ids: allocation.gpu_device_ids,
+                    instance_id: None,
+                    created_at: Utc::now(),
+                    index: intent.index,
+                    preassigned: false,
+                    restart_policy: intent.restart_policy.clone(),
+                    termination_grace_period_secs: intent.termination_grace_period_secs,
+                    pre_stop_command: intent.pre_stop_command.clone(),
+                    liveness: intent.liveness.clone(),
+                    env: intent.env.clone(),
+                    secret_files: intent.secret_files.clone(),
+                    volumes: intent.volumes.clone(),
+                    networks: intent.networks.clone(),
+                    owner: intent.owner.clone(),
+                });
+            }
+            CandidateLocation::Remote { peer_id } => {
+                assignment.remote.push(RemoteStartPlan {
+                    index: intent.index,
+                    id: intent.id,
+                    name: intent.name.clone(),
+                    image: intent.image.clone(),
+                    execution_platform: intent.execution_platform,
+                    isolation_mode: intent.isolation_mode,
+                    isolation_profile: intent.isolation_profile.clone(),
+                    command: intent.command.clone(),
+                    tty: intent.tty,
+                    cpu_millis: intent.cpu_millis,
+                    memory_bytes: intent.memory_bytes,
+                    gpu_count: intent.gpu_count,
+                    peer_id,
+                    restart_policy: intent.restart_policy.clone(),
+                    termination_grace_period_secs: intent.termination_grace_period_secs,
+                    pre_stop_command: intent.pre_stop_command.clone(),
+                    liveness: intent.liveness.clone(),
+                    env: intent.env.clone(),
+                    secret_files: intent.secret_files.clone(),
+                    volumes: intent.volumes.clone(),
+                    networks: intent.networks.clone(),
+                    owner: intent.owner.clone(),
+                });
+            }
+        }
+    }
+
+    /// Allocates the remaining intents using each intent's configured placement strategy.
     fn allocate_remaining(
         &self,
         assignment: &mut Assignment,
@@ -1319,190 +1586,17 @@ impl WorkloadManager {
         intents: Vec<&StartIntent>,
     ) -> Result<(), anyhow::Error> {
         for intent in intents {
-            if let Some(target_node) = intent.target_node {
-                let (location, allocation) =
-                    self.allocate_targeted_intent(candidates, intent, target_node)?;
-
-                match location {
-                    CandidateLocation::Local => {
-                        assignment.local.push(BatchStartPlan {
-                            id: intent.id,
-                            name: intent.name.clone(),
-                            image: intent.image.clone(),
-                            execution_platform: intent.execution_platform,
-                            isolation_mode: intent.isolation_mode,
-                            isolation_profile: intent.isolation_profile.clone(),
-                            command: intent.command.clone(),
-                            tty: intent.tty,
-                            slots: allocation.slots,
-                            requested_cpu_millis: intent.cpu_millis,
-                            requested_memory_bytes: intent.memory_bytes,
-                            requested_gpu_count: intent.gpu_count,
-                            gpu_device_ids: allocation.gpu_device_ids,
-                            instance_id: None,
-                            created_at: Utc::now(),
-                            index: intent.index,
-                            preassigned: false,
-                            restart_policy: intent.restart_policy.clone(),
-                            termination_grace_period_secs: intent.termination_grace_period_secs,
-                            pre_stop_command: intent.pre_stop_command.clone(),
-                            liveness: intent.liveness.clone(),
-                            env: intent.env.clone(),
-                            secret_files: intent.secret_files.clone(),
-                            volumes: intent.volumes.clone(),
-                            networks: intent.networks.clone(),
-                            owner: intent.owner.clone(),
-                        });
+            let (location, allocation) = if let Some(target_node) = intent.target_node {
+                self.allocate_targeted_intent(candidates, intent, target_node)?
+            } else {
+                match intent.placement.strategy {
+                    PlacementStrategy::Spread => self.allocate_spread_intent(candidates, intent)?,
+                    PlacementStrategy::Binpack => {
+                        self.allocate_binpack_intent(candidates, intent)?
                     }
-                    CandidateLocation::Remote { peer_id } => {
-                        assignment.remote.push(RemoteStartPlan {
-                            index: intent.index,
-                            id: intent.id,
-                            name: intent.name.clone(),
-                            image: intent.image.clone(),
-                            execution_platform: intent.execution_platform,
-                            isolation_mode: intent.isolation_mode,
-                            isolation_profile: intent.isolation_profile.clone(),
-                            command: intent.command.clone(),
-                            tty: intent.tty,
-                            cpu_millis: intent.cpu_millis,
-                            memory_bytes: intent.memory_bytes,
-                            gpu_count: intent.gpu_count,
-                            peer_id,
-                            restart_policy: intent.restart_policy.clone(),
-                            termination_grace_period_secs: intent.termination_grace_period_secs,
-                            pre_stop_command: intent.pre_stop_command.clone(),
-                            liveness: intent.liveness.clone(),
-                            env: intent.env.clone(),
-                            secret_files: intent.secret_files.clone(),
-                            volumes: intent.volumes.clone(),
-                            networks: intent.networks.clone(),
-                            owner: intent.owner.clone(),
-                        });
-                    }
-                }
-                continue;
-            }
-
-            let candidate_count = candidates.len();
-            if candidate_count == 0 {
-                return Err(SchedulingError::InsufficientCapacityForBatch.into());
-            }
-
-            let mut allocated: Option<(CandidateLocation, ResourceAllocation)> = None;
-            let mut skipped_for_constraints = false;
-            let mut skipped_for_networks = false;
-            let mut skipped_for_runtime = false;
-            for _ in 0..candidate_count {
-                let mut candidate = candidates
-                    .pop_front()
-                    .expect("candidate deque should not be empty");
-
-                if !candidate.matches_placement(intent) {
-                    skipped_for_constraints = true;
-                    candidates.push_back(candidate);
-                    continue;
-                }
-
-                if !candidate.supports_runtime_requirements(intent) {
-                    skipped_for_runtime = true;
-                    candidates.push_back(candidate);
-                    continue;
-                }
-
-                if !candidate.can_host(&intent.networks) {
-                    skipped_for_networks = true;
-                    candidates.push_back(candidate);
-                    continue;
-                }
-
-                if let Some(allocation) =
-                    candidate.allocate(intent.cpu_millis, intent.memory_bytes, intent.gpu_count)
-                {
-                    let location = candidate.location.clone();
-                    if !candidate.is_empty() {
-                        candidates.push_back(candidate);
-                    }
-                    allocated = Some((location, allocation));
-                    break;
-                } else {
-                    candidates.push_back(candidate);
-                }
-            }
-
-            let Some((location, allocation)) = allocated else {
-                if skipped_for_constraints {
-                    return Err(intent.placement_error().into());
-                } else if skipped_for_runtime {
-                    return Err(intent.runtime_requirements_error().into());
-                } else if skipped_for_networks {
-                    return Err(SchedulingError::NetworksBlocked {
-                        networks: intent.networks.clone(),
-                    }
-                    .into());
-                } else {
-                    return Err(SchedulingError::InsufficientCapacityForBatch.into());
                 }
             };
-
-            match location {
-                CandidateLocation::Local => {
-                    assignment.local.push(BatchStartPlan {
-                        id: intent.id,
-                        name: intent.name.clone(),
-                        image: intent.image.clone(),
-                        execution_platform: intent.execution_platform,
-                        isolation_mode: intent.isolation_mode,
-                        isolation_profile: intent.isolation_profile.clone(),
-                        command: intent.command.clone(),
-                        tty: intent.tty,
-                        slots: allocation.slots,
-                        requested_cpu_millis: intent.cpu_millis,
-                        requested_memory_bytes: intent.memory_bytes,
-                        requested_gpu_count: intent.gpu_count,
-                        gpu_device_ids: allocation.gpu_device_ids,
-                        instance_id: None,
-                        created_at: Utc::now(),
-                        index: intent.index,
-                        preassigned: false,
-                        restart_policy: intent.restart_policy.clone(),
-                        termination_grace_period_secs: intent.termination_grace_period_secs,
-                        pre_stop_command: intent.pre_stop_command.clone(),
-                        liveness: intent.liveness.clone(),
-                        env: intent.env.clone(),
-                        secret_files: intent.secret_files.clone(),
-                        volumes: intent.volumes.clone(),
-                        networks: intent.networks.clone(),
-                        owner: intent.owner.clone(),
-                    });
-                }
-                CandidateLocation::Remote { peer_id } => {
-                    assignment.remote.push(RemoteStartPlan {
-                        index: intent.index,
-                        id: intent.id,
-                        name: intent.name.clone(),
-                        image: intent.image.clone(),
-                        execution_platform: intent.execution_platform,
-                        isolation_mode: intent.isolation_mode,
-                        isolation_profile: intent.isolation_profile.clone(),
-                        command: intent.command.clone(),
-                        tty: intent.tty,
-                        cpu_millis: intent.cpu_millis,
-                        memory_bytes: intent.memory_bytes,
-                        gpu_count: intent.gpu_count,
-                        peer_id,
-                        restart_policy: intent.restart_policy.clone(),
-                        termination_grace_period_secs: intent.termination_grace_period_secs,
-                        pre_stop_command: intent.pre_stop_command.clone(),
-                        liveness: intent.liveness.clone(),
-                        env: intent.env.clone(),
-                        secret_files: intent.secret_files.clone(),
-                        volumes: intent.volumes.clone(),
-                        networks: intent.networks.clone(),
-                        owner: intent.owner.clone(),
-                    });
-                }
-            }
+            self.push_assignment(assignment, intent, location, allocation);
         }
 
         Ok(())
