@@ -22,17 +22,16 @@ const ETH_P_IPV4: u16 = 0x0800;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 const LOOPBACK_HDR_LEN: usize = 4;
-const NODEPORT_INGRESS_DROP_REASON_COUNT: u32 = 6;
+const NODEPORT_INGRESS_DROP_REASON_COUNT: u32 = 5;
 
 #[repr(u32)]
 #[derive(Clone, Copy)]
 enum IngressDropReason {
-    OversizeFrame = 0,
-    InvalidIpv4Header = 1,
-    InvalidL4Header = 2,
-    MissingHostEntry = 3,
-    NatInsertFailure = 4,
-    RewriteFailure = 5,
+    InvalidIpv4Header = 0,
+    InvalidL4Header = 1,
+    MissingHostEntry = 2,
+    NatInsertFailure = 3,
+    RewriteFailure = 4,
 }
 
 #[derive(Clone, Copy)]

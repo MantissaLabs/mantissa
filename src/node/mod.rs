@@ -211,7 +211,6 @@ impl node::Server for Node {
                     }
                     let mut ingress_drop_reasons = nodeport.reborrow().init_ingress_drop_reasons();
                     if let Some(reasons) = status.ingress_drop_reasons {
-                        ingress_drop_reasons.set_oversize_frames(reasons.oversize_frames);
                         ingress_drop_reasons.set_invalid_ipv4_headers(reasons.invalid_ipv4_headers);
                         ingress_drop_reasons.set_invalid_l4_headers(reasons.invalid_l4_headers);
                         ingress_drop_reasons.set_missing_host_entries(reasons.missing_host_entries);

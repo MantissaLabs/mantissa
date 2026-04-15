@@ -13,7 +13,7 @@ const NODEPORT_FLOW_CAPACITY: usize = 2048;
 /// Keep the userspace capacity checks aligned with the pinned host-access map size in the tc ingress program.
 const NODEPORT_HOST_CAPACITY: usize = 256;
 /// Keep the userspace readers aligned with the ingress drop-reason map size in the tc ingress program.
-const NODEPORT_INGRESS_DROP_REASON_COUNT: usize = 6;
+const NODEPORT_INGRESS_DROP_REASON_COUNT: usize = 5;
 
 /// Declarative nodeport mapping that connects an external port to an overlay VIP.
 #[derive(Clone, Debug)]
@@ -62,7 +62,6 @@ pub struct NodePortPacketCounters {
 /// Breakdown of the ingress drop paths currently tracked by the NodePort tc program.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NodePortIngressDropReasons {
-    pub oversize_frames: u64,
     pub invalid_ipv4_headers: u64,
     pub invalid_l4_headers: u64,
     pub missing_host_entries: u64,
@@ -682,12 +681,11 @@ mod platform {
                 NODEPORT_INGRESS_DROP_REASON_COUNT,
             )?;
             Ok(NodePortIngressDropReasons {
-                oversize_frames: values[0],
-                invalid_ipv4_headers: values[1],
-                invalid_l4_headers: values[2],
-                missing_host_entries: values[3],
-                nat_insert_failures: values[4],
-                rewrite_failures: values[5],
+                invalid_ipv4_headers: values[0],
+                invalid_l4_headers: values[1],
+                missing_host_entries: values[2],
+                nat_insert_failures: values[3],
+                rewrite_failures: values[4],
             })
         }
 

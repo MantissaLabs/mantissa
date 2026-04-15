@@ -6,10 +6,6 @@ fn nodeport_drop_reason_fields(
     reasons: protocol::info_capnp::node_port_ingress_drop_reasons::Reader<'_>,
 ) -> Result<Vec<String>> {
     let mut fields = Vec::new();
-    let oversize_frames = reasons.get_oversize_frames();
-    if oversize_frames > 0 {
-        fields.push(format!("oversize_frames={oversize_frames}"));
-    }
     let invalid_ipv4_headers = reasons.get_invalid_ipv4_headers();
     if invalid_ipv4_headers > 0 {
         fields.push(format!("invalid_ipv4_headers={invalid_ipv4_headers}"));

@@ -208,22 +208,18 @@ struct PacketCounters {
 }
 
 struct NodePortIngressDropReasons {
-  oversizeFrames @0 :UInt64;
-  # Legacy counter retained for diagnostics compatibility; should remain zero now that
-  # large GRO ingress skbs are classified before any NodePort drop decision.
-
-  invalidIpv4Headers @1 :UInt64;
+  invalidIpv4Headers @0 :UInt64;
   # Packets dropped because the IPv4 header could not be parsed safely.
 
-  invalidL4Headers @2 :UInt64;
+  invalidL4Headers @1 :UInt64;
   # Packets dropped because the TCP/UDP header was truncated or invalid.
 
-  missingHostEntries @3 :UInt64;
+  missingHostEntries @2 :UInt64;
   # Packets dropped because the host-access metadata for the target network was missing.
 
-  natInsertFailures @4 :UInt64;
+  natInsertFailures @3 :UInt64;
   # Packets dropped because the NodePort NAT flow maps rejected state insertion.
 
-  rewriteFailures @5 :UInt64;
+  rewriteFailures @4 :UInt64;
   # Packets dropped because header rewrite or checksum updates failed.
 }
