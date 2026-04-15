@@ -5,7 +5,7 @@ use crate::scheduler::placement::{
 use crate::services::types::{ServiceSpecValue, TaskTemplateSpecValue};
 use anyhow::anyhow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 /// Unique identifier for a service replica slot used to coordinate per-slot reconciliation.
@@ -86,6 +86,7 @@ pub(super) fn compute_slot_targets_with_placement(
     if eligible_nodes.is_empty() {
         return Ok(targets);
     }
+    let eligible_node_ids: HashSet<Uuid> = eligible_nodes.iter().copied().collect();
 
     let total_replicas: usize = task_templates
         .iter()
@@ -109,7 +110,7 @@ pub(super) fn compute_slot_targets_with_placement(
             placement_nodes
                 .iter()
                 .filter(|node| {
-                    eligible_nodes.contains(&node.node_id) && template.placement().matches(node)
+                    eligible_node_ids.contains(&node.node_id) && template.placement().matches(node)
                 })
                 .map(|node| node.node_id)
                 .collect()
