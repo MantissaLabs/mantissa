@@ -3,6 +3,7 @@ mod common;
 
 use common::convergence::wait_until;
 use common::testkit::{ClusterConfig, RuntimeBackendOverrideGuard, TestNode};
+use crdt_store::uuid_key::UuidKey;
 use mantissa::node::id::set_node_id;
 use mantissa::registry::Registry;
 use mantissa::scheduler::placement::{
@@ -17,9 +18,10 @@ use mantissa::topology_capnp::topology;
 use mantissa::workload::manager::{WorkloadManager, WorkloadStartRequest};
 use mantissa::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata,
-    WorkloadSpec,
+    WorkloadSpec, WorkloadVolumeMount,
 };
 use mantissa::workload::types::{ExecutionSpec, ResolvedExecutionSpec};
+use protocol::volumes::{LocalVolumeSourceKind, volumes};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -251,6 +253,110 @@ local_test!(
             )
             .await,
             "platform-constrained service should converge consistently across the cluster"
+        );
+    }
+);
+
+local_test!(
+    workloads_placement_constraints_honor_heterogeneous_platform_aliases,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+
+        let cfg = ClusterConfig {
+            sync_tick_ms: Some(100),
+            gossip_tick_ms: Some(100),
+            gossip_fanout: Some(2),
+            ..ClusterConfig::default()
+        };
+        let cluster = TestNode::new_cluster_inproc_with_config(2, cfg)
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes")
+            .await;
+
+        let node0_arch = node_platform_value(&cluster[0].node.registry, cluster[0].id())
+            .expect("node 0 platform should exist before override")
+            .1;
+        let node1_arch = node_platform_value(&cluster[1].node.registry, cluster[1].id())
+            .expect("node 1 platform should exist before override")
+            .1;
+        set_node_platform(&cluster, cluster[0].id(), "linux", &node0_arch).await;
+        set_node_platform(&cluster, cluster[1].id(), "macos", &node1_arch).await;
+
+        assert!(
+            wait_for_node_platform_all(
+                &cluster,
+                cluster[0].id(),
+                "linux",
+                &node0_arch,
+                Duration::from_secs(10)
+            )
+            .await,
+            "linux platform override should converge on every node"
+        );
+        assert!(
+            wait_for_node_platform_all(
+                &cluster,
+                cluster[1].id(),
+                "macos",
+                &node1_arch,
+                Duration::from_secs(10)
+            )
+            .await,
+            "macos platform override should converge on every node"
+        );
+        wait_for_pairwise_sessions(&cluster).await;
+        assert!(
+            wait_for_remote_scheduler_digest(&cluster[0], cluster[1].id(), Duration::from_secs(10))
+                .await,
+            "local planner should observe a remote digest before testing heterogeneous platform placement"
+        );
+
+        let mut request = demo_binpack_workload_request("platform-alias-workload");
+        request.execution.placement.constraints = vec![
+            PlacementConstraint::eq(PlacementConstraintSelector::NodePlatformOs, "darwin")
+                .expect("platform os alias constraint should parse"),
+        ];
+        request.execution.placement.strategy = PlacementStrategy::Spread;
+
+        let specs = cluster[0]
+            .node
+            .workload_manager
+            .start_workloads_batch(vec![request])
+            .await
+            .expect("start heterogeneous platform workload");
+        let workload_ids: HashSet<Uuid> = specs.iter().map(|spec| spec.id).collect();
+
+        let reached_running = wait_for_workloads_running_stable_all(
+            &cluster,
+            &workload_ids,
+            4,
+            Duration::from_secs(15),
+        )
+        .await;
+        if !reached_running {
+            let tasks = cluster[0]
+                .node
+                .workload_manager
+                .list_workloads(&TaskStateFilter::all())
+                .await
+                .expect("list workloads after heterogeneous placement failure");
+            panic!(
+                "heterogeneous platform workload should reach running; visible_tasks={tasks:#?}"
+            );
+        }
+
+        let tasks =
+            list_active_workloads_by_ids(&cluster[0].node.workload_manager, &workload_ids).await;
+        assert_eq!(
+            tasks.len(),
+            1,
+            "heterogeneous platform workload should keep one active task"
+        );
+        assert_eq!(
+            tasks[0].node_id,
+            cluster[1].id(),
+            "platform alias constraints should select the node advertising macos"
         );
     }
 );
@@ -734,6 +840,94 @@ local_test!(services_placement_task_affinity_packs_matching_template, {
     );
 });
 
+local_test!(
+    services_placement_task_anti_affinity_spreads_matching_template,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+
+        let cfg = ClusterConfig {
+            sync_tick_ms: Some(100),
+            gossip_tick_ms: Some(100),
+            gossip_fanout: Some(2),
+            ..ClusterConfig::default()
+        };
+        let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes")
+            .await;
+
+        let service_name = "placement-preference-task-anti-affinity";
+        let mut api = demo_backend_task_template("api", 2);
+        api.execution.placement.strategy = PlacementStrategy::Binpack;
+        api.execution.placement.preferences = vec![PlacementPreference::TaskAntiAffinity];
+        let worker = demo_backend_task_template("worker", 1);
+
+        let service_id = cluster[0]
+            .node
+            .service_controller
+            .submit_deployment(
+                Uuid::new_v4(),
+                service_name,
+                service_name,
+                vec![api, worker],
+            )
+            .await
+            .expect("submit task-anti-affinity deployment");
+
+        assert!(
+            wait_for_service_status(
+                &cluster[0].node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "task-anti-affinity deployment should reach running"
+        );
+        assert!(
+            wait_for_service_running_tasks_stable_all(
+                &cluster,
+                service_name,
+                3,
+                4,
+                Duration::from_secs(15)
+            )
+            .await,
+            "task-anti-affinity deployment should converge consistently across the cluster"
+        );
+
+        let tasks =
+            list_active_service_tasks(&cluster[0].node.workload_manager, service_name).await;
+        let api_nodes: HashSet<Uuid> = tasks
+            .iter()
+            .filter(|task| {
+                task.service_owner()
+                    .map(|owner| owner.template == "api")
+                    .unwrap_or(false)
+            })
+            .map(|task| task.node_id)
+            .collect();
+        let api_count = tasks
+            .iter()
+            .filter(|task| {
+                task.service_owner()
+                    .map(|owner| owner.template == "api")
+                    .unwrap_or(false)
+            })
+            .count();
+
+        assert_eq!(
+            api_count, 2,
+            "api template should keep both replicas active"
+        );
+        assert_eq!(
+            api_nodes.len(),
+            2,
+            "task anti-affinity should split only the matching template's replicas across nodes"
+        );
+    }
+);
+
 local_test!(services_placement_binpack_reuses_matching_node, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
 
@@ -954,6 +1148,85 @@ local_test!(
     }
 );
 
+local_test!(
+    services_placement_bound_local_volume_preserves_pinned_target_over_fallback,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+
+        let cfg = ClusterConfig {
+            sync_tick_ms: Some(100),
+            gossip_tick_ms: Some(100),
+            gossip_fanout: Some(2),
+            ..ClusterConfig::default()
+        };
+        let cluster = TestNode::new_cluster_inproc_with_config(2, cfg)
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes")
+            .await;
+
+        set_cluster_zone_labels(&cluster, &["west", "east"]).await;
+
+        let volume_id = create_immediate_managed_volume_on_node(
+            &cluster[0].node.volumes_client,
+            "placement-pinned-volume",
+            cluster[1].id(),
+        )
+        .await;
+        assert!(
+            wait_for_volume_binding_all(
+                &cluster,
+                volume_id,
+                cluster[1].id(),
+                Duration::from_secs(10)
+            )
+            .await,
+            "bound local volume should converge before deploying the service"
+        );
+
+        let service_name = "placement-volume-versus-constraints";
+        let mut template = demo_backend_task_template("backend", 1);
+        template.execution.volumes = vec![WorkloadVolumeMount {
+            volume_id,
+            volume_name: "placement-pinned-volume".to_string(),
+            target: "/data".to_string(),
+            read_only: false,
+        }];
+        template.execution.placement.constraints = vec![
+            PlacementConstraint::eq(
+                PlacementConstraintSelector::node_label("topology.zone"),
+                "west",
+            )
+            .expect("west placement constraint should parse"),
+        ];
+
+        let service_id = cluster[0]
+            .node
+            .service_controller
+            .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
+            .await
+            .expect("submit volume-pinned deployment");
+
+        assert!(
+            wait_for_service_task_count_all(&cluster, service_name, 0, Duration::from_secs(10))
+                .await,
+            "bound local volume should keep the pinned target and block fallback onto the west node"
+        );
+        let spec = cluster[0]
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("load blocked service")
+            .expect("blocked service should remain in registry");
+        assert_ne!(
+            spec.status(),
+            ServiceStatus::Running,
+            "conflicting placement and bound local volume should not report a running service"
+        );
+    }
+);
+
 /// Builds an execution shape shared by the placement-focused service templates in this test file.
 fn empty_service_execution(image: &str) -> ExecutionSpec<TaskTemplateNetworkRequirement> {
     ExecutionSpec {
@@ -1130,6 +1403,30 @@ fn workload_counts_by_node(tasks: &[WorkloadSpec]) -> HashMap<Uuid, usize> {
     counts
 }
 
+/// Overrides one node's replicated platform metadata through the peer store so in-process tests
+/// can exercise heterogeneous scheduling decisions.
+async fn set_node_platform(
+    cluster: &[TestNode],
+    node_id: Uuid,
+    platform_os: &str,
+    platform_arch: &str,
+) {
+    for node in cluster {
+        let mut value = node
+            .node
+            .registry
+            .peer_value_unscoped(node_id)
+            .expect("peer row should exist before platform override");
+        value.platform_os = platform_os.to_string();
+        value.platform_arch = platform_arch.to_string();
+        node.node
+            .peers
+            .upsert(&UuidKey::from(node_id), value)
+            .await
+            .expect("persist platform override into peer store");
+    }
+}
+
 /// Applies node labels through the topology RPC so placement tests exercise replicated metadata.
 async fn set_node_labels(
     topology: &topology::Client,
@@ -1179,6 +1476,39 @@ async fn set_cluster_zone_labels(cluster: &[TestNode], zones: &[&str]) {
     }
 }
 
+/// Waits until every node's registry converges to the expected platform metadata for one peer.
+async fn wait_for_node_platform_all(
+    cluster: &[TestNode],
+    node_id: Uuid,
+    expected_os: &str,
+    expected_arch: &str,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(100), || async {
+        node_platform_visible_on_all(cluster, node_id, expected_os, expected_arch)
+    })
+    .await
+}
+
+/// Returns true when every node has converged to the requested platform metadata for the peer.
+fn node_platform_visible_on_all(
+    cluster: &[TestNode],
+    node_id: Uuid,
+    expected_os: &str,
+    expected_arch: &str,
+) -> bool {
+    cluster.iter().all(|node| {
+        node_platform_value(&node.node.registry, node_id)
+            == Some((expected_os.to_string(), expected_arch.to_string()))
+    })
+}
+
+/// Returns the platform tuple visible in one node's peer registry, if present.
+fn node_platform_value(registry: &Registry, node_id: Uuid) -> Option<(String, String)> {
+    let value = registry.peer_value_unscoped(node_id)?;
+    Some((value.platform_os, value.platform_arch))
+}
+
 /// Waits until every node's registry converges to the expected label value for one peer.
 async fn wait_for_node_label_all(
     cluster: &[TestNode],
@@ -1210,6 +1540,96 @@ fn node_label_value(registry: &Registry, node_id: Uuid, key: &str) -> Option<Str
     registry
         .peer_labels(node_id)
         .and_then(|labels| labels.get(key).map(str::to_string))
+}
+
+/// Waits until every node can establish direct sessions to its known peers before remote
+/// scheduler placement assertions run.
+async fn wait_for_pairwise_sessions(cluster: &[TestNode]) {
+    assert!(
+        wait_until(
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+            || async {
+                for node in cluster {
+                    if node.node.registry.connect_known_peers(true).await.is_err() {
+                        return false;
+                    }
+                }
+                true
+            }
+        )
+        .await,
+        "cluster should establish pairwise sessions before remote placement checks"
+    );
+}
+
+/// Waits until the provided node sees one scheduler digest for the selected remote peer.
+async fn wait_for_remote_scheduler_digest(
+    node: &TestNode,
+    peer_id: Uuid,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(100), || async {
+        node.node
+            .scheduler
+            .observed_scheduler_digests()
+            .map(|digests| {
+                digests
+                    .iter()
+                    .any(|observed| observed.digest.node_id == peer_id)
+            })
+            .unwrap_or(false)
+    })
+    .await
+}
+
+/// Creates one managed local volume that is bound immediately to the selected node.
+async fn create_immediate_managed_volume_on_node(
+    client: &volumes::Client,
+    name: &str,
+    node_id: Uuid,
+) -> Uuid {
+    let mut request = client.create_request();
+    {
+        let mut inner = request.get().init_request();
+        inner.set_name(name);
+        let mut driver = inner.reborrow().init_driver();
+        let mut local = driver.reborrow().init_local();
+        local.set_source_kind(LocalVolumeSourceKind::Managed);
+        local.set_imported_path("");
+        inner.set_access_mode(protocol::volumes::VolumeAccessMode::ReadWriteOnce);
+        inner.set_binding_mode(protocol::volumes::VolumeBindingMode::Immediate);
+        inner.set_reclaim_policy(protocol::volumes::VolumeReclaimPolicy::Retain);
+        inner.set_requested_bytes(0);
+        inner.set_bound_node_id(node_id.as_bytes());
+    }
+
+    let response = request.send().promise.await.expect("create volume send");
+    let reader = response.get().expect("create volume response");
+    let bytes = reader
+        .get_volume()
+        .expect("volume payload")
+        .get_id()
+        .expect("volume id");
+    Uuid::from_slice(bytes).expect("decode volume id")
+}
+
+/// Waits until every node sees the expected bound-node decision for one local volume.
+async fn wait_for_volume_binding_all(
+    cluster: &[TestNode],
+    volume_id: Uuid,
+    expected_node: Uuid,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(100), || async {
+        cluster.iter().all(|node| {
+            matches!(
+                node.node.volume_registry.get_spec(volume_id),
+                Ok(Some(spec)) if spec.bound_node_id == Some(expected_node)
+            )
+        })
+    })
+    .await
 }
 
 /// Waits until the replicated service spec reaches the expected lifecycle status.
