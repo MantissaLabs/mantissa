@@ -1161,6 +1161,7 @@ mod tests {
                 liveness: None,
                 public_port: None,
                 tty: false,
+                placement: Default::default(),
             }],
             update: ServiceUpdateStrategy::default(),
         };
@@ -1203,6 +1204,7 @@ mod tests {
                 liveness: None,
                 public_port: None,
                 tty: false,
+                placement: Default::default(),
             }],
             update: ServiceUpdateStrategy::default(),
         };
@@ -1249,6 +1251,7 @@ mod tests {
                 }),
                 public_port: None,
                 tty: false,
+                placement: Default::default(),
             }],
             update: ServiceUpdateStrategy::default(),
         };
@@ -1290,6 +1293,7 @@ mod tests {
                 liveness: None,
                 public_port: None,
                 tty: false,
+                placement: Default::default(),
             }],
             update: ServiceUpdateStrategy::default(),
         };
@@ -1342,6 +1346,7 @@ mod tests {
                 liveness: None,
                 public_port: None,
                 tty: false,
+                placement: Default::default(),
             }],
             update: ServiceUpdateStrategy::default(),
         };
@@ -1380,6 +1385,7 @@ mod tests {
                     liveness: None,
                     public_port: None,
                     tty: false,
+                    placement: Default::default(),
                 },
                 TaskTemplateSpec {
                     name: "frontend".into(),
@@ -1399,6 +1405,7 @@ mod tests {
                     liveness: None,
                     public_port: None,
                     tty: false,
+                    placement: Default::default(),
                 },
             ],
             update: ServiceUpdateStrategy::default(),
