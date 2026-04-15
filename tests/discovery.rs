@@ -236,6 +236,7 @@ async fn upsert_service(
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: vec![TaskTemplateNetworkRequirement::new("default", network_id)],
+                placement: Default::default(),
             },
             depends_on: Vec::new(),
             replicas: replica_ids.len() as u16,

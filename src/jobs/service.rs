@@ -284,6 +284,7 @@ fn read_job_execution(reader: job_execution::Reader<'_>) -> Result<ResolvedExecu
         secret_files,
         volumes,
         networks,
+        placement: Default::default(),
     })
 }
 

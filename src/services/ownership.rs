@@ -1,4 +1,6 @@
+use crate::scheduler::placement::PlacementNode;
 use crate::services::types::{ServiceSpecValue, TaskTemplateSpecValue};
+use anyhow::anyhow;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -50,14 +52,26 @@ pub(super) fn build_replica_slots(spec: &ServiceSpecValue) -> Vec<ReplicaSlot> {
 }
 
 /// Computes deterministic target nodes for every replica slot to keep placement balanced.
+#[cfg(test)]
 pub(super) fn compute_slot_targets(
     service_id: Uuid,
     task_templates: &[TaskTemplateSpecValue],
     eligible_nodes: &[Uuid],
 ) -> HashMap<SlotKey, Uuid> {
+    compute_slot_targets_with_placement(service_id, task_templates, eligible_nodes, &[])
+        .unwrap_or_default()
+}
+
+/// Computes deterministic target nodes while honoring each template's hard placement policy.
+pub(super) fn compute_slot_targets_with_placement(
+    service_id: Uuid,
+    task_templates: &[TaskTemplateSpecValue],
+    eligible_nodes: &[Uuid],
+    placement_nodes: &[PlacementNode],
+) -> anyhow::Result<HashMap<SlotKey, Uuid>> {
     let mut targets = HashMap::new();
     if eligible_nodes.is_empty() {
-        return targets;
+        return Ok(targets);
     }
 
     let total_replicas: usize = task_templates
@@ -74,7 +88,26 @@ pub(super) fn compute_slot_targets(
     }
 
     let mut slots: Vec<(TaskTemplateSpecValue, u16)> = Vec::new();
+    let mut template_candidates: HashMap<String, Vec<Uuid>> = HashMap::new();
     for template in task_templates {
+        let candidates = if template.placement().is_unconstrained() || placement_nodes.is_empty() {
+            eligible_nodes.to_vec()
+        } else {
+            placement_nodes
+                .iter()
+                .filter(|node| {
+                    eligible_nodes.contains(&node.node_id) && template.placement().matches(node)
+                })
+                .map(|node| node.node_id)
+                .collect()
+        };
+        if candidates.is_empty() {
+            return Err(anyhow!(
+                "service template '{}' placement constraints exclude every eligible node",
+                template.name
+            ));
+        }
+        template_candidates.insert(template.name.clone(), candidates);
         for replica in 1..=template.replicas {
             slots.push((template.clone(), replica));
         }
@@ -90,7 +123,11 @@ pub(super) fn compute_slot_targets(
 
     for (template, replica) in slots {
         let key = SlotKey::new(service_id, &template.name, replica);
-        let ranked = rank_nodes_for_slot(service_id, &template.name, replica, eligible_nodes);
+        let candidates = template_candidates
+            .get(&template.name)
+            .map(Vec::as_slice)
+            .unwrap_or(eligible_nodes);
+        let ranked = rank_nodes_for_slot(service_id, &template.name, replica, candidates);
         let template_cap = template_caps
             .get(&template.name)
             .copied()
@@ -132,7 +169,7 @@ pub(super) fn compute_slot_targets(
         targets.insert(key, node_id);
     }
 
-    targets
+    Ok(targets)
 }
 
 /// Produces a stable ordering of candidate nodes for a replica slot using rendezvous hashing.
@@ -274,4 +311,114 @@ fn generation_owner_score(service_id: Uuid, service_epoch: u64, node_id: Uuid) -
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest.as_bytes()[..16]);
     u128::from_le_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SlotKey, compute_slot_targets_with_placement};
+    use crate::scheduler::placement::{
+        PlacementConstraint, PlacementNode, PlacementPolicy, PlacementStrategy,
+    };
+    use crate::services::types::TaskTemplateSpecValue;
+    use crate::topology::peers::PeerLabel;
+    use crate::workload::types::ExecutionSpec;
+    use uuid::Uuid;
+
+    /// Hard placement constraints should restrict deterministic slot targeting to matching nodes.
+    #[test]
+    fn slot_targets_honor_template_placement_constraints() {
+        let service_id = Uuid::new_v4();
+        let east = Uuid::new_v4();
+        let west = Uuid::new_v4();
+        let template =
+            template_with_constraints("backend", 1, vec!["node.labels.topology.zone == west"]);
+        let targets = compute_slot_targets_with_placement(
+            service_id,
+            &[template],
+            &[east, west],
+            &[placement_node(east, "east"), placement_node(west, "west")],
+        )
+        .expect("placement-filtered slot targets should build");
+
+        assert_eq!(
+            targets.get(&SlotKey::new(service_id, "backend", 1)),
+            Some(&west)
+        );
+    }
+
+    /// Deterministic slot targeting should fail fast when no eligible node satisfies a template.
+    #[test]
+    fn slot_targets_reject_unsatisfied_template_constraints() {
+        let service_id = Uuid::new_v4();
+        let east = Uuid::new_v4();
+        let template =
+            template_with_constraints("backend", 1, vec!["node.labels.topology.zone == west"]);
+        let err = compute_slot_targets_with_placement(
+            service_id,
+            &[template],
+            &[east],
+            &[placement_node(east, "east")],
+        )
+        .expect_err("unsatisfied placement constraints should fail");
+
+        assert!(
+            err.to_string().contains("exclude every eligible node"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// Builds one task template with the provided hard placement constraints for ownership tests.
+    fn template_with_constraints(
+        name: &str,
+        replicas: u16,
+        constraints: Vec<&str>,
+    ) -> TaskTemplateSpecValue {
+        TaskTemplateSpecValue {
+            name: name.to_string(),
+            execution: ExecutionSpec {
+                image: "ghcr.io/example/backend:latest".to_string(),
+                command: Vec::new(),
+                tty: false,
+                cpu_millis: 0,
+                memory_bytes: 0,
+                gpu_count: 0,
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                liveness: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: Vec::new(),
+                placement: PlacementPolicy {
+                    constraints: constraints
+                        .into_iter()
+                        .map(|expression| {
+                            PlacementConstraint::parse_expression(expression)
+                                .expect("placement constraint should parse")
+                        })
+                        .collect(),
+                    strategy: PlacementStrategy::Spread,
+                },
+            },
+            depends_on: Vec::new(),
+            replicas,
+            readiness: None,
+            public_port: None,
+            public_protocol: None,
+        }
+    }
+
+    /// Builds one scheduler-visible node record carrying a topology zone label for tests.
+    fn placement_node(node_id: Uuid, zone: &str) -> PlacementNode {
+        PlacementNode::new(
+            node_id,
+            format!("worker-{zone}"),
+            "10.0.0.1:7000",
+            vec![PeerLabel {
+                key: "topology.zone".to_string(),
+                value: zone.to_string(),
+            }],
+        )
+    }
 }

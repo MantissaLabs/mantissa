@@ -1219,6 +1219,7 @@ fn empty_resolved_execution(image: &str) -> ResolvedExecutionSpec {
         secret_files: Vec::new(),
         volumes: Vec::new(),
         networks: Vec::new(),
+        placement: Default::default(),
     }
 }
 
@@ -6884,6 +6885,7 @@ fn scheduling_retry_budget_stays_wide_for_untargeted_starts() {
         secret_files: Vec::new(),
         volumes: Vec::new(),
         networks: Vec::new(),
+        placement: Default::default(),
         owner: None,
         target_node: None,
     }];
@@ -6917,6 +6919,7 @@ fn scheduling_retry_budget_is_shorter_for_targeted_starts() {
         secret_files: Vec::new(),
         volumes: Vec::new(),
         networks: Vec::new(),
+        placement: Default::default(),
         owner: None,
         target_node: Some(Uuid::new_v4()),
     }];

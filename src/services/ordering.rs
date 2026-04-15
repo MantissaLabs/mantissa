@@ -204,6 +204,7 @@ mod tests {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
+                placement: Default::default(),
             },
             depends_on: Vec::new(),
             replicas: 1,

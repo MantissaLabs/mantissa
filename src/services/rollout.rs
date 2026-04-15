@@ -271,12 +271,17 @@ fn build_replacement_requests(
     task_templates: &[TaskTemplateSpecValue],
     replacements: &[ReplicaReplacement],
     eligible_nodes: &[Uuid],
+    placement_nodes: &[PlacementNode],
     volume_registry: &VolumeRegistry,
-) -> Vec<WorkloadStartRequest> {
-    let slot_targets =
-        compute_effective_slot_targets(service_id, task_templates, eligible_nodes, volume_registry)
-            .unwrap_or_default();
-    replacements
+) -> anyhow::Result<Vec<WorkloadStartRequest>> {
+    let slot_targets = compute_effective_slot_targets(
+        service_id,
+        task_templates,
+        eligible_nodes,
+        placement_nodes,
+        volume_registry,
+    )?;
+    Ok(replacements
         .iter()
         .map(|replacement| {
             let key = SlotKey::new(service_id, &replacement.template.name, replacement.replica);
@@ -288,7 +293,7 @@ fn build_replacement_requests(
                 target_node,
             )
         })
-        .collect()
+        .collect())
 }
 
 impl ServiceController {
@@ -378,7 +383,7 @@ impl ServiceController {
             &task_templates,
             &current_assignments,
             &replace,
-        );
+        )?;
         let mut rollout_error = self
             .run_replacement_phase(&replacement_phase, &mut progress, &mut artifacts)
             .await;
@@ -489,16 +494,18 @@ impl ServiceController {
         task_templates: &[TaskTemplateSpecValue],
         current_assignments: &[ServiceReplicaAssignment],
         replace: &[ReplicaReplacement],
-    ) -> RolloutArtifacts {
+    ) -> anyhow::Result<RolloutArtifacts> {
         let eligible_nodes = self.collect_eligible_nodes();
+        let placement_nodes = self.placement_nodes_for(&eligible_nodes);
         let replacement_requests = build_replacement_requests(
             service_name,
             current_spec.id,
             task_templates,
             replace,
             &eligible_nodes,
+            &placement_nodes,
             &self.volume_registry,
-        );
+        )?;
         let mut assignment_index: BTreeMap<(String, u16), Uuid> = BTreeMap::new();
         for assignment in current_assignments {
             assignment_index.insert(
@@ -513,13 +520,13 @@ impl ServiceController {
             .map(|template| (template.name.clone(), template))
             .collect();
 
-        RolloutArtifacts {
+        Ok(RolloutArtifacts {
             assignment_index,
             old_templates_by_name,
             replacement_requests,
             rollback_new_task_ids: HashSet::new(),
             rollback_old_tasks: HashMap::new(),
-        }
+        })
     }
 
     /// Builds a rollout status object from the tracked progress and desired phase.
@@ -1244,13 +1251,14 @@ impl ServiceController {
         // Rollback placement intentionally follows deterministic current ownership so recovery
         // converges the same way as regular reconciliation after membership changes.
         let eligible_nodes = self.collect_eligible_nodes();
+        let placement_nodes = self.placement_nodes_for(&eligible_nodes);
         let slot_targets = compute_effective_slot_targets(
             current_spec.id,
             &current_spec.task_templates,
             &eligible_nodes,
+            &placement_nodes,
             &self.volume_registry,
-        )
-        .unwrap_or_default();
+        )?;
 
         for step in current_graph.rollback_steps(&current_spec.task_templates, rollback_old_tasks) {
             let template = old_templates_by_name.get(&step.template).ok_or_else(|| {

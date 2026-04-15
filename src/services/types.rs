@@ -4,6 +4,7 @@ use std::ops::Deref;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::scheduler::placement::PlacementPolicy;
 use crate::workload::manager::WorkloadStartRequest;
 use crate::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadOwner, WorkloadServiceMetadata,
@@ -433,6 +434,11 @@ impl TaskTemplateSpecValue {
         self.execution.map_networks(|network| network.network_id)
     }
 
+    /// Returns the scheduler placement policy declared for this template.
+    pub fn placement(&self) -> &PlacementPolicy {
+        &self.execution.placement
+    }
+
     pub fn required_network_ids(&self) -> Vec<Uuid> {
         self.execution
             .networks
@@ -623,6 +629,7 @@ mod tests {
                     secret_files: Vec::new(),
                     volumes: Vec::new(),
                     networks: Vec::new(),
+                    placement: Default::default(),
                 },
                 depends_on: Vec::new(),
                 replicas: 1,

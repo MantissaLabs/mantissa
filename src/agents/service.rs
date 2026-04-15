@@ -464,6 +464,7 @@ fn read_session_execution(
         secret_files: decode_secret_files(reader.get_secret_files()?)?,
         volumes: decode_volume_mounts(reader.get_volumes()?)?,
         networks: read_uuid_list(reader.get_networks()?)?,
+        placement: Default::default(),
     })
 }
 
@@ -550,6 +551,7 @@ fn read_run_execution(reader: agent_run_spec::Reader<'_>) -> Result<ResolvedExec
         secret_files: decode_secret_files(reader.get_secret_files()?)?,
         volumes: decode_volume_mounts(reader.get_volumes()?)?,
         networks: read_uuid_list(reader.get_networks()?)?,
+        placement: Default::default(),
     })
 }
 

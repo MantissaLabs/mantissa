@@ -77,6 +77,12 @@ struct TaskTemplate {
 
   tty @19 :Bool;
   # Allocate a terminal for the replica entrypoint.
+
+  placementConstraints @20 :List(Text);
+  # Hard scheduler constraints encoded as Swarm-style expressions such as `node.labels.zone == west`.
+
+  placementStrategy @21 :PlacementStrategy;
+  # Candidate ranking strategy used after hard constraints pass.
 }
 
 struct TaskTemplateNetwork {
@@ -161,6 +167,11 @@ enum PublicProtocol {
 
   tcpUdp @2;
   # Support both TCP and UDP.
+}
+
+enum PlacementStrategy {
+  spread @0;
+  # Prefer even task distribution across matching nodes.
 }
 
 enum RestartPolicyName {

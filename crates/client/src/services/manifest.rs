@@ -235,6 +235,21 @@ pub enum LivenessKind {
     Tcp,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementStrategy {
+    #[default]
+    Spread,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+pub struct PlacementSpec {
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub strategy: PlacementStrategy,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct TaskTemplateSpec {
     pub name: String,
@@ -270,6 +285,8 @@ pub struct TaskTemplateSpec {
     pub public_port: Option<u16>,
     #[serde(default)]
     pub tty: bool,
+    #[serde(default)]
+    pub placement: PlacementSpec,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -422,6 +439,8 @@ impl ServiceManifest {
                     template.name
                 ));
             }
+
+            validate_template_placement(template)?;
 
             if let Some(readiness) = template.readiness.as_ref()
                 && readiness.port == 0
@@ -879,6 +898,51 @@ fn validate_template_dependencies(task_templates: &[TaskTemplateSpec]) -> Result
     if visited != task_templates.len() {
         return Err(anyhow!(
             "template depends_on graph contains a cycle and cannot be ordered"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Validates one task template placement section before the manifest is submitted.
+fn validate_template_placement(template: &TaskTemplateSpec) -> Result<()> {
+    for raw in &template.placement.constraints {
+        validate_constraint_expression(raw).map_err(|message| {
+            anyhow!(
+                "template '{}' defines an invalid placement constraint: {message}",
+                template.name
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Performs lightweight local validation for one Swarm-style placement constraint expression.
+fn validate_constraint_expression(raw: &str) -> std::result::Result<(), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("constraint must not be empty".to_string());
+    }
+
+    let (key, value) = if let Some(parts) = trimmed.split_once("!=") {
+        parts
+    } else if let Some(parts) = trimmed.split_once("==") {
+        parts
+    } else {
+        return Err(format!(
+            "constraint '{trimmed}' must use either '==' or '!='"
+        ));
+    };
+
+    if key.trim().is_empty() {
+        return Err(format!(
+            "constraint '{trimmed}' must include a non-empty key"
+        ));
+    }
+    if value.trim().is_empty() {
+        return Err(format!(
+            "constraint '{trimmed}' must include a non-empty value"
         ));
     }
 

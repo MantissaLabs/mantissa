@@ -1,5 +1,6 @@
 use crate::gossip::Message;
 use crate::registry::Registry;
+use crate::scheduler::placement::PlacementNode;
 use crate::services::dependencies::{TemplateDependencyStage, build_template_dependency_stages};
 use crate::services::ordering::should_accept_service_update;
 use crate::services::reconcile::{
@@ -40,9 +41,9 @@ mod readiness;
 mod rollout;
 #[path = "slot_reconcile.rs"]
 mod slot_reconcile;
-use ownership::{SlotKey, compute_slot_targets, select_generation_owner};
+use ownership::{SlotKey, compute_slot_targets_with_placement, select_generation_owner};
 #[cfg(test)]
-use ownership::{build_replica_slots, select_slot_owner, select_task_owner};
+use ownership::{build_replica_slots, compute_slot_targets, select_slot_owner, select_task_owner};
 use readiness::start_readiness_wait;
 #[cfg(test)]
 use readiness::{ReadinessClass, classify_readiness_states};
@@ -612,6 +613,29 @@ impl ServiceController {
         )
     }
 
+    /// Builds placement metadata for the provided candidate nodes from converged peer state.
+    fn placement_nodes_for(&self, node_ids: &[Uuid]) -> Vec<PlacementNode> {
+        node_ids
+            .iter()
+            .copied()
+            .map(|node_id| {
+                PlacementNode::new(
+                    node_id,
+                    self.cluster_registry
+                        .peer_hostname(node_id)
+                        .unwrap_or_default(),
+                    self.cluster_registry
+                        .peer_address(node_id)
+                        .unwrap_or_default(),
+                    self.cluster_registry
+                        .peer_labels(node_id)
+                        .map(|labels| labels.labels)
+                        .unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
     /// Returns true when peer metadata marks the provided node as actively draining.
     ///
     /// Slot reconciliation uses this to treat replicas on maintenance nodes as explicit drift so
@@ -676,9 +700,46 @@ impl ServiceController {
                     epoch = spec.service_epoch,
                     "service generation execution failed: {err:#}"
                 );
+                controller
+                    .record_generation_execution_error(&spec, err.to_string())
+                    .await;
             }
             controller.finish_generation_execution(key).await;
         });
+    }
+
+    /// Persists the latest deployment execution error while the same generation remains pending.
+    async fn record_generation_execution_error(&self, spec: &ServiceSpecValue, detail: String) {
+        let Ok(Some(mut current)) = self.registry.get(spec.id) else {
+            return;
+        };
+        if current.manifest_id != spec.manifest_id
+            || current.service_epoch != spec.service_epoch
+            || current.status() != ServiceStatus::Deploying
+        {
+            return;
+        }
+
+        current.set_status_detail(Some(detail));
+        if let Err(err) = self.apply_upsert(current.clone()).await {
+            tracing::warn!(
+                target: "services",
+                service = %spec.service_name,
+                manifest = %spec.manifest_id,
+                epoch = spec.service_epoch,
+                "failed to persist generation execution error detail: {err:#}"
+            );
+            return;
+        }
+        if let Err(err) = self.broadcast(ServiceEvent::Upsert(current)).await {
+            tracing::warn!(
+                target: "services",
+                service = %spec.service_name,
+                manifest = %spec.manifest_id,
+                epoch = spec.service_epoch,
+                "failed to broadcast generation execution error detail: {err:#}"
+            );
+        }
     }
 
     /// Removes one completed generation execution from the local in-flight dedupe set.
@@ -757,13 +818,15 @@ impl ServiceController {
 
         let service_id = compute_service_id(&service_name);
         let eligible_nodes = self.collect_eligible_nodes();
+        let placement_nodes = self.placement_nodes_for(&eligible_nodes);
         let requests = build_start_requests(
             &service_name,
             service_id,
             &task_templates,
             &eligible_nodes,
+            &placement_nodes,
             &self.volume_registry,
-        );
+        )?;
 
         if requests.is_empty() {
             let spec = ServiceSpecValue::new(
@@ -1018,10 +1081,12 @@ impl ServiceController {
             }
         }
 
+        let placement_nodes = self.placement_nodes_for(&eligible_nodes);
         let slot_targets = compute_effective_slot_targets(
             service_id,
             &task_templates,
             &eligible_nodes,
+            &placement_nodes,
             &self.volume_registry,
         )?;
 
@@ -2330,11 +2395,16 @@ fn build_start_requests(
     service_id: Uuid,
     task_templates: &[TaskTemplateSpecValue],
     eligible_nodes: &[Uuid],
+    placement_nodes: &[PlacementNode],
     volume_registry: &VolumeRegistry,
-) -> Vec<WorkloadStartRequest> {
-    let slot_targets =
-        compute_effective_slot_targets(service_id, task_templates, eligible_nodes, volume_registry)
-            .unwrap_or_default();
+) -> anyhow::Result<Vec<WorkloadStartRequest>> {
+    let slot_targets = compute_effective_slot_targets(
+        service_id,
+        task_templates,
+        eligible_nodes,
+        placement_nodes,
+        volume_registry,
+    )?;
     let mut requests = Vec::new();
     for template in task_templates {
         for replica_idx in 0..template.replicas {
@@ -2350,7 +2420,7 @@ fn build_start_requests(
             ));
         }
     }
-    requests
+    Ok(requests)
 }
 
 /// Builds workload start requests only for replicas still missing from the current manifest.
@@ -2385,9 +2455,15 @@ fn compute_effective_slot_targets(
     service_id: Uuid,
     task_templates: &[TaskTemplateSpecValue],
     eligible_nodes: &[Uuid],
+    placement_nodes: &[PlacementNode],
     volume_registry: &VolumeRegistry,
 ) -> anyhow::Result<HashMap<SlotKey, Uuid>> {
-    let mut targets = compute_slot_targets(service_id, task_templates, eligible_nodes);
+    let mut targets = compute_slot_targets_with_placement(
+        service_id,
+        task_templates,
+        eligible_nodes,
+        placement_nodes,
+    )?;
     for template in task_templates {
         let Some(target_node) = resolve_template_volume_target(volume_registry, &template.volumes)?
         else {
@@ -2659,6 +2735,7 @@ mod tests {
                         TaskTemplateNetworkRequirement::new(format!("net-{idx}"), Uuid::new_v4())
                     })
                     .collect(),
+                placement: Default::default(),
             },
             depends_on: Vec::new(),
             replicas: 1,
@@ -2782,6 +2859,7 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
+            placement: Default::default(),
         }
     }
 
@@ -2802,6 +2880,7 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
+            placement: Default::default(),
         }
     }
 

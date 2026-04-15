@@ -22,6 +22,7 @@ use self::digest::{
 use self::summary::SchedulerSummary;
 
 pub mod digest;
+pub mod placement;
 pub mod service;
 pub mod summary;
 

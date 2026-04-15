@@ -4322,6 +4322,7 @@ fn empty_service_execution(image: &str) -> ExecutionSpec<TaskTemplateNetworkRequ
         secret_files: Vec::new(),
         volumes: Vec::new(),
         networks: Vec::new(),
+        placement: Default::default(),
     }
 }
 
@@ -5965,6 +5966,7 @@ fn manifest_to_task_templates(manifest: &ServiceManifest) -> Vec<TaskTemplateSpe
                         .collect(),
                     volumes: Vec::new(),
                     networks,
+                    placement: Default::default(),
                 },
                 depends_on: task.depends_on.clone(),
                 replicas: task.replicas,

@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::gpu::gpu_runtime_status;
 use crate::runtime::types::{RuntimeInstanceRef, RuntimeSupportProfile};
 use crate::scheduler::digest::SchedulerDigestValue;
+use crate::scheduler::placement::{PlacementNode, PlacementPolicy};
 use crate::scheduler::{
     GpuDeviceReservation, GpuDeviceState, SchedulerSnapshot, SlotCapacity, SlotId, SlotState,
 };
@@ -39,6 +40,10 @@ pub(super) enum SchedulingError {
     NetworksBlocked { networks: Vec<Uuid> },
     #[error("local node lacks required networks for task '{task}'")]
     LocalNetworksBlocked { task: String },
+    #[error(
+        "scheduler reservation failed: placement constraints unsatisfied for task '{task}' ({constraints})"
+    )]
+    PlacementConstraintsBlocked { task: String, constraints: String },
     #[error(
         "scheduler reservation failed: runtime requirements unavailable for task '{task}' \
          (platform={execution_platform}, isolation={isolation_mode}, profile={isolation_profile:?}, features={feature_flags:?})"
@@ -131,6 +136,7 @@ pub(super) struct StartIntent {
     pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
+    pub(super) placement: PlacementPolicy,
     pub(super) owner: Option<WorkloadOwner>,
     pub(super) target_node: Option<Uuid>,
 }
@@ -154,6 +160,14 @@ impl StartIntent {
             isolation_mode: self.isolation_mode.as_str(),
             isolation_profile: self.isolation_profile.clone(),
             feature_flags: self.required_runtime_features.clone(),
+        }
+    }
+
+    /// Builds the scheduler-facing placement rejection error for this intent.
+    fn placement_error(&self) -> SchedulingError {
+        SchedulingError::PlacementConstraintsBlocked {
+            task: self.name.clone(),
+            constraints: self.placement.rendered_constraints().join(", "),
         }
     }
 }
@@ -186,6 +200,7 @@ enum CandidateLocation {
 /// either a local or remote plan once a slot is assigned.
 struct Candidate {
     location: CandidateLocation,
+    placement: PlacementNode,
     slots: Vec<SlotChoice>,
     gpu_devices: Vec<GpuChoice>,
     ready_networks: HashSet<Uuid>,
@@ -201,6 +216,7 @@ struct Candidate {
 impl Candidate {
     /// Builds one local candidate from the exact free slots and GPU devices currently available.
     fn new_local(
+        placement: PlacementNode,
         slots: Vec<SlotChoice>,
         gpu_devices: Vec<GpuChoice>,
         ready_networks: HashSet<Uuid>,
@@ -211,6 +227,7 @@ impl Candidate {
         } else {
             let mut candidate = Self {
                 location: CandidateLocation::Local,
+                placement,
                 slots,
                 gpu_devices,
                 ready_networks,
@@ -230,6 +247,7 @@ impl Candidate {
     /// Builds one remote candidate from a replicated scheduler digest.
     fn new_remote(
         peer_id: Uuid,
+        placement: PlacementNode,
         digest: SchedulerDigestValue,
         ready_networks: HashSet<Uuid>,
         runtime_support: RuntimeSupportProfile,
@@ -239,6 +257,7 @@ impl Candidate {
         } else {
             Some(Self {
                 location: CandidateLocation::Remote { peer_id },
+                placement,
                 slots: Vec::new(),
                 gpu_devices: Vec::new(),
                 ready_networks,
@@ -279,6 +298,11 @@ impl Candidate {
 
     fn can_host(&self, networks: &[Uuid]) -> bool {
         networks.iter().all(|net| self.ready_networks.contains(net))
+    }
+
+    /// Returns true when this candidate satisfies one intent's hard placement policy.
+    fn matches_placement(&self, intent: &StartIntent) -> bool {
+        intent.placement.matches(&self.placement)
     }
 
     /// Returns true when this candidate satisfies one intent's runtime requirements.
@@ -527,11 +551,13 @@ fn capacity_covers_workload(available: CandidateCapacity, demand: WorkloadDemand
 /// Returns true when the digest can plausibly host the intent without fetching slot details.
 fn digest_can_host_intent(
     digest: &SchedulerDigestValue,
+    placement: &PlacementNode,
     ready_networks: &HashSet<Uuid>,
     runtime_support: &RuntimeSupportProfile,
     intent: &StartIntent,
 ) -> bool {
     digest.free_slot_count > 0
+        && intent.placement.matches(placement)
         && digest.free_cpu_millis >= intent.cpu_millis
         && digest.free_memory_bytes >= intent.memory_bytes
         && (intent.gpu_count == 0
@@ -730,6 +756,7 @@ impl WorkloadManager {
                 secret_files: execution.secret_files,
                 volumes: execution.volumes,
                 networks: execution.networks,
+                placement: execution.placement,
                 owner,
                 target_node,
             });
@@ -1061,6 +1088,19 @@ impl WorkloadManager {
                 .get(&peer_id)
                 .cloned()
                 .unwrap_or_else(HashSet::new);
+            let placement = PlacementNode::new(
+                peer_id,
+                self.core
+                    .registry
+                    .peer_hostname(peer_id)
+                    .unwrap_or_default(),
+                self.core.registry.peer_address(peer_id).unwrap_or_default(),
+                self.core
+                    .registry
+                    .peer_labels(peer_id)
+                    .map(|labels| labels.labels)
+                    .unwrap_or_default(),
+            );
             let runtime_support = self
                 .core
                 .registry
@@ -1069,7 +1109,13 @@ impl WorkloadManager {
             let hostable_intent_count = intents
                 .iter()
                 .filter(|intent| {
-                    digest_can_host_intent(&digest, &ready_networks, &runtime_support, intent)
+                    digest_can_host_intent(
+                        &digest,
+                        &placement,
+                        &ready_networks,
+                        &runtime_support,
+                        intent,
+                    )
                 })
                 .count() as u32;
             let targeted = targeted_nodes.contains(&peer_id);
@@ -1107,9 +1153,26 @@ impl WorkloadManager {
     ) -> Result<VecDeque<Candidate>, anyhow::Error> {
         let mut queue = VecDeque::new();
         let mut provided_capacity = CandidateCapacity::default();
+        let has_hard_constraints = intents
+            .iter()
+            .any(|intent| !intent.placement.is_unconstrained());
         let local_runtime_support = self.runtime.runtime_set.advertised_support();
+        let local_placement = PlacementNode::new(
+            self.local_node_id,
+            self.local_node_name.clone(),
+            self.core
+                .registry
+                .peer_address(self.local_node_id)
+                .unwrap_or_default(),
+            self.core
+                .registry
+                .peer_labels(self.local_node_id)
+                .map(|labels| labels.labels)
+                .unwrap_or_default(),
+        );
         if self.core.registry.peer_schedulable(self.local_node_id)
             && let Some(local_candidate) = Candidate::new_local(
+                local_placement,
                 local_slots,
                 local_gpus,
                 local_ready.clone(),
@@ -1131,15 +1194,33 @@ impl WorkloadManager {
         let mut included_target_nodes = HashSet::new();
 
         for hint in hints {
-            if capacity_covers_workload(provided_capacity, demand)
+            if !has_hard_constraints
+                && capacity_covers_workload(provided_capacity, demand)
                 && queue.len() >= minimum_candidate_nodes
                 && included_target_nodes.len() == required_target_nodes.len()
             {
                 break;
             }
 
+            let placement = PlacementNode::new(
+                hint.peer_id,
+                self.core
+                    .registry
+                    .peer_hostname(hint.peer_id)
+                    .unwrap_or_default(),
+                self.core
+                    .registry
+                    .peer_address(hint.peer_id)
+                    .unwrap_or_default(),
+                self.core
+                    .registry
+                    .peer_labels(hint.peer_id)
+                    .map(|labels| labels.labels)
+                    .unwrap_or_default(),
+            );
             if let Some(candidate) = Candidate::new_remote(
                 hint.peer_id,
+                placement,
                 hint.digest.clone(),
                 hint.ready_networks.clone(),
                 self.core
@@ -1199,6 +1280,11 @@ impl WorkloadManager {
         if !candidate.supports_runtime_requirements(intent) {
             candidates.push_back(candidate);
             return Err(intent.runtime_requirements_error().into());
+        }
+
+        if !candidate.matches_placement(intent) {
+            candidates.push_back(candidate);
+            return Err(intent.placement_error().into());
         }
 
         if !candidate.can_host(&intent.networks) {
@@ -1304,12 +1390,19 @@ impl WorkloadManager {
             }
 
             let mut allocated: Option<(CandidateLocation, ResourceAllocation)> = None;
+            let mut skipped_for_constraints = false;
             let mut skipped_for_networks = false;
             let mut skipped_for_runtime = false;
             for _ in 0..candidate_count {
                 let mut candidate = candidates
                     .pop_front()
                     .expect("candidate deque should not be empty");
+
+                if !candidate.matches_placement(intent) {
+                    skipped_for_constraints = true;
+                    candidates.push_back(candidate);
+                    continue;
+                }
 
                 if !candidate.supports_runtime_requirements(intent) {
                     skipped_for_runtime = true;
@@ -1338,7 +1431,9 @@ impl WorkloadManager {
             }
 
             let Some((location, allocation)) = allocated else {
-                if skipped_for_runtime {
+                if skipped_for_constraints {
+                    return Err(intent.placement_error().into());
+                } else if skipped_for_runtime {
                     return Err(intent.runtime_requirements_error().into());
                 } else if skipped_for_networks {
                     return Err(SchedulingError::NetworksBlocked {
@@ -1422,6 +1517,7 @@ mod tests {
     };
     use crate::runtime::types::RuntimeSupportProfile;
     use crate::scheduler::digest::SchedulerDigestValue;
+    use crate::scheduler::placement::PlacementNode;
     use crate::workload::model::{ExecutionPlatform, IsolationMode};
     use std::collections::HashSet;
     use uuid::Uuid;
@@ -1454,6 +1550,7 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: vec![required_network],
+            placement: Default::default(),
             owner: None,
             target_node: None,
         };
@@ -1473,6 +1570,7 @@ mod tests {
         assert!(!digest_can_host_intent(
             &digest,
             &Default::default(),
+            &Default::default(),
             &RuntimeSupportProfile::default(),
             &intent
         ));
@@ -1482,6 +1580,7 @@ mod tests {
 
         assert!(!digest_can_host_intent(
             &digest,
+            &Default::default(),
             &ready_networks,
             &RuntimeSupportProfile::default(),
             &intent
@@ -1491,6 +1590,7 @@ mod tests {
         gpu_ready_digest.gpu_runtime_ready = true;
         assert!(digest_can_host_intent(
             &gpu_ready_digest,
+            &Default::default(),
             &ready_networks,
             &RuntimeSupportProfile::default(),
             &intent
@@ -1524,6 +1624,7 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
+            placement: Default::default(),
             owner: None,
             target_node: None,
         };
@@ -1554,12 +1655,14 @@ mod tests {
 
         assert!(!digest_can_host_intent(
             &digest,
+            &Default::default(),
             &HashSet::new(),
             &incompatible,
             &intent
         ));
         assert!(digest_can_host_intent(
             &digest,
+            &Default::default(),
             &HashSet::new(),
             &compatible,
             &intent
@@ -1596,6 +1699,7 @@ mod tests {
         let peer_id = Uuid::new_v4();
         let mut candidate = Candidate::new_remote(
             peer_id,
+            PlacementNode::default(),
             SchedulerDigestValue {
                 node_id: peer_id,
                 snapshot_version: 4,
@@ -1632,6 +1736,7 @@ mod tests {
         let peer_id = Uuid::new_v4();
         let mut candidate = Candidate::new_remote(
             peer_id,
+            PlacementNode::default(),
             SchedulerDigestValue {
                 node_id: peer_id,
                 snapshot_version: 2,

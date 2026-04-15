@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::scheduler::placement::PlacementPolicy;
 use crate::workload::model::{
     WorkloadEnvironmentVariable, WorkloadSecretFile, WorkloadVolumeMount,
 };
@@ -10,6 +11,8 @@ use crate::workload::model::{
 ///
 /// Terminology:
 /// - This type describes *how something should execute*.
+/// - It also carries the scheduler-side placement policy because every controller reuses the same
+///   launch path once it decides a workload should exist.
 /// - It does not describe *who owns the lifecycle semantics*.
 /// - A direct task, a service replica, a job attempt, and an agent run can all reuse the same
 ///   execution shape while differing in control-plane behavior.
@@ -41,6 +44,8 @@ pub struct ExecutionSpec<N> {
     pub volumes: Vec<WorkloadVolumeMount>,
     #[serde(default)]
     pub networks: Vec<N>,
+    #[serde(default)]
+    pub placement: PlacementPolicy,
 }
 
 impl<N> ExecutionSpec<N> {
@@ -64,6 +69,7 @@ impl<N> ExecutionSpec<N> {
             secret_files: self.secret_files.clone(),
             volumes: self.volumes.clone(),
             networks: self.networks.iter().map(&mut mapper).collect(),
+            placement: self.placement.clone(),
         }
     }
 }

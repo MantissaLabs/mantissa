@@ -806,6 +806,7 @@ mod tests {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
+                placement: Default::default(),
             },
             ExecutionPlatform::Oci,
             IsolationMode::Standard,

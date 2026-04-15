@@ -54,10 +54,12 @@ impl ServiceController {
         }
 
         let slots = build_replica_slots(&spec);
+        let placement_nodes = self.placement_nodes_for(eligible_nodes);
         let slot_targets = compute_effective_slot_targets(
             spec.id,
             &spec.task_templates,
             eligible_nodes,
+            &placement_nodes,
             &self.volume_registry,
         )?;
         let desired_ids: HashSet<Uuid> = slots.iter().filter_map(|slot| slot.replica_id).collect();

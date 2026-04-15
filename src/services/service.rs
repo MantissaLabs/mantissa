@@ -1,3 +1,6 @@
+use crate::scheduler::placement::{
+    PlacementConstraint, PlacementPolicy, PlacementStrategy as SchedulerPlacementStrategy,
+};
 use crate::services::manager::{ServiceController, ServiceDeploymentOutcome};
 use crate::services::types::{
     ServiceEvent, ServicePortProtocol, ServicePreviousGeneration, ServiceReadinessProbe,
@@ -401,6 +404,24 @@ fn read_readiness_probe(
     })
 }
 
+/// Decodes the placement strategy stored in the wire payload, defaulting conservatively.
+fn placement_strategy_from_proto(
+    strategy: protocol::services::PlacementStrategy,
+) -> SchedulerPlacementStrategy {
+    match strategy {
+        protocol::services::PlacementStrategy::Spread => SchedulerPlacementStrategy::Spread,
+    }
+}
+
+/// Encodes the internal placement strategy into the replicated wire enum.
+fn placement_strategy_to_proto(
+    strategy: SchedulerPlacementStrategy,
+) -> protocol::services::PlacementStrategy {
+    match strategy {
+        SchedulerPlacementStrategy::Spread => protocol::services::PlacementStrategy::Spread,
+    }
+}
+
 fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateSpecValue, Error> {
     let mut command = Vec::new();
     for arg in reader.get_command()?.iter() {
@@ -500,6 +521,22 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
     } else {
         None
     };
+    let mut placement_constraints = Vec::new();
+    for entry in reader.get_placement_constraints()?.iter() {
+        let raw = entry?.to_str()?.trim().to_string();
+        if raw.is_empty() {
+            return Err(Error::failed(
+                "placement constraints must be non-empty".to_string(),
+            ));
+        }
+        let parsed = PlacementConstraint::parse_expression(&raw)
+            .map_err(|err| Error::failed(err.to_string()))?;
+        placement_constraints.push(parsed);
+    }
+    let placement_strategy = match reader.get_placement_strategy() {
+        Ok(strategy) => placement_strategy_from_proto(strategy),
+        Err(_) => SchedulerPlacementStrategy::Spread,
+    };
 
     Ok(TaskTemplateSpecValue {
         name: reader.get_name()?.to_str()?.to_string(),
@@ -521,6 +558,10 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
             secret_files,
             volumes,
             networks,
+            placement: PlacementPolicy {
+                constraints: placement_constraints,
+                strategy: placement_strategy,
+            },
         },
         depends_on,
         replicas: reader.get_replicas(),
@@ -755,6 +796,14 @@ fn write_task_template(
     };
     builder.set_public_protocol(proto);
     builder.set_tty(template.tty);
+    let rendered_constraints = template.placement().rendered_constraints();
+    let mut placement_constraints = builder
+        .reborrow()
+        .init_placement_constraints(rendered_constraints.len() as u32);
+    for (idx, constraint) in rendered_constraints.iter().enumerate() {
+        placement_constraints.set(idx as u32, constraint);
+    }
+    builder.set_placement_strategy(placement_strategy_to_proto(template.placement().strategy));
 
     Ok(())
 }
@@ -801,6 +850,7 @@ fn read_uuid(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
 #[cfg(test)]
 mod tests {
     use super::{read_service_spec, read_task_template, write_service_spec, write_task_template};
+    use crate::scheduler::placement::{PlacementConstraint, PlacementPolicy, PlacementStrategy};
     use crate::services::types::{
         ServiceLivenessProbe, ServiceLivenessProbeKind, ServicePortProtocol,
         ServicePreviousGeneration, ServiceReadinessProbe, ServiceReadinessProbeKind,
@@ -839,6 +889,13 @@ mod tests {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: vec![TaskTemplateNetworkRequirement::new("default", network_id)],
+                placement: PlacementPolicy {
+                    constraints: vec![
+                        PlacementConstraint::parse_expression("node.labels.zone == west")
+                            .expect("constraint should parse"),
+                    ],
+                    strategy: PlacementStrategy::Spread,
+                },
             },
             depends_on: Vec::new(),
             replicas: 1,
@@ -861,6 +918,11 @@ mod tests {
         assert_eq!(
             decoded.networks, template.networks,
             "task-template network requirements should preserve their explicit network ids"
+        );
+        assert_eq!(
+            decoded.placement(),
+            template.placement(),
+            "task-template placement policy should round-trip through the wire payload"
         );
     }
 
@@ -937,6 +999,7 @@ mod tests {
                     failure_threshold: 4,
                     start_period_ms: 12_000,
                 }),
+                placement: Default::default(),
             },
             depends_on: vec!["backend".to_string()],
             replicas: 2,
@@ -976,6 +1039,7 @@ mod tests {
                         "backend",
                         previous_network_id,
                     )],
+                    placement: Default::default(),
                 },
                 depends_on: Vec::new(),
                 replicas: 1,

@@ -1097,6 +1097,7 @@ fn read_task_start_request(
             secret_files,
             volumes,
             networks,
+            placement: Default::default(),
         },
         execution_platform: read_execution_platform(reader.get_execution_platform()?.to_str()?),
         isolation_mode: read_isolation_mode(reader.get_isolation_mode()?.to_str()?),

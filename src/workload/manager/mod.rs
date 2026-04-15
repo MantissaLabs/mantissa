@@ -589,6 +589,7 @@ impl WorkloadManager {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
+                placement: Default::default(),
             },
             execution_platform: ExecutionPlatform::Oci,
             isolation_mode: IsolationMode::Standard,

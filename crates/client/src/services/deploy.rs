@@ -1,7 +1,8 @@
 use super::manifest::{
-    EnvironmentVariable, LivenessKind, LivenessProbe, ReadinessKind, ReadinessProbe,
-    RestartPolicyName, RolloutOrder, SecretFileProjection, SecretReference, ServiceManifest,
-    ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskTemplateSpec, VolumeMount,
+    EnvironmentVariable, LivenessKind, LivenessProbe, PlacementStrategy, ReadinessKind,
+    ReadinessProbe, RestartPolicyName, RolloutOrder, SecretFileProjection, SecretReference,
+    ServiceManifest, ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskTemplateSpec,
+    VolumeMount,
 };
 use crate::config::ClientConfig;
 use crate::connection;
@@ -351,6 +352,16 @@ fn write_task_template(
 
     builder.set_public_port(template.public_port.unwrap_or(0));
     builder.set_tty(template.tty);
+    let mut placement_constraints = builder
+        .reborrow()
+        .init_placement_constraints(template.placement.constraints.len() as u32);
+    for (idx, constraint) in template.placement.constraints.iter().enumerate() {
+        placement_constraints.set(idx as u32, constraint.trim());
+    }
+    let placement_strategy = match template.placement.strategy {
+        PlacementStrategy::Spread => protocol::services::PlacementStrategy::Spread,
+    };
+    builder.set_placement_strategy(placement_strategy);
 
     let mut files_builder = builder
         .reborrow()
