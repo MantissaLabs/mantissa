@@ -8,7 +8,7 @@ use common::privileged_networking::{
     PrivilegedTestGuard, command_stdout, create_privileged_network, create_privileged_node,
     delete_privileged_network, force_cleanup_privileged_network_links, link_exists,
     privileged_artifact_dir, privileged_network_interfaces, privileged_test_network,
-    privileged_test_subnet,
+    privileged_test_subnet, privileged_test_subnet_v6,
 };
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
@@ -21,7 +21,7 @@ use mantissa::services::types::{
 use mantissa::workload::types::ExecutionSpec;
 use protocol::services::services;
 use std::collections::BTreeSet;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -62,7 +62,16 @@ fn pinned_lb_map_dir(network_id: Uuid) -> PathBuf {
 /// Assert that the standard pinned load-balancer maps are reachable for one network.
 fn assert_lb_maps_present(network_id: Uuid) {
     let map_dir = pinned_lb_map_dir(network_id);
-    for map_name in ["LB_VIPS", "LB_BACKENDS", "LB_FWD", "LB_REV"] {
+    for map_name in [
+        "LB_VIPS",
+        "LB_BACKENDS",
+        "LB_FWD",
+        "LB_REV",
+        "LB_VIPS_V6",
+        "LB_BACKENDS_V6",
+        "LB_FWD_V6",
+        "LB_REV_V6",
+    ] {
         let pinned = map_dir.join(map_name);
         assert!(
             pinned.exists(),
@@ -313,6 +322,27 @@ fn interface_ipv4(iface: &str) -> Ipv4Addr {
         .unwrap_or_else(|| panic!("interface {iface} should expose an IPv4 address: {details}"))
 }
 
+/// Read the first non-link-local IPv6 address currently assigned to one host interface.
+fn interface_ipv6(iface: &str) -> Ipv6Addr {
+    let details = command_stdout("ip", &["-6", "-o", "addr", "show", "dev", iface]);
+    details
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find_map(|window| {
+            if window[0] != "inet6" {
+                return None;
+            }
+            let candidate = window[1].split('/').next()?;
+            let ip = candidate.parse::<Ipv6Addr>().ok()?;
+            if ip.is_unicast_link_local() {
+                return None;
+            }
+            Some(ip)
+        })
+        .unwrap_or_else(|| panic!("interface {iface} should expose an IPv6 address: {details}"))
+}
+
 /// Query the per-network DNS resolver for A records for one service label.
 async fn query_a_records(
     server_ip: Ipv4Addr,
@@ -342,6 +372,41 @@ async fn query_a_records(
     let mut ips = Vec::new();
     for answer in response.answers() {
         if let RData::A(ip) = answer.data() {
+            ips.push((*ip).into());
+        }
+    }
+    Ok((response.response_code(), ips))
+}
+
+/// Query the per-network DNS resolver for AAAA records for one service label.
+async fn query_aaaa_records(
+    server_ip: Ipv6Addr,
+    fqdn: &str,
+) -> anyhow::Result<(ResponseCode, Vec<Ipv6Addr>)> {
+    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0))
+        .await
+        .context("bind IPv6 dns client socket")?;
+    let mut query = Message::new();
+    query.set_id(0x4343);
+    query.set_message_type(MessageType::Query);
+    query.set_op_code(OpCode::Query);
+    query.add_query(Query::query(Name::from_ascii(fqdn)?, RecordType::AAAA));
+    let payload = query.to_vec()?;
+
+    socket
+        .send_to(&payload, SocketAddr::new(IpAddr::V6(server_ip), 53))
+        .await
+        .with_context(|| format!("send IPv6 dns query to resolver {server_ip}"))?;
+
+    let mut buf = [0u8; 2048];
+    let (len, _) = socket
+        .recv_from(&mut buf)
+        .await
+        .context("recv IPv6 dns response")?;
+    let response = Message::from_vec(&buf[..len]).context("decode IPv6 dns response")?;
+    let mut ips = Vec::new();
+    for answer in response.answers() {
+        if let RData::AAAA(ip) = answer.data() {
             ips.push((*ip).into());
         }
     }
@@ -385,6 +450,43 @@ async fn wait_for_backend_ips(
     }
 }
 
+/// Wait for the expected number of published IPv6 backend attachment IPs for one network.
+async fn wait_for_backend_ips_v6(
+    node: &HeadlessNode,
+    network_id: Uuid,
+    expected_count: usize,
+    timeout: Duration,
+) -> Vec<Ipv6Addr> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut backend_ips = BTreeSet::new();
+        for attachment in node
+            .network_registry
+            .list_attachments(Some(network_id))
+            .expect("list network attachments for IPv6 eBPF test")
+        {
+            if attachment.state != mantissa::network::types::NetworkAttachmentState::Ready
+                || !attachment.traffic_published
+            {
+                continue;
+            }
+            if let Some(assigned_ip) = attachment.assigned_ip.as_deref()
+                && let Ok(ip) = assigned_ip.parse::<Ipv6Addr>()
+            {
+                backend_ips.insert(ip);
+            }
+        }
+        if backend_ips.len() == expected_count {
+            return backend_ips.into_iter().collect();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "network {network_id} should publish {expected_count} IPv6 backend attachment(s); observed {backend_ips:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Wait until DNS answers include one VIP distinct from the published backend attachment IPs.
 async fn wait_for_vip_record(
     resolver_ip: Ipv4Addr,
@@ -407,6 +509,34 @@ async fn wait_for_vip_record(
         if Instant::now() >= deadline {
             anyhow::bail!(
                 "timed out waiting for vip record in dns answers from {resolver_ip} for {fqdn}; backend_ips={backend_ips:?}; last_answers={answers:?}; last_code={code:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Wait until DNS answers include one IPv6 VIP distinct from the published backend IPs.
+async fn wait_for_vip_record_v6(
+    resolver_ip: Ipv6Addr,
+    fqdn: &str,
+    backend_ips: &[Ipv6Addr],
+    timeout: Duration,
+) -> anyhow::Result<Ipv6Addr> {
+    let deadline = Instant::now() + timeout;
+    let backend_set: BTreeSet<Ipv6Addr> = backend_ips.iter().copied().collect();
+    loop {
+        let (code, answers) = query_aaaa_records(resolver_ip, fqdn).await?;
+        if code == ResponseCode::NoError
+            && let Some(vip) = answers
+                .iter()
+                .copied()
+                .find(|candidate| !backend_set.contains(candidate))
+        {
+            return Ok(vip);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for IPv6 vip record in dns answers from {resolver_ip} for {fqdn}; backend_ips={backend_ips:?}; last_answers={answers:?}; last_code={code:?}"
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -702,6 +832,136 @@ local_test!(ebpf_overlay_host_vip_reaches_service_from_host_access, {
     delete_privileged_network(&node, network_id).await;
     force_cleanup_privileged_network_links(network_id).await;
 });
+
+local_test!(
+    ebpf_overlay_ipv6_host_vip_reaches_service_from_host_access,
+    {
+        let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {
+            return;
+        };
+
+        let _config = PrivilegedTestGuard::apply(|config| {
+            config.network.wireguard.enabled = false;
+            config.network.wireguard.manage_firewall = false;
+            config.network.bpf.attach = true;
+            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            config.network.nodeport.enabled = false;
+            config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+        });
+
+        let node = create_privileged_node().await;
+        let subnet = privileged_test_subnet_v6();
+        let network = create_privileged_network(
+            &node,
+            privileged_test_network(
+                "ebpf-vip-v6",
+                "privileged ebpf IPv6 vip reachability test network",
+                &subnet,
+                1450,
+                Vec::new(),
+            ),
+            NetworkStatus::Ready,
+        )
+        .await;
+        let network_id = network.id;
+
+        let service_id = node
+            .service_controller
+            .submit_deployment(
+                Uuid::new_v4(),
+                "ebpf-vip-v6-service",
+                "ebpf-vip-v6-service",
+                vec![privileged_http_service_task_template(network_id, 1)],
+            )
+            .await
+            .expect("submit privileged IPv6 eBPF overlay deployment");
+
+        assert!(
+            wait_for_service_status(
+                &node.service_controller,
+                service_id,
+                ServiceStatus::Running,
+                Duration::from_secs(180),
+            )
+            .await,
+            "IPv6 eBPF overlay service should reach running state"
+        );
+
+        let backend_ips =
+            wait_for_backend_ips_v6(&node, network_id, 1, Duration::from_secs(60)).await;
+        let [
+            _vxlan_ifname,
+            _bridge_ifname,
+            _host_peer_ifname,
+            host_ifname,
+        ] = privileged_network_interfaces(network_id);
+        let resolver_ip = interface_ipv6(&host_ifname);
+        let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+        let vip = wait_for_vip_record_v6(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
+            .await
+            .expect("discover IPv6 VIP for host-access eBPF test");
+
+        let vip_addr = format!("[{vip}]:{EBPF_HTTP_PORT}");
+        let vip_ready = common::convergence::wait_until(
+            Duration::from_secs(30),
+            Duration::from_millis(100),
+            || async {
+                matches!(
+                    http_get(&vip_addr).await,
+                    Ok(response) if response.contains(EBPF_HTTP_RESPONSE)
+                )
+            },
+        )
+        .await;
+        if !vip_ready {
+            let (last_dns_code, last_dns_answers) = query_aaaa_records(resolver_ip, &fqdn)
+                .await
+                .expect("query IPv6 dns after host-access vip timeout");
+            let host_link = command_stdout("ip", &["link", "show", "dev", &host_ifname]);
+            let host_addr = command_stdout("ip", &["-6", "addr", "show", "dev", &host_ifname]);
+            let neighbour = command_stdout(
+                "ip",
+                &[
+                    "-6",
+                    "neigh",
+                    "show",
+                    "to",
+                    &vip.to_string(),
+                    "dev",
+                    &host_ifname,
+                ],
+            );
+            let last_http_error = http_get(&vip_addr)
+                .await
+                .map(|response| format!("unexpected response: {response}"))
+                .unwrap_or_else(|err| err.to_string());
+            panic!(
+                "host-access traffic should reach the IPv6 service VIP through the bridge tc datapath; vip={vip}; backend_ips={backend_ips:?}; last_dns_code={last_dns_code:?}; last_dns_answers={last_dns_answers:?}; host_link={host_link:?}; host_addr={host_addr:?}; neighbour={neighbour:?}; last_http_error={last_http_error}"
+            );
+        }
+
+        let neighbour = command_stdout(
+            "ip",
+            &[
+                "-6",
+                "neigh",
+                "show",
+                "to",
+                &vip.to_string(),
+                "dev",
+                &host_ifname,
+            ],
+        );
+        assert!(
+            neighbour.contains("PERMANENT"),
+            "host-access interface should keep a permanent IPv6 neighbour entry for the published VIP: {neighbour}"
+        );
+
+        remove_service_via_rpc(&node.services_client, service_id).await;
+        delete_privileged_network(&node, network_id).await;
+        force_cleanup_privileged_network_links(network_id).await;
+    }
+);
 
 local_test!(ebpf_overlay_vip_load_balances_across_local_replicas, {
     let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {

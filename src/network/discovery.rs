@@ -22,7 +22,7 @@ use health::{HealthMonitor, Status as HealthStatus};
 use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -1018,17 +1018,15 @@ fn compute_service_vip(
         Ok(subnet) => subnet,
         Err(_) => return Ok(None),
     };
-    if subnet.family != OverlayIpFamily::Ipv4 {
-        // The current VIP dataplane and neighbour responder are IPv4-only, so IPv6 overlays
-        // publish direct backend AAAA records for now instead of advertising a non-functional VIP.
-        return Ok(None);
-    }
-    let IpAddr::V4(base_ip) = subnet.base_ip else {
-        return Ok(None);
+    let address_bits = match subnet.family {
+        OverlayIpFamily::Ipv4 => 32u8,
+        OverlayIpFamily::Ipv6 => 128u8,
     };
-    let prefix = subnet.prefix;
-
-    let host_bits = 32u8.saturating_sub(prefix);
+    let base_ip = match subnet.base_ip {
+        IpAddr::V4(ip) => u32::from(ip) as u128,
+        IpAddr::V6(ip) => u128::from(ip),
+    };
+    let host_bits = address_bits.saturating_sub(subnet.prefix);
     if host_bits < 4 {
         return Ok(None);
     }
@@ -1039,43 +1037,53 @@ fn compute_service_vip(
         hasher.update(service_name.as_bytes());
         hasher.finalize()
     };
-
-    let mut slot_seed = [0u8; 4];
-    slot_seed.copy_from_slice(&digest.as_bytes()[..4]);
+    let mut slot_seed = [0u8; 16];
+    slot_seed.copy_from_slice(&digest.as_bytes()[..16]);
+    let slot_seed = u128::from_le_bytes(slot_seed);
 
     // Constrain VIPs to the even offsets of the overlay to avoid collisions with per-node resolver
     // addresses, which always occupy the odd slots (offsets 1, 3, 5, ...).
-    let available_even = (1u64 << host_bits).saturating_sub(16) / 2;
+    let max_hosts: u128 = match (subnet.family, host_bits) {
+        (OverlayIpFamily::Ipv4, 32) => u32::MAX as u128 + 1,
+        (OverlayIpFamily::Ipv6, 128) => return Ok(None),
+        _ => 1u128 << host_bits,
+    };
+    let available_even = max_hosts.saturating_sub(16) / 2;
     if available_even == 0 {
         return Ok(None);
     }
 
-    let backend_ips: std::collections::HashSet<u32> = backends
+    let backend_ips: std::collections::HashSet<u128> = backends
         .iter()
-        .filter_map(|backend| match backend.ip {
-            IpAddr::V4(ip) => Some(u32::from(ip)),
-            IpAddr::V6(_) => None,
+        .filter_map(|backend| match (subnet.family, backend.ip) {
+            (OverlayIpFamily::Ipv4, IpAddr::V4(ip)) => Some(u32::from(ip) as u128),
+            (OverlayIpFamily::Ipv6, IpAddr::V6(ip)) => Some(u128::from(ip)),
+            _ => None,
         })
         .collect();
     if backend_ips.len() != backends.len() {
         return Ok(None);
     }
 
-    let mut slot = (u32::from_le_bytes(slot_seed) % available_even as u32) * 2 + 8;
-    for _ in 0..available_even.min(16) as usize {
-        let candidate = u32::from(base_ip).saturating_add(slot);
+    let mut slot = (slot_seed % available_even) * 2 + 8;
+    let probe_budget = usize::try_from(available_even.min(16)).unwrap_or(16);
+    for _ in 0..probe_budget {
+        let candidate = base_ip.saturating_add(slot);
         if !backend_ips.contains(&candidate) {
-            let vip = Ipv4Addr::from(candidate);
+            let vip = match subnet.family {
+                OverlayIpFamily::Ipv4 => IpAddr::V4(Ipv4Addr::from(candidate as u32)),
+                OverlayIpFamily::Ipv6 => IpAddr::V6(Ipv6Addr::from(candidate)),
+            };
 
             let mut mac = [0u8; 6];
             mac[0] = 0x02;
             mac[1..].copy_from_slice(&digest.as_bytes()[4..9]);
 
-            return Ok(Some((IpAddr::V4(vip), mac)));
+            return Ok(Some((vip, mac)));
         }
 
         // Walk forward to the next even slot if we collided with an existing backend.
-        slot = slot.wrapping_add(2) % (available_even as u32 * 2);
+        slot = slot.wrapping_add(2) % (available_even * 2);
         if slot < 8 {
             slot = 8;
         }

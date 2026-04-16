@@ -649,7 +649,16 @@ mod platform {
 
     /// Check whether the pinned load balancer maps are reachable from userspace.
     fn lb_maps_present(base: &Path) -> bool {
-        const MAPS: &[&str] = &["LB_VIPS", "LB_BACKENDS", "LB_FWD", "LB_REV"];
+        const MAPS: &[&str] = &[
+            "LB_VIPS",
+            "LB_BACKENDS",
+            "LB_FWD",
+            "LB_REV",
+            "LB_VIPS_V6",
+            "LB_BACKENDS_V6",
+            "LB_FWD_V6",
+            "LB_REV_V6",
+        ];
         MAPS.iter().all(|name| map_is_pinned(base, name))
     }
 
@@ -709,7 +718,16 @@ mod platform {
     /// Ensure LB-related maps are pinned so subsequent program loads reuse the same instances and
     /// userspace can program them via predictable paths.
     fn ensure_lb_maps_pinned(bpf: &mut Ebpf, base: &Path) -> Result<()> {
-        const MAPS: &[&str] = &["LB_VIPS", "LB_BACKENDS", "LB_FWD", "LB_REV"];
+        const MAPS: &[&str] = &[
+            "LB_VIPS",
+            "LB_BACKENDS",
+            "LB_FWD",
+            "LB_REV",
+            "LB_VIPS_V6",
+            "LB_BACKENDS_V6",
+            "LB_FWD_V6",
+            "LB_REV_V6",
+        ];
         if let Err(err) = fs::create_dir_all(base) {
             warn!(
                 target: "network",

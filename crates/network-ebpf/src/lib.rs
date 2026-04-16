@@ -101,6 +101,19 @@ pub mod net {
             }
         }
 
+        /// Build an IPv6 Ethernet header with the provided source and destination MAC addresses.
+        ///
+        /// The bridge load balancer rewrites both IPv4 and IPv6 frames, so callers need the same
+        /// ergonomic constructor across both families.
+        #[inline(always)]
+        pub const fn ipv6(dst: [u8; 6], src: [u8; 6]) -> Self {
+            Self {
+                dst,
+                src,
+                eth_proto: 0x86ddu16.to_be(),
+            }
+        }
+
         /// Build the synthetic broadcast Ethernet header used for loopback-originated IPv4 traffic.
         ///
         /// NodePort ingress materializes this header before redirecting the packet into the overlay
@@ -161,6 +174,37 @@ pub mod net {
         pub fn is_fragmented(&self) -> bool {
             (u16::from_be(self.frag_off) & 0x1fff) != 0
         }
+    }
+
+    #[repr(C, packed)]
+    #[derive(Clone, Copy)]
+    pub struct Ipv6Header {
+        pub version_tc_flow: u32,
+        pub payload_len: u16,
+        pub next_header: u8,
+        pub hop_limit: u8,
+        pub src: [u8; 16],
+        pub dst: [u8; 16],
+    }
+
+    impl Ipv6Header {
+        #[inline(always)]
+        pub fn version(&self) -> u8 {
+            (u32::from_be(self.version_tc_flow) >> 28) as u8
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Icmpv6NeighborMessage {
+        pub icmp_type: u8,
+        pub code: u8,
+        pub checksum: u16,
+        pub flags_or_reserved: u32,
+        pub target: [u8; 16],
+        pub option_type: u8,
+        pub option_len: u8,
+        pub option_mac: [u8; 6],
     }
 
     #[repr(C, packed)]
@@ -295,6 +339,31 @@ pub mod lb {
         pub slot: u32,
     }
 
+    /// Key for IPv6 VIP-backed routing decisions stored in eBPF maps.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct VipKey6 {
+        pub vip: [u8; 16],
+    }
+
+    /// L2/L3 coordinates for an IPv6 backend attachment.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Backend6 {
+        pub ip: [u8; 16],
+        pub mac: [u8; 6],
+        pub _pad: [u8; 2],
+    }
+
+    /// Composite key used to isolate IPv6 backend lookup slots per VIP.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct VipBackendKey6 {
+        pub vip: [u8; 16],
+        pub slot: u32,
+        pub _pad: [u8; 4],
+    }
+
     /// Normalized 5-tuple used to maintain DNAT/SNAT state.
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -310,6 +379,19 @@ pub mod lb {
         pub padding: [u8; 2],
     }
 
+    /// Normalized IPv6 5-tuple used to maintain DNAT/SNAT state.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Flow6 {
+        pub src: [u8; 16],
+        pub dst: [u8; 16],
+        pub src_port: u16,
+        pub dst_port: u16,
+        pub proto: u8,
+        /// Explicit tail padding keeps all bytes deterministic for map lookups.
+        pub padding: [u8; 3],
+    }
+
     /// Cached per-flow translation data shared between ingress/egress hooks.
     #[repr(C, packed)]
     #[derive(Clone, Copy)]
@@ -318,5 +400,17 @@ pub mod lb {
         pub vip_mac: [u8; 6],
         pub backend_ip: u32,
         pub backend_mac: [u8; 6],
+    }
+
+    /// Cached per-flow IPv6 translation data shared between ingress and egress hooks.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct NatEntry6 {
+        pub vip: [u8; 16],
+        pub vip_mac: [u8; 6],
+        pub _pad0: [u8; 2],
+        pub backend_ip: [u8; 16],
+        pub backend_mac: [u8; 6],
+        pub _pad1: [u8; 2],
     }
 }

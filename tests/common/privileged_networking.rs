@@ -198,6 +198,14 @@ pub fn privileged_test_subnet() -> String {
     format!("10.{octet_b}.{octet_c}.0/24")
 }
 
+/// Generate one randomized private `/64` IPv6 subnet for privileged overlay tests.
+pub fn privileged_test_subnet_v6() -> String {
+    let bytes = Uuid::new_v4().into_bytes();
+    let segment_a = u16::from_be_bytes([bytes[0], bytes[1]]);
+    let segment_b = u16::from_be_bytes([bytes[2], bytes[3]]);
+    format!("fd42:{segment_a:04x}:{segment_b:04x}::/64")
+}
+
 /// Persist one overlay network and wait until it reaches the expected local lifecycle state.
 pub async fn create_privileged_network(
     node: &HeadlessNode,
