@@ -87,9 +87,42 @@ pub mod net {
     }
 
     impl EthernetHeader {
+        /// Build an IPv4 Ethernet header with the provided source and destination MAC addresses.
+        ///
+        /// The eBPF dataplane rewrites complete L2 headers when steering packets between bridge,
+        /// loopback, and overlay paths. Keeping the constructor here avoids duplicating byte-order
+        /// handling at each call site.
+        #[inline(always)]
+        pub const fn ipv4(dst: [u8; 6], src: [u8; 6]) -> Self {
+            Self {
+                dst,
+                src,
+                eth_proto: 0x0800u16.to_be(),
+            }
+        }
+
+        /// Build the synthetic broadcast Ethernet header used for loopback-originated IPv4 traffic.
+        ///
+        /// NodePort ingress materializes this header before redirecting the packet into the overlay
+        /// bridge so a locally generated skb can traverse an Ethernet path.
+        #[inline(always)]
+        pub const fn broadcast_ipv4(src: [u8; 6]) -> Self {
+            Self::ipv4([0xff; 6], src)
+        }
+
         #[inline(always)]
         pub fn protocol(&self) -> u16 {
             u16::from_be(self.eth_proto)
+        }
+
+        /// Report whether both MAC address fields are still zeroed.
+        ///
+        /// Some loopback-originated skbs expose an empty L2 slot instead of a populated Ethernet
+        /// header. The ingress classifier uses this to decide whether it can fill the slot in place
+        /// without overwriting a real Ethernet frame.
+        #[inline(always)]
+        pub fn has_zero_addresses(&self) -> bool {
+            is_zero(&self.dst) && is_zero(&self.src)
         }
 
         #[inline(always)]

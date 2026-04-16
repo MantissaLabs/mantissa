@@ -346,14 +346,20 @@ fn rewrite_source(
     Ok(())
 }
 
-/// Ensure the packet carries a valid Ethernet header when originating from loopback.
-/// Ensure nodeport packets have a valid Ethernet header before redirecting to the overlay.
+/// Ensure NodePort packets expose a usable Ethernet header before redirecting them to the overlay.
+///
+/// Physical ingress packets already arrive with a real Ethernet header and should be preserved.
+/// Locally generated loopback traffic either lacks the L2 header entirely or carries a zeroed
+/// placeholder slot. In those cases we materialize a synthetic broadcast IPv4 header so the
+/// bridge and overlay path can forward the skb like a normal Ethernet frame.
 fn ensure_ethernet(ctx: &mut TcContext, ip_offset: usize, host: &NodePortHost) -> Result<(), ()> {
+    let synthetic_eth = EthernetHeader::broadcast_ipv4(host.mac);
     if ip_offset == net::ETH_HDR_LEN {
-        if !eth_header_is_zero(ctx)? {
+        let eth: EthernetHeader = ctx.load(0).map_err(|_| ())?;
+        if !eth.has_zero_addresses() {
             return Ok(());
         }
-        write_eth_header(ctx, &host.mac)?;
+        ctx.store(0, &synthetic_eth, 0).map_err(|_| ())?;
         return Ok(());
     }
 
@@ -361,36 +367,9 @@ fn ensure_ethernet(ctx: &mut TcContext, ip_offset: usize, host: &NodePortHost) -
     let flags = (BPF_F_ADJ_ROOM_ENCAP_L2_ETH | BPF_F_ADJ_ROOM_NO_CSUM_RESET) as u64;
     ctx.adjust_room(delta, BPF_ADJ_ROOM_MAC, flags)
         .map_err(|_| ())?;
-    write_eth_header(ctx, &host.mac)?;
-    Ok(())
-}
-
-/// Check whether the packet Ethernet header is all zeroes (loopback) before overwriting it.
-fn eth_header_is_zero(ctx: &TcContext) -> Result<bool, ()> {
-    let dst0: u32 = ctx.load(0).map_err(|_| ())?;
-    let dst1: u16 = ctx.load(4).map_err(|_| ())?;
-    let src0: u32 = ctx.load(6).map_err(|_| ())?;
-    let src1: u16 = ctx.load(10).map_err(|_| ())?;
-    Ok(dst0 == 0 && dst1 == 0 && src0 == 0 && src1 == 0)
-}
-
-/// Materialize a broadcast Ethernet header so loopback traffic can traverse the overlay.
-fn write_eth_header(ctx: &mut TcContext, src: &[u8; 6]) -> Result<(), ()> {
-    let broadcast = 0xffu8;
-    ctx.store(0, &broadcast, 0).map_err(|_| ())?;
-    ctx.store(1, &broadcast, 0).map_err(|_| ())?;
-    ctx.store(2, &broadcast, 0).map_err(|_| ())?;
-    ctx.store(3, &broadcast, 0).map_err(|_| ())?;
-    ctx.store(4, &broadcast, 0).map_err(|_| ())?;
-    ctx.store(5, &broadcast, 0).map_err(|_| ())?;
-    ctx.store(6, &src[0], 0).map_err(|_| ())?;
-    ctx.store(7, &src[1], 0).map_err(|_| ())?;
-    ctx.store(8, &src[2], 0).map_err(|_| ())?;
-    ctx.store(9, &src[3], 0).map_err(|_| ())?;
-    ctx.store(10, &src[4], 0).map_err(|_| ())?;
-    ctx.store(11, &src[5], 0).map_err(|_| ())?;
-    let eth_proto = ETH_P_IPV4.to_be();
-    ctx.store(12, &eth_proto, 0).map_err(|_| ())?;
+    // `store()` lowers to `bpf_skb_store_bytes()`, so we can write the full header in one
+    // verifier-friendly helper call instead of emitting one store per field.
+    ctx.store(0, &synthetic_eth, 0).map_err(|_| ())?;
     Ok(())
 }
 
