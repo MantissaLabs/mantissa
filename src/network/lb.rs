@@ -1,10 +1,10 @@
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use uuid::Uuid;
 
 /// Backend coordinates used when populating dataplane maps.
 #[derive(Clone, Debug)]
 pub struct BackendAddress {
-    pub ip: Ipv4Addr,
+    pub ip: IpAddr,
     pub mac: [u8; 6],
 }
 
@@ -27,7 +27,7 @@ impl BpfLoadBalancer {
     pub fn sync_vip(
         &self,
         network_id: Uuid,
-        vip: Ipv4Addr,
+        vip: IpAddr,
         vip_mac: [u8; 6],
         backends: &[BackendAddress],
     ) -> anyhow::Result<()> {
@@ -45,7 +45,7 @@ mod platform {
     use nix::sys::statfs::{BPF_FS_MAGIC, statfs};
     use std::fs;
     use std::mem;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::os::fd::{AsFd, AsRawFd};
     use std::path::Path;
     use tracing::warn;
@@ -62,10 +62,11 @@ mod platform {
         pub fn sync_vip(
             &self,
             network_id: Uuid,
-            vip: Ipv4Addr,
+            vip: IpAddr,
             vip_mac: [u8; 6],
             backends: &[BackendAddress],
         ) -> Result<()> {
+            let vip = require_ipv4(vip, "service vip")?;
             let base = map_pin_dir(network_id)?;
             let vip_map = open_map(&base, "LB_VIPS").context("open LB_VIPS map")?;
             let backend_map = open_map(&base, "LB_BACKENDS").context("open LB_BACKENDS map")?;
@@ -91,7 +92,8 @@ mod platform {
                 // representation consistent for lookups and for rewriting packet headers.
                 vip: u32::from_ne_bytes(vip.octets()),
             };
-            let desired_ring = build_backend_lookup_ring(backends, MAX_BACKENDS_PER_VIP);
+            let desired_ring = build_backend_lookup_ring(backends, MAX_BACKENDS_PER_VIP)
+                .context("build backend ring")?;
             let programmed_slots = desired_ring.len();
             let existing_entry =
                 lookup_elem::<VipKey, VipEntry>(vip_map.fd().as_fd().as_raw_fd(), &key)
@@ -250,14 +252,17 @@ mod platform {
     }
 
     /// Precompute a per-VIP backend lookup ring so dataplane selection is O(1) on cache miss.
-    fn build_backend_lookup_ring(backends: &[BackendAddress], max_slots: usize) -> Vec<Backend> {
+    fn build_backend_lookup_ring(
+        backends: &[BackendAddress],
+        max_slots: usize,
+    ) -> Result<Vec<Backend>> {
         let candidates: Vec<Backend> = backends
             .iter()
             .take(max_slots)
             .map(backend_to_map_value)
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         if candidates.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let slot_count = desired_lookup_slots(candidates.len(), max_slots);
@@ -286,17 +291,26 @@ mod platform {
             ring.push(candidates[best_idx]);
         }
 
-        ring
+        Ok(ring)
     }
 
     /// Convert high-level backend coordinates into the raw value programmed into eBPF maps.
-    fn backend_to_map_value(backend: &BackendAddress) -> Backend {
-        Backend {
+    fn backend_to_map_value(backend: &BackendAddress) -> Result<Backend> {
+        let ip = require_ipv4(backend.ip, "service backend")?;
+        Ok(Backend {
             // Keep the backend IP representation consistent with how the eBPF programs read
             // and write IPv4 header fields (native-endian `u32` matching network bytes).
-            ip: u32::from_ne_bytes(backend.ip.octets()),
+            ip: u32::from_ne_bytes(ip.octets()),
             mac: backend.mac,
             _pad: 0,
+        })
+    }
+
+    /// Require IPv4 coordinates before programming the current IPv4-only dataplane maps.
+    fn require_ipv4(ip: IpAddr, context: &str) -> Result<Ipv4Addr> {
+        match ip {
+            IpAddr::V4(ip) => Ok(ip),
+            IpAddr::V6(ip) => anyhow::bail!("{context} {ip} requires IPv6 dataplane support"),
         }
     }
 
@@ -641,12 +655,12 @@ mod platform {
     mod tests {
         use super::*;
         use std::collections::BTreeSet;
-        use std::net::Ipv4Addr;
+        use std::net::{IpAddr, Ipv4Addr};
 
         /// Build a synthetic backend value for deterministic ring-construction tests.
         fn synthetic_backend(index: usize) -> BackendAddress {
             BackendAddress {
-                ip: Ipv4Addr::from(0x0a00_0001u32 + (index as u32)),
+                ip: IpAddr::V4(Ipv4Addr::from(0x0a00_0001u32 + (index as u32))),
                 mac: [
                     0x02,
                     ((index >> 16) & 0xff) as u8,
@@ -662,8 +676,10 @@ mod platform {
         #[test]
         fn backend_lookup_ring_is_deterministic() {
             let backends: Vec<BackendAddress> = (0..16).map(synthetic_backend).collect();
-            let ring_a = build_backend_lookup_ring(&backends, MAX_BACKENDS_PER_VIP);
-            let ring_b = build_backend_lookup_ring(&backends, MAX_BACKENDS_PER_VIP);
+            let ring_a =
+                build_backend_lookup_ring(&backends, MAX_BACKENDS_PER_VIP).expect("build ring a");
+            let ring_b =
+                build_backend_lookup_ring(&backends, MAX_BACKENDS_PER_VIP).expect("build ring b");
             assert_eq!(ring_a, ring_b);
             assert!(!ring_a.is_empty());
         }
@@ -673,7 +689,8 @@ mod platform {
         fn backend_lookup_ring_respects_cap() {
             let over_cap = MAX_BACKENDS_PER_VIP + 128;
             let backends: Vec<BackendAddress> = (0..over_cap).map(synthetic_backend).collect();
-            let ring = build_backend_lookup_ring(&backends, MAX_BACKENDS_PER_VIP);
+            let ring =
+                build_backend_lookup_ring(&backends, MAX_BACKENDS_PER_VIP).expect("build ring");
             assert!(ring.len() <= MAX_BACKENDS_PER_VIP);
         }
 
@@ -681,10 +698,14 @@ mod platform {
         #[test]
         fn backend_lookup_ring_uses_only_admitted_backends() {
             let backends: Vec<BackendAddress> = (0..12).map(synthetic_backend).collect();
-            let ring = build_backend_lookup_ring(&backends, MAX_BACKENDS_PER_VIP);
+            let ring =
+                build_backend_lookup_ring(&backends, MAX_BACKENDS_PER_VIP).expect("build ring");
             let admitted: BTreeSet<(u32, [u8; 6])> = backends
                 .iter()
                 .map(backend_to_map_value)
+                .collect::<Result<Vec<_>>>()
+                .expect("convert admitted backends")
+                .into_iter()
                 .map(|backend| (backend.ip, backend.mac))
                 .collect();
 
@@ -701,7 +722,7 @@ mod platform {
 mod platform {
     use super::BackendAddress;
     use anyhow::Result;
-    use std::net::Ipv4Addr;
+    use std::net::IpAddr;
     use uuid::Uuid;
 
     #[derive(Clone, Default)]
@@ -715,7 +736,7 @@ mod platform {
         pub fn sync_vip(
             &self,
             _network_id: Uuid,
-            _vip: Ipv4Addr,
+            _vip: IpAddr,
             _vip_mac: [u8; 6],
             _backends: &[BackendAddress],
         ) -> Result<()> {

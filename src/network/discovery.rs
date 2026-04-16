@@ -1,4 +1,4 @@
-use crate::network::allocator::parse_ipv4_cidr;
+use crate::network::allocator::{OverlayIpFamily, parse_overlay_cidr};
 use crate::network::attachment::{bridge_name, host_access_host_iface_name, vxlan_name};
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
 use crate::network::lb::{BackendAddress, BpfLoadBalancer};
@@ -69,7 +69,7 @@ pub struct ServiceDiscovery {
 }
 
 struct DnsServerHandle {
-    resolver_ip: Ipv4Addr,
+    resolver_ip: IpAddr,
     shutdown: Option<watch::Sender<bool>>,
     task: JoinHandle<()>,
 }
@@ -102,7 +102,7 @@ struct ServiceBackendCatalogEntry {
 struct ServiceRefreshResult {
     nodeport_mappings: Vec<NodePortMapping>,
     public_endpoint: Option<PublicEndpointObservation>,
-    host_vip: Option<Ipv4Addr>,
+    host_vip: Option<IpAddr>,
 }
 
 /// Observed public endpoint state for one template during the current refresh tick.
@@ -161,7 +161,7 @@ impl ServiceDiscovery {
     pub async fn ensure_network(
         &self,
         spec: &NetworkSpecValue,
-        resolver_ip: Option<Ipv4Addr>,
+        resolver_ip: Option<IpAddr>,
     ) -> Result<()> {
         let Some(resolver_ip) = resolver_ip else {
             self.teardown_network(spec.id).await?;
@@ -237,7 +237,7 @@ async fn spawn_dns_server(
     bpf: NetworkBpfManager,
     network_id: Uuid,
     network_name: String,
-    resolver_ip: Ipv4Addr,
+    resolver_ip: IpAddr,
     load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: Arc<AsyncMutex<BackendHealth>>,
     dns_port: u16,
@@ -246,7 +246,7 @@ async fn spawn_dns_server(
     missing_lb_maps: Arc<AsyncMutex<HashSet<Uuid>>>,
     health_monitor: Arc<HealthMonitor>,
 ) -> Result<DnsServerHandle> {
-    let bind_addr = SocketAddr::new(IpAddr::V4(resolver_ip), dns_port);
+    let bind_addr = SocketAddr::new(resolver_ip, dns_port);
     let socket = UdpSocket::bind(bind_addr)
         .await
         .with_context(|| format!("bind resolver socket {bind_addr}"))?;
@@ -562,11 +562,13 @@ async fn answer_query(
     lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
     backend_catalog: &Arc<AsyncMutex<NetworkBackendCatalog>>,
 ) -> Result<LookupOutcome> {
-    if query.query_type() == RecordType::AAAA {
-        return Ok(LookupOutcome::NoData);
-    }
-    if query.query_type() != RecordType::A {
+    if query.query_type() != RecordType::A && query.query_type() != RecordType::AAAA {
         return Ok(LookupOutcome::NotImplemented);
+    }
+
+    let expected_record_type = overlay_dns_record_type(registry, network_id)?;
+    if query.query_type() != expected_record_type {
+        return Ok(LookupOutcome::NoData);
     }
 
     let Some(service_name) = extract_service_label(query.name(), network_name) else {
@@ -631,17 +633,15 @@ async fn answer_query(
         backends
             .iter()
             .map(|backend| backend.ip)
-            .collect::<Vec<Ipv4Addr>>(),
+            .collect::<Vec<IpAddr>>(),
         offset,
     );
 
-    records.extend(addresses.into_iter().map(|addr| {
-        Record::from_rdata(
-            query.name().clone(),
-            SERVICE_TTL_SECS,
-            RData::A(addr.into()),
-        )
-    }));
+    records.extend(
+        addresses
+            .into_iter()
+            .map(|addr| address_record(query.name(), addr)),
+    );
 
     if let Some((vip, programmed)) = sync_service_vip_for_backends(
         bpf_lb,
@@ -656,14 +656,34 @@ async fn answer_query(
     .await?
         && programmed
     {
-        records.push(Record::from_rdata(
-            query.name().clone(),
-            SERVICE_TTL_SECS,
-            RData::A(vip.into()),
-        ));
+        records.push(address_record(query.name(), vip));
     }
 
     Ok(LookupOutcome::Records(records))
+}
+
+/// Resolve which DNS record family one overlay network should answer for service names.
+fn overlay_dns_record_type(registry: &NetworkRegistry, network_id: Uuid) -> Result<RecordType> {
+    let Some(spec) = registry.get_spec(network_id)? else {
+        bail!("network {network_id} is missing while resolving service records");
+    };
+    let subnet = parse_overlay_cidr(&spec.subnet_cidr)?;
+    Ok(match subnet.family {
+        OverlayIpFamily::Ipv4 => RecordType::A,
+        OverlayIpFamily::Ipv6 => RecordType::AAAA,
+    })
+}
+
+/// Build one DNS address record matching the concrete IP family being published.
+fn address_record(name: &Name, addr: IpAddr) -> Record {
+    match addr {
+        IpAddr::V4(addr) => {
+            Record::from_rdata(name.clone(), SERVICE_TTL_SECS, RData::A(addr.into()))
+        }
+        IpAddr::V6(addr) => {
+            Record::from_rdata(name.clone(), SERVICE_TTL_SECS, RData::AAAA(addr.into()))
+        }
+    }
 }
 
 fn extract_service_label(name: &Name, network_name: &str) -> Option<String> {
@@ -700,6 +720,11 @@ async fn resolve_service_backends(
     service_name: &str,
     health_snapshot: &HashMap<Uuid, HealthStatus>,
 ) -> Result<Vec<BackendAddress>> {
+    let expected_family = registry
+        .get_spec(network_id)?
+        .map(|spec| parse_overlay_cidr(&spec.subnet_cidr))
+        .transpose()?
+        .map(|subnet| subnet.family);
     let attachments = registry
         .list_attachments(Some(network_id))
         .context("list attachments for discovery")?;
@@ -845,7 +870,7 @@ async fn resolve_service_backends(
             );
             continue;
         }
-        let ip_addr = match ip_text.parse::<Ipv4Addr>() {
+        let ip_addr = match ip_text.parse::<IpAddr>() {
             Ok(addr) => addr,
             Err(err) => {
                 warn!(
@@ -858,6 +883,19 @@ async fn resolve_service_backends(
                 continue;
             }
         };
+        if let Some(expected_family) = expected_family
+            && ip_family(ip_addr) != expected_family
+        {
+            warn!(
+                target: "network",
+                network = %network_id,
+                task = %attachment.task_id,
+                expected_family = ?expected_family,
+                actual_ip = %ip_addr,
+                "attachment ip family does not match overlay subnet"
+            );
+            continue;
+        }
         let mac = match parse_mac(mac_text) {
             Ok(mac) => mac,
             Err(err) => {
@@ -932,11 +970,25 @@ fn parse_rfc3339(raw: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
 
 /// Sort backend endpoints deterministically so LB programming is stable across refreshes.
 fn sort_backends(backends: &mut [BackendAddress]) {
-    backends.sort_by(|a, b| {
-        let a_ip = u32::from(a.ip);
-        let b_ip = u32::from(b.ip);
-        a_ip.cmp(&b_ip).then_with(|| a.mac.cmp(&b.mac))
-    });
+    backends.sort_by(|a, b| compare_ip_addrs(a.ip, b.ip).then_with(|| a.mac.cmp(&b.mac)));
+}
+
+/// Return the overlay family associated with a concrete attachment or resolver address.
+fn ip_family(ip: IpAddr) -> OverlayIpFamily {
+    match ip {
+        IpAddr::V4(_) => OverlayIpFamily::Ipv4,
+        IpAddr::V6(_) => OverlayIpFamily::Ipv6,
+    }
+}
+
+/// Keep backend ordering stable across nodes by comparing family first and octets second.
+fn compare_ip_addrs(left: IpAddr, right: IpAddr) -> std::cmp::Ordering {
+    match (left, right) {
+        (IpAddr::V4(left), IpAddr::V4(right)) => left.octets().cmp(&right.octets()),
+        (IpAddr::V6(left), IpAddr::V6(right)) => left.octets().cmp(&right.octets()),
+        (IpAddr::V4(_), IpAddr::V6(_)) => std::cmp::Ordering::Less,
+        (IpAddr::V6(_), IpAddr::V4(_)) => std::cmp::Ordering::Greater,
+    }
 }
 
 fn build_task_template_index(specs: &[ServiceSpecValue]) -> HashMap<Uuid, (String, String)> {
@@ -958,13 +1010,23 @@ fn compute_service_vip(
     network_id: Uuid,
     service_name: &str,
     backends: &[BackendAddress],
-) -> Result<Option<(Ipv4Addr, [u8; 6])>> {
+) -> Result<Option<(IpAddr, [u8; 6])>> {
     let Some(spec) = registry.get_spec(network_id)? else {
         return Ok(None);
     };
-    let Ok((base_ip, prefix)) = parse_ipv4_cidr(&spec.subnet_cidr) else {
+    let subnet = match parse_overlay_cidr(&spec.subnet_cidr) {
+        Ok(subnet) => subnet,
+        Err(_) => return Ok(None),
+    };
+    if subnet.family != OverlayIpFamily::Ipv4 {
+        // The current VIP dataplane and neighbour responder are IPv4-only, so IPv6 overlays
+        // publish direct backend AAAA records for now instead of advertising a non-functional VIP.
+        return Ok(None);
+    }
+    let IpAddr::V4(base_ip) = subnet.base_ip else {
         return Ok(None);
     };
+    let prefix = subnet.prefix;
 
     let host_bits = 32u8.saturating_sub(prefix);
     if host_bits < 4 {
@@ -990,8 +1052,14 @@ fn compute_service_vip(
 
     let backend_ips: std::collections::HashSet<u32> = backends
         .iter()
-        .map(|backend| u32::from(backend.ip))
+        .filter_map(|backend| match backend.ip {
+            IpAddr::V4(ip) => Some(u32::from(ip)),
+            IpAddr::V6(_) => None,
+        })
         .collect();
+    if backend_ips.len() != backends.len() {
+        return Ok(None);
+    }
 
     let mut slot = (u32::from_le_bytes(slot_seed) % available_even as u32) * 2 + 8;
     for _ in 0..available_even.min(16) as usize {
@@ -1003,7 +1071,7 @@ fn compute_service_vip(
             mac[0] = 0x02;
             mac[1..].copy_from_slice(&digest.as_bytes()[4..9]);
 
-            return Ok(Some((vip, mac)));
+            return Ok(Some((IpAddr::V4(vip), mac)));
         }
 
         // Walk forward to the next even slot if we collided with an existing backend.
@@ -1049,7 +1117,7 @@ impl ServiceLoadBalancer {
 }
 
 /// Rotate the ordered list of backend addresses so the requested offset becomes the first entry.
-fn rotate_addresses(mut addresses: Vec<Ipv4Addr>, offset: usize) -> Vec<Ipv4Addr> {
+fn rotate_addresses(mut addresses: Vec<IpAddr>, offset: usize) -> Vec<IpAddr> {
     if addresses.is_empty() {
         return addresses;
     }
@@ -1068,7 +1136,7 @@ enum HealthState {
 
 #[derive(Default)]
 struct BackendHealth {
-    statuses: HashMap<(Uuid, String), HashMap<Ipv4Addr, HealthEntry>>,
+    statuses: HashMap<(Uuid, String), HashMap<IpAddr, HealthEntry>>,
 }
 
 impl BackendHealth {
@@ -1077,7 +1145,7 @@ impl BackendHealth {
         &self,
         network_id: Uuid,
         service_name: &str,
-        backend: Ipv4Addr,
+        backend: IpAddr,
     ) -> Option<HealthEntry> {
         let key = (network_id, service_name.to_ascii_lowercase());
         self.statuses
@@ -1090,7 +1158,7 @@ impl BackendHealth {
         &mut self,
         network_id: Uuid,
         service_name: &str,
-        backend: Ipv4Addr,
+        backend: IpAddr,
         entry_state: HealthEntry,
     ) {
         let key = (network_id, service_name.to_ascii_lowercase());
@@ -1372,7 +1440,7 @@ async fn evaluate_backend_health(
 async fn refresh_backend_mac(
     registry: &NetworkRegistry,
     network_id: Uuid,
-    ip: Ipv4Addr,
+    ip: IpAddr,
 ) -> Option<[u8; 6]> {
     let mac = resolve_neighbor_mac(network_id, ip).await?;
 
@@ -1399,7 +1467,7 @@ async fn refresh_backend_mac(
 /// Look up the current MAC associated with a backend IP by scanning neighbour entries on the
 /// overlay bridge and VXLAN devices so we can recover when containers are restarted out of band.
 #[cfg(target_os = "linux")]
-async fn resolve_neighbor_mac(network_id: Uuid, ip: Ipv4Addr) -> Option<[u8; 6]> {
+async fn resolve_neighbor_mac(network_id: Uuid, ip: IpAddr) -> Option<[u8; 6]> {
     use futures::TryStreamExt;
 
     let (conn, handle, _) = match rtnetlink::new_connection() {
@@ -1455,7 +1523,14 @@ async fn resolve_neighbor_mac(network_id: Uuid, ip: Ipv4Addr) -> Option<[u8; 6]>
         for nla in &msg.attributes {
             use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
             match nla {
-                NeighbourAttribute::Destination(NeighbourAddress::Inet(addr)) if *addr == ip => {
+                NeighbourAttribute::Destination(NeighbourAddress::Inet(addr))
+                    if ip == IpAddr::V4(*addr) =>
+                {
+                    found_ip = true;
+                }
+                NeighbourAttribute::Destination(NeighbourAddress::Inet6(addr))
+                    if ip == IpAddr::V6(*addr) =>
+                {
                     found_ip = true;
                 }
                 NeighbourAttribute::LinkLocalAddress(ll) if ll.len() == 6 => {
@@ -1475,11 +1550,11 @@ async fn resolve_neighbor_mac(network_id: Uuid, ip: Ipv4Addr) -> Option<[u8; 6]>
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn resolve_neighbor_mac(_network_id: Uuid, _ip: Ipv4Addr) -> Option<[u8; 6]> {
+async fn resolve_neighbor_mac(_network_id: Uuid, _ip: IpAddr) -> Option<[u8; 6]> {
     None
 }
 
-async fn probe_backend(ip: &Ipv4Addr, probe: &ServiceReadinessProbe) -> bool {
+async fn probe_backend(ip: &IpAddr, probe: &ServiceReadinessProbe) -> bool {
     match probe.kind {
         ServiceReadinessProbeKind::Http => {
             probe_backend_http(
@@ -1504,25 +1579,26 @@ fn nodeport_protocol(protocol: ServicePortProtocol) -> NodePortProtocol {
     }
 }
 
-async fn probe_backend_tcp(ip: &Ipv4Addr, port: u16, timeout: Duration) -> bool {
-    let addr = SocketAddr::new(IpAddr::V4(*ip), port);
+async fn probe_backend_tcp(ip: &IpAddr, port: u16, timeout: Duration) -> bool {
+    let addr = SocketAddr::new(*ip, port);
     matches!(
         tokio::time::timeout(timeout, TcpStream::connect(addr)).await,
         Ok(Ok(_))
     )
 }
 
-async fn probe_backend_http(ip: &Ipv4Addr, port: u16, path: &str, timeout: Duration) -> bool {
+async fn probe_backend_http(ip: &IpAddr, port: u16, path: &str, timeout: Duration) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let addr = SocketAddr::new(IpAddr::V4(*ip), port);
+    let addr = SocketAddr::new(*ip, port);
     let path = if path.is_empty() { "/" } else { path };
     let mut stream = match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
         Ok(Ok(s)) => s,
         _ => return false,
     };
 
-    let request = format!("GET {path} HTTP/1.0\r\nHost: {ip}\r\n\r\n");
+    let host = http_host_literal(*ip);
+    let request = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n");
     if tokio::time::timeout(timeout, stream.write_all(request.as_bytes()))
         .await
         .is_err()
@@ -1537,6 +1613,14 @@ async fn probe_backend_http(ip: &Ipv4Addr, port: u16, path: &str, timeout: Durat
             prefix.starts_with(b"HTTP/1.1 2") || prefix.starts_with(b"HTTP/1.0 2")
         }
         _ => false,
+    }
+}
+
+/// Render IP literals for HTTP Host headers, bracketing IPv6 addresses as required by URI syntax.
+fn http_host_literal(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
     }
 }
 
@@ -1941,7 +2025,7 @@ async fn sync_service_vip_for_backends(
     service_name: &str,
     backends: &[BackendAddress],
     expose_to_host: bool,
-) -> Result<Option<(Ipv4Addr, bool)>> {
+) -> Result<Option<(IpAddr, bool)>> {
     let Some((vip, mac)) = compute_service_vip(registry, network_id, service_name, backends)?
     else {
         return Ok(None);
@@ -1975,7 +2059,7 @@ async fn program_service_vip(
     registry: &NetworkRegistry,
     network_id: Uuid,
     service_name: &str,
-    vip: Ipv4Addr,
+    vip: IpAddr,
     vip_mac: [u8; 6],
     backends: &[BackendAddress],
     expose_to_host: bool,
@@ -2037,7 +2121,7 @@ async fn program_service_vip(
 /// ARP reply, the host neighbour table can remain in `FAILED` and prevent `curl` from reaching
 /// the VIP. Programming a permanent neighbour entry ties the VIP to the deterministic VIP MAC so
 /// packets reach the bridge tc-ingress load balancer immediately.
-async fn ensure_host_vip_neighbor(network_id: Uuid, vip: Ipv4Addr, vip_mac: [u8; 6]) -> Result<()> {
+async fn ensure_host_vip_neighbor(network_id: Uuid, vip: IpAddr, vip_mac: [u8; 6]) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (network_id, vip, vip_mac);
@@ -2081,7 +2165,7 @@ async fn ensure_host_vip_neighbor(network_id: Uuid, vip: Ipv4Addr, vip_mac: [u8;
 
         handle
             .neighbours()
-            .add(host_index, IpAddr::V4(vip))
+            .add(host_index, vip)
             .link_local_address(&vip_mac)
             .state(NeighbourState::Permanent)
             .replace()
@@ -2096,7 +2180,7 @@ async fn ensure_host_vip_neighbor(network_id: Uuid, vip: Ipv4Addr, vip_mac: [u8;
 /// Remove stale permanent host VIP neighbours that no longer belong to any published service.
 async fn reconcile_host_vip_neighbors(
     network_id: Uuid,
-    desired_vips: &HashSet<Ipv4Addr>,
+    desired_vips: &HashSet<IpAddr>,
 ) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
@@ -2143,7 +2227,12 @@ async fn reconcile_host_vip_neighbors(
             }
 
             let vip = msg.attributes.iter().find_map(|attr| match attr {
-                NeighbourAttribute::Destination(NeighbourAddress::Inet(v4)) => Some(*v4),
+                NeighbourAttribute::Destination(NeighbourAddress::Inet(v4)) => {
+                    Some(IpAddr::V4(*v4))
+                }
+                NeighbourAttribute::Destination(NeighbourAddress::Inet6(v6)) => {
+                    Some(IpAddr::V6(*v6))
+                }
                 _ => None,
             });
             if let Some(vip) = vip
@@ -2155,11 +2244,18 @@ async fn reconcile_host_vip_neighbors(
 
         for vip in stale_vips {
             let mut message = NeighbourMessage::default();
-            message.header.family = AddressFamily::Inet;
+            message.header.family = match vip {
+                IpAddr::V4(_) => AddressFamily::Inet,
+                IpAddr::V6(_) => AddressFamily::Inet6,
+            };
             message.header.ifindex = host_index;
+            let destination = match vip {
+                IpAddr::V4(vip) => NeighbourAddress::Inet(vip),
+                IpAddr::V6(vip) => NeighbourAddress::Inet6(vip),
+            };
             message
                 .attributes
-                .push(NeighbourAttribute::Destination(NeighbourAddress::Inet(vip)));
+                .push(NeighbourAttribute::Destination(destination));
 
             let mut request = NetlinkMessage::from(RouteNetlinkMessage::DelNeighbour(message));
             request.header.flags = NLM_F_REQUEST | NLM_F_ACK;
@@ -2234,7 +2330,7 @@ mod tests {
 
     fn backend(ip: [u8; 4], mac: [u8; 6]) -> BackendAddress {
         BackendAddress {
-            ip: Ipv4Addr::from(ip),
+            ip: IpAddr::V4(Ipv4Addr::from(ip)),
             mac,
         }
     }
@@ -2249,7 +2345,7 @@ mod tests {
         let mut health = BackendHealth::default();
         let key = (network_id, service.to_string());
         health.statuses.entry(key).or_default().insert(
-            unhealthy_ip,
+            IpAddr::V4(unhealthy_ip),
             HealthEntry {
                 state: HealthState::Unhealthy,
                 checked_at: Instant::now() - HEALTH_CACHE_STALE_AFTER - Duration::from_secs(1),
@@ -2268,7 +2364,7 @@ mod tests {
         );
 
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].ip, healthy_ip);
+        assert_eq!(filtered[0].ip, IpAddr::V4(healthy_ip));
     }
 
     #[test]
@@ -2280,7 +2376,7 @@ mod tests {
         let mut health = BackendHealth::default();
         let key = (network_id, service.to_string());
         health.statuses.entry(key).or_default().insert(
-            unhealthy_ip,
+            IpAddr::V4(unhealthy_ip),
             HealthEntry {
                 state: HealthState::Unhealthy,
                 checked_at: Instant::now() - HEALTH_CACHE_STALE_AFTER - Duration::from_secs(1),
@@ -2296,7 +2392,7 @@ mod tests {
         );
 
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].ip, unhealthy_ip);
+        assert_eq!(filtered[0].ip, IpAddr::V4(unhealthy_ip));
     }
 
     #[test]
@@ -2343,7 +2439,7 @@ mod tests {
         let mut health = BackendHealth::default();
         let key = (network_id, service.to_string());
         health.statuses.entry(key).or_default().insert(
-            Ipv4Addr::new(10, 42, 1, 11),
+            IpAddr::V4(Ipv4Addr::new(10, 42, 1, 11)),
             HealthEntry {
                 state: HealthState::Healthy,
                 checked_at: Instant::now()
@@ -2357,7 +2453,7 @@ mod tests {
             .get_mut(&(network_id, service.to_string()))
             .expect("service health entry")
             .insert(
-                Ipv4Addr::new(10, 42, 1, 12),
+                IpAddr::V4(Ipv4Addr::new(10, 42, 1, 12)),
                 HealthEntry {
                     state: HealthState::Unhealthy,
                     checked_at: Instant::now() - probe.interval() - Duration::from_millis(1),
@@ -2378,8 +2474,8 @@ mod tests {
         );
 
         assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].ip, Ipv4Addr::new(10, 42, 1, 10));
-        assert_eq!(selected[1].ip, Ipv4Addr::new(10, 42, 1, 12));
+        assert_eq!(selected[0].ip, IpAddr::V4(Ipv4Addr::new(10, 42, 1, 10)));
+        assert_eq!(selected[1].ip, IpAddr::V4(Ipv4Addr::new(10, 42, 1, 12)));
     }
 
     #[test]
@@ -2398,7 +2494,7 @@ mod tests {
         let key = (network_id, service.to_string());
         let mut entries = HashMap::new();
         entries.insert(
-            Ipv4Addr::new(10, 42, 1, 10),
+            IpAddr::V4(Ipv4Addr::new(10, 42, 1, 10)),
             HealthEntry {
                 state: HealthState::Healthy,
                 checked_at: Instant::now()
@@ -2408,7 +2504,7 @@ mod tests {
             },
         );
         entries.insert(
-            Ipv4Addr::new(10, 42, 1, 11),
+            IpAddr::V4(Ipv4Addr::new(10, 42, 1, 11)),
             HealthEntry {
                 state: HealthState::Healthy,
                 checked_at: Instant::now()
@@ -2418,7 +2514,7 @@ mod tests {
             },
         );
         entries.insert(
-            Ipv4Addr::new(10, 42, 1, 12),
+            IpAddr::V4(Ipv4Addr::new(10, 42, 1, 12)),
             HealthEntry {
                 state: HealthState::Healthy,
                 checked_at: Instant::now()
@@ -2428,7 +2524,7 @@ mod tests {
             },
         );
         entries.insert(
-            Ipv4Addr::new(10, 42, 1, 13),
+            IpAddr::V4(Ipv4Addr::new(10, 42, 1, 13)),
             HealthEntry {
                 state: HealthState::Healthy,
                 checked_at: Instant::now(),
@@ -2451,8 +2547,8 @@ mod tests {
         );
 
         assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].ip, Ipv4Addr::new(10, 42, 1, 10));
-        assert_eq!(selected[1].ip, Ipv4Addr::new(10, 42, 1, 11));
+        assert_eq!(selected[0].ip, IpAddr::V4(Ipv4Addr::new(10, 42, 1, 10)));
+        assert_eq!(selected[1].ip, IpAddr::V4(Ipv4Addr::new(10, 42, 1, 11)));
     }
 
     struct CatalogHarness {

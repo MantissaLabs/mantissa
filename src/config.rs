@@ -1,5 +1,5 @@
 use std::fs;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{
     RwLock,
@@ -428,11 +428,11 @@ pub fn global_config_source() -> ConfigSource {
 
 /// # Description:
 ///
-/// Resolve a configured nodeport IP address, if any, into an IPv4 value.
-pub fn nodeport_ip() -> Option<Ipv4Addr> {
+/// Resolve a configured nodeport IP address, if any, into an IP value.
+pub fn nodeport_ip() -> Option<IpAddr> {
     let config = global_config();
     let raw = config.network.nodeport.ip?;
-    raw.parse::<Ipv4Addr>().ok()
+    raw.parse::<IpAddr>().ok()
 }
 
 /// # Description:
@@ -929,9 +929,9 @@ impl Config {
         }
 
         if let Some(ref ip) = self.network.nodeport.ip
-            && ip.parse::<Ipv4Addr>().is_err()
+            && ip.parse::<IpAddr>().is_err()
         {
-            anyhow::bail!("network.nodeport.ip must be a valid IPv4 address (got '{ip}')");
+            anyhow::bail!("network.nodeport.ip must be a valid IP address (got '{ip}')");
         }
 
         if let Some(ref addr) = self.network.advertise_addr {

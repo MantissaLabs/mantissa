@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
@@ -19,7 +19,7 @@ const NODEPORT_INGRESS_DROP_REASON_COUNT: usize = 5;
 #[derive(Clone, Debug)]
 pub struct NodePortMapping {
     pub port: u16,
-    pub vip: Ipv4Addr,
+    pub vip: IpAddr,
     pub vip_port: u16,
     pub protocol: NodePortProtocol,
 }
@@ -75,7 +75,7 @@ pub struct NodePortStatus {
     pub desired_enabled: bool,
     pub state: NodePortRuntimeState,
     pub resolved_iface: Option<String>,
-    pub resolved_node_ip: Option<Ipv4Addr>,
+    pub resolved_node_ip: Option<IpAddr>,
     pub active_networks: usize,
     pub active_ports: usize,
     pub active_host_networks: usize,
@@ -103,26 +103,24 @@ impl std::fmt::Display for NodePortRuntimeState {
 
 /// # Description:
 ///
-/// Resolve an IPv4 address from one operator-configured advertise address when
+/// Resolve an IP address from one operator-configured advertise address when
 /// the address is expressed as a literal socket or a resolvable hostname.
-fn resolve_advertise_ipv4(addr: &str) -> Option<Ipv4Addr> {
+fn resolve_advertise_ip(addr: &str) -> Option<IpAddr> {
     addr.to_socket_addrs()
         .ok()?
-        .find_map(|socket| match socket.ip() {
-            IpAddr::V4(ip) => Some(ip),
-            IpAddr::V6(_) => None,
-        })
+        .next()
+        .map(|socket| socket.ip())
 }
 
 /// # Description:
 ///
-/// Pick the configured NodePort IPv4 identity, preferring the explicit
+/// Pick the configured NodePort IP identity, preferring the explicit
 /// `network.nodeport.ip` override over the advertise address when both exist.
 fn configured_node_ip_from_sources(
-    configured_node_ip: Option<Ipv4Addr>,
+    configured_node_ip: Option<IpAddr>,
     advertise_addr: Option<&str>,
-) -> Option<Ipv4Addr> {
-    configured_node_ip.or_else(|| advertise_addr.and_then(resolve_advertise_ipv4))
+) -> Option<IpAddr> {
+    configured_node_ip.or_else(|| advertise_addr.and_then(resolve_advertise_ip))
 }
 
 /// Project the active-public-network count after one NodePort sync applies.
@@ -327,12 +325,12 @@ mod platform {
     pub(super) struct PlatformNodePortManager {
         desired_enabled: bool,
         configured_iface: Option<String>,
-        configured_node_ip: Option<Ipv4Addr>,
+        configured_node_ip: Option<IpAddr>,
         configured_advertise_addr: Option<String>,
         iface: Option<String>,
-        node_ip: Option<Ipv4Addr>,
+        node_ip: Option<IpAddr>,
         attached_iface: Option<String>,
-        attached_node_ip: Option<Ipv4Addr>,
+        attached_node_ip: Option<IpAddr>,
         attachment: Option<NodePortAttachment>,
         ports_by_network: HashMap<Uuid, HashSet<NodePortSelector>>,
         port_owner: HashMap<NodePortSelector, Uuid>,
@@ -509,8 +507,10 @@ mod platform {
                     proto: entry.protocol.number(),
                     _pad: 0,
                 };
+                let vip = Self::require_ipv4(entry.vip, "nodeport vip")?;
+                let node_ip = Self::require_ipv4(node_ip, "nodeport node address")?;
                 let value = NodePortEntry {
-                    vip: u32::from_ne_bytes(entry.vip.octets()),
+                    vip: u32::from_ne_bytes(vip.octets()),
                     vip_port: entry.vip_port.to_be(),
                     _pad: 0,
                     overlay_ifindex: overlay_index,
@@ -541,6 +541,19 @@ mod platform {
                 self.detach_if_idle().await?;
             }
             Ok(())
+        }
+
+        /// Require one IPv4 address for the legacy NodePort map layout.
+        ///
+        /// The first IPv6 rollout keeps the NodePort userspace programming path explicit about the
+        /// remaining IPv4-only map ABI until the IPv6 dataplane maps are introduced.
+        fn require_ipv4(ip: IpAddr, context: &str) -> Result<Ipv4Addr> {
+            match ip {
+                IpAddr::V4(ip) => Ok(ip),
+                IpAddr::V6(ip) => Err(anyhow!(
+                    "{context} {ip} is IPv6 but the active map layout is IPv4-only"
+                )),
+            }
         }
 
         /// Collect the desired port selectors for one network and reject duplicate or conflicting claims.
@@ -761,19 +774,19 @@ mod platform {
 
             if let Some(iface) = self.iface.clone() {
                 if self.node_ip.is_none() {
-                    self.node_ip = detect_iface_ip(&iface).await?;
+                    self.node_ip = detect_iface_ip(&iface).await?.map(IpAddr::V4);
                 }
                 return Ok(());
             }
 
-            if let Some(node_ip) = self.node_ip {
+            if let Some(IpAddr::V4(node_ip)) = self.node_ip {
                 self.iface = detect_iface_for_ip(node_ip).await?;
                 return Ok(());
             }
 
             if let Some((iface, ip)) = detect_default_iface().await? {
                 self.iface = Some(iface);
-                self.node_ip = Some(ip);
+                self.node_ip = Some(IpAddr::V4(ip));
             }
 
             Ok(())
@@ -1607,31 +1620,34 @@ mod tests {
         NODEPORT_FLOW_CAPACITY, NODEPORT_HOST_CAPACITY, NODEPORT_VIP_CAPACITY,
         NodePortPacketCounters, NodePortRuntimeState, NodePortStatus,
         configured_node_ip_from_sources, nodeport_capacity_error,
-        projected_active_networks_after_sync, resolve_advertise_ipv4,
+        projected_active_networks_after_sync, resolve_advertise_ip,
     };
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn resolve_advertise_ipv4_accepts_literal_ipv4_socket() {
         assert_eq!(
-            resolve_advertise_ipv4("192.168.10.4:6578"),
-            Some(Ipv4Addr::new(192, 168, 10, 4))
+            resolve_advertise_ip("192.168.10.4:6578"),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 10, 4)))
         );
     }
 
     #[test]
     fn resolve_advertise_ipv4_ignores_ipv6_only_socket() {
-        assert_eq!(resolve_advertise_ipv4("[::1]:6578"), None);
+        assert_eq!(
+            resolve_advertise_ip("[::1]:6578"),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
     }
 
     #[test]
     fn configured_node_ip_prefers_explicit_override() {
-        let configured = Some(Ipv4Addr::new(10, 20, 30, 40));
+        let configured = Some(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40)));
         let advertise = Some("192.168.10.4:6578");
 
         assert_eq!(
             configured_node_ip_from_sources(configured, advertise),
-            Some(Ipv4Addr::new(10, 20, 30, 40))
+            Some(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40)))
         );
     }
 
@@ -1639,7 +1655,7 @@ mod tests {
     fn configured_node_ip_uses_advertise_addr_when_override_absent() {
         assert_eq!(
             configured_node_ip_from_sources(None, Some("192.168.10.4:6578")),
-            Some(Ipv4Addr::new(192, 168, 10, 4))
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 10, 4)))
         );
     }
 
@@ -1649,7 +1665,7 @@ mod tests {
             desired_enabled: true,
             state: NodePortRuntimeState::Pending,
             resolved_iface: Some("eth0".to_string()),
-            resolved_node_ip: Some(Ipv4Addr::new(10, 0, 0, 4)),
+            resolved_node_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4))),
             active_networks: 2,
             active_ports: 3,
             active_host_networks: 2,

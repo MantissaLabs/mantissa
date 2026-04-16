@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::config;
 use crate::gossip::Message;
-use crate::network::allocator::{allocate_overlay_address, parse_ipv4_cidr};
+use crate::network::allocator::{allocate_overlay_address, parse_overlay_cidr};
 use crate::network::attachment::{AttachmentProvisioningRequest, bridge_name};
 use crate::network::controller::DEFAULT_MTU;
 use crate::network::events::ForwardingEvent;
@@ -817,7 +817,7 @@ impl WorkloadManager {
             let allocation = allocate_overlay_address(&spec, task_id)
                 .context("failed to allocate overlay address")?;
 
-            let (_, prefix) = parse_ipv4_cidr(&spec.subnet_cidr)
+            let prefix = parse_overlay_cidr(&spec.subnet_cidr)
                 .context("failed to parse network subnet for attachment")?;
             let mut mtu = if spec.mtu == 0 { DEFAULT_MTU } else { spec.mtu };
             if config::wireguard_enabled() {
@@ -871,7 +871,7 @@ impl WorkloadManager {
                         &bridge,
                         mtu,
                         &allocation.assigned_ip,
-                        prefix,
+                        prefix.prefix,
                         &allocation.mac_address,
                         &mut attachment_target,
                     )

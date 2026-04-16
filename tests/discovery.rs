@@ -24,7 +24,7 @@ use mantissa::task::types::{TaskServiceMetadata, TaskValue, TaskValueDraft};
 use mantissa::workload::model::{WorkloadOwner, WorkloadPhase};
 use mantissa::workload::types::ExecutionSpec;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -42,6 +42,11 @@ struct DiscoveryHarness {
 
 /// Builds an unprivileged discovery harness with isolated stores and a high DNS bind port.
 async fn setup_discovery_harness(dns_port: u16) -> DiscoveryHarness {
+    setup_discovery_harness_with_subnet(dns_port, "10.42.0.0/16").await
+}
+
+/// Builds an unprivileged discovery harness for the provided overlay subnet.
+async fn setup_discovery_harness_with_subnet(dns_port: u16, subnet_cidr: &str) -> DiscoveryHarness {
     let actor = Uuid::new_v4();
 
     let network_dir = tempdir().expect("network tempdir");
@@ -106,7 +111,7 @@ async fn setup_discovery_harness(dns_port: u16) -> DiscoveryHarness {
         name: format!("dns-net-{}", Uuid::new_v4()),
         description: "dns integration test network".to_string(),
         driver: NetworkDriver::Vxlan,
-        subnet_cidr: "10.42.0.0/16".to_string(),
+        subnet_cidr: subnet_cidr.to_string(),
         vni: 1337,
         mtu: 1350,
         sealed: false,
@@ -190,6 +195,25 @@ fn ready_attachment_with_publication(
     service_name: &str,
     traffic_published: bool,
 ) -> NetworkAttachmentValue {
+    ready_attachment_with_publication_ip(
+        task_id,
+        node_id,
+        network_id,
+        IpAddr::V4(backend_ip),
+        service_name,
+        traffic_published,
+    )
+}
+
+/// Creates a ready attachment for either IPv4 or IPv6 backends.
+fn ready_attachment_with_publication_ip(
+    task_id: Uuid,
+    node_id: Uuid,
+    network_id: Uuid,
+    backend_ip: IpAddr,
+    service_name: &str,
+    traffic_published: bool,
+) -> NetworkAttachmentValue {
     NetworkAttachmentValue::new(NetworkAttachmentDraft {
         id: mantissa::network::types::compute_network_attachment_id(task_id, network_id),
         task_id,
@@ -249,26 +273,29 @@ async fn upsert_service(
     services.upsert(service).await.expect("upsert service");
 }
 
-/// Sends one DNS A query and returns response code plus all A answer IPs.
-async fn query_a_records(
+/// Sends one DNS query for the requested record type and decodes matching address answers.
+async fn query_records(
+    server_ip: IpAddr,
     dns_port: u16,
     fqdn: &str,
-) -> anyhow::Result<(ResponseCode, Vec<Ipv4Addr>)> {
-    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+    record_type: RecordType,
+) -> anyhow::Result<(ResponseCode, Vec<IpAddr>)> {
+    let client_ip = match server_ip {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    };
+    let socket = UdpSocket::bind(SocketAddr::new(client_ip, 0))
         .await
         .context("bind dns client socket")?;
     let mut query = Message::new();
     query.set_id(0x4242);
     query.set_message_type(MessageType::Query);
     query.set_op_code(OpCode::Query);
-    query.add_query(Query::query(Name::from_ascii(fqdn)?, RecordType::A));
+    query.add_query(Query::query(Name::from_ascii(fqdn)?, record_type));
     let payload = query.to_vec()?;
 
     socket
-        .send_to(
-            &payload,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), dns_port),
-        )
+        .send_to(&payload, SocketAddr::new(server_ip, dns_port))
         .await
         .context("send dns query")?;
 
@@ -280,11 +307,59 @@ async fn query_a_records(
     let response = Message::from_vec(&buf[..len]).context("decode dns response")?;
     let mut ips = Vec::new();
     for answer in response.answers() {
-        if let RData::A(ip) = answer.data() {
-            ips.push((*ip).into());
+        match answer.data() {
+            RData::A(ip) if record_type == RecordType::A => ips.push(IpAddr::V4((*ip).into())),
+            RData::AAAA(ip) if record_type == RecordType::AAAA => {
+                ips.push(IpAddr::V6((*ip).into()))
+            }
+            _ => {}
         }
     }
     Ok((response.response_code(), ips))
+}
+
+/// Sends one DNS A query and returns response code plus all A answer IPs.
+async fn query_a_records(
+    dns_port: u16,
+    fqdn: &str,
+) -> anyhow::Result<(ResponseCode, Vec<Ipv4Addr>)> {
+    let (code, ips) = query_records(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        dns_port,
+        fqdn,
+        RecordType::A,
+    )
+    .await?;
+    let ips = ips
+        .into_iter()
+        .map(|ip| match ip {
+            IpAddr::V4(ip) => Ok(ip),
+            IpAddr::V6(ip) => anyhow::bail!("expected IPv4 answer, received {ip}"),
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((code, ips))
+}
+
+/// Sends one DNS AAAA query and returns response code plus all AAAA answer IPs.
+async fn query_aaaa_records(
+    dns_port: u16,
+    fqdn: &str,
+) -> anyhow::Result<(ResponseCode, Vec<Ipv6Addr>)> {
+    let (code, ips) = query_records(
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+        dns_port,
+        fqdn,
+        RecordType::AAAA,
+    )
+    .await?;
+    let ips = ips
+        .into_iter()
+        .map(|ip| match ip {
+            IpAddr::V6(ip) => Ok(ip),
+            IpAddr::V4(ip) => anyhow::bail!("expected IPv6 answer, received {ip}"),
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((code, ips))
 }
 
 /// Polls DNS until the expected answer count is observed or timeout expires.
@@ -297,6 +372,26 @@ async fn wait_for_answer_count(
     let deadline = Instant::now() + timeout;
     loop {
         let (code, ips) = query_a_records(dns_port, fqdn).await?;
+        if ips.len() == expected_count {
+            return Ok((code, ips));
+        }
+        if Instant::now() >= deadline {
+            return Ok((code, ips));
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Polls DNS until the expected AAAA answer count is observed or timeout expires.
+async fn wait_for_aaaa_answer_count(
+    dns_port: u16,
+    fqdn: &str,
+    expected_count: usize,
+    timeout: Duration,
+) -> anyhow::Result<(ResponseCode, Vec<Ipv6Addr>)> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (code, ips) = query_aaaa_records(dns_port, fqdn).await?;
         if ips.len() == expected_count {
             return Ok((code, ips));
         }
@@ -340,7 +435,7 @@ local_test!(discovery_dns_reflects_backend_changes_unprivileged, {
 
     harness
         .discovery
-        .ensure_network(&harness.network, Some(Ipv4Addr::LOCALHOST))
+        .ensure_network(&harness.network, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)))
         .await
         .expect("start discovery");
 
@@ -448,7 +543,7 @@ local_test!(discovery_dns_requires_attachment_traffic_publication, {
 
     harness
         .discovery
-        .ensure_network(&harness.network, Some(Ipv4Addr::LOCALHOST))
+        .ensure_network(&harness.network, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)))
         .await
         .expect("start discovery");
 
@@ -485,4 +580,68 @@ local_test!(discovery_dns_requires_attachment_traffic_publication, {
         .teardown_network(network_id)
         .await
         .expect("teardown discovery");
+});
+
+local_test!(discovery_dns_answers_aaaa_for_ipv6_networks, {
+    let dns_port = 10532;
+    let service_name = "ipv6-backend";
+    let harness = setup_discovery_harness_with_subnet(dns_port, "fd42::/64").await;
+    let network_id = harness.network.id;
+
+    let node_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    let backend_ip = Ipv6Addr::new(0xfd42, 0, 0, 0, 0, 0, 0, 0x10);
+    upsert_service(&harness.services, service_name, network_id, vec![task_id]).await;
+
+    harness
+        .workloads
+        .upsert(
+            &UuidKey::from(task_id),
+            running_task(task_id, node_id, service_name, network_id),
+        )
+        .await
+        .expect("upsert ipv6 task");
+    harness
+        .registry
+        .upsert_attachment(ready_attachment_with_publication_ip(
+            task_id,
+            node_id,
+            network_id,
+            IpAddr::V6(backend_ip),
+            service_name,
+            true,
+        ))
+        .await
+        .expect("upsert ipv6 attachment");
+
+    harness
+        .discovery
+        .ensure_network(&harness.network, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)))
+        .await
+        .expect("start ipv6 discovery");
+
+    let fqdn = format!("backend.{}.svc.mantissa.", harness.network.name);
+    let (aaaa_code, aaaa_ips) =
+        wait_for_aaaa_answer_count(dns_port, &fqdn, 1, Duration::from_secs(5))
+            .await
+            .expect("query ipv6 dns");
+    assert_eq!(aaaa_code, ResponseCode::NoError);
+    assert_eq!(aaaa_ips, vec![backend_ip]);
+
+    let (a_code, a_ips) = query_records(
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+        dns_port,
+        &fqdn,
+        RecordType::A,
+    )
+    .await
+    .expect("query ipv4 record type against ipv6 network");
+    assert_eq!(a_code, ResponseCode::NoError);
+    assert!(a_ips.is_empty());
+
+    harness
+        .discovery
+        .teardown_network(network_id)
+        .await
+        .expect("teardown ipv6 discovery");
 });

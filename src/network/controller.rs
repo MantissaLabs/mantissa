@@ -1,6 +1,6 @@
 use crate::config;
 use crate::gossip::Message;
-use crate::network::allocator::{parse_ipv4_cidr, resolver_ipv4_address};
+use crate::network::allocator::{parse_overlay_cidr, resolver_ip_address};
 use crate::network::attachment::PlatformAttachmentProvisioner;
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
 use crate::network::discovery::ServiceDiscovery;
@@ -22,7 +22,7 @@ use aya::{programs::ProgramError, sys::SyscallError};
 use blake3::Hasher;
 use std::collections::{HashMap, HashSet};
 use std::future;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc::UnboundedReceiver};
 use tokio::time::Duration;
@@ -77,7 +77,7 @@ struct NetworkPlan {
     bridge_name: String,
     vni: u32,
     mtu: u32,
-    resolver_ipv4: Option<Ipv4Addr>,
+    resolver_ip: Option<IpAddr>,
     subnet_prefix: Option<u8>,
     underlay_iface: Option<String>,
     underlay_ip: Option<IpAddr>,
@@ -774,7 +774,7 @@ impl NetworkController {
         if let Err(err) = self
             .inner
             .discovery
-            .ensure_network(&spec, plan.resolver_ipv4)
+            .ensure_network(&spec, plan.resolver_ip)
             .await
         {
             warn!(
@@ -985,7 +985,7 @@ impl NetworkController {
         changed |= Self::ensure_default_bpf_programs(&mut spec.bpf_programs);
         spec.bpf_programs.sort();
 
-        let resolver_ipv4 = match resolver_ipv4_address(spec, self.inner.node_id) {
+        let resolver_ip = match resolver_ip_address(spec, self.inner.node_id) {
             Ok(ip) => Some(ip),
             Err(err) => {
                 warn!(
@@ -997,8 +997,8 @@ impl NetworkController {
             }
         };
 
-        let subnet_prefix = match parse_ipv4_cidr(&spec.subnet_cidr) {
-            Ok((_, prefix)) => Some(prefix),
+        let subnet_prefix = match parse_overlay_cidr(&spec.subnet_cidr) {
+            Ok(subnet) => Some(subnet.prefix),
             Err(err) => {
                 warn!(
                     target: "network",
@@ -1010,7 +1010,7 @@ impl NetworkController {
             }
         };
 
-        let host_access_mac = if resolver_ipv4.is_some() && subnet_prefix.is_some() {
+        let host_access_mac = if resolver_ip.is_some() && subnet_prefix.is_some() {
             Some(host_access_mac(spec.id, self.inner.node_id))
         } else {
             None
@@ -1023,7 +1023,7 @@ impl NetworkController {
             bridge_name: format!("mnt-br-{suffix}"),
             vni: spec.vni,
             mtu: spec.mtu,
-            resolver_ipv4,
+            resolver_ip,
             subnet_prefix,
             underlay_iface: None,
             underlay_ip: None,
@@ -1534,7 +1534,7 @@ impl NetworkPlan {
             bridge_name: format!("mnt-br-{suffix}"),
             vni: compute_deterministic_vni(network_id),
             mtu: DEFAULT_MTU,
-            resolver_ipv4: None,
+            resolver_ip: None,
             subnet_prefix: None,
             underlay_iface: None,
             underlay_ip: None,
@@ -1617,7 +1617,7 @@ mod platform {
     };
     use std::fs;
     use std::mem;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::process::Command;
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
@@ -1636,6 +1636,14 @@ mod platform {
     const BRPORT_ATTR_NEIGH_SUPPRESS: u16 = 32;
     const BRPORT_ATTR_MULTICAST_FLOOD: u16 = 27;
     const BRPORT_ATTR_BROADCAST_FLOOD: u16 = 30;
+
+    /// Convert a resolver address into the rtnetlink address family used by interface rows.
+    fn address_family(ip: IpAddr) -> AddressFamily {
+        match ip {
+            IpAddr::V4(_) => AddressFamily::Inet,
+            IpAddr::V6(_) => AddressFamily::Inet6,
+        }
+    }
 
     impl NetworkProvisioner {
         pub fn new() -> Result<Self> {
@@ -1891,7 +1899,7 @@ mod platform {
                     )
                 })?;
 
-            let host_access = if plan.resolver_ipv4.is_some() && plan.subnet_prefix.is_some() {
+            let host_access = if plan.resolver_ip.is_some() && plan.subnet_prefix.is_some() {
                 Some(
                     self.ensure_host_access_veth(
                         plan.network_id,
@@ -1924,27 +1932,6 @@ mod platform {
                 self.set_up(host_index).await.with_context(|| {
                     format!("bring link {} (idx {}) up", host_ifname, host_index)
                 })?;
-                if let Err(err) = self.configure_arp_tuning(&plan.bridge_name) {
-                    debug!(
-                        target: "network",
-                        iface = %plan.bridge_name,
-                        "failed to apply bridge arp tuning (continuing): {err:#}"
-                    );
-                }
-                if let Err(err) = self.configure_arp_tuning(&peer_ifname) {
-                    debug!(
-                        target: "network",
-                        iface = %peer_ifname,
-                        "failed to apply host-access peer arp tuning (continuing): {err:#}"
-                    );
-                }
-                if let Err(err) = self.configure_arp_tuning(&host_ifname) {
-                    debug!(
-                        target: "network",
-                        iface = %host_ifname,
-                        "failed to apply host-access arp tuning (continuing): {err:#}"
-                    );
-                }
             }
 
             if plan.mtu > 0 {
@@ -1979,17 +1966,28 @@ mod platform {
                 }
             }
 
-            if let (Some(ip), Some(prefix)) = (plan.resolver_ipv4, plan.subnet_prefix) {
+            if let (Some(ip), Some(prefix)) = (plan.resolver_ip, plan.subnet_prefix) {
                 let Some((host_index, _peer_index)) = host_access else {
                     return Err(anyhow!(
                         "host access veth missing despite resolver address being configured"
                     ));
                 };
                 let (host_ifname, _peer_ifname) = Self::host_access_ifnames(plan.network_id);
+                for iface in [&plan.bridge_name, &host_ifname] {
+                    if let Err(err) = self.configure_address_ownership_tuning(iface, ip) {
+                        debug!(
+                            target: "network",
+                            iface,
+                            ip = %ip,
+                            "failed to apply address ownership tuning (continuing): {err:#}"
+                        );
+                    }
+                }
 
                 // Older deployments assigned the resolver address to the bridge device. That makes
                 // host-originated overlay traffic (including VIP flows) bypass tc-ingress and
-                // therefore miss ARP + DNAT handling. Move the IP to the host-access veth.
+                // therefore miss VIP neighbor handling plus DNAT. Move the IP to the host-access
+                // veth so locally originated traffic enters through the bridge port path.
                 self.remove_interface_address(bridge_index, ip, prefix, &plan.bridge_name)
                     .await
                     .with_context(|| {
@@ -2040,14 +2038,14 @@ mod platform {
             Ok(())
         }
 
-        /// Ensure an IPv4 address exists on the provided link using a replace operation.
+        /// Ensure an interface owns the resolver address for the network, replacing stale state.
         ///
         /// Mantissa uses this to place the per-network resolver address on the interface that
         /// should own the connected route for the overlay subnet.
         async fn ensure_interface_address(
             &self,
             link_index: u32,
-            ip: Ipv4Addr,
+            ip: IpAddr,
             prefix: u8,
             link_name: &str,
         ) -> Result<()> {
@@ -2056,29 +2054,30 @@ mod platform {
             };
             handle
                 .address()
-                .add(link_index, IpAddr::V4(ip), prefix)
+                .add(link_index, ip, prefix)
                 .replace()
                 .execute()
                 .await
                 .with_context(|| format!("assign resolver {ip}/{prefix} on {link_name}"))
         }
 
-        /// Remove stale IPv4 addresses from a dedicated host-access interface.
+        /// Remove stale addresses from a dedicated host-access interface while preserving the active one.
         ///
         /// Split/merge transitions can move a network onto a new resolver address while reusing
         /// the same `mnhost-*` link name. We must delete old addresses first so the kernel does
-        /// not keep multiple /16s on the interface and pick an unexpected source IP for overlay
-        /// ARP + health probe traffic.
+        /// not keep multiple connected prefixes on the interface and pick an unexpected source IP
+        /// for overlay traffic and health probes.
         async fn remove_stale_interface_addresses(
             &self,
             link_index: u32,
-            keep_ip: Ipv4Addr,
+            keep_ip: IpAddr,
             keep_prefix: u8,
             link_name: &str,
         ) -> Result<()> {
             let Some(handle) = self.handle() else {
                 return Ok(());
             };
+            let family = address_family(keep_ip);
 
             let mut stream = handle
                 .address()
@@ -2091,15 +2090,14 @@ mod platform {
                 .await
                 .context("list interface addresses")?
             {
-                if message.header.family != AddressFamily::Inet {
+                if message.header.family != family {
                     continue;
                 }
 
-                let mut address: Option<Ipv4Addr> = None;
+                let mut address: Option<IpAddr> = None;
                 for attr in message.attributes.iter() {
                     match attr {
-                        AddressAttribute::Address(IpAddr::V4(ip))
-                        | AddressAttribute::Local(IpAddr::V4(ip)) => {
+                        AddressAttribute::Address(ip) | AddressAttribute::Local(ip) => {
                             address = Some(*ip);
                             break;
                         }
@@ -2125,12 +2123,15 @@ mod platform {
             Ok(())
         }
 
-        /// Apply ARP flux mitigation to an interface so it does not answer for foreign IPs.
+        /// Apply per-family address ownership tuning on interfaces that can own overlay resolver IPs.
         ///
-        /// We use this on the overlay bridge and host-access veth to ensure ARP replies come from
-        /// the interface that actually owns the address, preventing peers from caching the bridge
-        /// MAC for host-access IPs.
-        fn configure_arp_tuning(&self, iface: &str) -> Result<()> {
+        /// IPv4 needs ARP flux mitigation because the bridge and host-access links share one L2
+        /// domain. IPv6 neighbor discovery does not use these ARP-specific knobs, so the current
+        /// phase-one IPv6 path leaves it unchanged.
+        fn configure_address_ownership_tuning(&self, iface: &str, ip: IpAddr) -> Result<()> {
+            if matches!(ip, IpAddr::V6(_)) {
+                return Ok(());
+            }
             Self::write_sysctl_value(&format!("/proc/sys/net/ipv4/conf/{iface}/arp_ignore"), "1")?;
             Self::write_sysctl_value(
                 &format!("/proc/sys/net/ipv4/conf/{iface}/arp_announce"),
@@ -2144,16 +2145,21 @@ mod platform {
             fs::write(path, value).with_context(|| format!("write sysctl {path}"))
         }
 
-        /// Broadcast an ARP announcement for the host-access IP so peers refresh stale
-        /// neighbor entries after the resolver address moves off the bridge and onto the
-        /// host veth.
+        /// Broadcast an announcement for the host-access IP so peers refresh stale neighbor entries.
+        ///
+        /// The current implementation emits gratuitous ARP for IPv4. IPv6 neighbors converge via
+        /// normal discovery and permanent host-side entries in the first phase of IPv6 support.
         async fn announce_host_access_ip(
             &self,
             host_index: u32,
-            ip: Ipv4Addr,
+            ip: IpAddr,
             mac: [u8; 6],
             link_name: &str,
         ) -> Result<()> {
+            let IpAddr::V4(ip) = ip else {
+                let _ = (host_index, mac, link_name);
+                return Ok(());
+            };
             let frame = Self::build_arp_announcement_frame(mac, ip)
                 .with_context(|| format!("build arp announcement for {link_name}"))?;
 
@@ -2223,14 +2229,14 @@ mod platform {
             Ok(frame)
         }
 
-        /// Remove the specified IPv4 address from the provided link if present.
+        /// Remove the specified address from the provided link if present.
         ///
         /// This enables safe migrations where the resolver IP used to live on the bridge device
         /// but now should move onto the host-access veth so host traffic hits tc-ingress programs.
         async fn remove_interface_address(
             &self,
             link_index: u32,
-            ip: Ipv4Addr,
+            ip: IpAddr,
             prefix: u8,
             link_name: &str,
         ) -> Result<()> {
@@ -2238,10 +2244,16 @@ mod platform {
                 return Ok(());
             };
 
-            let msg = AddressMessageBuilder::<Ipv4Addr>::new()
-                .index(link_index)
-                .address(ip, prefix)
-                .build();
+            let msg = match ip {
+                IpAddr::V4(ip) => AddressMessageBuilder::<Ipv4Addr>::new()
+                    .index(link_index)
+                    .address(ip, prefix)
+                    .build(),
+                IpAddr::V6(ip) => AddressMessageBuilder::<Ipv6Addr>::new()
+                    .index(link_index)
+                    .address(ip, prefix)
+                    .build(),
+            };
             match handle.address().del(msg).execute().await {
                 Ok(()) => Ok(()),
                 Err(RtnetlinkError::NetlinkError(msg)) => {

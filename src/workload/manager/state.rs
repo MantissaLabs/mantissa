@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -443,13 +443,13 @@ impl WorkloadManager {
         }
     }
 
-    /// Resolves local IPv4 targets for HTTP/TCP liveness probes from runtime attachments first
+    /// Resolves local IP targets for HTTP/TCP liveness probes from runtime attachments first
     /// and Docker inspect fallback data second.
     async fn resolve_liveness_probe_targets(
         &self,
         task_id: Uuid,
         instance_id: &RuntimeInstanceRef,
-    ) -> Result<Vec<Ipv4Addr>, String> {
+    ) -> Result<Vec<IpAddr>, String> {
         let mut targets = BTreeSet::new();
         let attachments = self
             .networking
@@ -1943,10 +1943,8 @@ impl WorkloadManager {
         for network_id in network_ids {
             match self.networking.network_registry.get_spec(*network_id) {
                 Ok(Some(spec)) => {
-                    match crate::network::allocator::resolver_ipv4_address(
-                        &spec,
-                        self.local_node_id,
-                    ) {
+                    match crate::network::allocator::resolver_ip_address(&spec, self.local_node_id)
+                    {
                         Ok(addr) => {
                             if seen.insert(addr) {
                                 servers.push(addr.to_string());
@@ -3751,30 +3749,30 @@ fn terminal_exit_from_inspect(inspect: &RuntimeInfo) -> Option<(i32, Option<Stri
     Some((exit_code, exit_error))
 }
 
-/// Parses one optional textual IPv4 address into the deterministic probe target set.
-/// Adds one parsed IPv4 target to the deduplicated liveness probe target set.
-fn push_liveness_target(targets: &mut BTreeSet<Ipv4Addr>, raw: Option<&str>) {
+/// Parses one optional textual IP address into the deterministic probe target set.
+/// Adds one parsed target to the deduplicated liveness probe target set.
+fn push_liveness_target(targets: &mut BTreeSet<IpAddr>, raw: Option<&str>) {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return;
     };
-    if let Ok(ip) = raw.parse::<Ipv4Addr>() {
+    if let Ok(ip) = raw.parse::<IpAddr>() {
         targets.insert(ip);
     }
 }
 
 /// Renders one operator-facing list of local probe targets.
 /// Renders probe targets into a stable string for diagnostics and probe errors.
-fn format_liveness_targets(targets: &[Ipv4Addr], port: u16) -> String {
+fn format_liveness_targets(targets: &[IpAddr], port: u16) -> String {
     targets
         .iter()
-        .map(|ip| format!("{ip}:{port}"))
+        .map(|ip| SocketAddr::new(*ip, port).to_string())
         .collect::<Vec<_>>()
         .join(", ")
 }
 
 /// Returns true when any resolved local target answers the TCP liveness probe.
 /// Attempts the TCP liveness probe against each local task address until one succeeds.
-async fn probe_liveness_tcp(targets: &[Ipv4Addr], port: u16, timeout_budget: Duration) -> bool {
+async fn probe_liveness_tcp(targets: &[IpAddr], port: u16, timeout_budget: Duration) -> bool {
     for ip in targets {
         if probe_liveness_tcp_target(*ip, port, timeout_budget).await {
             return true;
@@ -3786,7 +3784,7 @@ async fn probe_liveness_tcp(targets: &[Ipv4Addr], port: u16, timeout_budget: Dur
 /// Returns true when any resolved local target answers the HTTP liveness probe.
 /// Attempts the HTTP liveness probe against each local task address until one succeeds.
 async fn probe_liveness_http(
-    targets: &[Ipv4Addr],
+    targets: &[IpAddr],
     port: u16,
     path: &str,
     timeout_budget: Duration,
@@ -3801,8 +3799,8 @@ async fn probe_liveness_http(
 
 /// Probes one local TCP endpoint for liveness by attempting a connection within the timeout.
 /// Performs one bounded TCP connect probe against a specific task address.
-async fn probe_liveness_tcp_target(ip: Ipv4Addr, port: u16, timeout_budget: Duration) -> bool {
-    let addr = SocketAddr::new(IpAddr::V4(ip), port);
+async fn probe_liveness_tcp_target(ip: IpAddr, port: u16, timeout_budget: Duration) -> bool {
+    let addr = SocketAddr::new(ip, port);
     matches!(
         timeout(timeout_budget, tokio::net::TcpStream::connect(addr)).await,
         Ok(Ok(_))
@@ -3812,21 +3810,24 @@ async fn probe_liveness_tcp_target(ip: Ipv4Addr, port: u16, timeout_budget: Dura
 /// Probes one local HTTP endpoint for liveness by requiring a 2xx response within the timeout.
 /// Performs one bounded HTTP GET probe against a specific task address and path.
 async fn probe_liveness_http_target(
-    ip: Ipv4Addr,
+    ip: IpAddr,
     port: u16,
     path: &str,
     timeout_budget: Duration,
 ) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let addr = SocketAddr::new(IpAddr::V4(ip), port);
+    let addr = SocketAddr::new(ip, port);
     let path = if path.is_empty() { "/" } else { path };
     let mut stream = match timeout(timeout_budget, tokio::net::TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
         _ => return false,
     };
 
-    let request = format!("GET {path} HTTP/1.0\r\nHost: {ip}\r\n\r\n");
+    let request = format!(
+        "GET {path} HTTP/1.0\r\nHost: {}\r\n\r\n",
+        http_host_literal(ip)
+    );
     if timeout(timeout_budget, stream.write_all(request.as_bytes()))
         .await
         .is_err()
@@ -3841,5 +3842,13 @@ async fn probe_liveness_http_target(
             prefix.starts_with(b"HTTP/1.1 2") || prefix.starts_with(b"HTTP/1.0 2")
         }
         _ => false,
+    }
+}
+
+/// Formats an IP literal for HTTP host headers, adding brackets when the target is IPv6.
+fn http_host_literal(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
     }
 }

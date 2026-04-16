@@ -11,7 +11,7 @@ use rtnetlink::packet_route::neighbour::{
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage, route::RouteType};
 use rtnetlink::{Handle, LinkUnspec, LinkVeth};
 use std::fs::File;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::task::spawn_blocking;
 use tracing::debug;
@@ -181,8 +181,8 @@ impl AttachmentProvisioner {
         network_namespace_pid: i32,
     ) -> Result<()> {
         let assigned_addr = assigned_ip
-            .parse::<Ipv4Addr>()
-            .context("invalid IPv4 address for attachment")?;
+            .parse::<IpAddr>()
+            .context("invalid attachment IP address")?;
         let mac_bytes = parse_mac(&mac)?;
 
         spawn_blocking(move || {
@@ -586,7 +586,7 @@ fn warn_unless_not_found(err: rtnetlink::Error, context: impl FnOnce() -> String
 fn configure_instance_interface_blocking(
     iface: String,
     mtu: u32,
-    assigned_ip: Ipv4Addr,
+    assigned_ip: IpAddr,
     prefix: u8,
     mac_bytes: Vec<u8>,
     network_namespace_pid: i32,
@@ -615,7 +615,7 @@ fn configure_instance_interface_blocking(
 fn configure_interface_in_current_ns(
     iface: &str,
     mtu: u32,
-    assigned_ip: Ipv4Addr,
+    assigned_ip: IpAddr,
     prefix: u8,
     mac_bytes: Vec<u8>,
 ) -> Result<()> {
@@ -660,7 +660,7 @@ fn configure_interface_in_current_ns(
 
         handle
             .address()
-            .add(index, IpAddr::V4(assigned_ip), prefix)
+            .add(index, assigned_ip, prefix)
             .replace()
             .execute()
             .await

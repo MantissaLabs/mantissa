@@ -246,7 +246,8 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
             status.state == NodePortRuntimeState::Ready
                 && status.active_ports == 1
                 && status.active_host_networks == 1
-                && status.resolved_node_ip == Some(std::net::Ipv4Addr::LOCALHOST)
+                && status.resolved_node_ip
+                    == Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
                 && status.stats_error.is_none()
         },
     )
@@ -421,7 +422,8 @@ local_test!(nodeport_udp_public_service_reaches_backend_and_cleans_up, {
             status.state == NodePortRuntimeState::Ready
                 && status.active_ports == 1
                 && status.active_host_networks == 1
-                && status.resolved_node_ip == Some(std::net::Ipv4Addr::LOCALHOST)
+                && status.resolved_node_ip
+                    == Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
                 && status.stats_error.is_none()
         },
     )
