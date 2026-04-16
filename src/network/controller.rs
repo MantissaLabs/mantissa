@@ -2126,10 +2126,16 @@ mod platform {
         /// Apply per-family address ownership tuning on interfaces that can own overlay resolver IPs.
         ///
         /// IPv4 needs ARP flux mitigation because the bridge and host-access links share one L2
-        /// domain. IPv6 neighbor discovery does not use these ARP-specific knobs, so the current
-        /// phase-one IPv6 path leaves it unchanged.
+        /// domain. IPv6 does not use ARP, but freshly assigned resolver addresses still start in
+        /// the kernel's duplicate-address-detection state. Disable DAD on these synthetic
+        /// host-access addresses so the embedded DNS listener can bind immediately instead of
+        /// racing the tentative window on every network reconciliation.
         fn configure_address_ownership_tuning(&self, iface: &str, ip: IpAddr) -> Result<()> {
             if matches!(ip, IpAddr::V6(_)) {
+                Self::write_sysctl_value(
+                    &format!("/proc/sys/net/ipv6/conf/{iface}/accept_dad"),
+                    "0",
+                )?;
                 return Ok(());
             }
             Self::write_sysctl_value(&format!("/proc/sys/net/ipv4/conf/{iface}/arp_ignore"), "1")?;

@@ -383,7 +383,7 @@ async fn query_aaaa_records(
     server_ip: Ipv6Addr,
     fqdn: &str,
 ) -> anyhow::Result<(ResponseCode, Vec<Ipv6Addr>)> {
-    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0))
+    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
         .await
         .context("bind IPv6 dns client socket")?;
     let mut query = Message::new();
@@ -393,16 +393,25 @@ async fn query_aaaa_records(
     query.add_query(Query::query(Name::from_ascii(fqdn)?, RecordType::AAAA));
     let payload = query.to_vec()?;
 
-    socket
-        .send_to(&payload, SocketAddr::new(IpAddr::V6(server_ip), 53))
-        .await
-        .with_context(|| format!("send IPv6 dns query to resolver {server_ip}"))?;
+    tokio::time::timeout(
+        HTTP_PROBE_TIMEOUT,
+        socket.send_to(&payload, SocketAddr::new(IpAddr::V6(server_ip), 53)),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "send IPv6 dns query to resolver {server_ip} timed out after {HTTP_PROBE_TIMEOUT:?}"
+        )
+    })??;
 
     let mut buf = [0u8; 2048];
-    let (len, _) = socket
-        .recv_from(&mut buf)
+    let (len, _) = tokio::time::timeout(HTTP_PROBE_TIMEOUT, socket.recv_from(&mut buf))
         .await
-        .context("recv IPv6 dns response")?;
+        .with_context(|| {
+            format!(
+                "recv IPv6 dns response from {server_ip} timed out after {HTTP_PROBE_TIMEOUT:?}"
+            )
+        })??;
     let response = Message::from_vec(&buf[..len]).context("decode IPv6 dns response")?;
     let mut ips = Vec::new();
     for answer in response.answers() {

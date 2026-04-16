@@ -587,9 +587,12 @@ fn compute_icmpv6_checksum(
 
 /// Fold a 64-bit checksum accumulator into the 16-bit wire representation.
 fn fold_checksum(mut sum: u64) -> u16 {
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
+    // The verifier rejects open-ended carry-fold loops in TC classifiers. These fixed reduction
+    // steps are sufficient to collapse the 64-bit helper accumulator into the 16-bit wire value.
+    sum = (sum & 0xffff_ffff) + (sum >> 32);
+    sum = (sum & 0xffff_ffff) + (sum >> 32);
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
     let folded = !(sum as u16);
     if folded == 0 {
         u16::MAX

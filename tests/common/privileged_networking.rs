@@ -9,10 +9,13 @@ use mantissa::network::types::{
 };
 use mantissa::server::headless::{HeadlessConfig, HeadlessNode, HeadlessTransport};
 use net::paths::STATE_DIR_ENV;
+use parking_lot::{Mutex, MutexGuard};
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::OnceLock;
+use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -65,6 +68,30 @@ fn privileged_override_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Returns the process-global registry of privileged test networks that still need host cleanup.
+fn privileged_network_cleanup_registry() -> &'static Mutex<BTreeSet<Uuid>> {
+    static REGISTRY: OnceLock<Mutex<BTreeSet<Uuid>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// Record one privileged test network so panic paths can still remove its kernel state.
+fn register_privileged_network_cleanup(network_id: Uuid) {
+    let mut guard = privileged_network_cleanup_registry().lock();
+    guard.insert(network_id);
+}
+
+/// Return the currently tracked privileged test networks and clear the registry in one step.
+fn take_registered_privileged_networks() -> Vec<Uuid> {
+    let mut guard = privileged_network_cleanup_registry().lock();
+    std::mem::take(&mut *guard).into_iter().collect()
+}
+
+/// Forget all tracked privileged test networks before a fresh test guard starts.
+fn clear_registered_privileged_networks() {
+    let mut guard = privileged_network_cleanup_registry().lock();
+    guard.clear();
+}
+
 impl PrivilegedTestGuard {
     /// Apply one isolated config override for a privileged networking test.
     ///
@@ -75,10 +102,8 @@ impl PrivilegedTestGuard {
     where
         F: FnOnce(&mut Config),
     {
-        let lock = match privileged_override_lock().lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let lock = privileged_override_lock().lock();
+        clear_registered_privileged_networks();
         let previous = global_config();
         let source = global_config_source();
         let state_dir = tempfile::tempdir().expect("create privileged test state dir");
@@ -108,6 +133,9 @@ impl PrivilegedTestGuard {
 impl Drop for PrivilegedTestGuard {
     /// Restore the process-global config snapshot after the test-scoped override completes.
     fn drop(&mut self) {
+        for network_id in take_registered_privileged_networks() {
+            force_cleanup_privileged_network_links_sync(network_id);
+        }
         set_global_config_with_source(self.previous.clone(), self.source.clone());
     }
 }
@@ -212,6 +240,7 @@ pub async fn create_privileged_network(
     network: NetworkSpecValue,
     expected_status: NetworkStatus,
 ) -> NetworkSpecValue {
+    register_privileged_network_cleanup(network.id);
     node.network_registry
         .upsert_spec(network.clone())
         .await
@@ -269,6 +298,32 @@ fn force_delete_privileged_network_links(interfaces: &[String; 4]) {
     force_delete_link(host_ifname);
     force_delete_link(host_peer_ifname);
     force_delete_link(bridge_ifname);
+}
+
+/// Force-remove one leaked privileged test network from the host during panic-path cleanup.
+fn force_cleanup_privileged_network_links_sync(network_id: Uuid) {
+    let interfaces = privileged_network_interfaces(network_id);
+    let pin_dir = privileged_network_bpf_pin_dir(network_id);
+
+    let cleanup_complete =
+        || interfaces.iter().all(|iface| !link_exists(iface)) && !pin_dir.exists();
+
+    force_delete_privileged_network_links(&interfaces);
+    let _ = std::fs::remove_dir_all(&pin_dir);
+
+    for _ in 0..50 {
+        if cleanup_complete() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+        force_delete_privileged_network_links(&interfaces);
+        let _ = std::fs::remove_dir_all(&pin_dir);
+    }
+
+    eprintln!(
+        "warning: forced privileged cleanup left residual network state for {network_id}: interfaces={interfaces:?} pin_dir={}",
+        pin_dir.display()
+    );
 }
 
 /// Force-remove leftover overlay links for one network id and wait until the host is clean.
