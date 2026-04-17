@@ -153,7 +153,7 @@ template does not expose a more specific service port signal.
 `node_ip` is resolved in this order:
 
 - `network.nodeport.ip`
-- the IPv4 component of `network.advertise_addr`
+- the IP component of `network.advertise_addr`
 - best-effort interface autodetection
 
 For production, set `network.nodeport.iface` explicitly and prefer an explicit
@@ -185,10 +185,10 @@ Compiled BPF objects live under `target/bpf/*.bpf.o` (built automatically on Lin
 | --- | --- | --- | --- |
 | `vxlan_xdp` | XDP on `mvx-*` | Frame sanity checks for VXLAN ingress; drops non IPv4/IPv6/ARP or non-unicast sources. | `VXLAN_STATS` |
 | `bridge_xdp` | XDP on `mnt-br-*` | L2 sanity checks for bridged traffic. | `BRIDGE_XDP_STATS` |
-| `bridge_tc_ingress` | TC ingress on `mnhp-*` (fallback: `mnt-br-*`) | VIP ARP responder + DNAT (VIP→backend) + flow-cache seeding for TCP/UDP. | `BRIDGE_TC_INGRESS_STATS`, `LB_VIPS`, `LB_BACKENDS`, `LB_FWD`, `LB_REV` |
-| `bridge_tc_egress` | TC egress on `mnhp-*` (fallback: `mnt-br-*`) | SNAT return path (backend→VIP) using cached reverse mapping. | `BRIDGE_TC_EGRESS_STATS`, `LB_REV` |
-| `nodeport_tc_ingress` | TC ingress on `network.nodeport.iface` and `lo` | Matches `node_ip:public_port`, rewrites to the service VIP, seeds NodePort NAT state, and redirects into the per-network host-access path. | `NODEPORT_TC_INGRESS_STATS`, `NODEPORT_VIPS`, `NODEPORT_FWD`, `NODEPORT_REV`, `NODEPORT_HOST` |
-| `nodeport_tc_egress` | TC egress on `network.nodeport.iface` and TC ingress on `mnhost-*` | Rewrites return traffic back to `node_ip:public_port` for external and host-local clients. | `NODEPORT_TC_EGRESS_STATS`, `NODEPORT_REV` |
+| `bridge_tc_ingress` | TC ingress on `mnhp-*` (fallback: `mnt-br-*`) | VIP ARP/NDP responder + DNAT (VIP→backend) + flow-cache seeding for TCP/UDP. | `BRIDGE_TC_INGRESS_STATS`, `LB_VIPS`, `LB_BACKENDS`, `LB_FWD`, `LB_REV`, plus the `*_V6` map family for IPv6 overlays |
+| `bridge_tc_egress` | TC egress on `mnhp-*` (fallback: `mnt-br-*`) | SNAT return path (backend→VIP) using cached reverse mapping. | `BRIDGE_TC_EGRESS_STATS`, `LB_REV`, `LB_REV_V6` |
+| `nodeport_tc_ingress` | TC ingress on `network.nodeport.iface` and `lo` | Matches `node_ip:public_port`, rewrites to the service VIP, seeds NodePort NAT state, and redirects into the per-network host-access path. | `NODEPORT_TC_INGRESS_STATS`, `NODEPORT_VIPS`, `NODEPORT_FWD`, `NODEPORT_REV`, `NODEPORT_HOST`, plus the `*_V6` map family for IPv6 publication |
+| `nodeport_tc_egress` | TC egress on `network.nodeport.iface` and TC ingress on `mnhost-*` | Rewrites return traffic back to `node_ip:public_port` for external and host-local clients. | `NODEPORT_TC_EGRESS_STATS`, `NODEPORT_REV`, `NODEPORT_REV_V6` |
 
 The “attach to `mnhp-*`” choice is what makes host-originated `curl http://<vip>:<port>` go through the eBPF load balancer reliably: it is the bridge port where host traffic enters/exits the overlay bridge.
 
@@ -325,9 +325,11 @@ This is the path you exercise with `curl http://<node_ip>:<public_port>`.
    - `nodeport_tc_egress` restores the original `node_ip:public_port` view for
      the external client
 
-For host-local loopback curls, Mantissa also configures the host-access
+For host-local IPv4 loopback curls, Mantissa also configures the host-access
 interface with `accept_local=1`, `route_localnet=1`, and `rp_filter=0` so the
-kernel accepts loopback-backed NodePort replies.
+kernel accepts `127.0.0.0/8` NodePort replies. For IPv6, prefer publishing a
+real local address on the chosen interface instead of `::1`; the IPv6 loopback
+address does not have an equivalent `route_localnet` escape hatch.
 
 ## Running the service discovery + public endpoint demo
 
@@ -353,7 +355,7 @@ Prerequisites: Linux host, kernel with XDP+TC and BPF enabled, and `bpf-linker` 
    dataplane, not the final NodePort socket.
 3. Pick one node IP:
    - `network.nodeport.ip` if set
-   - otherwise the IPv4 from `network.advertise_addr`
+   - otherwise the resolved IP from `network.advertise_addr`
 4. From another host or from the node itself, curl the published NodePort:
    ```bash
    curl -sS http://<node_ip>:8000
@@ -388,9 +390,13 @@ Prerequisites: Linux host, kernel with XDP+TC and BPF enabled, and `bpf-linker` 
 - Inspect pinned NodePort maps:
   - `sudo ls -la /sys/fs/bpf/mantissa/nodeport/`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_VIPS`
+  - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_VIPS_V6`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_FWD`
+  - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_FWD_V6`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_REV`
+  - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_REV_V6`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_HOST`
+  - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_HOST_V6`
 - Inspect stats (sanity check that packets hit the programs):
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_TC_INGRESS_STATS`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_TC_EGRESS_STATS`
@@ -401,7 +407,6 @@ Prerequisites: Linux host, kernel with XDP+TC and BPF enabled, and `bpf-linker` 
 
 ## Supported scope, limits, and non-goals
 
-- NodePort is IPv4-only in this release.
 - Public traffic supports TCP, UDP, and `tcp_udp`; `tcp` is the default when
   `public_protocol` is omitted.
 - Fragmented IPv4 is not handled by the VIP or NodePort NAT datapaths.
@@ -413,9 +418,9 @@ Prerequisites: Linux host, kernel with XDP+TC and BPF enabled, and `bpf-linker` 
   `MAX_BACKENDS_PER_VIP = 1024`, and 1024-entry LRU flow caches in each
   direction for the overlay LB, plus the fixed NodePort capacities exposed by
   `mantissa info`.
-- Mantissa does not currently provide IPv6 load balancing, fragmented IPv4
-  support, source-IP preservation guarantees for external clients, cloud load
-  balancer integration, or full network policy enforcement.
+- Mantissa does not currently provide source-IP preservation guarantees for
+  external clients, cloud load balancer integration, fragmented IPv4 support,
+  or full network policy enforcement.
 - Security hardening remains intentionally minimal: XDP programs mainly perform
   sanity filtering, and deeper conntrack validation is not part of the first
   production NodePort release.

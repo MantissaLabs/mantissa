@@ -123,6 +123,16 @@ pub mod net {
             Self::ipv4([0xff; 6], src)
         }
 
+        /// Build the synthetic broadcast Ethernet header used for loopback-originated IPv6 traffic.
+        ///
+        /// IPv6 NodePort curls on loopback still need an L2 envelope before the packet can be
+        /// redirected into the bridge dataplane, and the placeholder header is replaced later once
+        /// VIP load-balancing selects a concrete backend.
+        #[inline(always)]
+        pub const fn broadcast_ipv6(src: [u8; 6]) -> Self {
+            Self::ipv6([0xff; 6], src)
+        }
+
         #[inline(always)]
         pub fn protocol(&self) -> u16 {
             u16::from_be(self.eth_proto)

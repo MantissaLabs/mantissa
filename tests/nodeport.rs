@@ -5,9 +5,9 @@ mod common;
 
 use common::convergence::wait_until;
 use common::privileged_networking::{
-    PrivilegedTestGuard, create_privileged_network, create_privileged_node,
+    PrivilegedTestGuard, command_output, create_privileged_network, create_privileged_node,
     delete_privileged_network, privileged_artifact_dir, privileged_test_network,
-    privileged_test_subnet,
+    privileged_test_subnet, privileged_test_subnet_v6,
 };
 use mantissa::network::nodeport::NodePortRuntimeState;
 use mantissa::services::ServiceController;
@@ -17,6 +17,7 @@ use mantissa::services::types::{
 };
 use mantissa::workload::types::ExecutionSpec;
 use protocol::services::services;
+use std::net::{IpAddr, Ipv6Addr};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -25,6 +26,7 @@ use uuid::Uuid;
 const NODEPORT_HTTP_PORT: u16 = 18080;
 const NODEPORT_HTTP_REMAP_PORT: u16 = 18081;
 const NODEPORT_UDP_PORT: u16 = 18082;
+const NODEPORT_HTTP_PORT_V6: u16 = 18083;
 const NODEPORT_RESPONSE: &str = "hello from nodeport privileged test";
 const NODEPORT_CONFLICT_RESPONSE: &str = "hello from nodeport owner";
 const NODEPORT_DEGRADED_RESPONSE: &str = "hello from degraded nodeport service";
@@ -194,6 +196,45 @@ async fn udp_echo(addr: &str, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
     let (len, _) =
         tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut response)).await??;
     Ok(response[..len].to_vec())
+}
+
+/// Keeps one temporary IPv6 address assigned to `lo` for the lifetime of a privileged test.
+struct LoopbackIpv6AddressGuard {
+    ip: Ipv6Addr,
+}
+
+impl LoopbackIpv6AddressGuard {
+    /// Add one stable ULA to loopback so IPv6 NodePort tests can avoid the special `::1` path.
+    fn assign(ip: Ipv6Addr) -> Self {
+        let cidr = format!("{ip}/128");
+        command_output("ip", &["-6", "addr", "add", &cidr, "dev", "lo"]);
+        Self { ip }
+    }
+}
+
+impl Drop for LoopbackIpv6AddressGuard {
+    /// Remove the temporary loopback ULA once the test completes.
+    fn drop(&mut self) {
+        let cidr = format!("{}/128", self.ip);
+        let _ = std::process::Command::new("ip")
+            .args(["-6", "addr", "del", &cidr, "dev", "lo"])
+            .output();
+    }
+}
+
+/// Pick one deterministic-looking private IPv6 address for loopback NodePort publication tests.
+fn privileged_nodeport_loopback_v6() -> Ipv6Addr {
+    let bytes = Uuid::new_v4().into_bytes();
+    Ipv6Addr::new(
+        0xfd42,
+        u16::from_be_bytes([bytes[0], bytes[1]]),
+        u16::from_be_bytes([bytes[2], bytes[3]]),
+        u16::from_be_bytes([bytes[4], bytes[5]]),
+        u16::from_be_bytes([bytes[6], bytes[7]]),
+        u16::from_be_bytes([bytes[8], bytes[9]]),
+        u16::from_be_bytes([bytes[10], bytes[11]]),
+        u16::from_be_bytes([bytes[12], bytes[13]]),
+    )
 }
 
 local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
@@ -374,6 +415,151 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
 
     delete_privileged_network(&node, network_id).await;
 });
+
+local_test!(
+    nodeport_ipv6_public_service_reaches_backend_and_cleans_up,
+    {
+        let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
+            return;
+        };
+        let loopback_ip = privileged_nodeport_loopback_v6();
+
+        let _config = PrivilegedTestGuard::apply(|config| {
+            config.network.wireguard.enabled = false;
+            config.network.wireguard.manage_firewall = false;
+            config.network.bpf.attach = true;
+            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            config.network.nodeport.enabled = true;
+            config.network.nodeport.iface = Some("lo".to_string());
+            config.network.nodeport.ip = Some(loopback_ip.to_string());
+            config.network.advertise_addr = Some(format!("[{loopback_ip}]:6578"));
+        });
+        let _loopback_ip = LoopbackIpv6AddressGuard::assign(loopback_ip);
+        let node = create_privileged_node().await;
+        let subnet = privileged_test_subnet_v6();
+        let network = create_privileged_network(
+            &node,
+            privileged_test_network(
+                "nodeport-test-v6",
+                "privileged IPv6 nodeport integration test network",
+                &subnet,
+                1450,
+                Vec::new(),
+            ),
+            mantissa::network::types::NetworkStatus::Ready,
+        )
+        .await;
+        let network_id = network.id;
+
+        let service_id = node
+            .service_controller
+            .submit_deployment(
+                Uuid::new_v4(),
+                "nodeport-privileged-v6",
+                "nodeport-privileged-v6",
+                vec![privileged_nodeport_task_template(
+                    network_id,
+                    "echo",
+                    NODEPORT_RESPONSE,
+                    NODEPORT_HTTP_PORT_V6,
+                    NODEPORT_HTTP_PORT_V6,
+                )],
+            )
+            .await
+            .expect("submit privileged IPv6 NodePort deployment");
+
+        assert!(
+            wait_for_service_status(
+                &node.service_controller,
+                service_id,
+                ServiceStatus::Running,
+                Duration::from_secs(180),
+            )
+            .await,
+            "IPv6 public service should reach running state with the real runtime"
+        );
+
+        let nodeport_ready = wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+            || async {
+                let status = node.network_controller.nodeport_manager().status().await;
+                status.state == NodePortRuntimeState::Ready
+                    && status.active_ports == 1
+                    && status.active_host_networks == 1
+                    && status.resolved_node_ip == Some(IpAddr::V6(loopback_ip))
+                    && status.stats_error.is_none()
+            },
+        )
+        .await;
+        if !nodeport_ready {
+            let status = node.network_controller.nodeport_manager().status().await;
+            let service = node
+                .service_controller
+                .registry()
+                .get(service_id)
+                .expect("read privileged IPv6 NodePort service after readiness failure")
+                .expect(
+                    "privileged IPv6 NodePort service should still exist after readiness failure",
+                );
+            panic!(
+                "NodePort manager should report one ready published IPv6 port; status={status:?}; public_detail={:?}",
+                service.public_endpoint_detail()
+            );
+        }
+
+        let addr = format!("[{loopback_ip}]:{NODEPORT_HTTP_PORT_V6}");
+        let http_ok = wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(250),
+            || async {
+                match http_get(&addr).await {
+                    Ok(response) => response.contains(NODEPORT_RESPONSE),
+                    Err(_) => false,
+                }
+            },
+        )
+        .await;
+        if !http_ok {
+            let status = node.network_controller.nodeport_manager().status().await;
+            let service = node
+                .service_controller
+                .registry()
+                .get(service_id)
+                .expect("read privileged IPv6 NodePort service after http failure")
+                .expect("privileged IPv6 NodePort service should still exist after http failure");
+            let last_http_error = http_get(&addr)
+                .await
+                .map(|response| format!("unexpected response: {response}"))
+                .unwrap_or_else(|err| err.to_string());
+            panic!(
+                "published IPv6 NodePort should proxy loopback traffic into the overlay backend; status={status:?}; public_detail={:?}; last_http_error={last_http_error}",
+                service.public_endpoint_detail()
+            );
+        }
+
+        let delete_result = tokio::time::timeout(Duration::from_secs(30), async {
+            remove_service_via_rpc(&node.services_client, service_id).await;
+        })
+        .await;
+        if delete_result.is_err() {
+            let status = node.network_controller.nodeport_manager().status().await;
+            let service = node
+                .service_controller
+                .registry()
+                .get(service_id)
+                .expect("read privileged IPv6 NodePort service after delete timeout");
+            panic!(
+                "IPv6 public service deletion should not hang; status={status:?}; service_present={}; public_detail={:?}",
+                service.is_some(),
+                service
+                    .as_ref()
+                    .and_then(|spec| spec.public_endpoint_detail().map(str::to_string)),
+            );
+        }
+        delete_privileged_network(&node, network_id).await;
+    }
+);
 
 local_test!(
     nodeport_public_service_can_remap_public_port_to_probe_port,

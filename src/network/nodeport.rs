@@ -266,7 +266,7 @@ mod platform {
     use std::fs;
     use std::io;
     use std::mem;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::IpAddr;
     use std::os::fd::{AsFd, AsRawFd};
     use std::path::{Path, PathBuf};
     use tracing::{debug, info, warn};
@@ -294,13 +294,66 @@ mod platform {
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
+    struct NodePortEntry6 {
+        vip: [u8; 16],
+        vip_port: u16,
+        _pad: u16,
+        overlay_ifindex: u32,
+        node_ip: [u8; 16],
+    }
+    unsafe impl Pod for NodePortEntry6 {}
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
     struct NodePortHost {
         mac: [u8; 6],
         _pad: u16,
         host_ip: u32,
     }
     unsafe impl Pod for NodePortHost {}
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct NodePortHost6 {
+        mac: [u8; 6],
+        _pad: [u8; 2],
+        host_ip: [u8; 16],
+    }
+    unsafe impl Pod for NodePortHost6 {}
     unsafe impl Pod for NodePortPacketCounters {}
+
+    /// Pinned map names for one NodePort address family.
+    struct NodePortMapNames {
+        vip_map: &'static str,
+        host_map: &'static str,
+    }
+
+    const IPV4_MAPS: NodePortMapNames = NodePortMapNames {
+        vip_map: "NODEPORT_VIPS",
+        host_map: "NODEPORT_HOST",
+    };
+
+    const IPV6_MAPS: NodePortMapNames = NodePortMapNames {
+        vip_map: "NODEPORT_VIPS_V6",
+        host_map: "NODEPORT_HOST_V6",
+    };
+
+    /// Address family selector shared by interface discovery and map programming helpers.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum NodePortIpFamily {
+        Ipv4,
+        Ipv6,
+    }
+
+    impl NodePortIpFamily {
+        /// Return the map family that matches one concrete IP address.
+        fn from_ip(ip: IpAddr) -> Self {
+            match ip {
+                IpAddr::V4(_) => Self::Ipv4,
+                IpAddr::V6(_) => Self::Ipv6,
+            }
+        }
+    }
 
     /// Uniquely identify a nodeport binding by port and transport protocol.
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -472,27 +525,48 @@ mod platform {
                 Some(overlay_ifindex(network_id)?)
             };
             let base = map_pin_dir()?;
-            let vip_map = open_map(&base, "NODEPORT_VIPS").context("open NODEPORT_VIPS map")?;
-            let vip_fd = vip_map.fd().as_fd().as_raw_fd();
+            let ipv4_vip_map =
+                open_map(&base, IPV4_MAPS.vip_map).context("open NODEPORT_VIPS map")?;
+            let ipv6_vip_map =
+                open_map(&base, IPV6_MAPS.vip_map).context("open NODEPORT_VIPS_V6 map")?;
+            let ipv4_host_map =
+                open_map(&base, IPV4_MAPS.host_map).context("open NODEPORT_HOST map")?;
+            let ipv6_host_map =
+                open_map(&base, IPV6_MAPS.host_map).context("open NODEPORT_HOST_V6 map")?;
+            let ipv4_vip_fd = ipv4_vip_map.fd().as_fd().as_raw_fd();
+            let ipv6_vip_fd = ipv6_vip_map.fd().as_fd().as_raw_fd();
+            let ipv4_host_fd = ipv4_host_map.fd().as_fd().as_raw_fd();
+            let ipv6_host_fd = ipv6_host_map.fd().as_fd().as_raw_fd();
             if let Some(overlay_ifindex) = overlay_ifindex_opt {
                 let host_mac = host_access_mac(network_id).await?;
-                let host_ip = host_access_ip(network_id).await?;
-                let host_map =
-                    open_map(&base, "NODEPORT_HOST").context("open NODEPORT_HOST map")?;
-                let host_fd = host_map.fd().as_fd().as_raw_fd();
-                let value = NodePortHost {
-                    mac: host_mac,
-                    _pad: 0,
-                    host_ip: u32::from_ne_bytes(host_ip.octets()),
-                };
-                update_elem(host_fd, &overlay_ifindex, &value)
-                    .context("program nodeport host attachment")?;
-            } else if had_ports
-                && let Ok(overlay_ifindex) = overlay_ifindex(network_id)
-                && let Ok(host_map) = open_map(&base, "NODEPORT_HOST")
-            {
-                let host_fd = host_map.fd().as_fd().as_raw_fd();
-                let _ = delete_elem(host_fd, &overlay_ifindex);
+                let host_ip =
+                    host_access_ip(network_id, NodePortIpFamily::from_ip(node_ip)).await?;
+
+                match host_ip {
+                    IpAddr::V4(host_ip) => {
+                        let value = NodePortHost {
+                            mac: host_mac,
+                            _pad: 0,
+                            host_ip: u32::from_ne_bytes(host_ip.octets()),
+                        };
+                        update_elem(ipv4_host_fd, &overlay_ifindex, &value)
+                            .context("program IPv4 nodeport host attachment")?;
+                        let _ = delete_elem(ipv6_host_fd, &overlay_ifindex);
+                    }
+                    IpAddr::V6(host_ip) => {
+                        let value = NodePortHost6 {
+                            mac: host_mac,
+                            _pad: [0u8; 2],
+                            host_ip: host_ip.octets(),
+                        };
+                        update_elem(ipv6_host_fd, &overlay_ifindex, &value)
+                            .context("program IPv6 nodeport host attachment")?;
+                        let _ = delete_elem(ipv4_host_fd, &overlay_ifindex);
+                    }
+                }
+            } else if had_ports && let Ok(overlay_ifindex) = overlay_ifindex(network_id) {
+                let _ = delete_elem(ipv4_host_fd, &overlay_ifindex);
+                let _ = delete_elem(ipv6_host_fd, &overlay_ifindex);
             }
             let overlay_index = if entries.is_empty() {
                 0
@@ -507,17 +581,37 @@ mod platform {
                     proto: entry.protocol.number(),
                     _pad: 0,
                 };
-                let vip = Self::require_ipv4(entry.vip, "nodeport vip")?;
-                let node_ip = Self::require_ipv4(node_ip, "nodeport node address")?;
-                let value = NodePortEntry {
-                    vip: u32::from_ne_bytes(vip.octets()),
-                    vip_port: entry.vip_port.to_be(),
-                    _pad: 0,
-                    overlay_ifindex: overlay_index,
-                    node_ip: u32::from_ne_bytes(node_ip.octets()),
-                };
-                update_elem(vip_fd, &key, &value)
-                    .with_context(|| format!("program nodeport {}", entry.port))?;
+                match (entry.vip, node_ip) {
+                    (IpAddr::V4(vip), IpAddr::V4(node_ip)) => {
+                        let value = NodePortEntry {
+                            vip: u32::from_ne_bytes(vip.octets()),
+                            vip_port: entry.vip_port.to_be(),
+                            _pad: 0,
+                            overlay_ifindex: overlay_index,
+                            node_ip: u32::from_ne_bytes(node_ip.octets()),
+                        };
+                        update_elem(ipv4_vip_fd, &key, &value)
+                            .with_context(|| format!("program IPv4 nodeport {}", entry.port))?;
+                        let _ = delete_elem(ipv6_vip_fd, &key);
+                    }
+                    (IpAddr::V6(vip), IpAddr::V6(node_ip)) => {
+                        let value = NodePortEntry6 {
+                            vip: vip.octets(),
+                            vip_port: entry.vip_port.to_be(),
+                            _pad: 0,
+                            overlay_ifindex: overlay_index,
+                            node_ip: node_ip.octets(),
+                        };
+                        update_elem(ipv6_vip_fd, &key, &value)
+                            .with_context(|| format!("program IPv6 nodeport {}", entry.port))?;
+                        let _ = delete_elem(ipv4_vip_fd, &key);
+                    }
+                    (vip, node_ip) => {
+                        return Err(anyhow!(
+                            "nodeport VIP family mismatch: published VIP {vip} does not match node address {node_ip}; configure network.nodeport.ip for the same family"
+                        ));
+                    }
+                }
                 self.port_owner.insert(selector, network_id);
             }
 
@@ -528,8 +622,10 @@ mod platform {
                     proto: selector.protocol.number(),
                     _pad: 0,
                 };
-                delete_elem(vip_fd, &key)
-                    .with_context(|| format!("remove nodeport {}", selector.port))?;
+                // Remove the selector from both map families so stale entries are purged even if
+                // the node identity changed families between successive syncs.
+                let _ = delete_elem(ipv4_vip_fd, &key);
+                let _ = delete_elem(ipv6_vip_fd, &key);
                 self.port_owner.remove(selector);
             }
             self.ports_by_network.insert(network_id, desired_ports);
@@ -541,19 +637,6 @@ mod platform {
                 self.detach_if_idle().await?;
             }
             Ok(())
-        }
-
-        /// Require one IPv4 address for the legacy NodePort map layout.
-        ///
-        /// The first IPv6 rollout keeps the NodePort userspace programming path explicit about the
-        /// remaining IPv4-only map ABI until the IPv6 dataplane maps are introduced.
-        fn require_ipv4(ip: IpAddr, context: &str) -> Result<Ipv4Addr> {
-            match ip {
-                IpAddr::V4(ip) => Ok(ip),
-                IpAddr::V6(ip) => Err(anyhow!(
-                    "{context} {ip} is IPv6 but the active map layout is IPv4-only"
-                )),
-            }
         }
 
         /// Collect the desired port selectors for one network and reject duplicate or conflicting claims.
@@ -774,19 +857,19 @@ mod platform {
 
             if let Some(iface) = self.iface.clone() {
                 if self.node_ip.is_none() {
-                    self.node_ip = detect_iface_ip(&iface).await?.map(IpAddr::V4);
+                    self.node_ip = detect_iface_ip(&iface, None).await?;
                 }
                 return Ok(());
             }
 
-            if let Some(IpAddr::V4(node_ip)) = self.node_ip {
+            if let Some(node_ip) = self.node_ip {
                 self.iface = detect_iface_for_ip(node_ip).await?;
                 return Ok(());
             }
 
             if let Some((iface, ip)) = detect_default_iface().await? {
                 self.iface = Some(iface);
-                self.node_ip = Some(IpAddr::V4(ip));
+                self.node_ip = Some(ip);
             }
 
             Ok(())
@@ -806,7 +889,7 @@ mod platform {
             if self.node_ip.is_none() {
                 self.degrade_runtime(
                     format!(
-                        "nodeport IPv4 address missing for interface {iface}; set network.nodeport.ip or a concrete advertise address"
+                        "nodeport address missing for interface {iface}; set network.nodeport.ip or a concrete advertise address"
                     ),
                     "nodeport runtime degraded",
                 );
@@ -1030,32 +1113,63 @@ mod platform {
             .unwrap_or_else(|| format!("ifindex{index}"))
     }
 
-    /// Return true when any address attribute carries the provided IPv4 address.
-    fn address_attrs_contain_ipv4(attributes: &[AddressAttribute], needle: Ipv4Addr) -> bool {
+    /// Return true when any address attribute carries the provided IP address.
+    fn address_attrs_contain_ip(attributes: &[AddressAttribute], needle: IpAddr) -> bool {
         attributes.iter().any(|attr| match attr {
-            AddressAttribute::Address(addr) | AddressAttribute::Local(addr) => {
-                matches!(addr, IpAddr::V4(ip) if *ip == needle)
-            }
+            AddressAttribute::Address(addr) | AddressAttribute::Local(addr) => *addr == needle,
             _ => false,
         })
     }
 
-    /// Resolve the first IPv4 address found in one netlink address attribute list.
-    fn first_ipv4_from_address_attrs(attributes: &[AddressAttribute]) -> Option<Ipv4Addr> {
-        attributes.iter().find_map(|attr| match attr {
-            AddressAttribute::Address(addr) | AddressAttribute::Local(addr) => match addr {
-                IpAddr::V4(ip) => Some(*ip),
-                _ => None,
-            },
-            _ => None,
-        })
+    /// Filter out addresses that should never become a published NodePort identity.
+    fn is_usable_nodeport_ip(ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(ip) => !ip.is_unspecified(),
+            IpAddr::V6(ip) => !ip.is_unspecified() && !ip.is_unicast_link_local(),
+        }
     }
 
-    /// Find the interface that owns the provided IPv4 address.
-    async fn detect_iface_for_ip(node_ip: Ipv4Addr) -> Result<Option<String>> {
+    /// Resolve the first usable address in the requested family order from one link-address list.
+    fn first_ip_from_address_attrs(
+        attributes: &[AddressAttribute],
+        preferred_family: Option<NodePortIpFamily>,
+    ) -> Option<IpAddr> {
+        let mut ipv4 = None;
+        let mut ipv6 = None;
+
+        for attr in attributes {
+            let Some(candidate) = (match attr {
+                AddressAttribute::Address(addr) | AddressAttribute::Local(addr) => Some(*addr),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if !is_usable_nodeport_ip(candidate) {
+                continue;
+            }
+            match candidate {
+                IpAddr::V4(ip) if ipv4.is_none() => ipv4 = Some(IpAddr::V4(ip)),
+                IpAddr::V6(ip) if ipv6.is_none() => ipv6 = Some(IpAddr::V6(ip)),
+                _ => {}
+            }
+        }
+
+        match preferred_family {
+            Some(NodePortIpFamily::Ipv4) => ipv4.or(ipv6),
+            Some(NodePortIpFamily::Ipv6) => ipv6.or(ipv4),
+            None => ipv4.or(ipv6),
+        }
+    }
+
+    /// Find the interface that owns the provided NodePort address.
+    async fn detect_iface_for_ip(node_ip: IpAddr) -> Result<Option<String>> {
         let (conn, handle, _) =
             new_connection().context("open rtnetlink connection for nodeport iface lookup")?;
         tokio::spawn(conn);
+        let allow_loopback = match node_ip {
+            IpAddr::V4(ip) => ip.is_loopback(),
+            IpAddr::V6(ip) => ip.is_loopback(),
+        };
 
         let mut link_stream = handle.link().get().execute();
         while let Some(link) = link_stream
@@ -1067,7 +1181,9 @@ mod platform {
             let name = link_name_from_attrs(&link.attributes, index);
 
             let flags = link.header.flags;
-            if !flags.contains(LinkFlags::Up) || flags.contains(LinkFlags::Loopback) {
+            if !flags.contains(LinkFlags::Up)
+                || (!allow_loopback && flags.contains(LinkFlags::Loopback))
+            {
                 continue;
             }
             if name == MANTISSA_WIREGUARD_IFNAME {
@@ -1085,7 +1201,7 @@ mod platform {
                 .await
                 .context("enumerate nodeport iface addresses")?
             {
-                if address_attrs_contain_ipv4(&msg.attributes, node_ip) {
+                if address_attrs_contain_ip(&msg.attributes, node_ip) {
                     return Ok(Some(name.clone()));
                 }
             }
@@ -1094,8 +1210,11 @@ mod platform {
         Ok(None)
     }
 
-    /// Resolve an IPv4 address assigned to a specific interface name.
-    async fn detect_iface_ip(iface: &str) -> Result<Option<Ipv4Addr>> {
+    /// Resolve one usable NodePort address assigned to a specific interface.
+    async fn detect_iface_ip(
+        iface: &str,
+        preferred_family: Option<NodePortIpFamily>,
+    ) -> Result<Option<IpAddr>> {
         let (conn, handle, _) =
             new_connection().context("open rtnetlink connection for nodeport iface ip lookup")?;
         tokio::spawn(conn);
@@ -1123,7 +1242,7 @@ mod platform {
             .await
             .context("enumerate nodeport interface addresses")?
         {
-            if let Some(ip) = first_ipv4_from_address_attrs(&msg.attributes) {
+            if let Some(ip) = first_ip_from_address_attrs(&msg.attributes, preferred_family) {
                 return Ok(Some(ip));
             }
         }
@@ -1131,8 +1250,12 @@ mod platform {
         Ok(None)
     }
 
-    /// Pick the first up, non-loopback interface that has an IPv4 address.
-    async fn detect_default_iface() -> Result<Option<(String, Ipv4Addr)>> {
+    /// Pick the first up, non-loopback interface that has a usable NodePort address.
+    ///
+    /// IPv4 stays the default preference so existing operators keep the same best-effort behavior
+    /// when they have not pinned `network.nodeport.ip`, but IPv6-only hosts can still auto-resolve
+    /// a usable identity.
+    async fn detect_default_iface() -> Result<Option<(String, IpAddr)>> {
         let (conn, handle, _) =
             new_connection().context("open rtnetlink connection for nodeport autodetect")?;
         tokio::spawn(conn);
@@ -1165,7 +1288,7 @@ mod platform {
                 .await
                 .context("enumerate nodeport autodetect addresses")?
             {
-                if let Some(ip) = first_ipv4_from_address_attrs(&msg.attributes) {
+                if let Some(ip) = first_ip_from_address_attrs(&msg.attributes, None) {
                     return Ok(Some((name.clone(), ip)));
                 }
             }
@@ -1230,8 +1353,8 @@ mod platform {
         Ok(mac)
     }
 
-    /// Resolve the host-access interface IPv4 address to use for nodeport SNAT.
-    async fn host_access_ip(network_id: Uuid) -> Result<Ipv4Addr> {
+    /// Resolve the host-access interface address to use for NodePort SNAT in the matching family.
+    async fn host_access_ip(network_id: Uuid, family: NodePortIpFamily) -> Result<IpAddr> {
         let ifname = host_access_host_iface_name(network_id);
         let (conn, handle, _) =
             new_connection().context("open rtnetlink connection for nodeport ip lookup")?;
@@ -1260,13 +1383,17 @@ mod platform {
             .await
             .context("enumerate host access addresses")?
         {
-            if let Some(ip) = first_ipv4_from_address_attrs(&msg.attributes) {
+            if let Some(ip) = first_ip_from_address_attrs(&msg.attributes, Some(family)) {
                 return Ok(ip);
             }
         }
 
+        let family_label = match family {
+            NodePortIpFamily::Ipv4 => "IPv4",
+            NodePortIpFamily::Ipv6 => "IPv6",
+        };
         Err(anyhow!(
-            "host access interface {ifname} missing IPv4 address"
+            "host access interface {ifname} missing {family_label} address"
         ))
     }
 
@@ -1476,9 +1603,13 @@ mod platform {
     fn reset_nodeport_maps(root: &Path) -> Result<()> {
         let maps = [
             "NODEPORT_FWD",
+            "NODEPORT_FWD_V6",
             "NODEPORT_REV",
+            "NODEPORT_REV_V6",
             "NODEPORT_VIPS",
+            "NODEPORT_VIPS_V6",
             "NODEPORT_HOST",
+            "NODEPORT_HOST_V6",
             "NODEPORT_TC_INGRESS_STATS",
             "NODEPORT_TC_INGRESS_DROP_REASONS",
             "NODEPORT_TC_EGRESS_STATS",

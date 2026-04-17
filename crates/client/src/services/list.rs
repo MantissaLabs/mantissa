@@ -14,7 +14,7 @@ use protocol::services::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tabwriter::TabWriter;
 use uuid::Uuid;
 
@@ -488,10 +488,10 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
                 let Some(ip_text) = attachment.assigned_ip.as_deref() else {
                     continue;
                 };
-                let Ok(ip) = ip_text.parse::<Ipv4Addr>() else {
+                let Ok(ip) = ip_text.parse::<IpAddr>() else {
                     continue;
                 };
-                backend_ips.insert(u32::from(ip));
+                backend_ips.insert(ip);
             }
 
             if backend_ips.is_empty() {
@@ -508,11 +508,16 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
             };
 
             let rendered = if target_port == public_port {
-                format!("{}={vip}:{target_port}", template.name)
+                format!(
+                    "{}={}",
+                    template.name,
+                    render_socket_endpoint(vip, target_port)
+                )
             } else {
                 format!(
-                    "{}={vip}:{target_port} (nodeport {public_port})",
-                    template.name
+                    "{}={} (nodeport {public_port})",
+                    template.name,
+                    render_socket_endpoint(vip, target_port)
                 )
             };
             endpoints.push(rendered);
@@ -556,11 +561,15 @@ fn compute_service_vip(
     subnet_cidr: &str,
     network_id: Uuid,
     service_name: &str,
-    backend_ips: &HashSet<u32>,
-) -> Option<Ipv4Addr> {
-    let (base_ip, prefix) = parse_ipv4_cidr(subnet_cidr)?;
+    backend_ips: &HashSet<IpAddr>,
+) -> Option<IpAddr> {
+    let (base_ip, prefix) = parse_overlay_cidr(subnet_cidr)?;
+    let (family, base_ip, address_bits) = match base_ip {
+        IpAddr::V4(ip) => (ServiceIpFamily::Ipv4, u32::from(ip) as u128, 32u8),
+        IpAddr::V6(ip) => (ServiceIpFamily::Ipv6, u128::from(ip), 128u8),
+    };
 
-    let host_bits = 32u8.saturating_sub(prefix);
+    let host_bits = address_bits.saturating_sub(prefix);
     if host_bits < 4 {
         return None;
     }
@@ -578,20 +587,40 @@ fn compute_service_vip(
 
     // Constrain VIPs to the even offsets of the overlay to avoid collisions with per-node resolver
     // addresses, which always occupy the odd slots (offsets 1, 3, 5, ...).
-    let available_even = (1u64 << host_bits).saturating_sub(16) / 2;
+    let max_hosts = match (family, host_bits) {
+        (ServiceIpFamily::Ipv4, 32) => u32::MAX as u128 + 1,
+        (ServiceIpFamily::Ipv6, 128) => return None,
+        _ => 1u128 << host_bits,
+    };
+    let available_even = max_hosts.saturating_sub(16) / 2;
     if available_even == 0 {
         return None;
     }
 
-    let mut slot = (slot_seed % available_even as u128) as u32 * 2 + 8;
+    let normalized_backend_ips: HashSet<u128> = backend_ips
+        .iter()
+        .filter_map(|backend_ip| match (family, backend_ip) {
+            (ServiceIpFamily::Ipv4, IpAddr::V4(ip)) => Some(u32::from(*ip) as u128),
+            (ServiceIpFamily::Ipv6, IpAddr::V6(ip)) => Some(u128::from(*ip)),
+            _ => None,
+        })
+        .collect();
+    if normalized_backend_ips.len() != backend_ips.len() {
+        return None;
+    }
+
+    let mut slot = (slot_seed % available_even) * 2 + 8;
     for _ in 0..available_even.min(16) as usize {
-        let candidate = u32::from(base_ip).saturating_add(slot);
-        if !backend_ips.contains(&candidate) {
-            return Some(Ipv4Addr::from(candidate));
+        let candidate = base_ip.saturating_add(slot);
+        if !normalized_backend_ips.contains(&candidate) {
+            return Some(match family {
+                ServiceIpFamily::Ipv4 => IpAddr::V4(Ipv4Addr::from(candidate as u32)),
+                ServiceIpFamily::Ipv6 => IpAddr::V6(Ipv6Addr::from(candidate)),
+            });
         }
 
         // Walk forward to the next even slot if we collided with an existing backend.
-        slot = slot.wrapping_add(2) % (available_even as u32 * 2);
+        slot = slot.wrapping_add(2) % (available_even * 2);
         if slot < 8 {
             slot = 8;
         }
@@ -600,15 +629,34 @@ fn compute_service_vip(
     None
 }
 
-/// Parse an IPv4 CIDR string (e.g. "10.240.0.0/16") into its base address and prefix length.
-fn parse_ipv4_cidr(cidr: &str) -> Option<(Ipv4Addr, u8)> {
+/// Supported address families for client-side public endpoint rendering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceIpFamily {
+    Ipv4,
+    Ipv6,
+}
+
+/// Parse an overlay CIDR string into its base address and prefix length.
+fn parse_overlay_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
     let (base_text, prefix_text) = cidr.split_once('/')?;
     let prefix: u8 = prefix_text.parse().ok()?;
-    if prefix > 32 {
+    let base_ip: IpAddr = base_text.parse().ok()?;
+    let max_prefix = match base_ip {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > max_prefix {
         return None;
     }
-    let base_ip: Ipv4Addr = base_text.parse().ok()?;
     Some((base_ip, prefix))
+}
+
+/// Render one host-reachable VIP endpoint, bracket-wrapping IPv6 addresses for socket syntax.
+fn render_socket_endpoint(ip: IpAddr, port: u16) -> String {
+    match ip {
+        IpAddr::V4(ip) => format!("{ip}:{port}"),
+        IpAddr::V6(ip) => format!("[{ip}]:{port}"),
+    }
 }
 
 #[cfg(test)]
@@ -688,7 +736,7 @@ mod tests {
         )
         .expect("vip");
 
-        assert_eq!(vip, Ipv4Addr::new(10, 34, 24, 38));
+        assert_eq!(vip, IpAddr::V4(Ipv4Addr::new(10, 34, 24, 38)));
     }
 
     #[test]
@@ -702,7 +750,26 @@ mod tests {
         )
         .expect("vip");
 
-        assert_eq!(vip, Ipv4Addr::new(10, 146, 120, 162));
+        assert_eq!(vip, IpAddr::V4(Ipv4Addr::new(10, 146, 120, 162)));
+    }
+
+    #[test]
+    /// Keeps the CLI's rendered IPv6 VIPs aligned with the server-side family-generic hash path.
+    fn compute_service_vip_supports_ipv6_overlays() {
+        let vip = compute_service_vip(
+            "fd42:1234:5678::/64",
+            Uuid::parse_str("278974fb-d8a0-07a9-590c-9908d5b33462").expect("valid network id"),
+            "backend",
+            &HashSet::new(),
+        )
+        .expect("vip");
+
+        assert_eq!(
+            vip,
+            IpAddr::V6(Ipv6Addr::new(
+                0xfd42, 0x1234, 0x5678, 0, 0x4494, 0xcfb4, 0xd0a4, 0x5582,
+            ))
+        );
     }
 
     #[test]
@@ -727,5 +794,18 @@ mod tests {
         let template = test_template(Some(8001), None, None);
 
         assert_eq!(template.public_target_port(), Some(8001));
+    }
+
+    #[test]
+    /// Ensures IPv6 public endpoints render in valid socket syntax for copy-paste curls.
+    fn render_socket_endpoint_brackets_ipv6() {
+        let rendered = render_socket_endpoint(
+            IpAddr::V6(Ipv6Addr::new(
+                0xfd42, 0x1234, 0x5678, 0, 0x4494, 0xcfb4, 0xd0a4, 0x5582,
+            )),
+            8000,
+        );
+
+        assert_eq!(rendered, "[fd42:1234:5678:0:4494:cfb4:d0a4:5582]:8000");
     }
 }
