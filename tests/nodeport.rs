@@ -6,8 +6,8 @@ mod common;
 use common::convergence::wait_until;
 use common::privileged_networking::{
     PrivilegedTestGuard, create_privileged_network, create_privileged_node,
-    delete_privileged_network, force_cleanup_privileged_network_links, privileged_artifact_dir,
-    privileged_test_network, privileged_test_subnet,
+    delete_privileged_network, privileged_artifact_dir, privileged_test_network,
+    privileged_test_subnet,
 };
 use mantissa::network::nodeport::NodePortRuntimeState;
 use mantissa::services::ServiceController;
@@ -356,7 +356,6 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
     );
 
     delete_privileged_network(&node, network_id).await;
-    force_cleanup_privileged_network_links(network_id).await;
 });
 
 local_test!(nodeport_udp_public_service_reaches_backend_and_cleans_up, {
@@ -522,7 +521,6 @@ local_test!(nodeport_udp_public_service_reaches_backend_and_cleans_up, {
     );
 
     delete_privileged_network(&node, network_id).await;
-    force_cleanup_privileged_network_links(network_id).await;
 });
 
 local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
@@ -620,7 +618,6 @@ local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
 
     remove_service_via_rpc(&node.services_client, owner_service_id).await;
     delete_privileged_network(&node, network_id).await;
-    force_cleanup_privileged_network_links(network_id).await;
 });
 
 local_test!(
@@ -741,6 +738,5 @@ local_test!(
 
         remove_service_via_rpc(&node.services_client, service_id).await;
         delete_privileged_network(&node, network_id).await;
-        force_cleanup_privileged_network_links(network_id).await;
     }
 );

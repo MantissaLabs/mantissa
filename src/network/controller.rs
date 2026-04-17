@@ -20,7 +20,7 @@ use async_channel::Sender;
 #[cfg(target_os = "linux")]
 use aya::{programs::ProgramError, sys::SyscallError};
 use blake3::Hasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -658,7 +658,24 @@ impl NetworkController {
             .list_specs()
             .context("list network specifications")?;
 
-        let mut desired: HashSet<Uuid> = HashSet::with_capacity(specs.len());
+        let desired: HashSet<Uuid> = specs
+            .iter()
+            .filter(|spec| !spec.is_deleted())
+            .map(|spec| spec.id)
+            .collect();
+
+        if let Err(err) = self
+            .inner
+            .provisioner
+            .cleanup_orphaned_network_links(&desired)
+            .await
+        {
+            warn!(
+                target: "network",
+                "failed to clean orphaned kernel network interfaces: {err:#}"
+            );
+        }
+
         for spec in specs {
             if spec.is_deleted() {
                 if let Err(err) = self.teardown_deleted_network(&spec).await {
@@ -672,7 +689,6 @@ impl NetworkController {
                 continue;
             }
 
-            desired.insert(spec.id);
             if let Err(err) = self.reconcile_network(spec.clone()).await {
                 warn!(
                     target: "network",
@@ -1507,9 +1523,11 @@ impl NetworkController {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::NetworkController;
+    use super::{NetworkController, collect_orphaned_network_suffixes};
     use anyhow::Context;
     use aya::{programs::ProgramError, sys::SyscallError};
+    use std::collections::HashSet;
+    use uuid::Uuid;
 
     fn make_syscall_error() -> SyscallError {
         SyscallError {
@@ -1536,6 +1554,34 @@ mod tests {
         assert!(
             NetworkController::is_bpf_link_conflict(&err),
             "expected program error conflict to be detected"
+        );
+    }
+
+    #[test]
+    fn collects_only_orphaned_managed_network_suffixes() {
+        let live =
+            Uuid::parse_str("21523dac-bdaa-6cf5-359f-57139c6464a8").expect("valid live network id");
+        let desired = HashSet::from([live]);
+        let suffixes = collect_orphaned_network_suffixes(
+            &desired,
+            [
+                "mnhost-21523dac",
+                "mnhp-21523dac",
+                "mvx-21523dac",
+                "mnt-br-21523dac",
+                "mnhost-b3d339cd",
+                "mnt-br-b3d339cd",
+                "mvx-b3d339cd",
+                "mnhp-b3d339cd",
+                "docker0",
+                "mnhost-nothexzz",
+            ],
+        );
+
+        assert_eq!(
+            suffixes,
+            vec!["b3d339cd".to_string()],
+            "only managed suffixes that are absent from desired network ids should be collected"
         );
     }
 }
@@ -1571,6 +1617,50 @@ impl From<&NetworkPlan> for NetworkInterfaceContext {
 fn short_id(id: Uuid) -> String {
     let hex = id.simple().to_string();
     hex.chars().take(8).collect()
+}
+
+/// Returns the managed overlay interface suffix when a link name belongs to Mantissa networking.
+///
+/// Mantissa names every per-network interface from the first eight hex digits of the network id.
+/// This lets the controller detect leaked links from crashed runs and compare them against the
+/// currently replicated network set without storing extra local metadata.
+fn managed_network_interface_suffix(link_name: &str) -> Option<&str> {
+    const PREFIXES: [&str; 4] = ["mvx-", "mnt-br-", "mnhost-", "mnhp-"];
+
+    let suffix = PREFIXES
+        .into_iter()
+        .find_map(|prefix| link_name.strip_prefix(prefix))?;
+    if suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Some(suffix)
+    } else {
+        None
+    }
+}
+
+/// Collect the leaked per-network interface suffixes that do not correspond to any live network.
+///
+/// The controller uses this before reconciling active networks so orphaned host-access links from
+/// earlier crashes cannot leave duplicate connected routes that hijack host-originated health
+/// probes and embedded DNS traffic.
+fn collect_orphaned_network_suffixes<I, S>(desired: &HashSet<Uuid>, link_names: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let desired_suffixes: HashSet<String> = desired.iter().map(|id| short_id(*id)).collect();
+    let mut orphaned: BTreeSet<String> = BTreeSet::new();
+
+    for link_name in link_names {
+        let Some(suffix) = managed_network_interface_suffix(link_name.as_ref()) else {
+            continue;
+        };
+        if desired_suffixes.contains(suffix) {
+            continue;
+        }
+        orphaned.insert(suffix.to_string());
+    }
+
+    orphaned.into_iter().collect()
 }
 
 fn compute_deterministic_vni(network_id: Uuid) -> u32 {
@@ -1611,7 +1701,7 @@ fn format_mac(mac: [u8; 6]) -> String {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{NetworkPlan, VXLAN_PORT, format_mac};
+    use super::{NetworkPlan, VXLAN_PORT, collect_orphaned_network_suffixes, format_mac};
     use crate::config;
     use crate::network::attachment::{host_access_host_iface_name, host_access_peer_iface_name};
     use crate::network::wireguard::MANTISSA_WIREGUARD_IFNAME;
@@ -1712,8 +1802,103 @@ mod platform {
             self.handle.is_some()
         }
 
+        /// Delete any leaked per-network links whose suffix no longer corresponds to a live network.
+        ///
+        /// Crashed runs or externally interrupted tests can leave `mnhost-*`, `mnhp-*`, `mvx-*`,
+        /// and `mnt-br-*` interfaces behind. Those host-access links install connected overlay
+        /// routes, so a single orphan is enough to hijack host-originated health probes away from
+        /// the live overlay and make service discovery think every backend is unhealthy.
+        pub async fn cleanup_orphaned_network_links(
+            &self,
+            desired: &std::collections::HashSet<uuid::Uuid>,
+        ) -> Result<()> {
+            let Some(handle) = self.handle() else {
+                return Ok(());
+            };
+
+            let links = self
+                .list_link_indices()
+                .await
+                .context("list kernel links for orphan cleanup")?;
+            let orphaned_suffixes = collect_orphaned_network_suffixes(desired, links.keys());
+            if orphaned_suffixes.is_empty() {
+                return Ok(());
+            }
+
+            for suffix in orphaned_suffixes {
+                for link_name in [
+                    format!("mnhost-{suffix}"),
+                    format!("mnhp-{suffix}"),
+                    format!("mvx-{suffix}"),
+                    format!("mnt-br-{suffix}"),
+                ] {
+                    let Some(index) = links.get(&link_name).copied() else {
+                        continue;
+                    };
+                    self.delete_link_if_present(handle, index, &link_name)
+                        .await
+                        .with_context(|| format!("delete orphaned link {link_name}"))?;
+                }
+            }
+
+            Ok(())
+        }
+
         fn handle(&self) -> Option<&Handle> {
             self.handle.as_ref()
+        }
+
+        /// Snapshot current link names to indices so cleanup can remove leaked interfaces in one pass.
+        async fn list_link_indices(&self) -> Result<std::collections::HashMap<String, u32>> {
+            let Some(handle) = self.handle() else {
+                return Ok(std::collections::HashMap::new());
+            };
+
+            let mut links = std::collections::HashMap::new();
+            let mut stream = handle.link().get().execute();
+            while let Some(message) = stream.try_next().await.context("list links")? {
+                let Some(name) = message
+                    .attributes
+                    .iter()
+                    .find_map(|attribute| match attribute {
+                        LinkAttribute::IfName(name) => Some(name.clone()),
+                        _ => None,
+                    })
+                else {
+                    continue;
+                };
+                links.insert(name, message.header.index);
+            }
+
+            Ok(links)
+        }
+
+        /// Delete one link index while tolerating races where a parent deletion already removed it.
+        async fn delete_link_if_present(
+            &self,
+            handle: &Handle,
+            link_index: u32,
+            link_name: &str,
+        ) -> Result<()> {
+            match handle.link().del(link_index).execute().await {
+                Ok(()) => Ok(()),
+                Err(RtnetlinkError::NetlinkError(msg)) => {
+                    let errno = msg.raw_code().abs();
+                    if errno == libc::ENOENT || errno == libc::ENODEV {
+                        debug!(
+                            target: "network",
+                            link = link_name,
+                            errno,
+                            "orphan cleanup raced with link deletion; continuing"
+                        );
+                        Ok(())
+                    } else {
+                        Err(RtnetlinkError::NetlinkError(msg))
+                            .with_context(|| format!("delete link {link_name}"))
+                    }
+                }
+                Err(err) => Err(err).with_context(|| format!("delete link {link_name}")),
+            }
         }
 
         /// Compute stable interface names for the per-network host access veth pair.
@@ -3378,6 +3563,14 @@ mod platform {
         /// Report whether this platform can provision kernel interfaces and therefore bind resolver IPs.
         pub fn supports_resolver_bind(&self) -> bool {
             false
+        }
+
+        /// Unsupported platforms never create kernel overlay links, so there is nothing to clean.
+        pub async fn cleanup_orphaned_network_links(
+            &self,
+            _desired: &std::collections::HashSet<uuid::Uuid>,
+        ) -> Result<()> {
+            Ok(())
         }
 
         /// Return `None` on unsupported platforms, since no kernel interfaces are created.

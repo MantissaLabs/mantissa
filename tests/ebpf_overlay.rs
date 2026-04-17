@@ -6,9 +6,8 @@ mod common;
 use anyhow::Context;
 use common::privileged_networking::{
     PrivilegedTestGuard, command_stdout, create_privileged_network, create_privileged_node,
-    delete_privileged_network, force_cleanup_privileged_network_links, link_exists,
-    privileged_artifact_dir, privileged_network_interfaces, privileged_test_network,
-    privileged_test_subnet, privileged_test_subnet_v6,
+    delete_privileged_network, link_exists, privileged_artifact_dir, privileged_network_interfaces,
+    privileged_test_network, privileged_test_subnet, privileged_test_subnet_v6,
 };
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
@@ -629,7 +628,6 @@ local_test!(ebpf_overlay_attaches_programs_and_tears_down_cleanly, {
     assert_lb_maps_present(network.id);
 
     delete_privileged_network(&node, network.id).await;
-    force_cleanup_privileged_network_links(network.id).await;
 });
 
 local_test!(ebpf_overlay_multiple_networks_attach_and_cleanup_cleanly, {
@@ -697,7 +695,6 @@ local_test!(ebpf_overlay_multiple_networks_attach_and_cleanup_cleanly, {
     assert_lb_maps_present(network_b.id);
 
     delete_privileged_network(&node, network_a.id).await;
-    force_cleanup_privileged_network_links(network_a.id).await;
 
     for iface in &interfaces_a {
         assert!(
@@ -729,7 +726,6 @@ local_test!(ebpf_overlay_multiple_networks_attach_and_cleanup_cleanly, {
     );
 
     delete_privileged_network(&node, network_b.id).await;
-    force_cleanup_privileged_network_links(network_b.id).await;
 });
 
 local_test!(ebpf_overlay_host_vip_reaches_service_from_host_access, {
@@ -839,7 +835,6 @@ local_test!(ebpf_overlay_host_vip_reaches_service_from_host_access, {
 
     remove_service_via_rpc(&node.services_client, service_id).await;
     delete_privileged_network(&node, network_id).await;
-    force_cleanup_privileged_network_links(network_id).await;
 });
 
 local_test!(
@@ -968,7 +963,6 @@ local_test!(
 
         remove_service_via_rpc(&node.services_client, service_id).await;
         delete_privileged_network(&node, network_id).await;
-        force_cleanup_privileged_network_links(network_id).await;
     }
 );
 
@@ -1061,7 +1055,6 @@ local_test!(ebpf_overlay_vip_load_balances_across_local_replicas, {
 
     remove_service_via_rpc(&node.services_client, service_id).await;
     delete_privileged_network(&node, network_id).await;
-    force_cleanup_privileged_network_links(network_id).await;
 });
 
 local_test!(ebpf_overlay_return_path_preserves_vip_identity, {
@@ -1152,7 +1145,6 @@ local_test!(ebpf_overlay_return_path_preserves_vip_identity, {
 
     remove_service_via_rpc(&node.services_client, service_id).await;
     delete_privileged_network(&node, network_id).await;
-    force_cleanup_privileged_network_links(network_id).await;
 });
 
 local_test!(ebpf_overlay_udp_service_reaches_host_access_vip, {
@@ -1254,7 +1246,6 @@ local_test!(ebpf_overlay_udp_service_reaches_host_access_vip, {
 
     remove_service_via_rpc(&node.services_client, service_id).await;
     delete_privileged_network(&node, network_id).await;
-    force_cleanup_privileged_network_links(network_id).await;
 });
 
 local_test!(
@@ -1406,7 +1397,6 @@ local_test!(
         );
 
         delete_privileged_network(&node, network_id).await;
-        force_cleanup_privileged_network_links(network_id).await;
     }
 );
 
@@ -1511,7 +1501,6 @@ local_test!(
 
         remove_service_via_rpc(&node.services_client, service_id).await;
         delete_privileged_network(&node, network_id).await;
-        force_cleanup_privileged_network_links(network_id).await;
 
         assert!(
             common::convergence::wait_until(
@@ -1626,7 +1615,6 @@ local_test!(ebpf_overlay_heals_after_lb_map_removal, {
 
     remove_service_via_rpc(&node.services_client, service_id).await;
     delete_privileged_network(&node, network_id).await;
-    force_cleanup_privileged_network_links(network_id).await;
 });
 
 local_test!(
@@ -1667,7 +1655,6 @@ local_test!(
 
             let pin_dir = pinned_lb_map_dir(network.id);
             delete_privileged_network(&node, network.id).await;
-            force_cleanup_privileged_network_links(network.id).await;
 
             assert!(
                 common::convergence::wait_until(

@@ -6,9 +6,9 @@ mod common;
 use common::convergence::wait_until;
 use common::privileged_networking::{
     PrivilegedTestGuard, command_stdout, create_privileged_network, create_privileged_node,
-    delete_privileged_network, force_cleanup_privileged_network_links, link_exists,
-    privileged_headless_config, privileged_network_interfaces, privileged_networking_enabled,
-    privileged_test_network, privileged_test_subnet,
+    delete_privileged_network, link_exists, privileged_headless_config,
+    privileged_network_interfaces, privileged_networking_enabled, privileged_test_network,
+    privileged_test_subnet,
 };
 use crdt_store::uuid_key::UuidKey;
 use futures::TryStreamExt;
@@ -350,7 +350,6 @@ local_test!(wireguard_scoped_peer_gate_blocks_until_peer_enabled, {
     );
 
     delete_privileged_network(&node, network.id).await;
-    force_cleanup_privileged_network_links(network.id).await;
     cleanup_wireguard_interface().await;
 });
 
@@ -407,7 +406,6 @@ local_test!(wireguard_disabled_keeps_plaintext_overlay_path, {
     );
 
     delete_privileged_network(&node, network.id).await;
-    force_cleanup_privileged_network_links(network.id).await;
     cleanup_wireguard_interface().await;
 });
 
@@ -552,7 +550,6 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
     );
 
     delete_privileged_network(&restarted, network.id).await;
-    force_cleanup_privileged_network_links(network.id).await;
     cleanup_wireguard_interface().await;
 });
 
@@ -624,6 +621,5 @@ local_test!(wireguard_manage_firewall_installs_vxlan_rules, {
     );
 
     delete_privileged_network(&node, network.id).await;
-    force_cleanup_privileged_network_links(network.id).await;
     cleanup_wireguard_interface().await;
 });

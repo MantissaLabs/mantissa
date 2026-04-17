@@ -80,6 +80,12 @@ fn register_privileged_network_cleanup(network_id: Uuid) {
     guard.insert(network_id);
 }
 
+/// Stop tracking one privileged test network once explicit teardown has completed.
+fn unregister_privileged_network_cleanup(network_id: Uuid) {
+    let mut guard = privileged_network_cleanup_registry().lock();
+    guard.remove(&network_id);
+}
+
 /// Return the currently tracked privileged test networks and clear the registry in one step.
 fn take_registered_privileged_networks() -> Vec<Uuid> {
     let mut guard = privileged_network_cleanup_registry().lock();
@@ -342,6 +348,7 @@ pub async fn force_cleanup_privileged_network_links(network_id: Uuid) {
         "forced cleanup should remove leftover privileged test network state: interfaces={interfaces:?} pin_dir={}",
         pin_dir.display()
     );
+    unregister_privileged_network_cleanup(network_id);
 }
 
 /// Return the bpffs directory where one privileged test network pins its eBPF state.
@@ -349,7 +356,11 @@ fn privileged_network_bpf_pin_dir(network_id: Uuid) -> PathBuf {
     PathBuf::from("/sys/fs/bpf/mantissa").join(network_id.to_string())
 }
 
-/// Delete one privileged test overlay and wait until its kernel links disappear.
+/// Delete one privileged test overlay and always finish with explicit host-side cleanup verification.
+///
+/// The controller should remove the network state on its own, but privileged tests also force the
+/// kernel links and bpffs pins away before returning so callers cannot forget the cleanup half of
+/// the teardown sequence.
 pub async fn delete_privileged_network(node: &HeadlessNode, network_id: Uuid) {
     let Some(mut spec) = node
         .network_registry
@@ -393,9 +404,9 @@ pub async fn delete_privileged_network(node: &HeadlessNode, network_id: Uuid) {
         })
         .await;
 
+    force_delete_privileged_network_links(&interfaces);
+    let _ = std::fs::remove_dir_all(&pin_dir);
     if !cleaned_by_controller {
-        force_delete_privileged_network_links(&interfaces);
-        let _ = std::fs::remove_dir_all(&pin_dir);
         let _ = node
             .network_registry
             .remove_peer_states_for_network(network_id)
@@ -436,6 +447,7 @@ pub async fn delete_privileged_network(node: &HeadlessNode, network_id: Uuid) {
         "privileged test network {network_id} required forced cleanup; interfaces={interfaces:?} pin_dir={}",
         pin_dir.display()
     );
+    unregister_privileged_network_cleanup(network_id);
 }
 
 /// Run one host command and fail fast when it exits unsuccessfully.
