@@ -1,5 +1,5 @@
 use crate::network::attachment::host_access_peer_iface_name;
-use crate::network::types::{BpfProgramSpec, NetworkSpecValue};
+use crate::network::types::NetworkSpecValue;
 use anyhow::Result;
 use uuid::Uuid;
 
@@ -87,9 +87,7 @@ impl NetworkBpfManager {
         if spec.bpf_programs.is_empty() {
             return Ok(());
         }
-        self.platform
-            .ensure_programs(&spec.bpf_programs, interfaces)
-            .await
+        self.platform.ensure_programs(spec, interfaces).await
     }
 
     /// Tear down any previously attached programs for the network so the kernel datapath stays
@@ -101,9 +99,10 @@ impl NetworkBpfManager {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{BpfProgramSpec, NetworkInterfaceContext};
+    use super::NetworkInterfaceContext;
     use crate::config;
-    use crate::network::types::BpfAttachPoint;
+    use crate::network::allocator::{OverlayIpFamily, parse_overlay_cidr};
+    use crate::network::types::{BpfAttachPoint, BpfProgramSpec, NetworkSpecValue};
     use anyhow::{Context, Result, anyhow};
     use aya::maps::MapData;
     use aya::pin::PinError;
@@ -152,6 +151,7 @@ mod platform {
             target: AttachTarget<'_>,
             artifact: &Path,
             map_pin_path: &Path,
+            lb_family: Option<OverlayIpFamily>,
         ) -> Result<ProgramHandle>;
     }
 
@@ -164,12 +164,14 @@ mod platform {
 
     struct LoadedNetwork {
         programs: Vec<LoadedProgram>,
+        lb_family: Option<OverlayIpFamily>,
     }
 
     impl LoadedNetwork {
-        fn new() -> Self {
+        fn new(lb_family: Option<OverlayIpFamily>) -> Self {
             Self {
                 programs: Vec::new(),
+                lb_family,
             }
         }
 
@@ -184,8 +186,8 @@ mod platform {
             Ok(())
         }
 
-        fn matches(&self, specs: &[BpfProgramSpec]) -> bool {
-            self.canonical_specs() == canonical_specs(specs.iter())
+        fn matches(&self, specs: &[BpfProgramSpec], lb_family: Option<OverlayIpFamily>) -> bool {
+            self.lb_family == lb_family && self.canonical_specs() == canonical_specs(specs.iter())
         }
 
         fn canonical_specs(&self) -> Vec<(BpfAttachPoint, String)> {
@@ -218,9 +220,10 @@ mod platform {
 
         pub async fn ensure_programs(
             &self,
-            programs: &[BpfProgramSpec],
+            network: &NetworkSpecValue,
             interfaces: &NetworkInterfaceContext,
         ) -> Result<()> {
+            let programs = &network.bpf_programs;
             if !config::bpf_attach_enabled() {
                 tracing::debug!(
                     target: "network",
@@ -236,13 +239,16 @@ mod platform {
             self.validate_programs(programs, interfaces)?;
 
             let network_id = interfaces.network_id();
-            let map_pin_path = Self::map_pin_dir(network_id)?;
+            let lb_family = load_balancer_map_family(network)?;
             {
                 let guard = self.loaded.lock().await;
                 if let Some(existing) = guard.get(&network_id)
-                    && existing.matches(programs)
+                    && existing.matches(programs, lb_family)
                 {
-                    if lb_maps_required(programs) && !lb_maps_present(&map_pin_path) {
+                    let map_pin_path = Self::map_pin_path(network_id);
+                    if let Some(family) = lb_family
+                        && !lb_maps_present(&map_pin_path, family)
+                    {
                         warn!(
                             target: "network",
                             network = %network_id,
@@ -267,20 +273,29 @@ mod platform {
                     "failed to detach existing bpf programs before reattach: {err:#}"
                 );
             }
+            if let Err(err) = Self::remove_map_pin_dir(network_id) {
+                warn!(
+                    target: "network",
+                    network = %network_id,
+                    "failed to clear stale bpf map directory before reattach: {err:#}"
+                );
+            }
+            let map_pin_path = Self::map_pin_dir(network_id)?;
 
             self.clear_stale_xdp_targets(programs, interfaces);
 
             let mut ordered_programs: Vec<&BpfProgramSpec> = programs.iter().collect();
             ordered_programs.sort_by_key(|spec| attach_priority(spec.attach_point()));
 
-            let mut network = LoadedNetwork::new();
+            let mut loaded_network = LoadedNetwork::new(lb_family);
             for spec in ordered_programs {
                 let artifact = self
                     .resolver
-                    .resolve(spec)
+                    .resolve(spec, network)
                     .with_context(|| format!("resolve artifact for program '{}'", spec))?;
                 let attach_target = resolve_attach_target(spec.attach_point(), interfaces);
                 let target_ifname = interface_name(attach_target);
+                let program_lb_family = program_load_balancer_family(spec, lb_family);
 
                 info!(
                     target: "network",
@@ -298,10 +313,11 @@ mod platform {
                     attach_target,
                     &artifact,
                     &map_pin_path,
+                    program_lb_family,
                 ) {
                     Ok(handle) => handle,
                     Err(err) => {
-                        if let Err(teardown_err) = network.teardown() {
+                        if let Err(teardown_err) = loaded_network.teardown() {
                             warn!(
                                 target: "network",
                                 network = %network_id,
@@ -312,7 +328,7 @@ mod platform {
                     }
                 };
 
-                network.push(LoadedProgram {
+                loaded_network.push(LoadedProgram {
                     spec: spec.clone(),
                     _artifact: artifact,
                     handle,
@@ -320,7 +336,7 @@ mod platform {
             }
 
             let mut guard = self.loaded.lock().await;
-            if let Some(replaced) = guard.insert(network_id, network)
+            if let Some(replaced) = guard.insert(network_id, loaded_network)
                 && let Err(err) = replaced.teardown()
             {
                 warn!(
@@ -509,8 +525,10 @@ mod platform {
             }
         }
 
-        fn resolve(&self, spec: &BpfProgramSpec) -> Result<PathBuf> {
-            for candidate in self.candidates(&spec.name) {
+        fn resolve(&self, spec: &BpfProgramSpec, network: &NetworkSpecValue) -> Result<PathBuf> {
+            let family_specific_name = load_balancer_map_family(network)?
+                .and_then(|family| bridge_tc_artifact_name(spec, family));
+            for candidate in self.candidates(family_specific_name.unwrap_or(spec.name.as_str())) {
                 if candidate.exists() {
                     return Ok(candidate);
                 }
@@ -637,29 +655,70 @@ mod platform {
         }
     }
 
-    /// Return whether the configured programs expect the load balancer maps to be present.
-    fn lb_maps_required(programs: &[BpfProgramSpec]) -> bool {
-        programs.iter().any(|spec| {
+    /// Return the pinned load-balancer map names used by one single-stack bridge dataplane family.
+    fn lb_map_names(family: OverlayIpFamily) -> &'static [&'static str] {
+        match family {
+            OverlayIpFamily::Ipv4 => &["LB_VIPS", "LB_BACKENDS", "LB_FWD", "LB_REV"],
+            OverlayIpFamily::Ipv6 => &["LB_VIPS_V6", "LB_BACKENDS_V6", "LB_FWD_V6", "LB_REV_V6"],
+        }
+    }
+
+    /// Return the single-stack LB family required by one network's bridge TC programs.
+    fn load_balancer_map_family(network: &NetworkSpecValue) -> Result<Option<OverlayIpFamily>> {
+        let requires_lb = network.bpf_programs.iter().any(|spec| {
             matches!(
                 spec.attach_point(),
                 BpfAttachPoint::BridgeTcIngress | BpfAttachPoint::BridgeTcEgress
             )
-        })
+        });
+        if !requires_lb {
+            return Ok(None);
+        }
+
+        Ok(Some(parse_overlay_cidr(&network.subnet_cidr)?.family))
     }
 
-    /// Check whether the pinned load balancer maps are reachable from userspace.
-    fn lb_maps_present(base: &Path) -> bool {
-        const MAPS: &[&str] = &[
-            "LB_VIPS",
-            "LB_BACKENDS",
-            "LB_FWD",
-            "LB_REV",
-            "LB_VIPS_V6",
-            "LB_BACKENDS_V6",
-            "LB_FWD_V6",
-            "LB_REV_V6",
-        ];
-        MAPS.iter().all(|name| map_is_pinned(base, name))
+    /// Return the LB family required by one specific program being attached, if any.
+    fn program_load_balancer_family(
+        spec: &BpfProgramSpec,
+        network_lb_family: Option<OverlayIpFamily>,
+    ) -> Option<OverlayIpFamily> {
+        if matches!(
+            spec.attach_point(),
+            BpfAttachPoint::BridgeTcIngress | BpfAttachPoint::BridgeTcEgress
+        ) {
+            return network_lb_family;
+        }
+        None
+    }
+
+    /// Remap the built-in bridge TC program names to their family-specific object artifacts.
+    fn bridge_tc_artifact_name(
+        spec: &BpfProgramSpec,
+        family: OverlayIpFamily,
+    ) -> Option<&'static str> {
+        match (spec.attach_point(), spec.name.as_str(), family) {
+            (BpfAttachPoint::BridgeTcIngress, "bridge_tc_ingress", OverlayIpFamily::Ipv4) => {
+                Some("bridge_tc_ingress_v4")
+            }
+            (BpfAttachPoint::BridgeTcIngress, "bridge_tc_ingress", OverlayIpFamily::Ipv6) => {
+                Some("bridge_tc_ingress_v6")
+            }
+            (BpfAttachPoint::BridgeTcEgress, "bridge_tc_egress", OverlayIpFamily::Ipv4) => {
+                Some("bridge_tc_egress_v4")
+            }
+            (BpfAttachPoint::BridgeTcEgress, "bridge_tc_egress", OverlayIpFamily::Ipv6) => {
+                Some("bridge_tc_egress_v6")
+            }
+            _ => None,
+        }
+    }
+
+    /// Check whether the pinned load balancer maps for the requested family are reachable.
+    fn lb_maps_present(base: &Path, family: OverlayIpFamily) -> bool {
+        lb_map_names(family)
+            .iter()
+            .all(|name| map_is_pinned(base, name))
     }
 
     /// Attempt to locate a pinned map across the expected bpffs locations Aya may use.
@@ -715,19 +774,34 @@ mod platform {
         Ok(())
     }
 
-    /// Ensure LB-related maps are pinned so subsequent program loads reuse the same instances and
-    /// userspace can program them via predictable paths.
-    fn ensure_lb_maps_pinned(bpf: &mut Ebpf, base: &Path) -> Result<()> {
-        const MAPS: &[&str] = &[
-            "LB_VIPS",
-            "LB_BACKENDS",
-            "LB_FWD",
-            "LB_REV",
-            "LB_VIPS_V6",
-            "LB_BACKENDS_V6",
-            "LB_FWD_V6",
-            "LB_REV_V6",
-        ];
+    /// Remove pinned LB maps from the family that is not required by the current bridge artifact.
+    fn prune_unused_lb_maps(base: &Path, required_family: OverlayIpFamily) -> Result<()> {
+        let stale_family = match required_family {
+            OverlayIpFamily::Ipv4 => OverlayIpFamily::Ipv6,
+            OverlayIpFamily::Ipv6 => OverlayIpFamily::Ipv4,
+        };
+
+        for name in lb_map_names(stale_family) {
+            let path = base.join(name);
+            if path.exists() {
+                fs::remove_file(&path)
+                    .with_context(|| format!("remove stale lb map {}", path.display()))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Ensure only the required LB map family is pinned so unused bridge families do not reserve
+    /// large backend maps for every single-stack network.
+    fn ensure_lb_maps_pinned(
+        bpf: &mut Ebpf,
+        base: &Path,
+        required_family: Option<OverlayIpFamily>,
+    ) -> Result<()> {
+        let Some(required_family) = required_family else {
+            return Ok(());
+        };
         if let Err(err) = fs::create_dir_all(base) {
             warn!(
                 target: "network",
@@ -737,7 +811,15 @@ mod platform {
             return Ok(());
         }
 
-        for name in MAPS {
+        if let Err(err) = prune_unused_lb_maps(base, required_family) {
+            warn!(
+                target: "network",
+                path = %base.display(),
+                "failed to prune stale load balancer maps (continuing): {err:#}"
+            );
+        }
+
+        for name in lb_map_names(required_family) {
             let Some(map) = bpf.map_mut(name) else {
                 continue;
             };
@@ -861,12 +943,13 @@ mod platform {
         target: AttachTarget<'_>,
         artifact: &Path,
         map_pin_path: &Path,
+        lb_family: Option<OverlayIpFamily>,
     ) -> Result<ProgramHandle> {
         let mut attempt = 0;
         loop {
             attempt += 1;
             match loader
-                .load_and_attach(spec, target, artifact, map_pin_path)
+                .load_and_attach(spec, target, artifact, map_pin_path, lb_family)
                 .with_context(|| {
                     format!(
                         "load and attach program '{}' ({})",
@@ -1105,6 +1188,7 @@ mod platform {
             _target: AttachTarget<'_>,
             _artifact: &Path,
             _map_pin_path: &Path,
+            _lb_family: Option<OverlayIpFamily>,
         ) -> Result<ProgramHandle> {
             Ok(Box::new(NoopHandle))
         }
@@ -1127,13 +1211,15 @@ mod platform {
             target: AttachTarget<'_>,
             artifact: &Path,
             map_pin_path: &Path,
+            lb_family: Option<OverlayIpFamily>,
         ) -> Result<ProgramHandle> {
             let mut loader = EbpfLoader::new();
             loader.map_pin_path(map_pin_path);
             let mut bpf = loader
                 .load_file(artifact)
                 .with_context(|| format!("load bpf object {}", artifact.display()))?;
-            ensure_lb_maps_pinned(&mut bpf, map_pin_path).context("pin load balancer maps")?;
+            ensure_lb_maps_pinned(&mut bpf, map_pin_path, lb_family)
+                .context("pin load balancer maps")?;
 
             let program_name = spec.name.clone();
 
@@ -1359,7 +1445,17 @@ mod platform {
             config.network.bpf.artifact_dir = Some(dir.path().to_string_lossy().to_string());
             let resolver = ArtifactResolver::new_with_config(&config);
             let spec = BpfProgramSpec::new("resolver-example");
-            let resolved = resolver.resolve(&spec)?;
+            let network = NetworkSpecValue::new(NetworkSpecDraft {
+                name: "resolver-example".to_string(),
+                description: String::new(),
+                driver: NetworkDriver::Vxlan,
+                subnet_cidr: "10.200.0.0/24".to_string(),
+                vni: 42,
+                mtu: 1400,
+                sealed: false,
+                bpf_programs: vec![spec.clone()],
+            });
+            let resolved = resolver.resolve(&spec, &network)?;
             assert_eq!(resolved, artifact_path);
 
             Ok(())
@@ -1378,8 +1474,61 @@ mod platform {
             let (config, _) = load_config_with_source(None)?;
             let resolver = ArtifactResolver::new_with_config(&config);
             let spec = BpfProgramSpec::new("resolver-env-example");
-            let resolved = resolver.resolve(&spec)?;
+            let network = NetworkSpecValue::new(NetworkSpecDraft {
+                name: "resolver-env-example".to_string(),
+                description: String::new(),
+                driver: NetworkDriver::Vxlan,
+                subnet_cidr: "10.200.0.0/24".to_string(),
+                vni: 42,
+                mtu: 1400,
+                sealed: false,
+                bpf_programs: vec![spec.clone()],
+            });
+            let resolved = resolver.resolve(&spec, &network)?;
             assert_eq!(resolved, artifact_path);
+
+            Ok(())
+        }
+
+        #[test]
+        fn resolves_family_specific_bridge_artifact_from_network_subnet() -> Result<()> {
+            let dir = TempDir::new().context("create temp dir")?;
+            let v4_artifact = dir.path().join("bridge_tc_ingress_v4.bpf.o");
+            let v6_artifact = dir.path().join("bridge_tc_ingress_v6.bpf.o");
+            fs::write(&v4_artifact, b"v4").context("write IPv4 bridge artifact stub")?;
+            fs::write(&v6_artifact, b"v6").context("write IPv6 bridge artifact stub")?;
+
+            let mut config = crate::config::global_config();
+            config.network.bpf.artifact_dir = Some(dir.path().to_string_lossy().to_string());
+            let resolver = ArtifactResolver::new_with_config(&config);
+            let spec = BpfProgramSpec::with_attach_point(
+                "bridge_tc_ingress",
+                BpfAttachPoint::BridgeTcIngress,
+            );
+
+            let ipv4_network = NetworkSpecValue::new(NetworkSpecDraft {
+                name: "resolver-bridge-v4".to_string(),
+                description: String::new(),
+                driver: NetworkDriver::Vxlan,
+                subnet_cidr: "10.200.0.0/24".to_string(),
+                vni: 42,
+                mtu: 1400,
+                sealed: false,
+                bpf_programs: vec![spec.clone()],
+            });
+            let ipv6_network = NetworkSpecValue::new(NetworkSpecDraft {
+                name: "resolver-bridge-v6".to_string(),
+                description: String::new(),
+                driver: NetworkDriver::Vxlan,
+                subnet_cidr: "fd42::/64".to_string(),
+                vni: 43,
+                mtu: 1400,
+                sealed: false,
+                bpf_programs: vec![spec.clone()],
+            });
+
+            assert_eq!(resolver.resolve(&spec, &ipv4_network)?, v4_artifact);
+            assert_eq!(resolver.resolve(&spec, &ipv6_network)?, v6_artifact);
 
             Ok(())
         }
@@ -1451,6 +1600,7 @@ mod platform {
 #[cfg(not(target_os = "linux"))]
 mod platform {
     use super::{BpfProgramSpec, NetworkInterfaceContext};
+    use crate::network::types::NetworkSpecValue;
     use anyhow::Result;
 
     /// Non-Linux stub that exposes the same API surface while intentionally doing nothing.
@@ -1471,7 +1621,7 @@ mod platform {
         /// No-op placeholder to satisfy the async interface on platforms without eBPF support.
         pub async fn ensure_programs(
             &self,
-            _programs: &[BpfProgramSpec],
+            _network: &NetworkSpecValue,
             _interfaces: &NetworkInterfaceContext,
         ) -> Result<()> {
             Ok(())

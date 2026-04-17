@@ -11,6 +11,7 @@ use common::privileged_networking::{
 };
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
+use mantissa::network::allocator::{OverlayIpFamily, parse_overlay_cidr};
 use mantissa::network::types::NetworkStatus;
 use mantissa::server::headless::HeadlessNode;
 use mantissa::services::ServiceController;
@@ -42,8 +43,10 @@ fn privileged_ebpf_artifact_dir() -> Option<PathBuf> {
         &[
             "vxlan_xdp.bpf.o",
             "bridge_xdp.bpf.o",
-            "bridge_tc_ingress.bpf.o",
-            "bridge_tc_egress.bpf.o",
+            "bridge_tc_ingress_v4.bpf.o",
+            "bridge_tc_egress_v4.bpf.o",
+            "bridge_tc_ingress_v6.bpf.o",
+            "bridge_tc_egress_v6.bpf.o",
         ],
     )
 }
@@ -58,19 +61,21 @@ fn pinned_lb_map_dir(network_id: Uuid) -> PathBuf {
     PathBuf::from("/sys/fs/bpf/mantissa").join(network_id.to_string())
 }
 
-/// Assert that the standard pinned load-balancer maps are reachable for one network.
-fn assert_lb_maps_present(network_id: Uuid) {
+/// Assert that one network pins exactly the load-balancer map family required by its subnet.
+fn assert_lb_maps_present(network_id: Uuid, family: OverlayIpFamily) {
     let map_dir = pinned_lb_map_dir(network_id);
-    for map_name in [
-        "LB_VIPS",
-        "LB_BACKENDS",
-        "LB_FWD",
-        "LB_REV",
-        "LB_VIPS_V6",
-        "LB_BACKENDS_V6",
-        "LB_FWD_V6",
-        "LB_REV_V6",
-    ] {
+    let (expected, absent) = match family {
+        OverlayIpFamily::Ipv4 => (
+            ["LB_VIPS", "LB_BACKENDS", "LB_FWD", "LB_REV"],
+            ["LB_VIPS_V6", "LB_BACKENDS_V6", "LB_FWD_V6", "LB_REV_V6"],
+        ),
+        OverlayIpFamily::Ipv6 => (
+            ["LB_VIPS_V6", "LB_BACKENDS_V6", "LB_FWD_V6", "LB_REV_V6"],
+            ["LB_VIPS", "LB_BACKENDS", "LB_FWD", "LB_REV"],
+        ),
+    };
+
+    for map_name in expected {
         let pinned = map_dir.join(map_name);
         assert!(
             pinned.exists(),
@@ -78,6 +83,22 @@ fn assert_lb_maps_present(network_id: Uuid) {
             pinned.display()
         );
     }
+
+    for map_name in absent {
+        let pinned = map_dir.join(map_name);
+        assert!(
+            !pinned.exists(),
+            "unused load-balancer map {map_name} should stay absent for the opposite family: {}",
+            pinned.display()
+        );
+    }
+}
+
+/// Parse one test subnet so map-family assertions match the network under validation.
+fn overlay_family(subnet: &str) -> OverlayIpFamily {
+    parse_overlay_cidr(subnet)
+        .expect("test subnet should parse")
+        .family
 }
 
 /// Build one HTTP echo service template published on the overlay so the host-access VIP path is active.
@@ -625,7 +646,7 @@ local_test!(ebpf_overlay_attaches_programs_and_tears_down_cleanly, {
         "host-access egress qdisc should carry the bridge tc egress program: {egress_filters}"
     );
 
-    assert_lb_maps_present(network.id);
+    assert_lb_maps_present(network.id, overlay_family(&subnet));
 
     delete_privileged_network(&node, network.id).await;
 });
@@ -691,8 +712,8 @@ local_test!(ebpf_overlay_multiple_networks_attach_and_cleanup_cleanly, {
         );
     }
 
-    assert_lb_maps_present(network_a.id);
-    assert_lb_maps_present(network_b.id);
+    assert_lb_maps_present(network_a.id, overlay_family(&subnet_a));
+    assert_lb_maps_present(network_b.id, overlay_family(&subnet_b));
 
     delete_privileged_network(&node, network_a.id).await;
 
@@ -708,7 +729,7 @@ local_test!(ebpf_overlay_multiple_networks_attach_and_cleanup_cleanly, {
             "deleting network A should not tear down network B links: {iface}"
         );
     }
-    assert_lb_maps_present(network_b.id);
+    assert_lb_maps_present(network_b.id, overlay_family(&subnet_b));
 
     let [vxlan_ifname, _bridge_ifname, host_peer_ifname, _host_ifname] = interfaces_b.clone();
     let vxlan_details = command_stdout("ip", &["-d", "link", "show", "dev", &vxlan_ifname]);
@@ -1611,7 +1632,7 @@ local_test!(ebpf_overlay_heals_after_lb_map_removal, {
             vip_map.exists()
         );
     }
-    assert_lb_maps_present(network_id);
+    assert_lb_maps_present(network_id, OverlayIpFamily::Ipv4);
 
     remove_service_via_rpc(&node.services_client, service_id).await;
     delete_privileged_network(&node, network_id).await;
@@ -1651,7 +1672,7 @@ local_test!(
             )
             .await;
 
-            assert_lb_maps_present(network.id);
+            assert_lb_maps_present(network.id, overlay_family(&subnet));
 
             let pin_dir = pinned_lb_map_dir(network.id);
             delete_privileged_network(&node, network.id).await;

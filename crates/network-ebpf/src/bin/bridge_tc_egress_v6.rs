@@ -6,25 +6,26 @@ use core::{mem, ptr};
 
 use aya_ebpf::{
     bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT},
+    helpers::bpf_csum_diff,
     macros::{classifier, map},
     maps::{LruHashMap, PerCpuArray},
     programs::TcContext,
 };
 use network_ebpf::{
-    lb::{Flow4, NatEntry},
-    net::{self, EthernetHeader, Ipv4Header, UdpHeader},
+    lb::{Flow6, NatEntry6},
+    net::{self, EthernetHeader, Ipv6Header, UdpHeader},
     stats::{self, PacketStats},
 };
 
-const ETH_P_IPV4: u16 = 0x0800;
+const ETH_P_IPV6: u16 = 0x86dd;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 
 #[map(name = "BRIDGE_TC_EGRESS_STATS")]
 static mut BRIDGE_TC_EGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_entries(1, 0);
 
-#[map(name = "LB_REV")]
-static mut LB_REV: LruHashMap<Flow4, NatEntry> = LruHashMap::pinned(1024, 0);
+#[map(name = "LB_REV_V6")]
+static mut LB_REV_V6: LruHashMap<Flow6, NatEntry6> = LruHashMap::pinned(1024, 0);
 
 #[classifier]
 pub fn bridge_tc_egress(ctx: TcContext) -> i32 {
@@ -47,7 +48,7 @@ pub fn bridge_tc_egress(ctx: TcContext) -> i32 {
     }
 }
 
-/// Rewrite return-path traffic so backends present the stable service VIP identity.
+/// Rewrite return-path IPv6 traffic so backends present the stable service VIP identity.
 fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
     let data = ctx.data();
     let data_end = ctx.data_end();
@@ -55,52 +56,41 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
     let eth_hdr = unsafe { &mut *eth };
 
     match eth_hdr.protocol() {
-        ETH_P_IPV4 => handle_ipv4_packet(ctx, data, data_end, eth_hdr),
+        ETH_P_IPV6 => handle_ipv6_packet(ctx, data, data_end),
         _ => Ok(TC_ACT_OK),
     }
 }
 
-/// Apply IPv4 SNAT for packets returning from one previously selected backend.
-fn handle_ipv4_packet(
-    ctx: &mut TcContext,
-    data: usize,
-    data_end: usize,
-    eth_hdr: &mut EthernetHeader,
-) -> Result<i32, ()> {
+/// Apply IPv6 SNAT for packets returning from one previously selected backend.
+fn handle_ipv6_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Result<i32, ()> {
+    let eth_hdr: EthernetHeader = ctx.load(0).map_err(|_| ())?;
     let ip_offset = net::ETH_HDR_LEN;
-    let ip: *mut Ipv4Header =
-        unsafe { net::mut_ptr_at(data, data_end, ip_offset).map_err(|_| ())? };
-    let ip_hdr = unsafe { &mut *ip };
-    if ip_hdr.version() != 4 || ip_hdr.is_fragmented() {
+    let ip_hdr: Ipv6Header = ctx.load(ip_offset).map_err(|_| ())?;
+    if ip_hdr.version() != 6 {
         return Ok(TC_ACT_OK);
     }
-    let ihl = ip_hdr.header_len();
-    if ihl < 20 {
-        return Err(());
-    }
 
-    let proto = ip_hdr.protocol;
+    let proto = ip_hdr.next_header;
     if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
         return Ok(TC_ACT_OK);
     }
 
-    let l4_offset = ip_offset + ihl;
+    let l4_offset = ip_offset + mem::size_of::<Ipv6Header>();
     let (src_port, dst_port) = parse_ports(data, data_end, l4_offset, proto)?;
-    let reverse_key = Flow4 {
+    let reverse_key = Flow6 {
         src: ip_hdr.src,
         dst: ip_hdr.dst,
         src_port,
         dst_port,
         proto,
-        pad: 0,
-        padding: [0u8; 2],
+        padding: [0u8; 3],
     };
 
-    let Some(entry) = (unsafe { LB_REV.get(&reverse_key) }) else {
+    let Some(entry) = (unsafe { LB_REV_V6.get(&reverse_key) }) else {
         return Ok(TC_ACT_OK);
     };
 
-    apply_snat_v4(ctx, eth_hdr, ip_hdr, ip_offset, l4_offset, proto, *entry)?;
+    apply_snat_v6(ctx, &eth_hdr, &ip_hdr, ip_offset, l4_offset, proto, *entry)?;
     Ok(TC_ACT_OK)
 }
 
@@ -127,30 +117,51 @@ fn l4_checksum_offset(proto: u8) -> usize {
     }
 }
 
-/// Rewrite one IPv4 packet so the client observes the VIP instead of the backend.
-fn apply_snat_v4(
+/// Rewrite one IPv6 packet so the client observes the VIP instead of the backend.
+fn apply_snat_v6(
     ctx: &mut TcContext,
-    eth: &mut EthernetHeader,
-    ip: &mut Ipv4Header,
+    eth: &EthernetHeader,
+    ip: &Ipv6Header,
     ip_offset: usize,
     l4_offset: usize,
     proto: u8,
-    entry: NatEntry,
+    entry: NatEntry6,
 ) -> Result<(), ()> {
-    let old_src = ip.src;
-    ip.src = entry.vip;
-    eth.src = entry.vip_mac;
-    ctx.l3_csum_replace(ip_offset + 10, old_src as u64, ip.src as u64, 4)
-        .map_err(|_| ())?;
+    let mut updated_eth = *eth;
+    updated_eth.src = entry.vip_mac;
+    ctx.store(0, &updated_eth, 0).map_err(|_| ())?;
+
+    let mut updated_ip = *ip;
+    updated_ip.src = entry.vip;
+    ctx.store(ip_offset, &updated_ip, 0).map_err(|_| ())?;
+
+    let checksum_delta = ipv6_address_csum_diff(&ip.src, &entry.vip)?;
     ctx.l4_csum_replace(
         l4_offset + l4_checksum_offset(proto),
-        old_src as u64,
-        ip.src as u64,
-        (BPF_F_PSEUDO_HDR as u64) | 4,
+        0,
+        checksum_delta,
+        BPF_F_PSEUDO_HDR as u64,
     )
     .map_err(|_| ())?;
 
     Ok(())
+}
+
+/// Compute the checksum delta for one IPv6 pseudo-header address rewrite.
+fn ipv6_address_csum_diff(old: &[u8; 16], new: &[u8; 16]) -> Result<u64, ()> {
+    let diff = unsafe {
+        bpf_csum_diff(
+            old.as_ptr().cast_mut().cast(),
+            old.len() as u32,
+            new.as_ptr().cast_mut().cast(),
+            new.len() as u32,
+            0,
+        )
+    };
+    if diff < 0 {
+        return Err(());
+    }
+    Ok(diff as u64)
 }
 
 #[cfg(test)]

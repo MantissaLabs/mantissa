@@ -26,14 +26,26 @@ test = false
 bench = false
 
 [[bin]]
-name = "bridge_tc_ingress"
+name = "bridge_tc_ingress_v4"
 path = "src/bin/bridge_tc_ingress.rs"
 test = false
 bench = false
 
 [[bin]]
-name = "bridge_tc_egress"
+name = "bridge_tc_egress_v4"
 path = "src/bin/bridge_tc_egress.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "bridge_tc_ingress_v6"
+path = "src/bin/bridge_tc_ingress_v6.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "bridge_tc_egress_v6"
+path = "src/bin/bridge_tc_egress_v6.rs"
 test = false
 bench = false
 

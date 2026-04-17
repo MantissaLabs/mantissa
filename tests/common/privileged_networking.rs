@@ -304,21 +304,43 @@ pub async fn create_privileged_network(
         .schedule_spec_change(network.id)
         .await;
 
-    assert!(
-        wait_until(
-            Duration::from_secs(60),
-            Duration::from_millis(100),
-            || async {
-                matches!(
-                    node.network_registry.get_spec(network.id),
-                    Ok(Some(spec)) if spec.status == expected_status
-                )
-            }
-        )
-        .await,
-        "network {} should reach {expected_status:?}",
-        network.id
-    );
+    let reached_status = wait_until(
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        || async {
+            matches!(
+                node.network_registry.get_spec(network.id),
+                Ok(Some(spec)) if spec.status == expected_status
+            )
+        },
+    )
+    .await;
+    if !reached_status {
+        let observed_status = node
+            .network_registry
+            .get_spec(network.id)
+            .ok()
+            .flatten()
+            .map(|spec| spec.status);
+        let peer_errors: Vec<String> = node
+            .network_registry
+            .list_peer_states(Some(network.id))
+            .map(|states| {
+                states
+                    .into_iter()
+                    .filter_map(|state| {
+                        state
+                            .error
+                            .map(|error| format!("{}:{:?}:{error}", state.peer_name, state.state))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        panic!(
+            "network {} should reach {expected_status:?}; observed_status={observed_status:?}; peer_errors={peer_errors:?}",
+            network.id
+        );
+    }
 
     network
 }

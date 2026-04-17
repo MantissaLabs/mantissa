@@ -309,8 +309,10 @@ fn build_bpf() -> Result<()> {
     for program in [
         "vxlan_xdp",
         "bridge_xdp",
-        "bridge_tc_ingress",
-        "bridge_tc_egress",
+        "bridge_tc_ingress_v4",
+        "bridge_tc_egress_v4",
+        "bridge_tc_ingress_v6",
+        "bridge_tc_egress_v6",
         "nodeport_tc_ingress",
         "nodeport_tc_egress",
     ] {
