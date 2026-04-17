@@ -185,7 +185,12 @@ impl Topology {
             return Ok(s);
         }
 
-        let ip = compute_advertise_ip(None, None).map_err(|e| {
+        let preferred_family = match config::default_ip_family_policy() {
+            crate::ip_family::DefaultIpFamilyPolicy::Ipv6 => Some(crate::ip_family::IpFamily::Ipv6),
+            crate::ip_family::DefaultIpFamilyPolicy::Ipv4 => Some(crate::ip_family::IpFamily::Ipv4),
+            crate::ip_family::DefaultIpFamilyPolicy::Auto => None,
+        };
+        let ip = compute_advertise_ip(None, None, preferred_family).map_err(|e| {
             io::Error::new(e.kind(), format!("failed to compute advertise ip: {e}"))
         })?;
 

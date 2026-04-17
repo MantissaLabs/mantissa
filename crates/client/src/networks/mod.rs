@@ -6,6 +6,7 @@ mod list;
 mod status;
 mod types;
 
+use crate::config::NetworkIpFamily;
 use blake3::Hasher;
 
 pub use attachments::{attachments, attachments_raw};
@@ -19,8 +20,10 @@ pub use types::{
     NetworkPeerStatus, NetworkSpec, NetworkStatus, NetworkSummary,
 };
 
-const DEFAULT_NETWORK_SUBNET_PREFIX: u8 = 20;
-const DEFAULT_NETWORK_SUBNET_CANDIDATES: u16 = 1 << 12;
+const DEFAULT_NETWORK_SUBNET_PREFIX_V4: u8 = 20;
+const DEFAULT_NETWORK_SUBNET_CANDIDATES_V4: u32 = 1 << 12;
+const DEFAULT_NETWORK_SUBNET_PREFIX_V6: u8 = 64;
+const DEFAULT_NETWORK_SUBNET_CANDIDATES_V6: u32 = 1 << 16;
 
 /// Return the baseline dataplane programs required for VXLAN overlays so auto-provisioned
 /// networks behave consistently with CLI defaults.
@@ -37,9 +40,13 @@ pub fn default_network_bpf_programs() -> Vec<String> {
 ///
 /// Automatic network provisioning must not hand out the same CIDR to unrelated overlays, or
 /// host-side readiness probes and resolver ownership will race on overlapping connected routes.
-/// This derives a private `/20` from the network name hash and linearly probes until it finds a
-/// default-range CIDR that is not already taken.
-pub fn default_network_subnet<I, S>(name: &str, existing_subnets: I) -> String
+/// This derives a private subnet from the network name hash in the requested family and linearly
+/// probes until it finds one default-range CIDR that is not already taken.
+pub fn default_network_subnet<I, S>(
+    name: &str,
+    existing_subnets: I,
+    family: NetworkIpFamily,
+) -> String
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -48,40 +55,67 @@ where
         .into_iter()
         .map(|subnet| subnet.as_ref().trim().to_string())
         .collect();
-    let seed = default_network_subnet_seed(name);
+    let hash = default_network_subnet_hash(name);
+    let candidates = default_network_subnet_candidate_count(family);
 
-    for offset in 0..DEFAULT_NETWORK_SUBNET_CANDIDATES {
-        let candidate = default_network_subnet_candidate(seed.wrapping_add(offset));
+    for offset in 0..candidates {
+        let candidate = default_network_subnet_candidate(hash, offset, family);
         if !used.contains(&candidate) {
             return candidate;
         }
     }
 
-    default_network_subnet_candidate(seed)
+    default_network_subnet_candidate(hash, 0, family)
 }
 
-/// Hash one network name into the default-subnet candidate space.
-fn default_network_subnet_seed(name: &str) -> u16 {
+/// Hash one network name into a stable 32-bit subnet-selection seed.
+fn default_network_subnet_hash(name: &str) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(name.as_bytes());
     let digest = hasher.finalize();
-    let mut bytes = [0u8; 2];
-    bytes.copy_from_slice(&digest.as_bytes()[..2]);
-    u16::from_le_bytes(bytes) & (DEFAULT_NETWORK_SUBNET_CANDIDATES - 1)
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&digest.as_bytes()[..4]);
+    u32::from_le_bytes(bytes)
 }
 
-/// Convert one candidate index into a unique `10.0.0.0/8` `/20` subnet.
-fn default_network_subnet_candidate(index: u16) -> String {
-    let bucket = index % DEFAULT_NETWORK_SUBNET_CANDIDATES;
+/// Return the number of deterministic default-subnet candidates available for one family.
+fn default_network_subnet_candidate_count(family: NetworkIpFamily) -> u32 {
+    match family {
+        NetworkIpFamily::Ipv4 => DEFAULT_NETWORK_SUBNET_CANDIDATES_V4,
+        NetworkIpFamily::Ipv6 => DEFAULT_NETWORK_SUBNET_CANDIDATES_V6,
+    }
+}
+
+/// Convert one candidate offset into a unique default subnet in the requested address family.
+fn default_network_subnet_candidate(hash: u32, offset: u32, family: NetworkIpFamily) -> String {
+    match family {
+        NetworkIpFamily::Ipv4 => default_network_subnet_candidate_v4(hash, offset),
+        NetworkIpFamily::Ipv6 => default_network_subnet_candidate_v6(hash, offset),
+    }
+}
+
+/// Convert one candidate offset into a unique `10.0.0.0/8` `/20` subnet.
+fn default_network_subnet_candidate_v4(hash: u32, offset: u32) -> String {
+    let seed = hash & (DEFAULT_NETWORK_SUBNET_CANDIDATES_V4 - 1);
+    let bucket = seed.wrapping_add(offset) & (DEFAULT_NETWORK_SUBNET_CANDIDATES_V4 - 1);
     let second_octet = (bucket >> 4) as u8;
     let third_octet = ((bucket & 0x0f) << 4) as u8;
-    format!("10.{second_octet}.{third_octet}.0/{DEFAULT_NETWORK_SUBNET_PREFIX}")
+    format!("10.{second_octet}.{third_octet}.0/{DEFAULT_NETWORK_SUBNET_PREFIX_V4}")
+}
+
+/// Convert one candidate offset into a unique `fd42::/16` `/64` subnet.
+fn default_network_subnet_candidate_v6(hash: u32, offset: u32) -> String {
+    let group = (hash >> 16) as u16;
+    let seed = hash as u16;
+    let bucket = seed.wrapping_add(offset as u16);
+    format!("fd42:{group:04x}:{bucket:04x}::/{DEFAULT_NETWORK_SUBNET_PREFIX_V6}")
 }
 
 /// Build a default network creation request used by service deployments to auto-provision networks.
 pub fn default_network_create_request<I, S>(
     name: impl Into<String>,
     existing_subnets: I,
+    family: NetworkIpFamily,
 ) -> NetworkCreateRequest
 where
     I: IntoIterator<Item = S>,
@@ -96,7 +130,7 @@ where
         name: name.clone(),
         description: None,
         driver: NetworkDriver::Vxlan,
-        subnet_cidr: default_network_subnet(&name, existing_subnets),
+        subnet_cidr: default_network_subnet(&name, existing_subnets, family),
         vni: None,
         mtu: None,
         bpf_programs: programs,
@@ -107,11 +141,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::{default_network_create_request, default_network_subnet};
+    use crate::config::NetworkIpFamily;
 
     #[test]
-    fn default_network_subnet_varies_by_name() {
-        let left = default_network_subnet("discovery-demo", std::iter::empty::<&str>());
-        let right = default_network_subnet("discovery-demo-2", std::iter::empty::<&str>());
+    fn default_network_subnet_varies_by_name_for_ipv4() {
+        let left = default_network_subnet(
+            "discovery-demo",
+            std::iter::empty::<&str>(),
+            NetworkIpFamily::Ipv4,
+        );
+        let right = default_network_subnet(
+            "discovery-demo-2",
+            std::iter::empty::<&str>(),
+            NetworkIpFamily::Ipv4,
+        );
         assert_ne!(
             left, right,
             "different network names should not collapse onto the same default subnet"
@@ -119,9 +162,28 @@ mod tests {
     }
 
     #[test]
-    fn default_network_subnet_skips_used_defaults() {
-        let initial = default_network_subnet("alpha", std::iter::empty::<&str>());
-        let resolved = default_network_subnet("alpha", [initial.as_str()]);
+    fn default_network_subnet_varies_by_name_for_ipv6() {
+        let left = default_network_subnet(
+            "discovery-demo",
+            std::iter::empty::<&str>(),
+            NetworkIpFamily::Ipv6,
+        );
+        let right = default_network_subnet(
+            "discovery-demo-2",
+            std::iter::empty::<&str>(),
+            NetworkIpFamily::Ipv6,
+        );
+        assert_ne!(
+            left, right,
+            "different network names should not collapse onto the same IPv6 default subnet"
+        );
+    }
+
+    #[test]
+    fn default_network_subnet_skips_used_defaults_for_ipv4() {
+        let initial =
+            default_network_subnet("alpha", std::iter::empty::<&str>(), NetworkIpFamily::Ipv4);
+        let resolved = default_network_subnet("alpha", [initial.as_str()], NetworkIpFamily::Ipv4);
         assert_ne!(
             initial, resolved,
             "default subnet selection should probe away from an already used default range"
@@ -129,11 +191,37 @@ mod tests {
     }
 
     #[test]
-    fn default_network_create_request_uses_resolved_default_subnet() {
-        let request = default_network_create_request("demo", ["10.0.0.0/20"]);
+    fn default_network_subnet_skips_used_defaults_for_ipv6() {
+        let initial =
+            default_network_subnet("alpha", std::iter::empty::<&str>(), NetworkIpFamily::Ipv6);
+        let resolved = default_network_subnet("alpha", [initial.as_str()], NetworkIpFamily::Ipv6);
+        assert_ne!(
+            initial, resolved,
+            "IPv6 default subnet selection should probe away from an already used default range"
+        );
+    }
+
+    #[test]
+    fn default_network_create_request_uses_resolved_default_subnet_for_ipv4() {
+        let request =
+            default_network_create_request("demo", ["10.0.0.0/20"], NetworkIpFamily::Ipv4);
         assert!(
             request.subnet_cidr.ends_with("/20"),
             "auto-provisioned networks should use the deterministic /20 default range"
+        );
+    }
+
+    #[test]
+    fn default_network_create_request_uses_resolved_default_subnet_for_ipv6() {
+        let request =
+            default_network_create_request("demo", ["fd42:1234:5678::/64"], NetworkIpFamily::Ipv6);
+        assert!(
+            request.subnet_cidr.starts_with("fd42:"),
+            "auto-provisioned IPv6 networks should stay inside the default ULA range"
+        );
+        assert!(
+            request.subnet_cidr.ends_with("/64"),
+            "auto-provisioned IPv6 networks should use deterministic /64 defaults"
         );
     }
 }

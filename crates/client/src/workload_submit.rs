@@ -1,8 +1,10 @@
 use crate::config::ClientConfig;
+use crate::config::NetworkIpFamily;
 use crate::networks;
 use crate::volumes;
 use anyhow::{Result, anyhow};
 use blake3::Hasher;
+use serde::{Deserialize, Deserializer};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -41,6 +43,21 @@ pub struct ResolvedDeclaredVolume {
     pub volume_name: String,
 }
 
+/// One top-level manifest network declaration used to override auto-created network defaults.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ManifestNetworkSpec {
+    pub name: String,
+    #[serde(default, deserialize_with = "deserialize_optional_network_ip_family")]
+    pub ip_family: Option<NetworkIpFamily>,
+}
+
+/// One normalized network request returned after manifest-side network resolution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestedNetworkSpec {
+    pub name: String,
+    pub ip_family: Option<NetworkIpFamily>,
+}
+
 /// Derive the canonical network UUID from the manifest-facing network name.
 pub fn compute_network_id(name: &str) -> Uuid {
     let mut hasher = Hasher::new();
@@ -51,21 +68,100 @@ pub fn compute_network_id(name: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-/// Ensure every referenced manifest network exists before submission.
-pub async fn ensure_named_networks(
-    cfg: &ClientConfig,
-    required_networks: impl IntoIterator<Item = String>,
+/// Deserialize one optional manifest network family while accepting bare `ipv4` / `ipv6` syntax.
+fn deserialize_optional_network_ip_family<'de, D>(
+    deserializer: D,
+) -> Result<Option<NetworkIpFamily>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    NetworkIpFamily::deserialize(deserializer).map(Some)
+}
+
+/// Validate one set of top-level manifest network declarations before submission.
+pub fn validate_declared_networks(
+    declared_networks: &[ManifestNetworkSpec],
+    context: &str,
 ) -> Result<()> {
-    let mut required = Vec::new();
     let mut seen = HashSet::new();
-    for network in required_networks {
-        let trimmed = network.trim();
+    for network in declared_networks {
+        let trimmed = network.name.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("{context} declares a network with an empty name"));
+        }
+        if !seen.insert(trimmed.to_string()) {
+            return Err(anyhow!(
+                "{context} declares network '{}' multiple times",
+                trimmed
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve manifest network references against optional top-level family overrides.
+pub fn resolve_requested_networks<I, S>(
+    referenced_networks: I,
+    declared_networks: &[ManifestNetworkSpec],
+    context: &str,
+) -> Result<Vec<RequestedNetworkSpec>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    validate_declared_networks(declared_networks, context)?;
+
+    let mut overrides = HashMap::new();
+    for network in declared_networks {
+        overrides.insert(network.name.trim().to_string(), network.ip_family);
+    }
+
+    let mut requested = Vec::new();
+    let mut seen = HashSet::new();
+    for network in referenced_networks {
+        let trimmed = network.as_ref().trim();
         if trimmed.is_empty() {
             continue;
         }
         if seen.insert(trimmed.to_string()) {
-            required.push(trimmed.to_string());
+            requested.push(RequestedNetworkSpec {
+                name: trimmed.to_string(),
+                ip_family: overrides.get(trimmed).copied().flatten(),
+            });
         }
+    }
+
+    Ok(requested)
+}
+
+/// Ensure every referenced manifest network exists before submission.
+pub async fn ensure_named_networks(
+    cfg: &ClientConfig,
+    required_networks: impl IntoIterator<Item = RequestedNetworkSpec>,
+) -> Result<()> {
+    let mut required = Vec::new();
+    let mut seen = HashMap::new();
+    for network in required_networks {
+        let trimmed = network.name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(existing_family) = seen.get(trimmed).copied().flatten() {
+            if let Some(requested_family) = network.ip_family
+                && existing_family != requested_family
+            {
+                return Err(anyhow!(
+                    "manifest requests network '{}' with conflicting IP families",
+                    trimmed
+                ));
+            }
+            continue;
+        }
+        seen.insert(trimmed.to_string(), network.ip_family);
+        required.push(RequestedNetworkSpec {
+            name: trimmed.to_string(),
+            ip_family: network.ip_family,
+        });
     }
 
     if required.is_empty() {
@@ -77,25 +173,31 @@ pub async fn ensure_named_networks(
     let mut known_subnets: HashSet<String> =
         existing.iter().map(|net| net.subnet_cidr.clone()).collect();
 
-    for name in required {
-        if existing_names.contains(&name) {
+    for requested in required {
+        if existing_names.contains(&requested.name) {
             continue;
         }
 
+        let family = requested.ip_family.unwrap_or(cfg.default_network_ip_family);
         let request = networks::default_network_create_request(
-            name.clone(),
+            requested.name.clone(),
             known_subnets.iter().map(String::as_str),
+            family,
         );
         match networks::create_raw(cfg, &request).await {
             Ok(network_id) => {
-                println!("network '{name}' created with id {network_id} (auto-provisioned)");
+                println!(
+                    "network '{}' created with id {network_id} (auto-provisioned)",
+                    requested.name
+                );
                 known_subnets.insert(request.subnet_cidr.clone());
             }
             Err(error) => {
                 let fallback = networks::list_raw(cfg).await?;
-                if fallback.iter().any(|net| net.name == name) {
+                if fallback.iter().any(|net| net.name == requested.name) {
                     eprintln!(
-                        "warning: auto-provision for network '{name}' failed but it already exists: {error}"
+                        "warning: auto-provision for network '{}' failed but it already exists: {error}",
+                        requested.name
                     );
                     continue;
                 }

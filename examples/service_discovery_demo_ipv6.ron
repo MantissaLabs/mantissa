@@ -1,0 +1,67 @@
+// End-to-end IPv6 service discovery and public ingress demo.
+//
+// This manifest explicitly asks for an IPv6 overlay when Mantissa auto-creates the
+// `discovery-demo-ipv6` network. On dual-stack hosts, set `network.default_ip_family = ipv6`
+// if you also want NodePort publication to prefer the node's IPv6 address.
+(
+    name: "discovery-demo-ipv6",
+    networks: [
+        (
+            name: "discovery-demo-ipv6",
+            ip_family: ipv6,
+        ),
+    ],
+    tasks: [
+        (
+            name: "backend",
+            image: "hashicorp/http-echo:1.0.0",
+            command: [
+                "-listen",
+                ":8000",
+                "-text",
+                "hello from backend replica",
+            ],
+            replicas: 4,
+            resources: (
+                cpu_millis: 200,
+                memory_mb: 64,
+            ),
+            networks: ["discovery-demo-ipv6"],
+            env: [],
+            secret_files: [],
+            readiness: Some((
+                kind: http,
+                port: 8000,
+                path: Some("/"),
+            )),
+            liveness: Some((
+                kind: http,
+                port: 8000,
+                path: Some("/"),
+                interval_ms: 2000,
+                timeout_ms: 1000,
+                failure_threshold: 2,
+                start_period_ms: 1000,
+            )),
+            public_port: Some(8000),
+        ),
+        (
+            name: "frontend",
+            image: "curlimages/curl:8.9.1",
+            depends_on: ["backend"],
+            command: [
+                "sh",
+                "-c",
+                "while true; do printf '\\n---\\n' && date; curl --connect-timeout 5 --max-time 5 --no-keepalive --retry 0 -sS -w '\\n[curl] http=%{http_code} remote=%{remote_ip} dns=%{time_namelookup}s connect=%{time_connect}s start=%{time_starttransfer}s total=%{time_total}s\\n' http://backend.discovery-demo-ipv6.svc.mantissa:8000; rc=$?; echo \"[curl] rc=$rc\"; sleep 2; done",
+            ],
+            replicas: 1,
+            resources: (
+                cpu_millis: 200,
+                memory_mb: 64,
+            ),
+            networks: ["discovery-demo-ipv6"],
+            env: [],
+            secret_files: [],
+        ),
+    ],
+)

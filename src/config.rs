@@ -14,6 +14,8 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::ip_family::DefaultIpFamilyPolicy;
+
 /// # Description:
 ///
 /// Root configuration container loaded from the Mantissa RON config file.
@@ -53,6 +55,8 @@ pub struct StorageConfig {
 pub struct NetworkConfig {
     #[serde(default)]
     pub advertise_addr: Option<String>,
+    #[serde(default)]
+    pub default_ip_family: DefaultIpFamilyPolicy,
     #[serde(default = "default_true")]
     pub provision_kernel_interfaces: bool,
     #[serde(default)]
@@ -70,6 +74,7 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             advertise_addr: None,
+            default_ip_family: DefaultIpFamilyPolicy::Auto,
             provision_kernel_interfaces: true,
             wireguard: WireguardConfig::default(),
             bpf: BpfConfig::default(),
@@ -475,6 +480,14 @@ pub fn advertise_addr() -> Option<String> {
 
 /// # Description:
 ///
+/// Resolve the configured default IP-family policy used by auto-created networks and best-effort
+/// node identity autodetection.
+pub fn default_ip_family_policy() -> DefaultIpFamilyPolicy {
+    global_config().network.default_ip_family
+}
+
+/// # Description:
+///
 /// Resolve whether Mantissa should provision kernel network interfaces on this node.
 pub fn kernel_network_provisioning_enabled() -> bool {
     global_config().network.provision_kernel_interfaces
@@ -869,6 +882,15 @@ impl Config {
                 self.network.advertise_addr = Some(addr.to_string());
             }
         }
+        if let Ok(raw) = std::env::var("MANTISSA_DEFAULT_IP_FAMILY") {
+            applied = true;
+            match raw.trim() {
+                "auto" => self.network.default_ip_family = DefaultIpFamilyPolicy::Auto,
+                "ipv4" => self.network.default_ip_family = DefaultIpFamilyPolicy::Ipv4,
+                "ipv6" => self.network.default_ip_family = DefaultIpFamilyPolicy::Ipv6,
+                other => warn!("ignoring invalid MANTISSA_DEFAULT_IP_FAMILY '{other}'"),
+            }
+        }
 
         if let Ok(host) = std::env::var("MANTISSA_RUNTIME_OCI_HOST") {
             applied = true;
@@ -1250,6 +1272,10 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
         changes.push("network.advertise_addr".to_string());
     }
 
+    if old.network.default_ip_family != new.network.default_ip_family {
+        changes.push("network.default_ip_family".to_string());
+    }
+
     if old.network.provision_kernel_interfaces != new.network.provision_kernel_interfaces {
         changes.push("network.provision_kernel_interfaces".to_string());
     }
@@ -1321,6 +1347,15 @@ mod tests {
     }
 
     #[test]
+    fn default_ip_family_defaults_to_auto() {
+        let config = Config::default();
+        assert_eq!(
+            config.network.default_ip_family,
+            DefaultIpFamilyPolicy::Auto
+        );
+    }
+
+    #[test]
     fn rejects_unspecified_socket_advertise_addr() {
         let mut config = Config::default();
         config.network.advertise_addr = Some("0.0.0.0:6578".to_string());
@@ -1380,6 +1415,7 @@ mod tests {
             std::env::set_var("MANTISSA_BPF_NO_ATTACH", "1");
             std::env::set_var("MANTISSA_NODEPORT_IFACE", "eth0");
             std::env::set_var("MANTISSA_ADVERTISE_ADDR", "node-1.example.com:6578");
+            std::env::set_var("MANTISSA_DEFAULT_IP_FAMILY", "ipv6");
             std::env::set_var("MANTISSA_RUNTIME_OCI_HOST", "unix:///var/run/docker.sock");
             std::env::set_var("MANTISSA_GPU_DEVICE_OVERRIDES", "uuid:GPU-abc=id:GPU-abc");
             std::env::set_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY", "1");
@@ -1408,6 +1444,10 @@ mod tests {
             Some("node-1.example.com:6578")
         );
         assert_eq!(
+            config.network.default_ip_family,
+            DefaultIpFamilyPolicy::Ipv6
+        );
+        assert_eq!(
             config.runtimes.oci.host.as_deref(),
             Some("unix:///var/run/docker.sock")
         );
@@ -1433,6 +1473,7 @@ mod tests {
             std::env::remove_var("MANTISSA_BPF_NO_ATTACH");
             std::env::remove_var("MANTISSA_NODEPORT_IFACE");
             std::env::remove_var("MANTISSA_ADVERTISE_ADDR");
+            std::env::remove_var("MANTISSA_DEFAULT_IP_FAMILY");
             std::env::remove_var("MANTISSA_RUNTIME_OCI_HOST");
             std::env::remove_var("MANTISSA_GPU_DEVICE_OVERRIDES");
             std::env::remove_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY");
@@ -1483,6 +1524,20 @@ mod tests {
             changes
                 .iter()
                 .any(|change| change == "network.advertise_addr")
+        );
+    }
+
+    #[test]
+    fn default_ip_family_change_requires_restart() {
+        let old = Config::default();
+        let mut new = Config::default();
+        new.network.default_ip_family = DefaultIpFamilyPolicy::Ipv6;
+
+        let changes = restart_required_changes(&old, &new);
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "network.default_ip_family")
         );
     }
 }

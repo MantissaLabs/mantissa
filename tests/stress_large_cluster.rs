@@ -163,6 +163,7 @@ fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
     ServiceManifest {
         name: name.to_string(),
         volumes: Vec::new(),
+        networks: Vec::new(),
         update: ServiceUpdateStrategy::default(),
         task_templates: vec![TaskTemplateSpec {
             name: "stress-backend".to_string(),

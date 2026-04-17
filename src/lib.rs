@@ -15,6 +15,7 @@ pub mod crypto;
 mod dedupe;
 pub mod gossip;
 pub mod gpu;
+mod ip_family;
 pub mod jobs;
 pub mod logger;
 pub mod network;

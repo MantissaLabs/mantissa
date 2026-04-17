@@ -30,7 +30,7 @@ async fn prepare_manifest_submit_spec(
     path: &Path,
 ) -> Result<PreparedAgentSessionSpec> {
     let manifest = load_manifest_from_path(path)?;
-    ensure_named_networks(cfg, manifest.execution.networks.clone()).await?;
+    ensure_named_networks(cfg, manifest.requested_networks()?).await?;
     let resolved_volumes = ensure_declared_volumes(cfg, &manifest.declared_volume_specs()).await?;
 
     Ok(PreparedAgentSessionSpec {

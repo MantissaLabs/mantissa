@@ -1,11 +1,13 @@
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use client::config::ClientConfig;
+use client::config::NetworkIpFamily;
 use std::path::Path;
 use tokio::task::LocalSet;
 
 use crate::cli::*;
 use crate::config;
+use crate::ip_family::{IpFamily, infer_default_ip_family};
 use crate::server::RunMode;
 
 /// Parses process arguments, initializes shared runtime state, and dispatches CLI commands.
@@ -42,6 +44,24 @@ fn resolve_local_volume_ownership(
     }
 }
 
+/// Resolves the preferred family for auto-created overlay networks from explicit node addressing.
+///
+/// Automatic network creation should follow the operator's declared node IP family so service and
+/// job manifests can produce IPv6 overlays without an extra manual network creation step.
+fn resolve_default_network_ip_family() -> NetworkIpFamily {
+    let (has_ipv4, has_ipv6) = crate::node::address::detect_outbound_ip_families();
+    match infer_default_ip_family(
+        config::nodeport_ip(),
+        config::advertise_addr().as_deref(),
+        config::default_ip_family_policy(),
+        has_ipv4,
+        has_ipv6,
+    ) {
+        IpFamily::Ipv4 => NetworkIpFamily::Ipv4,
+        IpFamily::Ipv6 => NetworkIpFamily::Ipv6,
+    }
+}
+
 /// Executes the CLI command dispatcher for pre-parsed arguments.
 ///
 /// Keeping this path in the library avoids compiling the application module graph through
@@ -61,7 +81,10 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
     let _config_watcher = config::spawn_config_watcher();
 
     // Global listen address (only used by `init`/daemon start)
-    let mut cfg = ClientConfig::default();
+    let mut cfg = ClientConfig {
+        default_network_ip_family: resolve_default_network_ip_family(),
+        ..ClientConfig::default()
+    };
 
     match cmd {
         Command::Init(init) => {
@@ -554,6 +577,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                         client::networks::default_network_subnet(
                             &args.name,
                             existing.iter().map(|net| net.subnet_cidr.as_str()),
+                            cfg.default_network_ip_family,
                         )
                     }
                 };

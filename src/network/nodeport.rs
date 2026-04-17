@@ -243,6 +243,7 @@ mod platform {
         nodeport_capacity_error, projected_active_networks_after_sync,
     };
     use crate::config;
+    use crate::ip_family::{IpFamily, infer_default_ip_family};
     use crate::network::attachment::host_access_host_iface_name;
     use crate::network::wireguard::MANTISSA_WIREGUARD_IFNAME;
     use anyhow::{Context, Result, anyhow};
@@ -847,6 +848,21 @@ mod platform {
             self.set_runtime_status(NodePortRuntimeState::Degraded, Some(error.into()), message);
         }
 
+        /// Resolve the preferred family used when nodeport autodetect must choose between IPv4 and IPv6.
+        fn preferred_runtime_family(&self) -> NodePortIpFamily {
+            let (has_ipv4, has_ipv6) = crate::node::address::detect_outbound_ip_families();
+            match infer_default_ip_family(
+                self.configured_node_ip,
+                self.configured_advertise_addr.as_deref(),
+                config::default_ip_family_policy(),
+                has_ipv4,
+                has_ipv6,
+            ) {
+                IpFamily::Ipv4 => NodePortIpFamily::Ipv4,
+                IpFamily::Ipv6 => NodePortIpFamily::Ipv6,
+            }
+        }
+
         /// Re-resolve the runtime iface and node IP from explicit config before any fallback.
         async fn refresh_runtime_identity(&mut self) -> Result<()> {
             self.iface = self.configured_iface.clone();
@@ -854,10 +870,11 @@ mod platform {
                 self.configured_node_ip,
                 self.configured_advertise_addr.as_deref(),
             );
+            let preferred_family = Some(self.preferred_runtime_family());
 
             if let Some(iface) = self.iface.clone() {
                 if self.node_ip.is_none() {
-                    self.node_ip = detect_iface_ip(&iface, None).await?;
+                    self.node_ip = detect_iface_ip(&iface, preferred_family).await?;
                 }
                 return Ok(());
             }
@@ -867,7 +884,7 @@ mod platform {
                 return Ok(());
             }
 
-            if let Some((iface, ip)) = detect_default_iface().await? {
+            if let Some((iface, ip)) = detect_default_iface(preferred_family).await? {
                 self.iface = Some(iface);
                 self.node_ip = Some(ip);
             }
@@ -1252,10 +1269,12 @@ mod platform {
 
     /// Pick the first up, non-loopback interface that has a usable NodePort address.
     ///
-    /// IPv4 stays the default preference so existing operators keep the same best-effort behavior
-    /// when they have not pinned `network.nodeport.ip`, but IPv6-only hosts can still auto-resolve
-    /// a usable identity.
-    async fn detect_default_iface() -> Result<Option<(String, IpAddr)>> {
+    /// The preferred family comes from the same default-family policy used by auto-created
+    /// networks, so IPv6-only hosts resolve an IPv6 identity automatically while dual-stack
+    /// hosts keep the existing IPv4-first behavior unless the operator explicitly prefers IPv6.
+    async fn detect_default_iface(
+        preferred_family: Option<NodePortIpFamily>,
+    ) -> Result<Option<(String, IpAddr)>> {
         let (conn, handle, _) =
             new_connection().context("open rtnetlink connection for nodeport autodetect")?;
         tokio::spawn(conn);
@@ -1288,7 +1307,7 @@ mod platform {
                 .await
                 .context("enumerate nodeport autodetect addresses")?
             {
-                if let Some(ip) = first_ip_from_address_attrs(&msg.attributes, None) {
+                if let Some(ip) = first_ip_from_address_attrs(&msg.attributes, preferred_family) {
                     return Ok(Some((name.clone(), ip)));
                 }
             }

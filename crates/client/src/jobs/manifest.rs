@@ -2,7 +2,10 @@ use crate::runtime_contract::{
     DEFAULT_EXECUTION_PLATFORM, normalize_execution_platform, normalize_isolation_mode,
     normalize_isolation_profile,
 };
-use crate::workload_submit::{DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec};
+use crate::workload_submit::{
+    DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec, ManifestNetworkSpec,
+    RequestedNetworkSpec, resolve_requested_networks, validate_declared_networks,
+};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -22,6 +25,8 @@ pub struct JobManifest {
     pub isolation_profile: Option<String>,
     #[serde(default)]
     pub volumes: Vec<JobVolumeSpec>,
+    #[serde(default)]
+    pub networks: Vec<ManifestNetworkSpec>,
     pub execution: JobExecutionSpec,
     #[serde(default)]
     pub retry_policy: JobRetryPolicySpec,
@@ -251,12 +256,23 @@ impl JobManifest {
             return Err(anyhow!("job manifest must specify execution.image"));
         }
 
+        validate_declared_networks(&self.networks, "job manifest")?;
+
         normalize_execution_platform(&self.execution_platform)?;
         normalize_isolation_mode(&self.isolation_mode)?;
 
         let declared_volume_names = validate_declared_volumes(&self.volumes)?;
         validate_execution(&self.execution, &declared_volume_names)?;
         Ok(())
+    }
+
+    /// Resolves the manifest network references into auto-provision requests.
+    pub(crate) fn requested_networks(&self) -> Result<Vec<RequestedNetworkSpec>> {
+        resolve_requested_networks(
+            self.execution.networks.iter().map(String::as_str),
+            &self.networks,
+            "job manifest",
+        )
     }
 
     /// Converts the manifest-declared volumes into the shared provisioning helper shape.
@@ -662,6 +678,7 @@ mod tests {
                 capacity_mb: Some(32),
                 labels: Vec::new(),
             }],
+            networks: Vec::new(),
             execution: JobExecutionSpec {
                 image: "ghcr.io/demo/job:latest".to_string(),
                 command: vec!["echo".to_string(), "hello".to_string()],
@@ -727,6 +744,24 @@ mod tests {
                 .to_string()
                 .contains("references network 'jobs' multiple times"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    /// Resolves declared network family overrides onto execution network references.
+    #[test]
+    fn requested_networks_preserve_declared_family_override() {
+        let mut manifest = base_manifest();
+        manifest.networks = vec![ManifestNetworkSpec {
+            name: "jobs".to_string(),
+            ip_family: Some(crate::config::NetworkIpFamily::Ipv6),
+        }];
+
+        let requested = manifest.requested_networks().expect("network requests");
+        assert_eq!(requested.len(), 1);
+        assert_eq!(requested[0].name, "jobs");
+        assert_eq!(
+            requested[0].ip_family,
+            Some(crate::config::NetworkIpFamily::Ipv6)
         );
     }
 

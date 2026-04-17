@@ -6,12 +6,19 @@ use std::net::IpAddr;
 use std::path::Path;
 use uuid::Uuid;
 
+use crate::workload_submit::{
+    ManifestNetworkSpec, RequestedNetworkSpec, resolve_requested_networks,
+    validate_declared_networks,
+};
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceManifest {
     pub name: String,
     #[serde(default)]
     pub volumes: Vec<VolumeSpec>,
+    #[serde(default)]
+    pub networks: Vec<ManifestNetworkSpec>,
     #[serde(default, rename = "tasks")]
     pub task_templates: Vec<TaskTemplateSpec>,
     #[serde(default)]
@@ -428,6 +435,8 @@ impl ServiceManifest {
         if self.name.trim().is_empty() {
             return Err(anyhow!("service manifest must set a non-empty name"));
         }
+
+        validate_declared_networks(&self.networks, "service manifest")?;
 
         if self.task_templates.is_empty() {
             return Err(anyhow!(
@@ -896,6 +905,17 @@ impl ServiceManifest {
 
         Ok(())
     }
+
+    /// Resolves the set of manifest network references into auto-provision requests.
+    pub(crate) fn requested_networks(&self) -> Result<Vec<RequestedNetworkSpec>> {
+        resolve_requested_networks(
+            self.task_templates
+                .iter()
+                .flat_map(|template| template.networks.iter().map(String::as_str)),
+            &self.networks,
+            "service manifest",
+        )
+    }
 }
 
 /// Validates same-manifest template dependencies and rejects invalid graphs early.
@@ -1149,6 +1169,39 @@ mod tests {
     }
 
     #[test]
+    fn service_manifest_deserializes_top_level_network_family_overrides() {
+        let manifest: ServiceManifest = ron::from_str(
+            r#"
+            (
+                name: "demo",
+                networks: [
+                    (
+                        name: "frontend",
+                        ip_family: ipv6,
+                    ),
+                ],
+                tasks: [
+                    (
+                        name: "api",
+                        image: "ghcr.io/demo/api:latest",
+                        networks: ["frontend"],
+                    ),
+                ],
+            )
+            "#,
+        )
+        .expect("manifest");
+
+        let requested = manifest.requested_networks().expect("network requests");
+        assert_eq!(requested.len(), 1);
+        assert_eq!(requested[0].name, "frontend");
+        assert_eq!(
+            requested[0].ip_family,
+            Some(crate::config::NetworkIpFamily::Ipv6)
+        );
+    }
+
+    #[test]
     fn service_manifest_rejects_legacy_task_templates_field() {
         let error = ron::from_str::<ServiceManifest>(
             r#"
@@ -1286,10 +1339,25 @@ mod tests {
     }
 
     #[test]
+    fn service_discovery_ipv6_example_manifest_declares_ipv6_network() {
+        let manifest =
+            load_manifest_from_path(&example_manifest("service_discovery_demo_ipv6.ron"))
+                .expect("manifest");
+
+        assert_eq!(manifest.networks.len(), 1);
+        assert_eq!(manifest.networks[0].name, "discovery-demo-ipv6");
+        assert_eq!(
+            manifest.networks[0].ip_family,
+            Some(crate::config::NetworkIpFamily::Ipv6)
+        );
+    }
+
+    #[test]
     fn manifest_rejects_empty_pre_stop_command() {
         let manifest = ServiceManifest {
             name: "demo".into(),
             volumes: Vec::new(),
+            networks: Vec::new(),
             task_templates: vec![TaskTemplateSpec {
                 name: "api".into(),
                 image: "ghcr.io/demo/api:latest".into(),
@@ -1326,6 +1394,7 @@ mod tests {
         let manifest = ServiceManifest {
             name: "demo".into(),
             volumes: Vec::new(),
+            networks: Vec::new(),
             task_templates: vec![TaskTemplateSpec {
                 name: "api".into(),
                 image: "ghcr.io/demo/api:latest".into(),
@@ -1371,6 +1440,7 @@ mod tests {
         let manifest = ServiceManifest {
             name: "demo".into(),
             volumes: Vec::new(),
+            networks: Vec::new(),
             task_templates: vec![TaskTemplateSpec {
                 name: "api".into(),
                 image: "ghcr.io/demo/api:latest".into(),
@@ -1418,6 +1488,7 @@ mod tests {
         let manifest = ServiceManifest {
             name: "demo".into(),
             volumes: Vec::new(),
+            networks: Vec::new(),
             task_templates: vec![TaskTemplateSpec {
                 name: "api".into(),
                 image: "ghcr.io/demo/api:latest".into(),
@@ -1460,6 +1531,7 @@ mod tests {
         let manifest = ServiceManifest {
             name: "demo".into(),
             volumes: Vec::new(),
+            networks: Vec::new(),
             task_templates: vec![TaskTemplateSpec {
                 name: "api".into(),
                 image: "ghcr.io/demo/api:latest".into(),
@@ -1512,6 +1584,7 @@ mod tests {
                 capacity_mb: Some(1024),
                 labels: Vec::new(),
             }],
+            networks: Vec::new(),
             task_templates: vec![TaskTemplateSpec {
                 name: "api".into(),
                 image: "ghcr.io/demo/api:latest".into(),
@@ -1554,6 +1627,7 @@ mod tests {
         let manifest = ServiceManifest {
             name: "demo".into(),
             volumes: Vec::new(),
+            networks: Vec::new(),
             task_templates: vec![
                 TaskTemplateSpec {
                     name: "backend".into(),

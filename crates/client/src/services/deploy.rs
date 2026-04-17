@@ -122,15 +122,7 @@ pub async fn deploy_manifest(
     manifest: &ServiceManifest,
 ) -> Result<ServiceDeploymentHandle> {
     let manifest_id = Uuid::new_v4();
-    ensure_named_networks(
-        cfg,
-        manifest
-            .task_templates
-            .iter()
-            .flat_map(|template| template.networks.iter().cloned())
-            .collect::<Vec<_>>(),
-    )
-    .await?;
+    ensure_named_networks(cfg, manifest.requested_networks()?).await?;
     let resolved_volumes = ensure_declared_volumes(
         cfg,
         &manifest

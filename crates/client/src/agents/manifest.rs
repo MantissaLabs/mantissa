@@ -6,7 +6,10 @@ use crate::runtime_contract::{
     DEFAULT_EXECUTION_PLATFORM, normalize_execution_platform, normalize_isolation_mode,
     normalize_isolation_profile,
 };
-use crate::workload_submit::{DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec};
+use crate::workload_submit::{
+    DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec, ManifestNetworkSpec,
+    RequestedNetworkSpec, resolve_requested_networks, validate_declared_networks,
+};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -25,6 +28,8 @@ pub struct AgentManifest {
     pub isolation_profile: Option<String>,
     #[serde(default)]
     pub volumes: Vec<AgentVolumeSpec>,
+    #[serde(default)]
+    pub networks: Vec<ManifestNetworkSpec>,
     pub execution: AgentExecutionSpec,
     #[serde(default)]
     pub workspace: AgentWorkspaceSpec,
@@ -168,6 +173,8 @@ impl AgentManifest {
             return Err(anyhow!("agent manifest must specify execution.image"));
         }
 
+        validate_declared_networks(&self.networks, "agent manifest")?;
+
         normalize_execution_platform(&self.execution_platform)?;
         normalize_isolation_mode(&self.isolation_mode)?;
 
@@ -183,6 +190,15 @@ impl AgentManifest {
             self.checkpoint.mount.as_ref(),
         )?;
         Ok(())
+    }
+
+    /// Resolves the manifest network references into auto-provision requests.
+    pub(crate) fn requested_networks(&self) -> Result<Vec<RequestedNetworkSpec>> {
+        resolve_requested_networks(
+            self.execution.networks.iter().map(String::as_str),
+            &self.networks,
+            "agent manifest",
+        )
     }
 
     /// Converts the manifest-declared volumes into the shared provisioning helper shape.
@@ -700,6 +716,7 @@ mod tests {
                 capacity_mb: Some(128),
                 labels: Vec::new(),
             }],
+            networks: Vec::new(),
             execution: AgentExecutionSpec {
                 image: "ghcr.io/demo/codex:latest".to_string(),
                 command: vec!["codex".to_string(), "exec".to_string()],
@@ -774,6 +791,25 @@ mod tests {
                 .to_string()
                 .contains("workspace.working_directory must be an absolute path"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    /// Resolves declared network family overrides onto execution network references.
+    #[test]
+    fn requested_networks_preserve_declared_family_override() {
+        let mut manifest = base_manifest();
+        manifest.execution.networks = vec!["agents".to_string()];
+        manifest.networks = vec![ManifestNetworkSpec {
+            name: "agents".to_string(),
+            ip_family: Some(crate::config::NetworkIpFamily::Ipv6),
+        }];
+
+        let requested = manifest.requested_networks().expect("network requests");
+        assert_eq!(requested.len(), 1);
+        assert_eq!(requested[0].name, "agents");
+        assert_eq!(
+            requested[0].ip_family,
+            Some(crate::config::NetworkIpFamily::Ipv6)
         );
     }
 

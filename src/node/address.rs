@@ -1,6 +1,8 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 
+use crate::ip_family::IpFamily;
+
 // TODO: This is a really hacky way of getting the local IP address to send
 // on join request alongside the NodeInfo struct. We should probably get the
 // address from the stream on connection accept within Server, and find a way
@@ -32,13 +34,29 @@ pub fn outbound_ip_for<A: ToSocketAddrs>(dest: A) -> io::Result<IpAddr> {
     Ok(sock.local_addr()?.ip())
 }
 
+/// Returns the local IP the kernel would pick for one concrete address family.
+pub fn outbound_ip_for_family(family: IpFamily) -> io::Result<IpAddr> {
+    match family {
+        IpFamily::Ipv4 => outbound_ip_for("8.8.8.8:53"),
+        IpFamily::Ipv6 => outbound_ip_for("[2001:4860:4860::8888]:53"),
+    }
+}
+
+/// Detects whether the host currently has usable outbound routing in each supported family.
+pub fn detect_outbound_ip_families() -> (bool, bool) {
+    let has_ipv4 = outbound_ip_for_family(IpFamily::Ipv4).is_ok();
+    let has_ipv6 = outbound_ip_for_family(IpFamily::Ipv6).is_ok();
+    (has_ipv4, has_ipv6)
+}
+
 /// Best-effort local advertise address:
 /// 1) If `cfg_advertise` provided, use it.
 /// 2) Else, if `anchor` provided, derive via outbound_ip_for(anchor).
-/// 3) Else, derive via outbound_ip_for("8.8.8.8:53") as a default route probe.
+/// 3) Else, probe the preferred family first and fall back to the other family if required.
 pub fn compute_advertise_ip(
     cfg_advertise: Option<IpAddr>,
     anchor: Option<&str>,
+    preferred_family: Option<IpFamily>,
 ) -> io::Result<IpAddr> {
     if let Some(ip) = cfg_advertise {
         return Ok(ip);
@@ -48,7 +66,13 @@ pub fn compute_advertise_ip(
     {
         return Ok(ip);
     }
-    outbound_ip_for("8.8.8.8:53")
+
+    match preferred_family {
+        Some(IpFamily::Ipv6) => outbound_ip_for_family(IpFamily::Ipv6)
+            .or_else(|_| outbound_ip_for_family(IpFamily::Ipv4)),
+        Some(IpFamily::Ipv4) | None => outbound_ip_for_family(IpFamily::Ipv4)
+            .or_else(|_| outbound_ip_for_family(IpFamily::Ipv6)),
+    }
 }
 
 /// Extract the port from an advertise address string.
