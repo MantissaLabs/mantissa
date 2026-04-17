@@ -1297,7 +1297,7 @@ pub struct NetworksCreateArgs {
     pub driver: NetworkDriverOpt,
 
     /// CIDR range allocated to the overlay (e.g. 10.24.0.0/16).
-    /// Defaults to 10.42.0.0/16 when omitted.
+    /// Defaults to a deterministic private subnet derived from the network name when omitted.
     #[arg(long = "subnet", value_name = "CIDR")]
     pub subnet: Option<String>,
 
@@ -1320,14 +1320,6 @@ pub struct NetworksCreateArgs {
 }
 
 impl NetworksCreateArgs {
-    /// Resolve the subnet CIDR for network creation, falling back to the shared VXLAN range when
-    /// the caller does not provide an explicit value.
-    pub fn resolved_subnet(&self) -> String {
-        self.subnet
-            .clone()
-            .unwrap_or_else(|| client::networks::DEFAULT_NETWORK_SUBNET.to_string())
-    }
-
     /// Merge user-provided programs with the defaults so dataplane maps and load-balancing remain
     /// available even when no BPF flags are specified on the CLI.
     pub fn resolved_bpf_programs(&self) -> Vec<String> {

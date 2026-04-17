@@ -73,17 +73,23 @@ pub async fn ensure_named_networks(
     }
 
     let existing = networks::list_raw(cfg).await?;
-    let existing_names: HashSet<String> = existing.into_iter().map(|net| net.name).collect();
+    let existing_names: HashSet<String> = existing.iter().map(|net| net.name.clone()).collect();
+    let mut known_subnets: HashSet<String> =
+        existing.iter().map(|net| net.subnet_cidr.clone()).collect();
 
     for name in required {
         if existing_names.contains(&name) {
             continue;
         }
 
-        let request = networks::default_network_create_request(name.clone());
+        let request = networks::default_network_create_request(
+            name.clone(),
+            known_subnets.iter().map(String::as_str),
+        );
         match networks::create_raw(cfg, &request).await {
             Ok(network_id) => {
                 println!("network '{name}' created with id {network_id} (auto-provisioned)");
+                known_subnets.insert(request.subnet_cidr.clone());
             }
             Err(error) => {
                 let fallback = networks::list_raw(cfg).await?;
