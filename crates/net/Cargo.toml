@@ -17,6 +17,7 @@ thiserror = "1"
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
 capnp-futures = { workspace = true }
+parking_lot = { workspace = true }
 snow = { version = "0.9.6", default-features = false, features = ["ring-accelerated"] }
 hkdf = "0.12.4"
 sha2 = "0.10.9"
@@ -30,3 +31,6 @@ ed25519-dalek = { version = "2", default-features = false, features = [
 ] }
 getrandom = "0.2"
 libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -152,10 +152,9 @@ pub fn load_or_choose_wireguard_listen_port_with_preferred_and_override(
             io::Error::new(io::ErrorKind::InvalidData, "invalid wireguard port file")
         })?;
         if port == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "wireguard port file contained 0",
-            ));
+            let recovered_port = preferred_port.unwrap_or(DEFAULT_WIREGUARD_LISTEN_PORT);
+            persist_wireguard_listen_port(&path, recovered_port)?;
+            return Ok(recovered_port);
         }
 
         // Migrate older deployments that defaulted to 51820 when we can safely infer a more
@@ -165,16 +164,7 @@ pub fn load_or_choose_wireguard_listen_port_with_preferred_and_override(
             && let Some(preferred_port) = preferred_port
             && preferred_port != port
         {
-            fs::write(&path, format!("{preferred_port}\n"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = if running_as_root() { 0o640 } else { 0o600 };
-                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(mode));
-                if running_as_root() {
-                    ensure_mantissa_group(&path);
-                }
-            }
+            persist_wireguard_listen_port(&path, preferred_port)?;
             return Ok(preferred_port);
         }
 
@@ -188,17 +178,23 @@ pub fn load_or_choose_wireguard_listen_port_with_preferred_and_override(
             "wireguard port must be non-zero",
         ));
     }
-    fs::write(&path, format!("{port}\n"))?;
+    persist_wireguard_listen_port(&path, port)?;
+    Ok(port)
+}
+
+/// Persist the WireGuard listen port with the same permissions used for freshly generated state.
+fn persist_wireguard_listen_port(path: &Path, port: u16) -> io::Result<()> {
+    fs::write(path, format!("{port}\n"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = if running_as_root() { 0o640 } else { 0o600 };
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(mode));
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
         if running_as_root() {
-            ensure_mantissa_group(&path);
+            ensure_mantissa_group(path);
         }
     }
-    Ok(port)
+    Ok(())
 }
 
 /// Load a 32-byte WireGuard private key from `path`, or generate and persist a new one.
@@ -284,4 +280,75 @@ pub fn wireguard_tunnel_ipv6(node_id: Uuid) -> std::net::Ipv6Addr {
         u16::from_be_bytes([host[4], host[5]]),
         u16::from_be_bytes([host[6], host[7]]),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paths::STATE_DIR_ENV;
+    use parking_lot::{Mutex, MutexGuard};
+    use std::ffi::OsString;
+    use std::sync::OnceLock;
+    use tempfile::TempDir;
+
+    /// Serialize state-dir overrides because these tests mutate one process-global environment.
+    fn state_dir_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Restore one temporary environment override after the scoped test mutation ends.
+    struct EnvOverrideGuard {
+        previous: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl EnvOverrideGuard {
+        /// Apply one temporary state-dir override for a unit test and hold the serialization lock.
+        fn state_dir(path: &Path) -> Self {
+            let lock = state_dir_lock().lock();
+            let previous = std::env::var_os(STATE_DIR_ENV);
+            unsafe {
+                std::env::set_var(STATE_DIR_ENV, path.as_os_str());
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvOverrideGuard {
+        /// Restore the previous state-dir override after the test completes.
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe {
+                    std::env::set_var(STATE_DIR_ENV, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(STATE_DIR_ENV);
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn zero_port_file_is_repaired_to_preferred_port() {
+        let dir = TempDir::new().expect("create temp wireguard state dir");
+        let _guard = EnvOverrideGuard::state_dir(dir.path());
+        let port_path = resolve_wireguard_port_path().expect("resolve wireguard port path");
+        fs::write(&port_path, "0\n").expect("seed invalid wireguard port file");
+
+        let port = load_or_choose_wireguard_listen_port_with_preferred_and_override(
+            Some(6578),
+            None,
+        )
+        .expect("repair stale zero-valued wireguard port");
+
+        assert_eq!(port, 6578);
+        assert_eq!(
+            fs::read_to_string(&port_path).expect("read repaired wireguard port"),
+            "6578\n"
+        );
+    }
 }
