@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use super::convergence::wait_until;
+use aya::programs::tc::{TcAttachType, qdisc_detach_program};
 use mantissa::config::{
     Config, ConfigSource, global_config, global_config_source, set_global_config_with_source,
 };
@@ -12,6 +13,7 @@ use net::paths::STATE_DIR_ENV;
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
@@ -98,6 +100,51 @@ fn clear_registered_privileged_networks() {
     guard.clear();
 }
 
+/// Returns the shared bpffs directory where the NodePort dataplane pins its global maps.
+fn privileged_nodeport_bpf_pin_dir() -> PathBuf {
+    PathBuf::from("/sys/fs/bpf/mantissa/nodeport")
+}
+
+/// Detach one tc program name (and its truncated kernel-visible alias) from one interface hook.
+fn detach_tc_program_by_name(
+    iface: &str,
+    attach_type: TcAttachType,
+    program_name: &str,
+) -> io::Result<()> {
+    let mut candidates = vec![program_name.to_string()];
+    let truncated: String = program_name.chars().take(15).collect();
+    if truncated != program_name {
+        candidates.push(truncated);
+    }
+
+    for candidate in candidates {
+        match qdisc_detach_program(iface, attach_type, &candidate) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(())
+}
+
+/// Force-remove shared NodePort tc attachments and bpffs pins left behind by one failed test.
+fn force_cleanup_privileged_nodeport_state_sync() {
+    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+        for entry in entries.flatten() {
+            let Some(iface) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let _ = detach_tc_program_by_name(&iface, TcAttachType::Ingress, "nodeport_tc_ingress");
+            let _ = detach_tc_program_by_name(&iface, TcAttachType::Egress, "nodeport_tc_egress");
+            let _ = detach_tc_program_by_name(&iface, TcAttachType::Ingress, "nodeport_tc_egress");
+        }
+    }
+
+    let pin_dir = privileged_nodeport_bpf_pin_dir();
+    let _ = std::fs::remove_dir_all(&pin_dir);
+}
+
 impl PrivilegedTestGuard {
     /// Apply one isolated config override for a privileged networking test.
     ///
@@ -110,6 +157,7 @@ impl PrivilegedTestGuard {
     {
         let lock = privileged_override_lock().lock();
         clear_registered_privileged_networks();
+        force_cleanup_privileged_nodeport_state_sync();
         let previous = global_config();
         let source = global_config_source();
         let state_dir = tempfile::tempdir().expect("create privileged test state dir");
@@ -142,6 +190,7 @@ impl Drop for PrivilegedTestGuard {
         for network_id in take_registered_privileged_networks() {
             force_cleanup_privileged_network_links_sync(network_id);
         }
+        force_cleanup_privileged_nodeport_state_sync();
         set_global_config_with_source(self.previous.clone(), self.source.clone());
     }
 }

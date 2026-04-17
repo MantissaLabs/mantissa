@@ -642,9 +642,14 @@ mod platform {
                             .with_context(|| format!("program IPv6 nodeport {}", entry.port))?;
                         let _ = delete_elem(ipv4_vip_fd, &key);
                     }
-                    (vip, node_ip) => unreachable!(
-                        "resolved nodeport identity should always match VIP family: vip={vip} node_ip={node_ip}"
-                    ),
+                    (vip, node_ip) => {
+                        let error = format!(
+                            "nodeport resolved an invalid {} publication identity {node_ip} for VIP {vip}; configure network.nodeport.ip explicitly for the correct family",
+                            NodePortIpFamily::from_ip(node_ip).label(),
+                        );
+                        self.degrade_runtime(error.clone(), "nodeport runtime degraded");
+                        return Err(anyhow!(error));
+                    }
                 }
                 self.port_owner.insert(selector, network_id);
             }
@@ -922,7 +927,9 @@ mod platform {
                 return Ok(configured_ip);
             }
 
-            if let Some(node_ip) = detect_iface_ip(&iface, Some(family)).await? {
+            if let Some(node_ip) = detect_iface_ip(&iface, Some(family)).await?
+                && NodePortIpFamily::from_ip(node_ip) == family
+            {
                 return Ok(node_ip);
             }
 
