@@ -8,6 +8,7 @@ use anyhow::Result;
 use blake3::Hasher;
 use capnp::Error as CapnpError;
 use protocol::services::{
+    LivenessProbeKind as ProtoLivenessProbeKind, ReadinessProbeKind as ProtoReadinessProbeKind,
     RolloutPhase as ProtoRolloutPhase, ServiceStatus as ProtoServiceStatus, service_spec,
     task_template,
 };
@@ -178,6 +179,8 @@ pub struct TaskTemplateRow {
     pub replicas: u16,
     pub networks: Vec<String>,
     pub public_port: Option<u16>,
+    pub readiness_port: Option<u16>,
+    pub liveness_port: Option<u16>,
 }
 
 impl TaskTemplateRow {
@@ -199,6 +202,31 @@ impl TaskTemplateRow {
             Some(raw_public)
         };
 
+        let readiness_port = if reader.has_readiness() {
+            let readiness = reader.get_readiness()?;
+            match readiness.get_kind()? {
+                ProtoReadinessProbeKind::Http | ProtoReadinessProbeKind::Tcp => {
+                    let port = readiness.get_port();
+                    (port != 0).then_some(port)
+                }
+            }
+        } else {
+            None
+        };
+
+        let liveness_port = if reader.has_liveness() {
+            let liveness = reader.get_liveness()?;
+            match liveness.get_kind()? {
+                ProtoLivenessProbeKind::Http | ProtoLivenessProbeKind::Tcp => {
+                    let port = liveness.get_port();
+                    (port != 0).then_some(port)
+                }
+                ProtoLivenessProbeKind::Exec => None,
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             name: reader.get_name()?.to_str()?.to_string(),
             image: reader.get_image()?.to_str()?.to_string(),
@@ -206,7 +234,21 @@ impl TaskTemplateRow {
             replicas: reader.get_replicas(),
             networks,
             public_port,
+            readiness_port,
+            liveness_port,
         })
+    }
+
+    /// Returns the backend port the host-reachable VIP should be curled on for this template.
+    ///
+    /// The replicated service payload carries both the published NodePort and the controller-visible
+    /// probe metadata. The VIP dataplane only rewrites addresses, not ports, so the curlable host
+    /// VIP endpoint must use the backend service port inferred from readiness first, then
+    /// TCP/HTTP liveness, and finally `public_port` when no more specific signal exists.
+    fn public_target_port(&self) -> Option<u16> {
+        self.readiness_port
+            .or(self.liveness_port)
+            .or(self.public_port)
     }
 }
 
@@ -389,7 +431,10 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
         let mut endpoints = Vec::new();
 
         for template in &row.task_templates {
-            let Some(port) = template.public_port else {
+            let Some(public_port) = template.public_port else {
+                continue;
+            };
+            let Some(target_port) = template.public_target_port() else {
                 continue;
             };
 
@@ -462,7 +507,15 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
                 continue;
             };
 
-            endpoints.push(format!("{}={vip}:{port}", template.name));
+            let rendered = if target_port == public_port {
+                format!("{}={vip}:{target_port}", template.name)
+            } else {
+                format!(
+                    "{}={vip}:{target_port} (nodeport {public_port})",
+                    template.name
+                )
+            };
+            endpoints.push(rendered);
         }
 
         endpoints.sort();
@@ -584,6 +637,24 @@ mod tests {
         }
     }
 
+    /// Builds a minimal template row so endpoint rendering heuristics can be tested directly.
+    fn test_template(
+        public_port: Option<u16>,
+        readiness_port: Option<u16>,
+        liveness_port: Option<u16>,
+    ) -> TaskTemplateRow {
+        TaskTemplateRow {
+            name: "backend".to_string(),
+            image: "hashicorp/http-echo:1.0.0".to_string(),
+            command: Vec::new(),
+            replicas: 1,
+            networks: vec!["default".to_string()],
+            public_port,
+            readiness_port,
+            liveness_port,
+        }
+    }
+
     #[test]
     /// Ensures the services list reason column prefers the current lifecycle detail over rollout history.
     fn rollout_reason_summary_prefers_status_detail() {
@@ -632,5 +703,29 @@ mod tests {
         .expect("vip");
 
         assert_eq!(vip, Ipv4Addr::new(10, 146, 120, 162));
+    }
+
+    #[test]
+    /// Prefers the readiness port when rendering the curlable host VIP endpoint.
+    fn public_target_port_prefers_readiness_port() {
+        let template = test_template(Some(8001), Some(8000), Some(9000));
+
+        assert_eq!(template.public_target_port(), Some(8000));
+    }
+
+    #[test]
+    /// Falls back to the network liveness port when readiness is absent.
+    fn public_target_port_falls_back_to_liveness_port() {
+        let template = test_template(Some(8001), None, Some(8000));
+
+        assert_eq!(template.public_target_port(), Some(8000));
+    }
+
+    #[test]
+    /// Preserves the published port when no probe exposes a more specific backend service port.
+    fn public_target_port_falls_back_to_public_port() {
+        let template = test_template(Some(8001), None, None);
+
+        assert_eq!(template.public_target_port(), Some(8001));
     }
 }
