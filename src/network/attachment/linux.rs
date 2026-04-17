@@ -17,6 +17,7 @@ use tokio::task::spawn_blocking;
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::config;
 use crate::runtime::types::RuntimeAttachmentTarget;
 
 use super::{
@@ -37,7 +38,16 @@ impl Default for AttachmentProvisioner {
 }
 
 impl AttachmentProvisioner {
+    /// Returns a kernel-backed attachment provisioner when runtime networking is enabled on this
+    /// node, or a stub provisioner otherwise.
     pub fn new() -> Result<Self> {
+        if !config::kernel_network_provisioning_enabled() {
+            debug!(
+                target: "network",
+                "kernel network provisioning disabled by config; using stub attachment provisioner"
+            );
+            return Ok(Self::unavailable());
+        }
         if unsafe { libc::geteuid() } != 0 {
             debug!(
                 target: "network",

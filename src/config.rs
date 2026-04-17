@@ -49,16 +49,33 @@ pub struct StorageConfig {
 /// # Description:
 ///
 /// Network subsystem configuration for WireGuard, BPF, and nodeport.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NetworkConfig {
     #[serde(default)]
     pub advertise_addr: Option<String>,
+    #[serde(default = "default_true")]
+    pub provision_kernel_interfaces: bool,
     #[serde(default)]
     pub wireguard: WireguardConfig,
     #[serde(default)]
     pub bpf: BpfConfig,
     #[serde(default)]
     pub nodeport: NodePortConfig,
+}
+
+impl Default for NetworkConfig {
+    /// # Description:
+    ///
+    /// Returns the default network configuration used when no config is supplied.
+    fn default() -> Self {
+        Self {
+            advertise_addr: None,
+            provision_kernel_interfaces: true,
+            wireguard: WireguardConfig::default(),
+            bpf: BpfConfig::default(),
+            nodeport: NodePortConfig::default(),
+        }
+    }
 }
 
 /// # Description:
@@ -454,6 +471,13 @@ pub fn nodeport_enabled() -> bool {
 /// Resolve the operator-configured advertise address, if one has been supplied.
 pub fn advertise_addr() -> Option<String> {
     global_config().network.advertise_addr
+}
+
+/// # Description:
+///
+/// Resolve whether Mantissa should provision kernel network interfaces on this node.
+pub fn kernel_network_provisioning_enabled() -> bool {
+    global_config().network.provision_kernel_interfaces
 }
 
 /// # Description:
@@ -1224,6 +1248,10 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
 
     if old.network.advertise_addr != new.network.advertise_addr {
         changes.push("network.advertise_addr".to_string());
+    }
+
+    if old.network.provision_kernel_interfaces != new.network.provision_kernel_interfaces {
+        changes.push("network.provision_kernel_interfaces".to_string());
     }
 
     if old.network.wireguard.port != new.network.wireguard.port {

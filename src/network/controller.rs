@@ -771,16 +771,31 @@ impl NetworkController {
             }
         }
 
-        if let Err(err) = self
-            .inner
-            .discovery
-            .ensure_network(&spec, plan.resolver_ip)
-            .await
-        {
-            warn!(
+        if self.inner.provisioner.supports_resolver_bind() {
+            if let Err(err) = self
+                .inner
+                .discovery
+                .ensure_network(&spec, plan.resolver_ip)
+                .await
+            {
+                warn!(
+                    target: "network",
+                    network = %plan.network_id,
+                    "failed to ensure service discovery: {err:#}"
+                );
+            }
+        } else {
+            if let Err(err) = self.inner.discovery.teardown_network(spec.id).await {
+                warn!(
+                    target: "network",
+                    network = %plan.network_id,
+                    "failed to clear service discovery while network provisioner is unavailable: {err:#}"
+                );
+            }
+            debug!(
                 target: "network",
                 network = %plan.network_id,
-                "failed to ensure service discovery: {err:#}"
+                "skipping service discovery because resolver addresses cannot be bound without kernel networking"
             );
         }
 
@@ -1597,6 +1612,7 @@ fn format_mac(mac: [u8; 6]) -> String {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{NetworkPlan, VXLAN_PORT, format_mac};
+    use crate::config;
     use crate::network::attachment::{host_access_host_iface_name, host_access_peer_iface_name};
     use crate::network::wireguard::MANTISSA_WIREGUARD_IFNAME;
     use anyhow::{Context, Result, anyhow};
@@ -1646,7 +1662,16 @@ mod platform {
     }
 
     impl NetworkProvisioner {
+        /// Returns a kernel-backed network provisioner when the current node is allowed to touch
+        /// host interfaces, or a stub provisioner otherwise.
         pub fn new() -> Result<Self> {
+            if !config::kernel_network_provisioning_enabled() {
+                debug!(
+                    target: "network",
+                    "kernel network provisioning disabled by config; using stub network provisioner"
+                );
+                return Ok(Self::unavailable());
+            }
             if unsafe { libc::geteuid() } != 0 {
                 debug!(
                     target: "network",
@@ -1680,6 +1705,11 @@ mod platform {
                 handle: None,
                 underlay: Arc::new(AsyncMutex::new(None)),
             }
+        }
+
+        /// Report whether this host can provision kernel interfaces and therefore bind resolver IPs.
+        pub fn supports_resolver_bind(&self) -> bool {
+            self.handle.is_some()
         }
 
         fn handle(&self) -> Option<&Handle> {
@@ -3343,6 +3373,11 @@ mod platform {
     impl NetworkProvisioner {
         pub fn new() -> Result<Self> {
             Ok(Self)
+        }
+
+        /// Report whether this platform can provision kernel interfaces and therefore bind resolver IPs.
+        pub fn supports_resolver_bind(&self) -> bool {
+            false
         }
 
         /// Return `None` on unsupported platforms, since no kernel interfaces are created.

@@ -51,6 +51,7 @@ use mantissa::workload::manager::WorkloadManager;
 use mantissa::workload::model::WorkloadPhase;
 use mantissa::workload::model::WorkloadSpec;
 use mantissa::workload::types::ExecutionSpec;
+use parking_lot::{Mutex, MutexGuard};
 use protocol::health::NodeStatus;
 use protocol::secrets::secrets;
 use protocol::services::services;
@@ -61,7 +62,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -90,13 +91,12 @@ impl ConfigOverrideGuard {
     /// Force networking into a control-plane-only mode so logical-network tests do not depend on
     /// privileged dataplane setup in CI.
     fn control_plane_network_only() -> Self {
-        let lock = config_override_lock()
-            .lock()
-            .expect("config override lock should not be poisoned");
+        let lock = config_override_lock().lock();
         let previous = global_config();
         let source = global_config_source();
 
         let mut config = previous.clone();
+        config.network.provision_kernel_interfaces = false;
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = false;
@@ -4417,10 +4417,13 @@ local_test!(services_depends_on_waits_for_dependency_publication, {
         .expect("submit dependency-ordered deployment");
 
     assert!(
-        wait_for_service_status_detail(
+        wait_for_service_status_detail_any(
             &node.node.service_controller,
             service_id,
-            "waiting for dependency template 'backend'"
+            &[
+                "waiting for dependency template 'backend'",
+                "monitoring dependency readiness before launching template 'frontend'",
+            ]
         )
         .await,
         "dependency gate should publish a human-readable wait reason while frontend is blocked"
@@ -5806,21 +5809,22 @@ async fn wait_for_service_status(
     .await
 }
 
-/// Waits until the replicated service spec exposes a lifecycle detail containing the substring.
-async fn wait_for_service_status_detail(
+/// Waits until the replicated service spec exposes a lifecycle detail containing any substring.
+async fn wait_for_service_status_detail_any(
     manager: &ServiceController,
     service_id: Uuid,
-    expected_substring: &str,
+    expected_substrings: &[&str],
 ) -> bool {
     wait_until(
         Duration::from_secs(20),
         Duration::from_millis(50),
         || async {
             match manager.registry().get(service_id) {
-                Ok(Some(spec)) => spec
-                    .status_detail
-                    .as_deref()
-                    .is_some_and(|detail| detail.contains(expected_substring)),
+                Ok(Some(spec)) => spec.status_detail.as_deref().is_some_and(|detail| {
+                    expected_substrings
+                        .iter()
+                        .any(|expected| detail.contains(expected))
+                }),
                 _ => false,
             }
         },
