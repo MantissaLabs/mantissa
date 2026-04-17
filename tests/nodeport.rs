@@ -12,7 +12,8 @@ use common::privileged_networking::{
 use mantissa::network::nodeport::NodePortRuntimeState;
 use mantissa::services::ServiceController;
 use mantissa::services::types::{
-    ServicePortProtocol, ServiceStatus, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
+    ServicePortProtocol, ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceStatus,
+    TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
 };
 use mantissa::workload::types::ExecutionSpec;
 use protocol::services::services;
@@ -22,6 +23,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use uuid::Uuid;
 
 const NODEPORT_HTTP_PORT: u16 = 18080;
+const NODEPORT_HTTP_REMAP_PORT: u16 = 18081;
 const NODEPORT_UDP_PORT: u16 = 18082;
 const NODEPORT_RESPONSE: &str = "hello from nodeport privileged test";
 const NODEPORT_CONFLICT_RESPONSE: &str = "hello from nodeport owner";
@@ -41,6 +43,8 @@ fn privileged_nodeport_task_template(
     network_id: Uuid,
     template_name: &str,
     response: &str,
+    listen_port: u16,
+    public_port: u16,
 ) -> TaskTemplateSpecValue {
     TaskTemplateSpecValue {
         name: template_name.to_string(),
@@ -48,7 +52,7 @@ fn privileged_nodeport_task_template(
             image: "hashicorp/http-echo:1.0.0".to_string(),
             command: vec![
                 "-listen".to_string(),
-                format!(":{NODEPORT_HTTP_PORT}"),
+                format!(":{listen_port}"),
                 "-text".to_string(),
                 response.to_string(),
             ],
@@ -68,8 +72,15 @@ fn privileged_nodeport_task_template(
         },
         depends_on: Vec::new(),
         replicas: 1,
-        readiness: None,
-        public_port: Some(NODEPORT_HTTP_PORT),
+        readiness: Some(ServiceReadinessProbe {
+            kind: ServiceReadinessProbeKind::Http,
+            port: listen_port,
+            path: Some("/".to_string()),
+            interval_ms: 1_000,
+            timeout_ms: 1_000,
+            failure_threshold: 1,
+        }),
+        public_port: Some(public_port),
         public_protocol: Some(ServicePortProtocol::Tcp),
     }
 }
@@ -116,6 +127,8 @@ async fn deploy_privileged_nodeport_service(
     service_name: &str,
     network_id: Uuid,
     response: &str,
+    listen_port: u16,
+    public_port: u16,
 ) -> anyhow::Result<Uuid> {
     manager
         .submit_deployment(
@@ -126,6 +139,8 @@ async fn deploy_privileged_nodeport_service(
                 network_id,
                 service_name,
                 response,
+                listen_port,
+                public_port,
             )],
         )
         .await
@@ -222,6 +237,8 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
                 network_id,
                 "echo",
                 NODEPORT_RESPONSE,
+                NODEPORT_HTTP_PORT,
+                NODEPORT_HTTP_PORT,
             )],
         )
         .await
@@ -357,6 +374,113 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
 
     delete_privileged_network(&node, network_id).await;
 });
+
+local_test!(
+    nodeport_public_service_can_remap_public_port_to_probe_port,
+    {
+        let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
+            return;
+        };
+
+        let _config = PrivilegedTestGuard::apply(|config| {
+            config.network.wireguard.enabled = false;
+            config.network.wireguard.manage_firewall = false;
+            config.network.bpf.attach = true;
+            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            config.network.nodeport.enabled = true;
+            config.network.nodeport.iface = Some("lo".to_string());
+            config.network.nodeport.ip = Some("127.0.0.1".to_string());
+            config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+        });
+        let node = create_privileged_node().await;
+        let subnet = privileged_test_subnet();
+        let network = create_privileged_network(
+            &node,
+            privileged_test_network(
+                "nodeport-remap",
+                "privileged nodeport remap integration test network",
+                &subnet,
+                1450,
+                Vec::new(),
+            ),
+            mantissa::network::types::NetworkStatus::Ready,
+        )
+        .await;
+        let network_id = network.id;
+
+        let service_id = node
+            .service_controller
+            .submit_deployment(
+                Uuid::new_v4(),
+                "nodeport-remap",
+                "nodeport-remap",
+                vec![privileged_nodeport_task_template(
+                    network_id,
+                    "echo",
+                    NODEPORT_RESPONSE,
+                    NODEPORT_HTTP_PORT,
+                    NODEPORT_HTTP_REMAP_PORT,
+                )],
+            )
+            .await
+            .expect("submit remapped NodePort deployment");
+
+        let running = wait_for_service_status(
+            &node.service_controller,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(180),
+        )
+        .await;
+        if !running {
+            let status = node.network_controller.nodeport_manager().status().await;
+            let service = node
+                .service_controller
+                .registry()
+                .get(service_id)
+                .expect("read remapped NodePort service after running timeout")
+                .expect("remapped NodePort service should still exist after running timeout");
+            panic!(
+                "remapped public service should reach running state with the real runtime; service_status={:?}; public_detail={:?}; nodeport_status={status:?}",
+                service.status(),
+                service.public_endpoint_detail(),
+            );
+        }
+
+        let addr = format!("127.0.0.1:{NODEPORT_HTTP_REMAP_PORT}");
+        let http_ok = wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(250),
+            || async {
+                match http_get(&addr).await {
+                    Ok(response) => response.contains(NODEPORT_RESPONSE),
+                    Err(_) => false,
+                }
+            },
+        )
+        .await;
+        if !http_ok {
+            let status = node.network_controller.nodeport_manager().status().await;
+            let service = node
+                .service_controller
+                .registry()
+                .get(service_id)
+                .expect("read remapped NodePort service after http failure")
+                .expect("remapped NodePort service should still exist after http failure");
+            let last_http_error = http_get(&addr)
+                .await
+                .map(|response| format!("unexpected response: {response}"))
+                .unwrap_or_else(|err| err.to_string());
+            panic!(
+                "published NodePort should translate the public port onto the backend probe port; status={status:?}; public_detail={:?}; last_http_error={last_http_error}",
+                service.public_endpoint_detail()
+            );
+        }
+
+        remove_service_via_rpc(&node.services_client, service_id).await;
+        delete_privileged_network(&node, network_id).await;
+    }
+);
 
 local_test!(nodeport_udp_public_service_reaches_backend_and_cleans_up, {
     let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
@@ -559,6 +683,8 @@ local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
         "nodeport-owner",
         network_id,
         NODEPORT_CONFLICT_RESPONSE,
+        NODEPORT_HTTP_PORT,
+        NODEPORT_HTTP_PORT,
     )
     .await
     .expect("submit owner NodePort deployment");
@@ -592,6 +718,8 @@ local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
         "nodeport-conflict",
         network_id,
         "this service should never own the public port",
+        NODEPORT_HTTP_PORT,
+        NODEPORT_HTTP_PORT,
     )
     .await
     .expect_err("conflicting NodePort claim should be rejected");
@@ -659,6 +787,8 @@ local_test!(
             "nodeport-degraded",
             network_id,
             NODEPORT_DEGRADED_RESPONSE,
+            NODEPORT_HTTP_PORT,
+            NODEPORT_HTTP_PORT,
         )
         .await
         .expect("submit degraded NodePort deployment");

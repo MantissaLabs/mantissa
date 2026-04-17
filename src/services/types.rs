@@ -482,6 +482,29 @@ impl TaskTemplateSpecValue {
         self.public_port
     }
 
+    /// Returns the backend port public ingress should target for this template.
+    ///
+    /// Mantissa publishes `node_ip:public_port`, but the overlay VIP dataplane still needs the
+    /// workload's actual listen port. We infer that from the readiness probe first because it is
+    /// the controller-level signal used to admit healthy backends into discovery. When readiness
+    /// is absent, TCP/HTTP liveness still provides a concrete network port. As a final fallback we
+    /// reuse `public_port`, which preserves the original behavior for services that publish and
+    /// listen on the same numeric port.
+    pub fn public_target_port(&self) -> Option<u16> {
+        self.readiness()
+            .map(|probe| probe.port)
+            .filter(|port| *port != 0)
+            .or_else(|| {
+                self.liveness().and_then(|probe| match probe.kind {
+                    ServiceLivenessProbeKind::Http | ServiceLivenessProbeKind::Tcp => {
+                        (probe.port != 0).then_some(probe.port)
+                    }
+                    ServiceLivenessProbeKind::Exec => None,
+                })
+            })
+            .or(self.public_port())
+    }
+
     /// Return the public protocols to expose for the declared nodeport.
     ///
     /// The default remains TCP-only to match historical behavior unless the manifest opts in

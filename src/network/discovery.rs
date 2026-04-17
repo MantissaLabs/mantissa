@@ -95,6 +95,7 @@ struct ServiceBackendCatalogEntry {
     readiness: Option<ServiceReadinessProbe>,
     expose_to_host: bool,
     public_port: Option<u16>,
+    public_target_port: Option<u16>,
     public_protocols: Vec<NodePortProtocol>,
 }
 
@@ -1687,6 +1688,7 @@ async fn refresh_backend_catalog_if_needed(
             )
             .await?;
             let public_port = template.public_port();
+            let public_target_port = template.public_target_port();
             let public_protocols = if public_port.is_some() {
                 template
                     .public_protocols()
@@ -1708,6 +1710,7 @@ async fn refresh_backend_catalog_if_needed(
                     readiness: template.readiness().cloned(),
                     expose_to_host: public_port.is_some(),
                     public_port,
+                    public_target_port,
                     public_protocols,
                 },
             );
@@ -1904,6 +1907,7 @@ async fn refresh_single_service(
     .await?
         && let Some(port) = service.public_port
     {
+        let vip_port = service.public_target_port.unwrap_or(port);
         if !programmed {
             return Ok(ServiceRefreshResult {
                 nodeport_mappings: Vec::new(),
@@ -1925,7 +1929,7 @@ async fn refresh_single_service(
             mappings.push(NodePortMapping {
                 port,
                 vip,
-                vip_port: port,
+                vip_port,
                 protocol,
             });
         }

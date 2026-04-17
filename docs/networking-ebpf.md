@@ -145,6 +145,11 @@ sync:
 - The overlay VIP used for internal discovery and backend load balancing.
 - A NodePort listener on each capable node at `node_ip:public_port`.
 
+The external listener port and the backend listen port are not forced to be the
+same. Mantissa targets the readiness probe port first, then a TCP/HTTP liveness
+probe port when one is declared, and only falls back to `public_port` when the
+template does not expose a more specific service port signal.
+
 `node_ip` is resolved in this order:
 
 - `network.nodeport.ip`
@@ -310,7 +315,7 @@ This is the path you exercise with `curl http://<node_ip>:<public_port>`.
    host-local curl.
 2. `nodeport_tc_ingress` matches `dst=node_ip` and `dst_port=public_port`.
 3. The program looks up the configured service VIP, rewrites the destination to
-   the VIP and service port, records reverse NAT state, and redirects the
+   the VIP and inferred service port, records reverse NAT state, and redirects the
    packet into the network's host-access path.
 4. The packet then traverses the existing overlay VIP datapath:
    - `bridge_tc_ingress` DNATs VIP traffic to a chosen backend

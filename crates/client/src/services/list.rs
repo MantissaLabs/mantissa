@@ -519,8 +519,9 @@ fn compute_service_vip(
         hasher.finalize()
     };
 
-    let mut slot_seed = [0u8; 4];
-    slot_seed.copy_from_slice(&digest.as_bytes()[..4]);
+    let mut slot_seed = [0u8; 16];
+    slot_seed.copy_from_slice(&digest.as_bytes()[..16]);
+    let slot_seed = u128::from_le_bytes(slot_seed);
 
     // Constrain VIPs to the even offsets of the overlay to avoid collisions with per-node resolver
     // addresses, which always occupy the odd slots (offsets 1, 3, 5, ...).
@@ -529,7 +530,7 @@ fn compute_service_vip(
         return None;
     }
 
-    let mut slot = (u32::from_le_bytes(slot_seed) % available_even as u32) * 2 + 8;
+    let mut slot = (slot_seed % available_even as u128) as u32 * 2 + 8;
     for _ in 0..available_even.min(16) as usize {
         let candidate = u32::from(base_ip).saturating_add(slot);
         if !backend_ips.contains(&candidate) {
@@ -603,5 +604,33 @@ mod tests {
         let row = test_row(None, Some("old rollout failure"));
 
         assert_eq!(row.rollout_reason_summary(), "old rollout failure");
+    }
+
+    #[test]
+    /// Keeps the CLI's rendered IPv4 VIPs aligned with the server-side 128-bit hash selection.
+    fn compute_service_vip_matches_current_server_hash() {
+        let vip = compute_service_vip(
+            "10.34.16.0/20",
+            Uuid::parse_str("21523dac-bdaa-6cf5-359f-57139c6464a8").expect("valid network id"),
+            "backend",
+            &HashSet::new(),
+        )
+        .expect("vip");
+
+        assert_eq!(vip, Ipv4Addr::new(10, 34, 24, 38));
+    }
+
+    #[test]
+    /// Ensures distinct overlays keep rendering the correct host-reachable VIPs for the same template name.
+    fn compute_service_vip_keeps_template_names_isolated_by_network() {
+        let vip = compute_service_vip(
+            "10.146.112.0/20",
+            Uuid::parse_str("278974fb-d8a0-07a9-590c-9908d5b33462").expect("valid network id"),
+            "backend",
+            &HashSet::new(),
+        )
+        .expect("vip");
+
+        assert_eq!(vip, Ipv4Addr::new(10, 146, 120, 162));
     }
 }
