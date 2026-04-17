@@ -5,9 +5,9 @@ mod common;
 
 use common::convergence::wait_until;
 use common::privileged_networking::{
-    PrivilegedTestGuard, command_output, create_privileged_network, create_privileged_node,
-    delete_privileged_network, privileged_artifact_dir, privileged_test_network,
-    privileged_test_subnet, privileged_test_subnet_v6,
+    PrivilegedTestGuard, command_output, command_stdout, create_privileged_network,
+    create_privileged_node, delete_privileged_network, privileged_artifact_dir,
+    privileged_test_network, privileged_test_subnet, privileged_test_subnet_v6,
 };
 use mantissa::network::nodeport::NodePortRuntimeState;
 use mantissa::services::ServiceController;
@@ -31,6 +31,30 @@ const NODEPORT_RESPONSE: &str = "hello from nodeport privileged test";
 const NODEPORT_CONFLICT_RESPONSE: &str = "hello from nodeport owner";
 const NODEPORT_DEGRADED_RESPONSE: &str = "hello from degraded nodeport service";
 const NODEPORT_UDP_RESPONSE: &str = "hello from nodeport privileged udp test";
+
+/// Returns the first default-route interface name for the current privileged test namespace.
+fn default_route_iface() -> Option<String> {
+    let routes = command_stdout("ip", &["-4", "route", "show", "default"]);
+    routes.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        while let Some(field) = fields.next() {
+            if field == "dev" {
+                return fields.next().map(str::to_string);
+            }
+        }
+        None
+    })
+}
+
+/// Returns whether an interface already has a usable non-link-local IPv6 address.
+fn iface_has_usable_ipv6(iface: &str) -> bool {
+    let output = command_stdout("ip", &["-6", "addr", "show", "dev", iface]);
+    output
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter(|token| token != &"fe80::/64")
+        .any(|token| token.starts_with("fd") || token.starts_with("2") || token.starts_with("3"))
+}
 
 /// Resolve the compiled NodePort dataplane artifacts for the privileged validation lane.
 fn privileged_nodeport_artifact_dir() -> Option<std::path::PathBuf> {
@@ -1050,6 +1074,104 @@ local_test!(
             )
             .await,
             "degraded NodePort should not expose the public port on loopback"
+        );
+
+        remove_service_via_rpc(&node.services_client, service_id).await;
+        delete_privileged_network(&node, network_id).await;
+    }
+);
+
+local_test!(
+    nodeport_ipv6_publication_requires_usable_external_ipv6_address,
+    {
+        let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
+            return;
+        };
+        let Some(external_iface) = default_route_iface() else {
+            return;
+        };
+        if iface_has_usable_ipv6(&external_iface) {
+            eprintln!(
+                "skipping privileged IPv6 publication degradation test; interface {external_iface} already has a usable IPv6 address"
+            );
+            return;
+        }
+
+        let _config = PrivilegedTestGuard::apply(|config| {
+            config.network.wireguard.enabled = false;
+            config.network.wireguard.manage_firewall = false;
+            config.network.bpf.attach = true;
+            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            config.network.nodeport.enabled = true;
+            config.network.nodeport.iface = Some(external_iface.clone());
+            config.network.nodeport.ip = None;
+            config.network.advertise_addr = None;
+        });
+        let node = create_privileged_node().await;
+        let subnet = privileged_test_subnet_v6();
+        let network = create_privileged_network(
+            &node,
+            privileged_test_network(
+                "nodeport-degraded-v6",
+                "privileged nodeport ipv6 publication degradation test network",
+                &subnet,
+                1450,
+                Vec::new(),
+            ),
+            mantissa::network::types::NetworkStatus::Ready,
+        )
+        .await;
+        let network_id = network.id;
+
+        let service_id = deploy_privileged_nodeport_service(
+            &node.service_controller,
+            "nodeport-degraded-v6",
+            network_id,
+            NODEPORT_DEGRADED_RESPONSE,
+            NODEPORT_HTTP_PORT_V6,
+            NODEPORT_HTTP_PORT_V6,
+        )
+        .await
+        .expect("submit degraded IPv6 NodePort deployment");
+
+        assert!(
+            wait_for_service_status(
+                &node.service_controller,
+                service_id,
+                ServiceStatus::Running,
+                Duration::from_secs(180),
+            )
+            .await,
+            "service should still reach running even when IPv6 public exposure degrades"
+        );
+
+        assert!(
+            wait_until(
+                Duration::from_secs(60),
+                Duration::from_millis(100),
+                || async {
+                    let status = node.network_controller.nodeport_manager().status().await;
+                    let service = node
+                        .service_controller
+                        .registry()
+                        .get(service_id)
+                        .expect("read degraded IPv6 public service")
+                        .expect("degraded IPv6 public service should still exist");
+                    status.state == NodePortRuntimeState::Degraded
+                        && status.resolved_iface.as_deref() == Some(external_iface.as_str())
+                        && status.last_error.as_deref().is_some_and(|error| {
+                            error.contains("no usable IPv6 address")
+                                && error.contains(external_iface.as_str())
+                                && error.contains("link-local IPv6 addresses cannot be used")
+                        })
+                        && service.public_endpoint_detail().is_some_and(|detail| {
+                            detail.contains("could not publish NodePort")
+                                && detail.contains("no usable IPv6 address")
+                        })
+                }
+            )
+            .await,
+            "missing external IPv6 publication capacity should degrade NodePort with a precise operator-facing reason"
         );
 
         remove_service_via_rpc(&node.services_client, service_id).await;

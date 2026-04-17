@@ -240,7 +240,7 @@ mod platform {
         NODEPORT_FLOW_CAPACITY, NODEPORT_HOST_CAPACITY, NODEPORT_INGRESS_DROP_REASON_COUNT,
         NODEPORT_VIP_CAPACITY, NodePortIngressDropReasons, NodePortMapping, NodePortPacketCounters,
         NodePortProtocol, NodePortRuntimeState, NodePortStatus, configured_node_ip_from_sources,
-        nodeport_capacity_error, projected_active_networks_after_sync,
+        nodeport_capacity_error, projected_active_networks_after_sync, resolve_advertise_ip,
     };
     use crate::config;
     use crate::ip_family::{IpFamily, infer_default_ip_family};
@@ -340,7 +340,7 @@ mod platform {
     };
 
     /// Address family selector shared by interface discovery and map programming helpers.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     enum NodePortIpFamily {
         Ipv4,
         Ipv6,
@@ -352,6 +352,14 @@ mod platform {
             match ip {
                 IpAddr::V4(_) => Self::Ipv4,
                 IpAddr::V6(_) => Self::Ipv6,
+            }
+        }
+
+        /// Render a stable address-family label for diagnostics and operator guidance.
+        fn label(self) -> &'static str {
+            match self {
+                Self::Ipv4 => "IPv4",
+                Self::Ipv6 => "IPv6",
             }
         }
     }
@@ -517,9 +525,6 @@ mod platform {
             }
             self.set_runtime_status(NodePortRuntimeState::Ready, None, "nodeport runtime ready");
 
-            let node_ip = self
-                .node_ip
-                .ok_or_else(|| anyhow!("nodeport node_ip missing"))?;
             let overlay_ifindex_opt = if entries.is_empty() {
                 None
             } else {
@@ -538,32 +543,51 @@ mod platform {
             let ipv6_vip_fd = ipv6_vip_map.fd().as_fd().as_raw_fd();
             let ipv4_host_fd = ipv4_host_map.fd().as_fd().as_raw_fd();
             let ipv6_host_fd = ipv6_host_map.fd().as_fd().as_raw_fd();
+            let mut resolved_node_ips = HashMap::new();
             if let Some(overlay_ifindex) = overlay_ifindex_opt {
                 let host_mac = host_access_mac(network_id).await?;
-                let host_ip =
-                    host_access_ip(network_id, NodePortIpFamily::from_ip(node_ip)).await?;
+                let mut programmed_ipv4_host = false;
+                let mut programmed_ipv6_host = false;
 
-                match host_ip {
-                    IpAddr::V4(host_ip) => {
-                        let value = NodePortHost {
-                            mac: host_mac,
-                            _pad: 0,
-                            host_ip: u32::from_ne_bytes(host_ip.octets()),
-                        };
-                        update_elem(ipv4_host_fd, &overlay_ifindex, &value)
-                            .context("program IPv4 nodeport host attachment")?;
-                        let _ = delete_elem(ipv6_host_fd, &overlay_ifindex);
+                // Resolve publication identity once per requested family so dual-stack hosts can
+                // publish IPv4 and IPv6 services through the same interface without forcing one
+                // global node IP to fit every VIP entry.
+                for (family, sample_vip) in unique_nodeport_families(entries) {
+                    let node_ip = self
+                        .resolve_public_node_ip_for_family(family, sample_vip)
+                        .await?;
+                    resolved_node_ips.insert(family, node_ip);
+                    let host_ip = host_access_ip(network_id, family).await?;
+
+                    match host_ip {
+                        IpAddr::V4(host_ip) => {
+                            let value = NodePortHost {
+                                mac: host_mac,
+                                _pad: 0,
+                                host_ip: u32::from_ne_bytes(host_ip.octets()),
+                            };
+                            update_elem(ipv4_host_fd, &overlay_ifindex, &value)
+                                .context("program IPv4 nodeport host attachment")?;
+                            programmed_ipv4_host = true;
+                        }
+                        IpAddr::V6(host_ip) => {
+                            let value = NodePortHost6 {
+                                mac: host_mac,
+                                _pad: [0u8; 2],
+                                host_ip: host_ip.octets(),
+                            };
+                            update_elem(ipv6_host_fd, &overlay_ifindex, &value)
+                                .context("program IPv6 nodeport host attachment")?;
+                            programmed_ipv6_host = true;
+                        }
                     }
-                    IpAddr::V6(host_ip) => {
-                        let value = NodePortHost6 {
-                            mac: host_mac,
-                            _pad: [0u8; 2],
-                            host_ip: host_ip.octets(),
-                        };
-                        update_elem(ipv6_host_fd, &overlay_ifindex, &value)
-                            .context("program IPv6 nodeport host attachment")?;
-                        let _ = delete_elem(ipv4_host_fd, &overlay_ifindex);
-                    }
+                }
+
+                if !programmed_ipv4_host {
+                    let _ = delete_elem(ipv4_host_fd, &overlay_ifindex);
+                }
+                if !programmed_ipv6_host {
+                    let _ = delete_elem(ipv6_host_fd, &overlay_ifindex);
                 }
             } else if had_ports && let Ok(overlay_ifindex) = overlay_ifindex(network_id) {
                 let _ = delete_elem(ipv4_host_fd, &overlay_ifindex);
@@ -582,6 +606,17 @@ mod platform {
                     proto: entry.protocol.number(),
                     _pad: 0,
                 };
+                let family = NodePortIpFamily::from_ip(entry.vip);
+                let node_ip = if let Some(node_ip) = resolved_node_ips.get(&family).copied() {
+                    node_ip
+                } else {
+                    let node_ip = self
+                        .resolve_public_node_ip_for_family(family, entry.vip)
+                        .await?;
+                    resolved_node_ips.insert(family, node_ip);
+                    node_ip
+                };
+
                 match (entry.vip, node_ip) {
                     (IpAddr::V4(vip), IpAddr::V4(node_ip)) => {
                         let value = NodePortEntry {
@@ -607,11 +642,9 @@ mod platform {
                             .with_context(|| format!("program IPv6 nodeport {}", entry.port))?;
                         let _ = delete_elem(ipv4_vip_fd, &key);
                     }
-                    (vip, node_ip) => {
-                        return Err(anyhow!(
-                            "nodeport VIP family mismatch: published VIP {vip} does not match node address {node_ip}; configure network.nodeport.ip for the same family"
-                        ));
-                    }
+                    (vip, node_ip) => unreachable!(
+                        "resolved nodeport identity should always match VIP family: vip={vip} node_ip={node_ip}"
+                    ),
                 }
                 self.port_owner.insert(selector, network_id);
             }
@@ -846,6 +879,63 @@ mod platform {
         /// Record one runtime degradation while preserving the current desired config and identity.
         fn degrade_runtime(&mut self, error: impl Into<String>, message: &'static str) {
             self.set_runtime_status(NodePortRuntimeState::Degraded, Some(error.into()), message);
+        }
+
+        /// Resolve the concrete node publication address for one requested VIP family.
+        ///
+        /// `network.nodeport.ip` is treated as a hard publication override. If it is configured in
+        /// the wrong family, we surface that directly instead of silently switching to another
+        /// address. `advertise_addr` is softer: it can still anchor interface selection while we
+        /// pick a different family-specific address from the same interface when available.
+        async fn resolve_public_node_ip_for_family(
+            &mut self,
+            family: NodePortIpFamily,
+            vip: IpAddr,
+        ) -> Result<IpAddr> {
+            let Some(iface) = self.iface.clone() else {
+                let error = "nodeport interface missing; set network.nodeport.iface or configure a reachable advertise address".to_string();
+                self.degrade_runtime(error.clone(), "nodeport runtime degraded");
+                return Err(anyhow!(error));
+            };
+
+            if let Some(configured_ip) = self.configured_node_ip {
+                if NodePortIpFamily::from_ip(configured_ip) == family {
+                    return Ok(configured_ip);
+                }
+
+                let error = format!(
+                    "configured network.nodeport.ip {configured_ip} is {} but published VIP {vip} requires {}; set network.nodeport.ip to a usable {} address or remove the override",
+                    NodePortIpFamily::from_ip(configured_ip).label(),
+                    family.label(),
+                    family.label(),
+                );
+                self.degrade_runtime(error.clone(), "nodeport runtime degraded");
+                return Err(anyhow!(error));
+            }
+
+            if let Some(configured_ip) = self
+                .configured_advertise_addr
+                .as_deref()
+                .and_then(resolve_advertise_ip)
+                .filter(|ip| NodePortIpFamily::from_ip(*ip) == family)
+            {
+                return Ok(configured_ip);
+            }
+
+            if let Some(node_ip) = detect_iface_ip(&iface, Some(family)).await? {
+                return Ok(node_ip);
+            }
+
+            let error = match family {
+                NodePortIpFamily::Ipv4 => format!(
+                    "nodeport interface {iface} has no usable IPv4 address for published VIP {vip}; assign an IPv4 address or configure network.nodeport.ip"
+                ),
+                NodePortIpFamily::Ipv6 => format!(
+                    "nodeport interface {iface} has no usable IPv6 address for published VIP {vip}; link-local IPv6 addresses cannot be used for public NodePort, assign a global or ULA IPv6 address or configure network.nodeport.ip"
+                ),
+            };
+            self.degrade_runtime(error.clone(), "nodeport runtime degraded");
+            Err(anyhow!(error))
         }
 
         /// Resolve the preferred family used when nodeport autodetect must choose between IPv4 and IPv6.
@@ -1225,6 +1315,23 @@ mod platform {
         }
 
         Ok(None)
+    }
+
+    /// Return one sample VIP per requested publication family so shared per-family state can be
+    /// resolved only once during a NodePort sync.
+    fn unique_nodeport_families(entries: &[NodePortMapping]) -> Vec<(NodePortIpFamily, IpAddr)> {
+        let mut families = Vec::new();
+        for entry in entries {
+            let family = NodePortIpFamily::from_ip(entry.vip);
+            if families
+                .iter()
+                .any(|(existing_family, _)| *existing_family == family)
+            {
+                continue;
+            }
+            families.push((family, entry.vip));
+        }
+        families
     }
 
     /// Resolve one usable NodePort address assigned to a specific interface.
