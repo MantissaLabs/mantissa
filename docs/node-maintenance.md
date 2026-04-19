@@ -121,6 +121,53 @@ Service drain uses a start-first handoff:
 That keeps service availability higher than a naive stop-first maintenance
 flow, especially when networking or readiness causes replacement retries.
 
+## What Survives a Mantissa Stop
+
+Mantissa's networking plane is split between:
+
+- kernel-resident eBPF dataplane state, and
+- node-local userspace discovery and reconciliation.
+
+That distinction matters during maintenance.
+
+If Mantissa stops after it has already programmed one network:
+
+- attached tc/XDP programs remain attached to the interfaces,
+- pinned eBPF maps remain in bpffs,
+- already programmed VIP and NodePort forwarding can keep working from the
+  last reconciled state.
+
+But some things do **not** continue without the Mantissa process:
+
+- the per-network DNS listener on the resolver IP stops,
+- backend health refresh stops,
+- VIP and NodePort reconciliation stops,
+- stale backends are not removed until Mantissa returns.
+
+In practice that means direct traffic to an already-known VIP may keep flowing,
+but fresh `*.svc.mantissa` lookups on that node will fail once the local
+resolver is gone.
+
+## Upgrade and Failure Expectations
+
+The intended maintenance workflow is therefore:
+
+1. drain the node,
+2. wait for service-managed work to evacuate,
+3. restart or upgrade Mantissa,
+4. resume the node after it is healthy again.
+
+Under that model, node-local discovery does not need to survive a planned
+Mantissa restart. The workloads that still matter should already be running on
+nodes whose local discovery loop is up.
+
+For an unplanned Mantissa daemon failure, the cluster can still recover through
+normal replica placement and reconciliation on other nodes, but operators
+should not assume daemonless service discovery on the failed node itself.
+Existing dataplane state may continue forwarding for a while, but fresh service
+name resolution on that node depends on Mantissa returning or the workloads
+being recreated elsewhere.
+
 ## Standalone Tasks
 
 Standalone tasks do not have a higher-level controller that can recreate them
@@ -154,4 +201,5 @@ maintenance knob without rewriting the workload spec.
 ## Related Documents
 
 - `docs/distributed-scheduler.md`
+- `docs/networking-ebpf.md`
 - `docs/volumes.md`
