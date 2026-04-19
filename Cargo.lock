@@ -710,6 +710,7 @@ dependencies = [
  "crossterm",
  "futures",
  "net",
+ "parking_lot",
  "protocol",
  "ron",
  "serde",

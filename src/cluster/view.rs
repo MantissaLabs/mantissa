@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 use uuid::Uuid;
 
 /// Stable lineage identifier for a cluster across view transitions.
@@ -131,28 +133,16 @@ impl ClusterViewState {
 
     /// Returns the currently active cluster view.
     pub fn active_view(&self) -> ClusterViewId {
-        match self.active.lock() {
-            Ok(guard) => *guard,
-            Err(err) => *err.into_inner(),
-        }
+        *self.active.lock()
     }
 
     /// Replaces the active cluster view and returns the previous value.
     #[allow(dead_code)]
     pub fn set_active_view(&self, next: ClusterViewId) -> ClusterViewId {
-        match self.active.lock() {
-            Ok(mut guard) => {
-                let prev = *guard;
-                *guard = next;
-                prev
-            }
-            Err(err) => {
-                let mut guard = err.into_inner();
-                let prev = *guard;
-                *guard = next;
-                prev
-            }
-        }
+        let mut guard = self.active.lock();
+        let prev = *guard;
+        *guard = next;
+        prev
     }
 }
 

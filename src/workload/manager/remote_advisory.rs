@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex;
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -28,24 +29,21 @@ pub(super) struct RemotePrepareFeedbackSnapshot {
 
 #[derive(Clone)]
 pub(super) struct RemotePrepareFeedbackRegistry {
-    inner: Arc<StdMutex<HashMap<Uuid, RemotePrepareFeedback>>>,
+    inner: Arc<Mutex<HashMap<Uuid, RemotePrepareFeedback>>>,
 }
 
 impl RemotePrepareFeedbackRegistry {
     /// Builds one empty in-memory advisory registry for retryable remote prepare failures.
     pub(super) fn new() -> Self {
         Self {
-            inner: Arc::new(StdMutex::new(HashMap::new())),
+            inner: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Returns the currently active retryable prepare feedback after pruning expired entries.
     pub(super) fn snapshot(&self) -> HashMap<Uuid, RemotePrepareFeedbackSnapshot> {
         let now = Instant::now();
-        let mut guard = match self.inner.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = self.inner.lock();
         guard.retain(|_, feedback| feedback.reject_until > now);
         guard
             .iter()
@@ -64,10 +62,7 @@ impl RemotePrepareFeedbackRegistry {
     #[cfg(test)]
     pub(super) fn reject_until(&self, peer_id: Uuid) -> Option<Instant> {
         let now = Instant::now();
-        let mut guard = match self.inner.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = self.inner.lock();
         guard.retain(|_, feedback| feedback.reject_until > now);
         guard.get(&peer_id).map(|feedback| feedback.reject_until)
     }
@@ -75,10 +70,7 @@ impl RemotePrepareFeedbackRegistry {
     /// Records one retryable prepare failure so the planner can temporarily rank the peer lower.
     pub(super) fn record_retryable_failure(&self, peer_id: Uuid) {
         let now = Instant::now();
-        let mut guard = match self.inner.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = self.inner.lock();
         guard.retain(|_, feedback| feedback.reject_until > now);
         let consecutive_failures = guard
             .get(&peer_id)
@@ -96,10 +88,7 @@ impl RemotePrepareFeedbackRegistry {
 
     /// Clears any active backoff immediately after the peer accepts a prepare request.
     pub(super) fn clear_success(&self, peer_id: Uuid) {
-        let mut guard = match self.inner.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = self.inner.lock();
         guard.remove(&peer_id);
     }
 }

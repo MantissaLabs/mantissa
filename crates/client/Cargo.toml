@@ -25,6 +25,7 @@ serde = { version = "1", features = ["derive"] }
 ron = "0.10.1"
 blake3 = "1"
 base64 = "0.22.1"
+parking_lot = { workspace = true }
 
 [features]
 default = []

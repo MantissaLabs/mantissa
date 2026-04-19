@@ -6,9 +6,10 @@ use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, Netw
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use crdt_store::uuid_key::UuidKey;
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Cached projections over network peer/attachment stores keyed by store generation.
@@ -70,20 +71,14 @@ impl NetworkRegistry {
         self.attachments.change_clock()
     }
 
-    /// Acquire a read guard for cached derived views, recovering from poisoning if needed.
+    /// Acquire a read guard for cached derived views.
     fn cache_read(&self) -> RwLockReadGuard<'_, NetworkRegistryCache> {
-        match self.cache.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        self.cache.read()
     }
 
-    /// Acquire a write guard for cached derived views, recovering from poisoning if needed.
+    /// Acquire a write guard for cached derived views.
     fn cache_write(&self) -> RwLockWriteGuard<'_, NetworkRegistryCache> {
-        match self.cache.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        self.cache.write()
     }
 
     /// Refresh cached peer-state projections when the underlying store generation advanced.

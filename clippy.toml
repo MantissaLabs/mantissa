@@ -1,0 +1,7 @@
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "use parking_lot::Mutex instead" },
+    { path = "std::sync::MutexGuard", reason = "use parking_lot::MutexGuard instead" },
+    { path = "std::sync::RwLock", reason = "use parking_lot::RwLock instead" },
+    { path = "std::sync::RwLockReadGuard", reason = "use parking_lot::RwLockReadGuard instead" },
+    { path = "std::sync::RwLockWriteGuard", reason = "use parking_lot::RwLockWriteGuard instead" },
+]

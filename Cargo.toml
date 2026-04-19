@@ -34,6 +34,7 @@ parking_lot = "0.12"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
+disallowed_types = "warn"
 
 [build-dependencies]
 aya-build = { git = "https://github.com/aya-rs/aya" }

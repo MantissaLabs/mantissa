@@ -9,16 +9,17 @@ use anyhow::{Result as AnyResult, anyhow};
 use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::SigningKey;
 use net::noise::NoiseKeys;
+use parking_lot::{
+    RwLock as SyncRwLock, RwLockReadGuard as SyncRwLockReadGuard,
+    RwLockWriteGuard as SyncRwLockWriteGuard,
+};
 use protocol::gossip::gossip::Client as GossipClient;
 use protocol::health;
 use protocol::server::{self, cluster_session};
 use protocol::sync;
 use std::collections::{HashMap, HashSet};
 use std::panic::Location;
-use std::sync::{
-    Arc, RwLock as StdRwLock, RwLockReadGuard as StdRwLockReadGuard,
-    RwLockWriteGuard as StdRwLockWriteGuard,
-};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{debug, error, warn};
@@ -112,8 +113,8 @@ pub struct Registry {
     noise_keys: Arc<NoiseKeys>,
     node_id: Uuid,
     health_monitor: Arc<HealthMonitor>,
-    excluded_peers: Arc<std::sync::RwLock<HashSet<Uuid>>>,
-    peer_snapshot_cache: Arc<StdRwLock<PeerStoreSnapshotCache>>,
+    excluded_peers: Arc<SyncRwLock<HashSet<Uuid>>>,
+    peer_snapshot_cache: Arc<SyncRwLock<PeerStoreSnapshotCache>>,
 }
 
 #[derive(Clone, Copy)]
@@ -188,8 +189,8 @@ impl Registry {
             noise_keys,
             node_id,
             health_monitor,
-            excluded_peers: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            peer_snapshot_cache: Arc::new(StdRwLock::new(PeerStoreSnapshotCache::new())),
+            excluded_peers: Arc::new(SyncRwLock::new(HashSet::new())),
+            peer_snapshot_cache: Arc::new(SyncRwLock::new(PeerStoreSnapshotCache::new())),
         }
     }
 
@@ -572,43 +573,26 @@ impl Registry {
 
     /// Replaces the current out-of-scope peer set used to scope scheduling and dataplane lookups.
     pub fn set_excluded_peers(&self, excluded: HashSet<Uuid>) {
-        match self.excluded_peers.write() {
-            Ok(mut guard) => {
-                *guard = excluded;
-            }
-            Err(poisoned) => {
-                let mut guard = poisoned.into_inner();
-                *guard = excluded;
-            }
-        }
+        *self.excluded_peers.write() = excluded;
     }
 
     /// Returns true when the peer should be ignored for control-plane and dataplane operations.
     fn peer_is_excluded(&self, peer_id: Uuid) -> bool {
-        match self.excluded_peers.read() {
-            Ok(guard) => guard.contains(&peer_id),
-            Err(poisoned) => poisoned.into_inner().contains(&peer_id),
-        }
+        self.excluded_peers.read().contains(&peer_id)
     }
 
     /// # Description:
     ///
-    /// Acquires a read guard for peer store projections while recovering from poisoning.
-    fn peer_snapshot_cache_read(&self) -> StdRwLockReadGuard<'_, PeerStoreSnapshotCache> {
-        match self.peer_snapshot_cache.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+    /// Acquires a read guard for peer store projections.
+    fn peer_snapshot_cache_read(&self) -> SyncRwLockReadGuard<'_, PeerStoreSnapshotCache> {
+        self.peer_snapshot_cache.read()
     }
 
     /// # Description:
     ///
-    /// Acquires a write guard for peer store projections while recovering from poisoning.
-    fn peer_snapshot_cache_write(&self) -> StdRwLockWriteGuard<'_, PeerStoreSnapshotCache> {
-        match self.peer_snapshot_cache.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+    /// Acquires a write guard for peer store projections.
+    fn peer_snapshot_cache_write(&self) -> SyncRwLockWriteGuard<'_, PeerStoreSnapshotCache> {
+        self.peer_snapshot_cache.write()
     }
 
     /// # Description:

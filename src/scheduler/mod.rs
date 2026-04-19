@@ -3,9 +3,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use anyhow::Result as AnyhowResult;
 use arc_swap::ArcSwapOption;
 use crdt_store::uuid_key::UuidKey;
+use parking_lot::RwLock as SyncRwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::sync::RwLock as StdRwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::warn;
@@ -414,8 +414,8 @@ pub struct Scheduler {
     store_key: UuidKey,
     state: Arc<ArcSwapOption<SchedulerState>>, // stores Option<Arc<SchedulerState>>
     registry: Registry,
-    digest_publisher: StdRwLock<Option<SchedulerDigestPublisher>>,
-    digest_registry: StdRwLock<Option<SchedulerDigestRegistry>>,
+    digest_publisher: SyncRwLock<Option<SchedulerDigestPublisher>>,
+    digest_registry: SyncRwLock<Option<SchedulerDigestRegistry>>,
 }
 
 fn ptr_eq_option(a: &Option<Arc<SchedulerState>>, b: &Option<Arc<SchedulerState>>) -> bool {
@@ -446,43 +446,24 @@ impl Scheduler {
             store_key,
             state,
             registry,
-            digest_publisher: StdRwLock::new(None),
-            digest_registry: StdRwLock::new(None),
+            digest_publisher: SyncRwLock::new(None),
+            digest_registry: SyncRwLock::new(None),
         })
     }
 
     /// Attaches the scheduler digest publisher used to replicate shortlist metadata.
     pub fn set_digest_publisher(&self, publisher: SchedulerDigestPublisher) {
-        match self.digest_publisher.write() {
-            Ok(mut guard) => {
-                *guard = Some(publisher);
-            }
-            Err(err) => {
-                let mut guard = err.into_inner();
-                *guard = Some(publisher);
-            }
-        }
+        *self.digest_publisher.write() = Some(publisher);
     }
 
     /// Attaches the scheduler digest registry used by the planner for shortlist reads.
     pub fn set_digest_registry(&self, registry: SchedulerDigestRegistry) {
-        match self.digest_registry.write() {
-            Ok(mut guard) => {
-                *guard = Some(registry);
-            }
-            Err(err) => {
-                let mut guard = err.into_inner();
-                *guard = Some(registry);
-            }
-        }
+        *self.digest_registry.write() = Some(registry);
     }
 
     /// Returns the latest canonical scheduler digest rows replicated for shortlist selection.
     pub fn scheduler_digests(&self) -> AnyhowResult<Vec<SchedulerDigestValue>> {
-        let registry = match self.digest_registry.read() {
-            Ok(guard) => guard.clone(),
-            Err(err) => err.into_inner().clone(),
-        };
+        let registry = self.digest_registry.read().clone();
 
         let Some(registry) = registry else {
             return Ok(Vec::new());
@@ -493,10 +474,7 @@ impl Scheduler {
 
     /// Returns the latest canonical scheduler digests together with local ingest timestamps.
     pub fn observed_scheduler_digests(&self) -> AnyhowResult<Vec<ObservedSchedulerDigest>> {
-        let registry = match self.digest_registry.read() {
-            Ok(guard) => guard.clone(),
-            Err(err) => err.into_inner().clone(),
-        };
+        let registry = self.digest_registry.read().clone();
 
         let Some(registry) = registry else {
             return Ok(Vec::new());
@@ -507,10 +485,7 @@ impl Scheduler {
 
     /// Upserts one observed remote scheduler digest into the local replicated digest cache.
     pub async fn observe_scheduler_digest(&self, digest: SchedulerDigestValue) -> AnyhowResult<()> {
-        let registry = match self.digest_registry.read() {
-            Ok(guard) => guard.clone(),
-            Err(err) => err.into_inner().clone(),
-        };
+        let registry = self.digest_registry.read().clone();
 
         let Some(registry) = registry else {
             return Ok(());
@@ -730,10 +705,7 @@ impl Scheduler {
 
     /// Publishes one compact digest for the provided snapshot when the publisher is configured.
     async fn publish_digest_from_snapshot(&self, snapshot: &SchedulerSnapshot) {
-        let publisher = match self.digest_publisher.read() {
-            Ok(guard) => guard.clone(),
-            Err(err) => err.into_inner().clone(),
-        };
+        let publisher = self.digest_publisher.read().clone();
 
         let Some(publisher) = publisher else {
             return;

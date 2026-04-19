@@ -2598,11 +2598,7 @@ impl WorkloadManager {
 
     /// Returns one decoded task spec from the local cache when it still matches the store clock.
     fn cached_spec(&self, id: Uuid, change_clock: u64) -> Option<WorkloadSpec> {
-        let guard = self
-            .local_state
-            .workload_spec_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = self.local_state.workload_spec_cache.lock();
         guard
             .get(&id)
             .filter(|entry| entry.change_clock == change_clock)
@@ -2611,11 +2607,7 @@ impl WorkloadManager {
 
     /// Records one decoded task spec so repeated lookups can reuse it until the store changes.
     fn cache_spec(&self, change_clock: u64, spec: WorkloadSpec) {
-        let mut guard = self
-            .local_state
-            .workload_spec_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self.local_state.workload_spec_cache.lock();
         guard.insert(
             spec.id,
             super::CachedWorkloadSpecEntry { change_clock, spec },
@@ -2624,11 +2616,7 @@ impl WorkloadManager {
 
     /// Removes one task from the decoded spec cache after delete paths.
     fn evict_cached_spec(&self, id: Uuid) {
-        let mut guard = self
-            .local_state
-            .workload_spec_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self.local_state.workload_spec_cache.lock();
         guard.remove(&id);
     }
 
@@ -2637,11 +2625,7 @@ impl WorkloadManager {
         &self,
         change_clock: u64,
     ) -> Option<Arc<HashMap<Uuid, WorkloadValue>>> {
-        let guard = self
-            .local_state
-            .workload_value_index
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = self.local_state.workload_value_index.lock();
         guard
             .as_ref()
             .filter(|entry| entry.change_clock == change_clock)
@@ -2654,11 +2638,7 @@ impl WorkloadManager {
         change_clock: u64,
         workload_values: Arc<HashMap<Uuid, WorkloadValue>>,
     ) {
-        let mut guard = self
-            .local_state
-            .workload_value_index
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self.local_state.workload_value_index.lock();
         *guard = Some(super::CachedWorkloadValueIndex {
             change_clock,
             workload_values,

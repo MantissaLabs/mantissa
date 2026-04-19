@@ -27,13 +27,14 @@ use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Utc};
 use crdt_store::uuid_key::UuidKey;
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use tokio::sync::{
     Mutex as AsyncMutex, Notify, RwLock, Semaphore,
     mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender},
@@ -230,9 +231,9 @@ struct WorkloadManagerLocalState {
     // Best-effort mapping from workload id to the current backend-qualified runtime reference.
     local_instances: Arc<AsyncMutex<HashMap<Uuid, RuntimeInstanceRef>>>,
     // Per-workload decoded spec cache reused while the backing store stays unchanged.
-    workload_spec_cache: Arc<StdMutex<HashMap<Uuid, CachedWorkloadSpecEntry>>>,
+    workload_spec_cache: Arc<Mutex<HashMap<Uuid, CachedWorkloadSpecEntry>>>,
     // Full workload-store snapshot reused across periodic scans until the store changes.
-    workload_value_index: Arc<StdMutex<Option<CachedWorkloadValueIndex>>>,
+    workload_value_index: Arc<Mutex<Option<CachedWorkloadValueIndex>>>,
     // Per-workload liveness probe bookkeeping used by reconciliation.
     liveness_probes: Arc<AsyncMutex<HashMap<Uuid, LivenessProbeEntry>>>,
     // Stop deduplication guard so only one stop workflow runs per workload.
@@ -421,8 +422,8 @@ impl WorkloadManager {
             },
             local_state: WorkloadManagerLocalState {
                 local_instances: Arc::new(AsyncMutex::new(HashMap::new())),
-                workload_spec_cache: Arc::new(StdMutex::new(HashMap::new())),
-                workload_value_index: Arc::new(StdMutex::new(None)),
+                workload_spec_cache: Arc::new(Mutex::new(HashMap::new())),
+                workload_value_index: Arc::new(Mutex::new(None)),
                 liveness_probes: Arc::new(AsyncMutex::new(HashMap::new())),
                 inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
                 inflight_reconciles: Arc::new(AsyncMutex::new(HashSet::new())),

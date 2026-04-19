@@ -4,10 +4,11 @@ use crate::tasks::util::write_frame;
 use anyhow::{Result, anyhow};
 use capnp_rpc::new_client;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
+use parking_lot::Mutex;
 use protocol::task::{TaskLogStream, task_attach_session, task_log_sink};
 use std::io::{self, IsTerminal, Read, Write};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 pub(crate) const DEFAULT_DETACH_KEYS: &str = "ctrl-p,ctrl-q";
@@ -391,9 +392,8 @@ impl AttachCompletion {
 
     /// Resolves the completion handle at most once.
     fn finish(&self, result: Result<(), String>) {
-        if let Ok(mut guard) = self.sender.lock()
-            && let Some(sender) = guard.take()
-        {
+        let mut guard = self.sender.lock();
+        if let Some(sender) = guard.take() {
             let _ = sender.send(result);
         }
     }
@@ -432,11 +432,7 @@ impl CliTaskAttachSink {
             return write_frame(stream, bytes);
         }
 
-        let normalized = self
-            .normalizer
-            .lock()
-            .map_err(|_| capnp::Error::failed("attach terminal writer lock poisoned".into()))?
-            .normalize(stream, bytes);
+        let normalized = self.normalizer.lock().normalize(stream, bytes);
         match stream {
             TaskLogStream::Stdout | TaskLogStream::Console => {
                 let mut stdout = io::stdout();

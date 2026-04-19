@@ -4,11 +4,12 @@ use crate::store::scheduler_digest_store::SchedulerDigestStore;
 use anyhow::{Result as AnyhowResult, anyhow};
 use async_channel::{Receiver, Sender};
 use capnp::Error;
+use parking_lot::Mutex;
 use protocol::scheduling::{scheduler_digest, scheduler_digest_event};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use uuid::Uuid;
@@ -93,7 +94,7 @@ pub struct ObservedSchedulerDigest {
 #[derive(Clone)]
 pub struct SchedulerDigestRegistry {
     store: SchedulerDigestStore,
-    observed_at_unix_ms: Arc<StdMutex<HashMap<Uuid, u64>>>,
+    observed_at_unix_ms: Arc<Mutex<HashMap<Uuid, u64>>>,
 }
 
 impl SchedulerDigestRegistry {
@@ -101,7 +102,7 @@ impl SchedulerDigestRegistry {
     pub fn new(store: SchedulerDigestStore) -> Self {
         Self {
             store,
-            observed_at_unix_ms: Arc::new(StdMutex::new(HashMap::new())),
+            observed_at_unix_ms: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -181,29 +182,20 @@ impl SchedulerDigestRegistry {
     /// Records one local observation timestamp for a digest row.
     fn record_observed_now(&self, node_id: Uuid) {
         let now_unix_ms = current_unix_ms();
-        let mut guard = match self.observed_at_unix_ms.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = self.observed_at_unix_ms.lock();
         guard.insert(node_id, now_unix_ms);
     }
 
     /// Returns the local ingest timestamp for one digest row, seeding it lazily if absent.
     fn observed_at(&self, node_id: Uuid) -> u64 {
         let now_unix_ms = current_unix_ms();
-        let mut guard = match self.observed_at_unix_ms.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = self.observed_at_unix_ms.lock();
         *guard.entry(node_id).or_insert(now_unix_ms)
     }
 
     /// Clears the local ingest timestamp when the digest row disappears.
     fn clear_observed(&self, node_id: Uuid) {
-        let mut guard = match self.observed_at_unix_ms.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = self.observed_at_unix_ms.lock();
         guard.remove(&node_id);
     }
 }

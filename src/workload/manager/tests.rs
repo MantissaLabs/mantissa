@@ -1025,7 +1025,6 @@ async fn load_spec_cache_refreshes_after_store_change() {
         .local_state
         .workload_spec_cache
         .lock()
-        .unwrap()
         .get(&spec.id)
         .map(|entry| entry.change_clock)
         .expect("cache entry after first load");

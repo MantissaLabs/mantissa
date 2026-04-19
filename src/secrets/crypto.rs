@@ -5,10 +5,11 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 const AAD_PREFIX: &[u8] = b"mantissa.secret.v1";
@@ -60,7 +61,7 @@ impl SecretKeyring {
         // Rotation re-wraps secrets with `record.version`, but remote nodes might serve reads
         // against the previous version until they receive the broadcast.
         {
-            let mut cache = self.inner.cache.write().expect("poisoned master cache");
+            let mut cache = self.inner.cache.write();
             cache.insert(record.version, record.key);
         }
         self.inner
@@ -70,7 +71,7 @@ impl SecretKeyring {
 
     fn master_key_for(&self, version: u64) -> io::Result<[u8; MASTER_KEY_SIZE]> {
         {
-            let cache = self.inner.cache.read().expect("poisoned master cache");
+            let cache = self.inner.cache.read();
             if let Some(key) = cache.get(&version) {
                 return Ok(*key);
             }
@@ -82,7 +83,7 @@ impl SecretKeyring {
             .load_version(version)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "master key version missing"))?;
 
-        let mut cache = self.inner.cache.write().expect("poisoned master cache");
+        let mut cache = self.inner.cache.write();
         let entry = cache.entry(record.version).or_insert(record.key);
         Ok(*entry)
     }

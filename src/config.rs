@@ -1,16 +1,14 @@
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{
-    RwLock,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use net::paths::ensure_state_dir;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::sync::Lazy;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -418,12 +416,10 @@ pub fn load_config_with_source(path: Option<&Path>) -> Result<(Config, ConfigSou
 ///
 /// Replace the global configuration and record its origin metadata.
 pub fn set_global_config_with_source(config: Config, source: ConfigSource) {
-    let mut guard = GLOBAL_CONFIG.write().expect("global config lock poisoned");
+    let mut guard = GLOBAL_CONFIG.write();
     *guard = config;
 
-    let mut source_guard = GLOBAL_SOURCE
-        .write()
-        .expect("global config source lock poisoned");
+    let mut source_guard = GLOBAL_SOURCE.write();
     *source_guard = source;
     GLOBAL_LOADED.store(true, Ordering::Release);
 }
@@ -433,7 +429,7 @@ pub fn set_global_config_with_source(config: Config, source: ConfigSource) {
 /// Return a cloned snapshot of the current global configuration.
 pub fn global_config() -> Config {
     ensure_config_loaded();
-    let guard = GLOBAL_CONFIG.read().expect("global config lock poisoned");
+    let guard = GLOBAL_CONFIG.read();
     guard.clone()
 }
 
@@ -442,9 +438,7 @@ pub fn global_config() -> Config {
 /// Return a snapshot of the metadata describing where the current config came from.
 pub fn global_config_source() -> ConfigSource {
     ensure_config_loaded();
-    let guard = GLOBAL_SOURCE
-        .read()
-        .expect("global config source lock poisoned");
+    let guard = GLOBAL_SOURCE.read();
     guard.clone()
 }
 
@@ -778,12 +772,10 @@ fn ensure_config_loaded() {
         path: None,
         env_overrides,
     };
-    let mut guard = GLOBAL_CONFIG.write().expect("global config lock poisoned");
+    let mut guard = GLOBAL_CONFIG.write();
     *guard = config;
 
-    let mut source_guard = GLOBAL_SOURCE
-        .write()
-        .expect("global config source lock poisoned");
+    let mut source_guard = GLOBAL_SOURCE.write();
     *source_guard = source;
 }
 
