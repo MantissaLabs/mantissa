@@ -78,6 +78,7 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 ## Config keys (and legacy env vars)
 
 - `network.advertise_addr` (env: `MANTISSA_ADVERTISE_ADDR`)
+- `network.default_ip_family` (env: `MANTISSA_DEFAULT_IP_FAMILY`)
 - `network.wireguard.enabled` (legacy: `MANTISSA_WIREGUARD_DISABLE`)
 - `network.wireguard.port` (legacy: `MANTISSA_WIREGUARD_PORT`)
 - `network.wireguard.manage_firewall` (legacy: `MANTISSA_WIREGUARD_NO_FIREWALL`)
@@ -105,6 +106,21 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 - `replication.workload_repair_fanout` (legacy: `MANTISSA_WORKLOAD_REPAIR_FANOUT`)
 
 ## NodePort guidance
+
+## Default IP family guidance
+
+Use `network.default_ip_family` to steer auto-created overlay networks when a
+manifest does not request an explicit family.
+
+- `auto` keeps the existing IPv4-first behavior on dual-stack hosts, but
+  switches to IPv6 on IPv6-only hosts.
+- `ipv4` forces IPv4 defaults.
+- `ipv6` forces IPv6 defaults.
+
+When `network.advertise_addr` is set, Mantissa also uses that configured socket
+to infer the default family before falling back to host probing. This applies
+to both literal socket addresses and hostname-based advertise addresses such as
+`node-1.example.com:6578`.
 
 Use the NodePort settings to define the externally visible socket Mantissa
 publishes for services with `public_port`.

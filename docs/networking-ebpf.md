@@ -119,11 +119,13 @@ For a service name lookup, Mantissa:
 1. Lists “ready” network attachments for the network.
 2. Filters them to tasks that match the service/template label.
 3. Optionally probes health (if configured) and refreshes backend MACs.
-4. Returns A records in this order:
-   - A rotated list of backend IPs (so service discovery works even without eBPF).
-   - If the eBPF maps are successfully programmed, an additional A record for the VIP.
+4. Returns:
+   - one stable VIP record when the eBPF dataplane is programmed successfully,
+   - otherwise a rotated list of backend attachment IPs as the fallback path.
 
-This “backends first + optional VIP” ordering is deliberate: clients that always pick the first A record still distribute load (DNS rotation), while the VIP exists as a stable endpoint for host/public access and for clients that explicitly choose it.
+Normal service discovery should prefer the stable VIP whenever Mantissa can
+program it. The backend-only DNS path exists so discovery still works during
+degraded startup or in environments where VIP programming is unavailable.
 
 ### VIP computation (deterministic)
 
@@ -263,6 +265,22 @@ Both ingress/egress programs explicitly set the padding to zero when constructin
 5. Seeds `LB_FWD` and `LB_REV` so the return path can be reversed.
 
 It also contains a VIP ARP responder that synthesizes ARP replies for configured VIPs by rewriting ARP requests in-place and using `clone_redirect` back to the ingress port.
+
+### Load-balancing policy
+
+Mantissa does **not** use round-robin selection for VIP traffic.
+
+Backend choice is flow-hash based:
+
+- userspace precomputes one backend lookup ring per VIP,
+- the tc ingress program hashes the packet 5-tuple plus the VIP,
+- the hash selects one ring slot in O(1),
+- the selected backend is cached for the return path.
+
+That means repeated requests can legitimately hit the same replica several
+times in a row, especially with small samples. The intended guarantee is
+distributed per-flow spreading and stable selection semantics, not a strict
+`A, B, C, D` rotation order.
 
 ### Egress (backend → VIP SNAT)
 

@@ -1082,6 +1082,177 @@ local_test!(
     }
 );
 
+local_test!(ebpf_overlay_task_dns_reaches_service_vip, {
+    let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {
+        return;
+    };
+
+    let _config = PrivilegedTestGuard::apply(|config| {
+        config.network.wireguard.enabled = false;
+        config.network.wireguard.manage_firewall = false;
+        config.network.bpf.attach = true;
+        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        config.network.nodeport.enabled = false;
+        config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+    });
+
+    let node = create_privileged_node().await;
+    let subnet = privileged_test_subnet();
+    let network = create_privileged_network(
+        &node,
+        privileged_test_network(
+            "ebpf-vip-v4-task",
+            "privileged ebpf IPv4 task vip reachability test network",
+            &subnet,
+            1450,
+            Vec::new(),
+        ),
+        NetworkStatus::Ready,
+    )
+    .await;
+    let network_id = network.id;
+    let service_name = "ebpf-vip-v4-task-service";
+
+    let service_id = node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![
+                privileged_http_service_task_template(network_id, 1),
+                privileged_frontend_task_template(network_id),
+            ],
+        )
+        .await
+        .expect("submit privileged IPv4 internal VIP deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.service_controller,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(180),
+        )
+        .await,
+        "IPv4 eBPF overlay service with frontend task should reach running state"
+    );
+
+    let frontend_task_id =
+        wait_for_local_service_task(&node, service_name, "frontend", Duration::from_secs(60)).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let backend_ips = loop {
+        let backend_ips: BTreeSet<Ipv4Addr> = node
+            .network_registry
+            .list_attachments(Some(network_id))
+            .expect("list IPv4 attachments for task-facing eBPF test")
+            .into_iter()
+            .filter(|attachment| {
+                attachment.state == mantissa::network::types::NetworkAttachmentState::Ready
+                    && attachment.traffic_published
+                    && attachment.service_name.as_deref() == Some(service_name)
+                    && attachment.template_name.as_deref() == Some("backend")
+            })
+            .filter_map(|attachment| attachment.assigned_ip)
+            .filter_map(|ip| ip.parse::<Ipv4Addr>().ok())
+            .collect();
+        if backend_ips.len() == 1 {
+            break backend_ips.into_iter().collect::<Vec<_>>();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "network {network_id} should publish one backend attachment for {service_name}; observed {backend_ips:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let [
+        _vxlan_ifname,
+        _bridge_ifname,
+        _host_peer_ifname,
+        host_ifname,
+    ] = privileged_network_interfaces(network_id);
+    let resolver_ip = interface_ipv4(&host_ifname);
+    let fqdn = format!("backend.{}.svc.mantissa", network.name);
+    let vip = wait_for_vip_record(
+        resolver_ip,
+        &format!("{fqdn}."),
+        &backend_ips,
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("discover IPv4 VIP for task-facing eBPF test");
+
+    let curl_command = format!(
+        "curl -sS --connect-timeout 2 --max-time 5 -w '\\nREMOTE=%{{remote_ip}}\\n' http://{vip}:{EBPF_HTTP_PORT}/"
+    );
+    let task_vip_ready = common::convergence::wait_until(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        || async {
+            let output = exec_task_container(frontend_task_id, &curl_command);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            output.status.success()
+                && stdout.contains(EBPF_HTTP_RESPONSE)
+                && stdout.contains(&format!("REMOTE={vip}"))
+        },
+    )
+    .await;
+
+    if !task_vip_ready {
+        let dns_answers =
+            exec_task_container(frontend_task_id, &format!("getent ahostsv4 {fqdn} || true"));
+        let neighbours = exec_task_container(frontend_task_id, "ip neigh || true");
+        let resolver = exec_task_container(frontend_task_id, "cat /etc/resolv.conf || true");
+        let ping = exec_task_container(frontend_task_id, &format!("ping -c 1 {vip} || true"));
+        let direct_backend = exec_task_container(
+            frontend_task_id,
+            &format!(
+                "curl -sS --connect-timeout 2 --max-time 5 http://{}:{EBPF_HTTP_PORT}/ || true",
+                backend_ips[0]
+            ),
+        );
+        let last_curl = exec_task_container(frontend_task_id, &curl_command);
+        let pin_dir = pinned_lb_map_dir(network_id);
+        let fwd_dump = command_stdout(
+            "bpftool",
+            &[
+                "map",
+                "dump",
+                "pinned",
+                &pin_dir.join("LB_FWD").display().to_string(),
+            ],
+        );
+        let rev_dump = command_stdout(
+            "bpftool",
+            &[
+                "map",
+                "dump",
+                "pinned",
+                &pin_dir.join("LB_REV").display().to_string(),
+            ],
+        );
+        panic!(
+            "task-facing IPv4 DNS should resolve to a reachable service VIP; vip={vip}; backend_ips={backend_ips:?}; resolver_ip={resolver_ip}; fqdn={fqdn}; dns_stdout={:?}; dns_stderr={:?}; neigh_stdout={:?}; resolver_stdout={:?}; ping_stdout={:?}; direct_backend_status={:?}; direct_backend_stdout={:?}; direct_backend_stderr={:?}; fwd_dump={:?}; rev_dump={:?}; curl_status={:?}; curl_stdout={:?}; curl_stderr={:?}",
+            String::from_utf8_lossy(&dns_answers.stdout),
+            String::from_utf8_lossy(&dns_answers.stderr),
+            String::from_utf8_lossy(&neighbours.stdout),
+            String::from_utf8_lossy(&resolver.stdout),
+            String::from_utf8_lossy(&ping.stdout),
+            direct_backend.status.code(),
+            String::from_utf8_lossy(&direct_backend.stdout),
+            String::from_utf8_lossy(&direct_backend.stderr),
+            fwd_dump,
+            rev_dump,
+            last_curl.status.code(),
+            String::from_utf8_lossy(&last_curl.stdout),
+            String::from_utf8_lossy(&last_curl.stderr),
+        );
+    }
+
+    remove_service_via_rpc(&node.services_client, service_id).await;
+    delete_privileged_network(&node, network_id).await;
+});
+
 local_test!(ebpf_overlay_ipv6_task_dns_reaches_service_vip, {
     let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {
         return;
@@ -1182,15 +1353,18 @@ local_test!(ebpf_overlay_ipv6_task_dns_reaches_service_vip, {
     .await
     .expect("discover IPv6 VIP for task-facing eBPF test");
 
-    let curl_command =
-        format!("curl -g -6 --connect-timeout 2 --max-time 5 http://[{vip}]:{EBPF_HTTP_PORT}/");
+    let curl_command = format!(
+        "curl -g -6 -sS --connect-timeout 2 --max-time 5 -w '\\nREMOTE=%{{remote_ip}}\\n' http://[{vip}]:{EBPF_HTTP_PORT}/"
+    );
     let task_vip_ready = common::convergence::wait_until(
         Duration::from_secs(30),
         Duration::from_millis(100),
         || async {
             let output = exec_task_container(frontend_task_id, &curl_command);
+            let stdout = String::from_utf8_lossy(&output.stdout);
             output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains(EBPF_HTTP_RESPONSE)
+                && stdout.contains(EBPF_HTTP_RESPONSE)
+                && stdout.contains(&format!("REMOTE={vip}"))
         },
     )
     .await;

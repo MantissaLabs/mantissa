@@ -107,7 +107,7 @@ fn handle_ipv6_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
         IPPROTO_TCP | IPPROTO_UDP => {
             let proto = ip_hdr.next_header;
             let (src_port, dst_port) = parse_ports(data, data_end, l4_offset, proto)?;
-            let client_flow = Flow6 {
+            let flow_key = Flow6 {
                 src: ip_hdr.src,
                 dst: ip_hdr.dst,
                 src_port,
@@ -116,9 +116,14 @@ fn handle_ipv6_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
                 padding: [0u8; 3],
             };
 
-            let mut chosen = unsafe { LB_FWD_V6.get(&client_flow).copied() };
+            if let Some(entry) = unsafe { LB_REV_V6.get(&flow_key).copied() } {
+                apply_snat_v6(ctx, &eth, &ip_hdr, ip_offset, l4_offset, proto, &entry)?;
+                return Ok(TC_ACT_OK);
+            }
+
+            let mut chosen = unsafe { LB_FWD_V6.get(&flow_key).copied() };
             if chosen.is_none() {
-                chosen = select_backend_v6(&client_flow, ip_hdr.dst);
+                chosen = select_backend_v6(&flow_key, ip_hdr.dst);
             }
 
             let Some(choice) = chosen else {
@@ -129,7 +134,7 @@ fn handle_ipv6_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
 
             let reverse_key = Flow6 {
                 src: choice.backend_ip,
-                dst: client_flow.src,
+                dst: flow_key.src,
                 src_port: dst_port,
                 dst_port: src_port,
                 proto,
@@ -137,7 +142,7 @@ fn handle_ipv6_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
             };
 
             unsafe {
-                LB_FWD_V6.insert(&client_flow, &choice, 0).map_err(|_| ())?;
+                LB_FWD_V6.insert(&flow_key, &choice, 0).map_err(|_| ())?;
                 LB_REV_V6.insert(&reverse_key, &choice, 0).map_err(|_| ())?;
             }
 
@@ -315,6 +320,40 @@ fn apply_dnat_v6(
     ctx.store(ip_offset, &updated_ip, 0).map_err(|_| ())?;
 
     let checksum_delta = ipv6_address_csum_diff(&ip.dst, &choice.backend_ip)?;
+    ctx.l4_csum_replace(
+        l4_offset + l4_checksum_offset(proto),
+        0,
+        checksum_delta,
+        BPF_F_PSEUDO_HDR as u64,
+    )
+    .map_err(|_| ())?;
+
+    Ok(())
+}
+
+/// Rewrite one IPv6 return-path packet so local bridge forwarding still presents the VIP.
+///
+/// Some same-node task-to-task flows are bridged directly between local task ports. Handling the
+/// reverse rewrite on ingress as well keeps those replies on the stable VIP identity even when the
+/// packet never traverses a bridge-port tc egress hook on its way back to the client.
+fn apply_snat_v6(
+    ctx: &mut TcContext,
+    eth: &EthernetHeader,
+    ip: &Ipv6Header,
+    ip_offset: usize,
+    l4_offset: usize,
+    proto: u8,
+    entry: &NatEntry6,
+) -> Result<(), ()> {
+    let mut updated_eth = *eth;
+    updated_eth.src = entry.vip_mac;
+    ctx.store(0, &updated_eth, 0).map_err(|_| ())?;
+
+    let mut updated_ip = *ip;
+    updated_ip.src = entry.vip;
+    ctx.store(ip_offset, &updated_ip, 0).map_err(|_| ())?;
+
+    let checksum_delta = ipv6_address_csum_diff(&ip.src, &entry.vip)?;
     ctx.l4_csum_replace(
         l4_offset + l4_checksum_offset(proto),
         0,

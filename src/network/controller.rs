@@ -521,7 +521,7 @@ impl NetworkController {
                     network = %network_id,
                     "event-triggered network reconcile failed: {err:#}"
                 );
-                self.update_peer_state_error(network_id, err.to_string())
+                self.update_peer_state_error(network_id, format!("{err:#}"))
                     .await?;
             }
         }
@@ -557,7 +557,7 @@ impl NetworkController {
                             network = %network_id,
                             "immediate reconcile failed: {err:#}"
                         );
-                        self.update_peer_state_error(network_id, err.to_string())
+                        self.update_peer_state_error(network_id, format!("{err:#}"))
                             .await?;
                     }
                 }
@@ -696,7 +696,7 @@ impl NetworkController {
                     spec.name,
                     spec.id
                 );
-                self.update_peer_state_error(spec.id, err.to_string())
+                self.update_peer_state_error(spec.id, format!("{err:#}"))
                     .await?;
             }
         }

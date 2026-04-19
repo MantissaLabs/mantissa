@@ -119,6 +119,21 @@ fn handle_ipv4_packet(
     }
 
     let (src_port, dst_port) = parse_ports(data, data_end, l4_offset, proto)?;
+    let reverse_key = Flow4 {
+        src: ip_hdr.src,
+        dst: ip_hdr.dst,
+        src_port,
+        dst_port,
+        proto,
+        pad: 0,
+        padding: [0u8; 2],
+    };
+
+    if let Some(entry) = unsafe { LB_REV.get(&reverse_key).copied() } {
+        apply_snat_v4(ctx, eth_hdr, ip_hdr, ip_offset, l4_offset, proto, &entry)?;
+        return Ok(TC_ACT_OK);
+    }
+
     let client_flow = Flow4 {
         src: ip_hdr.src,
         dst: ip_hdr.dst,
@@ -300,6 +315,36 @@ fn apply_dnat_v4(
         l4_offset + l4_checksum_offset(proto),
         old_dst as u64,
         ip.dst as u64,
+        (BPF_F_PSEUDO_HDR as u64) | 4,
+    )
+    .map_err(|_| ())?;
+
+    Ok(())
+}
+
+/// Rewrite one IPv4 return-path packet so local bridge forwarding still presents the VIP.
+///
+/// Same-node task traffic can be forwarded directly between local bridge ports. Applying the
+/// reverse rewrite on ingress keeps those replies on the stable VIP identity even if the packet
+/// never traverses a tc egress hook before re-entering the client task.
+fn apply_snat_v4(
+    ctx: &mut TcContext,
+    eth: &mut EthernetHeader,
+    ip: &mut Ipv4Header,
+    ip_offset: usize,
+    l4_offset: usize,
+    proto: u8,
+    entry: &NatEntry,
+) -> Result<(), ()> {
+    let old_src = ip.src;
+    ip.src = entry.vip;
+    eth.src = entry.vip_mac;
+    ctx.l3_csum_replace(ip_offset + 10, old_src as u64, ip.src as u64, 4)
+        .map_err(|_| ())?;
+    ctx.l4_csum_replace(
+        l4_offset + l4_checksum_offset(proto),
+        old_src as u64,
+        ip.src as u64,
         (BPF_F_PSEUDO_HDR as u64) | 4,
     )
     .map_err(|_| ())?;

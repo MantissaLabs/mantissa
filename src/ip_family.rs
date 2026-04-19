@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
 /// # Description:
 ///
@@ -38,6 +38,24 @@ impl IpFamily {
 
 /// # Description:
 ///
+/// Resolve the address family implied by one configured advertise address. This accepts both
+/// literal socket addresses and hostname-based endpoints so default-family inference follows the
+/// same host/port shape operators use for the daemon itself.
+fn advertise_addr_family(addr: &str) -> Option<IpFamily> {
+    let trimmed = addr.trim();
+    if let Ok(socket_addr) = trimmed.parse::<SocketAddr>() {
+        return Some(IpFamily::from_ip(socket_addr.ip()));
+    }
+
+    trimmed
+        .to_socket_addrs()
+        .ok()?
+        .next()
+        .map(|socket_addr| IpFamily::from_ip(socket_addr.ip()))
+}
+
+/// # Description:
+///
 /// Resolve the effective default IP family from explicit node addresses, operator policy, and the
 /// discovered host capabilities in a stable precedence order.
 pub fn infer_default_ip_family(
@@ -52,9 +70,9 @@ pub fn infer_default_ip_family(
     }
 
     if let Some(addr) = explicit_advertise_addr
-        && let Ok(socket_addr) = addr.trim().parse::<SocketAddr>()
+        && let Some(family) = advertise_addr_family(addr)
     {
-        return IpFamily::from_ip(socket_addr.ip());
+        return family;
     }
 
     match policy {
@@ -70,7 +88,7 @@ pub fn infer_default_ip_family(
 #[cfg(test)]
 mod tests {
     use super::{DefaultIpFamilyPolicy, IpFamily, infer_default_ip_family};
-    use std::net::{IpAddr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv6Addr, ToSocketAddrs};
 
     #[test]
     fn infer_default_ip_family_prefers_explicit_node_ip() {
@@ -94,6 +112,24 @@ mod tests {
             true,
         );
         assert_eq!(family, IpFamily::Ipv6);
+    }
+
+    #[test]
+    fn infer_default_ip_family_resolves_hostname_advertise_addr() {
+        let expected = "localhost:6578"
+            .to_socket_addrs()
+            .expect("resolve localhost")
+            .next()
+            .map(|socket_addr| IpFamily::from_ip(socket_addr.ip()))
+            .expect("localhost should resolve");
+        let family = infer_default_ip_family(
+            None,
+            Some("localhost:6578"),
+            DefaultIpFamilyPolicy::Ipv4,
+            true,
+            true,
+        );
+        assert_eq!(family, expected);
     }
 
     #[test]
