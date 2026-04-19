@@ -2,7 +2,7 @@
 #![allow(static_mut_refs)]
 #![cfg_attr(not(test), no_main)]
 
-use core::{mem, ptr};
+use core::ptr;
 
 use aya_ebpf::{
     bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT},

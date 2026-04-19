@@ -1322,10 +1322,7 @@ mod tests {
 
         assert_eq!(manifest.task_templates.len(), 2);
         assert_eq!(manifest.task_templates[0].name, "backend");
-        assert_eq!(
-            manifest.task_templates[0].image,
-            "hashicorp/http-echo:1.0.0"
-        );
+        assert_eq!(manifest.task_templates[0].image, "busybox:1.36");
         assert!(manifest.task_templates[0].readiness.is_some());
         assert!(matches!(
             manifest.task_templates[0]
