@@ -646,80 +646,94 @@ local_test!(discovery_dns_answers_aaaa_for_ipv6_networks, {
         .expect("teardown ipv6 discovery");
 });
 
-local_test!(discovery_dns_rotates_single_ipv6_backend_answer_per_query, {
-    let dns_port = 10533;
-    let service_name = "ipv6-rotating-backend";
-    let harness = setup_discovery_harness_with_subnet(dns_port, "fd42::/64").await;
-    let network_id = harness.network.id;
+local_test!(
+    discovery_dns_rotates_ipv6_backend_answers_when_vip_unavailable,
+    {
+        let dns_port = 10533;
+        let service_name = "ipv6-rotating-backend";
+        let harness = setup_discovery_harness_with_subnet(dns_port, "fd42::/64").await;
+        let network_id = harness.network.id;
 
-    let node_id = Uuid::new_v4();
-    let task_ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
-    let backend_ips = [
-        Ipv6Addr::new(0xfd42, 0, 0, 0, 0, 0, 0, 0x10),
-        Ipv6Addr::new(0xfd42, 0, 0, 0, 0, 0, 0, 0x11),
-        Ipv6Addr::new(0xfd42, 0, 0, 0, 0, 0, 0, 0x12),
-    ];
-    upsert_service(&harness.services, service_name, network_id, task_ids.to_vec()).await;
+        let node_id = Uuid::new_v4();
+        let task_ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let backend_ips = [
+            Ipv6Addr::new(0xfd42, 0, 0, 0, 0, 0, 0, 0x10),
+            Ipv6Addr::new(0xfd42, 0, 0, 0, 0, 0, 0, 0x11),
+            Ipv6Addr::new(0xfd42, 0, 0, 0, 0, 0, 0, 0x12),
+        ];
+        upsert_service(
+            &harness.services,
+            service_name,
+            network_id,
+            task_ids.to_vec(),
+        )
+        .await;
 
-    for (task_id, backend_ip) in task_ids.into_iter().zip(backend_ips.into_iter()) {
+        for (task_id, backend_ip) in task_ids.into_iter().zip(backend_ips.into_iter()) {
+            harness
+                .workloads
+                .upsert(
+                    &UuidKey::from(task_id),
+                    running_task(task_id, node_id, service_name, network_id),
+                )
+                .await
+                .expect("upsert ipv6 rotating task");
+            harness
+                .registry
+                .upsert_attachment(ready_attachment_with_publication_ip(
+                    task_id,
+                    node_id,
+                    network_id,
+                    IpAddr::V6(backend_ip),
+                    service_name,
+                    true,
+                ))
+                .await
+                .expect("upsert ipv6 rotating attachment");
+        }
+
         harness
-            .workloads
-            .upsert(
-                &UuidKey::from(task_id),
-                running_task(task_id, node_id, service_name, network_id),
-            )
+            .discovery
+            .ensure_network(&harness.network, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)))
             .await
-            .expect("upsert ipv6 rotating task");
-        harness
-            .registry
-            .upsert_attachment(ready_attachment_with_publication_ip(
-                task_id,
-                node_id,
-                network_id,
-                IpAddr::V6(backend_ip),
-                service_name,
-                true,
-            ))
-            .await
-            .expect("upsert ipv6 rotating attachment");
-    }
+            .expect("start rotating ipv6 discovery");
 
-    harness
-        .discovery
-        .ensure_network(&harness.network, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)))
-        .await
-        .expect("start rotating ipv6 discovery");
+        let fqdn = format!("backend.{}.svc.mantissa.", harness.network.name);
+        let (_, initial_ips) =
+            wait_for_aaaa_answer_count(dns_port, &fqdn, 3, Duration::from_secs(5))
+                .await
+                .expect("wait for initial ipv6 answers");
+        assert_eq!(initial_ips.len(), 3);
 
-    let fqdn = format!("backend.{}.svc.mantissa.", harness.network.name);
-    let (_, initial_ips) = wait_for_aaaa_answer_count(dns_port, &fqdn, 1, Duration::from_secs(5))
-        .await
-        .expect("wait for initial single ipv6 answer");
-    assert_eq!(initial_ips.len(), 1);
+        let mut observed = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            let (code, ips) = query_aaaa_records(dns_port, &fqdn)
+                .await
+                .expect("query rotating ipv6 records");
+            assert_eq!(code, ResponseCode::NoError);
+            assert_eq!(
+                ips.len(),
+                3,
+                "ipv6 fallback dns should return every backend"
+            );
+            observed.insert(ips[0]);
+        }
 
-    let mut observed = std::collections::BTreeSet::new();
-    for _ in 0..6 {
-        let (code, ips) = query_aaaa_records(dns_port, &fqdn)
-            .await
-            .expect("query rotating ipv6 records");
-        assert_eq!(code, ResponseCode::NoError);
-        assert_eq!(ips.len(), 1, "ipv6 task dns should return one rotated backend");
-        observed.insert(ips[0]);
-    }
-
-    assert!(
-        observed.len() > 1,
-        "repeated ipv6 dns queries should rotate across backends instead of pinning one answer"
-    );
-    for backend_ip in backend_ips {
         assert!(
-            observed.contains(&backend_ip),
-            "rotating ipv6 answers should eventually include backend {backend_ip}"
+            observed.len() > 1,
+            "repeated ipv6 fallback dns queries should rotate their primary backend"
         );
-    }
+        for backend_ip in backend_ips {
+            assert!(
+                observed.contains(&backend_ip),
+                "rotating ipv6 fallback answers should eventually include backend {backend_ip}"
+            );
+        }
 
-    harness
-        .discovery
-        .teardown_network(network_id)
-        .await
-        .expect("teardown rotating ipv6 discovery");
-});
+        harness
+            .discovery
+            .teardown_network(network_id)
+            .await
+            .expect("teardown rotating ipv6 discovery");
+    }
+);

@@ -625,28 +625,6 @@ async fn answer_query(
         .await?;
         return Ok(LookupOutcome::NxDomain);
     }
-    let mut records = Vec::new();
-    let offset = {
-        let mut picker = load_balancer.lock().await;
-        picker.next_offset(network_id, &service_name, backends.len())
-    };
-    let addresses = select_task_dns_addresses(
-        rotate_addresses(
-            backends
-                .iter()
-                .map(|backend| backend.ip)
-                .collect::<Vec<IpAddr>>(),
-            offset,
-        ),
-        expected_record_type,
-    );
-
-    records.extend(
-        addresses
-            .into_iter()
-            .map(|addr| address_record(query.name(), addr)),
-    );
-
     if let Some((vip, programmed)) = sync_service_vip_for_backends(
         bpf_lb,
         bpf,
@@ -659,44 +637,31 @@ async fn answer_query(
     )
     .await?
         && programmed
-        && publish_service_vip_in_dns(vip)
     {
-        records.push(address_record(query.name(), vip));
+        // Service names should resolve to one stable VIP whenever the dataplane is available so
+        // clients do not depend on backend-record ordering for load-balancing.
+        return Ok(LookupOutcome::Records(vec![address_record(
+            query.name(),
+            vip,
+        )]));
     }
+
+    let offset = {
+        let mut picker = load_balancer.lock().await;
+        picker.next_offset(network_id, &service_name, backends.len())
+    };
+    let records = rotate_addresses(
+        backends
+            .iter()
+            .map(|backend| backend.ip)
+            .collect::<Vec<IpAddr>>(),
+        offset,
+    )
+    .into_iter()
+    .map(|addr| address_record(query.name(), addr))
+    .collect();
 
     Ok(LookupOutcome::Records(records))
-}
-
-/// Return whether one programmed service VIP should be advertised in task-facing DNS answers.
-///
-/// IPv4 VIPs are safe to publish directly because task namespaces can resolve them through the
-/// ARP responder on the bridge dataplane. The current IPv6 bridge path still does not provide
-/// reliable VIP neighbour discovery from task namespaces, so advertising the IPv6 VIP causes
-/// clients to stall on a failed first connection attempt before falling back to backend AAAA
-/// records. We still program the IPv6 VIP for host-access and NodePort publication; this only
-/// controls which addresses task DNS returns.
-fn publish_service_vip_in_dns(vip: IpAddr) -> bool {
-    matches!(vip, IpAddr::V4(_))
-}
-
-/// Choose which rotated backend addresses should be exposed in one task-facing DNS response.
-///
-/// For IPv4 we keep returning the full rotated A-record set because clients generally preserve the
-/// server order and can fan out across replicas by picking the first address. For IPv6 that is not
-/// a safe assumption: standard destination-address selection (RFC 6724) lets the client sort the
-/// returned AAAA set before it opens a socket, which can collapse a rotated multi-answer response
-/// back onto one stable preferred backend.
-///
-/// Until the internal IPv6 VIP path is reliable for task namespaces, task-facing AAAA answers must
-/// therefore behave more like "pick one backend for this query" than "here is the whole backend
-/// set". Returning a single rotated IPv6 backend preserves actual spreading for repeated lookups
-/// without pretending the client will honor Mantissa's answer order.
-fn select_task_dns_addresses(addresses: Vec<IpAddr>, record_type: RecordType) -> Vec<IpAddr> {
-    if record_type == RecordType::AAAA {
-        addresses.into_iter().take(1).collect()
-    } else {
-        addresses
-    }
 }
 
 /// Resolve which DNS record family one overlay network should answer for service names.
@@ -1149,10 +1114,9 @@ struct ServiceLoadBalancer {
 impl ServiceLoadBalancer {
     /// Track one per-service cursor offset so successive DNS responses rotate their primary backend.
     ///
-    /// This is enough to spread IPv4 traffic for clients that preserve server answer order and
-    /// connect to the first returned address. IPv6 needs one more normalization step after the
-    /// rotation because many client stacks apply RFC 6724 destination sorting to AAAA answers
-    /// before connect, which can otherwise undo the server-side round-robin.
+    /// Normal service DNS should prefer the stable service VIP whenever dataplane programming
+    /// succeeds. This cursor remains as the backend-only fallback path for environments where VIP
+    /// programming is unavailable and Mantissa still has to expose attachment addresses directly.
     fn next_offset(&mut self, network_id: Uuid, service_name: &str, backend_count: usize) -> usize {
         if backend_count == 0 {
             return 0;
@@ -2341,8 +2305,13 @@ async fn heal_lb_maps(
         attach_spec.bpf_programs = default_bpf_programs();
     }
 
+    let attachment_ifnames = registry
+        .list_attachments(Some(network_id))?
+        .into_iter()
+        .map(|attachment| crate::network::attachment::host_iface_name(attachment.id));
     let interfaces =
-        NetworkInterfaceContext::new(network_id, bridge_name(network_id), vxlan_name(network_id));
+        NetworkInterfaceContext::new(network_id, bridge_name(network_id), vxlan_name(network_id))
+            .with_attachment_host_ifnames(attachment_ifnames);
     bpf.ensure_network(&attach_spec, &interfaces).await
 }
 
@@ -2445,44 +2414,6 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].ip, IpAddr::V4(unhealthy_ip));
-    }
-
-    #[test]
-    fn publish_service_vip_in_dns_keeps_ipv4_vips() {
-        assert!(publish_service_vip_in_dns(IpAddr::V4(Ipv4Addr::new(
-            10, 42, 1, 10
-        ))));
-    }
-
-    #[test]
-    fn publish_service_vip_in_dns_skips_ipv6_vips() {
-        assert!(!publish_service_vip_in_dns(IpAddr::V6(Ipv6Addr::new(
-            0xfd42, 0, 0, 0, 0, 0, 0, 0x10
-        ))));
-    }
-
-    #[test]
-    fn select_task_dns_addresses_keeps_all_ipv4_backends() {
-        let addresses = vec![
-            IpAddr::V4(Ipv4Addr::new(10, 42, 1, 10)),
-            IpAddr::V4(Ipv4Addr::new(10, 42, 1, 11)),
-        ];
-
-        assert_eq!(
-            select_task_dns_addresses(addresses.clone(), RecordType::A),
-            addresses
-        );
-    }
-
-    #[test]
-    fn select_task_dns_addresses_keeps_one_ipv6_backend() {
-        let first = IpAddr::V6(Ipv6Addr::new(0xfd42, 0, 0, 0, 0, 0, 0, 0x10));
-        let second = IpAddr::V6(Ipv6Addr::new(0xfd42, 0, 0, 0, 0, 0, 0, 0x11));
-
-        assert_eq!(
-            select_task_dns_addresses(vec![first, second], RecordType::AAAA),
-            vec![first]
-        );
     }
 
     #[test]

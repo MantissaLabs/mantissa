@@ -339,11 +339,9 @@ mod tests {
         let port_path = resolve_wireguard_port_path().expect("resolve wireguard port path");
         fs::write(&port_path, "0\n").expect("seed invalid wireguard port file");
 
-        let port = load_or_choose_wireguard_listen_port_with_preferred_and_override(
-            Some(6578),
-            None,
-        )
-        .expect("repair stale zero-valued wireguard port");
+        let port =
+            load_or_choose_wireguard_listen_port_with_preferred_and_override(Some(6578), None)
+                .expect("repair stale zero-valued wireguard port");
 
         assert_eq!(port, 6578);
         assert_eq!(

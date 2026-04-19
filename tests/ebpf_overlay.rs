@@ -18,12 +18,13 @@ use mantissa::services::ServiceController;
 use mantissa::services::types::{
     ServicePortProtocol, ServiceStatus, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
 };
+use mantissa::workload::model::WorkloadStateFilter;
 use mantissa::workload::types::ExecutionSpec;
 use protocol::services::services;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -54,6 +55,15 @@ fn privileged_ebpf_artifact_dir() -> Option<PathBuf> {
 /// Return whether the detailed `ip link` output reports an attached XDP program.
 fn has_xdp_attachment(details: &str) -> bool {
     details.contains("prog/xdp") || details.contains("xdp id")
+}
+
+/// Assert that one tc hook carries a BPF classifier on the requested interface.
+fn assert_tc_attachment(interface: &str, hook: &str, context: &str) {
+    let filters = command_stdout("tc", &["filter", "show", "dev", interface, hook]);
+    assert!(
+        filters.contains("bpf"),
+        "{context}: expected a tc BPF program on {interface} {hook}, got: {filters}"
+    );
 }
 
 /// Return the bpffs directory where one network pins its load-balancer maps.
@@ -207,6 +217,39 @@ fn privileged_udp_service_task_template(network_id: Uuid) -> TaskTemplateSpecVal
     }
 }
 
+/// Build one idle curl container so privileged tests can exercise service DNS from inside a task.
+fn privileged_frontend_task_template(network_id: Uuid) -> TaskTemplateSpecValue {
+    TaskTemplateSpecValue {
+        name: "frontend".to_string(),
+        execution: ExecutionSpec {
+            image: "curlimages/curl:8.9.1".to_string(),
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "while true; do sleep 3600; done".to_string(),
+            ],
+            tty: false,
+            cpu_millis: 200,
+            memory_bytes: 64 * 1024 * 1024,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: vec![TaskTemplateNetworkRequirement::new("default", network_id)],
+            placement: Default::default(),
+        },
+        depends_on: Vec::new(),
+        replicas: 1,
+        readiness: None,
+        public_port: None,
+        public_protocol: None,
+    }
+}
+
 /// Wait until the replicated service reaches the expected lifecycle state.
 async fn wait_for_service_status(
     manager: &ServiceController,
@@ -221,6 +264,52 @@ async fn wait_for_service_status(
         )
     })
     .await
+}
+
+/// Return the local running task id for one service template in the privileged single-node harness.
+async fn wait_for_local_service_task(
+    node: &HeadlessNode,
+    service_name: &str,
+    template_name: &str,
+    timeout: Duration,
+) -> Uuid {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let tasks = node
+            .workload_manager
+            .list_workloads(&WorkloadStateFilter::all())
+            .await
+            .expect("list workloads for privileged service task lookup");
+        if let Some(task) = tasks.into_iter().find(|task| {
+            task.node_id == node.id
+                && matches!(
+                    task.state,
+                    mantissa::workload::model::WorkloadPhase::Running
+                )
+                && task
+                    .service_owner()
+                    .map(|owner| {
+                        owner.service_name == service_name && owner.template == template_name
+                    })
+                    .unwrap_or(false)
+        }) {
+            return task.id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for local service task {service_name}/{template_name}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Execute one shell command inside a local privileged test task container.
+fn exec_task_container(task_id: Uuid, command: &str) -> Output {
+    let container = format!("mantissa-{task_id}");
+    Command::new("docker")
+        .args(["exec", &container, "sh", "-lc", command])
+        .output()
+        .unwrap_or_else(|err| panic!("run docker exec against {container}: {err}"))
 }
 
 /// Remove one service through the real RPC surface so cleanup follows production controller paths.
@@ -628,22 +717,26 @@ local_test!(ebpf_overlay_attaches_programs_and_tears_down_cleanly, {
         "bridge interface should carry the xdp program: {bridge_details}"
     );
 
-    let ingress_filters = command_stdout(
-        "tc",
-        &["filter", "show", "dev", &host_peer_ifname, "ingress"],
+    let _ = bridge_ifname;
+    assert_tc_attachment(
+        &vxlan_ifname,
+        "ingress",
+        "vxlan ingress should carry the bridge tc ingress program",
     );
-    assert!(
-        ingress_filters.contains("bpf"),
-        "host-access ingress qdisc should carry the bridge tc ingress program: {ingress_filters}"
+    assert_tc_attachment(
+        &vxlan_ifname,
+        "egress",
+        "vxlan egress should carry the bridge tc egress program",
     );
-
-    let egress_filters = command_stdout(
-        "tc",
-        &["filter", "show", "dev", &host_peer_ifname, "egress"],
+    assert_tc_attachment(
+        &host_peer_ifname,
+        "ingress",
+        "host-access peer ingress should carry the bridge tc ingress program",
     );
-    assert!(
-        egress_filters.contains("bpf"),
-        "host-access egress qdisc should carry the bridge tc egress program: {egress_filters}"
+    assert_tc_attachment(
+        &host_peer_ifname,
+        "egress",
+        "host-access peer egress should carry the bridge tc egress program",
     );
 
     assert_lb_maps_present(network.id, overlay_family(&subnet));
@@ -737,13 +830,15 @@ local_test!(ebpf_overlay_multiple_networks_attach_and_cleanup_cleanly, {
         has_xdp_attachment(&vxlan_details),
         "network B should keep its xdp attachment after network A is deleted: {vxlan_details}"
     );
-    let ingress_filters = command_stdout(
-        "tc",
-        &["filter", "show", "dev", &host_peer_ifname, "ingress"],
+    assert_tc_attachment(
+        &host_peer_ifname,
+        "ingress",
+        "network B should keep its ingress tc program on the host-access bridge port after network A is deleted",
     );
-    assert!(
-        ingress_filters.contains("bpf"),
-        "network B should keep its ingress tc program after network A is deleted: {ingress_filters}"
+    assert_tc_attachment(
+        &host_peer_ifname,
+        "egress",
+        "network B should keep its egress tc program on the host-access bridge port after network A is deleted",
     );
 
     delete_privileged_network(&node, network_b.id).await;
@@ -987,6 +1082,174 @@ local_test!(
     }
 );
 
+local_test!(ebpf_overlay_ipv6_task_dns_reaches_service_vip, {
+    let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {
+        return;
+    };
+
+    let _config = PrivilegedTestGuard::apply(|config| {
+        config.network.wireguard.enabled = false;
+        config.network.wireguard.manage_firewall = false;
+        config.network.bpf.attach = true;
+        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        config.network.nodeport.enabled = false;
+        config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+    });
+
+    let node = create_privileged_node().await;
+    let subnet = privileged_test_subnet_v6();
+    let network = create_privileged_network(
+        &node,
+        privileged_test_network(
+            "ebpf-vip-v6-task",
+            "privileged ebpf IPv6 task vip reachability test network",
+            &subnet,
+            1450,
+            Vec::new(),
+        ),
+        NetworkStatus::Ready,
+    )
+    .await;
+    let network_id = network.id;
+    let service_name = "ebpf-vip-v6-task-service";
+
+    let service_id = node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![
+                privileged_http_service_task_template(network_id, 1),
+                privileged_frontend_task_template(network_id),
+            ],
+        )
+        .await
+        .expect("submit privileged IPv6 internal VIP deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.service_controller,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(180),
+        )
+        .await,
+        "IPv6 eBPF overlay service with frontend task should reach running state"
+    );
+
+    let frontend_task_id =
+        wait_for_local_service_task(&node, service_name, "frontend", Duration::from_secs(60)).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let backend_ips = loop {
+        let backend_ips: BTreeSet<Ipv6Addr> = node
+            .network_registry
+            .list_attachments(Some(network_id))
+            .expect("list IPv6 attachments for task-facing eBPF test")
+            .into_iter()
+            .filter(|attachment| {
+                attachment.state == mantissa::network::types::NetworkAttachmentState::Ready
+                    && attachment.traffic_published
+                    && attachment.service_name.as_deref() == Some(service_name)
+                    && attachment.template_name.as_deref() == Some("backend")
+            })
+            .filter_map(|attachment| attachment.assigned_ip)
+            .filter_map(|ip| ip.parse::<Ipv6Addr>().ok())
+            .collect();
+        if backend_ips.len() == 1 {
+            break backend_ips.into_iter().collect::<Vec<_>>();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "network {network_id} should publish one backend attachment for {service_name}; observed {backend_ips:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let [
+        _vxlan_ifname,
+        _bridge_ifname,
+        _host_peer_ifname,
+        host_ifname,
+    ] = privileged_network_interfaces(network_id);
+    let resolver_ip = interface_ipv6(&host_ifname);
+    let fqdn = format!("backend.{}.svc.mantissa", network.name);
+    let vip = wait_for_vip_record_v6(
+        resolver_ip,
+        &format!("{fqdn}."),
+        &backend_ips,
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("discover IPv6 VIP for task-facing eBPF test");
+
+    let curl_command =
+        format!("curl -g -6 --connect-timeout 2 --max-time 5 http://[{vip}]:{EBPF_HTTP_PORT}/");
+    let task_vip_ready = common::convergence::wait_until(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        || async {
+            let output = exec_task_container(frontend_task_id, &curl_command);
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(EBPF_HTTP_RESPONSE)
+        },
+    )
+    .await;
+
+    if !task_vip_ready {
+        let dns_answers =
+            exec_task_container(frontend_task_id, &format!("getent ahostsv6 {fqdn} || true"));
+        let neighbours = exec_task_container(frontend_task_id, "ip -6 neigh || true");
+        let resolver = exec_task_container(frontend_task_id, "cat /etc/resolv.conf || true");
+        let ping = exec_task_container(frontend_task_id, &format!("ping -6 -c 1 {vip} || true"));
+        let direct_backend = exec_task_container(
+            frontend_task_id,
+            &format!(
+                "curl -g -6 --connect-timeout 2 --max-time 5 http://[{}]:{EBPF_HTTP_PORT}/ || true",
+                backend_ips[0]
+            ),
+        );
+        let last_curl = exec_task_container(frontend_task_id, &curl_command);
+        let pin_dir = pinned_lb_map_dir(network_id);
+        let fwd_dump = command_stdout(
+            "bpftool",
+            &[
+                "map",
+                "dump",
+                "pinned",
+                &pin_dir.join("LB_FWD_V6").display().to_string(),
+            ],
+        );
+        let rev_dump = command_stdout(
+            "bpftool",
+            &[
+                "map",
+                "dump",
+                "pinned",
+                &pin_dir.join("LB_REV_V6").display().to_string(),
+            ],
+        );
+        panic!(
+            "task-facing IPv6 DNS should resolve to a reachable service VIP; vip={vip}; backend_ips={backend_ips:?}; resolver_ip={resolver_ip}; fqdn={fqdn}; dns_stdout={:?}; dns_stderr={:?}; neigh_stdout={:?}; resolver_stdout={:?}; ping_stdout={:?}; direct_backend_status={:?}; direct_backend_stdout={:?}; direct_backend_stderr={:?}; fwd_dump={:?}; rev_dump={:?}; curl_status={:?}; curl_stdout={:?}; curl_stderr={:?}",
+            String::from_utf8_lossy(&dns_answers.stdout),
+            String::from_utf8_lossy(&dns_answers.stderr),
+            String::from_utf8_lossy(&neighbours.stdout),
+            String::from_utf8_lossy(&resolver.stdout),
+            String::from_utf8_lossy(&ping.stdout),
+            direct_backend.status.code(),
+            String::from_utf8_lossy(&direct_backend.stdout),
+            String::from_utf8_lossy(&direct_backend.stderr),
+            fwd_dump,
+            rev_dump,
+            last_curl.status.code(),
+            String::from_utf8_lossy(&last_curl.stdout),
+            String::from_utf8_lossy(&last_curl.stderr),
+        );
+    }
+
+    remove_service_via_rpc(&node.services_client, service_id).await;
+    delete_privileged_network(&node, network_id).await;
+});
+
 local_test!(ebpf_overlay_vip_load_balances_across_local_replicas, {
     let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {
         return;
@@ -1077,6 +1340,101 @@ local_test!(ebpf_overlay_vip_load_balances_across_local_replicas, {
     remove_service_via_rpc(&node.services_client, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
+
+local_test!(
+    ebpf_overlay_ipv6_host_vip_load_balances_across_local_replicas,
+    {
+        let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {
+            return;
+        };
+
+        let _config = PrivilegedTestGuard::apply(|config| {
+            config.network.wireguard.enabled = false;
+            config.network.wireguard.manage_firewall = false;
+            config.network.bpf.attach = true;
+            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            config.network.nodeport.enabled = false;
+            config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+        });
+
+        let node = create_privileged_node().await;
+        let subnet = privileged_test_subnet_v6();
+        let network = create_privileged_network(
+            &node,
+            privileged_test_network(
+                "ebpf-vip-lb-v6",
+                "privileged ebpf IPv6 local replica load-balancing test network",
+                &subnet,
+                1450,
+                Vec::new(),
+            ),
+            NetworkStatus::Ready,
+        )
+        .await;
+        let network_id = network.id;
+
+        let service_id = node
+            .service_controller
+            .submit_deployment(
+                Uuid::new_v4(),
+                "ebpf-vip-lb-v6-service",
+                "ebpf-vip-lb-v6-service",
+                vec![privileged_http_hostname_task_template(network_id, 2)],
+            )
+            .await
+            .expect("submit privileged eBPF IPv6 load-balancing deployment");
+
+        assert!(
+            wait_for_service_status(
+                &node.service_controller,
+                service_id,
+                ServiceStatus::Running,
+                Duration::from_secs(180),
+            )
+            .await,
+            "eBPF IPv6 local load-balancing service should reach running state"
+        );
+
+        let backend_ips =
+            wait_for_backend_ips_v6(&node, network_id, 2, Duration::from_secs(60)).await;
+        let [
+            _vxlan_ifname,
+            _bridge_ifname,
+            _host_peer_ifname,
+            host_ifname,
+        ] = privileged_network_interfaces(network_id);
+        let resolver_ip = interface_ipv6(&host_ifname);
+        let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+        let vip = wait_for_vip_record_v6(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
+            .await
+            .expect("discover IPv6 VIP for local load-balancing test");
+        let vip_addr = format!("[{vip}]:{EBPF_HTTP_PORT}");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut responses = BTreeSet::new();
+        let mut last_response = None;
+        while Instant::now() < deadline && responses.len() < 2 {
+            match http_get(&vip_addr).await {
+                Ok(response) => {
+                    responses.insert(http_body(&response).trim().to_string());
+                    last_response = Some(response);
+                }
+                Err(err) => {
+                    last_response = Some(err.to_string());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(
+            responses.len() >= 2,
+            "host-access IPv6 VIP should spread requests across at least two local replicas; vip={vip}; backend_ips={backend_ips:?}; observed_responses={responses:?}; last_observation={last_response:?}"
+        );
+
+        remove_service_via_rpc(&node.services_client, service_id).await;
+        delete_privileged_network(&node, network_id).await;
+    }
+);
 
 local_test!(ebpf_overlay_return_path_preserves_vip_identity, {
     let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {

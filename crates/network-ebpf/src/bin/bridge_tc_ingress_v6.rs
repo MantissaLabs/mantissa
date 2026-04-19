@@ -16,7 +16,9 @@ use network_ebpf::{
         Backend6, Flow6, NatEntry6, VipBackendKey6, VipEntry, VipKey6, MAX_BACKENDS_PER_VIP,
         MAX_VIPS,
     },
-    net::{self, EthernetHeader, Icmpv6NeighborMessage, Ipv6Header, UdpHeader},
+    net::{
+        self, EthernetHeader, Icmpv6NeighborMessage, Icmpv6NeighborTarget, Ipv6Header, UdpHeader,
+    },
     stats::{self, PacketStats},
 };
 
@@ -161,14 +163,14 @@ fn handle_icmpv6_neighbor(
         return Ok(TC_ACT_OK);
     }
 
-    let mut message: Icmpv6NeighborMessage = ctx.load(l4_offset).map_err(|_| ())?;
-    if message.icmp_type != ICMPV6_NEIGHBOR_SOLICITATION || message.code != 0 {
+    let icmp_type: u8 = ctx.load(l4_offset).map_err(|_| ())?;
+    let code: u8 = ctx.load(l4_offset + 1).map_err(|_| ())?;
+    if icmp_type != ICMPV6_NEIGHBOR_SOLICITATION || code != 0 {
         return Ok(TC_ACT_OK);
     }
+    let target = load_neighbor_target(ctx, l4_offset)?;
 
-    let vip_key = VipKey6 {
-        vip: message.target,
-    };
+    let vip_key = VipKey6 { vip: target };
     let Some(config) = (unsafe { LB_VIPS_V6.get(&vip_key) }) else {
         return Ok(TC_ACT_OK);
     };
@@ -177,18 +179,22 @@ fn handle_icmpv6_neighbor(
     ctx.store(0, &updated_eth, 0).map_err(|_| ())?;
 
     let mut updated_ip = *ip_hdr;
-    updated_ip.src = message.target;
+    updated_ip.src = target;
     updated_ip.dst = ip_hdr.src;
     updated_ip.hop_limit = 255;
     ctx.store(net::ETH_HDR_LEN, &updated_ip, 0)
         .map_err(|_| ())?;
 
-    message.icmp_type = ICMPV6_NEIGHBOR_ADVERTISEMENT;
-    message.checksum = 0;
-    message.flags_or_reserved = ICMPV6_NA_FLAGS.to_be();
-    message.option_type = ICMPV6_TARGET_LINK_LAYER_ADDRESS;
-    message.option_len = 1;
-    message.option_mac = config.vip_mac;
+    let mut message = Icmpv6NeighborMessage {
+        icmp_type: ICMPV6_NEIGHBOR_ADVERTISEMENT,
+        code: 0,
+        checksum: 0,
+        flags_or_reserved: ICMPV6_NA_FLAGS.to_be(),
+        target,
+        option_type: ICMPV6_TARGET_LINK_LAYER_ADDRESS,
+        option_len: 1,
+        option_mac: config.vip_mac,
+    };
     message.checksum = compute_icmpv6_checksum(&updated_ip, &message)?;
     ctx.store(l4_offset, &message, 0).map_err(|_| ())?;
 
@@ -198,6 +204,15 @@ fn handle_icmpv6_neighbor(
     }
 
     Ok(TC_ACT_OK)
+}
+
+/// Read the fixed neighbour-solicitation header and return the target address.
+///
+/// We only need the target VIP being queried. Loading this fixed prefix keeps the parser simple
+/// and avoids depending on the variable option bytes that may follow the solicitation.
+fn load_neighbor_target(ctx: &TcContext, l4_offset: usize) -> Result<[u8; 16], ()> {
+    let solicitation: Icmpv6NeighborTarget = ctx.load(l4_offset).map_err(|_| ())?;
+    Ok(solicitation.target)
 }
 
 /// Select one IPv6 backend for the provided VIP in O(1) by hashing into a precomputed ring.

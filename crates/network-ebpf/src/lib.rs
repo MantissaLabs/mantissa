@@ -217,6 +217,16 @@ pub mod net {
         pub option_mac: [u8; 6],
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Icmpv6NeighborTarget {
+        pub icmp_type: u8,
+        pub code: u8,
+        pub checksum: u16,
+        pub flags_or_reserved: u32,
+        pub target: [u8; 16],
+    }
+
     #[repr(C, packed)]
     #[derive(Clone, Copy)]
     pub struct UdpHeader {

@@ -1,7 +1,7 @@
 use crate::config;
 use crate::gossip::Message;
 use crate::network::allocator::{parse_overlay_cidr, resolver_ip_address};
-use crate::network::attachment::PlatformAttachmentProvisioner;
+use crate::network::attachment::{PlatformAttachmentProvisioner, host_iface_name};
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
 use crate::network::discovery::ServiceDiscovery;
 use crate::network::events::ForwardingEvent;
@@ -717,7 +717,7 @@ impl NetworkController {
             self.send_event(NetworkEvent::Upsert(spec.clone())).await;
         }
 
-        let interface_ctx: NetworkInterfaceContext = (&plan).into();
+        let interface_ctx = self.build_interface_context(&plan)?;
         let mut retried_after_bpf_conflict = false;
         loop {
             debug!(
@@ -833,6 +833,22 @@ impl NetworkController {
         let mut active = self.inner.active_networks.lock().await;
         active.insert(plan.network_id);
         Ok(())
+    }
+
+    /// Build the current bridge-port attachment context for one network.
+    ///
+    /// Bridge tc programs must be attached to every local bridge-facing port that can carry
+    /// service-VIP traffic: the VXLAN device, the host-access peer, and any local `mnth-*`
+    /// task-attachment veths currently present for the network.
+    fn build_interface_context(&self, plan: &NetworkPlan) -> Result<NetworkInterfaceContext> {
+        let attachment_ifnames = self
+            .inner
+            .registry
+            .list_attachments(Some(plan.network_id))?
+            .into_iter()
+            .map(|attachment| host_iface_name(attachment.id));
+
+        Ok(NetworkInterfaceContext::from(plan).with_attachment_host_ifnames(attachment_ifnames))
     }
 
     #[cfg(target_os = "linux")]

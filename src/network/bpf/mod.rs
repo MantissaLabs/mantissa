@@ -11,6 +11,7 @@ pub struct NetworkInterfaceContext {
     bridge_ifname: String,
     vxlan_ifname: String,
     host_peer_ifname: String,
+    attachment_host_ifnames: Vec<String>,
 }
 
 impl NetworkInterfaceContext {
@@ -22,12 +23,30 @@ impl NetworkInterfaceContext {
         bridge_ifname: impl Into<String>,
         vxlan_ifname: impl Into<String>,
     ) -> Self {
+        let bridge_ifname = bridge_ifname.into();
+        let vxlan_ifname = vxlan_ifname.into();
         Self {
             network_id,
-            bridge_ifname: bridge_ifname.into(),
-            vxlan_ifname: vxlan_ifname.into(),
+            bridge_ifname,
+            vxlan_ifname,
             host_peer_ifname: host_access_peer_iface_name(network_id),
+            attachment_host_ifnames: Vec::new(),
         }
+    }
+
+    /// Attach the deterministic host-side veth names for local task attachments on this network.
+    ///
+    /// Bridge tc programs must run on every bridge-facing port that can carry service VIP
+    /// traffic. Local task attachments use `mnth-*` host veths, so callers provide them here
+    /// when they exist.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn with_attachment_host_ifnames<I, S>(mut self, ifnames: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.attachment_host_ifnames = ifnames.into_iter().map(Into::into).collect();
+        self
     }
 
     /// Return the stable network identifier so telemetry and logs can attribute actions properly.
@@ -52,6 +71,12 @@ impl NetworkInterfaceContext {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn host_peer_ifname(&self) -> &str {
         self.host_peer_ifname.as_str()
+    }
+
+    /// Provide the host-side attachment veth names that enter the bridge for local tasks.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn attachment_host_ifnames(&self) -> &[String] {
+        self.attachment_host_ifnames.as_slice()
     }
 }
 
@@ -127,7 +152,7 @@ mod platform {
     use tracing::{debug, info, warn};
     use uuid::Uuid;
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum AttachTarget<'a> {
         Xdp {
             interface: &'a str,
@@ -153,6 +178,13 @@ mod platform {
             map_pin_path: &Path,
             lb_family: Option<OverlayIpFamily>,
         ) -> Result<ProgramHandle>;
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+    struct DesiredAttachment {
+        attach_point: BpfAttachPoint,
+        name: String,
+        interface: String,
     }
 
     #[derive(Clone)]
@@ -186,19 +218,62 @@ mod platform {
             Ok(())
         }
 
-        fn matches(&self, specs: &[BpfProgramSpec], lb_family: Option<OverlayIpFamily>) -> bool {
-            self.lb_family == lb_family && self.canonical_specs() == canonical_specs(specs.iter())
+        fn matches(
+            &self,
+            desired: &[DesiredAttachment],
+            lb_family: Option<OverlayIpFamily>,
+        ) -> bool {
+            self.lb_family == lb_family && self.canonical_specs() == desired
         }
 
-        fn canonical_specs(&self) -> Vec<(BpfAttachPoint, String)> {
-            canonical_specs(self.programs.iter().map(|program| &program.spec))
+        fn canonical_specs(&self) -> Vec<DesiredAttachment> {
+            let mut attachments: Vec<_> = self
+                .programs
+                .iter()
+                .map(|program| DesiredAttachment {
+                    attach_point: program.spec.attach_point(),
+                    name: program.spec.name.clone(),
+                    interface: target_interface(program.target.as_ref()).to_string(),
+                })
+                .collect();
+            attachments.sort();
+            attachments
         }
     }
 
     struct LoadedProgram {
         spec: BpfProgramSpec,
+        target: OwnedAttachTarget,
         _artifact: PathBuf,
         handle: ProgramHandle,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum OwnedAttachTarget {
+        Xdp {
+            interface: String,
+        },
+        Tc {
+            interface: String,
+            attach_type: TcAttachType,
+        },
+    }
+
+    impl OwnedAttachTarget {
+        fn as_ref(&self) -> AttachTarget<'_> {
+            match self {
+                OwnedAttachTarget::Xdp { interface } => AttachTarget::Xdp {
+                    interface: interface.as_str(),
+                },
+                OwnedAttachTarget::Tc {
+                    interface,
+                    attach_type,
+                } => AttachTarget::Tc {
+                    interface: interface.as_str(),
+                    attach_type: *attach_type,
+                },
+            }
+        }
     }
 
     impl PlatformBpfManager {
@@ -240,10 +315,13 @@ mod platform {
 
             let network_id = interfaces.network_id();
             let lb_family = load_balancer_map_family(network)?;
+            let desired = desired_attachments(programs, interfaces);
+            let mut canonical_desired = desired.clone();
+            canonical_desired.sort();
             {
                 let guard = self.loaded.lock().await;
                 if let Some(existing) = guard.get(&network_id)
-                    && existing.matches(programs, lb_family)
+                    && existing.matches(&canonical_desired, lb_family)
                 {
                     let map_pin_path = Self::map_pin_path(network_id);
                     if let Some(family) = lb_family
@@ -283,18 +361,28 @@ mod platform {
             let map_pin_path = Self::map_pin_dir(network_id)?;
 
             self.clear_stale_xdp_targets(programs, interfaces);
-
-            let mut ordered_programs: Vec<&BpfProgramSpec> = programs.iter().collect();
-            ordered_programs.sort_by_key(|spec| attach_priority(spec.attach_point()));
+            clear_stale_bridge_tc_bridge_master_target(interfaces);
 
             let mut loaded_network = LoadedNetwork::new(lb_family);
-            for spec in ordered_programs {
+            for desired_attachment in desired {
+                let spec = programs
+                    .iter()
+                    .find(|program| {
+                        program.attach_point() == desired_attachment.attach_point
+                            && program.name == desired_attachment.name
+                    })
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "missing bpf spec '{}' for attach point {:?}",
+                            desired_attachment.name,
+                            desired_attachment.attach_point
+                        )
+                    })?;
                 let artifact = self
                     .resolver
                     .resolve(spec, network)
                     .with_context(|| format!("resolve artifact for program '{}'", spec))?;
-                let attach_target = resolve_attach_target(spec.attach_point(), interfaces);
-                let target_ifname = interface_name(attach_target);
+                let attach_target = desired_target(&desired_attachment);
                 let program_lb_family = program_load_balancer_family(spec, lb_family);
 
                 info!(
@@ -302,7 +390,7 @@ mod platform {
                     network = %interfaces.network_id(),
                     program = %spec,
                     attach_point = %spec.attach_point(),
-                    interface = %target_ifname,
+                    interface = %desired_attachment.interface,
                     artifact = %artifact.display(),
                     "attaching bpf program"
                 );
@@ -330,6 +418,7 @@ mod platform {
 
                 loaded_network.push(LoadedProgram {
                     spec: spec.clone(),
+                    target: own_target(attach_target),
                     _artifact: artifact,
                     handle,
                 });
@@ -374,6 +463,8 @@ mod platform {
             };
 
             let cleanup_result = Self::remove_map_pin_dir(network_id);
+            clear_stale_bridge_tc_host_peer_targets(interfaces);
+            clear_stale_bridge_tc_bridge_master_target(interfaces);
 
             detach_result?;
             cleanup_result?;
@@ -437,20 +528,12 @@ mod platform {
             interfaces: &NetworkInterfaceContext,
         ) -> Result<()> {
             let mut seen = HashSet::new();
-            for spec in programs {
-                let attach = spec.attach_point();
-                let target = resolve_attach_target(attach, interfaces);
-                let target_if = interface_name(target);
-
-                if !interface_exists(target_if) {
-                    return Err(anyhow!("interface '{}' missing for {}", target_if, attach));
-                }
-
-                if !seen.insert((attach, target_if.to_string())) {
+            for desired in desired_attachments(programs, interfaces) {
+                if !seen.insert((desired.attach_point, desired.interface.clone())) {
                     return Err(anyhow!(
                         "multiple programs declared for {} on {}",
-                        attach,
-                        target_if
+                        desired.attach_point,
+                        desired.interface
                     ));
                 }
             }
@@ -469,8 +552,16 @@ mod platform {
                 if !matches!(point, BpfAttachPoint::BridgeXdp | BpfAttachPoint::VxlanXdp) {
                     continue;
                 }
-                let attach_target = resolve_attach_target(point, interfaces);
-                let interface = interface_name(attach_target).to_string();
+                let attach_target = match point {
+                    BpfAttachPoint::VxlanXdp => AttachTarget::Xdp {
+                        interface: interfaces.vxlan_ifname(),
+                    },
+                    BpfAttachPoint::BridgeXdp => AttachTarget::Xdp {
+                        interface: interfaces.bridge_ifname(),
+                    },
+                    _ => continue,
+                };
+                let interface = target_interface(attach_target).to_string();
                 if seen.insert(interface.clone()) {
                     targets.push((
                         detach_priority(point),
@@ -583,37 +674,87 @@ mod platform {
         out
     }
 
-    fn resolve_attach_target<'a>(
-        attach_point: BpfAttachPoint,
-        interfaces: &'a NetworkInterfaceContext,
-    ) -> AttachTarget<'a> {
-        match attach_point {
-            BpfAttachPoint::VxlanXdp => AttachTarget::Xdp {
-                interface: interfaces.vxlan_ifname(),
-            },
-            BpfAttachPoint::BridgeXdp => AttachTarget::Xdp {
-                interface: interfaces.bridge_ifname(),
+    /// Expand one logical BPF program declaration into the concrete interface attachments it needs.
+    ///
+    /// Bridge tc programs must run on every local bridge-facing port that can carry overlay
+    /// traffic: the VXLAN device, the host-access peer, and any currently present `mnth-*`
+    /// attachment veths. This keeps task, remote, and host-originated service VIP traffic on the
+    /// same dataplane instead of depending on one special interface.
+    fn desired_attachments(
+        programs: &[BpfProgramSpec],
+        interfaces: &NetworkInterfaceContext,
+    ) -> Vec<DesiredAttachment> {
+        let mut desired = Vec::new();
+        let mut ordered_programs: Vec<&BpfProgramSpec> = programs.iter().collect();
+        ordered_programs.sort_by_key(|spec| attach_priority(spec.attach_point()));
+
+        for spec in ordered_programs {
+            let attach_point = spec.attach_point();
+            match attach_point {
+                BpfAttachPoint::VxlanXdp => desired.push(DesiredAttachment {
+                    attach_point,
+                    name: spec.name.clone(),
+                    interface: interfaces.vxlan_ifname().to_string(),
+                }),
+                BpfAttachPoint::BridgeXdp => desired.push(DesiredAttachment {
+                    attach_point,
+                    name: spec.name.clone(),
+                    interface: interfaces.bridge_ifname().to_string(),
+                }),
+                BpfAttachPoint::BridgeTcIngress | BpfAttachPoint::BridgeTcEgress => {
+                    let mut ports = vec![
+                        interfaces.vxlan_ifname().to_string(),
+                        interfaces.host_peer_ifname().to_string(),
+                    ];
+                    ports.extend(interfaces.attachment_host_ifnames().iter().cloned());
+                    ports.sort();
+                    ports.dedup();
+                    for interface in ports.into_iter().filter(|name| interface_exists(name)) {
+                        desired.push(DesiredAttachment {
+                            attach_point,
+                            name: spec.name.clone(),
+                            interface,
+                        });
+                    }
+                }
+            }
+        }
+
+        desired
+    }
+
+    fn desired_target(desired: &DesiredAttachment) -> AttachTarget<'_> {
+        match desired.attach_point {
+            BpfAttachPoint::VxlanXdp | BpfAttachPoint::BridgeXdp => AttachTarget::Xdp {
+                interface: desired.interface.as_str(),
             },
             BpfAttachPoint::BridgeTcIngress => AttachTarget::Tc {
-                interface: if interface_exists(interfaces.host_peer_ifname()) {
-                    interfaces.host_peer_ifname()
-                } else {
-                    interfaces.bridge_ifname()
-                },
+                interface: desired.interface.as_str(),
                 attach_type: TcAttachType::Ingress,
             },
             BpfAttachPoint::BridgeTcEgress => AttachTarget::Tc {
-                interface: if interface_exists(interfaces.host_peer_ifname()) {
-                    interfaces.host_peer_ifname()
-                } else {
-                    interfaces.bridge_ifname()
-                },
+                interface: desired.interface.as_str(),
                 attach_type: TcAttachType::Egress,
             },
         }
     }
 
-    fn interface_name(target: AttachTarget<'_>) -> &str {
+    fn own_target(target: AttachTarget<'_>) -> OwnedAttachTarget {
+        match target {
+            AttachTarget::Xdp { interface } => OwnedAttachTarget::Xdp {
+                interface: interface.to_string(),
+            },
+            AttachTarget::Tc {
+                interface,
+                attach_type,
+            } => OwnedAttachTarget::Tc {
+                interface: interface.to_string(),
+                attach_type,
+            },
+        }
+    }
+
+    fn target_interface(target: AttachTarget<'_>) -> &str {
         match target {
             AttachTarget::Xdp { interface } => interface,
             AttachTarget::Tc { interface, .. } => interface,
@@ -625,18 +766,6 @@ mod platform {
             Ok(cstr) => unsafe { if_nametoindex(cstr.as_ptr()) != 0 },
             Err(_) => false,
         }
-    }
-
-    fn canonical_specs<'a, I>(specs: I) -> Vec<(BpfAttachPoint, String)>
-    where
-        I: IntoIterator<Item = &'a BpfProgramSpec>,
-    {
-        let mut out: Vec<_> = specs
-            .into_iter()
-            .map(|spec| (spec.attach_point(), spec.name.clone()))
-            .collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        out
     }
 
     fn attach_priority(point: BpfAttachPoint) -> u8 {
@@ -772,6 +901,44 @@ mod platform {
         }
 
         Ok(())
+    }
+
+    /// Remove legacy host-peer tc attachments left behind from the earlier host-access-only bridge
+    /// dataplane target selection.
+    fn clear_stale_bridge_tc_host_peer_targets(interfaces: &NetworkInterfaceContext) {
+        if !interface_exists(interfaces.host_peer_ifname()) {
+            return;
+        }
+        for attach_type in [TcAttachType::Ingress, TcAttachType::Egress] {
+            if let Err(err) = detach_tc_filters(interfaces.host_peer_ifname(), attach_type, None) {
+                warn!(
+                    target: "network",
+                    network = %interfaces.network_id(),
+                    interface = interfaces.host_peer_ifname(),
+                    attach = ?attach_type,
+                    "failed to clear stale host-peer bridge tc attachment: {err:#}"
+                );
+            }
+        }
+    }
+
+    /// Remove stale bridge-master tc attachments left behind by the earlier single-interface
+    /// bridge target selection.
+    fn clear_stale_bridge_tc_bridge_master_target(interfaces: &NetworkInterfaceContext) {
+        if !interface_exists(interfaces.bridge_ifname()) {
+            return;
+        }
+        for attach_type in [TcAttachType::Ingress, TcAttachType::Egress] {
+            if let Err(err) = detach_tc_filters(interfaces.bridge_ifname(), attach_type, None) {
+                warn!(
+                    target: "network",
+                    network = %interfaces.network_id(),
+                    interface = interfaces.bridge_ifname(),
+                    attach = ?attach_type,
+                    "failed to clear stale bridge-master tc attachment: {err:#}"
+                );
+            }
+        }
     }
 
     /// Remove pinned LB maps from the family that is not required by the current bridge artifact.
@@ -967,7 +1134,7 @@ mod platform {
                             warn!(
                                 target: "network",
                                 program = %spec,
-                                interface = %interface_name(target),
+                                interface = %target_interface(target),
                                 "failed to clear conflicting XDP link before retry: {detach_err:#}"
                             );
                             return Err(err);
@@ -975,7 +1142,7 @@ mod platform {
                         warn!(
                             target: "network",
                             program = %spec,
-                            interface = %interface_name(target),
+                            interface = %target_interface(target),
                             "retrying XDP attachment after clearing stale link"
                         );
                         continue;
@@ -1354,9 +1521,10 @@ mod platform {
         };
         use crate::network::bpf::NetworkBpfManager;
         use crate::network::types::{NetworkDriver, NetworkSpecDraft, NetworkSpecValue};
+        use parking_lot::{Mutex, MutexGuard};
         use std::ffi::OsString;
         use std::fs;
-        use std::sync::{Mutex, MutexGuard, OnceLock};
+        use std::sync::OnceLock;
         use tempfile::TempDir;
         use uuid::Uuid;
 
@@ -1407,9 +1575,7 @@ mod platform {
         impl ConfigOverrideGuard {
             /// Replace the global config for one test and restore it afterward.
             fn with_mutator(mutator: impl FnOnce(&mut Config)) -> Self {
-                let lock = config_override_lock()
-                    .lock()
-                    .expect("bpf test config override lock should not be poisoned");
+                let lock = config_override_lock().lock();
                 let previous = global_config();
                 let source = global_config_source();
 
@@ -1463,9 +1629,7 @@ mod platform {
 
         #[test]
         fn resolves_artifact_from_env_directory() -> Result<()> {
-            let _lock = config_override_lock()
-                .lock()
-                .expect("bpf test config override lock should not be poisoned");
+            let _lock = config_override_lock().lock();
             let dir = TempDir::new().context("create temp dir")?;
             let artifact_path = dir.path().join("resolver-env-example.bpf.o");
             fs::write(&artifact_path, b"test").context("write artifact stub")?;

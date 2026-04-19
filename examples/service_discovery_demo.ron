@@ -3,12 +3,11 @@
     tasks: [
         (
             name: "backend",
-            image: "hashicorp/http-echo:1.0.0",
+            image: "busybox:1.36",
             command: [
-                "-listen",
-                ":8000",
-                "-text",
-                "hello from backend replica",
+                "sh",
+                "-c",
+                "mkdir -p /www && hostname >/www/index.html && exec httpd -f -p 8000 -h /www",
             ],
             replicas: 4,
             resources: (
