@@ -116,6 +116,8 @@ pub struct BpfConfig {
     pub attach: bool,
     #[serde(default)]
     pub artifact_dir: Option<String>,
+    #[serde(default = "default_bpf_overlay_flow_capacity")]
+    pub overlay_flow_capacity: usize,
 }
 
 impl Default for BpfConfig {
@@ -126,6 +128,7 @@ impl Default for BpfConfig {
         Self {
             attach: true,
             artifact_dir: None,
+            overlay_flow_capacity: default_bpf_overlay_flow_capacity(),
         }
     }
 }
@@ -141,6 +144,12 @@ pub struct NodePortConfig {
     pub iface: Option<String>,
     #[serde(default)]
     pub ip: Option<String>,
+    #[serde(default = "default_nodeport_vip_capacity")]
+    pub vip_capacity: usize,
+    #[serde(default = "default_nodeport_host_capacity")]
+    pub host_capacity: usize,
+    #[serde(default = "default_nodeport_flow_capacity")]
+    pub flow_capacity: usize,
 }
 
 impl Default for NodePortConfig {
@@ -152,6 +161,9 @@ impl Default for NodePortConfig {
             enabled: true,
             iface: None,
             ip: None,
+            vip_capacity: default_nodeport_vip_capacity(),
+            host_capacity: default_nodeport_host_capacity(),
+            flow_capacity: default_nodeport_flow_capacity(),
         }
     }
 }
@@ -379,6 +391,26 @@ static GLOBAL_LOADED: AtomicBool = AtomicBool::new(false);
 
 /// # Description:
 ///
+/// Default max entry count for one overlay VIP forward or reverse flow map.
+pub const DEFAULT_BPF_OVERLAY_FLOW_CAPACITY: usize = 1024;
+
+/// # Description:
+///
+/// Default max entry count for one NodePort VIP publication map.
+pub const DEFAULT_NODEPORT_VIP_CAPACITY: usize = 1024;
+
+/// # Description:
+///
+/// Default max entry count for one NodePort forward or reverse flow map.
+pub const DEFAULT_NODEPORT_FLOW_CAPACITY: usize = 2048;
+
+/// # Description:
+///
+/// Default max entry count for one NodePort host-access attachment map.
+pub const DEFAULT_NODEPORT_HOST_CAPACITY: usize = 256;
+
+/// # Description:
+///
 /// Tracks the origin metadata for the current configuration snapshot.
 #[derive(Clone, Debug, Default)]
 pub struct ConfigSource {
@@ -503,6 +535,35 @@ pub fn bpf_artifact_dir() -> Option<PathBuf> {
 
 /// # Description:
 ///
+/// Resolve the configured overlay flow-map capacity used when bridge tc programs pin their
+/// shared conntrack state.
+pub fn bpf_overlay_flow_capacity() -> usize {
+    global_config().network.bpf.overlay_flow_capacity
+}
+
+/// # Description:
+///
+/// Resolve the configured NodePort VIP-map capacity used when publishing external selectors.
+pub fn nodeport_vip_capacity() -> usize {
+    global_config().network.nodeport.vip_capacity
+}
+
+/// # Description:
+///
+/// Resolve the configured NodePort host-access map capacity used for per-network SNAT state.
+pub fn nodeport_host_capacity() -> usize {
+    global_config().network.nodeport.host_capacity
+}
+
+/// # Description:
+///
+/// Resolve the configured NodePort flow-map capacity used by the public ingress conntrack cache.
+pub fn nodeport_flow_capacity() -> usize {
+    global_config().network.nodeport.flow_capacity
+}
+
+/// # Description:
+///
 /// Resolve the scheduler reserve configuration used while deriving allocatable capacity.
 pub fn scheduler_runtime_config() -> RuntimeSchedulerConfig {
     global_config().scheduler.as_runtime()
@@ -621,9 +682,53 @@ fn validate_advertise_addr(raw: &str) -> Result<()> {
 
 /// # Description:
 ///
+/// Validate one configured eBPF map capacity so the loader can program it directly into the
+/// kernel before map creation.
+fn validate_map_capacity(name: &str, value: usize) -> Result<()> {
+    if value == 0 {
+        anyhow::bail!("{name} must be greater than zero");
+    }
+
+    if value > u32::MAX as usize {
+        anyhow::bail!("{name} must be less than or equal to {}", u32::MAX);
+    }
+
+    Ok(())
+}
+
+/// # Description:
+///
 /// Return a default true value for serde defaults.
 fn default_true() -> bool {
     true
+}
+
+/// # Description:
+///
+/// Returns the default overlay conntrack flow-map capacity.
+fn default_bpf_overlay_flow_capacity() -> usize {
+    DEFAULT_BPF_OVERLAY_FLOW_CAPACITY
+}
+
+/// # Description:
+///
+/// Returns the default NodePort VIP-map capacity.
+fn default_nodeport_vip_capacity() -> usize {
+    DEFAULT_NODEPORT_VIP_CAPACITY
+}
+
+/// # Description:
+///
+/// Returns the default NodePort host-access map capacity.
+fn default_nodeport_host_capacity() -> usize {
+    DEFAULT_NODEPORT_HOST_CAPACITY
+}
+
+/// # Description:
+///
+/// Returns the default NodePort public flow-map capacity.
+fn default_nodeport_flow_capacity() -> usize {
+    DEFAULT_NODEPORT_FLOW_CAPACITY
 }
 
 /// # Description:
@@ -851,6 +956,11 @@ impl Config {
             }
         }
 
+        applied |= apply_positive_usize_env_override(
+            "MANTISSA_BPF_OVERLAY_FLOW_CAPACITY",
+            &mut self.network.bpf.overlay_flow_capacity,
+        );
+
         if let Ok(iface) = std::env::var("MANTISSA_NODEPORT_IFACE") {
             applied = true;
             let iface = iface.trim();
@@ -866,6 +976,19 @@ impl Config {
                 self.network.nodeport.ip = Some(ip.to_string());
             }
         }
+
+        applied |= apply_positive_usize_env_override(
+            "MANTISSA_NODEPORT_VIP_CAPACITY",
+            &mut self.network.nodeport.vip_capacity,
+        );
+        applied |= apply_positive_usize_env_override(
+            "MANTISSA_NODEPORT_HOST_CAPACITY",
+            &mut self.network.nodeport.host_capacity,
+        );
+        applied |= apply_positive_usize_env_override(
+            "MANTISSA_NODEPORT_FLOW_CAPACITY",
+            &mut self.network.nodeport.flow_capacity,
+        );
 
         if let Ok(addr) = std::env::var("MANTISSA_ADVERTISE_ADDR") {
             applied = true;
@@ -965,6 +1088,23 @@ impl Config {
         {
             anyhow::bail!("network.wireguard.port must be non-zero");
         }
+
+        validate_map_capacity(
+            "network.bpf.overlay_flow_capacity",
+            self.network.bpf.overlay_flow_capacity,
+        )?;
+        validate_map_capacity(
+            "network.nodeport.vip_capacity",
+            self.network.nodeport.vip_capacity,
+        )?;
+        validate_map_capacity(
+            "network.nodeport.host_capacity",
+            self.network.nodeport.host_capacity,
+        )?;
+        validate_map_capacity(
+            "network.nodeport.flow_capacity",
+            self.network.nodeport.flow_capacity,
+        )?;
 
         if let Some(ref ip) = self.network.nodeport.ip
             && ip.parse::<IpAddr>().is_err()
@@ -1260,6 +1400,18 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
         changes.push("network.nodeport.ip".to_string());
     }
 
+    if old.network.nodeport.vip_capacity != new.network.nodeport.vip_capacity {
+        changes.push("network.nodeport.vip_capacity".to_string());
+    }
+
+    if old.network.nodeport.host_capacity != new.network.nodeport.host_capacity {
+        changes.push("network.nodeport.host_capacity".to_string());
+    }
+
+    if old.network.nodeport.flow_capacity != new.network.nodeport.flow_capacity {
+        changes.push("network.nodeport.flow_capacity".to_string());
+    }
+
     if old.network.advertise_addr != new.network.advertise_addr {
         changes.push("network.advertise_addr".to_string());
     }
@@ -1270,6 +1422,18 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
 
     if old.network.provision_kernel_interfaces != new.network.provision_kernel_interfaces {
         changes.push("network.provision_kernel_interfaces".to_string());
+    }
+
+    if old.network.bpf.attach != new.network.bpf.attach {
+        changes.push("network.bpf.attach".to_string());
+    }
+
+    if old.network.bpf.artifact_dir != new.network.bpf.artifact_dir {
+        changes.push("network.bpf.artifact_dir".to_string());
+    }
+
+    if old.network.bpf.overlay_flow_capacity != new.network.bpf.overlay_flow_capacity {
+        changes.push("network.bpf.overlay_flow_capacity".to_string());
     }
 
     if old.network.wireguard.port != new.network.wireguard.port {
@@ -1328,6 +1492,36 @@ mod tests {
     fn rejects_invalid_nodeport_ip() {
         let mut config = Config::default();
         config.network.nodeport.ip = Some("not-an-ip".to_string());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_bpf_map_capacity() {
+        let mut config = Config::default();
+        config.network.bpf.overlay_flow_capacity = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_nodeport_map_capacity() {
+        let mut config = Config::default();
+        config.network.nodeport.vip_capacity = 0;
+        assert!(config.validate().is_err());
+
+        config.network.nodeport.vip_capacity = DEFAULT_NODEPORT_VIP_CAPACITY;
+        config.network.nodeport.host_capacity = 0;
+        assert!(config.validate().is_err());
+
+        config.network.nodeport.host_capacity = DEFAULT_NODEPORT_HOST_CAPACITY;
+        config.network.nodeport.flow_capacity = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn rejects_oversized_bpf_map_capacity() {
+        let mut config = Config::default();
+        config.network.nodeport.flow_capacity = (u32::MAX as usize).saturating_add(1);
         assert!(config.validate().is_err());
     }
 
@@ -1405,7 +1599,11 @@ mod tests {
             std::env::set_var("MANTISSA_WIREGUARD_DISABLE", "1");
             std::env::set_var("MANTISSA_WIREGUARD_PORT", "51820");
             std::env::set_var("MANTISSA_BPF_NO_ATTACH", "1");
+            std::env::set_var("MANTISSA_BPF_OVERLAY_FLOW_CAPACITY", "4096");
             std::env::set_var("MANTISSA_NODEPORT_IFACE", "eth0");
+            std::env::set_var("MANTISSA_NODEPORT_VIP_CAPACITY", "2048");
+            std::env::set_var("MANTISSA_NODEPORT_HOST_CAPACITY", "512");
+            std::env::set_var("MANTISSA_NODEPORT_FLOW_CAPACITY", "8192");
             std::env::set_var("MANTISSA_ADVERTISE_ADDR", "node-1.example.com:6578");
             std::env::set_var("MANTISSA_DEFAULT_IP_FAMILY", "ipv6");
             std::env::set_var("MANTISSA_RUNTIME_OCI_HOST", "unix:///var/run/docker.sock");
@@ -1430,7 +1628,11 @@ mod tests {
         assert_eq!(config.network.wireguard.port, Some(51820));
         assert!(!config.network.bpf.attach);
         assert!(!config.network.nodeport.enabled);
+        assert_eq!(config.network.bpf.overlay_flow_capacity, 4096);
         assert_eq!(config.network.nodeport.iface.as_deref(), Some("eth0"));
+        assert_eq!(config.network.nodeport.vip_capacity, 2048);
+        assert_eq!(config.network.nodeport.host_capacity, 512);
+        assert_eq!(config.network.nodeport.flow_capacity, 8192);
         assert_eq!(
             config.network.advertise_addr.as_deref(),
             Some("node-1.example.com:6578")
@@ -1463,7 +1665,11 @@ mod tests {
             std::env::remove_var("MANTISSA_WIREGUARD_DISABLE");
             std::env::remove_var("MANTISSA_WIREGUARD_PORT");
             std::env::remove_var("MANTISSA_BPF_NO_ATTACH");
+            std::env::remove_var("MANTISSA_BPF_OVERLAY_FLOW_CAPACITY");
             std::env::remove_var("MANTISSA_NODEPORT_IFACE");
+            std::env::remove_var("MANTISSA_NODEPORT_VIP_CAPACITY");
+            std::env::remove_var("MANTISSA_NODEPORT_HOST_CAPACITY");
+            std::env::remove_var("MANTISSA_NODEPORT_FLOW_CAPACITY");
             std::env::remove_var("MANTISSA_ADVERTISE_ADDR");
             std::env::remove_var("MANTISSA_DEFAULT_IP_FAMILY");
             std::env::remove_var("MANTISSA_RUNTIME_OCI_HOST");
@@ -1530,6 +1736,40 @@ mod tests {
             changes
                 .iter()
                 .any(|change| change == "network.default_ip_family")
+        );
+    }
+
+    #[test]
+    fn bpf_and_nodeport_capacity_changes_require_restart() {
+        let old = Config::default();
+        let mut new = Config::default();
+        new.network.bpf.overlay_flow_capacity =
+            old.network.bpf.overlay_flow_capacity.saturating_add(1024);
+        new.network.nodeport.vip_capacity = old.network.nodeport.vip_capacity.saturating_add(128);
+        new.network.nodeport.host_capacity = old.network.nodeport.host_capacity.saturating_add(64);
+        new.network.nodeport.flow_capacity =
+            old.network.nodeport.flow_capacity.saturating_add(1024);
+
+        let changes = restart_required_changes(&old, &new);
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "network.bpf.overlay_flow_capacity")
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "network.nodeport.vip_capacity")
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "network.nodeport.host_capacity")
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "network.nodeport.flow_capacity")
         );
     }
 }

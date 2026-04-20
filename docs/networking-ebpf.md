@@ -338,7 +338,9 @@ mantissa info
 
 The `NodePort:` section shows whether the runtime is `disabled`, `pending`,
 `ready`, or `degraded`, plus the resolved iface/IP, active port counts,
-capacity limits, last error, and packet counters.
+capacity limits, last error, and packet counters. Those NodePort limits come
+from `network.nodeport.vip_capacity`, `network.nodeport.host_capacity`, and
+`network.nodeport.flow_capacity`.
 
 ## Packet flow: NodePort curl
 

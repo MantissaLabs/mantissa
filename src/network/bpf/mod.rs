@@ -761,6 +761,15 @@ mod platform {
         }
     }
 
+    /// # Description:
+    ///
+    /// Convert one configured map capacity into the `u32` value Aya expects before the loader
+    /// creates the pinned kernel map.
+    fn checked_map_capacity(name: &str, value: usize) -> Result<u32> {
+        u32::try_from(value)
+            .with_context(|| format!("configured {name} exceeds the kernel map size limit"))
+    }
+
     fn interface_exists(name: &str) -> bool {
         match CString::new(name) {
             Ok(cstr) => unsafe { if_nametoindex(cstr.as_ptr()) != 0 },
@@ -789,6 +798,16 @@ mod platform {
         match family {
             OverlayIpFamily::Ipv4 => &["LB_VIPS", "LB_BACKENDS", "LB_FWD", "LB_REV"],
             OverlayIpFamily::Ipv6 => &["LB_VIPS_V6", "LB_BACKENDS_V6", "LB_FWD_V6", "LB_REV_V6"],
+        }
+    }
+
+    /// # Description:
+    ///
+    /// Return the pinned flow-map names for one overlay address family.
+    fn lb_flow_map_names(family: OverlayIpFamily) -> &'static [&'static str] {
+        match family {
+            OverlayIpFamily::Ipv4 => &["LB_FWD", "LB_REV"],
+            OverlayIpFamily::Ipv6 => &["LB_FWD_V6", "LB_REV_V6"],
         }
     }
 
@@ -1003,6 +1022,28 @@ mod platform {
             }
         }
 
+        Ok(())
+    }
+
+    /// # Description:
+    ///
+    /// Apply the configured overlay flow capacity before Aya creates the pinned forward and
+    /// reverse conntrack maps for one bridge tc object.
+    fn configure_overlay_flow_map_capacities(
+        loader: &mut EbpfLoader<'_>,
+        family: Option<OverlayIpFamily>,
+    ) -> Result<()> {
+        let Some(family) = family else {
+            return Ok(());
+        };
+
+        let flow_capacity = checked_map_capacity(
+            "network.bpf.overlay_flow_capacity",
+            config::bpf_overlay_flow_capacity(),
+        )?;
+        for map_name in lb_flow_map_names(family) {
+            loader.set_max_entries(map_name, flow_capacity);
+        }
         Ok(())
     }
 
@@ -1382,6 +1423,8 @@ mod platform {
         ) -> Result<ProgramHandle> {
             let mut loader = EbpfLoader::new();
             loader.map_pin_path(map_pin_path);
+            configure_overlay_flow_map_capacities(&mut loader, lb_family)
+                .context("configure overlay bpf map capacities")?;
             let mut bpf = loader
                 .load_file(artifact)
                 .with_context(|| format!("load bpf object {}", artifact.display()))?;

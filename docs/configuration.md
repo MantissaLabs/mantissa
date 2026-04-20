@@ -38,11 +38,15 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
         bpf: (
             attach: true,
             artifact_dir: "/opt/mantissa/bpf",
+            overlay_flow_capacity: 4096,
         ),
         nodeport: (
             enabled: true,
             iface: "eth0",
             ip: "192.168.1.10",
+            vip_capacity: 2048,
+            host_capacity: 512,
+            flow_capacity: 8192,
         ),
     ),
     health: (
@@ -84,9 +88,13 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 - `network.wireguard.manage_firewall` (legacy: `MANTISSA_WIREGUARD_NO_FIREWALL`)
 - `network.bpf.attach` (legacy: `MANTISSA_BPF_NO_ATTACH`, `MANTISSA_SKIP_BPF`)
 - `network.bpf.artifact_dir` (legacy: `MANTISSA_BPF_DIR`)
+- `network.bpf.overlay_flow_capacity` (env: `MANTISSA_BPF_OVERLAY_FLOW_CAPACITY`)
 - `network.nodeport.enabled` (legacy: disabled when BPF attach is disabled)
 - `network.nodeport.iface` (legacy: `MANTISSA_NODEPORT_IFACE`)
 - `network.nodeport.ip` (legacy: `MANTISSA_NODEPORT_IP`)
+- `network.nodeport.vip_capacity` (env: `MANTISSA_NODEPORT_VIP_CAPACITY`)
+- `network.nodeport.host_capacity` (env: `MANTISSA_NODEPORT_HOST_CAPACITY`)
+- `network.nodeport.flow_capacity` (env: `MANTISSA_NODEPORT_FLOW_CAPACITY`)
 - `health.probe_fanout`
 - `health.probe_interval_ms`
 - `health.probe_timeout_ms`
@@ -138,6 +146,19 @@ publishes for services with `public_port`.
   be IPv4 or IPv6. When set, it wins over every other source. The configured
   address must match the family of the published VIPs served on the node. On
   multihomed, NATed, or policy-routed hosts, set it explicitly.
+- `network.bpf.overlay_flow_capacity`
+  Sets the pinned overlay VIP flow-map size used by the bridge tc dataplane.
+  The default is `1024` entries per forward or reverse map. Increase it on
+  nodes that carry many concurrent service flows.
+- `network.nodeport.vip_capacity`
+  Sets the pinned NodePort publication-map size. The default is `1024`
+  selectors.
+- `network.nodeport.host_capacity`
+  Sets the pinned NodePort host-access attachment-map size. The default is
+  `256` networks.
+- `network.nodeport.flow_capacity`
+  Sets the pinned NodePort conntrack flow-map size. The default is `2048`
+  entries per forward or reverse map.
 - `network.advertise_addr`
   This is the peer address published to the cluster. When `network.nodeport.ip`
   is unset, Mantissa reuses the IP portion of `network.advertise_addr` for
@@ -162,6 +183,9 @@ Recommended production pattern:
 If the address used for peer traffic and the address used for public service
 traffic are the same, you can omit `network.nodeport.ip` and rely on
 `network.advertise_addr` instead.
+
+Changing the BPF and NodePort map capacities requires a restart. The resolved
+NodePort limits are reported in `mantissa info`.
 
 ## NodePort contract and caveats
 

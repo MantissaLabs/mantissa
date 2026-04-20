@@ -6,14 +6,60 @@ use uuid::Uuid;
 
 const NODEPORT_PROTO_TCP: u8 = 6;
 const NODEPORT_PROTO_UDP: u8 = 17;
-/// Keep the userspace capacity checks aligned with the pinned VIP map size in the tc ingress program.
-const NODEPORT_VIP_CAPACITY: usize = 1024;
-/// Keep the userspace capacity checks aligned with the pinned NAT flow maps in the tc programs.
-const NODEPORT_FLOW_CAPACITY: usize = 2048;
-/// Keep the userspace capacity checks aligned with the pinned host-access map size in the tc ingress program.
-const NODEPORT_HOST_CAPACITY: usize = 256;
+/// Default max entry count for one pinned NodePort VIP publication map.
+#[cfg(test)]
+const NODEPORT_VIP_CAPACITY: usize = crate::config::DEFAULT_NODEPORT_VIP_CAPACITY;
+/// Default max entry count for one pinned NodePort forward or reverse flow map.
+#[cfg(test)]
+const NODEPORT_FLOW_CAPACITY: usize = crate::config::DEFAULT_NODEPORT_FLOW_CAPACITY;
+/// Default max entry count for one pinned NodePort host-access attachment map.
+#[cfg(test)]
+const NODEPORT_HOST_CAPACITY: usize = crate::config::DEFAULT_NODEPORT_HOST_CAPACITY;
 /// Keep the userspace readers aligned with the ingress drop-reason map size in the tc ingress program.
 const NODEPORT_INGRESS_DROP_REASON_COUNT: usize = 5;
+
+/// Capacity limits for the pinned NodePort maps that back publication, host-access SNAT, and
+/// public conntrack state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NodePortMapCapacities {
+    vip: usize,
+    host: usize,
+    flow: usize,
+}
+
+impl NodePortMapCapacities {
+    /// # Description:
+    ///
+    /// Resolve the current NodePort map-capacity configuration from the global config snapshot.
+    fn from_config() -> Self {
+        Self {
+            vip: crate::config::nodeport_vip_capacity(),
+            host: crate::config::nodeport_host_capacity(),
+            flow: crate::config::nodeport_flow_capacity(),
+        }
+    }
+
+    /// # Description:
+    ///
+    /// Convert the configured VIP-map capacity into Aya's `u32` max-entry type.
+    fn vip_u32(self) -> Result<u32> {
+        checked_map_capacity("network.nodeport.vip_capacity", self.vip)
+    }
+
+    /// # Description:
+    ///
+    /// Convert the configured host-access map capacity into Aya's `u32` max-entry type.
+    fn host_u32(self) -> Result<u32> {
+        checked_map_capacity("network.nodeport.host_capacity", self.host)
+    }
+
+    /// # Description:
+    ///
+    /// Convert the configured public flow-map capacity into Aya's `u32` max-entry type.
+    fn flow_u32(self) -> Result<u32> {
+        checked_map_capacity("network.nodeport.flow_capacity", self.flow)
+    }
+}
 
 /// Declarative nodeport mapping that connects an external port to an overlay VIP.
 #[derive(Clone, Debug)]
@@ -123,6 +169,15 @@ fn configured_node_ip_from_sources(
     configured_node_ip.or_else(|| advertise_addr.and_then(resolve_advertise_ip))
 }
 
+/// # Description:
+///
+/// Convert one configured NodePort map capacity into the `u32` value expected by Aya before the
+/// kernel creates the pinned map.
+fn checked_map_capacity(name: &str, value: usize) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| anyhow::anyhow!("configured {name} exceeds the kernel map size limit"))
+}
+
 /// Project the active-public-network count after one NodePort sync applies.
 fn projected_active_networks_after_sync(
     current_active_networks: usize,
@@ -140,15 +195,18 @@ fn projected_active_networks_after_sync(
 fn nodeport_capacity_error(
     projected_active_ports: usize,
     projected_active_networks: usize,
+    capacities: NodePortMapCapacities,
 ) -> Option<String> {
-    if projected_active_ports > NODEPORT_VIP_CAPACITY {
+    if projected_active_ports > capacities.vip {
         return Some(format!(
-            "nodeport VIP capacity exceeded: requested {projected_active_ports} active ports, limit {NODEPORT_VIP_CAPACITY}"
+            "nodeport VIP capacity exceeded: requested {projected_active_ports} active ports, limit {}",
+            capacities.vip
         ));
     }
-    if projected_active_networks > NODEPORT_HOST_CAPACITY {
+    if projected_active_networks > capacities.host {
         return Some(format!(
-            "nodeport host-access capacity exceeded: requested {projected_active_networks} active public networks, limit {NODEPORT_HOST_CAPACITY}"
+            "nodeport host-access capacity exceeded: requested {projected_active_networks} active public networks, limit {}",
+            capacities.host
         ));
     }
     None
@@ -214,6 +272,7 @@ impl PlatformNodePortManager {
 
     /// Return a disabled runtime snapshot on unsupported platforms.
     fn status(&self) -> NodePortStatus {
+        let capacities = NodePortMapCapacities::from_config();
         NodePortStatus {
             desired_enabled: false,
             state: NodePortRuntimeState::Disabled,
@@ -222,9 +281,9 @@ impl PlatformNodePortManager {
             active_networks: 0,
             active_ports: 0,
             active_host_networks: 0,
-            vip_capacity: NODEPORT_VIP_CAPACITY,
-            host_capacity: NODEPORT_HOST_CAPACITY,
-            flow_capacity: NODEPORT_FLOW_CAPACITY,
+            vip_capacity: capacities.vip,
+            host_capacity: capacities.host,
+            flow_capacity: capacities.flow,
             ingress_stats: None,
             ingress_drop_reasons: None,
             egress_stats: None,
@@ -237,10 +296,10 @@ impl PlatformNodePortManager {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{
-        NODEPORT_FLOW_CAPACITY, NODEPORT_HOST_CAPACITY, NODEPORT_INGRESS_DROP_REASON_COUNT,
-        NODEPORT_VIP_CAPACITY, NodePortIngressDropReasons, NodePortMapping, NodePortPacketCounters,
-        NodePortProtocol, NodePortRuntimeState, NodePortStatus, configured_node_ip_from_sources,
-        nodeport_capacity_error, projected_active_networks_after_sync, resolve_advertise_ip,
+        NODEPORT_INGRESS_DROP_REASON_COUNT, NodePortIngressDropReasons, NodePortMapCapacities,
+        NodePortMapping, NodePortPacketCounters, NodePortProtocol, NodePortRuntimeState,
+        NodePortStatus, configured_node_ip_from_sources, nodeport_capacity_error,
+        projected_active_networks_after_sync, resolve_advertise_ip,
     };
     use crate::config;
     use crate::ip_family::{IpFamily, infer_default_ip_family};
@@ -552,6 +611,7 @@ mod platform {
         port_owner: HashMap<NodePortSelector, Uuid>,
         host_ingress_attached: HashSet<Uuid>,
         host_ingress_ifindex: HashMap<Uuid, u32>,
+        capacities: NodePortMapCapacities,
         runtime_state: NodePortRuntimeState,
         last_error: Option<String>,
     }
@@ -562,6 +622,7 @@ mod platform {
             let configured_iface = config::nodeport_iface();
             let configured_node_ip = config::nodeport_ip();
             let configured_advertise_addr = config::advertise_addr();
+            let capacities = NodePortMapCapacities::from_config();
             let mut desired_enabled = config::nodeport_enabled();
             let initial_error = if desired_enabled && !config::bpf_attach_enabled() {
                 debug!(
@@ -588,6 +649,7 @@ mod platform {
                 port_owner: HashMap::new(),
                 host_ingress_attached: HashSet::new(),
                 host_ingress_ifindex: HashMap::new(),
+                capacities,
                 runtime_state: if desired_enabled {
                     NodePortRuntimeState::Pending
                 } else {
@@ -928,9 +990,11 @@ mod platform {
                 had_ports,
                 !desired_ports.is_empty(),
             );
-            if let Some(error) =
-                nodeport_capacity_error(projected_active_ports, projected_active_networks)
-            {
+            if let Some(error) = nodeport_capacity_error(
+                projected_active_ports,
+                projected_active_networks,
+                self.capacities,
+            ) {
                 self.degrade_runtime(error.clone(), "nodeport runtime degraded");
                 return Err(anyhow!(error));
             }
@@ -983,9 +1047,9 @@ mod platform {
                 active_networks,
                 active_ports: self.port_owner.len(),
                 active_host_networks: self.host_ingress_attached.len(),
-                vip_capacity: NODEPORT_VIP_CAPACITY,
-                host_capacity: NODEPORT_HOST_CAPACITY,
-                flow_capacity: NODEPORT_FLOW_CAPACITY,
+                vip_capacity: self.capacities.vip,
+                host_capacity: self.capacities.host,
+                flow_capacity: self.capacities.flow,
                 ingress_stats: None,
                 ingress_drop_reasons: None,
                 egress_stats: None,
@@ -1273,9 +1337,10 @@ mod platform {
                 );
             }
 
-            let mut ingress =
-                load_program("nodeport_tc_ingress").context("load nodeport ingress")?;
-            let mut egress = load_program("nodeport_tc_egress").context("load nodeport egress")?;
+            let mut ingress = load_program("nodeport_tc_ingress", self.capacities)
+                .context("load nodeport ingress")?;
+            let mut egress = load_program("nodeport_tc_egress", self.capacities)
+                .context("load nodeport egress")?;
 
             attach_tc(
                 &mut ingress,
@@ -1725,17 +1790,48 @@ mod platform {
         ))
     }
 
+    /// # Description:
+    ///
+    /// Apply the configured NodePort map capacities before Aya creates or reuses the pinned tc
+    /// maps that back public publication and conntrack state.
+    fn configure_nodeport_loader_capacities(
+        loader: &mut EbpfLoader<'_>,
+        capacities: NodePortMapCapacities,
+    ) -> Result<()> {
+        let vip_capacity = capacities.vip_u32()?;
+        let host_capacity = capacities.host_u32()?;
+        let flow_capacity = capacities.flow_u32()?;
+
+        for map_name in [IPV4_MAPS.vip_map, IPV6_MAPS.vip_map] {
+            loader.set_max_entries(map_name, vip_capacity);
+        }
+        for map_name in [IPV4_MAPS.host_map, IPV6_MAPS.host_map] {
+            loader.set_max_entries(map_name, host_capacity);
+        }
+        for map_name in [
+            IPV4_MAPS.forward_map,
+            IPV4_MAPS.reverse_map,
+            IPV6_MAPS.forward_map,
+            IPV6_MAPS.reverse_map,
+        ] {
+            loader.set_max_entries(map_name, flow_capacity);
+        }
+
+        Ok(())
+    }
+
     /// Load a tc program from the local BPF artifact directory.
-    fn load_program(name: &str) -> Result<Ebpf> {
+    fn load_program(name: &str, capacities: NodePortMapCapacities) -> Result<Ebpf> {
         let resolver = ArtifactResolver::new();
         let path = resolver
             .resolve(name)
             .with_context(|| format!("resolve nodeport artifact {name}"))?;
         let map_pin_path = map_pin_dir()?;
-        let bpf = EbpfLoader::new()
-            .map_pin_path(&map_pin_path)
-            .load_file(path)
-            .context("load nodeport ebpf")?;
+        let mut loader = EbpfLoader::new();
+        loader.map_pin_path(&map_pin_path);
+        configure_nodeport_loader_capacities(&mut loader, capacities)
+            .context("configure nodeport bpf map capacities")?;
+        let bpf = loader.load_file(path).context("load nodeport ebpf")?;
         Ok(bpf)
     }
 
@@ -2381,8 +2477,8 @@ mod tests {
     };
     use super::{
         NODEPORT_FLOW_CAPACITY, NODEPORT_HOST_CAPACITY, NODEPORT_VIP_CAPACITY,
-        NodePortPacketCounters, NodePortProtocol, NodePortRuntimeState, NodePortStatus,
-        configured_node_ip_from_sources, nodeport_capacity_error,
+        NodePortMapCapacities, NodePortPacketCounters, NodePortProtocol, NodePortRuntimeState,
+        NodePortStatus, configured_node_ip_from_sources, nodeport_capacity_error,
         projected_active_networks_after_sync, resolve_advertise_ip,
     };
     use std::collections::HashMap;
@@ -2558,15 +2654,31 @@ mod tests {
 
     #[test]
     fn nodeport_capacity_error_reports_vip_limit() {
-        let error = nodeport_capacity_error(NODEPORT_VIP_CAPACITY + 1, 1)
-            .expect("expected vip capacity error");
+        let error = nodeport_capacity_error(
+            NODEPORT_VIP_CAPACITY + 1,
+            1,
+            NodePortMapCapacities {
+                vip: NODEPORT_VIP_CAPACITY,
+                host: NODEPORT_HOST_CAPACITY,
+                flow: NODEPORT_FLOW_CAPACITY,
+            },
+        )
+        .expect("expected vip capacity error");
         assert!(error.contains("VIP capacity exceeded"));
     }
 
     #[test]
     fn nodeport_capacity_error_reports_host_limit() {
-        let error = nodeport_capacity_error(1, NODEPORT_HOST_CAPACITY + 1)
-            .expect("expected host capacity error");
+        let error = nodeport_capacity_error(
+            1,
+            NODEPORT_HOST_CAPACITY + 1,
+            NodePortMapCapacities {
+                vip: NODEPORT_VIP_CAPACITY,
+                host: NODEPORT_HOST_CAPACITY,
+                flow: NODEPORT_FLOW_CAPACITY,
+            },
+        )
+        .expect("expected host capacity error");
         assert!(error.contains("host-access capacity exceeded"));
     }
 }
