@@ -238,14 +238,39 @@ async fn http_get(addr: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&response).into_owned())
 }
 
-/// Sends one UDP datagram through the published NodePort address and waits for the echoed reply.
-async fn udp_echo(addr: &str, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+/// Sends one UDP datagram through one already-bound client socket and waits for the echoed reply.
+async fn udp_echo_with_socket(
+    socket: &UdpSocket,
+    addr: &str,
+    payload: &[u8],
+) -> anyhow::Result<Vec<u8>> {
     socket.send_to(payload, addr).await?;
     let mut response = [0u8; 2048];
     let (len, _) =
         tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut response)).await??;
     Ok(response[..len].to_vec())
+}
+
+/// Sends one UDP datagram through the published NodePort address and waits for the echoed reply.
+async fn udp_echo(addr: &str, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    udp_echo_with_socket(&socket, addr, payload).await
+}
+
+/// Binds one localhost UDP client socket from a small fixed port range for deterministic tests.
+async fn bind_udp_client_socket(start_port: u16) -> anyhow::Result<UdpSocket> {
+    let end_port = start_port.saturating_add(32);
+    for port in start_port..end_port {
+        match UdpSocket::bind(("127.0.0.1", port)).await {
+            Ok(socket) => return Ok(socket),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "no free udp client port in range {start_port}..{end_port}"
+    ))
 }
 
 /// Return the bpftool dump for one pinned NodePort map so cleanup assertions can inspect it.
@@ -1173,6 +1198,128 @@ local_test!(nodeport_udp_public_port_remap_clears_stale_flow_maps, {
         .await,
         "udp remap cleanup test should accept traffic on the new public port"
     );
+
+    remove_service_via_rpc(&node.services_client, service_id).await;
+    delete_privileged_network(&node, network_id).await;
+});
+
+local_test!(nodeport_small_flow_capacity_reports_estimated_evictions, {
+    let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
+        return;
+    };
+
+    let _config = PrivilegedTestGuard::apply(|config| {
+        config.network.wireguard.enabled = false;
+        config.network.wireguard.manage_firewall = false;
+        config.network.bpf.attach = true;
+        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        config.network.nodeport.enabled = true;
+        config.network.nodeport.iface = Some("lo".to_string());
+        config.network.nodeport.ip = Some("127.0.0.1".to_string());
+        config.network.nodeport.flow_capacity = 1;
+        config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+    });
+    let node = create_privileged_node().await;
+    let subnet = privileged_test_subnet();
+    let network = create_privileged_network(
+        &node,
+        privileged_test_network(
+            "nodeport-small-flow-capacity",
+            "privileged nodeport flow pressure test network",
+            &subnet,
+            1450,
+            Vec::new(),
+        ),
+        mantissa::network::types::NetworkStatus::Ready,
+    )
+    .await;
+    let network_id = network.id;
+
+    let service_id = deploy_privileged_nodeport_udp_service(
+        &node.service_controller,
+        "nodeport-small-flow-capacity",
+        network_id,
+        NODEPORT_UDP_PORT,
+        NODEPORT_UDP_PORT,
+    )
+    .await
+    .expect("submit privileged NodePort UDP flow pressure deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.service_controller,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(180),
+        )
+        .await,
+        "udp flow pressure test should reach running state before exercising the public dataplane"
+    );
+
+    let addr = format!("127.0.0.1:{NODEPORT_UDP_PORT}");
+    let payload = NODEPORT_UDP_RESPONSE.as_bytes();
+    let socket_a = bind_udp_client_socket(39_100)
+        .await
+        .expect("bind first udp pressure client");
+    let socket_b = bind_udp_client_socket(39_200)
+        .await
+        .expect("bind second udp pressure client");
+    assert_ne!(
+        socket_a
+            .local_addr()
+            .expect("read first udp pressure client address")
+            .port(),
+        socket_b
+            .local_addr()
+            .expect("read second udp pressure client address")
+            .port(),
+        "udp pressure test needs distinct client source ports to create distinct flows"
+    );
+    assert!(
+        wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(250),
+            || async {
+                matches!(
+                    udp_echo_with_socket(&socket_a, &addr, payload).await,
+                    Ok(response) if response == payload
+                )
+            },
+        )
+        .await,
+        "udp flow pressure test should establish the first NodePort flow"
+    );
+    let reported_eviction = wait_until(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        || async {
+            if !matches!(
+                socket_b.send_to(payload, &addr).await,
+                Ok(len) if len == payload.len()
+            ) {
+                return false;
+            }
+            let status = node.network_controller.nodeport_manager().status().await;
+            matches!(
+                status.flow_diagnostics,
+                Some(diagnostics)
+                    if status.state == NodePortRuntimeState::Ready
+                        && status.flow_capacity == 1
+                        && diagnostics.flow_creates >= 2
+                        && diagnostics.ipv4_flow_pairs == 1
+                        && diagnostics.estimated_flow_evictions >= 1
+            )
+        },
+    )
+    .await;
+    if !reported_eviction {
+        let status = node.network_controller.nodeport_manager().status().await;
+        let forward_dump = dump_nodeport_map("NODEPORT_FWD");
+        let reverse_dump = dump_nodeport_map("NODEPORT_REV");
+        panic!(
+            "small flow capacity should surface an estimated eviction after two UDP flows; status={status:?}; forward_dump={forward_dump:?}; reverse_dump={reverse_dump:?}"
+        );
+    }
 
     remove_service_via_rpc(&node.services_client, service_id).await;
     delete_privileged_network(&node, network_id).await;

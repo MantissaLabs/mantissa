@@ -27,6 +27,10 @@ const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 const LOOPBACK_HDR_LEN: usize = 4;
 const NODEPORT_INGRESS_DROP_REASON_COUNT: u32 = 5;
+const NODEPORT_FLOW_EVENT_COUNT: u32 = 4;
+const FLOW_EVENT_CREATE: u32 = 0;
+const FLOW_EVENT_CLEAR: u32 = 1;
+const FLOW_EVENT_INVALID_TRANSITION: u32 = 3;
 
 #[repr(u32)]
 #[derive(Clone, Copy)]
@@ -94,6 +98,10 @@ static mut NODEPORT_TC_INGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::pi
 #[map(name = "NODEPORT_TC_INGRESS_DROP_REASONS")]
 static mut NODEPORT_TC_INGRESS_DROP_REASONS: PerCpuArray<u64> =
     PerCpuArray::pinned(NODEPORT_INGRESS_DROP_REASON_COUNT, 0);
+
+#[map(name = "NODEPORT_TC_FLOW_EVENTS")]
+static mut NODEPORT_TC_FLOW_EVENTS: PerCpuArray<u64> =
+    PerCpuArray::pinned(NODEPORT_FLOW_EVENT_COUNT, 0);
 
 #[map(name = "NODEPORT_VIPS")]
 static mut NODEPORT_VIPS: HashMap<NodePortKey, NodePortEntry> = HashMap::pinned(1024, 0);
@@ -228,10 +236,14 @@ fn handle_ipv4_packet(
     };
     let reverse_flow = reverse_key_from_forward_flow(&client_flow);
 
+    let mut created_new_flow = false;
     let mut remove_after_redirect = false;
     let choice = if let Some(mut nat) = unsafe { NODEPORT_FWD.get(&client_flow).copied() } {
         match nat.conntrack.advance_forward(tcp_flags, now_ns) {
-            ConntrackVerdict::Reject => return Ok(IngressOutcome::Ignored),
+            ConntrackVerdict::Reject => {
+                record_flow_event(FLOW_EVENT_INVALID_TRANSITION);
+                return Ok(IngressOutcome::Ignored);
+            }
             ConntrackVerdict::Remove => {
                 remove_flow_pair(&client_flow, &reverse_flow);
                 return Ok(IngressOutcome::Ignored);
@@ -248,8 +260,10 @@ fn handle_ipv4_packet(
         }
     } else {
         let Some(conntrack) = ConntrackMetadata::begin_flow(proto, tcp_flags, now_ns) else {
+            record_flow_event(FLOW_EVENT_INVALID_TRANSITION);
             return Ok(IngressOutcome::Ignored);
         };
+        created_new_flow = true;
         NodePortNat {
             node_ip: entry.node_ip,
             node_port: dst_port,
@@ -279,6 +293,9 @@ fn handle_ipv4_packet(
     } else {
         persist_flow_pair(&client_flow, &reverse_flow, &choice)
             .map_err(|_| IngressDropReason::NatInsertFailure)?;
+        if created_new_flow {
+            record_flow_event(FLOW_EVENT_CREATE);
+        }
     }
 
     Ok(IngressOutcome::Redirected)
@@ -344,10 +361,14 @@ fn handle_ipv6_packet(
     };
     let reverse_flow = reverse_key_from_forward_flow_v6(&client_flow);
 
+    let mut created_new_flow = false;
     let mut remove_after_redirect = false;
     let choice = if let Some(mut nat) = unsafe { NODEPORT_FWD_V6.get(&client_flow).copied() } {
         match nat.conntrack.advance_forward(tcp_flags, now_ns) {
-            ConntrackVerdict::Reject => return Ok(IngressOutcome::Ignored),
+            ConntrackVerdict::Reject => {
+                record_flow_event(FLOW_EVENT_INVALID_TRANSITION);
+                return Ok(IngressOutcome::Ignored);
+            }
             ConntrackVerdict::Remove => {
                 remove_flow_pair_v6(&client_flow, &reverse_flow);
                 return Ok(IngressOutcome::Ignored);
@@ -364,8 +385,10 @@ fn handle_ipv6_packet(
         }
     } else {
         let Some(conntrack) = ConntrackMetadata::begin_flow(proto, tcp_flags, now_ns) else {
+            record_flow_event(FLOW_EVENT_INVALID_TRANSITION);
             return Ok(IngressOutcome::Ignored);
         };
+        created_new_flow = true;
         NodePortNat6 {
             node_ip: entry.node_ip,
             node_port: dst_port,
@@ -394,6 +417,9 @@ fn handle_ipv6_packet(
     } else {
         persist_flow_pair_v6(&client_flow, &reverse_flow, &choice)
             .map_err(|_| IngressDropReason::NatInsertFailure)?;
+        if created_new_flow {
+            record_flow_event(FLOW_EVENT_CREATE);
+        }
     }
 
     Ok(IngressOutcome::Redirected)
@@ -447,6 +473,17 @@ fn l3_version_matches(ctx: &TcContext, offset: usize, expected_version: u8) -> R
 #[inline(always)]
 fn flow_now_ns() -> u64 {
     unsafe { bpf_ktime_get_ns() }
+}
+
+/// Increment one shared NodePort flow event counter.
+#[inline(always)]
+fn record_flow_event(event_index: u32) {
+    unsafe {
+        stats::increment_reason(
+            core::ptr::addr_of_mut!(NODEPORT_TC_FLOW_EVENTS),
+            event_index,
+        );
+    }
 }
 
 /// Load and validate the fixed TCP header prefix at the provided transport offset.
@@ -564,6 +601,7 @@ fn persist_flow_pair_v6(
 /// The public dataplane uses LRU maps, so teardown cleanup must tolerate one side already being
 /// gone while still clearing as much stale state as remains.
 fn remove_flow_pair(forward_key: &Flow4, reverse_key: &Flow4) {
+    record_flow_event(FLOW_EVENT_CLEAR);
     unsafe {
         let _ = NODEPORT_FWD.remove(forward_key);
         let _ = NODEPORT_REV.remove(reverse_key);
@@ -575,6 +613,7 @@ fn remove_flow_pair(forward_key: &Flow4, reverse_key: &Flow4) {
 /// IPv6 teardown follows the same relaxed cleanup rule as IPv4 because either direction may have
 /// been evicted independently under map pressure.
 fn remove_flow_pair_v6(forward_key: &Flow6, reverse_key: &Flow6) {
+    record_flow_event(FLOW_EVENT_CLEAR);
     unsafe {
         let _ = NODEPORT_FWD_V6.remove(forward_key);
         let _ = NODEPORT_REV_V6.remove(reverse_key);

@@ -21,9 +21,17 @@ const ETH_P_IPV4: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86dd;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
+const NODEPORT_FLOW_EVENT_COUNT: u32 = 4;
+const FLOW_EVENT_CLEAR: u32 = 1;
+const FLOW_EVENT_REVERSE_MISS: u32 = 2;
+const FLOW_EVENT_INVALID_TRANSITION: u32 = 3;
 
 #[map(name = "NODEPORT_TC_EGRESS_STATS")]
 static mut NODEPORT_TC_EGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::pinned(1, 0);
+
+#[map(name = "NODEPORT_TC_FLOW_EVENTS")]
+static mut NODEPORT_TC_FLOW_EVENTS: PerCpuArray<u64> =
+    PerCpuArray::pinned(NODEPORT_FLOW_EVENT_COUNT, 0);
 
 #[map(name = "NODEPORT_FWD")]
 static mut NODEPORT_FWD: LruHashMap<Flow4, NodePortNat> = LruHashMap::pinned(2048, 0);
@@ -102,11 +110,15 @@ fn handle_ipv4_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
     };
 
     let Some(mut entry) = (unsafe { NODEPORT_REV.get(&reverse_key).copied() }) else {
+        record_flow_event(FLOW_EVENT_REVERSE_MISS);
         return Ok(false);
     };
     let forward_key = forward_key_from_reverse_flow(&reverse_key);
     let remove_after_rewrite = match entry.conntrack.advance_reverse(tcp_flags, now_ns) {
-        ConntrackVerdict::Reject => return Ok(false),
+        ConntrackVerdict::Reject => {
+            record_flow_event(FLOW_EVENT_INVALID_TRANSITION);
+            return Ok(false);
+        }
         ConntrackVerdict::Remove => {
             remove_flow_pair(&forward_key, &reverse_key);
             return Ok(false);
@@ -158,11 +170,15 @@ fn handle_ipv6_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
     };
 
     let Some(mut entry) = (unsafe { NODEPORT_REV_V6.get(&reverse_key).copied() }) else {
+        record_flow_event(FLOW_EVENT_REVERSE_MISS);
         return Ok(false);
     };
     let forward_key = forward_key_from_reverse_flow_v6(&reverse_key);
     let remove_after_rewrite = match entry.conntrack.advance_reverse(tcp_flags, now_ns) {
-        ConntrackVerdict::Reject => return Ok(false),
+        ConntrackVerdict::Reject => {
+            record_flow_event(FLOW_EVENT_INVALID_TRANSITION);
+            return Ok(false);
+        }
         ConntrackVerdict::Remove => {
             remove_flow_pair_v6(&forward_key, &reverse_key);
             return Ok(false);
@@ -194,6 +210,17 @@ fn handle_ipv6_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
 #[inline(always)]
 fn flow_now_ns() -> u64 {
     unsafe { bpf_ktime_get_ns() }
+}
+
+/// Increment one shared NodePort flow event counter.
+#[inline(always)]
+fn record_flow_event(event_index: u32) {
+    unsafe {
+        stats::increment_reason(
+            core::ptr::addr_of_mut!(NODEPORT_TC_FLOW_EVENTS),
+            event_index,
+        );
+    }
 }
 
 /// Load and validate the fixed TCP header prefix at the provided transport offset.
@@ -310,6 +337,7 @@ fn persist_flow_pair_v6(
 /// LRU pressure can already evict one side, so teardown cleanup ignores delete failures and
 /// focuses on removing whatever state still remains.
 fn remove_flow_pair(forward_key: &Flow4, reverse_key: &Flow4) {
+    record_flow_event(FLOW_EVENT_CLEAR);
     unsafe {
         let _ = NODEPORT_FWD.remove(forward_key);
         let _ = NODEPORT_REV.remove(reverse_key);
@@ -321,6 +349,7 @@ fn remove_flow_pair(forward_key: &Flow4, reverse_key: &Flow4) {
 /// IPv6 teardown follows the same relaxed cleanup rule because each direction can be evicted
 /// independently under map pressure.
 fn remove_flow_pair_v6(forward_key: &Flow6, reverse_key: &Flow6) {
+    record_flow_event(FLOW_EVENT_CLEAR);
     unsafe {
         let _ = NODEPORT_FWD_V6.remove(forward_key);
         let _ = NODEPORT_REV_V6.remove(reverse_key);

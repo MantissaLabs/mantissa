@@ -224,12 +224,29 @@ impl node::Server for Node {
                         egress.set_bytes(stats.bytes);
                         egress.set_drops(stats.drops);
                     }
+
+                    let mut flow_diagnostics = nodeport.reborrow().init_flow_diagnostics();
+                    if let Some(diagnostics) = status.flow_diagnostics {
+                        flow_diagnostics
+                            .set_ipv4_flow_pairs(usize_to_u32(diagnostics.ipv4_flow_pairs));
+                        flow_diagnostics
+                            .set_ipv6_flow_pairs(usize_to_u32(diagnostics.ipv6_flow_pairs));
+                        flow_diagnostics.set_flow_creates(diagnostics.flow_creates);
+                        flow_diagnostics.set_flow_clears(diagnostics.flow_clears);
+                        flow_diagnostics
+                            .set_estimated_flow_evictions(diagnostics.estimated_flow_evictions);
+                        flow_diagnostics.set_reverse_misses(diagnostics.reverse_misses);
+                        flow_diagnostics.set_invalid_conntrack_transitions(
+                            diagnostics.invalid_conntrack_transitions,
+                        );
+                    }
                 } else {
                     nodeport.set_state("unavailable");
                     nodeport.set_last_error("nodeport manager not wired");
                     nodeport.reborrow().init_ingress();
                     nodeport.reborrow().init_ingress_drop_reasons();
                     nodeport.reborrow().init_egress();
+                    nodeport.reborrow().init_flow_diagnostics();
                 }
             }
         }

@@ -29,6 +29,33 @@ fn nodeport_drop_reason_fields(
     Ok(fields)
 }
 
+/// Render the NodePort flow diagnostics in one compact line so operators can spot pressure and
+/// reverse-path failures from `mantissa info`.
+fn nodeport_flow_diagnostics_fields(
+    diagnostics: protocol::info_capnp::node_port_flow_diagnostics::Reader<'_>,
+) -> Vec<String> {
+    let ipv4_pairs = diagnostics.get_ipv4_flow_pairs();
+    let ipv6_pairs = diagnostics.get_ipv6_flow_pairs();
+    let total_pairs = ipv4_pairs.saturating_add(ipv6_pairs);
+
+    vec![
+        format!("flow_pairs={total_pairs}"),
+        format!("ipv4_flow_pairs={ipv4_pairs}"),
+        format!("ipv6_flow_pairs={ipv6_pairs}"),
+        format!("flow_creates={}", diagnostics.get_flow_creates()),
+        format!("flow_clears={}", diagnostics.get_flow_clears()),
+        format!(
+            "estimated_flow_evictions={}",
+            diagnostics.get_estimated_flow_evictions()
+        ),
+        format!("reverse_misses={}", diagnostics.get_reverse_misses()),
+        format!(
+            "invalid_conntrack_transitions={}",
+            diagnostics.get_invalid_conntrack_transitions()
+        ),
+    ]
+}
+
 pub async fn info(cfg: &ClientConfig) -> Result<()> {
     let client = connection::get_local_session(cfg).await?;
 
@@ -132,6 +159,7 @@ pub async fn info(cfg: &ClientConfig) -> Result<()> {
     let ingress = nodeport.get_ingress()?;
     let ingress_drop_reasons = nodeport.get_ingress_drop_reasons()?;
     let egress = nodeport.get_egress()?;
+    let flow_diagnostics = nodeport.get_flow_diagnostics()?;
 
     println!("NodePort:");
     println!("  desired_enabled: {}", nodeport.get_desired_enabled());
@@ -171,6 +199,10 @@ pub async fn info(cfg: &ClientConfig) -> Result<()> {
         egress.get_packets(),
         egress.get_bytes(),
         egress.get_drops(),
+    );
+    println!(
+        "  flow_diagnostics: {}",
+        nodeport_flow_diagnostics_fields(flow_diagnostics).join(" ")
     );
     if !last_error.is_empty() {
         println!("  last_error: {last_error}");

@@ -204,8 +204,8 @@ Compiled BPF objects live under `target/bpf/*.bpf.o` (built automatically on Lin
 | `bridge_xdp` | XDP on `mnt-br-*` | L2 sanity checks for bridged traffic. | `BRIDGE_XDP_STATS` |
 | `bridge_tc_ingress` | TC ingress on `mnhp-*` (fallback: `mnt-br-*`) | VIP ARP/NDP responder + DNAT (VIP→backend) + flow-cache seeding for TCP/UDP. | `BRIDGE_TC_INGRESS_STATS`, `LB_VIPS`, `LB_BACKENDS`, `LB_FWD`, `LB_REV`, plus the `*_V6` map family for IPv6 overlays |
 | `bridge_tc_egress` | TC egress on `mnhp-*` (fallback: `mnt-br-*`) | SNAT return path (backend→VIP) using cached reverse mapping. | `BRIDGE_TC_EGRESS_STATS`, `LB_REV`, `LB_REV_V6` |
-| `nodeport_tc_ingress` | TC ingress on `network.nodeport.iface` and `lo` | Matches `node_ip:public_port`, rewrites to the service VIP, seeds NodePort NAT state, and redirects into the per-network host-access path. | `NODEPORT_TC_INGRESS_STATS`, `NODEPORT_VIPS`, `NODEPORT_FWD`, `NODEPORT_REV`, `NODEPORT_HOST`, plus the `*_V6` map family for IPv6 publication |
-| `nodeport_tc_egress` | TC egress on `network.nodeport.iface` and TC ingress on `mnhost-*` | Rewrites return traffic back to `node_ip:public_port` for external and host-local clients. | `NODEPORT_TC_EGRESS_STATS`, `NODEPORT_REV`, `NODEPORT_REV_V6` |
+| `nodeport_tc_ingress` | TC ingress on `network.nodeport.iface` and `lo` | Matches `node_ip:public_port`, rewrites to the service VIP, seeds NodePort NAT state, and redirects into the per-network host-access path. | `NODEPORT_TC_INGRESS_STATS`, `NODEPORT_TC_FLOW_EVENTS`, `NODEPORT_VIPS`, `NODEPORT_FWD`, `NODEPORT_REV`, `NODEPORT_HOST`, plus the `*_V6` map family for IPv6 publication |
+| `nodeport_tc_egress` | TC egress on `network.nodeport.iface` and TC ingress on `mnhost-*` | Rewrites return traffic back to `node_ip:public_port` for external and host-local clients. | `NODEPORT_TC_EGRESS_STATS`, `NODEPORT_TC_FLOW_EVENTS`, `NODEPORT_REV`, `NODEPORT_REV_V6` |
 
 The “attach to `mnhp-*`” choice is what makes host-originated `curl http://<vip>:<port>` go through the eBPF load balancer reliably: it is the bridge port where host traffic enters/exits the overlay bridge.
 
@@ -338,9 +338,10 @@ mantissa info
 
 The `NodePort:` section shows whether the runtime is `disabled`, `pending`,
 `ready`, or `degraded`, plus the resolved iface/IP, active port counts,
-capacity limits, last error, and packet counters. Those NodePort limits come
-from `network.nodeport.vip_capacity`, `network.nodeport.host_capacity`, and
-`network.nodeport.flow_capacity`.
+capacity limits, packet counters, and flow diagnostics such as active flow
+pairs, reverse misses, invalid conntrack transitions, and estimated evictions.
+Those NodePort limits come from `network.nodeport.vip_capacity`,
+`network.nodeport.host_capacity`, and `network.nodeport.flow_capacity`.
 
 ## Packet flow: NodePort curl
 
@@ -433,6 +434,7 @@ Prerequisites: Linux host, kernel with XDP+TC and BPF enabled, and `bpf-linker` 
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_REV_V6`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_HOST`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_HOST_V6`
+  - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_TC_FLOW_EVENTS`
 - Inspect stats (sanity check that packets hit the programs):
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_TC_INGRESS_STATS`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_TC_EGRESS_STATS`

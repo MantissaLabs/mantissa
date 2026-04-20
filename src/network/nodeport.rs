@@ -17,6 +17,13 @@ const NODEPORT_FLOW_CAPACITY: usize = crate::config::DEFAULT_NODEPORT_FLOW_CAPAC
 const NODEPORT_HOST_CAPACITY: usize = crate::config::DEFAULT_NODEPORT_HOST_CAPACITY;
 /// Keep the userspace readers aligned with the ingress drop-reason map size in the tc ingress program.
 const NODEPORT_INGRESS_DROP_REASON_COUNT: usize = 5;
+/// Keep the userspace readers aligned with the shared NodePort flow-event map size in the tc programs.
+const NODEPORT_FLOW_EVENT_COUNT: usize = 4;
+
+const NODEPORT_FLOW_CREATE_INDEX: usize = 0;
+const NODEPORT_FLOW_CLEAR_INDEX: usize = 1;
+const NODEPORT_REVERSE_MISS_INDEX: usize = 2;
+const NODEPORT_INVALID_TRANSITION_INDEX: usize = 3;
 
 /// Capacity limits for the pinned NodePort maps that back publication, host-access SNAT, and
 /// public conntrack state.
@@ -115,6 +122,18 @@ pub struct NodePortIngressDropReasons {
     pub rewrite_failures: u64,
 }
 
+/// Aggregated flow diagnostics for the shared NodePort conntrack caches.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NodePortFlowDiagnostics {
+    pub ipv4_flow_pairs: usize,
+    pub ipv6_flow_pairs: usize,
+    pub flow_creates: u64,
+    pub flow_clears: u64,
+    pub estimated_flow_evictions: u64,
+    pub reverse_misses: u64,
+    pub invalid_conntrack_transitions: u64,
+}
+
 /// Snapshot of node-local nodeport capability and resolved external identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodePortStatus {
@@ -131,6 +150,7 @@ pub struct NodePortStatus {
     pub ingress_stats: Option<NodePortPacketCounters>,
     pub ingress_drop_reasons: Option<NodePortIngressDropReasons>,
     pub egress_stats: Option<NodePortPacketCounters>,
+    pub flow_diagnostics: Option<NodePortFlowDiagnostics>,
     pub last_error: Option<String>,
     pub stats_error: Option<String>,
 }
@@ -176,6 +196,20 @@ fn configured_node_ip_from_sources(
 fn checked_map_capacity(name: &str, value: usize) -> Result<u32> {
     u32::try_from(value)
         .map_err(|_| anyhow::anyhow!("configured {name} exceeds the kernel map size limit"))
+}
+
+/// # Description:
+///
+/// Estimate how many tracked NodePort flow pairs were evicted from the LRU maps by comparing the
+/// total successful flow creations against explicit clears and the current forward-map occupancy.
+fn estimated_flow_evictions(
+    flow_creates: u64,
+    flow_clears: u64,
+    ipv4_flow_pairs: usize,
+    ipv6_flow_pairs: usize,
+) -> u64 {
+    let active_pairs = (ipv4_flow_pairs as u64).saturating_add(ipv6_flow_pairs as u64);
+    flow_creates.saturating_sub(flow_clears.saturating_add(active_pairs))
 }
 
 /// Project the active-public-network count after one NodePort sync applies.
@@ -287,6 +321,7 @@ impl PlatformNodePortManager {
             ingress_stats: None,
             ingress_drop_reasons: None,
             egress_stats: None,
+            flow_diagnostics: None,
             last_error: Some("nodeport is only available on linux".to_string()),
             stats_error: None,
         }
@@ -296,10 +331,13 @@ impl PlatformNodePortManager {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{
-        NODEPORT_INGRESS_DROP_REASON_COUNT, NodePortIngressDropReasons, NodePortMapCapacities,
-        NodePortMapping, NodePortPacketCounters, NodePortProtocol, NodePortRuntimeState,
-        NodePortStatus, configured_node_ip_from_sources, nodeport_capacity_error,
-        projected_active_networks_after_sync, resolve_advertise_ip,
+        NODEPORT_FLOW_CLEAR_INDEX, NODEPORT_FLOW_CREATE_INDEX, NODEPORT_FLOW_EVENT_COUNT,
+        NODEPORT_INGRESS_DROP_REASON_COUNT, NODEPORT_INVALID_TRANSITION_INDEX,
+        NODEPORT_REVERSE_MISS_INDEX, NodePortFlowDiagnostics, NodePortIngressDropReasons,
+        NodePortMapCapacities, NodePortMapping, NodePortPacketCounters, NodePortProtocol,
+        NodePortRuntimeState, NodePortStatus, configured_node_ip_from_sources,
+        estimated_flow_evictions, nodeport_capacity_error, projected_active_networks_after_sync,
+        resolve_advertise_ip,
     };
     use crate::config;
     use crate::ip_family::{IpFamily, infer_default_ip_family};
@@ -612,6 +650,7 @@ mod platform {
         host_ingress_attached: HashSet<Uuid>,
         host_ingress_ifindex: HashMap<Uuid, u32>,
         capacities: NodePortMapCapacities,
+        userspace_flow_clears: u64,
         runtime_state: NodePortRuntimeState,
         last_error: Option<String>,
     }
@@ -650,6 +689,7 @@ mod platform {
                 host_ingress_attached: HashSet::new(),
                 host_ingress_ifindex: HashMap::new(),
                 capacities,
+                userspace_flow_clears: 0,
                 runtime_state: if desired_enabled {
                     NodePortRuntimeState::Pending
                 } else {
@@ -785,8 +825,9 @@ mod platform {
                 let _ = delete_elem(ipv4_vip_fd, &key);
                 let _ = delete_elem(ipv6_vip_fd, &key);
             }
-            clear_stale_nodeport_flows(&base, stale_mappings.as_slice())
+            let cleared_pairs = clear_stale_nodeport_flows(&base, stale_mappings.as_slice())
                 .context("clear stale nodeport flows")?;
+            self.userspace_flow_clears = self.userspace_flow_clears.saturating_add(cleared_pairs);
 
             if let Some(overlay_ifindex) = overlay_ifindex_opt {
                 let host_mac = host_access_mac(network_id).await?;
@@ -1026,6 +1067,16 @@ mod platform {
                 }
                 Err(err) => {
                     status.stats_error = Some(err.to_string());
+                    return status;
+                }
+            }
+
+            match self.read_flow_diagnostics() {
+                Ok(diagnostics) => {
+                    status.flow_diagnostics = Some(diagnostics);
+                }
+                Err(err) => {
+                    status.stats_error = Some(err.to_string());
                 }
             }
 
@@ -1053,6 +1104,7 @@ mod platform {
                 ingress_stats: None,
                 ingress_drop_reasons: None,
                 egress_stats: None,
+                flow_diagnostics: None,
                 last_error: self.last_error.clone(),
                 stats_error: None,
             }
@@ -1080,6 +1132,33 @@ mod platform {
                 missing_host_entries: values[2],
                 nat_insert_failures: values[3],
                 rewrite_failures: values[4],
+            })
+        }
+
+        /// Read the shared NodePort flow diagnostics and derive an eviction estimate from current
+        /// forward-map occupancy plus cumulative lifecycle counters.
+        fn read_flow_diagnostics(&self) -> Result<NodePortFlowDiagnostics> {
+            let values =
+                read_u64_percpu_array("NODEPORT_TC_FLOW_EVENTS", NODEPORT_FLOW_EVENT_COUNT)?;
+            let ipv4_flow_pairs = count_pinned_map_entries::<Flow4>(IPV4_MAPS.forward_map)?;
+            let ipv6_flow_pairs = count_pinned_map_entries::<Flow6>(IPV6_MAPS.forward_map)?;
+            let flow_creates = values[NODEPORT_FLOW_CREATE_INDEX];
+            let flow_clears =
+                values[NODEPORT_FLOW_CLEAR_INDEX].saturating_add(self.userspace_flow_clears);
+
+            Ok(NodePortFlowDiagnostics {
+                ipv4_flow_pairs,
+                ipv6_flow_pairs,
+                flow_creates,
+                flow_clears,
+                estimated_flow_evictions: estimated_flow_evictions(
+                    flow_creates,
+                    flow_clears,
+                    ipv4_flow_pairs,
+                    ipv6_flow_pairs,
+                ),
+                reverse_misses: values[NODEPORT_REVERSE_MISS_INDEX],
+                invalid_conntrack_transitions: values[NODEPORT_INVALID_TRANSITION_INDEX],
             })
         }
 
@@ -1336,6 +1415,7 @@ mod platform {
                     "nodeport map reset failed (continuing): {err:#}"
                 );
             }
+            self.userspace_flow_clears = 0;
 
             let mut ingress = load_program("nodeport_tc_ingress", self.capacities)
                 .context("load nodeport ingress")?;
@@ -2023,6 +2103,17 @@ mod platform {
         Ok(totals)
     }
 
+    /// Count the number of live entries in one pinned BPF map by walking its keys through the
+    /// kernel `get_next_key` interface.
+    fn count_pinned_map_entries<K>(name: &str) -> Result<usize>
+    where
+        K: Pod + Copy + Default,
+    {
+        let base = map_pin_dir()?;
+        let map = open_map(&base, name).with_context(|| format!("open {name}"))?;
+        count_map_keys::<K>(map.fd().as_fd().as_raw_fd())
+    }
+
     /// Clear every stale NodePort flow mapping identified during one selector sync.
     ///
     /// The sync path removes stale selectors from the public VIP maps before calling this helper,
@@ -2031,11 +2122,13 @@ mod platform {
     fn clear_stale_nodeport_flows(
         base: &Path,
         stale: &[(NodePortSelector, NodePortPublishedMapping)],
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        let mut cleared_pairs = 0u64;
         for (selector, mapping) in stale {
-            clear_nodeport_flows(base, *selector, *mapping)?;
+            cleared_pairs =
+                cleared_pairs.saturating_add(clear_nodeport_flows(base, *selector, *mapping)?);
         }
-        Ok(())
+        Ok(cleared_pairs)
     }
 
     /// Clear one stale selector's flow cache from the family that owns its VIP.
@@ -2047,7 +2140,7 @@ mod platform {
         base: &Path,
         selector: NodePortSelector,
         mapping: NodePortPublishedMapping,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         match (mapping.vip, mapping.node_ip) {
             (IpAddr::V4(vip), IpAddr::V4(node_ip)) => {
                 clear_nodeport_flows_v4(base, selector, vip, mapping.vip_port, node_ip)
@@ -2071,15 +2164,16 @@ mod platform {
         vip: std::net::Ipv4Addr,
         vip_port: u16,
         node_ip: std::net::Ipv4Addr,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        let mut cleared_pairs = 0u64;
         if let Ok(fwd_map) = open_map(base, IPV4_MAPS.forward_map) {
-            clear_nodeport_forward_flows_v4(
+            cleared_pairs = cleared_pairs.saturating_add(clear_nodeport_forward_flows_v4(
                 fwd_map.fd().as_fd().as_raw_fd(),
                 selector,
                 vip,
                 vip_port,
                 node_ip,
-            )?;
+            )?);
         }
         if let Ok(rev_map) = open_map(base, IPV4_MAPS.reverse_map) {
             clear_nodeport_reverse_flows_v4(
@@ -2090,7 +2184,7 @@ mod platform {
                 node_ip,
             )?;
         }
-        Ok(())
+        Ok(cleared_pairs)
     }
 
     /// Clear stale IPv6 forward and reverse flow entries for one published selector.
@@ -2103,15 +2197,16 @@ mod platform {
         vip: std::net::Ipv6Addr,
         vip_port: u16,
         node_ip: std::net::Ipv6Addr,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        let mut cleared_pairs = 0u64;
         if let Ok(fwd_map) = open_map(base, IPV6_MAPS.forward_map) {
-            clear_nodeport_forward_flows_v6(
+            cleared_pairs = cleared_pairs.saturating_add(clear_nodeport_forward_flows_v6(
                 fwd_map.fd().as_fd().as_raw_fd(),
                 selector,
                 vip,
                 vip_port,
                 node_ip,
-            )?;
+            )?);
         }
         if let Ok(rev_map) = open_map(base, IPV6_MAPS.reverse_map) {
             clear_nodeport_reverse_flows_v6(
@@ -2122,7 +2217,7 @@ mod platform {
                 node_ip,
             )?;
         }
-        Ok(())
+        Ok(cleared_pairs)
     }
 
     /// Remove IPv4 forward flows that still point at one stale public selector.
@@ -2136,7 +2231,8 @@ mod platform {
         vip: std::net::Ipv4Addr,
         vip_port: u16,
         node_ip: std::net::Ipv4Addr,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        let mut cleared_pairs = 0u64;
         visit_map_keys::<Flow4, _>(fd, |next| {
             let matches_selector = lookup_elem::<Flow4, NodePortNat>(fd, &next)?
                 .map(|entry| {
@@ -2147,8 +2243,12 @@ mod platform {
                         && entry.node_port == selector.port.to_be()
                 })
                 .unwrap_or(false);
+            if matches_selector {
+                cleared_pairs += 1;
+            }
             Ok(matches_selector)
-        })
+        })?;
+        Ok(cleared_pairs)
     }
 
     /// Remove IPv4 reverse flows that still restore one stale public selector.
@@ -2186,7 +2286,8 @@ mod platform {
         vip: std::net::Ipv6Addr,
         vip_port: u16,
         node_ip: std::net::Ipv6Addr,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        let mut cleared_pairs = 0u64;
         visit_map_keys::<Flow6, _>(fd, |next| {
             let matches_selector = lookup_elem::<Flow6, NodePortNat6>(fd, &next)?
                 .map(|entry| {
@@ -2197,8 +2298,12 @@ mod platform {
                         && entry.node_port == selector.port.to_be()
                 })
                 .unwrap_or(false);
+            if matches_selector {
+                cleared_pairs += 1;
+            }
             Ok(matches_selector)
-        })
+        })?;
+        Ok(cleared_pairs)
     }
 
     /// Remove IPv6 reverse flows that still restore one stale public selector.
@@ -2281,6 +2386,19 @@ mod platform {
         Ok(())
     }
 
+    /// Count the current number of keys in one pinned BPF map without mutating its contents.
+    fn count_map_keys<K>(fd: std::os::fd::RawFd) -> Result<usize>
+    where
+        K: Pod + Copy + Default,
+    {
+        let mut count = 0usize;
+        visit_map_keys::<K, _>(fd, |_next| {
+            count = count.saturating_add(1);
+            Ok(false)
+        })?;
+        Ok(count)
+    }
+
     /// Remove pinned nodeport maps so new layouts can be loaded atomically.
     fn reset_nodeport_maps(root: &Path) -> Result<()> {
         let maps = [
@@ -2295,6 +2413,7 @@ mod platform {
             "NODEPORT_TC_INGRESS_STATS",
             "NODEPORT_TC_INGRESS_DROP_REASONS",
             "NODEPORT_TC_EGRESS_STATS",
+            "NODEPORT_TC_FLOW_EVENTS",
         ];
 
         for name in maps {
@@ -2477,9 +2596,10 @@ mod tests {
     };
     use super::{
         NODEPORT_FLOW_CAPACITY, NODEPORT_HOST_CAPACITY, NODEPORT_VIP_CAPACITY,
-        NodePortMapCapacities, NodePortPacketCounters, NodePortProtocol, NodePortRuntimeState,
-        NodePortStatus, configured_node_ip_from_sources, nodeport_capacity_error,
-        projected_active_networks_after_sync, resolve_advertise_ip,
+        NodePortFlowDiagnostics, NodePortMapCapacities, NodePortPacketCounters, NodePortProtocol,
+        NodePortRuntimeState, NodePortStatus, configured_node_ip_from_sources,
+        estimated_flow_evictions, nodeport_capacity_error, projected_active_networks_after_sync,
+        resolve_advertise_ip,
     };
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -2623,6 +2743,15 @@ mod tests {
             }),
             ingress_drop_reasons: None,
             egress_stats: None,
+            flow_diagnostics: Some(NodePortFlowDiagnostics {
+                ipv4_flow_pairs: 2,
+                ipv6_flow_pairs: 1,
+                flow_creates: 5,
+                flow_clears: 1,
+                estimated_flow_evictions: 1,
+                reverse_misses: 2,
+                invalid_conntrack_transitions: 1,
+            }),
             last_error: None,
             stats_error: None,
         };
@@ -2631,6 +2760,18 @@ mod tests {
         assert_eq!(status.active_ports, 3);
         assert_eq!(status.active_host_networks, 2);
         assert_eq!(status.vip_capacity, NODEPORT_VIP_CAPACITY);
+        assert_eq!(
+            status.flow_diagnostics,
+            Some(NodePortFlowDiagnostics {
+                ipv4_flow_pairs: 2,
+                ipv6_flow_pairs: 1,
+                flow_creates: 5,
+                flow_clears: 1,
+                estimated_flow_evictions: 1,
+                reverse_misses: 2,
+                invalid_conntrack_transitions: 1,
+            })
+        );
         assert_eq!(
             status.ingress_stats,
             Some(NodePortPacketCounters {
@@ -2650,6 +2791,12 @@ mod tests {
     #[test]
     fn projected_active_networks_removes_empty_public_network() {
         assert_eq!(projected_active_networks_after_sync(3, true, false), 2);
+    }
+
+    #[test]
+    fn estimated_flow_evictions_tracks_lru_pressure() {
+        assert_eq!(estimated_flow_evictions(2, 0, 1, 0), 1);
+        assert_eq!(estimated_flow_evictions(5, 3, 1, 1), 0);
     }
 
     #[test]

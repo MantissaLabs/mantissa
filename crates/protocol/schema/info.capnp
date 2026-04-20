@@ -194,6 +194,9 @@ struct NodePortInfo {
 
   ingressDropReasons @14 :NodePortIngressDropReasons;
   # Breakdown of the ingress drop paths recorded by the NodePort tc program.
+
+  flowDiagnostics @15 :NodePortFlowDiagnostics;
+  # Flow occupancy and lifecycle counters for the shared NodePort conntrack caches.
 }
 
 struct PacketCounters {
@@ -222,4 +225,27 @@ struct NodePortIngressDropReasons {
 
   rewriteFailures @4 :UInt64;
   # Packets dropped because header rewrite or checksum updates failed.
+}
+
+struct NodePortFlowDiagnostics {
+  ipv4FlowPairs @0 :UInt32;
+  # Number of live IPv4 forward flow entries currently cached in the NodePort dataplane.
+
+  ipv6FlowPairs @1 :UInt32;
+  # Number of live IPv6 forward flow entries currently cached in the NodePort dataplane.
+
+  flowCreates @2 :UInt64;
+  # Total number of successful NodePort flow-pair creations since the current attach.
+
+  flowClears @3 :UInt64;
+  # Total number of explicit NodePort flow-pair removals since the current attach.
+
+  estimatedFlowEvictions @4 :UInt64;
+  # Estimated number of LRU flow-pair evictions derived from creates, clears, and occupancy.
+
+  reverseMisses @5 :UInt64;
+  # Packets that reached the return path without a matching reverse flow entry.
+
+  invalidConntrackTransitions @6 :UInt64;
+  # Packets rejected because they attempted an invalid NodePort conntrack state transition.
 }
