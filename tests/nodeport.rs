@@ -27,6 +27,7 @@ const NODEPORT_HTTP_PORT: u16 = 18080;
 const NODEPORT_HTTP_REMAP_PORT: u16 = 18081;
 const NODEPORT_UDP_PORT: u16 = 18082;
 const NODEPORT_HTTP_PORT_V6: u16 = 18083;
+const NODEPORT_UDP_REMAP_PORT: u16 = 18084;
 const NODEPORT_RESPONSE: &str = "hello from nodeport privileged test";
 const NODEPORT_CONFLICT_RESPONSE: &str = "hello from nodeport owner";
 const NODEPORT_DEGRADED_RESPONSE: &str = "hello from degraded nodeport service";
@@ -115,6 +116,8 @@ fn privileged_nodeport_task_template(
 fn privileged_nodeport_udp_task_template(
     network_id: Uuid,
     template_name: &str,
+    listen_port: u16,
+    public_port: u16,
 ) -> TaskTemplateSpecValue {
     TaskTemplateSpecValue {
         name: template_name.to_string(),
@@ -123,7 +126,7 @@ fn privileged_nodeport_udp_task_template(
             command: vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                format!("exec nc -u -lk -p {NODEPORT_UDP_PORT} -e cat"),
+                format!("exec nc -u -lk -p {listen_port} -e cat"),
             ],
             tty: false,
             cpu_millis: 200,
@@ -142,9 +145,32 @@ fn privileged_nodeport_udp_task_template(
         depends_on: Vec::new(),
         replicas: 1,
         readiness: None,
-        public_port: Some(NODEPORT_UDP_PORT),
+        public_port: Some(public_port),
         public_protocol: Some(ServicePortProtocol::Udp),
     }
+}
+
+/// Submit one privileged UDP NodePort deployment through the real service controller surface.
+async fn deploy_privileged_nodeport_udp_service(
+    manager: &ServiceController,
+    service_name: &str,
+    network_id: Uuid,
+    listen_port: u16,
+    public_port: u16,
+) -> anyhow::Result<Uuid> {
+    manager
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![privileged_nodeport_udp_task_template(
+                network_id,
+                service_name,
+                listen_port,
+                public_port,
+            )],
+        )
+        .await
 }
 
 /// Submit one privileged NodePort deployment through the real service controller surface.
@@ -220,6 +246,28 @@ async fn udp_echo(addr: &str, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
     let (len, _) =
         tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut response)).await??;
     Ok(response[..len].to_vec())
+}
+
+/// Return the bpftool dump for one pinned NodePort map so cleanup assertions can inspect it.
+fn dump_nodeport_map(name: &str) -> String {
+    let path = std::path::PathBuf::from("/sys/fs/bpf/mantissa/nodeport").join(name);
+    command_stdout(
+        "bpftool",
+        &["map", "dump", "pinned", &path.display().to_string()],
+    )
+}
+
+/// Count the number of entries currently present in one pinned NodePort map dump.
+fn count_nodeport_map_entries(name: &str) -> usize {
+    dump_nodeport_map(name).matches("key:").count()
+}
+
+/// Count the currently pinned IPv4 forward and reverse NodePort flow entries.
+fn nodeport_ipv4_flow_counts() -> (usize, usize) {
+    (
+        count_nodeport_map_entries("NODEPORT_FWD"),
+        count_nodeport_map_entries("NODEPORT_REV"),
+    )
 }
 
 /// Keeps one temporary IPv6 address assigned to `lo` for the lifetime of a privileged test.
@@ -723,18 +771,15 @@ local_test!(nodeport_udp_public_service_reaches_backend_and_cleans_up, {
     .await;
     let network_id = network.id;
 
-    let service_id = node
-        .service_controller
-        .submit_deployment(
-            Uuid::new_v4(),
-            "nodeport-udp",
-            "nodeport-udp",
-            vec![privileged_nodeport_udp_task_template(
-                network_id, "udp-echo",
-            )],
-        )
-        .await
-        .expect("submit privileged NodePort UDP deployment");
+    let service_id = deploy_privileged_nodeport_udp_service(
+        &node.service_controller,
+        "nodeport-udp",
+        network_id,
+        NODEPORT_UDP_PORT,
+        NODEPORT_UDP_PORT,
+    )
+    .await
+    .expect("submit privileged NodePort UDP deployment");
 
     assert!(
         wait_for_service_status(
@@ -854,6 +899,282 @@ local_test!(nodeport_udp_public_service_reaches_backend_and_cleans_up, {
         "public UDP port should stop responding after service deletion"
     );
 
+    delete_privileged_network(&node, network_id).await;
+});
+
+local_test!(nodeport_udp_service_removal_clears_stale_flow_maps, {
+    let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
+        return;
+    };
+
+    let _config = PrivilegedTestGuard::apply(|config| {
+        config.network.wireguard.enabled = false;
+        config.network.wireguard.manage_firewall = false;
+        config.network.bpf.attach = true;
+        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        config.network.nodeport.enabled = true;
+        config.network.nodeport.iface = Some("lo".to_string());
+        config.network.nodeport.ip = Some("127.0.0.1".to_string());
+        config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+    });
+    let node = create_privileged_node().await;
+    let subnet = privileged_test_subnet();
+    let network = create_privileged_network(
+        &node,
+        privileged_test_network(
+            "nodeport-udp-flow-clear",
+            "privileged nodeport udp flow cleanup test network",
+            &subnet,
+            1450,
+            Vec::new(),
+        ),
+        mantissa::network::types::NetworkStatus::Ready,
+    )
+    .await;
+    let network_id = network.id;
+
+    let service_id = deploy_privileged_nodeport_udp_service(
+        &node.service_controller,
+        "nodeport-udp-flow-clear",
+        network_id,
+        NODEPORT_UDP_PORT,
+        NODEPORT_UDP_PORT,
+    )
+    .await
+    .expect("submit privileged NodePort UDP cleanup deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.service_controller,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(180),
+        )
+        .await,
+        "udp public service should reach running state before flow cleanup assertions"
+    );
+
+    let addr = format!("127.0.0.1:{NODEPORT_UDP_PORT}");
+    let payload = NODEPORT_UDP_RESPONSE.as_bytes();
+    assert!(
+        wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(250),
+            || async {
+                matches!(udp_echo(&addr, payload).await, Ok(response) if response == payload)
+            },
+        )
+        .await,
+        "udp cleanup test should establish at least one public flow before service removal"
+    );
+
+    assert!(
+        wait_until(
+            Duration::from_secs(15),
+            Duration::from_millis(100),
+            || async {
+                let (forward, reverse) = nodeport_ipv4_flow_counts();
+                forward > 0 && reverse > 0
+            },
+        )
+        .await,
+        "udp cleanup test should leave cached NodePort flow entries after traffic"
+    );
+
+    remove_service_via_rpc(&node.services_client, service_id).await;
+
+    assert!(
+        wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+            || async {
+                let status = node.network_controller.nodeport_manager().status().await;
+                status.active_ports == 0
+                    && status.active_host_networks == 0
+                    && status.state == NodePortRuntimeState::Pending
+            },
+        )
+        .await,
+        "udp cleanup test should remove the published selector before checking pinned flow maps"
+    );
+
+    let cleared = wait_until(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        || async {
+            let (forward, reverse) = nodeport_ipv4_flow_counts();
+            forward == 0 && reverse == 0
+        },
+    )
+    .await;
+    if !cleared {
+        let forward_dump = dump_nodeport_map("NODEPORT_FWD");
+        let reverse_dump = dump_nodeport_map("NODEPORT_REV");
+        panic!(
+            "service removal should clear stale UDP NodePort flow maps; forward_dump={forward_dump:?}; reverse_dump={reverse_dump:?}"
+        );
+    }
+
+    delete_privileged_network(&node, network_id).await;
+});
+
+local_test!(nodeport_udp_public_port_remap_clears_stale_flow_maps, {
+    let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
+        return;
+    };
+
+    let _config = PrivilegedTestGuard::apply(|config| {
+        config.network.wireguard.enabled = false;
+        config.network.wireguard.manage_firewall = false;
+        config.network.bpf.attach = true;
+        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        config.network.nodeport.enabled = true;
+        config.network.nodeport.iface = Some("lo".to_string());
+        config.network.nodeport.ip = Some("127.0.0.1".to_string());
+        config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+    });
+    let node = create_privileged_node().await;
+    let subnet = privileged_test_subnet();
+    let network = create_privileged_network(
+        &node,
+        privileged_test_network(
+            "nodeport-udp-remap-flow-clear",
+            "privileged nodeport udp remap cleanup test network",
+            &subnet,
+            1450,
+            Vec::new(),
+        ),
+        mantissa::network::types::NetworkStatus::Ready,
+    )
+    .await;
+    let network_id = network.id;
+
+    let service_name = "nodeport-udp-remap-flow-clear";
+    let service_id = deploy_privileged_nodeport_udp_service(
+        &node.service_controller,
+        service_name,
+        network_id,
+        NODEPORT_UDP_PORT,
+        NODEPORT_UDP_PORT,
+    )
+    .await
+    .expect("submit initial privileged NodePort UDP remap deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.service_controller,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(180),
+        )
+        .await,
+        "udp remap cleanup test should reach running state before establishing flow state"
+    );
+
+    let old_addr = format!("127.0.0.1:{NODEPORT_UDP_PORT}");
+    let new_addr = format!("127.0.0.1:{NODEPORT_UDP_REMAP_PORT}");
+    let payload = NODEPORT_UDP_RESPONSE.as_bytes();
+    assert!(
+        wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(250),
+            || async {
+                matches!(udp_echo(&old_addr, payload).await, Ok(response) if response == payload)
+            },
+        )
+        .await,
+        "udp remap cleanup test should establish at least one flow on the original public port"
+    );
+
+    assert!(
+        wait_until(
+            Duration::from_secs(15),
+            Duration::from_millis(100),
+            || async {
+                let (forward, reverse) = nodeport_ipv4_flow_counts();
+                forward > 0 && reverse > 0
+            },
+        )
+        .await,
+        "udp remap cleanup test should observe cached flow entries before the remap"
+    );
+
+    let redeploy_id = deploy_privileged_nodeport_udp_service(
+        &node.service_controller,
+        service_name,
+        network_id,
+        NODEPORT_UDP_REMAP_PORT,
+        NODEPORT_UDP_REMAP_PORT,
+    )
+    .await
+    .expect("submit remapped privileged NodePort UDP deployment");
+    assert_eq!(
+        redeploy_id, service_id,
+        "redeploying the same service name should preserve the service id"
+    );
+
+    assert!(
+        wait_for_service_status(
+            &node.service_controller,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(180),
+        )
+        .await,
+        "udp remap cleanup test should return to running after the public port changes"
+    );
+    assert!(
+        wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+            || async {
+                let status = node.network_controller.nodeport_manager().status().await;
+                status.state == NodePortRuntimeState::Ready && status.active_ports == 1
+            },
+        )
+        .await,
+        "udp remap cleanup test should leave exactly one ready published port"
+    );
+
+    let cleared = wait_until(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        || async {
+            let (forward, reverse) = nodeport_ipv4_flow_counts();
+            forward == 0 && reverse == 0
+        },
+    )
+    .await;
+    if !cleared {
+        let forward_dump = dump_nodeport_map("NODEPORT_FWD");
+        let reverse_dump = dump_nodeport_map("NODEPORT_REV");
+        panic!(
+            "public port remap should clear stale UDP NodePort flow maps before new traffic arrives; forward_dump={forward_dump:?}; reverse_dump={reverse_dump:?}"
+        );
+    }
+
+    assert!(
+        wait_until(
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            || async { udp_echo(&old_addr, payload).await.is_err() },
+        )
+        .await,
+        "udp remap cleanup test should retire the old public port"
+    );
+    assert!(
+        wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(250),
+            || async {
+                matches!(udp_echo(&new_addr, payload).await, Ok(response) if response == payload)
+            },
+        )
+        .await,
+        "udp remap cleanup test should accept traffic on the new public port"
+    );
+
+    remove_service_via_rpc(&node.services_client, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
 

@@ -323,20 +323,104 @@ mod platform {
     unsafe impl Pod for NodePortHost6 {}
     unsafe impl Pod for NodePortPacketCounters {}
 
+    /// Userspace mirror of the IPv4 flow key layout pinned by the NodePort tc programs.
+    ///
+    /// The cleanup path iterates pinned flow maps directly, so these fields must stay byte-for-
+    /// byte aligned with `network_ebpf::lb::Flow4`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Flow4 {
+        src: u32,
+        dst: u32,
+        src_port: u16,
+        dst_port: u16,
+        proto: u8,
+        pad: u8,
+        padding: [u8; 2],
+    }
+    unsafe impl Pod for Flow4 {}
+
+    /// Userspace mirror of the IPv6 flow key layout pinned by the NodePort tc programs.
+    ///
+    /// Keeping the key layout local lets the manager clear stale IPv6 flow state without reaching
+    /// across crate boundaries for userspace-only map iteration code.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Flow6 {
+        src: [u8; 16],
+        dst: [u8; 16],
+        src_port: u16,
+        dst_port: u16,
+        proto: u8,
+        padding: [u8; 3],
+    }
+    unsafe impl Pod for Flow6 {}
+
+    /// Userspace mirror of the shared conntrack metadata stored next to NodePort flow entries.
+    ///
+    /// Cleanup logic only needs this to preserve the exact value layout while it looks up pinned
+    /// NAT entries and filters them by their published selector.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct ConntrackMetadata {
+        last_seen_ns: u64,
+        protocol: u8,
+        state: u8,
+        flags: u8,
+        _pad: [u8; 5],
+    }
+    unsafe impl Pod for ConntrackMetadata {}
+
+    /// Userspace mirror of one cached IPv4 NodePort NAT entry.
+    ///
+    /// The manager uses this to distinguish multiple public selectors that intentionally target
+    /// the same VIP and service port without flushing each other's flow cache entries.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct NodePortNat {
+        node_ip: u32,
+        node_port: u16,
+        _pad: u16,
+        client_ip: u32,
+        conntrack: ConntrackMetadata,
+    }
+    unsafe impl Pod for NodePortNat {}
+
+    /// Userspace mirror of one cached IPv6 NodePort NAT entry.
+    ///
+    /// IPv6 cleanup follows the same exact selector matching rules as IPv4, so it keeps a local
+    /// map-value mirror instead of branching on ad-hoc byte slices.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct NodePortNat6 {
+        node_ip: [u8; 16],
+        node_port: u16,
+        _pad: [u8; 2],
+        client_ip: [u8; 16],
+        conntrack: ConntrackMetadata,
+    }
+    unsafe impl Pod for NodePortNat6 {}
+
     /// Pinned map names for one NodePort address family.
     struct NodePortMapNames {
         vip_map: &'static str,
         host_map: &'static str,
+        forward_map: &'static str,
+        reverse_map: &'static str,
     }
 
     const IPV4_MAPS: NodePortMapNames = NodePortMapNames {
         vip_map: "NODEPORT_VIPS",
         host_map: "NODEPORT_HOST",
+        forward_map: "NODEPORT_FWD",
+        reverse_map: "NODEPORT_REV",
     };
 
     const IPV6_MAPS: NodePortMapNames = NodePortMapNames {
         vip_map: "NODEPORT_VIPS_V6",
         host_map: "NODEPORT_HOST_V6",
+        forward_map: "NODEPORT_FWD_V6",
+        reverse_map: "NODEPORT_REV_V6",
     };
 
     /// Address family selector shared by interface discovery and map programming helpers.
@@ -366,16 +450,86 @@ mod platform {
 
     /// Uniquely identify a nodeport binding by port and transport protocol.
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-    struct NodePortSelector {
+    pub(super) struct NodePortSelector {
         port: u16,
         protocol: NodePortProtocol,
     }
 
     impl NodePortSelector {
         /// Build a selector for nodeport ownership and deduplication.
-        fn new(port: u16, protocol: NodePortProtocol) -> Self {
+        pub(super) fn new(port: u16, protocol: NodePortProtocol) -> Self {
             Self { port, protocol }
         }
+    }
+
+    /// Fully resolved dataplane mapping programmed for one public selector on one refresh tick.
+    ///
+    /// Keeping the resolved VIP, target port, external node IP, and overlay attachment together
+    /// lets the manager detect when one selector changed meaningfully enough that stale flow state
+    /// must be purged before fresh traffic can reuse the old cache entry.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct NodePortPublishedMapping {
+        vip: IpAddr,
+        vip_port: u16,
+        node_ip: IpAddr,
+        overlay_ifindex: u32,
+    }
+
+    impl NodePortPublishedMapping {
+        /// Capture one resolved NodePort dataplane mapping after family-specific identity
+        /// selection completed.
+        pub(super) fn new(
+            vip: IpAddr,
+            vip_port: u16,
+            node_ip: IpAddr,
+            overlay_ifindex: u32,
+        ) -> Self {
+            Self {
+                vip,
+                vip_port,
+                node_ip,
+                overlay_ifindex,
+            }
+        }
+    }
+
+    /// Return the previously programmed selector mappings that need flow cleanup on this sync.
+    ///
+    /// A selector becomes stale when it disappears entirely or when its resolved dataplane target
+    /// changes in any way that would make the old cached translation incorrect for future packets.
+    pub(super) fn stale_nodeport_mappings(
+        previous: &HashMap<NodePortSelector, NodePortPublishedMapping>,
+        desired: &HashMap<NodePortSelector, NodePortPublishedMapping>,
+    ) -> Vec<(NodePortSelector, NodePortPublishedMapping)> {
+        previous
+            .iter()
+            .filter_map(|(selector, existing)| match desired.get(selector) {
+                Some(next) if next == existing => None,
+                _ => Some((*selector, *existing)),
+            })
+            .collect()
+    }
+
+    /// Return the overlay host-access ifindices that are no longer referenced after one sync.
+    ///
+    /// NodePort host maps are keyed by overlay ifindex, so removing stale indices prevents a dead
+    /// host-access attachment from continuing to advertise a routable SNAT source.
+    pub(super) fn stale_overlay_ifindices(
+        previous: &HashMap<NodePortSelector, NodePortPublishedMapping>,
+        desired: &HashMap<NodePortSelector, NodePortPublishedMapping>,
+    ) -> Vec<u32> {
+        let previous_indices: HashSet<u32> = previous
+            .values()
+            .map(|mapping| mapping.overlay_ifindex)
+            .collect();
+        let desired_indices: HashSet<u32> = desired
+            .values()
+            .map(|mapping| mapping.overlay_ifindex)
+            .collect();
+        previous_indices
+            .difference(&desired_indices)
+            .copied()
+            .collect()
     }
 
     struct NodePortAttachment {
@@ -394,7 +548,7 @@ mod platform {
         attached_iface: Option<String>,
         attached_node_ip: Option<IpAddr>,
         attachment: Option<NodePortAttachment>,
-        ports_by_network: HashMap<Uuid, HashSet<NodePortSelector>>,
+        ports_by_network: HashMap<Uuid, HashMap<NodePortSelector, NodePortPublishedMapping>>,
         port_owner: HashMap<NodePortSelector, Uuid>,
         host_ingress_attached: HashSet<Uuid>,
         host_ingress_ifindex: HashMap<Uuid, u32>,
@@ -543,20 +697,44 @@ mod platform {
             let ipv6_vip_fd = ipv6_vip_map.fd().as_fd().as_raw_fd();
             let ipv4_host_fd = ipv4_host_map.fd().as_fd().as_raw_fd();
             let ipv6_host_fd = ipv6_host_map.fd().as_fd().as_raw_fd();
+            let previous_mappings = self
+                .ports_by_network
+                .get(&network_id)
+                .cloned()
+                .unwrap_or_default();
             let mut resolved_node_ips = HashMap::new();
+            let overlay_index = if entries.is_empty() {
+                0
+            } else {
+                overlay_ifindex_opt.ok_or_else(|| anyhow!("nodeport overlay ifindex missing"))?
+            };
+            let desired_mappings = self
+                .collect_programmed_mappings(entries, overlay_index, &mut resolved_node_ips)
+                .await?;
+            let stale_mappings = stale_nodeport_mappings(&previous_mappings, &desired_mappings);
+            for (selector, _) in &stale_mappings {
+                let key = NodePortKey {
+                    port: selector.port.to_be(),
+                    proto: selector.protocol.number(),
+                    _pad: 0,
+                };
+                // Remove stale selectors from both families before clearing flow state so packets
+                // cannot recreate the old translation while this sync is still converging.
+                let _ = delete_elem(ipv4_vip_fd, &key);
+                let _ = delete_elem(ipv6_vip_fd, &key);
+            }
+            clear_stale_nodeport_flows(&base, stale_mappings.as_slice())
+                .context("clear stale nodeport flows")?;
+
             if let Some(overlay_ifindex) = overlay_ifindex_opt {
                 let host_mac = host_access_mac(network_id).await?;
                 let mut programmed_ipv4_host = false;
                 let mut programmed_ipv6_host = false;
 
-                // Resolve publication identity once per requested family so dual-stack hosts can
-                // publish IPv4 and IPv6 services through the same interface without forcing one
-                // global node IP to fit every VIP entry.
-                for (family, sample_vip) in unique_nodeport_families(entries) {
-                    let node_ip = self
-                        .resolve_public_node_ip_for_family(family, sample_vip)
-                        .await?;
-                    resolved_node_ips.insert(family, node_ip);
+                for family in unique_nodeport_families(entries)
+                    .into_iter()
+                    .map(|(family, _)| family)
+                {
                     let host_ip = host_access_ip(network_id, family).await?;
 
                     match host_ip {
@@ -589,57 +767,41 @@ mod platform {
                 if !programmed_ipv6_host {
                     let _ = delete_elem(ipv6_host_fd, &overlay_ifindex);
                 }
-            } else if had_ports && let Ok(overlay_ifindex) = overlay_ifindex(network_id) {
+            }
+            for overlay_ifindex in stale_overlay_ifindices(&previous_mappings, &desired_mappings) {
                 let _ = delete_elem(ipv4_host_fd, &overlay_ifindex);
                 let _ = delete_elem(ipv6_host_fd, &overlay_ifindex);
             }
-            let overlay_index = if entries.is_empty() {
-                0
-            } else {
-                overlay_ifindex_opt.ok_or_else(|| anyhow!("nodeport overlay ifindex missing"))?
-            };
 
-            for entry in entries {
-                let selector = NodePortSelector::new(entry.port, entry.protocol);
+            for (selector, mapping) in &desired_mappings {
                 let key = NodePortKey {
-                    port: entry.port.to_be(),
-                    proto: entry.protocol.number(),
+                    port: selector.port.to_be(),
+                    proto: selector.protocol.number(),
                     _pad: 0,
                 };
-                let family = NodePortIpFamily::from_ip(entry.vip);
-                let node_ip = if let Some(node_ip) = resolved_node_ips.get(&family).copied() {
-                    node_ip
-                } else {
-                    let node_ip = self
-                        .resolve_public_node_ip_for_family(family, entry.vip)
-                        .await?;
-                    resolved_node_ips.insert(family, node_ip);
-                    node_ip
-                };
-
-                match (entry.vip, node_ip) {
+                match (mapping.vip, mapping.node_ip) {
                     (IpAddr::V4(vip), IpAddr::V4(node_ip)) => {
                         let value = NodePortEntry {
                             vip: u32::from_ne_bytes(vip.octets()),
-                            vip_port: entry.vip_port.to_be(),
+                            vip_port: mapping.vip_port.to_be(),
                             _pad: 0,
-                            overlay_ifindex: overlay_index,
+                            overlay_ifindex: mapping.overlay_ifindex,
                             node_ip: u32::from_ne_bytes(node_ip.octets()),
                         };
                         update_elem(ipv4_vip_fd, &key, &value)
-                            .with_context(|| format!("program IPv4 nodeport {}", entry.port))?;
+                            .with_context(|| format!("program IPv4 nodeport {}", selector.port))?;
                         let _ = delete_elem(ipv6_vip_fd, &key);
                     }
                     (IpAddr::V6(vip), IpAddr::V6(node_ip)) => {
                         let value = NodePortEntry6 {
                             vip: vip.octets(),
-                            vip_port: entry.vip_port.to_be(),
+                            vip_port: mapping.vip_port.to_be(),
                             _pad: 0,
-                            overlay_ifindex: overlay_index,
+                            overlay_ifindex: mapping.overlay_ifindex,
                             node_ip: node_ip.octets(),
                         };
                         update_elem(ipv6_vip_fd, &key, &value)
-                            .with_context(|| format!("program IPv6 nodeport {}", entry.port))?;
+                            .with_context(|| format!("program IPv6 nodeport {}", selector.port))?;
                         let _ = delete_elem(ipv4_vip_fd, &key);
                     }
                     (vip, node_ip) => {
@@ -651,23 +813,18 @@ mod platform {
                         return Err(anyhow!(error));
                     }
                 }
-                self.port_owner.insert(selector, network_id);
+                self.port_owner.insert(*selector, network_id);
             }
 
-            let known = self.ports_by_network.entry(network_id).or_default().clone();
+            let known: HashSet<NodePortSelector> = previous_mappings.keys().copied().collect();
             for selector in known.difference(&desired_ports) {
-                let key = NodePortKey {
-                    port: selector.port.to_be(),
-                    proto: selector.protocol.number(),
-                    _pad: 0,
-                };
-                // Remove the selector from both map families so stale entries are purged even if
-                // the node identity changed families between successive syncs.
-                let _ = delete_elem(ipv4_vip_fd, &key);
-                let _ = delete_elem(ipv6_vip_fd, &key);
                 self.port_owner.remove(selector);
             }
-            self.ports_by_network.insert(network_id, desired_ports);
+            if desired_mappings.is_empty() {
+                self.ports_by_network.remove(&network_id);
+            } else {
+                self.ports_by_network.insert(network_id, desired_mappings);
+            }
             if entries.is_empty() {
                 self.host_ingress_attached.remove(&network_id);
                 self.host_ingress_ifindex.remove(&network_id);
@@ -709,6 +866,44 @@ mod platform {
             Ok(desired_ports)
         }
 
+        /// Resolve the fully programmed mapping state for one sync so cleanup and programming can
+        /// reason about the same selector snapshot.
+        ///
+        /// The sync loop first materializes the desired dataplane view, then removes stale state,
+        /// and only after that publishes fresh selectors. Keeping the resolved mappings in one
+        /// structure avoids recomputing family-specific node identities in each phase.
+        async fn collect_programmed_mappings(
+            &mut self,
+            entries: &[NodePortMapping],
+            overlay_ifindex: u32,
+            resolved_node_ips: &mut HashMap<NodePortIpFamily, IpAddr>,
+        ) -> Result<HashMap<NodePortSelector, NodePortPublishedMapping>> {
+            let mut desired = HashMap::new();
+            for entry in entries {
+                let family = NodePortIpFamily::from_ip(entry.vip);
+                let node_ip = if let Some(node_ip) = resolved_node_ips.get(&family).copied() {
+                    node_ip
+                } else {
+                    let node_ip = self
+                        .resolve_public_node_ip_for_family(family, entry.vip)
+                        .await?;
+                    resolved_node_ips.insert(family, node_ip);
+                    node_ip
+                };
+                let selector = NodePortSelector::new(entry.port, entry.protocol);
+                desired.insert(
+                    selector,
+                    NodePortPublishedMapping::new(
+                        entry.vip,
+                        entry.vip_port,
+                        node_ip,
+                        overlay_ifindex,
+                    ),
+                );
+            }
+            Ok(desired)
+        }
+
         /// Fail fast when the requested sync would exceed the fixed NodePort map capacities.
         fn ensure_sync_capacity(
             &mut self,
@@ -719,7 +914,7 @@ mod platform {
             let current_ports = self
                 .ports_by_network
                 .get(&network_id)
-                .map(HashSet::len)
+                .map(HashMap::len)
                 .unwrap_or(0);
             let projected_active_ports =
                 self.port_owner.len() - current_ports + desired_ports.len();
@@ -1732,6 +1927,264 @@ mod platform {
         Ok(totals)
     }
 
+    /// Clear every stale NodePort flow mapping identified during one selector sync.
+    ///
+    /// The sync path removes stale selectors from the public VIP maps before calling this helper,
+    /// which guarantees new packets cannot recreate the old translation while flow cleanup walks
+    /// the pinned forward and reverse caches.
+    fn clear_stale_nodeport_flows(
+        base: &Path,
+        stale: &[(NodePortSelector, NodePortPublishedMapping)],
+    ) -> Result<()> {
+        for (selector, mapping) in stale {
+            clear_nodeport_flows(base, *selector, *mapping)?;
+        }
+        Ok(())
+    }
+
+    /// Clear one stale selector's flow cache from the family that owns its VIP.
+    ///
+    /// Selector cleanup is family-local because IPv4 and IPv6 NodePort use separate pinned map
+    /// sets. Matching on the resolved mapping keeps the cleanup rules aligned with the current map
+    /// layout instead of depending on stringly-typed pin names at call sites.
+    fn clear_nodeport_flows(
+        base: &Path,
+        selector: NodePortSelector,
+        mapping: NodePortPublishedMapping,
+    ) -> Result<()> {
+        match (mapping.vip, mapping.node_ip) {
+            (IpAddr::V4(vip), IpAddr::V4(node_ip)) => {
+                clear_nodeport_flows_v4(base, selector, vip, mapping.vip_port, node_ip)
+            }
+            (IpAddr::V6(vip), IpAddr::V6(node_ip)) => {
+                clear_nodeport_flows_v6(base, selector, vip, mapping.vip_port, node_ip)
+            }
+            (vip, node_ip) => Err(anyhow!(
+                "nodeport stale mapping used mixed IP families: vip={vip} node_ip={node_ip}"
+            )),
+        }
+    }
+
+    /// Clear stale IPv4 forward and reverse flow entries for one published selector.
+    ///
+    /// Both directions must be purged together so no reply packet can keep using a public mapping
+    /// that the control plane has already retired or repointed.
+    fn clear_nodeport_flows_v4(
+        base: &Path,
+        selector: NodePortSelector,
+        vip: std::net::Ipv4Addr,
+        vip_port: u16,
+        node_ip: std::net::Ipv4Addr,
+    ) -> Result<()> {
+        if let Ok(fwd_map) = open_map(base, IPV4_MAPS.forward_map) {
+            clear_nodeport_forward_flows_v4(
+                fwd_map.fd().as_fd().as_raw_fd(),
+                selector,
+                vip,
+                vip_port,
+                node_ip,
+            )?;
+        }
+        if let Ok(rev_map) = open_map(base, IPV4_MAPS.reverse_map) {
+            clear_nodeport_reverse_flows_v4(
+                rev_map.fd().as_fd().as_raw_fd(),
+                selector,
+                vip,
+                vip_port,
+                node_ip,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Clear stale IPv6 forward and reverse flow entries for one published selector.
+    ///
+    /// IPv6 cleanup follows the same selector-level contract as IPv4 so dual-stack services do not
+    /// need different churn semantics during public mapping updates.
+    fn clear_nodeport_flows_v6(
+        base: &Path,
+        selector: NodePortSelector,
+        vip: std::net::Ipv6Addr,
+        vip_port: u16,
+        node_ip: std::net::Ipv6Addr,
+    ) -> Result<()> {
+        if let Ok(fwd_map) = open_map(base, IPV6_MAPS.forward_map) {
+            clear_nodeport_forward_flows_v6(
+                fwd_map.fd().as_fd().as_raw_fd(),
+                selector,
+                vip,
+                vip_port,
+                node_ip,
+            )?;
+        }
+        if let Ok(rev_map) = open_map(base, IPV6_MAPS.reverse_map) {
+            clear_nodeport_reverse_flows_v6(
+                rev_map.fd().as_fd().as_raw_fd(),
+                selector,
+                vip,
+                vip_port,
+                node_ip,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Remove IPv4 forward flows that still point at one stale public selector.
+    ///
+    /// Forward flow keys are shared by every packet that was already translated into the overlay
+    /// VIP tuple, so cleanup also checks the cached public port and node IP before deleting an
+    /// entry. That avoids clearing unrelated selectors that intentionally share a VIP target.
+    fn clear_nodeport_forward_flows_v4(
+        fd: std::os::fd::RawFd,
+        selector: NodePortSelector,
+        vip: std::net::Ipv4Addr,
+        vip_port: u16,
+        node_ip: std::net::Ipv4Addr,
+    ) -> Result<()> {
+        visit_map_keys::<Flow4, _>(fd, |next| {
+            let matches_selector = lookup_elem::<Flow4, NodePortNat>(fd, &next)?
+                .map(|entry| {
+                    next.dst == u32::from_ne_bytes(vip.octets())
+                        && next.dst_port == vip_port.to_be()
+                        && next.proto == selector.protocol.number()
+                        && entry.node_ip == u32::from_ne_bytes(node_ip.octets())
+                        && entry.node_port == selector.port.to_be()
+                })
+                .unwrap_or(false);
+            Ok(matches_selector)
+        })
+    }
+
+    /// Remove IPv4 reverse flows that still restore one stale public selector.
+    ///
+    /// Reverse keys already carry the VIP tuple, but the cached NAT value still disambiguates
+    /// multiple public ports that intentionally share the same service target.
+    fn clear_nodeport_reverse_flows_v4(
+        fd: std::os::fd::RawFd,
+        selector: NodePortSelector,
+        vip: std::net::Ipv4Addr,
+        vip_port: u16,
+        node_ip: std::net::Ipv4Addr,
+    ) -> Result<()> {
+        visit_map_keys::<Flow4, _>(fd, |next| {
+            let matches_selector = lookup_elem::<Flow4, NodePortNat>(fd, &next)?
+                .map(|entry| {
+                    next.src == u32::from_ne_bytes(vip.octets())
+                        && next.src_port == vip_port.to_be()
+                        && next.proto == selector.protocol.number()
+                        && entry.node_ip == u32::from_ne_bytes(node_ip.octets())
+                        && entry.node_port == selector.port.to_be()
+                })
+                .unwrap_or(false);
+            Ok(matches_selector)
+        })
+    }
+
+    /// Remove IPv6 forward flows that still point at one stale public selector.
+    ///
+    /// Matching the cached public selector in the NAT value keeps cleanup precise even when more
+    /// than one external port targets the same IPv6 VIP and service port.
+    fn clear_nodeport_forward_flows_v6(
+        fd: std::os::fd::RawFd,
+        selector: NodePortSelector,
+        vip: std::net::Ipv6Addr,
+        vip_port: u16,
+        node_ip: std::net::Ipv6Addr,
+    ) -> Result<()> {
+        visit_map_keys::<Flow6, _>(fd, |next| {
+            let matches_selector = lookup_elem::<Flow6, NodePortNat6>(fd, &next)?
+                .map(|entry| {
+                    next.dst == vip.octets()
+                        && next.dst_port == vip_port.to_be()
+                        && next.proto == selector.protocol.number()
+                        && entry.node_ip == node_ip.octets()
+                        && entry.node_port == selector.port.to_be()
+                })
+                .unwrap_or(false);
+            Ok(matches_selector)
+        })
+    }
+
+    /// Remove IPv6 reverse flows that still restore one stale public selector.
+    ///
+    /// The reverse direction uses the same selector match as the forward map so the two caches
+    /// retire together and leave no half-stale return path behind.
+    fn clear_nodeport_reverse_flows_v6(
+        fd: std::os::fd::RawFd,
+        selector: NodePortSelector,
+        vip: std::net::Ipv6Addr,
+        vip_port: u16,
+        node_ip: std::net::Ipv6Addr,
+    ) -> Result<()> {
+        visit_map_keys::<Flow6, _>(fd, |next| {
+            let matches_selector = lookup_elem::<Flow6, NodePortNat6>(fd, &next)?
+                .map(|entry| {
+                    next.src == vip.octets()
+                        && next.src_port == vip_port.to_be()
+                        && next.proto == selector.protocol.number()
+                        && entry.node_ip == node_ip.octets()
+                        && entry.node_port == selector.port.to_be()
+                })
+                .unwrap_or(false);
+            Ok(matches_selector)
+        })
+    }
+
+    /// Iterate every key in one pinned BPF map so stale entries can be deleted in place.
+    ///
+    /// Resetting the cursor after a delete mirrors the kernel's `get_next_key` contract and keeps
+    /// cleanup correct even when adjacent entries are removed during the same scan.
+    fn visit_map_keys<K, F>(fd: std::os::fd::RawFd, mut visitor: F) -> Result<()>
+    where
+        K: Pod + Copy + Default,
+        F: FnMut(K) -> Result<bool>,
+    {
+        const BPF_MAP_GET_NEXT_KEY: libc::c_uint = 4;
+
+        #[repr(C)]
+        struct BpfAttrKeyIter {
+            map_fd: u32,
+            _pad: u32,
+            key: u64,
+            next_key: u64,
+        }
+
+        let mut cursor: Option<K> = None;
+        loop {
+            let mut next = K::default();
+            let mut iter = BpfAttrKeyIter {
+                map_fd: fd as u32,
+                _pad: 0,
+                key: cursor
+                    .as_ref()
+                    .map(|key| key as *const _ as u64)
+                    .unwrap_or(0),
+                next_key: &mut next as *mut _ as u64,
+            };
+
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_bpf,
+                    BPF_MAP_GET_NEXT_KEY,
+                    &mut iter as *mut _,
+                    mem::size_of::<BpfAttrKeyIter>(),
+                )
+            };
+            if ret < 0 {
+                break;
+            }
+
+            if visitor(next)? {
+                let _ = delete_elem(fd, &next);
+                cursor = None;
+            } else {
+                cursor = Some(next);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Remove pinned nodeport maps so new layouts can be loaded atomically.
     fn reset_nodeport_maps(root: &Path) -> Result<()> {
         let maps = [
@@ -1829,6 +2282,47 @@ mod platform {
         Ok(())
     }
 
+    /// Look up one pinned BPF map entry by key, returning `None` when the entry is absent.
+    ///
+    /// Selector cleanup uses direct lookups while iterating flow keys so it can distinguish
+    /// multiple public selectors that intentionally reuse the same VIP target tuple.
+    fn lookup_elem<K: Pod, V: Pod + Default>(fd: i32, key: &K) -> Result<Option<V>> {
+        const BPF_MAP_LOOKUP_ELEM: libc::c_uint = 1;
+
+        #[repr(C)]
+        struct BpfAttrLookup {
+            map_fd: u32,
+            _pad: u32,
+            key: u64,
+            value: u64,
+        }
+
+        let mut value = V::default();
+        let mut attr = BpfAttrLookup {
+            map_fd: fd as u32,
+            _pad: 0,
+            key: key as *const _ as u64,
+            value: &mut value as *mut _ as u64,
+        };
+
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                BPF_MAP_LOOKUP_ELEM,
+                &mut attr as *mut _,
+                mem::size_of::<BpfAttrLookup>(),
+            )
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(None);
+            }
+            return Err(err.into());
+        }
+        Ok(Some(value))
+    }
+
     /// Open a pinned map by name using the same search order as the core BPF loader.
     fn open_map(base: &Path, name: &str) -> Result<MapData> {
         let candidates = [
@@ -1880,14 +2374,104 @@ use platform::PlatformNodePortManager;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::platform::{
+        NodePortPublishedMapping, NodePortSelector, stale_nodeport_mappings,
+        stale_overlay_ifindices,
+    };
     use super::{
         NODEPORT_FLOW_CAPACITY, NODEPORT_HOST_CAPACITY, NODEPORT_VIP_CAPACITY,
-        NodePortPacketCounters, NodePortRuntimeState, NodePortStatus,
+        NodePortPacketCounters, NodePortProtocol, NodePortRuntimeState, NodePortStatus,
         configured_node_ip_from_sources, nodeport_capacity_error,
         projected_active_networks_after_sync, resolve_advertise_ip,
     };
+    use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stale_nodeport_mappings_include_removed_and_changed_selectors() {
+        let selector_unchanged = NodePortSelector::new(18080, NodePortProtocol::Tcp);
+        let selector_changed = NodePortSelector::new(18081, NodePortProtocol::Udp);
+        let selector_removed = NodePortSelector::new(18082, NodePortProtocol::Udp);
+        let unchanged = NodePortPublishedMapping::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+            8080,
+            IpAddr::V4(Ipv4Addr::new(192, 168, 10, 4)),
+            42,
+        );
+        let changed_old = NodePortPublishedMapping::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 11)),
+            5353,
+            IpAddr::V4(Ipv4Addr::new(192, 168, 10, 4)),
+            42,
+        );
+        let changed_new = NodePortPublishedMapping::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 12)),
+            5353,
+            IpAddr::V4(Ipv4Addr::new(192, 168, 10, 4)),
+            42,
+        );
+        let removed = NodePortPublishedMapping::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 13)),
+            9000,
+            IpAddr::V4(Ipv4Addr::new(192, 168, 10, 4)),
+            42,
+        );
+
+        let previous = HashMap::from([
+            (selector_unchanged, unchanged),
+            (selector_changed, changed_old),
+            (selector_removed, removed),
+        ]);
+        let desired = HashMap::from([
+            (selector_unchanged, unchanged),
+            (selector_changed, changed_new),
+        ]);
+
+        let stale = stale_nodeport_mappings(&previous, &desired);
+        assert_eq!(stale.len(), 2);
+        assert!(stale.contains(&(selector_changed, changed_old)));
+        assert!(stale.contains(&(selector_removed, removed)));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stale_overlay_ifindices_only_report_detached_indices() {
+        let selector_a = NodePortSelector::new(18080, NodePortProtocol::Tcp);
+        let selector_b = NodePortSelector::new(18081, NodePortProtocol::Udp);
+        let previous = HashMap::from([
+            (
+                selector_a,
+                NodePortPublishedMapping::new(
+                    IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+                    8080,
+                    IpAddr::V4(Ipv4Addr::new(192, 168, 10, 4)),
+                    41,
+                ),
+            ),
+            (
+                selector_b,
+                NodePortPublishedMapping::new(
+                    IpAddr::V4(Ipv4Addr::new(10, 0, 0, 11)),
+                    5353,
+                    IpAddr::V4(Ipv4Addr::new(192, 168, 10, 4)),
+                    42,
+                ),
+            ),
+        ]);
+        let desired = HashMap::from([(
+            selector_b,
+            NodePortPublishedMapping::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 11)),
+                5353,
+                IpAddr::V4(Ipv4Addr::new(192, 168, 10, 4)),
+                42,
+            ),
+        )]);
+
+        assert_eq!(stale_overlay_ifindices(&previous, &desired), vec![41]);
+    }
     #[test]
     fn resolve_advertise_ipv4_accepts_literal_ipv4_socket() {
         assert_eq!(
