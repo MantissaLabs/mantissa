@@ -7,14 +7,15 @@ use core::{mem, ptr};
 use aya_ebpf::{
     bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT},
     helpers::bpf_csum_diff,
+    helpers::bpf_ktime_get_ns,
     macros::{classifier, map},
     maps::{HashMap, LruHashMap, PerCpuArray},
     programs::TcContext,
 };
 use network_ebpf::{
     lb::{
-        Backend6, ConntrackMetadata, Flow6, NatEntry6, VipBackendKey6, VipEntry, VipKey6,
-        MAX_BACKENDS_PER_VIP, MAX_VIPS,
+        Backend6, ConntrackMetadata, ConntrackVerdict, Flow6, NatEntry6, VipBackendKey6, VipEntry,
+        VipKey6, MAX_BACKENDS_PER_VIP, MAX_VIPS,
     },
     net::{
         self, EthernetHeader, Icmpv6NeighborMessage, Icmpv6NeighborTarget, Ipv6Header, TcpHeader,
@@ -41,6 +42,10 @@ const ICMPV6_NEIGHBOR_SOLICITATION: u8 = 135;
 const ICMPV6_NEIGHBOR_ADVERTISEMENT: u8 = 136;
 const ICMPV6_TARGET_LINK_LAYER_ADDRESS: u8 = 2;
 const ICMPV6_NA_FLAGS: u32 = 0x6000_0000;
+const ETH_DST_OFFSET: usize = 0;
+const ETH_SRC_OFFSET: usize = 6;
+const IPV6_SRC_OFFSET: usize = net::ETH_HDR_LEN + 8;
+const IPV6_DST_OFFSET: usize = net::ETH_HDR_LEN + 24;
 
 #[map(name = "BRIDGE_TC_INGRESS_STATS")]
 static mut BRIDGE_TC_INGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_entries(1, 0);
@@ -96,9 +101,10 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
 
 /// Process IPv6 VIP traffic and neighbour discovery for published AAAA VIPs.
 fn handle_ipv6_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Result<i32, ()> {
-    let eth: EthernetHeader = ctx.load(0).map_err(|_| ())?;
     let ip_offset = net::ETH_HDR_LEN;
-    let ip_hdr: Ipv6Header = ctx.load(ip_offset).map_err(|_| ())?;
+    let ip: *mut Ipv6Header =
+        unsafe { net::mut_ptr_at(data, data_end, ip_offset).map_err(|_| ())? };
+    let ip_hdr = unsafe { &mut *ip };
     if ip_hdr.version() != 6 {
         return Ok(TC_ACT_OK);
     }
@@ -108,6 +114,8 @@ fn handle_ipv6_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
         IPPROTO_TCP | IPPROTO_UDP => {
             let proto = ip_hdr.next_header;
             let (src_port, dst_port) = parse_ports(data, data_end, l4_offset, proto)?;
+            let tcp_flags = parse_tcp_flags(data, data_end, l4_offset, proto)?;
+            let now_ns = flow_now_ns();
             let flow_key = Flow6 {
                 src: ip_hdr.src,
                 dst: ip_hdr.dst,
@@ -117,39 +125,70 @@ fn handle_ipv6_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
                 padding: [0u8; 3],
             };
 
-            if let Some(entry) = unsafe { LB_REV_V6.get(&flow_key).copied() } {
-                apply_snat_v6(ctx, &eth, &ip_hdr, ip_offset, l4_offset, proto, &entry)?;
+            if let Some(mut entry) = unsafe { LB_REV_V6.get(&flow_key).copied() } {
+                let forward_key = forward_key_from_reverse_flow(&flow_key, entry.vip);
+                match entry.conntrack.advance_reverse(tcp_flags, now_ns) {
+                    ConntrackVerdict::Reject => return Ok(TC_ACT_OK),
+                    ConntrackVerdict::Remove => {
+                        remove_flow_pair(&forward_key, &flow_key);
+                        return Ok(TC_ACT_OK);
+                    }
+                    ConntrackVerdict::Allow(updated) => entry.conntrack = updated,
+                    ConntrackVerdict::AllowAndRemove(updated) => {
+                        entry.conntrack = updated;
+                        apply_snat_v6(ctx, l4_offset, proto, &flow_key, &entry)?;
+                        remove_flow_pair(&forward_key, &flow_key);
+                        return Ok(TC_ACT_OK);
+                    }
+                }
+
+                apply_snat_v6(ctx, l4_offset, proto, &flow_key, &entry)?;
+                persist_flow_pair(&forward_key, &flow_key, &entry)?;
                 return Ok(TC_ACT_OK);
             }
 
-            let mut chosen = unsafe { LB_FWD_V6.get(&flow_key).copied() };
-            if chosen.is_none() {
-                chosen = select_backend_v6(&flow_key, ip_hdr.dst);
-            }
-
-            let Some(choice) = chosen else {
-                return Ok(TC_ACT_OK);
+            let choice = if let Some(mut entry) = unsafe { LB_FWD_V6.get(&flow_key).copied() } {
+                let reverse_key = reverse_key_from_forward_flow(&flow_key, entry.backend_ip);
+                match entry.conntrack.advance_forward(tcp_flags, now_ns) {
+                    ConntrackVerdict::Reject => return Ok(TC_ACT_OK),
+                    ConntrackVerdict::Remove => {
+                        remove_flow_pair(&flow_key, &reverse_key);
+                        return Ok(TC_ACT_OK);
+                    }
+                    ConntrackVerdict::Allow(updated) => {
+                        entry.conntrack = updated;
+                        entry
+                    }
+                    ConntrackVerdict::AllowAndRemove(updated) => {
+                        entry.conntrack = updated;
+                        apply_dnat_v6(ctx, l4_offset, proto, &flow_key, &entry)?;
+                        remove_flow_pair(&flow_key, &reverse_key);
+                        return Ok(TC_ACT_OK);
+                    }
+                }
+            } else {
+                let Some(conntrack) = ConntrackMetadata::begin_flow(proto, tcp_flags, now_ns)
+                else {
+                    return Ok(TC_ACT_OK);
+                };
+                let Some(mut entry) = select_backend_v6(&flow_key, ip_hdr.dst) else {
+                    return Ok(TC_ACT_OK);
+                };
+                entry.conntrack = conntrack;
+                entry
             };
 
-            apply_dnat_v6(ctx, &eth, &ip_hdr, ip_offset, l4_offset, proto, &choice)?;
+            apply_dnat_v6(ctx, l4_offset, proto, &flow_key, &choice)?;
 
-            let reverse_key = Flow6 {
-                src: choice.backend_ip,
-                dst: flow_key.src,
-                src_port: dst_port,
-                dst_port: src_port,
-                proto,
-                padding: [0u8; 3],
-            };
-
-            unsafe {
-                LB_FWD_V6.insert(&flow_key, &choice, 0).map_err(|_| ())?;
-                LB_REV_V6.insert(&reverse_key, &choice, 0).map_err(|_| ())?;
-            }
+            let reverse_key = reverse_key_from_forward_flow(&flow_key, choice.backend_ip);
+            persist_flow_pair(&flow_key, &reverse_key, &choice)?;
 
             Ok(TC_ACT_OK)
         }
-        IPPROTO_ICMPV6 => handle_icmpv6_neighbor(ctx, &eth, &ip_hdr, l4_offset),
+        IPPROTO_ICMPV6 => {
+            let eth: EthernetHeader = ctx.load(0).map_err(|_| ())?;
+            handle_icmpv6_neighbor(ctx, &eth, ip_hdr, l4_offset)
+        }
         _ => Ok(TC_ACT_OK),
     }
 }
@@ -181,13 +220,17 @@ fn handle_icmpv6_neighbor(
         return Ok(TC_ACT_OK);
     };
 
+    let requester_ip = ip_hdr.src;
+    let updated_ip = Ipv6Header {
+        version_tc_flow: ip_hdr.version_tc_flow,
+        payload_len: ip_hdr.payload_len,
+        next_header: ip_hdr.next_header,
+        hop_limit: 255,
+        src: target,
+        dst: requester_ip,
+    };
     let updated_eth = EthernetHeader::ipv6(eth_hdr.source(), config.vip_mac);
     ctx.store(0, &updated_eth, 0).map_err(|_| ())?;
-
-    let mut updated_ip = *ip_hdr;
-    updated_ip.src = target;
-    updated_ip.dst = ip_hdr.src;
-    updated_ip.hop_limit = 255;
     ctx.store(net::ETH_HDR_LEN, &updated_ip, 0)
         .map_err(|_| ())?;
 
@@ -249,6 +292,15 @@ fn select_backend_v6(flow: &Flow6, vip: [u8; 16]) -> Option<NatEntry6> {
     })
 }
 
+/// Return a monotonic dataplane timestamp for conntrack refresh decisions.
+///
+/// IPv6 VIP flow tracking uses the same timestamp source as IPv4 so later aging logic can reason
+/// about both address families with one comparable monotonic clock.
+#[inline(always)]
+fn flow_now_ns() -> u64 {
+    unsafe { bpf_ktime_get_ns() }
+}
+
 /// Hash an IPv6 5-tuple plus VIP into one deterministic backend ring slot.
 fn hash_flow_v6(flow: &Flow6, vip: &[u8; 16]) -> u64 {
     let src_mix = fold_u64_chunks(&flow.src);
@@ -280,6 +332,19 @@ fn mix64(mut x: u64) -> u64 {
     x
 }
 
+/// Load and validate the fixed TCP header prefix at the provided transport offset.
+///
+/// The conntrack logic only needs the fixed TCP fields, but it still validates the advertised
+/// header length so malformed packets do not create or refresh IPv6 VIP state.
+fn read_tcp_header(data: usize, data_end: usize, l4_offset: usize) -> Result<TcpHeader, ()> {
+    let tcp: TcpHeader = unsafe { net::read_at(data, data_end, l4_offset).map_err(|_| ())? };
+    let header_len = tcp.data_offset();
+    if header_len < core::mem::size_of::<TcpHeader>() || data + l4_offset + header_len > data_end {
+        return Err(());
+    }
+    Ok(tcp)
+}
+
 /// Parse one TCP or UDP header so the dataplane can build its flow key.
 fn parse_ports(
     data: usize,
@@ -288,7 +353,7 @@ fn parse_ports(
     proto: u8,
 ) -> Result<(u16, u16), ()> {
     if proto == IPPROTO_TCP {
-        let tcp: TcpHeader = unsafe { net::read_at(data, data_end, l4_offset).map_err(|_| ())? };
+        let tcp = read_tcp_header(data, data_end, l4_offset)?;
         return Ok((tcp.source, tcp.dest));
     }
     if proto == IPPROTO_UDP {
@@ -296,6 +361,74 @@ fn parse_ports(
         return Ok((udp.source, udp.dest));
     }
     Err(())
+}
+
+/// Return the TCP flags byte for the current packet, or zero for UDP packets.
+///
+/// IPv6 UDP flows only need activity timestamps, so the shared TCP state machine ignores the zero
+/// flag value returned for non-TCP packets.
+fn parse_tcp_flags(data: usize, data_end: usize, l4_offset: usize, proto: u8) -> Result<u8, ()> {
+    if proto == IPPROTO_TCP {
+        return Ok(read_tcp_header(data, data_end, l4_offset)?.flags());
+    }
+    Ok(0)
+}
+
+/// Derive the backend-to-client reverse key for one cached client-to-VIP flow.
+///
+/// The forward and reverse IPv6 maps share the same conntrack metadata, so ingress updates both
+/// directions together after it admits or refreshes a VIP flow.
+fn reverse_key_from_forward_flow(flow: &Flow6, backend_ip: [u8; 16]) -> Flow6 {
+    Flow6 {
+        src: backend_ip,
+        dst: flow.src,
+        src_port: flow.dst_port,
+        dst_port: flow.src_port,
+        proto: flow.proto,
+        padding: [0u8; 3],
+    }
+}
+
+/// Reconstruct the client-to-VIP key that pairs with one reverse cache entry.
+///
+/// Same-node IPv6 replies can loop back through bridge ingress before tc egress sees them, so the
+/// ingress hook still needs to update the forward entry while processing reverse traffic.
+fn forward_key_from_reverse_flow(reverse_key: &Flow6, vip: [u8; 16]) -> Flow6 {
+    Flow6 {
+        src: reverse_key.dst,
+        dst: vip,
+        src_port: reverse_key.dst_port,
+        dst_port: reverse_key.src_port,
+        proto: reverse_key.proto,
+        padding: [0u8; 3],
+    }
+}
+
+/// Persist matching forward and reverse IPv6 cache entries after one conntrack update.
+///
+/// Keeping both directions synchronized avoids family-specific behavior differences between the
+/// same-node ingress path and the dedicated egress rewrite path.
+fn persist_flow_pair(
+    forward_key: &Flow6,
+    reverse_key: &Flow6,
+    entry: &NatEntry6,
+) -> Result<(), ()> {
+    unsafe {
+        LB_FWD_V6.insert(forward_key, entry, 0).map_err(|_| ())?;
+        LB_REV_V6.insert(reverse_key, entry, 0).map_err(|_| ())?;
+    }
+    Ok(())
+}
+
+/// Best-effort remove both directions of one cached IPv6 flow pair.
+///
+/// A teardown packet should retire both map entries, but the dataplane ignores delete failures in
+/// case one side was already evicted independently by the LRU cache.
+fn remove_flow_pair(forward_key: &Flow6, reverse_key: &Flow6) {
+    unsafe {
+        let _ = LB_FWD_V6.remove(forward_key);
+        let _ = LB_REV_V6.remove(reverse_key);
+    }
 }
 
 /// Return the TCP or UDP checksum field offset within the transport header.
@@ -310,22 +443,17 @@ fn l4_checksum_offset(proto: u8) -> usize {
 /// Rewrite one IPv6 packet to the chosen backend while preserving the original client identity.
 fn apply_dnat_v6(
     ctx: &mut TcContext,
-    eth: &EthernetHeader,
-    ip: &Ipv6Header,
-    ip_offset: usize,
     l4_offset: usize,
     proto: u8,
+    flow: &Flow6,
     choice: &NatEntry6,
 ) -> Result<(), ()> {
-    let mut updated_eth = *eth;
-    updated_eth.dst = choice.backend_mac;
-    ctx.store(0, &updated_eth, 0).map_err(|_| ())?;
+    ctx.store(ETH_DST_OFFSET, &choice.backend_mac, 0)
+        .map_err(|_| ())?;
+    ctx.store(IPV6_DST_OFFSET, &choice.backend_ip, 0)
+        .map_err(|_| ())?;
 
-    let mut updated_ip = *ip;
-    updated_ip.dst = choice.backend_ip;
-    ctx.store(ip_offset, &updated_ip, 0).map_err(|_| ())?;
-
-    let checksum_delta = ipv6_address_csum_diff(&ip.dst, &choice.backend_ip)?;
+    let checksum_delta = ipv6_address_csum_diff(&flow.dst, &choice.backend_ip)?;
     ctx.l4_csum_replace(
         l4_offset + l4_checksum_offset(proto),
         0,
@@ -344,22 +472,16 @@ fn apply_dnat_v6(
 /// packet never traverses a bridge-port tc egress hook on its way back to the client.
 fn apply_snat_v6(
     ctx: &mut TcContext,
-    eth: &EthernetHeader,
-    ip: &Ipv6Header,
-    ip_offset: usize,
     l4_offset: usize,
     proto: u8,
+    flow: &Flow6,
     entry: &NatEntry6,
 ) -> Result<(), ()> {
-    let mut updated_eth = *eth;
-    updated_eth.src = entry.vip_mac;
-    ctx.store(0, &updated_eth, 0).map_err(|_| ())?;
+    ctx.store(ETH_SRC_OFFSET, &entry.vip_mac, 0)
+        .map_err(|_| ())?;
+    ctx.store(IPV6_SRC_OFFSET, &entry.vip, 0).map_err(|_| ())?;
 
-    let mut updated_ip = *ip;
-    updated_ip.src = entry.vip;
-    ctx.store(ip_offset, &updated_ip, 0).map_err(|_| ())?;
-
-    let checksum_delta = ipv6_address_csum_diff(&ip.src, &entry.vip)?;
+    let checksum_delta = ipv6_address_csum_diff(&flow.src, &entry.vip)?;
     ctx.l4_csum_replace(
         l4_offset + l4_checksum_offset(proto),
         0,

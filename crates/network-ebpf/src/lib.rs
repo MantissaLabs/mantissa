@@ -409,6 +409,8 @@ pub mod net {
 }
 
 pub mod lb {
+    use super::net::{TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN};
+
     /// Maximum number of backend targets tracked per VIP entry.
     pub const MAX_BACKENDS_PER_VIP: usize = 1024;
     /// Maximum number of VIPs tracked in LB maps.
@@ -427,6 +429,8 @@ pub mod lb {
     pub const CONNTRACK_STATE_TCP_CLOSED: u8 = 5;
     /// Flag bit that marks one cached NAT flow as ready for aggressive teardown.
     pub const CONNTRACK_FLAG_TERMINATING: u8 = 0x01;
+    const IPPROTO_TCP: u8 = 6;
+    const IPPROTO_UDP: u8 = 17;
 
     /// Key for VIP-backed routing decisions stored in eBPF maps.
     #[repr(C)]
@@ -515,6 +519,49 @@ pub mod lb {
         pub padding: [u8; 3],
     }
 
+    /// Conntrack verdict returned after evaluating one packet against cached flow state.
+    ///
+    /// The overlay and NodePort datapaths share the same minimal lifecycle rules: packets are
+    /// either rejected without touching the cache, allowed with refreshed metadata, or allowed
+    /// while retiring the flow pair after the current rewrite completes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ConntrackVerdict {
+        Reject,
+        Remove,
+        Allow(ConntrackMetadata),
+        AllowAndRemove(ConntrackMetadata),
+    }
+
+    #[inline(always)]
+    const fn tcp_has_syn(flags: u8) -> bool {
+        flags & TCP_FLAG_SYN != 0
+    }
+
+    #[inline(always)]
+    const fn tcp_has_ack(flags: u8) -> bool {
+        flags & TCP_FLAG_ACK != 0
+    }
+
+    #[inline(always)]
+    const fn tcp_has_fin(flags: u8) -> bool {
+        flags & TCP_FLAG_FIN != 0
+    }
+
+    #[inline(always)]
+    const fn tcp_has_rst(flags: u8) -> bool {
+        flags & TCP_FLAG_RST != 0
+    }
+
+    #[inline(always)]
+    const fn tcp_has_syn_ack(flags: u8) -> bool {
+        tcp_has_syn(flags) && tcp_has_ack(flags) && !tcp_has_fin(flags) && !tcp_has_rst(flags)
+    }
+
+    #[inline(always)]
+    const fn tcp_has_syn_only(flags: u8) -> bool {
+        tcp_has_syn(flags) && !tcp_has_ack(flags) && !tcp_has_fin(flags) && !tcp_has_rst(flags)
+    }
+
     /// Per-flow conntrack metadata stored next to each NAT translation entry.
     ///
     /// The dataplane currently only needs a small amount of state: protocol identity, a minimal
@@ -522,7 +569,7 @@ pub mod lb {
     /// reserving that layout now, later hardening can tighten flow validation without another map
     /// value migration.
     #[repr(C)]
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct ConntrackMetadata {
         pub last_seen_ns: u64,
         pub protocol: u8,
@@ -585,6 +632,192 @@ pub mod lb {
         pub const fn is_terminating(&self) -> bool {
             self.flags & CONNTRACK_FLAG_TERMINATING != 0
         }
+
+        /// Build the initial conntrack metadata for one newly admitted flow.
+        ///
+        /// UDP can start on the first packet, while TCP only becomes tracked after a plain SYN.
+        /// Rejecting other first TCP packets keeps the dataplane from creating state from stray
+        /// ACK, FIN, or RST traffic.
+        #[inline(always)]
+        pub const fn begin_flow(protocol: u8, tcp_flags: u8, now_ns: u64) -> Option<Self> {
+            if protocol == IPPROTO_UDP {
+                return Some(
+                    Self::untracked(protocol)
+                        .with_state(CONNTRACK_STATE_UDP_ACTIVE)
+                        .with_last_seen_ns(now_ns),
+                );
+            }
+            if protocol == IPPROTO_TCP && tcp_has_syn_only(tcp_flags) {
+                return Some(
+                    Self::untracked(protocol)
+                        .with_state(CONNTRACK_STATE_TCP_SYN_SENT)
+                        .with_last_seen_ns(now_ns),
+                );
+            }
+            None
+        }
+
+        /// Evaluate one client-to-backend packet against the cached flow state.
+        ///
+        /// Forward packets refresh UDP activity, allow TCP SYN retransmits during setup, promote
+        /// flows to established once ACK traffic appears, and mark teardown after FIN or RST.
+        #[inline(always)]
+        pub const fn advance_forward(self, tcp_flags: u8, now_ns: u64) -> ConntrackVerdict {
+            if self.protocol == IPPROTO_UDP {
+                return ConntrackVerdict::Allow(
+                    self.with_state(CONNTRACK_STATE_UDP_ACTIVE)
+                        .with_last_seen_ns(now_ns),
+                );
+            }
+            if self.protocol != IPPROTO_TCP {
+                return ConntrackVerdict::Remove;
+            }
+
+            match self.state {
+                CONNTRACK_STATE_TCP_SYN_SENT => {
+                    if tcp_has_rst(tcp_flags) {
+                        ConntrackVerdict::AllowAndRemove(
+                            self.close_terminal_flow(now_ns).with_last_seen_ns(now_ns),
+                        )
+                    } else if tcp_has_fin(tcp_flags) {
+                        ConntrackVerdict::Allow(
+                            self.enter_fin_wait(now_ns).with_last_seen_ns(now_ns),
+                        )
+                    } else if tcp_has_syn_only(tcp_flags) {
+                        ConntrackVerdict::Allow(
+                            self.with_state(CONNTRACK_STATE_TCP_SYN_SENT)
+                                .with_last_seen_ns(now_ns),
+                        )
+                    } else if tcp_has_ack(tcp_flags) {
+                        ConntrackVerdict::Allow(
+                            self.with_state(CONNTRACK_STATE_TCP_ESTABLISHED)
+                                .with_last_seen_ns(now_ns),
+                        )
+                    } else {
+                        ConntrackVerdict::Reject
+                    }
+                }
+                CONNTRACK_STATE_TCP_ESTABLISHED => {
+                    if tcp_has_rst(tcp_flags) {
+                        ConntrackVerdict::AllowAndRemove(
+                            self.close_terminal_flow(now_ns).with_last_seen_ns(now_ns),
+                        )
+                    } else if tcp_has_fin(tcp_flags) {
+                        ConntrackVerdict::Allow(
+                            self.enter_fin_wait(now_ns).with_last_seen_ns(now_ns),
+                        )
+                    } else {
+                        ConntrackVerdict::Allow(
+                            self.with_state(CONNTRACK_STATE_TCP_ESTABLISHED)
+                                .with_last_seen_ns(now_ns),
+                        )
+                    }
+                }
+                CONNTRACK_STATE_TCP_FIN_WAIT => {
+                    if tcp_has_rst(tcp_flags) || tcp_has_fin(tcp_flags) {
+                        ConntrackVerdict::AllowAndRemove(
+                            self.close_terminal_flow(now_ns).with_last_seen_ns(now_ns),
+                        )
+                    } else {
+                        ConntrackVerdict::Allow(
+                            self.enter_fin_wait(now_ns).with_last_seen_ns(now_ns),
+                        )
+                    }
+                }
+                CONNTRACK_STATE_UNTRACKED
+                | CONNTRACK_STATE_UDP_ACTIVE
+                | CONNTRACK_STATE_TCP_CLOSED => ConntrackVerdict::Remove,
+                _ => ConntrackVerdict::Remove,
+            }
+        }
+
+        /// Evaluate one backend-to-client packet against the cached flow state.
+        ///
+        /// Reverse packets only pass during TCP setup when the backend responds with SYN-ACK or
+        /// RST. Once established, reverse traffic follows the same FIN/RST retirement rules as the
+        /// forward path.
+        #[inline(always)]
+        pub const fn advance_reverse(self, tcp_flags: u8, now_ns: u64) -> ConntrackVerdict {
+            if self.protocol == IPPROTO_UDP {
+                return ConntrackVerdict::Allow(
+                    self.with_state(CONNTRACK_STATE_UDP_ACTIVE)
+                        .with_last_seen_ns(now_ns),
+                );
+            }
+            if self.protocol != IPPROTO_TCP {
+                return ConntrackVerdict::Remove;
+            }
+
+            match self.state {
+                CONNTRACK_STATE_TCP_SYN_SENT => {
+                    if tcp_has_rst(tcp_flags) {
+                        ConntrackVerdict::AllowAndRemove(
+                            self.close_terminal_flow(now_ns).with_last_seen_ns(now_ns),
+                        )
+                    } else if tcp_has_syn_ack(tcp_flags) {
+                        ConntrackVerdict::Allow(
+                            self.with_state(CONNTRACK_STATE_TCP_ESTABLISHED)
+                                .with_last_seen_ns(now_ns),
+                        )
+                    } else {
+                        ConntrackVerdict::Reject
+                    }
+                }
+                CONNTRACK_STATE_TCP_ESTABLISHED => {
+                    if tcp_has_rst(tcp_flags) {
+                        ConntrackVerdict::AllowAndRemove(
+                            self.close_terminal_flow(now_ns).with_last_seen_ns(now_ns),
+                        )
+                    } else if tcp_has_fin(tcp_flags) {
+                        ConntrackVerdict::Allow(
+                            self.enter_fin_wait(now_ns).with_last_seen_ns(now_ns),
+                        )
+                    } else {
+                        ConntrackVerdict::Allow(
+                            self.with_state(CONNTRACK_STATE_TCP_ESTABLISHED)
+                                .with_last_seen_ns(now_ns),
+                        )
+                    }
+                }
+                CONNTRACK_STATE_TCP_FIN_WAIT => {
+                    if tcp_has_rst(tcp_flags) || tcp_has_fin(tcp_flags) {
+                        ConntrackVerdict::AllowAndRemove(
+                            self.close_terminal_flow(now_ns).with_last_seen_ns(now_ns),
+                        )
+                    } else {
+                        ConntrackVerdict::Allow(
+                            self.enter_fin_wait(now_ns).with_last_seen_ns(now_ns),
+                        )
+                    }
+                }
+                CONNTRACK_STATE_UNTRACKED
+                | CONNTRACK_STATE_UDP_ACTIVE
+                | CONNTRACK_STATE_TCP_CLOSED => ConntrackVerdict::Remove,
+                _ => ConntrackVerdict::Remove,
+            }
+        }
+
+        /// Return metadata for a flow that has entered the graceful-close phase.
+        ///
+        /// FIN packets still need one last rewrite on both directions, so the dataplane marks the
+        /// flow as terminating but keeps it alive until a later FIN or RST retires the pair.
+        #[inline(always)]
+        const fn enter_fin_wait(self, now_ns: u64) -> Self {
+            self.with_state(CONNTRACK_STATE_TCP_FIN_WAIT)
+                .with_last_seen_ns(now_ns)
+                .mark_terminating()
+        }
+
+        /// Return metadata for a flow that should be removed after the current packet.
+        ///
+        /// Reset packets and terminal close packets still need one last translation, so the caller
+        /// receives a closed state plus a separate verdict that says to delete the cached pair.
+        #[inline(always)]
+        const fn close_terminal_flow(self, now_ns: u64) -> Self {
+            self.with_state(CONNTRACK_STATE_TCP_CLOSED)
+                .with_last_seen_ns(now_ns)
+                .mark_terminating()
+        }
     }
 
     /// Cached per-flow translation data shared between ingress/egress hooks.
@@ -617,8 +850,12 @@ pub mod lb {
 #[cfg(test)]
 mod tests {
     use super::{
-        lb::{ConntrackMetadata, CONNTRACK_FLAG_TERMINATING, CONNTRACK_STATE_TCP_SYN_SENT},
-        net::{TcpHeader, TCP_FLAG_ACK, TCP_FLAG_SYN},
+        lb::{
+            ConntrackMetadata, ConntrackVerdict, CONNTRACK_FLAG_TERMINATING,
+            CONNTRACK_STATE_TCP_ESTABLISHED, CONNTRACK_STATE_TCP_FIN_WAIT,
+            CONNTRACK_STATE_TCP_SYN_SENT,
+        },
+        net::{TcpHeader, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN},
     };
 
     #[test]
@@ -676,5 +913,70 @@ mod tests {
             CONNTRACK_FLAG_TERMINATING
         );
         assert!(metadata.is_terminating());
+    }
+
+    #[test]
+    fn begin_flow_only_tracks_plain_tcp_syn_packets() {
+        assert!(ConntrackMetadata::begin_flow(6, TCP_FLAG_ACK, 10).is_none());
+
+        let metadata = ConntrackMetadata::begin_flow(6, TCP_FLAG_SYN, 10)
+            .expect("plain SYN should create tcp state");
+        assert_eq!(metadata.protocol, 6);
+        assert_eq!(metadata.state, CONNTRACK_STATE_TCP_SYN_SENT);
+        assert_eq!(metadata.last_seen_ns, 10);
+    }
+
+    #[test]
+    fn reverse_syn_ack_promotes_tcp_flow_to_established() {
+        let metadata = ConntrackMetadata::begin_flow(6, TCP_FLAG_SYN, 10)
+            .expect("plain SYN should create tcp state");
+
+        let verdict = metadata.advance_reverse(TCP_FLAG_SYN | TCP_FLAG_ACK, 20);
+        assert_eq!(
+            verdict,
+            ConntrackVerdict::Allow(
+                metadata
+                    .with_state(CONNTRACK_STATE_TCP_ESTABLISHED)
+                    .with_last_seen_ns(20),
+            )
+        );
+    }
+
+    #[test]
+    fn established_fin_marks_flow_terminating_without_immediate_removal() {
+        let metadata = ConntrackMetadata::begin_flow(6, TCP_FLAG_SYN, 10)
+            .expect("plain SYN should create tcp state")
+            .with_state(CONNTRACK_STATE_TCP_ESTABLISHED)
+            .with_last_seen_ns(15);
+
+        let verdict = metadata.advance_forward(TCP_FLAG_FIN | TCP_FLAG_ACK, 30);
+        assert_eq!(
+            verdict,
+            ConntrackVerdict::Allow(
+                metadata
+                    .with_state(CONNTRACK_STATE_TCP_FIN_WAIT)
+                    .with_last_seen_ns(30)
+                    .mark_terminating(),
+            )
+        );
+    }
+
+    #[test]
+    fn reset_closes_flow_and_requests_pair_removal() {
+        let metadata = ConntrackMetadata::begin_flow(6, TCP_FLAG_SYN, 10)
+            .expect("plain SYN should create tcp state")
+            .with_state(CONNTRACK_STATE_TCP_ESTABLISHED)
+            .with_last_seen_ns(15);
+
+        let verdict = metadata.advance_reverse(TCP_FLAG_RST, 40);
+        assert_eq!(
+            verdict,
+            ConntrackVerdict::AllowAndRemove(
+                metadata
+                    .with_state(super::lb::CONNTRACK_STATE_TCP_CLOSED)
+                    .with_last_seen_ns(40)
+                    .mark_terminating(),
+            )
+        );
     }
 }

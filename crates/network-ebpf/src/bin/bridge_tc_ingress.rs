@@ -6,14 +6,15 @@ use core::ptr;
 
 use aya_ebpf::{
     bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT},
+    helpers::bpf_ktime_get_ns,
     macros::{classifier, map},
     maps::{HashMap, LruHashMap, PerCpuArray},
     programs::TcContext,
 };
 use network_ebpf::{
     lb::{
-        Backend, ConntrackMetadata, Flow4, NatEntry, VipBackendKey, VipEntry, VipKey,
-        MAX_BACKENDS_PER_VIP, MAX_VIPS,
+        Backend, ConntrackMetadata, ConntrackVerdict, Flow4, NatEntry, VipBackendKey, VipEntry,
+        VipKey, MAX_BACKENDS_PER_VIP, MAX_VIPS,
     },
     net::{self, EthernetHeader, Ipv4Header, TcpHeader, UdpHeader},
     stats::{self, PacketStats},
@@ -120,6 +121,8 @@ fn handle_ipv4_packet(
     }
 
     let (src_port, dst_port) = parse_ports(data, data_end, l4_offset, proto)?;
+    let tcp_flags = parse_tcp_flags(data, data_end, l4_offset, proto)?;
+    let now_ns = flow_now_ns();
     let reverse_key = Flow4 {
         src: ip_hdr.src,
         dst: ip_hdr.dst,
@@ -130,8 +133,25 @@ fn handle_ipv4_packet(
         padding: [0u8; 2],
     };
 
-    if let Some(entry) = unsafe { LB_REV.get(&reverse_key).copied() } {
+    if let Some(mut entry) = unsafe { LB_REV.get(&reverse_key).copied() } {
+        let forward_key = forward_key_from_reverse_flow(&reverse_key, entry.vip);
+        match entry.conntrack.advance_reverse(tcp_flags, now_ns) {
+            ConntrackVerdict::Reject => return Ok(TC_ACT_OK),
+            ConntrackVerdict::Remove => {
+                remove_flow_pair(&forward_key, &reverse_key);
+                return Ok(TC_ACT_OK);
+            }
+            ConntrackVerdict::Allow(updated) => entry.conntrack = updated,
+            ConntrackVerdict::AllowAndRemove(updated) => {
+                entry.conntrack = updated;
+                apply_snat_v4(ctx, eth_hdr, ip_hdr, ip_offset, l4_offset, proto, &entry)?;
+                remove_flow_pair(&forward_key, &reverse_key);
+                return Ok(TC_ACT_OK);
+            }
+        }
+
         apply_snat_v4(ctx, eth_hdr, ip_hdr, ip_offset, l4_offset, proto, &entry)?;
+        persist_flow_pair(&forward_key, &reverse_key, &entry)?;
         return Ok(TC_ACT_OK);
     }
 
@@ -145,31 +165,40 @@ fn handle_ipv4_packet(
         padding: [0u8; 2],
     };
 
-    let mut chosen = unsafe { LB_FWD.get(&client_flow).copied() };
-    if chosen.is_none() {
-        chosen = select_backend_v4(&client_flow, ip_hdr.dst);
-    }
-
-    let Some(choice) = chosen else {
-        return Ok(TC_ACT_OK);
+    let choice = if let Some(mut entry) = unsafe { LB_FWD.get(&client_flow).copied() } {
+        let reverse_key = reverse_key_from_forward_flow(&client_flow, entry.backend_ip);
+        match entry.conntrack.advance_forward(tcp_flags, now_ns) {
+            ConntrackVerdict::Reject => return Ok(TC_ACT_OK),
+            ConntrackVerdict::Remove => {
+                remove_flow_pair(&client_flow, &reverse_key);
+                return Ok(TC_ACT_OK);
+            }
+            ConntrackVerdict::Allow(updated) => {
+                entry.conntrack = updated;
+                entry
+            }
+            ConntrackVerdict::AllowAndRemove(updated) => {
+                entry.conntrack = updated;
+                apply_dnat_v4(ctx, eth_hdr, ip_hdr, ip_offset, l4_offset, proto, &entry)?;
+                remove_flow_pair(&client_flow, &reverse_key);
+                return Ok(TC_ACT_OK);
+            }
+        }
+    } else {
+        let Some(conntrack) = ConntrackMetadata::begin_flow(proto, tcp_flags, now_ns) else {
+            return Ok(TC_ACT_OK);
+        };
+        let Some(mut entry) = select_backend_v4(&client_flow, ip_hdr.dst) else {
+            return Ok(TC_ACT_OK);
+        };
+        entry.conntrack = conntrack;
+        entry
     };
 
     apply_dnat_v4(ctx, eth_hdr, ip_hdr, ip_offset, l4_offset, proto, &choice)?;
 
-    let reverse_key = Flow4 {
-        src: choice.backend_ip,
-        dst: client_flow.src,
-        src_port: dst_port,
-        dst_port: src_port,
-        proto,
-        pad: 0,
-        padding: [0u8; 2],
-    };
-
-    unsafe {
-        LB_FWD.insert(&client_flow, &choice, 0).map_err(|_| ())?;
-        LB_REV.insert(&reverse_key, &choice, 0).map_err(|_| ())?;
-    }
+    let reverse_key = reverse_key_from_forward_flow(&client_flow, choice.backend_ip);
+    persist_flow_pair(&client_flow, &reverse_key, &choice)?;
 
     Ok(TC_ACT_OK)
 }
@@ -257,6 +286,15 @@ fn select_backend_v4(flow: &Flow4, vip: u32) -> Option<NatEntry> {
     })
 }
 
+/// Return a monotonic dataplane timestamp for conntrack refresh decisions.
+///
+/// The overlay state machine records last-seen activity per flow so later aging and diagnostics do
+/// not have to rely solely on opaque LRU eviction behavior.
+#[inline(always)]
+fn flow_now_ns() -> u64 {
+    unsafe { bpf_ktime_get_ns() }
+}
+
 /// Hash an IPv4 5-tuple plus VIP into one deterministic backend ring slot.
 fn hash_flow_v4(flow: &Flow4, vip: u32) -> u64 {
     let mut acc = (flow.src as u64) ^ ((flow.dst as u64) << 7);
@@ -276,6 +314,19 @@ fn mix64(mut x: u64) -> u64 {
     x
 }
 
+/// Load and validate the fixed TCP header prefix at the provided transport offset.
+///
+/// Conntrack hardening only needs the first 20 bytes of the TCP header, but it still validates the
+/// advertised header length so malformed packets do not create or refresh state.
+fn read_tcp_header(data: usize, data_end: usize, l4_offset: usize) -> Result<TcpHeader, ()> {
+    let tcp: TcpHeader = unsafe { net::read_at(data, data_end, l4_offset).map_err(|_| ())? };
+    let header_len = tcp.data_offset();
+    if header_len < core::mem::size_of::<TcpHeader>() || data + l4_offset + header_len > data_end {
+        return Err(());
+    }
+    Ok(tcp)
+}
+
 /// Parse one TCP or UDP header so the dataplane can build its flow key.
 fn parse_ports(
     data: usize,
@@ -284,7 +335,7 @@ fn parse_ports(
     proto: u8,
 ) -> Result<(u16, u16), ()> {
     if proto == IPPROTO_TCP {
-        let tcp: TcpHeader = unsafe { net::read_at(data, data_end, l4_offset).map_err(|_| ())? };
+        let tcp = read_tcp_header(data, data_end, l4_offset)?;
         return Ok((tcp.source, tcp.dest));
     }
     if proto == IPPROTO_UDP {
@@ -294,12 +345,79 @@ fn parse_ports(
     Err(())
 }
 
+/// Return the TCP flags byte for the current packet, or zero for UDP packets.
+///
+/// UDP flows do not have per-packet handshake flags, so the conntrack state machine treats zero
+/// as "not applicable" and only branches on flags for TCP packets.
+fn parse_tcp_flags(data: usize, data_end: usize, l4_offset: usize, proto: u8) -> Result<u8, ()> {
+    if proto == IPPROTO_TCP {
+        return Ok(read_tcp_header(data, data_end, l4_offset)?.flags());
+    }
+    Ok(0)
+}
+
 /// Return the TCP or UDP checksum field offset within the transport header.
 fn l4_checksum_offset(proto: u8) -> usize {
     if proto == IPPROTO_TCP {
         16
     } else {
         6
+    }
+}
+
+/// Derive the backend-to-client reverse key for one cached client-to-VIP flow.
+///
+/// The forward and reverse maps share the same conntrack metadata, so bridge ingress can refresh
+/// or retire both directions together after it chooses a backend for a client flow.
+fn reverse_key_from_forward_flow(flow: &Flow4, backend_ip: u32) -> Flow4 {
+    Flow4 {
+        src: backend_ip,
+        dst: flow.src,
+        src_port: flow.dst_port,
+        dst_port: flow.src_port,
+        proto: flow.proto,
+        pad: 0,
+        padding: [0u8; 2],
+    }
+}
+
+/// Reconstruct the client-to-VIP key that pairs with one reverse cache entry.
+///
+/// Same-node return traffic hits bridge ingress first, so that hook needs to find and refresh the
+/// forward cache entry even though the packet it is currently processing is already on the reverse
+/// backend-to-client direction.
+fn forward_key_from_reverse_flow(reverse_key: &Flow4, vip: u32) -> Flow4 {
+    Flow4 {
+        src: reverse_key.dst,
+        dst: vip,
+        src_port: reverse_key.dst_port,
+        dst_port: reverse_key.src_port,
+        proto: reverse_key.proto,
+        pad: 0,
+        padding: [0u8; 2],
+    }
+}
+
+/// Persist matching forward and reverse cache entries after one conntrack update.
+///
+/// Overlay ingress owns both maps, so it keeps the shared conntrack metadata aligned across both
+/// directions whenever a packet refreshes or advances the flow lifecycle.
+fn persist_flow_pair(forward_key: &Flow4, reverse_key: &Flow4, entry: &NatEntry) -> Result<(), ()> {
+    unsafe {
+        LB_FWD.insert(forward_key, entry, 0).map_err(|_| ())?;
+        LB_REV.insert(reverse_key, entry, 0).map_err(|_| ())?;
+    }
+    Ok(())
+}
+
+/// Best-effort remove both directions of one cached flow pair.
+///
+/// Connection teardown should retire both NAT entries, but cleanup must not fail the current
+/// packet if one side was already evicted by the LRU map.
+fn remove_flow_pair(forward_key: &Flow4, reverse_key: &Flow4) {
+    unsafe {
+        let _ = LB_FWD.remove(forward_key);
+        let _ = LB_REV.remove(reverse_key);
     }
 }
 
