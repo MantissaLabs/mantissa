@@ -13,7 +13,7 @@ use aya_ebpf::{
 };
 use network_ebpf::{
     lb::{Flow6, NatEntry6},
-    net::{self, EthernetHeader, Ipv6Header, UdpHeader},
+    net::{self, EthernetHeader, Ipv6Header, TcpHeader, UdpHeader},
     stats::{self, PacketStats},
 };
 
@@ -101,7 +101,11 @@ fn parse_ports(
     l4_offset: usize,
     proto: u8,
 ) -> Result<(u16, u16), ()> {
-    if proto == IPPROTO_TCP || proto == IPPROTO_UDP {
+    if proto == IPPROTO_TCP {
+        let tcp: TcpHeader = unsafe { net::read_at(data, data_end, l4_offset).map_err(|_| ())? };
+        return Ok((tcp.source, tcp.dest));
+    }
+    if proto == IPPROTO_UDP {
         let udp: UdpHeader = unsafe { net::read_at(data, data_end, l4_offset).map_err(|_| ())? };
         return Ok((udp.source, udp.dest));
     }

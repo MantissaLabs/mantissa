@@ -333,13 +333,27 @@ mod platform {
     }
     unsafe impl Pod for Flow6 {}
 
-    #[repr(C, packed)]
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct ConntrackMetadata {
+        last_seen_ns: u64,
+        protocol: u8,
+        state: u8,
+        flags: u8,
+        _pad: [u8; 5],
+    }
+    unsafe impl Pod for ConntrackMetadata {}
+
+    #[repr(C)]
     #[derive(Clone, Copy, Default)]
     struct NatEntry {
         vip: u32,
         vip_mac: [u8; 6],
+        _pad0: [u8; 2],
         backend_ip: u32,
         backend_mac: [u8; 6],
+        _pad1: [u8; 2],
+        conntrack: ConntrackMetadata,
     }
     unsafe impl Pod for NatEntry {}
 
@@ -352,6 +366,7 @@ mod platform {
         backend_ip: [u8; 16],
         backend_mac: [u8; 6],
         _pad1: [u8; 2],
+        conntrack: ConntrackMetadata,
     }
     unsafe impl Pod for NatEntry6 {}
 

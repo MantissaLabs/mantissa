@@ -13,11 +13,12 @@ use aya_ebpf::{
 };
 use network_ebpf::{
     lb::{
-        Backend6, Flow6, NatEntry6, VipBackendKey6, VipEntry, VipKey6, MAX_BACKENDS_PER_VIP,
-        MAX_VIPS,
+        Backend6, ConntrackMetadata, Flow6, NatEntry6, VipBackendKey6, VipEntry, VipKey6,
+        MAX_BACKENDS_PER_VIP, MAX_VIPS,
     },
     net::{
-        self, EthernetHeader, Icmpv6NeighborMessage, Icmpv6NeighborTarget, Ipv6Header, UdpHeader,
+        self, EthernetHeader, Icmpv6NeighborMessage, Icmpv6NeighborTarget, Ipv6Header, TcpHeader,
+        UdpHeader,
     },
     stats::{self, PacketStats},
 };
@@ -244,6 +245,7 @@ fn select_backend_v6(flow: &Flow6, vip: [u8; 16]) -> Option<NatEntry6> {
         backend_ip: backend.ip,
         backend_mac: backend.mac,
         _pad1: [0u8; 2],
+        conntrack: ConntrackMetadata::untracked(flow.proto),
     })
 }
 
@@ -285,7 +287,11 @@ fn parse_ports(
     l4_offset: usize,
     proto: u8,
 ) -> Result<(u16, u16), ()> {
-    if proto == IPPROTO_TCP || proto == IPPROTO_UDP {
+    if proto == IPPROTO_TCP {
+        let tcp: TcpHeader = unsafe { net::read_at(data, data_end, l4_offset).map_err(|_| ())? };
+        return Ok((tcp.source, tcp.dest));
+    }
+    if proto == IPPROTO_UDP {
         let udp: UdpHeader = unsafe { net::read_at(data, data_end, l4_offset).map_err(|_| ())? };
         return Ok((udp.source, udp.dest));
     }

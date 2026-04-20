@@ -78,6 +78,11 @@ pub mod stats {
 pub mod net {
     use core::{mem, ptr};
 
+    pub const TCP_FLAG_FIN: u8 = 0x01;
+    pub const TCP_FLAG_SYN: u8 = 0x02;
+    pub const TCP_FLAG_RST: u8 = 0x04;
+    pub const TCP_FLAG_ACK: u8 = 0x10;
+
     #[repr(C, packed)]
     #[derive(Clone, Copy)]
     pub struct EthernetHeader {
@@ -227,6 +232,90 @@ pub mod net {
         pub target: [u8; 16],
     }
 
+    /// Fixed TCP header prefix used by the dataplane to extract ports and connection flags.
+    ///
+    /// Mantissa only needs the stable fields that exist before any TCP options. Keeping the
+    /// shared parser here lets the overlay and NodePort classifiers agree on how TCP handshake
+    /// packets are identified before conntrack rules become stricter.
+    #[repr(C, packed)]
+    #[derive(Clone, Copy)]
+    pub struct TcpHeader {
+        pub source: u16,
+        pub dest: u16,
+        pub seq: u32,
+        pub ack_seq: u32,
+        pub data_offset_reserved: u8,
+        pub flags: u8,
+        pub window: u16,
+        pub check: u16,
+        pub urg_ptr: u16,
+    }
+
+    impl TcpHeader {
+        /// Return the full TCP header length in bytes, including any options.
+        ///
+        /// Later conntrack hardening needs this to reject malformed packets and to distinguish a
+        /// plain SYN from packets that already carry payload or option space.
+        #[inline(always)]
+        pub fn data_offset(&self) -> usize {
+            ((self.data_offset_reserved >> 4) as usize) * 4
+        }
+
+        /// Return the raw TCP flags byte as it appears on the wire.
+        ///
+        /// The classifiers store ports in on-wire byte order inside flow keys, so flag inspection
+        /// must avoid any other transformation beyond exposing this stable byte.
+        #[inline(always)]
+        pub fn flags(&self) -> u8 {
+            self.flags
+        }
+
+        /// Report whether the TCP packet carries the SYN flag.
+        ///
+        /// SYN detection is the minimal building block for later gating flow creation on a valid
+        /// first packet instead of any arbitrary tuple hit.
+        #[inline(always)]
+        pub fn is_syn(&self) -> bool {
+            self.flags() & TCP_FLAG_SYN != 0
+        }
+
+        /// Report whether the TCP packet carries the ACK flag.
+        ///
+        /// Handshake validation needs ACK visibility so stray ACKs do not create new conntrack
+        /// state in a later hardening step.
+        #[inline(always)]
+        pub fn is_ack(&self) -> bool {
+            self.flags() & TCP_FLAG_ACK != 0
+        }
+
+        /// Report whether the TCP packet carries the FIN flag.
+        ///
+        /// FIN tracking is the simplest way to bound how long closed flows remain in the reverse
+        /// translation cache once teardown handling is added.
+        #[inline(always)]
+        pub fn is_fin(&self) -> bool {
+            self.flags() & TCP_FLAG_FIN != 0
+        }
+
+        /// Report whether the TCP packet carries the RST flag.
+        ///
+        /// Reset detection lets later conntrack rules tear down state immediately when an endpoint
+        /// aborts the connection instead of waiting for generic aging.
+        #[inline(always)]
+        pub fn is_rst(&self) -> bool {
+            self.flags() & TCP_FLAG_RST != 0
+        }
+
+        /// Report whether the packet is a plain SYN without ACK, FIN, or RST.
+        ///
+        /// Mantissa's first conntrack hardening pass will use this to restrict TCP flow creation
+        /// to valid opening packets without implementing a full kernel-style state machine.
+        #[inline(always)]
+        pub fn is_syn_only(&self) -> bool {
+            self.is_syn() && !self.is_ack() && !self.is_fin() && !self.is_rst()
+        }
+    }
+
     #[repr(C, packed)]
     #[derive(Clone, Copy)]
     pub struct UdpHeader {
@@ -324,6 +413,20 @@ pub mod lb {
     pub const MAX_BACKENDS_PER_VIP: usize = 1024;
     /// Maximum number of VIPs tracked in LB maps.
     pub const MAX_VIPS: usize = 4096;
+    /// Conntrack state value used before a flow has been classified beyond its protocol number.
+    pub const CONNTRACK_STATE_UNTRACKED: u8 = 0;
+    /// Conntrack state value used for one active UDP flow.
+    pub const CONNTRACK_STATE_UDP_ACTIVE: u8 = 1;
+    /// Conntrack state value used for a TCP flow after the opening SYN is accepted.
+    pub const CONNTRACK_STATE_TCP_SYN_SENT: u8 = 2;
+    /// Conntrack state value used once a TCP flow has seen valid bidirectional traffic.
+    pub const CONNTRACK_STATE_TCP_ESTABLISHED: u8 = 3;
+    /// Conntrack state value used after FIN has started TCP teardown.
+    pub const CONNTRACK_STATE_TCP_FIN_WAIT: u8 = 4;
+    /// Conntrack state value used once a flow should be considered closed.
+    pub const CONNTRACK_STATE_TCP_CLOSED: u8 = 5;
+    /// Flag bit that marks one cached NAT flow as ready for aggressive teardown.
+    pub const CONNTRACK_FLAG_TERMINATING: u8 = 0x01;
 
     /// Key for VIP-backed routing decisions stored in eBPF maps.
     #[repr(C)]
@@ -412,14 +515,89 @@ pub mod lb {
         pub padding: [u8; 3],
     }
 
+    /// Per-flow conntrack metadata stored next to each NAT translation entry.
+    ///
+    /// The dataplane currently only needs a small amount of state: protocol identity, a minimal
+    /// TCP/UDP lifecycle marker, one teardown bit, and the last observed activity timestamp. By
+    /// reserving that layout now, later hardening can tighten flow validation without another map
+    /// value migration.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct ConntrackMetadata {
+        pub last_seen_ns: u64,
+        pub protocol: u8,
+        pub state: u8,
+        pub flags: u8,
+        pub _pad: [u8; 5],
+    }
+
+    impl ConntrackMetadata {
+        /// Build the default metadata for a freshly selected backend mapping.
+        ///
+        /// New flow selections initially only know the transport protocol. Later classifiers
+        /// refine the state after inspecting the first packet and recording a dataplane timestamp.
+        #[inline(always)]
+        pub const fn untracked(protocol: u8) -> Self {
+            Self {
+                last_seen_ns: 0,
+                protocol,
+                state: CONNTRACK_STATE_UNTRACKED,
+                flags: 0,
+                _pad: [0u8; 5],
+            }
+        }
+
+        /// Return a copy of the metadata with an updated protocol-specific conntrack state.
+        ///
+        /// This keeps later state transitions explicit and side-effect free while the dataplane
+        /// still stores the value inline inside map entries.
+        #[inline(always)]
+        pub const fn with_state(mut self, state: u8) -> Self {
+            self.state = state;
+            self
+        }
+
+        /// Return a copy of the metadata with a refreshed last-seen timestamp.
+        ///
+        /// Aging logic for UDP and closed TCP flows will use this field instead of relying solely
+        /// on opaque LRU eviction behavior.
+        #[inline(always)]
+        pub const fn with_last_seen_ns(mut self, last_seen_ns: u64) -> Self {
+            self.last_seen_ns = last_seen_ns;
+            self
+        }
+
+        /// Return a copy of the metadata with the teardown marker enabled.
+        ///
+        /// Later flow cleanup can use this bit to distinguish actively closing flows from normal
+        /// steady-state traffic without expanding the state enum further.
+        #[inline(always)]
+        pub const fn mark_terminating(mut self) -> Self {
+            self.flags |= CONNTRACK_FLAG_TERMINATING;
+            self
+        }
+
+        /// Report whether the flow has already been marked for teardown.
+        ///
+        /// Egress validation and cleanup paths can use this to avoid rewriting packets that belong
+        /// to a connection the dataplane has already decided to retire.
+        #[inline(always)]
+        pub const fn is_terminating(&self) -> bool {
+            self.flags & CONNTRACK_FLAG_TERMINATING != 0
+        }
+    }
+
     /// Cached per-flow translation data shared between ingress/egress hooks.
-    #[repr(C, packed)]
+    #[repr(C)]
     #[derive(Clone, Copy)]
     pub struct NatEntry {
         pub vip: u32,
         pub vip_mac: [u8; 6],
+        pub _pad0: [u8; 2],
         pub backend_ip: u32,
         pub backend_mac: [u8; 6],
+        pub _pad1: [u8; 2],
+        pub conntrack: ConntrackMetadata,
     }
 
     /// Cached per-flow IPv6 translation data shared between ingress and egress hooks.
@@ -432,5 +610,71 @@ pub mod lb {
         pub backend_ip: [u8; 16],
         pub backend_mac: [u8; 6],
         pub _pad1: [u8; 2],
+        pub conntrack: ConntrackMetadata,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        lb::{ConntrackMetadata, CONNTRACK_FLAG_TERMINATING, CONNTRACK_STATE_TCP_SYN_SENT},
+        net::{TcpHeader, TCP_FLAG_ACK, TCP_FLAG_SYN},
+    };
+
+    #[test]
+    fn tcp_header_reports_syn_only_packets() {
+        let syn = TcpHeader {
+            source: 1234u16.to_be(),
+            dest: 80u16.to_be(),
+            seq: 0,
+            ack_seq: 0,
+            data_offset_reserved: 5 << 4,
+            flags: TCP_FLAG_SYN,
+            window: 0,
+            check: 0,
+            urg_ptr: 0,
+        };
+
+        assert_eq!(syn.data_offset(), 20);
+        assert!(syn.is_syn());
+        assert!(!syn.is_ack());
+        assert!(syn.is_syn_only());
+    }
+
+    #[test]
+    fn tcp_header_reports_acknowledged_syn_packets() {
+        let syn_ack = TcpHeader {
+            source: 80u16.to_be(),
+            dest: 1234u16.to_be(),
+            seq: 0,
+            ack_seq: 0,
+            data_offset_reserved: 6 << 4,
+            flags: TCP_FLAG_SYN | TCP_FLAG_ACK,
+            window: 0,
+            check: 0,
+            urg_ptr: 0,
+        };
+
+        assert_eq!(syn_ack.data_offset(), 24);
+        assert!(syn_ack.is_syn());
+        assert!(syn_ack.is_ack());
+        assert!(!syn_ack.is_syn_only());
+    }
+
+    #[test]
+    fn conntrack_metadata_records_state_and_teardown() {
+        let metadata = ConntrackMetadata::untracked(6)
+            .with_state(CONNTRACK_STATE_TCP_SYN_SENT)
+            .with_last_seen_ns(42)
+            .mark_terminating();
+
+        assert_eq!(metadata.protocol, 6);
+        assert_eq!(metadata.state, CONNTRACK_STATE_TCP_SYN_SENT);
+        assert_eq!(metadata.last_seen_ns, 42);
+        assert_eq!(
+            metadata.flags & CONNTRACK_FLAG_TERMINATING,
+            CONNTRACK_FLAG_TERMINATING
+        );
+        assert!(metadata.is_terminating());
     }
 }
