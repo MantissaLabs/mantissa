@@ -200,6 +200,9 @@ struct NodePortInfo {
 
   sourceMode @16 :Text;
   # Source-address contract currently enforced for published NodePort traffic.
+
+  identitySource @17 :Text;
+  # Why the current NodePort publication identity was selected.
 }
 
 struct PacketCounters {

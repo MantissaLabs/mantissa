@@ -135,12 +135,41 @@ pub struct NodePortFlowDiagnostics {
     pub invalid_conntrack_transitions: u64,
 }
 
+/// Why the current NodePort publication identity was chosen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodePortIdentitySource {
+    NodePortIp,
+    AdvertiseAddr,
+    InterfaceAddress,
+    UnsafeAutodetect,
+}
+
+impl NodePortIdentitySource {
+    /// Render one stable source label for diagnostics and operator-facing status output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NodePortIp => "nodeport_ip",
+            Self::AdvertiseAddr => "advertise_addr",
+            Self::InterfaceAddress => "iface_address",
+            Self::UnsafeAutodetect => "unsafe_autodetect",
+        }
+    }
+}
+
+impl std::fmt::Display for NodePortIdentitySource {
+    /// Render the chosen NodePort identity source as stable text for logs and RPC output.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Snapshot of node-local nodeport capability and resolved external identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodePortStatus {
     pub desired_enabled: bool,
     pub state: NodePortRuntimeState,
     pub source_mode: crate::config::NodePortSourceMode,
+    pub identity_source: Option<NodePortIdentitySource>,
     pub resolved_iface: Option<String>,
     pub resolved_node_ip: Option<IpAddr>,
     pub active_networks: usize,
@@ -189,6 +218,22 @@ fn configured_node_ip_from_sources(
     advertise_addr: Option<&str>,
 ) -> Option<IpAddr> {
     configured_node_ip.or_else(|| advertise_addr.and_then(resolve_advertise_ip))
+}
+
+/// # Description:
+///
+/// Identify which explicit configuration source currently supplies the NodePort publication IP.
+fn configured_node_ip_source(
+    configured_node_ip: Option<IpAddr>,
+    advertise_addr: Option<&str>,
+) -> Option<NodePortIdentitySource> {
+    if configured_node_ip.is_some() {
+        return Some(NodePortIdentitySource::NodePortIp);
+    }
+    if advertise_addr.and_then(resolve_advertise_ip).is_some() {
+        return Some(NodePortIdentitySource::AdvertiseAddr);
+    }
+    None
 }
 
 /// # Description:
@@ -313,6 +358,7 @@ impl PlatformNodePortManager {
             desired_enabled: false,
             state: NodePortRuntimeState::Disabled,
             source_mode: crate::config::nodeport_source_mode(),
+            identity_source: None,
             resolved_iface: None,
             resolved_node_ip: None,
             active_networks: 0,
@@ -336,11 +382,11 @@ mod platform {
     use super::{
         NODEPORT_FLOW_CLEAR_INDEX, NODEPORT_FLOW_CREATE_INDEX, NODEPORT_FLOW_EVENT_COUNT,
         NODEPORT_INGRESS_DROP_REASON_COUNT, NODEPORT_INVALID_TRANSITION_INDEX,
-        NODEPORT_REVERSE_MISS_INDEX, NodePortFlowDiagnostics, NodePortIngressDropReasons,
-        NodePortMapCapacities, NodePortMapping, NodePortPacketCounters, NodePortProtocol,
-        NodePortRuntimeState, NodePortStatus, configured_node_ip_from_sources,
-        estimated_flow_evictions, nodeport_capacity_error, projected_active_networks_after_sync,
-        resolve_advertise_ip,
+        NODEPORT_REVERSE_MISS_INDEX, NodePortFlowDiagnostics, NodePortIdentitySource,
+        NodePortIngressDropReasons, NodePortMapCapacities, NodePortMapping, NodePortPacketCounters,
+        NodePortProtocol, NodePortRuntimeState, NodePortStatus, configured_node_ip_from_sources,
+        configured_node_ip_source, estimated_flow_evictions, nodeport_capacity_error,
+        projected_active_networks_after_sync, resolve_advertise_ip,
     };
     use crate::config;
     use crate::ip_family::{IpFamily, infer_default_ip_family};
@@ -643,9 +689,11 @@ mod platform {
     pub(super) struct PlatformNodePortManager {
         desired_enabled: bool,
         source_mode: config::NodePortSourceMode,
+        unsafe_allow_autodetect: bool,
         configured_iface: Option<String>,
         configured_node_ip: Option<IpAddr>,
         configured_advertise_addr: Option<String>,
+        identity_source: Option<NodePortIdentitySource>,
         iface: Option<String>,
         node_ip: Option<IpAddr>,
         attached_iface: Option<String>,
@@ -665,6 +713,7 @@ mod platform {
         /// Capture nodeport configuration from the global config for later attachment.
         pub(super) fn new() -> Self {
             let source_mode = config::nodeport_source_mode();
+            let unsafe_allow_autodetect = config::nodeport_unsafe_allow_autodetect();
             let configured_iface = config::nodeport_iface();
             let configured_node_ip = config::nodeport_ip();
             let configured_advertise_addr = config::advertise_addr();
@@ -697,9 +746,11 @@ mod platform {
             let mut manager = Self {
                 desired_enabled,
                 source_mode,
+                unsafe_allow_autodetect,
                 configured_iface: configured_iface.clone(),
                 configured_node_ip,
                 configured_advertise_addr,
+                identity_source: None,
                 iface: configured_iface,
                 node_ip: configured_node_ip,
                 attached_iface: None,
@@ -1121,6 +1172,7 @@ mod platform {
                 desired_enabled: self.desired_enabled,
                 state: self.runtime_state,
                 source_mode: self.source_mode,
+                identity_source: self.identity_source,
                 resolved_iface: self.iface.clone(),
                 resolved_node_ip: self.node_ip,
                 active_networks,
@@ -1212,6 +1264,7 @@ mod platform {
                         target: "network",
                         desired_enabled = current.desired_enabled,
                         state = ?current.state,
+                        identity_source = ?current.identity_source,
                         iface = ?current.resolved_iface,
                         node_ip = ?current.resolved_node_ip,
                         last_error = ?current.last_error,
@@ -1225,6 +1278,7 @@ mod platform {
                         target: "network",
                         desired_enabled = current.desired_enabled,
                         state = ?current.state,
+                        identity_source = ?current.identity_source,
                         iface = ?current.resolved_iface,
                         node_ip = ?current.resolved_node_ip,
                         active_networks = current.active_networks,
@@ -1237,6 +1291,7 @@ mod platform {
                         target: "network",
                         desired_enabled = current.desired_enabled,
                         state = ?current.state,
+                        identity_source = ?current.identity_source,
                         iface = ?current.resolved_iface,
                         node_ip = ?current.resolved_node_ip,
                         last_error = ?current.last_error,
@@ -1265,13 +1320,24 @@ mod platform {
             vip: IpAddr,
         ) -> Result<IpAddr> {
             let Some(iface) = self.iface.clone() else {
-                let error = "nodeport interface missing; set network.nodeport.iface or configure a reachable advertise address".to_string();
+                let error = if self.unsafe_allow_autodetect {
+                    "nodeport interface missing; set network.nodeport.iface or configure network.nodeport.ip / network.advertise_addr".to_string()
+                } else {
+                    "nodeport interface missing; set network.nodeport.iface, configure network.nodeport.ip / network.advertise_addr, or explicitly enable network.nodeport.unsafe_allow_autodetect for development".to_string()
+                };
                 self.degrade_runtime(error.clone(), "nodeport runtime degraded");
                 return Err(anyhow!(error));
             };
 
             if let Some(configured_ip) = self.configured_node_ip {
                 if NodePortIpFamily::from_ip(configured_ip) == family {
+                    if let Err(err) =
+                        ensure_iface_owns_ip(&iface, configured_ip, "network.nodeport.ip").await
+                    {
+                        let error = err.to_string();
+                        self.degrade_runtime(error.clone(), "nodeport runtime degraded");
+                        return Err(anyhow!(error));
+                    }
                     return Ok(configured_ip);
                 }
 
@@ -1291,6 +1357,13 @@ mod platform {
                 .and_then(resolve_advertise_ip)
                 .filter(|ip| NodePortIpFamily::from_ip(*ip) == family)
             {
+                if let Err(err) =
+                    ensure_iface_owns_ip(&iface, configured_ip, "network.advertise_addr").await
+                {
+                    let error = err.to_string();
+                    self.degrade_runtime(error.clone(), "nodeport runtime degraded");
+                    return Err(anyhow!(error));
+                }
                 return Ok(configured_ip);
             }
 
@@ -1334,11 +1407,18 @@ mod platform {
                 self.configured_node_ip,
                 self.configured_advertise_addr.as_deref(),
             );
+            self.identity_source = configured_node_ip_source(
+                self.configured_node_ip,
+                self.configured_advertise_addr.as_deref(),
+            );
             let preferred_family = Some(self.preferred_runtime_family());
 
             if let Some(iface) = self.iface.clone() {
                 if self.node_ip.is_none() {
                     self.node_ip = detect_iface_ip(&iface, preferred_family).await?;
+                    if self.node_ip.is_some() {
+                        self.identity_source = Some(NodePortIdentitySource::InterfaceAddress);
+                    }
                 }
                 return Ok(());
             }
@@ -1348,9 +1428,12 @@ mod platform {
                 return Ok(());
             }
 
-            if let Some((iface, ip)) = detect_default_iface(preferred_family).await? {
+            if self.unsafe_allow_autodetect
+                && let Some((iface, ip)) = detect_default_iface(preferred_family).await?
+            {
                 self.iface = Some(iface);
                 self.node_ip = Some(ip);
+                self.identity_source = Some(NodePortIdentitySource::UnsafeAutodetect);
             }
 
             Ok(())
@@ -1362,24 +1445,50 @@ mod platform {
 
             let Some(iface) = self.iface.clone() else {
                 self.degrade_runtime(
-                    "nodeport interface missing; set network.nodeport.iface or configure a reachable advertise address",
+                    if self.unsafe_allow_autodetect {
+                        "nodeport interface missing; set network.nodeport.iface or configure network.nodeport.ip / network.advertise_addr".to_string()
+                    } else {
+                        "nodeport interface missing; set network.nodeport.iface, configure network.nodeport.ip / network.advertise_addr, or explicitly enable network.nodeport.unsafe_allow_autodetect for development".to_string()
+                    },
                     "nodeport runtime degraded",
                 );
                 return Ok(false);
             };
-            if self.node_ip.is_none() {
+            let Some(node_ip) = self.node_ip else {
                 self.degrade_runtime(
                     format!(
-                        "nodeport address missing for interface {iface}; set network.nodeport.ip or a concrete advertise address"
+                        "nodeport address missing for interface {iface}; set network.nodeport.ip, set a concrete network.advertise_addr, or assign a usable address directly to the interface"
                     ),
+                    "nodeport runtime degraded",
+                );
+                return Ok(false);
+            };
+
+            if let Err(err) = ifindex(&iface) {
+                self.degrade_runtime(
+                    format!("nodeport interface {iface} is unavailable: {err:#}"),
                     "nodeport runtime degraded",
                 );
                 return Ok(false);
             }
 
-            if let Err(err) = ifindex(&iface) {
+            if let Err(err) = ensure_iface_owns_ip(
+                &iface,
+                node_ip,
+                match self.identity_source {
+                    Some(NodePortIdentitySource::NodePortIp) => "network.nodeport.ip",
+                    Some(NodePortIdentitySource::AdvertiseAddr) => "network.advertise_addr",
+                    Some(NodePortIdentitySource::InterfaceAddress) => "network.nodeport.iface",
+                    Some(NodePortIdentitySource::UnsafeAutodetect) => {
+                        "network.nodeport.unsafe_allow_autodetect"
+                    }
+                    None => "nodeport identity",
+                },
+            )
+            .await
+            {
                 self.degrade_runtime(
-                    format!("nodeport interface {iface} is unavailable: {err:#}"),
+                    format!("nodeport publication identity is inconsistent: {err:#}"),
                     "nodeport runtime degraded",
                 );
                 return Ok(false);
@@ -1604,6 +1713,46 @@ mod platform {
         })
     }
 
+    /// Check whether one specific interface currently owns the provided publication IP.
+    ///
+    /// This path is stricter than generic autodetect because it validates an explicit operator
+    /// choice in place, including loopback addresses used by the privileged test harness.
+    async fn iface_owns_ip(iface: &str, node_ip: IpAddr) -> Result<bool> {
+        let (conn, handle, _) = new_connection()
+            .context("open rtnetlink connection for nodeport interface address validation")?;
+        tokio::spawn(conn);
+
+        let Some(link) = handle
+            .link()
+            .get()
+            .match_name(iface.to_string())
+            .execute()
+            .try_next()
+            .await
+            .context("fetch nodeport interface for address validation")?
+        else {
+            return Ok(false);
+        };
+
+        let mut addr_stream = handle
+            .address()
+            .get()
+            .set_link_index_filter(link.header.index)
+            .execute();
+
+        while let Some(msg) = addr_stream
+            .try_next()
+            .await
+            .context("enumerate nodeport interface addresses for validation")?
+        {
+            if address_attrs_contain_ip(&msg.attributes, node_ip) {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
     /// Filter out addresses that should never become a published NodePort identity.
     fn is_usable_nodeport_ip(ip: IpAddr) -> bool {
         match ip {
@@ -1691,6 +1840,27 @@ mod platform {
         }
 
         Ok(None)
+    }
+
+    /// Confirm that the selected publication interface currently owns the requested NodePort IP.
+    ///
+    /// Explicit `network.nodeport.ip` and advertise-derived identities are only safe when the
+    /// chosen attach interface actually carries that address. Rejecting mismatches here prevents
+    /// NodePort from attaching to one interface while publishing an address that belongs to
+    /// another interface or is not assigned locally at all.
+    async fn ensure_iface_owns_ip(iface: &str, node_ip: IpAddr, source: &str) -> Result<()> {
+        if iface_owns_ip(iface, node_ip).await? {
+            return Ok(());
+        }
+
+        match detect_iface_for_ip(node_ip).await? {
+            Some(owner) => Err(anyhow!(
+                "{source} resolved {node_ip}, but interface {iface} does not own that address; it belongs to {owner}"
+            )),
+            None => Err(anyhow!(
+                "{source} resolved {node_ip}, but that address is not assigned to interface {iface}"
+            )),
+        }
     }
 
     /// Return one sample VIP per requested publication family so shared per-family state can be
@@ -2680,10 +2850,10 @@ mod tests {
     };
     use super::{
         NODEPORT_FLOW_CAPACITY, NODEPORT_HOST_CAPACITY, NODEPORT_VIP_CAPACITY,
-        NodePortFlowDiagnostics, NodePortMapCapacities, NodePortPacketCounters, NodePortProtocol,
-        NodePortRuntimeState, NodePortStatus, configured_node_ip_from_sources,
-        estimated_flow_evictions, nodeport_capacity_error, projected_active_networks_after_sync,
-        resolve_advertise_ip,
+        NodePortFlowDiagnostics, NodePortIdentitySource, NodePortMapCapacities,
+        NodePortPacketCounters, NodePortProtocol, NodePortRuntimeState, NodePortStatus,
+        configured_node_ip_from_sources, configured_node_ip_source, estimated_flow_evictions,
+        nodeport_capacity_error, projected_active_networks_after_sync, resolve_advertise_ip,
     };
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -2808,11 +2978,31 @@ mod tests {
     }
 
     #[test]
+    fn configured_node_ip_source_reports_explicit_override() {
+        assert_eq!(
+            configured_node_ip_source(
+                Some(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40))),
+                Some("192.168.10.4:6578")
+            ),
+            Some(NodePortIdentitySource::NodePortIp)
+        );
+    }
+
+    #[test]
+    fn configured_node_ip_source_reports_advertise_addr_fallback() {
+        assert_eq!(
+            configured_node_ip_source(None, Some("192.168.10.4:6578")),
+            Some(NodePortIdentitySource::AdvertiseAddr)
+        );
+    }
+
+    #[test]
     fn nodeport_status_tracks_active_counts() {
         let status = NodePortStatus {
             desired_enabled: true,
             state: NodePortRuntimeState::Pending,
             source_mode: crate::config::NodePortSourceMode::SnatHostAccess,
+            identity_source: Some(NodePortIdentitySource::NodePortIp),
             resolved_iface: Some("eth0".to_string()),
             resolved_node_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4))),
             active_networks: 2,
@@ -2847,6 +3037,10 @@ mod tests {
         assert_eq!(
             status.source_mode,
             crate::config::NodePortSourceMode::SnatHostAccess
+        );
+        assert_eq!(
+            status.identity_source,
+            Some(NodePortIdentitySource::NodePortIp)
         );
         assert_eq!(status.vip_capacity, NODEPORT_VIP_CAPACITY);
         assert_eq!(

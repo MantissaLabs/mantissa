@@ -156,13 +156,16 @@ template does not expose a more specific service port signal.
 
 - `network.nodeport.ip`
 - the IP component of `network.advertise_addr`
-- best-effort interface autodetection
+- the address already assigned to `network.nodeport.iface`
+- best-effort interface autodetection, but only when
+  `network.nodeport.unsafe_allow_autodetect = true`
 
-When neither explicit value is configured, Mantissa falls back to the first up,
-non-loopback interface that has a usable address in the preferred family. That
-autodetect path is intended as a development fallback. For production, set
+Mantissa now treats implicit interface picking as an explicit development
+escape hatch, not a normal production path. For production, set
 `network.nodeport.iface` explicitly and prefer an explicit
-`network.nodeport.ip` on multihomed, NATed, or policy-routed hosts.
+`network.nodeport.ip` on multihomed, NATed, or policy-routed hosts. If you
+reuse `network.advertise_addr`, the selected attach interface must actually own
+that address.
 
 Publication family and source-IP contract:
 
@@ -347,10 +350,10 @@ mantissa info
 ```
 
 The `NodePort:` section shows whether the runtime is `disabled`, `pending`,
-`ready`, or `degraded`, plus the resolved iface/IP, active port counts,
-capacity limits, packet counters, and flow diagnostics such as active flow
-pairs, reverse misses, invalid conntrack transitions, estimated evictions, and
-fragmented IPv4 ingress drops.
+`ready`, or `degraded`, plus the resolved iface/IP, identity source, active
+port counts, capacity limits, packet counters, and flow diagnostics such as
+active flow pairs, reverse misses, invalid conntrack transitions, estimated
+evictions, and fragmented IPv4 ingress drops.
 Those NodePort limits come from `network.nodeport.vip_capacity`,
 `network.nodeport.host_capacity`, and `network.nodeport.flow_capacity`.
 
@@ -474,9 +477,10 @@ Prerequisites: Linux host, kernel with XDP+TC and BPF enabled, and `bpf-linker` 
   reserving that endpoint.
 - Public reachability depends on node capability, routing, and operator-managed
   firewall policy.
-- Best-effort interface autodetect remains available for development, but
-  production nodes should set `network.nodeport.iface` explicitly and usually
-  set `network.nodeport.ip` as well.
+- Best-effort interface autodetect remains available only through
+  `network.nodeport.unsafe_allow_autodetect`, and production nodes should set
+  `network.nodeport.iface` explicitly and usually set `network.nodeport.ip` as
+  well.
 - Static sizing remains fixed for now: `MAX_VIPS = 4096`,
   `MAX_BACKENDS_PER_VIP = 1024`, and 1024-entry LRU flow caches in each
   direction for the overlay LB, plus the fixed NodePort capacities exposed by

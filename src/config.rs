@@ -145,6 +145,8 @@ pub struct NodePortConfig {
     #[serde(default)]
     pub ip: Option<String>,
     #[serde(default)]
+    pub unsafe_allow_autodetect: bool,
+    #[serde(default)]
     pub source_mode: NodePortSourceMode,
     #[serde(default = "default_nodeport_vip_capacity")]
     pub vip_capacity: usize,
@@ -163,6 +165,7 @@ impl Default for NodePortConfig {
             enabled: true,
             iface: None,
             ip: None,
+            unsafe_allow_autodetect: false,
             source_mode: NodePortSourceMode::default(),
             vip_capacity: default_nodeport_vip_capacity(),
             host_capacity: default_nodeport_host_capacity(),
@@ -516,6 +519,13 @@ pub fn nodeport_ip() -> Option<IpAddr> {
     let config = global_config();
     let raw = config.network.nodeport.ip?;
     raw.parse::<IpAddr>().ok()
+}
+
+/// # Description:
+///
+/// Resolve whether the operator explicitly allows unsafe NodePort autodetection for development.
+pub fn nodeport_unsafe_allow_autodetect() -> bool {
+    global_config().network.nodeport.unsafe_allow_autodetect
 }
 
 /// # Description:
@@ -1030,6 +1040,11 @@ impl Config {
             }
         }
 
+        if std::env::var_os("MANTISSA_NODEPORT_UNSAFE_ALLOW_AUTODETECT").is_some() {
+            self.network.nodeport.unsafe_allow_autodetect = true;
+            applied = true;
+        }
+
         if let Ok(raw) = std::env::var("MANTISSA_NODEPORT_SOURCE_MODE") {
             applied = true;
             match parse_nodeport_source_mode(raw.trim()) {
@@ -1171,6 +1186,12 @@ impl Config {
             && ip.parse::<IpAddr>().is_err()
         {
             anyhow::bail!("network.nodeport.ip must be a valid IP address (got '{ip}')");
+        }
+
+        if let Some(ref iface) = self.network.nodeport.iface
+            && iface.trim().is_empty()
+        {
+            anyhow::bail!("network.nodeport.iface cannot be empty");
         }
 
         if self.network.nodeport.source_mode == NodePortSourceMode::PreserveClient {
@@ -1467,6 +1488,11 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
         changes.push("network.nodeport.ip".to_string());
     }
 
+    if old.network.nodeport.unsafe_allow_autodetect != new.network.nodeport.unsafe_allow_autodetect
+    {
+        changes.push("network.nodeport.unsafe_allow_autodetect".to_string());
+    }
+
     if old.network.nodeport.source_mode != new.network.nodeport.source_mode {
         changes.push("network.nodeport.source_mode".to_string());
     }
@@ -1563,6 +1589,13 @@ mod tests {
     fn rejects_invalid_nodeport_ip() {
         let mut config = Config::default();
         config.network.nodeport.ip = Some("not-an-ip".to_string());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_empty_nodeport_iface() {
+        let mut config = Config::default();
+        config.network.nodeport.iface = Some("   ".to_string());
         assert!(config.validate().is_err());
     }
 
@@ -1679,6 +1712,7 @@ mod tests {
             std::env::set_var("MANTISSA_BPF_NO_ATTACH", "1");
             std::env::set_var("MANTISSA_BPF_OVERLAY_FLOW_CAPACITY", "4096");
             std::env::set_var("MANTISSA_NODEPORT_IFACE", "eth0");
+            std::env::set_var("MANTISSA_NODEPORT_UNSAFE_ALLOW_AUTODETECT", "1");
             std::env::set_var("MANTISSA_NODEPORT_SOURCE_MODE", "snat_host_access");
             std::env::set_var("MANTISSA_NODEPORT_VIP_CAPACITY", "2048");
             std::env::set_var("MANTISSA_NODEPORT_HOST_CAPACITY", "512");
@@ -1709,6 +1743,7 @@ mod tests {
         assert!(!config.network.nodeport.enabled);
         assert_eq!(config.network.bpf.overlay_flow_capacity, 4096);
         assert_eq!(config.network.nodeport.iface.as_deref(), Some("eth0"));
+        assert!(config.network.nodeport.unsafe_allow_autodetect);
         assert_eq!(
             config.network.nodeport.source_mode,
             NodePortSourceMode::SnatHostAccess
@@ -1750,6 +1785,7 @@ mod tests {
             std::env::remove_var("MANTISSA_BPF_NO_ATTACH");
             std::env::remove_var("MANTISSA_BPF_OVERLAY_FLOW_CAPACITY");
             std::env::remove_var("MANTISSA_NODEPORT_IFACE");
+            std::env::remove_var("MANTISSA_NODEPORT_UNSAFE_ALLOW_AUTODETECT");
             std::env::remove_var("MANTISSA_NODEPORT_SOURCE_MODE");
             std::env::remove_var("MANTISSA_NODEPORT_VIP_CAPACITY");
             std::env::remove_var("MANTISSA_NODEPORT_HOST_CAPACITY");
@@ -1868,6 +1904,20 @@ mod tests {
             changes
                 .iter()
                 .any(|change| change == "network.nodeport.source_mode")
+        );
+    }
+
+    #[test]
+    fn nodeport_unsafe_autodetect_change_requires_restart() {
+        let old = Config::default();
+        let mut new = Config::default();
+        new.network.nodeport.unsafe_allow_autodetect = true;
+
+        let changes = restart_required_changes(&old, &new);
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "network.nodeport.unsafe_allow_autodetect")
         );
     }
 }

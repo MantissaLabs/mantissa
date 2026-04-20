@@ -13,7 +13,7 @@ use common::privileged_networking::{
 };
 use futures::TryStreamExt;
 use mantissa::config::NodePortSourceMode;
-use mantissa::network::nodeport::NodePortRuntimeState;
+use mantissa::network::nodeport::{NodePortIdentitySource, NodePortRuntimeState};
 use mantissa::services::ServiceController;
 use mantissa::services::types::{
     ServicePortProtocol, ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceStatus,
@@ -633,6 +633,7 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
             let status = node.network_controller.nodeport_manager().status().await;
             status.state == NodePortRuntimeState::Ready
                 && status.source_mode == NodePortSourceMode::SnatHostAccess
+                && status.identity_source == Some(NodePortIdentitySource::NodePortIp)
                 && status.active_ports == 1
                 && status.active_host_networks == 1
                 && status.resolved_node_ip
@@ -934,6 +935,7 @@ local_test!(
             || async {
                 let status = node.network_controller.nodeport_manager().status().await;
                 status.state == NodePortRuntimeState::Ready
+                    && status.identity_source == Some(NodePortIdentitySource::NodePortIp)
                     && status.active_ports == 1
                     && status.active_host_networks == 1
                     && status.resolved_node_ip == Some(IpAddr::V6(loopback_ip))
@@ -2011,6 +2013,109 @@ local_test!(
             )
             .await,
             "degraded NodePort should not expose the public port on loopback"
+        );
+
+        remove_service_via_rpc(&node.services_client, service_id).await;
+        delete_privileged_network(&node, network_id).await;
+    }
+);
+
+local_test!(
+    nodeport_runtime_requires_explicit_identity_without_unsafe_autodetect,
+    {
+        let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
+            return;
+        };
+
+        let _config = PrivilegedTestGuard::apply(|config| {
+            config.network.wireguard.enabled = false;
+            config.network.wireguard.manage_firewall = false;
+            config.network.bpf.attach = true;
+            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            config.network.nodeport.enabled = true;
+            config.network.nodeport.iface = None;
+            config.network.nodeport.ip = None;
+            config.network.nodeport.unsafe_allow_autodetect = false;
+            config.network.advertise_addr = None;
+        });
+        let node = create_privileged_node().await;
+        let subnet = privileged_test_subnet();
+        let network = create_privileged_network(
+            &node,
+            privileged_test_network(
+                "nodeport-identity-required",
+                "privileged nodeport identity validation test network",
+                &subnet,
+                1450,
+                Vec::new(),
+            ),
+            mantissa::network::types::NetworkStatus::Ready,
+        )
+        .await;
+        let network_id = network.id;
+
+        let service_id = deploy_privileged_nodeport_service(
+            &node.service_controller,
+            "nodeport-identity-required",
+            network_id,
+            NODEPORT_DEGRADED_RESPONSE,
+            NODEPORT_HTTP_PORT,
+            NODEPORT_HTTP_PORT,
+        )
+        .await
+        .expect("submit explicit-identity NodePort deployment");
+
+        assert!(
+            wait_for_service_status(
+                &node.service_controller,
+                service_id,
+                ServiceStatus::Running,
+                Duration::from_secs(180),
+            )
+            .await,
+            "service should still reach running even when public exposure is rejected"
+        );
+
+        assert!(
+            wait_until(
+                Duration::from_secs(60),
+                Duration::from_millis(100),
+                || async {
+                    let status = node.network_controller.nodeport_manager().status().await;
+                    let service = node
+                        .service_controller
+                        .registry()
+                        .get(service_id)
+                        .expect("read explicit-identity degraded public service")
+                        .expect("explicit-identity degraded public service should still exist");
+                    status.state == NodePortRuntimeState::Degraded
+                        && status.identity_source.is_none()
+                        && status.last_error.as_deref().is_some_and(|error| {
+                            error.contains("unsafe_allow_autodetect")
+                                && error.contains("network.nodeport.iface")
+                        })
+                        && service.public_endpoint_detail().is_some_and(|detail| {
+                            detail.contains("could not publish NodePort")
+                                && detail.contains("unsafe_allow_autodetect")
+                        })
+                }
+            )
+            .await,
+            "missing explicit NodePort identity should degrade publication with a precise operator-facing error"
+        );
+
+        assert!(
+            wait_until(
+                Duration::from_secs(10),
+                Duration::from_millis(100),
+                || async {
+                    TcpStream::connect(format!("127.0.0.1:{NODEPORT_HTTP_PORT}"))
+                        .await
+                        .is_err()
+                }
+            )
+            .await,
+            "rejected NodePort identity selection should not expose the public port"
         );
 
         remove_service_via_rpc(&node.services_client, service_id).await;

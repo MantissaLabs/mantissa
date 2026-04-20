@@ -190,6 +190,11 @@ impl node::Server for Node {
                     nodeport.set_state(state);
                     let source_mode = status.source_mode.to_string();
                     nodeport.set_source_mode(source_mode);
+                    let identity_source = status
+                        .identity_source
+                        .map(|source| source.to_string())
+                        .unwrap_or_default();
+                    nodeport.set_identity_source(&identity_source);
                     nodeport.set_resolved_iface(status.resolved_iface.as_deref().unwrap_or(""));
                     let resolved_node_ip = status
                         .resolved_node_ip
@@ -247,6 +252,7 @@ impl node::Server for Node {
                 } else {
                     nodeport.set_state("unavailable");
                     nodeport.set_source_mode("");
+                    nodeport.set_identity_source("");
                     nodeport.set_last_error("nodeport manager not wired");
                     nodeport.reborrow().init_ingress();
                     nodeport.reborrow().init_ingress_drop_reasons();
