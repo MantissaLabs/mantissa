@@ -202,7 +202,10 @@ NodePort source mode and dataplane limits are reported in `mantissa info`.
   addresses and `::1` are not valid public identities.
 - `public_protocol` supports `tcp`, `udp`, and `tcp_udp`. If omitted, the
   default is `tcp`.
-- Fragmented IPv4 is not supported by the current datapath.
+- Fragmented IPv4 is not supported by the current datapath. Mantissa drops
+  published first fragments it can positively identify and reports those drops
+  in `mantissa info`; later fragments cannot be matched safely without
+  reassembly, so production traffic should still avoid fragmentation.
 - Mantissa does not currently translate ICMP errors for the VIP or NodePort NAT
   paths. Run published services on paths with correct MTU / PMTU behavior and
   avoid fragmentation.

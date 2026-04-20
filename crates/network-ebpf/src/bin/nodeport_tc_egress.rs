@@ -82,7 +82,7 @@ fn handle_ipv4_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
     let ip: *mut Ipv4Header =
         unsafe { net::mut_ptr_at(data, data_end, ip_offset).map_err(|_| ())? };
     let ip_hdr = unsafe { &mut *ip };
-    if ip_hdr.version() != 4 || ip_hdr.is_fragmented() {
+    if ip_hdr.version() != 4 {
         return Ok(false);
     }
     let ihl = ip_hdr.header_len();
@@ -93,6 +93,10 @@ fn handle_ipv4_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
     let l4_offset = ip_offset + ihl;
     let proto = ip_hdr.protocol;
     if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
+        return Ok(false);
+    }
+    let has_more_fragments = ip_hdr.has_more_fragments();
+    if ip_hdr.fragment_offset() != 0 {
         return Ok(false);
     }
 
@@ -113,6 +117,9 @@ fn handle_ipv4_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
         record_flow_event(FLOW_EVENT_REVERSE_MISS);
         return Ok(false);
     };
+    if has_more_fragments {
+        return Err(());
+    }
     let forward_key = forward_key_from_reverse_flow(&reverse_key);
     let remove_after_rewrite = match entry.conntrack.advance_reverse(tcp_flags, now_ns) {
         ConntrackVerdict::Reject => {

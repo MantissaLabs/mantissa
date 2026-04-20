@@ -22,6 +22,7 @@ use mantissa::services::types::{
 use mantissa::workload::types::ExecutionSpec;
 use protocol::services::services;
 use rtnetlink::packet_route::address::AddressAttribute;
+use std::mem;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Stdio;
 use std::time::Duration;
@@ -384,6 +385,101 @@ fn nodeport_ipv4_flow_counts() -> (usize, usize) {
         count_nodeport_map_entries("NODEPORT_FWD"),
         count_nodeport_map_entries("NODEPORT_REV"),
     )
+}
+
+/// Compute the IPv4 header checksum for one synthetic raw packet used in privileged fragment tests.
+fn ipv4_header_checksum(header: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for chunk in header.chunks_exact(2) {
+        sum = sum.saturating_add(u16::from_be_bytes([chunk[0], chunk[1]]) as u32);
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Inject one synthetic first IPv4 fragment into loopback so the NodePort tc ingress program can
+/// prove it rejects published fragmented traffic before any flow state is created.
+fn send_udp_first_fragment_v4(
+    iface: &str,
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    udp_payload_prefix: &[u8],
+) -> anyhow::Result<()> {
+    let total_len = (20 + 8 + udp_payload_prefix.len()) as u16;
+    let reported_udp_len = (8 + udp_payload_prefix.len() + 8) as u16;
+    let mut packet = vec![0u8; total_len as usize];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&total_len.to_be_bytes());
+    packet[4..6].copy_from_slice(&0x4242u16.to_be_bytes());
+    packet[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+    packet[8] = 64;
+    packet[9] = libc::IPPROTO_UDP as u8;
+    packet[12..16].copy_from_slice(&src.octets());
+    packet[16..20].copy_from_slice(&dst.octets());
+    let checksum = ipv4_header_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+    packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+    packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+    packet[24..26].copy_from_slice(&reported_udp_len.to_be_bytes());
+    packet[28..].copy_from_slice(udp_payload_prefix);
+
+    let ifindex = unsafe { libc::if_nametoindex(format!("{iface}\0").as_ptr().cast()) };
+    if ifindex == 0 {
+        anyhow::bail!(
+            "resolve loopback ifindex for fragmented NodePort test: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_DGRAM,
+            (libc::ETH_P_IP as u16).to_be() as i32,
+        )
+    };
+    if fd < 0 {
+        anyhow::bail!(
+            "open packet socket for fragmented NodePort test: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let mut addr: libc::sockaddr_ll = unsafe { mem::zeroed() };
+    addr.sll_family = libc::AF_PACKET as u16;
+    addr.sll_protocol = (libc::ETH_P_IP as u16).to_be();
+    addr.sll_ifindex = ifindex as i32;
+
+    let sent = unsafe {
+        libc::sendto(
+            fd,
+            packet.as_ptr().cast(),
+            packet.len(),
+            0,
+            (&addr as *const libc::sockaddr_ll).cast(),
+            mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        )
+    };
+    let close_result = unsafe { libc::close(fd) };
+
+    if sent < 0 {
+        anyhow::bail!(
+            "send fragmented NodePort first fragment: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    if close_result < 0 {
+        anyhow::bail!(
+            "close raw IPv4 socket for fragmented NodePort test: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    Ok(())
 }
 
 /// Keeps one temporary IPv6 address assigned to `lo` for the lifetime of a privileged test.
@@ -1440,6 +1536,123 @@ local_test!(nodeport_small_flow_capacity_reports_estimated_evictions, {
     remove_service_via_rpc(&node.services_client, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
+
+local_test!(
+    nodeport_fragmented_ipv4_first_fragment_is_dropped_and_reported,
+    {
+        let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
+            return;
+        };
+
+        let _config = PrivilegedTestGuard::apply(|config| {
+            config.network.wireguard.enabled = false;
+            config.network.wireguard.manage_firewall = false;
+            config.network.bpf.attach = true;
+            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            config.network.nodeport.enabled = true;
+            config.network.nodeport.iface = Some("lo".to_string());
+            config.network.nodeport.ip = Some("127.0.0.1".to_string());
+            config.network.nodeport.source_mode = NodePortSourceMode::SnatHostAccess;
+            config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+        });
+        let node = create_privileged_node().await;
+        let subnet = privileged_test_subnet();
+        let network = create_privileged_network(
+            &node,
+            privileged_test_network(
+                "nodeport-fragment-drop",
+                "privileged nodeport fragmented IPv4 drop test network",
+                &subnet,
+                1450,
+                Vec::new(),
+            ),
+            mantissa::network::types::NetworkStatus::Ready,
+        )
+        .await;
+        let network_id = network.id;
+
+        let service_id = deploy_privileged_nodeport_udp_service(
+            &node.service_controller,
+            "nodeport-fragment-drop",
+            network_id,
+            NODEPORT_UDP_PORT,
+            NODEPORT_UDP_PORT,
+        )
+        .await
+        .expect("submit fragmented IPv4 NodePort UDP deployment");
+
+        assert!(
+            wait_for_service_status(
+                &node.service_controller,
+                service_id,
+                ServiceStatus::Running,
+                Duration::from_secs(180),
+            )
+            .await,
+            "fragmented IPv4 drop test should reach running state before injecting traffic"
+        );
+
+        assert!(
+            wait_until(
+                Duration::from_secs(60),
+                Duration::from_millis(100),
+                || async {
+                    let status = node.network_controller.nodeport_manager().status().await;
+                    status.state == NodePortRuntimeState::Ready && status.active_ports == 1
+                }
+            )
+            .await,
+            "fragmented IPv4 drop test should expose one ready published port"
+        );
+
+        let fragment_reported = wait_until(
+            Duration::from_secs(30),
+            Duration::from_millis(100),
+            || async {
+                send_udp_first_fragment_v4(
+                    "lo",
+                    Ipv4Addr::LOCALHOST,
+                    Ipv4Addr::LOCALHOST,
+                    39_500,
+                    NODEPORT_UDP_PORT,
+                    b"mant",
+                )
+                .expect("inject fragmented IPv4 first fragment into NodePort");
+                let status = node.network_controller.nodeport_manager().status().await;
+                matches!(
+                    status.ingress_drop_reasons,
+                    Some(reasons) if reasons.fragmented_ipv4_packets >= 1
+                ) && nodeport_ipv4_flow_counts() == (0, 0)
+            },
+        )
+        .await;
+        if !fragment_reported {
+            let status = node.network_controller.nodeport_manager().status().await;
+            let forward_dump = dump_nodeport_map("NODEPORT_FWD");
+            let reverse_dump = dump_nodeport_map("NODEPORT_REV");
+            panic!(
+                "fragmented IPv4 first fragment should be dropped and reported without creating flow state; status={status:?}; forward_dump={forward_dump:?}; reverse_dump={reverse_dump:?}"
+            );
+        }
+
+        let addr = format!("127.0.0.1:{NODEPORT_UDP_PORT}");
+        let payload = NODEPORT_UDP_RESPONSE.as_bytes();
+        assert!(
+            wait_until(
+                Duration::from_secs(30),
+                Duration::from_millis(250),
+                || async {
+                    matches!(udp_echo(&addr, payload).await, Ok(response) if response == payload)
+                },
+            )
+            .await,
+            "fragmented IPv4 rejection should not break normal NodePort UDP traffic"
+        );
+
+        remove_service_via_rpc(&node.services_client, service_id).await;
+        delete_privileged_network(&node, network_id).await;
+    }
+);
 
 local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
     let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {

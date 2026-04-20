@@ -218,6 +218,8 @@ impl node::Server for Node {
                         ingress_drop_reasons.set_missing_host_entries(reasons.missing_host_entries);
                         ingress_drop_reasons.set_nat_insert_failures(reasons.nat_insert_failures);
                         ingress_drop_reasons.set_rewrite_failures(reasons.rewrite_failures);
+                        ingress_drop_reasons
+                            .set_fragmented_ipv4_packets(reasons.fragmented_ipv4_packets);
                     }
 
                     let mut egress = nodeport.reborrow().init_egress();

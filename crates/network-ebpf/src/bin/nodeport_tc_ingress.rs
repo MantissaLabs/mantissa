@@ -26,7 +26,7 @@ const ETH_P_IPV6: u16 = 0x86dd;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 const LOOPBACK_HDR_LEN: usize = 4;
-const NODEPORT_INGRESS_DROP_REASON_COUNT: u32 = 5;
+const NODEPORT_INGRESS_DROP_REASON_COUNT: u32 = 6;
 const NODEPORT_FLOW_EVENT_COUNT: u32 = 4;
 const FLOW_EVENT_CREATE: u32 = 0;
 const FLOW_EVENT_CLEAR: u32 = 1;
@@ -40,6 +40,7 @@ enum IngressDropReason {
     MissingHostEntry = 2,
     NatInsertFailure = 3,
     RewriteFailure = 4,
+    FragmentedIpv4Packets = 5,
 }
 
 #[derive(Clone, Copy)]
@@ -180,7 +181,7 @@ fn handle_ipv4_packet(
             .map_err(|_| IngressDropReason::InvalidIpv4Header)?
     };
     let ip_hdr = unsafe { &mut *ip };
-    if ip_hdr.version() != 4 || ip_hdr.is_fragmented() {
+    if ip_hdr.version() != 4 {
         return Ok(IngressOutcome::Ignored);
     }
     let ihl = ip_hdr.header_len();
@@ -191,6 +192,10 @@ fn handle_ipv4_packet(
     let l4_offset = ip_offset + ihl;
     let proto = ip_hdr.protocol;
     if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
+        return Ok(IngressOutcome::Ignored);
+    }
+    let has_more_fragments = ip_hdr.has_more_fragments();
+    if ip_hdr.fragment_offset() != 0 {
         return Ok(IngressOutcome::Ignored);
     }
 
@@ -210,6 +215,9 @@ fn handle_ipv4_packet(
     };
     if entry.node_ip != ip_hdr.dst || entry.overlay_ifindex == 0 {
         return Ok(IngressOutcome::Ignored);
+    }
+    if has_more_fragments {
+        return Err(IngressDropReason::FragmentedIpv4Packets);
     }
 
     let host = unsafe {

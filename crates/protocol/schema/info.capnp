@@ -228,6 +228,9 @@ struct NodePortIngressDropReasons {
 
   rewriteFailures @4 :UInt64;
   # Packets dropped because header rewrite or checksum updates failed.
+
+  fragmentedIpv4Packets @5 :UInt64;
+  # Published IPv4 packets dropped because the tc dataplane does not admit fragmented ingress.
 }
 
 struct NodePortFlowDiagnostics {

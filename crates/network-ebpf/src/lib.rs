@@ -78,6 +78,8 @@ pub mod stats {
 pub mod net {
     use core::{mem, ptr};
 
+    pub const IPV4_FLAG_MORE_FRAGMENTS: u16 = 0x2000;
+    pub const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
     pub const TCP_FLAG_FIN: u8 = 0x01;
     pub const TCP_FLAG_SYN: u8 = 0x02;
     pub const TCP_FLAG_RST: u8 = 0x04;
@@ -185,9 +187,31 @@ pub mod net {
             ((self.version_ihl & 0x0f) as usize) * 4
         }
 
+        /// Return the raw IPv4 fragment offset field in 8-byte units.
+        ///
+        /// The tc dataplane cannot reassemble IPv4 fragments, so it needs to distinguish an
+        /// initial fragment that still carries L4 ports from later fragments that no longer do.
+        #[inline(always)]
+        pub fn fragment_offset(&self) -> u16 {
+            u16::from_be(self.frag_off) & IPV4_FRAGMENT_OFFSET_MASK
+        }
+
+        /// Report whether the IPv4 more-fragments bit is set.
+        ///
+        /// The first IPv4 fragment keeps an offset of zero, so callers must also inspect this bit
+        /// when deciding whether a packet belongs to a fragmented datagram.
+        #[inline(always)]
+        pub fn has_more_fragments(&self) -> bool {
+            (u16::from_be(self.frag_off) & IPV4_FLAG_MORE_FRAGMENTS) != 0
+        }
+
+        /// Report whether the packet belongs to a fragmented IPv4 datagram.
+        ///
+        /// Mantissa treats both the first fragment and all later fragments as unsupported in the
+        /// public NAT paths because the tc programs do not perform fragment reassembly.
         #[inline(always)]
         pub fn is_fragmented(&self) -> bool {
-            (u16::from_be(self.frag_off) & 0x1fff) != 0
+            self.has_more_fragments() || self.fragment_offset() != 0
         }
     }
 
@@ -884,7 +908,10 @@ mod tests {
             CONNTRACK_STATE_TCP_ESTABLISHED, CONNTRACK_STATE_TCP_FIN_WAIT,
             CONNTRACK_STATE_TCP_SYN_SENT,
         },
-        net::{TcpHeader, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN},
+        net::{
+            Ipv4Header, TcpHeader, IPV4_FLAG_MORE_FRAGMENTS, IPV4_FRAGMENT_OFFSET_MASK,
+            TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN,
+        },
     };
 
     #[test]
@@ -925,6 +952,46 @@ mod tests {
         assert!(syn_ack.is_syn());
         assert!(syn_ack.is_ack());
         assert!(!syn_ack.is_syn_only());
+    }
+
+    #[test]
+    fn ipv4_header_reports_first_fragment() {
+        let ipv4 = Ipv4Header {
+            version_ihl: 0x45,
+            tos: 0,
+            tot_len: 0,
+            id: 0,
+            frag_off: IPV4_FLAG_MORE_FRAGMENTS.to_be(),
+            ttl: 64,
+            protocol: 17,
+            checksum: 0,
+            src: 0,
+            dst: 0,
+        };
+
+        assert_eq!(ipv4.fragment_offset(), 0);
+        assert!(ipv4.has_more_fragments());
+        assert!(ipv4.is_fragmented());
+    }
+
+    #[test]
+    fn ipv4_header_reports_non_initial_fragment() {
+        let ipv4 = Ipv4Header {
+            version_ihl: 0x45,
+            tos: 0,
+            tot_len: 0,
+            id: 0,
+            frag_off: (IPV4_FLAG_MORE_FRAGMENTS | 4).to_be(),
+            ttl: 64,
+            protocol: 17,
+            checksum: 0,
+            src: 0,
+            dst: 0,
+        };
+
+        assert_eq!(ipv4.fragment_offset(), 4 & IPV4_FRAGMENT_OFFSET_MASK);
+        assert!(ipv4.has_more_fragments());
+        assert!(ipv4.is_fragmented());
     }
 
     #[test]

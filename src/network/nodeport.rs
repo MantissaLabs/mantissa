@@ -16,7 +16,7 @@ const NODEPORT_FLOW_CAPACITY: usize = crate::config::DEFAULT_NODEPORT_FLOW_CAPAC
 #[cfg(test)]
 const NODEPORT_HOST_CAPACITY: usize = crate::config::DEFAULT_NODEPORT_HOST_CAPACITY;
 /// Keep the userspace readers aligned with the ingress drop-reason map size in the tc ingress program.
-const NODEPORT_INGRESS_DROP_REASON_COUNT: usize = 5;
+const NODEPORT_INGRESS_DROP_REASON_COUNT: usize = 6;
 /// Keep the userspace readers aligned with the shared NodePort flow-event map size in the tc programs.
 const NODEPORT_FLOW_EVENT_COUNT: usize = 4;
 
@@ -120,6 +120,7 @@ pub struct NodePortIngressDropReasons {
     pub missing_host_entries: u64,
     pub nat_insert_failures: u64,
     pub rewrite_failures: u64,
+    pub fragmented_ipv4_packets: u64,
 }
 
 /// Aggregated flow diagnostics for the shared NodePort conntrack caches.
@@ -1151,6 +1152,7 @@ mod platform {
                 missing_host_entries: values[2],
                 nat_insert_failures: values[3],
                 rewrite_failures: values[4],
+                fragmented_ipv4_packets: values[5],
             })
         }
 

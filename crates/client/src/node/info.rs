@@ -26,6 +26,10 @@ fn nodeport_drop_reason_fields(
     if rewrite_failures > 0 {
         fields.push(format!("rewrite_failures={rewrite_failures}"));
     }
+    let fragmented_ipv4_packets = reasons.get_fragmented_ipv4_packets();
+    if fragmented_ipv4_packets > 0 {
+        fields.push(format!("fragmented_ipv4_packets={fragmented_ipv4_packets}"));
+    }
     Ok(fields)
 }
 

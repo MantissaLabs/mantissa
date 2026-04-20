@@ -271,7 +271,8 @@ Both ingress/egress programs explicitly set the padding to zero when constructin
 
 `bridge_tc_ingress`:
 
-1. Accepts only IPv4, non-fragmented, TCP/UDP packets.
+1. Accepts only IPv4 TCP/UDP packets whose first fragment carries the complete
+   transport header.
 2. Builds a `Flow4` key from the pre-NAT 5‑tuple and looks in `LB_FWD`.
 3. On cache miss, hashes the flow into the precomputed per-VIP backend ring and performs one map
    lookup.
@@ -303,7 +304,8 @@ distributed per-flow spreading and stable selection semantics, not a strict
 
 `bridge_tc_egress`:
 
-1. Parses IPv4, non-fragmented, TCP/UDP packets.
+1. Parses IPv4 TCP/UDP packets whose first fragment carries the complete
+   transport header.
 2. Builds a reverse `Flow4` key (backend→client direction) and looks it up in `LB_REV`.
 3. On hit, applies SNAT so the client sees the VIP identity:
    - `eth.src = vip_mac`
@@ -341,7 +343,8 @@ mantissa info
 The `NodePort:` section shows whether the runtime is `disabled`, `pending`,
 `ready`, or `degraded`, plus the resolved iface/IP, active port counts,
 capacity limits, packet counters, and flow diagnostics such as active flow
-pairs, reverse misses, invalid conntrack transitions, and estimated evictions.
+pairs, reverse misses, invalid conntrack transitions, estimated evictions, and
+fragmented IPv4 ingress drops.
 Those NodePort limits come from `network.nodeport.vip_capacity`,
 `network.nodeport.host_capacity`, and `network.nodeport.flow_capacity`.
 
@@ -454,8 +457,10 @@ Prerequisites: Linux host, kernel with XDP+TC and BPF enabled, and `bpf-linker` 
   address or `::1`.
 - Fragmented IPv4 is not handled by the VIP or NodePort NAT datapaths.
 - Mantissa does not currently translate ICMP errors for the VIP or NodePort NAT
-  paths, so production deployments should rely on working PMTU and avoid
-  fragmentation on published traffic.
+  paths. Published first fragments that match a VIP or NodePort selector are
+  dropped explicitly, later fragments cannot be matched without reassembly, and
+  production deployments should rely on working PMTU and avoid fragmentation on
+  published traffic.
 - `public_port + protocol` ownership is cluster-global while a service is still
   reserving that endpoint.
 - Public reachability depends on node capability, routing, and operator-managed

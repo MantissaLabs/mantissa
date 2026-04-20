@@ -106,7 +106,7 @@ fn handle_ipv4_packet(
     let ip: *mut Ipv4Header =
         unsafe { net::mut_ptr_at(data, data_end, ip_offset).map_err(|_| ())? };
     let ip_hdr = unsafe { &mut *ip };
-    if ip_hdr.version() != 4 || ip_hdr.is_fragmented() {
+    if ip_hdr.version() != 4 {
         return Ok(TC_ACT_OK);
     }
     let ihl = ip_hdr.header_len();
@@ -117,6 +117,10 @@ fn handle_ipv4_packet(
     let l4_offset = ip_offset + ihl;
     let proto = ip_hdr.protocol;
     if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
+        return Ok(TC_ACT_OK);
+    }
+    let has_more_fragments = ip_hdr.has_more_fragments();
+    if ip_hdr.fragment_offset() != 0 {
         return Ok(TC_ACT_OK);
     }
 
@@ -134,6 +138,9 @@ fn handle_ipv4_packet(
     };
 
     if let Some(mut entry) = unsafe { LB_REV.get(&reverse_key).copied() } {
+        if has_more_fragments {
+            return Err(());
+        }
         let forward_key = forward_key_from_reverse_flow(&reverse_key, entry.vip);
         match entry.conntrack.advance_reverse(tcp_flags, now_ns) {
             ConntrackVerdict::Reject => return Ok(TC_ACT_OK),
@@ -164,6 +171,13 @@ fn handle_ipv4_packet(
         pad: 0,
         padding: [0u8; 2],
     };
+    if has_more_fragments {
+        let vip_key = VipKey { vip: ip_hdr.dst };
+        if unsafe { LB_VIPS.get(&vip_key) }.is_some() {
+            return Err(());
+        }
+        return Ok(TC_ACT_OK);
+    }
 
     let choice = if let Some(mut entry) = unsafe { LB_FWD.get(&client_flow).copied() } {
         let reverse_key = reverse_key_from_forward_flow(&client_flow, entry.backend_ip);
