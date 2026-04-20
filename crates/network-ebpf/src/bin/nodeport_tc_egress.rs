@@ -6,13 +6,13 @@ use core::mem;
 
 use aya_ebpf::{
     bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT},
-    helpers::bpf_csum_diff,
+    helpers::{bpf_csum_diff, bpf_ktime_get_ns},
     macros::{classifier, map},
     maps::{LruHashMap, PerCpuArray},
     programs::TcContext,
 };
 use network_ebpf::{
-    lb::{Flow4, Flow6},
+    lb::{ConntrackVerdict, Flow4, Flow6, NodePortNat, NodePortNat6},
     net::{self, EthernetHeader, Ipv4Header, Ipv6Header, TcpHeader, UdpHeader},
     stats::{self, PacketStats},
 };
@@ -22,26 +22,14 @@ const ETH_P_IPV6: u16 = 0x86dd;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct NodePortNat {
-    node_ip: u32,
-    node_port: u16,
-    _pad: u16,
-    client_ip: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct NodePortNat6 {
-    node_ip: [u8; 16],
-    node_port: u16,
-    _pad: [u8; 2],
-    client_ip: [u8; 16],
-}
-
 #[map(name = "NODEPORT_TC_EGRESS_STATS")]
 static mut NODEPORT_TC_EGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::pinned(1, 0);
+
+#[map(name = "NODEPORT_FWD")]
+static mut NODEPORT_FWD: LruHashMap<Flow4, NodePortNat> = LruHashMap::pinned(2048, 0);
+
+#[map(name = "NODEPORT_FWD_V6")]
+static mut NODEPORT_FWD_V6: LruHashMap<Flow6, NodePortNat6> = LruHashMap::pinned(2048, 0);
 
 #[map(name = "NODEPORT_REV")]
 static mut NODEPORT_REV: LruHashMap<Flow4, NodePortNat> = LruHashMap::pinned(2048, 0);
@@ -101,7 +89,9 @@ fn handle_ipv4_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
     }
 
     let (src_port, dst_port) = parse_ports(data, data_end, l4_offset, proto)?;
-    let key = Flow4 {
+    let tcp_flags = parse_tcp_flags(data, data_end, l4_offset, proto)?;
+    let now_ns = flow_now_ns();
+    let reverse_key = Flow4 {
         src: ip_hdr.src,
         dst: ip_hdr.dst,
         src_port,
@@ -111,12 +101,33 @@ fn handle_ipv4_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
         padding: [0u8; 2],
     };
 
-    let Some(entry) = (unsafe { NODEPORT_REV.get(&key) }) else {
+    let Some(mut entry) = (unsafe { NODEPORT_REV.get(&reverse_key).copied() }) else {
         return Ok(false);
     };
+    let forward_key = forward_key_from_reverse_flow(&reverse_key);
+    let remove_after_rewrite = match entry.conntrack.advance_reverse(tcp_flags, now_ns) {
+        ConntrackVerdict::Reject => return Ok(false),
+        ConntrackVerdict::Remove => {
+            remove_flow_pair(&forward_key, &reverse_key);
+            return Ok(false);
+        }
+        ConntrackVerdict::Allow(updated) => {
+            entry.conntrack = updated;
+            false
+        }
+        ConntrackVerdict::AllowAndRemove(updated) => {
+            entry.conntrack = updated;
+            true
+        }
+    };
 
-    rewrite_destination_v4(ctx, ip_offset, l4_offset, proto, entry)?;
-    rewrite_source_v4(ctx, ip_offset, l4_offset, proto, entry)?;
+    rewrite_destination_v4(ctx, ip_offset, l4_offset, proto, &entry)?;
+    rewrite_source_v4(ctx, ip_offset, l4_offset, proto, &entry)?;
+    if remove_after_rewrite {
+        remove_flow_pair(&forward_key, &reverse_key);
+    } else {
+        persist_flow_pair(&forward_key, &reverse_key, &entry)?;
+    }
     Ok(true)
 }
 
@@ -135,7 +146,9 @@ fn handle_ipv6_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
 
     let l4_offset = ip_offset + mem::size_of::<Ipv6Header>();
     let (src_port, dst_port) = parse_ports(data, data_end, l4_offset, proto)?;
-    let key = Flow6 {
+    let tcp_flags = parse_tcp_flags(data, data_end, l4_offset, proto)?;
+    let now_ns = flow_now_ns();
+    let reverse_key = Flow6 {
         src: ip_hdr.src,
         dst: ip_hdr.dst,
         src_port,
@@ -144,13 +157,56 @@ fn handle_ipv6_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
         padding: [0u8; 3],
     };
 
-    let Some(entry) = (unsafe { NODEPORT_REV_V6.get(&key) }) else {
+    let Some(mut entry) = (unsafe { NODEPORT_REV_V6.get(&reverse_key).copied() }) else {
         return Ok(false);
     };
+    let forward_key = forward_key_from_reverse_flow_v6(&reverse_key);
+    let remove_after_rewrite = match entry.conntrack.advance_reverse(tcp_flags, now_ns) {
+        ConntrackVerdict::Reject => return Ok(false),
+        ConntrackVerdict::Remove => {
+            remove_flow_pair_v6(&forward_key, &reverse_key);
+            return Ok(false);
+        }
+        ConntrackVerdict::Allow(updated) => {
+            entry.conntrack = updated;
+            false
+        }
+        ConntrackVerdict::AllowAndRemove(updated) => {
+            entry.conntrack = updated;
+            true
+        }
+    };
 
-    rewrite_destination_v6(ctx, &ip_hdr, ip_offset, l4_offset, proto, entry)?;
-    rewrite_source_v6(ctx, &ip_hdr, ip_offset, l4_offset, proto, entry)?;
+    rewrite_destination_v6(ctx, &ip_hdr, ip_offset, l4_offset, proto, &entry)?;
+    rewrite_source_v6(ctx, &ip_hdr, ip_offset, l4_offset, proto, &entry)?;
+    if remove_after_rewrite {
+        remove_flow_pair_v6(&forward_key, &reverse_key);
+    } else {
+        persist_flow_pair_v6(&forward_key, &reverse_key, &entry)?;
+    }
     Ok(true)
+}
+
+/// Return a monotonic dataplane timestamp for NodePort conntrack refresh decisions.
+///
+/// The return path updates the same shared flow metadata as ingress, so it uses the same clock
+/// source before persisting a refreshed cache entry.
+#[inline(always)]
+fn flow_now_ns() -> u64 {
+    unsafe { bpf_ktime_get_ns() }
+}
+
+/// Load and validate the fixed TCP header prefix at the provided transport offset.
+///
+/// Reverse-path NodePort matching only needs the stable header fields and flags, but malformed TCP
+/// packets must still be rejected before they can refresh or retire cached state.
+fn read_tcp_header(data: usize, data_end: usize, l4_offset: usize) -> Result<TcpHeader, ()> {
+    let tcp: TcpHeader = unsafe { net::read_at(data, data_end, l4_offset).map_err(|_| ())? };
+    let header_len = tcp.data_offset();
+    if header_len < core::mem::size_of::<TcpHeader>() || data + l4_offset + header_len > data_end {
+        return Err(());
+    }
+    Ok(tcp)
 }
 
 /// Parse the transport ports used to match one reverse flow key.
@@ -161,7 +217,7 @@ fn parse_ports(
     proto: u8,
 ) -> Result<(u16, u16), ()> {
     if proto == IPPROTO_TCP {
-        let tcp: TcpHeader = unsafe { net::read_at(data, data_end, l4_offset).map_err(|_| ())? };
+        let tcp = read_tcp_header(data, data_end, l4_offset)?;
         return Ok((tcp.source, tcp.dest));
     }
     if proto == IPPROTO_UDP {
@@ -169,6 +225,106 @@ fn parse_ports(
         return Ok((udp.source, udp.dest));
     }
     Err(())
+}
+
+/// Return the TCP flags byte for the current packet, or zero for UDP packets.
+///
+/// UDP does not carry handshake flags, so the reverse-path state machine treats a zero flag byte
+/// as "not applicable" for that protocol.
+fn parse_tcp_flags(data: usize, data_end: usize, l4_offset: usize, proto: u8) -> Result<u8, ()> {
+    if proto == IPPROTO_TCP {
+        return Ok(read_tcp_header(data, data_end, l4_offset)?.flags());
+    }
+    Ok(0)
+}
+
+/// Reconstruct the forward IPv4 flow key that pairs with one cached reverse NodePort entry.
+///
+/// Egress only sees VIP-to-client packets, but it still refreshes the matching forward entry so
+/// ingress reads the same conntrack state on the next client packet.
+fn forward_key_from_reverse_flow(reverse_key: &Flow4) -> Flow4 {
+    Flow4 {
+        src: reverse_key.dst,
+        dst: reverse_key.src,
+        src_port: reverse_key.dst_port,
+        dst_port: reverse_key.src_port,
+        proto: reverse_key.proto,
+        pad: 0,
+        padding: [0u8; 2],
+    }
+}
+
+/// Reconstruct the forward IPv6 flow key that pairs with one cached reverse NodePort entry.
+///
+/// IPv6 return traffic uses the same tuple inversion as IPv4 so both tc hooks stay aligned on the
+/// latest shared flow lifecycle.
+fn forward_key_from_reverse_flow_v6(reverse_key: &Flow6) -> Flow6 {
+    Flow6 {
+        src: reverse_key.dst,
+        dst: reverse_key.src,
+        src_port: reverse_key.dst_port,
+        dst_port: reverse_key.src_port,
+        proto: reverse_key.proto,
+        padding: [0u8; 3],
+    }
+}
+
+/// Persist matching IPv4 forward and reverse cache entries after one reverse-path update.
+///
+/// The return path confirms that a published flow is still active, so it keeps both cache
+/// directions synchronized before releasing the packet back to the host stack.
+fn persist_flow_pair(
+    forward_key: &Flow4,
+    reverse_key: &Flow4,
+    entry: &NodePortNat,
+) -> Result<(), ()> {
+    unsafe {
+        NODEPORT_FWD.insert(forward_key, entry, 0).map_err(|_| ())?;
+        NODEPORT_REV.insert(reverse_key, entry, 0).map_err(|_| ())?;
+    }
+    Ok(())
+}
+
+/// Persist matching IPv6 forward and reverse cache entries after one reverse-path update.
+///
+/// Keeping both maps aligned prevents ingress from observing stale state after egress has already
+/// advanced the conntrack lifecycle for the same flow.
+fn persist_flow_pair_v6(
+    forward_key: &Flow6,
+    reverse_key: &Flow6,
+    entry: &NodePortNat6,
+) -> Result<(), ()> {
+    unsafe {
+        NODEPORT_FWD_V6
+            .insert(forward_key, entry, 0)
+            .map_err(|_| ())?;
+        NODEPORT_REV_V6
+            .insert(reverse_key, entry, 0)
+            .map_err(|_| ())?;
+    }
+    Ok(())
+}
+
+/// Best-effort remove both directions of one cached IPv4 NodePort flow pair.
+///
+/// LRU pressure can already evict one side, so teardown cleanup ignores delete failures and
+/// focuses on removing whatever state still remains.
+fn remove_flow_pair(forward_key: &Flow4, reverse_key: &Flow4) {
+    unsafe {
+        let _ = NODEPORT_FWD.remove(forward_key);
+        let _ = NODEPORT_REV.remove(reverse_key);
+    }
+}
+
+/// Best-effort remove both directions of one cached IPv6 NodePort flow pair.
+///
+/// IPv6 teardown follows the same relaxed cleanup rule because each direction can be evicted
+/// independently under map pressure.
+fn remove_flow_pair_v6(forward_key: &Flow6, reverse_key: &Flow6) {
+    unsafe {
+        let _ = NODEPORT_FWD_V6.remove(forward_key);
+        let _ = NODEPORT_REV_V6.remove(reverse_key);
+    }
 }
 
 /// Return the checksum field offset within the TCP or UDP header.

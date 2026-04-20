@@ -845,6 +845,35 @@ pub mod lb {
         pub _pad1: [u8; 2],
         pub conntrack: ConntrackMetadata,
     }
+
+    /// Cached per-flow NodePort IPv4 translation data shared between ingress and egress hooks.
+    ///
+    /// Public ingress rewrites traffic from the published node address into the overlay VIP, then
+    /// return traffic uses the same cached tuple to restore the external client and node listener
+    /// identity on the way back out.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct NodePortNat {
+        pub node_ip: u32,
+        pub node_port: u16,
+        pub _pad: u16,
+        pub client_ip: u32,
+        pub conntrack: ConntrackMetadata,
+    }
+
+    /// Cached per-flow NodePort IPv6 translation data shared between ingress and egress hooks.
+    ///
+    /// This carries the externally visible node address, the original client address, and the
+    /// shared conntrack metadata so both tc hooks can enforce the same flow lifecycle.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct NodePortNat6 {
+        pub node_ip: [u8; 16],
+        pub node_port: u16,
+        pub _pad: [u8; 2],
+        pub client_ip: [u8; 16],
+        pub conntrack: ConntrackMetadata,
+    }
 }
 
 #[cfg(test)]
