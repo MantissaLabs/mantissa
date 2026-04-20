@@ -158,8 +158,23 @@ template does not expose a more specific service port signal.
 - the IP component of `network.advertise_addr`
 - best-effort interface autodetection
 
-For production, set `network.nodeport.iface` explicitly and prefer an explicit
+When neither explicit value is configured, Mantissa falls back to the first up,
+non-loopback interface that has a usable address in the preferred family. That
+autodetect path is intended as a development fallback. For production, set
+`network.nodeport.iface` explicitly and prefer an explicit
 `network.nodeport.ip` on multihomed, NATed, or policy-routed hosts.
+
+Publication family and source-IP contract:
+
+- NodePort publication works for both IPv4 and IPv6.
+- Each published VIP must be paired with a `node_ip` in the same family.
+- If the selected interface does not have a usable address in that family, the
+  NodePort runtime degrades instead of silently publishing the wrong address.
+- IPv6 publication requires a global or ULA address. Link-local IPv6 addresses
+  are rejected as public NodePort identities.
+- Inbound NodePort traffic is SNATed to the per-network host-access address
+  before it enters the overlay VIP dataplane. Backends see that host-access IP,
+  not the original external client IP.
 
 Protocol scope:
 
@@ -333,8 +348,9 @@ This is the path you exercise with `curl http://<node_ip>:<public_port>`.
    host-local curl.
 2. `nodeport_tc_ingress` matches `dst=node_ip` and `dst_port=public_port`.
 3. The program looks up the configured service VIP, rewrites the destination to
-   the VIP and inferred service port, records reverse NAT state, and redirects the
-   packet into the network's host-access path.
+   the VIP and inferred service port, rewrites the source to the network's
+   host-access address, records reverse NAT state, and redirects the packet
+   into the network's host-access path.
 4. The packet then traverses the existing overlay VIP datapath:
    - `bridge_tc_ingress` DNATs VIP traffic to a chosen backend
    - the bridge forwards locally or over VXLAN to a remote node
@@ -425,20 +441,30 @@ Prerequisites: Linux host, kernel with XDP+TC and BPF enabled, and `bpf-linker` 
 
 ## Supported scope, limits, and non-goals
 
-- Public traffic supports TCP, UDP, and `tcp_udp`; `tcp` is the default when
-  `public_protocol` is omitted.
+- Public traffic supports IPv4 and IPv6 publication, plus TCP, UDP, and
+  `tcp_udp`; `tcp` is the default when `public_protocol` is omitted.
+- Each published VIP must have a usable `node_ip` in the same address family.
+  For IPv6 publication, use a global or ULA address instead of a link-local
+  address or `::1`.
 - Fragmented IPv4 is not handled by the VIP or NodePort NAT datapaths.
+- Mantissa does not currently translate ICMP errors for the VIP or NodePort NAT
+  paths, so production deployments should rely on working PMTU and avoid
+  fragmentation on published traffic.
 - `public_port + protocol` ownership is cluster-global while a service is still
   reserving that endpoint.
 - Public reachability depends on node capability, routing, and operator-managed
   firewall policy.
+- Best-effort interface autodetect remains available for development, but
+  production nodes should set `network.nodeport.iface` explicitly and usually
+  set `network.nodeport.ip` as well.
 - Static sizing remains fixed for now: `MAX_VIPS = 4096`,
   `MAX_BACKENDS_PER_VIP = 1024`, and 1024-entry LRU flow caches in each
   direction for the overlay LB, plus the fixed NodePort capacities exposed by
   `mantissa info`.
-- Mantissa does not currently provide source-IP preservation guarantees for
-  external clients, cloud load balancer integration, fragmented IPv4 support,
-  or full network policy enforcement.
+- Mantissa does not preserve external client source IP through the NodePort
+  dataplane. Backends see the per-network host-access address after SNAT.
+- Mantissa does not currently provide cloud load balancer integration or full
+  network policy enforcement.
 - Security hardening remains intentionally minimal: XDP programs mainly perform
   sanity filtering, and deeper conntrack validation is not part of the first
   production NodePort release.

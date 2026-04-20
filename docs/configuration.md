@@ -129,16 +129,20 @@ publishes for services with `public_port`.
   Set this explicitly in production. It should be the host interface that
   receives external traffic for `node_ip:public_port`. Do not rely on
   autodetection on multihomed hosts, and do not use `lo` outside of local
-  privileged tests.
+  privileged tests. When unset, Mantissa falls back to the first up,
+  non-loopback, non-WireGuard interface that has a usable address in the
+  preferred family. Treat that path as a development fallback, not a production
+  deployment strategy.
 - `network.nodeport.ip`
-  This is the IPv4 address Mantissa publishes for public services. When set, it
-  wins over every other source. On multihomed, NATed, or policy-routed hosts,
-  set it explicitly.
+  This is the public address Mantissa publishes for NodePort services. It can
+  be IPv4 or IPv6. When set, it wins over every other source. The configured
+  address must match the family of the published VIPs served on the node. On
+  multihomed, NATed, or policy-routed hosts, set it explicitly.
 - `network.advertise_addr`
   This is the peer address published to the cluster. When `network.nodeport.ip`
-  is unset, Mantissa reuses the IPv4 portion of `network.advertise_addr` for
-  NodePort. If neither value is set, Mantissa falls back to best-effort local
-  interface detection.
+  is unset, Mantissa reuses the IP portion of `network.advertise_addr` for
+  NodePort when the family matches the published VIP. If neither value is set,
+  Mantissa falls back to best-effort local interface detection.
 
 Recommended production pattern:
 
@@ -162,10 +166,19 @@ traffic are the same, you can omit `network.nodeport.ip` and rely on
 ## NodePort contract and caveats
 
 - NodePort requires Linux and `network.bpf.attach = true`.
-- Public traffic is IPv4-only in this release.
+- Public traffic supports both IPv4 and IPv6 publication in this release.
+- Each published VIP must have a usable NodePort identity in the same address
+  family. For IPv6 publication, use a global or ULA address; link-local IPv6
+  addresses and `::1` are not valid public identities.
 - `public_protocol` supports `tcp`, `udp`, and `tcp_udp`. If omitted, the
   default is `tcp`.
 - Fragmented IPv4 is not supported by the current datapath.
+- Mantissa does not currently translate ICMP errors for the VIP or NodePort NAT
+  paths. Run published services on paths with correct MTU / PMTU behavior and
+  avoid fragmentation.
+- Mantissa rewrites the source of published traffic to the per-network
+  host-access address before forwarding into the overlay. Backends do not see
+  the original external client IP through the current NodePort dataplane.
 - `public_port + protocol` is cluster-global unique while a service still
   reserves that endpoint.
 - Mantissa manages the TC/eBPF attachments and the host-access sysctls needed
