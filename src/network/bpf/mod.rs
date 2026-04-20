@@ -145,12 +145,24 @@ mod platform {
     use std::ffi::CString;
     use std::fs;
     use std::io;
+    use std::mem;
+    use std::os::fd::{AsFd, AsRawFd};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
     use tracing::{debug, info, warn};
     use uuid::Uuid;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct BridgeRuntimeConfig {
+        tcp_mss: u16,
+        _pad: [u8; 6],
+    }
+
+    const IPV4_TCP_HEADER_BYTES: u32 = 40;
+    const IPV6_TCP_HEADER_BYTES: u32 = 60;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum AttachTarget<'a> {
@@ -333,6 +345,10 @@ mod platform {
                             "load balancer maps missing despite matching programs; forcing reload"
                         );
                     } else {
+                        if let Some(family) = lb_family {
+                            program_overlay_runtime_map(network, &map_pin_path, family)
+                                .context("refresh overlay runtime config")?;
+                        }
                         return Ok(());
                     }
                 }
@@ -422,6 +438,20 @@ mod platform {
                     _artifact: artifact,
                     handle,
                 });
+            }
+
+            if let Some(family) = lb_family
+                && let Err(err) = program_overlay_runtime_map(network, &map_pin_path, family)
+                    .context("program overlay runtime config")
+            {
+                if let Err(teardown_err) = loaded_network.teardown() {
+                    warn!(
+                        target: "network",
+                        network = %network_id,
+                        "failed to rollback partially attached bpf programs after runtime-map error: {teardown_err:#}"
+                    );
+                }
+                return Err(err);
             }
 
             let mut guard = self.loaded.lock().await;
@@ -796,8 +826,20 @@ mod platform {
     /// Return the pinned load-balancer map names used by one single-stack bridge dataplane family.
     fn lb_map_names(family: OverlayIpFamily) -> &'static [&'static str] {
         match family {
-            OverlayIpFamily::Ipv4 => &["LB_VIPS", "LB_BACKENDS", "LB_FWD", "LB_REV"],
-            OverlayIpFamily::Ipv6 => &["LB_VIPS_V6", "LB_BACKENDS_V6", "LB_FWD_V6", "LB_REV_V6"],
+            OverlayIpFamily::Ipv4 => &[
+                "LB_VIPS",
+                "LB_BACKENDS",
+                "LB_FWD",
+                "LB_REV",
+                "LB_RUNTIME_V4",
+            ],
+            OverlayIpFamily::Ipv6 => &[
+                "LB_VIPS_V6",
+                "LB_BACKENDS_V6",
+                "LB_FWD_V6",
+                "LB_REV_V6",
+                "LB_RUNTIME_V6",
+            ],
         }
     }
 
@@ -808,6 +850,14 @@ mod platform {
         match family {
             OverlayIpFamily::Ipv4 => &["LB_FWD", "LB_REV"],
             OverlayIpFamily::Ipv6 => &["LB_FWD_V6", "LB_REV_V6"],
+        }
+    }
+
+    /// Return the pinned runtime-config map name for one overlay load-balancer family.
+    fn lb_runtime_map_name(family: OverlayIpFamily) -> &'static str {
+        match family {
+            OverlayIpFamily::Ipv4 => "LB_RUNTIME_V4",
+            OverlayIpFamily::Ipv6 => "LB_RUNTIME_V6",
         }
     }
 
@@ -1043,6 +1093,124 @@ mod platform {
         )?;
         for map_name in lb_flow_map_names(family) {
             loader.set_max_entries(map_name, flow_capacity);
+        }
+        Ok(())
+    }
+
+    /// Compute the per-family overlay runtime config that tc ingress uses for SYN MSS clamping.
+    ///
+    /// The tc programs do not derive MTU math locally. Userspace converts the effective network
+    /// MTU into one TCP MSS ceiling and writes it into a tiny pinned config map keyed by zero.
+    fn overlay_runtime_config(
+        network: &NetworkSpecValue,
+        family: OverlayIpFamily,
+    ) -> Result<BridgeRuntimeConfig> {
+        let tcp_mss = match family {
+            OverlayIpFamily::Ipv4 => ipv4_tcp_mss_from_mtu(network.mtu),
+            OverlayIpFamily::Ipv6 => ipv6_tcp_mss_from_mtu(network.mtu),
+        }
+        .ok_or_else(|| {
+            anyhow!(
+                "overlay MTU {} is too small for {family:?} TCP",
+                network.mtu
+            )
+        })?;
+
+        Ok(BridgeRuntimeConfig {
+            tcp_mss,
+            _pad: [0u8; 6],
+        })
+    }
+
+    /// Convert one IPv4 MTU into the largest TCP MSS that still fits on that link.
+    fn ipv4_tcp_mss_from_mtu(mtu: u32) -> Option<u16> {
+        mtu.checked_sub(IPV4_TCP_HEADER_BYTES)
+            .and_then(|mss| u16::try_from(mss).ok())
+    }
+
+    /// Convert one IPv6 MTU into the largest TCP MSS that still fits on that link.
+    fn ipv6_tcp_mss_from_mtu(mtu: u32) -> Option<u16> {
+        mtu.checked_sub(IPV6_TCP_HEADER_BYTES)
+            .and_then(|mss| u16::try_from(mss).ok())
+    }
+
+    /// Refresh the pinned overlay runtime-config map for one network after program load or MTU change.
+    ///
+    /// Keeping this separate from attachment logic lets Mantissa update the per-network MSS ceiling
+    /// even when the attached program set itself did not change.
+    fn program_overlay_runtime_map(
+        network: &NetworkSpecValue,
+        base: &Path,
+        family: OverlayIpFamily,
+    ) -> Result<()> {
+        let map = open_pinned_map(base, lb_runtime_map_name(family))
+            .with_context(|| format!("open {} runtime map", family_label(family)))?;
+        let key = 0u32;
+        let config = overlay_runtime_config(network, family)?;
+        update_map_elem(map.fd().as_fd().as_raw_fd(), &key, &config)
+            .with_context(|| format!("program {} runtime map", family_label(family)))?;
+        Ok(())
+    }
+
+    /// Render one overlay address-family label for logs and operator-facing errors.
+    fn family_label(family: OverlayIpFamily) -> &'static str {
+        match family {
+            OverlayIpFamily::Ipv4 => "IPv4",
+            OverlayIpFamily::Ipv6 => "IPv6",
+        }
+    }
+
+    /// Open one pinned overlay BPF map using the same fallback search order as the loader.
+    fn open_pinned_map(base: &Path, name: &str) -> Result<MapData> {
+        let candidates = [
+            base.join(name),
+            base.join("tc").join("globals").join(name),
+            Path::new("/sys/fs/bpf/tc/globals").join(name),
+        ];
+
+        for candidate in candidates {
+            if let Ok(map) = MapData::from_pin(&candidate) {
+                return Ok(map);
+            }
+        }
+
+        Err(anyhow!("map {name} not found in expected pin locations"))
+    }
+
+    /// Update one pinned BPF map entry through `bpf(BPF_MAP_UPDATE_ELEM)`.
+    ///
+    /// Aya sizes and pins the map, but the runtime config value is refreshed directly here so it
+    /// can be rewritten without reconstructing the loaded tc object.
+    fn update_map_elem<K, V>(fd: i32, key: &K, value: &V) -> Result<()> {
+        const BPF_MAP_UPDATE_ELEM: libc::c_uint = 2;
+
+        #[repr(C)]
+        struct BpfAttrUpsert {
+            map_fd: u32,
+            _pad: u32,
+            key: u64,
+            value: u64,
+            flags: u64,
+        }
+
+        let mut attr = BpfAttrUpsert {
+            map_fd: fd as u32,
+            _pad: 0,
+            key: key as *const _ as u64,
+            value: value as *const _ as u64,
+            flags: 0,
+        };
+
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                BPF_MAP_UPDATE_ELEM,
+                &mut attr as *mut _,
+                mem::size_of::<BpfAttrUpsert>(),
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error().into());
         }
         Ok(())
     }

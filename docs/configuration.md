@@ -207,8 +207,10 @@ NodePort source mode and dataplane limits are reported in `mantissa info`.
   in `mantissa info`; later fragments cannot be matched safely without
   reassembly, so production traffic should still avoid fragmentation.
 - Mantissa does not currently translate ICMP errors for the VIP or NodePort NAT
-  paths. Run published services on paths with correct MTU / PMTU behavior and
-  avoid fragmentation.
+  paths. For TCP publication, Mantissa clamps SYN MSS to the effective
+  host-access or overlay MTU before forwarding traffic into the dataplane.
+  UDP and other non-TCP traffic still rely on correct MTU / PMTU behavior and
+  should avoid fragmentation.
 - `network.nodeport.source_mode` is part of the production contract.
   `snat_host_access` is the only supported value in this release.
 - In `snat_host_access` mode, Mantissa rewrites the source of published traffic

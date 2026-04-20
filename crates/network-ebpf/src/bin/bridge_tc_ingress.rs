@@ -13,8 +13,8 @@ use aya_ebpf::{
 };
 use network_ebpf::{
     lb::{
-        Backend, ConntrackMetadata, ConntrackVerdict, Flow4, NatEntry, VipBackendKey, VipEntry,
-        VipKey, MAX_BACKENDS_PER_VIP, MAX_VIPS,
+        Backend, BridgeRuntimeConfig, ConntrackMetadata, ConntrackVerdict, Flow4, NatEntry,
+        VipBackendKey, VipEntry, VipKey, MAX_BACKENDS_PER_VIP, MAX_VIPS,
     },
     net::{self, EthernetHeader, Ipv4Header, TcpHeader, UdpHeader},
     stats::{self, PacketStats},
@@ -58,6 +58,9 @@ static mut LB_FWD: LruHashMap<Flow4, NatEntry> = LruHashMap::pinned(1024, 0);
 #[map(name = "LB_REV")]
 static mut LB_REV: LruHashMap<Flow4, NatEntry> = LruHashMap::pinned(1024, 0);
 
+#[map(name = "LB_RUNTIME_V4")]
+static mut LB_RUNTIME_V4: HashMap<u32, BridgeRuntimeConfig> = HashMap::pinned(1, 0);
+
 #[classifier]
 pub fn bridge_tc_ingress(ctx: TcContext) -> i32 {
     let mut ctx = ctx;
@@ -89,20 +92,17 @@ fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
     let eth_hdr = unsafe { &mut *eth };
 
     match eth_hdr.protocol() {
-        ETH_P_IPV4 => handle_ipv4_packet(ctx, data, data_end, eth_hdr),
+        ETH_P_IPV4 => handle_ipv4_packet(ctx, data, data_end),
         ETH_P_ARP => handle_arp(ctx, data, data_end, eth_hdr),
         _ => Ok(TC_ACT_OK),
     }
 }
 
 /// Process IPv4 VIP traffic and update the cached reverse flow state for return-path SNAT.
-fn handle_ipv4_packet(
-    ctx: &mut TcContext,
-    data: usize,
-    data_end: usize,
-    eth_hdr: &mut EthernetHeader,
-) -> Result<i32, ()> {
+fn handle_ipv4_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Result<i32, ()> {
     let ip_offset = net::ETH_HDR_LEN;
+    let eth: *mut EthernetHeader = unsafe { net::mut_ptr_at(data, data_end, 0).map_err(|_| ())? };
+    let eth_hdr = unsafe { &mut *eth };
     let ip: *mut Ipv4Header =
         unsafe { net::mut_ptr_at(data, data_end, ip_offset).map_err(|_| ())? };
     let ip_hdr = unsafe { &mut *ip };
@@ -209,6 +209,18 @@ fn handle_ipv4_packet(
         entry
     };
 
+    if proto == IPPROTO_TCP && (tcp_flags & net::TCP_FLAG_SYN) != 0 {
+        clamp_tcp_mss(ctx, l4_offset, configured_tcp_mss())?;
+    }
+    // `ctx.store` and checksum helpers invalidate packet pointers under tc verifier rules, so the
+    // DNAT rewrite must reload fresh headers after any MSS clamp touched the skb.
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    let eth: *mut EthernetHeader = unsafe { net::mut_ptr_at(data, data_end, 0).map_err(|_| ())? };
+    let eth_hdr = unsafe { &mut *eth };
+    let ip: *mut Ipv4Header =
+        unsafe { net::mut_ptr_at(data, data_end, ip_offset).map_err(|_| ())? };
+    let ip_hdr = unsafe { &mut *ip };
     apply_dnat_v4(ctx, eth_hdr, ip_hdr, ip_offset, l4_offset, proto, &choice)?;
 
     let reverse_key = reverse_key_from_forward_flow(&client_flow, choice.backend_ip);
@@ -341,6 +353,21 @@ fn read_tcp_header(data: usize, data_end: usize, l4_offset: usize) -> Result<Tcp
     Ok(tcp)
 }
 
+/// Return the configured TCP MSS ceiling for the IPv4 overlay bridge dataplane.
+///
+/// Userspace programs this per-network value from the effective overlay MTU so ingress can clamp
+/// SYN MSS without duplicating MTU math or service-level policy in the tc program.
+#[inline(always)]
+fn configured_tcp_mss() -> u16 {
+    let key = 0u32;
+    unsafe {
+        LB_RUNTIME_V4
+            .get(&key)
+            .map(|config| config.tcp_mss)
+            .unwrap_or(0)
+    }
+}
+
 /// Parse one TCP or UDP header so the dataplane can build its flow key.
 fn parse_ports(
     data: usize,
@@ -368,6 +395,87 @@ fn parse_tcp_flags(data: usize, data_end: usize, l4_offset: usize, proto: u8) ->
         return Ok(read_tcp_header(data, data_end, l4_offset)?.flags());
     }
     Ok(0)
+}
+
+/// Clamp one TCP SYN MSS option to the configured overlay ceiling before DNAT reaches a backend.
+///
+/// The bridge VIP dataplane cannot translate ICMP fragmentation feedback today, so lowering SYN
+/// MSS is the least-complex way to keep TCP payloads within the configured overlay MTU.
+fn clamp_tcp_mss(ctx: &mut TcContext, l4_offset: usize, max_mss: u16) -> Result<(), ()> {
+    if max_mss == 0 {
+        return Ok(());
+    }
+
+    let tcp = read_tcp_header(ctx.data(), ctx.data_end(), l4_offset)?;
+    let header_len = tcp.data_offset();
+    if header_len <= core::mem::size_of::<TcpHeader>() {
+        return Ok(());
+    }
+
+    let Some((option_offset, current_mss)) = find_tcp_mss_option(ctx, l4_offset, header_len)?
+    else {
+        return Ok(());
+    };
+    if current_mss <= max_mss {
+        return Ok(());
+    }
+
+    let old_wire = current_mss.to_be();
+    let new_wire = max_mss.to_be();
+    ctx.store(option_offset, &new_wire, 0).map_err(|_| ())?;
+    ctx.l4_csum_replace(
+        l4_offset + l4_checksum_offset(IPPROTO_TCP),
+        old_wire as u64,
+        new_wire as u64,
+        2,
+    )
+    .map_err(|_| ())?;
+    Ok(())
+}
+
+/// Scan one TCP options block for the first MSS option using verifier-friendly packet loads.
+///
+/// Bridge tc ingress runs under the kernel verifier, so each option access is expressed through
+/// `ctx.load` on bounded offsets instead of generic pointer arithmetic.
+fn find_tcp_mss_option(
+    ctx: &TcContext,
+    l4_offset: usize,
+    header_len: usize,
+) -> Result<Option<(usize, u16)>, ()> {
+    let mut cursor = core::mem::size_of::<TcpHeader>();
+
+    for _ in 0..net::TCP_OPTION_SCAN_LIMIT {
+        if cursor >= header_len {
+            return Ok(None);
+        }
+
+        let kind: u8 = ctx.load(l4_offset + cursor).map_err(|_| ())?;
+        match kind {
+            net::TCP_OPTION_END => return Ok(None),
+            net::TCP_OPTION_NOP => {
+                cursor = cursor.saturating_add(1);
+            }
+            net::TCP_OPTION_MSS => {
+                let len: u8 = ctx.load(l4_offset + cursor + 1).map_err(|_| ())?;
+                if len as usize != net::TCP_OPTION_MSS_LEN
+                    || cursor.saturating_add(net::TCP_OPTION_MSS_LEN) > header_len
+                {
+                    return Ok(None);
+                }
+                let mss_wire: u16 = ctx.load(l4_offset + cursor + 2).map_err(|_| ())?;
+                return Ok(Some((l4_offset + cursor + 2, u16::from_be(mss_wire))));
+            }
+            _ => {
+                let len: u8 = ctx.load(l4_offset + cursor + 1).map_err(|_| ())?;
+                if len < 2 {
+                    return Ok(None);
+                }
+                cursor = cursor.saturating_add(len as usize);
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Return the TCP or UDP checksum field offset within the transport header.

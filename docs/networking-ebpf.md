@@ -204,9 +204,9 @@ Compiled BPF objects live under `target/bpf/*.bpf.o` (built automatically on Lin
 | --- | --- | --- | --- |
 | `vxlan_xdp` | XDP on `mvx-*` | Frame sanity checks for VXLAN ingress; drops non IPv4/IPv6/ARP or non-unicast sources. | `VXLAN_STATS` |
 | `bridge_xdp` | XDP on `mnt-br-*` | L2 sanity checks for bridged traffic. | `BRIDGE_XDP_STATS` |
-| `bridge_tc_ingress` | TC ingress on `mnhp-*` (fallback: `mnt-br-*`) | VIP ARP/NDP responder + DNAT (VIP→backend) + flow-cache seeding for TCP/UDP. | `BRIDGE_TC_INGRESS_STATS`, `LB_VIPS`, `LB_BACKENDS`, `LB_FWD`, `LB_REV`, plus the `*_V6` map family for IPv6 overlays |
+| `bridge_tc_ingress` | TC ingress on `mnhp-*` (fallback: `mnt-br-*`) | VIP ARP/NDP responder + DNAT (VIP→backend) + TCP SYN MSS clamping + flow-cache seeding for TCP/UDP. | `BRIDGE_TC_INGRESS_STATS`, `LB_VIPS`, `LB_BACKENDS`, `LB_FWD`, `LB_REV`, `LB_RUNTIME_V4`, plus the `*_V6` map family for IPv6 overlays |
 | `bridge_tc_egress` | TC egress on `mnhp-*` (fallback: `mnt-br-*`) | SNAT return path (backend→VIP) using cached reverse mapping. | `BRIDGE_TC_EGRESS_STATS`, `LB_REV`, `LB_REV_V6` |
-| `nodeport_tc_ingress` | TC ingress on `network.nodeport.iface` and `lo` | Matches `node_ip:public_port`, rewrites to the service VIP, seeds NodePort NAT state, and redirects into the per-network host-access path. | `NODEPORT_TC_INGRESS_STATS`, `NODEPORT_TC_FLOW_EVENTS`, `NODEPORT_VIPS`, `NODEPORT_FWD`, `NODEPORT_REV`, `NODEPORT_HOST`, plus the `*_V6` map family for IPv6 publication |
+| `nodeport_tc_ingress` | TC ingress on `network.nodeport.iface` and `lo` | Matches `node_ip:public_port`, clamps TCP SYN MSS to the host-access MTU, rewrites to the service VIP, seeds NodePort NAT state, and redirects into the per-network host-access path. | `NODEPORT_TC_INGRESS_STATS`, `NODEPORT_TC_FLOW_EVENTS`, `NODEPORT_VIPS`, `NODEPORT_FWD`, `NODEPORT_REV`, `NODEPORT_HOST`, plus the `*_V6` map family for IPv6 publication |
 | `nodeport_tc_egress` | TC egress on `network.nodeport.iface` and TC ingress on `mnhost-*` | Rewrites return traffic back to `node_ip:public_port` for external and host-local clients. | `NODEPORT_TC_EGRESS_STATS`, `NODEPORT_TC_FLOW_EVENTS`, `NODEPORT_REV`, `NODEPORT_REV_V6` |
 
 The “attach to `mnhp-*`” choice is what makes host-originated `curl http://<vip>:<port>` go through the eBPF load balancer reliably: it is the bridge port where host traffic enters/exits the overlay bridge.
@@ -256,6 +256,10 @@ Shared structs are defined in `crates/network-ebpf/src/lib.rs` under the `lb` mo
 - `LB_FWD` / `LB_REV` (`LruHashMap<Flow4, NatEntry>`, 1024 entries each)
   - `Flow4` is the normalized 5‑tuple.
   - `NatEntry` contains VIP and backend IP/MAC for rewrites.
+- `LB_RUNTIME_V4` (`HashMap<u32, BridgeRuntimeConfig>`, 1 entry)
+  - Key: `0`
+  - Value: `BridgeRuntimeConfig { tcp_mss, ... }`
+  - Userspace programs the effective IPv4 TCP MSS derived from the network MTU.
 - Stats maps (`*_STATS`) are per-CPU counters (packets/bytes/drops) and can be inspected with `bpftool`.
 
 ### Flow keys: deterministic bytes matter
@@ -280,7 +284,9 @@ Both ingress/egress programs explicitly set the padding to zero when constructin
    - `eth.dst = backend_mac`
    - `ip.dst = backend_ip`
    - Updates IPv4 and TCP/UDP checksums using kernel helpers (`l3_csum_replace`, `l4_csum_replace` with `BPF_F_PSEUDO_HDR`).
-5. Seeds `LB_FWD` and `LB_REV` so the return path can be reversed.
+5. Clamps TCP SYN MSS to the per-network ceiling from `LB_RUNTIME_V4` before
+   the packet reaches the backend.
+6. Seeds `LB_FWD` and `LB_REV` so the return path can be reversed.
 
 It also contains a VIP ARP responder that synthesizes ARP replies for configured VIPs by rewriting ARP requests in-place and using `clone_redirect` back to the ingress port.
 
@@ -429,6 +435,8 @@ Prerequisites: Linux host, kernel with XDP+TC and BPF enabled, and `bpf-linker` 
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/<network-uuid>/LB_BACKENDS`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/<network-uuid>/LB_FWD`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/<network-uuid>/LB_REV`
+  - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/<network-uuid>/LB_RUNTIME_V4`
+  - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/<network-uuid>/LB_RUNTIME_V6`
 - Inspect pinned NodePort maps:
   - `sudo ls -la /sys/fs/bpf/mantissa/nodeport/`
   - `sudo bpftool map dump pinned /sys/fs/bpf/mantissa/nodeport/NODEPORT_VIPS`
@@ -457,10 +465,11 @@ Prerequisites: Linux host, kernel with XDP+TC and BPF enabled, and `bpf-linker` 
   address or `::1`.
 - Fragmented IPv4 is not handled by the VIP or NodePort NAT datapaths.
 - Mantissa does not currently translate ICMP errors for the VIP or NodePort NAT
-  paths. Published first fragments that match a VIP or NodePort selector are
-  dropped explicitly, later fragments cannot be matched without reassembly, and
-  production deployments should rely on working PMTU and avoid fragmentation on
-  published traffic.
+  paths. TCP publication instead clamps SYN MSS to the effective host-access or
+  overlay MTU before packets reach the backend. Published first fragments that
+  match a VIP or NodePort selector are dropped explicitly, later fragments
+  cannot be matched without reassembly, and UDP or other non-TCP traffic still
+  relies on working PMTU and should avoid fragmentation on published traffic.
 - `public_port + protocol` ownership is cluster-global while a service is still
   reserving that endpoint.
 - Public reachability depends on node capability, routing, and operator-managed

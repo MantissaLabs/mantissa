@@ -36,6 +36,7 @@ const NODEPORT_HTTP_REMAP_PORT: u16 = 18081;
 const NODEPORT_UDP_PORT: u16 = 18082;
 const NODEPORT_HTTP_PORT_V6: u16 = 18083;
 const NODEPORT_UDP_REMAP_PORT: u16 = 18084;
+const NODEPORT_HTTP_MTU_PORT: u16 = 18085;
 const NODEPORT_RESPONSE: &str = "hello from nodeport privileged test";
 const NODEPORT_CONFLICT_RESPONSE: &str = "hello from nodeport owner";
 const NODEPORT_DEGRADED_RESPONSE: &str = "hello from degraded nodeport service";
@@ -304,6 +305,50 @@ async fn capture_tcpdump_line(
     if !status.success() {
         anyhow::bail!(
             "tcpdump on {iface} failed: {}",
+            String::from_utf8_lossy(&errors).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output).trim().to_string())
+}
+
+/// Capture one verbose tcpdump line so tests can assert SYN TCP options such as MSS.
+async fn capture_verbose_tcpdump_line(
+    iface: &str,
+    filter: &str,
+    trigger_addr: &str,
+) -> anyhow::Result<String> {
+    let mut child = TokioCommand::new("tcpdump")
+        .args(["-nn", "-vv", "-l", "-U", "-i", iface, "-c", "1", filter])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn verbose tcpdump on {iface} with filter '{filter}'"))?;
+    let mut stdout = child.stdout.take().context("take verbose tcpdump stdout")?;
+    let mut stderr = child.stderr.take().context("take verbose tcpdump stderr")?;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _ = http_get(trigger_addr).await?;
+
+    let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(status) => status.with_context(|| format!("wait for verbose tcpdump on {iface}"))?,
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!("verbose tcpdump on {iface} timed out while waiting for '{filter}'");
+        }
+    };
+    let mut output = Vec::new();
+    stdout
+        .read_to_end(&mut output)
+        .await
+        .context("read verbose tcpdump stdout")?;
+    let mut errors = Vec::new();
+    stderr
+        .read_to_end(&mut errors)
+        .await
+        .context("read verbose tcpdump stderr")?;
+    if !status.success() {
+        anyhow::bail!(
+            "verbose tcpdump on {iface} failed: {}",
             String::from_utf8_lossy(&errors).trim()
         );
     }
@@ -722,6 +767,101 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
         "public port should stop accepting traffic after service deletion"
     );
 
+    delete_privileged_network(&node, network_id).await;
+});
+
+local_test!(nodeport_tcp_syn_mss_clamps_to_host_access_mtu, {
+    let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
+        return;
+    };
+
+    let _config = PrivilegedTestGuard::apply(|config| {
+        config.network.wireguard.enabled = false;
+        config.network.wireguard.manage_firewall = false;
+        config.network.bpf.attach = true;
+        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        config.network.nodeport.enabled = true;
+        config.network.nodeport.iface = Some("lo".to_string());
+        config.network.nodeport.ip = Some("127.0.0.1".to_string());
+        config.network.nodeport.source_mode = NodePortSourceMode::SnatHostAccess;
+        config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+    });
+    let node = create_privileged_node().await;
+    let subnet = privileged_test_subnet();
+    let network = create_privileged_network(
+        &node,
+        privileged_test_network(
+            "nodeport-mtu",
+            "privileged nodeport tcp mss clamp test network",
+            &subnet,
+            600,
+            Vec::new(),
+        ),
+        mantissa::network::types::NetworkStatus::Ready,
+    )
+    .await;
+    let network_id = network.id;
+
+    let service_id = deploy_privileged_nodeport_service(
+        &node.service_controller,
+        "nodeport-mtu",
+        network_id,
+        NODEPORT_RESPONSE,
+        NODEPORT_HTTP_MTU_PORT,
+        NODEPORT_HTTP_MTU_PORT,
+    )
+    .await
+    .expect("submit privileged NodePort MSS clamp deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.service_controller,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(180),
+        )
+        .await,
+        "small-MTU NodePort service should reach running state"
+    );
+
+    let addr = format!("127.0.0.1:{NODEPORT_HTTP_MTU_PORT}");
+    assert!(
+        wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(250),
+            || async {
+                matches!(
+                    http_get(&addr).await,
+                    Ok(response) if response.contains(NODEPORT_RESPONSE)
+                )
+            }
+        )
+        .await,
+        "small-MTU NodePort service should answer HTTP requests before the MSS assertion"
+    );
+
+    let [
+        _vxlan_ifname,
+        _bridge_ifname,
+        _host_peer_ifname,
+        host_ifname,
+    ] = privileged_network_interfaces(network_id);
+    let host_access_ip = interface_ipv4(&host_ifname).await;
+    let capture = capture_verbose_tcpdump_line(
+        &host_ifname,
+        &format!(
+            "src host {host_access_ip} and tcp dst port {NODEPORT_HTTP_MTU_PORT} and tcp[tcpflags] & tcp-syn != 0"
+        ),
+        &addr,
+    )
+    .await
+    .expect("capture NodePort SYN on the host-access interface");
+    assert!(
+        capture.contains("mss 560"),
+        "NodePort ingress should clamp the forwarded TCP SYN MSS to the host-access MTU: {capture}"
+    );
+
+    remove_service_via_rpc(&node.services_client, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
 

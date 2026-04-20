@@ -80,10 +80,17 @@ pub mod net {
 
     pub const IPV4_FLAG_MORE_FRAGMENTS: u16 = 0x2000;
     pub const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
+    pub const IPV4_TCP_HEADER_BYTES: u32 = 40;
+    pub const IPV6_TCP_HEADER_BYTES: u32 = 60;
     pub const TCP_FLAG_FIN: u8 = 0x01;
     pub const TCP_FLAG_SYN: u8 = 0x02;
     pub const TCP_FLAG_RST: u8 = 0x04;
     pub const TCP_FLAG_ACK: u8 = 0x10;
+    pub const TCP_OPTION_END: u8 = 0;
+    pub const TCP_OPTION_NOP: u8 = 1;
+    pub const TCP_OPTION_MSS: u8 = 2;
+    pub const TCP_OPTION_MSS_LEN: usize = 4;
+    pub const TCP_OPTION_SCAN_LIMIT: usize = 16;
 
     #[repr(C, packed)]
     #[derive(Clone, Copy)]
@@ -429,6 +436,75 @@ pub mod net {
             return Err(PacketReadError::OutOfBounds);
         }
         Ok((data + offset) as *mut T)
+    }
+
+    /// Convert one IPv4 MTU into the largest safe TCP MSS for that dataplane hop.
+    ///
+    /// The public NodePort path and the overlay VIP path both forward TCP over interfaces whose
+    /// MTU is known in advance. Clamping SYN MSS to that effective MTU avoids relying on ICMP
+    /// fragmentation feedback that the NAT paths do not translate today.
+    #[inline(always)]
+    pub fn ipv4_tcp_mss_from_mtu(mtu: u32) -> Option<u16> {
+        mtu.checked_sub(IPV4_TCP_HEADER_BYTES)
+            .and_then(|mss| u16::try_from(mss).ok())
+    }
+
+    /// Convert one IPv6 MTU into the largest safe TCP MSS for that dataplane hop.
+    ///
+    /// IPv6 does not permit in-path fragmentation, so advertising a bounded MSS is the simplest
+    /// way to keep TCP over the overlay within the configured link MTU.
+    #[inline(always)]
+    pub fn ipv6_tcp_mss_from_mtu(mtu: u32) -> Option<u16> {
+        mtu.checked_sub(IPV6_TCP_HEADER_BYTES)
+            .and_then(|mss| u16::try_from(mss).ok())
+    }
+
+    /// Scan the TCP options area for one MSS option and return its packet offset and current value.
+    ///
+    /// The dataplane only needs the first MSS option inside a bounded TCP options block. Malformed
+    /// option lengths simply disable clamping for that packet instead of rejecting otherwise valid
+    /// SYN traffic.
+    pub fn tcp_mss_option_offset(
+        data: usize,
+        data_end: usize,
+        l4_offset: usize,
+        header_len: usize,
+    ) -> Result<Option<(usize, u16)>, PacketReadError> {
+        let mut cursor = l4_offset + mem::size_of::<TcpHeader>();
+        let options_end = l4_offset.saturating_add(header_len);
+
+        for _ in 0..TCP_OPTION_SCAN_LIMIT {
+            if cursor >= options_end {
+                return Ok(None);
+            }
+
+            let kind: u8 = unsafe { read_at(data, data_end, cursor)? };
+            match kind {
+                TCP_OPTION_END => return Ok(None),
+                TCP_OPTION_NOP => {
+                    cursor = cursor.saturating_add(1);
+                }
+                TCP_OPTION_MSS => {
+                    let len: u8 = unsafe { read_at(data, data_end, cursor + 1)? };
+                    if len as usize != TCP_OPTION_MSS_LEN
+                        || cursor.saturating_add(TCP_OPTION_MSS_LEN) > options_end
+                    {
+                        return Ok(None);
+                    }
+                    let mss_be: u16 = unsafe { read_at(data, data_end, cursor + 2)? };
+                    return Ok(Some((cursor + 2, u16::from_be(mss_be))));
+                }
+                _ => {
+                    let len: u8 = unsafe { read_at(data, data_end, cursor + 1)? };
+                    if len < 2 {
+                        return Ok(None);
+                    }
+                    cursor = cursor.saturating_add(len as usize);
+                }
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -857,6 +933,17 @@ pub mod lb {
         pub conntrack: ConntrackMetadata,
     }
 
+    /// Runtime overlay configuration shared by the bridge tc ingress programs.
+    ///
+    /// Userspace computes one per-family TCP MSS ceiling from the effective overlay MTU and pins
+    /// it here so the dataplane can clamp SYN MSS without deriving MTU math on the hot path.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct BridgeRuntimeConfig {
+        pub tcp_mss: u16,
+        pub _pad: [u8; 6],
+    }
+
     /// Cached per-flow IPv6 translation data shared between ingress and egress hooks.
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -909,8 +996,10 @@ mod tests {
             CONNTRACK_STATE_TCP_SYN_SENT,
         },
         net::{
-            Ipv4Header, TcpHeader, IPV4_FLAG_MORE_FRAGMENTS, IPV4_FRAGMENT_OFFSET_MASK,
-            TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN,
+            ipv4_tcp_mss_from_mtu, ipv6_tcp_mss_from_mtu, tcp_mss_option_offset, Ipv4Header,
+            TcpHeader, IPV4_FLAG_MORE_FRAGMENTS, IPV4_FRAGMENT_OFFSET_MASK, TCP_FLAG_ACK,
+            TCP_FLAG_FIN, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_OPTION_END, TCP_OPTION_MSS,
+            TCP_OPTION_MSS_LEN, TCP_OPTION_NOP,
         },
     };
 
@@ -992,6 +1081,64 @@ mod tests {
         assert_eq!(ipv4.fragment_offset(), 4 & IPV4_FRAGMENT_OFFSET_MASK);
         assert!(ipv4.has_more_fragments());
         assert!(ipv4.is_fragmented());
+    }
+
+    #[test]
+    fn ipv4_tcp_mss_from_mtu_uses_standard_header_budget() {
+        assert_eq!(ipv4_tcp_mss_from_mtu(600), Some(560));
+        assert_eq!(ipv4_tcp_mss_from_mtu(40), Some(0));
+        assert_eq!(ipv4_tcp_mss_from_mtu(39), None);
+    }
+
+    #[test]
+    fn ipv6_tcp_mss_from_mtu_uses_standard_header_budget() {
+        assert_eq!(ipv6_tcp_mss_from_mtu(600), Some(540));
+        assert_eq!(ipv6_tcp_mss_from_mtu(60), Some(0));
+        assert_eq!(ipv6_tcp_mss_from_mtu(59), None);
+    }
+
+    #[test]
+    fn tcp_mss_option_offset_finds_first_mss_option() {
+        let packet = [
+            0x00,
+            0x50,
+            0x30,
+            0x39,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x70,
+            TCP_FLAG_SYN,
+            0x40,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            TCP_OPTION_MSS,
+            TCP_OPTION_MSS_LEN as u8,
+            0x05,
+            0xb4,
+            TCP_OPTION_NOP,
+            TCP_OPTION_END,
+            0x00,
+            0x00,
+        ];
+
+        let located = tcp_mss_option_offset(
+            packet.as_ptr() as usize,
+            packet.as_ptr() as usize + packet.len(),
+            0,
+            28,
+        )
+        .expect("scan tcp options should stay in bounds");
+
+        assert_eq!(located, Some((22, 1460)));
     }
 
     #[test]

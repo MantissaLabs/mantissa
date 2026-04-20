@@ -81,7 +81,7 @@ struct NodePortEntry6 {
 #[derive(Clone, Copy)]
 struct NodePortHost {
     mac: [u8; 6],
-    _pad: u16,
+    tcp_mss: u16,
     host_ip: u32,
 }
 
@@ -89,7 +89,7 @@ struct NodePortHost {
 #[derive(Clone, Copy)]
 struct NodePortHost6 {
     mac: [u8; 6],
-    _pad: [u8; 2],
+    tcp_mss: u16,
     host_ip: [u8; 16],
 }
 
@@ -225,7 +225,13 @@ fn handle_ipv4_packet(
             .get(&entry.overlay_ifindex)
             .ok_or(IngressDropReason::MissingHostEntry)?
     };
+    // Capture the client address before any MSS rewrite because tc helper calls invalidate packet
+    // header pointers for later direct reads.
     let original_src = ip_hdr.src;
+    if proto == IPPROTO_TCP && (tcp_flags & net::TCP_FLAG_SYN) != 0 {
+        clamp_tcp_mss(ctx, l4_offset, host.tcp_mss)
+            .map_err(|_| IngressDropReason::InvalidL4Header)?;
+    }
     let snat_src = host.host_ip;
     let flow_src = if snat_src != 0 {
         snat_src
@@ -354,7 +360,13 @@ fn handle_ipv6_packet(
             .get(&entry.overlay_ifindex)
             .ok_or(IngressDropReason::MissingHostEntry)?
     };
+    // Capture the client address before any MSS rewrite because tc helper calls invalidate packet
+    // header pointers for later direct reads.
     let original_src = ip_hdr.src;
+    if proto == IPPROTO_TCP && (tcp_flags & net::TCP_FLAG_SYN) != 0 {
+        clamp_tcp_mss(ctx, l4_offset, host.tcp_mss)
+            .map_err(|_| IngressDropReason::InvalidL4Header)?;
+    }
     let snat_src = host.host_ip;
     let should_snat = snat_src != [0u8; 16] && original_src != snat_src;
     let flow_src = if should_snat { snat_src } else { original_src };
@@ -534,6 +546,87 @@ fn parse_tcp_flags(data: usize, data_end: usize, l4_offset: usize, proto: u8) ->
         return Ok(read_tcp_header(data, data_end, l4_offset)?.flags());
     }
     Ok(0)
+}
+
+/// Clamp one TCP SYN MSS option to the configured per-network ceiling before redirecting it.
+///
+/// Mantissa does not translate ICMP fragmentation feedback for the public NAT path, so ingress
+/// lowers the advertised MSS up front and leaves non-TCP traffic to explicit PMTU-safe operation.
+fn clamp_tcp_mss(ctx: &mut TcContext, l4_offset: usize, max_mss: u16) -> Result<(), ()> {
+    if max_mss == 0 {
+        return Ok(());
+    }
+
+    let tcp = read_tcp_header(ctx.data(), ctx.data_end(), l4_offset)?;
+    let header_len = tcp.data_offset();
+    if header_len <= core::mem::size_of::<TcpHeader>() {
+        return Ok(());
+    }
+
+    let Some((option_offset, current_mss)) = find_tcp_mss_option(ctx, l4_offset, header_len)?
+    else {
+        return Ok(());
+    };
+    if current_mss <= max_mss {
+        return Ok(());
+    }
+
+    let old_wire = current_mss.to_be();
+    let new_wire = max_mss.to_be();
+    ctx.store(option_offset, &new_wire, 0).map_err(|_| ())?;
+    ctx.l4_csum_replace(
+        l4_offset + l4_checksum_offset(IPPROTO_TCP),
+        old_wire as u64,
+        new_wire as u64,
+        2,
+    )
+    .map_err(|_| ())?;
+    Ok(())
+}
+
+/// Scan one TCP header options block for the first MSS option using verifier-friendly `ctx.load`.
+///
+/// The generic pointer-based helper is convenient for unit tests, but the live tc verifier needs
+/// explicit packet loads on bounded offsets so it can prove every option read stays in range.
+fn find_tcp_mss_option(
+    ctx: &TcContext,
+    l4_offset: usize,
+    header_len: usize,
+) -> Result<Option<(usize, u16)>, ()> {
+    let mut cursor = core::mem::size_of::<TcpHeader>();
+
+    for _ in 0..net::TCP_OPTION_SCAN_LIMIT {
+        if cursor >= header_len {
+            return Ok(None);
+        }
+
+        let kind: u8 = ctx.load(l4_offset + cursor).map_err(|_| ())?;
+        match kind {
+            net::TCP_OPTION_END => return Ok(None),
+            net::TCP_OPTION_NOP => {
+                cursor = cursor.saturating_add(1);
+            }
+            net::TCP_OPTION_MSS => {
+                let len: u8 = ctx.load(l4_offset + cursor + 1).map_err(|_| ())?;
+                if len as usize != net::TCP_OPTION_MSS_LEN
+                    || cursor.saturating_add(net::TCP_OPTION_MSS_LEN) > header_len
+                {
+                    return Ok(None);
+                }
+                let mss_wire: u16 = ctx.load(l4_offset + cursor + 2).map_err(|_| ())?;
+                return Ok(Some((l4_offset + cursor + 2, u16::from_be(mss_wire))));
+            }
+            _ => {
+                let len: u8 = ctx.load(l4_offset + cursor + 1).map_err(|_| ())?;
+                if len < 2 {
+                    return Ok(None);
+                }
+                cursor = cursor.saturating_add(len as usize);
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Derive the reverse cache key that pairs with one IPv4 NodePort forward flow.

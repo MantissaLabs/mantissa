@@ -4,6 +4,8 @@
 mod common;
 
 use anyhow::Context;
+use aya::Pod;
+use aya::maps::{HashMap as BpfHashMap, Map, MapData};
 use common::privileged_networking::{
     PrivilegedTestGuard, command_stdout, create_privileged_network, create_privileged_node,
     delete_privileged_network, link_exists, privileged_artifact_dir, privileged_network_interfaces,
@@ -36,6 +38,15 @@ const EBPF_UDP_PORT: u16 = 18083;
 const EBPF_HTTP_RESPONSE: &str = "hello from ebpf overlay privileged test";
 const EBPF_UDP_RESPONSE: &str = "hello from ebpf overlay privileged udp test";
 const HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct BridgeRuntimeConfigValue {
+    tcp_mss: u16,
+    _pad: [u8; 6],
+}
+
+unsafe impl Pod for BridgeRuntimeConfigValue {}
 
 /// Resolve the compiled overlay dataplane artifacts for the privileged eBPF validation lane.
 fn privileged_ebpf_artifact_dir() -> Option<PathBuf> {
@@ -76,12 +87,36 @@ fn assert_lb_maps_present(network_id: Uuid, family: OverlayIpFamily) {
     let map_dir = pinned_lb_map_dir(network_id);
     let (expected, absent) = match family {
         OverlayIpFamily::Ipv4 => (
-            ["LB_VIPS", "LB_BACKENDS", "LB_FWD", "LB_REV"],
-            ["LB_VIPS_V6", "LB_BACKENDS_V6", "LB_FWD_V6", "LB_REV_V6"],
+            [
+                "LB_VIPS",
+                "LB_BACKENDS",
+                "LB_FWD",
+                "LB_REV",
+                "LB_RUNTIME_V4",
+            ],
+            [
+                "LB_VIPS_V6",
+                "LB_BACKENDS_V6",
+                "LB_FWD_V6",
+                "LB_REV_V6",
+                "LB_RUNTIME_V6",
+            ],
         ),
         OverlayIpFamily::Ipv6 => (
-            ["LB_VIPS_V6", "LB_BACKENDS_V6", "LB_FWD_V6", "LB_REV_V6"],
-            ["LB_VIPS", "LB_BACKENDS", "LB_FWD", "LB_REV"],
+            [
+                "LB_VIPS_V6",
+                "LB_BACKENDS_V6",
+                "LB_FWD_V6",
+                "LB_REV_V6",
+                "LB_RUNTIME_V6",
+            ],
+            [
+                "LB_VIPS",
+                "LB_BACKENDS",
+                "LB_FWD",
+                "LB_REV",
+                "LB_RUNTIME_V4",
+            ],
         ),
     };
 
@@ -102,6 +137,30 @@ fn assert_lb_maps_present(network_id: Uuid, family: OverlayIpFamily) {
             pinned.display()
         );
     }
+}
+
+/// Read the pinned overlay runtime-config value for one network and address family.
+fn read_overlay_runtime_config(network_id: Uuid, map_name: &str) -> BridgeRuntimeConfigValue {
+    let path = pinned_lb_map_dir(network_id).join(map_name);
+    let map = MapData::from_pin(&path).unwrap_or_else(|err| {
+        panic!(
+            "open pinned overlay runtime map {}: {err:#}",
+            path.display()
+        )
+    });
+    let map = BpfHashMap::<_, u32, BridgeRuntimeConfigValue>::try_from(Map::HashMap(map))
+        .unwrap_or_else(|err| {
+            panic!(
+                "interpret pinned overlay runtime map {} as a hash map: {err:#}",
+                path.display()
+            )
+        });
+    map.get(&0, 0).unwrap_or_else(|err| {
+        panic!(
+            "read pinned overlay runtime map {} key 0: {err:#}",
+            path.display()
+        )
+    })
 }
 
 /// Parse one test subnet so map-family assertions match the network under validation.
@@ -742,6 +801,97 @@ local_test!(ebpf_overlay_attaches_programs_and_tears_down_cleanly, {
     assert_lb_maps_present(network.id, overlay_family(&subnet));
 
     delete_privileged_network(&node, network.id).await;
+});
+
+local_test!(ebpf_overlay_programs_runtime_mss_for_small_mtu, {
+    let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {
+        return;
+    };
+
+    let _config = PrivilegedTestGuard::apply(|config| {
+        config.network.wireguard.enabled = false;
+        config.network.wireguard.manage_firewall = false;
+        config.network.bpf.attach = true;
+        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        config.network.nodeport.enabled = false;
+        config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+    });
+
+    let node = create_privileged_node().await;
+    let subnet = privileged_test_subnet();
+    let network = create_privileged_network(
+        &node,
+        privileged_test_network(
+            "ebpf-mtu",
+            "privileged ebpf overlay MSS runtime test network",
+            &subnet,
+            600,
+            Vec::new(),
+        ),
+        NetworkStatus::Ready,
+    )
+    .await;
+    let network_id = network.id;
+
+    let runtime = read_overlay_runtime_config(network_id, "LB_RUNTIME_V4");
+    assert_eq!(
+        runtime.tcp_mss, 560,
+        "the pinned overlay runtime config should advertise the MTU-derived IPv4 TCP MSS"
+    );
+
+    let service_id = node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            "ebpf-mtu-service",
+            "ebpf-mtu-service",
+            vec![privileged_http_service_task_template(network_id, 1)],
+        )
+        .await
+        .expect("submit privileged small-MTU overlay deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.service_controller,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(180),
+        )
+        .await,
+        "small-MTU overlay service should reach running state"
+    );
+
+    let backend_ips = wait_for_backend_ips(&node, network_id, 1, Duration::from_secs(60)).await;
+    let [
+        _vxlan_ifname,
+        _bridge_ifname,
+        _host_peer_ifname,
+        host_ifname,
+    ] = privileged_network_interfaces(network_id);
+    let resolver_ip = interface_ipv4(&host_ifname);
+    let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+    let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
+        .await
+        .expect("discover VIP for the small-MTU overlay service");
+    let vip_addr = format!("{vip}:{EBPF_HTTP_PORT}");
+
+    assert!(
+        common::convergence::wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(250),
+            || async {
+                matches!(
+                    http_get(&vip_addr).await,
+                    Ok(response) if response.contains(EBPF_HTTP_RESPONSE)
+                )
+            }
+        )
+        .await,
+        "small-MTU overlay service should still answer host-access VIP traffic"
+    );
+
+    remove_service_via_rpc(&node.services_client, service_id).await;
+    delete_privileged_network(&node, network_id).await;
 });
 
 local_test!(ebpf_overlay_multiple_networks_attach_and_cleanup_cleanly, {

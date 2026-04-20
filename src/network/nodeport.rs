@@ -408,7 +408,7 @@ mod platform {
     #[derive(Clone, Copy, Default)]
     struct NodePortHost {
         mac: [u8; 6],
-        _pad: u16,
+        tcp_mss: u16,
         host_ip: u32,
     }
     unsafe impl Pod for NodePortHost {}
@@ -417,7 +417,7 @@ mod platform {
     #[derive(Clone, Copy, Default)]
     struct NodePortHost6 {
         mac: [u8; 6],
-        _pad: [u8; 2],
+        tcp_mss: u16,
         host_ip: [u8; 16],
     }
     unsafe impl Pod for NodePortHost6 {}
@@ -522,6 +522,8 @@ mod platform {
         forward_map: "NODEPORT_FWD_V6",
         reverse_map: "NODEPORT_REV_V6",
     };
+    const IPV4_TCP_HEADER_BYTES: u32 = 40;
+    const IPV6_TCP_HEADER_BYTES: u32 = 60;
 
     /// Address family selector shared by interface discovery and map programming helpers.
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -850,6 +852,7 @@ mod platform {
 
             if let Some(overlay_ifindex) = overlay_ifindex_opt {
                 let host_mac = host_access_mac(network_id).await?;
+                let host_mtu = host_access_mtu(network_id).await?;
                 let mut programmed_ipv4_host = false;
                 let mut programmed_ipv6_host = false;
 
@@ -858,12 +861,17 @@ mod platform {
                     .map(|(family, _)| family)
                 {
                     let host_ip = host_access_ip(network_id, family).await?;
+                    let tcp_mss = tcp_mss_for_family(host_mtu, family).with_context(|| {
+                        format!(
+                            "derive {family:?} NodePort TCP MSS from host-access MTU {host_mtu}"
+                        )
+                    })?;
 
                     match host_ip {
                         IpAddr::V4(host_ip) => {
                             let value = NodePortHost {
                                 mac: host_mac,
-                                _pad: 0,
+                                tcp_mss,
                                 host_ip: u32::from_ne_bytes(host_ip.octets()),
                             };
                             update_elem(ipv4_host_fd, &overlay_ifindex, &value)
@@ -873,7 +881,7 @@ mod platform {
                         IpAddr::V6(host_ip) => {
                             let value = NodePortHost6 {
                                 mac: host_mac,
-                                _pad: [0u8; 2],
+                                tcp_mss,
                                 host_ip: host_ip.octets(),
                             };
                             update_elem(ipv6_host_fd, &overlay_ifindex, &value)
@@ -1889,6 +1897,61 @@ mod platform {
         Err(anyhow!(
             "host access interface {ifname} missing {family_label} address"
         ))
+    }
+
+    /// Resolve the configured MTU on one host-access interface so NodePort can clamp TCP MSS.
+    ///
+    /// The public dataplane rewrites traffic into the overlay through the host-access veth, so
+    /// its MTU is the authoritative bound for the initial SYN MSS the backend should observe.
+    async fn host_access_mtu(network_id: Uuid) -> Result<u32> {
+        let ifname = host_access_host_iface_name(network_id);
+        let (conn, handle, _) =
+            new_connection().context("open rtnetlink connection for nodeport MTU lookup")?;
+        tokio::spawn(conn);
+
+        let Some(link) = handle
+            .link()
+            .get()
+            .match_name(ifname.clone())
+            .execute()
+            .try_next()
+            .await
+            .context("fetch nodeport host access link for MTU")?
+        else {
+            return Err(anyhow!("host access interface {ifname} not found"));
+        };
+
+        link.attributes
+            .iter()
+            .find_map(|attr| match attr {
+                LinkAttribute::Mtu(mtu) => Some(*mtu),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("host access interface {ifname} missing MTU"))
+    }
+
+    /// Convert one host-access MTU into the per-family TCP MSS ceiling programmed into BPF maps.
+    ///
+    /// Userspace computes this once during reconciliation so the tc programs only need to read a
+    /// scalar MSS value from their host map before clamping SYN options.
+    fn tcp_mss_for_family(mtu: u32, family: NodePortIpFamily) -> Result<u16> {
+        let value = match family {
+            NodePortIpFamily::Ipv4 => ipv4_tcp_mss_from_mtu(mtu),
+            NodePortIpFamily::Ipv6 => ipv6_tcp_mss_from_mtu(mtu),
+        };
+        value.ok_or_else(|| anyhow!("MTU {mtu} is too small for {family:?} TCP"))
+    }
+
+    /// Convert one IPv4 MTU into the largest TCP MSS that still fits on that link.
+    fn ipv4_tcp_mss_from_mtu(mtu: u32) -> Option<u16> {
+        mtu.checked_sub(IPV4_TCP_HEADER_BYTES)
+            .and_then(|mss| u16::try_from(mss).ok())
+    }
+
+    /// Convert one IPv6 MTU into the largest TCP MSS that still fits on that link.
+    fn ipv6_tcp_mss_from_mtu(mtu: u32) -> Option<u16> {
+        mtu.checked_sub(IPV6_TCP_HEADER_BYTES)
+            .and_then(|mss| u16::try_from(mss).ok())
     }
 
     /// # Description:
