@@ -146,6 +146,11 @@ publishes for services with `public_port`.
   be IPv4 or IPv6. When set, it wins over every other source. The configured
   address must match the family of the published VIPs served on the node. On
   multihomed, NATed, or policy-routed hosts, set it explicitly.
+- `network.nodeport.source_mode`
+  Controls what source address published backends observe. The current
+  production contract is `snat_host_access`, which rewrites external traffic to
+  the per-network host-access address before it enters the overlay. The
+  reserved `preserve_client` mode is not implemented yet and fails validation.
 - `network.bpf.overlay_flow_capacity`
   Sets the pinned overlay VIP flow-map size used by the bridge tc dataplane.
   The default is `1024` entries per forward or reverse map. Increase it on
@@ -175,6 +180,7 @@ Recommended production pattern:
             enabled: true,
             iface: "eth0",
             ip: "203.0.113.10",
+            source_mode: snat_host_access,
         ),
     ),
 )
@@ -185,7 +191,7 @@ traffic are the same, you can omit `network.nodeport.ip` and rely on
 `network.advertise_addr` instead.
 
 Changing the BPF and NodePort map capacities requires a restart. The resolved
-NodePort limits are reported in `mantissa info`.
+NodePort source mode and dataplane limits are reported in `mantissa info`.
 
 ## NodePort contract and caveats
 
@@ -200,9 +206,12 @@ NodePort limits are reported in `mantissa info`.
 - Mantissa does not currently translate ICMP errors for the VIP or NodePort NAT
   paths. Run published services on paths with correct MTU / PMTU behavior and
   avoid fragmentation.
-- Mantissa rewrites the source of published traffic to the per-network
-  host-access address before forwarding into the overlay. Backends do not see
-  the original external client IP through the current NodePort dataplane.
+- `network.nodeport.source_mode` is part of the production contract.
+  `snat_host_access` is the only supported value in this release.
+- In `snat_host_access` mode, Mantissa rewrites the source of published traffic
+  to the per-network host-access address before forwarding into the overlay.
+  Backends do not see the original external client IP through the current
+  NodePort dataplane.
 - `public_port + protocol` is cluster-global unique while a service still
   reserves that endpoint.
 - Mantissa manages the TC/eBPF attachments and the host-access sysctls needed

@@ -172,9 +172,11 @@ Publication family and source-IP contract:
   NodePort runtime degrades instead of silently publishing the wrong address.
 - IPv6 publication requires a global or ULA address. Link-local IPv6 addresses
   are rejected as public NodePort identities.
-- Inbound NodePort traffic is SNATed to the per-network host-access address
-  before it enters the overlay VIP dataplane. Backends see that host-access IP,
-  not the original external client IP.
+- `network.nodeport.source_mode` makes the source-address contract explicit.
+  The current release supports `snat_host_access` only.
+- In `snat_host_access` mode, inbound NodePort traffic is SNATed to the
+  per-network host-access address before it enters the overlay VIP dataplane.
+  Backends see that host-access IP, not the original external client IP.
 
 Protocol scope:
 

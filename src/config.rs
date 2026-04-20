@@ -144,6 +144,8 @@ pub struct NodePortConfig {
     pub iface: Option<String>,
     #[serde(default)]
     pub ip: Option<String>,
+    #[serde(default)]
+    pub source_mode: NodePortSourceMode,
     #[serde(default = "default_nodeport_vip_capacity")]
     pub vip_capacity: usize,
     #[serde(default = "default_nodeport_host_capacity")]
@@ -161,10 +163,43 @@ impl Default for NodePortConfig {
             enabled: true,
             iface: None,
             ip: None,
+            source_mode: NodePortSourceMode::default(),
             vip_capacity: default_nodeport_vip_capacity(),
             host_capacity: default_nodeport_host_capacity(),
             flow_capacity: default_nodeport_flow_capacity(),
         }
+    }
+}
+
+/// # Description:
+///
+/// Source-address contract applied to published NodePort traffic before it enters the overlay.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodePortSourceMode {
+    #[default]
+    SnatHostAccess,
+    PreserveClient,
+}
+
+impl NodePortSourceMode {
+    /// # Description:
+    ///
+    /// Render one stable label for config diagnostics, CLI output, and operator-facing docs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SnatHostAccess => "snat_host_access",
+            Self::PreserveClient => "preserve_client",
+        }
+    }
+}
+
+impl std::fmt::Display for NodePortSourceMode {
+    /// # Description:
+    ///
+    /// Render one stable text representation of the configured NodePort source-address contract.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -492,6 +527,13 @@ pub fn nodeport_iface() -> Option<String> {
 
 /// # Description:
 ///
+/// Resolve the configured NodePort source-address mode that governs what backends observe.
+pub fn nodeport_source_mode() -> NodePortSourceMode {
+    global_config().network.nodeport.source_mode
+}
+
+/// # Description:
+///
 /// Resolve the configured nodeport enabled flag.
 pub fn nodeport_enabled() -> bool {
     global_config().network.nodeport.enabled
@@ -694,6 +736,17 @@ fn validate_map_capacity(name: &str, value: usize) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// # Description:
+///
+/// Parse one NodePort source-mode label from environment overrides or operator-facing diagnostics.
+fn parse_nodeport_source_mode(raw: &str) -> Option<NodePortSourceMode> {
+    match raw.trim() {
+        "snat_host_access" => Some(NodePortSourceMode::SnatHostAccess),
+        "preserve_client" => Some(NodePortSourceMode::PreserveClient),
+        _ => None,
+    }
 }
 
 /// # Description:
@@ -977,6 +1030,14 @@ impl Config {
             }
         }
 
+        if let Ok(raw) = std::env::var("MANTISSA_NODEPORT_SOURCE_MODE") {
+            applied = true;
+            match parse_nodeport_source_mode(raw.trim()) {
+                Some(mode) => self.network.nodeport.source_mode = mode,
+                None => warn!("ignoring invalid MANTISSA_NODEPORT_SOURCE_MODE '{raw}'"),
+            }
+        }
+
         applied |= apply_positive_usize_env_override(
             "MANTISSA_NODEPORT_VIP_CAPACITY",
             &mut self.network.nodeport.vip_capacity,
@@ -1110,6 +1171,12 @@ impl Config {
             && ip.parse::<IpAddr>().is_err()
         {
             anyhow::bail!("network.nodeport.ip must be a valid IP address (got '{ip}')");
+        }
+
+        if self.network.nodeport.source_mode == NodePortSourceMode::PreserveClient {
+            anyhow::bail!(
+                "network.nodeport.source_mode 'preserve_client' is not supported yet; use 'snat_host_access'"
+            );
         }
 
         if let Some(ref addr) = self.network.advertise_addr {
@@ -1400,6 +1467,10 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
         changes.push("network.nodeport.ip".to_string());
     }
 
+    if old.network.nodeport.source_mode != new.network.nodeport.source_mode {
+        changes.push("network.nodeport.source_mode".to_string());
+    }
+
     if old.network.nodeport.vip_capacity != new.network.nodeport.vip_capacity {
         changes.push("network.nodeport.vip_capacity".to_string());
     }
@@ -1492,6 +1563,13 @@ mod tests {
     fn rejects_invalid_nodeport_ip() {
         let mut config = Config::default();
         config.network.nodeport.ip = Some("not-an-ip".to_string());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unsupported_nodeport_source_mode() {
+        let mut config = Config::default();
+        config.network.nodeport.source_mode = NodePortSourceMode::PreserveClient;
         assert!(config.validate().is_err());
     }
 
@@ -1601,6 +1679,7 @@ mod tests {
             std::env::set_var("MANTISSA_BPF_NO_ATTACH", "1");
             std::env::set_var("MANTISSA_BPF_OVERLAY_FLOW_CAPACITY", "4096");
             std::env::set_var("MANTISSA_NODEPORT_IFACE", "eth0");
+            std::env::set_var("MANTISSA_NODEPORT_SOURCE_MODE", "snat_host_access");
             std::env::set_var("MANTISSA_NODEPORT_VIP_CAPACITY", "2048");
             std::env::set_var("MANTISSA_NODEPORT_HOST_CAPACITY", "512");
             std::env::set_var("MANTISSA_NODEPORT_FLOW_CAPACITY", "8192");
@@ -1630,6 +1709,10 @@ mod tests {
         assert!(!config.network.nodeport.enabled);
         assert_eq!(config.network.bpf.overlay_flow_capacity, 4096);
         assert_eq!(config.network.nodeport.iface.as_deref(), Some("eth0"));
+        assert_eq!(
+            config.network.nodeport.source_mode,
+            NodePortSourceMode::SnatHostAccess
+        );
         assert_eq!(config.network.nodeport.vip_capacity, 2048);
         assert_eq!(config.network.nodeport.host_capacity, 512);
         assert_eq!(config.network.nodeport.flow_capacity, 8192);
@@ -1667,6 +1750,7 @@ mod tests {
             std::env::remove_var("MANTISSA_BPF_NO_ATTACH");
             std::env::remove_var("MANTISSA_BPF_OVERLAY_FLOW_CAPACITY");
             std::env::remove_var("MANTISSA_NODEPORT_IFACE");
+            std::env::remove_var("MANTISSA_NODEPORT_SOURCE_MODE");
             std::env::remove_var("MANTISSA_NODEPORT_VIP_CAPACITY");
             std::env::remove_var("MANTISSA_NODEPORT_HOST_CAPACITY");
             std::env::remove_var("MANTISSA_NODEPORT_FLOW_CAPACITY");
@@ -1770,6 +1854,20 @@ mod tests {
             changes
                 .iter()
                 .any(|change| change == "network.nodeport.flow_capacity")
+        );
+    }
+
+    #[test]
+    fn nodeport_source_mode_change_requires_restart() {
+        let old = Config::default();
+        let mut new = Config::default();
+        new.network.nodeport.source_mode = NodePortSourceMode::PreserveClient;
+
+        let changes = restart_required_changes(&old, &new);
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "network.nodeport.source_mode")
         );
     }
 }

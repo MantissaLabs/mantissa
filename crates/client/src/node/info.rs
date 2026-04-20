@@ -152,6 +152,7 @@ pub async fn info(cfg: &ClientConfig) -> Result<()> {
 
     let nodeport = info.get_nodeport()?;
     let nodeport_state = nodeport.get_state()?.to_str()?.to_string();
+    let nodeport_source_mode = nodeport.get_source_mode()?.to_str()?.to_string();
     let resolved_iface = nodeport.get_resolved_iface()?.to_str()?.to_string();
     let resolved_node_ip = nodeport.get_resolved_node_ip()?.to_str()?.to_string();
     let last_error = nodeport.get_last_error()?.to_str()?.to_string();
@@ -165,6 +166,9 @@ pub async fn info(cfg: &ClientConfig) -> Result<()> {
     println!("  desired_enabled: {}", nodeport.get_desired_enabled());
     if !nodeport_state.is_empty() {
         println!("  state: {nodeport_state}");
+    }
+    if !nodeport_source_mode.is_empty() {
+        println!("  source_mode: {nodeport_source_mode}");
     }
     if !resolved_iface.is_empty() {
         println!("  resolved_iface: {resolved_iface}");

@@ -3,12 +3,16 @@
 #[macro_use]
 mod common;
 
+use anyhow::Context;
 use common::convergence::wait_until;
 use common::privileged_networking::{
     PrivilegedTestGuard, command_output, command_stdout, create_privileged_network,
     create_privileged_node, delete_privileged_network, privileged_artifact_dir,
-    privileged_test_network, privileged_test_subnet, privileged_test_subnet_v6,
+    privileged_network_interfaces, privileged_test_network, privileged_test_subnet,
+    privileged_test_subnet_v6,
 };
+use futures::TryStreamExt;
+use mantissa::config::NodePortSourceMode;
 use mantissa::network::nodeport::NodePortRuntimeState;
 use mantissa::services::ServiceController;
 use mantissa::services::types::{
@@ -17,10 +21,13 @@ use mantissa::services::types::{
 };
 use mantissa::workload::types::ExecutionSpec;
 use protocol::services::services;
-use std::net::{IpAddr, Ipv6Addr};
+use rtnetlink::packet_route::address::AddressAttribute;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::process::Command as TokioCommand;
 use uuid::Uuid;
 
 const NODEPORT_HTTP_PORT: u16 = 18080;
@@ -257,6 +264,90 @@ async fn udp_echo(addr: &str, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
     udp_echo_with_socket(&socket, addr, payload).await
 }
 
+/// Capture one tcpdump line on the host-access interface so NodePort tests can assert the
+/// source-address contract seen by overlay backends.
+async fn capture_tcpdump_line(
+    iface: &str,
+    filter: &str,
+    trigger_addr: &str,
+) -> anyhow::Result<String> {
+    let mut child = TokioCommand::new("tcpdump")
+        .args(["-nn", "-l", "-U", "-i", iface, "-c", "1", filter])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn tcpdump on {iface} with filter '{filter}'"))?;
+    let mut stdout = child.stdout.take().context("take tcpdump stdout")?;
+    let mut stderr = child.stderr.take().context("take tcpdump stderr")?;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _ = http_get(trigger_addr).await?;
+
+    let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(status) => status.with_context(|| format!("wait for tcpdump on {iface}"))?,
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!("tcpdump on {iface} timed out while waiting for '{filter}'");
+        }
+    };
+    let mut output = Vec::new();
+    stdout
+        .read_to_end(&mut output)
+        .await
+        .context("read tcpdump stdout")?;
+    let mut errors = Vec::new();
+    stderr
+        .read_to_end(&mut errors)
+        .await
+        .context("read tcpdump stderr")?;
+    if !status.success() {
+        anyhow::bail!(
+            "tcpdump on {iface} failed: {}",
+            String::from_utf8_lossy(&errors).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output).trim().to_string())
+}
+
+/// Read the first IPv4 address currently assigned to one host interface through rtnetlink.
+async fn interface_ipv4(iface: &str) -> Ipv4Addr {
+    let (conn, handle, _) =
+        rtnetlink::new_connection().expect("open rtnetlink connection for interface IPv4 lookup");
+    tokio::spawn(conn);
+
+    let link = handle
+        .link()
+        .get()
+        .match_name(iface.to_string())
+        .execute()
+        .try_next()
+        .await
+        .expect("query interface for IPv4 lookup")
+        .unwrap_or_else(|| panic!("interface {iface} should exist for IPv4 lookup"));
+
+    let mut addresses = handle
+        .address()
+        .get()
+        .set_link_index_filter(link.header.index)
+        .execute();
+
+    while let Some(msg) = addresses
+        .try_next()
+        .await
+        .expect("enumerate interface IPv4 addresses")
+    {
+        for attr in &msg.attributes {
+            match attr {
+                AddressAttribute::Address(IpAddr::V4(addr))
+                | AddressAttribute::Local(IpAddr::V4(addr)) => return *addr,
+                _ => {}
+            }
+        }
+    }
+
+    panic!("interface {iface} should expose an IPv4 address");
+}
+
 /// Binds one localhost UDP client socket from a small fixed port range for deterministic tests.
 async fn bind_udp_client_socket(start_port: u16) -> anyhow::Result<UdpSocket> {
     let end_port = start_port.saturating_add(32);
@@ -347,6 +438,7 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
         config.network.nodeport.enabled = true;
         config.network.nodeport.iface = Some("lo".to_string());
         config.network.nodeport.ip = Some("127.0.0.1".to_string());
+        config.network.nodeport.source_mode = NodePortSourceMode::SnatHostAccess;
         config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
     });
     let node = create_privileged_node().await;
@@ -399,6 +491,7 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
         || async {
             let status = node.network_controller.nodeport_manager().status().await;
             status.state == NodePortRuntimeState::Ready
+                && status.source_mode == NodePortSourceMode::SnatHostAccess
                 && status.active_ports == 1
                 && status.active_host_networks == 1
                 && status.resolved_node_ip
@@ -461,6 +554,29 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
             service.public_endpoint_detail()
         );
     }
+
+    let [
+        _vxlan_ifname,
+        _bridge_ifname,
+        _host_peer_ifname,
+        host_ifname,
+    ] = privileged_network_interfaces(network_id);
+    let host_access_ip = interface_ipv4(&host_ifname).await;
+    let capture = capture_tcpdump_line(
+        &host_ifname,
+        &format!("src host {host_access_ip} and tcp dst port {NODEPORT_HTTP_PORT}"),
+        &addr,
+    )
+    .await
+    .expect("capture NodePort forward packet on the host-access interface");
+    assert!(
+        capture.contains(&format!("IP {host_access_ip}.")),
+        "NodePort traffic should enter the overlay with the host-access source identity: {capture}"
+    );
+    assert!(
+        !capture.contains("IP 127.0.0.1."),
+        "NodePort backends should not observe the original loopback client address in snat_host_access mode: {capture}"
+    );
 
     assert!(
         wait_until(

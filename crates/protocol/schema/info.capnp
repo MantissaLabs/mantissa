@@ -160,7 +160,7 @@ struct NodePortInfo {
   # External interface currently selected for NodePort attach.
 
   resolvedNodeIp @3 :Text;
-  # External IPv4 address currently advertised for NodePort traffic.
+  # External address currently advertised for NodePort traffic.
 
   activeNetworks @4 :UInt32;
   # Number of networks that currently publish at least one public service on this node.
@@ -197,6 +197,9 @@ struct NodePortInfo {
 
   flowDiagnostics @15 :NodePortFlowDiagnostics;
   # Flow occupancy and lifecycle counters for the shared NodePort conntrack caches.
+
+  sourceMode @16 :Text;
+  # Source-address contract currently enforced for published NodePort traffic.
 }
 
 struct PacketCounters {

@@ -139,6 +139,7 @@ pub struct NodePortFlowDiagnostics {
 pub struct NodePortStatus {
     pub desired_enabled: bool,
     pub state: NodePortRuntimeState,
+    pub source_mode: crate::config::NodePortSourceMode,
     pub resolved_iface: Option<String>,
     pub resolved_node_ip: Option<IpAddr>,
     pub active_networks: usize,
@@ -310,6 +311,7 @@ impl PlatformNodePortManager {
         NodePortStatus {
             desired_enabled: false,
             state: NodePortRuntimeState::Disabled,
+            source_mode: crate::config::nodeport_source_mode(),
             resolved_iface: None,
             resolved_node_ip: None,
             active_networks: 0,
@@ -637,6 +639,7 @@ mod platform {
     /// Linux implementation that loads nodeport tc programs and keeps their maps synchronized.
     pub(super) struct PlatformNodePortManager {
         desired_enabled: bool,
+        source_mode: config::NodePortSourceMode,
         configured_iface: Option<String>,
         configured_node_ip: Option<IpAddr>,
         configured_advertise_addr: Option<String>,
@@ -658,12 +661,26 @@ mod platform {
     impl PlatformNodePortManager {
         /// Capture nodeport configuration from the global config for later attachment.
         pub(super) fn new() -> Self {
+            let source_mode = config::nodeport_source_mode();
             let configured_iface = config::nodeport_iface();
             let configured_node_ip = config::nodeport_ip();
             let configured_advertise_addr = config::advertise_addr();
             let capacities = NodePortMapCapacities::from_config();
             let mut desired_enabled = config::nodeport_enabled();
-            let initial_error = if desired_enabled && !config::bpf_attach_enabled() {
+            let initial_error = if desired_enabled
+                && source_mode != config::NodePortSourceMode::SnatHostAccess
+            {
+                debug!(
+                    target: "network",
+                    source_mode = %source_mode,
+                    "nodeport disabled because the configured source mode is not implemented"
+                );
+                desired_enabled = false;
+                Some(format!(
+                    "nodeport disabled because network.nodeport.source_mode '{}' is not supported yet",
+                    source_mode
+                ))
+            } else if desired_enabled && !config::bpf_attach_enabled() {
                 debug!(
                     target: "network",
                     "nodeport disabled because bpf attachment is disabled"
@@ -676,6 +693,7 @@ mod platform {
 
             let mut manager = Self {
                 desired_enabled,
+                source_mode,
                 configured_iface: configured_iface.clone(),
                 configured_node_ip,
                 configured_advertise_addr,
@@ -1093,6 +1111,7 @@ mod platform {
             NodePortStatus {
                 desired_enabled: self.desired_enabled,
                 state: self.runtime_state,
+                source_mode: self.source_mode,
                 resolved_iface: self.iface.clone(),
                 resolved_node_ip: self.node_ip,
                 active_networks,
@@ -2728,6 +2747,7 @@ mod tests {
         let status = NodePortStatus {
             desired_enabled: true,
             state: NodePortRuntimeState::Pending,
+            source_mode: crate::config::NodePortSourceMode::SnatHostAccess,
             resolved_iface: Some("eth0".to_string()),
             resolved_node_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4))),
             active_networks: 2,
@@ -2759,6 +2779,10 @@ mod tests {
         assert_eq!(status.active_networks, 2);
         assert_eq!(status.active_ports, 3);
         assert_eq!(status.active_host_networks, 2);
+        assert_eq!(
+            status.source_mode,
+            crate::config::NodePortSourceMode::SnatHostAccess
+        );
         assert_eq!(status.vip_capacity, NODEPORT_VIP_CAPACITY);
         assert_eq!(
             status.flow_diagnostics,
