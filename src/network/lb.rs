@@ -62,6 +62,9 @@ impl BpfLoadBalancer {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{BackendAddress, LoadBalancerFlowDiagnostics, LoadBalancerStatus};
+    use crate::network::attachment::{
+        bridge_name, host_access_host_iface_name, host_access_peer_iface_name, vxlan_name,
+    };
     use anyhow::{Context, Result};
     use aya::Pod;
     use aya::maps::MapData;
@@ -130,7 +133,7 @@ mod platform {
             };
 
             for base in network_dirs {
-                if !network_has_lb_maps(&base) {
+                if !network_has_lb_maps(&base) || !network_has_live_dataplane_interfaces(&base) {
                     continue;
                 }
 
@@ -881,6 +884,53 @@ mod platform {
             || scoped_map_path(base, IPV6_MAPS.forward_map).is_some()
     }
 
+    /// Return whether one pinned network directory still belongs to a live local overlay dataplane.
+    ///
+    /// The status reader aggregates bpffs directories node-wide, so it must ignore stale UUID
+    /// directories left behind after manual cleanup or interrupted teardown. A network counts as
+    /// live only when at least one of its deterministic local interfaces is still present.
+    fn network_has_live_dataplane_interfaces(base: &Path) -> bool {
+        network_has_live_dataplane_interfaces_in(base, Path::new("/sys/class/net"))
+    }
+
+    /// Check whether a pinned network directory still has any of its expected local interfaces
+    /// under the provided net-class root.
+    ///
+    /// The helper takes the net-class root explicitly so unit tests can exercise stale-directory
+    /// filtering without touching the real host interface namespace.
+    fn network_has_live_dataplane_interfaces_in(base: &Path, net_class_root: &Path) -> bool {
+        let Some(network_id) = network_id_from_map_dir(base) else {
+            return false;
+        };
+
+        expected_local_interface_names(network_id)
+            .into_iter()
+            .any(|iface| net_class_root.join(iface).exists())
+    }
+
+    /// Parse the network UUID from one pinned bpffs network directory name.
+    ///
+    /// The load-balancer status root uses the network UUID string as the stable per-network
+    /// directory name, so invalid names can be discarded immediately.
+    fn network_id_from_map_dir(base: &Path) -> Option<Uuid> {
+        base.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| Uuid::parse_str(name).ok())
+    }
+
+    /// Build every deterministic local interface name that can prove a network is still live.
+    ///
+    /// Any one of these interfaces is enough to show the overlay dataplane still exists locally,
+    /// even if other pieces are mid-reconcile or mid-teardown.
+    fn expected_local_interface_names(network_id: Uuid) -> [String; 4] {
+        [
+            bridge_name(network_id),
+            host_access_host_iface_name(network_id),
+            host_access_peer_iface_name(network_id),
+            vxlan_name(network_id),
+        ]
+    }
+
     /// Iterate every key in one BPF map so callers can delete stale entries in place.
     fn visit_map_keys<K, F>(fd: std::os::fd::RawFd, mut visitor: F) -> Result<()>
     where
@@ -1177,6 +1227,7 @@ mod platform {
         use super::*;
         use std::collections::BTreeSet;
         use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        use tempfile::tempdir;
 
         /// Ensure split flow counts still add up to the total operator-visible flow occupancy.
         #[test]
@@ -1275,6 +1326,38 @@ mod platform {
                 .expect("build IPv6 ring b");
             assert_eq!(ring_a, ring_b);
             assert!(!ring_a.is_empty());
+        }
+
+        /// Ensure stale bpffs directories do not count as live overlay dataplane networks.
+        #[test]
+        fn stale_network_directory_requires_live_local_interfaces() {
+            let root = tempdir().expect("create root tempdir");
+            let net_class_root = tempdir().expect("create net-class tempdir");
+            let network_id = Uuid::new_v4();
+            let network_dir = root.path().join(network_id.to_string());
+            fs::create_dir(&network_dir).expect("create network dir");
+
+            assert!(!network_has_live_dataplane_interfaces_in(
+                &network_dir,
+                net_class_root.path()
+            ));
+        }
+
+        /// Ensure any deterministic local dataplane interface marks the bpffs directory as live.
+        #[test]
+        fn live_network_directory_accepts_expected_local_interface() {
+            let root = tempdir().expect("create root tempdir");
+            let net_class_root = tempdir().expect("create net-class tempdir");
+            let network_id = Uuid::new_v4();
+            let network_dir = root.path().join(network_id.to_string());
+            fs::create_dir(&network_dir).expect("create network dir");
+            fs::create_dir(net_class_root.path().join(bridge_name(network_id)))
+                .expect("create bridge iface entry");
+
+            assert!(network_has_live_dataplane_interfaces_in(
+                &network_dir,
+                net_class_root.path()
+            ));
         }
     }
 }
