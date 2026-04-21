@@ -8,6 +8,25 @@ pub struct BackendAddress {
     pub mac: [u8; 6],
 }
 
+/// Live flow occupancy for the overlay VIP conntrack caches.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LoadBalancerFlowDiagnostics {
+    pub ipv4_flow_pairs: usize,
+    pub ipv6_flow_pairs: usize,
+}
+
+/// Snapshot of the local overlay VIP dataplane state that backs internal service load balancing.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LoadBalancerStatus {
+    pub desired_enabled: bool,
+    pub programmed_networks: usize,
+    pub ipv4_vips: usize,
+    pub ipv6_vips: usize,
+    pub flow_capacity: usize,
+    pub flow_diagnostics: Option<LoadBalancerFlowDiagnostics>,
+    pub stats_error: Option<String>,
+}
+
 /// Platform abstraction that either programs real eBPF maps (Linux) or acts as a no-op shim on
 /// unsupported hosts so higher layers can remain platform-agnostic.
 #[derive(Clone, Default)]
@@ -33,11 +52,16 @@ impl BpfLoadBalancer {
     ) -> anyhow::Result<()> {
         self.inner.sync_vip(network_id, vip, vip_mac, backends)
     }
+
+    /// Return the current node-local overlay VIP dataplane status for diagnostics.
+    pub fn status(&self) -> LoadBalancerStatus {
+        self.inner.status()
+    }
 }
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::BackendAddress;
+    use super::{BackendAddress, LoadBalancerFlowDiagnostics, LoadBalancerStatus};
     use anyhow::{Context, Result};
     use aya::Pod;
     use aya::maps::MapData;
@@ -79,6 +103,52 @@ mod platform {
     impl PlatformBpfLoadBalancer {
         pub fn new() -> Self {
             Self
+        }
+
+        /// Return the current overlay VIP dataplane status by aggregating the pinned per-network
+        /// maps that back local VIP publication.
+        pub fn status(&self) -> LoadBalancerStatus {
+            let mut status = LoadBalancerStatus {
+                desired_enabled: crate::config::bpf_attach_enabled(),
+                flow_capacity: crate::config::bpf_overlay_flow_capacity(),
+                ..LoadBalancerStatus::default()
+            };
+
+            if !status.desired_enabled {
+                status.stats_error = Some("overlay bpf attach is disabled".to_string());
+                return status;
+            }
+
+            let mut flow_diagnostics = LoadBalancerFlowDiagnostics::default();
+
+            let network_dirs = match load_balancer_network_dirs() {
+                Ok(network_dirs) => network_dirs,
+                Err(err) => {
+                    status.stats_error = Some(format!("read overlay load-balancer maps: {err:#}"));
+                    return status;
+                }
+            };
+
+            for base in network_dirs {
+                if !network_has_lb_maps(&base) {
+                    continue;
+                }
+
+                status.programmed_networks += 1;
+                if let Err(err) =
+                    accumulate_network_status(&base, &mut status, &mut flow_diagnostics)
+                {
+                    status.stats_error.get_or_insert_with(|| {
+                        format!(
+                            "read overlay load-balancer maps from {}: {err:#}",
+                            base.display()
+                        )
+                    });
+                }
+            }
+
+            status.flow_diagnostics = Some(flow_diagnostics);
+            status
         }
 
         /// Synchronize one VIP into the pinned map family matching its IP address.
@@ -762,6 +832,55 @@ mod platform {
         Ok(())
     }
 
+    /// Aggregate one network's pinned load-balancer state into the node-wide diagnostics snapshot.
+    fn accumulate_network_status(
+        base: &Path,
+        status: &mut LoadBalancerStatus,
+        flow_diagnostics: &mut LoadBalancerFlowDiagnostics,
+    ) -> Result<()> {
+        status.ipv4_vips += count_network_map_entries::<VipKey>(base, IPV4_MAPS.vip_map)?;
+        status.ipv6_vips += count_network_map_entries::<VipKey6>(base, IPV6_MAPS.vip_map)?;
+        flow_diagnostics.ipv4_flow_pairs +=
+            count_network_map_entries::<Flow4>(base, IPV4_MAPS.forward_map)?;
+        flow_diagnostics.ipv6_flow_pairs +=
+            count_network_map_entries::<Flow6>(base, IPV6_MAPS.forward_map)?;
+        Ok(())
+    }
+
+    /// Return every per-network bpffs directory that can carry one overlay load-balancer map set.
+    fn load_balancer_network_dirs() -> Result<Vec<std::path::PathBuf>> {
+        let root = map_root_dir()?;
+        let mut dirs = Vec::new();
+
+        for entry in fs::read_dir(&root)
+            .with_context(|| format!("read overlay load-balancer root {}", root.display()))?
+        {
+            let entry = entry.with_context(|| format!("read entry from {}", root.display()))?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if Uuid::parse_str(name).is_ok() {
+                dirs.push(path);
+            }
+        }
+
+        dirs.sort();
+        Ok(dirs)
+    }
+
+    /// Return whether one network directory currently pins any overlay load-balancer map family.
+    fn network_has_lb_maps(base: &Path) -> bool {
+        scoped_map_path(base, IPV4_MAPS.vip_map).is_some()
+            || scoped_map_path(base, IPV4_MAPS.forward_map).is_some()
+            || scoped_map_path(base, IPV6_MAPS.vip_map).is_some()
+            || scoped_map_path(base, IPV6_MAPS.forward_map).is_some()
+    }
+
     /// Iterate every key in one BPF map so callers can delete stale entries in place.
     fn visit_map_keys<K, F>(fd: std::os::fd::RawFd, mut visitor: F) -> Result<()>
     where
@@ -810,6 +929,20 @@ mod platform {
         Ok(())
     }
 
+    /// Count the number of live entries in one pinned BPF map by walking its keys through the
+    /// kernel `get_next_key` interface.
+    fn count_map_keys<K>(fd: std::os::fd::RawFd) -> Result<usize>
+    where
+        K: Pod + Copy + Default,
+    {
+        let mut count = 0usize;
+        visit_map_keys::<K, _>(fd, |_| {
+            count += 1;
+            Ok(false)
+        })?;
+        Ok(count)
+    }
+
     /// Remove forward IPv4 flow entries whose destination matches the specified VIP.
     fn clear_vip_forward_flows_v4(fd: std::os::fd::RawFd, vip: u32) -> Result<()> {
         visit_map_keys::<Flow4, _>(fd, |next| Ok(next.dst == vip))
@@ -840,9 +973,17 @@ mod platform {
         })
     }
 
-    fn map_pin_dir(network_id: Uuid) -> Result<std::path::PathBuf> {
+    /// Return the shared bpffs root that stores one subdirectory per overlay network.
+    fn map_root_dir() -> Result<std::path::PathBuf> {
         ensure_bpffs().context("prepare bpffs mount")?;
-        let path = std::path::PathBuf::from("/sys/fs/bpf/mantissa").join(network_id.to_string());
+        let path = std::path::PathBuf::from("/sys/fs/bpf/mantissa");
+        fs::create_dir_all(&path)
+            .with_context(|| format!("create load-balancer map root {}", path.display()))?;
+        Ok(path)
+    }
+
+    fn map_pin_dir(network_id: Uuid) -> Result<std::path::PathBuf> {
+        let path = map_root_dir()?.join(network_id.to_string());
         fs::create_dir_all(&path)
             .with_context(|| format!("create map pin directory {}", path.display()))?;
         Ok(path)
@@ -952,6 +1093,38 @@ mod platform {
         Ok(())
     }
 
+    /// Resolve one network-scoped pinned map path without falling back to the global tc namespace.
+    ///
+    /// Node-wide diagnostics aggregate every network directory independently, so they must avoid
+    /// the shared `tc/globals` fallback or the same map could be counted multiple times.
+    fn scoped_map_path(base: &Path, name: &str) -> Option<std::path::PathBuf> {
+        [base.join(name), base.join("tc").join("globals").join(name)]
+            .into_iter()
+            .find(|candidate| candidate.exists())
+    }
+
+    /// Open one network-scoped pinned map if it exists for the requested network directory.
+    fn open_network_map(base: &Path, name: &str) -> Result<Option<MapData>> {
+        let Some(path) = scoped_map_path(base, name) else {
+            return Ok(None);
+        };
+        Ok(Some(MapData::from_pin(&path).with_context(|| {
+            format!("open pinned load-balancer map {}", path.display())
+        })?))
+    }
+
+    /// Count the number of live entries in one network-scoped pinned map, returning zero when the
+    /// requested family is not present for that network.
+    fn count_network_map_entries<K>(base: &Path, name: &str) -> Result<usize>
+    where
+        K: Pod + Copy + Default,
+    {
+        let Some(map) = open_network_map(base, name)? else {
+            return Ok(0);
+        };
+        count_map_keys::<K>(map.fd().as_fd().as_raw_fd())
+    }
+
     /// Try to open a pinned map from the expected mantissa directory, falling back to the tc/globals
     /// location Aya may use for TC programs on some kernels.
     fn open_map(base: &Path, name: &str) -> Result<MapData> {
@@ -1004,6 +1177,17 @@ mod platform {
         use super::*;
         use std::collections::BTreeSet;
         use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        /// Ensure split flow counts still add up to the total operator-visible flow occupancy.
+        #[test]
+        fn load_balancer_flow_diagnostics_split_by_family() {
+            let diagnostics = LoadBalancerFlowDiagnostics {
+                ipv4_flow_pairs: 3,
+                ipv6_flow_pairs: 5,
+            };
+
+            assert_eq!(diagnostics.ipv4_flow_pairs + diagnostics.ipv6_flow_pairs, 8);
+        }
 
         /// Build a synthetic backend value for deterministic ring-construction tests.
         fn synthetic_backend(index: usize) -> BackendAddress {
@@ -1097,7 +1281,7 @@ mod platform {
 
 #[cfg(not(target_os = "linux"))]
 mod platform {
-    use super::BackendAddress;
+    use super::{BackendAddress, LoadBalancerStatus};
     use anyhow::Result;
     use std::net::IpAddr;
     use uuid::Uuid;
@@ -1118,6 +1302,16 @@ mod platform {
             _backends: &[BackendAddress],
         ) -> Result<()> {
             Ok(())
+        }
+
+        /// Return a disabled overlay load-balancer snapshot on unsupported platforms.
+        pub fn status(&self) -> LoadBalancerStatus {
+            LoadBalancerStatus {
+                desired_enabled: false,
+                flow_capacity: crate::config::bpf_overlay_flow_capacity(),
+                stats_error: Some("overlay load balancer is only available on linux".to_string()),
+                ..LoadBalancerStatus::default()
+            }
         }
     }
 }

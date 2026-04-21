@@ -1,4 +1,5 @@
 use crate::info_capnp::info as SystemInfo;
+use crate::network::lb::BpfLoadBalancer;
 use crate::network::nodeport::NodePortManager;
 use crate::node::id::new_node_id_v7;
 use crate::node::info::NodeInfo;
@@ -84,6 +85,7 @@ impl node::Server for Node {
             Some(manager) => Some(manager.status().await),
             None => None,
         };
+        let load_balancer_status = BpfLoadBalancer::new().status();
 
         {
             let builder = &mut builder;
@@ -260,6 +262,24 @@ impl node::Server for Node {
                     nodeport.reborrow().init_ingress_drop_reasons();
                     nodeport.reborrow().init_egress();
                     nodeport.reborrow().init_flow_diagnostics();
+                }
+            }
+
+            // Overlay Load Balancer
+            {
+                let status = load_balancer_status;
+                let mut load_balancer = system.reborrow().init_load_balancer();
+                load_balancer.set_desired_enabled(status.desired_enabled);
+                load_balancer.set_programmed_networks(usize_to_u32(status.programmed_networks));
+                load_balancer.set_ipv4_vips(usize_to_u32(status.ipv4_vips));
+                load_balancer.set_ipv6_vips(usize_to_u32(status.ipv6_vips));
+                load_balancer.set_flow_capacity(usize_to_u32(status.flow_capacity));
+                load_balancer.set_stats_error(status.stats_error.as_deref().unwrap_or(""));
+
+                let mut flow_diagnostics = load_balancer.reborrow().init_flow_diagnostics();
+                if let Some(diagnostics) = status.flow_diagnostics {
+                    flow_diagnostics.set_ipv4_flow_pairs(usize_to_u32(diagnostics.ipv4_flow_pairs));
+                    flow_diagnostics.set_ipv6_flow_pairs(usize_to_u32(diagnostics.ipv6_flow_pairs));
                 }
             }
         }

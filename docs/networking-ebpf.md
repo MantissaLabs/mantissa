@@ -355,6 +355,13 @@ ingress drops.
 Those NodePort limits come from `network.nodeport.vip_capacity`,
 `network.nodeport.host_capacity`, and `network.nodeport.flow_capacity`.
 
+The `Load Balancer:` section reports the local overlay VIP dataplane state:
+how many per-network LB map sets are currently pinned, how many IPv4 and IPv6
+VIPs are programmed, the configured overlay flow capacity, and the live
+IPv4/IPv6 forward-flow cache occupancy. This is the quickest way to confirm
+that internal service VIP
+publication is active even when no public NodePort is involved.
+
 ## Packet flow: NodePort curl
 
 This is the path you exercise with `curl http://<node_ip>:<public_port>`.

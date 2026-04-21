@@ -24,6 +24,9 @@ struct Info {
 
   nodeport @7 :NodePortInfo;
   # Local NodePort runtime state and dataplane counters.
+
+  loadBalancer @8 :LoadBalancerInfo;
+  # Local overlay VIP load-balancer state and dataplane counters.
 }
 
 struct Cpu {
@@ -260,4 +263,35 @@ struct NodePortFlowDiagnostics {
 
   returnPathBypassPackets @7 :UInt64;
   # Packets seen by the NodePort return hook that did not match any published return candidate and were ignored.
+}
+
+struct LoadBalancerInfo {
+  desiredEnabled @0 :Bool;
+  # Whether the operator intends the overlay BPF dataplane to be enabled on this node.
+
+  programmedNetworks @1 :UInt32;
+  # Number of local network map directories that currently pin an overlay load-balancer family.
+
+  ipv4Vips @2 :UInt32;
+  # Number of IPv4 VIPs currently programmed into the local overlay dataplane.
+
+  ipv6Vips @3 :UInt32;
+  # Number of IPv6 VIPs currently programmed into the local overlay dataplane.
+
+  flowCapacity @4 :UInt32;
+  # Maximum number of tracked overlay VIP NAT flows in each pinned LRU map.
+
+  flowDiagnostics @5 :LoadBalancerFlowDiagnostics;
+  # Live flow occupancy for the overlay VIP conntrack caches.
+
+  statsError @6 :Text;
+  # Last error encountered while reading overlay VIP dataplane counters.
+}
+
+struct LoadBalancerFlowDiagnostics {
+  ipv4FlowPairs @0 :UInt32;
+  # Number of live IPv4 forward flow entries currently cached in the overlay VIP dataplane.
+
+  ipv6FlowPairs @1 :UInt32;
+  # Number of live IPv6 forward flow entries currently cached in the overlay VIP dataplane.
 }

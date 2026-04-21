@@ -64,6 +64,22 @@ fn nodeport_flow_diagnostics_fields(
     ]
 }
 
+/// Render the overlay load-balancer flow diagnostics in one compact line so operators can inspect
+/// VIP cache occupancy from `mantissa info`.
+fn load_balancer_flow_diagnostics_fields(
+    diagnostics: protocol::info_capnp::load_balancer_flow_diagnostics::Reader<'_>,
+) -> Vec<String> {
+    let ipv4_pairs = diagnostics.get_ipv4_flow_pairs();
+    let ipv6_pairs = diagnostics.get_ipv6_flow_pairs();
+    let total_pairs = ipv4_pairs.saturating_add(ipv6_pairs);
+
+    vec![
+        format!("flow_pairs={total_pairs}"),
+        format!("ipv4_flow_pairs={ipv4_pairs}"),
+        format!("ipv6_flow_pairs={ipv6_pairs}"),
+    ]
+}
+
 pub async fn info(cfg: &ClientConfig) -> Result<()> {
     let client = connection::get_local_session(cfg).await?;
 
@@ -225,6 +241,31 @@ pub async fn info(cfg: &ClientConfig) -> Result<()> {
     }
     if !stats_error.is_empty() {
         println!("  stats_error: {stats_error}");
+    }
+
+    let load_balancer = info.get_load_balancer()?;
+    let load_balancer_stats_error = load_balancer.get_stats_error()?.to_str()?.to_string();
+    let load_balancer_flow_diagnostics = load_balancer.get_flow_diagnostics()?;
+    let ipv4_vips = load_balancer.get_ipv4_vips();
+    let ipv6_vips = load_balancer.get_ipv6_vips();
+    let total_vips = ipv4_vips.saturating_add(ipv6_vips);
+
+    println!("Load Balancer:");
+    println!("  desired_enabled: {}", load_balancer.get_desired_enabled());
+    println!(
+        "  programmed_networks: {}",
+        load_balancer.get_programmed_networks()
+    );
+    println!("  active_vips: {total_vips}");
+    println!("  ipv4_vips: {ipv4_vips}");
+    println!("  ipv6_vips: {ipv6_vips}");
+    println!("  flow_capacity: {}", load_balancer.get_flow_capacity());
+    println!(
+        "  flow_diagnostics: {}",
+        load_balancer_flow_diagnostics_fields(load_balancer_flow_diagnostics).join(" ")
+    );
+    if !load_balancer_stats_error.is_empty() {
+        println!("  stats_error: {load_balancer_stats_error}");
     }
 
     Ok(())

@@ -14,6 +14,7 @@ use common::privileged_networking::{
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use mantissa::network::allocator::{OverlayIpFamily, parse_overlay_cidr};
+use mantissa::network::lb::BpfLoadBalancer;
 use mantissa::network::types::NetworkStatus;
 use mantissa::server::headless::HeadlessNode;
 use mantissa::services::ServiceController;
@@ -1097,6 +1098,114 @@ local_test!(ebpf_overlay_host_vip_reaches_service_from_host_access, {
     assert!(
         neighbour.contains("PERMANENT"),
         "host-access interface should keep a permanent neighbour entry for the published VIP: {neighbour}"
+    );
+
+    remove_service_via_rpc(&node.services_client, service_id).await;
+    delete_privileged_network(&node, network_id).await;
+});
+
+local_test!(ebpf_overlay_status_reports_programmed_vip_traffic, {
+    let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {
+        return;
+    };
+
+    let _config = PrivilegedTestGuard::apply(|config| {
+        config.network.wireguard.enabled = false;
+        config.network.wireguard.manage_firewall = false;
+        config.network.bpf.attach = true;
+        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        config.network.nodeport.enabled = false;
+        config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+    });
+
+    let node = create_privileged_node().await;
+    let subnet = privileged_test_subnet();
+    let network = create_privileged_network(
+        &node,
+        privileged_test_network(
+            "ebpf-status",
+            "privileged ebpf status test network",
+            &subnet,
+            1450,
+            Vec::new(),
+        ),
+        NetworkStatus::Ready,
+    )
+    .await;
+    let network_id = network.id;
+
+    let service_id = node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            "ebpf-status-service",
+            "ebpf-status-service",
+            vec![privileged_http_service_task_template(network_id, 1)],
+        )
+        .await
+        .expect("submit privileged eBPF overlay status deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.service_controller,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(180),
+        )
+        .await,
+        "eBPF overlay status service should reach running state"
+    );
+
+    let backend_ips = wait_for_backend_ips(&node, network_id, 1, Duration::from_secs(60)).await;
+    let [
+        _vxlan_ifname,
+        _bridge_ifname,
+        _host_peer_ifname,
+        host_ifname,
+    ] = privileged_network_interfaces(network_id);
+    let resolver_ip = interface_ipv4(&host_ifname);
+    let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+    let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
+        .await
+        .expect("discover VIP for overlay status test");
+    let vip_addr = format!("{vip}:{EBPF_HTTP_PORT}");
+
+    assert!(
+        common::convergence::wait_until(
+            Duration::from_secs(30),
+            Duration::from_millis(100),
+            || async {
+                matches!(
+                    http_get(&vip_addr).await,
+                    Ok(response) if response.contains(EBPF_HTTP_RESPONSE)
+                )
+            },
+        )
+        .await,
+        "overlay status test service should answer through the host-access VIP"
+    );
+
+    let status_ready = common::convergence::wait_until(
+        Duration::from_secs(15),
+        Duration::from_millis(100),
+        || async {
+            let status = BpfLoadBalancer::new().status();
+            status.programmed_networks >= 1 && status.ipv4_vips >= 1
+        },
+    )
+    .await;
+    let status = BpfLoadBalancer::new().status();
+    assert!(
+        status_ready,
+        "overlay load-balancer status should report the programmed VIP and bridge traffic: {status:?}"
+    );
+    assert!(
+        status.flow_capacity >= 1,
+        "overlay load-balancer status should expose the configured flow capacity: {status:?}"
+    );
+    assert!(
+        status.stats_error.is_none(),
+        "overlay load-balancer status should not report read failures during the privileged test: {status:?}"
     );
 
     remove_service_via_rpc(&node.services_client, service_id).await;
