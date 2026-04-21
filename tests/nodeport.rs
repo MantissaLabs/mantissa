@@ -121,6 +121,48 @@ fn privileged_nodeport_task_template(
     }
 }
 
+/// Builds one internal frontend task that repeatedly resolves and curls the backend service name.
+///
+/// The loop intentionally uses a fresh `wget` process each time so every iteration exercises the
+/// overlay DNS path and produces host-access traffic that the NodePort return hook must ignore.
+fn privileged_nodeport_frontend_task_template(
+    network_id: Uuid,
+    service_name: &str,
+    target_port: u16,
+) -> TaskTemplateSpecValue {
+    TaskTemplateSpecValue {
+        name: "frontend".to_string(),
+        execution: ExecutionSpec {
+            image: "busybox:1.36".to_string(),
+            command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "while true; do wget -T 2 -q -O - http://backend.{service_name}.svc.mantissa:{target_port} >/dev/null 2>&1; sleep 1; done"
+                ),
+            ],
+            tty: false,
+            cpu_millis: 200,
+            memory_bytes: 64 * 1024 * 1024,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: vec![TaskTemplateNetworkRequirement::new("default", network_id)],
+            placement: Default::default(),
+        },
+        depends_on: vec!["backend".to_string()],
+        replicas: 1,
+        readiness: None,
+        public_port: None,
+        public_protocol: None,
+    }
+}
+
 /// Builds one real UDP echo service attached to the test overlay and published through NodePort.
 fn privileged_nodeport_udp_task_template(
     network_id: Uuid,
@@ -2125,6 +2167,104 @@ local_test!(nodeport_runtime_autodetects_identity_by_default, {
     remove_service_via_rpc(&node.services_client, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
+
+local_test!(
+    nodeport_non_candidate_return_traffic_bypasses_reverse_miss_accounting,
+    {
+        let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
+            return;
+        };
+
+        let service_name = "nodeport-return-bypass";
+        let _config = PrivilegedTestGuard::apply(|config| {
+            config.network.wireguard.enabled = false;
+            config.network.wireguard.manage_firewall = false;
+            config.network.bpf.attach = true;
+            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            config.network.nodeport.enabled = true;
+            config.network.nodeport.iface = Some("lo".to_string());
+            config.network.nodeport.ip = Some("127.0.0.1".to_string());
+            config.network.nodeport.source_mode = NodePortSourceMode::SnatHostAccess;
+            config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+        });
+        let node = create_privileged_node().await;
+        let subnet = privileged_test_subnet();
+        let network = create_privileged_network(
+            &node,
+            privileged_test_network(
+                "nodeport-return-bypass",
+                "privileged nodeport reverse-miss bypass accounting test network",
+                &subnet,
+                1450,
+                Vec::new(),
+            ),
+            mantissa::network::types::NetworkStatus::Ready,
+        )
+        .await;
+        let network_id = network.id;
+
+        let service_id = node
+            .service_controller
+            .submit_deployment(
+                Uuid::new_v4(),
+                service_name,
+                service_name,
+                vec![
+                    privileged_nodeport_task_template(
+                        network_id,
+                        "backend",
+                        NODEPORT_RESPONSE,
+                        NODEPORT_HTTP_PORT,
+                        NODEPORT_HTTP_PORT,
+                    ),
+                    privileged_nodeport_frontend_task_template(
+                        network_id,
+                        service_name,
+                        NODEPORT_HTTP_PORT,
+                    ),
+                ],
+            )
+            .await
+            .expect("submit reverse-miss bypass NodePort deployment");
+
+        assert!(
+            wait_for_service_status(
+                &node.service_controller,
+                service_id,
+                ServiceStatus::Running,
+                Duration::from_secs(180),
+            )
+            .await,
+            "reverse-miss bypass test should reach running state with one public backend and one internal frontend"
+        );
+
+        let bypass_reported = wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(250),
+            || async {
+                let status = node.network_controller.nodeport_manager().status().await;
+                matches!(
+                    status.flow_diagnostics,
+                    Some(diagnostics)
+                        if status.state == NodePortRuntimeState::Ready
+                            && status.active_ports == 1
+                            && diagnostics.return_path_bypass_packets > 0
+                            && diagnostics.reverse_misses == 0
+                )
+            },
+        )
+        .await;
+        if !bypass_reported {
+            let status = node.network_controller.nodeport_manager().status().await;
+            panic!(
+                "internal DNS and host-access traffic should bypass reverse-miss accounting instead of inflating reverse_misses; status={status:?}"
+            );
+        }
+
+        remove_service_via_rpc(&node.services_client, service_id).await;
+        delete_privileged_network(&node, network_id).await;
+    }
+);
 
 local_test!(
     nodeport_ipv6_publication_requires_usable_external_ipv6_address,

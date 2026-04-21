@@ -18,12 +18,13 @@ const NODEPORT_HOST_CAPACITY: usize = crate::config::DEFAULT_NODEPORT_HOST_CAPAC
 /// Keep the userspace readers aligned with the ingress drop-reason map size in the tc ingress program.
 const NODEPORT_INGRESS_DROP_REASON_COUNT: usize = 6;
 /// Keep the userspace readers aligned with the shared NodePort flow-event map size in the tc programs.
-const NODEPORT_FLOW_EVENT_COUNT: usize = 4;
+const NODEPORT_FLOW_EVENT_COUNT: usize = 5;
 
 const NODEPORT_FLOW_CREATE_INDEX: usize = 0;
 const NODEPORT_FLOW_CLEAR_INDEX: usize = 1;
 const NODEPORT_REVERSE_MISS_INDEX: usize = 2;
 const NODEPORT_INVALID_TRANSITION_INDEX: usize = 3;
+const NODEPORT_RETURN_BYPASS_INDEX: usize = 4;
 
 /// Capacity limits for the pinned NodePort maps that back publication, host-access SNAT, and
 /// public conntrack state.
@@ -133,6 +134,7 @@ pub struct NodePortFlowDiagnostics {
     pub estimated_flow_evictions: u64,
     pub reverse_misses: u64,
     pub invalid_conntrack_transitions: u64,
+    pub return_path_bypass_packets: u64,
 }
 
 /// Why the current NodePort publication identity was chosen.
@@ -382,11 +384,11 @@ mod platform {
     use super::{
         NODEPORT_FLOW_CLEAR_INDEX, NODEPORT_FLOW_CREATE_INDEX, NODEPORT_FLOW_EVENT_COUNT,
         NODEPORT_INGRESS_DROP_REASON_COUNT, NODEPORT_INVALID_TRANSITION_INDEX,
-        NODEPORT_REVERSE_MISS_INDEX, NodePortFlowDiagnostics, NodePortIdentitySource,
-        NodePortIngressDropReasons, NodePortMapCapacities, NodePortMapping, NodePortPacketCounters,
-        NodePortProtocol, NodePortRuntimeState, NodePortStatus, configured_node_ip_from_sources,
-        configured_node_ip_source, estimated_flow_evictions, nodeport_capacity_error,
-        projected_active_networks_after_sync, resolve_advertise_ip,
+        NODEPORT_RETURN_BYPASS_INDEX, NODEPORT_REVERSE_MISS_INDEX, NodePortFlowDiagnostics,
+        NodePortIdentitySource, NodePortIngressDropReasons, NodePortMapCapacities, NodePortMapping,
+        NodePortPacketCounters, NodePortProtocol, NodePortRuntimeState, NodePortStatus,
+        configured_node_ip_from_sources, configured_node_ip_source, estimated_flow_evictions,
+        nodeport_capacity_error, projected_active_networks_after_sync, resolve_advertise_ip,
     };
     use crate::config;
     use crate::ip_family::{IpFamily, infer_default_ip_family};
@@ -449,6 +451,26 @@ mod platform {
         node_ip: [u8; 16],
     }
     unsafe impl Pod for NodePortEntry6 {}
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+    pub(super) struct NodePortReturnKey {
+        pub(super) vip: u32,
+        pub(super) vip_port: u16,
+        pub(super) proto: u8,
+        pub(super) _pad: u8,
+    }
+    unsafe impl Pod for NodePortReturnKey {}
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+    pub(super) struct NodePortReturnKey6 {
+        pub(super) vip: [u8; 16],
+        pub(super) vip_port: u16,
+        pub(super) proto: u8,
+        pub(super) _pad: u8,
+    }
+    unsafe impl Pod for NodePortReturnKey6 {}
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -550,6 +572,7 @@ mod platform {
     /// Pinned map names for one NodePort address family.
     struct NodePortMapNames {
         vip_map: &'static str,
+        return_map: &'static str,
         host_map: &'static str,
         forward_map: &'static str,
         reverse_map: &'static str,
@@ -557,6 +580,7 @@ mod platform {
 
     const IPV4_MAPS: NodePortMapNames = NodePortMapNames {
         vip_map: "NODEPORT_VIPS",
+        return_map: "NODEPORT_RETURNS",
         host_map: "NODEPORT_HOST",
         forward_map: "NODEPORT_FWD",
         reverse_map: "NODEPORT_REV",
@@ -564,6 +588,7 @@ mod platform {
 
     const IPV6_MAPS: NodePortMapNames = NodePortMapNames {
         vip_map: "NODEPORT_VIPS_V6",
+        return_map: "NODEPORT_RETURNS_V6",
         host_map: "NODEPORT_HOST_V6",
         forward_map: "NODEPORT_FWD_V6",
         reverse_map: "NODEPORT_REV_V6",
@@ -678,6 +703,44 @@ mod platform {
             .difference(&desired_indices)
             .copied()
             .collect()
+    }
+
+    /// Return the published VIP/service-port tuples that should count as real NodePort return-path
+    /// candidates for one sync snapshot.
+    ///
+    /// The tc egress hook is attached to both the external interface and every host-access
+    /// interface, so it sees unrelated traffic as well as real NodePort replies. Keeping one
+    /// family-specific candidate set in bpffs lets the dataplane distinguish "ordinary traffic
+    /// that passed through the hook" from "published return packet missing conntrack state"
+    /// without scanning the publication map by value at packet time.
+    pub(super) fn nodeport_return_keys(
+        mappings: &HashMap<NodePortSelector, NodePortPublishedMapping>,
+    ) -> (HashSet<NodePortReturnKey>, HashSet<NodePortReturnKey6>) {
+        let mut ipv4 = HashSet::new();
+        let mut ipv6 = HashSet::new();
+
+        for (selector, mapping) in mappings {
+            match mapping.vip {
+                IpAddr::V4(vip) => {
+                    ipv4.insert(NodePortReturnKey {
+                        vip: u32::from_ne_bytes(vip.octets()),
+                        vip_port: mapping.vip_port.to_be(),
+                        proto: selector.protocol.number(),
+                        _pad: 0,
+                    });
+                }
+                IpAddr::V6(vip) => {
+                    ipv6.insert(NodePortReturnKey6 {
+                        vip: vip.octets(),
+                        vip_port: mapping.vip_port.to_be(),
+                        proto: selector.protocol.number(),
+                        _pad: 0,
+                    });
+                }
+            }
+        }
+
+        (ipv4, ipv6)
     }
 
     struct NodePortAttachment {
@@ -860,12 +923,18 @@ mod platform {
                 open_map(&base, IPV4_MAPS.vip_map).context("open NODEPORT_VIPS map")?;
             let ipv6_vip_map =
                 open_map(&base, IPV6_MAPS.vip_map).context("open NODEPORT_VIPS_V6 map")?;
+            let ipv4_return_map =
+                open_map(&base, IPV4_MAPS.return_map).context("open NODEPORT_RETURNS map")?;
+            let ipv6_return_map =
+                open_map(&base, IPV6_MAPS.return_map).context("open NODEPORT_RETURNS_V6 map")?;
             let ipv4_host_map =
                 open_map(&base, IPV4_MAPS.host_map).context("open NODEPORT_HOST map")?;
             let ipv6_host_map =
                 open_map(&base, IPV6_MAPS.host_map).context("open NODEPORT_HOST_V6 map")?;
             let ipv4_vip_fd = ipv4_vip_map.fd().as_fd().as_raw_fd();
             let ipv6_vip_fd = ipv6_vip_map.fd().as_fd().as_raw_fd();
+            let ipv4_return_fd = ipv4_return_map.fd().as_fd().as_raw_fd();
+            let ipv6_return_fd = ipv6_return_map.fd().as_fd().as_raw_fd();
             let ipv4_host_fd = ipv4_host_map.fd().as_fd().as_raw_fd();
             let ipv6_host_fd = ipv6_host_map.fd().as_fd().as_raw_fd();
             let previous_mappings = self
@@ -883,6 +952,10 @@ mod platform {
                 .collect_programmed_mappings(entries, overlay_index, &mut resolved_node_ips)
                 .await?;
             let stale_mappings = stale_nodeport_mappings(&previous_mappings, &desired_mappings);
+            let (previous_return_keys_v4, previous_return_keys_v6) =
+                nodeport_return_keys(&previous_mappings);
+            let (desired_return_keys_v4, desired_return_keys_v6) =
+                nodeport_return_keys(&desired_mappings);
             for (selector, _) in &stale_mappings {
                 let key = NodePortKey {
                     port: selector.port.to_be(),
@@ -893,6 +966,12 @@ mod platform {
                 // cannot recreate the old translation while this sync is still converging.
                 let _ = delete_elem(ipv4_vip_fd, &key);
                 let _ = delete_elem(ipv6_vip_fd, &key);
+            }
+            for key in previous_return_keys_v4.difference(&desired_return_keys_v4) {
+                let _ = delete_elem(ipv4_return_fd, key);
+            }
+            for key in previous_return_keys_v6.difference(&desired_return_keys_v6) {
+                let _ = delete_elem(ipv6_return_fd, key);
             }
             let cleared_pairs = clear_stale_nodeport_flows(&base, stale_mappings.as_slice())
                 .context("clear stale nodeport flows")?;
@@ -949,6 +1028,15 @@ mod platform {
             for overlay_ifindex in stale_overlay_ifindices(&previous_mappings, &desired_mappings) {
                 let _ = delete_elem(ipv4_host_fd, &overlay_ifindex);
                 let _ = delete_elem(ipv6_host_fd, &overlay_ifindex);
+            }
+
+            for key in &desired_return_keys_v4 {
+                update_elem(ipv4_return_fd, key, &1u8)
+                    .context("program IPv4 nodeport return candidate")?;
+            }
+            for key in &desired_return_keys_v6 {
+                update_elem(ipv6_return_fd, key, &1u8)
+                    .context("program IPv6 nodeport return candidate")?;
             }
 
             for (selector, mapping) in &desired_mappings {
@@ -1215,6 +1303,10 @@ mod platform {
 
         /// Read the shared NodePort flow diagnostics and derive an eviction estimate from current
         /// forward-map occupancy plus cumulative lifecycle counters.
+        ///
+        /// The return-path hook also sees ordinary traffic on the external and host-access
+        /// interfaces, so the diagnostics distinguish candidate reverse misses from packets that
+        /// simply bypassed NodePort accounting on those shared hooks.
         fn read_flow_diagnostics(&self) -> Result<NodePortFlowDiagnostics> {
             let values =
                 read_u64_percpu_array("NODEPORT_TC_FLOW_EVENTS", NODEPORT_FLOW_EVENT_COUNT)?;
@@ -1237,6 +1329,7 @@ mod platform {
                 ),
                 reverse_misses: values[NODEPORT_REVERSE_MISS_INDEX],
                 invalid_conntrack_transitions: values[NODEPORT_INVALID_TRANSITION_INDEX],
+                return_path_bypass_packets: values[NODEPORT_RETURN_BYPASS_INDEX],
             })
         }
 
@@ -2131,7 +2224,12 @@ mod platform {
         let host_capacity = capacities.host_u32()?;
         let flow_capacity = capacities.flow_u32()?;
 
-        for map_name in [IPV4_MAPS.vip_map, IPV6_MAPS.vip_map] {
+        for map_name in [
+            IPV4_MAPS.vip_map,
+            IPV4_MAPS.return_map,
+            IPV6_MAPS.vip_map,
+            IPV6_MAPS.return_map,
+        ] {
             loader.set_max_entries(map_name, vip_capacity);
         }
         for map_name in [IPV4_MAPS.host_map, IPV6_MAPS.host_map] {
@@ -2657,6 +2755,8 @@ mod platform {
             "NODEPORT_REV_V6",
             "NODEPORT_VIPS",
             "NODEPORT_VIPS_V6",
+            "NODEPORT_RETURNS",
+            "NODEPORT_RETURNS_V6",
             "NODEPORT_HOST",
             "NODEPORT_HOST_V6",
             "NODEPORT_TC_INGRESS_STATS",
@@ -2840,8 +2940,8 @@ use platform::PlatformNodePortManager;
 mod tests {
     #[cfg(target_os = "linux")]
     use super::platform::{
-        NodePortPublishedMapping, NodePortSelector, stale_nodeport_mappings,
-        stale_overlay_ifindices,
+        NodePortPublishedMapping, NodePortReturnKey, NodePortReturnKey6, NodePortSelector,
+        nodeport_return_keys, stale_nodeport_mappings, stale_overlay_ifindices,
     };
     use super::{
         NODEPORT_FLOW_CAPACITY, NODEPORT_HOST_CAPACITY, NODEPORT_VIP_CAPACITY,
@@ -2937,6 +3037,62 @@ mod tests {
 
         assert_eq!(stale_overlay_ifindices(&previous, &desired), vec![41]);
     }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn nodeport_return_keys_dedupe_shared_vip_targets() {
+        let tcp_a = NodePortSelector::new(18080, NodePortProtocol::Tcp);
+        let tcp_b = NodePortSelector::new(18081, NodePortProtocol::Tcp);
+        let udp = NodePortSelector::new(18082, NodePortProtocol::Udp);
+        let ipv6 = NodePortSelector::new(18083, NodePortProtocol::Tcp);
+        let shared_ipv4 = NodePortPublishedMapping::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)),
+            8080,
+            IpAddr::V4(Ipv4Addr::new(192, 168, 10, 4)),
+            42,
+        );
+        let shared_ipv6 = NodePortPublishedMapping::new(
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            8080,
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            42,
+        );
+
+        let mappings = HashMap::from([
+            (tcp_a, shared_ipv4),
+            (tcp_b, shared_ipv4),
+            (udp, shared_ipv4),
+            (ipv6, shared_ipv6),
+        ]);
+
+        let (ipv4, ipv6_keys) = nodeport_return_keys(&mappings);
+        assert_eq!(
+            ipv4,
+            std::collections::HashSet::from([
+                NodePortReturnKey {
+                    vip: u32::from_ne_bytes([10, 0, 0, 10]),
+                    vip_port: 8080u16.to_be(),
+                    proto: NodePortProtocol::Tcp.number(),
+                    _pad: 0,
+                },
+                NodePortReturnKey {
+                    vip: u32::from_ne_bytes([10, 0, 0, 10]),
+                    vip_port: 8080u16.to_be(),
+                    proto: NodePortProtocol::Udp.number(),
+                    _pad: 0,
+                },
+            ])
+        );
+        assert_eq!(
+            ipv6_keys,
+            std::collections::HashSet::from([NodePortReturnKey6 {
+                vip: Ipv6Addr::LOCALHOST.octets(),
+                vip_port: 8080u16.to_be(),
+                proto: NodePortProtocol::Tcp.number(),
+                _pad: 0,
+            }])
+        );
+    }
     #[test]
     fn resolve_advertise_ipv4_accepts_literal_ipv4_socket() {
         assert_eq!(
@@ -3021,6 +3177,7 @@ mod tests {
                 estimated_flow_evictions: 1,
                 reverse_misses: 2,
                 invalid_conntrack_transitions: 1,
+                return_path_bypass_packets: 3,
             }),
             last_error: None,
             stats_error: None,
@@ -3048,6 +3205,7 @@ mod tests {
                 estimated_flow_evictions: 1,
                 reverse_misses: 2,
                 invalid_conntrack_transitions: 1,
+                return_path_bypass_packets: 3,
             })
         );
         assert_eq!(

@@ -248,6 +248,8 @@ impl node::Server for Node {
                         flow_diagnostics.set_invalid_conntrack_transitions(
                             diagnostics.invalid_conntrack_transitions,
                         );
+                        flow_diagnostics
+                            .set_return_path_bypass_packets(diagnostics.return_path_bypass_packets);
                     }
                 } else {
                     nodeport.set_state("unavailable");

@@ -253,8 +253,11 @@ struct NodePortFlowDiagnostics {
   # Estimated number of LRU flow-pair evictions derived from creates, clears, and occupancy.
 
   reverseMisses @5 :UInt64;
-  # Packets that reached the return path without a matching reverse flow entry.
+  # Candidate NodePort return packets that reached the return path without a matching reverse flow entry.
 
   invalidConntrackTransitions @6 :UInt64;
-  # Packets rejected because they attempted an invalid NodePort conntrack state transition.
+  # Cached NodePort flows rejected because they attempted an invalid conntrack state transition.
+
+  returnPathBypassPackets @7 :UInt64;
+  # Packets seen by the NodePort return hook that did not match any published return candidate and were ignored.
 }

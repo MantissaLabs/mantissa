@@ -8,7 +8,7 @@ use aya_ebpf::{
     bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT},
     helpers::{bpf_csum_diff, bpf_ktime_get_ns},
     macros::{classifier, map},
-    maps::{LruHashMap, PerCpuArray},
+    maps::{HashMap, LruHashMap, PerCpuArray},
     programs::TcContext,
 };
 use network_ebpf::{
@@ -21,10 +21,29 @@ const ETH_P_IPV4: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86dd;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
-const NODEPORT_FLOW_EVENT_COUNT: u32 = 4;
+const NODEPORT_FLOW_EVENT_COUNT: u32 = 5;
 const FLOW_EVENT_CLEAR: u32 = 1;
 const FLOW_EVENT_REVERSE_MISS: u32 = 2;
 const FLOW_EVENT_INVALID_TRANSITION: u32 = 3;
+const FLOW_EVENT_RETURN_BYPASS: u32 = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NodePortReturnKey {
+    vip: u32,
+    vip_port: u16,
+    proto: u8,
+    _pad: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NodePortReturnKey6 {
+    vip: [u8; 16],
+    vip_port: u16,
+    proto: u8,
+    _pad: u8,
+}
 
 #[map(name = "NODEPORT_TC_EGRESS_STATS")]
 static mut NODEPORT_TC_EGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::pinned(1, 0);
@@ -32,6 +51,12 @@ static mut NODEPORT_TC_EGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::pin
 #[map(name = "NODEPORT_TC_FLOW_EVENTS")]
 static mut NODEPORT_TC_FLOW_EVENTS: PerCpuArray<u64> =
     PerCpuArray::pinned(NODEPORT_FLOW_EVENT_COUNT, 0);
+
+#[map(name = "NODEPORT_RETURNS")]
+static mut NODEPORT_RETURNS: HashMap<NodePortReturnKey, u8> = HashMap::pinned(1024, 0);
+
+#[map(name = "NODEPORT_RETURNS_V6")]
+static mut NODEPORT_RETURNS_V6: HashMap<NodePortReturnKey6, u8> = HashMap::pinned(1024, 0);
 
 #[map(name = "NODEPORT_FWD")]
 static mut NODEPORT_FWD: LruHashMap<Flow4, NodePortNat> = LruHashMap::pinned(2048, 0);
@@ -114,7 +139,7 @@ fn handle_ipv4_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
     };
 
     let Some(mut entry) = (unsafe { NODEPORT_REV.get(&reverse_key).copied() }) else {
-        record_flow_event(FLOW_EVENT_REVERSE_MISS);
+        record_reverse_miss_v4(ip_hdr.src, src_port, proto);
         return Ok(false);
     };
     if has_more_fragments {
@@ -177,7 +202,7 @@ fn handle_ipv6_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Resu
     };
 
     let Some(mut entry) = (unsafe { NODEPORT_REV_V6.get(&reverse_key).copied() }) else {
-        record_flow_event(FLOW_EVENT_REVERSE_MISS);
+        record_reverse_miss_v6(&ip_hdr.src, src_port, proto);
         return Ok(false);
     };
     let forward_key = forward_key_from_reverse_flow_v6(&reverse_key);
@@ -228,6 +253,49 @@ fn record_flow_event(event_index: u32) {
             event_index,
         );
     }
+}
+
+/// Record one reverse-path miss only when the packet still matches a published IPv4 return
+/// candidate.
+///
+/// The NodePort return hook also sees ordinary host-access and external-interface traffic. Those
+/// packets should be ignored for reverse-miss accounting unless their source tuple still matches a
+/// published VIP/service-port candidate that could legitimately require cached conntrack state.
+#[inline(always)]
+fn record_reverse_miss_v4(vip: u32, vip_port: u16, proto: u8) {
+    let candidate = NodePortReturnKey {
+        vip,
+        vip_port,
+        proto,
+        _pad: 0,
+    };
+    let event = if unsafe { NODEPORT_RETURNS.get(&candidate) }.is_some() {
+        FLOW_EVENT_REVERSE_MISS
+    } else {
+        FLOW_EVENT_RETURN_BYPASS
+    };
+    record_flow_event(event);
+}
+
+/// Record one reverse-path miss only when the packet still matches a published IPv6 return
+/// candidate.
+///
+/// IPv6 return traffic shares the same egress hook and the same diagnostic contract as IPv4, so
+/// bypass traffic is separated from real reverse misses with one family-specific publication map.
+#[inline(always)]
+fn record_reverse_miss_v6(vip: &[u8; 16], vip_port: u16, proto: u8) {
+    let candidate = NodePortReturnKey6 {
+        vip: *vip,
+        vip_port,
+        proto,
+        _pad: 0,
+    };
+    let event = if unsafe { NODEPORT_RETURNS_V6.get(&candidate) }.is_some() {
+        FLOW_EVENT_REVERSE_MISS
+    } else {
+        FLOW_EVENT_RETURN_BYPASS
+    };
+    record_flow_event(event);
 }
 
 /// Load and validate the fixed TCP header prefix at the provided transport offset.

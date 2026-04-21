@@ -27,7 +27,7 @@ const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 const LOOPBACK_HDR_LEN: usize = 4;
 const NODEPORT_INGRESS_DROP_REASON_COUNT: u32 = 6;
-const NODEPORT_FLOW_EVENT_COUNT: u32 = 4;
+const NODEPORT_FLOW_EVENT_COUNT: u32 = 5;
 const FLOW_EVENT_CREATE: u32 = 0;
 const FLOW_EVENT_CLEAR: u32 = 1;
 const FLOW_EVENT_INVALID_TRANSITION: u32 = 3;
@@ -274,7 +274,6 @@ fn handle_ipv4_packet(
         }
     } else {
         let Some(conntrack) = ConntrackMetadata::begin_flow(proto, tcp_flags, now_ns) else {
-            record_flow_event(FLOW_EVENT_INVALID_TRANSITION);
             return Ok(IngressOutcome::Ignored);
         };
         created_new_flow = true;
@@ -405,7 +404,6 @@ fn handle_ipv6_packet(
         }
     } else {
         let Some(conntrack) = ConntrackMetadata::begin_flow(proto, tcp_flags, now_ns) else {
-            record_flow_event(FLOW_EVENT_INVALID_TRANSITION);
             return Ok(IngressOutcome::Ignored);
         };
         created_new_flow = true;

@@ -57,6 +57,10 @@ fn nodeport_flow_diagnostics_fields(
             "invalid_conntrack_transitions={}",
             diagnostics.get_invalid_conntrack_transitions()
         ),
+        format!(
+            "return_path_bypass_packets={}",
+            diagnostics.get_return_path_bypass_packets()
+        ),
     ]
 }
 
