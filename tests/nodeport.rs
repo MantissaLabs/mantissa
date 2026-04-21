@@ -2020,108 +2020,111 @@ local_test!(
     }
 );
 
-local_test!(
-    nodeport_runtime_requires_explicit_identity_without_unsafe_autodetect,
-    {
-        let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
-            return;
-        };
+local_test!(nodeport_runtime_autodetects_identity_by_default, {
+    let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
+        return;
+    };
 
-        let _config = PrivilegedTestGuard::apply(|config| {
-            config.network.wireguard.enabled = false;
-            config.network.wireguard.manage_firewall = false;
-            config.network.bpf.attach = true;
-            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
-            config.network.nodeport.enabled = true;
-            config.network.nodeport.iface = None;
-            config.network.nodeport.ip = None;
-            config.network.nodeport.unsafe_allow_autodetect = false;
-            config.network.advertise_addr = None;
-        });
-        let node = create_privileged_node().await;
-        let subnet = privileged_test_subnet();
-        let network = create_privileged_network(
-            &node,
-            privileged_test_network(
-                "nodeport-identity-required",
-                "privileged nodeport identity validation test network",
-                &subnet,
-                1450,
-                Vec::new(),
-            ),
-            mantissa::network::types::NetworkStatus::Ready,
-        )
-        .await;
-        let network_id = network.id;
+    let _config = PrivilegedTestGuard::apply(|config| {
+        config.network.wireguard.enabled = false;
+        config.network.wireguard.manage_firewall = false;
+        config.network.bpf.attach = true;
+        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        config.network.nodeport.enabled = true;
+        config.network.nodeport.iface = None;
+        config.network.nodeport.ip = None;
+        config.network.advertise_addr = None;
+    });
+    let node = create_privileged_node().await;
+    let subnet = privileged_test_subnet();
+    let network = create_privileged_network(
+        &node,
+        privileged_test_network(
+            "nodeport-identity-autodetect",
+            "privileged nodeport identity autodetect test network",
+            &subnet,
+            1450,
+            Vec::new(),
+        ),
+        mantissa::network::types::NetworkStatus::Ready,
+    )
+    .await;
+    let network_id = network.id;
 
-        let service_id = deploy_privileged_nodeport_service(
+    let service_id = deploy_privileged_nodeport_service(
+        &node.service_controller,
+        "nodeport-identity-autodetect",
+        network_id,
+        NODEPORT_RESPONSE,
+        NODEPORT_HTTP_PORT,
+        NODEPORT_HTTP_PORT,
+    )
+    .await
+    .expect("submit autodetected NodePort deployment");
+
+    assert!(
+        wait_for_service_status(
             &node.service_controller,
-            "nodeport-identity-required",
-            network_id,
-            NODEPORT_DEGRADED_RESPONSE,
-            NODEPORT_HTTP_PORT,
-            NODEPORT_HTTP_PORT,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(180),
         )
-        .await
-        .expect("submit explicit-identity NodePort deployment");
+        .await,
+        "service should still reach running when NodePort falls back to autodetect"
+    );
 
-        assert!(
-            wait_for_service_status(
-                &node.service_controller,
-                service_id,
-                ServiceStatus::Running,
-                Duration::from_secs(180),
-            )
-            .await,
-            "service should still reach running even when public exposure is rejected"
-        );
+    assert!(
+        wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+            || async {
+                let status = node.network_controller.nodeport_manager().status().await;
+                let service = node
+                    .service_controller
+                    .registry()
+                    .get(service_id)
+                    .expect("read autodetected NodePort service")
+                    .expect("autodetected NodePort service should still exist");
+                status.state == NodePortRuntimeState::Ready
+                    && status.identity_source == Some(NodePortIdentitySource::Autodetect)
+                    && matches!(status.resolved_node_ip, Some(IpAddr::V4(_)))
+                    && status.active_ports == 1
+                    && status.active_host_networks == 1
+                    && status.stats_error.is_none()
+                    && service.public_endpoint_detail().is_none()
+            }
+        )
+        .await,
+        "missing explicit NodePort identity should fall back to autodetect and publish successfully"
+    );
 
-        assert!(
-            wait_until(
-                Duration::from_secs(60),
-                Duration::from_millis(100),
-                || async {
-                    let status = node.network_controller.nodeport_manager().status().await;
-                    let service = node
-                        .service_controller
-                        .registry()
-                        .get(service_id)
-                        .expect("read explicit-identity degraded public service")
-                        .expect("explicit-identity degraded public service should still exist");
-                    status.state == NodePortRuntimeState::Degraded
-                        && status.identity_source.is_none()
-                        && status.last_error.as_deref().is_some_and(|error| {
-                            error.contains("unsafe_allow_autodetect")
-                                && error.contains("network.nodeport.iface")
-                        })
-                        && service.public_endpoint_detail().is_some_and(|detail| {
-                            detail.contains("could not publish NodePort")
-                                && detail.contains("unsafe_allow_autodetect")
-                        })
+    let status = node.network_controller.nodeport_manager().status().await;
+    let resolved_node_ip = status
+        .resolved_node_ip
+        .expect("autodetect should resolve one publication address");
+    let addr = match resolved_node_ip {
+        IpAddr::V4(ip) => format!("{ip}:{NODEPORT_HTTP_PORT}"),
+        IpAddr::V6(ip) => format!("[{ip}]:{NODEPORT_HTTP_PORT}"),
+    };
+
+    assert!(
+        wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(250),
+            || async {
+                match http_get(&addr).await {
+                    Ok(response) => response.contains(NODEPORT_RESPONSE),
+                    Err(_) => false,
                 }
-            )
-            .await,
-            "missing explicit NodePort identity should degrade publication with a precise operator-facing error"
-        );
+            }
+        )
+        .await,
+        "autodetected NodePort identity should expose the public port"
+    );
 
-        assert!(
-            wait_until(
-                Duration::from_secs(10),
-                Duration::from_millis(100),
-                || async {
-                    TcpStream::connect(format!("127.0.0.1:{NODEPORT_HTTP_PORT}"))
-                        .await
-                        .is_err()
-                }
-            )
-            .await,
-            "rejected NodePort identity selection should not expose the public port"
-        );
-
-        remove_service_via_rpc(&node.services_client, service_id).await;
-        delete_privileged_network(&node, network_id).await;
-    }
-);
+    remove_service_via_rpc(&node.services_client, service_id).await;
+    delete_privileged_network(&node, network_id).await;
+});
 
 local_test!(
     nodeport_ipv6_publication_requires_usable_external_ipv6_address,

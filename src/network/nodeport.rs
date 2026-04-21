@@ -141,7 +141,7 @@ pub enum NodePortIdentitySource {
     NodePortIp,
     AdvertiseAddr,
     InterfaceAddress,
-    UnsafeAutodetect,
+    Autodetect,
 }
 
 impl NodePortIdentitySource {
@@ -151,7 +151,7 @@ impl NodePortIdentitySource {
             Self::NodePortIp => "nodeport_ip",
             Self::AdvertiseAddr => "advertise_addr",
             Self::InterfaceAddress => "iface_address",
-            Self::UnsafeAutodetect => "unsafe_autodetect",
+            Self::Autodetect => "autodetect",
         }
     }
 }
@@ -689,7 +689,6 @@ mod platform {
     pub(super) struct PlatformNodePortManager {
         desired_enabled: bool,
         source_mode: config::NodePortSourceMode,
-        unsafe_allow_autodetect: bool,
         configured_iface: Option<String>,
         configured_node_ip: Option<IpAddr>,
         configured_advertise_addr: Option<String>,
@@ -713,7 +712,6 @@ mod platform {
         /// Capture nodeport configuration from the global config for later attachment.
         pub(super) fn new() -> Self {
             let source_mode = config::nodeport_source_mode();
-            let unsafe_allow_autodetect = config::nodeport_unsafe_allow_autodetect();
             let configured_iface = config::nodeport_iface();
             let configured_node_ip = config::nodeport_ip();
             let configured_advertise_addr = config::advertise_addr();
@@ -746,7 +744,6 @@ mod platform {
             let mut manager = Self {
                 desired_enabled,
                 source_mode,
-                unsafe_allow_autodetect,
                 configured_iface: configured_iface.clone(),
                 configured_node_ip,
                 configured_advertise_addr,
@@ -1320,10 +1317,12 @@ mod platform {
             vip: IpAddr,
         ) -> Result<IpAddr> {
             let Some(iface) = self.iface.clone() else {
-                let error = if self.unsafe_allow_autodetect {
-                    "nodeport interface missing; set network.nodeport.iface or configure network.nodeport.ip / network.advertise_addr".to_string()
+                let error = if let Some(node_ip) = self.node_ip {
+                    format!(
+                        "nodeport could not find an interface that owns publication address {node_ip}; set network.nodeport.iface explicitly or assign that address to a usable interface"
+                    )
                 } else {
-                    "nodeport interface missing; set network.nodeport.iface, configure network.nodeport.ip / network.advertise_addr, or explicitly enable network.nodeport.unsafe_allow_autodetect for development".to_string()
+                    "nodeport interface missing; set network.nodeport.iface, configure network.nodeport.ip / network.advertise_addr, or assign a usable address to one up non-loopback interface".to_string()
                 };
                 self.degrade_runtime(error.clone(), "nodeport runtime degraded");
                 return Err(anyhow!(error));
@@ -1428,12 +1427,10 @@ mod platform {
                 return Ok(());
             }
 
-            if self.unsafe_allow_autodetect
-                && let Some((iface, ip)) = detect_default_iface(preferred_family).await?
-            {
+            if let Some((iface, ip)) = detect_default_iface(preferred_family).await? {
                 self.iface = Some(iface);
                 self.node_ip = Some(ip);
-                self.identity_source = Some(NodePortIdentitySource::UnsafeAutodetect);
+                self.identity_source = Some(NodePortIdentitySource::Autodetect);
             }
 
             Ok(())
@@ -1444,14 +1441,14 @@ mod platform {
             self.refresh_runtime_identity().await?;
 
             let Some(iface) = self.iface.clone() else {
-                self.degrade_runtime(
-                    if self.unsafe_allow_autodetect {
-                        "nodeport interface missing; set network.nodeport.iface or configure network.nodeport.ip / network.advertise_addr".to_string()
-                    } else {
-                        "nodeport interface missing; set network.nodeport.iface, configure network.nodeport.ip / network.advertise_addr, or explicitly enable network.nodeport.unsafe_allow_autodetect for development".to_string()
-                    },
-                    "nodeport runtime degraded",
-                );
+                let error = if let Some(node_ip) = self.node_ip {
+                    format!(
+                        "nodeport could not find an interface that owns publication address {node_ip}; set network.nodeport.iface explicitly or assign that address to a usable interface"
+                    )
+                } else {
+                    "nodeport interface missing; set network.nodeport.iface, configure network.nodeport.ip / network.advertise_addr, or assign a usable address to one up non-loopback interface".to_string()
+                };
+                self.degrade_runtime(error, "nodeport runtime degraded");
                 return Ok(false);
             };
             let Some(node_ip) = self.node_ip else {
@@ -1479,9 +1476,7 @@ mod platform {
                     Some(NodePortIdentitySource::NodePortIp) => "network.nodeport.ip",
                     Some(NodePortIdentitySource::AdvertiseAddr) => "network.advertise_addr",
                     Some(NodePortIdentitySource::InterfaceAddress) => "network.nodeport.iface",
-                    Some(NodePortIdentitySource::UnsafeAutodetect) => {
-                        "network.nodeport.unsafe_allow_autodetect"
-                    }
+                    Some(NodePortIdentitySource::Autodetect) => "nodeport autodetect",
                     None => "nodeport identity",
                 },
             )

@@ -92,7 +92,6 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 - `network.nodeport.enabled` (legacy: disabled when BPF attach is disabled)
 - `network.nodeport.iface` (legacy: `MANTISSA_NODEPORT_IFACE`)
 - `network.nodeport.ip` (legacy: `MANTISSA_NODEPORT_IP`)
-- `network.nodeport.unsafe_allow_autodetect` (env: `MANTISSA_NODEPORT_UNSAFE_ALLOW_AUTODETECT`)
 - `network.nodeport.vip_capacity` (env: `MANTISSA_NODEPORT_VIP_CAPACITY`)
 - `network.nodeport.host_capacity` (env: `MANTISSA_NODEPORT_HOST_CAPACITY`)
 - `network.nodeport.flow_capacity` (env: `MANTISSA_NODEPORT_FLOW_CAPACITY`)
@@ -135,22 +134,15 @@ Use the NodePort settings to define the externally visible socket Mantissa
 publishes for services with `public_port`.
 
 - `network.nodeport.iface`
-  Set this explicitly in production. It should be the host interface that
-  receives external traffic for `node_ip:public_port`. Do not rely on
-  autodetection on multihomed hosts, and do not use `lo` outside of local
-  privileged tests. When unset, Mantissa only falls back to interface
-  autodetection if `network.nodeport.unsafe_allow_autodetect` is enabled.
+  Set this explicitly when you want to pin NodePort attach to one host
+  interface. It should be the interface that receives external traffic for
+  `node_ip:public_port`. Do not use `lo` outside of local privileged tests.
+  When unset, Mantissa falls back to best-effort interface autodetection.
 - `network.nodeport.ip`
   This is the public address Mantissa publishes for NodePort services. It can
   be IPv4 or IPv6. When set, it wins over every other source. The configured
   address must match the family of the published VIPs served on the node. On
   multihomed, NATed, or policy-routed hosts, set it explicitly.
-- `network.nodeport.unsafe_allow_autodetect`
-  Development-only escape hatch for best-effort publication identity
-  selection. When enabled and no explicit `iface`, `ip`, or usable
-  `advertise_addr` is configured, Mantissa picks the first up, non-loopback,
-  non-WireGuard interface with a usable address in the preferred family.
-  Leave this disabled in production.
 - `network.nodeport.source_mode`
   Controls what source address published backends observe. The current
   production contract is `snat_host_access`, which rewrites external traffic to
@@ -174,8 +166,8 @@ publishes for services with `public_port`.
   is unset, Mantissa reuses the IP portion of `network.advertise_addr` for
   NodePort when the family matches the published VIP and the selected attach
   interface actually owns that address. If neither value is set, Mantissa
-  requires either `network.nodeport.iface` or
-  `network.nodeport.unsafe_allow_autodetect = true`.
+  falls back to the first up, non-loopback, non-WireGuard interface with a
+  usable address in the preferred family.
 
 Recommended production pattern:
 
@@ -208,11 +200,12 @@ NodePort source mode, identity source, and dataplane limits are reported in
 - Each published VIP must have a usable NodePort identity in the same address
   family. For IPv6 publication, use a global or ULA address; link-local IPv6
   addresses and `::1` are not valid public identities.
-- Mantissa does not silently publish through an implicit interface anymore.
-  Production publication requires an explicit `network.nodeport.iface`, an
-  explicit `network.nodeport.ip`, or a usable `network.advertise_addr`.
-  Best-effort autodetect remains available only through
-  `network.nodeport.unsafe_allow_autodetect`.
+- Mantissa resolves `node_ip` from `network.nodeport.ip`, then
+  `network.advertise_addr`, then an address already assigned to
+  `network.nodeport.iface`, and finally by best-effort autodetect.
+  Production nodes should still set `network.nodeport.iface` explicitly and
+  usually set `network.nodeport.ip` on multihomed, NATed, or policy-routed
+  hosts.
 - `public_protocol` supports `tcp`, `udp`, and `tcp_udp`. If omitted, the
   default is `tcp`.
 - Fragmented IPv4 is not supported by the current datapath. Mantissa drops

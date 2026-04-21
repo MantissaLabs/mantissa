@@ -157,12 +157,9 @@ template does not expose a more specific service port signal.
 - `network.nodeport.ip`
 - the IP component of `network.advertise_addr`
 - the address already assigned to `network.nodeport.iface`
-- best-effort interface autodetection, but only when
-  `network.nodeport.unsafe_allow_autodetect = true`
+- best-effort interface autodetection
 
-Mantissa now treats implicit interface picking as an explicit development
-escape hatch, not a normal production path. For production, set
-`network.nodeport.iface` explicitly and prefer an explicit
+For production, set `network.nodeport.iface` explicitly and prefer an explicit
 `network.nodeport.ip` on multihomed, NATed, or policy-routed hosts. If you
 reuse `network.advertise_addr`, the selected attach interface must actually own
 that address.
@@ -477,8 +474,8 @@ Prerequisites: Linux host, kernel with XDP+TC and BPF enabled, and `bpf-linker` 
   reserving that endpoint.
 - Public reachability depends on node capability, routing, and operator-managed
   firewall policy.
-- Best-effort interface autodetect remains available only through
-  `network.nodeport.unsafe_allow_autodetect`, and production nodes should set
+- Best-effort interface autodetect is the default fallback when no explicit
+  NodePort identity is configured, but production nodes should still set
   `network.nodeport.iface` explicitly and usually set `network.nodeport.ip` as
   well.
 - Static sizing remains fixed for now: `MAX_VIPS = 4096`,
