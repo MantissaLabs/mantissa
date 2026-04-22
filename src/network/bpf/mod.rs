@@ -2013,6 +2013,9 @@ mod platform {
 
         #[tokio::test(flavor = "current_thread")]
         async fn requires_reload_when_no_programs_are_loaded() -> Result<()> {
+            let _guard = ConfigOverrideGuard::with_mutator(|config| {
+                config.network.bpf.attach = true;
+            });
             let manager = PlatformBpfManager {
                 resolver: ArtifactResolver::new(),
                 loader: Arc::new(NoopProgramLoader),
@@ -2041,6 +2044,9 @@ mod platform {
 
         #[tokio::test(flavor = "current_thread")]
         async fn requires_reload_is_false_when_loaded_programs_match() -> Result<()> {
+            let _guard = ConfigOverrideGuard::with_mutator(|config| {
+                config.network.bpf.attach = true;
+            });
             let manager = PlatformBpfManager {
                 resolver: ArtifactResolver::new(),
                 loader: Arc::new(NoopProgramLoader),
@@ -2078,6 +2084,37 @@ mod platform {
             assert!(
                 !manager.requires_reload(&network, &ctx).await?,
                 "matching loaded programs should not trigger a destructive reload"
+            );
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn requires_reload_is_false_when_bpf_attachment_disabled() -> Result<()> {
+            let _guard = ConfigOverrideGuard::with_mutator(|config| {
+                config.network.bpf.attach = false;
+            });
+            let manager = PlatformBpfManager {
+                resolver: ArtifactResolver::new(),
+                loader: Arc::new(NoopProgramLoader),
+                loaded: Arc::new(AsyncMutex::new(HashMap::new())),
+            };
+            let network_id = Uuid::new_v4();
+            let ctx = NetworkInterfaceContext::new(network_id, "br-test", "vxlan-test");
+            let spec = BpfProgramSpec::with_attach_point("vxlan_xdp", BpfAttachPoint::VxlanXdp);
+            let network = NetworkSpecValue::new(NetworkSpecDraft {
+                name: "reload-disabled".to_string(),
+                description: String::new(),
+                driver: NetworkDriver::Vxlan,
+                subnet_cidr: "10.200.0.0/24".to_string(),
+                vni: 44,
+                mtu: 1400,
+                sealed: false,
+                bpf_programs: vec![spec],
+            });
+
+            assert!(
+                !manager.requires_reload(&network, &ctx).await?,
+                "disabled BPF attachment should report no local reload requirement"
             );
             Ok(())
         }
