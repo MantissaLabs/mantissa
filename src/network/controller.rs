@@ -42,6 +42,9 @@ pub(crate) const DEFAULT_MTU: u32 = 1450;
 const VXLAN_PORT: u16 = 4789;
 const WIREGUARD_RECONCILE_DEBOUNCE: Duration = Duration::from_secs(1);
 const WIREGUARD_RECONCILE_RETRY_LIMIT: usize = 3;
+const LINK_STATE_SETTLE_ATTEMPTS: usize = 10;
+const LINK_STATE_SETTLE_DELAY: Duration = Duration::from_millis(20);
+const LINK_STATE_UPDATE_RETRIES: usize = 2;
 
 #[derive(Clone)]
 pub struct NetworkController {
@@ -677,6 +680,10 @@ impl NetworkController {
             }
             let (mut plan, _) = self.prepare_plan(&mut spec)?;
             self.apply_wireguard_overrides(&mut plan).await?;
+            self.inner
+                .provisioner
+                .apply_plan_underlay_constraints(&mut plan)
+                .await?;
             if let Err(err) = self.reconcile_remote_forwarding(&plan).await {
                 warn!(
                     target: "network",
@@ -774,6 +781,10 @@ impl NetworkController {
     async fn reconcile_network(&self, mut spec: NetworkSpecValue) -> Result<()> {
         let (mut plan, spec_changed) = self.prepare_plan(&mut spec)?;
         self.apply_wireguard_overrides(&mut plan).await?;
+        self.inner
+            .provisioner
+            .apply_plan_underlay_constraints(&mut plan)
+            .await?;
         if spec_changed {
             self.inner
                 .registry
@@ -1640,7 +1651,9 @@ impl NetworkController {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{NetworkController, collect_orphaned_network_suffixes};
+    use super::{
+        NetworkController, collect_orphaned_network_suffixes, is_managed_overlay_link_name,
+    };
     use anyhow::Context;
     use aya::{programs::ProgramError, sys::SyscallError};
     use std::collections::HashSet;
@@ -1722,6 +1735,18 @@ mod tests {
             "only managed suffixes that are absent from desired network ids should be collected"
         );
     }
+
+    #[test]
+    fn identifies_all_managed_overlay_link_names() {
+        assert!(is_managed_overlay_link_name("mvx-21523dac"));
+        assert!(is_managed_overlay_link_name("mnt-br-21523dac"));
+        assert!(is_managed_overlay_link_name("mnhost-21523dac"));
+        assert!(is_managed_overlay_link_name("mnhp-21523dac"));
+        assert!(is_managed_overlay_link_name("mnth-21523dac"));
+        assert!(is_managed_overlay_link_name("mntc-21523dac"));
+        assert!(!is_managed_overlay_link_name("eth0"));
+        assert!(!is_managed_overlay_link_name("docker0"));
+    }
 }
 
 impl NetworkPlan {
@@ -1773,6 +1798,17 @@ fn managed_network_interface_suffix(link_name: &str) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// Returns whether a host link name belongs to Mantissa-managed overlay plumbing.
+///
+/// Underlay detection must ignore the controller's own bridge, VXLAN, host-access, and task
+/// attachment devices or it can accidentally bootstrap a new network from another overlay
+/// network's transient local MTU and addressing state.
+fn is_managed_overlay_link_name(link_name: &str) -> bool {
+    managed_network_interface_suffix(link_name).is_some()
+        || link_name.starts_with("mnth-")
+        || link_name.starts_with("mntc-")
 }
 
 /// Collect the leaked per-network interface suffixes that do not correspond to any live network.
@@ -1839,8 +1875,12 @@ fn format_mac(mac: [u8; 6]) -> String {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::{NetworkPlan, VXLAN_PORT, collect_orphaned_network_suffixes, format_mac};
+    use super::{
+        NetworkPlan, VXLAN_PORT, collect_orphaned_network_suffixes, format_mac,
+        is_managed_overlay_link_name,
+    };
     use crate::config;
+    use crate::ip_family::DefaultIpFamilyPolicy;
     use crate::network::attachment::{host_access_host_iface_name, host_access_peer_iface_name};
     use crate::network::wireguard::MANTISSA_WIREGUARD_IFNAME;
     use anyhow::{Context, Result, anyhow};
@@ -1855,22 +1895,31 @@ mod platform {
         InfoBridgePort, InfoData, InfoKind, InfoPortData, InfoVxlan, LinkAttribute, LinkFlags,
         LinkHeader, LinkInfo, LinkProtoInfoBridge,
     };
+    use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RouteHeader};
     use rtnetlink::{
         AddressMessageBuilder, Error as RtnetlinkError, Handle, LinkBridge, LinkMessageBuilder,
-        LinkUnspec, LinkVeth, LinkVxlan, new_connection,
+        LinkUnspec, LinkVeth, LinkVxlan, RouteMessageBuilder, new_connection,
     };
     use std::fs;
     use std::mem;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
     use std::process::Command;
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
     use tracing::{debug, info, warn};
 
+    #[derive(Clone, Debug)]
+    struct ResolvedUnderlay {
+        index: u32,
+        name: String,
+        ip: IpAddr,
+        mtu: u32,
+    }
+
     #[derive(Clone)]
     pub struct NetworkProvisioner {
         handle: Option<Handle>,
-        underlay: Arc<AsyncMutex<Option<(u32, IpAddr)>>>,
+        underlay: Arc<AsyncMutex<Option<ResolvedUnderlay>>>,
     }
 
     const IFLA_PROTINFO: u16 = 12;
@@ -1886,6 +1935,71 @@ mod platform {
         match ip {
             IpAddr::V4(_) => AddressFamily::Inet,
             IpAddr::V6(_) => AddressFamily::Inet6,
+        }
+    }
+
+    /// Resolve one configured advertise socket string into its current IP address.
+    ///
+    /// The underlay selector uses this to anchor VXLAN creation to the same local interface the
+    /// node advertises to peers whenever the configured advertise address belongs to this host.
+    fn resolve_advertise_ip(addr: &str) -> Option<IpAddr> {
+        addr.to_socket_addrs()
+            .ok()?
+            .next()
+            .map(|socket| socket.ip())
+    }
+
+    /// Return the VXLAN encapsulation overhead required by one underlay IP family.
+    ///
+    /// Linux derives the default VXLAN device MTU from the lower-device MTU minus the UDP/IP
+    /// encapsulation size. Mantissa mirrors that rule centrally so all overlay interfaces share
+    /// the same effective MTU instead of relying on kernel-side failures after creation.
+    fn vxlan_underlay_overhead(ip: IpAddr) -> u32 {
+        match ip {
+            IpAddr::V4(_) => 50,
+            IpAddr::V6(_) => 70,
+        }
+    }
+
+    /// Clamp one requested overlay MTU to the ceiling supported by the resolved underlay.
+    ///
+    /// This keeps the bridge and VXLAN interfaces aligned with the selected transport path even
+    /// when the replicated network spec asks for a larger MTU than the current underlay can carry.
+    fn clamp_overlay_mtu(requested_mtu: u32, underlay: &ResolvedUnderlay) -> Result<u32> {
+        let overhead = vxlan_underlay_overhead(underlay.ip);
+        let ceiling = underlay.mtu.checked_sub(overhead).ok_or_else(|| {
+            anyhow!(
+                "underlay {} (idx {}) mtu {} is too small for vxlan over {} (overhead {})",
+                underlay.name,
+                underlay.index,
+                underlay.mtu,
+                underlay.ip,
+                overhead
+            )
+        })?;
+        if ceiling == 0 {
+            anyhow::bail!(
+                "underlay {} (idx {}) leaves no payload mtu for vxlan encapsulation",
+                underlay.name,
+                underlay.index
+            );
+        }
+        Ok(requested_mtu.min(ceiling))
+    }
+
+    /// Return the preferred default-route family order for plaintext underlay discovery.
+    ///
+    /// An explicit advertise address takes precedence. Otherwise we follow the configured default
+    /// IP-family policy and still fall back to the opposite family if the preferred table has no
+    /// usable default route.
+    fn preferred_route_families(advertise_ip: Option<IpAddr>) -> [AddressFamily; 2] {
+        match advertise_ip {
+            Some(IpAddr::V6(_)) => [AddressFamily::Inet6, AddressFamily::Inet],
+            Some(IpAddr::V4(_)) => [AddressFamily::Inet, AddressFamily::Inet6],
+            None => match config::default_ip_family_policy() {
+                DefaultIpFamilyPolicy::Ipv6 => [AddressFamily::Inet6, AddressFamily::Inet],
+                _ => [AddressFamily::Inet, AddressFamily::Inet6],
+            },
         }
     }
 
@@ -2037,6 +2151,33 @@ mod platform {
                 }
                 Err(err) => Err(err).with_context(|| format!("delete link {link_name}")),
             }
+        }
+
+        /// Delete one link and wait until the kernel no longer resolves the link name.
+        ///
+        /// Recovery paths recreate interfaces with the same deterministic name. Waiting for the
+        /// original link to disappear closes the race where rtnetlink accepts the delete but the
+        /// next lookup still resolves to the stale kernel object for a short window.
+        async fn delete_link_and_wait_absent(
+            &self,
+            handle: &Handle,
+            link_index: u32,
+            link_name: &str,
+        ) -> Result<()> {
+            self.delete_link_if_present(handle, link_index, link_name)
+                .await?;
+
+            for _ in 0..20 {
+                if self.find_link(link_name).await?.is_none() {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+
+            let remaining = self.find_link(link_name).await?;
+            Err(anyhow!(
+                "link {link_name} still present after delete request; remaining_index={remaining:?}"
+            ))
         }
 
         /// Compute stable interface names for the per-network host access veth pair.
@@ -2215,7 +2356,7 @@ mod platform {
             for attempt in 0..=1 {
                 match self.attach_master(vxlan_index, bridge_index).await {
                     Ok(()) => {}
-                    Err(err) if attempt == 0 && Self::is_recoverable_vxlan_link_error(&err) => {
+                    Err(err) if attempt == 0 => {
                         warn!(
                             target: "network",
                             vxlan = %plan.vxlan_name,
@@ -2225,7 +2366,7 @@ mod platform {
                             error = %err,
                             "vxlan bridge attach hit stale local state; recreating link once"
                         );
-                        self.delete_link_if_present(handle, vxlan_index, &plan.vxlan_name)
+                        self.delete_link_and_wait_absent(handle, vxlan_index, &plan.vxlan_name)
                             .await
                             .with_context(|| {
                                 format!(
@@ -2270,7 +2411,7 @@ mod platform {
 
                 match self.set_mtu(vxlan_index, plan.mtu).await {
                     Ok(()) => return Ok(vxlan_index),
-                    Err(err) if attempt == 0 && Self::is_recoverable_vxlan_link_error(&err) => {
+                    Err(err) if attempt == 0 => {
                         warn!(
                             target: "network",
                             vxlan = %plan.vxlan_name,
@@ -2279,7 +2420,7 @@ mod platform {
                             error = %err,
                             "vxlan mtu update hit stale local state; recreating link once"
                         );
-                        self.delete_link_if_present(handle, vxlan_index, &plan.vxlan_name)
+                        self.delete_link_and_wait_absent(handle, vxlan_index, &plan.vxlan_name)
                             .await
                             .with_context(|| {
                                 format!(
@@ -2486,28 +2627,6 @@ mod platform {
                 "provisioner: kernel interfaces ensured"
             );
             Ok(())
-        }
-
-        /// Return whether one VXLAN setup error should trigger a delete-and-recreate retry.
-        ///
-        /// The controller only retries when the kernel reports that the existing link object is
-        /// inconsistent or disappeared underneath us. This keeps the recovery path narrow and
-        /// avoids masking genuine configuration errors with repeated retries.
-        fn is_recoverable_vxlan_link_error(err: &anyhow::Error) -> bool {
-            err.chain().any(|cause| {
-                cause
-                    .downcast_ref::<RtnetlinkError>()
-                    .and_then(|err| match err {
-                        RtnetlinkError::NetlinkError(message) => Some(message.raw_code().abs()),
-                        _ => None,
-                    })
-                    .is_some_and(|errno| {
-                        errno == libc::EBUSY
-                            || errno == libc::EINVAL
-                            || errno == libc::ENODEV
-                            || errno == libc::ENOENT
-                    })
-            })
         }
 
         /// Ensure an interface owns the resolver address for the network, replacing stale state.
@@ -2844,9 +2963,11 @@ mod platform {
                 }
 
                 if recreate {
-                    handle.link().del(index).execute().await.with_context(|| {
-                        format!("delete vxlan {} (idx {})", plan.vxlan_name, index)
-                    })?;
+                    self.delete_link_and_wait_absent(handle, index, &plan.vxlan_name)
+                        .await
+                        .with_context(|| {
+                            format!("delete vxlan {} (idx {})", plan.vxlan_name, index)
+                        })?;
                 } else {
                     if let Err(err) = self.configure_existing_vxlan(index, &plan.vxlan_name).await {
                         warn!(
@@ -2869,24 +2990,25 @@ mod platform {
             let mut last_error: Option<anyhow::Error> = None;
 
             for attempt in 0..=1 {
-                let mut forced_underlay_name: Option<String> = None;
-                let (underlay_index, underlay_ip) = if let (Some(ifname), Some(ip)) =
+                let resolved_underlay = if let (Some(ifname), Some(ip)) =
                     (plan.underlay_iface.as_deref(), plan.underlay_ip)
                 {
-                    forced_underlay_name = Some(ifname.to_string());
-                    match self.find_link(ifname).await? {
-                        Some(index) => (index, ip),
-                        None => {
+                    match self.explicit_underlay_by_name(ifname, ip).await {
+                        Ok(info) => info,
+                        Err(err) => {
                             warn!(
                                 target: "network",
                                 attempt,
                                 underlay = ifname,
-                                "requested wireguard underlay interface missing; falling back to detected underlay"
+                                error = %err,
+                                "requested explicit underlay is unavailable; refreshing detected underlay"
                             );
-                            forced_underlay_name = None;
+                            let mut guard = self.underlay.lock().await;
+                            *guard = None;
+                            drop(guard);
                             self.underlay_info()
                                 .await
-                                .context("resolve underlay interface for vxlan")?
+                                .context("resolve detected underlay for vxlan")?
                         }
                     }
                 } else {
@@ -2895,31 +3017,9 @@ mod platform {
                         .context("resolve underlay interface for vxlan")?
                 };
 
-                let underlay_name = match forced_underlay_name {
-                    Some(name) => name,
-                    None => match self.link_name(underlay_index).await {
-                        Ok(Some(name)) => name,
-                        Ok(None) => {
-                            warn!(
-                                target: "network",
-                                underlay_index,
-                                attempt,
-                                "underlay index missing while preparing vxlan; will fall back to numeric name"
-                            );
-                            format!("ifindex{underlay_index}")
-                        }
-                        Err(err) => {
-                            warn!(
-                                target: "network",
-                                underlay_index,
-                                attempt,
-                                error = %err,
-                                "failed to resolve underlay name before vxlan creation; falling back to numeric name"
-                            );
-                            format!("ifindex{underlay_index}")
-                        }
-                    },
-                };
+                let underlay_index = resolved_underlay.index;
+                let underlay_ip = resolved_underlay.ip;
+                let underlay_name = resolved_underlay.name;
 
                 info!(
                     target: "network",
@@ -3339,6 +3439,12 @@ mod platform {
             Ok(())
         }
 
+        /// Set one link MTU while tolerating already-converged kernel state.
+        ///
+        /// Network reconciles can revisit the same deterministic interface while the kernel is
+        /// still finishing a previous MTU update. Re-reading the observed MTU before and after a
+        /// netlink error keeps the helper idempotent and prevents transient kernel timing from
+        /// being misclassified as a stale-link failure.
         async fn set_mtu(&self, index: u32, mtu: u32) -> Result<()> {
             if mtu == 0 {
                 return Ok(());
@@ -3353,6 +3459,17 @@ mod platform {
                 .await
                 .context("resolve link name before setting mtu")?
                 .unwrap_or_else(|| format!("ifindex{index}"));
+            let current_mtu = self.link_mtu(index).await?;
+            if current_mtu == Some(mtu) {
+                debug!(
+                    target: "network",
+                    link = %name,
+                    link_index = index,
+                    mtu,
+                    "provisioner: link already has desired mtu"
+                );
+                return Ok(());
+            }
             debug!(
                 target: "network",
                 link = %name,
@@ -3360,20 +3477,91 @@ mod platform {
                 mtu,
                 "provisioner: updating mtu"
             );
-            handle
-                .link()
-                .set(LinkUnspec::new_with_index(index).mtu(mtu).build())
-                .execute()
-                .await
-                .with_context(|| format!("set mtu {mtu} on link {name} (index {index})"))?;
-            debug!(
-                target: "network",
-                link = %name,
-                link_index = index,
-                mtu,
-                "provisioner: mtu updated"
-            );
+            for retry in 0..super::LINK_STATE_UPDATE_RETRIES {
+                match handle
+                    .link()
+                    .set(LinkUnspec::new_with_index(index).mtu(mtu).build())
+                    .execute()
+                    .await
+                {
+                    Ok(()) => {
+                        debug!(
+                            target: "network",
+                            link = %name,
+                            link_index = index,
+                            mtu,
+                            "provisioner: mtu updated"
+                        );
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        let observed_mtu = self.wait_for_link_mtu(index, mtu).await?;
+                        if observed_mtu == Some(mtu) {
+                            debug!(
+                                target: "network",
+                                link = %name,
+                                link_index = index,
+                                mtu,
+                                "provisioner: mtu update already converged after netlink error"
+                            );
+                            return Ok(());
+                        }
+
+                        if retry + 1 < super::LINK_STATE_UPDATE_RETRIES {
+                            debug!(
+                                target: "network",
+                                link = %name,
+                                link_index = index,
+                                mtu,
+                                retry,
+                                observed_mtu = ?observed_mtu,
+                                error = %err,
+                                "provisioner: retrying mtu update after transient mismatch"
+                            );
+                            continue;
+                        }
+
+                        return Err(err).with_context(|| match (current_mtu, observed_mtu) {
+                            (Some(current), Some(observed)) => format!(
+                                "set mtu {mtu} on link {name} (index {index}); current_mtu={current}; observed_mtu_after_error={observed}"
+                            ),
+                            (Some(current), None) => format!(
+                                "set mtu {mtu} on link {name} (index {index}); current_mtu={current}; observed_mtu_after_error=none"
+                            ),
+                            (None, Some(observed)) => format!(
+                                "set mtu {mtu} on link {name} (index {index}); observed_mtu_after_error={observed}"
+                            ),
+                            (None, None) => {
+                                format!("set mtu {mtu} on link {name} (index {index})")
+                            }
+                        });
+                    }
+                }
+            }
+
             Ok(())
+        }
+
+        /// Wait briefly for one link to report the requested MTU after a netlink update.
+        ///
+        /// Some kernels acknowledge MTU changes later than the original rtnetlink request path.
+        /// A short settle window lets the provisioner distinguish "the update converged anyway"
+        /// from a real MTU programming failure without adding an unbounded retry loop.
+        async fn wait_for_link_mtu(&self, index: u32, desired_mtu: u32) -> Result<Option<u32>> {
+            let mut observed = self.link_mtu(index).await?;
+            if observed == Some(desired_mtu) {
+                return Ok(observed);
+            }
+
+            for _ in 0..super::LINK_STATE_SETTLE_ATTEMPTS {
+                tokio::time::sleep(super::LINK_STATE_SETTLE_DELAY).await;
+                observed = self.link_mtu(index).await?;
+                if observed == Some(desired_mtu) {
+                    return Ok(observed);
+                }
+            }
+
+            Ok(observed)
         }
 
         /// Ensure a link advertises the requested MAC address for deterministic forwarding.
@@ -3414,6 +3602,13 @@ mod platform {
             Ok(())
         }
 
+        /// Attach one link to the requested bridge, treating already-converged kernel state as success.
+        ///
+        /// The network controller can reconcile a reused VXLAN or host-access port immediately
+        /// after the kernel has already applied the same bridge enslave request. In that case the
+        /// rtnetlink update can still report a transient busy error even though the link now
+        /// belongs to the desired bridge. Re-reading the current controller after a failed update
+        /// keeps the helper idempotent without hiding genuine attachment conflicts.
         async fn attach_master(&self, link_index: u32, master_index: u32) -> Result<()> {
             let Some(handle) = self.handle() else {
                 return Ok(());
@@ -3451,34 +3646,104 @@ mod platform {
                 bridge_index = master_index,
                 "provisioner: attaching link to bridge"
             );
-            handle
-                .link()
-                .set(
-                    LinkUnspec::new_with_index(link_index)
-                        .controller(master_index)
-                        .build(),
-                )
-                .execute()
-                .await
-                .with_context(|| {
-                    match current_master {
-                        Some(current) => format!(
-                            "attach link {link_name} (index {link_index}) to bridge {master_name} (index {master_index}); current_master={current}"
-                        ),
-                        None => format!(
-                            "attach link {link_name} (index {link_index}) to bridge {master_name} (index {master_index})"
-                        ),
+            for retry in 0..super::LINK_STATE_UPDATE_RETRIES {
+                match handle
+                    .link()
+                    .set(
+                        LinkUnspec::new_with_index(link_index)
+                            .controller(master_index)
+                            .build(),
+                    )
+                    .execute()
+                    .await
+                {
+                    Ok(()) => {
+                        debug!(
+                            target: "network",
+                            link = %link_name,
+                            link_index,
+                            bridge = %master_name,
+                            bridge_index = master_index,
+                            "provisioner: link attached to bridge"
+                        );
+                        return Ok(());
                     }
-                })?;
-            debug!(
-                target: "network",
-                link = %link_name,
-                link_index,
-                bridge = %master_name,
-                bridge_index = master_index,
-                "provisioner: link attached to bridge"
-            );
+                    Err(err) => {
+                        let observed_master = self
+                            .wait_for_link_controller(link_index, master_index)
+                            .await?;
+                        if observed_master == Some(master_index) {
+                            debug!(
+                                target: "network",
+                                link = %link_name,
+                                link_index,
+                                bridge = %master_name,
+                                bridge_index = master_index,
+                                "provisioner: bridge attach already converged after netlink error"
+                            );
+                            return Ok(());
+                        }
+
+                        if retry + 1 < super::LINK_STATE_UPDATE_RETRIES {
+                            debug!(
+                                target: "network",
+                                link = %link_name,
+                                link_index,
+                                bridge = %master_name,
+                                bridge_index = master_index,
+                                retry,
+                                observed_master = ?observed_master,
+                                error = %err,
+                                "provisioner: retrying bridge attach after transient mismatch"
+                            );
+                            continue;
+                        }
+
+                        return Err(err).with_context(|| match (current_master, observed_master) {
+                            (Some(current), Some(observed)) => format!(
+                                "attach link {link_name} (index {link_index}) to bridge {master_name} (index {master_index}); current_master={current}; observed_master_after_error={observed}"
+                            ),
+                            (Some(current), None) => format!(
+                                "attach link {link_name} (index {link_index}) to bridge {master_name} (index {master_index}); current_master={current}; observed_master_after_error=none"
+                            ),
+                            (None, Some(observed)) => format!(
+                                "attach link {link_name} (index {link_index}) to bridge {master_name} (index {master_index}); observed_master_after_error={observed}"
+                            ),
+                            (None, None) => format!(
+                                "attach link {link_name} (index {link_index}) to bridge {master_name} (index {master_index})"
+                            ),
+                        });
+                    }
+                }
+            }
+
             Ok(())
+        }
+
+        /// Wait briefly for one link to report the requested bridge controller after attach.
+        ///
+        /// Bridge enslave requests can converge slightly after the original rtnetlink call
+        /// returns. A short bounded wait avoids treating that convergence lag as a hard bridge
+        /// attach failure while still surfacing persistent mismatches promptly.
+        async fn wait_for_link_controller(
+            &self,
+            index: u32,
+            desired_controller: u32,
+        ) -> Result<Option<u32>> {
+            let mut observed = self.link_controller_index(index).await?;
+            if observed == Some(desired_controller) {
+                return Ok(observed);
+            }
+
+            for _ in 0..super::LINK_STATE_SETTLE_ATTEMPTS {
+                tokio::time::sleep(super::LINK_STATE_SETTLE_DELAY).await;
+                observed = self.link_controller_index(index).await?;
+                if observed == Some(desired_controller) {
+                    return Ok(observed);
+                }
+            }
+
+            Ok(observed)
         }
 
         /// Return the current bridge/controller link index for one interface when present.
@@ -3496,6 +3761,27 @@ mod platform {
                 for nla in link.attributes.into_iter() {
                     if let LinkAttribute::Controller(controller) = nla {
                         return Ok(Some(controller));
+                    }
+                }
+            }
+            Ok(None)
+        }
+
+        /// Return the current MTU for one link when the kernel still resolves the interface.
+        ///
+        /// MTU updates can converge slightly ahead of the corresponding rtnetlink response. The
+        /// provisioner uses this snapshot to keep MTU programming idempotent and to surface the
+        /// observed kernel state in any remaining error paths.
+        async fn link_mtu(&self, index: u32) -> Result<Option<u32>> {
+            let Some(handle) = self.handle() else {
+                return Ok(None);
+            };
+
+            let mut links = handle.link().get().match_index(index).execute();
+            while let Some(link) = links.try_next().await? {
+                for nla in link.attributes.into_iter() {
+                    if let LinkAttribute::Mtu(mtu) = nla {
+                        return Ok(Some(mtu));
                     }
                 }
             }
@@ -3540,60 +3826,405 @@ mod platform {
             }
         }
 
-        async fn underlay_info(&self) -> Result<(u32, IpAddr)> {
+        /// Resolve the underlay interface currently used for plaintext VXLAN creation.
+        ///
+        /// The provisioner caches the last good underlay choice, but it validates that cache on
+        /// every use so transient Mantissa-managed interfaces or kernel index reuse cannot pin the
+        /// controller to another overlay network's local plumbing.
+        async fn underlay_info(&self) -> Result<ResolvedUnderlay> {
             let cached = {
                 let guard = self.underlay.lock().await;
-                *guard
+                guard.clone()
             };
 
-            if let Some(info) = cached {
-                let name = self
-                    .link_name(info.0)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| format!("ifindex{}", info.0));
+            if let Some(info) = cached
+                && let Some(validated) = self.validate_cached_underlay(&info).await?
+            {
                 debug!(
                     target: "network",
-                    underlay = %name,
-                    underlay_index = info.0,
-                    underlay_ip = %info.1,
+                    underlay = %validated.name,
+                    underlay_index = validated.index,
+                    underlay_ip = %validated.ip,
+                    underlay_mtu = validated.mtu,
                     "provisioner: reusing cached underlay interface"
                 );
-                return Ok(info);
+                let mut guard = self.underlay.lock().await;
+                *guard = Some(validated.clone());
+                return Ok(validated);
             }
 
             let info = self.detect_underlay_info().await?;
             {
                 let mut guard = self.underlay.lock().await;
-                *guard = Some(info);
+                *guard = Some(info.clone());
             }
-            let name = self
-                .link_name(info.0)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| format!("ifindex{}", info.0));
             info!(
                 target: "network",
-                underlay = %name,
-                underlay_index = info.0,
-                underlay_ip = %info.1,
+                underlay = %info.name,
+                underlay_index = info.index,
+                underlay_ip = %info.ip,
+                underlay_mtu = info.mtu,
                 "provisioner: detected underlay interface"
             );
             Ok(info)
         }
 
-        async fn detect_underlay_info(&self) -> Result<(u32, IpAddr)> {
-            // Walk all links and choose the first non-loopback interface that is up
-            // and has an assigned IP address. Prefer IPv4 addresses but fall back to
-            // IPv6 if needed.
+        /// Resolve the effective underlay interface for plaintext VXLAN traffic.
+        ///
+        /// Mantissa prefers the local interface that owns the configured advertise address so the
+        /// overlay uses the same source IP the node publishes to peers. When no explicit local
+        /// advertise address is available, the controller falls back to the kernel's default route
+        /// and only then scans interfaces, always excluding Mantissa-managed overlay links.
+        async fn detect_underlay_info(&self) -> Result<ResolvedUnderlay> {
+            let advertise_ip = config::advertise_addr()
+                .as_deref()
+                .and_then(resolve_advertise_ip);
+
+            if let Some(ip) = advertise_ip {
+                if let Some(info) = self.local_underlay_for_ip(ip).await? {
+                    info!(
+                        target: "network",
+                        underlay = %info.name,
+                        underlay_index = info.index,
+                        underlay_ip = %info.ip,
+                        underlay_mtu = info.mtu,
+                        "selected underlay from locally owned advertise address"
+                    );
+                    return Ok(info);
+                }
+
+                warn!(
+                    target: "network",
+                    advertise_ip = %ip,
+                    "configured advertise address does not belong to a local usable interface; falling back to route-based underlay detection"
+                );
+            }
+
+            for family in preferred_route_families(advertise_ip) {
+                if let Some(info) = self.default_route_underlay(family).await? {
+                    info!(
+                        target: "network",
+                        underlay = %info.name,
+                        underlay_index = info.index,
+                        underlay_ip = %info.ip,
+                        underlay_mtu = info.mtu,
+                        family = ?family,
+                        "selected underlay from default route"
+                    );
+                    return Ok(info);
+                }
+            }
+
+            self.scan_underlay_candidates().await
+        }
+
+        /// Resolve one explicit interface/IP pair into a complete underlay snapshot.
+        ///
+        /// This ensures the provisioner carries the lower-device MTU alongside the chosen source
+        /// IP so later MTU clamping can be derived from one consistent kernel snapshot.
+        async fn resolved_underlay(
+            &self,
+            index: u32,
+            name: String,
+            ip: IpAddr,
+        ) -> Result<Option<ResolvedUnderlay>> {
+            let mtu = self.link_mtu(index).await?.ok_or_else(|| {
+                anyhow!("link {name} (index {index}) disappeared before its mtu could be read")
+            })?;
+            Ok(Some(ResolvedUnderlay {
+                index,
+                name,
+                ip,
+                mtu,
+            }))
+        }
+
+        /// Validate one cached underlay choice against the current kernel link and address state.
+        ///
+        /// The cache remains valid only while the same interface still owns the same local source
+        /// IP. Any name, index, or address drift forces a fresh underlay detection pass.
+        async fn validate_cached_underlay(
+            &self,
+            cached: &ResolvedUnderlay,
+        ) -> Result<Option<ResolvedUnderlay>> {
+            let Some(info) = self.local_underlay_for_ip(cached.ip).await? else {
+                return Ok(None);
+            };
+            if info.name != cached.name {
+                return Ok(None);
+            }
+            Ok(Some(info))
+        }
+
+        /// Resolve the local usable interface that currently owns one specific IP address.
+        ///
+        /// This is the most deterministic underlay source because it ties VXLAN creation directly
+        /// to the address the node advertises or otherwise expects peers to reach.
+        async fn local_underlay_for_ip(&self, ip: IpAddr) -> Result<Option<ResolvedUnderlay>> {
+            let Some(handle) = self.handle() else {
+                return Err(anyhow!("rtnetlink handle unavailable"));
+            };
+
+            let family = address_family(ip);
+            let mut links = handle.link().get().execute();
+            while let Some(link) = links.try_next().await.context("enumerate link devices")? {
+                let index = link.header.index;
+                let name = link
+                    .attributes
+                    .iter()
+                    .find_map(|attr| match attr {
+                        LinkAttribute::IfName(name) => Some(name.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| format!("ifindex{index}"));
+                let flags = link.header.flags;
+                if !flags.contains(LinkFlags::Up) {
+                    continue;
+                }
+                if name == MANTISSA_WIREGUARD_IFNAME || is_managed_overlay_link_name(&name) {
+                    continue;
+                }
+                if !flags.contains(LinkFlags::Loopback) && ip.is_loopback() {
+                    continue;
+                }
+                if self.interface_has_ip(index, family, ip).await? {
+                    return self.resolved_underlay(index, name, ip).await;
+                }
+            }
+            Ok(None)
+        }
+
+        /// Return whether one interface currently owns the provided local address.
+        ///
+        /// Matching against the explicit address avoids guessing the source IP on interfaces that
+        /// carry several addresses from the same family.
+        async fn interface_has_ip(
+            &self,
+            index: u32,
+            family: AddressFamily,
+            desired_ip: IpAddr,
+        ) -> Result<bool> {
+            let Some(handle) = self.handle() else {
+                return Ok(false);
+            };
+
+            let mut addresses = handle
+                .address()
+                .get()
+                .set_link_index_filter(index)
+                .execute();
+            while let Some(message) = addresses.try_next().await.context("enumerate addresses")? {
+                if message.header.family != family {
+                    continue;
+                }
+                for attribute in message.attributes {
+                    if let AddressAttribute::Address(ip) | AddressAttribute::Local(ip) = attribute
+                        && ip == desired_ip
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+
+        /// Resolve the kernel-selected default-route interface for one IP family.
+        ///
+        /// Route-driven lookup is stable across unrelated local interfaces because it follows the
+        /// same kernel output-interface decision the host would use for plain underlay traffic.
+        async fn default_route_underlay(
+            &self,
+            family: AddressFamily,
+        ) -> Result<Option<ResolvedUnderlay>> {
+            let Some(handle) = self.handle() else {
+                return Err(anyhow!("rtnetlink handle unavailable"));
+            };
+
+            match family {
+                AddressFamily::Inet => {
+                    let mut routes = handle
+                        .route()
+                        .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
+                        .execute();
+                    while let Some(route) = routes.try_next().await.context("list ipv4 routes")? {
+                        if let Some(info) = self
+                            .route_underlay_from_message(route.header, route.attributes)
+                            .await?
+                        {
+                            return Ok(Some(info));
+                        }
+                    }
+                }
+                AddressFamily::Inet6 => {
+                    let mut routes = handle
+                        .route()
+                        .get(RouteMessageBuilder::<Ipv6Addr>::new().build())
+                        .execute();
+                    while let Some(route) = routes.try_next().await.context("list ipv6 routes")? {
+                        if let Some(info) = self
+                            .route_underlay_from_message(route.header, route.attributes)
+                            .await?
+                        {
+                            return Ok(Some(info));
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            Ok(None)
+        }
+
+        /// Convert one default-route row into a usable underlay snapshot when possible.
+        ///
+        /// Only main-table default routes qualify here. If the route exposes a preferred source
+        /// address we use it directly; otherwise we fall back to the first usable interface address
+        /// in the same family.
+        async fn route_underlay_from_message(
+            &self,
+            header: RouteHeader,
+            attributes: Vec<RouteAttribute>,
+        ) -> Result<Option<ResolvedUnderlay>> {
+            let mut table = u32::from(header.table);
+            let mut output_ifindex = None;
+            let mut destination_present = false;
+            let mut preferred_source = None;
+
+            for attribute in attributes {
+                match attribute {
+                    RouteAttribute::Oif(index) => output_ifindex = Some(index),
+                    RouteAttribute::Destination(_) => destination_present = true,
+                    RouteAttribute::Table(route_table) => table = route_table,
+                    RouteAttribute::PrefSource(RouteAddress::Inet(ip)) => {
+                        preferred_source = Some(IpAddr::V4(ip));
+                    }
+                    RouteAttribute::PrefSource(RouteAddress::Inet6(ip)) => {
+                        preferred_source = Some(IpAddr::V6(ip));
+                    }
+                    _ => {}
+                }
+            }
+
+            if table != u32::from(RouteHeader::RT_TABLE_MAIN)
+                || header.destination_prefix_length != 0
+                || destination_present
+            {
+                return Ok(None);
+            }
+
+            let Some(index) = output_ifindex else {
+                return Ok(None);
+            };
+            self.underlay_from_interface_index(index, preferred_source)
+                .await
+        }
+
+        /// Resolve one interface index into a usable underlay snapshot.
+        ///
+        /// This filters out down, WireGuard-managed, and Mantissa-managed overlay links before
+        /// returning the lower-device name, source IP, and current link MTU.
+        async fn underlay_from_interface_index(
+            &self,
+            index: u32,
+            preferred_ip: Option<IpAddr>,
+        ) -> Result<Option<ResolvedUnderlay>> {
+            let Some(handle) = self.handle() else {
+                return Err(anyhow!("rtnetlink handle unavailable"));
+            };
+
+            let mut links = handle.link().get().match_index(index).execute();
+            let Some(link) = links.try_next().await.context("resolve route interface")? else {
+                return Ok(None);
+            };
+            let name = link
+                .attributes
+                .iter()
+                .find_map(|attr| match attr {
+                    LinkAttribute::IfName(name) => Some(name.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| format!("ifindex{index}"));
+            let flags = link.header.flags;
+            if !flags.contains(LinkFlags::Up)
+                || name == MANTISSA_WIREGUARD_IFNAME
+                || is_managed_overlay_link_name(&name)
+            {
+                return Ok(None);
+            }
+
+            let ip = match preferred_ip {
+                Some(ip) => ip,
+                None => {
+                    let family = match flags.contains(LinkFlags::Loopback) {
+                        true => AddressFamily::Inet,
+                        false => AddressFamily::Unspec,
+                    };
+                    let Some(ip) = self.interface_primary_ip(index, family).await? else {
+                        return Ok(None);
+                    };
+                    ip
+                }
+            };
+
+            self.resolved_underlay(index, name, ip).await
+        }
+
+        /// Pick one usable source IP from an interface, optionally constraining the family.
+        ///
+        /// The route lookup prefers the route's own preferred source. This helper only runs when
+        /// the kernel did not provide one, in which case we choose the first stable non-link-local
+        /// address available on the output interface.
+        async fn interface_primary_ip(
+            &self,
+            index: u32,
+            family: AddressFamily,
+        ) -> Result<Option<IpAddr>> {
+            let Some(handle) = self.handle() else {
+                return Ok(None);
+            };
+
+            let mut addresses = handle
+                .address()
+                .get()
+                .set_link_index_filter(index)
+                .execute();
+            let mut ipv6_candidate = None;
+            while let Some(message) = addresses.try_next().await.context("enumerate addresses")? {
+                if family != AddressFamily::Unspec && message.header.family != family {
+                    continue;
+                }
+                for attribute in message.attributes {
+                    if let AddressAttribute::Address(ip) | AddressAttribute::Local(ip) = attribute {
+                        if ip.is_loopback()
+                            || matches!(ip, IpAddr::V6(addr) if addr.is_unicast_link_local())
+                        {
+                            continue;
+                        }
+                        match ip {
+                            IpAddr::V4(_) => return Ok(Some(ip)),
+                            IpAddr::V6(_) => {
+                                if ipv6_candidate.is_none() {
+                                    ipv6_candidate = Some(ip);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(ipv6_candidate)
+        }
+
+        /// Scan links as a last-resort fallback when no explicit advertise or default route wins.
+        ///
+        /// This keeps the old best-effort behavior for unusual hosts without routing metadata, but
+        /// it now refuses loopback, WireGuard, and Mantissa-managed overlay interfaces so the
+        /// controller cannot bootstrap a new VXLAN device from another overlay's transient state.
+        async fn scan_underlay_candidates(&self) -> Result<ResolvedUnderlay> {
             let Some(handle) = self.handle() else {
                 return Err(anyhow!("rtnetlink handle unavailable"));
             };
 
             let mut link_stream = handle.link().get().execute();
-
             while let Some(link) = link_stream
                 .try_next()
                 .await
@@ -3611,88 +4242,100 @@ mod platform {
 
                 let flags = link.header.flags;
                 if !flags.contains(LinkFlags::Up) {
-                    warn!(
-                        target: "network",
-                        "skipping underlay candidate {} (index {}) because it is down",
-                        name,
-                        index
-                    );
                     continue;
                 }
-                if flags.contains(LinkFlags::Loopback) {
-                    warn!(
-                        target: "network",
-                        "skipping underlay candidate {} (index {}) because it is loopback",
-                        name,
-                        index
-                    );
-                    continue;
-                }
-                if name == MANTISSA_WIREGUARD_IFNAME {
-                    debug!(
-                        target: "network",
-                        "skipping underlay candidate {name} (index {index}) because it is managed by wireguard"
-                    );
-                    continue;
-                }
-
-                let mut addr_stream = handle
-                    .address()
-                    .get()
-                    .set_link_index_filter(index)
-                    .execute();
-
-                let mut ipv6_candidate: Option<IpAddr> = None;
-
-                while let Some(msg) = addr_stream
-                    .try_next()
-                    .await
-                    .context("enumerate interface addresses via rtnetlink")?
+                if flags.contains(LinkFlags::Loopback)
+                    || name == MANTISSA_WIREGUARD_IFNAME
+                    || is_managed_overlay_link_name(&name)
                 {
-                    for attr in msg.attributes.iter() {
-                        if let AddressAttribute::Address(addr) | AddressAttribute::Local(addr) =
-                            attr
-                        {
-                            let ip = *addr;
-                            if ip.is_loopback() {
-                                continue;
-                            }
-
-                            match ip {
-                                IpAddr::V4(_) => {
-                                    info!(
-                                        target: "network",
-                                        "selected underlay interface {name} (index {index}) with address {ip}"
-                                    );
-                                    return Ok((index, ip));
-                                }
-                                IpAddr::V6(_) => {
-                                    if ipv6_candidate.is_none() {
-                                        ipv6_candidate = Some(ip);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    continue;
                 }
 
-                if let Some(ip) = ipv6_candidate {
+                let Some(ip) = self
+                    .interface_primary_ip(index, AddressFamily::Unspec)
+                    .await?
+                else {
+                    continue;
+                };
+                if let Some(info) = self.resolved_underlay(index, name, ip).await? {
                     info!(
                         target: "network",
-                        "selected underlay interface {name} (index {index}) with address {ip}"
+                        underlay = %info.name,
+                        underlay_index = info.index,
+                        underlay_ip = %info.ip,
+                        underlay_mtu = info.mtu,
+                        "selected underlay from fallback link scan"
                     );
-                    return Ok((index, ip));
+                    return Ok(info);
                 }
-
-                warn!(
-                    target: "network",
-                    "no usable addresses found on underlay candidate {name} (index {index}), continuing"
-                );
             }
 
             Err(anyhow!(
-                "unable to locate a non-loopback interface with an IP address for vxlan underlay"
+                "unable to locate a usable local interface for vxlan underlay"
             ))
+        }
+
+        /// Resolve and apply the effective underlay contract for one network plan.
+        ///
+        /// The controller keeps the replicated spec as the operator intent, but every reconcile
+        /// still needs one concrete local underlay interface and one effective MTU derived from
+        /// the host's current routing state before it touches kernel links.
+        pub async fn apply_plan_underlay_constraints(&self, plan: &mut NetworkPlan) -> Result<()> {
+            if self.handle.is_none() {
+                return Ok(());
+            }
+
+            let underlay = if let (Some(ifname), Some(ip)) =
+                (plan.underlay_iface.as_deref(), plan.underlay_ip)
+            {
+                self.explicit_underlay_by_name(ifname, ip).await?
+            } else {
+                self.underlay_info().await?
+            };
+
+            let requested_mtu = plan.mtu;
+            let effective_mtu = clamp_overlay_mtu(requested_mtu, &underlay)?;
+            if effective_mtu != requested_mtu {
+                warn!(
+                    target: "network",
+                    network = %plan.network_id,
+                    requested_mtu,
+                    effective_mtu,
+                    underlay = %underlay.name,
+                    underlay_index = underlay.index,
+                    underlay_ip = %underlay.ip,
+                    underlay_mtu = underlay.mtu,
+                    "clamping overlay mtu to the selected underlay ceiling"
+                );
+                plan.mtu = effective_mtu;
+            }
+
+            plan.underlay_iface = Some(underlay.name);
+            plan.underlay_ip = Some(underlay.ip);
+            Ok(())
+        }
+
+        /// Resolve one explicitly requested underlay interface into a usable local snapshot.
+        ///
+        /// WireGuard underlay selection feeds an exact interface and tunnel IP into the network
+        /// plan, so reconcile must honor that explicit lower-device choice instead of rerunning the
+        /// plaintext autodetection filters.
+        async fn explicit_underlay_by_name(
+            &self,
+            ifname: &str,
+            ip: IpAddr,
+        ) -> Result<ResolvedUnderlay> {
+            let Some(index) = self.find_link(ifname).await? else {
+                anyhow::bail!("explicit underlay interface {ifname} is missing");
+            };
+            if !self.interface_has_ip(index, address_family(ip), ip).await? {
+                anyhow::bail!(
+                    "explicit underlay interface {ifname} no longer owns local address {ip}"
+                );
+            }
+            self.resolved_underlay(index, ifname.to_string(), ip)
+                .await?
+                .ok_or_else(|| anyhow!("explicit underlay interface {ifname} disappeared"))
         }
 
         async fn link_name(&self, index: u32) -> Result<Option<String>> {
@@ -3872,6 +4515,11 @@ mod platform {
         /// Return `None` on unsupported platforms, since no kernel interfaces are created.
         pub async fn link_index(&self, _name: &str) -> Result<Option<u32>> {
             Ok(None)
+        }
+
+        /// Unsupported platforms do not derive kernel underlay constraints for overlay links.
+        pub async fn apply_plan_underlay_constraints(&self, _plan: &mut NetworkPlan) -> Result<()> {
+            Ok(())
         }
 
         pub async fn ensure_network(&self, plan: &NetworkPlan) -> Result<()> {
