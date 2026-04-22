@@ -15,7 +15,7 @@ use crate::{
     scheduler::Scheduler,
     server::{
         RunHandles, Server,
-        bootstrap::{BootedRuntime, BootstrapContext, BootstrapOptions, boot},
+        bootstrap::{BootedRuntime, BootstrapContext, BootstrapOptions, RuntimeTaskHandles, boot},
     },
     services::ServiceController,
     workload::manager::{WorkloadManager, WorkloadRuntimeConfig},
@@ -138,6 +138,7 @@ pub struct HeadlessNode {
 
     // Runtime handles for TCP
     handles: Option<RunHandles>,
+    runtime_tasks: Option<RuntimeTaskHandles>,
     _tmp_dir: Option<PathBuf>, // when using convenience constructors
 }
 
@@ -211,6 +212,7 @@ impl HeadlessNode {
             stores,
             components: comps,
             server,
+            runtime_tasks,
         } = boot(ctx, options).await?;
 
         // Cap’n Proto Server capability
@@ -279,6 +281,7 @@ impl HeadlessNode {
             _signing: signing,
             transport: effective_transport,
             handles,
+            runtime_tasks: Some(runtime_tasks),
             server: stored_server,
             _tmp_dir: None,
         })
@@ -651,6 +654,21 @@ impl HeadlessNode {
             }
         }
     }
+
+    /// Shut down the full headless runtime before dropping the node.
+    ///
+    /// Restart tests use this instead of plain `stop()` when they need to
+    /// model a real daemon exit. The method stops the exported transport,
+    /// tears down discovery-owned listeners and NodePort publication, and then
+    /// aborts the long-running runtime actors spawned during bootstrap.
+    pub async fn shutdown(mut self) -> io::Result<()> {
+        self.stop().await?;
+        if let Some(runtime_tasks) = self.runtime_tasks.take() {
+            runtime_tasks.abort();
+        }
+        self.network_controller.shutdown().await.map_err(to_io)?;
+        Ok(())
+    }
 }
 
 impl Drop for HeadlessNode {
@@ -668,6 +686,9 @@ impl Drop for HeadlessNode {
                     handles.abort();
                 }
             }
+        }
+        if let Some(runtime_tasks) = self.runtime_tasks.take() {
+            runtime_tasks.abort();
         }
         crate::workload::manager::cleanup_secret_runtime_roots_for_node(self.id);
         if let Some(dir) = self._tmp_dir.take() {

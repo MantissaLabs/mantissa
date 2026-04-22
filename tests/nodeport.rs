@@ -8,12 +8,13 @@ use common::convergence::wait_until;
 use common::privileged_networking::{
     PrivilegedTestGuard, command_output, command_stdout, create_privileged_network,
     create_privileged_node, delete_privileged_network, privileged_artifact_dir,
-    privileged_network_interfaces, privileged_test_network, privileged_test_subnet,
-    privileged_test_subnet_v6,
+    privileged_headless_config, privileged_network_interfaces, privileged_test_network,
+    privileged_test_subnet, privileged_test_subnet_v6,
 };
 use futures::TryStreamExt;
 use mantissa::config::NodePortSourceMode;
 use mantissa::network::nodeport::{NodePortIdentitySource, NodePortRuntimeState};
+use mantissa::server::headless::{HeadlessKeys, HeadlessNode};
 use mantissa::services::ServiceController;
 use mantissa::services::types::{
     ServicePortProtocol, ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceStatus,
@@ -25,7 +26,9 @@ use rtnetlink::packet_route::address::AddressAttribute;
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
+use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::process::Command as TokioCommand;
@@ -813,6 +816,289 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
     delete_privileged_network(&node, network_id).await;
 });
 
+// Ensure daemon restart with persisted state restores active NodePort publication.
+local_test!(nodeport_restart_restores_public_service_publication, {
+    let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
+        return;
+    };
+
+    let _config = PrivilegedTestGuard::apply(|config| {
+        config.network.wireguard.enabled = false;
+        config.network.wireguard.manage_firewall = false;
+        config.network.bpf.attach = true;
+        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        config.network.nodeport.enabled = true;
+        config.network.nodeport.iface = Some("lo".to_string());
+        config.network.nodeport.ip = Some("127.0.0.1".to_string());
+        config.network.nodeport.source_mode = NodePortSourceMode::SnatHostAccess;
+        config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+    });
+
+    let temp_dir = tempdir().expect("create tempdir for persisted NodePort restart database");
+    let db_path = temp_dir.path().join("nodeport-restart.redb");
+    let db = Arc::new(redb::Database::create(db_path).expect("create persisted redb"));
+    let self_id = Uuid::new_v4();
+    let noise_keys = Arc::new(net::noise::NoiseKeys::from_private_bytes([0x72; 32]));
+    let signing = ed25519_dalek::SigningKey::from_bytes(&[0x92; 32]);
+
+    let node = HeadlessNode::new_with(
+        db.clone(),
+        self_id,
+        HeadlessKeys::new(noise_keys.clone(), signing.clone()),
+        privileged_headless_config(),
+    )
+    .await
+    .expect("start persisted NodePort node");
+
+    let network = create_privileged_network(
+        &node,
+        privileged_test_network(
+            "nodeport-restart",
+            "privileged nodeport restart persistence network",
+            &privileged_test_subnet(),
+            1450,
+            Vec::new(),
+        ),
+        mantissa::network::types::NetworkStatus::Ready,
+    )
+    .await;
+    let network_id = network.id;
+
+    let service_id = deploy_privileged_nodeport_service(
+        &node.service_controller,
+        "nodeport-restart",
+        network_id,
+        NODEPORT_RESPONSE,
+        NODEPORT_HTTP_PORT,
+        NODEPORT_HTTP_PORT,
+    )
+    .await
+    .expect("submit persisted NodePort deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.service_controller,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(180),
+        )
+        .await,
+        "published service should reach running before the restart"
+    );
+
+    let first_ready = wait_until(
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        || async {
+            let status = node.network_controller.nodeport_manager().status().await;
+            status.state == NodePortRuntimeState::Ready
+                && status.source_mode == NodePortSourceMode::SnatHostAccess
+                && status.identity_source == Some(NodePortIdentitySource::NodePortIp)
+                && status.active_ports == 1
+                && status.active_host_networks == 1
+                && status.resolved_node_ip == Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                && status.stats_error.is_none()
+        },
+    )
+    .await;
+    if !first_ready {
+        let status = node.network_controller.nodeport_manager().status().await;
+        let service = node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("read persisted NodePort service after first readiness failure")
+            .expect("persisted NodePort service should still exist before restart");
+        panic!(
+            "NodePort manager should report one ready published port before restart; status={status:?}; public_detail={:?}",
+            service.public_endpoint_detail()
+        );
+    }
+
+    let addr = format!("127.0.0.1:{NODEPORT_HTTP_PORT}");
+    assert!(
+        wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(250),
+            || async {
+                matches!(
+                    http_get(&addr).await,
+                    Ok(response) if response.contains(NODEPORT_RESPONSE)
+                )
+            }
+        )
+        .await,
+        "published service should answer HTTP before the restart"
+    );
+
+    node.shutdown()
+        .await
+        .expect("shut down first persisted NodePort node");
+
+    let restarted = HeadlessNode::new_with(
+        db,
+        self_id,
+        HeadlessKeys::new(noise_keys, signing),
+        privileged_headless_config(),
+    )
+    .await
+    .expect("restart persisted NodePort node");
+
+    let running_after_restart = wait_for_service_status(
+        &restarted.service_controller,
+        service_id,
+        ServiceStatus::Running,
+        Duration::from_secs(180),
+    )
+    .await;
+    if !running_after_restart {
+        let status = restarted
+            .network_controller
+            .nodeport_manager()
+            .status()
+            .await;
+        let network_spec = restarted
+            .network_registry
+            .get_spec(network_id)
+            .expect("load persisted network after restart running timeout");
+        let peer_state = restarted
+            .network_registry
+            .get_peer_state(network_id, restarted.id)
+            .expect("load local peer state after restart running timeout");
+        let service = restarted
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("read persisted NodePort service after restart running timeout")
+            .expect("persisted NodePort service should still exist after restart");
+        panic!(
+            "restart should restore the active public service to running; service={service:?}; public_detail={:?}; nodeport_status={status:?}; network_spec={network_spec:?}; peer_state={peer_state:?}",
+            service.public_endpoint_detail(),
+        );
+    }
+
+    let nodeport_ready_after_restart = wait_until(
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        || async {
+            let status = restarted
+                .network_controller
+                .nodeport_manager()
+                .status()
+                .await;
+            status.state == NodePortRuntimeState::Ready
+                && status.source_mode == NodePortSourceMode::SnatHostAccess
+                && status.identity_source == Some(NodePortIdentitySource::NodePortIp)
+                && status.active_ports == 1
+                && status.active_host_networks == 1
+                && status.resolved_node_ip == Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                && status.stats_error.is_none()
+        },
+    )
+    .await;
+    if !nodeport_ready_after_restart {
+        let status = restarted
+            .network_controller
+            .nodeport_manager()
+            .status()
+            .await;
+        let network_spec = restarted
+            .network_registry
+            .get_spec(network_id)
+            .expect("load persisted network after restart readiness failure");
+        let peer_state = restarted
+            .network_registry
+            .get_peer_state(network_id, restarted.id)
+            .expect("load local peer state after restart readiness failure");
+        let service = restarted
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("read persisted NodePort service after restart readiness failure")
+            .expect("persisted NodePort service should still exist after restart readiness");
+        panic!(
+            "restart should restore NodePort publication for the persisted service; status={status:?}; public_detail={:?}; service={service:?}; network_spec={network_spec:?}; peer_state={peer_state:?}",
+            service.public_endpoint_detail(),
+        );
+    }
+
+    let detail_cleared_after_restart = wait_until(
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        || async {
+            restarted
+                .service_controller
+                .registry()
+                .get(service_id)
+                .expect("read persisted NodePort service while clearing restart detail")
+                .is_some_and(|service| service.public_endpoint_detail().is_none())
+        },
+    )
+    .await;
+    let service = restarted
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("read persisted NodePort service after restart detail wait")
+        .expect("persisted NodePort service should still exist after restart");
+    assert!(
+        detail_cleared_after_restart,
+        "persisted public service should not remain degraded after restart; service={service:?}"
+    );
+
+    let http_ok_after_restart = wait_until(
+        Duration::from_secs(60),
+        Duration::from_millis(250),
+        || async {
+            matches!(
+                http_get(&addr).await,
+                Ok(response) if response.contains(NODEPORT_RESPONSE)
+            )
+        },
+    )
+    .await;
+    if !http_ok_after_restart {
+        let status = restarted
+            .network_controller
+            .nodeport_manager()
+            .status()
+            .await;
+        let last_http_error = http_get(&addr)
+            .await
+            .map(|response| format!("unexpected response: {response}"))
+            .unwrap_or_else(|err| err.to_string());
+        panic!(
+            "restart should restore public NodePort reachability for the persisted service; status={status:?}; last_http_error={last_http_error}"
+        );
+    }
+
+    remove_service_via_rpc(&restarted.services_client, service_id).await;
+    assert!(
+        wait_until(
+            Duration::from_secs(180),
+            Duration::from_millis(100),
+            || async {
+                match restarted
+                    .service_controller
+                    .registry()
+                    .get(service_id)
+                    .expect("read persisted NodePort service during restart teardown")
+                {
+                    None => true,
+                    Some(service) => service.status() == ServiceStatus::Stopped,
+                }
+            }
+        )
+        .await,
+        "restart teardown should drive the persisted service into a terminal state before deleting the network"
+    );
+    delete_privileged_network(&restarted, network_id).await;
+    restarted
+        .shutdown()
+        .await
+        .expect("shut down restarted persisted NodePort node");
+});
+
 local_test!(nodeport_tcp_syn_mss_clamps_to_host_access_mtu, {
     let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
         return;
@@ -867,21 +1153,65 @@ local_test!(nodeport_tcp_syn_mss_clamps_to_host_access_mtu, {
         "small-MTU NodePort service should reach running state"
     );
 
+    let nodeport_ready = wait_until(
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        || async {
+            let status = node.network_controller.nodeport_manager().status().await;
+            status.state == NodePortRuntimeState::Ready
+                && status.source_mode == NodePortSourceMode::SnatHostAccess
+                && status.identity_source == Some(NodePortIdentitySource::NodePortIp)
+                && status.active_ports == 1
+                && status.active_host_networks == 1
+                && status.resolved_node_ip
+                    == Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+                && status.stats_error.is_none()
+        },
+    )
+    .await;
+    if !nodeport_ready {
+        let status = node.network_controller.nodeport_manager().status().await;
+        let service = node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("read small-MTU NodePort service after readiness failure")
+            .expect("small-MTU NodePort service should still exist after readiness failure");
+        panic!(
+            "small-MTU NodePort service should publish before HTTP assertions; status={status:?}; public_detail={:?}",
+            service.public_endpoint_detail()
+        );
+    }
+
     let addr = format!("127.0.0.1:{NODEPORT_HTTP_MTU_PORT}");
-    assert!(
-        wait_until(
-            Duration::from_secs(60),
-            Duration::from_millis(250),
-            || async {
-                matches!(
-                    http_get(&addr).await,
-                    Ok(response) if response.contains(NODEPORT_RESPONSE)
-                )
-            }
-        )
-        .await,
-        "small-MTU NodePort service should answer HTTP requests before the MSS assertion"
-    );
+    let http_ok = wait_until(
+        Duration::from_secs(60),
+        Duration::from_millis(250),
+        || async {
+            matches!(
+                http_get(&addr).await,
+                Ok(response) if response.contains(NODEPORT_RESPONSE)
+            )
+        },
+    )
+    .await;
+    if !http_ok {
+        let status = node.network_controller.nodeport_manager().status().await;
+        let service = node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("read small-MTU NodePort service after HTTP failure")
+            .expect("small-MTU NodePort service should still exist after HTTP failure");
+        let last_http_error = http_get(&addr)
+            .await
+            .map(|response| format!("unexpected response: {response}"))
+            .unwrap_or_else(|err| err.to_string());
+        panic!(
+            "small-MTU NodePort service should answer HTTP requests before the MSS assertion; status={status:?}; public_detail={:?}; last_http_error={last_http_error}",
+            service.public_endpoint_detail()
+        );
+    }
 
     let [
         _vxlan_ifname,

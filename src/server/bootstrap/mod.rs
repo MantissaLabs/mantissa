@@ -6,7 +6,7 @@ mod transport;
 use crate::server;
 
 pub(crate) use context::BootstrapContext;
-pub(crate) use runtime::{BootedRuntime, BootstrapOptions, boot};
+pub(crate) use runtime::{BootedRuntime, BootstrapOptions, RuntimeTaskHandles, boot};
 
 pub(crate) type BootstrapResult<T> = Result<T, Box<dyn std::error::Error>>;
 

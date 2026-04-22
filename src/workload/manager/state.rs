@@ -2784,6 +2784,25 @@ impl WorkloadManager {
                     "failed to refresh attachments while adopting runtime instance: {err:#}"
                 );
             }
+
+            // Service tasks deliberately stage attachment publication behind a
+            // separate traffic bit so rollouts can cut over only after a
+            // replacement is ready. After daemon restart, inventory adoption
+            // can recreate those attachment rows, but no rollout path re-runs
+            // to flip the publication bit back on. Recheck publication here so
+            // restarted discovery and NodePort can see already-running service
+            // backends again.
+            if matches!(value.state, WorkloadPhase::Running)
+                && value.service_owner().is_some()
+                && !value.networks.is_empty()
+                && let Err(err) = self.ensure_task_service_traffic_ready(task_id).await
+            {
+                warn!(
+                    target: "task",
+                    task = %task_id,
+                    "failed to restore service traffic publication while adopting runtime instance: {err:#}"
+                );
+            }
         }
 
         Ok(())
@@ -2821,6 +2840,18 @@ impl WorkloadManager {
             }
             if let Some(revision) = revision
                 && attachment.task_updated_at.as_deref() != Some(revision)
+            {
+                return Ok(true);
+            }
+            // Persisted attachment rows can survive a daemon restart even when the kernel-side
+            // host veth vanished. Treat that as drift so inventory adoption re-runs attachment
+            // provisioning before service discovery starts probing the backend again.
+            if !self
+                .networking
+                .attachment_provisioner
+                .attachment_exists(attachment.id)
+                .await
+                .context("check attachment presence for inventory refresh")?
             {
                 return Ok(true);
             }

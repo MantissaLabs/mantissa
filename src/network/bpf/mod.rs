@@ -1300,17 +1300,25 @@ mod platform {
     fn is_bpf_link_conflict(err: &anyhow::Error) -> bool {
         err.chain().any(|cause| {
             if let Some(sys) = cause.downcast_ref::<aya::sys::SyscallError>() {
-                return sys.call == "bpf_link_create"
-                    && matches!(sys.io_error.raw_os_error(), Some(code) if code == libc::EEXIST);
+                return is_stale_bpf_attach_errno(sys.call, sys.io_error.raw_os_error());
             }
             if let Some(aya::programs::ProgramError::SyscallError(sys)) =
                 cause.downcast_ref::<aya::programs::ProgramError>()
             {
-                return sys.call == "bpf_link_create"
-                    && matches!(sys.io_error.raw_os_error(), Some(code) if code == libc::EEXIST);
+                return is_stale_bpf_attach_errno(sys.call, sys.io_error.raw_os_error());
             }
             false
         })
+    }
+
+    /// Classify errno values that indicate one stale eBPF attachment is still occupying the
+    /// target hook and should be force-detached before retrying.
+    fn is_stale_bpf_attach_errno(call: &str, errno: Option<i32>) -> bool {
+        match errno {
+            Some(code) if code == libc::EEXIST => call == "bpf_link_create",
+            Some(code) if code == libc::EBUSY => true,
+            _ => false,
+        }
     }
 
     fn load_with_retry(
@@ -1968,6 +1976,30 @@ mod platform {
             manager.ensure_network(&spec, &ctx).await?;
             manager.teardown_network(&ctx).await?;
             Ok(())
+        }
+
+        #[test]
+        fn stale_bpf_attach_errno_detects_link_create_eexist() {
+            assert!(is_stale_bpf_attach_errno(
+                "bpf_link_create",
+                Some(libc::EEXIST)
+            ));
+        }
+
+        #[test]
+        fn stale_bpf_attach_errno_detects_attach_busy() {
+            assert!(is_stale_bpf_attach_errno(
+                "bpf_set_link_xdp_fd",
+                Some(libc::EBUSY)
+            ));
+        }
+
+        #[test]
+        fn stale_bpf_attach_errno_rejects_unrelated_errno() {
+            assert!(!is_stale_bpf_attach_errno(
+                "bpf_link_create",
+                Some(libc::ENOENT)
+            ));
         }
     }
 }

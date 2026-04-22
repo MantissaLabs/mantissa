@@ -46,6 +46,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
+use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 /// Overrides applied to the shared bootstrap pipeline.
@@ -124,6 +125,28 @@ pub struct BootedRuntime {
     pub stores: BootstrapStores,
     pub components: RuntimeComponents,
     pub server: Server,
+    pub runtime_tasks: RuntimeTaskHandles,
+}
+
+/// Join handles for the background actors spawned during bootstrap.
+///
+/// Headless tests keep these handles so they can shut down long-running
+/// controllers before restarting the same node identity from durable state.
+pub struct RuntimeTaskHandles {
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl RuntimeTaskHandles {
+    /// Abort every runtime actor that bootstrap spawned.
+    ///
+    /// Headless restart tests use this after graceful subsystem cleanup so
+    /// lingering controllers do not keep sockets, timers, or store watchers
+    /// alive across the simulated daemon restart.
+    pub fn abort(self) {
+        for task in self.tasks {
+            task.abort();
+        }
+    }
 }
 
 /// Actors that only exist to run background loops once bootstrap completes.
@@ -274,7 +297,7 @@ pub async fn boot(
         Box::pin(build_runtime_components(&ctx, &stores, &options)).await?;
     apply_runtime_overrides(&components, &options);
     let server = build_server(&ctx, &stores, &components);
-    spawn_runtime_tasks(
+    let runtime_tasks = spawn_runtime_tasks(
         &components,
         actors,
         gossip_rx,
@@ -289,6 +312,7 @@ pub async fn boot(
         stores,
         components,
         server,
+        runtime_tasks,
     })
 }
 
@@ -908,8 +932,6 @@ async fn finish_boot(server: &Server, components: &RuntimeComponents) -> Bootstr
             info!(target: "scheduler", "scheduler has no slots configured");
         }
     }
-
-    components.network_controller.spawn();
     Ok(())
 }
 
@@ -924,7 +946,7 @@ async fn spawn_runtime_tasks(
     gossip_dedupe: DedupeStateHandle,
     signing_key: ed25519_dalek::SigningKey,
     gossip_fanout: usize,
-) {
+) -> RuntimeTaskHandles {
     let RuntimeActors {
         runtime_health: _runtime_health,
         secret_replicator,
@@ -938,48 +960,49 @@ async fn spawn_runtime_tasks(
     let topology_lifecycle = components.topology.clone();
     let topology_for_gossip = components.topology.clone();
     let gossip_tick = topology_for_gossip.gossip_interval();
+    let mut tasks = Vec::new();
 
     let mut workload_runner = components.workload_manager.clone();
-    tokio::task::spawn_local(async move {
+    tasks.push(tokio::task::spawn_local(async move {
         workload_runner.run().await;
-    });
+    }));
 
     let mut job_runner = components.job_controller.clone();
-    tokio::task::spawn_local(async move {
+    tasks.push(tokio::task::spawn_local(async move {
         job_runner.run().await;
-    });
+    }));
 
     let mut agent_runner = components.agent_controller.clone();
-    tokio::task::spawn_local(async move {
+    tasks.push(tokio::task::spawn_local(async move {
         agent_runner.run().await;
-    });
+    }));
 
     let mut service_runner = components.service_controller.clone();
-    tokio::task::spawn_local(async move {
+    tasks.push(tokio::task::spawn_local(async move {
         service_runner.run().await;
-    });
+    }));
 
-    tokio::task::spawn_local(async move {
+    tasks.push(tokio::task::spawn_local(async move {
         secret_replicator.run().await;
-    });
+    }));
 
-    tokio::task::spawn_local(async move {
+    tasks.push(tokio::task::spawn_local(async move {
         volume_replicator.run().await;
-    });
+    }));
 
-    tokio::task::spawn_local(async move {
+    tasks.push(tokio::task::spawn_local(async move {
         scheduler_digest_replicator.run().await;
-    });
+    }));
 
-    tokio::task::spawn_local(async move {
+    tasks.push(tokio::task::spawn_local(async move {
         volume_controller.run().await;
-    });
+    }));
 
-    tokio::task::spawn_local(async move {
+    tasks.push(tokio::task::spawn_local(async move {
         network_gossiper.run().await;
-    });
+    }));
 
-    tokio::task::spawn_local(async move {
+    tasks.push(tokio::task::spawn_local(async move {
         gossip::start(
             gossip_rx,
             topology_for_gossip,
@@ -988,23 +1011,27 @@ async fn spawn_runtime_tasks(
             gossip_tick,
         )
         .await;
-    });
+    }));
 
-    tokio::task::spawn_local(async move {
+    tasks.push(tokio::task::spawn_local(async move {
         topology_runner.run().await;
-    });
+    }));
 
     if topology_lifecycle.already_joined().await.unwrap_or(false) {
         topology_lifecycle.ensure_cluster_background_tasks();
 
         let topology_for_boot = components.topology.clone();
-        tokio::task::spawn_local(async move {
+        tasks.push(tokio::task::spawn_local(async move {
             if let Err(error) = topology_for_boot
                 .connect_known_peers(Some(&signing_key))
                 .await
             {
                 error!(target: "server", "Startup connect failed: {error}");
             }
-        });
+        }));
     }
+
+    tasks.extend(components.network_controller.spawn());
+
+    RuntimeTaskHandles { tasks }
 }

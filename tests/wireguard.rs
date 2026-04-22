@@ -439,7 +439,7 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
         Vec::new(),
     );
 
-    let mut node = HeadlessNode::new_with(
+    let node = HeadlessNode::new_with(
         db.clone(),
         self_id,
         HeadlessKeys::new(noise_keys.clone(), signing.clone()),
@@ -487,8 +487,9 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
     let port_before =
         std::fs::read_to_string(&port_path).expect("read persisted WireGuard port before restart");
 
-    node.stop().await.expect("stop first WireGuard node");
-    drop(node);
+    node.shutdown()
+        .await
+        .expect("shut down first WireGuard node");
 
     let restarted = HeadlessNode::new_with(
         db,

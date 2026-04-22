@@ -5,6 +5,7 @@ use rtnetlink::packet_core::{
     NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST, NetlinkMessage,
     NetlinkPayload,
 };
+use rtnetlink::packet_route::link::LinkAttribute;
 use rtnetlink::packet_route::neighbour::{
     NeighbourAddress, NeighbourAttribute, NeighbourFlags, NeighbourMessage, NeighbourState,
 };
@@ -72,14 +73,31 @@ impl AttachmentProvisioner {
         self.handle.as_ref()
     }
 
+    /// Returns whether the host-side veth for one runtime attachment still exists and remains
+    /// bridged into the overlay dataplane.
+    ///
+    /// Restart recovery depends on this meaning "traffic can still reach the overlay bridge", not
+    /// merely "a link with the deterministic name still exists". Detached leftovers must return
+    /// false so the workload manager re-provisions them.
     pub async fn attachment_exists(&self, attachment_id: Uuid) -> Result<bool> {
         let Some(handle) = self.handle() else {
             return Ok(false);
         };
         let host_if = host_iface_name(attachment_id);
-        Ok(self.link_index(handle, &host_if).await?.is_some())
+        Ok(self
+            .link_state(handle, &host_if)
+            .await?
+            .and_then(|state| state.controller)
+            .is_some())
     }
 
+    /// Creates or re-creates one runtime attachment veth pair and wires its host side into the
+    /// requested bridge before moving the peer into the runtime namespace.
+    ///
+    /// When this method is called, the higher-level repair logic has already concluded that the
+    /// attachment is missing or stale. Any pre-existing host-side veth is therefore treated as
+    /// partial state and replaced so the peer can be recreated deterministically in the host
+    /// namespace before being moved into the runtime namespace again.
     pub async fn ensure_attachment(
         &self,
         request: &AttachmentProvisioningRequest<'_>,
@@ -97,9 +115,29 @@ impl AttachmentProvisioner {
         let instance_if = instance_iface_name(request.attachment_id);
 
         let bridge_name = request.bridge_name;
+        let bridge_index = self
+            .link_index(handle, bridge_name)
+            .await?
+            .context("bridge missing while configuring attachment")?;
 
-        let host_index = match self.link_index(handle, &host_if).await? {
-            Some(index) => index,
+        let host_index = match self.link_state(handle, &host_if).await? {
+            Some(existing) => {
+                debug!(
+                    target: "task",
+                    attachment = %request.attachment_id,
+                    host_if = host_if,
+                    host_index = existing.index,
+                    host_controller = existing.controller,
+                    bridge = bridge_name,
+                    bridge_index,
+                    "replacing stale runtime attachment host interface before reprovisioning"
+                );
+                self.delete_link(handle, existing.index, &host_if).await?;
+                self.create_veth(handle, &host_if, &instance_if).await?;
+                self.link_index(handle, &host_if)
+                    .await?
+                    .context("veth host interface missing after recreation")?
+            }
             None => {
                 self.create_veth(handle, &host_if, &instance_if).await?;
                 self.link_index(handle, &host_if)
@@ -125,11 +163,6 @@ impl AttachmentProvisioner {
                 .await
                 .with_context(|| format!("failed to set mtu {} on {host_if}", request.mtu))?;
         }
-
-        let bridge_index = self
-            .link_index(handle, bridge_name)
-            .await?
-            .context("bridge missing while configuring attachment")?;
 
         handle
             .link()
@@ -388,11 +421,46 @@ impl AttachmentProvisioner {
         Ok(())
     }
 
-    async fn link_index(&self, handle: &Handle, name: &str) -> Result<Option<u32>> {
+    /// Deletes one host-side link by index while tolerating races where the kernel has already
+    /// removed it between discovery and teardown.
+    async fn delete_link(&self, handle: &Handle, index: u32, link_name: &str) -> Result<()> {
+        if let Err(err) = handle.link().del(index).execute().await {
+            match err {
+                rtnetlink::Error::NetlinkError(message) => {
+                    let raw = message.raw_code();
+                    let errno = raw.abs();
+                    if errno == libc::ENODEV || errno == libc::ENOENT || errno == libc::ENXIO {
+                        debug!(
+                            target: "task",
+                            link = link_name,
+                            errno,
+                            raw_code = raw,
+                            "interface already removed while deleting stale attachment; ignoring"
+                        );
+                    } else {
+                        return Err(rtnetlink::Error::NetlinkError(message))
+                            .with_context(|| format!("failed to delete interface {link_name}"));
+                    }
+                }
+                other => {
+                    return Err(other)
+                        .with_context(|| format!("failed to delete interface {link_name}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the host-side link index together with its current controller/master when the
+    /// interface still exists in the host namespace.
+    async fn link_state(&self, handle: &Handle, name: &str) -> Result<Option<LinkState>> {
         let mut stream = handle.link().get().match_name(name.to_string()).execute();
 
         match stream.try_next().await {
-            Ok(Some(msg)) => Ok(Some(msg.header.index)),
+            Ok(Some(msg)) => Ok(Some(LinkState {
+                index: msg.header.index,
+                controller: link_controller(msg.attributes.iter()),
+            })),
             Ok(None) => Ok(None),
             Err(rtnetlink::Error::NetlinkError(message)) => {
                 let raw = message.raw_code();
@@ -412,6 +480,14 @@ impl AttachmentProvisioner {
             }
             Err(err) => Err(err).context("query link state"),
         }
+    }
+
+    /// Returns the link index for one host-namespace interface when it still exists.
+    async fn link_index(&self, handle: &Handle, name: &str) -> Result<Option<u32>> {
+        Ok(self
+            .link_state(handle, name)
+            .await?
+            .map(|state| state.index))
     }
 
     async fn program_fdb_entry(
@@ -570,6 +646,23 @@ fn parse_mac(mac: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Captures the minimal host-side link metadata needed to decide whether one attachment is still
+/// wired into the overlay dataplane.
+struct LinkState {
+    index: u32,
+    controller: Option<u32>,
+}
+
+/// Extract the current master/controller index from one rtnetlink link attribute list.
+fn link_controller<'a>(attributes: impl IntoIterator<Item = &'a LinkAttribute>) -> Option<u32> {
+    attributes
+        .into_iter()
+        .find_map(|attribute| match attribute {
+            LinkAttribute::Controller(index) => Some(*index),
+            _ => None,
+        })
+}
+
 fn format_mac_bytes(mac: &[u8]) -> Option<String> {
     if mac.len() != 6 {
         return None;
@@ -696,5 +789,26 @@ fn namespace_pid_for_attachment_target(target: &RuntimeAttachmentTarget) -> Resu
         RuntimeAttachmentTarget::TapDevice(name) => Err(anyhow!(
             "tap-device attachment targets are not supported by the linux provisioner: {name}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::link_controller;
+    use rtnetlink::packet_route::link::LinkAttribute;
+
+    #[test]
+    fn link_controller_returns_none_when_link_has_no_master() {
+        let attributes = [LinkAttribute::IfName("mnth-test".to_string())];
+        assert_eq!(link_controller(attributes.iter()), None);
+    }
+
+    #[test]
+    fn link_controller_returns_master_index_when_present() {
+        let attributes = [
+            LinkAttribute::IfName("mnth-test".to_string()),
+            LinkAttribute::Controller(42),
+        ];
+        assert_eq!(link_controller(attributes.iter()), Some(42));
     }
 }

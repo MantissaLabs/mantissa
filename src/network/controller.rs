@@ -33,6 +33,10 @@ use uuid::Uuid;
 const RECONCILE_DRIFT_INTERVAL: Duration = Duration::from_secs(60);
 /// Frequency to check for attachment updates that require forwarding refresh.
 const ATTACHMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+/// Retry interval for service-discovery startup after local interface programming.
+const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// Number of short retries before discovery startup falls back to the normal drift sweep.
+const DISCOVERY_RETRY_ATTEMPTS: usize = 10;
 pub(crate) const DEFAULT_MTU: u32 = 1450;
 #[cfg(target_os = "linux")]
 const VXLAN_PORT: u16 = 4789;
@@ -163,13 +167,19 @@ impl NetworkController {
         })
     }
 
-    /// Spawn the reconciliation loop on the current local executor.
-    pub fn spawn(&self) {
-        self.spawn_forwarding_listener();
+    /// Spawn the long-running controller tasks on the current local executor.
+    ///
+    /// Bootstrap keeps the returned join handles so headless restart tests can
+    /// abort the network controller cleanly before starting a replacement node
+    /// with the same persisted state.
+    pub fn spawn(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut tasks = Vec::with_capacity(2);
+        tasks.push(self.spawn_forwarding_listener());
         let controller = self.clone();
-        tokio::task::spawn_local(async move {
+        tasks.push(tokio::task::spawn_local(async move {
             controller.run().await;
-        });
+        }));
+        tasks
     }
 
     /// Request an immediate reconcile for the provided network identifier.
@@ -426,15 +436,71 @@ impl NetworkController {
         Ok(())
     }
 
-    fn spawn_forwarding_listener(&self) {
+    fn spawn_forwarding_listener(&self) -> tokio::task::JoinHandle<()> {
         let controller = self.clone();
         tokio::task::spawn_local(async move {
             controller.forwarding_event_loop().await;
-        });
+        })
+    }
+
+    /// Tear down discovery-owned per-network resources before a headless restart.
+    ///
+    /// The headless restart harness reuses the same node identity and durable
+    /// state in one process. Stopping discovery listeners explicitly here keeps
+    /// the replacement node from racing stale DNS sockets or NodePort
+    /// publication left behind by the previous runtime instance.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.inner
+            .discovery
+            .shutdown()
+            .await
+            .context("shut down service discovery before headless restart")
+    }
+
+    /// Queue every persisted non-deleted network for one startup reconcile.
+    ///
+    /// The controller rebuilds local interfaces, discovery listeners, and NodePort publication
+    /// from durable replicated state after daemon restart. Enqueuing the known specs explicitly
+    /// keeps that recovery path deterministic instead of relying on the slow drift sweep.
+    async fn queue_startup_spec_reconcile(&self) -> Result<usize> {
+        let specs = self
+            .inner
+            .registry
+            .list_specs()
+            .context("list network specs for startup reconcile")?;
+
+        let mut pending = self.inner.pending_specs.lock().await;
+        let mut inserted = 0usize;
+        for spec in specs {
+            if spec.is_deleted() {
+                continue;
+            }
+            if pending.insert(spec.id) {
+                inserted = inserted.saturating_add(1);
+            }
+        }
+        Ok(inserted)
     }
 
     /// Run the event-driven reconciliation loop with a slow drift sweep for external changes.
     async fn run(&self) {
+        match self.queue_startup_spec_reconcile().await {
+            Ok(queued) if queued > 0 => {
+                debug!(
+                    target: "network",
+                    queued,
+                    "queued persisted network specs for startup reconcile"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    "failed to queue persisted network specs on startup: {err:#}"
+                );
+            }
+        }
+
         if let Err(err) = self.reconcile_pending_forwarding().await {
             warn!(
                 target: "network",
@@ -788,16 +854,17 @@ impl NetworkController {
         }
 
         if self.inner.provisioner.supports_resolver_bind() {
-            if let Err(err) = self
-                .inner
-                .discovery
-                .ensure_network(&spec, plan.resolver_ip)
-                .await
-            {
+            if let Err(err) = self.ensure_service_discovery(&spec, plan.resolver_ip).await {
                 warn!(
                     target: "network",
                     network = %plan.network_id,
                     "failed to ensure service discovery: {err:#}"
+                );
+            } else if let Err(err) = self.inner.discovery.refresh_network(plan.network_id).await {
+                warn!(
+                    target: "network",
+                    network = %plan.network_id,
+                    "failed to refresh service discovery state after startup: {err:#}"
                 );
             }
         } else {
@@ -835,6 +902,33 @@ impl NetworkController {
         Ok(())
     }
 
+    /// Start or rebuild the per-network discovery listener with a short local retry window.
+    ///
+    /// Immediately after the controller creates or repairs the host-access interface, the kernel
+    /// can briefly report the resolver address as not yet bindable. Retrying here keeps restart
+    /// recovery on the fast path instead of waiting for the slow drift sweep to retry discovery a
+    /// full minute later.
+    async fn ensure_service_discovery(
+        &self,
+        spec: &NetworkSpecValue,
+        resolver_ip: Option<IpAddr>,
+    ) -> Result<()> {
+        let mut last_error = None;
+        for attempt in 0..DISCOVERY_RETRY_ATTEMPTS {
+            match self.inner.discovery.ensure_network(spec, resolver_ip).await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt + 1 < DISCOVERY_RETRY_ATTEMPTS {
+                        tokio::time::sleep(DISCOVERY_RETRY_INTERVAL).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.expect("discovery retry loop should capture one startup error"))
+    }
+
     /// Build the current bridge-port attachment context for one network.
     ///
     /// Bridge tc programs must be attached to every local bridge-facing port that can carry
@@ -855,19 +949,26 @@ impl NetworkController {
     fn is_bpf_link_conflict(err: &anyhow::Error) -> bool {
         err.chain().any(|cause| {
             if let Some(sys) = cause.downcast_ref::<SyscallError>() {
-                return Self::is_link_create_conflict(sys);
+                return Self::is_stale_bpf_attach_conflict(sys);
             }
             if let Some(ProgramError::SyscallError(sys)) = cause.downcast_ref::<ProgramError>() {
-                return Self::is_link_create_conflict(sys);
+                return Self::is_stale_bpf_attach_conflict(sys);
             }
             false
         })
     }
 
     #[cfg(target_os = "linux")]
-    fn is_link_create_conflict(sys: &SyscallError) -> bool {
-        sys.call == "bpf_link_create"
-            && matches!(sys.io_error.raw_os_error(), Some(code) if code == libc::EEXIST)
+    fn is_stale_bpf_attach_conflict(sys: &SyscallError) -> bool {
+        match sys.io_error.raw_os_error() {
+            Some(code) if code == libc::EEXIST => sys.call == "bpf_link_create",
+            // Restarted daemons can hit EBUSY while reattaching XDP to interfaces that still
+            // carry the previous process' stale hook. Treat that as the same stale-attachment
+            // class so reconciliation rebuilds the dataplane instead of leaving the network in
+            // error until a manual detach happens.
+            Some(code) if code == libc::EBUSY => true,
+            _ => false,
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1545,16 +1646,16 @@ mod tests {
     use std::collections::HashSet;
     use uuid::Uuid;
 
-    fn make_syscall_error() -> SyscallError {
+    fn make_syscall_error(errno: i32) -> SyscallError {
         SyscallError {
             call: "bpf_link_create",
-            io_error: std::io::Error::from_raw_os_error(libc::EEXIST),
+            io_error: std::io::Error::from_raw_os_error(errno),
         }
     }
 
     #[test]
     fn detects_syscall_conflict_directly() {
-        let err = Err::<(), _>(make_syscall_error())
+        let err = Err::<(), _>(make_syscall_error(libc::EEXIST))
             .context("attach xdp")
             .unwrap_err();
         assert!(
@@ -1565,11 +1666,32 @@ mod tests {
 
     #[test]
     fn detects_syscall_conflict_wrapped_in_program_error() {
-        let program_err: ProgramError = make_syscall_error().into();
+        let program_err: ProgramError = make_syscall_error(libc::EEXIST).into();
         let err = Err::<(), _>(program_err).context("attach xdp").unwrap_err();
         assert!(
             NetworkController::is_bpf_link_conflict(&err),
             "expected program error conflict to be detected"
+        );
+    }
+
+    #[test]
+    fn detects_xdp_busy_conflict_directly() {
+        let err = Err::<(), _>(make_syscall_error(libc::EBUSY))
+            .context("attach xdp")
+            .unwrap_err();
+        assert!(
+            NetworkController::is_bpf_link_conflict(&err),
+            "expected xdp busy conflict to be detected"
+        );
+    }
+
+    #[test]
+    fn detects_xdp_busy_conflict_wrapped_in_program_error() {
+        let program_err: ProgramError = make_syscall_error(libc::EBUSY).into();
+        let err = Err::<(), _>(program_err).context("attach xdp").unwrap_err();
+        assert!(
+            NetworkController::is_bpf_link_conflict(&err),
+            "expected wrapped xdp busy conflict to be detected"
         );
     }
 

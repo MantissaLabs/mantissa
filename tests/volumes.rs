@@ -515,7 +515,7 @@ local_test!(volumes_create_persists_across_restart, {
     let noise_keys = Arc::new(NoiseKeys::from_private_bytes([0x91; 32]));
     let signing = ed25519_dalek::SigningKey::from_bytes(&[0xA1; 32]);
 
-    let mut node = HeadlessNode::new_with(
+    let node = HeadlessNode::new_with(
         db.clone(),
         self_id,
         HeadlessKeys::new(noise_keys.clone(), signing.clone()),
@@ -537,8 +537,7 @@ local_test!(volumes_create_persists_across_restart, {
         VolumeBindingMode::WaitForFirstConsumer
     ));
 
-    node.stop().await.expect("stop node");
-    drop(node);
+    node.shutdown().await.expect("shut down node");
 
     let restarted = HeadlessNode::new_with(
         db,
@@ -1213,7 +1212,7 @@ local_test!(restart_restores_volume_node_state, {
     let runtime = Arc::new(RecordingRuntimeBackend::default());
     let local_volume_root = state_dir.path().join("volumes");
 
-    let mut node = create_recording_node_with_parts(
+    let node = create_recording_node_with_parts(
         db.clone(),
         self_id,
         HeadlessKeys::new(noise.clone(), signing.clone()),
@@ -1234,8 +1233,7 @@ local_test!(restart_restores_volume_node_state, {
         .local_path
         .expect("local path before restart");
 
-    node.stop().await.expect("stop first node");
-    drop(node);
+    node.shutdown().await.expect("shut down first node");
 
     let registry = VolumeRegistry::new(
         open_volume_spec_store(db.clone(), self_id).expect("open volume spec store"),

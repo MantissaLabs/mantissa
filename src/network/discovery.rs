@@ -70,19 +70,37 @@ pub struct ServiceDiscovery {
 
 struct DnsServerHandle {
     resolver_ip: IpAddr,
+    backend_catalog: Arc<AsyncMutex<NetworkBackendCatalog>>,
     shutdown: Option<watch::Sender<bool>>,
     task: JoinHandle<()>,
 }
 
 /// Cached backend-resolution metadata for one network, invalidated by store generations and
 /// health state changes.
-#[derive(Default)]
 struct NetworkBackendCatalog {
     attachment_generation: u64,
     workload_generation: u64,
     service_generation: u64,
     health_fingerprint: u64,
     services: HashMap<String, ServiceBackendCatalogEntry>,
+}
+
+impl Default for NetworkBackendCatalog {
+    /// Build one backend catalog that always forces an initial refresh.
+    ///
+    /// Store change clocks restart from zero when a node boots from persisted
+    /// state. Using impossible sentinel generations here guarantees the first
+    /// discovery refresh rebuilds the backend catalog instead of incorrectly
+    /// treating an empty catalog as already current.
+    fn default() -> Self {
+        Self {
+            attachment_generation: u64::MAX,
+            workload_generation: u64::MAX,
+            service_generation: u64::MAX,
+            health_fingerprint: u64::MAX,
+            services: HashMap::new(),
+        }
+    }
 }
 
 /// One service entry in the backend catalog.
@@ -173,6 +191,7 @@ impl ServiceDiscovery {
             let guard = self.servers.lock().await;
             if let Some(existing) = guard.get(&spec.id)
                 && existing.resolver_ip == resolver_ip
+                && !existing.task.is_finished()
             {
                 return Ok(());
             }
@@ -203,6 +222,38 @@ impl ServiceDiscovery {
         Ok(())
     }
 
+    /// Refresh one network's current discovery-derived dataplane state immediately.
+    ///
+    /// Network reconciliation calls this after (re)starting the per-network
+    /// listener so public publication and VIP programming can be rebuilt from
+    /// the latest durable stores without waiting for the next background tick.
+    pub async fn refresh_network(&self, network_id: Uuid) -> Result<()> {
+        let backend_catalog = {
+            let guard = self.servers.lock().await;
+            guard
+                .get(&network_id)
+                .map(|server| server.backend_catalog.clone())
+        };
+        let Some(backend_catalog) = backend_catalog else {
+            return Ok(());
+        };
+
+        refresh_network_services(
+            &self.registry,
+            &self.workloads,
+            &self.services,
+            &self.bpf,
+            network_id,
+            &self.health,
+            &self.bpf_lb,
+            &self.nodeport,
+            &self.missing_lb_maps,
+            &self.health_monitor,
+            &backend_catalog,
+        )
+        .await
+    }
+
     pub async fn teardown_network(&self, network_id: Uuid) -> Result<()> {
         let handle = {
             let mut guard = self.servers.lock().await;
@@ -224,6 +275,25 @@ impl ServiceDiscovery {
             handle.task.await.with_context(|| {
                 format!("wait for service discovery listener shutdown for network {network_id}")
             })?;
+        }
+
+        Ok(())
+    }
+
+    /// Stop every active discovery listener and withdraw its local publication state.
+    ///
+    /// Headless restart tests reuse one process, so discovery needs an explicit
+    /// shutdown path that releases resolver sockets and clears NodePort
+    /// mappings before a replacement runtime starts from the same persisted
+    /// state.
+    pub async fn shutdown(&self) -> Result<()> {
+        let network_ids = {
+            let guard = self.servers.lock().await;
+            guard.keys().copied().collect::<Vec<_>>()
+        };
+
+        for network_id in network_ids {
+            self.teardown_network(network_id).await?;
         }
 
         Ok(())
@@ -404,6 +474,7 @@ async fn spawn_dns_server(
 
     Ok(DnsServerHandle {
         resolver_ip,
+        backend_catalog,
         shutdown: Some(shutdown_tx),
         task: server,
     })

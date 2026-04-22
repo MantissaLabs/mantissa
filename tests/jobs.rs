@@ -282,7 +282,7 @@ local_test!(jobs_retry_backoff_survives_controller_restart, {
     let local_volume_root = state_dir.path().join("volumes");
     let runtime = Arc::new(ControllableExitRuntimeBackend::default());
 
-    let mut node = create_restartable_job_node(
+    let node = create_restartable_job_node(
         db.clone(),
         self_id,
         HeadlessKeys::new(noise_keys.clone(), signing.clone()),
@@ -315,8 +315,7 @@ local_test!(jobs_retry_backoff_survives_controller_restart, {
         "job should enter retrying before restart"
     );
 
-    node.stop().await.expect("stop restartable node");
-    drop(node);
+    node.shutdown().await.expect("shut down restartable node");
 
     let restarted = create_restartable_job_node(
         db,

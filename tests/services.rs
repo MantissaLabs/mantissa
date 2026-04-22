@@ -27,7 +27,6 @@ use mantissa::network::types::{
 use mantissa::node::id::set_node_id;
 use mantissa::runtime::set::RuntimeSet;
 use mantissa::runtime::testing::IN_MEMORY_RUNTIME_BACKEND_KIND;
-use mantissa::runtime::testing::new_in_memory_runtime_backend;
 use mantissa::runtime::types::{
     RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError, RuntimeEvent,
     RuntimeInfo,
@@ -478,12 +477,13 @@ local_test!(services_deploying_generation_resumes_after_restart, {
     let noise_keys = Arc::new(NoiseKeys::from_private_bytes([0x63; 32]));
     let signing = ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]);
     let local_volume_root = state_dir.path().join("volumes");
+    let runtime_backend = Arc::new(SlowCreateRuntimeBackend::default());
 
-    let mut node = create_restartable_service_node(
+    let node = create_restartable_service_node(
         db.clone(),
         self_id,
         HeadlessKeys::new(noise_keys.clone(), signing.clone()),
-        Arc::new(SlowCreateRuntimeBackend::default()),
+        runtime_backend.clone(),
         local_volume_root.clone(),
     )
     .await;
@@ -556,14 +556,13 @@ local_test!(services_deploying_generation_resumes_after_restart, {
         .and_then(|spec| spec.replica_ids.first().copied())
         .expect("backend task id should be persisted before restart");
 
-    node.stop().await.expect("stop first node");
-    drop(node);
+    node.shutdown().await.expect("shut down first node");
 
     let restarted = create_restartable_service_node(
         db,
         self_id,
         HeadlessKeys::new(noise_keys, signing),
-        new_in_memory_runtime_backend(),
+        runtime_backend,
         local_volume_root,
     )
     .await;
