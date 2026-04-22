@@ -283,6 +283,13 @@ impl WorkloadManager {
             });
         }
 
+        if let Err(err) = self.withdraw_local_service_traffic_publication().await {
+            warn!(
+                target: "task",
+                "failed to withdraw local service traffic publication at startup: {err:#}"
+            );
+        }
+
         if let Err(err) = self.reconcile_local_runtime_inventory().await {
             warn!(
                 target: "task",

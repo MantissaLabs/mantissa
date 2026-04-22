@@ -71,6 +71,11 @@ impl NetworkRegistry {
         self.attachments.change_clock()
     }
 
+    /// Returns the current peer-state store change clock used to invalidate derived projections.
+    pub fn peer_change_clock(&self) -> u64 {
+        self.peers.change_clock()
+    }
+
     /// Acquire a read guard for cached derived views.
     fn cache_read(&self) -> RwLockReadGuard<'_, NetworkRegistryCache> {
         self.cache.read()

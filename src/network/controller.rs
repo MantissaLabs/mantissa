@@ -485,8 +485,75 @@ impl NetworkController {
         Ok(inserted)
     }
 
+    /// Mark every persisted local network as `Configuring` during startup recovery.
+    ///
+    /// Peer readiness is durable replicated state, so a daemon restart can otherwise leave a
+    /// stale local `Ready` row visible to the rest of the cluster until reconciliation runs. That
+    /// would let discovery keep routing traffic to attachments whose local bridge, BPF, or
+    /// runtime-facing network path has not been rebuilt yet.
+    async fn mark_startup_networks_configuring(&self) -> Result<usize> {
+        let specs = self
+            .inner
+            .registry
+            .list_specs()
+            .context("list network specs for startup peer-state demotion")?;
+
+        let mut updated = 0usize;
+        for spec in specs {
+            if spec.is_deleted() {
+                continue;
+            }
+
+            if let Some(existing) = self
+                .inner
+                .registry
+                .get_peer_state(spec.id, self.inner.node_id)?
+                && existing.state == NetworkPeerState::Configuring
+                && existing.error.is_none()
+            {
+                continue;
+            }
+
+            let mut state = NetworkPeerStateValue::new(
+                spec.id,
+                self.inner.node_id,
+                self.inner.node_name.clone(),
+                NetworkPeerState::Configuring,
+                None,
+            );
+            state.touch();
+
+            self.inner
+                .registry
+                .upsert_peer_state(state.clone())
+                .await
+                .context("persist startup peer-state configuring")?;
+            self.send_event(NetworkEvent::PeerUpsert(state)).await;
+            updated = updated.saturating_add(1);
+        }
+
+        Ok(updated)
+    }
+
     /// Run the event-driven reconciliation loop with a slow drift sweep for external changes.
     async fn run(&self) {
+        match self.mark_startup_networks_configuring().await {
+            Ok(updated) if updated > 0 => {
+                debug!(
+                    target: "network",
+                    updated,
+                    "marked persisted local networks as configuring during startup recovery"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    "failed to demote persisted peer readiness on startup: {err:#}"
+                );
+            }
+        }
+
         match self.queue_startup_spec_reconcile().await {
             Ok(queued) if queued > 0 => {
                 debug!(

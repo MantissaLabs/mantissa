@@ -1250,6 +1250,41 @@ impl WorkloadManager {
         }
     }
 
+    /// Withdraw service traffic from every local attachment row before restart recovery begins.
+    ///
+    /// Attachment publication is durable replicated state. After a daemon restart, local service
+    /// tasks can still have persisted `traffic_published=true` rows even though the node has not
+    /// rebuilt its bridge, BPF, and runtime attachment path yet. Clearing that bit up front keeps
+    /// remote discovery from selecting those stale local backends until the local node explicitly
+    /// republishes them as ready.
+    pub async fn withdraw_local_service_traffic_publication(&self) -> Result<usize, anyhow::Error> {
+        let attachments = self
+            .networking
+            .network_registry
+            .list_attachments(None)
+            .context("list attachments for startup traffic withdrawal")?;
+
+        let mut updated = 0usize;
+        for mut attachment in attachments {
+            if attachment.node_id != self.local_node_id
+                || !attachment.traffic_published
+                || attachment.service_name.is_none()
+            {
+                continue;
+            }
+
+            attachment.set_traffic_published(false);
+            self.networking
+                .network_registry
+                .upsert_attachment(attachment)
+                .await
+                .context("persist startup service traffic withdrawal")?;
+            updated = updated.saturating_add(1);
+        }
+
+        Ok(updated)
+    }
+
     /// Waits until attachment rows exist for every declared task network and then publishes them.
     ///
     /// Service controllers use this during start-first handoff so replacement endpoints only
@@ -1316,15 +1351,37 @@ impl WorkloadManager {
         let ready = attachments.iter().all(|attachment| {
             attachment.state == crate::network::types::NetworkAttachmentState::Ready
         });
+        let mut networks_ready = true;
+        for attachment in &attachments {
+            let peer_ready = self
+                .networking
+                .network_registry
+                .get_peer_state(attachment.network_id, self.local_node_id)
+                .context("load local network peer state while checking task traffic readiness")?
+                .is_some_and(|state| state.state.is_ready());
+            if !peer_ready {
+                networks_ready = false;
+                break;
+            }
+        }
         let published = attachments
             .iter()
             .all(|attachment| attachment.traffic_published);
-        if !published {
-            self.set_task_traffic_published(task_id, true).await?;
+        let publishable = ready && networks_ready;
+
+        if published && !publishable {
+            self.set_task_traffic_published(task_id, false).await?;
             return Ok(false);
         }
 
-        Ok(ready)
+        if !published {
+            if publishable {
+                self.set_task_traffic_published(task_id, true).await?;
+            }
+            return Ok(false);
+        }
+
+        Ok(publishable)
     }
 
     async fn ensure_remote_secret_availability(

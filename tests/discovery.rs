@@ -9,7 +9,7 @@ use mantissa::network::discovery::ServiceDiscovery;
 use mantissa::network::registry::NetworkRegistry;
 use mantissa::network::types::{
     NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver,
-    NetworkSpecDraft, NetworkSpecValue,
+    NetworkPeerState, NetworkPeerStateValue, NetworkSpecDraft, NetworkSpecValue,
 };
 use mantissa::services::registry::ServiceRegistry;
 use mantissa::services::types::{
@@ -232,6 +232,17 @@ fn ready_attachment_with_publication_ip(
     })
 }
 
+/// Creates a ready peer-state row for the synthetic backend node used by discovery tests.
+fn ready_peer_state(network_id: Uuid, node_id: Uuid) -> NetworkPeerStateValue {
+    NetworkPeerStateValue::new(
+        network_id,
+        node_id,
+        format!("node-{node_id}"),
+        NetworkPeerState::Ready,
+        None,
+    )
+}
+
 /// Upserts one service spec exposing the `backend` template on the provided network.
 async fn upsert_service(
     services: &ServiceRegistry,
@@ -432,6 +443,11 @@ local_test!(discovery_dns_reflects_backend_changes_unprivileged, {
         ))
         .await
         .expect("upsert attachment a");
+    harness
+        .registry
+        .upsert_peer_state(ready_peer_state(network_id, node_id))
+        .await
+        .expect("upsert ready peer state");
 
     harness
         .discovery
@@ -540,6 +556,11 @@ local_test!(discovery_dns_requires_attachment_traffic_publication, {
         ))
         .await
         .expect("upsert unpublished attachment");
+    harness
+        .registry
+        .upsert_peer_state(ready_peer_state(network_id, node_id))
+        .await
+        .expect("upsert ready peer state");
 
     harness
         .discovery
@@ -613,6 +634,11 @@ local_test!(discovery_dns_answers_aaaa_for_ipv6_networks, {
         ))
         .await
         .expect("upsert ipv6 attachment");
+    harness
+        .registry
+        .upsert_peer_state(ready_peer_state(network_id, node_id))
+        .await
+        .expect("upsert ready peer state");
 
     harness
         .discovery
@@ -668,6 +694,11 @@ local_test!(
             task_ids.to_vec(),
         )
         .await;
+        harness
+            .registry
+            .upsert_peer_state(ready_peer_state(network_id, node_id))
+            .await
+            .expect("upsert ready peer state");
 
         for (task_id, backend_ip) in task_ids.into_iter().zip(backend_ips.into_iter()) {
             harness

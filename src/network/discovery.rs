@@ -81,6 +81,7 @@ struct NetworkBackendCatalog {
     attachment_generation: u64,
     workload_generation: u64,
     service_generation: u64,
+    peer_generation: u64,
     health_fingerprint: u64,
     services: HashMap<String, ServiceBackendCatalogEntry>,
 }
@@ -97,6 +98,7 @@ impl Default for NetworkBackendCatalog {
             attachment_generation: u64::MAX,
             workload_generation: u64::MAX,
             service_generation: u64::MAX,
+            peer_generation: u64::MAX,
             health_fingerprint: u64::MAX,
             services: HashMap::new(),
         }
@@ -798,6 +800,12 @@ async fn resolve_service_backends(
         .map(|spec| parse_overlay_cidr(&spec.subnet_cidr))
         .transpose()?
         .map(|subnet| subnet.family);
+    let ready_peers: HashSet<Uuid> = registry
+        .list_peer_states(Some(network_id))?
+        .into_iter()
+        .filter(|state| state.state.is_ready())
+        .map(|state| state.peer_id)
+        .collect();
     let attachments = registry
         .list_attachments(Some(network_id))
         .context("list attachments for discovery")?;
@@ -813,6 +821,16 @@ async fn resolve_service_backends(
     );
 
     for attachment in attachments {
+        if !ready_peers.contains(&attachment.node_id) {
+            tracing::trace!(
+                target: "network",
+                network = %network_id,
+                attachment = %attachment.id,
+                node = %attachment.node_id,
+                "skipping attachment on node whose network peer state is not ready"
+            );
+            continue;
+        }
         if matches!(
             health_snapshot.get(&attachment.node_id),
             Some(HealthStatus::Down)
@@ -1724,6 +1742,7 @@ async fn refresh_backend_catalog_if_needed(
     let attachment_generation = registry.attachment_change_clock();
     let workload_generation = workloads.change_clock();
     let service_generation = services.change_clock();
+    let peer_generation = registry.peer_change_clock();
     let health_fingerprint = health_snapshot_fingerprint(health_snapshot);
 
     {
@@ -1731,6 +1750,7 @@ async fn refresh_backend_catalog_if_needed(
         if guard.attachment_generation == attachment_generation
             && guard.workload_generation == workload_generation
             && guard.service_generation == service_generation
+            && guard.peer_generation == peer_generation
             && guard.health_fingerprint == health_fingerprint
         {
             return Ok(());
@@ -1796,6 +1816,7 @@ async fn refresh_backend_catalog_if_needed(
     guard.attachment_generation = attachment_generation;
     guard.workload_generation = workload_generation;
     guard.service_generation = service_generation;
+    guard.peer_generation = peer_generation;
     guard.health_fingerprint = health_fingerprint;
     guard.services = next_services;
     Ok(())
@@ -2401,7 +2422,7 @@ mod tests {
     use crate::network::registry::NetworkRegistry;
     use crate::network::types::{
         NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver,
-        NetworkSpecDraft, NetworkSpecValue,
+        NetworkPeerState, NetworkPeerStateValue, NetworkSpecDraft, NetworkSpecValue,
     };
     use crate::services::registry::ServiceRegistry;
     use crate::services::types::{
@@ -2909,6 +2930,17 @@ mod tests {
             ))
             .await
             .expect("upsert ready attachment");
+        harness
+            .registry
+            .upsert_peer_state(NetworkPeerStateValue::new(
+                harness.network.id,
+                node_id,
+                "backend-node",
+                NetworkPeerState::Ready,
+                None,
+            ))
+            .await
+            .expect("upsert ready peer state");
 
         let catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
         let mut health = HashMap::new();
@@ -2966,6 +2998,118 @@ mod tests {
                 .map(|entry| entry.candidates.len())
                 .unwrap_or_default(),
             0
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backend_catalog_refresh_invalidates_on_peer_change_clock() {
+        let harness = setup_catalog_harness().await;
+        let service_name = "backend-service";
+        let node_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        upsert_catalog_service(
+            &harness.services,
+            service_name,
+            harness.network.id,
+            vec![task_id],
+        )
+        .await;
+
+        harness
+            .workloads
+            .upsert(
+                &UuidKey::from(task_id),
+                catalog_task(task_id, node_id, service_name, harness.network.id),
+            )
+            .await
+            .expect("upsert running task");
+        harness
+            .registry
+            .upsert_attachment(catalog_attachment(
+                task_id,
+                node_id,
+                harness.network.id,
+                Ipv4Addr::new(10, 88, 1, 10),
+                service_name,
+            ))
+            .await
+            .expect("upsert ready attachment");
+        harness
+            .registry
+            .upsert_peer_state(NetworkPeerStateValue::new(
+                harness.network.id,
+                node_id,
+                "backend-node",
+                NetworkPeerState::Configuring,
+                None,
+            ))
+            .await
+            .expect("upsert configuring peer state");
+
+        let catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
+        let mut health = HashMap::new();
+        health.insert(node_id, HealthStatus::Alive);
+        refresh_backend_catalog_if_needed(
+            &catalog,
+            &harness.registry,
+            &harness.workloads,
+            &harness.services,
+            harness.network.id,
+            &health,
+        )
+        .await
+        .expect("initial catalog refresh");
+
+        let initial_peer_generation = { catalog.lock().await.peer_generation };
+        let initial_candidates = {
+            let guard = catalog.lock().await;
+            guard
+                .services
+                .get("backend")
+                .map(|entry| entry.candidates.len())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            initial_candidates, 0,
+            "attachments on non-ready peers must be excluded from discovery"
+        );
+
+        harness
+            .registry
+            .upsert_peer_state(NetworkPeerStateValue::new(
+                harness.network.id,
+                node_id,
+                "backend-node",
+                NetworkPeerState::Ready,
+                None,
+            ))
+            .await
+            .expect("upsert ready peer state");
+
+        refresh_backend_catalog_if_needed(
+            &catalog,
+            &harness.registry,
+            &harness.workloads,
+            &harness.services,
+            harness.network.id,
+            &health,
+        )
+        .await
+        .expect("refresh after peer-state change");
+
+        let guard = catalog.lock().await;
+        assert!(
+            guard.peer_generation > initial_peer_generation,
+            "peer generation must advance after peer-state upsert"
+        );
+        assert_eq!(
+            guard
+                .services
+                .get("backend")
+                .map(|entry| entry.candidates.len())
+                .unwrap_or_default(),
+            1,
+            "ready peer state should re-admit the backend into discovery"
         );
     }
 

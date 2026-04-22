@@ -1456,6 +1456,41 @@ local_test!(
             );
         }
 
+        let nodeport_ready = wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+            || async {
+                let status = node.network_controller.nodeport_manager().status().await;
+                let service = node
+                    .service_controller
+                    .registry()
+                    .get(service_id)
+                    .expect("read remapped NodePort service while waiting for publication")
+                    .expect("remapped NodePort service should still exist while waiting");
+                status.state == NodePortRuntimeState::Ready
+                    && status.identity_source == Some(NodePortIdentitySource::NodePortIp)
+                    && status.active_ports == 1
+                    && status.active_host_networks == 1
+                    && status.resolved_node_ip == Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                    && status.stats_error.is_none()
+                    && service.public_endpoint_detail().is_none()
+            },
+        )
+        .await;
+        if !nodeport_ready {
+            let status = node.network_controller.nodeport_manager().status().await;
+            let service = node
+                .service_controller
+                .registry()
+                .get(service_id)
+                .expect("read remapped NodePort service after readiness failure")
+                .expect("remapped NodePort service should still exist after readiness failure");
+            panic!(
+                "remapped public service should publish one healthy NodePort before the HTTP probe; status={status:?}; public_detail={:?}",
+                service.public_endpoint_detail(),
+            );
+        }
+
         let addr = format!("127.0.0.1:{NODEPORT_HTTP_REMAP_PORT}");
         let http_ok = wait_until(
             Duration::from_secs(60),
