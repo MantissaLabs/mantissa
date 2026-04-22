@@ -1229,12 +1229,14 @@ impl WorkloadManager {
             return Ok(WorkloadTrafficPublicationUpdate::NoAttachments);
         }
         let mut changed = false;
+        let mut changed_networks = HashSet::new();
 
         for mut attachment in attachments {
             if attachment.traffic_published == traffic_published {
                 continue;
             }
             attachment.set_traffic_published(traffic_published);
+            changed_networks.insert(attachment.network_id);
             self.networking
                 .network_registry
                 .upsert_attachment(attachment)
@@ -1244,6 +1246,13 @@ impl WorkloadManager {
         }
 
         if changed {
+            if let Some(sender) = &self.networking.forwarding_events {
+                for network_id in changed_networks {
+                    // Discovery refresh is best-effort; ignore send failures if the network
+                    // controller has already shut down.
+                    let _ = sender.send(ForwardingEvent::TrafficPublicationChanged { network_id });
+                }
+            }
             Ok(WorkloadTrafficPublicationUpdate::Updated)
         } else {
             Ok(WorkloadTrafficPublicationUpdate::Unchanged)

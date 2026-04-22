@@ -6810,6 +6810,9 @@ async fn attachment_ready_triggers_forwarding_event() {
         .expect("forwarding event should be emitted");
     match event {
         ForwardingEvent::AttachmentReady { network_id } => assert_eq!(network_id, spec.id),
+        ForwardingEvent::TrafficPublicationChanged { network_id } => panic!(
+            "non-service workload should not emit a traffic publication refresh event: {network_id}"
+        ),
     }
 }
 

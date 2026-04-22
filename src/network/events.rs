@@ -5,4 +5,5 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 pub enum ForwardingEvent {
     AttachmentReady { network_id: Uuid },
+    TrafficPublicationChanged { network_id: Uuid },
 }

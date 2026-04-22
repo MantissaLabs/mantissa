@@ -762,6 +762,19 @@ impl NetworkController {
                         self.inner.wake.notify_one();
                     }
                 }
+                ForwardingEvent::TrafficPublicationChanged { network_id } => {
+                    // Refresh discovery-derived VIP and NodePort publication immediately after a
+                    // service attachment becomes publishable or is withdrawn, so backend
+                    // eligibility and operator-facing public endpoint status do not wait for the
+                    // background discovery tick.
+                    if let Err(err) = self.inner.discovery.refresh_network(network_id).await {
+                        warn!(
+                            target: "network",
+                            network = %network_id,
+                            "traffic-publication-triggered discovery refresh failed: {err:#}"
+                        );
+                    }
+                }
             }
         }
     }
