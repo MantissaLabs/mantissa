@@ -2192,6 +2192,125 @@ mod platform {
             Ok(())
         }
 
+        /// Ensure the VXLAN bridge port is attached, configured, and usable for dataplane traffic.
+        ///
+        /// Normal reconciles reuse an existing `mvx-*` device when possible, but stale local
+        /// cleanup can occasionally leave a link object that still resolves by name while
+        /// rejecting bridge attach or MTU programming. When that happens, recreate the VXLAN
+        /// device once and reapply the bridge-port wiring so the rest of the network reconcile
+        /// can proceed deterministically.
+        async fn ensure_vxlan_bridge_port(
+            &self,
+            plan: &NetworkPlan,
+            bridge_index: u32,
+        ) -> Result<u32> {
+            let handle = self
+                .handle()
+                .ok_or_else(|| anyhow!("rtnetlink handle unavailable"))?;
+            let mut vxlan_index = self
+                .ensure_vxlan(plan)
+                .await
+                .with_context(|| format!("ensure vxlan interface {}", plan.vxlan_name))?;
+
+            for attempt in 0..=1 {
+                match self.attach_master(vxlan_index, bridge_index).await {
+                    Ok(()) => {}
+                    Err(err) if attempt == 0 && Self::is_recoverable_vxlan_link_error(&err) => {
+                        warn!(
+                            target: "network",
+                            vxlan = %plan.vxlan_name,
+                            vxlan_index,
+                            bridge = %plan.bridge_name,
+                            bridge_index,
+                            error = %err,
+                            "vxlan bridge attach hit stale local state; recreating link once"
+                        );
+                        self.delete_link_if_present(handle, vxlan_index, &plan.vxlan_name)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "delete stale vxlan {} (idx {}) after bridge attach failure",
+                                    plan.vxlan_name, vxlan_index
+                                )
+                            })?;
+                        vxlan_index = self.ensure_vxlan(plan).await.with_context(|| {
+                            format!(
+                                "recreate vxlan interface {} after bridge attach failure",
+                                plan.vxlan_name
+                            )
+                        })?;
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(err).with_context(|| {
+                            format!(
+                                "attach vxlan {} (idx {}) to bridge {} (idx {})",
+                                plan.vxlan_name, vxlan_index, plan.bridge_name, bridge_index
+                            )
+                        });
+                    }
+                }
+
+                self.configure_bridge_port(vxlan_index, bridge_index, &plan.vxlan_name)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "configure bridge port for vxlan {} (idx {}) on bridge {} (idx {})",
+                            plan.vxlan_name, vxlan_index, plan.bridge_name, bridge_index
+                        )
+                    })?;
+
+                self.set_up(vxlan_index).await.with_context(|| {
+                    format!("bring link {} (idx {}) up", plan.vxlan_name, vxlan_index)
+                })?;
+
+                if plan.mtu == 0 {
+                    return Ok(vxlan_index);
+                }
+
+                match self.set_mtu(vxlan_index, plan.mtu).await {
+                    Ok(()) => return Ok(vxlan_index),
+                    Err(err) if attempt == 0 && Self::is_recoverable_vxlan_link_error(&err) => {
+                        warn!(
+                            target: "network",
+                            vxlan = %plan.vxlan_name,
+                            vxlan_index,
+                            mtu = plan.mtu,
+                            error = %err,
+                            "vxlan mtu update hit stale local state; recreating link once"
+                        );
+                        self.delete_link_if_present(handle, vxlan_index, &plan.vxlan_name)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "delete stale vxlan {} (idx {}) after mtu failure",
+                                    plan.vxlan_name, vxlan_index
+                                )
+                            })?;
+                        vxlan_index = self.ensure_vxlan(plan).await.with_context(|| {
+                            format!(
+                                "recreate vxlan interface {} after mtu failure",
+                                plan.vxlan_name
+                            )
+                        })?;
+                    }
+                    Err(err) => {
+                        return Err(err).with_context(|| {
+                            format!(
+                                "set mtu {} on vxlan {} (idx {})",
+                                plan.mtu, plan.vxlan_name, vxlan_index
+                            )
+                        });
+                    }
+                }
+            }
+
+            Err(anyhow!(
+                "vxlan {} did not reach a usable state after one recreate attempt",
+                plan.vxlan_name
+            ))
+        }
+
         pub async fn ensure_network(&self, plan: &NetworkPlan) -> Result<()> {
             if self.handle.is_none() {
                 debug!(
@@ -2212,17 +2331,6 @@ mod platform {
                 mtu = plan.mtu,
                 "provisioner: ensuring kernel interfaces"
             );
-            let vxlan_index = self
-                .ensure_vxlan(plan)
-                .await
-                .with_context(|| format!("ensure vxlan interface {}", plan.vxlan_name))?;
-            debug!(
-                target: "network",
-                vxlan = %plan.vxlan_name,
-                vxlan_index,
-                "provisioner: vxlan interface ready"
-            );
-
             let bridge_index = self
                 .ensure_bridge(plan)
                 .await
@@ -2234,23 +2342,21 @@ mod platform {
                 "provisioner: bridge interface ready"
             );
 
-            self.attach_master(vxlan_index, bridge_index)
+            let vxlan_index = self
+                .ensure_vxlan_bridge_port(plan, bridge_index)
                 .await
                 .with_context(|| {
                     format!(
-                        "attach vxlan {} (idx {}) to bridge {} (idx {})",
-                        plan.vxlan_name, vxlan_index, plan.bridge_name, bridge_index
+                        "ensure vxlan {} is attached and configured on bridge {}",
+                        plan.vxlan_name, plan.bridge_name
                     )
                 })?;
-
-            self.configure_bridge_port(vxlan_index, bridge_index, &plan.vxlan_name)
-                .await
-                .with_context(|| {
-                    format!(
-                        "configure bridge port for vxlan {} (idx {}) on bridge {} (idx {})",
-                        plan.vxlan_name, vxlan_index, plan.bridge_name, bridge_index
-                    )
-                })?;
+            debug!(
+                target: "network",
+                vxlan = %plan.vxlan_name,
+                vxlan_index,
+                "provisioner: vxlan interface ready"
+            );
 
             let host_access = if plan.resolver_ip.is_some() && plan.subnet_prefix.is_some() {
                 Some(
@@ -2271,9 +2377,6 @@ mod platform {
                 None
             };
 
-            self.set_up(vxlan_index).await.with_context(|| {
-                format!("bring link {} (idx {}) up", plan.vxlan_name, vxlan_index)
-            })?;
             self.set_up(bridge_index).await.with_context(|| {
                 format!("bring link {} (idx {}) up", plan.bridge_name, bridge_index)
             })?;
@@ -2288,12 +2391,6 @@ mod platform {
             }
 
             if plan.mtu > 0 {
-                self.set_mtu(vxlan_index, plan.mtu).await.with_context(|| {
-                    format!(
-                        "set mtu {} on vxlan {} (idx {})",
-                        plan.mtu, plan.vxlan_name, vxlan_index
-                    )
-                })?;
                 self.set_mtu(bridge_index, plan.mtu)
                     .await
                     .with_context(|| {
@@ -2389,6 +2486,28 @@ mod platform {
                 "provisioner: kernel interfaces ensured"
             );
             Ok(())
+        }
+
+        /// Return whether one VXLAN setup error should trigger a delete-and-recreate retry.
+        ///
+        /// The controller only retries when the kernel reports that the existing link object is
+        /// inconsistent or disappeared underneath us. This keeps the recovery path narrow and
+        /// avoids masking genuine configuration errors with repeated retries.
+        fn is_recoverable_vxlan_link_error(err: &anyhow::Error) -> bool {
+            err.chain().any(|cause| {
+                cause
+                    .downcast_ref::<RtnetlinkError>()
+                    .and_then(|err| match err {
+                        RtnetlinkError::NetlinkError(message) => Some(message.raw_code().abs()),
+                        _ => None,
+                    })
+                    .is_some_and(|errno| {
+                        errno == libc::EBUSY
+                            || errno == libc::EINVAL
+                            || errno == libc::ENODEV
+                            || errno == libc::ENOENT
+                    })
+            })
         }
 
         /// Ensure an interface owns the resolver address for the network, replacing stale state.
@@ -3310,6 +3429,19 @@ mod platform {
                 .await
                 .context("resolve bridge name before attaching interface")?
                 .unwrap_or_else(|| format!("ifindex{master_index}"));
+            let current_master = self.link_controller_index(link_index).await?;
+
+            if current_master == Some(master_index) {
+                debug!(
+                    target: "network",
+                    link = %link_name,
+                    link_index,
+                    bridge = %master_name,
+                    bridge_index = master_index,
+                    "provisioner: link already attached to bridge"
+                );
+                return Ok(());
+            }
 
             debug!(
                 target: "network",
@@ -3329,9 +3461,14 @@ mod platform {
                 .execute()
                 .await
                 .with_context(|| {
-                    format!(
-                        "attach link {link_name} (index {link_index}) to bridge {master_name} (index {master_index})"
-                    )
+                    match current_master {
+                        Some(current) => format!(
+                            "attach link {link_name} (index {link_index}) to bridge {master_name} (index {master_index}); current_master={current}"
+                        ),
+                        None => format!(
+                            "attach link {link_name} (index {link_index}) to bridge {master_name} (index {master_index})"
+                        ),
+                    }
                 })?;
             debug!(
                 target: "network",
@@ -3342,6 +3479,27 @@ mod platform {
                 "provisioner: link attached to bridge"
             );
             Ok(())
+        }
+
+        /// Return the current bridge/controller link index for one interface when present.
+        ///
+        /// Bridge attachment is idempotent in the healthy case. Reading the current controller
+        /// lets the provisioner skip a redundant bridge-enslave request and distinguish a link
+        /// that is already attached to the desired bridge from one that is busy on stale state.
+        async fn link_controller_index(&self, index: u32) -> Result<Option<u32>> {
+            let Some(handle) = self.handle() else {
+                return Ok(None);
+            };
+
+            let mut links = handle.link().get().match_index(index).execute();
+            while let Some(link) = links.try_next().await? {
+                for nla in link.attributes.into_iter() {
+                    if let LinkAttribute::Controller(controller) = nla {
+                        return Ok(Some(controller));
+                    }
+                }
+            }
+            Ok(None)
         }
 
         /// Resolve the kernel interface index for the provided link name.
