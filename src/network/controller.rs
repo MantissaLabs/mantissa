@@ -504,32 +504,9 @@ impl NetworkController {
                 continue;
             }
 
-            if let Some(existing) = self
-                .inner
-                .registry
-                .get_peer_state(spec.id, self.inner.node_id)?
-                && existing.state == NetworkPeerState::Configuring
-                && existing.error.is_none()
-            {
-                continue;
+            if self.mark_peer_configuring(spec.id).await? {
+                updated = updated.saturating_add(1);
             }
-
-            let mut state = NetworkPeerStateValue::new(
-                spec.id,
-                self.inner.node_id,
-                self.inner.node_name.clone(),
-                NetworkPeerState::Configuring,
-                None,
-            );
-            state.touch();
-
-            self.inner
-                .registry
-                .upsert_peer_state(state.clone())
-                .await
-                .context("persist startup peer-state configuring")?;
-            self.send_event(NetworkEvent::PeerUpsert(state)).await;
-            updated = updated.saturating_add(1);
         }
 
         Ok(updated)
@@ -889,6 +866,16 @@ impl NetworkController {
                 "network resources ensured"
             );
 
+            if self
+                .inner
+                .bpf
+                .requires_reload(&spec, &interface_ctx)
+                .await
+                .context("determine whether bpf reconcile requires local reload")?
+            {
+                self.prepare_for_dataplane_rebuild(plan.network_id).await?;
+            }
+
             match self.inner.bpf.ensure_network(&spec, &interface_ctx).await {
                 Ok(()) => break,
                 Err(err) => {
@@ -900,6 +887,7 @@ impl NetworkController {
                     }
 
                     retried_after_bpf_conflict = true;
+                    self.prepare_for_dataplane_rebuild(plan.network_id).await?;
                     warn!(
                         target: "network",
                         network = %plan.network_id,
@@ -1401,6 +1389,58 @@ impl NetworkController {
             .context("persist peer state ready")?;
 
         self.send_event(NetworkEvent::PeerUpsert(state)).await;
+        Ok(())
+    }
+
+    /// Persist the local peer as `Configuring` so discovery can withdraw local backends.
+    ///
+    /// The controller uses this before startup recovery and before destructive dataplane reloads.
+    /// Returning `true` means a replicated state change was emitted; `false` means the peer was
+    /// already in the desired `Configuring` state without an error payload.
+    async fn mark_peer_configuring(&self, network_id: Uuid) -> Result<bool> {
+        if let Some(existing) = self
+            .inner
+            .registry
+            .get_peer_state(network_id, self.inner.node_id)?
+            && existing.state == NetworkPeerState::Configuring
+            && existing.error.is_none()
+        {
+            return Ok(false);
+        }
+
+        let mut state = NetworkPeerStateValue::new(
+            network_id,
+            self.inner.node_id,
+            self.inner.node_name.clone(),
+            NetworkPeerState::Configuring,
+            None,
+        );
+        state.touch();
+
+        self.inner
+            .registry
+            .upsert_peer_state(state.clone())
+            .await
+            .context("persist peer state configuring")?;
+        self.send_event(NetworkEvent::PeerUpsert(state)).await;
+        Ok(true)
+    }
+
+    /// Withdraw local routability before rebuilding bridge, BPF, or discovery state.
+    ///
+    /// A destructive dataplane rebuild can temporarily invalidate local VIP and NodePort routing
+    /// even while attachment rows still exist. Marking the peer as `Configuring` first makes
+    /// discovery stop admitting local backends, and the explicit refresh updates the local
+    /// nodeport / VIP view immediately instead of waiting for the next background tick.
+    async fn prepare_for_dataplane_rebuild(&self, network_id: Uuid) -> Result<()> {
+        let _ = self.mark_peer_configuring(network_id).await?;
+        if let Err(err) = self.inner.discovery.refresh_network(network_id).await {
+            warn!(
+                target: "network",
+                network = %network_id,
+                "failed to refresh service discovery while withdrawing local dataplane readiness: {err:#}"
+            );
+        }
         Ok(())
     }
 

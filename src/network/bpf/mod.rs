@@ -115,6 +115,22 @@ impl NetworkBpfManager {
         self.platform.ensure_programs(spec, interfaces).await
     }
 
+    /// Report whether ensuring this network will detach and rebuild local eBPF state.
+    ///
+    /// The network controller uses this before reconciling a live dataplane so it can demote the
+    /// local peer from `Ready` to `Configuring` before traffic is still routed to a node whose
+    /// bridge and BPF state are about to be reloaded.
+    pub async fn requires_reload(
+        &self,
+        spec: &NetworkSpecValue,
+        interfaces: &NetworkInterfaceContext,
+    ) -> Result<bool> {
+        if spec.bpf_programs.is_empty() {
+            return Ok(false);
+        }
+        self.platform.requires_reload(spec, interfaces).await
+    }
+
     /// Tear down any previously attached programs for the network so the kernel datapath stays
     /// clean when the overlay is removed or reconfigured.
     pub async fn teardown_network(&self, interfaces: &NetworkInterfaceContext) -> Result<()> {
@@ -303,6 +319,47 @@ mod platform {
                 loader: Arc::new(NoopProgramLoader),
                 loaded: Arc::new(AsyncMutex::new(HashMap::new())),
             }
+        }
+
+        /// Determine whether the next ensure pass will perform a destructive local reload.
+        ///
+        /// A `true` result means the currently loaded attachment set or pinned load-balancer maps
+        /// do not match the desired state, so `ensure_programs()` will tear down and rebuild local
+        /// eBPF state instead of reusing the current dataplane.
+        pub async fn requires_reload(
+            &self,
+            network: &NetworkSpecValue,
+            interfaces: &NetworkInterfaceContext,
+        ) -> Result<bool> {
+            let programs = &network.bpf_programs;
+            if !config::bpf_attach_enabled() || programs.is_empty() {
+                return Ok(false);
+            }
+
+            self.validate_programs(programs, interfaces)?;
+
+            let network_id = interfaces.network_id();
+            let lb_family = load_balancer_map_family(network)?;
+            let mut canonical_desired = desired_attachments(programs, interfaces);
+            canonical_desired.sort();
+
+            let guard = self.loaded.lock().await;
+            let Some(existing) = guard.get(&network_id) else {
+                return Ok(true);
+            };
+
+            if !existing.matches(&canonical_desired, lb_family) {
+                return Ok(true);
+            }
+
+            if let Some(family) = lb_family {
+                let map_pin_path = Self::map_pin_path(network_id);
+                if !lb_maps_present(&map_pin_path, family) {
+                    return Ok(true);
+                }
+            }
+
+            Ok(false)
         }
 
         pub async fn ensure_programs(
@@ -1743,6 +1800,7 @@ mod platform {
         use parking_lot::{Mutex, MutexGuard};
         use std::ffi::OsString;
         use std::fs;
+        use std::path::PathBuf;
         use std::sync::OnceLock;
         use tempfile::TempDir;
         use uuid::Uuid;
@@ -1954,6 +2012,77 @@ mod platform {
         }
 
         #[tokio::test(flavor = "current_thread")]
+        async fn requires_reload_when_no_programs_are_loaded() -> Result<()> {
+            let manager = PlatformBpfManager {
+                resolver: ArtifactResolver::new(),
+                loader: Arc::new(NoopProgramLoader),
+                loaded: Arc::new(AsyncMutex::new(HashMap::new())),
+            };
+            let network_id = Uuid::new_v4();
+            let ctx = NetworkInterfaceContext::new(network_id, "br-test", "vxlan-test");
+            let spec = BpfProgramSpec::with_attach_point("vxlan_xdp", BpfAttachPoint::VxlanXdp);
+            let network = NetworkSpecValue::new(NetworkSpecDraft {
+                name: "reload-required".to_string(),
+                description: String::new(),
+                driver: NetworkDriver::Vxlan,
+                subnet_cidr: "10.200.0.0/24".to_string(),
+                vni: 42,
+                mtu: 1400,
+                sealed: false,
+                bpf_programs: vec![spec],
+            });
+
+            assert!(
+                manager.requires_reload(&network, &ctx).await?,
+                "an unloaded dataplane should be treated as requiring a local reload"
+            );
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn requires_reload_is_false_when_loaded_programs_match() -> Result<()> {
+            let manager = PlatformBpfManager {
+                resolver: ArtifactResolver::new(),
+                loader: Arc::new(NoopProgramLoader),
+                loaded: Arc::new(AsyncMutex::new(HashMap::new())),
+            };
+            let network_id = Uuid::new_v4();
+            let ctx = NetworkInterfaceContext::new(network_id, "br-test", "vxlan-test");
+            let spec = BpfProgramSpec::with_attach_point("vxlan_xdp", BpfAttachPoint::VxlanXdp);
+            let network = NetworkSpecValue::new(NetworkSpecDraft {
+                name: "reload-not-required".to_string(),
+                description: String::new(),
+                driver: NetworkDriver::Vxlan,
+                subnet_cidr: "10.200.0.0/24".to_string(),
+                vni: 43,
+                mtu: 1400,
+                sealed: false,
+                bpf_programs: vec![spec.clone()],
+            });
+
+            let mut loaded_network = LoadedNetwork::new(None);
+            loaded_network.push(LoadedProgram {
+                spec,
+                target: OwnedAttachTarget::Xdp {
+                    interface: "vxlan-test".to_string(),
+                },
+                _artifact: PathBuf::new(),
+                handle: Box::new(NoopHandle),
+            });
+            manager
+                .loaded
+                .lock()
+                .await
+                .insert(network_id, loaded_network);
+
+            assert!(
+                !manager.requires_reload(&network, &ctx).await?,
+                "matching loaded programs should not trigger a destructive reload"
+            );
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "current_thread")]
         async fn ensure_network_skips_when_bpf_attachment_disabled() -> Result<()> {
             let _guard = ConfigOverrideGuard::with_mutator(|config| {
                 config.network.bpf.attach = false;
@@ -2023,6 +2152,16 @@ mod platform {
         /// Produce the same stub manager for callers that request an unavailable variant.
         pub fn unavailable() -> Self {
             Self
+        }
+
+        /// Non-Linux targets never perform a destructive eBPF reload because the stub manager
+        /// does not attach any programs.
+        pub async fn requires_reload(
+            &self,
+            _network: &NetworkSpecValue,
+            _interfaces: &NetworkInterfaceContext,
+        ) -> Result<bool> {
+            Ok(false)
         }
 
         /// No-op placeholder to satisfy the async interface on platforms without eBPF support.
