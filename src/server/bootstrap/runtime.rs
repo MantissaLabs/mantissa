@@ -147,6 +147,19 @@ impl RuntimeTaskHandles {
             task.abort();
         }
     }
+
+    /// Abort every runtime actor and wait until each task has fully stopped.
+    ///
+    /// Restart tests reuse the same durable state immediately after shutdown.
+    /// Waiting for the cancelled tasks closes the window where a previous
+    /// controller can still be unwinding while the replacement runtime starts
+    /// reconciling the same local networking resources.
+    pub async fn abort_and_wait(self) {
+        for task in self.tasks {
+            task.abort();
+            let _ = task.await;
+        }
+    }
 }
 
 /// Actors that only exist to run background loops once bootstrap completes.

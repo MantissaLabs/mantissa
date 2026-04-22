@@ -663,10 +663,10 @@ impl HeadlessNode {
     /// aborts the long-running runtime actors spawned during bootstrap.
     pub async fn shutdown(mut self) -> io::Result<()> {
         self.stop().await?;
-        if let Some(runtime_tasks) = self.runtime_tasks.take() {
-            runtime_tasks.abort();
-        }
         self.network_controller.shutdown().await.map_err(to_io)?;
+        if let Some(runtime_tasks) = self.runtime_tasks.take() {
+            runtime_tasks.abort_and_wait().await;
+        }
         Ok(())
     }
 }
