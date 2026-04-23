@@ -62,11 +62,20 @@ impl NetworkGossiper {
                 self.controller.schedule_spec_change(network_id).await;
             }
             NetworkEvent::PeerUpsert(state) => {
+                let network_id = state.network_id;
                 self.registry.upsert_peer_state(state).await?;
+                self.controller.refresh_publication(network_id).await;
             }
             NetworkEvent::PeerRemove(id) => {
+                let network_id = self
+                    .registry
+                    .get_peer_state_by_id(id)?
+                    .map(|state| state.network_id);
                 if let Err(err) = self.registry.remove_peer_state(id).await {
                     warn!(target: "network", "failed to remove peer state via gossip: {err:#}");
+                }
+                if let Some(network_id) = network_id {
+                    self.controller.refresh_publication(network_id).await;
                 }
             }
         }

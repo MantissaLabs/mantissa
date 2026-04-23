@@ -255,6 +255,17 @@ impl NetworkRegistry {
         Ok(snapshot.and_then(|snap| Self::select_latest_peer_state(snap.as_slice())))
     }
 
+    /// Retrieve the latest peer state entry by its deterministic row identifier.
+    pub fn get_peer_state_by_id(&self, id: Uuid) -> Result<Option<NetworkPeerStateValue>> {
+        let key = UuidKey::from(id);
+        let snapshot = self
+            .peers
+            .get_snapshot(&key)
+            .map_err(|e| anyhow!("network peer state lookup by id failed: {e}"))?;
+
+        Ok(snapshot.and_then(|snap| Self::select_latest_peer_state(snap.as_slice())))
+    }
+
     /// Delete the specified network and cascade removal to its peer state entries.
     #[allow(dead_code)]
     pub async fn remove_spec(&self, id: Uuid) -> Result<()> {

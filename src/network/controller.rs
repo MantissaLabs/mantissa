@@ -195,6 +195,17 @@ impl NetworkController {
         }
     }
 
+    /// Refresh discovery-derived VIP and NodePort publication for one network immediately.
+    pub async fn refresh_publication(&self, network_id: Uuid) {
+        if let Err(err) = self.inner.discovery.refresh_network(network_id).await {
+            warn!(
+                target: "network",
+                network = %network_id,
+                "publication refresh failed: {err:#}"
+            );
+        }
+    }
+
     /// Return the local NodePort manager used by network discovery and public-service publication.
     pub fn nodeport_manager(&self) -> NodePortManager {
         self.inner.discovery.nodeport_manager()
@@ -767,13 +778,7 @@ impl NetworkController {
                     // service attachment becomes publishable or is withdrawn, so backend
                     // eligibility and operator-facing public endpoint status do not wait for the
                     // background discovery tick.
-                    if let Err(err) = self.inner.discovery.refresh_network(network_id).await {
-                        warn!(
-                            target: "network",
-                            network = %network_id,
-                            "traffic-publication-triggered discovery refresh failed: {err:#}"
-                        );
-                    }
+                    self.refresh_publication(network_id).await;
                 }
             }
         }
@@ -1447,13 +1452,7 @@ impl NetworkController {
     /// nodeport / VIP view immediately instead of waiting for the next background tick.
     async fn prepare_for_dataplane_rebuild(&self, network_id: Uuid) -> Result<()> {
         let _ = self.mark_peer_configuring(network_id).await?;
-        if let Err(err) = self.inner.discovery.refresh_network(network_id).await {
-            warn!(
-                target: "network",
-                network = %network_id,
-                "failed to refresh service discovery while withdrawing local dataplane readiness: {err:#}"
-            );
-        }
+        self.refresh_publication(network_id).await;
         Ok(())
     }
 

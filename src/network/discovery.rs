@@ -37,14 +37,14 @@ const SERVICE_ZONE_SUFFIX: &str = "svc.mantissa";
 const SERVICE_TTL_SECS: u32 = 5;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 // Keep cached health around for roughly one DNS TTL to avoid stale blackholes.
+#[cfg(test)]
 const HEALTH_CACHE_STALE_AFTER: Duration = Duration::from_secs(SERVICE_TTL_SECS as u64);
-/// Bound how many active readiness probes one node performs per service on one refresh tick.
+/// Bound how many already-healthy endpoints discovery rechecks on one refresh tick.
 ///
-/// Discovery already filters hard failures through node health, running-task state, and published
-/// attachment state. Readiness probing remains useful for "alive but should not receive traffic"
-/// cases, but sampling a small subset per refresh keeps the steady-state cost proportional to
-/// service churn rather than cluster size.
-const MAX_READINESS_PROBES_PER_REFRESH: usize = 2;
+/// Unknown and unhealthy endpoints are always reprobed as soon as they become eligible because
+/// readiness-enabled services must not route traffic to them until they pass. This limit only
+/// applies to steady-state spot-checking of endpoints that are already known healthy.
+const MAX_HEALTHY_READINESS_RECHECKS_PER_REFRESH: usize = 2;
 /// Slow down steady-state rechecks for backends that are already known healthy.
 ///
 /// Once a backend is admitted into discovery, local liveness and peer health cover the common hard
@@ -549,6 +549,7 @@ async fn handle_datagram(
         registry,
         workloads,
         services,
+        health,
         network_id,
         &health_snapshot,
     )
@@ -1267,6 +1268,30 @@ impl BackendHealth {
         let entry = self.statuses.entry(key).or_default();
         entry.insert(backend, entry_state);
     }
+
+    /// Drop every cached readiness observation for one service after discovery no longer trusts it.
+    fn clear_service(&mut self, network_id: Uuid, service_name: &str) {
+        let key = (network_id, service_name.to_ascii_lowercase());
+        self.statuses.remove(&key);
+    }
+
+    /// Retain cached readiness only for backends whose identity is still unchanged and admitted.
+    fn retain_service_backends(
+        &mut self,
+        network_id: Uuid,
+        service_name: &str,
+        retained_backends: &HashSet<IpAddr>,
+    ) {
+        let key = (network_id, service_name.to_ascii_lowercase());
+        let mut remove_service = false;
+        if let Some(entries) = self.statuses.get_mut(&key) {
+            entries.retain(|ip, _| retained_backends.contains(ip));
+            remove_service = entries.is_empty();
+        }
+        if remove_service {
+            self.statuses.remove(&key);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1347,11 +1372,11 @@ fn probe_priority(entry: Option<HealthEntry>) -> ProbePriority {
     }
 }
 
-/// Selects the bounded subset of backends that should receive active readiness probes on this tick.
+/// Selects the backends that should receive active readiness probes on this tick.
 ///
-/// The selection prefers stale unknown and unhealthy backends, then rotates through stale healthy
-/// backends by oldest observation first. This keeps readiness traffic bounded without pinning the
-/// same healthy replicas forever.
+/// Unknown and unhealthy backends are always reprobed once stale so readiness remains the sole
+/// authority for routing eligibility. Only already-healthy endpoints are rate-limited for
+/// steady-state spot-checking.
 fn select_backends_for_active_probe(
     health: &BackendHealth,
     network_id: Uuid,
@@ -1360,7 +1385,8 @@ fn select_backends_for_active_probe(
     probe: &ServiceReadinessProbe,
 ) -> Vec<BackendAddress> {
     let now = Instant::now();
-    let mut candidates = Vec::new();
+    let mut eager = Vec::new();
+    let mut healthy = Vec::new();
     for backend in backends {
         let entry = health.get_entry(network_id, service_name, backend.ip);
         let recheck_after = readiness_recheck_after(entry, probe);
@@ -1372,70 +1398,115 @@ fn select_backends_for_active_probe(
             continue;
         }
 
-        candidates.push((
-            probe_priority(entry),
-            checked_at,
-            backend.ip,
-            backend.clone(),
-        ));
+        match probe_priority(entry) {
+            ProbePriority::Unknown | ProbePriority::Unhealthy => {
+                eager.push((probe_priority(entry), backend.ip, backend.clone()));
+            }
+            ProbePriority::Healthy => {
+                healthy.push((
+                    checked_at.expect("healthy backend probes should carry a cached timestamp"),
+                    backend.ip,
+                    backend.clone(),
+                ));
+            }
+        }
     }
 
-    candidates.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.cmp(&right.1))
-            .then_with(|| left.2.cmp(&right.2))
-    });
-    candidates
-        .into_iter()
-        .take(MAX_READINESS_PROBES_PER_REFRESH)
-        .map(|(_, _, _, backend)| backend)
-        .collect()
+    eager.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    healthy.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    let mut selected: Vec<BackendAddress> =
+        eager.into_iter().map(|(_, _, backend)| backend).collect();
+    selected.extend(
+        healthy
+            .into_iter()
+            .take(MAX_HEALTHY_READINESS_RECHECKS_PER_REFRESH)
+            .map(|(_, _, backend)| backend),
+    );
+    selected
 }
 
 /// Filter candidate backends using cached health without performing probes.
 ///
-/// This keeps DNS responses fast and avoids blocking on synchronous checks.
+/// Readiness-enabled services only admit endpoints that have already passed their readiness probe.
+/// Unknown and unhealthy endpoints remain unroutable until active probing marks them healthy.
 fn filter_cached_backends(
     health: &BackendHealth,
     network_id: Uuid,
     service_name: &str,
     backends: Vec<BackendAddress>,
 ) -> Vec<BackendAddress> {
-    let now = Instant::now();
     let mut preferred = Vec::with_capacity(backends.len());
-    let mut stale_unhealthy = Vec::with_capacity(backends.len());
     for backend in backends {
         let entry = health.get_entry(network_id, service_name, backend.ip);
         match entry {
-            None => preferred.push(backend),
-            Some(entry) => {
-                let is_stale =
-                    now.saturating_duration_since(entry.checked_at) >= HEALTH_CACHE_STALE_AFTER;
-                match entry.state {
-                    HealthState::Healthy => preferred.push(backend),
-                    HealthState::Unknown if entry.consecutive_failures == 0 => {
-                        preferred.push(backend)
-                    }
-                    HealthState::Unknown => {}
-                    HealthState::Unhealthy => {
-                        // Keep stale unhealthy endpoints out of normal DNS responses whenever at
-                        // least one non-unhealthy endpoint exists. This avoids periodic latency
-                        // spikes where clients connect-timeout on a dead backend before falling
-                        // back to another A record.
-                        if is_stale {
-                            stale_unhealthy.push(backend);
-                        }
-                    }
-                }
-            }
+            None => {}
+            Some(entry) => match entry.state {
+                HealthState::Healthy => preferred.push(backend),
+                HealthState::Unknown | HealthState::Unhealthy => {}
+            },
         }
     }
 
-    if preferred.is_empty() {
-        stale_unhealthy
-    } else {
-        preferred
+    preferred
+}
+
+/// Normalize one backend set into a stable identity used to detect candidate-set changes.
+fn canonical_backend_identity(backends: &[BackendAddress]) -> Vec<(IpAddr, [u8; 6])> {
+    let mut entries: Vec<(IpAddr, [u8; 6])> = backends
+        .iter()
+        .map(|backend| (backend.ip, backend.mac))
+        .collect();
+    entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    entries
+}
+
+/// Reconcile one service health cache entry against the latest derived backend catalog.
+///
+/// Readiness remains authoritative for routing, but topology changes should only drop cached
+/// health for backends whose identity disappeared or changed. Surviving healthy backends stay
+/// routable so peer churn does not create avoidable service gaps.
+fn reconcile_service_health_cache(
+    health: &mut BackendHealth,
+    network_id: Uuid,
+    service_name: &str,
+    previous: Option<&ServiceBackendCatalogEntry>,
+    next: Option<&ServiceBackendCatalogEntry>,
+) {
+    match (previous, next) {
+        (None, None) => {}
+        (Some(previous), None) => {
+            if previous.readiness.is_some() {
+                health.clear_service(network_id, service_name);
+            }
+        }
+        (None, Some(next)) => {
+            if next.readiness.is_some() {
+                health.clear_service(network_id, service_name);
+            }
+        }
+        (Some(previous), Some(next)) => {
+            if previous.readiness != next.readiness {
+                health.clear_service(network_id, service_name);
+                return;
+            }
+            if next.readiness.is_none() {
+                return;
+            }
+
+            let previous_candidates = canonical_backend_identity(&previous.candidates);
+            let next_candidates = canonical_backend_identity(&next.candidates);
+            if previous_candidates == next_candidates {
+                return;
+            }
+
+            let previous_map: HashMap<IpAddr, [u8; 6]> = previous_candidates.into_iter().collect();
+            let retained_backends: HashSet<IpAddr> = next_candidates
+                .into_iter()
+                .filter_map(|(ip, mac)| (previous_map.get(&ip).copied() == Some(mac)).then_some(ip))
+                .collect();
+            health.retain_service_backends(network_id, service_name, &retained_backends);
+        }
     }
 }
 
@@ -1736,6 +1807,7 @@ async fn refresh_backend_catalog_if_needed(
     registry: &NetworkRegistry,
     workloads: &WorkloadStore,
     services: &ServiceRegistry,
+    health: &Arc<AsyncMutex<BackendHealth>>,
     network_id: Uuid,
     health_snapshot: &HashMap<Uuid, HealthStatus>,
 ) -> Result<()> {
@@ -1745,7 +1817,7 @@ async fn refresh_backend_catalog_if_needed(
     let peer_generation = registry.peer_change_clock();
     let health_fingerprint = health_snapshot_fingerprint(health_snapshot);
 
-    {
+    let previous_services = {
         let guard = backend_catalog.lock().await;
         if guard.attachment_generation == attachment_generation
             && guard.workload_generation == workload_generation
@@ -1755,7 +1827,8 @@ async fn refresh_backend_catalog_if_needed(
         {
             return Ok(());
         }
-    }
+        guard.services.clone()
+    };
 
     let service_specs = services
         .list()
@@ -1808,6 +1881,22 @@ async fn refresh_backend_catalog_if_needed(
                     public_target_port,
                     public_protocols,
                 },
+            );
+        }
+    }
+
+    {
+        let mut guard = health.lock().await;
+        let mut service_keys: HashSet<String> =
+            previous_services.keys().cloned().collect::<HashSet<_>>();
+        service_keys.extend(next_services.keys().cloned());
+        for service_key in service_keys {
+            reconcile_service_health_cache(
+                &mut guard,
+                network_id,
+                &service_key,
+                previous_services.get(&service_key),
+                next_services.get(&service_key),
             );
         }
     }
@@ -1874,6 +1963,7 @@ async fn refresh_network_services(
         registry,
         workloads,
         services,
+        health,
         network_id,
         &health_snapshot,
     )
@@ -2465,6 +2555,18 @@ mod tests {
                 consecutive_failures: 1,
             },
         );
+        health
+            .statuses
+            .get_mut(&(network_id, service.to_string()))
+            .expect("service health entry")
+            .insert(
+                IpAddr::V4(healthy_ip),
+                HealthEntry {
+                    state: HealthState::Healthy,
+                    checked_at: Instant::now(),
+                    consecutive_failures: 0,
+                },
+            );
 
         let filtered = filter_cached_backends(
             &health,
@@ -2481,7 +2583,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_cached_backends_keeps_stale_unhealthy_when_only_choice() {
+    fn filter_cached_backends_excludes_unhealthy_when_it_is_the_only_choice() {
         let network_id = Uuid::new_v4();
         let service = "backend";
         let unhealthy_ip = Ipv4Addr::new(10, 42, 1, 10);
@@ -2504,8 +2606,50 @@ mod tests {
             vec![backend([10, 42, 1, 10], [0x02, 0, 0, 0, 0, 1])],
         );
 
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].ip, IpAddr::V4(unhealthy_ip));
+        assert!(
+            filtered.is_empty(),
+            "unhealthy endpoints must stay unroutable even when they are the only candidate"
+        );
+    }
+
+    #[test]
+    fn filter_cached_backends_excludes_unknown_backends_from_routing() {
+        let network_id = Uuid::new_v4();
+        let service = "backend";
+        let unknown_ip = Ipv4Addr::new(10, 42, 1, 10);
+
+        let filtered = filter_cached_backends(
+            &BackendHealth::default(),
+            network_id,
+            service,
+            vec![backend([10, 42, 1, 10], [0x02, 0, 0, 0, 0, 1])],
+        );
+        assert!(
+            filtered.is_empty(),
+            "unknown endpoints must not enter routing before passing readiness"
+        );
+
+        let mut health = BackendHealth::default();
+        let key = (network_id, service.to_string());
+        health.statuses.entry(key).or_default().insert(
+            IpAddr::V4(unknown_ip),
+            HealthEntry {
+                state: HealthState::Unknown,
+                checked_at: Instant::now() - Duration::from_secs(1),
+                consecutive_failures: 1,
+            },
+        );
+
+        let filtered = filter_cached_backends(
+            &health,
+            network_id,
+            service,
+            vec![backend([10, 42, 1, 10], [0x02, 0, 0, 0, 0, 1])],
+        );
+        assert!(
+            filtered.is_empty(),
+            "cached unknown endpoints must remain unroutable until they become healthy"
+        );
     }
 
     #[test]
@@ -2586,9 +2730,10 @@ mod tests {
             &probe,
         );
 
-        assert_eq!(selected.len(), 2);
+        assert_eq!(selected.len(), 3);
         assert_eq!(selected[0].ip, IpAddr::V4(Ipv4Addr::new(10, 42, 1, 10)));
         assert_eq!(selected[1].ip, IpAddr::V4(Ipv4Addr::new(10, 42, 1, 12)));
+        assert_eq!(selected[2].ip, IpAddr::V4(Ipv4Addr::new(10, 42, 1, 11)));
     }
 
     #[test]
@@ -2943,6 +3088,7 @@ mod tests {
             .expect("upsert ready peer state");
 
         let catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
+        let readiness = Arc::new(AsyncMutex::new(BackendHealth::default()));
         let mut health = HashMap::new();
         health.insert(node_id, HealthStatus::Alive);
         refresh_backend_catalog_if_needed(
@@ -2950,6 +3096,7 @@ mod tests {
             &harness.registry,
             &harness.workloads,
             &harness.services,
+            &readiness,
             harness.network.id,
             &health,
         )
@@ -2980,6 +3127,7 @@ mod tests {
             &harness.registry,
             &harness.workloads,
             &harness.services,
+            &readiness,
             harness.network.id,
             &health,
         )
@@ -3047,6 +3195,7 @@ mod tests {
             .expect("upsert configuring peer state");
 
         let catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
+        let readiness = Arc::new(AsyncMutex::new(BackendHealth::default()));
         let mut health = HashMap::new();
         health.insert(node_id, HealthStatus::Alive);
         refresh_backend_catalog_if_needed(
@@ -3054,6 +3203,7 @@ mod tests {
             &harness.registry,
             &harness.workloads,
             &harness.services,
+            &readiness,
             harness.network.id,
             &health,
         )
@@ -3091,6 +3241,7 @@ mod tests {
             &harness.registry,
             &harness.workloads,
             &harness.services,
+            &readiness,
             harness.network.id,
             &health,
         )
@@ -3114,6 +3265,184 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn backend_catalog_refresh_retains_unchanged_healthy_backends() {
+        let harness = setup_catalog_harness().await;
+        let service_name = "backend-service";
+        let ready_node = Uuid::new_v4();
+        let withdrawing_node = Uuid::new_v4();
+        let ready_task = Uuid::new_v4();
+        let withdrawing_task = Uuid::new_v4();
+        let ready_ip = IpAddr::V4(Ipv4Addr::new(10, 88, 1, 10));
+        let withdrawing_ip = IpAddr::V4(Ipv4Addr::new(10, 88, 1, 11));
+        upsert_catalog_service_with_readiness(
+            &harness.services,
+            service_name,
+            harness.network.id,
+            vec![ready_task, withdrawing_task],
+            Some(ServiceReadinessProbe {
+                kind: ServiceReadinessProbeKind::Http,
+                port: 8_000,
+                path: Some("/healthz".to_string()),
+                interval_ms: 2_000,
+                timeout_ms: 300,
+                failure_threshold: 1,
+            }),
+        )
+        .await;
+
+        harness
+            .workloads
+            .upsert(
+                &UuidKey::from(ready_task),
+                catalog_task(ready_task, ready_node, service_name, harness.network.id),
+            )
+            .await
+            .expect("upsert ready task");
+        harness
+            .workloads
+            .upsert(
+                &UuidKey::from(withdrawing_task),
+                catalog_task(
+                    withdrawing_task,
+                    withdrawing_node,
+                    service_name,
+                    harness.network.id,
+                ),
+            )
+            .await
+            .expect("upsert withdrawing task");
+        harness
+            .registry
+            .upsert_attachment(catalog_attachment(
+                ready_task,
+                ready_node,
+                harness.network.id,
+                match ready_ip {
+                    IpAddr::V4(ip) => ip,
+                    IpAddr::V6(_) => unreachable!("test only uses IPv4 backends"),
+                },
+                service_name,
+            ))
+            .await
+            .expect("upsert ready attachment");
+        harness
+            .registry
+            .upsert_attachment(catalog_attachment(
+                withdrawing_task,
+                withdrawing_node,
+                harness.network.id,
+                match withdrawing_ip {
+                    IpAddr::V4(ip) => ip,
+                    IpAddr::V6(_) => unreachable!("test only uses IPv4 backends"),
+                },
+                service_name,
+            ))
+            .await
+            .expect("upsert withdrawing attachment");
+        harness
+            .registry
+            .upsert_peer_state(NetworkPeerStateValue::new(
+                harness.network.id,
+                ready_node,
+                "ready-node",
+                NetworkPeerState::Ready,
+                None,
+            ))
+            .await
+            .expect("upsert ready peer state");
+        harness
+            .registry
+            .upsert_peer_state(NetworkPeerStateValue::new(
+                harness.network.id,
+                withdrawing_node,
+                "withdrawing-node",
+                NetworkPeerState::Ready,
+                None,
+            ))
+            .await
+            .expect("upsert withdrawing peer state");
+
+        let catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
+        let readiness = Arc::new(AsyncMutex::new(BackendHealth::default()));
+        let mut health = HashMap::new();
+        health.insert(ready_node, HealthStatus::Alive);
+        health.insert(withdrawing_node, HealthStatus::Alive);
+        refresh_backend_catalog_if_needed(
+            &catalog,
+            &harness.registry,
+            &harness.workloads,
+            &harness.services,
+            &readiness,
+            harness.network.id,
+            &health,
+        )
+        .await
+        .expect("initial catalog refresh");
+
+        {
+            let mut guard = readiness.lock().await;
+            guard.set_entry(
+                harness.network.id,
+                "backend",
+                ready_ip,
+                HealthEntry {
+                    state: HealthState::Healthy,
+                    checked_at: Instant::now(),
+                    consecutive_failures: 0,
+                },
+            );
+            guard.set_entry(
+                harness.network.id,
+                "backend",
+                withdrawing_ip,
+                HealthEntry {
+                    state: HealthState::Healthy,
+                    checked_at: Instant::now(),
+                    consecutive_failures: 0,
+                },
+            );
+        }
+
+        harness
+            .registry
+            .upsert_peer_state(NetworkPeerStateValue::new(
+                harness.network.id,
+                withdrawing_node,
+                "withdrawing-node",
+                NetworkPeerState::Configuring,
+                None,
+            ))
+            .await
+            .expect("withdraw peer state");
+
+        refresh_backend_catalog_if_needed(
+            &catalog,
+            &harness.registry,
+            &harness.workloads,
+            &harness.services,
+            &readiness,
+            harness.network.id,
+            &health,
+        )
+        .await
+        .expect("refresh after peer withdrawal");
+
+        let guard = readiness.lock().await;
+        assert!(
+            guard
+                .get_entry(harness.network.id, "backend", ready_ip)
+                .is_some(),
+            "unchanged healthy backend should keep its readiness cache"
+        );
+        assert!(
+            guard
+                .get_entry(harness.network.id, "backend", withdrawing_ip)
+                .is_none(),
+            "withdrawn backend should lose its readiness cache"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn backend_catalog_refresh_requires_service_readiness_opt_in() {
         let harness = setup_catalog_harness().await;
         upsert_catalog_service(
@@ -3125,11 +3454,13 @@ mod tests {
         .await;
 
         let catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
+        let readiness = Arc::new(AsyncMutex::new(BackendHealth::default()));
         refresh_backend_catalog_if_needed(
             &catalog,
             &harness.registry,
             &harness.workloads,
             &harness.services,
+            &readiness,
             harness.network.id,
             &HashMap::new(),
         )
@@ -3164,11 +3495,13 @@ mod tests {
         .await;
 
         let catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
+        let readiness = Arc::new(AsyncMutex::new(BackendHealth::default()));
         refresh_backend_catalog_if_needed(
             &catalog,
             &harness.registry,
             &harness.workloads,
             &harness.services,
+            &readiness,
             harness.network.id,
             &HashMap::new(),
         )

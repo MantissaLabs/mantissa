@@ -13,7 +13,8 @@ use mantissa::network::types::{
 };
 use mantissa::services::registry::ServiceRegistry;
 use mantissa::services::types::{
-    ServiceSpecValue, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
+    ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceSpecValue,
+    TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
 };
 use mantissa::store::network_store::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
@@ -28,7 +29,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
@@ -250,6 +252,17 @@ async fn upsert_service(
     network_id: Uuid,
     replica_ids: Vec<Uuid>,
 ) {
+    upsert_service_with_readiness(services, service_name, network_id, replica_ids, None).await;
+}
+
+/// Upserts one service spec while preserving any explicit readiness probe configuration.
+async fn upsert_service_with_readiness(
+    services: &ServiceRegistry,
+    service_name: &str,
+    network_id: Uuid,
+    replica_ids: Vec<Uuid>,
+    readiness: Option<ServiceReadinessProbe>,
+) {
     let service = ServiceSpecValue::new(
         Uuid::new_v4(),
         "dns-test-manifest",
@@ -275,13 +288,50 @@ async fn upsert_service(
             },
             depends_on: Vec::new(),
             replicas: replica_ids.len() as u16,
-            readiness: None,
+            readiness,
             public_port: None,
             public_protocol: None,
         }],
         replica_ids,
     );
     services.upsert(service).await.expect("upsert service");
+}
+
+/// Spawn one tiny loopback-bound HTTP responder so discovery can run real readiness probes.
+fn spawn_http_ready_server(
+    ip: Ipv4Addr,
+    port: u16,
+    expected_path: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let listener = TcpListener::bind((ip, port))
+            .await
+            .expect("bind readiness http server");
+        loop {
+            let (mut stream, _) = listener.accept().await.expect("accept readiness probe");
+            let mut buf = [0u8; 1024];
+            let read = stream.read(&mut buf).await.expect("read readiness probe");
+            if read == 0 {
+                continue;
+            }
+
+            let request = String::from_utf8_lossy(&buf[..read]);
+            let is_ready = request.starts_with(&format!("GET {expected_path} "));
+            let (status, body) = if is_ready {
+                ("200 OK", "ok")
+            } else {
+                ("404 Not Found", "missing")
+            };
+            let response = format!(
+                "HTTP/1.0 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write readiness response");
+        }
+    })
 }
 
 /// Sends one DNS query for the requested record type and decodes matching address answers.
@@ -768,3 +818,149 @@ local_test!(
             .expect("teardown rotating ipv6 discovery");
     }
 );
+
+local_test!(discovery_dns_routes_only_healthy_readiness_backends, {
+    let dns_port = 10534;
+    let probe_port = 18090;
+    let service_name = "readiness-backed-service";
+    let harness = setup_discovery_harness(dns_port).await;
+    let network_id = harness.network.id;
+
+    let ready_node = Uuid::new_v4();
+    let recovering_node = Uuid::new_v4();
+    let ready_task = Uuid::new_v4();
+    let recovering_task = Uuid::new_v4();
+    let ready_ip = Ipv4Addr::new(127, 0, 0, 10);
+    let recovering_ip = Ipv4Addr::new(127, 0, 0, 11);
+    let probe = ServiceReadinessProbe {
+        kind: ServiceReadinessProbeKind::Http,
+        port: probe_port,
+        path: Some("/healthz".to_string()),
+        interval_ms: 200,
+        timeout_ms: 200,
+        failure_threshold: 1,
+    };
+
+    upsert_service_with_readiness(
+        &harness.services,
+        service_name,
+        network_id,
+        vec![ready_task, recovering_task],
+        Some(probe),
+    )
+    .await;
+
+    harness
+        .workloads
+        .upsert(
+            &UuidKey::from(ready_task),
+            running_task(ready_task, ready_node, service_name, network_id),
+        )
+        .await
+        .expect("upsert ready task");
+    harness
+        .workloads
+        .upsert(
+            &UuidKey::from(recovering_task),
+            running_task(recovering_task, recovering_node, service_name, network_id),
+        )
+        .await
+        .expect("upsert recovering task");
+    harness
+        .registry
+        .upsert_attachment(ready_attachment_with_publication(
+            ready_task,
+            ready_node,
+            network_id,
+            ready_ip,
+            service_name,
+            true,
+        ))
+        .await
+        .expect("upsert ready attachment");
+    harness
+        .registry
+        .upsert_attachment(ready_attachment_with_publication(
+            recovering_task,
+            recovering_node,
+            network_id,
+            recovering_ip,
+            service_name,
+            true,
+        ))
+        .await
+        .expect("upsert recovering attachment");
+    harness
+        .registry
+        .upsert_peer_state(ready_peer_state(network_id, ready_node))
+        .await
+        .expect("upsert ready peer state");
+    harness
+        .registry
+        .upsert_peer_state(ready_peer_state(network_id, recovering_node))
+        .await
+        .expect("upsert recovering peer state");
+
+    harness
+        .discovery
+        .ensure_network(&harness.network, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)))
+        .await
+        .expect("start discovery");
+
+    let fqdn = format!("backend.{}.svc.mantissa.", harness.network.name);
+    let (initial_code, initial_ips) = query_a_records(dns_port, &fqdn)
+        .await
+        .expect("query initial readiness dns");
+    assert_eq!(initial_code, ResponseCode::NXDomain);
+    assert!(
+        initial_ips.is_empty(),
+        "unknown readiness backends must not be routable before passing probes"
+    );
+
+    let ready_server = spawn_http_ready_server(ready_ip, probe_port, "/healthz");
+    let (_, ready_answers) = wait_for_answer_count(dns_port, &fqdn, 1, Duration::from_secs(5))
+        .await
+        .expect("wait for first healthy backend");
+    assert_eq!(ready_answers, vec![ready_ip]);
+
+    let recovering_server = spawn_http_ready_server(recovering_ip, probe_port, "/healthz");
+    let (_, dual_answers) = wait_for_answer_count(dns_port, &fqdn, 2, Duration::from_secs(5))
+        .await
+        .expect("wait for second healthy backend");
+    let dual_set: std::collections::BTreeSet<Ipv4Addr> = dual_answers.into_iter().collect();
+    assert_eq!(
+        dual_set,
+        std::collections::BTreeSet::from([ready_ip, recovering_ip]),
+        "both readiness-proven backends should be routable"
+    );
+
+    harness
+        .registry
+        .upsert_peer_state(NetworkPeerStateValue::new(
+            network_id,
+            ready_node,
+            format!("node-{ready_node}"),
+            NetworkPeerState::Configuring,
+            None,
+        ))
+        .await
+        .expect("withdraw ready peer");
+
+    let (post_withdraw_code, post_withdraw_ips) = query_a_records(dns_port, &fqdn)
+        .await
+        .expect("query dns after peer withdrawal");
+    assert_eq!(post_withdraw_code, ResponseCode::NoError);
+    assert_eq!(
+        post_withdraw_ips,
+        vec![recovering_ip],
+        "peer withdrawal must immediately remove the stale backend while preserving surviving healthy replicas"
+    );
+
+    ready_server.abort();
+    recovering_server.abort();
+    harness
+        .discovery
+        .teardown_network(network_id)
+        .await
+        .expect("teardown discovery");
+});
