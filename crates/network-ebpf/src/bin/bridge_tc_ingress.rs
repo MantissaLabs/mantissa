@@ -5,7 +5,7 @@
 use core::ptr;
 
 use aya_ebpf::{
-    bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT},
+    bindings::{BPF_F_NO_PREALLOC, BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT},
     helpers::bpf_ktime_get_ns,
     macros::{classifier, map},
     maps::{HashMap, LruHashMap, PerCpuArray},
@@ -41,16 +41,17 @@ const ARP_OPER_REQUEST: u16 = 1;
 const ARP_OPER_REPLY: u16 = 2;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
+const SPARSE_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC as u32;
 
 #[map(name = "BRIDGE_TC_INGRESS_STATS")]
 static mut BRIDGE_TC_INGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_entries(1, 0);
 
 #[map(name = "LB_VIPS")]
-static mut LB_VIPS: HashMap<VipKey, VipEntry> = HashMap::pinned(MAX_VIPS as u32, 0);
+static mut LB_VIPS: HashMap<VipKey, VipEntry> = HashMap::pinned(MAX_VIPS as u32, SPARSE_MAP_FLAGS);
 
 #[map(name = "LB_BACKENDS")]
 static mut LB_BACKENDS: HashMap<VipBackendKey, Backend> =
-    HashMap::pinned((MAX_BACKENDS_PER_VIP * MAX_VIPS) as u32, 0);
+    HashMap::pinned((MAX_BACKENDS_PER_VIP * MAX_VIPS) as u32, SPARSE_MAP_FLAGS);
 
 #[map(name = "LB_FWD")]
 static mut LB_FWD: LruHashMap<Flow4, NatEntry> = LruHashMap::pinned(1024, 0);

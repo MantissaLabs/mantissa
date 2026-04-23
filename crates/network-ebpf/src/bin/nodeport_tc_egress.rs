@@ -5,7 +5,7 @@
 use core::mem;
 
 use aya_ebpf::{
-    bindings::{BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT},
+    bindings::{BPF_F_NO_PREALLOC, BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT},
     helpers::{bpf_csum_diff, bpf_ktime_get_ns},
     macros::{classifier, map},
     maps::{HashMap, LruHashMap, PerCpuArray},
@@ -26,6 +26,7 @@ const FLOW_EVENT_CLEAR: u32 = 1;
 const FLOW_EVENT_REVERSE_MISS: u32 = 2;
 const FLOW_EVENT_INVALID_TRANSITION: u32 = 3;
 const FLOW_EVENT_RETURN_BYPASS: u32 = 4;
+const SPARSE_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC as u32;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -53,10 +54,12 @@ static mut NODEPORT_TC_FLOW_EVENTS: PerCpuArray<u64> =
     PerCpuArray::pinned(NODEPORT_FLOW_EVENT_COUNT, 0);
 
 #[map(name = "NODEPORT_RETURNS")]
-static mut NODEPORT_RETURNS: HashMap<NodePortReturnKey, u8> = HashMap::pinned(1024, 0);
+static mut NODEPORT_RETURNS: HashMap<NodePortReturnKey, u8> =
+    HashMap::pinned(1024, SPARSE_MAP_FLAGS);
 
 #[map(name = "NODEPORT_RETURNS_V6")]
-static mut NODEPORT_RETURNS_V6: HashMap<NodePortReturnKey6, u8> = HashMap::pinned(1024, 0);
+static mut NODEPORT_RETURNS_V6: HashMap<NodePortReturnKey6, u8> =
+    HashMap::pinned(1024, SPARSE_MAP_FLAGS);
 
 #[map(name = "NODEPORT_FWD")]
 static mut NODEPORT_FWD: LruHashMap<Flow4, NodePortNat> = LruHashMap::pinned(2048, 0);

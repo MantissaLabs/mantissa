@@ -7,8 +7,8 @@ use core::mem;
 use aya_ebpf::{
     bindings::bpf_adj_room_mode::BPF_ADJ_ROOM_MAC,
     bindings::{
-        BPF_F_ADJ_ROOM_ENCAP_L2_ETH, BPF_F_ADJ_ROOM_NO_CSUM_RESET, BPF_F_PSEUDO_HDR, TC_ACT_OK,
-        TC_ACT_SHOT,
+        BPF_F_ADJ_ROOM_ENCAP_L2_ETH, BPF_F_ADJ_ROOM_NO_CSUM_RESET, BPF_F_NO_PREALLOC,
+        BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT,
     },
     helpers::{bpf_csum_diff, bpf_ktime_get_ns},
     macros::{classifier, map},
@@ -31,6 +31,7 @@ const NODEPORT_FLOW_EVENT_COUNT: u32 = 5;
 const FLOW_EVENT_CREATE: u32 = 0;
 const FLOW_EVENT_CLEAR: u32 = 1;
 const FLOW_EVENT_INVALID_TRANSITION: u32 = 3;
+const SPARSE_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC as u32;
 
 #[repr(u32)]
 #[derive(Clone, Copy)]
@@ -105,10 +106,12 @@ static mut NODEPORT_TC_FLOW_EVENTS: PerCpuArray<u64> =
     PerCpuArray::pinned(NODEPORT_FLOW_EVENT_COUNT, 0);
 
 #[map(name = "NODEPORT_VIPS")]
-static mut NODEPORT_VIPS: HashMap<NodePortKey, NodePortEntry> = HashMap::pinned(1024, 0);
+static mut NODEPORT_VIPS: HashMap<NodePortKey, NodePortEntry> =
+    HashMap::pinned(1024, SPARSE_MAP_FLAGS);
 
 #[map(name = "NODEPORT_VIPS_V6")]
-static mut NODEPORT_VIPS_V6: HashMap<NodePortKey, NodePortEntry6> = HashMap::pinned(1024, 0);
+static mut NODEPORT_VIPS_V6: HashMap<NodePortKey, NodePortEntry6> =
+    HashMap::pinned(1024, SPARSE_MAP_FLAGS);
 
 #[map(name = "NODEPORT_FWD")]
 static mut NODEPORT_FWD: LruHashMap<Flow4, NodePortNat> = LruHashMap::pinned(2048, 0);
@@ -123,10 +126,10 @@ static mut NODEPORT_REV: LruHashMap<Flow4, NodePortNat> = LruHashMap::pinned(204
 static mut NODEPORT_REV_V6: LruHashMap<Flow6, NodePortNat6> = LruHashMap::pinned(2048, 0);
 
 #[map(name = "NODEPORT_HOST")]
-static mut NODEPORT_HOST: HashMap<u32, NodePortHost> = HashMap::pinned(256, 0);
+static mut NODEPORT_HOST: HashMap<u32, NodePortHost> = HashMap::pinned(256, SPARSE_MAP_FLAGS);
 
 #[map(name = "NODEPORT_HOST_V6")]
-static mut NODEPORT_HOST_V6: HashMap<u32, NodePortHost6> = HashMap::pinned(256, 0);
+static mut NODEPORT_HOST_V6: HashMap<u32, NodePortHost6> = HashMap::pinned(256, SPARSE_MAP_FLAGS);
 
 /// Intercept external nodeport traffic and redirect it into the overlay dataplane.
 #[classifier]
