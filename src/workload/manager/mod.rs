@@ -1188,6 +1188,51 @@ impl WorkloadManager {
         Ok(updated)
     }
 
+    /// Retires one unavailable service-owned workload directly into `Stopped`.
+    ///
+    /// Service reconciliation uses this when a superseded service task belongs to a node that is
+    /// already marked `Down`. In that case an RPC stop can never reach the original owner, but the
+    /// replicated workload row still needs to leave the active task set so cluster-visible task
+    /// listings converge on the replacement replicas only.
+    pub async fn retire_unavailable_service_workload(
+        &self,
+        id: Uuid,
+        reason: impl Into<String>,
+    ) -> Result<WorkloadSpec, anyhow::Error> {
+        let spec = self.load_spec(id).await?;
+        if spec
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.as_service_replica())
+            .is_none()
+        {
+            return Err(anyhow!(
+                "workload {id} is not service-owned and cannot be retired by service cleanup"
+            ));
+        }
+
+        if matches!(
+            spec.state,
+            WorkloadPhase::Stopping
+                | WorkloadPhase::Stopped
+                | WorkloadPhase::Failed
+                | WorkloadPhase::Exited(_)
+        ) {
+            return Ok(spec);
+        }
+
+        let mut updated = spec.clone();
+        updated.phase_version = updated.phase_version.saturating_add(1);
+        updated.state = WorkloadPhase::Stopped;
+        updated.phase_reason = Some(reason.into());
+        updated.phase_progress = None;
+        updated.updated_at = Utc::now().to_rfc3339();
+        self.persist_spec(&updated).await?;
+        self.enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(updated.clone())))
+            .await?;
+        Ok(updated)
+    }
+
     /// Re-drives final local stop cleanup for one workload row that is already in a terminal stop state.
     ///
     /// Inactive-service reconciliation uses this to keep draining lingering local `Stopping`

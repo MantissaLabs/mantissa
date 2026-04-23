@@ -83,7 +83,7 @@ impl ServiceController {
             self.restore_volume_available_service(&spec).await?;
         }
 
-        self.reconcile_extra_tasks(&spec, &service_tasks, eligible_nodes)
+        self.reconcile_extra_tasks(&spec, &service_tasks, eligible_nodes, health_snapshot)
             .await;
 
         for slot in slots {
@@ -146,6 +146,7 @@ impl ServiceController {
         spec: &ServiceSpecValue,
         service_tasks: &ServiceReplicaSnapshot<'_>,
         eligible_nodes: &[Uuid],
+        health_snapshot: &HashMap<Uuid, HealthStatus>,
     ) {
         for task in service_tasks.observed_tasks() {
             if service_tasks.is_desired(task.id) {
@@ -171,6 +172,12 @@ impl ServiceController {
                     task.id,
                     spec.service_name
                 );
+                self.retire_down_superseded_service_task_best_effort(
+                    &spec.service_name,
+                    task.id,
+                    health_snapshot,
+                )
+                .await;
             }
         }
     }
@@ -235,8 +242,15 @@ impl ServiceController {
             let restart_immediately = task_on_draining_node
                 || should_restart_missing_slot_immediately(spec.status(), task);
             if restart_immediately || self.slot_missing_elapsed(key).await {
-                self.start_slot_task(spec, slot, task_id, preferred_node, key)
-                    .await?;
+                self.start_slot_task(
+                    spec,
+                    slot,
+                    task_id,
+                    preferred_node,
+                    env.health_snapshot,
+                    key,
+                )
+                .await?;
             }
             return Ok(());
         }
@@ -291,7 +305,7 @@ impl ServiceController {
             return Ok(());
         }
 
-        self.move_slot_task(spec, slot, task, desired_node, key)
+        self.move_slot_task(spec, slot, task, desired_node, env.health_snapshot, key)
             .await?;
 
         Ok(())
@@ -304,6 +318,7 @@ impl ServiceController {
         slot: &ReplicaSlot,
         task_id: Uuid,
         preferred_node: Option<Uuid>,
+        health_snapshot: &HashMap<Uuid, HealthStatus>,
         key: &SlotKey,
     ) -> anyhow::Result<()> {
         let requires_pinned_target = mounted_local_volumes_require_pinned_target(
@@ -376,8 +391,12 @@ impl ServiceController {
                         return Err(err);
                     }
                     self.clear_slot_missing(key).await;
-                    self.withdraw_and_stop_superseded_task_best_effort(&spec.service_name, task_id)
-                        .await;
+                    self.withdraw_and_stop_superseded_task_best_effort(
+                        &spec.service_name,
+                        task_id,
+                        health_snapshot,
+                    )
+                    .await;
                     return Ok(());
                 }
                 Err(err) => {
@@ -463,8 +482,12 @@ impl ServiceController {
             return Err(err);
         }
         self.clear_slot_missing(key).await;
-        self.withdraw_and_stop_superseded_task_best_effort(&spec.service_name, task_id)
-            .await;
+        self.withdraw_and_stop_superseded_task_best_effort(
+            &spec.service_name,
+            task_id,
+            health_snapshot,
+        )
+        .await;
         Ok(())
     }
 
@@ -520,6 +543,7 @@ impl ServiceController {
         slot: &ReplicaSlot,
         task: &WorkloadSpec,
         preferred_node: Uuid,
+        health_snapshot: &HashMap<Uuid, HealthStatus>,
         key: &SlotKey,
     ) -> anyhow::Result<()> {
         let replacement_task_id = Uuid::new_v4();
@@ -577,8 +601,12 @@ impl ServiceController {
             .await;
             return Err(err);
         }
-        self.withdraw_and_stop_superseded_task_best_effort(&spec.service_name, task.id)
-            .await;
+        self.withdraw_and_stop_superseded_task_best_effort(
+            &spec.service_name,
+            task.id,
+            health_snapshot,
+        )
+        .await;
         self.set_rebalance_cooldown(key).await;
 
         tracing::debug!(
@@ -622,6 +650,7 @@ impl ServiceController {
         &self,
         service_name: &str,
         superseded_task_id: Uuid,
+        health_snapshot: &HashMap<Uuid, HealthStatus>,
     ) {
         if let Err(err) = self
             .workload_manager
@@ -645,6 +674,73 @@ impl ServiceController {
                 service = %service_name,
                 task = %superseded_task_id,
                 "failed to stop superseded task after cutover: {err:#}"
+            );
+            self.retire_down_superseded_service_task_best_effort(
+                service_name,
+                superseded_task_id,
+                health_snapshot,
+            )
+            .await;
+        }
+    }
+
+    /// Retires one superseded service task directly when its original owner node is already down.
+    ///
+    /// Fresh task identities keep service handoff correct, but the old workload row can still stay
+    /// visible as `Running` if the original owner is gone and the normal remote stop RPC cannot be
+    /// delivered. Narrow that case to service-owned workloads on nodes already marked `Down` so
+    /// cluster-visible task listings converge on the replacement tasks.
+    async fn retire_down_superseded_service_task_best_effort(
+        &self,
+        service_name: &str,
+        superseded_task_id: Uuid,
+        health_snapshot: &HashMap<Uuid, HealthStatus>,
+    ) {
+        let spec = match self
+            .workload_manager
+            .inspect_workload(superseded_task_id)
+            .await
+        {
+            Ok(spec) => spec,
+            Err(err) => {
+                tracing::warn!(
+                    target: "services",
+                    service = %service_name,
+                    task = %superseded_task_id,
+                    "failed to inspect superseded task after stop failure: {err:#}"
+                );
+                return;
+            }
+        };
+        if spec
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.as_service_replica())
+            .is_none()
+        {
+            return;
+        }
+        if !node_is_down(spec.node_id, health_snapshot) {
+            return;
+        }
+
+        if let Err(err) = self
+            .workload_manager
+            .retire_unavailable_service_workload(
+                superseded_task_id,
+                format!(
+                    "service controller retired superseded task after owner node {} went down",
+                    spec.node_id
+                ),
+            )
+            .await
+        {
+            tracing::warn!(
+                target: "services",
+                service = %service_name,
+                task = %superseded_task_id,
+                node = %spec.node_id,
+                "failed to retire superseded task on down node: {err:#}"
             );
         }
     }

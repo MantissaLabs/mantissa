@@ -1949,6 +1949,16 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
         rescheduled,
         "remaining live nodes should reschedule replicas away from the down node"
     );
+    assert!(
+        surviving_nodes_observe_no_active_service_tasks_on_node(
+            &cluster,
+            service_name,
+            down_node_id,
+            Duration::from_secs(15),
+        )
+        .await,
+        "surviving nodes should stop listing active service tasks on the failed node"
+    );
 });
 
 local_test!(services_node_drain_blocks_on_standalone_task, {
@@ -5061,6 +5071,28 @@ async fn list_active_service_tasks(
                 .unwrap_or(false)
         })
         .collect()
+}
+
+/// Returns true once every surviving node stops listing active service tasks on the failed node.
+async fn surviving_nodes_observe_no_active_service_tasks_on_node(
+    cluster: &[TestNode],
+    service_name: &str,
+    down_node_id: Uuid,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(100), || async {
+        for node in cluster {
+            if node.id() == down_node_id {
+                continue;
+            }
+            let tasks = list_active_service_tasks(&node.node.workload_manager, service_name).await;
+            if tasks.iter().any(|task| task.node_id == down_node_id) {
+                return false;
+            }
+        }
+        true
+    })
+    .await
 }
 
 /// Lists active tasks for one task template within a service.
