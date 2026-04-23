@@ -315,11 +315,12 @@ impl ServiceController {
             return Ok(());
         }
 
+        let replacement_task_id = Uuid::new_v4();
         if let Some(preferred_node) = preferred_node {
             let request = slot.template.replica_start_request(
                 &spec.service_name,
                 slot.replica,
-                task_id,
+                replacement_task_id,
                 Some(preferred_node),
             );
 
@@ -338,15 +339,45 @@ impl ServiceController {
                             specs.len()
                         );
                     }
-                    self.clear_slot_missing(key).await;
-                    if spec.status() == ServiceStatus::Running {
-                        self.publish_task_traffic_for_cutover(
+                    if spec.status() == ServiceStatus::Running
+                        && let Err(err) = self
+                            .publish_task_traffic_for_cutover(
+                                &spec.service_name,
+                                replacement_task_id,
+                                Duration::from_secs(30),
+                            )
+                            .await
+                    {
+                        self.abort_replacement_task_best_effort(
                             &spec.service_name,
-                            task_id,
-                            Duration::from_secs(30),
+                            replacement_task_id,
+                            "preferred replacement never became traffic-ready",
                         )
-                        .await?;
+                        .await;
+                        return Err(err);
                     }
+                    if let Err(err) = self
+                        .swap_service_slot_task_id_for_cutover(
+                            spec.id,
+                            spec.manifest_id,
+                            &slot.template.name,
+                            slot.replica,
+                            task_id,
+                            replacement_task_id,
+                        )
+                        .await
+                    {
+                        self.abort_replacement_task_best_effort(
+                            &spec.service_name,
+                            replacement_task_id,
+                            "preferred replacement could not claim service slot",
+                        )
+                        .await;
+                        return Err(err);
+                    }
+                    self.clear_slot_missing(key).await;
+                    self.withdraw_and_stop_superseded_task_best_effort(&spec.service_name, task_id)
+                        .await;
                     return Ok(());
                 }
                 Err(err) => {
@@ -372,9 +403,12 @@ impl ServiceController {
             return Ok(());
         }
 
-        let fallback =
-            slot.template
-                .replica_start_request(&spec.service_name, slot.replica, task_id, None);
+        let fallback = slot.template.replica_start_request(
+            &spec.service_name,
+            slot.replica,
+            replacement_task_id,
+            None,
+        );
 
         self.workload_manager
             .start_workloads_batch(vec![fallback])
@@ -392,15 +426,45 @@ impl ServiceController {
             })
             .map_err(|err| anyhow!("fallback placement failed: {err}"))?;
 
-        self.clear_slot_missing(key).await;
-        if spec.status() == ServiceStatus::Running {
-            self.publish_task_traffic_for_cutover(
+        if spec.status() == ServiceStatus::Running
+            && let Err(err) = self
+                .publish_task_traffic_for_cutover(
+                    &spec.service_name,
+                    replacement_task_id,
+                    Duration::from_secs(30),
+                )
+                .await
+        {
+            self.abort_replacement_task_best_effort(
                 &spec.service_name,
-                task_id,
-                Duration::from_secs(30),
+                replacement_task_id,
+                "fallback replacement never became traffic-ready",
             )
-            .await?;
+            .await;
+            return Err(err);
         }
+        if let Err(err) = self
+            .swap_service_slot_task_id_for_cutover(
+                spec.id,
+                spec.manifest_id,
+                &slot.template.name,
+                slot.replica,
+                task_id,
+                replacement_task_id,
+            )
+            .await
+        {
+            self.abort_replacement_task_best_effort(
+                &spec.service_name,
+                replacement_task_id,
+                "fallback replacement could not claim service slot",
+            )
+            .await;
+            return Err(err);
+        }
+        self.clear_slot_missing(key).await;
+        self.withdraw_and_stop_superseded_task_best_effort(&spec.service_name, task_id)
+            .await;
         Ok(())
     }
 
@@ -443,13 +507,13 @@ impl ServiceController {
         Ok(())
     }
 
-    /// Moves a replica to the preferred node using a start-first handoff to avoid downtime.
+    /// Moves a replica to the preferred node using a fresh-identity start-first handoff.
     ///
-    /// The previous stop-then-start workflow could temporarily drop a healthy attachment entry
-    /// when the replacement launch retried due network/readiness lag (for example when a node
-    /// rejoins after being down and service scale changed while it was offline). Starting the
-    /// preferred placement first keeps the slot represented in attachment state throughout the
-    /// transition; stale local containers are then drained by task inventory reconciliation.
+    /// Overlay addressing is derived from task id, so reusing the old task id across old and new
+    /// placements makes both nodes advertise the same IP, MAC, and attachment identity during the
+    /// handoff window. Start the replacement with a new task id, wait for it to become
+    /// traffic-ready, then atomically switch the service slot to the new identity before
+    /// withdrawing and stopping the superseded task.
     async fn move_slot_task(
         &self,
         spec: &ServiceSpecValue,
@@ -458,10 +522,11 @@ impl ServiceController {
         preferred_node: Uuid,
         key: &SlotKey,
     ) -> anyhow::Result<()> {
+        let replacement_task_id = Uuid::new_v4();
         let request = slot.template.replica_start_request(
             &spec.service_name,
             slot.replica,
-            task.id,
+            replacement_task_id,
             Some(preferred_node),
         );
 
@@ -477,8 +542,43 @@ impl ServiceController {
                 )
             })?;
 
-        self.publish_task_traffic_for_cutover(&spec.service_name, task.id, Duration::from_secs(30))
-            .await?;
+        if let Err(err) = self
+            .publish_task_traffic_for_cutover(
+                &spec.service_name,
+                replacement_task_id,
+                Duration::from_secs(30),
+            )
+            .await
+        {
+            self.abort_replacement_task_best_effort(
+                &spec.service_name,
+                replacement_task_id,
+                "rebalance replacement never became traffic-ready",
+            )
+            .await;
+            return Err(err);
+        }
+        if let Err(err) = self
+            .swap_service_slot_task_id_for_cutover(
+                spec.id,
+                spec.manifest_id,
+                &slot.template.name,
+                slot.replica,
+                task.id,
+                replacement_task_id,
+            )
+            .await
+        {
+            self.abort_replacement_task_best_effort(
+                &spec.service_name,
+                replacement_task_id,
+                "rebalance replacement could not claim service slot",
+            )
+            .await;
+            return Err(err);
+        }
+        self.withdraw_and_stop_superseded_task_best_effort(&spec.service_name, task.id)
+            .await;
         self.set_rebalance_cooldown(key).await;
 
         tracing::debug!(
@@ -486,13 +586,67 @@ impl ServiceController {
             service = %spec.service_name,
             template = %slot.template.name,
             replica = slot.replica,
-            task = %task.id,
+            old_task = %task.id,
+            replacement_task = %replacement_task_id,
             previous_node = %task.node_id,
             preferred_node = %preferred_node,
-            "rebalance replacement accepted; previous owner will drain stale local runtime"
+            "rebalance replacement accepted and cut over to a fresh task identity"
         );
 
         Ok(())
+    }
+
+    /// Stops a failed replacement task that never became the desired slot owner.
+    async fn abort_replacement_task_best_effort(
+        &self,
+        service_name: &str,
+        replacement_task_id: Uuid,
+        context: &str,
+    ) {
+        if let Err(err) = self
+            .workload_manager
+            .request_workload_stop(replacement_task_id)
+            .await
+        {
+            tracing::warn!(
+                target: "services",
+                service = %service_name,
+                replacement_task = %replacement_task_id,
+                "{context}; failed to stop superseded replacement: {err:#}"
+            );
+        }
+    }
+
+    /// Withdraws service traffic from the old task and requests stop after cutover succeeds.
+    async fn withdraw_and_stop_superseded_task_best_effort(
+        &self,
+        service_name: &str,
+        superseded_task_id: Uuid,
+    ) {
+        if let Err(err) = self
+            .workload_manager
+            .set_task_traffic_published(superseded_task_id, false)
+            .await
+        {
+            tracing::warn!(
+                target: "services",
+                service = %service_name,
+                task = %superseded_task_id,
+                "failed to withdraw superseded task traffic after cutover: {err:#}"
+            );
+        }
+        if let Err(err) = self
+            .workload_manager
+            .request_workload_stop(superseded_task_id)
+            .await
+        {
+            tracing::warn!(
+                target: "services",
+                service = %service_name,
+                task = %superseded_task_id,
+                "failed to stop superseded task after cutover: {err:#}"
+            );
+        }
     }
 
     /// Claims a local in-flight marker so a slot is not reconciled concurrently.

@@ -1695,10 +1695,25 @@ local_test!(services_node_drain_migrates_singleton_service, {
         Duration::from_secs(20),
         Duration::from_millis(100),
         || async {
+            let Some(service) = cluster[0]
+                .node
+                .service_controller
+                .registry()
+                .get(service_id)
+                .expect("load singleton service during drain")
+            else {
+                return false;
+            };
+            let Some(replacement_task_id) = service.replica_ids.first().copied() else {
+                return false;
+            };
+            if replacement_task_id == task_id {
+                return false;
+            }
             let task = cluster[0]
                 .node
                 .workload_manager
-                .inspect_workload(task_id)
+                .inspect_workload(replacement_task_id)
                 .await
                 .ok();
             let local_drained = list_local_active_service_tasks(
@@ -1726,6 +1741,22 @@ local_test!(services_node_drain_migrates_singleton_service, {
         )
         .await,
         "singleton service should recover to running after drain migration"
+    );
+
+    let migrated_service = cluster[0]
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("load migrated singleton service")
+        .expect("migrated singleton service should exist");
+    let replacement_task_id = *migrated_service
+        .replica_ids
+        .first()
+        .expect("singleton service should still own one replica id after drain");
+    assert_ne!(
+        replacement_task_id, task_id,
+        "singleton drain should cut over to a fresh task identity instead of reusing the old one"
     );
 });
 
@@ -1866,39 +1897,51 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
         )
         .await
         .expect("cluster should mark failed node as down");
+    let baseline_spec = cluster[0]
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("load baseline service before node-down reschedule")
+        .expect("baseline service should exist");
+    let baseline_ids: BTreeSet<Uuid> = baseline_spec.replica_ids.iter().copied().collect();
 
     let rescheduled = wait_until(
         Duration::from_secs(30),
         Duration::from_millis(100),
         || async {
-            for node in &cluster[..2] {
-                let tasks =
-                    list_active_service_tasks(&node.node.workload_manager, service_name).await;
-                if tasks.len() != 3
-                    || tasks.iter().any(|task| {
-                        task.node_id == down_node_id || task.state != WorkloadPhase::Running
-                    })
-                {
+            let Some(current) = cluster[0]
+                .node
+                .service_controller
+                .registry()
+                .get(service_id)
+                .expect("load rescheduled service")
+            else {
+                return false;
+            };
+            if current.status() != ServiceStatus::Running || current.replica_ids.len() != 3 {
+                return false;
+            }
+
+            let mut saw_replacement = false;
+            for task_id in &current.replica_ids {
+                let Ok(task) = cluster[0]
+                    .node
+                    .workload_manager
+                    .inspect_workload(*task_id)
+                    .await
+                else {
                     return false;
+                };
+                if task.node_id == down_node_id || task.state != WorkloadPhase::Running {
+                    return false;
+                }
+                if !baseline_ids.contains(task_id) {
+                    saw_replacement = true;
                 }
             }
 
-            let local_tasks_left = list_local_active_service_tasks(
-                &cluster[0].node.workload_manager,
-                service_name,
-                cluster[0].id(),
-            )
-            .await
-            .len();
-            let local_tasks_right = list_local_active_service_tasks(
-                &cluster[1].node.workload_manager,
-                service_name,
-                cluster[1].id(),
-            )
-            .await
-            .len();
-
-            local_tasks_left + local_tasks_right == 3
+            saw_replacement
         },
     )
     .await;
@@ -2031,10 +2074,25 @@ local_test!(
             Duration::from_secs(20),
             Duration::from_millis(100),
             || async {
+                let Some(service) = cluster[0]
+                    .node
+                    .service_controller
+                    .registry()
+                    .get(service_id)
+                    .expect("load deploying service during drain")
+                else {
+                    return false;
+                };
+                let Some(replacement_task_id) = service.replica_ids.first().copied() else {
+                    return false;
+                };
+                if replacement_task_id == task_id {
+                    return false;
+                }
                 let task = cluster[0]
                     .node
                     .workload_manager
-                    .inspect_workload(task_id)
+                    .inspect_workload(replacement_task_id)
                     .await
                     .ok();
                 let local_drained = list_local_active_service_tasks(
@@ -2609,7 +2667,6 @@ local_test!(
                     .await;
             panic!("networked service should publish visible attachments before split: {details}");
         }
-
         let source_view = current_cluster_view(&left_a.topology()).await;
         let mut split_req = left_a.topology().split_cluster_request();
         {
@@ -2693,6 +2750,22 @@ local_test!(
             "cluster should reconnect all nodes after merge",
         )
         .await;
+        let publication_preserved = visible_service_attachment_presence_refs(
+            &all_nodes,
+            service_name,
+            network_id,
+            1,
+            Duration::from_secs(12),
+        )
+        .await;
+        if !publication_preserved {
+            let details =
+                collect_service_attachment_publication_debug(&all_nodes, service_name, network_id)
+                    .await;
+            panic!(
+                "merge should keep at least one visible published backend per node while rebalancing: {details}"
+            );
+        }
 
         assert!(
             wait_for_min_local_service_task_count(
@@ -4786,6 +4859,29 @@ async fn wait_for_visible_service_attachments_published_refs(
     false
 }
 
+/// Returns true when every node keeps at least `min_visible` published service attachments
+/// visible for the full observation window.
+async fn visible_service_attachment_presence_refs(
+    nodes: &[&TestNode],
+    service_name: &str,
+    network_id: Uuid,
+    min_visible: usize,
+    window: Duration,
+) -> bool {
+    let deadline = Instant::now() + window;
+    while Instant::now() < deadline {
+        for node in nodes {
+            let visible =
+                count_visible_published_service_attachments(node, service_name, network_id).await;
+            if visible < min_visible {
+                return false;
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    true
+}
+
 /// Collects one node snapshot once every visible service task is running with a published attachment.
 async fn collect_published_service_attachment_snapshot(
     node: &TestNode,
@@ -4831,6 +4927,37 @@ async fn collect_published_service_attachment_snapshot(
     }
 
     Some(snapshot)
+}
+
+/// Counts visible running service tasks that currently have ready, published attachments.
+async fn count_visible_published_service_attachments(
+    node: &TestNode,
+    service_name: &str,
+    network_id: Uuid,
+) -> usize {
+    let tasks = list_active_service_tasks(&node.node.workload_manager, service_name).await;
+    let attachments = node
+        .node
+        .network_registry
+        .list_attachments(Some(network_id))
+        .unwrap_or_default();
+
+    let mut by_task = HashMap::with_capacity(attachments.len());
+    for attachment in attachments {
+        by_task.entry(attachment.task_id).or_insert(attachment);
+    }
+
+    tasks
+        .into_iter()
+        .filter(|task| matches!(task.state, WorkloadPhase::Running))
+        .filter(|task| {
+            by_task.get(&task.id).is_some_and(|attachment| {
+                attachment.node_id == task.node_id
+                    && attachment.state == NetworkAttachmentState::Ready
+                    && attachment.traffic_published
+            })
+        })
+        .count()
 }
 
 /// Collects one per-node debug snapshot for attachment publication assertions.

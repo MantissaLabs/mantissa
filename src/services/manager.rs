@@ -1876,8 +1876,7 @@ impl ServiceController {
         task_id: Uuid,
         timeout: Duration,
     ) -> anyhow::Result<()> {
-        self.workload_manager
-            .publish_task_traffic_when_attachment_rows_exist(task_id, timeout)
+        self.wait_for_task_cutover_ready(service_name, task_id, timeout)
             .await
             .map_err(|err| {
                 anyhow!(
@@ -1886,6 +1885,138 @@ impl ServiceController {
                     service_name
                 )
             })
+    }
+
+    /// Waits until one replacement task is both running and traffic-ready before cutover.
+    ///
+    /// Start-first service handoff must not swap slot ownership to a replacement until the new
+    /// runtime has actually reached `Running` and every local attachment is ready to publish
+    /// service traffic. Otherwise the service can momentarily point at a replica that still has
+    /// attachment rows but cannot carry overlay traffic yet.
+    async fn wait_for_task_cutover_ready(
+        &self,
+        service_name: &str,
+        task_id: Uuid,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "timed out waiting for replacement task {} in service '{}' to become traffic-ready",
+                    task_id,
+                    service_name
+                ));
+            }
+
+            let state = self
+                .workload_manager
+                .workload_phase_snapshot(&[task_id])
+                .await?
+                .first()
+                .and_then(|(_, state)| state.as_ref())
+                .cloned();
+
+            match state {
+                Some(WorkloadPhase::Running) => {
+                    if self
+                        .workload_manager
+                        .ensure_task_service_traffic_ready(task_id)
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                }
+                Some(WorkloadPhase::Pending)
+                | Some(WorkloadPhase::Pulling)
+                | Some(WorkloadPhase::Creating)
+                | Some(WorkloadPhase::Unknown)
+                | None => {}
+                Some(other) => {
+                    return Err(anyhow!(
+                        "replacement task {} for service '{}' entered non-routable state {:?} before cutover",
+                        task_id,
+                        service_name,
+                        other
+                    ));
+                }
+            }
+
+            sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+        }
+    }
+
+    /// Replaces one service slot's desired task id after a fresh replacement is ready.
+    ///
+    /// Service slot identity is positional inside `replica_ids`, so start-first handoff must
+    /// update exactly one slot once the replacement task is ready instead of reusing the
+    /// previous task id across multiple placements.
+    async fn swap_service_slot_task_id_for_cutover(
+        &self,
+        service_id: Uuid,
+        manifest_id: Uuid,
+        template_name: &str,
+        replica: u16,
+        previous_task_id: Uuid,
+        replacement_task_id: Uuid,
+    ) -> anyhow::Result<()> {
+        let Some(mut current) = self.registry.get(service_id)? else {
+            return Err(anyhow!(
+                "service {} disappeared before slot '{}' replica {} could cut over to {}",
+                service_id,
+                template_name,
+                replica,
+                replacement_task_id
+            ));
+        };
+        if current.manifest_id != manifest_id {
+            return Err(anyhow!(
+                "service '{}' advanced to manifest {} before slot '{}' replica {} could cut over",
+                current.service_name,
+                current.manifest_id,
+                template_name,
+                replica
+            ));
+        }
+
+        let Some(slot_index) = service_slot_index(&current, template_name, replica) else {
+            return Err(anyhow!(
+                "service '{}' no longer declares slot '{}' replica {} during cutover",
+                current.service_name,
+                template_name,
+                replica
+            ));
+        };
+
+        let Some(current_task_id) = current.replica_ids.get(slot_index).copied() else {
+            return Err(anyhow!(
+                "service '{}' slot '{}' replica {} lost its desired task id during cutover",
+                current.service_name,
+                template_name,
+                replica
+            ));
+        };
+
+        if current_task_id == replacement_task_id {
+            return Ok(());
+        }
+        if current_task_id != previous_task_id {
+            return Err(anyhow!(
+                "service '{}' slot '{}' replica {} points at {} instead of expected {} during cutover",
+                current.service_name,
+                template_name,
+                replica,
+                current_task_id,
+                previous_task_id
+            ));
+        }
+
+        current.replica_ids[slot_index] = replacement_task_id;
+        current.phase_version = current.phase_version.saturating_add(1);
+        current.touch();
+        self.apply_upsert(current.clone()).await?;
+        self.broadcast(ServiceEvent::Upsert(current)).await?;
+        Ok(())
     }
 
     /// Best-effort steady-state publication for a running desired task.
@@ -2098,6 +2229,24 @@ impl ServiceReplicaSnapshot<'_> {
         }
         task_ids
     }
+}
+
+/// Resolves the positional replica-slot index stored in `ServiceSpecValue::replica_ids`.
+///
+/// Service slots are flattened in template order and then replica order. Slot handoff updates
+/// need the exact index for one `(template, replica)` pair so the controller can replace only
+/// the desired slot without disturbing the rest of the service assignment vector.
+fn service_slot_index(spec: &ServiceSpecValue, template_name: &str, replica: u16) -> Option<usize> {
+    let mut cursor = 0usize;
+    for template in &spec.task_templates {
+        for current_replica in 1..=template.replicas {
+            if template.name == template_name && current_replica == replica {
+                return Some(cursor);
+            }
+            cursor = cursor.saturating_add(1);
+        }
+    }
+    None
 }
 
 /// Returns true if a task state should be treated as a healthy, in-flight replica.

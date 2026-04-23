@@ -208,7 +208,7 @@ mod platform {
         ) -> Result<ProgramHandle>;
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
     struct DesiredAttachment {
         attach_point: BpfAttachPoint,
         name: String,
@@ -258,11 +258,7 @@ mod platform {
             let mut attachments: Vec<_> = self
                 .programs
                 .iter()
-                .map(|program| DesiredAttachment {
-                    attach_point: program.spec.attach_point(),
-                    name: program.spec.name.clone(),
-                    interface: target_interface(program.target.as_ref()).to_string(),
-                })
+                .map(desired_attachment_for_loaded_program)
                 .collect();
             attachments.sort();
             attachments
@@ -348,7 +344,13 @@ mod platform {
                 return Ok(true);
             };
 
-            if !existing.matches(&canonical_desired, lb_family) {
+            if !existing.matches(&canonical_desired, lb_family)
+                && !can_incrementally_reconcile_loaded_network(
+                    existing,
+                    &canonical_desired,
+                    lb_family,
+                )
+            {
                 return Ok(true);
             }
 
@@ -387,12 +389,12 @@ mod platform {
             let desired = desired_attachments(programs, interfaces);
             let mut canonical_desired = desired.clone();
             canonical_desired.sort();
+            let map_pin_path = Self::map_pin_path(network_id);
             {
                 let guard = self.loaded.lock().await;
                 if let Some(existing) = guard.get(&network_id)
                     && existing.matches(&canonical_desired, lb_family)
                 {
-                    let map_pin_path = Self::map_pin_path(network_id);
                     if let Some(family) = lb_family
                         && !lb_maps_present(&map_pin_path, family)
                     {
@@ -412,25 +414,86 @@ mod platform {
             }
 
             let mut guard = self.loaded.lock().await;
-            let previous = guard.remove(&network_id);
-            drop(guard);
+            if let Some(mut existing) = guard.remove(&network_id) {
+                let can_reconcile_incrementally = can_incrementally_reconcile_loaded_network(
+                    &existing,
+                    &canonical_desired,
+                    lb_family,
+                );
+                let maps_available = lb_family
+                    .map(|family| lb_maps_present(&map_pin_path, family))
+                    .unwrap_or(true);
+                if can_reconcile_incrementally && maps_available {
+                    drop(guard);
+                    match self
+                        .reconcile_incremental_tc_attachments(
+                            network,
+                            programs,
+                            &desired,
+                            &map_pin_path,
+                            &mut existing,
+                            lb_family,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            let mut guard = self.loaded.lock().await;
+                            guard.insert(network_id, existing);
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            warn!(
+                                target: "network",
+                                network = %network_id,
+                                "incremental task-attachment bpf reconcile failed; falling back to full reload: {err:#}"
+                            );
+                            if let Err(teardown_err) = existing.teardown() {
+                                warn!(
+                                    target: "network",
+                                    network = %network_id,
+                                    "failed to detach partially reconciled bpf programs before full reload: {teardown_err:#}"
+                                );
+                            }
+                            if let Err(remove_err) = Self::remove_map_pin_dir(network_id) {
+                                warn!(
+                                    target: "network",
+                                    network = %network_id,
+                                    "failed to clear bpf map directory after incremental reconcile fallback: {remove_err:#}"
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    drop(guard);
+                    if let Some(family) = lb_family
+                        && !maps_available
+                    {
+                        warn!(
+                            target: "network",
+                            network = %network_id,
+                            "load balancer maps missing before attachment reconcile; forcing full reload for {:?}",
+                            family
+                        );
+                    }
+                    if let Err(err) = existing.teardown() {
+                        warn!(
+                            target: "network",
+                            network = %network_id,
+                            "failed to detach existing bpf programs before reattach: {err:#}"
+                        );
+                    }
+                    if let Err(err) = Self::remove_map_pin_dir(network_id) {
+                        warn!(
+                            target: "network",
+                            network = %network_id,
+                            "failed to clear stale bpf map directory before reattach: {err:#}"
+                        );
+                    }
+                }
+            } else {
+                drop(guard);
+            }
 
-            if let Some(existing) = previous
-                && let Err(err) = existing.teardown()
-            {
-                warn!(
-                    target: "network",
-                    network = %network_id,
-                    "failed to detach existing bpf programs before reattach: {err:#}"
-                );
-            }
-            if let Err(err) = Self::remove_map_pin_dir(network_id) {
-                warn!(
-                    target: "network",
-                    network = %network_id,
-                    "failed to clear stale bpf map directory before reattach: {err:#}"
-                );
-            }
             let map_pin_path = Self::map_pin_dir(network_id)?;
 
             self.clear_stale_xdp_targets(programs, interfaces);
@@ -671,6 +734,145 @@ mod platform {
                 }
             }
         }
+
+        /// Reconciles task-attachment bridge tc programs without tearing down the whole dataplane.
+        ///
+        /// Local `mnth-*` interfaces appear and disappear whenever service replicas move. Those
+        /// changes should only add or drop the corresponding bridge tc attachments; they must not
+        /// force a full bridge and map reload that interrupts unrelated VIP traffic on the node.
+        async fn reconcile_incremental_tc_attachments(
+            &self,
+            network: &NetworkSpecValue,
+            programs: &[BpfProgramSpec],
+            desired: &[DesiredAttachment],
+            map_pin_path: &Path,
+            loaded_network: &mut LoadedNetwork,
+            lb_family: Option<OverlayIpFamily>,
+        ) -> Result<()> {
+            let desired_set: HashSet<_> = desired.iter().cloned().collect();
+            let current_set: HashSet<_> = loaded_network.canonical_specs().into_iter().collect();
+            let additions: Vec<_> = desired_set.difference(&current_set).cloned().collect();
+            let removals: HashSet<_> = current_set.difference(&desired_set).cloned().collect();
+
+            if removals.is_empty() && additions.is_empty() {
+                if let Some(family) = lb_family {
+                    program_overlay_runtime_map(network, map_pin_path, family)
+                        .context("refresh overlay runtime config")?;
+                }
+                return Ok(());
+            }
+
+            let mut retained = Vec::with_capacity(loaded_network.programs.len());
+            for mut program in loaded_network.programs.drain(..) {
+                let desired_program = desired_attachment_for_loaded_program(&program);
+                if removals.contains(&desired_program) {
+                    let interface = target_interface(program.target.as_ref()).to_string();
+                    if interface_exists(&interface) {
+                        program.handle.detach().with_context(|| {
+                            format!(
+                                "detach incremental tc program '{}' from {}",
+                                program.spec.name, interface
+                            )
+                        })?;
+                    }
+                } else {
+                    retained.push(program);
+                }
+            }
+            loaded_network.programs = retained;
+
+            let mut attached_programs = Vec::new();
+            for desired_attachment in additions {
+                let spec = programs
+                    .iter()
+                    .find(|program| {
+                        program.attach_point() == desired_attachment.attach_point
+                            && program.name == desired_attachment.name
+                    })
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "missing bpf spec '{}' for incremental attach point {:?}",
+                            desired_attachment.name,
+                            desired_attachment.attach_point
+                        )
+                    })?;
+                let artifact = self
+                    .resolver
+                    .resolve(spec, network)
+                    .with_context(|| format!("resolve artifact for program '{}'", spec))?;
+                let attach_target = desired_target(&desired_attachment);
+                let program_lb_family = program_load_balancer_family(spec, lb_family);
+
+                info!(
+                    target: "network",
+                    network = %network.id,
+                    program = %spec,
+                    attach_point = %spec.attach_point(),
+                    interface = %desired_attachment.interface,
+                    artifact = %artifact.display(),
+                    "incrementally attaching bpf program"
+                );
+
+                let handle = load_with_retry(
+                    &*self.loader,
+                    spec,
+                    attach_target,
+                    &artifact,
+                    map_pin_path,
+                    program_lb_family,
+                )?;
+
+                attached_programs.push(LoadedProgram {
+                    spec: spec.clone(),
+                    target: own_target(attach_target),
+                    _artifact: artifact,
+                    handle,
+                });
+            }
+
+            loaded_network.programs.extend(attached_programs);
+
+            if let Some(family) = lb_family {
+                program_overlay_runtime_map(network, map_pin_path, family)
+                    .context("refresh overlay runtime config")?;
+            }
+
+            Ok(())
+        }
+    }
+
+    fn desired_attachment_for_loaded_program(program: &LoadedProgram) -> DesiredAttachment {
+        DesiredAttachment {
+            attach_point: program.spec.attach_point(),
+            name: program.spec.name.clone(),
+            interface: target_interface(program.target.as_ref()).to_string(),
+        }
+    }
+
+    fn can_incrementally_reconcile_loaded_network(
+        existing: &LoadedNetwork,
+        desired: &[DesiredAttachment],
+        lb_family: Option<OverlayIpFamily>,
+    ) -> bool {
+        if existing.lb_family != lb_family {
+            return false;
+        }
+
+        let current: HashSet<_> = existing.canonical_specs().into_iter().collect();
+        let desired: HashSet<_> = desired.iter().cloned().collect();
+        let removed = current.difference(&desired);
+        let added = desired.difference(&current);
+
+        removed
+            .chain(added)
+            .all(is_incremental_task_attachment_delta)
+    }
+
+    fn is_incremental_task_attachment_delta(attachment: &DesiredAttachment) -> bool {
+        matches!(
+            attachment.attach_point,
+            BpfAttachPoint::BridgeTcIngress | BpfAttachPoint::BridgeTcEgress
+        ) && attachment.interface.starts_with("mnth-")
     }
 
     #[derive(Clone)]
@@ -2142,6 +2344,78 @@ mod platform {
             manager.ensure_network(&spec, &ctx).await?;
             manager.teardown_network(&ctx).await?;
             Ok(())
+        }
+
+        #[test]
+        fn task_attachment_delta_can_be_reconciled_incrementally() {
+            let mut loaded = LoadedNetwork::new(Some(OverlayIpFamily::Ipv4));
+            loaded.push(LoadedProgram {
+                spec: BpfProgramSpec::with_attach_point(
+                    "bridge_tc_ingress",
+                    BpfAttachPoint::BridgeTcIngress,
+                ),
+                target: OwnedAttachTarget::Tc {
+                    interface: "lo".to_string(),
+                    attach_type: TcAttachType::Ingress,
+                },
+                _artifact: PathBuf::new(),
+                handle: Box::new(NoopHandle),
+            });
+            loaded.push(LoadedProgram {
+                spec: BpfProgramSpec::with_attach_point(
+                    "bridge_tc_ingress",
+                    BpfAttachPoint::BridgeTcIngress,
+                ),
+                target: OwnedAttachTarget::Tc {
+                    interface: "mnth-stale".to_string(),
+                    attach_type: TcAttachType::Ingress,
+                },
+                _artifact: PathBuf::new(),
+                handle: Box::new(NoopHandle),
+            });
+
+            let desired = vec![DesiredAttachment {
+                attach_point: BpfAttachPoint::BridgeTcIngress,
+                name: "bridge_tc_ingress".to_string(),
+                interface: "lo".to_string(),
+            }];
+
+            assert!(
+                can_incrementally_reconcile_loaded_network(
+                    &loaded,
+                    &desired,
+                    Some(OverlayIpFamily::Ipv4)
+                ),
+                "dropping one stale mnth-* tc attachment should stay incremental"
+            );
+        }
+
+        #[test]
+        fn non_task_attachment_delta_requires_full_reload() {
+            let mut loaded = LoadedNetwork::new(Some(OverlayIpFamily::Ipv4));
+            loaded.push(LoadedProgram {
+                spec: BpfProgramSpec::with_attach_point(
+                    "bridge_tc_ingress",
+                    BpfAttachPoint::BridgeTcIngress,
+                ),
+                target: OwnedAttachTarget::Tc {
+                    interface: "mnhp-demo".to_string(),
+                    attach_type: TcAttachType::Ingress,
+                },
+                _artifact: PathBuf::new(),
+                handle: Box::new(NoopHandle),
+            });
+
+            let desired = Vec::new();
+
+            assert!(
+                !can_incrementally_reconcile_loaded_network(
+                    &loaded,
+                    &desired,
+                    Some(OverlayIpFamily::Ipv4)
+                ),
+                "fixed bridge-facing ports should still require a full reload when they change"
+            );
         }
 
         #[test]
