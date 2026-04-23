@@ -3,6 +3,10 @@ use async_trait::async_trait;
 use std::net::IpAddr;
 use uuid::Uuid;
 
+pub(crate) use crate::network::naming::{
+    bridge_name, host_access_host_iface_name, host_access_peer_iface_name, host_iface_name,
+    instance_iface_name, vxlan_name,
+};
 use crate::runtime::types::RuntimeAttachmentTarget;
 
 #[cfg(target_os = "linux")]
@@ -155,45 +159,4 @@ impl AttachmentProvisionerApi for AttachmentProvisioner {
     async fn list_remote_fdb(&self, _vxlan_name: &str) -> Result<Vec<(String, IpAddr)>> {
         Ok(Vec::new())
     }
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn host_iface_name(attachment_id: Uuid) -> String {
-    format!("mnth-{}", short_id(attachment_id))
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn instance_iface_name(attachment_id: Uuid) -> String {
-    format!("mntc-{}", short_id(attachment_id))
-}
-
-pub(crate) fn bridge_name(network_id: Uuid) -> String {
-    format!("mnt-br-{}", short_id(network_id))
-}
-
-/// Compute the deterministic host-access interface name for an overlay network.
-///
-/// Mantissa wires a per-network veth pair into the overlay bridge so host-originated traffic can
-/// traverse the same tc-ingress eBPF dataplane as containers (VIP ARP + DNAT).
-pub(crate) fn host_access_host_iface_name(network_id: Uuid) -> String {
-    format!("mnhost-{}", short_id(network_id))
-}
-
-/// Compute the deterministic bridge-peer interface name for the host-access veth pair.
-///
-/// The peer is enslaved to the overlay bridge so frames from the host side enter as bridge-port
-/// ingress traffic.
-pub(crate) fn host_access_peer_iface_name(network_id: Uuid) -> String {
-    format!("mnhp-{}", short_id(network_id))
-}
-
-/// Compute the deterministic VXLAN device name for an overlay network so dataplane helpers can
-/// target the correct interface.
-pub(crate) fn vxlan_name(network_id: Uuid) -> String {
-    format!("mvx-{}", short_id(network_id))
-}
-
-fn short_id(id: Uuid) -> String {
-    let hex = id.simple().to_string();
-    hex.chars().take(8).collect()
 }

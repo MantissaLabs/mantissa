@@ -1,3 +1,4 @@
+pub(crate) mod addressing;
 pub mod allocator;
 pub mod attachment;
 pub mod bpf;
@@ -6,6 +7,7 @@ pub mod discovery;
 pub mod events;
 pub mod gossip;
 pub mod lb;
+pub(crate) mod naming;
 pub mod nodeport;
 pub mod registry;
 pub mod service;

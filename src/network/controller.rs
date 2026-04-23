@@ -5,6 +5,9 @@ use crate::network::attachment::{PlatformAttachmentProvisioner, host_iface_name}
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext, overlay_bpf_program_specs};
 use crate::network::discovery::ServiceDiscovery;
 use crate::network::events::ForwardingEvent;
+use crate::network::naming::{
+    collect_orphaned_network_suffixes, is_managed_overlay_link_name, managed_interface_suffix,
+};
 use crate::network::nodeport::NodePortManager;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
@@ -19,8 +22,7 @@ use anyhow::{Context, Result};
 use async_channel::Sender;
 #[cfg(target_os = "linux")]
 use aya::{programs::ProgramError, sys::SyscallError};
-use blake3::Hasher;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -74,22 +76,6 @@ struct NetworkControllerInner {
     attachment_sync_notify: Option<Arc<Notify>>,
     wake: Notify,
     gossip_tx: Sender<Message>,
-}
-
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-#[derive(Clone, Debug)]
-struct NetworkPlan {
-    network_id: Uuid,
-    vxlan_name: String,
-    bridge_name: String,
-    vni: u32,
-    mtu: u32,
-    resolver_ip: Option<IpAddr>,
-    subnet_prefix: Option<u8>,
-    underlay_iface: Option<String>,
-    underlay_ip: Option<IpAddr>,
-    /// Deterministic host-access MAC used for static FDB programming when resolver networking is enabled.
-    host_access_mac: Option<[u8; 6]>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1243,7 +1229,7 @@ impl NetworkController {
             None
         };
 
-        let suffix = short_id(spec.id);
+        let suffix = managed_interface_suffix(spec.id);
         let plan = NetworkPlan {
             network_id: spec.id,
             vxlan_name: format!("mvx-{suffix}"),
@@ -1763,228 +1749,9 @@ impl NetworkController {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::{
-        NetworkController, collect_orphaned_network_suffixes, is_managed_overlay_link_name,
-    };
-    use anyhow::Context;
-    use aya::{programs::ProgramError, sys::SyscallError};
-    use std::collections::HashSet;
-    use uuid::Uuid;
-
-    fn make_syscall_error(errno: i32) -> SyscallError {
-        SyscallError {
-            call: "bpf_link_create",
-            io_error: std::io::Error::from_raw_os_error(errno),
-        }
-    }
-
-    #[test]
-    fn detects_syscall_conflict_directly() {
-        let err = Err::<(), _>(make_syscall_error(libc::EEXIST))
-            .context("attach xdp")
-            .unwrap_err();
-        assert!(
-            NetworkController::is_bpf_link_conflict(&err),
-            "expected syscall conflict to be detected"
-        );
-    }
-
-    #[test]
-    fn detects_syscall_conflict_wrapped_in_program_error() {
-        let program_err: ProgramError = make_syscall_error(libc::EEXIST).into();
-        let err = Err::<(), _>(program_err).context("attach xdp").unwrap_err();
-        assert!(
-            NetworkController::is_bpf_link_conflict(&err),
-            "expected program error conflict to be detected"
-        );
-    }
-
-    #[test]
-    fn detects_xdp_busy_conflict_directly() {
-        let err = Err::<(), _>(make_syscall_error(libc::EBUSY))
-            .context("attach xdp")
-            .unwrap_err();
-        assert!(
-            NetworkController::is_bpf_link_conflict(&err),
-            "expected xdp busy conflict to be detected"
-        );
-    }
-
-    #[test]
-    fn detects_xdp_busy_conflict_wrapped_in_program_error() {
-        let program_err: ProgramError = make_syscall_error(libc::EBUSY).into();
-        let err = Err::<(), _>(program_err).context("attach xdp").unwrap_err();
-        assert!(
-            NetworkController::is_bpf_link_conflict(&err),
-            "expected wrapped xdp busy conflict to be detected"
-        );
-    }
-
-    #[test]
-    fn collects_only_orphaned_managed_network_suffixes() {
-        let live =
-            Uuid::parse_str("21523dac-bdaa-6cf5-359f-57139c6464a8").expect("valid live network id");
-        let desired = HashSet::from([live]);
-        let suffixes = collect_orphaned_network_suffixes(
-            &desired,
-            [
-                "mnhost-21523dac",
-                "mnhp-21523dac",
-                "mvx-21523dac",
-                "mnt-br-21523dac",
-                "mnhost-b3d339cd",
-                "mnt-br-b3d339cd",
-                "mvx-b3d339cd",
-                "mnhp-b3d339cd",
-                "docker0",
-                "mnhost-nothexzz",
-            ],
-        );
-
-        assert_eq!(
-            suffixes,
-            vec!["b3d339cd".to_string()],
-            "only managed suffixes that are absent from desired network ids should be collected"
-        );
-    }
-
-    #[test]
-    fn identifies_all_managed_overlay_link_names() {
-        assert!(is_managed_overlay_link_name("mvx-21523dac"));
-        assert!(is_managed_overlay_link_name("mnt-br-21523dac"));
-        assert!(is_managed_overlay_link_name("mnhost-21523dac"));
-        assert!(is_managed_overlay_link_name("mnhp-21523dac"));
-        assert!(is_managed_overlay_link_name("mnth-21523dac"));
-        assert!(is_managed_overlay_link_name("mntc-21523dac"));
-        assert!(!is_managed_overlay_link_name("eth0"));
-        assert!(!is_managed_overlay_link_name("docker0"));
-    }
-}
-
-impl NetworkPlan {
-    fn from_id(network_id: Uuid) -> Self {
-        let suffix = short_id(network_id);
-        Self {
-            network_id,
-            vxlan_name: format!("mvx-{suffix}"),
-            bridge_name: format!("mnt-br-{suffix}"),
-            vni: compute_deterministic_vni(network_id),
-            mtu: DEFAULT_MTU,
-            resolver_ip: None,
-            subnet_prefix: None,
-            underlay_iface: None,
-            underlay_ip: None,
-            host_access_mac: None,
-        }
-    }
-}
-
-impl From<&NetworkPlan> for NetworkInterfaceContext {
-    fn from(plan: &NetworkPlan) -> Self {
-        NetworkInterfaceContext::new(
-            plan.network_id,
-            plan.bridge_name.clone(),
-            plan.vxlan_name.clone(),
-        )
-    }
-}
-
-fn short_id(id: Uuid) -> String {
-    let hex = id.simple().to_string();
-    hex.chars().take(8).collect()
-}
-
-/// Returns the managed overlay interface suffix when a link name belongs to Mantissa networking.
-///
-/// Mantissa names every per-network interface from the first eight hex digits of the network id.
-/// This lets the controller detect leaked links from crashed runs and compare them against the
-/// currently replicated network set without storing extra local metadata.
-fn managed_network_interface_suffix(link_name: &str) -> Option<&str> {
-    const PREFIXES: [&str; 4] = ["mvx-", "mnt-br-", "mnhost-", "mnhp-"];
-
-    let suffix = PREFIXES
-        .into_iter()
-        .find_map(|prefix| link_name.strip_prefix(prefix))?;
-    if suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        Some(suffix)
-    } else {
-        None
-    }
-}
-
-/// Returns whether a host link name belongs to Mantissa-managed overlay plumbing.
-///
-/// Underlay detection must ignore the controller's own bridge, VXLAN, host-access, and task
-/// attachment devices or it can accidentally bootstrap a new network from another overlay
-/// network's transient local MTU and addressing state.
-fn is_managed_overlay_link_name(link_name: &str) -> bool {
-    managed_network_interface_suffix(link_name).is_some()
-        || link_name.starts_with("mnth-")
-        || link_name.starts_with("mntc-")
-}
-
-/// Collect the leaked per-network interface suffixes that do not correspond to any live network.
-///
-/// The controller uses this before reconciling active networks so orphaned host-access links from
-/// earlier crashes cannot leave duplicate connected routes that hijack host-originated health
-/// probes and embedded DNS traffic.
-fn collect_orphaned_network_suffixes<I, S>(desired: &HashSet<Uuid>, link_names: I) -> Vec<String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let desired_suffixes: HashSet<String> = desired.iter().map(|id| short_id(*id)).collect();
-    let mut orphaned: BTreeSet<String> = BTreeSet::new();
-
-    for link_name in link_names {
-        let Some(suffix) = managed_network_interface_suffix(link_name.as_ref()) else {
-            continue;
-        };
-        if desired_suffixes.contains(suffix) {
-            continue;
-        }
-        orphaned.insert(suffix.to_string());
-    }
-
-    orphaned.into_iter().collect()
-}
-
-fn compute_deterministic_vni(network_id: Uuid) -> u32 {
-    let bytes = network_id.as_u128();
-    let vni = (bytes & 0x00FF_FFFF) as u32;
-    // Reserved VNIs are 0 and 16777215; clamp to safe range.
-    let vni = if vni == 0 { 1 } else { vni };
-    // VXLAN VNI is 24 bits; ensure we stay in range.
-    vni & 0x00FF_FFFF
-}
-
-/// Derive a stable host-access MAC for a node/network pair so peers can program static FDB entries.
-///
-/// The MAC is locally administered and unicast, avoiding conflicts with hardware addresses while
-/// providing a deterministic value for control-plane reconciliation.
-fn host_access_mac(network_id: Uuid, node_id: Uuid) -> [u8; 6] {
-    let digest = {
-        let mut hasher = Hasher::new();
-        hasher.update(network_id.as_bytes());
-        hasher.update(node_id.as_bytes());
-        hasher.update(b"host-access-mac");
-        hasher.finalize()
-    };
-
-    let mut mac = [0u8; 6];
-    mac[0] = 0x02;
-    mac[1..].copy_from_slice(&digest.as_bytes()[0..5]);
-    mac
-}
-
-/// Format a MAC address as a lowercase, colon-delimited string for netlink programming.
-fn format_mac(mac: [u8; 6]) -> String {
-    format!(
-        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-    )
-}
-
+mod plan;
 mod platform;
+#[cfg(all(test, target_os = "linux"))]
+mod tests;
+
+use self::plan::{NetworkPlan, compute_deterministic_vni, format_mac, host_access_mac};

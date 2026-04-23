@@ -7,6 +7,7 @@ mod linux {
     };
     use crate::config;
     use crate::ip_family::DefaultIpFamilyPolicy;
+    use crate::network::addressing::resolve_advertise_ip;
     use crate::network::attachment::{host_access_host_iface_name, host_access_peer_iface_name};
     use crate::network::wireguard::MANTISSA_WIREGUARD_IFNAME;
     use anyhow::{Context, Result, anyhow};
@@ -28,7 +29,7 @@ mod linux {
     };
     use std::fs;
     use std::mem;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::process::Command;
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
@@ -62,17 +63,6 @@ mod linux {
             IpAddr::V4(_) => AddressFamily::Inet,
             IpAddr::V6(_) => AddressFamily::Inet6,
         }
-    }
-
-    /// Resolve one configured advertise socket string into its current IP address.
-    ///
-    /// The underlay selector uses this to anchor VXLAN creation to the same local interface the
-    /// node advertises to peers whenever the configured advertise address belongs to this host.
-    fn resolve_advertise_ip(addr: &str) -> Option<IpAddr> {
-        addr.to_socket_addrs()
-            .ok()?
-            .next()
-            .map(|socket| socket.ip())
     }
 
     /// Return the VXLAN encapsulation overhead required by one underlay IP family.

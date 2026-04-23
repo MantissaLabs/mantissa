@@ -1,4 +1,5 @@
 use super::*;
+use crate::network::bpf::overlay_bpf_program_specs;
 
 /// Persist the latest public-endpoint outcome back into the replicated service rows.
 ///
@@ -337,7 +338,7 @@ async fn heal_lb_maps(
     };
     let mut attach_spec = spec.clone();
     if attach_spec.bpf_programs.is_empty() {
-        attach_spec.bpf_programs = default_bpf_programs();
+        attach_spec.bpf_programs = overlay_bpf_program_specs();
     }
 
     let attachment_ifnames = registry

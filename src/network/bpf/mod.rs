@@ -1,4 +1,4 @@
-use crate::network::attachment::host_access_peer_iface_name;
+use crate::network::naming::host_access_peer_iface_name;
 use crate::network::types::{BpfAttachPoint, BpfProgramSpec, NetworkSpecValue};
 use anyhow::Result;
 use uuid::Uuid;
