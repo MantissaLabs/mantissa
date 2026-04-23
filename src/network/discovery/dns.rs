@@ -4,22 +4,10 @@ use super::*;
 ///
 /// The socket answers service queries for one overlay network, while the sibling interval task
 /// keeps backend selection, VIP programming, and NodePort publication current.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn spawn_dns_server(
-    registry: NetworkRegistry,
-    workloads: WorkloadStore,
-    services: ServiceRegistry,
-    bpf: NetworkBpfManager,
-    network_id: Uuid,
-    network_name: String,
+    runtime: DiscoveryRuntime,
     resolver_ip: IpAddr,
-    load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
-    health: Arc<AsyncMutex<BackendHealth>>,
     dns_port: u16,
-    bpf_lb: BpfLoadBalancer,
-    nodeport: NodePortManager,
-    missing_lb_maps: Arc<AsyncMutex<HashSet<Uuid>>>,
-    health_monitor: Arc<HealthMonitor>,
 ) -> Result<DnsServerHandle> {
     let bind_addr = SocketAddr::new(resolver_ip, dns_port);
     let socket = UdpSocket::bind(bind_addr)
@@ -27,51 +15,21 @@ pub(super) async fn spawn_dns_server(
         .with_context(|| format!("bind resolver socket {bind_addr}"))?;
     info!(
         target: "network",
-        network = %network_id,
+        network = %runtime.network_id,
         resolver = %resolver_ip,
         "started service discovery listener"
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let task_registry = registry.clone();
-    let service_registry = services.clone();
-    let backend_catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
-    let lb_manager = bpf_lb.clone();
-    let bpf_manager = bpf.clone();
-    let lb_missing = missing_lb_maps.clone();
-    let refresh_health_monitor = health_monitor.clone();
-    if let Err(err) = refresh_network_services(
-        &task_registry,
-        &workloads,
-        &service_registry,
-        &bpf_manager,
-        network_id,
-        &health,
-        &lb_manager,
-        &nodeport,
-        &lb_missing,
-        &refresh_health_monitor,
-        &backend_catalog,
-    )
-    .await
-    {
+    if let Err(err) = refresh_network_services(&runtime).await {
         warn!(
             target: "network",
-            network = %network_id,
+            network = %runtime.network_id,
             "initial service discovery refresh failed: {err:#}"
         );
     }
     let mut refresh_shutdown = shutdown_rx.clone();
-    let refresh_task_registry = task_registry.clone();
-    let refresh_workloads = workloads.clone();
-    let refresh_service_registry = service_registry.clone();
-    let refresh_bpf_manager = bpf_manager.clone();
-    let refresh_health = health.clone();
-    let refresh_lb_manager = lb_manager.clone();
-    let refresh_nodeport = nodeport.clone();
-    let refresh_lb_missing = lb_missing.clone();
-    let refresh_health_monitor = health_monitor.clone();
-    let refresh_backend_catalog = backend_catalog.clone();
+    let refresh_runtime = runtime.clone();
     let refresh_task = tokio::spawn(async move {
         let mut refresh = time::interval(REFRESH_INTERVAL);
         loop {
@@ -82,22 +40,10 @@ pub(super) async fn spawn_dns_server(
                     }
                 }
                 _ = refresh.tick() => {
-                    if let Err(err) = refresh_network_services(
-                        &refresh_task_registry,
-                        &refresh_workloads,
-                        &refresh_service_registry,
-                        &refresh_bpf_manager,
-                        network_id,
-                        &refresh_health,
-                        &refresh_lb_manager,
-                        &refresh_nodeport,
-                        &refresh_lb_missing,
-                        &refresh_health_monitor,
-                        &refresh_backend_catalog,
-                    ).await {
+                    if let Err(err) = refresh_network_services(&refresh_runtime).await {
                         warn!(
                             target: "network",
-                            network = %network_id,
+                            network = %refresh_runtime.network_id,
                             "service discovery refresh failed: {err:#}"
                         );
                     }
@@ -107,16 +53,7 @@ pub(super) async fn spawn_dns_server(
     });
 
     let mut dns_shutdown = shutdown_rx.clone();
-    let dns_task_registry = task_registry.clone();
-    let dns_workloads = workloads.clone();
-    let dns_service_registry = service_registry.clone();
-    let dns_bpf_manager = bpf_manager.clone();
-    let dns_load_balancer = load_balancer.clone();
-    let dns_health = health.clone();
-    let dns_lb_manager = lb_manager.clone();
-    let dns_lb_missing = lb_missing.clone();
-    let dns_health_monitor = health_monitor.clone();
-    let dns_backend_catalog = backend_catalog.clone();
+    let dns_runtime = runtime.clone();
     let dns_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
         loop {
@@ -129,26 +66,12 @@ pub(super) async fn spawn_dns_server(
                 result = socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, peer)) => {
-                            if let Err(err) = handle_datagram(
-                                &socket,
-                                &buf[..len],
-                                peer,
-                                &dns_task_registry,
-                            &dns_workloads,
-                                &dns_service_registry,
-                                &dns_bpf_manager,
-                                network_id,
-                                &network_name,
-                                &dns_load_balancer,
-                                &dns_health,
-                                &dns_lb_manager,
-                                &dns_lb_missing,
-                                &dns_health_monitor,
-                                &dns_backend_catalog,
-                            ).await {
+                            if let Err(err) =
+                                handle_datagram(&socket, &buf[..len], peer, &dns_runtime).await
+                            {
                                 warn!(
                                     target: "network",
-                                    network = %network_id,
+                                    network = %dns_runtime.network_id,
                                     "service discovery failed to handle udp datagram: {err:#}"
                                 );
                             }
@@ -156,7 +79,7 @@ pub(super) async fn spawn_dns_server(
                         Err(err) => {
                             warn!(
                                 target: "network",
-                                network = %network_id,
+                                network = %dns_runtime.network_id,
                                 "service discovery socket recv failed: {err}"
                             );
                         }
@@ -166,7 +89,7 @@ pub(super) async fn spawn_dns_server(
         }
         info!(
             target: "network",
-            network = %network_id,
+            network = %dns_runtime.network_id,
             "service discovery listener stopped"
         );
     });
@@ -178,37 +101,25 @@ pub(super) async fn spawn_dns_server(
 
     Ok(DnsServerHandle {
         resolver_ip,
-        backend_catalog,
+        runtime,
         shutdown: Some(shutdown_tx),
         task: server,
     })
 }
 
 /// Decode one DNS datagram, ensure backend state is fresh, and write the reply.
-#[allow(clippy::too_many_arguments)]
 async fn handle_datagram(
     socket: &UdpSocket,
     payload: &[u8],
     peer: SocketAddr,
-    registry: &NetworkRegistry,
-    workloads: &WorkloadStore,
-    services: &ServiceRegistry,
-    bpf: &NetworkBpfManager,
-    network_id: Uuid,
-    network_name: &str,
-    load_balancer: &Arc<AsyncMutex<ServiceLoadBalancer>>,
-    health: &Arc<AsyncMutex<BackendHealth>>,
-    bpf_lb: &BpfLoadBalancer,
-    lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
-    health_monitor: &Arc<HealthMonitor>,
-    backend_catalog: &Arc<AsyncMutex<NetworkBackendCatalog>>,
+    runtime: &DiscoveryRuntime,
 ) -> Result<()> {
     let request = match Message::from_vec(payload) {
         Ok(message) => message,
         Err(err) => {
             debug!(
                 target: "network",
-                network = %network_id,
+                network = %runtime.network_id,
                 "discarding malformed dns query: {err}"
             );
             return Ok(());
@@ -222,7 +133,7 @@ async fn handle_datagram(
         .collect();
     debug!(
         target: "network",
-        network = %network_id,
+        network = %runtime.network_id,
         peer = %peer,
         ?query_names,
         "received dns query"
@@ -246,40 +157,17 @@ async fn handle_datagram(
     let mut saw_nodata = false;
     let mut saw_notimp = false;
 
-    let health_snapshot = health_monitor.snapshot();
-    if let Err(err) = refresh_backend_catalog_if_needed(
-        backend_catalog,
-        registry,
-        workloads,
-        services,
-        health,
-        network_id,
-        &health_snapshot,
-    )
-    .await
-    {
+    let health_snapshot = runtime.health_monitor.snapshot();
+    if let Err(err) = refresh_backend_catalog_if_needed(runtime, &health_snapshot).await {
         warn!(
             target: "network",
-            network = %network_id,
+            network = %runtime.network_id,
             "failed to refresh backend catalog while answering dns query: {err:#}"
         );
     }
 
     for query in request.queries() {
-        match answer_query(
-            query,
-            registry,
-            bpf,
-            network_id,
-            network_name,
-            load_balancer,
-            health,
-            bpf_lb,
-            lb_missing,
-            backend_catalog,
-        )
-        .await?
-        {
+        match answer_query(query, runtime).await? {
             LookupOutcome::Records(records) => {
                 for record in records {
                     response.add_answer(record);
@@ -288,7 +176,7 @@ async fn handle_datagram(
                 }
                 debug!(
                     target: "network",
-                    network = %network_id,
+                    network = %runtime.network_id,
                     peer = %peer,
                     name = %query.name(),
                     answers = total_answer_records,
@@ -332,34 +220,22 @@ enum LookupOutcome {
 /// If the eBPF VIP dataplane is available, service names resolve to one stable VIP. Otherwise
 /// discovery rotates backend records in userspace so service reachability does not depend on
 /// dataplane availability.
-#[allow(clippy::too_many_arguments)]
-async fn answer_query(
-    query: &Query,
-    registry: &NetworkRegistry,
-    bpf: &NetworkBpfManager,
-    network_id: Uuid,
-    network_name: &str,
-    load_balancer: &Arc<AsyncMutex<ServiceLoadBalancer>>,
-    health: &Arc<AsyncMutex<BackendHealth>>,
-    bpf_lb: &BpfLoadBalancer,
-    lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
-    backend_catalog: &Arc<AsyncMutex<NetworkBackendCatalog>>,
-) -> Result<LookupOutcome> {
+async fn answer_query(query: &Query, runtime: &DiscoveryRuntime) -> Result<LookupOutcome> {
     if query.query_type() != RecordType::A && query.query_type() != RecordType::AAAA {
         return Ok(LookupOutcome::NotImplemented);
     }
 
-    let expected_record_type = overlay_dns_record_type(registry, network_id)?;
+    let expected_record_type = overlay_dns_record_type(&runtime.registry, runtime.network_id)?;
     if query.query_type() != expected_record_type {
         return Ok(LookupOutcome::NoData);
     }
 
-    let Some(service_name) = extract_service_label(query.name(), network_name) else {
+    let Some(service_name) = extract_service_label(query.name(), &runtime.network_name) else {
         return Ok(LookupOutcome::NxDomain);
     };
 
     let catalog_entry = {
-        let guard = backend_catalog.lock().await;
+        let guard = runtime.backend_catalog.lock().await;
         guard
             .services
             .get(&service_name.to_ascii_lowercase())
@@ -371,21 +247,26 @@ async fn answer_query(
 
     let candidates = catalog_entry.candidates.clone();
     let mut backends = if catalog_entry.readiness.is_some() {
-        let guard = health.lock().await;
-        filter_cached_backends(&guard, network_id, &service_name, candidates.clone())
+        let guard = runtime.health.lock().await;
+        filter_cached_backends(
+            &guard,
+            runtime.network_id,
+            &service_name,
+            candidates.clone(),
+        )
     } else {
         candidates.clone()
     };
     tracing::trace!(
         target: "network",
-        network = %network_id,
+        network = %runtime.network_id,
         service = %service_name,
         candidate_backends = candidates.len(),
         healthy_backends = backends.len(),
         "post-health backends"
     );
     backends = normalize_backend_selection(
-        network_id,
+        runtime.network_id,
         &service_name,
         candidates,
         backends,
@@ -395,11 +276,7 @@ async fn answer_query(
 
     if backends.is_empty() {
         let _ = sync_service_vip_for_backends(
-            bpf_lb,
-            bpf,
-            lb_missing,
-            registry,
-            network_id,
+            runtime,
             &service_name,
             &[],
             catalog_entry.expose_to_host,
@@ -408,11 +285,7 @@ async fn answer_query(
         return Ok(LookupOutcome::NxDomain);
     }
     if let Some((vip, programmed)) = sync_service_vip_for_backends(
-        bpf_lb,
-        bpf,
-        lb_missing,
-        registry,
-        network_id,
+        runtime,
         &service_name,
         &backends,
         catalog_entry.expose_to_host,
@@ -429,8 +302,8 @@ async fn answer_query(
     }
 
     let offset = {
-        let mut picker = load_balancer.lock().await;
-        picker.next_offset(network_id, &service_name, backends.len())
+        let mut picker = runtime.load_balancer.lock().await;
+        picker.next_offset(runtime.network_id, &service_name, backends.len())
     };
     let records = rotate_addresses(
         backends

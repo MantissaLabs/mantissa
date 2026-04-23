@@ -78,6 +78,22 @@ struct NetworkControllerInner {
     gossip_tx: Sender<Message>,
 }
 
+/// Construction inputs for one network controller instance.
+///
+/// The controller owns several long-lived stores and channels. Grouping those dependencies keeps
+/// startup readable and avoids a constructor whose positional arguments are hard to audit.
+pub struct NetworkControllerInit {
+    pub registry: NetworkRegistry,
+    pub cluster_registry: Registry,
+    pub workload_store: WorkloadStore,
+    pub service_registry: ServiceRegistry,
+    pub node_id: Uuid,
+    pub node_name: String,
+    pub gossip_tx: Sender<Message>,
+    pub forwarding_events: Option<UnboundedReceiver<ForwardingEvent>>,
+    pub attachment_sync_notify: Option<Arc<Notify>>,
+}
+
 #[cfg(target_os = "linux")]
 fn default_bpf_programs() -> Vec<BpfProgramSpec> {
     if !config::bpf_attach_enabled() {
@@ -93,18 +109,19 @@ fn default_bpf_programs() -> Vec<BpfProgramSpec> {
 }
 
 impl NetworkController {
-    #[allow(clippy::arc_with_non_send_sync, clippy::too_many_arguments)]
-    pub fn new(
-        registry: NetworkRegistry,
-        cluster_registry: Registry,
-        workload_store: WorkloadStore,
-        service_registry: ServiceRegistry,
-        node_id: Uuid,
-        node_name: String,
-        gossip_tx: Sender<Message>,
-        forwarding_events: Option<UnboundedReceiver<ForwardingEvent>>,
-        attachment_sync_notify: Option<Arc<Notify>>,
-    ) -> Result<Self> {
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn new(init: NetworkControllerInit) -> Result<Self> {
+        let NetworkControllerInit {
+            registry,
+            cluster_registry,
+            workload_store,
+            service_registry,
+            node_id,
+            node_name,
+            gossip_tx,
+            forwarding_events,
+            attachment_sync_notify,
+        } = init;
         let provisioner = platform::NetworkProvisioner::new()?;
         let attachment = PlatformAttachmentProvisioner::new().unwrap_or_else(|err| {
             warn!(target: "network", "failed to initialize attachment provisioner: {err}");

@@ -463,20 +463,21 @@ async fn build_runtime_components(
     let job_registry = JobRegistry::new(stores.jobs.clone());
     let agent_registry = AgentRegistry::new(stores.agents.clone());
     let (forwarding_tx, forwarding_rx) = mpsc::unbounded_channel();
-    let network_controller = NetworkController::new(
-        network_registry.clone(),
-        registry.clone(),
-        stores.workloads.clone(),
-        service_registry.clone(),
-        ctx.self_id,
-        local_node_name.clone(),
-        gossip_tx.clone(),
-        Some(forwarding_rx),
-        Some(attachment_sync_notify),
-    )
-    .map_err(|error| -> Box<dyn std::error::Error> {
-        Box::new(std::io::Error::other(error.to_string()))
-    })?;
+    let network_controller =
+        NetworkController::new(crate::network::controller::NetworkControllerInit {
+            registry: network_registry.clone(),
+            cluster_registry: registry.clone(),
+            workload_store: stores.workloads.clone(),
+            service_registry: service_registry.clone(),
+            node_id: ctx.self_id,
+            node_name: local_node_name.clone(),
+            gossip_tx: gossip_tx.clone(),
+            forwarding_events: Some(forwarding_rx),
+            attachment_sync_notify: Some(attachment_sync_notify),
+        })
+        .map_err(|error| -> Box<dyn std::error::Error> {
+            Box::new(std::io::Error::other(error.to_string()))
+        })?;
     ctx.node
         .set_nodeport_manager(network_controller.nodeport_manager());
     let network_gossiper = NetworkGossiper::new(

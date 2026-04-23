@@ -85,9 +85,31 @@ pub struct ServiceDiscovery {
 
 struct DnsServerHandle {
     resolver_ip: IpAddr,
-    backend_catalog: Arc<AsyncMutex<NetworkBackendCatalog>>,
+    runtime: DiscoveryRuntime,
     shutdown: Option<watch::Sender<bool>>,
     task: JoinHandle<()>,
+}
+
+/// Shared per-network discovery state used by DNS queries and background refreshes.
+///
+/// Discovery serves one overlay network through two concurrent paths: DNS query handling and the
+/// periodic refresh loop. Bundling the stable network-scoped dependencies here keeps those paths
+/// on one source of truth and avoids long helper argument lists.
+#[derive(Clone)]
+struct DiscoveryRuntime {
+    registry: NetworkRegistry,
+    workloads: WorkloadStore,
+    services: ServiceRegistry,
+    bpf: NetworkBpfManager,
+    network_id: Uuid,
+    network_name: String,
+    load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
+    health: Arc<AsyncMutex<BackendHealth>>,
+    health_monitor: Arc<HealthMonitor>,
+    backend_catalog: Arc<AsyncMutex<NetworkBackendCatalog>>,
+    bpf_lb: BpfLoadBalancer,
+    nodeport: NodePortManager,
+    missing_lb_maps: Arc<AsyncMutex<HashSet<Uuid>>>,
 }
 
 /// Cached backend-resolution metadata for one network, invalidated by store generations and
@@ -194,6 +216,30 @@ impl ServiceDiscovery {
         self.nodeport.clone()
     }
 
+    /// Build the network-scoped runtime bundle shared by one resolver socket and refresh loop.
+    fn build_runtime(
+        &self,
+        network_id: Uuid,
+        network_name: String,
+        backend_catalog: Arc<AsyncMutex<NetworkBackendCatalog>>,
+    ) -> DiscoveryRuntime {
+        DiscoveryRuntime {
+            registry: self.registry.clone(),
+            workloads: self.workloads.clone(),
+            services: self.services.clone(),
+            bpf: self.bpf.clone(),
+            network_id,
+            network_name,
+            load_balancer: self.load_balancer.clone(),
+            health: self.health.clone(),
+            health_monitor: self.health_monitor.clone(),
+            backend_catalog,
+            bpf_lb: self.bpf_lb.clone(),
+            nodeport: self.nodeport.clone(),
+            missing_lb_maps: self.missing_lb_maps.clone(),
+        }
+    }
+
     pub async fn ensure_network(
         &self,
         spec: &NetworkSpecValue,
@@ -216,23 +262,9 @@ impl ServiceDiscovery {
 
         self.teardown_network(spec.id).await?;
 
-        let server = spawn_dns_server(
-            self.registry.clone(),
-            self.workloads.clone(),
-            self.services.clone(),
-            self.bpf.clone(),
-            spec.id,
-            spec.name.clone(),
-            resolver_ip,
-            self.load_balancer.clone(),
-            self.health.clone(),
-            self.dns_port,
-            self.bpf_lb.clone(),
-            self.nodeport.clone(),
-            self.missing_lb_maps.clone(),
-            self.health_monitor.clone(),
-        )
-        .await?;
+        let backend_catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
+        let runtime = self.build_runtime(spec.id, spec.name.clone(), backend_catalog);
+        let server = spawn_dns_server(runtime, resolver_ip, self.dns_port).await?;
 
         let mut guard = self.servers.lock().await;
         guard.insert(spec.id, server);
@@ -245,30 +277,15 @@ impl ServiceDiscovery {
     /// listener so public publication and VIP programming can be rebuilt from
     /// the latest durable stores without waiting for the next background tick.
     pub async fn refresh_network(&self, network_id: Uuid) -> Result<()> {
-        let backend_catalog = {
+        let runtime = {
             let guard = self.servers.lock().await;
-            guard
-                .get(&network_id)
-                .map(|server| server.backend_catalog.clone())
+            guard.get(&network_id).map(|server| server.runtime.clone())
         };
-        let Some(backend_catalog) = backend_catalog else {
+        let Some(runtime) = runtime else {
             return Ok(());
         };
 
-        refresh_network_services(
-            &self.registry,
-            &self.workloads,
-            &self.services,
-            &self.bpf,
-            network_id,
-            &self.health,
-            &self.bpf_lb,
-            &self.nodeport,
-            &self.missing_lb_maps,
-            &self.health_monitor,
-            &backend_catalog,
-        )
-        .await
+        refresh_network_services(&runtime).await
     }
 
     pub async fn teardown_network(&self, network_id: Uuid) -> Result<()> {
@@ -317,232 +334,240 @@ impl ServiceDiscovery {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn resolve_service_backends(
-    registry: &NetworkRegistry,
-    workloads: &WorkloadStore,
-    template_index: &HashMap<Uuid, (String, String)>,
-    network_id: Uuid,
-    service_name: &str,
-    health_snapshot: &HashMap<Uuid, HealthStatus>,
-) -> Result<Vec<BackendAddress>> {
-    let expected_family = registry
-        .get_spec(network_id)?
-        .map(|spec| parse_overlay_cidr(&spec.subnet_cidr))
-        .transpose()?
-        .map(|subnet| subnet.family);
-    let ready_peers: HashSet<Uuid> = registry
-        .list_peer_states(Some(network_id))?
-        .into_iter()
-        .filter(|state| state.state.is_ready())
-        .map(|state| state.peer_id)
-        .collect();
-    let attachments = registry
-        .list_attachments(Some(network_id))
-        .context("list attachments for discovery")?;
-    let mut cache: HashMap<Uuid, Option<WorkloadValue>> = HashMap::new();
-    let mut results = Vec::new();
+/// Resolves service backends while one backend-catalog refresh is in progress.
+struct ServiceBackendResolver<'a> {
+    runtime: &'a DiscoveryRuntime,
+    template_index: &'a HashMap<Uuid, (String, String)>,
+    health_snapshot: &'a HashMap<Uuid, HealthStatus>,
+}
 
-    tracing::trace!(
-        target: "network",
-        network = %network_id,
-        service = %service_name,
-        attachments = attachments.len(),
-        "resolving service backends"
-    );
+impl ServiceBackendResolver<'_> {
+    /// Resolve the currently routable backend attachment set for one service template name.
+    async fn resolve(&self, service_name: &str) -> Result<Vec<BackendAddress>> {
+        let expected_family = self
+            .runtime
+            .registry
+            .get_spec(self.runtime.network_id)?
+            .map(|spec| parse_overlay_cidr(&spec.subnet_cidr))
+            .transpose()?
+            .map(|subnet| subnet.family);
+        let ready_peers: HashSet<Uuid> = self
+            .runtime
+            .registry
+            .list_peer_states(Some(self.runtime.network_id))?
+            .into_iter()
+            .filter(|state| state.state.is_ready())
+            .map(|state| state.peer_id)
+            .collect();
+        let attachments = self
+            .runtime
+            .registry
+            .list_attachments(Some(self.runtime.network_id))
+            .context("list attachments for discovery")?;
+        let mut cache: HashMap<Uuid, Option<WorkloadValue>> = HashMap::new();
+        let mut results = Vec::new();
 
-    for attachment in attachments {
-        if !ready_peers.contains(&attachment.node_id) {
-            tracing::trace!(
-                target: "network",
-                network = %network_id,
-                attachment = %attachment.id,
-                node = %attachment.node_id,
-                "skipping attachment on node whose network peer state is not ready"
-            );
-            continue;
-        }
-        if matches!(
-            health_snapshot.get(&attachment.node_id),
-            Some(HealthStatus::Down)
-        ) {
-            tracing::trace!(
-                target: "network",
-                network = %network_id,
-                attachment = %attachment.id,
-                node = %attachment.node_id,
-                "skipping attachment on down node"
-            );
-            continue;
-        }
-        if attachment.state != NetworkAttachmentState::Ready {
-            tracing::trace!(
-                target: "network",
-                network = %network_id,
-                attachment = %attachment.id,
-                state = ?attachment.state,
-                "skipping attachment not ready"
-            );
-            continue;
-        }
-        if !attachment.traffic_published {
-            tracing::trace!(
-                target: "network",
-                network = %network_id,
-                attachment = %attachment.id,
-                "skipping attachment not published for traffic"
-            );
-            continue;
-        }
-        let Some(ip_text) = &attachment.assigned_ip else {
-            tracing::debug!(
-                target: "network",
-                network = %network_id,
-                attachment = %attachment.id,
-                "skipping attachment without ip"
-            );
-            continue;
-        };
-        let Some(mac_text) = &attachment.mac else {
-            tracing::debug!(
-                target: "network",
-                network = %network_id,
-                attachment = %attachment.id,
-                "skipping attachment without mac"
-            );
-            continue;
-        };
-        let task_entry = cache
-            .entry(attachment.task_id)
-            .or_insert_with(|| load_task(workloads, attachment.task_id));
-        let task = match task_entry.as_ref() {
-            Some(task) => task,
-            None => {
-                tracing::debug!(
+        tracing::trace!(
+            target: "network",
+            network = %self.runtime.network_id,
+            service = %service_name,
+            attachments = attachments.len(),
+            "resolving service backends"
+        );
+
+        for attachment in attachments {
+            if !ready_peers.contains(&attachment.node_id) {
+                tracing::trace!(
                     target: "network",
-                    network = %network_id,
+                    network = %self.runtime.network_id,
                     attachment = %attachment.id,
-                    task = %attachment.task_id,
-                    "skipping attachment; task record missing"
+                    node = %attachment.node_id,
+                    "skipping attachment on node whose network peer state is not ready"
                 );
                 continue;
             }
-        };
-
-        let mut template_match = false;
-        if let Some(template) = attachment.template_name.as_deref() {
-            template_match |= template.eq_ignore_ascii_case(service_name);
-        }
-        if let Some(service) = attachment.service_name.as_deref() {
-            template_match |= service.eq_ignore_ascii_case(service_name);
-        }
-        if let Some(meta) = task.service_owner() {
-            template_match |= meta.template.eq_ignore_ascii_case(service_name);
-        }
-        template_match |= task.name.eq_ignore_ascii_case(service_name);
-        if let Some((_, template)) = template_index.get(&attachment.task_id) {
-            template_match |= template.eq_ignore_ascii_case(service_name);
-        }
-
-        if !template_match {
-            tracing::trace!(
-                target: "network",
-                network = %network_id,
-                attachment = %attachment.id,
-                task = %attachment.task_id,
-                template = %attachment.template_name.clone().unwrap_or_default(),
-                service = %service_name,
-                "skipping attachment; template mismatch"
-            );
-            continue;
-        }
-
-        if task.node_id != attachment.node_id {
-            if attachment_is_newer_than_task(&attachment, task) {
+            if matches!(
+                self.health_snapshot.get(&attachment.node_id),
+                Some(HealthStatus::Down)
+            ) {
+                tracing::trace!(
+                    target: "network",
+                    network = %self.runtime.network_id,
+                    attachment = %attachment.id,
+                    node = %attachment.node_id,
+                    "skipping attachment on down node"
+                );
+                continue;
+            }
+            if attachment.state != NetworkAttachmentState::Ready {
+                tracing::trace!(
+                    target: "network",
+                    network = %self.runtime.network_id,
+                    attachment = %attachment.id,
+                    state = ?attachment.state,
+                    "skipping attachment not ready"
+                );
+                continue;
+            }
+            if !attachment.traffic_published {
+                tracing::trace!(
+                    target: "network",
+                    network = %self.runtime.network_id,
+                    attachment = %attachment.id,
+                    "skipping attachment not published for traffic"
+                );
+                continue;
+            }
+            let Some(ip_text) = &attachment.assigned_ip else {
                 tracing::debug!(
                     target: "network",
-                    network = %network_id,
+                    network = %self.runtime.network_id,
+                    attachment = %attachment.id,
+                    "skipping attachment without ip"
+                );
+                continue;
+            };
+            let Some(mac_text) = &attachment.mac else {
+                tracing::debug!(
+                    target: "network",
+                    network = %self.runtime.network_id,
+                    attachment = %attachment.id,
+                    "skipping attachment without mac"
+                );
+                continue;
+            };
+            let task_entry = cache
+                .entry(attachment.task_id)
+                .or_insert_with(|| load_task(&self.runtime.workloads, attachment.task_id));
+            let task = match task_entry.as_ref() {
+                Some(task) => task,
+                None => {
+                    tracing::debug!(
+                        target: "network",
+                        network = %self.runtime.network_id,
+                        attachment = %attachment.id,
+                        task = %attachment.task_id,
+                        "skipping attachment; task record missing"
+                    );
+                    continue;
+                }
+            };
+
+            let mut template_match = false;
+            if let Some(template) = attachment.template_name.as_deref() {
+                template_match |= template.eq_ignore_ascii_case(service_name);
+            }
+            if let Some(service) = attachment.service_name.as_deref() {
+                template_match |= service.eq_ignore_ascii_case(service_name);
+            }
+            if let Some(meta) = task.service_owner() {
+                template_match |= meta.template.eq_ignore_ascii_case(service_name);
+            }
+            template_match |= task.name.eq_ignore_ascii_case(service_name);
+            if let Some((_, template)) = self.template_index.get(&attachment.task_id) {
+                template_match |= template.eq_ignore_ascii_case(service_name);
+            }
+
+            if !template_match {
+                tracing::trace!(
+                    target: "network",
+                    network = %self.runtime.network_id,
+                    attachment = %attachment.id,
+                    task = %attachment.task_id,
+                    template = %attachment.template_name.clone().unwrap_or_default(),
+                    service = %service_name,
+                    "skipping attachment; template mismatch"
+                );
+                continue;
+            }
+
+            if task.node_id != attachment.node_id {
+                if attachment_is_newer_than_task(&attachment, task) {
+                    tracing::debug!(
+                        target: "network",
+                        network = %self.runtime.network_id,
+                        attachment = %attachment.id,
+                        task = %task.id,
+                        expected_node = %task.node_id,
+                        actual_node = %attachment.node_id,
+                        "keeping attachment; task record appears stale"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "network",
+                        network = %self.runtime.network_id,
+                        attachment = %attachment.id,
+                        task = %task.id,
+                        expected_node = %task.node_id,
+                        actual_node = %attachment.node_id,
+                        "skipping attachment; task moved to another node"
+                    );
+                    continue;
+                }
+            }
+            if task.state != WorkloadPhase::Running {
+                tracing::debug!(
+                    target: "network",
+                    network = %self.runtime.network_id,
                     attachment = %attachment.id,
                     task = %task.id,
-                    expected_node = %task.node_id,
-                    actual_node = %attachment.node_id,
-                    "keeping attachment; task record appears stale"
-                );
-            } else {
-                tracing::debug!(
-                    target: "network",
-                    network = %network_id,
-                    attachment = %attachment.id,
-                    task = %task.id,
-                    expected_node = %task.node_id,
-                    actual_node = %attachment.node_id,
-                    "skipping attachment; task moved to another node"
+                    state = ?task.state,
+                    "skipping attachment; task not running"
                 );
                 continue;
             }
-        }
-        if task.state != WorkloadPhase::Running {
-            tracing::debug!(
-                target: "network",
-                network = %network_id,
-                attachment = %attachment.id,
-                task = %task.id,
-                state = ?task.state,
-                "skipping attachment; task not running"
-            );
-            continue;
-        }
-        let ip_addr = match ip_text.parse::<IpAddr>() {
-            Ok(addr) => addr,
-            Err(err) => {
+            let ip_addr = match ip_text.parse::<IpAddr>() {
+                Ok(addr) => addr,
+                Err(err) => {
+                    warn!(
+                        target: "network",
+                        network = %self.runtime.network_id,
+                        task = %attachment.task_id,
+                        "invalid attachment ip {}: {err}",
+                        ip_text
+                    );
+                    continue;
+                }
+            };
+            if let Some(expected_family) = expected_family
+                && ip_family(ip_addr) != expected_family
+            {
                 warn!(
                     target: "network",
-                    network = %network_id,
+                    network = %self.runtime.network_id,
                     task = %attachment.task_id,
-                    "invalid attachment ip {}: {err}",
-                    ip_text
+                    expected_family = ?expected_family,
+                    actual_ip = %ip_addr,
+                    "attachment ip family does not match overlay subnet"
                 );
                 continue;
             }
-        };
-        if let Some(expected_family) = expected_family
-            && ip_family(ip_addr) != expected_family
-        {
-            warn!(
-                target: "network",
-                network = %network_id,
-                task = %attachment.task_id,
-                expected_family = ?expected_family,
-                actual_ip = %ip_addr,
-                "attachment ip family does not match overlay subnet"
-            );
-            continue;
+            let mac = match parse_mac(mac_text) {
+                Ok(mac) => mac,
+                Err(err) => {
+                    warn!(
+                        target: "network",
+                        network = %self.runtime.network_id,
+                        task = %attachment.task_id,
+                        "invalid attachment mac {}: {err}",
+                        mac_text
+                    );
+                    continue;
+                }
+            };
+            results.push(BackendAddress { ip: ip_addr, mac });
         }
-        let mac = match parse_mac(mac_text) {
-            Ok(mac) => mac,
-            Err(err) => {
-                warn!(
-                    target: "network",
-                    network = %network_id,
-                    task = %attachment.task_id,
-                    "invalid attachment mac {}: {err}",
-                    mac_text
-                );
-                continue;
-            }
-        };
-        results.push(BackendAddress { ip: ip_addr, mac });
+
+        tracing::trace!(
+            target: "network",
+            network = %self.runtime.network_id,
+            service = %service_name,
+            backends = results.len(),
+            "resolved service backends"
+        );
+
+        Ok(results)
     }
-
-    tracing::trace!(
-        target: "network",
-        network = %network_id,
-        service = %service_name,
-        backends = results.len(),
-        "resolved service backends"
-    );
-
-    Ok(results)
 }
 
 /// Load the most relevant task value so discovery follows the current scheduling decision.
@@ -760,22 +785,17 @@ fn rotate_addresses(mut addresses: Vec<IpAddr>, offset: usize) -> Vec<IpAddr> {
 }
 
 async fn refresh_backend_catalog_if_needed(
-    backend_catalog: &Arc<AsyncMutex<NetworkBackendCatalog>>,
-    registry: &NetworkRegistry,
-    workloads: &WorkloadStore,
-    services: &ServiceRegistry,
-    health: &Arc<AsyncMutex<BackendHealth>>,
-    network_id: Uuid,
+    runtime: &DiscoveryRuntime,
     health_snapshot: &HashMap<Uuid, HealthStatus>,
 ) -> Result<()> {
-    let attachment_generation = registry.attachment_change_clock();
-    let workload_generation = workloads.change_clock();
-    let service_generation = services.change_clock();
-    let peer_generation = registry.peer_change_clock();
+    let attachment_generation = runtime.registry.attachment_change_clock();
+    let workload_generation = runtime.workloads.change_clock();
+    let service_generation = runtime.services.change_clock();
+    let peer_generation = runtime.registry.peer_change_clock();
     let health_fingerprint = health_snapshot_fingerprint(health_snapshot);
 
     let previous_services = {
-        let guard = backend_catalog.lock().await;
+        let guard = runtime.backend_catalog.lock().await;
         if guard.attachment_generation == attachment_generation
             && guard.workload_generation == workload_generation
             && guard.service_generation == service_generation
@@ -787,31 +807,29 @@ async fn refresh_backend_catalog_if_needed(
         guard.services.clone()
     };
 
-    let service_specs = services
+    let service_specs = runtime
+        .services
         .list()
         .context("load service specs for backend catalog refresh")?;
     let template_index = build_task_template_index(&service_specs);
+    let resolver = ServiceBackendResolver {
+        runtime,
+        template_index: &template_index,
+        health_snapshot,
+    };
     let mut next_services = HashMap::new();
     for spec in &service_specs {
         for template in &spec.task_templates {
             if !template
                 .networks
                 .iter()
-                .any(|net| net.network_id == network_id)
+                .any(|net| net.network_id == runtime.network_id)
             {
                 continue;
             }
 
             let service_name = template.name.clone();
-            let candidates = resolve_service_backends(
-                registry,
-                workloads,
-                &template_index,
-                network_id,
-                &service_name,
-                health_snapshot,
-            )
-            .await?;
+            let candidates = resolver.resolve(&service_name).await?;
             let public_port = template.public_port();
             let public_target_port = template.public_target_port();
             let public_protocols = if public_port.is_some() {
@@ -843,14 +861,14 @@ async fn refresh_backend_catalog_if_needed(
     }
 
     {
-        let mut guard = health.lock().await;
+        let mut guard = runtime.health.lock().await;
         let mut service_keys: HashSet<String> =
             previous_services.keys().cloned().collect::<HashSet<_>>();
         service_keys.extend(next_services.keys().cloned());
         for service_key in service_keys {
             reconcile_service_health_cache(
                 &mut guard,
-                network_id,
+                runtime.network_id,
                 &service_key,
                 previous_services.get(&service_key),
                 next_services.get(&service_key),
@@ -858,7 +876,7 @@ async fn refresh_backend_catalog_if_needed(
         }
     }
 
-    let mut guard = backend_catalog.lock().await;
+    let mut guard = runtime.backend_catalog.lock().await;
     guard.attachment_generation = attachment_generation;
     guard.workload_generation = workload_generation;
     guard.service_generation = service_generation;
@@ -897,36 +915,11 @@ fn health_status_discriminant(status: HealthStatus) -> u8 {
 
 /// Periodically refresh health and BPF state for all services attached to a specific network so
 /// dataplane programming keeps up with container restarts even when no DNS queries arrive.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "network refresh keeps one explicit private control-plane context"
-)]
-async fn refresh_network_services(
-    registry: &NetworkRegistry,
-    workloads: &WorkloadStore,
-    services: &ServiceRegistry,
-    bpf: &NetworkBpfManager,
-    network_id: Uuid,
-    health: &Arc<AsyncMutex<BackendHealth>>,
-    bpf_lb: &BpfLoadBalancer,
-    nodeport: &NodePortManager,
-    lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
-    health_monitor: &Arc<HealthMonitor>,
-    backend_catalog: &Arc<AsyncMutex<NetworkBackendCatalog>>,
-) -> Result<()> {
-    let health_snapshot = health_monitor.snapshot();
-    refresh_backend_catalog_if_needed(
-        backend_catalog,
-        registry,
-        workloads,
-        services,
-        health,
-        network_id,
-        &health_snapshot,
-    )
-    .await?;
+async fn refresh_network_services(runtime: &DiscoveryRuntime) -> Result<()> {
+    let health_snapshot = runtime.health_monitor.snapshot();
+    refresh_backend_catalog_if_needed(runtime, &health_snapshot).await?;
     let entries: Vec<ServiceBackendCatalogEntry> = {
-        let guard = backend_catalog.lock().await;
+        let guard = runtime.backend_catalog.lock().await;
         guard.services.values().cloned().collect()
     };
     let mut nodeport_entries = Vec::new();
@@ -934,10 +927,7 @@ async fn refresh_network_services(
     let mut host_vips = HashSet::new();
 
     for entry in entries {
-        let result = refresh_single_service(
-            registry, bpf, network_id, &entry, health, bpf_lb, lb_missing,
-        )
-        .await?;
+        let result = refresh_single_service(runtime, &entry).await?;
         nodeport_entries.extend(result.nodeport_mappings);
         if let Some(observation) = result.public_endpoint {
             public_endpoint_observations.push(observation);
@@ -947,7 +937,11 @@ async fn refresh_network_services(
         }
     }
 
-    if let Err(err) = nodeport.sync_ports(network_id, &nodeport_entries).await {
+    if let Err(err) = runtime
+        .nodeport
+        .sync_ports(runtime.network_id, &nodeport_entries)
+        .await
+    {
         for observation in &mut public_endpoint_observations {
             if observation.detail.is_none() {
                 observation.detail = Some(format!(
@@ -958,18 +952,19 @@ async fn refresh_network_services(
         }
         warn!(
             target: "network",
-            network = %network_id,
+            network = %runtime.network_id,
             "failed to sync public nodeport mappings: {err:#}"
         );
     }
-    if let Err(err) = reconcile_host_vip_neighbors(network_id, &host_vips).await {
+    if let Err(err) = reconcile_host_vip_neighbors(runtime.network_id, &host_vips).await {
         warn!(
             target: "network",
-            network = %network_id,
+            network = %runtime.network_id,
             "failed to reconcile host vip neighbours: {err:#}"
         );
     }
-    apply_public_endpoint_observations(services, public_endpoint_observations.as_slice()).await?;
+    apply_public_endpoint_observations(&runtime.services, public_endpoint_observations.as_slice())
+        .await?;
 
     Ok(())
 }
@@ -980,20 +975,15 @@ async fn refresh_network_services(
 /// Returns nodeport mappings when the service is marked public so external listeners can be
 /// reconciled by the caller.
 async fn refresh_single_service(
-    registry: &NetworkRegistry,
-    bpf: &NetworkBpfManager,
-    network_id: Uuid,
+    runtime: &DiscoveryRuntime,
     service: &ServiceBackendCatalogEntry,
-    health: &Arc<AsyncMutex<BackendHealth>>,
-    bpf_lb: &BpfLoadBalancer,
-    lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
 ) -> Result<ServiceRefreshResult> {
     let service_name = service.service_name.as_str();
     let candidates = service.candidates.clone();
     let mut backends = evaluate_backend_health(
-        health,
-        registry,
-        network_id,
+        &runtime.health,
+        &runtime.registry,
+        runtime.network_id,
         service_name,
         candidates.clone(),
         service.readiness.clone(),
@@ -1001,7 +991,7 @@ async fn refresh_single_service(
     .await;
 
     backends = normalize_backend_selection(
-        network_id,
+        runtime.network_id,
         service_name,
         candidates,
         backends,
@@ -1010,17 +1000,8 @@ async fn refresh_single_service(
     );
 
     if backends.is_empty() {
-        let _ = sync_service_vip_for_backends(
-            bpf_lb,
-            bpf,
-            lb_missing,
-            registry,
-            network_id,
-            service_name,
-            &[],
-            service.expose_to_host,
-        )
-        .await?;
+        let _ = sync_service_vip_for_backends(runtime, service_name, &[], service.expose_to_host)
+            .await?;
         return Ok(ServiceRefreshResult {
             nodeport_mappings: Vec::new(),
             public_endpoint: service.public_port.map(|port| PublicEndpointObservation {
@@ -1037,17 +1018,9 @@ async fn refresh_single_service(
         });
     }
 
-    if let Some((vip, programmed)) = sync_service_vip_for_backends(
-        bpf_lb,
-        bpf,
-        lb_missing,
-        registry,
-        network_id,
-        service_name,
-        &backends,
-        service.expose_to_host,
-    )
-    .await?
+    if let Some((vip, programmed)) =
+        sync_service_vip_for_backends(runtime, service_name, &backends, service.expose_to_host)
+            .await?
         && let Some(port) = service.public_port
     {
         let vip_port = service.public_target_port.unwrap_or(port);

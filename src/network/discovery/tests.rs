@@ -296,6 +296,7 @@ struct CatalogHarness {
     workloads: WorkloadStore,
     services: ServiceRegistry,
     network: NetworkSpecValue,
+    runtime: DiscoveryRuntime,
 }
 
 /// Creates isolated stores backing one discovery catalog test harness.
@@ -365,12 +366,35 @@ async fn setup_catalog_harness() -> CatalogHarness {
         .await
         .expect("upsert network spec");
 
+    let discovery = ServiceDiscovery::new_with_dns_port(
+        registry.clone(),
+        workloads.clone(),
+        services.clone(),
+        NetworkBpfManager::unavailable(),
+        HealthMonitor::new(actor),
+        5_353,
+    );
+    let runtime = discovery.build_runtime(
+        network.id,
+        network.name.clone(),
+        Arc::new(AsyncMutex::new(NetworkBackendCatalog::default())),
+    );
+
     CatalogHarness {
         registry,
         workloads,
         services,
         network,
+        runtime,
     }
+}
+
+/// Refreshes the derived backend catalog using the same network-scoped runtime bundle as
+/// production discovery.
+async fn refresh_catalog(harness: &CatalogHarness, health_snapshot: &HashMap<Uuid, HealthStatus>) {
+    refresh_backend_catalog_if_needed(&harness.runtime, health_snapshot)
+        .await
+        .expect("refresh backend catalog");
 }
 
 /// Builds one running task value used by catalog invalidation tests.
@@ -568,24 +592,19 @@ async fn backend_catalog_refresh_invalidates_on_task_change_clock() {
         .await
         .expect("upsert ready peer state");
 
-    let catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
-    let readiness = Arc::new(AsyncMutex::new(BackendHealth::default()));
     let mut health = HashMap::new();
     health.insert(node_id, HealthStatus::Alive);
-    refresh_backend_catalog_if_needed(
-        &catalog,
-        &harness.registry,
-        &harness.workloads,
-        &harness.services,
-        &readiness,
-        harness.network.id,
-        &health,
-    )
-    .await
-    .expect("initial catalog refresh");
-    let initial_workload_generation = { catalog.lock().await.workload_generation };
+    refresh_catalog(&harness, &health).await;
+    let initial_workload_generation = {
+        harness
+            .runtime
+            .backend_catalog
+            .lock()
+            .await
+            .workload_generation
+    };
     let initial_candidates = {
-        let guard = catalog.lock().await;
+        let guard = harness.runtime.backend_catalog.lock().await;
         guard
             .services
             .get("backend")
@@ -603,19 +622,9 @@ async fn backend_catalog_refresh_invalidates_on_task_change_clock() {
         .await
         .expect("upsert stopped task");
 
-    refresh_backend_catalog_if_needed(
-        &catalog,
-        &harness.registry,
-        &harness.workloads,
-        &harness.services,
-        &readiness,
-        harness.network.id,
-        &health,
-    )
-    .await
-    .expect("refresh after task change");
+    refresh_catalog(&harness, &health).await;
 
-    let guard = catalog.lock().await;
+    let guard = harness.runtime.backend_catalog.lock().await;
     assert!(
         guard.workload_generation > initial_workload_generation,
         "workload generation must advance after task upsert"
@@ -675,25 +684,13 @@ async fn backend_catalog_refresh_invalidates_on_peer_change_clock() {
         .await
         .expect("upsert configuring peer state");
 
-    let catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
-    let readiness = Arc::new(AsyncMutex::new(BackendHealth::default()));
     let mut health = HashMap::new();
     health.insert(node_id, HealthStatus::Alive);
-    refresh_backend_catalog_if_needed(
-        &catalog,
-        &harness.registry,
-        &harness.workloads,
-        &harness.services,
-        &readiness,
-        harness.network.id,
-        &health,
-    )
-    .await
-    .expect("initial catalog refresh");
+    refresh_catalog(&harness, &health).await;
 
-    let initial_peer_generation = { catalog.lock().await.peer_generation };
+    let initial_peer_generation = { harness.runtime.backend_catalog.lock().await.peer_generation };
     let initial_candidates = {
-        let guard = catalog.lock().await;
+        let guard = harness.runtime.backend_catalog.lock().await;
         guard
             .services
             .get("backend")
@@ -717,19 +714,9 @@ async fn backend_catalog_refresh_invalidates_on_peer_change_clock() {
         .await
         .expect("upsert ready peer state");
 
-    refresh_backend_catalog_if_needed(
-        &catalog,
-        &harness.registry,
-        &harness.workloads,
-        &harness.services,
-        &readiness,
-        harness.network.id,
-        &health,
-    )
-    .await
-    .expect("refresh after peer-state change");
+    refresh_catalog(&harness, &health).await;
 
-    let guard = catalog.lock().await;
+    let guard = harness.runtime.backend_catalog.lock().await;
     assert!(
         guard.peer_generation > initial_peer_generation,
         "peer generation must advance after peer-state upsert"
@@ -843,25 +830,13 @@ async fn backend_catalog_refresh_retains_unchanged_healthy_backends() {
         .await
         .expect("upsert withdrawing peer state");
 
-    let catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
-    let readiness = Arc::new(AsyncMutex::new(BackendHealth::default()));
     let mut health = HashMap::new();
     health.insert(ready_node, HealthStatus::Alive);
     health.insert(withdrawing_node, HealthStatus::Alive);
-    refresh_backend_catalog_if_needed(
-        &catalog,
-        &harness.registry,
-        &harness.workloads,
-        &harness.services,
-        &readiness,
-        harness.network.id,
-        &health,
-    )
-    .await
-    .expect("initial catalog refresh");
+    refresh_catalog(&harness, &health).await;
 
     {
-        let mut guard = readiness.lock().await;
+        let mut guard = harness.runtime.health.lock().await;
         guard.set_entry(
             harness.network.id,
             "backend",
@@ -896,19 +871,9 @@ async fn backend_catalog_refresh_retains_unchanged_healthy_backends() {
         .await
         .expect("withdraw peer state");
 
-    refresh_backend_catalog_if_needed(
-        &catalog,
-        &harness.registry,
-        &harness.workloads,
-        &harness.services,
-        &readiness,
-        harness.network.id,
-        &health,
-    )
-    .await
-    .expect("refresh after peer withdrawal");
+    refresh_catalog(&harness, &health).await;
 
-    let guard = readiness.lock().await;
+    let guard = harness.runtime.health.lock().await;
     assert!(
         guard
             .get_entry(harness.network.id, "backend", ready_ip)
@@ -934,21 +899,9 @@ async fn backend_catalog_refresh_requires_service_readiness_opt_in() {
     )
     .await;
 
-    let catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
-    let readiness = Arc::new(AsyncMutex::new(BackendHealth::default()));
-    refresh_backend_catalog_if_needed(
-        &catalog,
-        &harness.registry,
-        &harness.workloads,
-        &harness.services,
-        &readiness,
-        harness.network.id,
-        &HashMap::new(),
-    )
-    .await
-    .expect("refresh catalog without explicit service readiness");
+    refresh_catalog(&harness, &HashMap::new()).await;
 
-    let guard = catalog.lock().await;
+    let guard = harness.runtime.backend_catalog.lock().await;
     let entry = guard
         .services
         .get("backend")
@@ -975,21 +928,9 @@ async fn backend_catalog_refresh_keeps_explicit_readiness_probe() {
     )
     .await;
 
-    let catalog = Arc::new(AsyncMutex::new(NetworkBackendCatalog::default()));
-    let readiness = Arc::new(AsyncMutex::new(BackendHealth::default()));
-    refresh_backend_catalog_if_needed(
-        &catalog,
-        &harness.registry,
-        &harness.workloads,
-        &harness.services,
-        &readiness,
-        harness.network.id,
-        &HashMap::new(),
-    )
-    .await
-    .expect("refresh catalog with explicit readiness probe");
+    refresh_catalog(&harness, &HashMap::new()).await;
 
-    let guard = catalog.lock().await;
+    let guard = harness.runtime.backend_catalog.lock().await;
     let entry = guard
         .services
         .get("backend")

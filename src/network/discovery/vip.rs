@@ -67,97 +67,87 @@ fn summarize_public_endpoint_issues(issues: &[String]) -> String {
 /// Compute and synchronize one service VIP for the provided backend set.
 ///
 /// Returns the selected VIP and whether dataplane programming succeeded.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn sync_service_vip_for_backends(
-    bpf_lb: &BpfLoadBalancer,
-    bpf: &NetworkBpfManager,
-    lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
-    registry: &NetworkRegistry,
-    network_id: Uuid,
+    runtime: &DiscoveryRuntime,
     service_name: &str,
     backends: &[BackendAddress],
     expose_to_host: bool,
 ) -> Result<Option<(IpAddr, bool)>> {
-    let Some((vip, mac)) = compute_service_vip(registry, network_id, service_name, backends)?
+    let Some((vip, mac)) = compute_service_vip(
+        &runtime.registry,
+        runtime.network_id,
+        service_name,
+        backends,
+    )?
     else {
         return Ok(None);
     };
-    let programmed = program_service_vip(
-        bpf_lb,
-        bpf,
-        lb_missing,
-        registry,
-        network_id,
-        service_name,
-        vip,
-        mac,
-        backends,
-        expose_to_host,
-    )
-    .await;
+    let programmed =
+        program_service_vip(runtime, service_name, vip, mac, backends, expose_to_host).await;
     Ok(Some((vip, programmed)))
 }
 
 /// Attempt to synchronize VIP metadata into the eBPF maps if they are available, returning whether
 /// the dataplane was programmed successfully. Missing maps are warned once per network.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "vip programming needs the private dataplane and service metadata bundle"
-)]
 async fn program_service_vip(
-    bpf_lb: &BpfLoadBalancer,
-    bpf: &NetworkBpfManager,
-    lb_missing: &Arc<AsyncMutex<HashSet<Uuid>>>,
-    registry: &NetworkRegistry,
-    network_id: Uuid,
+    runtime: &DiscoveryRuntime,
     service_name: &str,
     vip: IpAddr,
     vip_mac: [u8; 6],
     backends: &[BackendAddress],
     expose_to_host: bool,
 ) -> bool {
-    match bpf_lb.sync_vip(network_id, vip, vip_mac, backends) {
+    match runtime
+        .bpf_lb
+        .sync_vip(runtime.network_id, vip, vip_mac, backends)
+    {
         Ok(()) => {
             if expose_to_host
-                && let Err(err) = ensure_host_vip_neighbor(network_id, vip, vip_mac).await
+                && let Err(err) = ensure_host_vip_neighbor(runtime.network_id, vip, vip_mac).await
             {
                 debug!(
                     target: "network",
-                    network = %network_id,
+                    network = %runtime.network_id,
                     service = %service_name,
                     vip = %vip,
                     "failed to program host neighbour for vip (continuing): {err:#}"
                 );
             }
-            let mut guard = lb_missing.lock().await;
-            guard.remove(&network_id);
+            let mut guard = runtime.missing_lb_maps.lock().await;
+            guard.remove(&runtime.network_id);
             true
         }
         Err(err) => {
             // Attempt to heal the maps by re-ensuring BPF programs, then retry once.
-            let healed = heal_lb_maps(bpf, registry, network_id).await;
-            if healed.is_ok() && bpf_lb.sync_vip(network_id, vip, vip_mac, backends).is_ok() {
+            let healed = heal_lb_maps(&runtime.bpf, &runtime.registry, runtime.network_id).await;
+            if healed.is_ok()
+                && runtime
+                    .bpf_lb
+                    .sync_vip(runtime.network_id, vip, vip_mac, backends)
+                    .is_ok()
+            {
                 if expose_to_host
-                    && let Err(err) = ensure_host_vip_neighbor(network_id, vip, vip_mac).await
+                    && let Err(err) =
+                        ensure_host_vip_neighbor(runtime.network_id, vip, vip_mac).await
                 {
                     debug!(
                         target: "network",
-                        network = %network_id,
+                        network = %runtime.network_id,
                         service = %service_name,
                         vip = %vip,
                         "failed to program host neighbour for vip after healing (continuing): {err:#}"
                     );
                 }
-                let mut guard = lb_missing.lock().await;
-                guard.remove(&network_id);
+                let mut guard = runtime.missing_lb_maps.lock().await;
+                guard.remove(&runtime.network_id);
                 return true;
             }
 
-            let mut guard = lb_missing.lock().await;
-            if guard.insert(network_id) {
+            let mut guard = runtime.missing_lb_maps.lock().await;
+            if guard.insert(runtime.network_id) {
                 warn!(
                     target: "network",
-                    network = %network_id,
+                    network = %runtime.network_id,
                     service = %service_name,
                     "failed to sync bpf vip for service; falling back to dns round robin: {err:#}"
                 );
