@@ -20,5 +20,6 @@ pub fn fixed_noise_keys(byte: u8) -> net::noise::NoiseKeys {
 #[macro_use]
 pub mod macros;
 pub mod convergence;
+#[cfg(target_os = "linux")]
 pub mod privileged_networking;
 pub mod testkit;

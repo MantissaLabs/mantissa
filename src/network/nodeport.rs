@@ -354,6 +354,7 @@ impl PlatformNodePortManager {
     }
 }
 
+#[cfg(target_os = "linux")]
 mod platform;
 
 #[cfg(target_os = "linux")]
