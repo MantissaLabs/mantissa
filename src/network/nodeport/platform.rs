@@ -31,7 +31,7 @@ use std::fs;
 use std::io;
 use std::mem;
 use std::net::IpAddr;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -210,6 +210,7 @@ const IPV6_MAPS: NodePortMapNames = NodePortMapNames {
     forward_map: "NODEPORT_FWD_V6",
     reverse_map: "NODEPORT_REV_V6",
 };
+
 /// Combined IPv4 and TCP header size used when deriving a safe MSS clamp.
 const IPV4_TCP_HEADER_BYTES: u32 = 40;
 /// Combined IPv6 and TCP header size used when deriving a safe MSS clamp.
@@ -251,6 +252,15 @@ impl NodePortSelector {
     /// Build a selector for nodeport ownership and deduplication.
     pub(super) fn new(port: u16, protocol: NodePortProtocol) -> Self {
         Self { port, protocol }
+    }
+
+    /// Convert this public selector into the exact key used by the BPF publication maps.
+    fn map_key(self) -> NodePortKey {
+        NodePortKey {
+            port: self.port.to_be(),
+            proto: self.protocol.number(),
+            _pad: 0,
+        }
     }
 }
 
@@ -355,6 +365,268 @@ pub(super) fn nodeport_return_keys(
     }
 
     (ipv4, ipv6)
+}
+
+/// Open NodePort's pinned BPF maps and provide family-aware programming operations.
+///
+/// The raw tc programs keep IPv4 and IPv6 state in separate maps. This helper keeps that split
+/// close to the map operations so `sync_ports` can stay focused on sync ordering instead of
+/// interleaving publication logic for both families.
+struct NodePortPinnedMaps {
+    base: PathBuf,
+    ipv4_vip_map: MapData,
+    ipv6_vip_map: MapData,
+    ipv4_return_map: MapData,
+    ipv6_return_map: MapData,
+    ipv4_host_map: MapData,
+    ipv6_host_map: MapData,
+}
+
+impl NodePortPinnedMaps {
+    /// Open all maps required for one NodePort sync while preserving their owning file handles.
+    fn open() -> Result<Self> {
+        let base = map_pin_dir()?;
+        Ok(Self {
+            ipv4_vip_map: open_map(&base, IPV4_MAPS.vip_map).context("open NODEPORT_VIPS map")?,
+            ipv6_vip_map: open_map(&base, IPV6_MAPS.vip_map)
+                .context("open NODEPORT_VIPS_V6 map")?,
+            ipv4_return_map: open_map(&base, IPV4_MAPS.return_map)
+                .context("open NODEPORT_RETURNS map")?,
+            ipv6_return_map: open_map(&base, IPV6_MAPS.return_map)
+                .context("open NODEPORT_RETURNS_V6 map")?,
+            ipv4_host_map: open_map(&base, IPV4_MAPS.host_map).context("open NODEPORT_HOST map")?,
+            ipv6_host_map: open_map(&base, IPV6_MAPS.host_map)
+                .context("open NODEPORT_HOST_V6 map")?,
+            base,
+        })
+    }
+
+    /// Return the underlying file descriptor for one pinned map.
+    fn fd(map: &MapData) -> RawFd {
+        map.fd().as_fd().as_raw_fd()
+    }
+
+    /// Remove selectors and flow state that disappeared or changed during this sync.
+    fn remove_stale_public_state(
+        &self,
+        previous_mappings: &HashMap<NodePortSelector, NodePortPublishedMapping>,
+        desired_mappings: &HashMap<NodePortSelector, NodePortPublishedMapping>,
+    ) -> Result<u64> {
+        let stale_mappings = stale_nodeport_mappings(previous_mappings, desired_mappings);
+        let (previous_return_keys_v4, previous_return_keys_v6) =
+            nodeport_return_keys(previous_mappings);
+        let (desired_return_keys_v4, desired_return_keys_v6) =
+            nodeport_return_keys(desired_mappings);
+
+        for (selector, _) in &stale_mappings {
+            self.delete_public_selector_from_all_families(*selector);
+        }
+        self.delete_removed_return_keys(
+            &previous_return_keys_v4,
+            &desired_return_keys_v4,
+            &previous_return_keys_v6,
+            &desired_return_keys_v6,
+        );
+
+        clear_stale_nodeport_flows(&self.base, stale_mappings.as_slice())
+            .context("clear stale nodeport flows")
+    }
+
+    /// Delete one public selector from both family publication maps before flow cleanup runs.
+    fn delete_public_selector_from_all_families(&self, selector: NodePortSelector) {
+        let key = selector.map_key();
+        let _ = delete_elem(Self::fd(&self.ipv4_vip_map), &key);
+        let _ = delete_elem(Self::fd(&self.ipv6_vip_map), &key);
+    }
+
+    /// Drop return-path candidates that are no longer part of the desired publication set.
+    fn delete_removed_return_keys(
+        &self,
+        previous_v4: &HashSet<NodePortReturnKey>,
+        desired_v4: &HashSet<NodePortReturnKey>,
+        previous_v6: &HashSet<NodePortReturnKey6>,
+        desired_v6: &HashSet<NodePortReturnKey6>,
+    ) {
+        for key in previous_v4.difference(desired_v4) {
+            let _ = delete_elem(Self::fd(&self.ipv4_return_map), key);
+        }
+        for key in previous_v6.difference(desired_v6) {
+            let _ = delete_elem(Self::fd(&self.ipv6_return_map), key);
+        }
+    }
+
+    /// Program the host-access map entries required by the current publication families.
+    async fn sync_host_entries(
+        &self,
+        network_id: Uuid,
+        overlay_ifindex: Option<u32>,
+        entries: &[NodePortMapping],
+        previous_mappings: &HashMap<NodePortSelector, NodePortPublishedMapping>,
+        desired_mappings: &HashMap<NodePortSelector, NodePortPublishedMapping>,
+    ) -> Result<()> {
+        if let Some(overlay_ifindex) = overlay_ifindex {
+            self.program_current_host_entries(network_id, overlay_ifindex, entries)
+                .await?;
+        }
+
+        for stale_ifindex in stale_overlay_ifindices(previous_mappings, desired_mappings) {
+            self.delete_host_entry_from_all_families(stale_ifindex);
+        }
+
+        Ok(())
+    }
+
+    /// Program the host-access entry for each family requested by the current mappings.
+    async fn program_current_host_entries(
+        &self,
+        network_id: Uuid,
+        overlay_ifindex: u32,
+        entries: &[NodePortMapping],
+    ) -> Result<()> {
+        let host_mac = host_access_mac(network_id).await?;
+        let host_mtu = host_access_mtu(network_id).await?;
+        let mut programmed_ipv4_host = false;
+        let mut programmed_ipv6_host = false;
+
+        for (family, _) in unique_nodeport_families(entries) {
+            let host_ip = host_access_ip(network_id, family).await?;
+            let tcp_mss = tcp_mss_for_family(host_mtu, family).with_context(|| {
+                format!("derive {family:?} NodePort TCP MSS from host-access MTU {host_mtu}")
+            })?;
+
+            match host_ip {
+                IpAddr::V4(host_ip) => {
+                    self.program_ipv4_host_entry(overlay_ifindex, host_mac, tcp_mss, host_ip)?;
+                    programmed_ipv4_host = true;
+                }
+                IpAddr::V6(host_ip) => {
+                    self.program_ipv6_host_entry(overlay_ifindex, host_mac, tcp_mss, host_ip)?;
+                    programmed_ipv6_host = true;
+                }
+            }
+        }
+
+        if !programmed_ipv4_host {
+            let _ = delete_elem(Self::fd(&self.ipv4_host_map), &overlay_ifindex);
+        }
+        if !programmed_ipv6_host {
+            let _ = delete_elem(Self::fd(&self.ipv6_host_map), &overlay_ifindex);
+        }
+
+        Ok(())
+    }
+
+    /// Program one IPv4 host-access SNAT entry.
+    fn program_ipv4_host_entry(
+        &self,
+        overlay_ifindex: u32,
+        host_mac: [u8; 6],
+        tcp_mss: u16,
+        host_ip: std::net::Ipv4Addr,
+    ) -> Result<()> {
+        let value = NodePortHost {
+            mac: host_mac,
+            tcp_mss,
+            host_ip: u32::from_ne_bytes(host_ip.octets()),
+        };
+        update_elem(Self::fd(&self.ipv4_host_map), &overlay_ifindex, &value)
+            .context("program IPv4 nodeport host attachment")
+    }
+
+    /// Program one IPv6 host-access SNAT entry.
+    fn program_ipv6_host_entry(
+        &self,
+        overlay_ifindex: u32,
+        host_mac: [u8; 6],
+        tcp_mss: u16,
+        host_ip: std::net::Ipv6Addr,
+    ) -> Result<()> {
+        let value = NodePortHost6 {
+            mac: host_mac,
+            tcp_mss,
+            host_ip: host_ip.octets(),
+        };
+        update_elem(Self::fd(&self.ipv6_host_map), &overlay_ifindex, &value)
+            .context("program IPv6 nodeport host attachment")
+    }
+
+    /// Remove a host-access ifindex from both family maps when it is no longer referenced.
+    fn delete_host_entry_from_all_families(&self, overlay_ifindex: u32) {
+        let _ = delete_elem(Self::fd(&self.ipv4_host_map), &overlay_ifindex);
+        let _ = delete_elem(Self::fd(&self.ipv6_host_map), &overlay_ifindex);
+    }
+
+    /// Program the return-path candidate maps for the desired publication set.
+    fn program_return_keys(
+        &self,
+        desired_mappings: &HashMap<NodePortSelector, NodePortPublishedMapping>,
+    ) -> Result<()> {
+        let (desired_return_keys_v4, desired_return_keys_v6) =
+            nodeport_return_keys(desired_mappings);
+
+        for key in &desired_return_keys_v4 {
+            update_elem(Self::fd(&self.ipv4_return_map), key, &1u8)
+                .context("program IPv4 nodeport return candidate")?;
+        }
+        for key in &desired_return_keys_v6 {
+            update_elem(Self::fd(&self.ipv6_return_map), key, &1u8)
+                .context("program IPv6 nodeport return candidate")?;
+        }
+
+        Ok(())
+    }
+
+    /// Program every desired public selector into the matching family map.
+    fn program_public_mappings(
+        &self,
+        desired_mappings: &HashMap<NodePortSelector, NodePortPublishedMapping>,
+    ) -> Result<()> {
+        for (selector, mapping) in desired_mappings {
+            self.program_public_mapping(*selector, *mapping)?;
+        }
+        Ok(())
+    }
+
+    /// Program one public selector and clear the opposite-family selector if it existed.
+    fn program_public_mapping(
+        &self,
+        selector: NodePortSelector,
+        mapping: NodePortPublishedMapping,
+    ) -> Result<()> {
+        let key = selector.map_key();
+        match (mapping.vip, mapping.node_ip) {
+            (IpAddr::V4(vip), IpAddr::V4(node_ip)) => {
+                let value = NodePortEntry {
+                    vip: u32::from_ne_bytes(vip.octets()),
+                    vip_port: mapping.vip_port.to_be(),
+                    _pad: 0,
+                    overlay_ifindex: mapping.overlay_ifindex,
+                    node_ip: u32::from_ne_bytes(node_ip.octets()),
+                };
+                update_elem(Self::fd(&self.ipv4_vip_map), &key, &value)
+                    .with_context(|| format!("program IPv4 nodeport {}", selector.port))?;
+                let _ = delete_elem(Self::fd(&self.ipv6_vip_map), &key);
+                Ok(())
+            }
+            (IpAddr::V6(vip), IpAddr::V6(node_ip)) => {
+                let value = NodePortEntry6 {
+                    vip: vip.octets(),
+                    vip_port: mapping.vip_port.to_be(),
+                    _pad: 0,
+                    overlay_ifindex: mapping.overlay_ifindex,
+                    node_ip: node_ip.octets(),
+                };
+                update_elem(Self::fd(&self.ipv6_vip_map), &key, &value)
+                    .with_context(|| format!("program IPv6 nodeport {}", selector.port))?;
+                let _ = delete_elem(Self::fd(&self.ipv4_vip_map), &key);
+                Ok(())
+            }
+            (vip, node_ip) => Err(anyhow!(
+                "nodeport resolved an invalid {} publication identity {node_ip} for VIP {vip}; configure network.nodeport.ip explicitly for the correct family",
+                NodePortIpFamily::from_ip(node_ip).label(),
+            )),
+        }
+    }
 }
 
 struct NodePortAttachment {
@@ -530,24 +802,7 @@ impl PlatformNodePortManager {
         } else {
             Some(overlay_ifindex(network_id)?)
         };
-        let base = map_pin_dir()?;
-        let ipv4_vip_map = open_map(&base, IPV4_MAPS.vip_map).context("open NODEPORT_VIPS map")?;
-        let ipv6_vip_map =
-            open_map(&base, IPV6_MAPS.vip_map).context("open NODEPORT_VIPS_V6 map")?;
-        let ipv4_return_map =
-            open_map(&base, IPV4_MAPS.return_map).context("open NODEPORT_RETURNS map")?;
-        let ipv6_return_map =
-            open_map(&base, IPV6_MAPS.return_map).context("open NODEPORT_RETURNS_V6 map")?;
-        let ipv4_host_map =
-            open_map(&base, IPV4_MAPS.host_map).context("open NODEPORT_HOST map")?;
-        let ipv6_host_map =
-            open_map(&base, IPV6_MAPS.host_map).context("open NODEPORT_HOST_V6 map")?;
-        let ipv4_vip_fd = ipv4_vip_map.fd().as_fd().as_raw_fd();
-        let ipv6_vip_fd = ipv6_vip_map.fd().as_fd().as_raw_fd();
-        let ipv4_return_fd = ipv4_return_map.fd().as_fd().as_raw_fd();
-        let ipv6_return_fd = ipv6_return_map.fd().as_fd().as_raw_fd();
-        let ipv4_host_fd = ipv4_host_map.fd().as_fd().as_raw_fd();
-        let ipv6_host_fd = ipv6_host_map.fd().as_fd().as_raw_fd();
+        let maps = NodePortPinnedMaps::open()?;
         let previous_mappings = self
             .ports_by_network
             .get(&network_id)
@@ -562,132 +817,24 @@ impl PlatformNodePortManager {
         let desired_mappings = self
             .collect_programmed_mappings(entries, overlay_index, &mut resolved_node_ips)
             .await?;
-        let stale_mappings = stale_nodeport_mappings(&previous_mappings, &desired_mappings);
-        let (previous_return_keys_v4, previous_return_keys_v6) =
-            nodeport_return_keys(&previous_mappings);
-        let (desired_return_keys_v4, desired_return_keys_v6) =
-            nodeport_return_keys(&desired_mappings);
-        for (selector, _) in &stale_mappings {
-            let key = NodePortKey {
-                port: selector.port.to_be(),
-                proto: selector.protocol.number(),
-                _pad: 0,
-            };
-            // Remove stale selectors from both families before clearing flow state so packets
-            // cannot recreate the old translation while this sync is still converging.
-            let _ = delete_elem(ipv4_vip_fd, &key);
-            let _ = delete_elem(ipv6_vip_fd, &key);
-        }
-        for key in previous_return_keys_v4.difference(&desired_return_keys_v4) {
-            let _ = delete_elem(ipv4_return_fd, key);
-        }
-        for key in previous_return_keys_v6.difference(&desired_return_keys_v6) {
-            let _ = delete_elem(ipv6_return_fd, key);
-        }
-        let cleared_pairs = clear_stale_nodeport_flows(&base, stale_mappings.as_slice())
-            .context("clear stale nodeport flows")?;
+        let cleared_pairs =
+            maps.remove_stale_public_state(&previous_mappings, &desired_mappings)?;
         self.userspace_flow_clears = self.userspace_flow_clears.saturating_add(cleared_pairs);
 
-        if let Some(overlay_ifindex) = overlay_ifindex_opt {
-            let host_mac = host_access_mac(network_id).await?;
-            let host_mtu = host_access_mtu(network_id).await?;
-            let mut programmed_ipv4_host = false;
-            let mut programmed_ipv6_host = false;
-
-            for family in unique_nodeport_families(entries)
-                .into_iter()
-                .map(|(family, _)| family)
-            {
-                let host_ip = host_access_ip(network_id, family).await?;
-                let tcp_mss = tcp_mss_for_family(host_mtu, family).with_context(|| {
-                    format!("derive {family:?} NodePort TCP MSS from host-access MTU {host_mtu}")
-                })?;
-
-                match host_ip {
-                    IpAddr::V4(host_ip) => {
-                        let value = NodePortHost {
-                            mac: host_mac,
-                            tcp_mss,
-                            host_ip: u32::from_ne_bytes(host_ip.octets()),
-                        };
-                        update_elem(ipv4_host_fd, &overlay_ifindex, &value)
-                            .context("program IPv4 nodeport host attachment")?;
-                        programmed_ipv4_host = true;
-                    }
-                    IpAddr::V6(host_ip) => {
-                        let value = NodePortHost6 {
-                            mac: host_mac,
-                            tcp_mss,
-                            host_ip: host_ip.octets(),
-                        };
-                        update_elem(ipv6_host_fd, &overlay_ifindex, &value)
-                            .context("program IPv6 nodeport host attachment")?;
-                        programmed_ipv6_host = true;
-                    }
-                }
-            }
-
-            if !programmed_ipv4_host {
-                let _ = delete_elem(ipv4_host_fd, &overlay_ifindex);
-            }
-            if !programmed_ipv6_host {
-                let _ = delete_elem(ipv6_host_fd, &overlay_ifindex);
-            }
+        maps.sync_host_entries(
+            network_id,
+            overlay_ifindex_opt,
+            entries,
+            &previous_mappings,
+            &desired_mappings,
+        )
+        .await?;
+        maps.program_return_keys(&desired_mappings)?;
+        if let Err(err) = maps.program_public_mappings(&desired_mappings) {
+            self.degrade_runtime(err.to_string(), "nodeport runtime degraded");
+            return Err(err);
         }
-        for overlay_ifindex in stale_overlay_ifindices(&previous_mappings, &desired_mappings) {
-            let _ = delete_elem(ipv4_host_fd, &overlay_ifindex);
-            let _ = delete_elem(ipv6_host_fd, &overlay_ifindex);
-        }
-
-        for key in &desired_return_keys_v4 {
-            update_elem(ipv4_return_fd, key, &1u8)
-                .context("program IPv4 nodeport return candidate")?;
-        }
-        for key in &desired_return_keys_v6 {
-            update_elem(ipv6_return_fd, key, &1u8)
-                .context("program IPv6 nodeport return candidate")?;
-        }
-
-        for (selector, mapping) in &desired_mappings {
-            let key = NodePortKey {
-                port: selector.port.to_be(),
-                proto: selector.protocol.number(),
-                _pad: 0,
-            };
-            match (mapping.vip, mapping.node_ip) {
-                (IpAddr::V4(vip), IpAddr::V4(node_ip)) => {
-                    let value = NodePortEntry {
-                        vip: u32::from_ne_bytes(vip.octets()),
-                        vip_port: mapping.vip_port.to_be(),
-                        _pad: 0,
-                        overlay_ifindex: mapping.overlay_ifindex,
-                        node_ip: u32::from_ne_bytes(node_ip.octets()),
-                    };
-                    update_elem(ipv4_vip_fd, &key, &value)
-                        .with_context(|| format!("program IPv4 nodeport {}", selector.port))?;
-                    let _ = delete_elem(ipv6_vip_fd, &key);
-                }
-                (IpAddr::V6(vip), IpAddr::V6(node_ip)) => {
-                    let value = NodePortEntry6 {
-                        vip: vip.octets(),
-                        vip_port: mapping.vip_port.to_be(),
-                        _pad: 0,
-                        overlay_ifindex: mapping.overlay_ifindex,
-                        node_ip: node_ip.octets(),
-                    };
-                    update_elem(ipv6_vip_fd, &key, &value)
-                        .with_context(|| format!("program IPv6 nodeport {}", selector.port))?;
-                    let _ = delete_elem(ipv4_vip_fd, &key);
-                }
-                (vip, node_ip) => {
-                    let error = format!(
-                        "nodeport resolved an invalid {} publication identity {node_ip} for VIP {vip}; configure network.nodeport.ip explicitly for the correct family",
-                        NodePortIpFamily::from_ip(node_ip).label(),
-                    );
-                    self.degrade_runtime(error.clone(), "nodeport runtime degraded");
-                    return Err(anyhow!(error));
-                }
-            }
+        for selector in desired_mappings.keys() {
             self.port_owner.insert(*selector, network_id);
         }
 
