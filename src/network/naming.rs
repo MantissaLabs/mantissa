@@ -46,6 +46,7 @@ pub(crate) fn vxlan_name(network_id: Uuid) -> String {
 /// Mantissa-managed network interfaces all embed the same eight-hex network suffix, which lets
 /// the controller identify orphaned devices without storing extra local metadata.
 pub(crate) fn managed_network_interface_suffix(link_name: &str) -> Option<&str> {
+    // Prefixes that encode one network suffix rather than one task attachment suffix.
     const PREFIXES: [&str; 4] = ["mvx-", "mnt-br-", "mnhost-", "mnhp-"];
 
     let suffix = PREFIXES

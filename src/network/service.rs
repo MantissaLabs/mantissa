@@ -41,6 +41,7 @@ impl NetworksRpc {
         }
     }
 
+    /// Read a required text field from a Cap'n Proto request and reject empty values at the edge.
     fn read_non_empty_text(text: capnp::text::Reader<'_>, field: &str) -> Result<String, Error> {
         let value = text
             .to_str()
@@ -54,6 +55,7 @@ impl NetworksRpc {
         }
     }
 
+    /// Read an optional request text field without applying domain validation.
     fn read_optional_text(text: capnp::text::Reader<'_>) -> Result<String, Error> {
         Ok(text
             .to_str()
@@ -61,6 +63,7 @@ impl NetworksRpc {
             .to_string())
     }
 
+    /// Convert the requested wire driver into the local network driver enum.
     fn driver_from_request(spec: &network_create_spec::Reader<'_>) -> Result<NetworkDriver, Error> {
         let driver = spec
             .get_driver()
@@ -69,10 +72,12 @@ impl NetworksRpc {
     }
 }
 
+/// Convert local errors into Cap'n Proto RPC errors at the network service boundary.
 fn to_capnp<E: std::fmt::Display>(error: E) -> Error {
     Error::failed(error.to_string())
 }
 
+/// Decode one UUID from its 16-byte wire representation.
 fn read_uuid(bytes: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
     let data = bytes.to_owned();
     if data.len() != 16 {
@@ -84,6 +89,7 @@ fn read_uuid(bytes: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
     Uuid::from_slice(&data).map_err(to_capnp)
 }
 
+/// Convert the protocol driver enum into the replicated network driver enum.
 fn convert_driver(driver: protocol::network::NetworkDriver) -> NetworkDriver {
     NetworkDriver::from_proto(driver)
 }
@@ -100,6 +106,7 @@ fn collect_bpf_programs(
     Ok(programs)
 }
 
+/// Serialize one replicated network spec into the Cap'n Proto response shape.
 fn write_network_spec(mut builder: network_spec::Builder<'_>, spec: &NetworkSpecValue) {
     builder.set_id(spec.id.as_bytes());
     builder.set_name(&spec.name);
@@ -122,6 +129,7 @@ fn write_network_spec(mut builder: network_spec::Builder<'_>, spec: &NetworkSpec
     }
 }
 
+/// Serialize one compact network list row with aggregated peer counts.
 fn write_network_summary(
     mut builder: network_summary::Builder<'_>,
     spec: &NetworkSpecValue,
@@ -139,6 +147,7 @@ fn write_network_summary(
     builder.set_updated_at(&spec.updated_at);
 }
 
+/// Serialize one network peer-state row for inspect and status responses.
 fn write_network_peer_status(
     mut builder: network_peer_status::Builder<'_>,
     state: &NetworkPeerStateValue,
@@ -154,6 +163,7 @@ fn write_network_peer_status(
     }
 }
 
+/// Serialize one network attachment row for attachment inspection responses.
 fn write_network_attachment(
     mut builder: network_attachment_spec::Builder<'_>,
     attachment: &NetworkAttachmentValue,
@@ -177,6 +187,7 @@ fn write_network_attachment(
     builder.set_traffic_published(attachment.traffic_published);
 }
 
+/// Build per-network total/ready peer counts used by network list responses.
 fn aggregate_peer_counts(
     specs: &[NetworkSpecValue],
     registry: &NetworkRegistry,
@@ -188,6 +199,7 @@ fn aggregate_peer_counts(
     Ok(counts)
 }
 
+/// Decode a network spec from its wire representation for gossip and RPC ingestion.
 fn read_network_spec(reader: network_spec::Reader<'_>) -> Result<NetworkSpecValue, Error> {
     let id = read_uuid(reader.get_id()?)?;
     let name = reader.get_name()?.to_str()?.to_string();
@@ -223,6 +235,7 @@ fn read_network_spec(reader: network_spec::Reader<'_>) -> Result<NetworkSpecValu
     })
 }
 
+/// Decode a peer-state payload and its stable CRDT keys from a network event.
 fn read_peer_state(
     reader: network_peer_status::Reader<'_>,
     id_bytes: capnp::data::Reader<'_>,
@@ -252,6 +265,7 @@ fn read_peer_state(
     })
 }
 
+/// Serialize one network gossip event onto the Cap'n Proto wire format.
 pub(crate) fn write_network_event(
     mut builder: network_event::Builder<'_>,
     event: &NetworkEvent,
@@ -279,6 +293,7 @@ pub(crate) fn write_network_event(
     Ok(())
 }
 
+/// Decode one network gossip event from the Cap'n Proto wire format.
 pub(crate) fn read_network_event(reader: network_event::Reader<'_>) -> Result<NetworkEvent, Error> {
     match reader.get_event()? {
         network_event::EventType::Upsert => {
@@ -303,6 +318,7 @@ pub(crate) fn read_network_event(reader: network_event::Reader<'_>) -> Result<Ne
 }
 
 impl networks::Server for NetworksRpc {
+    /// Handle network create/update requests and trigger local plus gossiped reconciliation.
     async fn create(
         self: Rc<Self>,
         params: networks::CreateParams,
@@ -387,6 +403,7 @@ impl networks::Server for NetworksRpc {
         Ok(())
     }
 
+    /// Mark a network deleted and schedule local plus remote teardown.
     async fn delete(
         self: Rc<Self>,
         params: networks::DeleteParams,
@@ -422,6 +439,7 @@ impl networks::Server for NetworksRpc {
         Ok(())
     }
 
+    /// Return compact network summaries for CLI and API consumers.
     async fn list(
         self: Rc<Self>,
         _params: networks::ListParams,
@@ -443,6 +461,7 @@ impl networks::Server for NetworksRpc {
         Ok(())
     }
 
+    /// Return the full replicated spec for one requested network.
     async fn inspect(
         self: Rc<Self>,
         params: networks::InspectParams,
@@ -480,6 +499,7 @@ impl networks::Server for NetworksRpc {
         Ok(())
     }
 
+    /// Return the latest known peer readiness rows for one network.
     async fn peer_status(
         self: Rc<Self>,
         params: networks::PeerStatusParams,
@@ -496,6 +516,7 @@ impl networks::Server for NetworksRpc {
         Ok(())
     }
 
+    /// Return workload attachment rows for all networks or one selected network.
     async fn attachments(
         self: Rc<Self>,
         params: networks::AttachmentsParams,

@@ -576,16 +576,19 @@ fn attachment_revision_timestamp(attachment: &NetworkAttachmentValue) -> Option<
         .and_then(parse_rfc3339)
 }
 
+/// Parse the best available attachment timestamp, preferring the latest update over creation.
 fn parse_timestamp(updated_at: &str, created_at: &str) -> Option<DateTime<Utc>> {
     parse_rfc3339(updated_at).or_else(|| parse_rfc3339(created_at))
 }
 
+/// Parse one RFC3339 timestamp from replicated state, returning `None` for malformed legacy data.
 fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
     chrono::DateTime::parse_from_rfc3339(raw)
         .map(|dt| dt.with_timezone(&Utc))
         .ok()
 }
 
+/// Rank attachment lifecycle states so more terminal or converged rows win MVReg selection ties.
 fn attachment_state_rank(state: crate::network::types::NetworkAttachmentState) -> u8 {
     use crate::network::types::NetworkAttachmentState::*;
     match state {

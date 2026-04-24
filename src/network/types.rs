@@ -212,6 +212,7 @@ impl BpfAttachPoint {
 }
 
 impl fmt::Display for BpfAttachPoint {
+    /// Render one attach point as its stable wire token for logs and API output.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_token())
     }
@@ -440,6 +441,7 @@ pub enum NetworkAttachmentState {
 }
 
 impl NetworkAttachmentState {
+    /// Convert the replicated attachment state into its Cap'n Proto enum value.
     pub fn to_proto(self) -> protocol::network::AttachmentState {
         match self {
             NetworkAttachmentState::Pending => protocol::network::AttachmentState::Pending,
@@ -451,6 +453,7 @@ impl NetworkAttachmentState {
     }
 
     #[allow(dead_code)]
+    /// Convert a Cap'n Proto attachment state into the replicated enum used by the registry.
     pub fn from_proto(state: protocol::network::AttachmentState) -> Self {
         match state {
             protocol::network::AttachmentState::Pending => NetworkAttachmentState::Pending,
@@ -517,6 +520,7 @@ impl NetworkAttachmentValue {
 }
 
 impl PartialEq for NetworkAttachmentValue {
+    /// Compare attachments by replicated semantics rather than observability timestamps.
     fn eq(&self, other: &Self) -> bool {
         self.semantically_equals(other)
     }
@@ -525,12 +529,14 @@ impl PartialEq for NetworkAttachmentValue {
 impl Eq for NetworkAttachmentValue {}
 
 impl PartialOrd for NetworkAttachmentValue {
+    /// Delegate ordering to the total order used by MVReg value comparison.
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for NetworkAttachmentValue {
+    /// Provide a deterministic total order across semantic attachment fields.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.id
             .cmp(&other.id)
@@ -551,6 +557,7 @@ impl Ord for NetworkAttachmentValue {
 }
 
 impl Hash for NetworkAttachmentValue {
+    /// Hash the semantic attachment fields so timestamp-only variants do not diverge.
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
         self.task_id.hash(state);
@@ -638,6 +645,7 @@ impl NetworkAttachmentValue {
     }
 }
 
+/// Return the current timestamp in the replicated RFC3339 format used by network rows.
 fn current_timestamp() -> String {
     Utc::now().to_rfc3339()
 }

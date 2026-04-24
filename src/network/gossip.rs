@@ -54,6 +54,10 @@ impl NetworkGossiper {
             .map_err(|e| anyhow!("failed to enqueue network gossip: {e}"))
     }
 
+    /// Apply one received network event and schedule the follow-up local reconciliation work.
+    ///
+    /// Gossip only mutates the replicated registry; controller scheduling happens here so every
+    /// peer converges its local kernel state after the registry write succeeds.
     async fn apply_event(&self, event: NetworkEvent) -> Result<()> {
         match event {
             NetworkEvent::Upsert(spec) => {

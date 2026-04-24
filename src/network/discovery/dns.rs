@@ -343,6 +343,7 @@ fn address_record(name: &Name, addr: IpAddr) -> Record {
     }
 }
 
+/// Extract the service label from `<service>.<network>.svc.mantissa.` queries.
 fn extract_service_label(name: &Name, network_name: &str) -> Option<String> {
     let mut labels = Vec::new();
     for raw in name.iter() {

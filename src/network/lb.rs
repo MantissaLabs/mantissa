@@ -35,6 +35,7 @@ pub struct BpfLoadBalancer {
 }
 
 impl BpfLoadBalancer {
+    /// Build the platform load balancer wrapper used by service discovery.
     pub fn new() -> Self {
         Self {
             inner: PlatformBpfLoadBalancer::new(),
@@ -89,6 +90,7 @@ mod platform {
         reverse_map: &'static str,
     }
 
+    /// Pinned map names used by the IPv4 overlay VIP dataplane.
     const IPV4_MAPS: LbMapNames = LbMapNames {
         vip_map: "LB_VIPS",
         backend_map: "LB_BACKENDS",
@@ -96,6 +98,7 @@ mod platform {
         reverse_map: "LB_REV",
     };
 
+    /// Pinned map names used by the IPv6 overlay VIP dataplane.
     const IPV6_MAPS: LbMapNames = LbMapNames {
         vip_map: "LB_VIPS_V6",
         backend_map: "LB_BACKENDS_V6",
@@ -104,6 +107,7 @@ mod platform {
     };
 
     impl PlatformBpfLoadBalancer {
+        /// Build the Linux load balancer map programmer.
         pub fn new() -> Self {
             Self
         }
@@ -327,9 +331,13 @@ mod platform {
     ///
     /// Keep this in sync with `network_ebpf::lb::MAX_BACKENDS_PER_VIP`.
     const MAX_BACKENDS_PER_VIP: usize = 1024;
+    /// bpf(2) command used to upsert VIP and backend map entries.
     const BPF_MAP_UPDATE_ELEM: libc::c_uint = 2;
+    /// bpf(2) command used to delete stale VIP, backend, and flow entries.
     const BPF_MAP_DELETE_ELEM: libc::c_uint = 3;
+    /// bpf(2) command used to iterate pinned map keys for diagnostics and cleanup.
     const BPF_MAP_GET_NEXT_KEY: libc::c_uint = 4;
+    /// bpf(2) command used to read current VIP metadata before deciding whether flows are stale.
     const BPF_MAP_LOOKUP_ELEM: libc::c_uint = 1;
 
     #[repr(C)]
@@ -1032,6 +1040,7 @@ mod platform {
         Ok(path)
     }
 
+    /// Return and create the per-network pinned map directory.
     fn map_pin_dir(network_id: Uuid) -> Result<std::path::PathBuf> {
         let path = map_root_dir()?.join(network_id.to_string());
         fs::create_dir_all(&path)
@@ -1039,6 +1048,7 @@ mod platform {
         Ok(path)
     }
 
+    /// Upsert one key/value pair into a pinned BPF map through a raw bpf syscall.
     fn update_elem<K: Pod, V: Pod>(fd: std::os::fd::RawFd, key: &K, val: &V) -> Result<()> {
         #[repr(C)]
         struct BpfAttrUpsert {
@@ -1373,10 +1383,12 @@ mod platform {
     pub struct PlatformBpfLoadBalancer;
 
     impl PlatformBpfLoadBalancer {
+        /// Build the no-op load balancer used on unsupported platforms.
         pub fn new() -> Self {
             Self
         }
 
+        /// Ignore VIP syncs on unsupported platforms so discovery can fall back to DNS records.
         pub fn sync_vip(
             &self,
             _network_id: Uuid,

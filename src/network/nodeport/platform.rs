@@ -193,6 +193,7 @@ struct NodePortMapNames {
     reverse_map: &'static str,
 }
 
+/// Pinned map names used by the IPv4 NodePort dataplane programs.
 const IPV4_MAPS: NodePortMapNames = NodePortMapNames {
     vip_map: "NODEPORT_VIPS",
     return_map: "NODEPORT_RETURNS",
@@ -201,6 +202,7 @@ const IPV4_MAPS: NodePortMapNames = NodePortMapNames {
     reverse_map: "NODEPORT_REV",
 };
 
+/// Pinned map names used by the IPv6 NodePort dataplane programs.
 const IPV6_MAPS: NodePortMapNames = NodePortMapNames {
     vip_map: "NODEPORT_VIPS_V6",
     return_map: "NODEPORT_RETURNS_V6",
@@ -208,7 +210,9 @@ const IPV6_MAPS: NodePortMapNames = NodePortMapNames {
     forward_map: "NODEPORT_FWD_V6",
     reverse_map: "NODEPORT_REV_V6",
 };
+/// Combined IPv4 and TCP header size used when deriving a safe MSS clamp.
 const IPV4_TCP_HEADER_BYTES: u32 = 40;
+/// Combined IPv6 and TCP header size used when deriving a safe MSS clamp.
 const IPV6_TCP_HEADER_BYTES: u32 = 60;
 
 /// Address family selector shared by interface discovery and map programming helpers.
@@ -2283,6 +2287,7 @@ where
     K: Pod + Copy + Default,
     F: FnMut(K) -> Result<bool>,
 {
+    // `BPF_MAP_GET_NEXT_KEY` walks pinned maps without needing Aya map wrappers.
     const BPF_MAP_GET_NEXT_KEY: libc::c_uint = 4;
 
     #[repr(C)]
@@ -2374,6 +2379,7 @@ fn reset_nodeport_maps(root: &Path) -> Result<()> {
 
 /// Update a pinned BPF map entry with the provided key/value pair.
 fn update_elem<K: Pod, V: Pod>(fd: i32, key: &K, val: &V) -> Result<()> {
+    // `BPF_MAP_UPDATE_ELEM` lets NodePort publish VIP, host, and flow entries atomically.
     const BPF_MAP_UPDATE_ELEM: libc::c_uint = 2;
 
     #[repr(C)]
@@ -2409,6 +2415,7 @@ fn update_elem<K: Pod, V: Pod>(fd: i32, key: &K, val: &V) -> Result<()> {
 
 /// Delete a pinned BPF map entry when it is no longer needed.
 fn delete_elem<K: Pod>(fd: i32, key: &K) -> Result<()> {
+    // `BPF_MAP_DELETE_ELEM` removes stale selectors and cached reverse-flow state.
     const BPF_MAP_DELETE_ELEM: libc::c_uint = 3;
 
     #[repr(C)]
@@ -2447,6 +2454,7 @@ fn delete_elem<K: Pod>(fd: i32, key: &K) -> Result<()> {
 /// Selector cleanup uses direct lookups while iterating flow keys so it can distinguish
 /// multiple public selectors that intentionally reuse the same VIP target tuple.
 fn lookup_elem<K: Pod, V: Pod + Default>(fd: i32, key: &K) -> Result<Option<V>> {
+    // `BPF_MAP_LOOKUP_ELEM` reads reverse-flow metadata before deciding whether to delete a key.
     const BPF_MAP_LOOKUP_ELEM: libc::c_uint = 1;
 
     #[repr(C)]

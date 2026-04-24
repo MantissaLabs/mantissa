@@ -163,6 +163,10 @@ impl OverlayLayout {
     }
 }
 
+/// Derive the allocation layout for one overlay subnet.
+///
+/// Mantissa splits usable host addresses into alternating resolver and task slots so resolver
+/// addresses remain deterministic per node while workload addresses remain deterministic per task.
 fn overlay_layout(network: &NetworkSpecValue) -> Result<OverlayLayout> {
     let subnet = parse_overlay_cidr(&network.subnet_cidr)?;
     let base = match subnet.base_ip {

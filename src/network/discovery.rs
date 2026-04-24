@@ -48,10 +48,13 @@ use self::vip::{
     apply_public_endpoint_observations, reconcile_host_vip_neighbors, sync_service_vip_for_backends,
 };
 
+/// DNS suffix served by Mantissa's in-network service resolver.
 const SERVICE_ZONE_SUFFIX: &str = "svc.mantissa";
+/// DNS TTL for service answers; keep it short so publication changes drain quickly.
 const SERVICE_TTL_SECS: u32 = 5;
+/// Background interval used to refresh VIP, NodePort, and DNS-derived publication state.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-// Keep cached health around for roughly one DNS TTL to avoid stale blackholes.
+/// Keep cached health around for roughly one DNS TTL to avoid stale blackholes.
 #[cfg(test)]
 const HEALTH_CACHE_STALE_AFTER: Duration = Duration::from_secs(SERVICE_TTL_SECS as u64);
 /// Bound how many already-healthy endpoints discovery rechecks on one refresh tick.
@@ -240,6 +243,7 @@ impl ServiceDiscovery {
         }
     }
 
+    /// Start or update the DNS resolver and service publication runtime for one overlay network.
     pub async fn ensure_network(
         &self,
         spec: &NetworkSpecValue,
@@ -288,6 +292,7 @@ impl ServiceDiscovery {
         refresh_network_services(&runtime).await
     }
 
+    /// Stop DNS serving and withdraw NodePort mappings for one overlay network.
     pub async fn teardown_network(&self, network_id: Uuid) -> Result<()> {
         let handle = {
             let mut guard = self.servers.lock().await;
@@ -638,6 +643,7 @@ fn compare_ip_addrs(left: IpAddr, right: IpAddr) -> std::cmp::Ordering {
     }
 }
 
+/// Index service replica IDs back to their service and template names for backend resolution.
 fn build_task_template_index(specs: &[ServiceSpecValue]) -> HashMap<Uuid, (String, String)> {
     let mut index = HashMap::new();
     for spec in specs {
@@ -652,6 +658,7 @@ fn build_task_template_index(specs: &[ServiceSpecValue]) -> HashMap<Uuid, (Strin
     index
 }
 
+/// Derive the deterministic service VIP from the service name, network, and IP family.
 fn compute_service_vip(
     registry: &NetworkRegistry,
     network_id: Uuid,
@@ -739,6 +746,7 @@ fn compute_service_vip(
     Ok(None)
 }
 
+/// Parse a persisted attachment MAC string into the fixed byte array expected by dataplane maps.
 fn parse_mac(text: &str) -> Result<[u8; 6], String> {
     let parts: Vec<&str> = text.split(':').collect();
     if parts.len() != 6 {
@@ -784,6 +792,7 @@ fn rotate_addresses(mut addresses: Vec<IpAddr>, offset: usize) -> Vec<IpAddr> {
     addresses
 }
 
+/// Rebuild the derived backend catalog when source stores or peer health have changed.
 async fn refresh_backend_catalog_if_needed(
     runtime: &DiscoveryRuntime,
     health_snapshot: &HashMap<Uuid, HealthStatus>,

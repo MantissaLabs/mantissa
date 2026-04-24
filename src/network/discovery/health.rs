@@ -497,10 +497,12 @@ async fn resolve_neighbor_mac(network_id: Uuid, ip: IpAddr) -> Option<[u8; 6]> {
 }
 
 #[cfg(not(target_os = "linux"))]
+/// Return no neighbour MAC on unsupported platforms because no kernel overlay bridge exists.
 async fn resolve_neighbor_mac(_network_id: Uuid, _ip: IpAddr) -> Option<[u8; 6]> {
     None
 }
 
+/// Dispatch one backend readiness probe according to the service's configured probe kind.
 async fn probe_backend(ip: &IpAddr, probe: &ServiceReadinessProbe) -> bool {
     match probe.kind {
         ServiceReadinessProbeKind::Http => {
@@ -526,6 +528,7 @@ pub(super) fn nodeport_protocol(protocol: ServicePortProtocol) -> NodePortProtoc
     }
 }
 
+/// Probe backend TCP readiness by attempting to establish one connection within the timeout.
 async fn probe_backend_tcp(ip: &IpAddr, port: u16, timeout: Duration) -> bool {
     let addr = SocketAddr::new(*ip, port);
     matches!(
@@ -534,6 +537,7 @@ async fn probe_backend_tcp(ip: &IpAddr, port: u16, timeout: Duration) -> bool {
     )
 }
 
+/// Probe backend HTTP readiness by issuing a minimal HTTP/1.0 GET and accepting 2xx responses.
 async fn probe_backend_http(ip: &IpAddr, port: u16, path: &str, timeout: Duration) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

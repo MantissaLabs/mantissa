@@ -49,12 +49,19 @@ mod linux {
         underlay: Arc<AsyncMutex<Option<ResolvedUnderlay>>>,
     }
 
+    /// Link attribute containing bridge-port protocol information.
     const IFLA_PROTINFO: u16 = 12;
+    /// Bridge-port attribute controlling whether frames can egress back out their ingress port.
     const BRPORT_ATTR_HAIRPIN_MODE: u16 = 4;
+    /// Bridge-port attribute controlling MAC learning on the VXLAN port.
     const BRPORT_ATTR_LEARNING: u16 = 8;
+    /// Bridge-port attribute controlling unknown unicast flooding.
     const BRPORT_ATTR_UNICAST_FLOOD: u16 = 9;
+    /// Bridge-port attribute controlling neighbour suppression.
     const BRPORT_ATTR_NEIGH_SUPPRESS: u16 = 32;
+    /// Bridge-port attribute controlling multicast flooding.
     const BRPORT_ATTR_MULTICAST_FLOOD: u16 = 27;
+    /// Bridge-port attribute controlling broadcast flooding.
     const BRPORT_ATTR_BROADCAST_FLOOD: u16 = 30;
 
     /// Convert a resolver address into the rtnetlink address family used by interface rows.
@@ -212,6 +219,7 @@ mod linux {
             Ok(())
         }
 
+        /// Return the rtnetlink handle when kernel provisioning is available.
         fn handle(&self) -> Option<&Handle> {
             self.handle.as_ref()
         }
@@ -568,6 +576,7 @@ mod linux {
             ))
         }
 
+        /// Ensure bridge, VXLAN, host-access veth, addresses, and MTUs match one network plan.
         pub async fn ensure_network(&self, plan: &NetworkPlan) -> Result<()> {
             if self.handle.is_none() {
                 debug!(
@@ -994,6 +1003,7 @@ mod linux {
             }
         }
 
+        /// Delete the local kernel interfaces that implement one overlay network.
         pub async fn teardown_network(&self, plan: &NetworkPlan) -> Result<()> {
             let Some(handle) = self.handle() else {
                 return Ok(());
@@ -1030,6 +1040,7 @@ mod linux {
             Ok(())
         }
 
+        /// Create or validate the deterministic VXLAN interface for one network plan.
         async fn ensure_vxlan(&self, plan: &NetworkPlan) -> Result<u32> {
             let handle = self
                 .handle()
@@ -1262,6 +1273,7 @@ mod linux {
             Err(last_error.unwrap_or_else(|| anyhow!("vxlan creation failed after retries")))
         }
 
+        /// Reapply VXLAN runtime flags on a reused interface so stale settings do not linger.
         async fn configure_existing_vxlan(&self, index: u32, name: &str) -> Result<()> {
             let Some(handle) = self.handle() else {
                 return Ok(());
@@ -1284,6 +1296,7 @@ mod linux {
                 .with_context(|| format!("configure vxlan {} (idx {})", name, index))
         }
 
+        /// Configure VXLAN bridge-port attributes used by overlay forwarding.
         async fn configure_bridge_port(
             &self,
             vxlan_index: u32,
@@ -1426,6 +1439,7 @@ mod linux {
             })
         }
 
+        /// Log the effective bridge-port attributes after configuration for diagnostics.
         async fn log_bridge_port_state(&self, index: u32, name: &str) -> Result<()> {
             let Some(handle) = self.handle() else {
                 return Ok(());
@@ -1486,6 +1500,7 @@ mod linux {
             Ok(())
         }
 
+        /// Create or reuse the deterministic Linux bridge for one overlay network.
         async fn ensure_bridge(&self, plan: &NetworkPlan) -> Result<u32> {
             if let Some(index) = self.find_link(&plan.bridge_name).await? {
                 debug!(
@@ -1521,6 +1536,7 @@ mod linux {
             Ok(index)
         }
 
+        /// Bring one interface up by index and tolerate already-up state.
         async fn set_up(&self, index: u32) -> Result<()> {
             let Some(handle) = self.handle() else {
                 return Ok(());
@@ -1912,6 +1928,7 @@ mod linux {
             self.find_link(name).await
         }
 
+        /// Resolve one interface name to its current ifindex.
         async fn find_link(&self, name: &str) -> Result<Option<u32>> {
             let Some(handle) = self.handle() else {
                 return Ok(None);
@@ -2454,6 +2471,7 @@ mod linux {
                 .ok_or_else(|| anyhow!("explicit underlay interface {ifname} disappeared"))
         }
 
+        /// Resolve one ifindex back to its interface name.
         async fn link_name(&self, index: u32) -> Result<Option<String>> {
             let Some(handle) = self.handle() else {
                 return Ok(None);
@@ -2529,6 +2547,7 @@ mod linux {
             Ok(None)
         }
 
+        /// Collect a compact link inventory string list used in VXLAN creation diagnostics.
         async fn collect_link_inventory(&self) -> Result<Vec<String>> {
             let mut entries = Vec::new();
             let Some(handle) = self.handle() else {
@@ -2558,6 +2577,7 @@ mod linux {
             Ok(entries)
         }
 
+        /// Best-effort load of the Linux VXLAN module before creating VXLAN devices.
         fn ensure_vxlan_module() -> Result<()> {
             match Command::new("modprobe").arg("vxlan").status() {
                 Ok(status) if status.success() => Ok(()),
@@ -2614,6 +2634,7 @@ mod stub {
     pub struct NetworkProvisioner;
 
     impl NetworkProvisioner {
+        /// Build the no-op provisioner used on unsupported platforms.
         pub fn new() -> Result<Self> {
             Ok(Self)
         }
@@ -2641,6 +2662,7 @@ mod stub {
             Ok(())
         }
 
+        /// Log successful no-op provisioning so non-Linux tests can exercise control-plane flow.
         pub async fn ensure_network(&self, plan: &NetworkPlan) -> Result<()> {
             info!(
                 target: "network",
@@ -2650,6 +2672,7 @@ mod stub {
             Ok(())
         }
 
+        /// Unsupported platforms do not create kernel links, so teardown is a no-op.
         pub async fn teardown_network(&self, _plan: &NetworkPlan) -> Result<()> {
             Ok(())
         }

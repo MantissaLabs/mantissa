@@ -37,7 +37,9 @@ mod linux {
         _pad: [u8; 6],
     }
 
+    /// Combined IPv4 plus TCP header size used to derive runtime MSS limits.
     const IPV4_TCP_HEADER_BYTES: u32 = 40;
+    /// Combined IPv6 plus TCP header size used to derive runtime MSS limits.
     const IPV6_TCP_HEADER_BYTES: u32 = 60;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,10 +56,12 @@ mod linux {
     type ProgramHandle = Box<dyn Detachable + Send>;
 
     trait Detachable {
+        /// Detach one loaded program from its kernel hook before dropping the BPF object.
         fn detach(&mut self) -> Result<()>;
     }
 
     trait ProgramLoader: Send + Sync {
+        /// Load one BPF object and attach the requested program to its resolved target.
         fn load_and_attach(
             &self,
             spec: &BpfProgramSpec,
@@ -88,6 +92,7 @@ mod linux {
     }
 
     impl LoadedNetwork {
+        /// Create an empty loaded-network handle for one overlay load-balancer family.
         fn new(lb_family: Option<OverlayIpFamily>) -> Self {
             Self {
                 programs: Vec::new(),
@@ -95,10 +100,12 @@ mod linux {
             }
         }
 
+        /// Track one successfully attached program so future reconciles can detach or compare it.
         fn push(&mut self, program: LoadedProgram) {
             self.programs.push(program);
         }
 
+        /// Detach every loaded program associated with this network.
         fn teardown(mut self) -> Result<()> {
             for program in self.programs.iter_mut() {
                 program.handle.detach()?;
@@ -106,6 +113,7 @@ mod linux {
             Ok(())
         }
 
+        /// Return whether the live loaded program set exactly matches the desired attachment set.
         fn matches(
             &self,
             desired: &[DesiredAttachment],
@@ -114,6 +122,7 @@ mod linux {
             self.lb_family == lb_family && self.canonical_specs() == desired
         }
 
+        /// Render loaded programs into sorted attachment descriptors for deterministic comparison.
         fn canonical_specs(&self) -> Vec<DesiredAttachment> {
             let mut attachments: Vec<_> = self
                 .programs
@@ -144,6 +153,7 @@ mod linux {
     }
 
     impl OwnedAttachTarget {
+        /// Borrow an owned target as the lightweight attach target used by loader helpers.
         fn as_ref(&self) -> AttachTarget<'_> {
             match self {
                 OwnedAttachTarget::Xdp { interface } => AttachTarget::Xdp {
@@ -161,6 +171,7 @@ mod linux {
     }
 
     impl PlatformBpfManager {
+        /// Build a Linux eBPF manager using the configured artifact resolver and Aya loader.
         pub fn new() -> Result<Self> {
             Ok(Self {
                 resolver: ArtifactResolver::new(),
@@ -169,6 +180,7 @@ mod linux {
             })
         }
 
+        /// Build a no-op manager used when Linux BPF attachment is disabled or unavailable.
         pub fn unavailable() -> Self {
             Self {
                 resolver: ArtifactResolver::new(),
@@ -224,6 +236,7 @@ mod linux {
             Ok(false)
         }
 
+        /// Ensure all declared programs are loaded and attached for one network.
         pub async fn ensure_programs(
             &self,
             network: &NetworkSpecValue,
@@ -447,6 +460,7 @@ mod linux {
             Ok(())
         }
 
+        /// Detach every program currently tracked for one network and remove its pin directory.
         pub async fn teardown_programs(&self, interfaces: &NetworkInterfaceContext) -> Result<()> {
             let mut guard = self.loaded.lock().await;
             let network = guard.remove(&interfaces.network_id());
@@ -532,6 +546,7 @@ mod linux {
             Ok(path)
         }
 
+        /// Reject duplicate attach-point/interface declarations before touching kernel state.
         fn validate_programs(
             &self,
             programs: &[BpfProgramSpec],
@@ -550,6 +565,7 @@ mod linux {
             Ok(())
         }
 
+        /// Force-detach stale XDP hooks that can block a clean attach after daemon restart.
         fn clear_stale_xdp_targets(
             &self,
             programs: &[BpfProgramSpec],
@@ -701,6 +717,7 @@ mod linux {
         }
     }
 
+    /// Convert one loaded program handle back into the desired-attachment shape.
     fn desired_attachment_for_loaded_program(program: &LoadedProgram) -> DesiredAttachment {
         DesiredAttachment {
             attach_point: program.spec.attach_point(),
@@ -709,6 +726,7 @@ mod linux {
         }
     }
 
+    /// Return whether a loaded network can be updated by task-veth attach/detach only.
     fn can_incrementally_reconcile_loaded_network(
         existing: &LoadedNetwork,
         desired: &[DesiredAttachment],
@@ -728,6 +746,7 @@ mod linux {
             .all(is_incremental_task_attachment_delta)
     }
 
+    /// Identify bridge tc changes caused solely by local task attachment veth churn.
     fn is_incremental_task_attachment_delta(attachment: &DesiredAttachment) -> bool {
         matches!(
             attachment.attach_point,
@@ -765,6 +784,7 @@ mod linux {
             }
         }
 
+        /// Resolve the best BPF object path for one declared program and network family.
         fn resolve(&self, spec: &BpfProgramSpec, network: &NetworkSpecValue) -> Result<PathBuf> {
             let family_specific_name = load_balancer_map_family(network)?
                 .and_then(|family| bridge_tc_artifact_name(spec, family));
@@ -780,6 +800,7 @@ mod linux {
             ))
         }
 
+        /// Produce candidate artifact paths from explicit paths and configured search roots.
         fn candidates(&self, name: &str) -> Vec<PathBuf> {
             let mut out = Vec::new();
             let path = PathBuf::from(name);
@@ -812,6 +833,7 @@ mod linux {
         }
     }
 
+    /// Preserve candidate order while removing duplicate filesystem paths.
     fn dedup(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
@@ -872,6 +894,7 @@ mod linux {
         desired
     }
 
+    /// Convert a desired attachment descriptor into the concrete loader target.
     fn desired_target(desired: &DesiredAttachment) -> AttachTarget<'_> {
         match desired.attach_point {
             BpfAttachPoint::VxlanXdp | BpfAttachPoint::BridgeXdp => AttachTarget::Xdp {
@@ -888,6 +911,7 @@ mod linux {
         }
     }
 
+    /// Convert a borrowed target into an owned target that can be retained after attach.
     fn own_target(target: AttachTarget<'_>) -> OwnedAttachTarget {
         match target {
             AttachTarget::Xdp { interface } => OwnedAttachTarget::Xdp {
@@ -903,6 +927,7 @@ mod linux {
         }
     }
 
+    /// Return the interface name associated with one XDP or TC attach target.
     fn target_interface(target: AttachTarget<'_>) -> &str {
         match target {
             AttachTarget::Xdp { interface } => interface,
@@ -919,6 +944,7 @@ mod linux {
             .with_context(|| format!("configured {name} exceeds the kernel map size limit"))
     }
 
+    /// Check whether a network interface currently exists before trying to attach to it.
     fn interface_exists(name: &str) -> bool {
         match CString::new(name) {
             Ok(cstr) => unsafe { if_nametoindex(cstr.as_ptr()) != 0 },
@@ -926,6 +952,7 @@ mod linux {
         }
     }
 
+    /// Order attachments so XDP programs load before bridge TC programs.
     fn attach_priority(point: BpfAttachPoint) -> u8 {
         match point {
             BpfAttachPoint::VxlanXdp => 0,
@@ -934,6 +961,7 @@ mod linux {
         }
     }
 
+    /// Order forced detachments so bridge XDP hooks are cleared before VXLAN XDP hooks.
     fn detach_priority(point: BpfAttachPoint) -> u8 {
         match point {
             BpfAttachPoint::BridgeXdp => 0,
@@ -1051,6 +1079,7 @@ mod linux {
             .any(|candidate| MapData::from_pin(&candidate).is_ok())
     }
 
+    /// Force-detach an XDP or TC hook before retrying a stale attachment failure.
     fn force_detach_target(target: AttachTarget<'_>) -> Result<()> {
         match target {
             AttachTarget::Xdp { interface } => detach_xdp(interface),
@@ -1301,6 +1330,7 @@ mod linux {
     /// Aya sizes and pins the map, but the runtime config value is refreshed directly here so it
     /// can be rewritten without reconstructing the loaded tc object.
     fn update_map_elem<K, V>(fd: i32, key: &K, value: &V) -> Result<()> {
+        // bpf(2) command used to upsert one value into an already-open map fd.
         const BPF_MAP_UPDATE_ELEM: libc::c_uint = 2;
 
         #[repr(C)]
@@ -1334,6 +1364,7 @@ mod linux {
         Ok(())
     }
 
+    /// Return whether Aya failed to pin a map only because that pin path already exists.
     fn is_already_pinned(err: &PinError) -> bool {
         matches!(
             err,
@@ -1342,6 +1373,7 @@ mod linux {
         )
     }
 
+    /// Detach an XDP program from one interface, falling back to iproute2 if raw netlink fails.
     fn detach_xdp(interface: &str) -> Result<()> {
         let Some(if_index) = interface_index(interface)? else {
             debug!(
@@ -1365,6 +1397,7 @@ mod linux {
         }
     }
 
+    /// Resolve an interface name into its kernel ifindex using libc.
     fn interface_index(name: &str) -> Result<Option<i32>> {
         let cstr = CString::new(name).context("interface name contains null byte")?;
         let index = unsafe { if_nametoindex(cstr.as_ptr()) };
@@ -1375,6 +1408,7 @@ mod linux {
         }
     }
 
+    /// Use `ip link set xdp off` as a compatibility fallback for XDP detach.
     fn detach_xdp_with_ip(interface: &str) -> Result<()> {
         let output = Command::new("ip")
             .args(["link", "set", "dev", interface, "xdp", "off"])
@@ -1416,6 +1450,7 @@ mod linux {
         matches!(statfs(path), Ok(stat) if stat.filesystem_type() == BPF_FS_MAGIC)
     }
 
+    /// Detect stale BPF attachment conflicts inside nested Aya errors.
     fn is_bpf_link_conflict(err: &anyhow::Error) -> bool {
         err.chain().any(|cause| {
             if let Some(sys) = cause.downcast_ref::<aya::sys::SyscallError>() {
@@ -1440,6 +1475,7 @@ mod linux {
         }
     }
 
+    /// Load and attach one program, retrying once after clearing stale XDP attachment state.
     fn load_with_retry(
         loader: &dyn ProgramLoader,
         spec: &BpfProgramSpec,
@@ -1501,6 +1537,7 @@ mod linux {
         use std::ptr;
         use std::slice;
 
+        /// Nested IFLA_XDP attribute carrying the replacement XDP program fd.
         const IFLA_XDP_FD_ATTR: u16 = 1;
 
         #[repr(C)]
@@ -1633,6 +1670,7 @@ mod linux {
                 Ok(Self { fd })
             }
 
+            /// Send one raw route-netlink message to the kernel.
             fn send(&self, msg: &[u8]) -> io::Result<()> {
                 if unsafe { send(self.fd.as_raw_fd(), msg.as_ptr() as *const _, msg.len(), 0) } < 0
                 {
@@ -1641,6 +1679,7 @@ mod linux {
                 Ok(())
             }
 
+            /// Read and interpret the kernel acknowledgement for a netlink request.
             fn recv_ack(&self) -> io::Result<()> {
                 let mut buf = [0u8; 256];
                 let len = unsafe {
@@ -1676,6 +1715,7 @@ mod linux {
             }
         }
 
+        /// View one plain C-compatible request struct as bytes for netlink send.
         fn bytes_of<T>(val: &T) -> &[u8] {
             unsafe { slice::from_raw_parts((val as *const T).cast::<u8>(), mem::size_of::<T>()) }
         }
@@ -1685,6 +1725,7 @@ mod linux {
     struct NoopProgramLoader;
 
     impl ProgramLoader for NoopProgramLoader {
+        /// Return a no-op handle when BPF attachment is disabled.
         fn load_and_attach(
             &self,
             _spec: &BpfProgramSpec,
@@ -1700,6 +1741,7 @@ mod linux {
     struct NoopHandle;
 
     impl Detachable for NoopHandle {
+        /// No-op detach for disabled BPF attachment mode.
         fn detach(&mut self) -> Result<()> {
             Ok(())
         }
@@ -1708,6 +1750,7 @@ mod linux {
     struct AyaProgramLoader;
 
     impl ProgramLoader for AyaProgramLoader {
+        /// Load an Aya eBPF object and attach the requested XDP or TC classifier program.
         fn load_and_attach(
             &self,
             spec: &BpfProgramSpec,
@@ -1810,6 +1853,7 @@ mod linux {
     }
 
     impl Detachable for XdpHandle {
+        /// Detach the retained XDP link id from its program before dropping the object.
         fn detach(&mut self) -> Result<()> {
             if let Some(link_id) = self.link_id.take() {
                 let program = self
@@ -1833,6 +1877,7 @@ mod linux {
     }
 
     impl Detachable for TcHandle {
+        /// Detach the retained TC classifier link id from its program before dropping the object.
         fn detach(&mut self) -> Result<()> {
             if let Some(link_id) = self.link_id.take() {
                 let program = self

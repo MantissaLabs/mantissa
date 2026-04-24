@@ -39,13 +39,20 @@ const ATTACHMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 /// Number of short retries before discovery startup falls back to the normal drift sweep.
 const DISCOVERY_RETRY_ATTEMPTS: usize = 10;
+/// Default overlay MTU used when a network spec omits an explicit MTU.
 pub(crate) const DEFAULT_MTU: u32 = 1450;
 #[cfg(target_os = "linux")]
+/// UDP destination port used by Linux VXLAN devices created for Mantissa overlays.
 const VXLAN_PORT: u16 = 4789;
+/// Minimum interval between expensive WireGuard interface reconciles.
 const WIREGUARD_RECONCILE_DEBOUNCE: Duration = Duration::from_secs(1);
+/// Number of short retries scheduled after WireGuard reconciliation is debounce-skipped.
 const WIREGUARD_RECONCILE_RETRY_LIMIT: usize = 3;
+/// Number of checks used when waiting for netlink link state to converge.
 const LINK_STATE_SETTLE_ATTEMPTS: usize = 10;
+/// Delay between netlink link-state convergence checks.
 const LINK_STATE_SETTLE_DELAY: Duration = Duration::from_millis(20);
+/// Number of netlink update retries after a transient link-state failure.
 const LINK_STATE_UPDATE_RETRIES: usize = 2;
 
 #[derive(Clone)]
@@ -95,6 +102,7 @@ pub struct NetworkControllerInit {
 }
 
 #[cfg(target_os = "linux")]
+/// Return the canonical eBPF program bundle when dataplane attachment is enabled on Linux.
 fn default_bpf_programs() -> Vec<BpfProgramSpec> {
     if !config::bpf_attach_enabled() {
         return Vec::new();
@@ -104,12 +112,14 @@ fn default_bpf_programs() -> Vec<BpfProgramSpec> {
 }
 
 #[cfg(not(target_os = "linux"))]
+/// Return no default eBPF programs on unsupported platforms.
 fn default_bpf_programs() -> Vec<BpfProgramSpec> {
     Vec::new()
 }
 
 impl NetworkController {
     #[allow(clippy::arc_with_non_send_sync)]
+    /// Construct the network controller and all local platform adapters used by reconciliation.
     pub fn new(init: NetworkControllerInit) -> Result<Self> {
         let NetworkControllerInit {
             registry,
@@ -209,6 +219,7 @@ impl NetworkController {
         self.inner.discovery.nodeport_manager()
     }
 
+    /// Publish a network event onto the gossip plane so peers converge replicated network state.
     async fn send_event(&self, event: NetworkEvent) {
         let tx = self.inner.gossip_tx.clone();
         if let Err(err) = tx
@@ -448,6 +459,7 @@ impl NetworkController {
         Ok(())
     }
 
+    /// Spawn the attachment-forwarding event listener that reacts to workload-network changes.
     fn spawn_forwarding_listener(&self) -> tokio::task::JoinHandle<()> {
         let controller = self.clone();
         tokio::task::spawn_local(async move {
@@ -620,6 +632,7 @@ impl NetworkController {
         }
     }
 
+    /// Reconcile forwarding state for networks queued by attachment or peer-state changes.
     async fn reconcile_pending_forwarding(&self) -> Result<()> {
         let pending: Vec<Uuid> = {
             let mut guard = self.inner.pending_forwarding.lock().await;
@@ -651,6 +664,7 @@ impl NetworkController {
         Ok(())
     }
 
+    /// Reconcile network specs that were explicitly queued by config, gossip, or startup.
     async fn reconcile_pending_specs(&self) -> Result<()> {
         let queued: Vec<Uuid> = {
             let mut guard = self.inner.pending_specs.lock().await;
@@ -697,6 +711,7 @@ impl NetworkController {
         Ok(())
     }
 
+    /// Refresh remote forwarding when the attachment store root changes through anti-entropy.
     async fn refresh_forwarding_from_attachments(&self) -> Result<()> {
         let root = self
             .inner
@@ -749,6 +764,7 @@ impl NetworkController {
         Ok(())
     }
 
+    /// Consume workload attachment events and queue the affected network for forwarding reconcile.
     async fn forwarding_event_loop(&self) {
         let receiver = {
             let mut guard = self.inner.forwarding_events.lock().await;
@@ -782,6 +798,7 @@ impl NetworkController {
         }
     }
 
+    /// Run one full drift reconcile across all known network specs and stale active networks.
     async fn reconcile_once(&self) -> Result<()> {
         let _ = self.reconcile_wireguard_underlay().await?;
 
@@ -838,6 +855,7 @@ impl NetworkController {
         Ok(())
     }
 
+    /// Reconcile one active network from replicated spec through local dataplane readiness.
     async fn reconcile_network(&self, mut spec: NetworkSpecValue) -> Result<()> {
         let (mut plan, spec_changed) = self.prepare_plan(&mut spec)?;
         self.apply_wireguard_overrides(&mut plan).await?;
@@ -1028,6 +1046,7 @@ impl NetworkController {
     }
 
     #[cfg(target_os = "linux")]
+    /// Detect stale eBPF link conflicts that can be recovered by rebuilding local dataplane state.
     fn is_bpf_link_conflict(err: &anyhow::Error) -> bool {
         err.chain().any(|cause| {
             if let Some(sys) = cause.downcast_ref::<SyscallError>() {
@@ -1041,6 +1060,7 @@ impl NetworkController {
     }
 
     #[cfg(target_os = "linux")]
+    /// Classify Linux syscall failures that mean a previous BPF attachment is still present.
     fn is_stale_bpf_attach_conflict(sys: &SyscallError) -> bool {
         match sys.io_error.raw_os_error() {
             Some(code) if code == libc::EEXIST => sys.call == "bpf_link_create",
@@ -1054,10 +1074,12 @@ impl NetworkController {
     }
 
     #[cfg(not(target_os = "linux"))]
+    /// Non-Linux platforms never run eBPF attachment recovery.
     fn is_bpf_link_conflict(_err: &anyhow::Error) -> bool {
         false
     }
 
+    /// Tear down local runtime state for networks no longer present in the active spec set.
     async fn teardown_removed_networks(&self, desired: &HashSet<Uuid>) -> Result<()> {
         let mut active = self.inner.active_networks.lock().await;
         let stale: Vec<Uuid> = active
@@ -1102,6 +1124,7 @@ impl NetworkController {
         Ok(())
     }
 
+    /// Tear down local runtime and replicated rows for a network whose spec is tombstoned.
     async fn teardown_deleted_network(&self, spec: &NetworkSpecValue) -> Result<()> {
         let has_active = {
             let active = self.inner.active_networks.lock().await;
@@ -1161,6 +1184,7 @@ impl NetworkController {
         Ok(())
     }
 
+    /// Remove replicated attachment, peer, and in-memory forwarding state for a deleted network.
     async fn cleanup_network_state(&self, network_id: Uuid) -> Result<()> {
         self.inner
             .registry
@@ -1197,6 +1221,7 @@ impl NetworkController {
         Ok(())
     }
 
+    /// Normalize one network spec and derive the local deterministic dataplane plan.
     fn prepare_plan(&self, spec: &mut NetworkSpecValue) -> Result<(NetworkPlan, bool)> {
         let mut changed = false;
 
@@ -1378,6 +1403,7 @@ impl NetworkController {
         changed
     }
 
+    /// Mark the local peer ready after network, BPF, discovery, and forwarding have converged.
     async fn mark_peer_ready(&self, network_id: Uuid) -> Result<()> {
         if let Some(existing) = self
             .inner
@@ -1454,6 +1480,7 @@ impl NetworkController {
         Ok(())
     }
 
+    /// Persist a local peer error so scheduling and discovery stop using this network path.
     async fn update_peer_state_error(&self, network_id: Uuid, message: String) -> Result<()> {
         if let Some(existing) = self
             .inner
@@ -1483,6 +1510,7 @@ impl NetworkController {
         Ok(())
     }
 
+    /// Reconcile VXLAN FDB entries for remote task and host-access MAC forwarding.
     async fn reconcile_remote_forwarding(&self, plan: &NetworkPlan) -> Result<()> {
         let attachments = self
             .inner
@@ -1567,6 +1595,7 @@ impl NetworkController {
             }
         }
 
+        // Linux uses the all-zero MAC in VXLAN FDB entries to represent flood targets.
         const FLOOD_MAC: &str = "00:00:00:00:00:00";
 
         // Reconcile from kernel truth so split/merge churn cannot leave stale FDB entries behind

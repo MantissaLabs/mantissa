@@ -33,6 +33,7 @@ pub struct AttachmentProvisioner {
 }
 
 impl Default for AttachmentProvisioner {
+    /// Build a privileged Linux provisioner for tests and callers that need `Default`.
     fn default() -> Self {
         Self::new().expect("attachment provisioner initialization")
     }
@@ -65,10 +66,12 @@ impl AttachmentProvisioner {
         })
     }
 
+    /// Return a stub provisioner used when privileges or kernel networking support are absent.
     pub fn unavailable() -> Self {
         Self { handle: None }
     }
 
+    /// Return the rtnetlink handle when kernel attachment provisioning is enabled.
     fn handle(&self) -> Option<&Handle> {
         self.handle.as_ref()
     }
@@ -214,6 +217,7 @@ impl AttachmentProvisioner {
         Ok(())
     }
 
+    /// Configure the runtime-side veth from inside the target network namespace.
     async fn configure_instance_interface(
         &self,
         iface: String,
@@ -244,6 +248,7 @@ impl AttachmentProvisioner {
         Ok(())
     }
 
+    /// Delete the host-side veth for one attachment, tolerating already-removed links.
     pub async fn teardown_attachment(&self, attachment_id: Uuid) -> Result<()> {
         let Some(handle) = self.handle() else {
             return Ok(());
@@ -278,6 +283,7 @@ impl AttachmentProvisioner {
         Ok(())
     }
 
+    /// Ensure one static VXLAN FDB entry points a task MAC at a remote underlay address.
     pub async fn ensure_remote_fdb(
         &self,
         vxlan_name: &str,
@@ -325,6 +331,7 @@ impl AttachmentProvisioner {
         }
     }
 
+    /// Remove one static VXLAN FDB entry when the remote task or peer is withdrawn.
     pub async fn remove_remote_fdb(
         &self,
         vxlan_name: &str,
@@ -351,6 +358,7 @@ impl AttachmentProvisioner {
         Ok(())
     }
 
+    /// Ensure the all-zero VXLAN flood entry for broadcast and unknown-unicast delivery.
     pub async fn ensure_flood_entry(
         &self,
         vxlan_name: &str,
@@ -360,6 +368,7 @@ impl AttachmentProvisioner {
             .await
     }
 
+    /// Remove one VXLAN flood entry when a peer no longer participates in the overlay.
     pub async fn remove_flood_entry(&self, vxlan_name: &str, dst: std::net::IpAddr) -> Result<()> {
         self.remove_remote_fdb(vxlan_name, "00:00:00:00:00:00", dst)
             .await
@@ -411,6 +420,7 @@ impl AttachmentProvisioner {
         Ok(entries)
     }
 
+    /// Create the deterministic host/runtime veth pair for one workload attachment.
     async fn create_veth(&self, handle: &Handle, host_if: &str, container_if: &str) -> Result<()> {
         handle
             .link()
@@ -490,6 +500,7 @@ impl AttachmentProvisioner {
             .map(|state| state.index))
     }
 
+    /// Submit the netlink message required to add or replace one VXLAN bridge FDB entry.
     async fn program_fdb_entry(
         &self,
         handle: &Handle,
@@ -554,6 +565,7 @@ impl AttachmentProvisioner {
             .await
     }
 
+    /// Submit the netlink message required to delete one VXLAN bridge FDB entry.
     async fn delete_fdb_entry(
         &self,
         _handle: &Handle,
@@ -580,6 +592,7 @@ impl AttachmentProvisioner {
         self.submit_request(request).await
     }
 
+    /// Submit a raw route-netlink request and surface any kernel error acknowledgement.
     async fn submit_request(
         &self,
         request: NetlinkMessage<RouteNetlinkMessage>,
@@ -599,39 +612,48 @@ impl AttachmentProvisioner {
 
 #[async_trait]
 impl AttachmentProvisionerApi for AttachmentProvisioner {
+    /// Trait-forwarder for checking attachment existence through the Linux provisioner.
     async fn attachment_exists(&self, attachment_id: Uuid) -> Result<bool> {
         AttachmentProvisioner::attachment_exists(self, attachment_id).await
     }
 
+    /// Trait-forwarder for creating or repairing a Linux runtime attachment.
     async fn ensure_attachment(&self, request: &AttachmentProvisioningRequest<'_>) -> Result<()> {
         AttachmentProvisioner::ensure_attachment(self, request).await
     }
 
+    /// Trait-forwarder for deleting a Linux runtime attachment.
     async fn teardown_attachment(&self, attachment_id: Uuid) -> Result<()> {
         AttachmentProvisioner::teardown_attachment(self, attachment_id).await
     }
 
+    /// Trait-forwarder for programming remote VXLAN FDB entries.
     async fn ensure_remote_fdb(&self, vxlan_name: &str, mac: &str, dst: IpAddr) -> Result<bool> {
         AttachmentProvisioner::ensure_remote_fdb(self, vxlan_name, mac, dst).await
     }
 
+    /// Trait-forwarder for removing remote VXLAN FDB entries.
     async fn remove_remote_fdb(&self, vxlan_name: &str, mac: &str, dst: IpAddr) -> Result<()> {
         AttachmentProvisioner::remove_remote_fdb(self, vxlan_name, mac, dst).await
     }
 
+    /// Trait-forwarder for programming VXLAN flood entries.
     async fn ensure_flood_entry(&self, vxlan_name: &str, dst: IpAddr) -> Result<bool> {
         AttachmentProvisioner::ensure_flood_entry(self, vxlan_name, dst).await
     }
 
+    /// Trait-forwarder for removing VXLAN flood entries.
     async fn remove_flood_entry(&self, vxlan_name: &str, dst: IpAddr) -> Result<()> {
         AttachmentProvisioner::remove_flood_entry(self, vxlan_name, dst).await
     }
 
+    /// Trait-forwarder for listing Linux VXLAN FDB entries.
     async fn list_remote_fdb(&self, vxlan_name: &str) -> Result<Vec<(String, IpAddr)>> {
         AttachmentProvisioner::list_remote_fdb(self, vxlan_name).await
     }
 }
 
+/// Parse a colon-delimited MAC string into the byte vector expected by rtnetlink.
 fn parse_mac(mac: &str) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(6);
     for part in mac.split(':') {
@@ -663,6 +685,7 @@ fn link_controller<'a>(attributes: impl IntoIterator<Item = &'a LinkAttribute>) 
         })
 }
 
+/// Format a six-byte kernel MAC address as the canonical lower-case string representation.
 fn format_mac_bytes(mac: &[u8]) -> Option<String> {
     if mac.len() != 6 {
         return None;
@@ -673,6 +696,7 @@ fn format_mac_bytes(mac: &[u8]) -> Option<String> {
     ))
 }
 
+/// Log a netlink deletion error unless it only reports an entry that is already absent.
 fn warn_unless_not_found(err: rtnetlink::Error, context: impl FnOnce() -> String) {
     use tracing::warn;
     if let rtnetlink::Error::NetlinkError(ref message) = err
@@ -686,6 +710,7 @@ fn warn_unless_not_found(err: rtnetlink::Error, context: impl FnOnce() -> String
     warn!(target: "network", "{}: {err}", context());
 }
 
+/// Enter the runtime network namespace, configure the interface, and restore the host namespace.
 fn configure_instance_interface_blocking(
     iface: String,
     mtu: u32,
@@ -715,6 +740,7 @@ fn configure_instance_interface_blocking(
     configure_result
 }
 
+/// Configure the moved veth inside the currently active network namespace.
 fn configure_interface_in_current_ns(
     iface: &str,
     mtu: u32,
@@ -780,6 +806,7 @@ fn configure_interface_in_current_ns(
     })
 }
 
+/// Resolve the supported runtime attachment target into a Linux network namespace PID.
 fn namespace_pid_for_attachment_target(target: &RuntimeAttachmentTarget) -> Result<i32> {
     match target {
         RuntimeAttachmentTarget::NetworkNamespacePid(pid) => Ok(*pid),

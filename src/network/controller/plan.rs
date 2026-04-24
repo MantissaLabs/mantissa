@@ -44,6 +44,7 @@ impl NetworkPlan {
 }
 
 impl From<&NetworkPlan> for NetworkInterfaceContext {
+    /// Convert a controller plan into the BPF interface context used by program attachment.
     fn from(plan: &NetworkPlan) -> Self {
         NetworkInterfaceContext::new(
             plan.network_id,

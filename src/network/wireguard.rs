@@ -700,6 +700,10 @@ fn ensure_vxlan_firewall_accept(ifname: &str) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
+/// Treat VXLAN firewall setup as a no-op on non-Linux builds.
+///
+/// The production WireGuard overlay is Linux-only, but keeping this stub lets the rest of the crate
+/// compile on macOS for control-plane development and unprivileged tests.
 fn ensure_vxlan_firewall_accept(_ifname: &str) -> Result<()> {
     Ok(())
 }
@@ -810,6 +814,10 @@ fn is_mantissa_tunnel_ipv6(ip: Ipv6Addr) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+/// Return whether the filter table already contains the requested IPv6 firewall rule.
+///
+/// Firewall checks are best-effort because a missing client or rule should drive insertion rather
+/// than fail the whole WireGuard reconciliation path before any route state is updated.
 fn ip6tables_has_rule(chain: &str, spec: &[&str]) -> bool {
     let rule = spec.join(" ");
     let ip6t = match iptables::new(true) {
@@ -842,6 +850,10 @@ fn ip6tables_has_rule(chain: &str, spec: &[&str]) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+/// Insert one IPv6 firewall rule at the top of the requested filter chain.
+///
+/// WireGuard reconciliation uses this narrowly for VXLAN-over-WireGuard accept rules so the overlay
+/// can recover after host firewall state is flushed or after a fresh node bootstrap.
 fn ip6tables_insert_rule(chain: &str, spec: &[&str]) -> std::io::Result<()> {
     let rule = spec.join(" ");
     let ip6t = iptables::new(true).map_err(|err| {

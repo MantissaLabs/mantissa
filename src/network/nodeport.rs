@@ -6,7 +6,9 @@ use uuid::Uuid;
 
 use crate::network::addressing::resolve_advertise_ip;
 
+/// IP protocol number for TCP used by NodePort selector and dataplane keys.
 const NODEPORT_PROTO_TCP: u8 = 6;
+/// IP protocol number for UDP used by NodePort selector and dataplane keys.
 const NODEPORT_PROTO_UDP: u8 = 17;
 /// Default max entry count for one pinned NodePort VIP publication map.
 #[cfg(test)]
@@ -21,11 +23,15 @@ const NODEPORT_HOST_CAPACITY: usize = crate::config::DEFAULT_NODEPORT_HOST_CAPAC
 const NODEPORT_INGRESS_DROP_REASON_COUNT: usize = 6;
 /// Keep the userspace readers aligned with the shared NodePort flow-event map size in the tc programs.
 const NODEPORT_FLOW_EVENT_COUNT: usize = 5;
-
+/// Flow-event counter index incremented when the dataplane creates a conntrack pair.
 const NODEPORT_FLOW_CREATE_INDEX: usize = 0;
+/// Flow-event counter index incremented when userspace clears stale conntrack entries.
 const NODEPORT_FLOW_CLEAR_INDEX: usize = 1;
+/// Flow-event counter index incremented when a return packet misses reverse conntrack.
 const NODEPORT_REVERSE_MISS_INDEX: usize = 2;
+/// Flow-event counter index incremented when TCP state transitions are invalid.
 const NODEPORT_INVALID_TRANSITION_INDEX: usize = 3;
+/// Flow-event counter index incremented when return traffic bypasses NodePort translation.
 const NODEPORT_RETURN_BYPASS_INDEX: usize = 4;
 
 /// Capacity limits for the pinned NodePort maps that back publication, host-access SNAT, and
@@ -287,6 +293,7 @@ pub struct NodePortManager {
 }
 
 impl Default for NodePortManager {
+    /// Build the default NodePort manager through the same path as explicit construction.
     fn default() -> Self {
         Self::new()
     }
