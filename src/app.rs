@@ -49,7 +49,7 @@ fn resolve_local_volume_ownership(
 /// Automatic network creation should follow the operator's declared node IP family so service and
 /// job manifests can produce IPv6 overlays without an extra manual network creation step.
 fn resolve_default_network_ip_family() -> NetworkIpFamily {
-    let (has_ipv4, has_ipv6) = crate::node::address::detect_outbound_ip_families();
+    let (has_ipv4, has_ipv6) = crate::node::address::detect_local_ip_families();
     match infer_default_ip_family(
         config::nodeport_ip(),
         config::advertise_addr().as_deref(),

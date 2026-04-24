@@ -1226,7 +1226,7 @@ impl PlatformNodePortManager {
 
     /// Resolve the preferred family used when nodeport autodetect must choose between IPv4 and IPv6.
     fn preferred_runtime_family(&self) -> NodePortIpFamily {
-        let (has_ipv4, has_ipv6) = crate::node::address::detect_outbound_ip_families();
+        let (has_ipv4, has_ipv6) = crate::node::address::detect_local_ip_families();
         match infer_default_ip_family(
             self.configured_node_ip,
             self.configured_advertise_addr.as_deref(),

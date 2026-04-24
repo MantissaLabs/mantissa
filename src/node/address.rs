@@ -1,13 +1,9 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+#[cfg(unix)]
+use std::ptr;
 
 use crate::ip_family::IpFamily;
-
-// TODO: This is a really hacky way of getting the local IP address to send
-// on join request alongside the NodeInfo struct. We should probably get the
-// address from the stream on connection accept within Server, and find a way
-// to pass that down to Topology/Membership. For the time being, it is more
-// convenient to use this approach to keep Server and Topology decoupled.
 
 /// Returns the local IP the kernel would pick to reach `dest` (no packets sent).
 pub fn outbound_ip_for<A: ToSocketAddrs>(dest: A) -> io::Result<IpAddr> {
@@ -34,25 +30,20 @@ pub fn outbound_ip_for<A: ToSocketAddrs>(dest: A) -> io::Result<IpAddr> {
     Ok(sock.local_addr()?.ip())
 }
 
-/// Returns the local IP the kernel would pick for one concrete address family.
-pub fn outbound_ip_for_family(family: IpFamily) -> io::Result<IpAddr> {
-    match family {
-        IpFamily::Ipv4 => outbound_ip_for("8.8.8.8:53"),
-        IpFamily::Ipv6 => outbound_ip_for("[2001:4860:4860::8888]:53"),
-    }
-}
-
-/// Detects whether the host currently has usable outbound routing in each supported family.
-pub fn detect_outbound_ip_families() -> (bool, bool) {
-    let has_ipv4 = outbound_ip_for_family(IpFamily::Ipv4).is_ok();
-    let has_ipv6 = outbound_ip_for_family(IpFamily::Ipv6).is_ok();
+/// Detects whether the host currently has usable local interface addresses in each family.
+pub fn detect_local_ip_families() -> (bool, bool) {
+    let Ok(addresses) = usable_local_interface_ips() else {
+        return (false, false);
+    };
+    let has_ipv4 = addresses.iter().any(IpAddr::is_ipv4);
+    let has_ipv6 = addresses.iter().any(IpAddr::is_ipv6);
     (has_ipv4, has_ipv6)
 }
 
 /// Best-effort local advertise address:
 /// 1) If `cfg_advertise` provided, use it.
 /// 2) Else, if `anchor` provided, derive via outbound_ip_for(anchor).
-/// 3) Else, probe the preferred family first and fall back to the other family if required.
+/// 3) Else, select a usable local interface address in the preferred family order.
 pub fn compute_advertise_ip(
     cfg_advertise: Option<IpAddr>,
     anchor: Option<&str>,
@@ -68,10 +59,114 @@ pub fn compute_advertise_ip(
     }
 
     match preferred_family {
-        Some(IpFamily::Ipv6) => outbound_ip_for_family(IpFamily::Ipv6)
-            .or_else(|_| outbound_ip_for_family(IpFamily::Ipv4)),
-        Some(IpFamily::Ipv4) | None => outbound_ip_for_family(IpFamily::Ipv4)
-            .or_else(|_| outbound_ip_for_family(IpFamily::Ipv6)),
+        Some(IpFamily::Ipv6) => local_interface_ip_for_family(IpFamily::Ipv6)
+            .or_else(|_| local_interface_ip_for_family(IpFamily::Ipv4)),
+        Some(IpFamily::Ipv4) | None => local_interface_ip_for_family(IpFamily::Ipv4)
+            .or_else(|_| local_interface_ip_for_family(IpFamily::Ipv6)),
+    }
+}
+
+/// Returns one local non-loopback interface address for the requested address family.
+fn local_interface_ip_for_family(family: IpFamily) -> io::Result<IpAddr> {
+    usable_local_interface_ips()?
+        .into_iter()
+        .find(|ip| {
+            matches!(
+                (family, ip),
+                (IpFamily::Ipv4, IpAddr::V4(_)) | (IpFamily::Ipv6, IpAddr::V6(_))
+            )
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!("no usable local {family:?} interface address found"),
+            )
+        })
+}
+
+/// Enumerates usable local interface addresses without probing public internet endpoints.
+#[cfg(unix)]
+fn usable_local_interface_ips() -> io::Result<Vec<IpAddr>> {
+    let mut addrs: *mut libc::ifaddrs = ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let _guard = IfAddrs(addrs);
+
+    let mut ips = Vec::new();
+    let mut cursor = addrs;
+    while !cursor.is_null() {
+        let interface = unsafe { &*cursor };
+        if interface_is_usable(interface.ifa_flags)
+            && let Some(ip) = unsafe { sockaddr_to_ip(interface.ifa_addr) }
+            && is_usable_advertise_ip(ip)
+        {
+            ips.push(ip);
+        }
+        cursor = interface.ifa_next;
+    }
+
+    Ok(ips)
+}
+
+/// Reports no local interfaces on unsupported targets while keeping callers portable.
+#[cfg(not(unix))]
+fn usable_local_interface_ips() -> io::Result<Vec<IpAddr>> {
+    Ok(Vec::new())
+}
+
+#[cfg(unix)]
+/// Owns the linked list allocated by `getifaddrs` until enumeration completes.
+struct IfAddrs(*mut libc::ifaddrs);
+
+#[cfg(unix)]
+impl Drop for IfAddrs {
+    /// Releases the linked list returned by `getifaddrs`.
+    fn drop(&mut self) {
+        unsafe { libc::freeifaddrs(self.0) };
+    }
+}
+
+/// Returns whether an interface should be considered for automatic advertisement.
+#[cfg(unix)]
+fn interface_is_usable(flags: libc::c_uint) -> bool {
+    let up = flags & libc::IFF_UP as libc::c_uint != 0;
+    let loopback = flags & libc::IFF_LOOPBACK as libc::c_uint != 0;
+    up && !loopback
+}
+
+/// Converts an OS socket address from `getifaddrs` into a Rust IP address.
+#[cfg(unix)]
+unsafe fn sockaddr_to_ip(addr: *const libc::sockaddr) -> Option<IpAddr> {
+    if addr.is_null() {
+        return None;
+    }
+
+    match unsafe { (*addr).sa_family as libc::c_int } {
+        libc::AF_INET => {
+            let addr = unsafe { &*(addr as *const libc::sockaddr_in) };
+            Some(IpAddr::V4(Ipv4Addr::from(
+                addr.sin_addr.s_addr.to_ne_bytes(),
+            )))
+        }
+        libc::AF_INET6 => {
+            let addr = unsafe { &*(addr as *const libc::sockaddr_in6) };
+            Some(IpAddr::V6(Ipv6Addr::from(addr.sin6_addr.s6_addr)))
+        }
+        _ => None,
+    }
+}
+
+/// Returns whether an interface address is safe to publish automatically.
+fn is_usable_advertise_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast(),
+        IpAddr::V6(ip) => {
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_unicast_link_local()
+                && !ip.is_multicast()
+        }
     }
 }
 

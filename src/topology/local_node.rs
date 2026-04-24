@@ -185,6 +185,29 @@ impl Topology {
             return Ok(s);
         }
 
+        if let Some(bound) = self.local.advertise.bound()
+            && !bound.ip().is_unspecified()
+        {
+            return Ok(bound.to_string());
+        }
+
+        if let Ok(cfg_sa) = self.local.advertise.configured().parse::<SocketAddr>()
+            && !cfg_sa.ip().is_unspecified()
+            && cfg_sa.port() != 0
+        {
+            return Ok(cfg_sa.to_string());
+        }
+
+        if self
+            .local
+            .advertise
+            .configured()
+            .parse::<SocketAddr>()
+            .is_err()
+        {
+            return Ok(self.local.advertise.configured().to_string());
+        }
+
         let preferred_family = match config::default_ip_family_policy() {
             crate::ip_family::DefaultIpFamilyPolicy::Ipv6 => Some(crate::ip_family::IpFamily::Ipv6),
             crate::ip_family::DefaultIpFamilyPolicy::Ipv4 => Some(crate::ip_family::IpFamily::Ipv4),
@@ -195,20 +218,11 @@ impl Topology {
         })?;
 
         if let Some(bound) = self.local.advertise.bound() {
-            if bound.ip().is_unspecified() {
-                return Ok(SocketAddr::new(ip, bound.port()).to_string());
-            } else {
-                return Ok(bound.to_string());
-            }
+            return Ok(SocketAddr::new(ip, bound.port()).to_string());
         }
 
         if let Ok(cfg_sa) = self.local.advertise.configured().parse::<SocketAddr>() {
-            if cfg_sa.ip().is_unspecified() || cfg_sa.port() == 0 {
-                let port = if cfg_sa.port() == 0 { 0 } else { cfg_sa.port() };
-                return Ok(SocketAddr::new(ip, port).to_string());
-            } else {
-                return Ok(cfg_sa.to_string());
-            }
+            return Ok(SocketAddr::new(ip, cfg_sa.port()).to_string());
         }
 
         Ok(self.local.advertise.configured().to_string())
