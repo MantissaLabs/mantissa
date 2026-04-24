@@ -7,6 +7,7 @@ use super::*;
 use crate::agents::types::{
     AGENT_ALLOW_NETWORK_ENV_VAR, AGENT_ALLOW_WRITE_ENV_VAR, AGENT_WORKDIR_ENV_VAR,
 };
+use crate::network::allocator::allocate_overlay_address;
 use crate::network::attachment::{AttachmentProvisionerApi, AttachmentProvisioningRequest};
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
@@ -5046,6 +5047,99 @@ async fn runtime_attachments_created_and_removed_on_stop() {
     assert!(attachments_after.is_empty());
 
     assert!(manager.inspect_workload(task_spec.id).await.is_err());
+}
+
+#[tokio::test]
+async fn runtime_attachments_avoid_overlay_ip_collisions() {
+    let (manager, scheduler, _mock_cm, network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![
+            SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0)),
+            SlotSpec::new(2, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0)),
+        ])
+        .await
+        .expect("init slots");
+
+    let spec = NetworkSpecValue::new(NetworkSpecDraft {
+        name: "collision-net".to_string(),
+        description: "collision test network".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.92.0.0/24".to_string(),
+        vni: 0,
+        mtu: 0,
+        sealed: false,
+        bpf_programs: vec![],
+    });
+    network_registry
+        .upsert_spec(spec.clone())
+        .await
+        .expect("upsert network spec");
+
+    let peer_state = NetworkPeerStateValue::new(
+        spec.id,
+        manager.local_node_id,
+        "local-node",
+        NetworkPeerState::Ready,
+        None,
+    );
+    network_registry
+        .upsert_peer_state(peer_state)
+        .await
+        .expect("upsert peer state");
+
+    let first_id = Uuid::from_u128(1);
+    let first_ip = allocate_overlay_address(&spec, first_id)
+        .expect("allocate first task")
+        .assigned_ip;
+    let second_id = (2..10_000u128)
+        .map(Uuid::from_u128)
+        .find(|candidate| {
+            allocate_overlay_address(&spec, *candidate)
+                .expect("allocate candidate task")
+                .assigned_ip
+                == first_ip
+        })
+        .expect("find deterministic preferred-slot collision");
+
+    let requests = [first_id, second_id]
+        .into_iter()
+        .map(|id| WorkloadStartRequest {
+            name: format!("collision-{id}"),
+            execution: ResolvedExecutionSpec {
+                networks: vec![spec.id],
+                ..empty_resolved_execution("img")
+            },
+            execution_platform: ExecutionPlatform::Oci,
+            isolation_mode: crate::workload::model::IsolationMode::Standard,
+            isolation_profile: None,
+            gpu_device_ids: Vec::new(),
+            id: Some(id),
+            slot_ids: Vec::new(),
+            owner: None,
+            target_node: None,
+        })
+        .collect::<Vec<_>>();
+
+    manager
+        .start_workloads_batch(requests)
+        .await
+        .expect("start colliding networked tasks");
+
+    let attachments = network_registry
+        .list_attachments(Some(spec.id))
+        .expect("list collision attachments");
+    assert_eq!(attachments.len(), 2);
+    let assigned_ips = attachments
+        .iter()
+        .map(|attachment| {
+            attachment
+                .assigned_ip
+                .clone()
+                .expect("attachment should have assigned ip")
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(assigned_ips.len(), 2, "attachment IPs must be unique");
 }
 
 #[tokio::test]

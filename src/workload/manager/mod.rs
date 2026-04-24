@@ -236,6 +236,8 @@ struct WorkloadManagerLocalState {
     workload_value_index: Arc<Mutex<Option<CachedWorkloadValueIndex>>>,
     // Per-workload liveness probe bookkeeping used by reconciliation.
     liveness_probes: Arc<AsyncMutex<HashMap<Uuid, LivenessProbeEntry>>>,
+    // Short critical section that reserves overlay attachment addresses before provisioning.
+    attachment_assignment_lock: Arc<AsyncMutex<()>>,
     // Stop deduplication guard so only one stop workflow runs per workload.
     inflight_stops: Arc<AsyncMutex<HashSet<Uuid>>>,
     // Reconcile deduplication guard so only one reconcile workflow runs per workload.
@@ -425,6 +427,7 @@ impl WorkloadManager {
                 workload_spec_cache: Arc::new(Mutex::new(HashMap::new())),
                 workload_value_index: Arc::new(Mutex::new(None)),
                 liveness_probes: Arc::new(AsyncMutex::new(HashMap::new())),
+                attachment_assignment_lock: Arc::new(AsyncMutex::new(())),
                 inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
                 inflight_reconciles: Arc::new(AsyncMutex::new(HashSet::new())),
                 removed_task_watermarks: Arc::new(AsyncMutex::new(HashMap::new())),

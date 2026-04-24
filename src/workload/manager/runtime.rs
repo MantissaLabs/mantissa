@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -10,7 +11,7 @@ use uuid::Uuid;
 
 use crate::config;
 use crate::gossip::Message;
-use crate::network::allocator::{allocate_overlay_address, parse_overlay_cidr};
+use crate::network::allocator::{OverlayAddressAllocator, parse_overlay_cidr};
 use crate::network::attachment::{AttachmentProvisioningRequest, bridge_name};
 use crate::network::controller::DEFAULT_MTU;
 use crate::network::events::ForwardingEvent;
@@ -55,6 +56,7 @@ impl WorkloadManager {
             .network_registry
             .list_attachments(None)
             .context("list attachments for repair")?;
+        let conflicting_attachment_ids = conflicting_overlay_attachment_ids(&attachments);
         let mut attachment_index: HashMap<
             Uuid,
             HashMap<Uuid, (NetworkAttachmentState, Option<String>)>,
@@ -80,14 +82,25 @@ impl WorkloadManager {
                 continue;
             }
 
-            if self
+            let has_ip_conflict = conflicting_attachment_ids.contains(&attachment.id);
+            let attachment_exists = self
                 .networking
                 .attachment_provisioner
                 .attachment_exists(attachment.id)
                 .await
-                .context("check attachment presence during repair")?
-            {
+                .context("check attachment presence during repair")?;
+            if attachment_exists && !has_ip_conflict {
                 continue;
+            }
+            if has_ip_conflict {
+                warn!(
+                    target: "task",
+                    task = %attachment.task_id,
+                    attachment = %attachment.id,
+                    network = %attachment.network_id,
+                    assigned_ip = %attachment.assigned_ip.clone().unwrap_or_default(),
+                    "repairing runtime attachment with duplicate overlay ip"
+                );
             }
 
             let spec = match self.load_spec(attachment.task_id).await {
@@ -667,7 +680,61 @@ fn task_policy_allows_runtime_restart(spec: &WorkloadSpec, exit_code: i32) -> bo
     }
 }
 
+/// Return attachment IDs that currently share the same assigned IP within one network.
+fn conflicting_overlay_attachment_ids(attachments: &[NetworkAttachmentValue]) -> HashSet<Uuid> {
+    let mut owners: HashMap<(Uuid, String), Vec<Uuid>> = HashMap::new();
+    for attachment in attachments {
+        if matches!(attachment.state, NetworkAttachmentState::Removing) {
+            continue;
+        }
+        let Some(ip) = attachment.assigned_ip.as_deref() else {
+            continue;
+        };
+        owners
+            .entry((attachment.network_id, ip.to_string()))
+            .or_default()
+            .push(attachment.id);
+    }
+
+    owners
+        .into_values()
+        .filter(|ids| ids.len() > 1)
+        .flatten()
+        .collect()
+}
+
 impl WorkloadManager {
+    /// Allocate an overlay IP that does not conflict with existing attachments on the network.
+    ///
+    /// Removing rows are ignored because they are already being withdrawn and should not pin an
+    /// address indefinitely.
+    fn allocate_overlay_address_for_attachment(
+        &self,
+        network: &crate::network::types::NetworkSpecValue,
+        task_id: Uuid,
+        attachment_id: Uuid,
+    ) -> Result<crate::network::allocator::AttachmentAllocation> {
+        let mut allocator = OverlayAddressAllocator::new(network);
+        let attachments = self
+            .networking
+            .network_registry
+            .list_attachments(Some(network.id))
+            .context("list attachments for overlay address allocation")?;
+        for attachment in attachments {
+            if attachment.id == attachment_id
+                || matches!(attachment.state, NetworkAttachmentState::Removing)
+            {
+                continue;
+            }
+            if let Some(ip) = attachment.assigned_ip
+                && let Ok(ip) = ip.parse::<IpAddr>()
+            {
+                allocator.reserve(ip);
+            }
+        }
+        allocator.allocate_overlay_address(task_id)
+    }
+
     /// Ensures that runtime network attachments exist for the provided task identifier.
     pub(super) async fn ensure_runtime_attachments(
         &self,
@@ -821,9 +888,6 @@ impl WorkloadManager {
                 .context("failed to load network specification")?
                 .ok_or_else(|| anyhow::anyhow!("network {} not found", network_id))?;
 
-            let allocation = allocate_overlay_address(&spec, task_id)
-                .context("failed to allocate overlay address")?;
-
             let prefix = parse_overlay_cidr(&spec.subnet_cidr)
                 .context("failed to parse network subnet for attachment")?;
             let mut mtu = if spec.mtu == 0 { DEFAULT_MTU } else { spec.mtu };
@@ -832,13 +896,6 @@ impl WorkloadManager {
             }
             let bridge = bridge_name(spec.id);
 
-            attachment.set_assignment(
-                Some(allocation.assigned_ip.clone()),
-                Some(allocation.mac_address.clone()),
-            );
-
-            let assignment_changed =
-                previous_ip != attachment.assigned_ip || previous_mac != attachment.mac;
             let metadata_changed = location_changed || label_changed;
 
             let provisioned = self
@@ -848,7 +905,36 @@ impl WorkloadManager {
                 .await
                 .context("check existing attachment state")?;
 
-            if !provisioned {
+            let allocation;
+            let assignment_changed;
+            let needs_reconfigure;
+            {
+                let _assignment_guard = self.local_state.attachment_assignment_lock.lock().await;
+                allocation = self
+                    .allocate_overlay_address_for_attachment(&spec, task_id, attachment.id)
+                    .context("failed to allocate overlay address")?;
+
+                attachment.set_assignment(
+                    Some(allocation.assigned_ip.clone()),
+                    Some(allocation.mac_address.clone()),
+                );
+                assignment_changed =
+                    previous_ip != attachment.assigned_ip || previous_mac != attachment.mac;
+                needs_reconfigure = !provisioned || assignment_changed;
+
+                // Persist the reserved address before provisioning so concurrent task starts on
+                // this node cannot reserve the same overlay IP while the veth setup is in flight.
+                if needs_reconfigure {
+                    attachment.set_state(NetworkAttachmentState::Configuring, None);
+                    self.networking
+                        .network_registry
+                        .upsert_attachment(attachment.clone())
+                        .await
+                        .context("persist configuring attachment state")?;
+                }
+            }
+
+            if needs_reconfigure {
                 tracing::debug!(
                     target: "task",
                     task_id = %task_id,
@@ -859,15 +945,8 @@ impl WorkloadManager {
                     attachment_target = ?attachment_target,
                     assigned_ip = %allocation.assigned_ip,
                     mac = %allocation.mac_address,
-                    "provisioning new runtime attachment"
+                    "provisioning runtime attachment"
                 );
-
-                attachment.set_state(NetworkAttachmentState::Configuring, None);
-                self.networking
-                    .network_registry
-                    .upsert_attachment(attachment.clone())
-                    .await
-                    .context("persist configuring attachment state")?;
 
                 if let Err(err) = self
                     .ensure_runtime_attachment_with_retry(
