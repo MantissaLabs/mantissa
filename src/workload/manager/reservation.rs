@@ -3,7 +3,7 @@ use std::collections::HashSet;
 
 use anyhow::Context;
 use chrono::Utc;
-use protocol::scheduling::{self, prepare_leases_response};
+use protocol::scheduling::{self, prepare_leases_response, scheduler as scheduler_rpc};
 use protocol::server::cluster_session;
 use tracing::warn;
 use uuid::Uuid;
@@ -50,6 +50,19 @@ pub(super) struct RemotePrepareRejection {
     pub(super) digest: SchedulerDigestValue,
 }
 
+/// Prepared binding returned by one remote scheduler for a single task.
+struct PreparedRemoteLeaseBinding {
+    lease_id: Uuid,
+    slot_ids: Vec<SlotId>,
+    gpu_device_ids: Vec<String>,
+}
+
+/// Structured outcome of a remote prepare RPC after Cap'n Proto decoding.
+enum RemotePrepareOutcome {
+    Prepared(HashMap<Uuid, PreparedRemoteLeaseBinding>),
+    Rejected(RemotePrepareRejection),
+}
+
 /// Maps one structured rejection reason into the human-readable task-manager retry message.
 fn describe_remote_prepare_rejection(reason: RemotePrepareRejectionReason) -> &'static str {
     match reason {
@@ -82,6 +95,72 @@ fn parse_uuid(bytes: capnp::data::Reader<'_>) -> Result<Uuid, anyhow::Error> {
     let mut raw = [0u8; 16];
     raw.copy_from_slice(bytes);
     Ok(Uuid::from_bytes(raw))
+}
+
+/// Decodes one prepared lease row returned by a remote scheduler.
+fn parse_prepared_remote_lease(
+    reader: scheduling::prepared_lease::Reader<'_>,
+) -> Result<(Uuid, PreparedRemoteLeaseBinding), anyhow::Error> {
+    let lease_id = parse_uuid(reader.get_lease_id().context("read prepared lease id")?)
+        .context("decode prepared lease id")?;
+    let task_id = parse_uuid(reader.get_task_id().context("read prepared task id")?)
+        .context("decode prepared task id")?;
+    let slot_ids = reader
+        .get_slot_ids()
+        .context("read prepared slot ids")?
+        .iter()
+        .collect::<Vec<_>>();
+
+    let gpu_devices = reader
+        .get_gpu_device_ids()
+        .context("read prepared GPU device ids")?;
+    let mut gpu_device_ids = Vec::with_capacity(gpu_devices.len() as usize);
+    for device_id in gpu_devices.iter() {
+        let device_id = device_id.context("read prepared GPU device id")?;
+        gpu_device_ids.push(
+            device_id
+                .to_str()
+                .context("decode prepared GPU device id")?
+                .to_string(),
+        );
+    }
+
+    Ok((
+        task_id,
+        PreparedRemoteLeaseBinding {
+            lease_id,
+            slot_ids,
+            gpu_device_ids,
+        },
+    ))
+}
+
+/// Decodes the remote scheduler prepare response into a small domain enum.
+fn parse_prepare_response(
+    response: scheduling::prepare_leases_response::Reader<'_>,
+) -> Result<RemotePrepareOutcome, anyhow::Error> {
+    match response
+        .which()
+        .context("read prepareLeases response variant")?
+    {
+        prepare_leases_response::Prepared(Ok(leases)) => {
+            let mut bindings_by_task = HashMap::new();
+            for lease in leases.iter() {
+                let (task_id, binding) = parse_prepared_remote_lease(lease)?;
+                if bindings_by_task.insert(task_id, binding).is_some() {
+                    return Err(anyhow::anyhow!(
+                        "duplicate prepared binding returned for task {task_id}"
+                    ));
+                }
+            }
+            Ok(RemotePrepareOutcome::Prepared(bindings_by_task))
+        }
+        prepare_leases_response::Prepared(Err(err)) => Err(anyhow::anyhow!(err.to_string())),
+        prepare_leases_response::Rejected(Ok(rejected)) => Ok(RemotePrepareOutcome::Rejected(
+            parse_prepare_rejection(rejected).context("decode prepare rejection")?,
+        )),
+        prepare_leases_response::Rejected(Err(err)) => Err(anyhow::anyhow!(err.to_string())),
+    }
 }
 
 impl WorkloadManager {
@@ -292,8 +371,8 @@ impl WorkloadManager {
         }
 
         for (peer_id, peer_plans) in grouped {
-            let session = match self.remote_session(peer_id).await {
-                Ok(session) => session,
+            let scheduler_client = match self.remote_scheduler_client(peer_id).await {
+                Ok(client) => client,
                 Err(err) => {
                     self.local_state
                         .remote_prepare_feedback
@@ -303,308 +382,204 @@ impl WorkloadManager {
                 }
             };
 
-            let scheduler_client =
-                match session.clone().get_scheduler_request().send().promise.await {
-                    Ok(resp) => match resp.get() {
-                        Ok(result) => match result.get_scheduler() {
-                            Ok(client) => client,
-                            Err(err) => {
-                                self.local_state
-                                    .remote_prepare_feedback
-                                    .record_retryable_failure(peer_id);
-                                self.abort_remote_leases(&reservations).await;
-                                return Err(ExecutionError::Retry(anyhow::anyhow!(
-                                    err.to_string()
-                                )));
-                            }
-                        },
-                        Err(err) => {
-                            self.local_state
-                                .remote_prepare_feedback
-                                .record_retryable_failure(peer_id);
-                            self.abort_remote_leases(&reservations).await;
-                            return Err(ExecutionError::Retry(anyhow::anyhow!(err.to_string())));
-                        }
-                    },
-                    Err(err) => {
+            let outcome = match self
+                .send_prepare_leases_request(&scheduler_client, &peer_plans)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    self.abort_remote_leases(&reservations).await;
+                    if matches!(&err, ExecutionError::Retry(_)) {
                         self.local_state
                             .remote_prepare_feedback
                             .record_retryable_failure(peer_id);
-                        self.abort_remote_leases(&reservations).await;
-                        return Err(ExecutionError::Retry(anyhow::anyhow!(err.to_string())));
                     }
-                };
-
-            let mut prepare_req = scheduler_client.prepare_leases_request();
-            {
-                let mut inner = prepare_req.get().init_request();
-                inner.set_coordinator_node_id(self.local_node_id.as_bytes());
-                inner.set_ttl_ms(30_000);
-                let mut intents_builder = inner.reborrow().init_intents(peer_plans.len() as u32);
-                for (idx, plan) in peer_plans.iter().enumerate() {
-                    let mut entry = intents_builder.reborrow().get(idx as u32);
-                    entry.set_task_id(plan.id.as_bytes());
-                    entry.set_cpu_millis(plan.cpu_millis);
-                    entry.set_memory_bytes(plan.memory_bytes);
-                    entry.set_gpu_count(plan.gpu_count);
+                    return Err(err);
                 }
-            }
+            };
 
-            match prepare_req.send().promise.await {
-                Ok(resp) => match resp.get() {
-                    Ok(result) => match result.get_response() {
-                        Ok(response) => match response.which() {
-                            Ok(prepare_leases_response::Prepared(Ok(leases))) => {
-                                let mut bindings_by_task = HashMap::new();
-                                for lease in leases.iter() {
-                                    let lease_id = match lease.get_lease_id() {
-                                        Ok(bytes) => match parse_uuid(bytes) {
-                                            Ok(lease_id) => lease_id,
-                                            Err(err) => {
-                                                self.abort_remote_leases(&reservations).await;
-                                                return Err(ExecutionError::Fatal(err));
-                                            }
-                                        },
-                                        Err(err) => {
-                                            self.abort_remote_leases(&reservations).await;
-                                            return Err(ExecutionError::Fatal(anyhow::anyhow!(
-                                                err.to_string()
-                                            )));
-                                        }
-                                    };
-                                    let task_id = match lease.get_task_id() {
-                                        Ok(bytes) => match parse_uuid(bytes) {
-                                            Ok(task_id) => task_id,
-                                            Err(err) => {
-                                                self.abort_remote_leases(&reservations).await;
-                                                return Err(ExecutionError::Fatal(err));
-                                            }
-                                        },
-                                        Err(err) => {
-                                            self.abort_remote_leases(&reservations).await;
-                                            return Err(ExecutionError::Fatal(anyhow::anyhow!(
-                                                err.to_string()
-                                            )));
-                                        }
-                                    };
-                                    let expires_at_unix_ms = lease.get_expires_at_unix_ms();
-                                    let slot_ids = match lease.get_slot_ids() {
-                                        Ok(ids) => ids.iter().collect::<Vec<_>>(),
-                                        Err(err) => {
-                                            self.abort_remote_leases(&reservations).await;
-                                            return Err(ExecutionError::Fatal(anyhow::anyhow!(
-                                                err.to_string()
-                                            )));
-                                        }
-                                    };
-                                    let gpu_devices = match lease.get_gpu_device_ids() {
-                                        Ok(ids) => ids,
-                                        Err(err) => {
-                                            self.abort_remote_leases(&reservations).await;
-                                            return Err(ExecutionError::Fatal(anyhow::anyhow!(
-                                                err.to_string()
-                                            )));
-                                        }
-                                    };
-                                    let mut gpu_device_ids =
-                                        Vec::with_capacity(gpu_devices.len() as usize);
-                                    for device_id in gpu_devices.iter() {
-                                        let value = match device_id {
-                                            Ok(value) => value,
-                                            Err(err) => {
-                                                self.abort_remote_leases(&reservations).await;
-                                                return Err(ExecutionError::Fatal(
-                                                    anyhow::anyhow!(err.to_string()),
-                                                ));
-                                            }
-                                        };
-                                        let value = match value.to_str() {
-                                            Ok(value) => value,
-                                            Err(err) => {
-                                                self.abort_remote_leases(&reservations).await;
-                                                return Err(ExecutionError::Fatal(
-                                                    anyhow::anyhow!(err.to_string()),
-                                                ));
-                                            }
-                                        };
-                                        gpu_device_ids.push(value.to_string());
-                                    }
-
-                                    if bindings_by_task
-                                        .insert(
-                                            task_id,
-                                            (
-                                                lease_id,
-                                                expires_at_unix_ms,
-                                                slot_ids,
-                                                gpu_device_ids,
-                                            ),
-                                        )
-                                        .is_some()
-                                    {
-                                        self.abort_remote_leases(&reservations).await;
-                                        return Err(ExecutionError::Fatal(anyhow::anyhow!(
-                                            "duplicate prepared binding returned for task {task_id}"
-                                        )));
-                                    }
-                                }
-                                let mut lease_reservations = Vec::new();
-                                for plan in &peer_plans {
-                                    let Some((
-                                        lease_id,
-                                        _expires_at_unix_ms,
-                                        prepared_slot_ids,
-                                        prepared_gpu_ids,
-                                    )) = bindings_by_task.remove(&plan.id)
-                                    else {
-                                        self.abort_remote_leases(&reservations).await;
-                                        return Err(ExecutionError::Fatal(anyhow::anyhow!(
-                                            "missing prepared binding for remote task {} on peer {}",
-                                            plan.id,
-                                            peer_id
-                                        )));
-                                    };
-
-                                    if prepared_slot_ids.is_empty() {
-                                        self.abort_remote_leases(&reservations).await;
-                                        return Err(ExecutionError::Fatal(anyhow::anyhow!(
-                                            "prepared remote task {} on peer {} without slots",
-                                            plan.id,
-                                            peer_id
-                                        )));
-                                    }
-
-                                    if prepared_gpu_ids.len() < plan.gpu_count as usize {
-                                        self.abort_remote_leases(&reservations).await;
-                                        return Err(ExecutionError::Fatal(anyhow::anyhow!(
-                                            "prepared remote task {} on peer {} returned only {} GPU(s) for request of {}",
-                                            plan.id,
-                                            peer_id,
-                                            prepared_gpu_ids.len(),
-                                            plan.gpu_count
-                                        )));
-                                    }
-
-                                    lease_reservations.push(RemoteLeaseReservation {
-                                        lease_id,
-                                        task_id: plan.id,
-                                    });
-                                    prepared_plans.push(PreparedRemoteStartPlan {
-                                        index: plan.index,
-                                        id: plan.id,
-                                        lease_id,
-                                        lease_coordinator_node_id: self.local_node_id,
-                                        name: plan.name.clone(),
-                                        image: plan.image.clone(),
-                                        execution_platform: plan.execution_platform,
-                                        isolation_mode: plan.isolation_mode,
-                                        isolation_profile: plan.isolation_profile.clone(),
-                                        command: plan.command.clone(),
-                                        tty: plan.tty,
-                                        cpu_millis: plan.cpu_millis,
-                                        memory_bytes: plan.memory_bytes,
-                                        gpu_count: plan.gpu_count,
-                                        slot_ids: prepared_slot_ids,
-                                        gpu_device_ids: prepared_gpu_ids,
-                                        peer_id: plan.peer_id,
-                                        restart_policy: plan.restart_policy.clone(),
-                                        termination_grace_period_secs: plan
-                                            .termination_grace_period_secs,
-                                        pre_stop_command: plan.pre_stop_command.clone(),
-                                        liveness: plan.liveness.clone(),
-                                        env: plan.env.clone(),
-                                        secret_files: plan.secret_files.clone(),
-                                        volumes: plan.volumes.clone(),
-                                        networks: plan.networks.clone(),
-                                        owner: plan.owner.clone(),
-                                    });
-                                }
-
-                                if !bindings_by_task.is_empty() {
-                                    self.abort_remote_leases(&reservations).await;
-                                    return Err(ExecutionError::Fatal(anyhow::anyhow!(
-                                        "peer {peer_id} returned unexpected prepared bindings"
-                                    )));
-                                }
-
-                                reservations.insert(
-                                    peer_id,
-                                    RemoteReservation {
-                                        leases: lease_reservations,
-                                    },
-                                );
-                                self.local_state
-                                    .remote_prepare_feedback
-                                    .clear_success(peer_id);
-                            }
-                            Ok(prepare_leases_response::Prepared(Err(err))) => {
-                                self.abort_remote_leases(&reservations).await;
-                                return Err(ExecutionError::Fatal(anyhow::anyhow!(
-                                    err.to_string()
-                                )));
-                            }
-                            Ok(prepare_leases_response::Rejected(Ok(rejected))) => {
-                                let rejection = match parse_prepare_rejection(rejected) {
-                                    Ok(rejection) => rejection,
-                                    Err(err) => {
-                                        self.abort_remote_leases(&reservations).await;
-                                        return Err(ExecutionError::Fatal(err));
-                                    }
-                                };
-                                let rejection_message = format!(
-                                    "peer {peer_id} rejected lease prepare: {} (digest version {}, free slots {}, free cpu {}, free memory {}, free gpu {})",
-                                    describe_remote_prepare_rejection(rejection.reason),
-                                    rejection.digest.snapshot_version,
-                                    rejection.digest.free_slot_count,
-                                    rejection.digest.free_cpu_millis,
-                                    rejection.digest.free_memory_bytes,
-                                    rejection.digest.free_gpu_count,
-                                );
-                                self.abort_remote_leases(&reservations).await;
-                                if let Err(err) = self
-                                    .apply_remote_prepare_rejection(peer_id, rejection)
-                                    .await
-                                {
-                                    return Err(ExecutionError::Fatal(err));
-                                }
-                                return Err(ExecutionError::Retry(anyhow::anyhow!(
-                                    rejection_message
-                                )));
-                            }
-                            Ok(prepare_leases_response::Rejected(Err(err))) => {
-                                self.abort_remote_leases(&reservations).await;
-                                return Err(ExecutionError::Fatal(anyhow::anyhow!(
-                                    err.to_string()
-                                )));
-                            }
-                            Err(err) => {
-                                self.abort_remote_leases(&reservations).await;
-                                return Err(ExecutionError::Fatal(anyhow::anyhow!(
-                                    err.to_string()
-                                )));
-                            }
-                        },
+            match outcome {
+                RemotePrepareOutcome::Prepared(bindings_by_task) => {
+                    let (reservation, peer_prepared_plans) = match self.build_prepared_remote_plans(
+                        peer_id,
+                        &peer_plans,
+                        bindings_by_task,
+                    ) {
+                        Ok(prepared) => prepared,
                         Err(err) => {
                             self.abort_remote_leases(&reservations).await;
-                            return Err(ExecutionError::Fatal(anyhow::anyhow!(err.to_string())));
+                            return Err(ExecutionError::Fatal(err));
                         }
-                    },
-                    Err(err) => {
-                        self.abort_remote_leases(&reservations).await;
-                        return Err(ExecutionError::Fatal(anyhow::anyhow!(err.to_string())));
-                    }
-                },
-                Err(err) => {
-                    self.abort_remote_leases(&reservations).await;
+                    };
+
+                    reservations.insert(peer_id, reservation);
+                    prepared_plans.extend(peer_prepared_plans);
                     self.local_state
                         .remote_prepare_feedback
-                        .record_retryable_failure(peer_id);
-                    return Err(ExecutionError::Retry(anyhow::anyhow!(err.to_string())));
+                        .clear_success(peer_id);
                 }
-            }
+                RemotePrepareOutcome::Rejected(rejection) => {
+                    let rejection_message = format!(
+                        "peer {peer_id} rejected lease prepare: {} (digest version {}, free slots {}, free cpu {}, free memory {}, free gpu {})",
+                        describe_remote_prepare_rejection(rejection.reason),
+                        rejection.digest.snapshot_version,
+                        rejection.digest.free_slot_count,
+                        rejection.digest.free_cpu_millis,
+                        rejection.digest.free_memory_bytes,
+                        rejection.digest.free_gpu_count,
+                    );
+                    self.abort_remote_leases(&reservations).await;
+                    if let Err(err) = self
+                        .apply_remote_prepare_rejection(peer_id, rejection)
+                        .await
+                    {
+                        return Err(ExecutionError::Fatal(err));
+                    }
+                    return Err(ExecutionError::Retry(anyhow::anyhow!(rejection_message)));
+                }
+            };
         }
 
         Ok((reservations, prepared_plans))
+    }
+
+    /// Opens the remote scheduler capability for a peer before sending reservation requests.
+    async fn remote_scheduler_client(
+        &self,
+        peer_id: Uuid,
+    ) -> Result<scheduler_rpc::Client, anyhow::Error> {
+        let session = self.remote_session(peer_id).await?;
+        session
+            .clone()
+            .get_scheduler_request()
+            .send()
+            .promise
+            .await
+            .with_context(|| format!("failed to request scheduler service from peer {peer_id}"))?
+            .get()
+            .with_context(|| format!("invalid scheduler response from peer {peer_id}"))?
+            .get_scheduler()
+            .with_context(|| format!("missing scheduler service from peer {peer_id}"))
+    }
+
+    /// Sends one remote prepare RPC and classifies transport failures separately from decode bugs.
+    async fn send_prepare_leases_request(
+        &self,
+        scheduler_client: &scheduler_rpc::Client,
+        peer_plans: &[&RemoteStartPlan],
+    ) -> Result<RemotePrepareOutcome, ExecutionError> {
+        let mut prepare_req = scheduler_client.prepare_leases_request();
+        {
+            let mut inner = prepare_req.get().init_request();
+            inner.set_coordinator_node_id(self.local_node_id.as_bytes());
+            inner.set_ttl_ms(30_000);
+            let mut intents_builder = inner.reborrow().init_intents(peer_plans.len() as u32);
+            for (idx, plan) in peer_plans.iter().enumerate() {
+                let mut entry = intents_builder.reborrow().get(idx as u32);
+                entry.set_task_id(plan.id.as_bytes());
+                entry.set_cpu_millis(plan.cpu_millis);
+                entry.set_memory_bytes(plan.memory_bytes);
+                entry.set_gpu_count(plan.gpu_count);
+            }
+        }
+
+        let response = prepare_req
+            .send()
+            .promise
+            .await
+            .map_err(|err| ExecutionError::Retry(anyhow::anyhow!(err.to_string())))?;
+        let result = response
+            .get()
+            .map_err(|err| ExecutionError::Fatal(anyhow::anyhow!(err.to_string())))?;
+        let response = result
+            .get_response()
+            .map_err(|err| ExecutionError::Fatal(anyhow::anyhow!(err.to_string())))?;
+        parse_prepare_response(response).map_err(ExecutionError::Fatal)
+    }
+
+    /// Validates prepared bindings and converts them into launch plans plus rollback metadata.
+    fn build_prepared_remote_plans(
+        &self,
+        peer_id: Uuid,
+        peer_plans: &[&RemoteStartPlan],
+        mut bindings_by_task: HashMap<Uuid, PreparedRemoteLeaseBinding>,
+    ) -> Result<(RemoteReservation, Vec<PreparedRemoteStartPlan>), anyhow::Error> {
+        let mut lease_reservations = Vec::new();
+        let mut prepared_plans = Vec::new();
+
+        for plan in peer_plans {
+            let Some(binding) = bindings_by_task.remove(&plan.id) else {
+                return Err(anyhow::anyhow!(
+                    "missing prepared binding for remote task {} on peer {}",
+                    plan.id,
+                    peer_id
+                ));
+            };
+
+            if binding.slot_ids.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "prepared remote task {} on peer {} without slots",
+                    plan.id,
+                    peer_id
+                ));
+            }
+
+            if binding.gpu_device_ids.len() < plan.gpu_count as usize {
+                return Err(anyhow::anyhow!(
+                    "prepared remote task {} on peer {} returned only {} GPU(s) for request of {}",
+                    plan.id,
+                    peer_id,
+                    binding.gpu_device_ids.len(),
+                    plan.gpu_count
+                ));
+            }
+
+            lease_reservations.push(RemoteLeaseReservation {
+                lease_id: binding.lease_id,
+                task_id: plan.id,
+            });
+            prepared_plans.push(PreparedRemoteStartPlan {
+                index: plan.index,
+                id: plan.id,
+                lease_id: binding.lease_id,
+                lease_coordinator_node_id: self.local_node_id,
+                name: plan.name.clone(),
+                image: plan.image.clone(),
+                execution_platform: plan.execution_platform,
+                isolation_mode: plan.isolation_mode,
+                isolation_profile: plan.isolation_profile.clone(),
+                command: plan.command.clone(),
+                tty: plan.tty,
+                cpu_millis: plan.cpu_millis,
+                memory_bytes: plan.memory_bytes,
+                gpu_count: plan.gpu_count,
+                slot_ids: binding.slot_ids,
+                gpu_device_ids: binding.gpu_device_ids,
+                peer_id: plan.peer_id,
+                restart_policy: plan.restart_policy.clone(),
+                termination_grace_period_secs: plan.termination_grace_period_secs,
+                pre_stop_command: plan.pre_stop_command.clone(),
+                liveness: plan.liveness.clone(),
+                env: plan.env.clone(),
+                secret_files: plan.secret_files.clone(),
+                volumes: plan.volumes.clone(),
+                networks: plan.networks.clone(),
+                owner: plan.owner.clone(),
+            });
+        }
+
+        if !bindings_by_task.is_empty() {
+            return Err(anyhow::anyhow!(
+                "peer {peer_id} returned unexpected prepared bindings"
+            ));
+        }
+
+        Ok((
+            RemoteReservation {
+                leases: lease_reservations,
+            },
+            prepared_plans,
+        ))
     }
 
     /// Aborts prepared remote leases accumulated during previous stages.
