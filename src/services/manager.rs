@@ -17,8 +17,7 @@ use crate::volumes::types::VolumeDriver;
 use crate::volumes::{LocalVolumeAccessError, VolumeRegistry};
 use crate::workload::manager::WorkloadManager;
 use crate::workload::manager::{
-    WorkloadStartRequest, WorkloadTrafficPublicationUpdate,
-    workload_start_error_requires_service_requeue,
+    WorkloadStartRequest, workload_start_error_requires_service_requeue,
 };
 use crate::workload::model::{WorkloadPhase, WorkloadSpec, WorkloadVolumeMount};
 use anyhow::anyhow;
@@ -2026,14 +2025,11 @@ impl ServiceController {
     async fn publish_running_task_traffic_best_effort(&self, service_name: &str, task_id: Uuid) {
         match self
             .workload_manager
-            .set_task_traffic_published(task_id, true)
+            .ensure_task_service_traffic_ready(task_id)
             .await
         {
-            Ok(
-                WorkloadTrafficPublicationUpdate::Updated
-                | WorkloadTrafficPublicationUpdate::Unchanged,
-            ) => {}
-            Ok(WorkloadTrafficPublicationUpdate::NoAttachments) => {
+            Ok(true) => {}
+            Ok(false) => {
                 self.spawn_task_traffic_publish_waiter(
                     service_name.to_string(),
                     task_id,
@@ -2046,13 +2042,13 @@ impl ServiceController {
                     target: "services",
                     service = %service_name,
                     task = %task_id,
-                    "failed to publish running task traffic: {err:#}"
+                    "failed to check running task traffic publication readiness: {err:#}"
                 );
             }
         }
     }
 
-    /// Starts one background waiter that publishes a task once its attachment rows arrive locally.
+    /// Starts one background waiter that publishes a task once its attachments are traffic-ready.
     ///
     /// Publication intent can precede attachment replication during initial deployment and
     /// convergence after partitions. This preserves the intent without blocking service
@@ -2073,14 +2069,14 @@ impl ServiceController {
         let waiters = self.inflight_traffic_publish_waiters.clone();
         tokio::task::spawn_local(async move {
             let result = workload_manager
-                .publish_task_traffic_when_attachment_rows_exist(task_id, timeout)
+                .publish_task_traffic_when_ready(task_id, timeout)
                 .await;
             if let Err(err) = result {
                 tracing::warn!(
                     target: "services",
                     service = %service_name,
                     task = %task_id,
-                    "failed to publish running task traffic after attachment wait: {err:#}"
+                    "failed to publish running task traffic after readiness wait: {err:#}"
                 );
             }
 

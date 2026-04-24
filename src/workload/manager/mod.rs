@@ -1339,38 +1339,26 @@ impl WorkloadManager {
         Ok(updated)
     }
 
-    /// Waits until attachment rows exist for every declared task network and then publishes them.
+    /// Waits until every declared task network is ready for service traffic and then publishes it.
     ///
-    /// Service controllers use this during start-first handoff so replacement endpoints only
-    /// become visible after the runtime has created attachment rows that can carry the
-    /// publication bit durably.
-    pub async fn publish_task_traffic_when_attachment_rows_exist(
+    /// Service controllers use this during steady-state healing and start-first handoff so
+    /// replacement endpoints only become visible after the runtime has created attachment rows,
+    /// marked them ready, and the local network peer has rebuilt forwarding state.
+    pub async fn publish_task_traffic_when_ready(
         &self,
         task_id: Uuid,
         timeout: Duration,
     ) -> Result<(), anyhow::Error> {
-        let spec = self.load_spec(task_id).await?;
-        if spec.networks.is_empty() {
-            return Ok(());
-        }
-
-        let expected = spec.networks.len();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let attachments = self
-                .networking
-                .network_registry
-                .list_attachments_for_task(task_id)
-                .context("list attachments while waiting for publishable task traffic")?;
-            if attachments.len() >= expected {
-                self.set_task_traffic_published(task_id, true).await?;
+            if self.ensure_task_service_traffic_ready(task_id).await? {
                 return Ok(());
             }
 
             if tokio::time::Instant::now() >= deadline {
                 return Err(anyhow!(
-                    "timed out waiting for {} attachment row(s) before publishing task traffic",
-                    expected
+                    "timed out waiting for task {} network attachments to become traffic-ready",
+                    task_id
                 ));
             }
 

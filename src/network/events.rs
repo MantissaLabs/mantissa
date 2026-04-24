@@ -1,7 +1,7 @@
 use uuid::Uuid;
 
-/// Events emitted by attachment provisioning that require the network controller
-/// to refresh remote forwarding state.
+/// Events emitted by attachment provisioning and service publication that require
+/// the network controller to refresh forwarding or discovery-derived dataplane state.
 #[derive(Debug, Clone)]
 pub enum ForwardingEvent {
     AttachmentReady { network_id: Uuid },

@@ -786,6 +786,11 @@ impl NetworkController {
                     if inserted {
                         self.inner.wake.notify_one();
                     }
+                    // Discovery-derived VIP and NodePort publication depend on attachment
+                    // readiness as well as the publication bit. Refresh immediately so a service
+                    // whose publication intent arrived before the attachment became Ready does not
+                    // wait for the periodic discovery tick before exposing the backend.
+                    self.refresh_publication(network_id).await;
                 }
                 ForwardingEvent::TrafficPublicationChanged { network_id } => {
                     // Refresh discovery-derived VIP and NodePort publication immediately after a
@@ -982,6 +987,7 @@ impl NetworkController {
             );
         }
 
+        self.reconcile_remote_forwarding(&plan).await?;
         self.mark_peer_ready(plan.network_id).await?;
 
         if spec.status != NetworkStatus::Ready {
@@ -995,7 +1001,7 @@ impl NetworkController {
             self.send_event(NetworkEvent::Upsert(updated_spec)).await;
         }
 
-        self.reconcile_remote_forwarding(&plan).await?;
+        self.refresh_publication(plan.network_id).await;
 
         let mut active = self.inner.active_networks.lock().await;
         active.insert(plan.network_id);

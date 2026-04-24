@@ -5190,7 +5190,7 @@ async fn set_task_traffic_published_reports_missing_attachments() {
 }
 
 #[tokio::test]
-async fn publish_task_traffic_when_attachment_rows_exist_publishes_late_attachment() {
+async fn publish_task_traffic_when_ready_waits_for_ready_late_attachment() {
     let (manager, _scheduler, _mock_cm, network_registry) = setup_manager().await;
 
     let network = NetworkSpecValue::new(NetworkSpecDraft {
@@ -5270,17 +5270,37 @@ async fn publish_task_traffic_when_attachment_rows_exist_publishes_late_attachme
     let manager_for_wait = manager.clone();
     let wait_publish = async move {
         manager_for_wait
-            .publish_task_traffic_when_attachment_rows_exist(
-                task_id,
-                std::time::Duration::from_secs(2),
-            )
+            .publish_task_traffic_when_ready(task_id, std::time::Duration::from_secs(2))
             .await
     };
     let insert_attachment = async {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let attachment_id =
+            crate::network::types::compute_network_attachment_id(task_id, network.id);
         network_registry
             .upsert_attachment(NetworkAttachmentValue::new(NetworkAttachmentDraft {
-                id: crate::network::types::compute_network_attachment_id(task_id, network.id),
+                id: attachment_id,
+                task_id,
+                node_id: manager.local_node_id,
+                instance_id: format!("mantissa-{task_id}"),
+                network_id: network.id,
+                task_updated_at: Some(now.clone()),
+                requested_ip: Some("10.54.0.2".to_string()),
+                assigned_ip: Some("10.54.0.2".to_string()),
+                mac: Some("02:11:22:33:44:aa".to_string()),
+                state: NetworkAttachmentState::Configuring,
+                error: None,
+                traffic_published: false,
+                service_name: Some("svc".to_string()),
+                template_name: Some("backend".to_string()),
+            }))
+            .await
+            .expect("insert configuring attachment");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        network_registry
+            .upsert_attachment(NetworkAttachmentValue::new(NetworkAttachmentDraft {
+                id: attachment_id,
                 task_id,
                 node_id: manager.local_node_id,
                 instance_id: format!("mantissa-{task_id}"),
@@ -5296,7 +5316,7 @@ async fn publish_task_traffic_when_attachment_rows_exist_publishes_late_attachme
                 template_name: Some("backend".to_string()),
             }))
             .await
-            .expect("insert attachment");
+            .expect("mark late attachment ready");
     };
 
     let (wait_result, _) = tokio::join!(wait_publish, insert_attachment);
