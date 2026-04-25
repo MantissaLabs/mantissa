@@ -1725,12 +1725,20 @@ mod tests {
         );
 
         let root_v1 = store.root_digest_at_version(1).await.unwrap();
+        assert_eq!(store.current_root_schema_version(), 1);
+        assert_eq!(store.root_digest().await, root_v1);
+
         let root_v2 = store.root_digest_at_version(2).await.unwrap();
         assert_ne!(root_v1, root_v2);
 
         let ranges_v1 = store.page_range_summary_at_version(1).await.unwrap();
         let ranges_v2 = store.page_range_summary_at_version(2).await.unwrap();
         assert_ne!(ranges_v1, ranges_v2);
+
+        assert_eq!(store.current_root_schema_version(), 1);
+        assert_eq!(store.root_digest().await, root_v1);
+        let snapshot_after_non_current_reads = store.get_snapshot(&k).unwrap().unwrap();
+        assert_eq!(snapshot_after_non_current_reads, snapshot_v1);
 
         let raw_reg = store.get_reg(&k).unwrap().unwrap();
         assert_eq!(
@@ -1742,6 +1750,9 @@ mod tests {
         );
 
         store.rebuild_mst_from_disk_at_version(2).await.unwrap();
+        assert_eq!(store.current_root_schema_version(), 2);
+        assert_eq!(store.root_digest().await, root_v2);
+
         let snapshot_v2 = store.get_snapshot(&k).unwrap().unwrap();
         assert_eq!(
             snapshot_v2.as_slice(),
