@@ -714,10 +714,11 @@ impl PeerValue {
 pub(crate) fn root_schema_from_node_info(
     ni: node_info_capnp::Reader<'_>,
 ) -> Result<RootSchemaInfo, CapnpError> {
-    RootSchemaInfo::new(
+    RootSchemaInfo::with_publication_generation(
         ni.get_minimum_root_schema_version(),
         ni.get_supported_root_schema_version(),
         ni.get_root_schema_updated_at_unix_ms(),
+        ni.get_root_schema_publication_generation(),
     )
     .map_err(CapnpError::failed)
 }

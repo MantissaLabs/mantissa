@@ -400,7 +400,7 @@ async fn build_runtime_components(
     } = channels;
 
     let cluster_view = stores.restore_active_view()?;
-    let root_schema = stores.restore_root_schema_state(options.root_schema_override)?;
+    let root_schema = stores.restore_root_schema_state(&ctx.db, options.root_schema_override)?;
     let (gossip_client, gossip_dedupe) = build_gossip_client(&cluster_view, &gossip_routes);
 
     let runtime_health = config::health_runtime_config();

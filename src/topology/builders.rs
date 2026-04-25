@@ -196,6 +196,7 @@ pub(super) fn write_root_schema_to_node_info(
     info.set_minimum_root_schema_version(root_schema.minimum_supported_version);
     info.set_supported_root_schema_version(root_schema.supported_version);
     info.set_root_schema_updated_at_unix_ms(root_schema.updated_at_unix_ms);
+    info.set_root_schema_publication_generation(root_schema.publication_generation);
 }
 
 /// Writes replicated node labels into the topology `NodeInfo` builder.

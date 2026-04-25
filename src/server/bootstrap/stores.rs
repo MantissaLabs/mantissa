@@ -9,7 +9,10 @@ use crate::store::agent_store::{AgentStore, open_agent_store};
 use crate::store::cluster_operation_store::ClusterOperationStore;
 use crate::store::cluster_view_store::ClusterViewStore;
 use crate::store::job_store::{JobStore, open_job_store};
-use crate::store::local::{LocalCredentialStore, LocalSessionStore, SecretMasterStore};
+use crate::store::local::{
+    LocalCredentialStore, LocalSessionStore, SecretMasterStore,
+    next_root_schema_publication_generation,
+};
 use crate::store::network_store::{
     NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore, open_network_attachment_store,
     open_network_peer_store, open_network_spec_store,
@@ -180,13 +183,24 @@ impl BootstrapStores {
     /// Builds the local semantic root schema support range advertised at startup.
     pub(super) fn restore_root_schema_state(
         &self,
+        db: &redb::Database,
         override_state: Option<RootSchemaState>,
     ) -> BootstrapResult<RootSchemaState> {
+        let publication_generation = next_root_schema_publication_generation(db)
+            .map_err(|error| store_error("advance root schema publication generation", error))?;
+
         if let Some(root_schema) = override_state {
+            let root_schema = RootSchemaState::with_publication_generation(
+                root_schema.minimum_supported_version(),
+                root_schema.supported_version(),
+                publication_generation,
+            )
+            .map_err(|error| store_error("build overridden root schema state", error))?;
             info!(
                 target: "sync",
                 minimum_root_schema_version = root_schema.minimum_supported_version(),
                 supported_root_schema_version = root_schema.supported_version(),
+                root_schema_publication_generation = root_schema.publication_generation(),
                 "initialized overridden local root schema support range during startup"
             );
             return Ok(root_schema);
@@ -196,12 +210,14 @@ impl BootstrapStores {
             target: "sync",
             minimum_root_schema_version = MIN_SUPPORTED_ROOT_SCHEMA_VERSION,
             supported_root_schema_version = SUPPORTED_ROOT_SCHEMA_VERSION,
+            root_schema_publication_generation = publication_generation,
             "initialized local root schema support range during startup"
         );
 
-        RootSchemaState::new(
+        RootSchemaState::with_publication_generation(
             MIN_SUPPORTED_ROOT_SCHEMA_VERSION,
             SUPPORTED_ROOT_SCHEMA_VERSION,
+            publication_generation,
         )
         .map_err(|error| store_error("build root schema state", error))
     }

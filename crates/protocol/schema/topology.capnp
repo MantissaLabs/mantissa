@@ -299,6 +299,9 @@ struct NodeInfo {
 
   rootSchemaUpdatedAtUnixMs @33 :UInt64;
   # Last publication time for this node's root-schema support range.
+
+  rootSchemaPublicationGeneration @34 :UInt64;
+  # Durable per-node publication order for root-schema support changes.
 }
 
 struct NodeList {
