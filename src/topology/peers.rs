@@ -953,6 +953,8 @@ mod tests {
         let peer = PeerValue {
             address: "127.0.0.1:7000".to_string(),
             hostname: "node-a".to_string(),
+            platform_os: std::env::consts::OS.to_string(),
+            platform_arch: std::env::consts::ARCH.to_string(),
             noise_static_pub: [1u8; 32],
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
@@ -982,6 +984,8 @@ mod tests {
         let peer = PeerValue {
             address: "127.0.0.1:7000".to_string(),
             hostname: "node-a".to_string(),
+            platform_os: std::env::consts::OS.to_string(),
+            platform_arch: std::env::consts::ARCH.to_string(),
             noise_static_pub: [1u8; 32],
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
