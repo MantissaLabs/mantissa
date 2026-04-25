@@ -424,8 +424,8 @@ local_test!(
         )
         .await;
 
-        let updated_support =
-            stored_peer_runtime_support(&anchor, anchor.id()).expect("updated local runtime support");
+        let updated_support = stored_peer_runtime_support(&anchor, anchor.id())
+            .expect("updated local runtime support");
         assert!(
             updated_support
                 .feature_flags

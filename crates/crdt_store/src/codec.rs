@@ -14,9 +14,9 @@ const VERSIONED_PAYLOAD_VERSION: u8 = 1;
 /// releases can add new envelope versions without overloading one raw byte
 /// stream format for multiple protocol eras.
 ///
-/// Append-only payload evolution still requires explicit version-aware decode
-/// paths when newer structs must accept older payloads, because bincode itself
-/// does not carry schema information or synthesize missing fields.
+/// The envelope version is not a schema migration by itself. Any persisted
+/// struct shape that changes still needs an explicit decode path for the older
+/// shape before this function can safely write the newer shape.
 pub fn encode<T>(value: &T) -> crate::Result<Vec<u8>>
 where
     T: Serialize,
@@ -36,9 +36,9 @@ where
 /// expected to use this format so upgrade behavior remains easy to reason
 /// about.
 ///
-/// Older readers still benefit from bincode tolerating trailing bytes inside
-/// the envelope payload, but newer readers do not automatically recover
-/// missing fields from older payloads.
+/// Bincode still defines the inner payload semantics. That means simple older
+/// readers may ignore trailing bytes in some top-level cases, but newer readers
+/// do not automatically recover missing fields from older payloads.
 pub fn decode<T>(bytes: &[u8]) -> crate::Result<T>
 where
     T: DeserializeOwned,
@@ -83,7 +83,7 @@ mod tests {
         value: u64,
     }
 
-    /// Evolved payload shape used to prove append-only fields can be defaulted.
+    /// Evolved payload shape used by narrow inner-bincode behavior tests.
     #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
     struct EvolvedPayload {
         value: u64,
@@ -117,9 +117,27 @@ mod tests {
         );
     }
 
-    /// Additive field evolution must continue to work inside the versioned envelope.
+    /// Decoding must reject envelopes with versions this binary does not understand.
     #[test]
-    fn codec_reads_new_payloads_with_older_structs() {
+    fn codec_rejects_unsupported_envelope_versions() {
+        let payload = SamplePayload { value: 42 };
+        let mut encoded = super::encode(&payload).expect("encode payload");
+        encoded[super::VERSIONED_PAYLOAD_TAG.len()] =
+            super::VERSIONED_PAYLOAD_VERSION.saturating_add(1);
+
+        let error =
+            super::decode::<SamplePayload>(&encoded).expect_err("reject future envelope version");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported binary payload envelope version"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Older top-level structs can ignore trailing bincode bytes in this narrow case.
+    #[test]
+    fn codec_allows_simple_older_reader_to_ignore_trailing_payload_bytes() {
         let encoded = super::encode(&EvolvedPayload {
             value: 19,
             enabled: true,
