@@ -274,6 +274,13 @@ local_test!(
         TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes")
             .await;
 
+        wait_for_pairwise_sessions(&cluster).await;
+        assert!(
+            wait_for_remote_scheduler_digest(&cluster[0], cluster[1].id(), Duration::from_secs(10))
+                .await,
+            "local planner should observe a remote digest before testing heterogeneous platform placement"
+        );
+
         let node0_arch = node_platform_value(&cluster[0].node.registry, cluster[0].id())
             .expect("node 0 platform should exist before override")
             .1;
@@ -304,12 +311,6 @@ local_test!(
             )
             .await,
             "macos platform override should converge on every node"
-        );
-        wait_for_pairwise_sessions(&cluster).await;
-        assert!(
-            wait_for_remote_scheduler_digest(&cluster[0], cluster[1].id(), Duration::from_secs(10))
-                .await,
-            "local planner should observe a remote digest before testing heterogeneous platform placement"
         );
 
         let mut request = demo_binpack_workload_request("platform-alias-workload");
