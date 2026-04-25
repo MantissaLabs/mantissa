@@ -13,8 +13,9 @@ use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode, Hea
 use mantissa::topology::peers::{PeerSchedulingState, PeerValue};
 use mantissa::workload::model::{ExecutionPlatform, IsolationMode};
 use net::noise::NoiseKeys;
-use protocol::sync::Domain;
+use protocol::sync::{Domain, delta_sink};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -28,6 +29,25 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{byte:02x}");
     }
     out
+}
+
+struct NoopDeltaSink;
+
+impl delta_sink::Server for NoopDeltaSink {
+    async fn push_chunk(
+        self: Rc<Self>,
+        _params: delta_sink::PushChunkParams,
+    ) -> Result<(), capnp::Error> {
+        Ok(())
+    }
+
+    async fn end(
+        self: Rc<Self>,
+        _params: delta_sink::EndParams,
+        _results: delta_sink::EndResults,
+    ) -> Result<(), capnp::Error> {
+        Ok(())
+    }
 }
 
 /// Builds one in-process headless config that advertises the requested root schema support range.
@@ -166,14 +186,7 @@ async fn peers_root_hex_at_version(
     node: &TestNode,
     root_schema_version: u32,
 ) -> Result<String, capnp::Error> {
-    let view_response = node
-        .topology()
-        .get_cluster_view_request()
-        .send()
-        .promise
-        .await?;
-    let cluster_view = ClusterViewId::from_capnp(view_response.get()?.get_view()?)
-        .map_err(capnp::Error::failed)?;
+    let cluster_view = active_cluster_view(node).await?;
 
     let mut request = node.node.sync_client.get_roots_for_view_request();
     {
@@ -194,6 +207,85 @@ async fn peers_root_hex_at_version(
     Err(capnp::Error::failed(
         "missing peers root in sync roots response".to_string(),
     ))
+}
+
+/// Reads the active cluster view from the topology service.
+async fn active_cluster_view(node: &TestNode) -> Result<ClusterViewId, capnp::Error> {
+    let view_response = node
+        .topology()
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await?;
+    let cluster_view = ClusterViewId::from_capnp(view_response.get()?.get_view()?)
+        .map_err(capnp::Error::failed)?;
+    Ok(cluster_view)
+}
+
+/// Requests peer-domain range summaries for one explicit root schema version.
+async fn request_peers_ranges_at_version(
+    node: &TestNode,
+    root_schema_version: u32,
+) -> Result<(), capnp::Error> {
+    let cluster_view = active_cluster_view(node).await?;
+
+    let mut request = node.node.sync_client.get_ranges_for_view_request();
+    {
+        let mut req = request.get().init_req();
+        cluster_view.write_capnp(req.reborrow().init_view());
+        req.set_root_schema_version(root_schema_version);
+        let mut domains = req.reborrow().init_domains(1);
+        domains.set(0, Domain::Peers);
+    }
+
+    request.send().promise.await?;
+    Ok(())
+}
+
+/// Opens an empty delta stream for one explicit root schema version.
+async fn open_empty_delta_at_version(
+    node: &TestNode,
+    root_schema_version: u32,
+) -> Result<(), capnp::Error> {
+    let cluster_view = active_cluster_view(node).await?;
+
+    let mut request = node.node.sync_client.open_delta_for_view_request();
+    {
+        let mut req = request.get().init_req();
+        cluster_view.write_capnp(req.reborrow().init_view());
+        req.set_root_schema_version(root_schema_version);
+        req.reborrow().init_wants(0);
+        req.set_sink(capnp_rpc::new_client(NoopDeltaSink));
+    }
+
+    request.send().promise.await?;
+    Ok(())
+}
+
+/// Opens a delta stream whose top-level request and domain want disagree on root schema.
+async fn open_delta_with_mismatched_want_version(
+    node: &TestNode,
+    request_root_schema_version: u32,
+    want_root_schema_version: u32,
+) -> Result<(), capnp::Error> {
+    let cluster_view = active_cluster_view(node).await?;
+
+    let mut request = node.node.sync_client.open_delta_for_view_request();
+    {
+        let mut req = request.get().init_req();
+        cluster_view.write_capnp(req.reborrow().init_view());
+        req.set_root_schema_version(request_root_schema_version);
+        let mut wants = req.reborrow().init_wants(1);
+        let mut want = wants.reborrow().get(0);
+        want.set_domain(Domain::Peers);
+        cluster_view.write_capnp(want.reborrow().init_view());
+        want.set_root_schema_version(want_root_schema_version);
+        want.reborrow().init_want();
+        req.set_sink(capnp_rpc::new_client(NoopDeltaSink));
+    }
+
+    request.send().promise.await?;
+    Ok(())
 }
 
 /// Marks one node drained through the real topology RPC with an optional stop-timeout override.
@@ -236,6 +328,60 @@ local_test!(root_schema_join_rejects_without_overlap, {
                 .to_string()
                 .contains("compatible root schema version overlap"),
         "unexpected join error: {error}"
+    );
+});
+
+// Validates every sync entry point rejects root schema versions outside local support.
+local_test!(
+    root_schema_rejects_unsupported_version_on_all_sync_entrypoints,
+    {
+        let node = new_node_with_root_schema(1, 1).await;
+
+        let roots_error = peers_root_hex_at_version(&node, 2)
+            .await
+            .expect_err("unsupported roots request should fail");
+        assert!(
+            roots_error
+                .to_string()
+                .contains("root schema version 2 is unsupported"),
+            "unexpected roots error: {roots_error}"
+        );
+
+        let ranges_error = request_peers_ranges_at_version(&node, 2)
+            .await
+            .expect_err("unsupported ranges request should fail");
+        assert!(
+            ranges_error
+                .to_string()
+                .contains("root schema version 2 is unsupported"),
+            "unexpected ranges error: {ranges_error}"
+        );
+
+        let delta_error = open_empty_delta_at_version(&node, 2)
+            .await
+            .expect_err("unsupported delta request should fail");
+        assert!(
+            delta_error
+                .to_string()
+                .contains("root schema version 2 is unsupported"),
+            "unexpected delta error: {delta_error}"
+        );
+    }
+);
+
+// Validates delta requests reject wants whose root schema disagrees with the request.
+local_test!(root_schema_delta_rejects_mismatched_want_version, {
+    let node = new_node_with_root_schema(1, 2).await;
+
+    let error = open_delta_with_mismatched_want_version(&node, 1, 2)
+        .await
+        .expect_err("mismatched want root schema should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("domain want root schema mismatch: expected 1, got 2"),
+        "unexpected mismatched want error: {error}"
     );
 });
 
@@ -355,6 +501,24 @@ local_test!(root_schema_downgrade_overlap_recovers_missed_updates, {
     assert!(
         converged,
         "downgraded peer did not recover missed scheduling update through overlap-version sync"
+    );
+
+    let roots_equal_at_v1 = wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || async {
+            let anchor_root = peers_root_hex_at_version(&anchor, 1).await.ok();
+            let downgraded_root = peers_root_hex_at_version(&downgraded, 1).await.ok();
+            match (anchor_root, downgraded_root) {
+                (Some(left), Some(right)) => !left.is_empty() && left == right,
+                _ => false,
+            }
+        },
+    )
+    .await;
+    assert!(
+        roots_equal_at_v1,
+        "downgrade recovery should converge through the shared v1 root projection"
     );
 });
 
