@@ -168,6 +168,116 @@ Existing dataplane state may continue forwarding for a while, but fresh service
 name resolution on that node depends on Mantissa returning or the workloads
 being recreated elsewhere.
 
+## Mantissa Daemon Upgrades
+
+Mantissa uses a root-schema support range to keep distributed state sync safe
+while different daemon versions are running during maintenance. Each node
+advertises:
+
+- `minimumRootSchemaVersion`: the oldest semantic MST root projection this
+  binary can still serve,
+- `supportedRootSchemaVersion`: the newest semantic MST root projection this
+  binary can serve,
+- `rootSchemaPublicationGeneration`: a durable per-node publication counter
+  used to make restarts and downgrades win over stale advertisements.
+
+When two nodes sync, they use the highest root schema version that both sides
+support. If there is no overlap, join is rejected and sync skips that peer
+instead of comparing incompatible MST roots.
+
+The active cluster cutover is therefore pairwise and automatic:
+
+1. a release that introduces root schema `N` should still serve the previous
+   production schema while the cluster is being upgraded,
+2. old and new nodes sync through the shared schema,
+3. new nodes sync with each other through schema `N`,
+4. once every node runs a binary that supports schema `N`, all normal sync
+   traffic uses schema `N`,
+5. a later release may raise `minimumRootSchemaVersion` after the rollback
+   window for the older schema has closed.
+
+There is no separate cluster-wide flip bit today. The advertised support ranges
+and peer-to-peer negotiation are the cutover mechanism.
+
+## Upgrade Policy
+
+Mantissa upgrades should be treated as bounded hops, not arbitrary jumps across
+many root-schema eras. A target binary is a valid rolling-upgrade target only
+when its root-schema range overlaps the version currently running in the
+cluster.
+
+For example, a node running a binary that only supports schema `1` cannot
+rolling-upgrade directly into a binary whose range is `5..=10`. There is no
+common schema, so the new daemon cannot safely join or sync with the old
+cluster. Use one of these paths instead:
+
+- upgrade through bridge releases whose ranges overlap each step,
+- ship a direct-upgrade release that still serves schema `1`,
+- stop the whole cluster and perform an offline hard cutover when data loss or
+  manual store migration is acceptable.
+
+The same rule applies to rollback. During the rollback window, the upgraded
+binary must keep serving the schema understood by the rollback binary. Once a
+release raises `minimumRootSchemaVersion`, rolling back to binaries below that
+minimum is no longer supported without an offline recovery plan.
+
+## Recommended Upgrade Runbook
+
+For a routine rolling daemon upgrade:
+
+1. confirm the target binary's root-schema range overlaps the currently
+   deployed binary,
+2. confirm the rollback binary can still read the local store and shares a root
+   schema with the target binary,
+3. drain one node or a small batch of nodes,
+4. wait for service-managed work to evacuate,
+5. stop Mantissa on the drained node,
+6. install the target binary,
+7. start Mantissa and wait for the node to rejoin and sync,
+8. resume the node after it is healthy,
+9. repeat until every node is upgraded.
+
+After the whole cluster is upgraded, keep the older root schema supported until
+the operational rollback window has passed. Only then should a follow-up
+release raise the minimum supported root schema.
+
+For a downgrade:
+
+1. verify the downgrade binary overlaps the current cluster root-schema range,
+2. drain the node before replacing the binary,
+3. start the older binary and let it publish its lower support range,
+4. wait for peers to observe the new publication before resuming the node.
+
+The durable publication generation makes a same-node downgrade visible even if
+an older, higher-schema advertisement is still present in peer stores.
+
+## Versioned Storage Payloads
+
+Redb rows use Mantissa's versioned bincode envelope for opaque CRDT payloads.
+The envelope makes persisted blobs self-identifying, but it is not a general
+schema migration system. If a persisted Rust type changes shape in a way that
+bincode cannot decode from older rows, the release must add an explicit
+migration or perform a deliberate hard cutover.
+
+Root-schema negotiation protects MST root compatibility between live peers. It
+does not automatically make every old Redb payload readable by every future
+binary.
+
+## Root-Schema Change Checklist
+
+When introducing a new root schema:
+
+1. define the new canonical projection for any domain whose MST leaf semantics
+   changed,
+2. keep the previous production projection available while rolling upgrades and
+   rollback are expected,
+3. update `SUPPORTED_ROOT_SCHEMA_VERSION` only after the new projection is
+   implemented and tested,
+4. update `MIN_SUPPORTED_ROOT_SCHEMA_VERSION` only in a later cleanup release,
+5. add tests for mixed-version upgrade, full cutover, downgrade, unsupported
+   schema rejection, and store payload migration when persisted row shapes
+   change.
+
 ## Standalone Tasks
 
 Standalone tasks do not have a higher-level controller that can recreate them
@@ -193,6 +303,10 @@ maintenance knob without rewriting the workload spec.
 
 - `src/topology/peers.rs`
 - `src/topology/service.rs`
+- `src/topology/sync.rs`
+- `src/cluster/root_schema.rs`
+- `crates/crdt_store/src/codec.rs`
+- `crates/crdt_store/src/mst_store.rs`
 - `src/services/slot_reconcile.rs`
 - `src/workload/manager/state.rs`
 - `crates/client/src/node/drain.rs`
