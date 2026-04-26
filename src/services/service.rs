@@ -19,11 +19,13 @@ use crate::workload::capnp_codec::{
 };
 use crate::workload::types::ExecutionSpec;
 use capnp::Error;
+use crdt_store::codec::StoreValueCodec;
 use protocol::services::{
     placement_constraint, placement_constraint_selector, service_event, service_spec, services,
     task_template,
 };
 use std::collections::HashSet;
+use std::io::Cursor;
 use std::rc::Rc;
 use tracing::warn;
 use uuid::Uuid;
@@ -181,6 +183,37 @@ pub(crate) fn write_service_spec(
     }
 
     Ok(())
+}
+
+impl StoreValueCodec for ServiceSpecValue {
+    /// Encodes one service spec as the stable Cap'n Proto store value.
+    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut builder = message.init_root::<service_spec::Builder<'_>>();
+            write_service_spec(&mut builder, self).map_err(service_store_codec_error)?;
+        }
+        Ok(capnp::serialize::write_message_to_words(&message))
+    }
+
+    /// Decodes one service spec from the stable Cap'n Proto store value.
+    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        let reader =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .map_err(service_store_codec_error)?;
+        let spec = reader
+            .get_root::<service_spec::Reader<'_>>()
+            .map_err(service_store_codec_error)?;
+        read_service_spec(spec).map_err(service_store_codec_error)
+    }
+}
+
+/// Converts service store-codec errors into the CRDT store error type.
+fn service_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
+    Box::new(crdt_store::error::Error::Other(format!(
+        "service store codec error: {error}"
+    )))
 }
 
 pub(crate) fn write_service_event(
@@ -995,6 +1028,7 @@ mod tests {
         PlacementConstraint, PlacementConstraintSelector, PlacementPolicy, PlacementPreference,
         PlacementStrategy,
     };
+    use crate::services::registry::ServiceRegistry;
     use crate::services::types::{
         ServiceLivenessProbe, ServiceLivenessProbeKind, ServicePortProtocol,
         ServicePreviousGeneration, ServiceReadinessProbe, ServiceReadinessProbeKind,
@@ -1004,13 +1038,62 @@ mod tests {
         TaskTemplateNetworkRequirement, TaskTemplateRestartPolicy, TaskTemplateRestartPolicyKind,
         TaskTemplateSpecValue,
     };
+    use crate::store::service_store::open_service_store;
     use crate::task::types::{
         TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskVolumeMount,
     };
     use crate::workload::types::ExecutionSpec;
     use capnp::message::Builder;
+    use crdt_store::codec::StoreValueCodec;
     use protocol::services::{service_spec, task_template};
+    use std::sync::Arc;
+    use tempfile::tempdir;
     use uuid::Uuid;
+
+    /// Builds one deterministic service spec used by store codec tests.
+    fn sample_service_spec() -> ServiceSpecValue {
+        let mut spec = ServiceSpecValue::new(
+            Uuid::new_v4(),
+            "demo-manifest",
+            "demo-service",
+            vec![TaskTemplateSpecValue {
+                name: "web".to_string(),
+                execution: ExecutionSpec {
+                    image: "ghcr.io/demo/web:v1".to_string(),
+                    command: vec![
+                        "serve".to_string(),
+                        "--port".to_string(),
+                        "8080".to_string(),
+                    ],
+                    tty: false,
+                    cpu_millis: 250,
+                    memory_bytes: 128 * 1024 * 1024,
+                    gpu_count: 0,
+                    restart_policy: None,
+                    termination_grace_period_secs: None,
+                    pre_stop_command: None,
+                    liveness: None,
+                    env: Vec::new(),
+                    secret_files: Vec::new(),
+                    volumes: Vec::new(),
+                    networks: Vec::new(),
+                    placement: Default::default(),
+                },
+                depends_on: Vec::new(),
+                replicas: 2,
+                readiness: None,
+                public_port: Some(8080),
+                public_protocol: Some(ServicePortProtocol::Tcp),
+            }],
+            vec![Uuid::new_v4(), Uuid::new_v4()],
+        );
+        spec.updated_at = "2026-03-25T12:00:00Z".to_string();
+        spec.service_epoch = 2;
+        spec.phase_version = 5;
+        spec.status = ServiceStatus::Deploying;
+        spec.status_detail = Some("waiting for placement".to_string());
+        spec
+    }
 
     /// Service template wire round-trips must preserve the declared network UUID exactly.
     #[test]
@@ -1270,5 +1353,50 @@ mod tests {
             decoded, spec,
             "service spec wire round-trip should preserve rollout state and explicit ids"
         );
+    }
+
+    /// Service spec values should round-trip through the Cap'n Proto store-value codec.
+    #[test]
+    fn store_value_codec_roundtrips_service_spec() {
+        let spec = sample_service_spec();
+
+        let encoded = spec
+            .encode_store_value()
+            .expect("encode service spec value");
+        let decoded =
+            ServiceSpecValue::decode_store_value(&encoded).expect("decode service spec value");
+
+        assert_eq!(decoded, spec);
+    }
+
+    /// Reopening the service store should decode Cap'n Proto MVReg rows from Redb.
+    #[tokio::test]
+    async fn service_store_reopens_capnp_rows() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("service-reopen-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let spec = sample_service_spec();
+
+        {
+            let store = open_service_store(db.clone(), actor).expect("open service store");
+            let registry = ServiceRegistry::new(store);
+            registry.upsert(spec.clone()).await.expect("upsert service");
+        }
+
+        let reopened = open_service_store(db, actor).expect("reopen service store");
+        reopened
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild service MST");
+        let registry = ServiceRegistry::new(reopened);
+        let got = registry
+            .get(spec.id)
+            .expect("lookup reopened service")
+            .expect("service present");
+
+        assert_eq!(got, spec);
     }
 }
