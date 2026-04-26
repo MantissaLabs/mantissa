@@ -251,16 +251,27 @@ For a downgrade:
 The durable publication generation makes a same-node downgrade visible even if
 an older, higher-schema advertisement is still present in peer stores.
 
-## Versioned Storage Payloads
+## Storage Payloads
 
-Redb rows use Mantissa's versioned bincode envelope for opaque CRDT payloads.
-The envelope makes persisted blobs self-identifying, but it is not a general
-schema migration system. If a persisted Rust type changes shape in a way that
-bincode cannot decode from older rows, the release must add an explicit
-migration or perform a deliberate hard cutover.
+Redb rows use Cap'n Proto payloads. Replicated CRDT stores use Mantissa-owned
+MVReg rows whose values are encoded by each domain's `StoreValueCodec`
+implementation. Local bootstrap/authentication rows and cluster-operation rows
+also use explicit Cap'n Proto structs.
+
+Routine additive changes should add new Cap'n Proto fields with new field ids.
+Do not renumber fields, reuse field ids, or change the meaning of an existing
+field. When a field becomes obsolete, keep the field id allocated and stop
+depending on it in domain code.
+
+Changing a row's semantics is a store-format change, not only a root-schema
+change. Examples include switching a table from MVReg to another CRDT, changing
+the meaning of an existing field, or replacing a value with a different payload
+struct. Those changes must be handled as a deliberate hard cutover or by adding
+an explicit migration for the affected table.
 
 Root-schema negotiation protects MST root compatibility between live peers. It
 does not automatically make every old Redb payload readable by every future
+binary, and it does not make every new payload meaningful to an older rollback
 binary.
 
 ## Root-Schema Change Checklist
@@ -275,8 +286,8 @@ When introducing a new root schema:
    implemented and tested,
 4. update `MIN_SUPPORTED_ROOT_SCHEMA_VERSION` only in a later cleanup release,
 5. add tests for mixed-version upgrade, full cutover, downgrade, unsupported
-   schema rejection, and store payload migration when persisted row shapes
-   change.
+   schema rejection, and any store-format hard cutover or migration needed by
+   the release.
 
 ## Standalone Tasks
 
