@@ -7,6 +7,8 @@
 //! - Stores durable registers + tombstones in Redb tables.
 //! - Maintains an in-memory Merkle Search Tree to power fast anti-entropy.
 
+capnp::generated_code!(pub mod store_capnp);
+
 pub mod adapter;
 pub mod codec;
 pub mod error;

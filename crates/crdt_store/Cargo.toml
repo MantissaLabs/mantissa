@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
+capnp = { workspace = true }
 redb = "3.1.1"
 merkle-search-tree = "0.8.0"
 crdts = "7.3.2"
@@ -20,6 +21,9 @@ uuid = { version = "1", features = ["serde"] }
 base64 = "0.22.1"
 twox-hash = "2.1.1"
 thiserror = "1"
+
+[build-dependencies]
+capnpc = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
