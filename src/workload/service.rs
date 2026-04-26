@@ -7,14 +7,17 @@ use crate::workload::manager::WorkloadManager;
 use crate::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadAgentRunMetadata, WorkloadEvent, WorkloadJobMetadata,
     WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStateFilter,
-    WorkloadStateKind, WorkloadStatus,
+    WorkloadStateKind, WorkloadStatus, WorkloadValue, merge_status_into_value, spec_to_status,
+    spec_to_value, value_to_spec,
 };
 use capnp::Error;
+use crdt_store::codec::StoreValueCodec;
 use protocol::gossip::gossip_message;
 use protocol::workload::{
     WorkloadStateFilter as ProtoWorkloadStateFilter, workload, workload_event,
     workload_list_request, workload_spec, workload_status,
 };
+use std::io::Cursor;
 use std::rc::Rc;
 use uuid::Uuid;
 
@@ -111,6 +114,58 @@ pub fn read_event(reader: workload_event::Reader<'_>) -> Result<WorkloadEvent, E
             Ok(WorkloadEvent::Remove { id })
         }
     }
+}
+
+impl StoreValueCodec for WorkloadValue {
+    /// Encodes one workload value as the stable Cap'n Proto store value.
+    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        let mut event = message.init_root::<workload_event::Builder<'_>>();
+        let spec = value_to_spec(self.id, self.clone());
+
+        if self.definition_complete {
+            event.set_event(workload_event::EventType::UpsertSpec);
+            write_spec(event.reborrow().init_spec(), &spec);
+        } else {
+            let status = spec_to_status(&spec);
+            event.set_event(workload_event::EventType::UpsertStatus);
+            write_status(event.reborrow().init_status(), &status);
+        }
+
+        Ok(capnp::serialize::write_message_to_words(&message))
+    }
+
+    /// Decodes one workload value from the stable Cap'n Proto store value.
+    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+        let event = decode_workload_store_event(bytes)?;
+        match event {
+            WorkloadEvent::UpsertSpec(spec) => Ok(spec_to_value(spec.as_ref())),
+            WorkloadEvent::UpsertStatus(status) => {
+                Ok(merge_status_into_value(None, status.as_ref()))
+            }
+            WorkloadEvent::Remove { id } => Err(Box::new(crdt_store::error::Error::Other(
+                format!("workload store value cannot decode remove event for {id}"),
+            ))),
+        }
+    }
+}
+
+/// Decodes one workload store event payload.
+fn decode_workload_store_event(bytes: &[u8]) -> crdt_store::Result<WorkloadEvent> {
+    let mut cursor = Cursor::new(bytes);
+    let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+        .map_err(workload_store_codec_error)?;
+    let event = reader
+        .get_root::<workload_event::Reader<'_>>()
+        .map_err(workload_store_codec_error)?;
+    read_event(event).map_err(workload_store_codec_error)
+}
+
+/// Converts workload store-codec errors into the CRDT store error type.
+fn workload_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
+    Box::new(crdt_store::error::Error::Other(format!(
+        "workload store codec error: {error}"
+    )))
 }
 
 /// Encodes one compact workload lifecycle status into the workload wire payload.
@@ -598,4 +653,189 @@ fn list_filter_from_request(
     }
 
     Ok(WorkloadStateFilter::new(allowed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::workload_store::open_workload_store;
+    use crate::volumes::types::LocalVolumeOwnership;
+    use crate::workload::model::{
+        WorkloadEnvironmentVariable, WorkloadJobMetadata, WorkloadOwner, WorkloadSecretFile,
+        WorkloadSecretReference, WorkloadValueDraft, WorkloadVolumeMount, merge_status_into_value,
+        spec_to_status, value_to_spec,
+    };
+    use crate::workload::types::{
+        WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadRestartPolicy,
+        WorkloadRestartPolicyKind,
+    };
+    use crdt_store::codec::StoreValueCodec;
+    use crdt_store::uuid_key::UuidKey;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    /// Builds one complete workload row that exercises the store codec's nested fields.
+    fn sample_complete_workload_value() -> WorkloadValue {
+        let id = Uuid::new_v4();
+        let mut value = WorkloadValue::new(WorkloadValueDraft {
+            id,
+            name: "ingest-worker".to_string(),
+            image: "ghcr.io/demo/ingest:v1".to_string(),
+            execution_platform: ExecutionPlatform::MicroVm,
+            isolation_mode: IsolationMode::Sandboxed,
+            isolation_profile: Some("trusted".to_string()),
+            state: WorkloadPhase::Running,
+            phase_reason: Some("container started".to_string()),
+            phase_progress: Some("ready".to_string()),
+            created_at: "2026-03-25T12:00:00Z".to_string(),
+            updated_at: "2026-03-25T12:01:00Z".to_string(),
+            command: vec!["/bin/ingest".to_string(), "--once".to_string()],
+            tty: true,
+            node_id: Uuid::new_v4(),
+            node_name: "node-a".to_string(),
+            slot_ids: vec![7, 9],
+            networks: vec![Uuid::new_v4()],
+            cpu_millis: 1_500,
+            memory_bytes: 512 * 1024 * 1024,
+            gpu_count: 1,
+            gpu_device_ids: vec!["gpu-0".to_string()],
+            termination_grace_period_secs: Some(30),
+            pre_stop_command: Some(vec!["/bin/drain".to_string()]),
+            liveness: Some(WorkloadLivenessProbe {
+                kind: WorkloadLivenessProbeKind::Http,
+                command: Vec::new(),
+                port: 8080,
+                path: Some("/healthz".to_string()),
+                interval_ms: 5_000,
+                timeout_ms: 1_000,
+                failure_threshold: 2,
+                start_period_ms: 10_000,
+            }),
+            env: vec![
+                WorkloadEnvironmentVariable {
+                    name: "RUST_LOG".to_string(),
+                    value: Some("debug".to_string()),
+                    secret: None,
+                },
+                WorkloadEnvironmentVariable {
+                    name: "TOKEN".to_string(),
+                    value: None,
+                    secret: Some(WorkloadSecretReference {
+                        name: "api-token".to_string(),
+                        version_id: Some(Uuid::new_v4()),
+                    }),
+                },
+            ],
+            secret_files: vec![WorkloadSecretFile {
+                path: "/run/secrets/token".to_string(),
+                secret: WorkloadSecretReference {
+                    name: "api-token".to_string(),
+                    version_id: Some(Uuid::new_v4()),
+                },
+                mode: Some(0o400),
+                ownership: LocalVolumeOwnership::User {
+                    uid: 1_000,
+                    gid: 1_000,
+                },
+                path_env_name: Some("TOKEN_FILE".to_string()),
+            }],
+            volumes: vec![WorkloadVolumeMount {
+                volume_id: Uuid::new_v4(),
+                volume_name: "data".to_string(),
+                target: "/var/lib/data".to_string(),
+                read_only: false,
+            }],
+            owner: Some(WorkloadOwner::JobAttempt(WorkloadJobMetadata::new(
+                Uuid::new_v4(),
+                "daily-ingest",
+            ))),
+            lease_id: Some(Uuid::new_v4()),
+            lease_coordinator_node_id: Some(Uuid::new_v4()),
+            task_epoch: 2,
+            phase_version: 4,
+            launch_attempt: 1,
+            last_terminal_observed_launch: Some(1),
+        });
+        value.restart_policy = Some(WorkloadRestartPolicy {
+            name: WorkloadRestartPolicyKind::OnFailure,
+            max_retry_count: Some(3),
+        });
+        value
+    }
+
+    /// Builds one status-only placeholder value as produced by hot workload gossip.
+    fn sample_status_only_workload_value() -> WorkloadValue {
+        let complete = sample_complete_workload_value();
+        let spec = value_to_spec(complete.id, complete);
+        let status = spec_to_status(&spec);
+        merge_status_into_value(None, &status)
+    }
+
+    /// Workload values should round-trip through their Cap'n Proto store-value codec.
+    #[test]
+    fn store_value_codec_roundtrips_workload_values() {
+        let complete = sample_complete_workload_value();
+        let status_only = sample_status_only_workload_value();
+
+        let encoded = complete
+            .encode_store_value()
+            .expect("encode complete workload store value");
+        let decoded = WorkloadValue::decode_store_value(&encoded)
+            .expect("decode complete workload store value");
+        assert_eq!(decoded, complete);
+        assert!(decoded.definition_complete);
+
+        let encoded = status_only
+            .encode_store_value()
+            .expect("encode status-only workload store value");
+        let decoded = WorkloadValue::decode_store_value(&encoded)
+            .expect("decode status-only workload store value");
+        assert_eq!(decoded, status_only);
+        assert!(!decoded.definition_complete);
+    }
+
+    /// Reopening the workload store should decode Cap'n Proto MVReg rows from Redb.
+    #[tokio::test]
+    async fn workload_store_reopens_capnp_rows() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("workload-reopen-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let complete = sample_complete_workload_value();
+        let status_only = sample_status_only_workload_value();
+        let complete_key = UuidKey::from(complete.id);
+        let status_only_key = UuidKey::from(status_only.id);
+
+        {
+            let store = open_workload_store(db.clone(), actor).expect("open workload store");
+            store
+                .upsert(&complete_key, complete.clone())
+                .await
+                .expect("upsert complete workload");
+            store
+                .upsert(&status_only_key, status_only.clone())
+                .await
+                .expect("upsert status-only workload");
+        }
+
+        let store = open_workload_store(db, actor).expect("reopen workload store");
+        store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild workload MST");
+
+        let complete_snapshot = store
+            .get_snapshot(&complete_key)
+            .expect("lookup complete workload")
+            .expect("complete workload present");
+        let status_only_snapshot = store
+            .get_snapshot(&status_only_key)
+            .expect("lookup status-only workload")
+            .expect("status-only workload present");
+
+        assert_eq!(complete_snapshot.as_slice(), &[complete]);
+        assert_eq!(status_only_snapshot.as_slice(), &[status_only]);
+    }
 }

@@ -1,6 +1,6 @@
 use crate::store::open::open_arc_store;
 use crate::workload::model::WorkloadValue;
-use crdt_store::adapter::MvRegAdapterSorted;
+use crdt_store::adapter::StoreMvRegAdapterSorted;
 use crdt_store::hash::XXHash128;
 use crdt_store::mst_store::CrdtMstStore;
 use crdt_store::table_set::TableSet;
@@ -17,7 +17,7 @@ impl TableSet for WorkloadTables {
 }
 
 pub type WorkloadStoreInner =
-    CrdtMstStore<MvRegAdapterSorted<UuidKey, WorkloadValue, Uuid>, XXHash128, WorkloadTables>;
+    CrdtMstStore<StoreMvRegAdapterSorted<UuidKey, WorkloadValue, Uuid>, XXHash128, WorkloadTables>;
 
 pub type WorkloadStore = Arc<WorkloadStoreInner>;
 
