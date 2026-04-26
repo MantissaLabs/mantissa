@@ -1,5 +1,5 @@
 use super::*;
-use crate::topology::builders::write_platform_fields_to_node_info;
+use crate::topology::peers::write_peer;
 
 impl Topology {
     /// Returns the current converged scheduling state for the local node.
@@ -265,18 +265,10 @@ impl Topology {
             .hostname
             .clone()
             .unwrap_or_default();
-        info.set_hostname(&host);
-
         let addr = self
             .compute_advertise_addr()
             .unwrap_or_else(|_| String::new());
         let preferred_wireguard_port = extract_port(&addr).ok();
-        info.set_addr(&addr);
-        write_platform_fields_to_node_info(
-            info.reborrow(),
-            std::env::consts::OS,
-            std::env::consts::ARCH,
-        );
 
         let noise_pub = self.local.public_key.to_bytes();
         let signing_pub = self.local.signing_key.verifying_key().to_bytes();
@@ -287,19 +279,11 @@ impl Topology {
             &signing_pub,
         );
 
-        info.set_public_key(&noise_pub);
-        info.set_signing_key(&signing_pub);
-        info.set_identity_sig(&identity_sig);
-        info.set_incarnation(self.swim_local_incarnation());
         let scheduling = self.current_scheduling_state();
-        write_scheduling_fields_to_node_info(info.reborrow(), &scheduling);
         info.set_drain_state(drain_state_from_scheduling(&scheduling));
         let labels = self.current_label_state();
-        super::builders::write_labels_to_node_info(info.reborrow(), &labels);
-        write_runtime_support_to_node_info(info.reborrow(), &self.local.runtime_support);
-        super::builders::write_root_schema_to_node_info(info.reborrow(), root_schema);
 
-        if config::wireguard_enabled() && net::paths::running_as_root() {
+        let wireguard = if config::wireguard_enabled() && net::paths::running_as_root() {
             match net::wireguard::resolve_wireguard_key_path()
                 .and_then(net::wireguard::load_or_generate_wireguard_keys)
             {
@@ -315,20 +299,18 @@ impl Topology {
                                 .peer_wireguard(self.local.node.id)
                                 .map(|wg| wg.enabled)
                                 .unwrap_or(false);
-                            write_wireguard_to_node_info(
-                                info.reborrow(),
-                                Some(&WireGuardPeerValue {
-                                    public_key: keys.public_bytes(),
-                                    port,
-                                    enabled,
-                                }),
-                            );
+                            Some(WireGuardPeerValue {
+                                public_key: keys.public_bytes(),
+                                port,
+                                enabled,
+                            })
                         }
                         Err(err) => {
                             tracing::warn!(
                                 target: "topology",
                                 "failed to resolve WireGuard listen port for NodeInfo: {err}"
                             );
+                            None
                         }
                     }
                 }
@@ -337,9 +319,29 @@ impl Topology {
                         target: "topology",
                         "failed to load WireGuard keys for NodeInfo: {err}"
                     );
+                    None
                 }
             }
-        }
+        } else {
+            None
+        };
+
+        let peer = PeerValue {
+            address: addr,
+            hostname: host,
+            platform_os: std::env::consts::OS.to_string(),
+            platform_arch: std::env::consts::ARCH.to_string(),
+            noise_static_pub: noise_pub,
+            signing_pub,
+            identity_sig: identity_sig.to_vec(),
+            wireguard,
+            scheduling,
+            labels,
+            runtime_support: self.local.runtime_support.clone(),
+            root_schema,
+            membership: PeerMembership::active(self.swim_local_incarnation()),
+        };
+        write_peer(info.reborrow().init_peer(), &peer);
     }
 
     /// True if we already have at least one peer (not ourselves) or any stored ticket.

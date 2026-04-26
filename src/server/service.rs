@@ -53,6 +53,7 @@ impl JoinRequest {
         let signing_vk = ed25519_dalek::VerifyingKey::from_bytes(&peer.signing_pub)
             .map_err(|error| capnp::Error::failed(error.to_string()))?;
         let identity_sig = peer.identity_sig.clone();
+        let incarnation = peer.membership.incarnation;
 
         Ok(Self {
             join_token,
@@ -64,7 +65,7 @@ impl JoinRequest {
             noise_static_pub,
             signing_vk,
             identity_sig,
-            incarnation: info.get_incarnation(),
+            incarnation,
         })
     }
     /// Converts the parsed join request into the relayed topology event.

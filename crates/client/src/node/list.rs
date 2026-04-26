@@ -2,7 +2,7 @@ use crate::config::ClientConfig;
 use crate::connection;
 use crate::output;
 use anyhow::Result;
-use protocol::topology::{NodeDrainState, node_info::Reader as NodeInfo};
+use protocol::topology::{NodeDrainState, node_info::Reader as NodeInfo, peer::Reader as PeerInfo};
 use std::io::Write;
 use tabwriter::TabWriter;
 use uuid::Uuid;
@@ -27,17 +27,18 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     list.sort_by_key(id_sort_key_uuid_bytes);
 
     for n in &list {
+        let peer = n.get_peer()?;
         writeln!(
             &mut tw,
             "{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}",
             id_string(n)?,
-            n.get_hostname()?.to_str()?,
-            n.get_addr()?.to_str()?,
+            peer.get_hostname()?.to_str()?,
+            peer.get_address()?.to_str()?,
             n.get_health()?,
-            sched_label(n),
+            sched_label(&peer),
             drain_label(n)?,
-            labels_label(n)?,
-            reason_label(n)?,
+            labels_label(&peer)?,
+            reason_label(&peer)?,
         )?;
     }
 
@@ -69,8 +70,8 @@ fn id_string(n: &NodeInfo) -> anyhow::Result<String> {
 }
 
 #[inline]
-fn sched_label(n: &NodeInfo) -> &'static str {
-    if n.get_schedulable() {
+fn sched_label(peer: &PeerInfo) -> &'static str {
+    if peer.get_schedulable() {
         "open"
     } else {
         "fenced"
@@ -88,8 +89,8 @@ fn drain_label(n: &NodeInfo) -> anyhow::Result<&'static str> {
 }
 
 #[inline]
-fn reason_label(n: &NodeInfo) -> anyhow::Result<String> {
-    let reason = n.get_scheduling_reason()?.to_str()?.trim().to_string();
+fn reason_label(peer: &PeerInfo) -> anyhow::Result<String> {
+    let reason = peer.get_scheduling_reason()?.to_str()?.trim().to_string();
     if reason.is_empty() {
         Ok("-".to_string())
     } else {
@@ -98,8 +99,8 @@ fn reason_label(n: &NodeInfo) -> anyhow::Result<String> {
 }
 
 #[inline]
-fn labels_label(n: &NodeInfo) -> anyhow::Result<String> {
-    let labels = n.get_labels()?;
+fn labels_label(peer: &PeerInfo) -> anyhow::Result<String> {
+    let labels = peer.get_labels()?;
     if labels.is_empty() {
         return Ok("-".to_string());
     }

@@ -44,10 +44,7 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
-use self::builders::{
-    drain_state_from_scheduling, write_runtime_support_to_node_info,
-    write_scheduling_fields_to_node_info, write_wireguard_to_node_info,
-};
+use self::builders::drain_state_from_scheduling;
 use self::local_state::LocalNodeState;
 use self::peer_cache::{PeerCacheEntry, PeerSnapshot, PeerSnapshotCache};
 use self::runtime::{GossipWarmSetState, TopologyRuntime};

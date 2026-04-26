@@ -4,11 +4,15 @@ use crate::topology::{PeerHandle, Topology, peer_provider::PeerProvider};
 use async_trait::async_trait;
 use capnp::Error as CapnpError;
 use capnp::text_list;
-use crdts::MVReg;
+use crdt_store::codec::StoreValueCodec;
+use crdt_store::mvreg::MvReg;
 use ed25519_dalek::VerifyingKey;
-use protocol::node::node_id as node_id_capnp;
-use protocol::topology::node_info as node_info_capnp;
+use protocol::topology::{
+    PeerMembershipState as CapnpPeerMembershipState, node_info as node_info_capnp,
+    peer as peer_capnp,
+};
 use std::collections::BTreeMap;
+use std::io::Cursor;
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
@@ -363,7 +367,6 @@ pub struct PeerValue {
     pub identity_sig: Vec<u8>,
 
     /// Optional WireGuard configuration used to encrypt the VXLAN underlay.
-    // Always serialize the option tag to keep bincode framing stable across reads.
     #[serde(default)]
     pub wireguard: Option<WireGuardPeerValue>,
 
@@ -386,6 +389,233 @@ pub struct PeerValue {
     /// Membership state used to causally order graceful leave and rejoin for one node identity.
     #[serde(default)]
     pub membership: PeerMembership,
+}
+
+impl StoreValueCodec for PeerValue {
+    /// Encodes one peer value into the stable Cap'n Proto store payload.
+    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        let builder = message.init_root::<peer_capnp::Builder<'_>>();
+        write_peer(builder, self);
+        Ok(capnp::serialize::write_message_to_words(&message))
+    }
+
+    /// Decodes one peer value from the stable Cap'n Proto store payload.
+    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        let reader =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .map_err(peer_store_codec_error)?;
+        let value = reader
+            .get_root::<peer_capnp::Reader<'_>>()
+            .map_err(peer_store_codec_error)?;
+        read_peer(value).map_err(peer_store_codec_error)
+    }
+}
+
+/// Writes one peer value into the shared Cap'n Proto peer representation.
+pub(crate) fn write_peer(mut builder: peer_capnp::Builder<'_>, value: &PeerValue) {
+    builder.set_address(&value.address);
+    builder.set_hostname(&value.hostname);
+    builder.set_platform_os(&value.platform_os);
+    builder.set_platform_arch(&value.platform_arch);
+    builder.set_noise_static_pub(&value.noise_static_pub);
+    builder.set_signing_pub(&value.signing_pub);
+    builder.set_identity_sig(&value.identity_sig);
+
+    if let Some(wireguard) = value.wireguard.as_ref() {
+        builder.set_wireguard_public_key(&wireguard.public_key);
+        builder.set_wireguard_port(wireguard.port);
+        builder.set_wireguard_enabled(wireguard.enabled);
+    }
+
+    builder.set_schedulable(value.scheduling.schedulable);
+    builder.set_drain_requested(value.scheduling.drain_requested);
+    builder.set_scheduling_updated_at_unix_ms(value.scheduling.updated_at_unix_ms);
+    builder.set_scheduling_actor_node_id(value.scheduling.actor_node_id.as_bytes());
+    builder.set_scheduling_reason(value.scheduling.reason.as_deref().unwrap_or_default());
+    builder.set_drain_task_stop_timeout_secs(
+        value.scheduling.drain_task_stop_timeout_secs.unwrap_or(0),
+    );
+
+    let mut labels = builder
+        .reborrow()
+        .init_labels(value.labels.labels.len() as u32);
+    for (idx, label) in value.labels.labels.iter().enumerate() {
+        labels.set(idx as u32, label.format_assignment());
+    }
+    builder.set_labels_updated_at_unix_ms(value.labels.updated_at_unix_ms);
+    builder.set_labels_actor_node_id(value.labels.actor_node_id.as_bytes());
+
+    let mut execution_platforms = builder
+        .reborrow()
+        .init_execution_platforms(value.runtime_support.execution_platforms.len() as u32);
+    for (idx, execution_platform) in value.runtime_support.execution_platforms.iter().enumerate() {
+        execution_platforms.set(idx as u32, execution_platform.as_str());
+    }
+
+    let mut isolation_modes = builder
+        .reborrow()
+        .init_isolation_modes(value.runtime_support.isolation_modes.len() as u32);
+    for (idx, isolation_mode) in value.runtime_support.isolation_modes.iter().enumerate() {
+        isolation_modes.set(idx as u32, isolation_mode.as_str());
+    }
+
+    let mut isolation_profiles = builder
+        .reborrow()
+        .init_isolation_profiles(value.runtime_support.isolation_profiles.len() as u32);
+    for (idx, isolation_profile) in value.runtime_support.isolation_profiles.iter().enumerate() {
+        isolation_profiles.set(idx as u32, isolation_profile);
+    }
+
+    let mut feature_flags = builder
+        .reborrow()
+        .init_runtime_feature_flags(value.runtime_support.feature_flags.len() as u32);
+    for (idx, feature_flag) in value.runtime_support.feature_flags.iter().enumerate() {
+        feature_flags.set(idx as u32, feature_flag);
+    }
+
+    builder.set_minimum_root_schema_version(value.root_schema.minimum_supported_version);
+    builder.set_supported_root_schema_version(value.root_schema.supported_version);
+    builder.set_root_schema_updated_at_unix_ms(value.root_schema.updated_at_unix_ms);
+    builder.set_root_schema_publication_generation(value.root_schema.publication_generation);
+    builder.set_membership_incarnation(value.membership.incarnation);
+    builder.set_membership_state(match value.membership.state {
+        PeerMembershipState::Active => CapnpPeerMembershipState::Active,
+        PeerMembershipState::Left => CapnpPeerMembershipState::Left,
+    });
+}
+
+/// Reads one peer value from the shared Cap'n Proto peer representation.
+pub(crate) fn read_peer(reader: peer_capnp::Reader<'_>) -> Result<PeerValue, CapnpError> {
+    let wireguard_public_key = reader.get_wireguard_public_key()?;
+    let wireguard = if wireguard_public_key.is_empty() {
+        None
+    } else {
+        Some(WireGuardPeerValue {
+            public_key: read_fixed_data(reader.get_wireguard_public_key()?, "wireguardPublicKey")?,
+            port: reader.get_wireguard_port(),
+            enabled: reader.get_wireguard_enabled(),
+        })
+    };
+
+    let scheduling_reason = reader.get_scheduling_reason()?.to_str()?.trim().to_string();
+    let scheduling = PeerSchedulingState {
+        schedulable: reader.get_schedulable(),
+        drain_requested: reader.get_drain_requested(),
+        updated_at_unix_ms: reader.get_scheduling_updated_at_unix_ms(),
+        actor_node_id: read_uuid_or_nil(
+            reader.get_scheduling_actor_node_id()?,
+            "schedulingActorNodeId",
+        )?,
+        reason: (!scheduling_reason.is_empty()).then_some(scheduling_reason),
+        drain_task_stop_timeout_secs: match reader.get_drain_task_stop_timeout_secs() {
+            0 => None,
+            value => Some(value),
+        },
+    };
+
+    let labels = PeerLabelState::from_node_info(
+        read_text_list(reader.get_labels()?)?,
+        reader.get_labels_updated_at_unix_ms(),
+        Some(read_uuid_or_nil(
+            reader.get_labels_actor_node_id()?,
+            "labelsActorNodeId",
+        )?),
+    )
+    .map_err(CapnpError::failed)?;
+
+    let execution_platforms = read_text_list(reader.get_execution_platforms()?)?;
+    let isolation_modes = read_text_list(reader.get_isolation_modes()?)?;
+    let isolation_profiles = read_text_list(reader.get_isolation_profiles()?)?;
+    let feature_flags = read_text_list(reader.get_runtime_feature_flags()?)?;
+    let runtime_support = if execution_platforms.is_empty()
+        && isolation_modes.is_empty()
+        && isolation_profiles.is_empty()
+        && feature_flags.is_empty()
+    {
+        RuntimeSupportProfile::default()
+    } else {
+        RuntimeSupportProfile::new(
+            execution_platforms
+                .into_iter()
+                .filter_map(|value| value.parse().ok()),
+            isolation_modes
+                .into_iter()
+                .filter_map(|value| value.parse().ok()),
+            isolation_profiles,
+            feature_flags,
+        )
+    };
+
+    let root_schema = RootSchemaInfo::with_publication_generation(
+        reader.get_minimum_root_schema_version(),
+        reader.get_supported_root_schema_version(),
+        reader.get_root_schema_updated_at_unix_ms(),
+        reader.get_root_schema_publication_generation(),
+    )
+    .map_err(CapnpError::failed)?;
+
+    let membership_state = match reader.get_membership_state()? {
+        CapnpPeerMembershipState::Active => PeerMembershipState::Active,
+        CapnpPeerMembershipState::Left => PeerMembershipState::Left,
+    };
+
+    Ok(PeerValue {
+        address: reader.get_address()?.to_str()?.to_string(),
+        hostname: reader.get_hostname()?.to_str()?.to_string(),
+        platform_os: reader.get_platform_os()?.to_str()?.to_string(),
+        platform_arch: reader.get_platform_arch()?.to_str()?.to_string(),
+        noise_static_pub: read_fixed_data(reader.get_noise_static_pub()?, "noiseStaticPub")?,
+        signing_pub: read_fixed_data(reader.get_signing_pub()?, "signingPub")?,
+        identity_sig: reader.get_identity_sig()?.to_vec(),
+        wireguard,
+        scheduling,
+        labels,
+        runtime_support,
+        root_schema,
+        membership: PeerMembership {
+            incarnation: reader.get_membership_incarnation(),
+            state: membership_state,
+        },
+    })
+}
+
+/// Reads a fixed-size data field and reports the schema field name on mismatch.
+fn read_fixed_data<const N: usize>(
+    data: capnp::data::Reader<'_>,
+    field_name: &str,
+) -> Result<[u8; N], CapnpError> {
+    if data.len() != N {
+        return Err(CapnpError::failed(format!(
+            "{field_name} must be exactly {N} bytes"
+        )));
+    }
+
+    let mut out = [0u8; N];
+    out.copy_from_slice(data);
+    Ok(out)
+}
+
+/// Reads an optional UUID data field, treating empty data as the nil UUID.
+fn read_uuid_or_nil(data: capnp::data::Reader<'_>, field_name: &str) -> Result<Uuid, CapnpError> {
+    if data.is_empty() {
+        return Ok(Uuid::nil());
+    }
+    if data.len() != 16 {
+        return Err(CapnpError::failed(format!(
+            "{field_name} must be empty or exactly 16 bytes"
+        )));
+    }
+
+    Uuid::from_slice(data).map_err(|err| CapnpError::failed(err.to_string()))
+}
+
+/// Converts peer store-codec errors into the CRDT store error type.
+fn peer_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
+    Box::new(crdt_store::error::Error::Other(format!(
+        "peer store codec error: {error}"
+    )))
 }
 
 /// Peer snapshot projection used by the peer-domain MST.
@@ -483,9 +713,9 @@ impl PeerValue {
         self.membership.is_active()
     }
 
-    /// Selects one deterministic winner from the concurrent values stored in one raw MVReg.
-    pub fn select_reg(reg: &MVReg<PeerValue, Uuid>) -> Option<PeerValue> {
-        let values = reg.read().val;
+    /// Selects one deterministic winner from the concurrent values stored in one MVReg.
+    pub fn select_reg(reg: &MvReg<PeerValue, Uuid>) -> Option<PeerValue> {
+        let values = reg.read_values();
         Self::select(values.as_slice())
     }
 
@@ -614,153 +844,41 @@ impl PeerValue {
         node_id: Uuid,
         ni: node_info_capnp::Reader<'_>,
     ) -> Result<PeerValue, CapnpError> {
-        let address = ni.get_addr()?.to_string()?;
-        let hostname = ni.get_hostname()?.to_string()?;
-
-        let pk_bytes = ni.get_public_key()?;
-        if pk_bytes.len() != 32 {
-            return Err(CapnpError::failed(
-                "publicKey must be exactly 32 bytes".into(),
-            ));
-        }
-        let mut noise_static_pub = [0u8; 32];
-        noise_static_pub.copy_from_slice(pk_bytes);
-
-        let sk_bytes = ni.get_signing_key()?;
-        if sk_bytes.len() != 32 {
-            return Err(CapnpError::failed(
-                "signingKey must be exactly 32 bytes".into(),
-            ));
-        }
-        let mut signing_pub = [0u8; 32];
-        signing_pub.copy_from_slice(sk_bytes);
-
-        let identity_sig = ni.get_identity_sig()?;
-        if identity_sig.is_empty() {
+        let value = read_peer(ni.get_peer()?)?;
+        if value.identity_sig.is_empty() {
             return Err(CapnpError::failed(
                 "identitySig must be set for peer identity verification".into(),
             ));
         }
-        if identity_sig.len() != 64 {
+        if value.identity_sig.len() != 64 {
             return Err(CapnpError::failed(
                 "identitySig must be exactly 64 bytes".into(),
             ));
         }
 
-        let signing_vk = VerifyingKey::from_bytes(&signing_pub)
+        let signing_vk = VerifyingKey::from_bytes(&value.signing_pub)
             .map_err(|e| CapnpError::failed(e.to_string()))?;
         crate::node::identity::verify_peer_identity(
             &signing_vk,
             &node_id,
-            &noise_static_pub,
-            identity_sig,
+            &value.noise_static_pub,
+            &value.identity_sig,
         )
         .map_err(|e| CapnpError::failed(e.to_string()))?;
 
-        let wg_key_bytes = ni.get_wireguard_public_key()?;
-        let wireguard = if wg_key_bytes.is_empty() {
-            None
-        } else {
-            if wg_key_bytes.len() != 32 {
-                return Err(CapnpError::failed(
-                    "wireguardPublicKey must be exactly 32 bytes".into(),
-                ));
-            }
-            let mut public_key = [0u8; 32];
-            public_key.copy_from_slice(wg_key_bytes);
-
-            Some(WireGuardPeerValue {
-                public_key,
-                port: ni.get_wireguard_port(),
-                enabled: ni.get_wireguard_enabled(),
-            })
-        };
-
-        let scheduling = PeerSchedulingState::from_node_info(
-            node_id,
-            ni.get_schedulable(),
-            ni.get_drain_requested(),
-            ni.get_scheduling_updated_at_unix_ms(),
-            read_optional_node_id_capnp(ni.get_scheduling_actor_node_id()?)?,
-            Some(ni.get_scheduling_reason()?.to_string()?),
-            match ni.get_drain_task_stop_timeout_secs() {
-                0 => None,
-                value => Some(value),
-            },
-        );
-        let labels = labels_from_node_info(ni)?;
-        let runtime_support = runtime_support_from_node_info(ni)?;
-        let root_schema = root_schema_from_node_info(ni)?;
-
-        Ok(PeerValue {
-            address,
-            hostname,
-            platform_os: ni.get_platform_os()?.to_string()?,
-            platform_arch: ni.get_platform_arch()?.to_string()?,
-            noise_static_pub,
-            signing_pub,
-            identity_sig: identity_sig.to_vec(),
-            wireguard,
-            scheduling,
-            labels,
-            runtime_support,
-            root_schema,
-            membership: PeerMembership::active(ni.get_incarnation()),
-        })
+        Ok(value)
     }
 }
 
-/// Decodes one peer root-schema support snapshot from the topology `NodeInfo` reader.
-pub(crate) fn root_schema_from_node_info(
-    ni: node_info_capnp::Reader<'_>,
-) -> Result<RootSchemaInfo, CapnpError> {
-    RootSchemaInfo::with_publication_generation(
-        ni.get_minimum_root_schema_version(),
-        ni.get_supported_root_schema_version(),
-        ni.get_root_schema_updated_at_unix_ms(),
-        ni.get_root_schema_publication_generation(),
-    )
-    .map_err(CapnpError::failed)
-}
-
-/// Decodes one runtime support profile from the topology `NodeInfo` reader.
-pub(crate) fn runtime_support_from_node_info(
-    ni: node_info_capnp::Reader<'_>,
-) -> Result<RuntimeSupportProfile, CapnpError> {
-    let execution_platforms = read_text_list(ni.get_execution_platforms()?)?;
-    let isolation_modes = read_text_list(ni.get_isolation_modes()?)?;
-    let isolation_profiles = read_text_list(ni.get_isolation_profiles()?)?;
-    let feature_flags = read_text_list(ni.get_runtime_feature_flags()?)?;
-
-    let execution_platforms = execution_platforms
-        .into_iter()
-        .filter_map(|value| {
-            value
-                .parse::<crate::workload::model::ExecutionPlatform>()
-                .ok()
-        })
-        .collect::<Vec<_>>();
-    let isolation_modes = isolation_modes
-        .into_iter()
-        .filter_map(|value| value.parse::<crate::workload::model::IsolationMode>().ok())
-        .collect::<Vec<_>>();
-
-    Ok(RuntimeSupportProfile::new(
-        execution_platforms,
-        isolation_modes,
-        isolation_profiles,
-        feature_flags,
-    ))
-}
-
-/// Decodes one label-state payload from the topology `NodeInfo` reader.
-pub(crate) fn labels_from_node_info(
-    ni: node_info_capnp::Reader<'_>,
-) -> Result<PeerLabelState, CapnpError> {
+/// Decodes one label-state payload from the topology `Peer` reader.
+pub(crate) fn labels_from_peer(peer: peer_capnp::Reader<'_>) -> Result<PeerLabelState, CapnpError> {
     PeerLabelState::from_node_info(
-        read_text_list(ni.get_labels()?)?,
-        ni.get_labels_updated_at_unix_ms(),
-        read_optional_node_id_capnp(ni.get_labels_actor_node_id()?)?,
+        read_text_list(peer.get_labels()?)?,
+        peer.get_labels_updated_at_unix_ms(),
+        Some(read_uuid_or_nil(
+            peer.get_labels_actor_node_id()?,
+            "labelsActorNodeId",
+        )?),
     )
     .map_err(CapnpError::failed)
 }
@@ -772,20 +890,6 @@ fn read_text_list(list: text_list::Reader<'_>) -> Result<Vec<String>, CapnpError
         values.push(value?.to_str()?.to_string());
     }
     Ok(values)
-}
-
-/// Decode one optional node id payload used by peer scheduling metadata.
-fn read_optional_node_id_capnp(
-    reader: node_id_capnp::Reader<'_>,
-) -> Result<Option<Uuid>, CapnpError> {
-    let bytes = reader.get_bytes()?;
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-
-    Uuid::from_slice(bytes)
-        .map(Some)
-        .map_err(|err| CapnpError::failed(err.to_string()))
 }
 
 #[cfg(test)]
@@ -1009,5 +1113,64 @@ mod tests {
         assert_eq!(legacy.runtime_support, RuntimeSupportProfile::default());
         assert_eq!(evolved.runtime_support, peer.runtime_support);
         assert_ne!(legacy, evolved);
+    }
+
+    /// Peer store values must preserve every replicated field through Cap'n Proto.
+    #[test]
+    fn peer_value_codec_roundtrips_peer_values() {
+        let actor = Uuid::from_bytes([9u8; 16]);
+        let peer = PeerValue {
+            address: "10.0.0.8:6578".to_string(),
+            hostname: "node-store".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "x86_64".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: Some(WireGuardPeerValue {
+                public_key: [4u8; 32],
+                port: 51820,
+                enabled: true,
+            }),
+            scheduling: PeerSchedulingState {
+                schedulable: false,
+                drain_requested: true,
+                updated_at_unix_ms: 1234,
+                actor_node_id: actor,
+                reason: Some("kernel update".to_string()),
+                drain_task_stop_timeout_secs: Some(30),
+            },
+            labels: PeerLabelState::new(
+                vec![
+                    PeerLabel {
+                        key: "topology.zone".to_string(),
+                        value: "west".to_string(),
+                    },
+                    PeerLabel {
+                        key: "hardware.gpu".to_string(),
+                        value: "true".to_string(),
+                    },
+                ],
+                5678,
+                actor,
+            ),
+            runtime_support: RuntimeSupportProfile::new(
+                [crate::workload::model::ExecutionPlatform::Oci],
+                [crate::workload::model::IsolationMode::Sandboxed],
+                ["trusted"],
+                ["exec", "logs"],
+            ),
+            root_schema: crate::cluster::RootSchemaInfo::with_publication_generation(1, 3, 9012, 4)
+                .expect("root schema"),
+            membership: super::PeerMembership::left(44),
+        };
+
+        let encoded = <PeerValue as crdt_store::codec::StoreValueCodec>::encode_store_value(&peer)
+            .expect("encode peer store value");
+        let decoded =
+            <PeerValue as crdt_store::codec::StoreValueCodec>::decode_store_value(&encoded)
+                .expect("decode peer store value");
+
+        assert_eq!(decoded, peer);
     }
 }

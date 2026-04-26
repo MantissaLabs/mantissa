@@ -78,7 +78,7 @@ pub(super) async fn resolve_node_selector(
         if node_matches_selector(&node, trimmed)? {
             matches.push((
                 read_node_id(&node)?,
-                node.get_hostname()?.to_str()?.to_string(),
+                node.get_peer()?.get_hostname()?.to_str()?.to_string(),
             ));
         }
     }
@@ -118,7 +118,7 @@ fn node_matches_selector(reader: &node_info::Reader<'_>, selector: &str) -> Resu
     if id.to_string() == selector {
         return Ok(true);
     }
-    Ok(reader.get_hostname()?.to_str()? == selector)
+    Ok(reader.get_peer()?.get_hostname()?.to_str()? == selector)
 }
 
 /// Parses one CLI volume mount flag in `SOURCE:TARGET[:ro|rw]` form.

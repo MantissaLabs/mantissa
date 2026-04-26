@@ -147,7 +147,7 @@ struct RegItem {
   # Raw key bytes.
 
   reg @1 :Data;
-  # bincode(MVReg<...>) payload.
+  # Domain adapter register payload.
 }
 
 struct TombItem {

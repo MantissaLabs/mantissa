@@ -353,7 +353,9 @@ impl ProcessNode {
 
             for entry in nodes.iter() {
                 let addr = entry
-                    .get_addr()
+                    .get_peer()
+                    .context("read topology peer while resolving local node id")?
+                    .get_address()
                     .context("read topology addr while resolving local node id")?
                     .to_str()
                     .context("decode topology addr while resolving local node id")?;

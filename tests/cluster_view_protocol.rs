@@ -106,7 +106,7 @@ async fn node_labels_from_list(
             continue;
         }
 
-        let labels = row.get_labels().ok()?;
+        let labels = row.get_peer().ok()?.get_labels().ok()?;
         let mut out = Vec::with_capacity(labels.len() as usize);
         for label in labels.iter() {
             let text = label.ok()?.to_str().ok()?.trim().to_string();
@@ -1406,8 +1406,9 @@ local_test!(cluster_view_startup_preserves_persisted_self_drain_fence, {
                         continue;
                     }
 
-                    let listed_addr = row
-                        .get_addr()
+                    let peer = row.get_peer().expect("listed peer");
+                    let listed_addr = peer
+                        .get_address()
                         .expect("listed addr")
                         .to_string()
                         .expect("decode listed addr");
@@ -1416,10 +1417,10 @@ local_test!(cluster_view_startup_preserves_persisted_self_drain_fence, {
                     }
 
                     return (
-                        row.get_schedulable(),
-                        row.get_drain_requested(),
+                        peer.get_schedulable(),
+                        peer.get_drain_requested(),
                         row.get_drain_state().expect("drain state"),
-                        match row.get_drain_task_stop_timeout_secs() {
+                        match peer.get_drain_task_stop_timeout_secs() {
                             0 => None,
                             value => Some(value),
                         },

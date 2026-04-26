@@ -9,7 +9,6 @@ use crate::cluster::{ClusterId, ClusterViewId};
 use crate::config;
 use crate::node::address::extract_port;
 use crate::node::id::read_node_id;
-use crate::node::identity::pubkey_from_slice;
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::server::credential::ClusterCredential;
 use crate::store::local::{LocalCredentialStore, LocalSessionStore, MasterKeyRecord};
@@ -18,10 +17,9 @@ use crate::sync::SyncTraceContext;
 use crate::topology::health::status_to_node_status;
 use crate::topology::peers::{
     PeerLabel, PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
-    labels_from_node_info, root_schema_from_node_info, runtime_support_from_node_info,
+    labels_from_peer,
 };
 use capnp::Error;
-use capnp::data;
 use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::VerifyingKey;
 use protocol::server::{self, cluster_session};
@@ -30,6 +28,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use tracing::{info, warn};
 use uuid::Uuid;
+use x25519_dalek::PublicKey;
 
 use super::cluster_operations::SplitOperationBuildInput;
 
@@ -208,8 +207,8 @@ impl Topology {
         let credential = resp.get_credential()?.to_vec();
         let node_info = resp.get_node_info()?;
         let peer_id = read_node_id(node_info.get_id()?)?;
-        let peer_incarnation = node_info.get_incarnation();
         let peer_value = PeerValue::from_node_info(peer_id, node_info)?;
+        let peer_incarnation = peer_value.membership.incarnation;
 
         Ok(JoinResponse {
             peer_id,
@@ -1149,12 +1148,22 @@ impl topology::Server for Topology {
     }
 }
 
-fn verifying_key_from_data(d: data::Reader<'_>) -> Result<VerifyingKey, capnp::Error> {
-    let arr: [u8; 32] = d
-        .try_into()
-        .map_err(|_| capnp::Error::failed("ed25519 pubkey must be 32 bytes".to_string()))?;
+fn read_optional_uuid_data(
+    data: capnp::data::Reader<'_>,
+    field_name: &str,
+) -> Result<Option<Uuid>, capnp::Error> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+    if data.len() != 16 {
+        return Err(capnp::Error::failed(format!(
+            "{field_name} must be empty or exactly 16 bytes"
+        )));
+    }
 
-    VerifyingKey::from_bytes(&arr).map_err(|e| capnp::Error::failed(e.to_string()))
+    Uuid::from_slice(data)
+        .map(Some)
+        .map_err(|err| capnp::Error::failed(err.to_string()))
 }
 
 fn cluster_id_from_topology_event(
@@ -1180,84 +1189,32 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
         EventType::Add => {
             let node = reader.get_node()?;
             let id = read_node_id(node.get_id()?)?;
-            let pubkey =
-                pubkey_from_slice(node.get_public_key()?).expect("Failed to parse public key");
-            let signing_pub = verifying_key_from_data(node.get_signing_key()?)?;
-            let identity_sig = node.get_identity_sig()?;
-            if identity_sig.is_empty() {
-                return Err(capnp::Error::failed(
-                    "identitySig must be set for peer identity verification".into(),
-                ));
-            }
-            if identity_sig.len() != 64 {
-                return Err(capnp::Error::failed(
-                    "identitySig must be exactly 64 bytes".into(),
-                ));
-            }
-            let wg_pk_bytes = node.get_wireguard_public_key()?;
-            let wireguard = if wg_pk_bytes.is_empty() {
-                None
-            } else {
-                if wg_pk_bytes.len() != 32 {
-                    return Err(capnp::Error::failed(
-                        "wireguardPublicKey must be exactly 32 bytes".into(),
-                    ));
-                }
-                let mut public_key = [0u8; 32];
-                public_key.copy_from_slice(wg_pk_bytes);
-
-                Some(WireGuardPeerValue {
-                    public_key,
-                    port: node.get_wireguard_port(),
-                    enabled: node.get_wireguard_enabled(),
-                })
-            };
+            let peer = PeerValue::from_node_info(id, node)?;
+            let signing_pub = VerifyingKey::from_bytes(&peer.signing_pub)
+                .map_err(|err| capnp::Error::failed(err.to_string()))?;
             let client = if node.has_handle() {
                 Some(node.get_handle()?)
             } else {
                 None
             };
-            let scheduling = PeerSchedulingState::from_node_info(
-                id,
-                node.get_schedulable(),
-                node.get_drain_requested(),
-                node.get_scheduling_updated_at_unix_ms(),
-                {
-                    let actor = node.get_scheduling_actor_node_id()?;
-                    let bytes = actor.get_bytes()?;
-                    if bytes.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            Uuid::from_slice(bytes)
-                                .map_err(|err| capnp::Error::failed(err.to_string()))?,
-                        )
-                    }
-                },
-                Some(node.get_scheduling_reason()?.to_string()?),
-                match node.get_drain_task_stop_timeout_secs() {
-                    0 => None,
-                    value => Some(value),
-                },
-            );
 
             TopologyEvent::Join {
                 id,
-                hostname: node.get_hostname()?.to_str()?.to_string(),
-                address: node.get_addr()?.to_str()?.to_string(),
-                platform_os: node.get_platform_os()?.to_str()?.to_string(),
-                platform_arch: node.get_platform_arch()?.to_str()?.to_string(),
+                hostname: peer.hostname.clone(),
+                address: peer.address.clone(),
+                platform_os: peer.platform_os.clone(),
+                platform_arch: peer.platform_arch.clone(),
                 root_hash: node.get_root_hash()?.to_str()?.to_string(),
-                incarnation: node.get_incarnation(),
+                incarnation: peer.membership.incarnation,
                 client,
-                noise_static_pub: pubkey,
+                noise_static_pub: PublicKey::from(peer.noise_static_pub),
                 signing_pub: Box::new(signing_pub),
-                identity_sig: identity_sig.to_vec(),
-                wireguard,
-                scheduling: Box::new(scheduling),
-                labels: Box::new(labels_from_node_info(node)?),
-                runtime_support: Box::new(runtime_support_from_node_info(node)?),
-                root_schema: root_schema_from_node_info(node)?,
+                identity_sig: peer.identity_sig,
+                wireguard: peer.wireguard,
+                scheduling: Box::new(peer.scheduling),
+                labels: Box::new(peer.labels),
+                runtime_support: Box::new(peer.runtime_support),
+                root_schema: peer.root_schema,
             }
         }
         EventType::Remove => {
@@ -1265,7 +1222,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
             let id = read_node_id(node.get_id()?)?;
             TopologyEvent::Leave {
                 id,
-                incarnation: node.get_incarnation(),
+                incarnation: node.get_peer()?.get_membership_incarnation(),
             }
         }
         EventType::Alive => {
@@ -1273,7 +1230,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
             let id = read_node_id(node.get_id()?)?;
             TopologyEvent::Alive {
                 id,
-                incarnation: node.get_incarnation(),
+                incarnation: node.get_peer()?.get_membership_incarnation(),
             }
         }
         EventType::Suspect => {
@@ -1281,7 +1238,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
             let id = read_node_id(node.get_id()?)?;
             TopologyEvent::Suspect {
                 id,
-                incarnation: node.get_incarnation(),
+                incarnation: node.get_peer()?.get_membership_incarnation(),
             }
         }
         EventType::Down => {
@@ -1289,7 +1246,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
             let id = read_node_id(node.get_id()?)?;
             TopologyEvent::Down {
                 id,
-                incarnation: node.get_incarnation(),
+                incarnation: node.get_peer()?.get_membership_incarnation(),
             }
         }
         EventType::ClusterNameUpdated => TopologyEvent::ClusterNameUpdated {
@@ -1301,27 +1258,20 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
         EventType::NodeSchedulingUpdated => {
             let node = reader.get_node()?;
             let id = read_node_id(node.get_id()?)?;
+            let peer = node.get_peer()?;
             TopologyEvent::NodeSchedulingUpdated {
                 id,
                 scheduling: PeerSchedulingState::from_node_info(
                     id,
-                    node.get_schedulable(),
-                    node.get_drain_requested(),
-                    node.get_scheduling_updated_at_unix_ms(),
-                    {
-                        let actor = node.get_scheduling_actor_node_id()?;
-                        let bytes = actor.get_bytes()?;
-                        if bytes.is_empty() {
-                            None
-                        } else {
-                            Some(
-                                Uuid::from_slice(bytes)
-                                    .map_err(|err| capnp::Error::failed(err.to_string()))?,
-                            )
-                        }
-                    },
-                    Some(node.get_scheduling_reason()?.to_string()?),
-                    match node.get_drain_task_stop_timeout_secs() {
+                    peer.get_schedulable(),
+                    peer.get_drain_requested(),
+                    peer.get_scheduling_updated_at_unix_ms(),
+                    read_optional_uuid_data(
+                        peer.get_scheduling_actor_node_id()?,
+                        "schedulingActorNodeId",
+                    )?,
+                    Some(peer.get_scheduling_reason()?.to_string()?),
+                    match peer.get_drain_task_stop_timeout_secs() {
                         0 => None,
                         value => Some(value),
                     },
@@ -1333,7 +1283,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
             let id = read_node_id(node.get_id()?)?;
             TopologyEvent::NodeLabelsUpdated {
                 id,
-                labels: labels_from_node_info(node)?,
+                labels: labels_from_peer(node.get_peer()?)?,
             }
         }
     };

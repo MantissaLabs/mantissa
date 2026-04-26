@@ -1,7 +1,7 @@
 use crate::store::peer_store::PeersStore;
 use crate::topology::peers::PeerValue;
+use crdt_store::mvreg::MvReg;
 use crdt_store::uuid_key::UuidKey;
-use crdts::MVReg;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -22,7 +22,7 @@ pub(super) struct PeerSnapshotCache {
     last_generation: u64,
     entries: Arc<Vec<PeerCacheEntry>>,
     /// Reusable vectors backing snapshot extraction to avoid per-tick allocations.
-    actives: Vec<(UuidKey, MVReg<PeerValue, Uuid>)>,
+    actives: Vec<(UuidKey, MvReg<PeerValue, Uuid>)>,
     tombstones: Vec<(UuidKey, u64)>,
 }
 

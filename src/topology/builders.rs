@@ -2,12 +2,14 @@ use crate::cluster::operations::SplitNodeCandidate;
 use crate::cluster::{ClusterId, ClusterViewId, RootSchemaInfo};
 use crate::node::id::set_node_id;
 use crate::runtime::types::RuntimeSupportProfile;
-use crate::topology::peers::{PeerLabelState, PeerSchedulingState, PeerValue, WireGuardPeerValue};
+use crate::topology::peers::{
+    PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue, write_peer,
+};
 use protocol::gossip::gossip_message;
 use protocol::server;
 use protocol::topology::{
-    cluster_view_summary, node_drain_status, node_info as node_info_capnp, split_candidate,
-    topology_event,
+    PeerMembershipState as CapnpPeerMembershipState, cluster_view_summary, node_drain_status,
+    node_info as node_info_capnp, peer as peer_capnp, split_candidate, topology_event,
 };
 use uuid::Uuid;
 
@@ -31,16 +33,6 @@ pub(super) struct JoinPayload {
     pub(super) labels: PeerLabelState,
     pub(super) runtime_support: RuntimeSupportProfile,
     pub(super) root_schema: RootSchemaInfo,
-}
-
-/// Writes the scheduler-visible platform selectors into the topology `NodeInfo` builder.
-pub(super) fn write_platform_fields_to_node_info(
-    mut info: node_info_capnp::Builder<'_>,
-    platform_os: &str,
-    platform_arch: &str,
-) {
-    info.set_platform_os(platform_os);
-    info.set_platform_arch(platform_arch);
 }
 
 /// Internal drain state used while deriving the operator-facing drain status response.
@@ -124,95 +116,29 @@ pub(super) fn drain_state_from_scheduling(
     }
 }
 
-/// Writes one runtime support profile into the topology `NodeInfo` builder.
-pub(super) fn write_runtime_support_to_node_info(
-    mut info: node_info_capnp::Builder<'_>,
-    runtime_support: &RuntimeSupportProfile,
-) {
-    let mut execution_platforms = info
-        .reborrow()
-        .init_execution_platforms(runtime_support.execution_platforms.len() as u32);
-    for (idx, execution_platform) in runtime_support.execution_platforms.iter().enumerate() {
-        execution_platforms.set(idx as u32, execution_platform.as_str());
-    }
-
-    let mut isolation_modes = info
-        .reborrow()
-        .init_isolation_modes(runtime_support.isolation_modes.len() as u32);
-    for (idx, isolation_mode) in runtime_support.isolation_modes.iter().enumerate() {
-        isolation_modes.set(idx as u32, isolation_mode.as_str());
-    }
-
-    let mut isolation_profiles = info
-        .reborrow()
-        .init_isolation_profiles(runtime_support.isolation_profiles.len() as u32);
-    for (idx, isolation_profile) in runtime_support.isolation_profiles.iter().enumerate() {
-        isolation_profiles.set(idx as u32, isolation_profile);
-    }
-
-    let mut feature_flags = info
-        .reborrow()
-        .init_runtime_feature_flags(runtime_support.feature_flags.len() as u32);
-    for (idx, feature_flag) in runtime_support.feature_flags.iter().enumerate() {
-        feature_flags.set(idx as u32, feature_flag);
-    }
-}
-
-/// Writes the scheduling-related `NodeInfo` fields shared by join, list, and gossip payloads.
-pub(super) fn write_scheduling_fields_to_node_info(
-    mut info: node_info_capnp::Builder<'_>,
+/// Writes the scheduling-related `Peer` fields shared by join, list, and gossip payloads.
+pub(super) fn write_scheduling_fields_to_peer(
+    mut peer: peer_capnp::Builder<'_>,
     scheduling: &PeerSchedulingState,
 ) {
-    info.set_schedulable(scheduling.schedulable);
-    info.set_drain_requested(scheduling.drain_requested);
-    info.set_drain_task_stop_timeout_secs(scheduling.drain_task_stop_timeout_secs.unwrap_or(0));
-    info.set_scheduling_updated_at_unix_ms(scheduling.updated_at_unix_ms);
-    set_node_id(
-        info.reborrow().init_scheduling_actor_node_id(),
-        &scheduling.actor_node_id,
-    );
+    peer.set_schedulable(scheduling.schedulable);
+    peer.set_drain_requested(scheduling.drain_requested);
+    peer.set_drain_task_stop_timeout_secs(scheduling.drain_task_stop_timeout_secs.unwrap_or(0));
+    peer.set_scheduling_updated_at_unix_ms(scheduling.updated_at_unix_ms);
+    peer.set_scheduling_actor_node_id(scheduling.actor_node_id.as_bytes());
     if let Some(reason) = scheduling.reason.as_deref() {
-        info.set_scheduling_reason(reason);
+        peer.set_scheduling_reason(reason);
     }
 }
 
-/// Writes the optional WireGuard endpoint fields carried by one peer snapshot.
-pub(super) fn write_wireguard_to_node_info(
-    mut info: node_info_capnp::Builder<'_>,
-    wireguard: Option<&WireGuardPeerValue>,
-) {
-    if let Some(wg) = wireguard {
-        info.set_wireguard_public_key(&wg.public_key);
-        info.set_wireguard_port(wg.port);
-        info.set_wireguard_enabled(wg.enabled);
-    }
-}
-
-/// Writes root-schema support metadata into the topology `NodeInfo` builder.
-pub(super) fn write_root_schema_to_node_info(
-    mut info: node_info_capnp::Builder<'_>,
-    root_schema: RootSchemaInfo,
-) {
-    info.set_minimum_root_schema_version(root_schema.minimum_supported_version);
-    info.set_supported_root_schema_version(root_schema.supported_version);
-    info.set_root_schema_updated_at_unix_ms(root_schema.updated_at_unix_ms);
-    info.set_root_schema_publication_generation(root_schema.publication_generation);
-}
-
-/// Writes replicated node labels into the topology `NodeInfo` builder.
-pub(super) fn write_labels_to_node_info(
-    mut info: node_info_capnp::Builder<'_>,
-    labels: &PeerLabelState,
-) {
-    let mut entries = info.reborrow().init_labels(labels.labels.len() as u32);
+/// Writes replicated node labels into the topology `Peer` builder.
+pub(super) fn write_labels_to_peer(mut peer: peer_capnp::Builder<'_>, labels: &PeerLabelState) {
+    let mut entries = peer.reborrow().init_labels(labels.labels.len() as u32);
     for (idx, label) in labels.labels.iter().enumerate() {
         entries.set(idx as u32, label.format_assignment());
     }
-    info.set_labels_updated_at_unix_ms(labels.updated_at_unix_ms);
-    set_node_id(
-        info.reborrow().init_labels_actor_node_id(),
-        &labels.actor_node_id,
-    );
+    peer.set_labels_updated_at_unix_ms(labels.updated_at_unix_ms);
+    peer.set_labels_actor_node_id(labels.actor_node_id.as_bytes());
 }
 
 /// Writes one join payload into the topology `NodeInfo` request sent to the anchor.
@@ -223,24 +149,29 @@ pub(super) fn write_join_payload_to_node_info(
 ) {
     set_node_id(info.reborrow().init_id(), &payload.id);
     cluster_view.write_capnp(info.reborrow().init_active_cluster_view());
-    info.set_hostname(&payload.hostname);
-    info.set_addr(&payload.advertise_addr);
-    write_platform_fields_to_node_info(
-        info.reborrow(),
-        &payload.platform_os,
-        &payload.platform_arch,
-    );
     info.set_handle(payload.server_handle.clone());
-    info.set_public_key(&payload.public_key);
-    info.set_signing_key(&payload.signing_key);
-    info.set_identity_sig(&payload.identity_sig);
-    info.set_incarnation(payload.incarnation);
-    write_scheduling_fields_to_node_info(info.reborrow(), &payload.scheduling);
+    let peer = join_payload_peer_value(payload);
+    write_peer(info.reborrow().init_peer(), &peer);
     info.set_drain_state(drain_state_from_scheduling(&payload.scheduling));
-    write_labels_to_node_info(info.reborrow(), &payload.labels);
-    write_runtime_support_to_node_info(info.reborrow(), &payload.runtime_support);
-    write_wireguard_to_node_info(info.reborrow(), payload.wireguard.as_ref());
-    write_root_schema_to_node_info(info.reborrow(), payload.root_schema);
+}
+
+/// Builds the peer projection carried by one join payload.
+fn join_payload_peer_value(payload: &JoinPayload) -> PeerValue {
+    PeerValue {
+        address: payload.advertise_addr.clone(),
+        hostname: payload.hostname.clone(),
+        platform_os: payload.platform_os.clone(),
+        platform_arch: payload.platform_arch.clone(),
+        noise_static_pub: payload.public_key,
+        signing_pub: payload.signing_key,
+        identity_sig: payload.identity_sig.to_vec(),
+        wireguard: payload.wireguard.clone(),
+        scheduling: payload.scheduling.clone(),
+        labels: payload.labels.clone(),
+        runtime_support: payload.runtime_support.clone(),
+        root_schema: payload.root_schema,
+        membership: PeerMembership::active(payload.incarnation),
+    }
 }
 
 /// Writes one prepared node-list row into the `list` RPC response.
@@ -251,21 +182,8 @@ pub(super) fn write_listed_node_row(
 ) {
     set_node_id(node.reborrow().init_id(), &row.id);
     cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
-    node.set_addr(&row.value.address);
-    node.set_hostname(&row.value.hostname);
-    write_platform_fields_to_node_info(
-        node.reborrow(),
-        &row.value.platform_os,
-        &row.value.platform_arch,
-    );
-    node.set_public_key(&row.value.noise_static_pub);
-    node.set_signing_key(&row.value.signing_pub);
-    write_scheduling_fields_to_node_info(node.reborrow(), &row.value.scheduling);
+    write_peer(node.reborrow().init_peer(), &row.value);
     node.set_drain_state(row.drain_state);
-    write_labels_to_node_info(node.reborrow(), &row.value.labels);
-    write_runtime_support_to_node_info(node.reborrow(), &row.value.runtime_support);
-    write_wireguard_to_node_info(node.reborrow(), row.value.wireguard.as_ref());
-    write_root_schema_to_node_info(node.reborrow(), row.value.root_schema);
     node.set_health(row.health);
 }
 
@@ -390,19 +308,23 @@ fn write_join_event(
     };
 
     let mut node = init_topology_event_node(msg, topology_event::EventType::Add, id, cluster_view);
-    node.set_hostname(hostname);
-    node.set_addr(address);
-    write_platform_fields_to_node_info(node.reborrow(), platform_os, platform_arch);
     node.set_root_hash(root_hash);
-    node.set_public_key(&noise_static_pub.to_bytes());
-    node.set_signing_key(&signing_pub.to_bytes());
-    node.set_identity_sig(identity_sig);
-    node.set_incarnation(*incarnation);
-    write_scheduling_fields_to_node_info(node.reborrow(), scheduling.as_ref());
-    write_labels_to_node_info(node.reborrow(), labels.as_ref());
-    write_runtime_support_to_node_info(node.reborrow(), runtime_support.as_ref());
-    write_wireguard_to_node_info(node.reborrow(), wireguard.as_ref());
-    write_root_schema_to_node_info(node.reborrow(), *root_schema);
+    let peer = PeerValue {
+        address: address.clone(),
+        hostname: hostname.clone(),
+        platform_os: platform_os.clone(),
+        platform_arch: platform_arch.clone(),
+        noise_static_pub: noise_static_pub.to_bytes(),
+        signing_pub: signing_pub.to_bytes(),
+        identity_sig: identity_sig.clone(),
+        wireguard: wireguard.clone(),
+        scheduling: scheduling.as_ref().clone(),
+        labels: labels.as_ref().clone(),
+        runtime_support: runtime_support.as_ref().clone(),
+        root_schema: *root_schema,
+        membership: PeerMembership::active(*incarnation),
+    };
+    write_peer(node.reborrow().init_peer(), &peer);
 
     if let Some(client) = client.as_ref() {
         // Only embed our own handle; forwarding a capability learned from another peer
@@ -421,7 +343,13 @@ fn write_membership_event(
     cluster_view: ClusterViewId,
 ) {
     let mut node = init_topology_event_node(msg, event_type, id, cluster_view);
-    node.set_incarnation(incarnation);
+    let mut peer = node.reborrow().init_peer();
+    peer.set_membership_incarnation(incarnation);
+    peer.set_membership_state(if matches!(event_type, topology_event::EventType::Remove) {
+        CapnpPeerMembershipState::Left
+    } else {
+        CapnpPeerMembershipState::Active
+    });
 }
 
 /// Writes one cluster-name update event into a gossip message builder.
@@ -455,7 +383,7 @@ fn write_node_scheduling_updated_event(
         id,
         cluster_view,
     );
-    write_scheduling_fields_to_node_info(node.reborrow(), scheduling);
+    write_scheduling_fields_to_peer(node.reborrow().init_peer(), scheduling);
 }
 
 /// Writes one label-update event into a gossip message builder.
@@ -471,7 +399,7 @@ fn write_node_labels_updated_event(
         id,
         cluster_view,
     );
-    write_labels_to_node_info(node.reborrow(), labels);
+    write_labels_to_peer(node.reborrow().init_peer(), labels);
 }
 
 /// Writes one topology event into the outbound gossip message list.

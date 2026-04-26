@@ -5888,10 +5888,11 @@ async fn listed_node_state_via_topology(
         if listed_id != node_id {
             continue;
         }
+        let peer = node.get_peer()?;
 
         return Ok(TestListedNodeState {
-            schedulable: node.get_schedulable(),
-            drain_requested: node.get_drain_requested(),
+            schedulable: peer.get_schedulable(),
+            drain_requested: peer.get_drain_requested(),
             drain_state: node.get_drain_state()?,
         });
     }

@@ -199,109 +199,127 @@ struct NodeInfo {
   # ID of the node.
 
   handle @1 :Server;
-  # Interface to contact the node back.
+  # Live interface to contact the node back on the current RPC connection.
 
-  hostname @2 :Text;
-  # Hostname of the node.
+  peer @2 :Peer;
+  # Durable peer metadata advertised by the node.
 
-  addr @3 :Text;
-  # IP address of the machine.
-
-  info @4 :Info;
+  info @3 :Info;
   # Machine resource usage.
 
-  rootHash @5 :Text;
+  rootHash @4 :Text;
   # The root hash of the tracking merkle search tree.
   # It is used for Anti-Antropy and syncing data between
   # nodes.
 
-  publicKey @6 :Data;
-  # The node's static public key used in secure communications.
-
-  signingKey @7 :Data;
-  # Ed25519 public key for signed cluster credentials.
-
-  health @8 :NodeStatus;
+  health @5 :NodeStatus;
   # Health status of the node.
 
-  wireguardPublicKey @9 :Data;
+  activeClusterView @6 :ClusterViewId;
+  # Active cluster view currently used by this node for control-plane operations.
+
+  drainState @7 :NodeDrainState;
+  # Derived maintenance progress state used by `Topology.list` output.
+}
+
+enum PeerMembershipState {
+  active @0;
+  # The peer row represents a member that should participate in the cluster.
+
+  left @1;
+  # The peer row represents a graceful leave marker for this node identity.
+}
+
+struct Peer {
+  # Durable peer metadata shared by topology RPC and the peer store.
+
+  address @0 :Text;
+  # IP address and port advertised for direct node-to-node connections.
+
+  hostname @1 :Text;
+  # Hostname of the node.
+
+  platformOs @2 :Text;
+  # Canonical scheduler-visible operating-system identifier for placement selectors.
+
+  platformArch @3 :Text;
+  # Canonical scheduler-visible architecture identifier for placement selectors.
+
+  noiseStaticPub @4 :Data;
+  # The node's static public key used in secure communications.
+
+  signingPub @5 :Data;
+  # Ed25519 public key for signed cluster credentials.
+
+  identitySig @6 :Data;
+  # Ed25519 signature binding the node id, noise key, and signing key.
+
+  wireguardPublicKey @7 :Data;
   # Optional WireGuard public key used to encrypt the VXLAN underlay.
   # Empty means the node is not advertising WireGuard capability yet.
 
-  wireguardPort @10 :UInt16;
-  # UDP listen port for WireGuard. 0 means "reuse the port from `addr`".
+  wireguardPort @8 :UInt16;
+  # UDP listen port for WireGuard. 0 means "reuse the port from `address`".
 
-  wireguardEnabled @11 :Bool;
+  wireguardEnabled @9 :Bool;
   # True once the node has created and configured its WireGuard interface.
 
-  identitySig @12 :Data;
-  # Ed25519 signature binding (id, publicKey, signingKey) for peer identity verification.
-
-  activeClusterView @13 :ClusterViewId;
-  # Active cluster view currently used by this node for control-plane operations.
-
-  incarnation @14 :UInt64;
-  # SWIM-style incarnation number for liveness conflict resolution.
-
-  schedulable @15 :Bool;
+  schedulable @10 :Bool = true;
   # True when this node is allowed to receive new workload placements.
 
-  drainRequested @16 :Bool;
+  drainRequested @11 :Bool;
   # True when maintenance drain has been requested for this node.
 
-  schedulingUpdatedAtUnixMs @17 :UInt64;
+  schedulingUpdatedAtUnixMs @12 :UInt64;
   # Last-writer timestamp for scheduling state convergence.
 
-  schedulingActorNodeId @18 :Node.NodeId;
+  schedulingActorNodeId @13 :Data;
   # Actor node id used to resolve scheduling-state conflicts deterministically.
 
-  schedulingReason @19 :Text;
+  schedulingReason @14 :Text;
   # Optional operator-supplied maintenance reason for diagnostics.
 
-  drainState @20 :NodeDrainState;
-  # Derived maintenance progress state used by `Topology.list` output.
-
-  drainTaskStopTimeoutSecs @21 :UInt32;
+  drainTaskStopTimeoutSecs @15 :UInt32;
   # Optional drain-only override for task stop timeout in seconds, 0 uses task defaults.
 
-  executionPlatforms @22 :List(Text);
-  # Execution platforms this node can host, for example "oci" or "microvm".
-
-  isolationModes @23 :List(Text);
-  # Isolation contracts this node can satisfy, for example "standard" or "sandboxed".
-
-  isolationProfiles @24 :List(Text);
-  # Optional named isolation profiles this node can satisfy for workload placement.
-
-  runtimeFeatureFlags @25 :List(Text);
-  # Runtime-specific feature flags such as "exec" or "lifecycle_events".
-
-  labels @26 :List(Text);
+  labels @16 :List(Text);
   # Operator-supplied node labels encoded as `key=value` assignments.
 
-  labelsUpdatedAtUnixMs @27 :UInt64;
+  labelsUpdatedAtUnixMs @17 :UInt64;
   # Last-writer timestamp for label-state convergence.
 
-  labelsActorNodeId @28 :Node.NodeId;
+  labelsActorNodeId @18 :Data;
   # Actor node id used to resolve label-state conflicts deterministically.
 
-  platformOs @29 :Text;
-  # Canonical scheduler-visible operating-system identifier for placement selectors.
+  executionPlatforms @19 :List(Text);
+  # Execution platforms this node can host, for example "oci" or "microvm".
 
-  platformArch @30 :Text;
-  # Canonical scheduler-visible architecture identifier for placement selectors.
+  isolationModes @20 :List(Text);
+  # Isolation contracts this node can satisfy, for example "standard" or "sandboxed".
 
-  minimumRootSchemaVersion @31 :UInt32 = 1;
+  isolationProfiles @21 :List(Text);
+  # Optional named isolation profiles this node can satisfy for workload placement.
+
+  runtimeFeatureFlags @22 :List(Text);
+  # Runtime-specific feature flags such as "exec" or "lifecycle_events".
+
+  minimumRootSchemaVersion @23 :UInt32 = 1;
   # Lowest semantic root schema version this node binary still serves.
 
-  supportedRootSchemaVersion @32 :UInt32 = 1;
+  supportedRootSchemaVersion @24 :UInt32 = 1;
   # Highest semantic root schema version this node binary can serve.
 
-  rootSchemaUpdatedAtUnixMs @33 :UInt64;
+  rootSchemaUpdatedAtUnixMs @25 :UInt64;
   # Last publication time for this node's root-schema support range.
 
-  rootSchemaPublicationGeneration @34 :UInt64;
+  rootSchemaPublicationGeneration @26 :UInt64;
   # Durable per-node publication order for root-schema support changes.
+
+  membershipIncarnation @27 :UInt64;
+  # SWIM-style incarnation number for membership conflict resolution.
+
+  membershipState @28 :PeerMembershipState;
+  # Durable membership state for the peer identity.
 }
 
 struct NodeList {
