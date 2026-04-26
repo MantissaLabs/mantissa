@@ -1,9 +1,11 @@
 use crate::cluster::ClusterViewId;
-use serde::{Deserialize, Serialize};
+use crate::node::id::set_node_id;
+use capnp::Error as CapnpError;
+use std::io::Cursor;
 use uuid::Uuid;
 
 /// Supported operation kinds for cluster topology restructuring.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClusterOperationKind {
     Merge,
     Split,
@@ -17,10 +19,18 @@ impl ClusterOperationKind {
             Self::Split => protocol::topology::ClusterOperationKind::Split,
         }
     }
+
+    /// Converts the Cap'n Proto operation kind into internal durable state.
+    fn from_capnp(value: protocol::topology::ClusterOperationKind) -> Self {
+        match value {
+            protocol::topology::ClusterOperationKind::Merge => Self::Merge,
+            protocol::topology::ClusterOperationKind::Split => Self::Split,
+        }
+    }
 }
 
 /// Lifecycle stages for merge/split orchestration operations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClusterOperationStage {
     Proposed,
     Prepared,
@@ -30,7 +40,7 @@ pub enum ClusterOperationStage {
 }
 
 /// Service behavior policy applied when a split operation commits.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum SplitServicePolicy {
     /// Keep services active in each resulting partition and prune out-of-scope runtime tasks.
     #[default]
@@ -40,7 +50,7 @@ pub enum SplitServicePolicy {
 }
 
 /// Network behavior policy applied when a split operation commits.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum SplitNetworkPolicy {
     /// Isolate overlays per partition by pruning out-of-scope peer and attachment rows.
     #[default]
@@ -50,7 +60,7 @@ pub enum SplitNetworkPolicy {
 }
 
 /// Service behavior policy applied when a merge operation commits.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum MergeServicePolicy {
     /// Trigger post-merge service reconciliation so replicas can rebalance across all nodes.
     #[default]
@@ -60,7 +70,7 @@ pub enum MergeServicePolicy {
 }
 
 /// Records the deterministic split target index selected for one node.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SplitNodeAssignment {
     pub node_id: Uuid,
     pub target_index: usize,
@@ -77,41 +87,66 @@ impl ClusterOperationStage {
             Self::Aborted => protocol::topology::ClusterOperationStage::Aborted,
         }
     }
+
+    /// Converts the Cap'n Proto stage value into internal durable state.
+    fn from_capnp(value: protocol::topology::ClusterOperationStage) -> Self {
+        match value {
+            protocol::topology::ClusterOperationStage::Proposed => Self::Proposed,
+            protocol::topology::ClusterOperationStage::Prepared => Self::Prepared,
+            protocol::topology::ClusterOperationStage::Committed => Self::Committed,
+            protocol::topology::ClusterOperationStage::Finalized => Self::Finalized,
+            protocol::topology::ClusterOperationStage::Aborted => Self::Aborted,
+        }
+    }
 }
 
 /// Durable operation record used to track merge/split intent and progression.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterOperationRecord {
     pub id: Uuid,
     pub kind: ClusterOperationKind,
     pub stage: ClusterOperationStage,
-    #[serde(default)]
     pub dry_run: bool,
     pub source_views: Vec<ClusterViewId>,
     pub target_views: Vec<ClusterViewId>,
-    #[serde(default)]
     pub target_cluster_names: Vec<String>,
-    #[serde(default)]
     pub split_assignments: Vec<SplitNodeAssignment>,
-    #[serde(default)]
     pub split_service_policy: SplitServicePolicy,
-    #[serde(default)]
     pub split_network_policy: SplitNetworkPolicy,
-    #[serde(default)]
     pub merge_service_policy: MergeServicePolicy,
     /// Last mutation timestamp used for retention ordering and stale-row eviction.
-    #[serde(default)]
     pub updated_at_unix_ms: u64,
     pub details: String,
 }
 
 impl ClusterOperationRecord {
+    /// Encodes this operation record into its stable Cap'n Proto durable payload.
+    pub fn encode_capnp(&self) -> Result<Vec<u8>, CapnpError> {
+        let mut message = capnp::message::Builder::new_default();
+        self.write_capnp(message.init_root::<protocol::topology::cluster_operation::Builder<'_>>());
+        Ok(capnp::serialize::write_message_to_words(&message))
+    }
+
+    /// Decodes one operation record from its stable Cap'n Proto durable payload.
+    pub fn decode_capnp(bytes: &[u8]) -> Result<Self, CapnpError> {
+        let mut cursor = Cursor::new(bytes);
+        let reader =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
+        let operation = reader.get_root::<protocol::topology::cluster_operation::Reader<'_>>()?;
+        Self::read_capnp(operation)
+    }
+
     /// Encodes this operation record into a Cap'n Proto builder for topology RPC responses.
     pub fn write_capnp(&self, mut builder: protocol::topology::cluster_operation::Builder<'_>) {
         builder.set_id(self.id.as_bytes());
         builder.set_kind(self.kind.to_capnp());
         builder.set_stage(self.stage.to_capnp());
         builder.set_details(&self.details);
+        builder.set_dry_run(self.dry_run);
+        builder.set_split_service_policy(split_service_policy_to_capnp(self.split_service_policy));
+        builder.set_split_network_policy(split_network_policy_to_capnp(self.split_network_policy));
+        builder.set_merge_service_policy(merge_service_policy_to_capnp(self.merge_service_policy));
+        builder.set_updated_at_unix_ms(self.updated_at_unix_ms);
 
         let mut sources = builder
             .reborrow()
@@ -126,5 +161,211 @@ impl ClusterOperationRecord {
         for (idx, target) in self.target_views.iter().enumerate() {
             target.write_capnp(targets.reborrow().get(idx as u32));
         }
+
+        let mut target_names = builder
+            .reborrow()
+            .init_target_cluster_names(self.target_cluster_names.len() as u32);
+        for (idx, name) in self.target_cluster_names.iter().enumerate() {
+            target_names.set(idx as u32, name);
+        }
+
+        let mut assignments = builder
+            .reborrow()
+            .init_split_assignments(self.split_assignments.len() as u32);
+        for (idx, assignment) in self.split_assignments.iter().enumerate() {
+            let mut assignment_builder = assignments.reborrow().get(idx as u32);
+            set_node_id(
+                assignment_builder.reborrow().init_node_id(),
+                &assignment.node_id,
+            );
+            assignment_builder.set_target_index(assignment.target_index as u64);
+        }
+    }
+
+    /// Decodes one operation record from a Cap'n Proto topology payload.
+    fn read_capnp(
+        reader: protocol::topology::cluster_operation::Reader<'_>,
+    ) -> Result<Self, CapnpError> {
+        let id = uuid_from_data(reader.get_id()?, "cluster operation id")?;
+        let source_views = read_cluster_views(reader.get_source_views()?)?;
+        let target_views = read_cluster_views(reader.get_target_views()?)?;
+        let target_cluster_names = read_text_list(reader.get_target_cluster_names()?)?;
+        let split_assignments = read_split_assignments(reader.get_split_assignments()?)?;
+
+        Ok(Self {
+            id,
+            kind: ClusterOperationKind::from_capnp(reader.get_kind()?),
+            stage: ClusterOperationStage::from_capnp(reader.get_stage()?),
+            dry_run: reader.get_dry_run(),
+            source_views,
+            target_views,
+            target_cluster_names,
+            split_assignments,
+            split_service_policy: split_service_policy_from_capnp(
+                reader.get_split_service_policy()?,
+            ),
+            split_network_policy: split_network_policy_from_capnp(
+                reader.get_split_network_policy()?,
+            ),
+            merge_service_policy: merge_service_policy_from_capnp(
+                reader.get_merge_service_policy()?,
+            ),
+            updated_at_unix_ms: reader.get_updated_at_unix_ms(),
+            details: reader.get_details()?.to_str()?.to_string(),
+        })
+    }
+}
+
+/// Converts one split service policy to its Cap'n Proto representation.
+fn split_service_policy_to_capnp(
+    value: SplitServicePolicy,
+) -> protocol::topology::SplitServicePolicy {
+    match value {
+        SplitServicePolicy::Partitioned => protocol::topology::SplitServicePolicy::Partitioned,
+        SplitServicePolicy::Preserve => protocol::topology::SplitServicePolicy::Preserve,
+    }
+}
+
+/// Converts one Cap'n Proto split service policy into durable state.
+fn split_service_policy_from_capnp(
+    value: protocol::topology::SplitServicePolicy,
+) -> SplitServicePolicy {
+    match value {
+        protocol::topology::SplitServicePolicy::Partitioned => SplitServicePolicy::Partitioned,
+        protocol::topology::SplitServicePolicy::Preserve => SplitServicePolicy::Preserve,
+    }
+}
+
+/// Converts one split network policy to its Cap'n Proto representation.
+fn split_network_policy_to_capnp(
+    value: SplitNetworkPolicy,
+) -> protocol::topology::SplitNetworkPolicy {
+    match value {
+        SplitNetworkPolicy::Isolate => protocol::topology::SplitNetworkPolicy::Isolate,
+        SplitNetworkPolicy::Preserve => protocol::topology::SplitNetworkPolicy::Preserve,
+    }
+}
+
+/// Converts one Cap'n Proto split network policy into durable state.
+fn split_network_policy_from_capnp(
+    value: protocol::topology::SplitNetworkPolicy,
+) -> SplitNetworkPolicy {
+    match value {
+        protocol::topology::SplitNetworkPolicy::Isolate => SplitNetworkPolicy::Isolate,
+        protocol::topology::SplitNetworkPolicy::Preserve => SplitNetworkPolicy::Preserve,
+    }
+}
+
+/// Converts one merge service policy to its Cap'n Proto representation.
+fn merge_service_policy_to_capnp(
+    value: MergeServicePolicy,
+) -> protocol::topology::MergeServicePolicy {
+    match value {
+        MergeServicePolicy::Rebalance => protocol::topology::MergeServicePolicy::Rebalance,
+        MergeServicePolicy::Preserve => protocol::topology::MergeServicePolicy::Preserve,
+    }
+}
+
+/// Converts one Cap'n Proto merge service policy into durable state.
+fn merge_service_policy_from_capnp(
+    value: protocol::topology::MergeServicePolicy,
+) -> MergeServicePolicy {
+    match value {
+        protocol::topology::MergeServicePolicy::Rebalance => MergeServicePolicy::Rebalance,
+        protocol::topology::MergeServicePolicy::Preserve => MergeServicePolicy::Preserve,
+    }
+}
+
+/// Reads one UUID data field and validates its fixed width.
+fn uuid_from_data(data: capnp::data::Reader<'_>, field_name: &str) -> Result<Uuid, CapnpError> {
+    if data.len() != 16 {
+        return Err(CapnpError::failed(format!(
+            "{field_name} must be exactly 16 bytes"
+        )));
+    }
+    Uuid::from_slice(data).map_err(|err| CapnpError::failed(err.to_string()))
+}
+
+/// Decodes one cluster-view list from a Cap'n Proto operation payload.
+fn read_cluster_views(
+    reader: capnp::struct_list::Reader<'_, protocol::topology::cluster_view_id::Owned>,
+) -> Result<Vec<ClusterViewId>, CapnpError> {
+    let mut views = Vec::with_capacity(reader.len() as usize);
+    for item in reader.iter() {
+        views.push(ClusterViewId::from_capnp(item).map_err(CapnpError::failed)?);
+    }
+    Ok(views)
+}
+
+/// Decodes one text list from a Cap'n Proto operation payload.
+fn read_text_list(reader: capnp::text_list::Reader<'_>) -> Result<Vec<String>, CapnpError> {
+    let mut values = Vec::with_capacity(reader.len() as usize);
+    for item in reader.iter() {
+        values.push(item?.to_str()?.to_string());
+    }
+    Ok(values)
+}
+
+/// Decodes split node assignments from a Cap'n Proto operation payload.
+fn read_split_assignments(
+    reader: capnp::struct_list::Reader<'_, protocol::topology::split_node_assignment::Owned>,
+) -> Result<Vec<SplitNodeAssignment>, CapnpError> {
+    let mut assignments = Vec::with_capacity(reader.len() as usize);
+    for item in reader.iter() {
+        let node_id = uuid_from_data(item.get_node_id()?.get_bytes()?, "split assignment node id")?;
+        let target_index = usize::try_from(item.get_target_index()).map_err(|_| {
+            CapnpError::failed("split assignment target index overflows usize".to_string())
+        })?;
+        assignments.push(SplitNodeAssignment {
+            node_id,
+            target_index,
+        });
+    }
+    Ok(assignments)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::ClusterId;
+
+    /// Ensures durable cluster operation payloads preserve every Cap'n Proto field.
+    #[test]
+    fn cluster_operation_capnp_round_trip_preserves_durable_fields() {
+        let source_cluster = ClusterId::from_uuid(Uuid::from_u128(0x100));
+        let target_cluster_a = ClusterId::from_uuid(Uuid::from_u128(0x200));
+        let target_cluster_b = ClusterId::from_uuid(Uuid::from_u128(0x300));
+        let operation = ClusterOperationRecord {
+            id: Uuid::from_u128(0x400),
+            kind: ClusterOperationKind::Split,
+            stage: ClusterOperationStage::Committed,
+            dry_run: true,
+            source_views: vec![ClusterViewId::new(source_cluster, 7)],
+            target_views: vec![
+                ClusterViewId::new(target_cluster_a, 8),
+                ClusterViewId::new(target_cluster_b, 9),
+            ],
+            target_cluster_names: vec!["blue".to_string(), "green".to_string()],
+            split_assignments: vec![
+                SplitNodeAssignment {
+                    node_id: Uuid::from_u128(0x500),
+                    target_index: 0,
+                },
+                SplitNodeAssignment {
+                    node_id: Uuid::from_u128(0x600),
+                    target_index: 1,
+                },
+            ],
+            split_service_policy: SplitServicePolicy::Preserve,
+            split_network_policy: SplitNetworkPolicy::Preserve,
+            merge_service_policy: MergeServicePolicy::Preserve,
+            updated_at_unix_ms: 123_456,
+            details: "round trip".to_string(),
+        };
+
+        let payload = operation.encode_capnp().expect("encode operation");
+        let decoded = ClusterOperationRecord::decode_capnp(&payload).expect("decode operation");
+
+        assert_eq!(decoded, operation);
     }
 }

@@ -6,7 +6,6 @@ use crate::cluster::operations::{
 use crate::cluster::{ClusterId, ClusterViewId};
 use crate::node::id::read_node_id;
 use crate::topology::Topology;
-use crdt_store::codec;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tracing::warn;
@@ -240,8 +239,8 @@ impl Topology {
         operation_id: Uuid,
         payload: &[u8],
     ) -> Result<(), capnp::Error> {
-        let mut incoming: ClusterOperationRecord =
-            codec::decode(payload).map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let mut incoming: ClusterOperationRecord = ClusterOperationRecord::decode_capnp(payload)
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
         if incoming.updated_at_unix_ms == 0 {
             incoming.updated_at_unix_ms = Self::now_unix_ms();
         }

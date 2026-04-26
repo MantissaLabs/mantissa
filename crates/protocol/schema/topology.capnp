@@ -486,6 +486,35 @@ struct ClusterOperation {
 
   details @5 :Text;
   # Human-readable details, including conflict hints.
+
+  dryRun @6 :Bool;
+  # True when the operation validates intent without committing state changes.
+
+  targetClusterNames @7 :List(Text);
+  # Friendly lineage names assigned to split target views.
+
+  splitAssignments @8 :List(SplitNodeAssignment);
+  # Deterministic node-to-target assignments for split operations.
+
+  splitServicePolicy @9 :SplitServicePolicy;
+  # Service behavior policy applied when the split commits.
+
+  splitNetworkPolicy @10 :SplitNetworkPolicy;
+  # Network behavior policy applied when the split commits.
+
+  mergeServicePolicy @11 :MergeServicePolicy;
+  # Service behavior policy applied when the merge commits.
+
+  updatedAtUnixMs @12 :UInt64;
+  # Last mutation time used for retention ordering and stale-row eviction.
+}
+
+struct SplitNodeAssignment {
+  nodeId @0 :Node.NodeId;
+  # Node assigned to one split target.
+
+  targetIndex @1 :UInt64;
+  # Index into the operation's target view list.
 }
 
 struct MergeRequest {
