@@ -1,6 +1,6 @@
 use crate::scheduler::digest::SchedulerDigestValue;
 use crate::store::open::open_arc_store;
-use crdt_store::adapter::MvRegAdapterSorted;
+use crdt_store::adapter::StoreMvRegAdapterSorted;
 use crdt_store::hash::XXHash128;
 use crdt_store::mst_store::CrdtMstStore;
 use crdt_store::table_set::TableSet;
@@ -19,7 +19,7 @@ impl TableSet for SchedulerDigestTables {
 
 /// Specialized MST/CRDT store for per-node scheduler digest rows.
 pub type SchedulerDigestStoreInner = CrdtMstStore<
-    MvRegAdapterSorted<UuidKey, SchedulerDigestValue, Uuid>,
+    StoreMvRegAdapterSorted<UuidKey, SchedulerDigestValue, Uuid>,
     XXHash128,
     SchedulerDigestTables,
 >;

@@ -20,7 +20,6 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::adapter::RegAdapter;
-use crate::codec;
 use crate::error::Error;
 use crate::table_set::TableSet;
 
@@ -173,12 +172,12 @@ where
 
     #[inline]
     fn encode_reg(r: &C::Reg) -> crate::Result<Vec<u8>> {
-        codec::encode(r)
+        C::encode_reg(r)
     }
 
     #[inline]
     fn decode_reg(bytes: &[u8]) -> crate::Result<C::Reg> {
-        codec::decode(bytes)
+        C::decode_reg(bytes)
     }
 
     #[inline]
@@ -1068,6 +1067,18 @@ where
         Ok((registers_out, tombstones_out))
     }
 
+    /// Encodes exported register rows into the opaque sync payload representation.
+    pub fn encode_register_delta(
+        &self,
+        regs: Registers<C::Key, C::Reg>,
+    ) -> crate::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut out = Vec::with_capacity(regs.len());
+        for (key, reg) in regs {
+            out.push((Self::encode_key(&key), Self::encode_reg(&reg)?));
+        }
+        Ok(out)
+    }
+
     // Debug helpers (feature-gated). When disabled, they are cheap no-ops.
     pub async fn debug_dump_root(&self, label: &str) {
         if std::env::var_os("CRDT_STORE_DEBUG_DUMP").is_some() {
@@ -1398,6 +1409,14 @@ mod tests {
 
         fn key_from_bytes(b: &[u8]) -> std::io::Result<Self::Key> {
             UuidKey::try_from(b).map_err(Into::into)
+        }
+
+        fn encode_reg(reg: &Self::Reg) -> crate::Result<Vec<u8>> {
+            crate::codec::encode(reg)
+        }
+
+        fn decode_reg(bytes: &[u8]) -> crate::Result<Self::Reg> {
+            crate::codec::decode(bytes)
         }
 
         fn merge_regs(current: Option<Self::Reg>, incoming: Self::Reg) -> Self::Reg {

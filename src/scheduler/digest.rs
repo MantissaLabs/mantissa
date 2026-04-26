@@ -4,11 +4,13 @@ use crate::store::scheduler_digest_store::SchedulerDigestStore;
 use anyhow::{Result as AnyhowResult, anyhow};
 use async_channel::{Receiver, Sender};
 use capnp::Error;
+use crdt_store::codec::StoreValueCodec;
 use parking_lot::Mutex;
 use protocol::scheduling::{scheduler_digest, scheduler_digest_event};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
@@ -74,6 +76,34 @@ impl SchedulerDigestValue {
             gpu_runtime_ready: snapshot.gpu_devices.is_empty() || gpu_runtime_status().is_ready(),
         }
     }
+}
+
+impl StoreValueCodec for SchedulerDigestValue {
+    /// Encodes one scheduler digest as the stable Cap'n Proto store value.
+    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        write_scheduler_digest(message.init_root::<scheduler_digest::Builder>(), self);
+        Ok(capnp::serialize::write_message_to_words(&message))
+    }
+
+    /// Decodes one scheduler digest from the stable Cap'n Proto store value.
+    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        let reader =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .map_err(store_codec_error)?;
+        let digest = reader
+            .get_root::<scheduler_digest::Reader>()
+            .map_err(store_codec_error)?;
+        read_scheduler_digest(digest).map_err(store_codec_error)
+    }
+}
+
+/// Converts scheduler store-codec errors into the CRDT store error type.
+fn store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
+    Box::new(crdt_store::error::Error::Other(format!(
+        "scheduler digest store codec error: {error}"
+    )))
 }
 
 /// Gossip event carrying one compact scheduler digest mutation.
@@ -435,9 +465,26 @@ mod tests {
         should_replace_scheduler_digest_event,
     };
     use crate::store::scheduler_digest_store::open_scheduler_digest_store;
+    use crdt_store::codec::StoreValueCodec;
     use std::sync::Arc;
     use tempfile::tempdir;
     use uuid::Uuid;
+
+    /// Builds one deterministic digest row used by scheduler digest storage tests.
+    fn sample_digest(node_id: Uuid, snapshot_version: u64) -> SchedulerDigestValue {
+        SchedulerDigestValue {
+            node_id,
+            snapshot_version,
+            updated_at_unix_ms: 42,
+            free_slot_count: 2,
+            free_cpu_millis: 1_000,
+            free_memory_bytes: 2_048,
+            largest_free_slot_cpu_millis: 500,
+            largest_free_slot_memory_bytes: 1_024,
+            free_gpu_count: 1,
+            gpu_runtime_ready: true,
+        }
+    }
 
     /// Newer snapshot versions should win when coalescing concurrent digest upserts.
     #[test]
@@ -534,5 +581,54 @@ mod tests {
             observed.observed_at_unix_ms > observed.digest.updated_at_unix_ms,
             "local ingest time should not reuse the peer-provided digest timestamp"
         );
+    }
+
+    /// Scheduler digest values should round-trip through the Cap'n Proto store-value codec.
+    #[test]
+    fn store_value_codec_roundtrips_scheduler_digest() {
+        let digest = sample_digest(Uuid::new_v4(), 11);
+
+        let encoded = digest
+            .encode_store_value()
+            .expect("encode scheduler digest store value");
+        let decoded = SchedulerDigestValue::decode_store_value(&encoded)
+            .expect("decode scheduler digest store value");
+
+        assert_eq!(decoded, digest);
+    }
+
+    /// Reopening the scheduler digest store should decode Cap'n Proto MVReg rows from Redb.
+    #[tokio::test]
+    async fn scheduler_digest_store_reopens_capnp_rows() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("scheduler-digest-reopen-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let node_id = Uuid::new_v4();
+        let digest = sample_digest(node_id, 12);
+
+        {
+            let store = open_scheduler_digest_store(db.clone(), actor).expect("open digest store");
+            let registry = SchedulerDigestRegistry::new(store);
+            registry
+                .upsert(digest.clone())
+                .await
+                .expect("upsert digest");
+        }
+
+        let reopened = open_scheduler_digest_store(db, actor).expect("reopen digest store");
+        reopened
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild digest MST");
+        let registry = SchedulerDigestRegistry::new(reopened);
+        let got = registry
+            .get(node_id)
+            .expect("lookup reopened digest")
+            .expect("digest present");
+
+        assert_eq!(got, digest);
     }
 }

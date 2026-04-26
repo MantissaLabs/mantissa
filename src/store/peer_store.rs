@@ -68,6 +68,16 @@ impl RegAdapter for PeerRegAdapter {
         UuidKey::try_from(b).map_err(Into::into)
     }
 
+    /// Encodes one peer register into the current bincode-backed store payload.
+    fn encode_reg(reg: &Self::Reg) -> crdt_store::Result<Vec<u8>> {
+        crdt_store::codec::encode(reg)
+    }
+
+    /// Decodes one peer register from the current bincode-backed store payload.
+    fn decode_reg(bytes: &[u8]) -> crdt_store::Result<Self::Reg> {
+        crdt_store::codec::decode(bytes)
+    }
+
     /// Merges local and incoming peer registers for anti-entropy application.
     fn merge_regs(current: Option<Self::Reg>, incoming: Self::Reg) -> Self::Reg {
         match current {

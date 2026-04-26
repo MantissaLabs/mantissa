@@ -21,8 +21,7 @@ use crate::store::service_store::ServiceStore;
 use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
 use crate::store::workload_store::WorkloadStore;
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
-use crdt_store::codec;
-use crdt_store::mst_store::{Registers, Tombstones};
+use crdt_store::mst_store::Tombstones;
 use crdt_store::uuid_key::UuidKey;
 use protocol::sync::{Domain, delta_sink, sync};
 use std::rc::Rc;
@@ -278,7 +277,10 @@ impl DomainStoreRef<'_> {
             let (regs, tombs) = store
                 .export_page_ranges_delta(want_ranges)
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
-            Ok((encode_registers(regs)?, encode_tombstones(tombs)))
+            let regs = store
+                .encode_register_delta(regs)
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            Ok((regs, encode_tombstones(tombs)))
         })
     }
 
@@ -465,21 +467,6 @@ impl sync::Server for SyncService {
         sink.end_request().send().promise.await?;
         Ok(())
     }
-}
-
-/// Serializes CRDT register payloads into the on-the-wire bincode representation used by
-/// `DeltaChunk.regs`.
-fn encode_registers<R>(regs: Registers<UuidKey, R>) -> Result<EncodedRegisters, capnp::Error>
-where
-    R: serde::Serialize,
-{
-    let mut out = EncodedRegisters::with_capacity(regs.len());
-    for (k, r) in regs {
-        let key_bytes = k.as_ref().to_vec();
-        let reg_bytes = codec::encode(&r).map_err(|e| capnp::Error::failed(e.to_string()))?;
-        out.push((key_bytes, reg_bytes));
-    }
-    Ok(out)
 }
 
 /// Converts tombstone rows into the compact wire format used by `DeltaChunk.tombs`.

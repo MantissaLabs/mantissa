@@ -9,10 +9,8 @@ use crate::cluster::{ClusterViewId, RootSchemaState};
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use capnp_rpc::new_client;
 use crdt_store::adapter::RegAdapter;
-use crdt_store::codec;
 use crdt_store::mst_store::CrdtMstStore;
 use crdt_store::{Entry, PageDigestRange, TableSet, compute_want_from_have, uuid_key::UuidKey};
-use crdts::MVReg;
 use merkle_search_tree::digest::Hasher as MstHasher;
 use protocol::sync::{self, Domain, delta_chunk, delta_sink};
 use std::rc::Rc;
@@ -20,7 +18,7 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 use tracing::{debug, warn};
 
-type RegisterDelta<V> = Vec<(UuidKey, MVReg<V, uuid::Uuid>)>;
+type RegisterDelta<C> = Vec<(UuidKey, <C as RegAdapter>::Reg)>;
 type TombstoneDelta = Vec<(UuidKey, u64)>;
 
 /// Carries one peer-scoped context for anti-entropy diagnostics.
@@ -428,13 +426,12 @@ impl delta_sink::Server for DeltaSinkImpl {
 /// selected the destination store for the reported domain. `apply_chunk()` is the narrow step
 /// that turns the wire payload into typed register/tombstone batches and hands them to the
 /// store's incremental MST update path.
-async fn apply_chunk<C, H, T, V>(
+async fn apply_chunk<C, H, T>(
     store: Arc<CrdtMstStore<C, H, T>>,
     chunk: &delta_chunk::Reader<'_>,
 ) -> Result<(), capnp::Error>
 where
-    C: RegAdapter<Key = UuidKey, Actor = uuid::Uuid, Reg = MVReg<V, uuid::Uuid>, Value = V>,
-    V: Clone + Send + Sync + for<'de> serde::Deserialize<'de> + 'static,
+    C: RegAdapter<Key = UuidKey, Actor = uuid::Uuid>,
     H: MstHasher<16, C::Key>
         + MstHasher<16, Entry<C::Snapshot>>
         + Default
@@ -445,8 +442,8 @@ where
     T: TableSet,
 {
     // Registers and tombstones share the same chunk envelope, but the register payload must be
-    // deserialized into the value type carried by the destination store's CRDT adapter.
-    let regs = decode_register::<V>(chunk)?;
+    // deserialized by the destination store's CRDT adapter.
+    let regs = decode_register::<C>(chunk)?;
     let tombs = collect_tombstones(chunk)?;
 
     store
@@ -466,17 +463,17 @@ fn collect_tombstones(chunk: &delta_chunk::Reader<'_>) -> Result<TombstoneDelta,
     Ok(tombs)
 }
 
-/// Deserializes MVReg payloads from one wire chunk for the selected domain value type.
-fn decode_register<V>(chunk: &delta_chunk::Reader<'_>) -> Result<RegisterDelta<V>, capnp::Error>
+/// Deserializes register payloads from one wire chunk with the selected domain adapter.
+fn decode_register<C>(chunk: &delta_chunk::Reader<'_>) -> Result<RegisterDelta<C>, capnp::Error>
 where
-    V: for<'de> serde::Deserialize<'de>,
+    C: RegAdapter<Key = UuidKey>,
 {
     let mut regs = Vec::new();
     for entry in chunk.get_regs()?.iter() {
         let key =
             UuidKey::try_from(entry.get_key()?).map_err(|e| capnp::Error::failed(e.to_string()))?;
-        let register: MVReg<V, uuid::Uuid> =
-            codec::decode(entry.get_reg()?).map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let register =
+            C::decode_reg(entry.get_reg()?).map_err(|e| capnp::Error::failed(e.to_string()))?;
         regs.push((key, register));
     }
     Ok(regs)
