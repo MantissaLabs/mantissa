@@ -1,6 +1,6 @@
 use crate::network::types::{NetworkAttachmentValue, NetworkPeerStateValue, NetworkSpecValue};
 use crate::store::open::open_arc_store;
-use crdt_store::adapter::MvRegAdapterSorted;
+use crdt_store::adapter::StoreMvRegAdapterSorted;
 use crdt_store::hash::XXHash128;
 use crdt_store::mst_store::CrdtMstStore;
 use crdt_store::table_set::TableSet;
@@ -36,15 +36,18 @@ impl TableSet for NetworkAttachmentTables {
 }
 
 /// Specialized MST/CRDT store for network specifications.
-pub type NetworkSpecStoreInner =
-    CrdtMstStore<MvRegAdapterSorted<UuidKey, NetworkSpecValue, Uuid>, XXHash128, NetworkSpecTables>;
+pub type NetworkSpecStoreInner = CrdtMstStore<
+    StoreMvRegAdapterSorted<UuidKey, NetworkSpecValue, Uuid>,
+    XXHash128,
+    NetworkSpecTables,
+>;
 
 /// Shared handle to the network specification store.
 pub type NetworkSpecStore = Arc<NetworkSpecStoreInner>;
 
 /// Specialized MST/CRDT store for per-peer network state.
 pub type NetworkPeerStoreInner = CrdtMstStore<
-    MvRegAdapterSorted<UuidKey, NetworkPeerStateValue, Uuid>,
+    StoreMvRegAdapterSorted<UuidKey, NetworkPeerStateValue, Uuid>,
     XXHash128,
     NetworkPeerTables,
 >;
@@ -54,7 +57,7 @@ pub type NetworkPeerStore = Arc<NetworkPeerStoreInner>;
 
 /// Specialized MST/CRDT store for network attachment state.
 pub type NetworkAttachmentStoreInner = CrdtMstStore<
-    MvRegAdapterSorted<UuidKey, NetworkAttachmentValue, Uuid>,
+    StoreMvRegAdapterSorted<UuidKey, NetworkAttachmentValue, Uuid>,
     XXHash128,
     NetworkAttachmentTables,
 >;

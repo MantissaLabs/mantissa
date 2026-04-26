@@ -10,12 +10,14 @@ use crate::volumes::types::{
 use anyhow::Result;
 use capnp::Error;
 use capnp::struct_list;
+use crdt_store::codec::StoreValueCodec;
 use protocol::volumes::{
     LocalVolumeSourceKind, local_volume_ownership, local_volume_spec, volume_driver_spec,
     volume_event, volume_inspect, volume_label, volume_node_status, volume_spec, volume_summary,
     volumes,
 };
 use std::fs;
+use std::io::Cursor;
 use std::path::Path;
 use std::rc::Rc;
 use uuid::Uuid;
@@ -329,6 +331,27 @@ fn read_volume_spec(reader: volume_spec::Reader<'_>) -> Result<VolumeSpecValue, 
     })
 }
 
+impl StoreValueCodec for VolumeSpecValue {
+    /// Encodes one volume spec as the stable Cap'n Proto store value.
+    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        write_volume_spec(message.init_root::<volume_spec::Builder<'_>>(), self);
+        Ok(capnp::serialize::write_message_to_words(&message))
+    }
+
+    /// Decodes one volume spec from the stable Cap'n Proto store value.
+    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        let reader =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .map_err(volume_store_codec_error)?;
+        let spec = reader
+            .get_root::<volume_spec::Reader<'_>>()
+            .map_err(volume_store_codec_error)?;
+        read_volume_spec(spec).map_err(volume_store_codec_error)
+    }
+}
+
 /// Serializes one node-local volume state row into the Cap'n Proto wire representation.
 fn write_volume_node_status(
     mut builder: volume_node_status::Builder<'_>,
@@ -374,6 +397,34 @@ fn read_volume_node_status(
         updated_at: reader.get_updated_at()?.to_str()?.to_string(),
         last_error: empty_means_none(reader.get_last_error()?.to_str()?.trim()),
     })
+}
+
+impl StoreValueCodec for VolumeNodeStateValue {
+    /// Encodes one volume node-state row as the stable Cap'n Proto store value.
+    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        write_volume_node_status(message.init_root::<volume_node_status::Builder<'_>>(), self);
+        Ok(capnp::serialize::write_message_to_words(&message))
+    }
+
+    /// Decodes one volume node-state row from the stable Cap'n Proto store value.
+    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        let reader =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .map_err(volume_store_codec_error)?;
+        let state = reader
+            .get_root::<volume_node_status::Reader<'_>>()
+            .map_err(volume_store_codec_error)?;
+        read_volume_node_status(state).map_err(volume_store_codec_error)
+    }
+}
+
+/// Converts volume store-codec errors into the CRDT store error type.
+fn volume_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
+    Box::new(crdt_store::error::Error::Other(format!(
+        "volume store codec error: {error}"
+    )))
 }
 
 /// Serializes one volume summary row for list output.
@@ -829,5 +880,133 @@ impl volumes::Server for VolumesRpc {
             .map_err(to_capnp)?;
         write_volume_inspect(results.get().init_volume(), &spec, &node_states);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
+    use crate::volumes::types::VolumeStatus;
+    use crdt_store::uuid_key::UuidKey;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    /// Builds one deterministic volume spec used by store codec tests.
+    fn sample_volume_spec() -> VolumeSpecValue {
+        VolumeSpecValue {
+            id: crate::volumes::types::compute_volume_id("cache"),
+            name: "cache".to_string(),
+            driver: VolumeDriver::Local(LocalVolumeSpec {
+                source: LocalVolumeSource::Managed,
+                ownership: LocalVolumeOwnership::FsGroup { gid: 2_000 },
+            }),
+            access_mode: VolumeAccessMode::ReadWriteOnce,
+            binding_mode: VolumeBindingMode::WaitForFirstConsumer,
+            reclaim_policy: VolumeReclaimPolicy::Retain,
+            requested_bytes: Some(10 * 1024 * 1024),
+            labels: vec![VolumeLabel {
+                key: "tier".to_string(),
+                value: "cache".to_string(),
+            }],
+            status: VolumeStatus::Bound,
+            bound_node_id: Some(Uuid::new_v4()),
+            bound_node_name: Some("node-a".to_string()),
+            volume_epoch: 3,
+            phase_version: 5,
+            created_at: "2026-03-25T12:00:00Z".to_string(),
+            updated_at: "2026-03-25T12:01:00Z".to_string(),
+            reason: Some("bound".to_string()),
+            message: Some("volume is bound".to_string()),
+        }
+    }
+
+    /// Builds one deterministic volume node-state row used by store codec tests.
+    fn sample_volume_node_state(volume_id: Uuid) -> VolumeNodeStateValue {
+        let node_id = Uuid::new_v4();
+        VolumeNodeStateValue {
+            id: crate::volumes::types::compute_volume_node_state_id(volume_id, node_id),
+            volume_id,
+            node_id,
+            node_name: "node-a".to_string(),
+            local_path: Some("/var/lib/mantissa/volumes/cache".to_string()),
+            state: VolumeNodeState::Published,
+            capacity_bytes: Some(20 * 1024 * 1024),
+            used_bytes: Some(4 * 1024 * 1024),
+            published_task_ids: vec![Uuid::new_v4()],
+            updated_at: "2026-03-25T12:02:00Z".to_string(),
+            last_error: None,
+        }
+    }
+
+    /// Volume values should round-trip through their Cap'n Proto store-value codecs.
+    #[test]
+    fn store_value_codec_roundtrips_volume_values() {
+        let spec = sample_volume_spec();
+        let state = sample_volume_node_state(spec.id);
+
+        let encoded = spec
+            .encode_store_value()
+            .expect("encode volume spec store value");
+        let decoded =
+            VolumeSpecValue::decode_store_value(&encoded).expect("decode volume spec store value");
+        assert_eq!(decoded, spec);
+
+        let encoded = state
+            .encode_store_value()
+            .expect("encode volume node store value");
+        let decoded = VolumeNodeStateValue::decode_store_value(&encoded)
+            .expect("decode volume node store value");
+        assert_eq!(decoded, state);
+    }
+
+    /// Reopening volume stores should decode Cap'n Proto MVReg rows from Redb.
+    #[tokio::test]
+    async fn volume_stores_reopen_capnp_rows() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("volume-reopen-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let spec = sample_volume_spec();
+        let state = sample_volume_node_state(spec.id);
+        let spec_key = UuidKey::from(spec.id);
+        let state_key = UuidKey::from(state.id);
+
+        {
+            let specs = open_volume_spec_store(db.clone(), actor).expect("open volume specs");
+            let states = open_volume_node_store(db.clone(), actor).expect("open volume nodes");
+            specs
+                .upsert(&spec_key, spec.clone())
+                .await
+                .expect("upsert volume spec");
+            states
+                .upsert(&state_key, state.clone())
+                .await
+                .expect("upsert volume state");
+        }
+
+        let specs = open_volume_spec_store(db.clone(), actor).expect("reopen volume specs");
+        let states = open_volume_node_store(db, actor).expect("reopen volume nodes");
+        specs
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild volume spec MST");
+        states
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild volume node MST");
+        let spec_snapshot = specs
+            .get_snapshot(&spec_key)
+            .expect("lookup reopened volume spec")
+            .expect("volume spec present");
+        let state_snapshot = states
+            .get_snapshot(&state_key)
+            .expect("lookup reopened volume node")
+            .expect("volume node present");
+
+        assert_eq!(spec_snapshot.as_slice(), &[spec]);
+        assert_eq!(state_snapshot.as_slice(), &[state]);
     }
 }

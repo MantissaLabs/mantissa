@@ -1,6 +1,6 @@
 use crate::store::open::open_arc_store;
 use crate::volumes::types::{VolumeNodeStateValue, VolumeSpecValue};
-use crdt_store::adapter::MvRegAdapterSorted;
+use crdt_store::adapter::StoreMvRegAdapterSorted;
 use crdt_store::hash::XXHash128;
 use crdt_store::mst_store::CrdtMstStore;
 use crdt_store::table_set::TableSet;
@@ -27,15 +27,18 @@ impl TableSet for VolumeNodeTables {
 }
 
 /// Specialized MST/CRDT store for volume specifications.
-pub type VolumeSpecStoreInner =
-    CrdtMstStore<MvRegAdapterSorted<UuidKey, VolumeSpecValue, Uuid>, XXHash128, VolumeSpecTables>;
+pub type VolumeSpecStoreInner = CrdtMstStore<
+    StoreMvRegAdapterSorted<UuidKey, VolumeSpecValue, Uuid>,
+    XXHash128,
+    VolumeSpecTables,
+>;
 
 /// Shared handle to the volume specification store.
 pub type VolumeSpecStore = Arc<VolumeSpecStoreInner>;
 
 /// Specialized MST/CRDT store for per-node volume state.
 pub type VolumeNodeStoreInner = CrdtMstStore<
-    MvRegAdapterSorted<UuidKey, VolumeNodeStateValue, Uuid>,
+    StoreMvRegAdapterSorted<UuidKey, VolumeNodeStateValue, Uuid>,
     XXHash128,
     VolumeNodeTables,
 >;

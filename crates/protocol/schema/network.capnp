@@ -242,6 +242,15 @@ struct NetworkAttachmentSpec {
 
   trafficPublished @12 :Bool;
   # True when service discovery and public endpoint publication may route traffic here.
+
+  taskUpdatedAt @13 :Text;
+  # Last workload update timestamp observed when this attachment row was produced.
+
+  serviceName @14 :Text;
+  # Optional owning service name, empty when the attachment is not service-owned.
+
+  templateName @15 :Text;
+  # Optional owning service template name, empty when the attachment is not service-owned.
 }
 
 struct NetworkEvent {

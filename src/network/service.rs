@@ -2,18 +2,20 @@ use crate::network::controller::NetworkController;
 use crate::network::gossip::NetworkGossiper;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
-    BpfProgramSpec, NetworkAttachmentValue, NetworkDriver, NetworkEvent, NetworkPeerState,
-    NetworkPeerStateValue, NetworkSpecDraft, NetworkSpecUpdate, NetworkSpecValue, NetworkStatus,
-    compute_network_id,
+    BpfProgramSpec, NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue,
+    NetworkDriver, NetworkEvent, NetworkPeerState, NetworkPeerStateValue, NetworkSpecDraft,
+    NetworkSpecUpdate, NetworkSpecValue, NetworkStatus, compute_network_id,
 };
 use crate::topology::Topology;
 use capnp::Error;
+use crdt_store::codec::StoreValueCodec;
 use protocol::network::{
     network_attachment_spec, network_create_spec, network_event, network_peer_status, network_spec,
     network_summary, networks,
 };
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::io::Cursor;
 use std::rc::Rc;
 use uuid::Uuid;
 
@@ -185,6 +187,9 @@ fn write_network_attachment(
         builder.set_error("");
     }
     builder.set_traffic_published(attachment.traffic_published);
+    builder.set_task_updated_at(attachment.task_updated_at.as_deref().unwrap_or_default());
+    builder.set_service_name(attachment.service_name.as_deref().unwrap_or_default());
+    builder.set_template_name(attachment.template_name.as_deref().unwrap_or_default());
 }
 
 /// Build per-network total/ready peer counts used by network list responses.
@@ -265,6 +270,134 @@ fn read_peer_state(
     })
 }
 
+/// Decode a network attachment row from its wire representation.
+fn read_network_attachment(
+    reader: network_attachment_spec::Reader<'_>,
+) -> Result<NetworkAttachmentValue, Error> {
+    let id = read_uuid(reader.get_attachment_id()?)?;
+    let task_id = read_uuid(reader.get_task_id()?)?;
+    let node_id = read_uuid(reader.get_node_id()?)?;
+    let network_id = read_uuid(reader.get_network_id()?)?;
+
+    let mut value = NetworkAttachmentValue::new(NetworkAttachmentDraft {
+        id,
+        task_id,
+        node_id,
+        instance_id: reader.get_instance_id()?.to_str()?.to_string(),
+        network_id,
+        task_updated_at: empty_means_none(reader.get_task_updated_at()?.to_str()?.trim()),
+        requested_ip: empty_means_none(reader.get_requested_ip()?.to_str()?.trim()),
+        assigned_ip: empty_means_none(reader.get_assigned_ip()?.to_str()?.trim()),
+        mac: empty_means_none(reader.get_mac()?.to_str()?.trim()),
+        state: NetworkAttachmentState::from_proto(reader.get_state()?),
+        error: empty_means_none(reader.get_error()?.to_str()?.trim()),
+        traffic_published: reader.get_traffic_published(),
+        service_name: empty_means_none(reader.get_service_name()?.to_str()?.trim()),
+        template_name: empty_means_none(reader.get_template_name()?.to_str()?.trim()),
+    });
+    value.created_at = reader.get_created_at()?.to_str()?.to_string();
+    value.updated_at = reader.get_updated_at()?.to_str()?.to_string();
+    Ok(value)
+}
+
+impl StoreValueCodec for NetworkSpecValue {
+    /// Encodes one network spec as the stable Cap'n Proto store value.
+    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        write_network_spec(message.init_root::<network_spec::Builder<'_>>(), self);
+        Ok(capnp::serialize::write_message_to_words(&message))
+    }
+
+    /// Decodes one network spec from the stable Cap'n Proto store value.
+    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        let reader =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .map_err(network_store_codec_error)?;
+        let spec = reader
+            .get_root::<network_spec::Reader<'_>>()
+            .map_err(network_store_codec_error)?;
+        read_network_spec(spec).map_err(network_store_codec_error)
+    }
+}
+
+impl StoreValueCodec for NetworkPeerStateValue {
+    /// Encodes one network peer-state row as the stable Cap'n Proto store value.
+    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        write_network_event(
+            message.init_root::<network_event::Builder<'_>>(),
+            &NetworkEvent::PeerUpsert(self.clone()),
+        )
+        .map_err(network_store_codec_error)?;
+        Ok(capnp::serialize::write_message_to_words(&message))
+    }
+
+    /// Decodes one network peer-state row from the stable Cap'n Proto store value.
+    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+        let event = decode_network_store_event(bytes)?;
+        match event {
+            NetworkEvent::PeerUpsert(value) => Ok(value),
+            NetworkEvent::Upsert(_) | NetworkEvent::PeerRemove(_) => {
+                Err(Box::new(crdt_store::error::Error::Other(
+                    "network peer store value had wrong event type".to_string(),
+                )))
+            }
+        }
+    }
+}
+
+impl StoreValueCodec for NetworkAttachmentValue {
+    /// Encodes one network attachment row as the stable Cap'n Proto store value.
+    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        write_network_attachment(
+            message.init_root::<network_attachment_spec::Builder<'_>>(),
+            self,
+        );
+        Ok(capnp::serialize::write_message_to_words(&message))
+    }
+
+    /// Decodes one network attachment row from the stable Cap'n Proto store value.
+    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        let reader =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .map_err(network_store_codec_error)?;
+        let attachment = reader
+            .get_root::<network_attachment_spec::Reader<'_>>()
+            .map_err(network_store_codec_error)?;
+        read_network_attachment(attachment).map_err(network_store_codec_error)
+    }
+}
+
+/// Decodes one network store event payload.
+fn decode_network_store_event(bytes: &[u8]) -> crdt_store::Result<NetworkEvent> {
+    let mut cursor = Cursor::new(bytes);
+    let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+        .map_err(network_store_codec_error)?;
+    let event = reader
+        .get_root::<network_event::Reader<'_>>()
+        .map_err(network_store_codec_error)?;
+    read_network_event(event).map_err(network_store_codec_error)
+}
+
+/// Converts network store-codec errors into the CRDT store error type.
+fn network_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
+    Box::new(crdt_store::error::Error::Other(format!(
+        "network store codec error: {error}"
+    )))
+}
+
+/// Converts empty network store text fields into absent optional values.
+fn empty_means_none(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 /// Serialize one network gossip event onto the Cap'n Proto wire format.
 pub(crate) fn write_network_event(
     mut builder: network_event::Builder<'_>,
@@ -291,6 +424,180 @@ pub(crate) fn write_network_event(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::types::{
+        BpfAttachPoint, compute_network_attachment_id, compute_network_peer_state_id,
+    };
+    use crate::store::network_store::{
+        open_network_attachment_store, open_network_peer_store, open_network_spec_store,
+    };
+    use crdt_store::uuid_key::UuidKey;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    /// Builds one deterministic network spec used by store codec tests.
+    fn sample_network_spec() -> NetworkSpecValue {
+        NetworkSpecValue {
+            id: compute_network_id("frontend"),
+            name: "frontend".to_string(),
+            description: "frontend overlay".to_string(),
+            driver: NetworkDriver::Vxlan,
+            subnet_cidr: "10.42.0.0/24".to_string(),
+            vni: 42,
+            mtu: 1450,
+            created_at: "2026-03-25T12:00:00Z".to_string(),
+            updated_at: "2026-03-25T12:01:00Z".to_string(),
+            status: NetworkStatus::Ready,
+            sealed: true,
+            bpf_programs: vec![BpfProgramSpec::with_attach_point(
+                "frontend-filter",
+                BpfAttachPoint::BridgeTcIngress,
+            )],
+        }
+    }
+
+    /// Builds one deterministic network peer row used by store codec tests.
+    fn sample_network_peer(network_id: Uuid) -> NetworkPeerStateValue {
+        let peer_id = Uuid::new_v4();
+        NetworkPeerStateValue {
+            id: compute_network_peer_state_id(network_id, peer_id),
+            network_id,
+            peer_id,
+            peer_name: "node-a".to_string(),
+            state: NetworkPeerState::Ready,
+            error: None,
+            updated_at: "2026-03-25T12:02:00Z".to_string(),
+        }
+    }
+
+    /// Builds one deterministic network attachment row used by store codec tests.
+    fn sample_network_attachment(network_id: Uuid) -> NetworkAttachmentValue {
+        let task_id = Uuid::new_v4();
+        let mut value = NetworkAttachmentValue::new(NetworkAttachmentDraft {
+            id: compute_network_attachment_id(task_id, network_id),
+            task_id,
+            node_id: Uuid::new_v4(),
+            instance_id: "instance-1".to_string(),
+            network_id,
+            task_updated_at: Some("2026-03-25T12:02:30Z".to_string()),
+            requested_ip: Some("10.42.0.10".to_string()),
+            assigned_ip: Some("10.42.0.10".to_string()),
+            mac: Some("02:00:00:00:00:10".to_string()),
+            state: NetworkAttachmentState::Ready,
+            error: None,
+            traffic_published: true,
+            service_name: Some("frontend".to_string()),
+            template_name: Some("web".to_string()),
+        });
+        value.created_at = "2026-03-25T12:02:00Z".to_string();
+        value.updated_at = "2026-03-25T12:03:00Z".to_string();
+        value
+    }
+
+    /// Network values should round-trip through their Cap'n Proto store-value codecs.
+    #[test]
+    fn store_value_codec_roundtrips_network_values() {
+        let spec = sample_network_spec();
+        let peer = sample_network_peer(spec.id);
+        let attachment = sample_network_attachment(spec.id);
+
+        let encoded = spec
+            .encode_store_value()
+            .expect("encode network spec store value");
+        let decoded = NetworkSpecValue::decode_store_value(&encoded)
+            .expect("decode network spec store value");
+        assert_eq!(decoded, spec);
+
+        let encoded = peer
+            .encode_store_value()
+            .expect("encode network peer store value");
+        let decoded = NetworkPeerStateValue::decode_store_value(&encoded)
+            .expect("decode network peer store value");
+        assert_eq!(decoded, peer);
+
+        let encoded = attachment
+            .encode_store_value()
+            .expect("encode network attachment store value");
+        let decoded = NetworkAttachmentValue::decode_store_value(&encoded)
+            .expect("decode network attachment store value");
+        assert_eq!(decoded, attachment);
+        assert_eq!(decoded.created_at, attachment.created_at);
+        assert_eq!(decoded.updated_at, attachment.updated_at);
+    }
+
+    /// Reopening network stores should decode Cap'n Proto MVReg rows from Redb.
+    #[tokio::test]
+    async fn network_stores_reopen_capnp_rows() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("network-reopen-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let spec = sample_network_spec();
+        let peer = sample_network_peer(spec.id);
+        let attachment = sample_network_attachment(spec.id);
+        let spec_key = UuidKey::from(spec.id);
+        let peer_key = UuidKey::from(peer.id);
+        let attachment_key = UuidKey::from(attachment.id);
+
+        {
+            let specs = open_network_spec_store(db.clone(), actor).expect("open network specs");
+            let peers = open_network_peer_store(db.clone(), actor).expect("open network peers");
+            let attachments =
+                open_network_attachment_store(db.clone(), actor).expect("open network attachments");
+            specs
+                .upsert(&spec_key, spec.clone())
+                .await
+                .expect("upsert network spec");
+            peers
+                .upsert(&peer_key, peer.clone())
+                .await
+                .expect("upsert network peer");
+            attachments
+                .upsert(&attachment_key, attachment.clone())
+                .await
+                .expect("upsert network attachment");
+        }
+
+        let specs = open_network_spec_store(db.clone(), actor).expect("reopen network specs");
+        let peers = open_network_peer_store(db.clone(), actor).expect("reopen network peers");
+        let attachments =
+            open_network_attachment_store(db, actor).expect("reopen network attachments");
+        specs
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild network spec MST");
+        peers
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild network peer MST");
+        attachments
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild network attachment MST");
+
+        let spec_snapshot = specs
+            .get_snapshot(&spec_key)
+            .expect("lookup reopened network spec")
+            .expect("network spec present");
+        let peer_snapshot = peers
+            .get_snapshot(&peer_key)
+            .expect("lookup reopened network peer")
+            .expect("network peer present");
+        let attachment_snapshot = attachments
+            .get_snapshot(&attachment_key)
+            .expect("lookup reopened network attachment")
+            .expect("network attachment present");
+
+        assert_eq!(spec_snapshot.as_slice(), &[spec]);
+        assert_eq!(peer_snapshot.as_slice(), &[peer]);
+        assert_eq!(attachment_snapshot.as_slice(), &[attachment]);
+    }
 }
 
 /// Decode one network gossip event from the Cap'n Proto wire format.
