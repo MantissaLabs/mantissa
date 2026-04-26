@@ -1,16 +1,15 @@
-use crdt_store::codec;
+use crate::node::id::{read_node_id, set_node_id};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use serde::{Deserialize, Serialize};
+use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// Domain separation tag for the signed payload.
 const DOMAIN: &[u8] = b"mantissa/cluster-cred/v1";
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct ClusterCredential {
     /// Who signed this credential (their ed25519 verifying key).
-    #[serde(with = "serde_ed25519::verifying_key")]
     pub issuer: VerifyingKey,
 
     /// The subject of the credential (the peer this is for).
@@ -23,7 +22,6 @@ pub struct ClusterCredential {
     pub nonce: [u8; 16],
 
     /// Signature by `issuer` over `message(issuer, subject, not_after, nonce)`.
-    #[serde(with = "serde_ed25519::signature")]
     pub sig: Signature,
 }
 
@@ -66,17 +64,64 @@ impl ClusterCredential {
             .map_err(|e| e.to_string())
     }
 
-    /// Serialize to bytes (bincode).
+    /// Serializes this credential into its stable Cap'n Proto payload.
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
-        codec::encode(self).map_err(|e| e.to_string())
+        let mut message = capnp::message::Builder::new_default();
+        let mut builder = message.init_root::<protocol::server::cluster_credential::Builder<'_>>();
+        builder.set_issuer(&self.issuer.to_bytes());
+        set_node_id(builder.reborrow().init_subject(), &self.subject);
+        builder.set_not_after_unix_secs(self.not_after);
+        builder.set_nonce(&self.nonce);
+        builder.set_signature(&self.sig.to_bytes());
+        Ok(capnp::serialize::write_message_to_words(&message))
     }
 
-    /// Parse from bytes then verify.
+    /// Parses one Cap'n Proto payload from bytes and then verifies it.
     pub fn from_bytes_verified(b: &[u8]) -> Result<Self, String> {
-        let cred: Self = codec::decode(b).map_err(|e| e.to_string())?;
+        let cred = Self::from_capnp_bytes(b)?;
         cred.verify()?;
         Ok(cred)
     }
+
+    /// Decodes one credential from its stable Cap'n Proto payload.
+    fn from_capnp_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let mut cursor = Cursor::new(bytes);
+        let reader =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .map_err(|e| e.to_string())?;
+        let credential = reader
+            .get_root::<protocol::server::cluster_credential::Reader<'_>>()
+            .map_err(|e| e.to_string())?;
+        Self::from_capnp(credential)
+    }
+
+    /// Decodes one credential from a Cap'n Proto reader.
+    fn from_capnp(
+        reader: protocol::server::cluster_credential::Reader<'_>,
+    ) -> Result<Self, String> {
+        let issuer = read_fixed_bytes::<32>(reader.get_issuer().map_err(|e| e.to_string())?)
+            .and_then(|bytes| VerifyingKey::from_bytes(&bytes).map_err(|e| e.to_string()))?;
+        let subject = read_node_id(reader.get_subject().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        let nonce = read_fixed_bytes::<16>(reader.get_nonce().map_err(|e| e.to_string())?)?;
+        let sig = Signature::from_slice(reader.get_signature().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+
+        Ok(Self {
+            issuer,
+            subject,
+            not_after: reader.get_not_after_unix_secs(),
+            nonce,
+            sig,
+        })
+    }
+}
+
+/// Reads a fixed-width Cap'n Proto data field into an array.
+fn read_fixed_bytes<const N: usize>(bytes: &[u8]) -> Result<[u8; N], String> {
+    bytes
+        .try_into()
+        .map_err(|_| format!("expected {N} bytes, got {}", bytes.len()))
 }
 
 fn now_secs() -> u64 {
@@ -85,51 +130,6 @@ fn now_secs() -> u64 {
         Err(err) => {
             tracing::warn!("system clock error for credential verification: {err}");
             0
-        }
-    }
-}
-
-/// Minimal serde helpers to encode/decode ed25519 types as raw bytes.
-/// Keeps the struct strongly typed while on-the-wire remains compact.
-mod serde_ed25519 {
-    use super::*;
-    use serde::{Deserialize, Deserializer, Serializer, de};
-
-    pub mod verifying_key {
-        use super::*;
-        pub fn serialize<S>(vk: &VerifyingKey, s: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            s.serialize_bytes(&vk.to_bytes())
-        }
-        pub fn deserialize<'de, D>(d: D) -> Result<VerifyingKey, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            let bytes: Vec<u8> = Deserialize::deserialize(d)?;
-            let arr: [u8; 32] = bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| de::Error::custom("verifying key must be 32 bytes"))?;
-            VerifyingKey::from_bytes(&arr).map_err(de::Error::custom)
-        }
-    }
-
-    pub mod signature {
-        use super::*;
-        pub fn serialize<S>(sig: &Signature, s: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            s.serialize_bytes(&sig.to_bytes())
-        }
-        pub fn deserialize<'de, D>(d: D) -> Result<Signature, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            let bytes: Vec<u8> = Deserialize::deserialize(d)?;
-            Signature::from_slice(&bytes).map_err(de::Error::custom)
         }
     }
 }

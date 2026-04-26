@@ -3,14 +3,13 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit},
 };
-use crdt_store::codec;
 use hkdf::Hkdf;
 use net::noise::NoiseKeys;
 use redb::{Database, ReadableTable, TableDefinition};
-use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{
     io,
+    io::Cursor,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -31,7 +30,7 @@ fn now_secs() -> u64 {
 }
 
 /// What we store (plaintext) before sealing.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TicketRecord {
     ticket: Vec<u8>,
     issued_at: u64,
@@ -39,6 +38,61 @@ pub struct TicketRecord {
     expires_at: Option<u64>,
     /// Optional human hint (e.g., “anchor 192.168.1.10:6578”).
     note: Option<String>,
+}
+
+impl TicketRecord {
+    /// Encodes this local ticket record into its stable Cap'n Proto plaintext payload.
+    fn encode_capnp(&self) -> Vec<u8> {
+        let mut message = capnp::message::Builder::new_default();
+        let mut builder =
+            message.init_root::<protocol::server::session_ticket_record::Builder<'_>>();
+        builder.set_ticket(&self.ticket);
+        builder.set_issued_at_unix_secs(self.issued_at);
+
+        if let Some(expires_at) = self.expires_at {
+            builder.set_has_expires_at(true);
+            builder.set_expires_at_unix_secs(expires_at);
+        }
+
+        if let Some(note) = self.note.as_deref() {
+            builder.set_has_note(true);
+            builder.set_note(note);
+        }
+
+        capnp::serialize::write_message_to_words(&message)
+    }
+
+    /// Decodes one local ticket record from its stable Cap'n Proto plaintext payload.
+    fn decode_capnp(bytes: &[u8]) -> io::Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        let reader =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .map_err(into_io)?;
+        let record = reader
+            .get_root::<protocol::server::session_ticket_record::Reader<'_>>()
+            .map_err(into_io)?;
+        let note = if record.get_has_note() {
+            Some(
+                record
+                    .get_note()
+                    .map_err(into_io)?
+                    .to_str()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        Ok(Self {
+            ticket: record.get_ticket().map_err(into_io)?.to_vec(),
+            issued_at: record.get_issued_at_unix_secs(),
+            expires_at: record
+                .get_has_expires_at()
+                .then_some(record.get_expires_at_unix_secs()),
+            note,
+        })
+    }
 }
 
 /// Derive a per-node KEK from the Noise static private key.
@@ -167,7 +221,7 @@ impl LocalSessionStore {
             expires_at,
             note,
         };
-        let plain = codec::encode(&rec).map_err(into_io)?;
+        let plain = rec.encode_capnp();
         let blob = seal(&self.kek, &plain)?;
 
         with_write_tx(&self.db, |tx| {
@@ -187,7 +241,7 @@ impl LocalSessionStore {
                 Some(guard) => {
                     let blob = guard.value();
                     let pt = open(&self.kek, blob)?;
-                    let rec: TicketRecord = codec::decode(&pt).map_err(into_io)?;
+                    let rec = TicketRecord::decode_capnp(&pt)?;
                     Some(rec)
                 }
                 None => None,
@@ -234,7 +288,7 @@ impl LocalSessionStore {
                 let peer = Uuid::from_bytes(key.value());
                 let blob = value.value();
                 let pt = open(&self.kek, blob)?;
-                let rec: TicketRecord = codec::decode(&pt).map_err(into_io)?;
+                let rec = TicketRecord::decode_capnp(&pt)?;
                 out.push((peer, rec));
             }
             Ok(out)
@@ -264,5 +318,26 @@ impl LocalSessionStore {
             }
             Ok(peers.len())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ensures local ticket plaintext payloads preserve optional metadata.
+    #[test]
+    fn ticket_record_capnp_round_trip_preserves_metadata() {
+        let record = TicketRecord {
+            ticket: b"ticket".to_vec(),
+            issued_at: 10,
+            expires_at: Some(20),
+            note: Some("anchor".to_string()),
+        };
+
+        let encoded = record.encode_capnp();
+        let decoded = TicketRecord::decode_capnp(&encoded).expect("decode ticket record");
+
+        assert_eq!(decoded, record);
     }
 }

@@ -31,6 +31,43 @@ interface Server {
   # Used after join to contact other neighbors in the mesh/network.
 }
 
+struct ClusterCredential {
+  issuer @0 :Data;
+  # Ed25519 verifying key bytes for the node that signed the credential.
+
+  subject @1 :Node.NodeId;
+  # Node identity this credential authenticates.
+
+  notAfterUnixSecs @2 :UInt64;
+  # Absolute unix timestamp after which the credential is invalid.
+
+  nonce @3 :Data;
+  # Per-credential random bytes included in the signed payload.
+
+  signature @4 :Data;
+  # Ed25519 signature over the canonical credential message.
+}
+
+struct SessionTicketRecord {
+  ticket @0 :Data;
+  # Opaque ticket bytes returned by the remote server session authority.
+
+  issuedAtUnixSecs @1 :UInt64;
+  # Local unix timestamp when this ticket was cached.
+
+  hasExpiresAt @2 :Bool;
+  # True when `expiresAtUnixSecs` contains an absolute expiry timestamp.
+
+  expiresAtUnixSecs @3 :UInt64;
+  # Optional absolute expiry timestamp for this cached ticket.
+
+  hasNote @4 :Bool;
+  # True when `note` contains an operator-facing hint.
+
+  note @5 :Text;
+  # Optional human-readable hint associated with the cached ticket.
+}
+
 interface ClusterSession {
   # ClusterSession is the top level interface that gives access to a node's
   # Access to a given service is granted only if a node has proper permission.

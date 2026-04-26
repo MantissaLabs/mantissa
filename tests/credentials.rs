@@ -29,9 +29,9 @@ fn credential_expiry_and_tamper() {
     std::thread::sleep(std::time::Duration::from_secs(2));
     assert!(cred.verify().is_err(), "should be expired");
 
-    // Tamper a byte
-    let mut bytes = cred.to_bytes().unwrap();
-    let len = bytes.len();
-    bytes[len - 1] ^= 0xFF;
+    // Tamper a signed field and re-encode it; verification must reject it.
+    let mut tampered = ClusterCredential::sign(&sk, subject, 60, [3u8; 16]);
+    tampered.subject = Uuid::new_v4();
+    let bytes = tampered.to_bytes().unwrap();
     assert!(ClusterCredential::from_bytes_verified(&bytes).is_err());
 }
