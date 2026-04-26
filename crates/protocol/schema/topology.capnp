@@ -336,6 +336,36 @@ struct ClusterViewSummary {
   # Friendly cluster lineage name when one has been defined.
 }
 
+struct ClusterNameRecord {
+  name @0 :Text;
+  # Friendly cluster lineage name.
+
+  updatedAtUnixMs @1 :UInt64;
+  # Wall-clock update time used as the primary conflict-resolution order.
+
+  actorNodeId @2 :Data;
+  # 16-byte node id that authored the update.
+}
+
+struct ClusterNodeCountRecord {
+  nodeCount @0 :UInt32;
+  # Last published member count for the cluster lineage.
+
+  updatedAtUnixMs @1 :UInt64;
+  # Wall-clock update time used as the primary conflict-resolution order.
+
+  actorNodeId @2 :Data;
+  # 16-byte node id that authored the update.
+}
+
+struct ClusterViewMetadataRecord {
+  name @0 :ClusterNameRecord;
+  # Optional friendly-name metadata for the cluster lineage.
+
+  nodeCount @1 :ClusterNodeCountRecord;
+  # Optional member-count metadata for the cluster lineage.
+}
+
 struct SplitCandidate {
   nodeId @0 :Node.NodeId;
   # Candidate node identifier.

@@ -1,16 +1,20 @@
 use crate::cluster::{ClusterId, ClusterViewId};
 use crate::store::open::open_arc_store;
 use crate::store::tx::{into_io, with_read_tx, with_write_tx};
-use crdt_store::adapter::MvRegAdapterSorted;
-use crdt_store::codec;
+use crdt_store::adapter::StoreMvRegAdapterSorted;
+use crdt_store::codec::StoreValueCodec;
 use crdt_store::hash::XXHash128;
 use crdt_store::mst_store::CrdtMstStore;
 use crdt_store::mvreg::MvRegSnapshot;
 use crdt_store::table_set::TableSet;
 use crdt_store::uuid_key::UuidKey;
+use protocol::topology::{
+    cluster_name_record, cluster_node_count_record, cluster_view_id, cluster_view_metadata_record,
+};
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::io;
+use std::io::Cursor;
 use std::sync::Arc;
 use tracing::warn;
 use uuid::Uuid;
@@ -33,7 +37,7 @@ impl TableSet for ClusterViewDomainTables {
 
 /// Specialized MST/CRDT store for replicated cluster-view lineage metadata.
 pub type ClusterViewDomainStoreInner = CrdtMstStore<
-    MvRegAdapterSorted<UuidKey, ClusterViewMetadataRecord, Uuid>,
+    StoreMvRegAdapterSorted<UuidKey, ClusterViewMetadataRecord, Uuid>,
     XXHash128,
     ClusterViewDomainTables,
 >;
@@ -148,6 +152,140 @@ impl ClusterViewMetadataRecord {
     }
 }
 
+impl StoreValueCodec for ClusterViewMetadataRecord {
+    /// Encodes one cluster-view metadata record as the stable Cap'n Proto store value.
+    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        write_cluster_view_metadata_record(
+            message.init_root::<cluster_view_metadata_record::Builder<'_>>(),
+            self,
+        );
+        Ok(capnp::serialize::write_message_to_words(&message))
+    }
+
+    /// Decodes one cluster-view metadata record from the stable Cap'n Proto store value.
+    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        let reader =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .map_err(cluster_view_store_codec_error)?;
+        let record = reader
+            .get_root::<cluster_view_metadata_record::Reader<'_>>()
+            .map_err(cluster_view_store_codec_error)?;
+        read_cluster_view_metadata_record(record).map_err(cluster_view_store_codec_error)
+    }
+}
+
+/// Encodes one cluster-view metadata row into the store schema.
+fn write_cluster_view_metadata_record(
+    mut builder: cluster_view_metadata_record::Builder<'_>,
+    record: &ClusterViewMetadataRecord,
+) {
+    if let Some(name) = record.name.as_ref() {
+        write_cluster_name_record(builder.reborrow().init_name(), name);
+    }
+    if let Some(node_count) = record.node_count.as_ref() {
+        write_cluster_node_count_record(builder.reborrow().init_node_count(), node_count);
+    }
+}
+
+/// Decodes one cluster-view metadata row from the store schema.
+fn read_cluster_view_metadata_record(
+    reader: cluster_view_metadata_record::Reader<'_>,
+) -> Result<ClusterViewMetadataRecord, capnp::Error> {
+    let name = if reader.has_name() {
+        Some(read_cluster_name_record(reader.get_name()?)?)
+    } else {
+        None
+    };
+    let node_count = if reader.has_node_count() {
+        Some(read_cluster_node_count_record(reader.get_node_count()?)?)
+    } else {
+        None
+    };
+    Ok(ClusterViewMetadataRecord { name, node_count })
+}
+
+/// Encodes one cluster name record into the store schema.
+fn write_cluster_name_record(
+    mut builder: cluster_name_record::Builder<'_>,
+    record: &ClusterNameRecord,
+) {
+    builder.set_name(&record.name);
+    builder.set_updated_at_unix_ms(record.updated_at_unix_ms);
+    builder.set_actor_node_id(record.actor_node_id.as_bytes());
+}
+
+/// Decodes one cluster name record from the store schema.
+fn read_cluster_name_record(
+    reader: cluster_name_record::Reader<'_>,
+) -> Result<ClusterNameRecord, capnp::Error> {
+    Ok(ClusterNameRecord {
+        name: reader.get_name()?.to_str()?.to_string(),
+        updated_at_unix_ms: reader.get_updated_at_unix_ms(),
+        actor_node_id: read_uuid_data(reader.get_actor_node_id()?, "cluster name actor node id")?,
+    })
+}
+
+/// Encodes one cluster node-count record into the store schema.
+fn write_cluster_node_count_record(
+    mut builder: cluster_node_count_record::Builder<'_>,
+    record: &ClusterNodeCountRecord,
+) {
+    builder.set_node_count(record.node_count);
+    builder.set_updated_at_unix_ms(record.updated_at_unix_ms);
+    builder.set_actor_node_id(record.actor_node_id.as_bytes());
+}
+
+/// Decodes one cluster node-count record from the store schema.
+fn read_cluster_node_count_record(
+    reader: cluster_node_count_record::Reader<'_>,
+) -> Result<ClusterNodeCountRecord, capnp::Error> {
+    Ok(ClusterNodeCountRecord {
+        node_count: reader.get_node_count(),
+        updated_at_unix_ms: reader.get_updated_at_unix_ms(),
+        actor_node_id: read_uuid_data(
+            reader.get_actor_node_id()?,
+            "cluster node-count actor node id",
+        )?,
+    })
+}
+
+/// Encodes one active cluster view into its local singleton store row.
+fn encode_active_cluster_view(view: ClusterViewId) -> io::Result<Vec<u8>> {
+    let mut message = capnp::message::Builder::new_default();
+    view.write_capnp(message.init_root::<cluster_view_id::Builder<'_>>());
+    Ok(capnp::serialize::write_message_to_words(&message))
+}
+
+/// Decodes one active cluster view from its local singleton store row.
+fn decode_active_cluster_view(bytes: &[u8]) -> io::Result<ClusterViewId> {
+    let mut cursor = Cursor::new(bytes);
+    let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+        .map_err(into_io)?;
+    let view = reader
+        .get_root::<cluster_view_id::Reader<'_>>()
+        .map_err(into_io)?;
+    ClusterViewId::from_capnp(view).map_err(io::Error::other)
+}
+
+/// Decodes one required UUID from a store `Data` field.
+fn read_uuid_data(data: capnp::data::Reader<'_>, field: &str) -> Result<Uuid, capnp::Error> {
+    let bytes = data.to_owned();
+    let slice: [u8; 16] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| capnp::Error::failed(format!("invalid {field}: expected 16-byte UUID")))?;
+    Ok(Uuid::from_bytes(slice))
+}
+
+/// Converts cluster-view store-codec errors into the CRDT store error type.
+fn cluster_view_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
+    Box::new(crdt_store::error::Error::Other(format!(
+        "cluster-view store codec error: {error}"
+    )))
+}
+
 /// Durable store for local active-view state and replicated cluster-view lineage metadata.
 #[derive(Clone)]
 pub struct ClusterViewStore {
@@ -260,14 +398,14 @@ impl ClusterViewStore {
                 return Ok(None);
             };
 
-            let view: ClusterViewId = codec::decode(payload.value()).map_err(into_io)?;
+            let view = decode_active_cluster_view(payload.value())?;
             Ok(Some(view))
         })
     }
 
     /// Persists the provided active cluster view atomically.
     pub fn write_active_view(&self, view: ClusterViewId) -> io::Result<()> {
-        let payload = codec::encode(&view).map_err(into_io)?;
+        let payload = encode_active_cluster_view(view)?;
         with_write_tx(&self.db, |tx| {
             let mut table = tx.open_table(T_ACTIVE_CLUSTER_VIEW).map_err(into_io)?;
             table
@@ -386,5 +524,128 @@ impl ClusterViewStore {
             .into_iter()
             .filter_map(|(cluster_id, record)| record.name.map(|name| (cluster_id, name)))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crdt_store::codec::StoreValueCodec;
+    use tempfile::tempdir;
+
+    /// Builds one metadata row that exercises every cluster-view store field.
+    fn sample_metadata_record() -> ClusterViewMetadataRecord {
+        ClusterViewMetadataRecord {
+            name: Some(ClusterNameRecord {
+                name: "production".to_string(),
+                updated_at_unix_ms: 1_776_000_000_001,
+                actor_node_id: Uuid::new_v4(),
+            }),
+            node_count: Some(ClusterNodeCountRecord {
+                node_count: 7,
+                updated_at_unix_ms: 1_776_000_000_002,
+                actor_node_id: Uuid::new_v4(),
+            }),
+        }
+    }
+
+    /// Cluster-view metadata should round-trip through the Cap'n Proto store-value codec.
+    #[test]
+    fn store_value_codec_roundtrips_cluster_view_metadata() {
+        let record = sample_metadata_record();
+        let encoded = record
+            .encode_store_value()
+            .expect("encode cluster-view metadata");
+        let decoded = ClusterViewMetadataRecord::decode_store_value(&encoded)
+            .expect("decode cluster-view metadata");
+        assert_eq!(decoded, record);
+
+        let name_only = ClusterViewMetadataRecord {
+            node_count: None,
+            ..record.clone()
+        };
+        let encoded = name_only
+            .encode_store_value()
+            .expect("encode name-only metadata");
+        let decoded = ClusterViewMetadataRecord::decode_store_value(&encoded)
+            .expect("decode name-only metadata");
+        assert_eq!(decoded, name_only);
+
+        let empty = ClusterViewMetadataRecord::default();
+        let encoded = empty.encode_store_value().expect("encode empty metadata");
+        let decoded =
+            ClusterViewMetadataRecord::decode_store_value(&encoded).expect("decode empty metadata");
+        assert_eq!(decoded, empty);
+    }
+
+    /// The local active-view singleton should use the existing Cap'n Proto view id schema.
+    #[test]
+    fn active_cluster_view_codec_roundtrips_view_ids() {
+        let view = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 42);
+        let encoded = encode_active_cluster_view(view).expect("encode active cluster view");
+        let decoded = decode_active_cluster_view(&encoded).expect("decode active cluster view");
+        assert_eq!(decoded, view);
+    }
+
+    /// Reopening the cluster-view store should decode Cap'n Proto rows from Redb.
+    #[tokio::test]
+    async fn cluster_view_store_reopens_capnp_rows() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("cluster-view-reopen-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let cluster_id = ClusterId::from_uuid(Uuid::new_v4());
+        let active_view = ClusterViewId::new(cluster_id, 3);
+        let name = ClusterNameRecord {
+            name: "edge".to_string(),
+            updated_at_unix_ms: 1_776_000_001_001,
+            actor_node_id: actor,
+        };
+        let count = ClusterNodeCountRecord {
+            node_count: 5,
+            updated_at_unix_ms: 1_776_000_001_002,
+            actor_node_id: actor,
+        };
+
+        {
+            let store = ClusterViewStore::new(db.clone(), actor).expect("open cluster-view store");
+            store
+                .write_active_view(active_view)
+                .expect("write active view");
+            store
+                .upsert_cluster_name(cluster_id, &name)
+                .await
+                .expect("upsert cluster name");
+            store
+                .upsert_cluster_node_count(cluster_id, &count)
+                .await
+                .expect("upsert node count");
+        }
+
+        let store = ClusterViewStore::new(db, actor).expect("reopen cluster-view store");
+        store
+            .rebuild_cluster_view_domain_mst()
+            .await
+            .expect("rebuild cluster-view metadata MST");
+
+        assert_eq!(
+            store.read_active_view().expect("read active view"),
+            Some(active_view)
+        );
+        let metadata = store
+            .list_cluster_metadata()
+            .expect("list cluster metadata");
+        assert_eq!(
+            metadata,
+            vec![(
+                cluster_id,
+                ClusterViewMetadataRecord {
+                    name: Some(name),
+                    node_count: Some(count),
+                },
+            )]
+        );
     }
 }
