@@ -169,6 +169,103 @@ struct SchedulerDigestEvent {
   }
 }
 
+struct SchedulerStoreLeaseReservation {
+  leaseId @0 :Data;
+  # 16-byte UUID identifying the prepared lease.
+
+  coordinatorNodeId @1 :Data;
+  # 16-byte UUID of the node coordinating this lease.
+
+  taskId @2 :Data;
+  # 16-byte UUID of the task associated with the lease.
+
+  expiresAtUnixMs @3 :UInt64;
+  # Absolute wall-clock expiry used to reclaim leaked leases.
+}
+
+struct SchedulerStoreSlotReservation {
+  owner @0 :Data;
+  # 16-byte UUID of the node owning the committed reservation.
+
+  taskId @1 :Data;
+  # 16-byte UUID of the task using the slot, empty when unassigned.
+}
+
+struct SchedulerStoreGpuDeviceReservation {
+  owner @0 :Data;
+  # 16-byte UUID of the node owning the committed reservation.
+
+  taskId @1 :Data;
+  # 16-byte UUID of the task using the GPU, empty when unassigned.
+}
+
+struct SchedulerStoreSlot {
+  slotId @0 :UInt64;
+  # Slot identifier within the node snapshot.
+
+  cpuMillis @1 :UInt64;
+  # CPU reservation in milli-cores for the slot.
+
+  memoryBytes @2 :UInt64;
+  # Memory reservation in bytes for the slot.
+
+  gpuCount @3 :UInt32;
+  # Deprecated GPU capacity kept for existing slot capacity semantics.
+
+  union {
+    free @4 :Void;
+    # Slot is available for scheduling.
+
+    leased @5 :SchedulerStoreLeaseReservation;
+    # Slot is held by a prepared lease.
+
+    reserved @6 :SchedulerStoreSlotReservation;
+    # Slot is committed to a running workload.
+  }
+}
+
+struct SchedulerStoreGpuDevice {
+  deviceId @0 :Text;
+  # Stable GPU device identifier used by the scheduler.
+
+  index @1 :UInt32;
+  # Runtime-reported GPU index.
+
+  uuid @2 :Text;
+  # Vendor-reported UUID, empty when unavailable.
+
+  pciBusId @3 :Text;
+  # PCI bus identifier, empty when unavailable.
+
+  name @4 :Text;
+  # Human-readable GPU model name.
+
+  memoryTotalBytes @5 :UInt64;
+  # Total device memory in bytes.
+
+  union {
+    free @6 :Void;
+    # GPU device is available for scheduling.
+
+    leased @7 :SchedulerStoreLeaseReservation;
+    # GPU device is held by a prepared lease.
+
+    reserved @8 :SchedulerStoreGpuDeviceReservation;
+    # GPU device is committed to a running workload.
+  }
+}
+
+struct SchedulerStoreSnapshot {
+  version @0 :UInt64;
+  # Monotonic scheduler snapshot version.
+
+  slots @1 :List(SchedulerStoreSlot);
+  # Complete scheduler slot state.
+
+  gpuDevices @2 :List(SchedulerStoreGpuDevice);
+  # Complete scheduler GPU state.
+}
+
 struct SummaryRequest {
   peerId @0 :Data;
   # 16-byte UUID of the peer to query; empty means local node.
