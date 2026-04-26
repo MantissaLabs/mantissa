@@ -67,6 +67,11 @@ where
         self.dots.is_empty()
     }
 
+    /// Returns the number of actor counters carried by this clock.
+    pub fn len(&self) -> usize {
+        self.dots.len()
+    }
+
     /// Returns the counter for one actor, treating missing actors as zero.
     pub fn get(&self, actor: &A) -> u64 {
         self.dots.get(actor).copied().unwrap_or(0)
