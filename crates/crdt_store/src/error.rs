@@ -4,8 +4,6 @@ use thiserror::Error;
 pub enum Error {
     #[error("redb error: {0}")]
     Redb(#[from] redb::Error),
-    #[error("serialize error: {0}")]
-    Bincode(#[from] bincode::Error),
     #[error("invalid key bytes: {0}")]
     InvalidKey(String),
     #[error("io: {0}")]

@@ -1330,15 +1330,14 @@ impl std::hash::Hasher for HashBytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::{MvRegAdapterSorted, RegAdapter};
+    use crate::adapter::{RegAdapter, StoreMvRegAdapterSorted};
+    use crate::codec::{MvRegStoreCodec, StoreRegisterCodec, StoreValueCodec};
     use crate::hash::XXHash128;
-    use crate::mvreg::MvRegSnapshot;
+    use crate::mvreg::{MvReg, MvRegSnapshot};
     use crate::uuid_key::UuidKey;
-    use crdts::ctx::ReadCtx;
-    use crdts::{CmRDT, CvRDT, MVReg};
-    use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     // Use the production hasher from the crate for tests
 
@@ -1350,15 +1349,39 @@ mod tests {
         const META: &'static str = "meta";
     }
 
-    type Adapter = MvRegAdapterSorted<UuidKey, String, u8>;
+    type Adapter = StoreMvRegAdapterSorted<UuidKey, String, Uuid>;
 
-    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
     struct VersionedValue {
         name: String,
         alias: String,
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+    impl StoreValueCodec for VersionedValue {
+        fn encode_store_value(&self) -> crate::Result<Vec<u8>> {
+            let name = self.name.as_bytes();
+            let alias = self.alias.as_bytes();
+            let mut encoded = Vec::with_capacity(8 + name.len() + alias.len());
+            encoded.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            encoded.extend_from_slice(name);
+            encoded.extend_from_slice(&(alias.len() as u32).to_le_bytes());
+            encoded.extend_from_slice(alias);
+            Ok(encoded)
+        }
+
+        fn decode_store_value(bytes: &[u8]) -> crate::Result<Self> {
+            let (name, rest) = read_string_field(bytes, "name")?;
+            let (alias, rest) = read_string_field(rest, "alias")?;
+            if !rest.is_empty() {
+                return Err(Box::new(Error::Other(
+                    "versioned value payload has trailing bytes".to_string(),
+                )));
+            }
+            Ok(Self { name, alias })
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
     struct VersionedProjection {
         name: String,
         alias: Option<String>,
@@ -1368,8 +1391,8 @@ mod tests {
 
     impl RegAdapter for VersionedAdapter {
         type Key = UuidKey;
-        type Actor = u8;
-        type Reg = MVReg<VersionedValue, u8>;
+        type Actor = Uuid;
+        type Reg = MvReg<VersionedValue, Uuid>;
         type Value = VersionedValue;
         type Snapshot = MvRegSnapshot<VersionedProjection>;
 
@@ -1379,10 +1402,7 @@ mod tests {
             v: Self::Value,
         ) -> Self::Reg {
             let mut reg = current.unwrap_or_default();
-            let rc: ReadCtx<Vec<VersionedValue>, u8> = reg.read();
-            let add = rc.derive_add_ctx(*actor);
-            let op = reg.write(v, add);
-            reg.apply(op);
+            reg.write(*actor, v);
             reg
         }
 
@@ -1391,9 +1411,8 @@ mod tests {
         }
 
         fn snapshot_reg_at_version(reg: &Self::Reg, root_schema_version: u32) -> Self::Snapshot {
-            let rc: ReadCtx<Vec<VersionedValue>, u8> = reg.read();
-            let values = rc
-                .val
+            let values = reg
+                .read_values()
                 .into_iter()
                 .map(|value| VersionedProjection {
                     name: value.name,
@@ -1412,11 +1431,11 @@ mod tests {
         }
 
         fn encode_reg(reg: &Self::Reg) -> crate::Result<Vec<u8>> {
-            crate::codec::encode(reg)
+            MvRegStoreCodec::<VersionedValue, Uuid>::encode_store_reg(reg)
         }
 
         fn decode_reg(bytes: &[u8]) -> crate::Result<Self::Reg> {
-            crate::codec::decode(bytes)
+            MvRegStoreCodec::<VersionedValue, Uuid>::decode_store_reg(bytes)
         }
 
         fn merge_regs(current: Option<Self::Reg>, incoming: Self::Reg) -> Self::Reg {
@@ -1442,11 +1461,36 @@ mod tests {
         UuidKey::try_from(&bytes[..]).unwrap()
     }
 
+    fn actor(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    fn read_string_field<'a>(bytes: &'a [u8], field: &str) -> crate::Result<(String, &'a [u8])> {
+        if bytes.len() < 4 {
+            return Err(Box::new(Error::Other(format!(
+                "versioned value {field} length is missing"
+            ))));
+        }
+        let len = u32::from_le_bytes(bytes[0..4].try_into().expect("length width")) as usize;
+        let end = 4usize.saturating_add(len);
+        if bytes.len() < end {
+            return Err(Box::new(Error::Other(format!(
+                "versioned value {field} is truncated"
+            ))));
+        }
+        let value = String::from_utf8(bytes[4..end].to_vec()).map_err(|error| {
+            Box::new(Error::Other(format!(
+                "versioned value {field} is not valid UTF-8: {error}"
+            )))
+        })?;
+        Ok((value, &bytes[end..]))
+    }
+
     #[tokio::test]
     async fn upsert_and_remove_and_rebuild() {
         let (_dir, db) = temp_db();
         let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
-            CrdtMstStore::open(db, 1u8).unwrap();
+            CrdtMstStore::open(db, actor(1)).unwrap();
 
         // Upsert a few keys
         for n in 1..=3u8 {
@@ -1468,7 +1512,7 @@ mod tests {
     async fn root_digest_matches_hex() {
         let (_dir, db) = temp_db();
         let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
-            CrdtMstStore::open(db, 1u8).unwrap();
+            CrdtMstStore::open(db, actor(1)).unwrap();
 
         // Mutate so we have a non-empty root
         store.upsert(&key(1), "v1".into()).await.unwrap();
@@ -1486,7 +1530,7 @@ mod tests {
     async fn get_snapshot_returns_current_value() {
         let (_dir, db) = temp_db();
         let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
-            CrdtMstStore::open(db, 1u8).unwrap();
+            CrdtMstStore::open(db, actor(1)).unwrap();
 
         let k = key(9);
         store.upsert(&k, "alpha".into()).await.unwrap();
@@ -1503,7 +1547,7 @@ mod tests {
     async fn merge_register_clears_tombstone() {
         let (_dir, db) = temp_db();
         let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
-            CrdtMstStore::open(db, 1u8).unwrap();
+            CrdtMstStore::open(db, actor(1)).unwrap();
 
         let k = key(1);
         store.apply_tombstone(&k, 42).await.unwrap();
@@ -1511,7 +1555,7 @@ mod tests {
 
         let reg = {
             let current = None;
-            <Adapter as RegAdapter>::upsert_reg(current, &1u8, "hello".to_string())
+            <Adapter as RegAdapter>::upsert_reg(current, &actor(1), "hello".to_string())
         };
         store.merge_register(&k, &reg).await.unwrap();
 
@@ -1524,7 +1568,7 @@ mod tests {
     async fn export_page_ranges_delta_optimized() {
         let (_dir, db) = temp_db();
         let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
-            CrdtMstStore::open(db, 1u8).unwrap();
+            CrdtMstStore::open(db, actor(1)).unwrap();
 
         // upsert keys 1..=5; tombstone key 3
         for n in 1..=5u8 {
@@ -1573,7 +1617,7 @@ mod tests {
     async fn apply_tombstone_uses_monotonic_ts_in_mst() {
         let (_dir, db) = temp_db();
         let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
-            CrdtMstStore::open(db, 1u8).unwrap();
+            CrdtMstStore::open(db, actor(1)).unwrap();
         let k = key(1);
 
         // First a higher remote ts arrives
@@ -1597,9 +1641,9 @@ mod tests {
         let (_local_dir, local_db) = temp_db();
         let (_remote_dir, remote_db) = temp_db();
         let local: CrdtMstStore<Adapter, XXHash128, TestTables> =
-            CrdtMstStore::open(local_db, 1u8).unwrap();
+            CrdtMstStore::open(local_db, actor(1)).unwrap();
         let remote: CrdtMstStore<Adapter, XXHash128, TestTables> =
-            CrdtMstStore::open(remote_db, 2u8).unwrap();
+            CrdtMstStore::open(remote_db, actor(2)).unwrap();
         let tomb_key = key(1);
 
         // Give the local store a newer tombstone sequence than the remote store.
@@ -1632,7 +1676,7 @@ mod tests {
     async fn export_overlap_ranges_are_deduped() {
         let (_dir, db) = temp_db();
         let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
-            CrdtMstStore::open(db, 1u8).unwrap();
+            CrdtMstStore::open(db, actor(1)).unwrap();
 
         for n in 1..=5u8 {
             store.upsert(&key(n), format!("v{n}")).await.unwrap();
@@ -1669,9 +1713,9 @@ mod tests {
         let (_src_dir, db_src) = temp_db();
         let (_dst_dir, db_dst) = temp_db();
         let src: CrdtMstStore<Adapter, XXHash128, TestTables> =
-            CrdtMstStore::open(db_src, 1u8).unwrap();
+            CrdtMstStore::open(db_src, actor(1)).unwrap();
         let dst: CrdtMstStore<Adapter, XXHash128, TestTables> =
-            CrdtMstStore::open(db_dst, 2u8).unwrap();
+            CrdtMstStore::open(db_dst, actor(2)).unwrap();
 
         // Populate source
         for n in 1..=4u8 {
@@ -1697,9 +1741,9 @@ mod tests {
     async fn apply_delta_chunk_update_mst_keeps_tree_fresh() {
         let (_dir, db) = temp_db();
         let src: CrdtMstStore<Adapter, XXHash128, TestTables> =
-            CrdtMstStore::open(db.clone(), 1u8).unwrap();
+            CrdtMstStore::open(db.clone(), actor(1)).unwrap();
         let dst: CrdtMstStore<Adapter, XXHash128, TestTables> =
-            CrdtMstStore::open(db, 2u8).unwrap();
+            CrdtMstStore::open(db, actor(2)).unwrap();
 
         src.upsert(&key(1), "x".into()).await.unwrap();
         src.upsert(&key(2), "y".into()).await.unwrap();
@@ -1720,7 +1764,7 @@ mod tests {
     async fn root_schema_versions_change_snapshot_projection_without_losing_raw_registers() {
         let (_dir, db) = temp_db();
         let store: CrdtMstStore<VersionedAdapter, XXHash128, TestTables> =
-            CrdtMstStore::open(db, 1u8).unwrap();
+            CrdtMstStore::open(db, actor(1)).unwrap();
 
         let k = key(7);
         store
@@ -1761,7 +1805,7 @@ mod tests {
 
         let raw_reg = store.get_reg(&k).unwrap().unwrap();
         assert_eq!(
-            raw_reg.read().val,
+            raw_reg.read_values(),
             vec![VersionedValue {
                 name: "alpha".to_string(),
                 alias: "v2-visible".to_string(),

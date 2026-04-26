@@ -10,7 +10,6 @@ workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-bincode = "1"
 capnp = { workspace = true }
 redb = "3.1.1"
 merkle-search-tree = "0.8.0"
