@@ -9,10 +9,12 @@ use crate::topology::Topology;
 use capnp::Error;
 use capnp::struct_list;
 use chrono::Utc;
+use crdt_store::codec::StoreValueCodec;
 use protocol::secrets::{
     secret_ciphertext, secret_event, secret_metadata_entry, secret_record, secret_spec, secrets,
 };
 use std::collections::BTreeMap;
+use std::io::Cursor;
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -178,6 +180,41 @@ fn read_secret_record(reader: secret_record::Reader<'_>) -> Result<SecretValue, 
     let ciphertext = read_secret_ciphertext(reader.get_ciphertext()?)?;
     let spec_reader = reader.get_spec()?;
     read_secret_spec_value(spec_reader, ciphertext)
+}
+
+impl StoreValueCodec for SecretValue {
+    /// Encodes one secret value as the stable Cap'n Proto store value.
+    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut record = message.init_root::<secret_record::Builder<'_>>();
+            write_secret_spec(record.reborrow().init_spec(), self);
+            write_secret_ciphertext(
+                record.reborrow().init_ciphertext(),
+                &self.current_version.ciphertext,
+            );
+        }
+        Ok(capnp::serialize::write_message_to_words(&message))
+    }
+
+    /// Decodes one secret value from the stable Cap'n Proto store value.
+    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        let reader =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .map_err(secret_store_codec_error)?;
+        let record = reader
+            .get_root::<secret_record::Reader<'_>>()
+            .map_err(secret_store_codec_error)?;
+        read_secret_record(record).map_err(secret_store_codec_error)
+    }
+}
+
+/// Converts secret store-codec errors into the CRDT store error type.
+fn secret_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
+    Box::new(crdt_store::error::Error::Other(format!(
+        "secret store codec error: {error}"
+    )))
 }
 
 fn read_secret_spec_value(
@@ -646,4 +683,85 @@ async fn distribute_master_key(topology: Topology, record: MasterKeyRecord) -> R
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::secret_store::open_secret_store;
+    use crdt_store::uuid_key::UuidKey;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    /// Builds one deterministic secret value used by store codec tests.
+    fn sample_secret() -> SecretValue {
+        let mut labels = BTreeMap::new();
+        labels.insert("env".to_string(), "dev".to_string());
+        let metadata = SecretMetadata {
+            description: Some("database password".to_string()),
+            labels,
+        };
+        let ciphertext = SecretCiphertext {
+            master_key_version: 7,
+            nonce: [1u8; 12],
+            ciphertext: vec![2, 3, 4, 5],
+            digest: [6u8; 32],
+        };
+        let version = SecretVersion::new(
+            Uuid::new_v4(),
+            ciphertext,
+            "2026-03-25T12:00:00Z",
+            Some(Uuid::new_v4()),
+            7,
+        );
+        let mut secret = SecretValue::new("db-password", metadata, "2026-03-25T12:00:00Z", version);
+        secret.touch("2026-03-25T12:01:00Z");
+        secret
+    }
+
+    /// Secret values should round-trip through the Cap'n Proto store-value codec.
+    #[test]
+    fn store_value_codec_roundtrips_secret_value() {
+        let secret = sample_secret();
+
+        let encoded = secret
+            .encode_store_value()
+            .expect("encode secret store value");
+        let decoded = SecretValue::decode_store_value(&encoded).expect("decode secret store value");
+
+        assert_eq!(decoded, secret);
+    }
+
+    /// Reopening the secret store should decode Cap'n Proto MVReg rows from Redb.
+    #[tokio::test]
+    async fn secret_store_reopens_capnp_rows() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("secret-reopen-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let secret = sample_secret();
+        let key = UuidKey::from(secret.id);
+
+        {
+            let store = open_secret_store(db.clone(), actor).expect("open secret store");
+            store
+                .upsert(&key, secret.clone())
+                .await
+                .expect("upsert secret");
+        }
+
+        let reopened = open_secret_store(db, actor).expect("reopen secret store");
+        reopened
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild secret MST");
+        let snapshot = reopened
+            .get_snapshot(&key)
+            .expect("lookup reopened secret")
+            .expect("secret present");
+
+        assert_eq!(snapshot.as_slice(), &[secret]);
+    }
 }

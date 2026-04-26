@@ -1,6 +1,6 @@
 use crate::agents::types::AgentRecordValue;
 use crate::store::open::open_arc_store;
-use crdt_store::adapter::MvRegAdapterSorted;
+use crdt_store::adapter::StoreMvRegAdapterSorted;
 use crdt_store::hash::XXHash128;
 use crdt_store::mst_store::CrdtMstStore;
 use crdt_store::table_set::TableSet;
@@ -18,7 +18,7 @@ impl TableSet for AgentTables {
 }
 
 pub type AgentStoreInner =
-    CrdtMstStore<MvRegAdapterSorted<UuidKey, AgentRecordValue, Uuid>, XXHash128, AgentTables>;
+    CrdtMstStore<StoreMvRegAdapterSorted<UuidKey, AgentRecordValue, Uuid>, XXHash128, AgentTables>;
 
 pub type AgentStore = Arc<AgentStoreInner>;
 

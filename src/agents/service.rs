@@ -1,7 +1,7 @@
 use crate::agents::manager::{AgentController, AgentSubmission};
 use crate::agents::types::{
-    AgentCheckpointPolicy, AgentEvent, AgentEventEntry, AgentEventKind, AgentRunSpecValue,
-    AgentRunStatus, AgentSessionSpecValue, AgentSessionStatus, AgentToolPolicy,
+    AgentCheckpointPolicy, AgentEvent, AgentEventEntry, AgentEventKind, AgentRecordValue,
+    AgentRunSpecValue, AgentRunStatus, AgentSessionSpecValue, AgentSessionStatus, AgentToolPolicy,
     AgentWorkspacePolicy,
 };
 use crate::topology::Topology;
@@ -13,10 +13,12 @@ use crate::workload::capnp_codec::{
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
 use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
+use crdt_store::codec::StoreValueCodec;
 use protocol::agents::{
     agent_event, agent_event_entry, agent_run_spec, agent_session_spec, agents,
 };
 use protocol::gossip::gossip_message;
+use std::io::Cursor;
 use std::rc::Rc;
 use uuid::Uuid;
 
@@ -250,6 +252,48 @@ pub fn add_event(
     event: &AgentEvent,
 ) -> Result<(), Error> {
     write_agent_event(list.reborrow().get(index).init_agent(), event)
+}
+
+impl StoreValueCodec for AgentRecordValue {
+    /// Encodes one agent record as the stable Cap'n Proto store value.
+    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+        let event = match self {
+            AgentRecordValue::Session(session) => AgentEvent::UpsertSession(session.clone()),
+            AgentRecordValue::Run(run) => AgentEvent::UpsertRun(run.clone()),
+        };
+
+        let mut message = capnp::message::Builder::new_default();
+        write_agent_event(message.init_root::<agent_event::Builder<'_>>(), &event)
+            .map_err(agent_store_codec_error)?;
+        Ok(capnp::serialize::write_message_to_words(&message))
+    }
+
+    /// Decodes one agent record from the stable Cap'n Proto store value.
+    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        let reader =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .map_err(agent_store_codec_error)?;
+        let event = reader
+            .get_root::<agent_event::Reader<'_>>()
+            .map_err(agent_store_codec_error)
+            .and_then(|event| read_agent_event(event).map_err(agent_store_codec_error))?;
+
+        match event {
+            AgentEvent::UpsertSession(session) => Ok(AgentRecordValue::Session(session)),
+            AgentEvent::UpsertRun(run) => Ok(AgentRecordValue::Run(run)),
+            AgentEvent::Remove { id } => Err(Box::new(crdt_store::error::Error::Other(format!(
+                "agent store value cannot decode remove event for {id}"
+            )))),
+        }
+    }
+}
+
+/// Converts agent store-codec errors into the CRDT store error type.
+fn agent_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
+    Box::new(crdt_store::error::Error::Other(format!(
+        "agent store codec error: {error}"
+    )))
 }
 
 /// Encodes one durable agent session into the agents RPC wire payload.
@@ -855,4 +899,151 @@ fn read_isolation_mode(value: &str) -> IsolationMode {
 fn normalize_text(reader: capnp::text::Reader<'_>) -> Option<String> {
     let value = reader.to_str().ok()?.trim().to_string();
     (!value.is_empty()).then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::types::AgentInteractionPolicy;
+    use crate::store::agent_store::open_agent_store;
+    use crdt_store::uuid_key::UuidKey;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    /// Builds one deterministic resolved execution spec used by agent store tests.
+    fn sample_execution() -> ResolvedExecutionSpec {
+        ResolvedExecutionSpec {
+            image: "ghcr.io/demo/agent:v1".to_string(),
+            command: vec!["agent".to_string()],
+            tty: true,
+            cpu_millis: 500,
+            memory_bytes: 256 * 1024 * 1024,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: Some(30),
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: Vec::new(),
+            placement: Default::default(),
+        }
+    }
+
+    /// Builds one deterministic agent session record used by store codec tests.
+    fn sample_session() -> AgentSessionSpecValue {
+        let mut session = AgentSessionSpecValue::new(
+            Uuid::new_v4(),
+            "demo-agent",
+            sample_execution(),
+            ExecutionPlatform::Oci,
+            IsolationMode::Sandboxed,
+            Some("default".to_string()),
+            AgentWorkspacePolicy::default(),
+            AgentToolPolicy {
+                allowed_tools: vec!["shell".to_string()],
+                allow_network: true,
+                allow_pty: true,
+                allow_write: false,
+            },
+            AgentCheckpointPolicy::default(),
+            AgentInteractionPolicy::default(),
+            Some("inspect the workspace".to_string()),
+        );
+        session.created_at = "2026-03-25T12:00:00Z".to_string();
+        session.updated_at = "2026-03-25T12:01:00Z".to_string();
+        session.phase_version = 2;
+        session.status = AgentSessionStatus::Queued;
+        session.status_detail = Some("queued".to_string());
+        session
+    }
+
+    /// Builds one deterministic agent run record used by store codec tests.
+    fn sample_run(session: &AgentSessionSpecValue) -> AgentRunSpecValue {
+        let mut run = AgentRunSpecValue::new(
+            Uuid::new_v4(),
+            session.id,
+            session.name.clone(),
+            sample_execution(),
+            ExecutionPlatform::Oci,
+            IsolationMode::Sandboxed,
+            Some("default".to_string()),
+            Some("inspect the workspace".to_string()),
+        );
+        run.created_at = "2026-03-25T12:02:00Z".to_string();
+        run.updated_at = "2026-03-25T12:03:00Z".to_string();
+        run.phase_version = 4;
+        run.status = AgentRunStatus::Running;
+        run.status_detail = Some("running".to_string());
+        run.workload_id = Some(Uuid::new_v4());
+        run.started_at = Some("2026-03-25T12:02:30Z".to_string());
+        run
+    }
+
+    /// Agent records should round-trip through the Cap'n Proto store-value codec.
+    #[test]
+    fn store_value_codec_roundtrips_agent_records() {
+        let session = sample_session();
+        let run = sample_run(&session);
+        let records = [
+            AgentRecordValue::Session(Box::new(session)),
+            AgentRecordValue::Run(Box::new(run)),
+        ];
+
+        for record in records {
+            let encoded = record
+                .encode_store_value()
+                .expect("encode agent store value");
+            let decoded =
+                AgentRecordValue::decode_store_value(&encoded).expect("decode agent store value");
+            assert_eq!(decoded, record);
+        }
+    }
+
+    /// Reopening the agent store should decode Cap'n Proto MVReg rows from Redb.
+    #[tokio::test]
+    async fn agent_store_reopens_capnp_rows() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("agent-reopen-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let session = sample_session();
+        let run = sample_run(&session);
+        let session_record = AgentRecordValue::Session(Box::new(session.clone()));
+        let run_record = AgentRecordValue::Run(Box::new(run.clone()));
+        let session_key = UuidKey::from(session.id);
+        let run_key = UuidKey::from(run.id);
+
+        {
+            let store = open_agent_store(db.clone(), actor).expect("open agent store");
+            store
+                .upsert(&session_key, session_record.clone())
+                .await
+                .expect("upsert agent session");
+            store
+                .upsert(&run_key, run_record.clone())
+                .await
+                .expect("upsert agent run");
+        }
+
+        let reopened = open_agent_store(db, actor).expect("reopen agent store");
+        reopened
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild agent MST");
+        let session_snapshot = reopened
+            .get_snapshot(&session_key)
+            .expect("lookup reopened session")
+            .expect("session present");
+        let run_snapshot = reopened
+            .get_snapshot(&run_key)
+            .expect("lookup reopened run")
+            .expect("run present");
+
+        assert_eq!(session_snapshot.as_slice(), &[session_record]);
+        assert_eq!(run_snapshot.as_slice(), &[run_record]);
+    }
 }

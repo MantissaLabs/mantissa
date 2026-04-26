@@ -8,11 +8,13 @@ use crate::workload::capnp_codec::{
 use crate::workload::model::{ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec};
 use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
+use crdt_store::codec::StoreValueCodec;
 use protocol::gossip::gossip_message;
 use protocol::jobs::{
     job_attempt_snapshot, job_detail, job_event, job_execution, job_record, job_retry_policy,
     job_snapshot, job_submit_spec, jobs,
 };
+use std::io::Cursor;
 use std::rc::Rc;
 use uuid::Uuid;
 
@@ -355,6 +357,35 @@ fn write_job_record(
     Ok(())
 }
 
+impl StoreValueCodec for JobSpecValue {
+    /// Encodes one job spec as the stable Cap'n Proto store value.
+    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        write_job_record(message.init_root::<job_record::Builder<'_>>(), self)
+            .map_err(job_store_codec_error)?;
+        Ok(capnp::serialize::write_message_to_words(&message))
+    }
+
+    /// Decodes one job spec from the stable Cap'n Proto store value.
+    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        let reader =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .map_err(job_store_codec_error)?;
+        let record = reader
+            .get_root::<job_record::Reader<'_>>()
+            .map_err(job_store_codec_error)?;
+        read_job_record(record).map_err(job_store_codec_error)
+    }
+}
+
+/// Converts job store-codec errors into the CRDT store error type.
+fn job_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
+    Box::new(crdt_store::error::Error::Other(format!(
+        "job store codec error: {error}"
+    )))
+}
+
 /// Decodes one replicated job record from the internal jobs wire payload.
 fn read_job_record(reader: job_record::Reader<'_>) -> Result<JobSpecValue, Error> {
     let id = read_uuid(reader.get_id()?)?;
@@ -600,5 +631,101 @@ fn workload_phase_exit_code(state: &WorkloadPhase) -> Option<i32> {
         | WorkloadPhase::Stopped
         | WorkloadPhase::Failed
         | WorkloadPhase::Unknown => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::job_store::open_job_store;
+    use crdt_store::uuid_key::UuidKey;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    /// Builds one deterministic resolved execution spec used by job store tests.
+    fn sample_execution() -> ResolvedExecutionSpec {
+        ResolvedExecutionSpec {
+            image: "ghcr.io/demo/job:v1".to_string(),
+            command: vec!["run".to_string()],
+            tty: false,
+            cpu_millis: 250,
+            memory_bytes: 128 * 1024 * 1024,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: Some(30),
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: Vec::new(),
+            placement: Default::default(),
+        }
+    }
+
+    /// Builds one deterministic job spec used by store codec tests.
+    fn sample_job() -> JobSpecValue {
+        let mut job = JobSpecValue::new(
+            Uuid::new_v4(),
+            "demo-job",
+            sample_execution(),
+            ExecutionPlatform::Oci,
+            IsolationMode::Sandboxed,
+            Some("default".to_string()),
+            JobRetryPolicy {
+                max_retries: 2,
+                backoff_secs: 5,
+            },
+        );
+        job.created_at = "2026-03-25T12:00:00Z".to_string();
+        job.updated_at = "2026-03-25T12:01:00Z".to_string();
+        job.phase_version = 3;
+        job.status = JobStatus::Running;
+        job.status_detail = Some("attempt running".to_string());
+        job.active_workload_id = Some(Uuid::new_v4());
+        job.last_workload_id = job.active_workload_id;
+        job.attempts_started = 1;
+        job
+    }
+
+    /// Job specs should round-trip through the Cap'n Proto store-value codec.
+    #[test]
+    fn store_value_codec_roundtrips_job_spec() {
+        let job = sample_job();
+
+        let encoded = job.encode_store_value().expect("encode job store value");
+        let decoded = JobSpecValue::decode_store_value(&encoded).expect("decode job store value");
+
+        assert_eq!(decoded, job);
+    }
+
+    /// Reopening the job store should decode Cap'n Proto MVReg rows from Redb.
+    #[tokio::test]
+    async fn job_store_reopens_capnp_rows() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("job-reopen-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let job = sample_job();
+        let key = UuidKey::from(job.id);
+
+        {
+            let store = open_job_store(db.clone(), actor).expect("open job store");
+            store.upsert(&key, job.clone()).await.expect("upsert job");
+        }
+
+        let reopened = open_job_store(db, actor).expect("reopen job store");
+        reopened
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild job MST");
+        let snapshot = reopened
+            .get_snapshot(&key)
+            .expect("lookup reopened job")
+            .expect("job present");
+
+        assert_eq!(snapshot.as_slice(), &[job]);
     }
 }

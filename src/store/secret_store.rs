@@ -1,6 +1,6 @@
 use crate::secrets::types::SecretValue;
 use crate::store::open::open_arc_store;
-use crdt_store::adapter::MvRegAdapterSorted;
+use crdt_store::adapter::StoreMvRegAdapterSorted;
 use crdt_store::hash::XXHash128;
 use crdt_store::mst_store::CrdtMstStore;
 use crdt_store::table_set::TableSet;
@@ -17,7 +17,7 @@ impl TableSet for SecretTables {
 }
 
 pub type SecretStoreInner =
-    CrdtMstStore<MvRegAdapterSorted<UuidKey, SecretValue, Uuid>, XXHash128, SecretTables>;
+    CrdtMstStore<StoreMvRegAdapterSorted<UuidKey, SecretValue, Uuid>, XXHash128, SecretTables>;
 
 pub type SecretStore = Arc<SecretStoreInner>;
 
