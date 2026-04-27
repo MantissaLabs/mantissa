@@ -38,6 +38,9 @@ use crate::table_set::TableSet;
 /// Default semantic root-schema version used until the caller commits a newer one.
 const DEFAULT_ROOT_SCHEMA_VERSION: u32 = 1;
 
+/// Prefix for per-origin tombstone prune frontier entries in the metadata table.
+const TOMB_PRUNED_META_PREFIX: &str = "tomb_pruned/";
+
 /// Value stored in each MST leaf.
 ///
 /// Active leaves carry a CRDT snapshot. Deleted leaves carry the tombstone sequence and
@@ -124,6 +127,23 @@ fn tombstone_observed_index_key(key_bytes: &[u8], record: &TombstoneRecord) -> V
     out
 }
 
+/// Builds the metadata key for one origin actor's tombstone prune frontier.
+///
+/// The frontier records the highest origin-local tombstone sequence this node has
+/// deliberately forgotten. Future inbound tombstones at or below that sequence can be
+/// ignored because accepting them would recreate GCed delete markers.
+fn tombstone_prune_frontier_key(origin_actor: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut key = String::with_capacity(TOMB_PRUNED_META_PREFIX.len() + origin_actor.len() * 2);
+    key.push_str(TOMB_PRUNED_META_PREFIX);
+    for byte in origin_actor {
+        key.push(char::from(HEX[(byte >> 4) as usize]));
+        key.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    key
+}
+
 /// CRDT + MST store. Parameterized by:
 /// - `C`: a register adapter (MVReg, ORSWOT, etc.)
 /// - `H`: the MST hasher
@@ -203,6 +223,55 @@ where
         Ok(t.get(Self::encode_key(k).as_slice())
             .map_err(into_err)?
             .is_some())
+    }
+
+    /// Returns the highest tombstone sequence deliberately forgotten for an origin actor.
+    ///
+    /// GC advances this frontier after it has purged durable tombstones from one
+    /// origin. Future inbound tombstones at or below the frontier are stale and
+    /// must not recreate the deleted rows.
+    pub fn tombstone_prune_frontier(&self, origin_actor: &[u8]) -> crate::Result<u64> {
+        let r = self.db.begin_read().map_err(into_err)?;
+        let meta = r.open_table(T::meta()).map_err(into_err)?;
+        let frontier_key = tombstone_prune_frontier_key(origin_actor);
+        Ok(meta
+            .get(frontier_key.as_str())
+            .map_err(into_err)?
+            .map(|row| row.value())
+            .unwrap_or(0))
+    }
+
+    /// Advances the tombstone prune frontier for one origin actor.
+    ///
+    /// The frontier is monotonic because lowering it could let an older delete
+    /// marker re-enter the store after GC already decided that sequence was safe
+    /// to forget.
+    pub fn advance_tombstone_prune_frontier(
+        &self,
+        origin_actor: &[u8],
+        sequence: u64,
+    ) -> crate::Result<()> {
+        if sequence == 0 {
+            return Ok(());
+        }
+
+        let w = self.db.begin_write().map_err(into_err)?;
+        {
+            let mut meta = w.open_table(T::meta()).map_err(into_err)?;
+            let frontier_key = tombstone_prune_frontier_key(origin_actor);
+            let current = meta
+                .get(frontier_key.as_str())
+                .map_err(into_err)?
+                .map(|row| row.value())
+                .unwrap_or(0);
+
+            if sequence > current {
+                meta.insert(frontier_key.as_str(), &sequence)
+                    .map_err(into_err)?;
+            }
+        }
+        w.commit().map_err(into_err)?;
+        Ok(())
     }
 
     #[inline]
@@ -756,8 +825,22 @@ where
         let incoming = self.local_tombstone(ts);
         let next_tombstone = {
             let r = self.db.begin_read().map_err(into_err)?;
+            let meta = r.open_table(T::meta()).map_err(into_err)?;
             let tombs = r.open_table(T::tombs()).map_err(into_err)?;
             let kb = Self::encode_key(k);
+            let frontier_key = tombstone_prune_frontier_key(&incoming.origin_actor);
+            let pruned_sequence = meta
+                .get(frontier_key.as_str())
+                .map_err(into_err)?
+                .map(|row| row.value())
+                .unwrap_or(0);
+
+            // If GC has already forgotten this origin sequence, do not recreate
+            // a tombstone row or an MST leaf for it. A frontier of zero means no
+            // pruning has happened for that origin yet.
+            if pruned_sequence > 0 && incoming.sequence <= pruned_sequence {
+                return Ok(());
+            }
 
             // Keep whichever tombstone is newer by sequence, with origin actor as
             // a deterministic tie-breaker. This prevents a stale delete from
@@ -1002,6 +1085,7 @@ where
 
         let r = self.db.begin_read().map_err(into_err)?;
         let values = r.open_table(T::values()).map_err(into_err)?;
+        let meta = r.open_table(T::meta()).map_err(into_err)?;
         let tomb_table = r.open_table(T::tombs()).map_err(into_err)?;
 
         // All tombstones prepared from one inbound chunk share the same local
@@ -1010,6 +1094,20 @@ where
         let observed_at_unix_ms = now_unix_ms();
         let mut out = Vec::with_capacity(tombs.len());
         for (k, incoming) in tombs {
+            let frontier_key = tombstone_prune_frontier_key(&incoming.origin_actor);
+            let pruned_sequence = meta
+                .get(frontier_key.as_str())
+                .map_err(into_err)?
+                .map(|row| row.value())
+                .unwrap_or(0);
+
+            // A tombstone at or below the per-origin prune frontier was already
+            // deliberately forgotten by local GC. Dropping it here prevents an
+            // old peer from reintroducing that delete marker during anti-entropy.
+            if pruned_sequence > 0 && incoming.sequence <= pruned_sequence {
+                continue;
+            }
+
             let kb = Self::encode_key(&k);
             let current_tomb = match tomb_table.get(kb.as_slice()).map_err(into_err)? {
                 Some(row) => Some(Self::decode_tombstone(row.value())?),
@@ -1661,7 +1759,7 @@ impl std::hash::Hasher for HashBytes {
 mod tests {
     use super::*;
     use crate::adapter::{RegAdapter, StoreMvRegAdapterSorted};
-    use crate::codec::{MvRegStoreCodec, StoreRegisterCodec, StoreValueCodec};
+    use crate::codec::{MvRegStoreCodec, StoreRegisterCodec, StoreValueCodec, TombstoneRecord};
     use crate::hash::XXHash128;
     use crate::mvreg::{MvReg, MvRegSnapshot};
     use crate::uuid_key::UuidKey;
@@ -1973,6 +2071,78 @@ mod tests {
         store.apply_tombstone(&k, 10).await.unwrap();
         let root_after = store.root_hex().await;
         assert_eq!(root_after_lower, root_after);
+    }
+
+    #[test]
+    fn tombstone_prune_frontier_advances_monotonically() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+        let origin = <Adapter as RegAdapter>::actor_to_bytes(&actor(2));
+
+        assert_eq!(store.tombstone_prune_frontier(&origin).unwrap(), 0);
+
+        store.advance_tombstone_prune_frontier(&origin, 9).unwrap();
+        store.advance_tombstone_prune_frontier(&origin, 3).unwrap();
+
+        assert_eq!(store.tombstone_prune_frontier(&origin).unwrap(), 9);
+    }
+
+    #[tokio::test]
+    async fn apply_tombstone_ignores_pruned_local_sequence() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+        let origin = <Adapter as RegAdapter>::actor_to_bytes(&actor(1));
+        let k = key(1);
+
+        store.advance_tombstone_prune_frontier(&origin, 10).unwrap();
+        let change_clock_before = store.change_clock();
+
+        store.apply_tombstone(&k, 10).await.unwrap();
+
+        assert!(!store.has_tombstone(&k).unwrap());
+        assert_eq!(store.change_clock(), change_clock_before);
+
+        store.apply_tombstone(&k, 11).await.unwrap();
+        let (_actives, tombs) = store.load_all().unwrap();
+
+        assert_eq!(tombs.len(), 1);
+        assert_eq!(tombs[0].0, k);
+        assert_eq!(tombs[0].1.sequence, 11);
+        assert_eq!(tombs[0].1.origin_actor, origin);
+    }
+
+    #[tokio::test]
+    async fn delta_tombstone_ignores_pruned_remote_sequence() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+        let origin = <Adapter as RegAdapter>::actor_to_bytes(&actor(2));
+        let k = key(1);
+
+        store.advance_tombstone_prune_frontier(&origin, 7).unwrap();
+
+        let stale_tombstone = TombstoneRecord::new(7, origin.clone(), 0);
+        store
+            .apply_delta_chunk_update_mst(Vec::new(), vec![(k.clone(), stale_tombstone)])
+            .await
+            .unwrap();
+
+        assert!(!store.has_tombstone(&k).unwrap());
+
+        let fresh_tombstone = TombstoneRecord::new(8, origin.clone(), 0);
+        store
+            .apply_delta_chunk_update_mst(Vec::new(), vec![(k.clone(), fresh_tombstone)])
+            .await
+            .unwrap();
+        let (_actives, tombs) = store.load_all().unwrap();
+
+        assert_eq!(tombs.len(), 1);
+        assert_eq!(tombs[0].0, k);
+        assert_eq!(tombs[0].1.sequence, 8);
+        assert_eq!(tombs[0].1.origin_actor, origin);
+        assert!(tombs[0].1.observed_at_unix_ms > 0);
     }
 
     #[tokio::test]
