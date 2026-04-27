@@ -22,7 +22,8 @@ use crate::scheduler::service::SchedulerService;
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
-use crate::sync::{SyncRunner, SyncService, SyncStores};
+use crate::store::gc::StoreGcRunner;
+use crate::sync::{SyncGcProgress, SyncRunner, SyncService, SyncStores};
 use crate::task::service::TaskService;
 use crate::topology::{Keys, Topology, TopologyConfig, TopologyDependencies, TopologyStorage};
 use crate::volumes::{VolumeController, VolumeRegistry, VolumeReplicator, VolumesRpc};
@@ -117,6 +118,10 @@ pub struct RuntimeComponents {
     pub network_registry: NetworkRegistry,
     pub volume_registry: VolumeRegistry,
     pub network_controller: NetworkController,
+    pub sync_stores: SyncStores,
+    pub sync_gc_progress: SyncGcProgress,
+    pub cluster_view: ClusterViewState,
+    pub root_schema: RootSchemaState,
 }
 
 /// Fully booted runtime shared by the daemon and headless startup paths.
@@ -417,6 +422,7 @@ async fn build_runtime_components(
         root_schema,
         Some(attachment_sync_notify.clone()),
     );
+    let sync_gc_progress = sync_runner.gc_progress();
     let network_registry = NetworkRegistry::new(
         stores.networks.clone(),
         stores.network_peers.clone(),
@@ -451,7 +457,7 @@ async fn build_runtime_components(
     })?;
     hydrate_topology(&topology).await?;
     let topology_client = capnp_rpc::new_client(topology.clone());
-    let sync_client = build_sync_client(cluster_view, root_schema, sync_stores);
+    let sync_client = build_sync_client(cluster_view.clone(), root_schema, sync_stores.clone());
 
     let local_node_name = resolve_local_node_name(ctx);
     let secret_registry = crate::secrets::registry::SecretRegistry::new(stores.secrets.clone());
@@ -627,6 +633,10 @@ async fn build_runtime_components(
             network_registry,
             volume_registry,
             network_controller,
+            sync_stores,
+            sync_gc_progress,
+            cluster_view,
+            root_schema,
         },
         RuntimeActors {
             runtime_health,
@@ -1030,6 +1040,18 @@ async fn spawn_runtime_tasks(
     tasks.push(tokio::task::spawn_local(async move {
         network_gossiper.run().await;
     }));
+
+    let store_gc_runner = StoreGcRunner::new(
+        components.sync_stores.clone(),
+        components.registry.clone(),
+        components.sync_gc_progress.clone(),
+        components.cluster_view.clone(),
+        components.root_schema,
+        config::store_gc_runtime_config(),
+    );
+    if let Some(task) = store_gc_runner.spawn() {
+        tasks.push(task);
+    }
 
     tasks.push(tokio::task::spawn_local(async move {
         gossip::start(

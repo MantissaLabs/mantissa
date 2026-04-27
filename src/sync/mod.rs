@@ -43,7 +43,7 @@ type EncodedTombstones = Vec<EncodedTombstone>;
 /// Canonical full-sync domain set shared by both client and server sync paths.
 ///
 /// Both client and server treat an empty domain list as "all domains in this order".
-const ALL_DOMAINS: [Domain; 13] = [
+pub const ALL_DOMAINS: [Domain; 13] = [
     Domain::Peers,
     Domain::Workloads,
     Domain::Services,

@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use crdt_store::gc::StoreGcPolicy;
 use net::paths::ensure_state_dir;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::sync::Lazy;
@@ -44,6 +45,76 @@ pub struct StorageConfig {
     pub local_volume_root: Option<String>,
     #[serde(default)]
     pub local_volume_enforce_capacity: bool,
+    #[serde(default)]
+    pub gc: StoreGcConfig,
+}
+
+/// # Description:
+///
+/// Storage garbage collection policy used by the background maintenance loop.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct StoreGcConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_store_gc_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_store_gc_tombstone_min_retention_ms")]
+    pub tombstone_min_retention_ms: u64,
+    #[serde(default = "default_store_gc_tombstone_batch_limit")]
+    pub tombstone_batch_limit: usize,
+    #[serde(default)]
+    pub mvreg_batch_limit: usize,
+    #[serde(default)]
+    pub mvreg_max_values: Option<usize>,
+    #[serde(default = "default_store_gc_stale_peer_rejoin_after_ms")]
+    pub stale_peer_rejoin_after_ms: u64,
+}
+
+impl Default for StoreGcConfig {
+    /// # Description:
+    ///
+    /// Returns conservative store GC defaults for bounded production sweeps.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_ms: default_store_gc_interval_ms(),
+            tombstone_min_retention_ms: default_store_gc_tombstone_min_retention_ms(),
+            tombstone_batch_limit: default_store_gc_tombstone_batch_limit(),
+            mvreg_batch_limit: 0,
+            mvreg_max_values: None,
+            stale_peer_rejoin_after_ms: default_store_gc_stale_peer_rejoin_after_ms(),
+        }
+    }
+}
+
+/// # Description:
+///
+/// Runtime-friendly store GC settings after scalar config values are normalized.
+#[derive(Clone, Debug)]
+pub struct RuntimeStoreGcConfig {
+    pub enabled: bool,
+    pub interval: Duration,
+    pub stale_peer_rejoin_after: Duration,
+    pub policy: StoreGcPolicy,
+}
+
+impl StoreGcConfig {
+    /// # Description:
+    ///
+    /// Converts persisted storage GC settings into runtime durations and store policy knobs.
+    fn as_runtime(&self) -> RuntimeStoreGcConfig {
+        RuntimeStoreGcConfig {
+            enabled: self.enabled,
+            interval: Duration::from_millis(self.interval_ms),
+            stale_peer_rejoin_after: Duration::from_millis(self.stale_peer_rejoin_after_ms),
+            policy: StoreGcPolicy {
+                tombstone_min_retention_ms: self.tombstone_min_retention_ms,
+                tombstone_batch_limit: self.tombstone_batch_limit,
+                mvreg_batch_limit: self.mvreg_batch_limit,
+                mvreg_max_values: self.mvreg_max_values,
+            },
+        }
+    }
 }
 
 /// # Description:
@@ -446,6 +517,21 @@ pub const DEFAULT_NODEPORT_HOST_CAPACITY: usize = 256;
 
 /// # Description:
 ///
+/// Default interval between store GC maintenance passes.
+pub const DEFAULT_STORE_GC_INTERVAL_MS: u64 = 60_000;
+
+/// # Description:
+///
+/// Default minimum local tombstone age before GC can prune it.
+pub const DEFAULT_STORE_GC_TOMBSTONE_MIN_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// # Description:
+///
+/// Default maximum tombstone rows pruned from one domain in one GC pass.
+pub const DEFAULT_STORE_GC_TOMBSTONE_BATCH_LIMIT: usize = 1024;
+
+/// # Description:
+///
 /// Tracks the origin metadata for the current configuration snapshot.
 #[derive(Clone, Debug, Default)]
 pub struct ConfigSource {
@@ -628,6 +714,13 @@ pub fn replication_runtime_config() -> RuntimeReplicationConfig {
 
 /// # Description:
 ///
+/// Resolve the store GC runtime configuration used by the maintenance runner.
+pub fn store_gc_runtime_config() -> RuntimeStoreGcConfig {
+    global_config().storage.gc.as_runtime()
+}
+
+/// # Description:
+///
 /// Resolve whether WireGuard underlay is enabled on this node.
 pub fn wireguard_enabled() -> bool {
     global_config().network.wireguard.enabled
@@ -754,6 +847,34 @@ fn parse_nodeport_source_mode(raw: &str) -> Option<NodePortSourceMode> {
 /// Return a default true value for serde defaults.
 fn default_true() -> bool {
     true
+}
+
+/// # Description:
+///
+/// Returns the default interval between store GC maintenance passes.
+fn default_store_gc_interval_ms() -> u64 {
+    DEFAULT_STORE_GC_INTERVAL_MS
+}
+
+/// # Description:
+///
+/// Returns the default tombstone retention window for replicated store GC.
+fn default_store_gc_tombstone_min_retention_ms() -> u64 {
+    DEFAULT_STORE_GC_TOMBSTONE_MIN_RETENTION_MS
+}
+
+/// # Description:
+///
+/// Returns the default bounded tombstone batch size for one store GC pass.
+fn default_store_gc_tombstone_batch_limit() -> usize {
+    DEFAULT_STORE_GC_TOMBSTONE_BATCH_LIMIT
+}
+
+/// # Description:
+///
+/// Returns the default offline-peer guard window paired with tombstone retention.
+fn default_store_gc_stale_peer_rejoin_after_ms() -> u64 {
+    DEFAULT_STORE_GC_TOMBSTONE_MIN_RETENTION_MS
 }
 
 /// # Description:
@@ -1210,6 +1331,40 @@ impl Config {
             }
         }
 
+        if self.storage.gc.interval_ms == 0 {
+            anyhow::bail!("storage.gc.interval_ms must be greater than zero");
+        }
+
+        if self.storage.gc.tombstone_min_retention_ms == 0 {
+            anyhow::bail!("storage.gc.tombstone_min_retention_ms must be greater than zero");
+        }
+
+        if self.storage.gc.tombstone_batch_limit == 0 {
+            anyhow::bail!("storage.gc.tombstone_batch_limit must be greater than zero");
+        }
+
+        if let Some(max_values) = self.storage.gc.mvreg_max_values
+            && max_values == 0
+        {
+            anyhow::bail!("storage.gc.mvreg_max_values must be greater than zero when set");
+        }
+
+        if self.storage.gc.mvreg_max_values.is_some() && self.storage.gc.mvreg_batch_limit == 0 {
+            anyhow::bail!(
+                "storage.gc.mvreg_batch_limit must be greater than zero when MVReg compaction is enabled"
+            );
+        }
+
+        if self.storage.gc.stale_peer_rejoin_after_ms == 0 {
+            anyhow::bail!("storage.gc.stale_peer_rejoin_after_ms must be greater than zero");
+        }
+
+        if self.storage.gc.stale_peer_rejoin_after_ms > self.storage.gc.tombstone_min_retention_ms {
+            anyhow::bail!(
+                "storage.gc.stale_peer_rejoin_after_ms must be less than or equal to storage.gc.tombstone_min_retention_ms"
+            );
+        }
+
         if self.health.probe_fanout == 0 {
             anyhow::bail!("health.probe_fanout must be greater than zero");
         }
@@ -1453,6 +1608,10 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
         changes.push("storage.local_volume_enforce_capacity".to_string());
     }
 
+    if old.storage.gc != new.storage.gc {
+        changes.push("storage.gc".to_string());
+    }
+
     if old.scheduler.reserved_cpu_millis != new.scheduler.reserved_cpu_millis {
         changes.push("scheduler.reserved_cpu_millis".to_string());
     }
@@ -1556,6 +1715,61 @@ mod tests {
     fn defaults_validate() {
         let config = Config::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn storage_gc_runtime_config_converts_policy() {
+        let mut config = Config::default();
+        config.storage.gc.interval_ms = 5_000;
+        config.storage.gc.tombstone_min_retention_ms = 10_000;
+        config.storage.gc.tombstone_batch_limit = 17;
+        config.storage.gc.mvreg_batch_limit = 9;
+        config.storage.gc.mvreg_max_values = Some(3);
+        config.storage.gc.stale_peer_rejoin_after_ms = 7_000;
+
+        let runtime = config.storage.gc.as_runtime();
+        assert!(runtime.enabled);
+        assert_eq!(runtime.interval, Duration::from_millis(5_000));
+        assert_eq!(
+            runtime.stale_peer_rejoin_after,
+            Duration::from_millis(7_000)
+        );
+        assert_eq!(runtime.policy.tombstone_min_retention_ms, 10_000);
+        assert_eq!(runtime.policy.tombstone_batch_limit, 17);
+        assert_eq!(runtime.policy.mvreg_batch_limit, 9);
+        assert_eq!(runtime.policy.mvreg_max_values, Some(3));
+    }
+
+    #[test]
+    fn rejects_invalid_storage_gc_config() {
+        let mut config = Config::default();
+        config.storage.gc.interval_ms = 0;
+        assert!(config.validate().is_err());
+
+        config = Config::default();
+        config.storage.gc.tombstone_min_retention_ms = 0;
+        assert!(config.validate().is_err());
+
+        config = Config::default();
+        config.storage.gc.tombstone_batch_limit = 0;
+        assert!(config.validate().is_err());
+
+        config = Config::default();
+        config.storage.gc.mvreg_max_values = Some(0);
+        assert!(config.validate().is_err());
+
+        config = Config::default();
+        config.storage.gc.mvreg_max_values = Some(2);
+        config.storage.gc.mvreg_batch_limit = 0;
+        assert!(config.validate().is_err());
+
+        config = Config::default();
+        config.storage.gc.stale_peer_rejoin_after_ms = config
+            .storage
+            .gc
+            .tombstone_min_retention_ms
+            .saturating_add(1);
+        assert!(config.validate().is_err());
     }
 
     #[test]
