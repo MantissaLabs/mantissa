@@ -12,6 +12,7 @@ capnp::generated_code!(pub mod store_capnp);
 pub mod adapter;
 pub mod codec;
 pub mod error;
+pub mod gc;
 pub mod hash;
 pub mod mst_store;
 pub mod mvreg;

@@ -31,8 +31,9 @@ pub mod delta;
 pub mod gc_progress;
 pub mod ranges;
 
+pub use crdt_store::gc::GcBarrier;
 pub use delta::{SyncRunner, SyncTraceContext};
-pub use gc_progress::{GcBarrier, SyncGcProgress};
+pub use gc_progress::SyncGcProgress;
 
 type EncodedRegister = (Vec<u8>, Vec<u8>);
 type EncodedRegisters = Vec<EncodedRegister>;

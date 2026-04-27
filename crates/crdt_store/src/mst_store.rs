@@ -20,7 +20,7 @@
 // base64 used only in debug helpers/tests; prefer fully-qualified calls to avoid unused imports.
 use merkle_search_tree::digest::Hasher as MstHasher;
 use merkle_search_tree::{MerkleSearchTree, builder::Builder};
-use redb::{ReadableDatabase, ReadableTable};
+use redb::{ReadableDatabase, ReadableTable, Table};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
@@ -33,6 +33,7 @@ use tracing::debug;
 use crate::adapter::RegAdapter;
 use crate::codec::{TombstoneRecord, decode_tombstone_row, encode_tombstone_row};
 use crate::error::Error;
+use crate::gc::{GcBarrier, StoreGcPolicy, StoreGcReport};
 use crate::table_set::TableSet;
 
 /// Default semantic root-schema version used until the caller commits a newer one.
@@ -66,6 +67,12 @@ pub type SnapshotsAndTombs<K, S> = (Snapshots<K, S>, Tombstones<K>);
 
 /// Tuple of `(Registers, Tombstones)` returned by delta exporters.
 pub type RegistersAndTombs<K, R> = (Registers<K, R>, Tombstones<K>);
+
+/// Candidate tombstone age-index row selected for one GC pass.
+struct TombstoneGcCandidate {
+    index_key: Vec<u8>,
+    key_bytes: Vec<u8>,
+}
 
 /// In-memory Merkle Search Tree keyed by CRDT register keys for a given adapter.
 type InMemoryMerkleSearchTree<C, H> =
@@ -127,6 +134,21 @@ fn tombstone_observed_index_key(key_bytes: &[u8], record: &TombstoneRecord) -> V
     out
 }
 
+/// Splits an observed-time index key into `(observed_at_unix_ms, raw key bytes)`.
+fn tombstone_observed_index_parts(index_key: &[u8]) -> crate::Result<(u64, &[u8])> {
+    let timestamp_width = std::mem::size_of::<u64>();
+    if index_key.len() < timestamp_width {
+        return Err(Box::new(Error::Other(format!(
+            "tombstone observed index key is too short: {} bytes",
+            index_key.len()
+        ))));
+    }
+
+    let mut timestamp = [0u8; 8];
+    timestamp.copy_from_slice(&index_key[..timestamp_width]);
+    Ok((u64::from_be_bytes(timestamp), &index_key[timestamp_width..]))
+}
+
 /// Builds the metadata key for one origin actor's tombstone prune frontier.
 ///
 /// The frontier records the highest origin-local tombstone sequence this node has
@@ -142,6 +164,31 @@ fn tombstone_prune_frontier_key(origin_actor: &[u8]) -> String {
         key.push(char::from(HEX[(byte & 0x0f) as usize]));
     }
     key
+}
+
+/// Advances one prune frontier inside an existing Redb write transaction.
+fn advance_tombstone_prune_frontier_in_meta(
+    meta: &mut Table<'_, &'static str, u64>,
+    origin_actor: &[u8],
+    sequence: u64,
+) -> crate::Result<()> {
+    if sequence == 0 {
+        return Ok(());
+    }
+
+    let frontier_key = tombstone_prune_frontier_key(origin_actor);
+    let current = meta
+        .get(frontier_key.as_str())
+        .map_err(into_err)?
+        .map(|row| row.value())
+        .unwrap_or(0);
+
+    if sequence > current {
+        meta.insert(frontier_key.as_str(), &sequence)
+            .map_err(into_err)?;
+    }
+
+    Ok(())
 }
 
 /// CRDT + MST store. Parameterized by:
@@ -251,24 +298,10 @@ where
         origin_actor: &[u8],
         sequence: u64,
     ) -> crate::Result<()> {
-        if sequence == 0 {
-            return Ok(());
-        }
-
         let w = self.db.begin_write().map_err(into_err)?;
         {
             let mut meta = w.open_table(T::meta()).map_err(into_err)?;
-            let frontier_key = tombstone_prune_frontier_key(origin_actor);
-            let current = meta
-                .get(frontier_key.as_str())
-                .map_err(into_err)?
-                .map(|row| row.value())
-                .unwrap_or(0);
-
-            if sequence > current {
-                meta.insert(frontier_key.as_str(), &sequence)
-                    .map_err(into_err)?;
-            }
+            advance_tombstone_prune_frontier_in_meta(&mut meta, origin_actor, sequence)?;
         }
         w.commit().map_err(into_err)?;
         Ok(())
@@ -490,6 +523,152 @@ where
     /// Expose the current change counter so callers can detect when cached views are stale.
     pub fn change_clock(&self) -> u64 {
         self.change_clock.load(Ordering::Acquire)
+    }
+
+    /// Garbage-collects tombstones proven safe by an external sync barrier.
+    ///
+    /// The store owns only the local mechanics: scanning the age index, removing
+    /// eligible primary/index rows, advancing the per-origin prune frontier, and
+    /// refreshing the in-memory MST. The caller is responsible for passing a
+    /// barrier built from active peer/root-equality state.
+    pub async fn garbage_collect_tombstones(
+        &self,
+        policy: &StoreGcPolicy,
+        barrier: GcBarrier,
+        now_unix_ms: u64,
+    ) -> crate::Result<StoreGcReport> {
+        let mut report = StoreGcReport::default();
+        if policy.tombstone_batch_limit == 0 {
+            return Ok(report);
+        }
+        if barrier.root_schema_version != self.current_root_schema_version() {
+            return Err(Box::new(Error::Other(format!(
+                "tombstone GC barrier root schema {} does not match current store root schema {}",
+                barrier.root_schema_version,
+                self.current_root_schema_version()
+            ))));
+        }
+
+        let retention_cutoff = now_unix_ms.saturating_sub(policy.tombstone_min_retention_ms);
+        let eligible_before_unix_ms = barrier.safe_observed_before_unix_ms.min(retention_cutoff);
+        let candidates = self.collect_tombstone_gc_candidates(
+            eligible_before_unix_ms,
+            policy.tombstone_batch_limit,
+            &mut report,
+        )?;
+        if candidates.is_empty() {
+            return Ok(report);
+        }
+
+        report.tombstones_pruned =
+            self.prune_tombstone_gc_candidates(&candidates, eligible_before_unix_ms)?;
+        if report.tombstones_pruned > 0 {
+            // The MST crate currently supports upsert but not delete. Rebuild
+            // once per GC batch instead of trying to emulate removal with a
+            // sentinel leaf, which would keep deleted keys in the root.
+            self.rebuild_mst_from_disk().await?;
+            self.bump_change_clock();
+        }
+
+        Ok(report)
+    }
+
+    /// Collects tombstone index rows older than the exclusive GC cutoff.
+    ///
+    /// The age index is ordered by big-endian observed time, so scanning can stop
+    /// as soon as the first non-eligible row is reached.
+    fn collect_tombstone_gc_candidates(
+        &self,
+        eligible_before_unix_ms: u64,
+        batch_limit: usize,
+        report: &mut StoreGcReport,
+    ) -> crate::Result<Vec<TombstoneGcCandidate>> {
+        let r = self.db.begin_read().map_err(into_err)?;
+        let tombs_by_observed = r.open_table(T::tombs_by_observed()).map_err(into_err)?;
+        let mut candidates = Vec::with_capacity(batch_limit.min(1024));
+        let mut it = tombs_by_observed.iter().map_err(into_err)?;
+
+        while candidates.len() < batch_limit {
+            let Some(row) = it.next() else {
+                break;
+            };
+            let (index_key_guard, _) = row.map_err(into_err)?;
+            let index_key = index_key_guard.value();
+            let (observed_at_unix_ms, key_bytes) = tombstone_observed_index_parts(index_key)?;
+            if observed_at_unix_ms >= eligible_before_unix_ms {
+                break;
+            }
+
+            report.tombstones_scanned = report.tombstones_scanned.saturating_add(1);
+            candidates.push(TombstoneGcCandidate {
+                index_key: index_key.to_vec(),
+                key_bytes: key_bytes.to_vec(),
+            });
+        }
+
+        Ok(candidates)
+    }
+
+    /// Removes selected tombstones and advances prune frontiers in one transaction.
+    ///
+    /// Each candidate is verified against the primary tombstone row before
+    /// deletion. If the primary row is missing or now points at a different
+    /// observed-time index key, only the stale secondary index row is removed.
+    fn prune_tombstone_gc_candidates(
+        &self,
+        candidates: &[TombstoneGcCandidate],
+        eligible_before_unix_ms: u64,
+    ) -> crate::Result<usize> {
+        let w = self.db.begin_write().map_err(into_err)?;
+        let mut pruned = 0usize;
+        {
+            let mut tombs = w.open_table(T::tombs()).map_err(into_err)?;
+            let mut tombs_by_observed = w.open_table(T::tombs_by_observed()).map_err(into_err)?;
+            let mut meta = w.open_table(T::meta()).map_err(into_err)?;
+
+            for candidate in candidates {
+                let current = match tombs
+                    .get(candidate.key_bytes.as_slice())
+                    .map_err(into_err)?
+                {
+                    Some(row) => Some(Self::decode_tombstone(row.value())?),
+                    None => None,
+                };
+
+                let Some(record) = current else {
+                    let _ = tombs_by_observed
+                        .remove(candidate.index_key.as_slice())
+                        .map_err(into_err)?;
+                    continue;
+                };
+
+                let expected_index_key =
+                    tombstone_observed_index_key(candidate.key_bytes.as_slice(), &record);
+                if expected_index_key != candidate.index_key
+                    || record.observed_at_unix_ms >= eligible_before_unix_ms
+                {
+                    let _ = tombs_by_observed
+                        .remove(candidate.index_key.as_slice())
+                        .map_err(into_err)?;
+                    continue;
+                }
+
+                let _ = tombs
+                    .remove(candidate.key_bytes.as_slice())
+                    .map_err(into_err)?;
+                let _ = tombs_by_observed
+                    .remove(candidate.index_key.as_slice())
+                    .map_err(into_err)?;
+                advance_tombstone_prune_frontier_in_meta(
+                    &mut meta,
+                    &record.origin_actor,
+                    record.sequence,
+                )?;
+                pruned = pruned.saturating_add(1);
+            }
+        }
+        w.commit().map_err(into_err)?;
+        Ok(pruned)
     }
 
     /// Insert or update value for key `k`.
@@ -1760,6 +1939,7 @@ mod tests {
     use super::*;
     use crate::adapter::{RegAdapter, StoreMvRegAdapterSorted};
     use crate::codec::{MvRegStoreCodec, StoreRegisterCodec, StoreValueCodec, TombstoneRecord};
+    use crate::gc::{GcBarrier, StoreGcPolicy, StoreGcReport};
     use crate::hash::XXHash128;
     use crate::mvreg::{MvReg, MvRegSnapshot};
     use crate::uuid_key::UuidKey;
@@ -1900,6 +2080,23 @@ mod tests {
 
     fn actor(n: u128) -> Uuid {
         Uuid::from_u128(n)
+    }
+
+    fn tombstone_gc_policy(retention_ms: u64, batch_limit: usize) -> StoreGcPolicy {
+        StoreGcPolicy {
+            tombstone_min_retention_ms: retention_ms,
+            tombstone_batch_limit: batch_limit,
+            mvreg_batch_limit: 0,
+            mvreg_max_values: None,
+        }
+    }
+
+    fn tombstone_gc_barrier(safe_observed_before_unix_ms: u64) -> GcBarrier {
+        GcBarrier {
+            safe_observed_before_unix_ms,
+            active_peer_count: 1,
+            root_schema_version: DEFAULT_ROOT_SCHEMA_VERSION,
+        }
     }
 
     fn read_string_field<'a>(bytes: &'a [u8], field: &str) -> crate::Result<(String, &'a [u8])> {
@@ -2143,6 +2340,135 @@ mod tests {
         assert_eq!(tombs[0].1.sequence, 8);
         assert_eq!(tombs[0].1.origin_actor, origin);
         assert!(tombs[0].1.observed_at_unix_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn tombstone_gc_prunes_eligible_rows_and_advances_frontier() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+        let origin = <Adapter as RegAdapter>::actor_to_bytes(&actor(2));
+
+        store
+            .apply_delta_chunk_update_mst(
+                Vec::new(),
+                vec![
+                    (key(1), TombstoneRecord::new(1, origin.clone(), 10)),
+                    (key(2), TombstoneRecord::new(2, origin.clone(), 20)),
+                    (key(3), TombstoneRecord::new(3, origin.clone(), 50)),
+                ],
+            )
+            .await
+            .unwrap();
+        let root_before = store.root_hex().await;
+
+        let report = store
+            .garbage_collect_tombstones(&tombstone_gc_policy(0, 10), tombstone_gc_barrier(30), 100)
+            .await
+            .unwrap();
+        let root_after = store.root_hex().await;
+        let (_actives, mut tombs) = store.load_all().unwrap();
+        tombs.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        assert_eq!(
+            report,
+            StoreGcReport {
+                tombstones_scanned: 2,
+                tombstones_pruned: 2,
+                registers_scanned: 0,
+                registers_compacted: 0,
+            }
+        );
+        assert_eq!(tombs.len(), 1);
+        assert_eq!(tombs[0].0, key(3));
+        assert_eq!(tombs[0].1.sequence, 3);
+        assert_eq!(store.tombstone_prune_frontier(&origin).unwrap(), 2);
+        assert_ne!(root_before, root_after);
+
+        store.rebuild_mst_from_disk().await.unwrap();
+        assert_eq!(root_after, store.root_hex().await);
+
+        let stale_tombstone = TombstoneRecord::new(2, origin.clone(), 0);
+        store
+            .apply_delta_chunk_update_mst(Vec::new(), vec![(key(1), stale_tombstone)])
+            .await
+            .unwrap();
+        assert!(!store.has_tombstone(&key(1)).unwrap());
+
+        let fresh_tombstone = TombstoneRecord::new(4, origin.clone(), 0);
+        store
+            .apply_delta_chunk_update_mst(Vec::new(), vec![(key(1), fresh_tombstone)])
+            .await
+            .unwrap();
+        assert!(store.has_tombstone(&key(1)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn tombstone_gc_respects_retention_and_barrier_boundary() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+        let origin = <Adapter as RegAdapter>::actor_to_bytes(&actor(2));
+
+        store
+            .apply_delta_chunk_update_mst(
+                Vec::new(),
+                vec![
+                    (key(1), TombstoneRecord::new(1, origin.clone(), 10)),
+                    (key(2), TombstoneRecord::new(2, origin.clone(), 20)),
+                    (key(3), TombstoneRecord::new(3, origin.clone(), 90)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let report = store
+            .garbage_collect_tombstones(&tombstone_gc_policy(10, 10), tombstone_gc_barrier(20), 100)
+            .await
+            .unwrap();
+        let (_actives, mut tombs) = store.load_all().unwrap();
+        tombs.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        assert_eq!(report.tombstones_scanned, 1);
+        assert_eq!(report.tombstones_pruned, 1);
+        assert_eq!(
+            tombs.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            vec![key(2), key(3)]
+        );
+        assert_eq!(store.tombstone_prune_frontier(&origin).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn tombstone_gc_honors_batch_limit() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+        let origin = <Adapter as RegAdapter>::actor_to_bytes(&actor(2));
+
+        store
+            .apply_delta_chunk_update_mst(
+                Vec::new(),
+                vec![
+                    (key(1), TombstoneRecord::new(1, origin.clone(), 10)),
+                    (key(2), TombstoneRecord::new(2, origin.clone(), 11)),
+                    (key(3), TombstoneRecord::new(3, origin.clone(), 12)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let report = store
+            .garbage_collect_tombstones(&tombstone_gc_policy(0, 2), tombstone_gc_barrier(100), 100)
+            .await
+            .unwrap();
+        let (_actives, mut tombs) = store.load_all().unwrap();
+        tombs.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        assert_eq!(report.tombstones_scanned, 2);
+        assert_eq!(report.tombstones_pruned, 2);
+        assert_eq!(tombs.len(), 1);
+        assert_eq!(tombs[0].0, key(3));
+        assert_eq!(store.tombstone_prune_frontier(&origin).unwrap(), 2);
     }
 
     #[tokio::test]

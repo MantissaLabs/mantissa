@@ -6,23 +6,13 @@
 //! safe up to the last local time when both sides reported the same MST root.
 
 use crate::cluster::ClusterViewId;
+use crdt_store::gc::GcBarrier;
 use parking_lot::Mutex;
 use protocol::sync::Domain;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
-
-/// Barrier proving all active peers have recently matched one domain root.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GcBarrier {
-    /// Oldest local equal-root observation across the active peer set.
-    pub safe_observed_before_unix_ms: u64,
-    /// Number of peers covered by this barrier, including the local node.
-    pub active_peer_count: usize,
-    /// Root schema version used for the equality observations.
-    pub root_schema_version: u32,
-}
 
 /// In-memory tracker for root-equality observations produced by anti-entropy.
 #[derive(Clone, Debug, Default)]
