@@ -23,6 +23,7 @@ use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
 use crate::store::gc::StoreGcRunner;
+use crate::store::registry::{ReplicatedStoreHandles, replicated_store_registry};
 use crate::sync::{SyncGcProgress, SyncRunner, SyncService, SyncStores};
 use crate::task::service::TaskService;
 use crate::topology::{Keys, Topology, TopologyConfig, TopologyDependencies, TopologyStorage};
@@ -673,12 +674,12 @@ fn build_topology_stores(stores: &BootstrapStores) -> TopologyStorage {
 /// Sync serves and reconciles every replicated domain, so bootstrap assembles
 /// that store set once and hands it to the sync server and client-side runner.
 fn build_sync_stores(stores: &BootstrapStores) -> SyncStores {
-    SyncStores {
+    replicated_store_registry(ReplicatedStoreHandles {
         peers: stores.peers.clone(),
         workloads: stores.workloads.clone(),
+        services: stores.services.clone(),
         jobs: stores.jobs.clone(),
         agents: stores.agents.clone(),
-        services: stores.services.clone(),
         secrets: stores.secrets.clone(),
         networks: stores.networks.clone(),
         network_peers: stores.network_peers.clone(),
@@ -687,7 +688,7 @@ fn build_sync_stores(stores: &BootstrapStores) -> SyncStores {
         volumes: stores.volumes.clone(),
         volume_nodes: stores.volume_nodes.clone(),
         scheduler_digests: stores.scheduler_digests.clone(),
-    }
+    })
 }
 
 /// Builds the gossip capability and dedupe handle.

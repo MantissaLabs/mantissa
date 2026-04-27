@@ -10,19 +10,10 @@
 //! inside one control-plane lineage.
 
 use crate::cluster::{ClusterViewId, ClusterViewState, RootSchemaState};
-use crate::store::agent_store::AgentStore;
-use crate::store::cluster_view_store::ClusterViewDomainStore;
-use crate::store::job_store::JobStore;
-use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
-use crate::store::peer_store::PeersStore;
-use crate::store::scheduler_digest_store::SchedulerDigestStore;
-use crate::store::secret_store::SecretStore;
-use crate::store::service_store::ServiceStore;
-use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
-use crate::store::workload_store::WorkloadStore;
+use crate::store::registry::{
+    EncodedRegister, EncodedRegisters, EncodedTombstone, EncodedTombstones,
+};
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
-use crdt_store::mst_store::{TombstonePruneFrontiers, Tombstones};
-use crdt_store::uuid_key::UuidKey;
 use protocol::sync::{Domain, delta_sink, sync};
 use std::rc::Rc;
 use tracing::{debug, trace};
@@ -31,33 +22,12 @@ pub mod delta;
 pub mod gc_progress;
 pub mod ranges;
 
+pub use crate::store::registry::{
+    REPLICATED_DOMAINS as ALL_DOMAINS, ReplicatedStoreRegistry as SyncStores,
+};
 pub use crdt_store::gc::GcBarrier;
 pub use delta::{SyncRunner, SyncTraceContext};
 pub use gc_progress::SyncGcProgress;
-
-type EncodedRegister = (Vec<u8>, Vec<u8>);
-type EncodedRegisters = Vec<EncodedRegister>;
-type EncodedTombstone = (Vec<u8>, u64, Vec<u8>);
-type EncodedTombstones = Vec<EncodedTombstone>;
-
-/// Canonical full-sync domain set shared by both client and server sync paths.
-///
-/// Both client and server treat an empty domain list as "all domains in this order".
-pub const ALL_DOMAINS: [Domain; 13] = [
-    Domain::Peers,
-    Domain::Workloads,
-    Domain::Services,
-    Domain::Jobs,
-    Domain::Agents,
-    Domain::Secrets,
-    Domain::Networks,
-    Domain::NetworkPeers,
-    Domain::NetworkAttachments,
-    Domain::ClusterViews,
-    Domain::Volumes,
-    Domain::VolumeNodes,
-    Domain::SchedulerDigests,
-];
 
 /// Number of replicated domains exposed through view-scoped sync RPCs.
 pub const VIEW_SCOPED_DOMAIN_COUNT: usize = ALL_DOMAINS.len();
@@ -89,33 +59,17 @@ fn delta_chunk_target_bytes() -> usize {
         .unwrap_or(DEFAULT_DELTA_CHUNK_TARGET_BYTES)
 }
 
+/// Normalizes storage/runtime errors into Cap'n Proto failures for RPC propagation.
+fn to_capnp<E: std::fmt::Display>(e: E) -> capnp::Error {
+    capnp::Error::failed(e.to_string())
+}
+
 #[derive(Clone)]
 /// Cap'n Proto server that exposes all replicated stores through one sync interface.
 pub struct SyncService {
     cluster_view: ClusterViewState,
     root_schema: RootSchemaState,
     stores: SyncStores,
-}
-
-#[derive(Clone)]
-/// Bundle of replicated stores served through `SyncService`.
-///
-/// Keeping the stores grouped here lets topology bootstrap and tests construct the sync
-/// surface without threading ten separate arguments through every call site.
-pub struct SyncStores {
-    pub peers: PeersStore,
-    pub workloads: WorkloadStore,
-    pub jobs: JobStore,
-    pub agents: AgentStore,
-    pub services: ServiceStore,
-    pub secrets: SecretStore,
-    pub networks: NetworkSpecStore,
-    pub network_peers: NetworkPeerStore,
-    pub network_attachments: NetworkAttachmentStore,
-    pub cluster_views: ClusterViewDomainStore,
-    pub volumes: VolumeSpecStore,
-    pub volume_nodes: VolumeNodeStore,
-    pub scheduler_digests: SchedulerDigestStore,
 }
 
 impl SyncService {
@@ -153,163 +107,6 @@ impl SyncService {
         }
         Ok(requested)
     }
-
-    /// Resolves a sync domain to its backing replicated store handle.
-    fn domain_store(&self, domain: Domain) -> DomainStoreRef<'_> {
-        match domain {
-            Domain::Peers => DomainStoreRef::Peers(&self.stores.peers),
-            Domain::Workloads => DomainStoreRef::Workloads(&self.stores.workloads),
-            Domain::Services => DomainStoreRef::Services(&self.stores.services),
-            Domain::Jobs => DomainStoreRef::Jobs(&self.stores.jobs),
-            Domain::Agents => DomainStoreRef::Agents(&self.stores.agents),
-            Domain::Secrets => DomainStoreRef::Secrets(&self.stores.secrets),
-            Domain::Networks => DomainStoreRef::Networks(&self.stores.networks),
-            Domain::NetworkPeers => DomainStoreRef::NetworkPeers(&self.stores.network_peers),
-            Domain::NetworkAttachments => {
-                DomainStoreRef::NetworkAttachments(&self.stores.network_attachments)
-            }
-            Domain::ClusterViews => DomainStoreRef::ClusterViews(&self.stores.cluster_views),
-            Domain::Volumes => DomainStoreRef::Volumes(&self.stores.volumes),
-            Domain::VolumeNodes => DomainStoreRef::VolumeNodes(&self.stores.volume_nodes),
-            Domain::SchedulerDigests => {
-                DomainStoreRef::SchedulerDigests(&self.stores.scheduler_digests)
-            }
-        }
-    }
-}
-
-/// Typed reference to one sync domain's replicated store and diagnostics labels.
-enum DomainStoreRef<'a> {
-    Peers(&'a PeersStore),
-    Workloads(&'a WorkloadStore),
-    Services(&'a ServiceStore),
-    Jobs(&'a JobStore),
-    Agents(&'a AgentStore),
-    Secrets(&'a SecretStore),
-    Networks(&'a NetworkSpecStore),
-    NetworkPeers(&'a NetworkPeerStore),
-    NetworkAttachments(&'a NetworkAttachmentStore),
-    ClusterViews(&'a ClusterViewDomainStore),
-    Volumes(&'a VolumeSpecStore),
-    VolumeNodes(&'a VolumeNodeStore),
-    SchedulerDigests(&'a SchedulerDigestStore),
-}
-
-macro_rules! with_domain_store {
-    ($domain_store:expr, |$store:ident| $body:block) => {
-        match $domain_store {
-            DomainStoreRef::Peers($store) => $body,
-            DomainStoreRef::Workloads($store) => $body,
-            DomainStoreRef::Services($store) => $body,
-            DomainStoreRef::Jobs($store) => $body,
-            DomainStoreRef::Agents($store) => $body,
-            DomainStoreRef::Secrets($store) => $body,
-            DomainStoreRef::Networks($store) => $body,
-            DomainStoreRef::NetworkPeers($store) => $body,
-            DomainStoreRef::NetworkAttachments($store) => $body,
-            DomainStoreRef::ClusterViews($store) => $body,
-            DomainStoreRef::Volumes($store) => $body,
-            DomainStoreRef::VolumeNodes($store) => $body,
-            DomainStoreRef::SchedulerDigests($store) => $body,
-        }
-    };
-}
-
-impl DomainStoreRef<'_> {
-    /// Returns the protocol domain represented by this store reference.
-    fn domain(&self) -> Domain {
-        match self {
-            Self::Peers(_) => Domain::Peers,
-            Self::Workloads(_) => Domain::Workloads,
-            Self::Services(_) => Domain::Services,
-            Self::Jobs(_) => Domain::Jobs,
-            Self::Agents(_) => Domain::Agents,
-            Self::Secrets(_) => Domain::Secrets,
-            Self::Networks(_) => Domain::Networks,
-            Self::NetworkPeers(_) => Domain::NetworkPeers,
-            Self::NetworkAttachments(_) => Domain::NetworkAttachments,
-            Self::ClusterViews(_) => Domain::ClusterViews,
-            Self::Volumes(_) => Domain::Volumes,
-            Self::VolumeNodes(_) => Domain::VolumeNodes,
-            Self::SchedulerDigests(_) => Domain::SchedulerDigests,
-        }
-    }
-
-    /// Builds the diagnostic label used when dumping MST state for one sync phase.
-    fn dump_label(&self, prefix: &str) -> String {
-        format!("{prefix}.{}", domain_debug_label(self.domain()))
-    }
-
-    /// Reads the current MST root digest for this domain at one semantic version.
-    async fn root_digest(&self, root_schema_version: u32) -> Result<[u8; 16], capnp::Error> {
-        with_domain_store!(self, |store| {
-            store
-                .root_digest_at_version(root_schema_version)
-                .await
-                .map_err(|e| capnp::Error::failed(e.to_string()))
-        })
-    }
-
-    /// Loads durable tombstone prune frontiers advertised during the roots phase.
-    fn tombstone_prune_frontiers(&self) -> Result<TombstonePruneFrontiers, capnp::Error> {
-        with_domain_store!(self, |store| {
-            store
-                .load_tombstone_prune_frontiers()
-                .map_err(|e| capnp::Error::failed(e.to_string()))
-        })
-    }
-
-    /// Produces digest ranges for anti-entropy while emitting domain diagnostics.
-    async fn page_range_summary(
-        &self,
-        root_schema_version: u32,
-    ) -> Result<Vec<crdt_store::PageDigestRange>, capnp::Error> {
-        let domain = self.domain();
-        debug!(
-            "getRangesForView: received ({})",
-            domain_debug_label(domain)
-        );
-        let dump_label = self.dump_label("server.before.get_ranges");
-        with_domain_store!(self, |store| {
-            store.debug_dump_root(&dump_label).await;
-            store.debug_dump_ranges(&dump_label, 5).await;
-            store
-                .page_range_summary_at_version(root_schema_version)
-                .await
-                .map_err(|e| capnp::Error::failed(e.to_string()))
-        })
-    }
-
-    /// Exports and encodes delta payloads for the requested ranges.
-    fn export_delta_encoded(
-        &self,
-        want_ranges: &[crdt_store::PageDigestRange],
-    ) -> Result<(EncodedRegisters, EncodedTombstones), capnp::Error> {
-        with_domain_store!(self, |store| {
-            let (regs, tombs) = store
-                .export_page_ranges_delta(want_ranges)
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
-            let regs = store
-                .encode_register_delta(regs)
-                .map_err(|e| capnp::Error::failed(e.to_string()))?;
-            Ok((regs, encode_tombstones(tombs)))
-        })
-    }
-
-    /// Dumps domain-specific diagnostics for an incoming delta request.
-    async fn debug_dump_delta_state(&self) {
-        let domain = self.domain();
-        debug!(
-            target: "delta",
-            "open_delta_for_view: received ({})",
-            domain_debug_label(domain)
-        );
-        let dump_label = self.dump_label("server.before.open_delta");
-        with_domain_store!(self, |store| {
-            store.debug_dump_root(&dump_label).await;
-            store.debug_dump_ranges(&dump_label, 5).await;
-        })
-    }
 }
 
 impl sync::Server for SyncService {
@@ -334,12 +131,18 @@ impl sync::Server for SyncService {
         );
 
         let mut list = results.get().init_roots(VIEW_SCOPED_DOMAIN_COUNT as u32);
-        for (idx, domain) in ALL_DOMAINS.iter().copied().enumerate() {
-            let store = self.domain_store(domain);
-            let root_digest = store.root_digest(requested_root_schema_version).await?;
-            let frontiers = store.tombstone_prune_frontiers()?;
+        for (idx, store) in self.stores.entries().iter().enumerate() {
+            let root_digest = store
+                .store
+                .root_digest_at_version(requested_root_schema_version)
+                .await
+                .map_err(to_capnp)?;
+            let frontiers = store
+                .store
+                .load_tombstone_prune_frontiers()
+                .map_err(to_capnp)?;
             let mut entry = list.reborrow().get(idx as u32);
-            entry.set_domain(domain);
+            entry.set_domain(store.domain);
             entry.set_root_digest(&root_digest);
             active_view.write_capnp(entry.reborrow().init_view());
             entry.set_root_schema_version(requested_root_schema_version);
@@ -391,12 +194,18 @@ impl sync::Server for SyncService {
 
         let mut list = results.get().init_ranges(requested_domains.len() as u32);
         for (idx, domain) in requested_domains.iter().copied().enumerate() {
-            let store = self.domain_store(domain);
+            let store = self.stores.require(domain).map_err(to_capnp)?;
+            debug!("getRangesForView: received ({})", store.label);
+            let dump_label = store.dump_label("server.before.get_ranges");
+            store.store.debug_dump_root(&dump_label).await;
+            store.store.debug_dump_ranges(&dump_label, 5).await;
             let ranges = store
-                .page_range_summary(requested_root_schema_version)
-                .await?;
+                .store
+                .page_range_summary_at_version(requested_root_schema_version)
+                .await
+                .map_err(to_capnp)?;
             let mut entry = list.reborrow().get(idx as u32);
-            entry.set_domain(store.domain());
+            entry.set_domain(store.domain);
             let summary = entry.reborrow().init_summary();
             capnp_fill_ranges(&ranges, summary)?;
             active_view.write_capnp(entry.reborrow().init_view());
@@ -462,11 +271,21 @@ impl sync::Server for SyncService {
             }
 
             // Export only the pages the caller proved it is missing for this domain.
-            let store = self.domain_store(domain);
-            store.debug_dump_delta_state().await;
-            let (regs, tombs) = store.export_delta_encoded(&want_ranges)?;
+            let store = self.stores.require(domain).map_err(to_capnp)?;
+            debug!(
+                target: "delta",
+                "open_delta_for_view: received ({})",
+                store.label
+            );
+            let dump_label = store.dump_label("server.before.open_delta");
+            store.store.debug_dump_root(&dump_label).await;
+            store.store.debug_dump_ranges(&dump_label, 5).await;
+            let (regs, tombs) = store
+                .store
+                .export_delta_encoded(&want_ranges)
+                .map_err(to_capnp)?;
             if send_chunks(
-                domain,
+                store.domain,
                 regs,
                 tombs,
                 active_view,
@@ -486,20 +305,6 @@ impl sync::Server for SyncService {
         sink.end_request().send().promise.await?;
         Ok(())
     }
-}
-
-/// Converts tombstone rows into the compact wire format used by `DeltaChunk.tombs`.
-fn encode_tombstones(tombs: Tombstones<UuidKey>) -> EncodedTombstones {
-    tombs
-        .into_iter()
-        .map(|(k, tombstone)| {
-            (
-                k.as_ref().to_vec(),
-                tombstone.sequence,
-                tombstone.origin_actor,
-            )
-        })
-        .collect()
 }
 
 /// Returns the approximate payload bytes for one encoded register entry.
@@ -638,25 +443,6 @@ async fn send_chunks(
     }
 
     Ok(true)
-}
-
-/// Returns the debug label associated with one sync domain.
-fn domain_debug_label(domain: Domain) -> &'static str {
-    match domain {
-        Domain::Peers => "peers",
-        Domain::Workloads => "workloads",
-        Domain::Services => "services",
-        Domain::Jobs => "jobs",
-        Domain::Agents => "agents",
-        Domain::Secrets => "secrets",
-        Domain::Networks => "networks",
-        Domain::NetworkPeers => "network peers",
-        Domain::NetworkAttachments => "network attachments",
-        Domain::ClusterViews => "cluster views",
-        Domain::Volumes => "volumes",
-        Domain::VolumeNodes => "volume nodes",
-        Domain::SchedulerDigests => "scheduler digests",
-    }
 }
 
 #[cfg(test)]

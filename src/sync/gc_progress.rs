@@ -6,6 +6,7 @@
 //! safe up to the last local time when both sides reported the same MST root.
 
 use crate::cluster::ClusterViewId;
+use crate::store::registry::domain_key;
 use crdt_store::gc::GcBarrier;
 use parking_lot::Mutex;
 use protocol::sync::Domain;
@@ -164,25 +165,6 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
-}
-
-/// Maps a sync domain to a stable compact key used inside the progress map.
-fn domain_key(domain: Domain) -> u16 {
-    match domain {
-        Domain::Peers => 0,
-        Domain::Workloads => 1,
-        Domain::Services => 2,
-        Domain::Jobs => 3,
-        Domain::Agents => 4,
-        Domain::Secrets => 5,
-        Domain::Networks => 6,
-        Domain::NetworkPeers => 7,
-        Domain::NetworkAttachments => 8,
-        Domain::ClusterViews => 9,
-        Domain::Volumes => 10,
-        Domain::VolumeNodes => 11,
-        Domain::SchedulerDigests => 12,
-    }
 }
 
 #[cfg(test)]

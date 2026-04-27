@@ -8,7 +8,8 @@
 use crate::cluster::{ClusterViewState, RootSchemaState};
 use crate::config::RuntimeStoreGcConfig;
 use crate::registry::Registry;
-use crate::sync::{ALL_DOMAINS, SyncGcProgress, SyncStores};
+use crate::store::registry::ReplicatedStoreEntry;
+use crate::sync::{SyncGcProgress, SyncStores};
 use crdt_store::gc::{GcBarrier, StoreGcReport};
 use protocol::sync::Domain;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -107,7 +108,8 @@ impl StoreGcRunner {
             );
         }
 
-        for domain in ALL_DOMAINS {
+        for entry in self.stores.entries() {
+            let domain = entry.domain;
             if let Some(active_remote_peers) = &active_remote_peers {
                 let Some(barrier) = self.progress.barrier_for_domain(
                     active_remote_peers.iter().copied(),
@@ -123,12 +125,12 @@ impl StoreGcRunner {
                         root_schema_version,
                         "skipping tombstone GC without complete sync barrier"
                     );
-                    self.compact_domain_registers_with_trace(domain).await;
+                    self.compact_domain_registers_with_trace(entry).await;
                     continue;
                 };
 
                 match self
-                    .garbage_collect_domain_tombstones(domain, barrier, now_unix_ms)
+                    .garbage_collect_domain_tombstones(entry, barrier, now_unix_ms)
                     .await
                 {
                     Ok(report) => self.trace_domain_report(domain, &report),
@@ -142,140 +144,33 @@ impl StoreGcRunner {
                 }
             }
 
-            self.compact_domain_registers_with_trace(domain).await;
+            self.compact_domain_registers_with_trace(entry).await;
         }
     }
 
     /// Applies store-local tombstone GC to the backing store for one sync domain.
     async fn garbage_collect_domain_tombstones(
         &self,
-        domain: Domain,
+        entry: &ReplicatedStoreEntry,
         barrier: GcBarrier,
         now_unix_ms: u64,
     ) -> crdt_store::Result<StoreGcReport> {
-        let policy = &self.config.policy;
-        match domain {
-            Domain::Peers => {
-                self.stores
-                    .peers
-                    .garbage_collect_tombstones(policy, barrier, now_unix_ms)
-                    .await
-            }
-            Domain::Workloads => {
-                self.stores
-                    .workloads
-                    .garbage_collect_tombstones(policy, barrier, now_unix_ms)
-                    .await
-            }
-            Domain::Services => {
-                self.stores
-                    .services
-                    .garbage_collect_tombstones(policy, barrier, now_unix_ms)
-                    .await
-            }
-            Domain::Jobs => {
-                self.stores
-                    .jobs
-                    .garbage_collect_tombstones(policy, barrier, now_unix_ms)
-                    .await
-            }
-            Domain::Agents => {
-                self.stores
-                    .agents
-                    .garbage_collect_tombstones(policy, barrier, now_unix_ms)
-                    .await
-            }
-            Domain::Secrets => {
-                self.stores
-                    .secrets
-                    .garbage_collect_tombstones(policy, barrier, now_unix_ms)
-                    .await
-            }
-            Domain::Networks => {
-                self.stores
-                    .networks
-                    .garbage_collect_tombstones(policy, barrier, now_unix_ms)
-                    .await
-            }
-            Domain::NetworkPeers => {
-                self.stores
-                    .network_peers
-                    .garbage_collect_tombstones(policy, barrier, now_unix_ms)
-                    .await
-            }
-            Domain::NetworkAttachments => {
-                self.stores
-                    .network_attachments
-                    .garbage_collect_tombstones(policy, barrier, now_unix_ms)
-                    .await
-            }
-            Domain::ClusterViews => {
-                self.stores
-                    .cluster_views
-                    .garbage_collect_tombstones(policy, barrier, now_unix_ms)
-                    .await
-            }
-            Domain::Volumes => {
-                self.stores
-                    .volumes
-                    .garbage_collect_tombstones(policy, barrier, now_unix_ms)
-                    .await
-            }
-            Domain::VolumeNodes => {
-                self.stores
-                    .volume_nodes
-                    .garbage_collect_tombstones(policy, barrier, now_unix_ms)
-                    .await
-            }
-            Domain::SchedulerDigests => {
-                self.stores
-                    .scheduler_digests
-                    .garbage_collect_tombstones(policy, barrier, now_unix_ms)
-                    .await
-            }
-        }
+        entry
+            .store
+            .garbage_collect_tombstones(&self.config.policy, barrier, now_unix_ms)
+            .await
     }
 
     /// Applies register compaction to one sync domain and traces any work done.
-    async fn compact_domain_registers_with_trace(&self, domain: Domain) {
-        match self.compact_domain_registers(domain).await {
-            Ok(report) => self.trace_domain_report(domain, &report),
+    async fn compact_domain_registers_with_trace(&self, entry: &ReplicatedStoreEntry) {
+        match entry.store.compact_registers(&self.config.policy).await {
+            Ok(report) => self.trace_domain_report(entry.domain, &report),
             Err(error) => {
                 error!(
                     target: "store.gc",
-                    ?domain,
+                    domain = ?entry.domain,
                     "register compaction failed: {error}"
                 );
-            }
-        }
-    }
-
-    /// Applies store-local register compaction to the backing store for one sync domain.
-    async fn compact_domain_registers(&self, domain: Domain) -> crdt_store::Result<StoreGcReport> {
-        let policy = &self.config.policy;
-        match domain {
-            Domain::Peers => self.stores.peers.compact_registers(policy).await,
-            Domain::Workloads => self.stores.workloads.compact_registers(policy).await,
-            Domain::Services => self.stores.services.compact_registers(policy).await,
-            Domain::Jobs => self.stores.jobs.compact_registers(policy).await,
-            Domain::Agents => self.stores.agents.compact_registers(policy).await,
-            Domain::Secrets => self.stores.secrets.compact_registers(policy).await,
-            Domain::Networks => self.stores.networks.compact_registers(policy).await,
-            Domain::NetworkPeers => self.stores.network_peers.compact_registers(policy).await,
-            Domain::NetworkAttachments => {
-                self.stores
-                    .network_attachments
-                    .compact_registers(policy)
-                    .await
-            }
-            Domain::ClusterViews => self.stores.cluster_views.compact_registers(policy).await,
-            Domain::Volumes => self.stores.volumes.compact_registers(policy).await,
-            Domain::VolumeNodes => self.stores.volume_nodes.compact_registers(policy).await,
-            Domain::SchedulerDigests => {
-                self.stores
-                    .scheduler_digests
-                    .compact_registers(policy)
-                    .await
             }
         }
     }

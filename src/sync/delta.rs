@@ -6,22 +6,18 @@
 
 use super::{ALL_DOMAINS, SyncStores};
 use crate::cluster::{ClusterViewId, RootSchemaState};
+use crate::store::registry::{EncodedRegisters, EncodedTombstones};
 use crate::sync::gc_progress::SyncGcProgress;
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use capnp_rpc::new_client;
-use crdt_store::adapter::RegAdapter;
-use crdt_store::codec::TombstoneRecord;
-use crdt_store::mst_store::{CrdtMstStore, TombstonePruneFrontiers};
-use crdt_store::{Entry, PageDigestRange, TableSet, compute_want_from_have, uuid_key::UuidKey};
-use merkle_search_tree::digest::Hasher as MstHasher;
+use crdt_store::PageDigestRange;
+use crdt_store::compute_want_from_have;
+use crdt_store::mst_store::TombstonePruneFrontiers;
 use protocol::sync::{self, Domain, delta_chunk, delta_sink};
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tracing::{debug, warn};
-
-type RegisterDelta<C> = Vec<(UuidKey, <C as RegAdapter>::Reg)>;
-type TombstoneDelta = Vec<(UuidKey, TombstoneRecord)>;
 
 /// Root-phase payload for one remote domain, including GC prune-frontier metadata.
 struct RemoteDomainRoot {
@@ -149,260 +145,6 @@ impl SyncRunner {
     }
 }
 
-impl SyncStores {
-    /// Returns the local MST root digest for one domain so the roots phase can skip matches.
-    async fn root_digest(
-        &self,
-        domain: Domain,
-        root_schema_version: u32,
-    ) -> crdt_store::Result<[u8; 16]> {
-        match domain {
-            Domain::Peers => self.peers.root_digest_at_version(root_schema_version).await,
-            Domain::Workloads => {
-                self.workloads
-                    .root_digest_at_version(root_schema_version)
-                    .await
-            }
-            Domain::Services => {
-                self.services
-                    .root_digest_at_version(root_schema_version)
-                    .await
-            }
-            Domain::Jobs => self.jobs.root_digest_at_version(root_schema_version).await,
-            Domain::Agents => {
-                self.agents
-                    .root_digest_at_version(root_schema_version)
-                    .await
-            }
-            Domain::Secrets => {
-                self.secrets
-                    .root_digest_at_version(root_schema_version)
-                    .await
-            }
-            Domain::Networks => {
-                self.networks
-                    .root_digest_at_version(root_schema_version)
-                    .await
-            }
-            Domain::NetworkPeers => {
-                self.network_peers
-                    .root_digest_at_version(root_schema_version)
-                    .await
-            }
-            Domain::NetworkAttachments => {
-                self.network_attachments
-                    .root_digest_at_version(root_schema_version)
-                    .await
-            }
-            Domain::ClusterViews => {
-                self.cluster_views
-                    .root_digest_at_version(root_schema_version)
-                    .await
-            }
-            Domain::Volumes => {
-                self.volumes
-                    .root_digest_at_version(root_schema_version)
-                    .await
-            }
-            Domain::VolumeNodes => {
-                self.volume_nodes
-                    .root_digest_at_version(root_schema_version)
-                    .await
-            }
-            Domain::SchedulerDigests => {
-                self.scheduler_digests
-                    .root_digest_at_version(root_schema_version)
-                    .await
-            }
-        }
-    }
-
-    /// Applies remote tombstone prune frontiers for one local domain store.
-    async fn apply_tombstone_prune_frontiers(
-        &self,
-        domain: Domain,
-        frontiers: TombstonePruneFrontiers,
-    ) -> crdt_store::Result<usize> {
-        match domain {
-            Domain::Peers => self.peers.apply_tombstone_prune_frontiers(frontiers).await,
-            Domain::Workloads => {
-                self.workloads
-                    .apply_tombstone_prune_frontiers(frontiers)
-                    .await
-            }
-            Domain::Services => {
-                self.services
-                    .apply_tombstone_prune_frontiers(frontiers)
-                    .await
-            }
-            Domain::Jobs => self.jobs.apply_tombstone_prune_frontiers(frontiers).await,
-            Domain::Agents => self.agents.apply_tombstone_prune_frontiers(frontiers).await,
-            Domain::Secrets => {
-                self.secrets
-                    .apply_tombstone_prune_frontiers(frontiers)
-                    .await
-            }
-            Domain::Networks => {
-                self.networks
-                    .apply_tombstone_prune_frontiers(frontiers)
-                    .await
-            }
-            Domain::NetworkPeers => {
-                self.network_peers
-                    .apply_tombstone_prune_frontiers(frontiers)
-                    .await
-            }
-            Domain::NetworkAttachments => {
-                self.network_attachments
-                    .apply_tombstone_prune_frontiers(frontiers)
-                    .await
-            }
-            Domain::ClusterViews => {
-                self.cluster_views
-                    .apply_tombstone_prune_frontiers(frontiers)
-                    .await
-            }
-            Domain::Volumes => {
-                self.volumes
-                    .apply_tombstone_prune_frontiers(frontiers)
-                    .await
-            }
-            Domain::VolumeNodes => {
-                self.volume_nodes
-                    .apply_tombstone_prune_frontiers(frontiers)
-                    .await
-            }
-            Domain::SchedulerDigests => {
-                self.scheduler_digests
-                    .apply_tombstone_prune_frontiers(frontiers)
-                    .await
-            }
-        }
-    }
-
-    /// Returns the local digest summary for one domain used to compute missing pages.
-    async fn page_range_summary(
-        &self,
-        domain: Domain,
-        root_schema_version: u32,
-    ) -> crdt_store::Result<Vec<PageDigestRange>> {
-        match domain {
-            Domain::Peers => {
-                self.peers
-                    .page_range_summary_at_version(root_schema_version)
-                    .await
-            }
-            Domain::Workloads => {
-                self.workloads
-                    .page_range_summary_at_version(root_schema_version)
-                    .await
-            }
-            Domain::Services => {
-                self.services
-                    .page_range_summary_at_version(root_schema_version)
-                    .await
-            }
-            Domain::Jobs => {
-                self.jobs
-                    .page_range_summary_at_version(root_schema_version)
-                    .await
-            }
-            Domain::Agents => {
-                self.agents
-                    .page_range_summary_at_version(root_schema_version)
-                    .await
-            }
-            Domain::Secrets => {
-                self.secrets
-                    .page_range_summary_at_version(root_schema_version)
-                    .await
-            }
-            Domain::Networks => {
-                self.networks
-                    .page_range_summary_at_version(root_schema_version)
-                    .await
-            }
-            Domain::NetworkPeers => {
-                self.network_peers
-                    .page_range_summary_at_version(root_schema_version)
-                    .await
-            }
-            Domain::NetworkAttachments => {
-                self.network_attachments
-                    .page_range_summary_at_version(root_schema_version)
-                    .await
-            }
-            Domain::ClusterViews => {
-                self.cluster_views
-                    .page_range_summary_at_version(root_schema_version)
-                    .await
-            }
-            Domain::Volumes => {
-                self.volumes
-                    .page_range_summary_at_version(root_schema_version)
-                    .await
-            }
-            Domain::VolumeNodes => {
-                self.volume_nodes
-                    .page_range_summary_at_version(root_schema_version)
-                    .await
-            }
-            Domain::SchedulerDigests => {
-                self.scheduler_digests
-                    .page_range_summary_at_version(root_schema_version)
-                    .await
-            }
-        }
-    }
-
-    /// Rebuilds every in-memory domain MST using one selected semantic root schema.
-    pub async fn rebuild_msts_for_root_schema_version(
-        &self,
-        root_schema_version: u32,
-    ) -> crdt_store::Result<()> {
-        self.peers
-            .rebuild_mst_from_disk_at_version(root_schema_version)
-            .await?;
-        self.workloads
-            .rebuild_mst_from_disk_at_version(root_schema_version)
-            .await?;
-        self.jobs
-            .rebuild_mst_from_disk_at_version(root_schema_version)
-            .await?;
-        self.agents
-            .rebuild_mst_from_disk_at_version(root_schema_version)
-            .await?;
-        self.services
-            .rebuild_mst_from_disk_at_version(root_schema_version)
-            .await?;
-        self.secrets
-            .rebuild_mst_from_disk_at_version(root_schema_version)
-            .await?;
-        self.networks
-            .rebuild_mst_from_disk_at_version(root_schema_version)
-            .await?;
-        self.network_peers
-            .rebuild_mst_from_disk_at_version(root_schema_version)
-            .await?;
-        self.network_attachments
-            .rebuild_mst_from_disk_at_version(root_schema_version)
-            .await?;
-        self.cluster_views
-            .rebuild_mst_from_disk_at_version(root_schema_version)
-            .await?;
-        self.volumes
-            .rebuild_mst_from_disk_at_version(root_schema_version)
-            .await?;
-        self.volume_nodes
-            .rebuild_mst_from_disk_at_version(root_schema_version)
-            .await?;
-        self.scheduler_digests
-            .rebuild_mst_from_disk_at_version(root_schema_version)
-            .await?;
-        Ok(())
-    }
-}
-
 /// Local sink implementation passed to a remote peer during `open_delta_for_view`.
 ///
 /// The remote peer pushes typed delta chunks into this sink, which decodes them and applies
@@ -426,20 +168,6 @@ impl DeltaSinkImpl {
             expected_root_schema_version,
         }
     }
-}
-
-// Expands one explicit `Domain -> SyncStores field` mapping into the async dispatch that
-// feeds the incoming chunk into the correct replicated store. Keeping the mapping local
-// preserves a readable domain switch without repeating the same `apply_chunk(...).await?`
-// boilerplate for every sync domain.
-macro_rules! apply_domain_chunk {
-    ($stores:expr, $chunk:expr, $domain:expr, {
-        $($variant:ident => $field:ident),+ $(,)?
-    }) => {
-        match $domain {
-            $(Domain::$variant => apply_chunk($stores.$field.clone(), $chunk).await?,)+
-        }
-    };
 }
 
 impl delta_sink::Server for DeltaSinkImpl {
@@ -474,22 +202,15 @@ impl delta_sink::Server for DeltaSinkImpl {
             "received delta chunk"
         );
 
-        // Domain dispatch stays explicit, but the store itself now carries the decoded value type.
-        apply_domain_chunk!(self.stores, &chunk, domain, {
-            Peers => peers,
-            Workloads => workloads,
-            Jobs => jobs,
-            Agents => agents,
-            Services => services,
-            Secrets => secrets,
-            Networks => networks,
-            NetworkPeers => network_peers,
-            NetworkAttachments => network_attachments,
-            ClusterViews => cluster_views,
-            Volumes => volumes,
-            VolumeNodes => volume_nodes,
-            SchedulerDigests => scheduler_digests,
-        });
+        let registers = collect_registers(&chunk)?;
+        let tombstones = collect_tombstones(&chunk)?;
+        self.stores
+            .require(domain)
+            .map_err(to_capnp)?
+            .store
+            .apply_delta_encoded(registers, tombstones)
+            .await
+            .map_err(to_capnp)?;
 
         Ok(())
     }
@@ -504,74 +225,24 @@ impl delta_sink::Server for DeltaSinkImpl {
     }
 }
 
-/// Decodes one streamed chunk and merges it into one typed MST-backed replicated store.
-///
-/// All replicated sync domains in Mantissa are backed by `Arc<CrdtMstStore<...>>` with the
-/// same delta-apply entrypoint, but with different value types and table sets. This helper
-/// targets that shared storage abstraction directly so the delta sink can reuse one generic
-/// path for every domain instead of carrying one wrapper trait impl per store alias.
-///
-/// In the larger sync flow, `push_chunk()` has already validated the chunk's cluster view and
-/// selected the destination store for the reported domain. `apply_chunk()` is the narrow step
-/// that turns the wire payload into typed register/tombstone batches and hands them to the
-/// store's incremental MST update path.
-async fn apply_chunk<C, H, T>(
-    store: Arc<CrdtMstStore<C, H, T>>,
-    chunk: &delta_chunk::Reader<'_>,
-) -> Result<(), capnp::Error>
-where
-    C: RegAdapter<Key = UuidKey, Actor = uuid::Uuid>,
-    H: MstHasher<16, C::Key>
-        + MstHasher<16, Entry<C::Snapshot>>
-        + Default
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    T: TableSet,
-{
-    // Registers and tombstones share the same chunk envelope, but the register payload must be
-    // deserialized by the destination store's CRDT adapter.
-    let regs = decode_register::<C>(chunk)?;
-    let tombs = collect_tombstones::<C>(chunk)?;
-
-    store
-        .apply_delta_chunk_update_mst(regs, tombs)
-        .await
-        .map_err(to_capnp)
-}
-
-/// Extracts tombstone rows from a wire chunk.
-fn collect_tombstones<C>(chunk: &delta_chunk::Reader<'_>) -> Result<TombstoneDelta, capnp::Error>
-where
-    C: RegAdapter<Key = UuidKey>,
-{
+/// Extracts opaque tombstone rows from a wire chunk.
+fn collect_tombstones(chunk: &delta_chunk::Reader<'_>) -> Result<EncodedTombstones, capnp::Error> {
     let mut tombs = Vec::new();
     for entry in chunk.get_tombs()?.iter() {
-        let key =
-            UuidKey::try_from(entry.get_key()?).map_err(|e| capnp::Error::failed(e.to_string()))?;
-        let origin_actor = entry.get_origin_actor().map_err(to_capnp)?.to_vec();
-        let actor = C::actor_from_bytes(&origin_actor).map_err(to_capnp)?;
         tombs.push((
-            key,
-            TombstoneRecord::new(entry.get_ts(), C::actor_to_bytes(&actor), 0),
+            entry.get_key()?.to_vec(),
+            entry.get_ts(),
+            entry.get_origin_actor()?.to_vec(),
         ));
     }
     Ok(tombs)
 }
 
-/// Deserializes register payloads from one wire chunk with the selected domain adapter.
-fn decode_register<C>(chunk: &delta_chunk::Reader<'_>) -> Result<RegisterDelta<C>, capnp::Error>
-where
-    C: RegAdapter<Key = UuidKey>,
-{
+/// Extracts opaque register payloads from one wire chunk.
+fn collect_registers(chunk: &delta_chunk::Reader<'_>) -> Result<EncodedRegisters, capnp::Error> {
     let mut regs = Vec::new();
     for entry in chunk.get_regs()?.iter() {
-        let key =
-            UuidKey::try_from(entry.get_key()?).map_err(|e| capnp::Error::failed(e.to_string()))?;
-        let register =
-            C::decode_reg(entry.get_reg()?).map_err(|e| capnp::Error::failed(e.to_string()))?;
-        regs.push((key, register));
+        regs.push((entry.get_key()?.to_vec(), entry.get_reg()?.to_vec()));
     }
     Ok(regs)
 }
@@ -660,7 +331,7 @@ async fn sync_selected_domains_with_stores(
             }
 
             let local_root = stores
-                .root_digest(*domain, root_schema_version)
+                .root_digest_at_version(*domain, root_schema_version)
                 .await
                 .map_err(to_capnp)?;
             let remote_root = remote_root.map(|root| root.digest);
@@ -718,7 +389,7 @@ async fn sync_selected_domains_with_stores(
             let remote_summary = summary.get_summary()?;
             let remote_ranges = page_ranges_from_capnp(remote_summary)?;
             let local_ranges = stores
-                .page_range_summary(domain, root_schema_version)
+                .page_range_summary_at_version(domain, root_schema_version)
                 .await
                 .map_err(to_capnp)?;
             // Ask the peer only for pages present in its summary but missing locally.
