@@ -112,6 +112,9 @@ struct DomainRoot {
 
   rootSchemaVersion @3 :UInt32 = 1;
   # Semantic root schema version associated with this root.
+
+  tombstonePruneFrontiers @4 :List(TombstonePruneFrontier);
+  # Origin-local tombstone sequences this peer has safely pruned.
 }
 
 struct DomainRangeSummary {
@@ -159,6 +162,14 @@ struct TombItem {
 
   originActor @2 :Data;
   # Stable actor bytes for the node that allocated `ts`.
+}
+
+struct TombstonePruneFrontier {
+  originActor @0 :Data;
+  # Stable actor bytes for the node that allocated the tombstone sequence.
+
+  sequence @1 :UInt64;
+  # Highest origin-local tombstone sequence known to be safely pruned.
 }
 
 struct ViewRequest {

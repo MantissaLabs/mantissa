@@ -2,17 +2,43 @@
 mod common;
 
 use common::testkit::{ClusterConfig, TestNode};
+use crdt_store::adapter::RegAdapter;
 use crdt_store::gc::{GcBarrier, StoreGcPolicy};
+use crdt_store::mvreg::{MvReg, MvRegEntry, VectorClock};
 use crdt_store::uuid_key::UuidKey;
+use mantissa::agents::types::{
+    AgentCheckpointPolicy, AgentInteractionPolicy, AgentRecordValue, AgentSessionSpecValue,
+    AgentSessionStatus, AgentToolPolicy, AgentWorkspacePolicy,
+};
 use mantissa::config::{
     Config, ConfigSource, global_config, global_config_source, set_global_config_with_source,
 };
+use mantissa::jobs::types::{JobRetryPolicy, JobSpecValue, JobStatus};
+use mantissa::network::types::{
+    BpfProgramSpec, NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue,
+    NetworkDriver, NetworkPeerState, NetworkPeerStateValue, NetworkSpecDraft, NetworkSpecValue,
+    NetworkStatus,
+};
 use mantissa::scheduler::digest::SchedulerDigestValue;
+use mantissa::secrets::types::{SecretCiphertext, SecretMetadata, SecretValue, SecretVersion};
+use mantissa::store::agent_store::AgentRegAdapter;
+use mantissa::store::job_store::JobRegAdapter;
+use mantissa::store::network_store::{
+    NetworkAttachmentRegAdapter, NetworkPeerRegAdapter, NetworkSpecRegAdapter,
+};
 use mantissa::store::scheduler_digest_store::{SchedulerDigestStore, open_scheduler_digest_store};
-use mantissa::store::workload_store::WorkloadStore;
+use mantissa::store::secret_store::SecretRegAdapter;
+use mantissa::store::volume_store::{VolumeNodeRegAdapter, VolumeSpecRegAdapter};
+use mantissa::store::workload_store::{WorkloadRegAdapter, WorkloadStore, open_workload_store};
+use mantissa::volumes::types::{
+    LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode,
+    VolumeDriver, VolumeNodeState, VolumeNodeStateValue, VolumeReclaimPolicy, VolumeSpecDraft,
+    VolumeSpecValue, VolumeStatus,
+};
 use mantissa::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadValue, WorkloadValueDraft,
 };
+use mantissa::workload::types::ResolvedExecutionSpec;
 use parking_lot::{Mutex, MutexGuard};
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
@@ -85,6 +111,31 @@ fn open_test_scheduler_digest_store(actor: Uuid) -> (TempDir, SchedulerDigestSto
     (dir, store)
 }
 
+/// Opens one isolated workload store and keeps the database handle available for reopen tests.
+fn open_reopenable_workload_store(actor: Uuid) -> (TempDir, Arc<redb::Database>, WorkloadStore) {
+    let dir = tempfile::tempdir().expect("create workload store tempdir");
+    let db = Arc::new(
+        redb::Database::create(dir.path().join("store.redb"))
+            .expect("create workload redb database"),
+    );
+    let store = open_workload_store(db.clone(), actor).expect("open workload store");
+    (dir, db, store)
+}
+
+/// Opens one isolated scheduler-digest store and keeps the database handle for reopen tests.
+fn open_reopenable_scheduler_digest_store(
+    actor: Uuid,
+) -> (TempDir, Arc<redb::Database>, SchedulerDigestStore) {
+    let dir = tempfile::tempdir().expect("create scheduler digest store tempdir");
+    let db = Arc::new(
+        redb::Database::create(dir.path().join("store.redb"))
+            .expect("create scheduler digest redb database"),
+    );
+    let store =
+        open_scheduler_digest_store(db.clone(), actor).expect("open scheduler digest store");
+    (dir, db, store)
+}
+
 /// Builds one scheduler digest with deterministic rank fields for compaction tests.
 fn scheduler_digest(node_id: Uuid, snapshot_version: u64) -> SchedulerDigestValue {
     SchedulerDigestValue {
@@ -139,6 +190,231 @@ fn workload_value(id: Uuid, node_id: Uuid, version: u64) -> WorkloadValue {
         launch_attempt: version,
         last_terminal_observed_launch: None,
     })
+}
+
+/// Builds the minimal resolved execution spec needed by controller-level value fixtures.
+fn execution_spec() -> ResolvedExecutionSpec {
+    ResolvedExecutionSpec {
+        image: "example/gc-test:latest".to_string(),
+        command: Vec::new(),
+        tty: false,
+        cpu_millis: 100,
+        memory_bytes: 128 * 1024 * 1024,
+        gpu_count: 0,
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        networks: Vec::new(),
+        placement: Default::default(),
+    }
+}
+
+/// Builds one job value with deterministic lifecycle fields for compaction tests.
+fn job_value(id: Uuid, version: u64, status: JobStatus) -> JobSpecValue {
+    let mut value = JobSpecValue::new(
+        id,
+        format!("gc-job-{version}"),
+        execution_spec(),
+        ExecutionPlatform::Oci,
+        IsolationMode::Standard,
+        None,
+        JobRetryPolicy::default(),
+    );
+    value.attempts_started = version as u32;
+    value.phase_version = version;
+    value.status = status;
+    value.updated_at = format!("2026-04-27T00:02:{:02}Z", version % 60);
+    value
+}
+
+/// Builds one agent session record with deterministic lifecycle fields.
+fn agent_session_record(id: Uuid, version: u64, status: AgentSessionStatus) -> AgentRecordValue {
+    let mut value = AgentSessionSpecValue::new(
+        id,
+        format!("gc-agent-{version}"),
+        execution_spec(),
+        ExecutionPlatform::Oci,
+        IsolationMode::Sandboxed,
+        None,
+        AgentWorkspacePolicy::default(),
+        AgentToolPolicy::default(),
+        AgentCheckpointPolicy::default(),
+        AgentInteractionPolicy::default(),
+        None,
+    );
+    value.event_sequence = version;
+    value.phase_version = version;
+    value.status = status;
+    value.updated_at = format!("2026-04-27T00:03:{:02}Z", version % 60);
+    AgentRecordValue::Session(Box::new(value))
+}
+
+/// Builds one network spec value whose total ordering advances with `version`.
+fn network_spec_value(name: &str, version: u32, status: NetworkStatus) -> NetworkSpecValue {
+    let mut value = NetworkSpecValue::new(NetworkSpecDraft {
+        name: name.to_string(),
+        description: format!("network version {version}"),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: format!("10.{version}.0.0/24"),
+        vni: version,
+        mtu: 1450 + version,
+        sealed: false,
+        bpf_programs: vec![BpfProgramSpec::new(format!("program-{version}"))],
+    });
+    value.status = status;
+    value.updated_at = format!("2026-04-27T00:04:{:02}Z", version % 60);
+    value
+}
+
+/// Builds one network peer-state value with deterministic fields.
+fn network_peer_value(
+    network_id: Uuid,
+    peer_id: Uuid,
+    state: NetworkPeerState,
+) -> NetworkPeerStateValue {
+    let mut value = NetworkPeerStateValue::new(network_id, peer_id, "peer", state, None);
+    value.updated_at = "2026-04-27T00:05:00Z".to_string();
+    value
+}
+
+/// Builds one network attachment value with deterministic task revision fields.
+fn network_attachment_value(
+    id: Uuid,
+    task_id: Uuid,
+    network_id: Uuid,
+    version: u64,
+    state: NetworkAttachmentState,
+) -> NetworkAttachmentValue {
+    NetworkAttachmentValue::new(NetworkAttachmentDraft {
+        id,
+        task_id,
+        node_id: Uuid::from_u128(900 + version as u128),
+        instance_id: format!("instance-{version}"),
+        network_id,
+        task_updated_at: Some(format!("2026-04-27T00:06:{:02}Z", version % 60)),
+        requested_ip: None,
+        assigned_ip: Some(format!("10.0.0.{version}")),
+        mac: None,
+        state,
+        error: None,
+        traffic_published: version > 1,
+        service_name: None,
+        template_name: None,
+    })
+}
+
+/// Builds one secret value whose deterministic ordering advances with `version`.
+fn secret_value(name: &str, version: u8) -> SecretValue {
+    let ciphertext = SecretCiphertext {
+        master_key_version: u64::from(version),
+        nonce: [version; 12],
+        ciphertext: vec![version; 4],
+        digest: [version; 32],
+    };
+    let secret_version = SecretVersion::new(
+        Uuid::from_u128(10_000 + u128::from(version)),
+        ciphertext,
+        format!("2026-04-27T00:07:{version:02}Z"),
+        Some(Uuid::from_u128(10)),
+        u64::from(version),
+    );
+    let mut value = SecretValue::new(
+        name,
+        SecretMetadata::default(),
+        "2026-04-27T00:07:00Z",
+        secret_version,
+    );
+    value.touch(format!("2026-04-27T00:08:{version:02}Z"));
+    value
+}
+
+/// Builds one volume spec value whose phase ordering advances with `version`.
+fn volume_spec_value(name: &str, version: u64, status: VolumeStatus) -> VolumeSpecValue {
+    let mut value = VolumeSpecValue::new(VolumeSpecDraft {
+        name: name.to_string(),
+        driver: VolumeDriver::Local(LocalVolumeSpec {
+            source: LocalVolumeSource::Managed,
+            ownership: LocalVolumeOwnership::Daemon,
+        }),
+        access_mode: VolumeAccessMode::ReadWriteOnce,
+        binding_mode: VolumeBindingMode::Immediate,
+        reclaim_policy: VolumeReclaimPolicy::Retain,
+        requested_bytes: Some(version * 1024),
+        labels: Vec::new(),
+        bound_node_id: Some(Uuid::from_u128(11_000 + u128::from(version))),
+        bound_node_name: Some(format!("node-{version}")),
+    });
+    value.volume_epoch = version;
+    value.phase_version = version;
+    value.status = status;
+    value.updated_at = format!("2026-04-27T00:09:{:02}Z", version % 60);
+    value
+}
+
+/// Builds one volume node-state value whose rank advances with lifecycle state.
+fn volume_node_value(
+    volume_id: Uuid,
+    node_id: Uuid,
+    state: VolumeNodeState,
+) -> VolumeNodeStateValue {
+    let mut value = VolumeNodeStateValue::new(
+        volume_id,
+        node_id,
+        "node",
+        Some("/tmp/mantissa-volume".to_string()),
+        state,
+        Some(1024),
+    );
+    value.updated_at = "2026-04-27T00:10:00Z".to_string();
+    value
+}
+
+/// Builds a one-actor vector clock for deterministic MVReg fixtures.
+fn mvreg_clock(actor: Uuid, counter: u64) -> VectorClock<Uuid> {
+    let mut clock = VectorClock::new();
+    clock.apply(actor, counter);
+    clock
+}
+
+/// Builds one explicit MVReg entry for deterministic adapter compaction fixtures.
+fn mvreg_entry<V>(actor: Uuid, counter: u64, value: V) -> MvRegEntry<V, Uuid> {
+    MvRegEntry::new(mvreg_clock(actor, counter), value)
+}
+
+/// Asserts that one domain adapter compacts a two-value register to the expected winner.
+macro_rules! assert_compacts_to_one_value {
+    ($adapter:ty, $older:expr, $newer:expr, |$retained:ident : $retained_ty:ty| $body:block) => {{
+        let dropped_actor = Uuid::from_u128(70_001);
+        let winner_actor = Uuid::from_u128(70_002);
+        let reg = MvReg::from_entries(vec![
+            mvreg_entry(dropped_actor, 1, $older),
+            mvreg_entry(winner_actor, 1, $newer),
+        ]);
+        let compacted = <$adapter as RegAdapter>::compact_reg(reg, 1)
+            .expect("compact domain register")
+            .expect("register should compact");
+
+        assert_eq!(compacted.entries().len(), 1);
+        assert_eq!(
+            compacted.entries()[0].clock().get(&dropped_actor),
+            1,
+            "retained entry should absorb the dropped actor clock"
+        );
+        assert_eq!(
+            compacted.entries()[0].clock().get(&winner_actor),
+            1,
+            "retained entry should keep the winner actor clock"
+        );
+
+        let mut values = compacted.read_values();
+        assert_eq!(values.len(), 1);
+        let $retained: $retained_ty = values.pop().expect("retained compacted value");
+        $body
+    }};
 }
 
 /// Returns a permissive GC policy used by tests that need immediate maintenance passes.
@@ -378,6 +654,123 @@ fn assert_visible_scheduler_versions(
     assert_eq!(versions, expected_versions);
 }
 
+// Every compacting domain adapter should retain the same winner that its registry prefers.
+local_test!(store_compaction_rankers_cover_all_replicated_domains, {
+    let workload_id = Uuid::from_u128(50_001);
+    let workload_node = Uuid::from_u128(50_002);
+    assert_compacts_to_one_value!(
+        WorkloadRegAdapter,
+        workload_value(workload_id, workload_node, 1),
+        workload_value(workload_id, workload_node, 2),
+        |retained: WorkloadValue| {
+            assert_eq!(retained.phase_version, 2);
+            assert_eq!(retained.task_epoch, 2);
+        }
+    );
+
+    let job_id = Uuid::from_u128(50_003);
+    assert_compacts_to_one_value!(
+        JobRegAdapter,
+        job_value(job_id, 1, JobStatus::Pending),
+        job_value(job_id, 2, JobStatus::Failed),
+        |retained: JobSpecValue| {
+            assert_eq!(retained.phase_version, 2);
+            assert_eq!(retained.status, JobStatus::Failed);
+        }
+    );
+
+    let agent_id = Uuid::from_u128(50_004);
+    assert_compacts_to_one_value!(
+        AgentRegAdapter,
+        agent_session_record(agent_id, 1, AgentSessionStatus::WaitingInput),
+        agent_session_record(agent_id, 2, AgentSessionStatus::Closed),
+        |retained: AgentRecordValue| {
+            let AgentRecordValue::Session(session) = retained else {
+                panic!("agent session compaction should retain a session value");
+            };
+            assert_eq!(session.phase_version, 2);
+            assert_eq!(session.event_sequence, 2);
+            assert_eq!(session.status, AgentSessionStatus::Closed);
+        }
+    );
+
+    assert_compacts_to_one_value!(
+        NetworkSpecRegAdapter,
+        network_spec_value("gc-network", 1, NetworkStatus::Pending),
+        network_spec_value("gc-network", 2, NetworkStatus::Ready),
+        |retained: NetworkSpecValue| {
+            assert_eq!(retained.vni, 2);
+            assert_eq!(retained.status, NetworkStatus::Ready);
+        }
+    );
+
+    let network_id = Uuid::from_u128(50_005);
+    let network_peer_id = Uuid::from_u128(50_006);
+    assert_compacts_to_one_value!(
+        NetworkPeerRegAdapter,
+        network_peer_value(network_id, network_peer_id, NetworkPeerState::Configuring),
+        network_peer_value(network_id, network_peer_id, NetworkPeerState::Ready),
+        |retained: NetworkPeerStateValue| {
+            assert_eq!(retained.state, NetworkPeerState::Ready);
+        }
+    );
+
+    let attachment_id = Uuid::from_u128(50_007);
+    let task_id = Uuid::from_u128(50_008);
+    assert_compacts_to_one_value!(
+        NetworkAttachmentRegAdapter,
+        network_attachment_value(
+            attachment_id,
+            task_id,
+            network_id,
+            1,
+            NetworkAttachmentState::Pending,
+        ),
+        network_attachment_value(
+            attachment_id,
+            task_id,
+            network_id,
+            2,
+            NetworkAttachmentState::Removing,
+        ),
+        |retained: NetworkAttachmentValue| {
+            assert_eq!(retained.state, NetworkAttachmentState::Removing);
+            assert!(retained.traffic_published);
+        }
+    );
+
+    assert_compacts_to_one_value!(
+        SecretRegAdapter,
+        secret_value("gc-secret", 1),
+        secret_value("gc-secret", 2),
+        |retained: SecretValue| {
+            assert_eq!(retained.current_version.master_key_version, 2);
+        }
+    );
+
+    assert_compacts_to_one_value!(
+        VolumeSpecRegAdapter,
+        volume_spec_value("gc-volume", 1, VolumeStatus::Pending),
+        volume_spec_value("gc-volume", 2, VolumeStatus::Ready),
+        |retained: VolumeSpecValue| {
+            assert_eq!(retained.phase_version, 2);
+            assert_eq!(retained.volume_epoch, 2);
+            assert_eq!(retained.status, VolumeStatus::Ready);
+        }
+    );
+
+    let volume_id = Uuid::from_u128(50_009);
+    let volume_node_id = Uuid::from_u128(50_010);
+    assert_compacts_to_one_value!(
+        VolumeNodeRegAdapter,
+        volume_node_value(volume_id, volume_node_id, VolumeNodeState::Pending),
+        volume_node_value(volume_id, volume_node_id, VolumeNodeState::Published),
+        |retained: VolumeNodeStateValue| {
+            assert_eq!(retained.state, VolumeNodeState::Published);
+        }
+    );
+});
+
 // Tombstone GC should respect the retention cutoff and make bounded progress by batch.
 local_test!(store_gc_respects_retention_and_batch_limits, {
     let actor = Uuid::from_u128(101);
@@ -429,6 +822,44 @@ local_test!(store_gc_respects_retention_and_batch_limits, {
     assert_eq!(second.tombstones_pruned, 2);
     assert_eq!(third.tombstones_pruned, 1);
     assert_eq!(scheduler_digest_tombstone_count(&store), 0);
+});
+
+// Tombstone GC must reject barriers for incompatible root-schema projections.
+local_test!(store_gc_rejects_mismatched_root_schema_barrier, {
+    let actor = Uuid::from_u128(102);
+    let workload_id = Uuid::from_u128(1_100);
+    let key = UuidKey::from(workload_id);
+    let (_dir, _db, store) = open_reopenable_workload_store(actor);
+
+    store
+        .upsert(&key, workload_value(workload_id, actor, 1))
+        .await
+        .expect("upsert workload before delete");
+    store.remove(&key).await.expect("remove workload");
+    assert_eq!(workload_tombstone_count(&store), 1);
+
+    let rejected = store
+        .garbage_collect_tombstones(
+            &StoreGcPolicy {
+                tombstone_min_retention_ms: 0,
+                tombstone_batch_limit: 16,
+                mvreg_batch_limit: 0,
+                mvreg_max_values: None,
+            },
+            GcBarrier {
+                safe_observed_before_unix_ms: u64::MAX,
+                active_peer_count: 1,
+                root_schema_version: 999,
+            },
+            u64::MAX,
+        )
+        .await;
+
+    assert!(
+        rejected.is_err(),
+        "GC must reject a barrier for a different root-schema projection"
+    );
+    assert_eq!(workload_tombstone_count(&store), 1);
 });
 
 // Tombstone GC should keep converged replicas converged once every replica prunes the row.
@@ -574,6 +1005,106 @@ local_test!(
     }
 );
 
+// Prune frontiers and compacted registers should survive reopening the same Redb database.
+local_test!(store_gc_and_compaction_survive_reopen, {
+    let actor_a = Uuid::from_u128(31);
+    let actor_b = Uuid::from_u128(32);
+    let workload_id = Uuid::from_u128(45);
+    let workload_key = UuidKey::from(workload_id);
+    let (_workload_dir, workload_db, workload_store) = open_reopenable_workload_store(actor_a);
+
+    workload_store
+        .upsert(&workload_key, workload_value(workload_id, actor_a, 1))
+        .await
+        .expect("upsert workload before delete");
+    let tombstone_sequence = workload_store
+        .remove(&workload_key)
+        .await
+        .expect("remove workload before GC");
+    let (_, stale_workload_tombstones) = workload_store
+        .load_all_regs()
+        .expect("capture stale workload tombstone before GC");
+
+    workload_store
+        .garbage_collect_tombstones(
+            &StoreGcPolicy {
+                tombstone_min_retention_ms: 0,
+                tombstone_batch_limit: 16,
+                mvreg_batch_limit: 0,
+                mvreg_max_values: None,
+            },
+            GcBarrier {
+                safe_observed_before_unix_ms: u64::MAX,
+                active_peer_count: 1,
+                root_schema_version: 1,
+            },
+            u64::MAX,
+        )
+        .await
+        .expect("GC workload tombstone");
+    assert_eq!(workload_tombstone_count(&workload_store), 0);
+
+    let reopened_workloads =
+        open_workload_store(workload_db.clone(), actor_a).expect("reopen workload store");
+    reopened_workloads
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild reopened workload MST");
+    assert_eq!(workload_tombstone_count(&reopened_workloads), 0);
+    assert_eq!(
+        reopened_workloads
+            .tombstone_prune_frontier(actor_a.as_bytes())
+            .expect("read reopened workload prune frontier"),
+        tombstone_sequence
+    );
+    reopened_workloads
+        .apply_delta_chunk_update_mst(Vec::new(), stale_workload_tombstones)
+        .await
+        .expect("apply stale workload tombstone after reopen");
+    assert_eq!(workload_tombstone_count(&reopened_workloads), 0);
+
+    let digest_node_id = Uuid::from_u128(46);
+    let digest_key = UuidKey::from(digest_node_id);
+    let (_digest_dir, digest_db, digest_store_a) = open_reopenable_scheduler_digest_store(actor_a);
+    let (_peer_dir, digest_store_b) = open_test_scheduler_digest_store(actor_b);
+
+    digest_store_a
+        .upsert(&digest_key, scheduler_digest(digest_node_id, 1))
+        .await
+        .expect("upsert old digest");
+    digest_store_b
+        .upsert(&digest_key, scheduler_digest(digest_node_id, 2))
+        .await
+        .expect("upsert new digest");
+    replicate_all_scheduler_digest_rows(&digest_store_a, &digest_store_b).await;
+    replicate_all_scheduler_digest_rows(&digest_store_b, &digest_store_a).await;
+    let (stale_digest_registers, _) = digest_store_b
+        .load_all_regs()
+        .expect("capture stale digest registers before compaction");
+
+    digest_store_a
+        .compact_registers(&immediate_gc_policy())
+        .await
+        .expect("compact digest register");
+    assert_visible_scheduler_versions(&digest_store_a, &digest_key, &[2]);
+    let compacted_root = digest_store_a.root_hex().await;
+
+    let reopened_digests =
+        open_scheduler_digest_store(digest_db.clone(), actor_a).expect("reopen digest store");
+    reopened_digests
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild reopened digest MST");
+    assert_eq!(reopened_digests.root_hex().await, compacted_root);
+    assert_visible_scheduler_versions(&reopened_digests, &digest_key, &[2]);
+
+    reopened_digests
+        .apply_delta_chunk_update_mst(stale_digest_registers, Vec::new())
+        .await
+        .expect("apply stale digest register after reopen");
+    assert_visible_scheduler_versions(&reopened_digests, &digest_key, &[2]);
+});
+
 // Background GC should prune replicated tombstones only after a real multi-node convergence barrier.
 local_test!(
     store_gc_background_prunes_workload_tombstones_after_three_node_convergence,
@@ -648,6 +1179,167 @@ local_test!(
         }
     }
 );
+
+// An active but unreachable peer should hold the tombstone barrier until it rejoins and syncs.
+local_test!(
+    store_gc_active_peer_blocks_tombstone_pruning_until_rejoin,
+    {
+        let _config = install_gc_test_config(true, 100, 32, None);
+        let mut cluster = TestNode::new_cluster_inproc_with_config(3, fast_cluster_config(3))
+            .await
+            .expect("start three-node GC cluster");
+        TestNode::assert_cluster_size_all(&cluster, 3, "GC cluster should converge").await;
+        wait_workload_roots_equal_all(&cluster, Duration::from_secs(10))
+            .await
+            .expect("initial workload roots should converge");
+
+        cluster[2].stop().await.expect("stop active peer");
+        cluster[2].node.stop_cluster_background_tasks();
+
+        let rows = workload_batch(3_000, 4, cluster[0].id());
+        cluster[0]
+            .node
+            .workloads
+            .upsert_many(rows.clone())
+            .await
+            .expect("seed workload rows while peer is offline");
+        wait_workload_roots_equal_all(&cluster[..2], Duration::from_secs(10))
+            .await
+            .expect("online peers should converge on seeded workloads");
+
+        for (key, _) in &rows {
+            cluster[0]
+                .node
+                .workloads
+                .remove(key)
+                .await
+                .expect("remove workload row while peer is offline");
+        }
+        wait_workload_roots_equal_all(&cluster[..2], Duration::from_secs(10))
+            .await
+            .expect("online peers should converge on tombstones");
+
+        sleep(Duration::from_millis(500)).await;
+        for node in &cluster[..2] {
+            assert_eq!(
+                workload_tombstone_count(&node.node.workloads),
+                rows.len(),
+                "offline active peer should block tombstone pruning"
+            );
+        }
+
+        cluster[2].start().await.expect("restart active peer");
+        cluster[2].node.ensure_cluster_background_tasks();
+        for node in &cluster {
+            node.node.sync_once_now();
+        }
+
+        TestNode::wait_cluster_size_all(&cluster, 3, Duration::from_secs(10))
+            .await
+            .expect("restarted peer should be visible again");
+
+        let rejoined = wait_until(
+            Duration::from_secs(30),
+            Duration::from_millis(50),
+            || async {
+                for node in &cluster {
+                    node.node.sync_once_now();
+                }
+
+                cluster.iter().all(|node| {
+                    workload_tombstone_count(&node.node.workloads) == 0
+                        && rows.iter().all(|(key, _)| {
+                            !node
+                                .node
+                                .workloads
+                                .exists(key)
+                                .expect("check workload row after active peer rejoin")
+                        })
+                })
+            },
+        )
+        .await;
+        if !rejoined {
+            let mut states = Vec::with_capacity(cluster.len());
+            for node in &cluster {
+                let live_rows = rows
+                    .iter()
+                    .filter(|(key, _)| {
+                        node.node
+                            .workloads
+                            .exists(key)
+                            .expect("check workload row for active peer diagnostics")
+                    })
+                    .count();
+                states.push(format!(
+                    "{} root={} tombstones={} live_rows={}",
+                    &node.id().to_string()[..8],
+                    node.node.workloads.root_hex().await,
+                    workload_tombstone_count(&node.node.workloads),
+                    live_rows
+                ));
+            }
+            panic!(
+                "GC should prune tombstones after the active peer rejoins without reviving rows: {}",
+                states.join(", ")
+            );
+        }
+        wait_workload_roots_equal_all(&cluster, Duration::from_secs(10))
+            .await
+            .expect("workload roots should reconverge after active peer GC");
+    }
+);
+
+// A clean leave removes the departed peer from the active barrier and lets GC proceed.
+local_test!(store_gc_clean_leave_unblocks_tombstone_pruning, {
+    let _config = install_gc_test_config(true, 100, 32, None);
+    let cluster = TestNode::new_cluster_inproc_with_config(3, fast_cluster_config(3))
+        .await
+        .expect("start three-node GC cluster");
+    TestNode::assert_cluster_size_all(&cluster, 3, "GC cluster should converge").await;
+
+    cluster[2].leave().await.expect("third node leaves cleanly");
+    TestNode::wait_cluster_size_all(&cluster[..2], 2, Duration::from_secs(10))
+        .await
+        .expect("remaining nodes should stop counting the left peer as active");
+
+    let rows = workload_batch(4_000, 4, cluster[0].id());
+    cluster[0]
+        .node
+        .workloads
+        .upsert_many(rows.clone())
+        .await
+        .expect("seed workload rows after peer leave");
+    wait_workload_roots_equal_all(&cluster[..2], Duration::from_secs(10))
+        .await
+        .expect("remaining nodes should converge on seeded workloads");
+
+    for (key, _) in &rows {
+        cluster[0]
+            .node
+            .workloads
+            .remove(key)
+            .await
+            .expect("remove workload row after peer leave");
+    }
+    wait_workload_roots_equal_all(&cluster[..2], Duration::from_secs(10))
+        .await
+        .expect("remaining nodes should converge on tombstones");
+
+    assert!(
+        wait_until(
+            Duration::from_secs(15),
+            Duration::from_millis(50),
+            || async {
+                cluster[..2]
+                    .iter()
+                    .all(|node| workload_tombstone_count(&node.node.workloads) == 0)
+            }
+        )
+        .await,
+        "GC should prune tombstones using only the remaining active peers"
+    );
+});
 
 // A ten-node cluster should converge after compacting a heavily concurrent MVReg.
 local_test!(

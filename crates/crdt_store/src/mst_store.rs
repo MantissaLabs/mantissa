@@ -62,6 +62,9 @@ pub type Registers<K, R> = Vec<(K, R)>;
 /// List of `(Key, tombstone metadata)` pairs.
 pub type Tombstones<K> = Vec<(K, TombstoneRecord)>;
 
+/// List of `(origin actor bytes, highest safely pruned tombstone sequence)` pairs.
+pub type TombstonePruneFrontiers = Vec<(Vec<u8>, u64)>;
+
 /// Tuple of `(Snapshots, Tombstones)` returned by bulk loaders.
 pub type SnapshotsAndTombs<K, S> = (Snapshots<K, S>, Tombstones<K>);
 
@@ -173,6 +176,39 @@ fn tombstone_prune_frontier_key(origin_actor: &[u8]) -> String {
         key.push(char::from(HEX[(byte & 0x0f) as usize]));
     }
     key
+}
+
+/// Decodes one hexadecimal actor nibble stored in a prune-frontier metadata key.
+fn decode_actor_hex_nibble(raw: u8) -> crate::Result<u8> {
+    match raw {
+        b'0'..=b'9' => Ok(raw - b'0'),
+        b'a'..=b'f' => Ok(raw - b'a' + 10),
+        b'A'..=b'F' => Ok(raw - b'A' + 10),
+        _ => Err(Box::new(Error::Other(format!(
+            "invalid tombstone prune frontier actor hex byte: {raw}"
+        )))),
+    }
+}
+
+/// Extracts origin actor bytes from one prune-frontier metadata key.
+fn tombstone_prune_frontier_origin_actor(meta_key: &str) -> crate::Result<Option<Vec<u8>>> {
+    let Some(encoded_actor) = meta_key.strip_prefix(TOMB_PRUNED_META_PREFIX) else {
+        return Ok(None);
+    };
+    if encoded_actor.len() % 2 != 0 {
+        return Err(Box::new(Error::Other(format!(
+            "invalid tombstone prune frontier actor length: {}",
+            encoded_actor.len()
+        ))));
+    }
+
+    let mut actor = Vec::with_capacity(encoded_actor.len() / 2);
+    for pair in encoded_actor.as_bytes().chunks_exact(2) {
+        let high = decode_actor_hex_nibble(pair[0])?;
+        let low = decode_actor_hex_nibble(pair[1])?;
+        actor.push((high << 4) | low);
+    }
+    Ok(Some(actor))
 }
 
 /// Advances one prune frontier inside an existing Redb write transaction.
@@ -295,6 +331,107 @@ where
             .map_err(into_err)?
             .map(|row| row.value())
             .unwrap_or(0))
+    }
+
+    /// Loads all durable tombstone prune frontiers for sync with slower peers.
+    pub fn load_tombstone_prune_frontiers(&self) -> crate::Result<TombstonePruneFrontiers> {
+        let r = self.db.begin_read().map_err(into_err)?;
+        let meta = r.open_table(T::meta()).map_err(into_err)?;
+        let mut frontiers = Vec::new();
+        for row in meta.iter().map_err(into_err)? {
+            let (key, sequence) = row.map_err(into_err)?;
+            let Some(origin_actor) = tombstone_prune_frontier_origin_actor(key.value())? else {
+                continue;
+            };
+            let sequence = sequence.value();
+            if sequence > 0 {
+                frontiers.push((origin_actor, sequence));
+            }
+        }
+        Ok(frontiers)
+    }
+
+    /// Applies peer prune frontiers and drops local tombstones proven obsolete by them.
+    ///
+    /// A peer only advertises a frontier after its own barrier allowed pruning, so adopting
+    /// that frontier lets nodes that missed the equal-root pruning window catch up without
+    /// reintroducing already-forgotten delete markers.
+    pub async fn apply_tombstone_prune_frontiers(
+        &self,
+        frontiers: TombstonePruneFrontiers,
+    ) -> crate::Result<usize> {
+        let mut frontier_by_origin: HashMap<Vec<u8>, u64> = HashMap::new();
+        for (origin_actor, sequence) in frontiers {
+            if sequence == 0 {
+                continue;
+            }
+            frontier_by_origin
+                .entry(origin_actor)
+                .and_modify(|current| *current = (*current).max(sequence))
+                .or_insert(sequence);
+        }
+        if frontier_by_origin.is_empty() {
+            return Ok(0);
+        }
+
+        let candidates = {
+            let r = self.db.begin_read().map_err(into_err)?;
+            let tombs = r.open_table(T::tombs()).map_err(into_err)?;
+            let mut candidates = Vec::new();
+            for row in tombs.iter().map_err(into_err)? {
+                let (key, tombstone) = row.map_err(into_err)?;
+                let record = Self::decode_tombstone(tombstone.value())?;
+                if frontier_by_origin
+                    .get(&record.origin_actor)
+                    .is_some_and(|frontier| record.sequence <= *frontier)
+                {
+                    candidates.push(key.value().to_vec());
+                }
+            }
+            candidates
+        };
+
+        let w = self.db.begin_write().map_err(into_err)?;
+        let mut pruned = 0usize;
+        {
+            let mut tombs = w.open_table(T::tombs()).map_err(into_err)?;
+            let mut tombs_by_observed = w.open_table(T::tombs_by_observed()).map_err(into_err)?;
+            let mut meta = w.open_table(T::meta()).map_err(into_err)?;
+
+            for key_bytes in &candidates {
+                let record = {
+                    let Some(row) = tombs.get(key_bytes.as_slice()).map_err(into_err)? else {
+                        continue;
+                    };
+                    Self::decode_tombstone(row.value())?
+                };
+                let should_prune = frontier_by_origin
+                    .get(&record.origin_actor)
+                    .is_some_and(|frontier| record.sequence <= *frontier);
+                if !should_prune {
+                    continue;
+                }
+
+                let index_key = tombstone_observed_index_key(key_bytes.as_slice(), &record);
+                let _ = tombs.remove(key_bytes.as_slice()).map_err(into_err)?;
+                let _ = tombs_by_observed
+                    .remove(index_key.as_slice())
+                    .map_err(into_err)?;
+                pruned = pruned.saturating_add(1);
+            }
+
+            for (origin_actor, sequence) in &frontier_by_origin {
+                advance_tombstone_prune_frontier_in_meta(&mut meta, origin_actor, *sequence)?;
+            }
+        }
+        w.commit().map_err(into_err)?;
+
+        if pruned > 0 {
+            self.rebuild_mst_from_disk().await?;
+            self.bump_change_clock();
+        }
+
+        Ok(pruned)
     }
 
     /// Advances the tombstone prune frontier for one origin actor.
@@ -2625,6 +2762,54 @@ mod tests {
             .await
             .unwrap();
         assert!(store.has_tombstone(&key(1)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn applying_remote_prune_frontier_prunes_matching_local_tombstones() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+        let origin = <Adapter as RegAdapter>::actor_to_bytes(&actor(2));
+
+        store
+            .apply_delta_chunk_update_mst(
+                Vec::new(),
+                vec![
+                    (key(1), TombstoneRecord::new(1, origin.clone(), 10)),
+                    (key(2), TombstoneRecord::new(2, origin.clone(), 20)),
+                    (key(3), TombstoneRecord::new(3, origin.clone(), 30)),
+                ],
+            )
+            .await
+            .unwrap();
+        let root_before = store.root_hex().await;
+
+        let pruned = store
+            .apply_tombstone_prune_frontiers(vec![(origin.clone(), 2)])
+            .await
+            .unwrap();
+        let root_after = store.root_hex().await;
+        let (_actives, mut tombs) = store.load_all().unwrap();
+        tombs.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        assert_eq!(pruned, 2);
+        assert_eq!(store.tombstone_prune_frontier(&origin).unwrap(), 2);
+        assert_eq!(
+            store.load_tombstone_prune_frontiers().unwrap(),
+            vec![(origin.clone(), 2)]
+        );
+        assert_eq!(tombs.len(), 1);
+        assert_eq!(tombs[0].0, key(3));
+        assert_ne!(root_before, root_after);
+
+        store
+            .apply_delta_chunk_update_mst(
+                Vec::new(),
+                vec![(key(1), TombstoneRecord::new(2, origin.clone(), 0))],
+            )
+            .await
+            .unwrap();
+        assert!(!store.has_tombstone(&key(1)).unwrap());
     }
 
     #[tokio::test]

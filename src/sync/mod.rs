@@ -21,7 +21,7 @@ use crate::store::service_store::ServiceStore;
 use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
 use crate::store::workload_store::WorkloadStore;
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
-use crdt_store::mst_store::Tombstones;
+use crdt_store::mst_store::{TombstonePruneFrontiers, Tombstones};
 use crdt_store::uuid_key::UuidKey;
 use protocol::sync::{Domain, delta_sink, sync};
 use std::rc::Rc;
@@ -250,6 +250,15 @@ impl DomainStoreRef<'_> {
         })
     }
 
+    /// Loads durable tombstone prune frontiers advertised during the roots phase.
+    fn tombstone_prune_frontiers(&self) -> Result<TombstonePruneFrontiers, capnp::Error> {
+        with_domain_store!(self, |store| {
+            store
+                .load_tombstone_prune_frontiers()
+                .map_err(|e| capnp::Error::failed(e.to_string()))
+        })
+    }
+
     /// Produces digest ranges for anti-entropy while emitting domain diagnostics.
     async fn page_range_summary(
         &self,
@@ -326,15 +335,22 @@ impl sync::Server for SyncService {
 
         let mut list = results.get().init_roots(VIEW_SCOPED_DOMAIN_COUNT as u32);
         for (idx, domain) in ALL_DOMAINS.iter().copied().enumerate() {
-            let root_digest = self
-                .domain_store(domain)
-                .root_digest(requested_root_schema_version)
-                .await?;
+            let store = self.domain_store(domain);
+            let root_digest = store.root_digest(requested_root_schema_version).await?;
+            let frontiers = store.tombstone_prune_frontiers()?;
             let mut entry = list.reborrow().get(idx as u32);
             entry.set_domain(domain);
             entry.set_root_digest(&root_digest);
             active_view.write_capnp(entry.reborrow().init_view());
             entry.set_root_schema_version(requested_root_schema_version);
+            let mut frontier_list = entry
+                .reborrow()
+                .init_tombstone_prune_frontiers(frontiers.len() as u32);
+            for (frontier_idx, (origin_actor, sequence)) in frontiers.iter().enumerate() {
+                let mut frontier = frontier_list.reborrow().get(frontier_idx as u32);
+                frontier.set_origin_actor(origin_actor);
+                frontier.set_sequence(*sequence);
+            }
         }
 
         Ok(())

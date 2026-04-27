@@ -11,7 +11,7 @@ use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use capnp_rpc::new_client;
 use crdt_store::adapter::RegAdapter;
 use crdt_store::codec::TombstoneRecord;
-use crdt_store::mst_store::CrdtMstStore;
+use crdt_store::mst_store::{CrdtMstStore, TombstonePruneFrontiers};
 use crdt_store::{Entry, PageDigestRange, TableSet, compute_want_from_have, uuid_key::UuidKey};
 use merkle_search_tree::digest::Hasher as MstHasher;
 use protocol::sync::{self, Domain, delta_chunk, delta_sink};
@@ -22,6 +22,13 @@ use tracing::{debug, warn};
 
 type RegisterDelta<C> = Vec<(UuidKey, <C as RegAdapter>::Reg)>;
 type TombstoneDelta = Vec<(UuidKey, TombstoneRecord)>;
+
+/// Root-phase payload for one remote domain, including GC prune-frontier metadata.
+struct RemoteDomainRoot {
+    domain: Domain,
+    digest: [u8; 16],
+    prune_frontiers: TombstonePruneFrontiers,
+}
 
 /// Carries one peer-scoped context for anti-entropy diagnostics.
 #[derive(Clone, Debug)]
@@ -205,6 +212,69 @@ impl SyncStores {
             Domain::SchedulerDigests => {
                 self.scheduler_digests
                     .root_digest_at_version(root_schema_version)
+                    .await
+            }
+        }
+    }
+
+    /// Applies remote tombstone prune frontiers for one local domain store.
+    async fn apply_tombstone_prune_frontiers(
+        &self,
+        domain: Domain,
+        frontiers: TombstonePruneFrontiers,
+    ) -> crdt_store::Result<usize> {
+        match domain {
+            Domain::Peers => self.peers.apply_tombstone_prune_frontiers(frontiers).await,
+            Domain::Workloads => {
+                self.workloads
+                    .apply_tombstone_prune_frontiers(frontiers)
+                    .await
+            }
+            Domain::Services => {
+                self.services
+                    .apply_tombstone_prune_frontiers(frontiers)
+                    .await
+            }
+            Domain::Jobs => self.jobs.apply_tombstone_prune_frontiers(frontiers).await,
+            Domain::Agents => self.agents.apply_tombstone_prune_frontiers(frontiers).await,
+            Domain::Secrets => {
+                self.secrets
+                    .apply_tombstone_prune_frontiers(frontiers)
+                    .await
+            }
+            Domain::Networks => {
+                self.networks
+                    .apply_tombstone_prune_frontiers(frontiers)
+                    .await
+            }
+            Domain::NetworkPeers => {
+                self.network_peers
+                    .apply_tombstone_prune_frontiers(frontiers)
+                    .await
+            }
+            Domain::NetworkAttachments => {
+                self.network_attachments
+                    .apply_tombstone_prune_frontiers(frontiers)
+                    .await
+            }
+            Domain::ClusterViews => {
+                self.cluster_views
+                    .apply_tombstone_prune_frontiers(frontiers)
+                    .await
+            }
+            Domain::Volumes => {
+                self.volumes
+                    .apply_tombstone_prune_frontiers(frontiers)
+                    .await
+            }
+            Domain::VolumeNodes => {
+                self.volume_nodes
+                    .apply_tombstone_prune_frontiers(frontiers)
+                    .await
+            }
+            Domain::SchedulerDigests => {
+                self.scheduler_digests
+                    .apply_tombstone_prune_frontiers(frontiers)
                     .await
             }
         }
@@ -558,20 +628,42 @@ async fn sync_selected_domains_with_stores(
                 .get_domain()
                 .map_err(|_| capnp::Error::failed("unknown domain".into()))?;
             let digest = read_root_digest(entry.get_root_digest()?)?;
-            remote_roots.push((domain, digest));
+            let frontiers_reader = entry.get_tombstone_prune_frontiers()?;
+            let mut prune_frontiers = Vec::with_capacity(frontiers_reader.len() as usize);
+            for frontier in frontiers_reader.iter() {
+                let origin_actor = frontier.get_origin_actor()?.to_vec();
+                let sequence = frontier.get_sequence();
+                if sequence > 0 {
+                    prune_frontiers.push((origin_actor, sequence));
+                }
+            }
+            remote_roots.push(RemoteDomainRoot {
+                domain,
+                digest,
+                prune_frontiers,
+            });
         }
 
         let mut domains_to_sync = Vec::new();
         // Root equality lets us skip the more expensive page-summary walk for matched domains.
         for domain in &requested_domains {
+            let remote_root = remote_roots
+                .iter()
+                .find(|candidate| candidate.domain == *domain);
+            if let Some(remote_root) = remote_root
+                && !remote_root.prune_frontiers.is_empty()
+            {
+                stores
+                    .apply_tombstone_prune_frontiers(*domain, remote_root.prune_frontiers.clone())
+                    .await
+                    .map_err(to_capnp)?;
+            }
+
             let local_root = stores
                 .root_digest(*domain, root_schema_version)
                 .await
                 .map_err(to_capnp)?;
-            let remote_root = remote_roots
-                .iter()
-                .find(|(candidate, _)| candidate == domain)
-                .map(|(_, digest)| *digest);
+            let remote_root = remote_root.map(|root| root.digest);
             match remote_root {
                 Some(remote_root) if remote_root == local_root => {
                     if let Some(ctx) = context.trace.as_ref() {
