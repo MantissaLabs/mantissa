@@ -1,8 +1,9 @@
 use std::io;
+use std::marker::PhantomData;
 use std::{fmt::Debug, hash::Hash};
 
 use crate::codec::{MvRegStoreCodec, StoreActorCodec, StoreRegisterCodec, StoreValueCodec};
-use crate::mvreg::{MvReg, MvRegSnapshot};
+use crate::mvreg::{MvReg, MvRegEntry, MvRegSnapshot};
 use crate::uuid_key::{UuidKey, UuidKeyParseError};
 
 /// Register-centric adapter (works great for MVReg, Orswot, etc.).
@@ -63,13 +64,69 @@ impl From<UuidKeyParseError> for io::Error {
     }
 }
 
-/// Mantissa-owned MVReg adapter backed by Cap'n Proto store rows.
-pub struct StoreMvRegAdapterSorted<K, V, A>(std::marker::PhantomData<(K, V, A)>);
+/// Domain-specific ranker used by generic MVReg adapter compaction.
+pub trait MvRegCompactionRanker<V, A>
+where
+    A: Ord,
+{
+    /// Deterministic durable-state rank used to choose compaction winners.
+    type Rank: Ord;
 
-impl<V, A> RegAdapter for StoreMvRegAdapterSorted<UuidKey, V, A>
+    /// Returns the rank for one active MVReg entry.
+    fn rank(entry: &MvRegEntry<V, A>) -> Self::Rank;
+}
+
+/// Compaction policy plugged into the generic MVReg adapter.
+pub trait MvRegCompactionPolicy<V, A>
+where
+    A: Ord,
+{
+    /// Returns a compacted register when this policy wants to rewrite the row.
+    fn compact(reg: MvReg<V, A>, max_values: usize) -> crate::Result<Option<MvReg<V, A>>>;
+}
+
+/// Default no-op compaction policy for domains that have not opted in.
+pub struct NoMvRegCompaction;
+
+impl<V, A> MvRegCompactionPolicy<V, A> for NoMvRegCompaction
+where
+    A: Ord,
+{
+    /// Leaves registers unchanged when a domain has no explicit compaction rank.
+    fn compact(_reg: MvReg<V, A>, _max_values: usize) -> crate::Result<Option<MvReg<V, A>>> {
+        Ok(None)
+    }
+}
+
+/// MVReg compaction policy that keeps the highest-ranked entries.
+pub struct RankedMvRegCompaction<R>(PhantomData<R>);
+
+impl<V, A, R> MvRegCompactionPolicy<V, A> for RankedMvRegCompaction<R>
+where
+    V: Clone + Ord,
+    A: Clone + Ord,
+    R: MvRegCompactionRanker<V, A>,
+{
+    /// Compacts the register using the ranker and lets MVReg absorb dropped clocks.
+    fn compact(mut reg: MvReg<V, A>, max_values: usize) -> crate::Result<Option<MvReg<V, A>>> {
+        Ok(reg
+            .compact_with(max_values, |entry| R::rank(entry))
+            .then_some(reg))
+    }
+}
+
+/// Convenience alias for the generic adapter with ranked MVReg compaction enabled.
+pub type CompactingStoreMvRegAdapterSorted<K, V, A, R> =
+    StoreMvRegAdapterSorted<K, V, A, RankedMvRegCompaction<R>>;
+
+/// Mantissa-owned MVReg adapter backed by Cap'n Proto store rows.
+pub struct StoreMvRegAdapterSorted<K, V, A, C = NoMvRegCompaction>(PhantomData<(K, V, A, C)>);
+
+impl<V, A, C> RegAdapter for StoreMvRegAdapterSorted<UuidKey, V, A, C>
 where
     V: Clone + Debug + Hash + Ord + StoreValueCodec,
     A: StoreActorCodec + Hash + Debug,
+    C: MvRegCompactionPolicy<V, A>,
 {
     type Key = UuidKey;
     type Actor = A;
@@ -109,6 +166,10 @@ where
 
     fn decode_reg(bytes: &[u8]) -> crate::Result<Self::Reg> {
         MvRegStoreCodec::<V, A>::decode_store_reg(bytes)
+    }
+
+    fn compact_reg(reg: Self::Reg, max_values: usize) -> crate::Result<Option<Self::Reg>> {
+        C::compact(reg, max_values)
     }
 
     fn merge_regs(current: Option<Self::Reg>, incoming: Self::Reg) -> Self::Reg {

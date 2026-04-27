@@ -22,7 +22,14 @@ impl TableSet for PeerTables {
     const META: &'static str = "peer_meta";
 }
 
-/// Peer-specific MVReg adapter that excludes sync-support metadata from MST snapshots.
+/// Peer-specific MVReg adapter with a custom root-visible projection.
+///
+/// Most MVReg-backed domains can use `StoreMvRegAdapterSorted` and only provide
+/// a compaction rank when they want GC to drop older concurrent values. Peers
+/// are different: the durable `PeerValue` contains fields that are intentionally
+/// omitted or version-gated in `PeerRootSnapshot` so older binaries can keep
+/// negotiating stable MST roots. If peer compaction is enabled later, add that
+/// ranking to this adapter instead of replacing it with the generic adapter.
 pub struct PeerRegAdapter;
 
 impl RegAdapter for PeerRegAdapter {
