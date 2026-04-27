@@ -18,6 +18,7 @@ use crate::{
         bootstrap::{BootedRuntime, BootstrapContext, BootstrapOptions, RuntimeTaskHandles, boot},
     },
     services::ServiceController,
+    store::scheduler_digest_store::SchedulerDigestStore,
     workload::manager::{WorkloadManager, WorkloadRuntimeConfig},
 };
 use net::noise::NoiseKeys;
@@ -125,6 +126,7 @@ pub struct HeadlessNode {
     pub jobs: crate::store::job_store::JobStore,
     pub agents: crate::store::agent_store::AgentStore,
     pub services: crate::store::service_store::ServiceStore,
+    pub scheduler_digests: SchedulerDigestStore,
     pub local_sessions: crate::store::local::LocalSessionStore,
     pub local_creds: crate::store::local::LocalCredentialStore,
 
@@ -280,6 +282,7 @@ impl HeadlessNode {
             jobs: stores.jobs.clone(),
             agents: stores.agents.clone(),
             services: stores.services.clone(),
+            scheduler_digests: stores.scheduler_digests.clone(),
             local_sessions: stores.local_sessions.clone(),
             local_creds: stores.local_creds.clone(),
             _db: db,
