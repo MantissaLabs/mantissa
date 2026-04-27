@@ -74,6 +74,15 @@ struct TombstoneGcCandidate {
     key_bytes: Vec<u8>,
 }
 
+/// Candidate register row selected for one compaction pass.
+struct RegisterCompactionCandidate<C: RegAdapter> {
+    key_bytes: Vec<u8>,
+    original_reg_bytes: Vec<u8>,
+    key: C::Key,
+    reg: C::Reg,
+    snapshot: C::Snapshot,
+}
+
 /// In-memory Merkle Search Tree keyed by CRDT register keys for a given adapter.
 type InMemoryMerkleSearchTree<C, H> =
     MerkleSearchTree<<C as RegAdapter>::Key, Entry<<C as RegAdapter>::Snapshot>, H>;
@@ -573,6 +582,50 @@ where
         Ok(report)
     }
 
+    /// Compacts register rows according to the adapter's opt-in policy.
+    ///
+    /// This store-level pass owns only the generic mechanics: scan value rows,
+    /// ask the adapter whether each decoded register should be rewritten, commit
+    /// bounded rewrites, and update the in-memory MST leaves. Domain-specific
+    /// decisions about which MVReg values can be dropped belong in
+    /// `RegAdapter::compact_reg`.
+    pub async fn compact_registers(&self, policy: &StoreGcPolicy) -> crate::Result<StoreGcReport> {
+        let mut report = StoreGcReport::default();
+        let Some(max_values) = policy.mvreg_max_values else {
+            return Ok(report);
+        };
+        if max_values == 0 || policy.mvreg_batch_limit == 0 {
+            return Ok(report);
+        }
+
+        let candidates = self.collect_register_compaction_candidates(
+            max_values,
+            policy.mvreg_batch_limit,
+            &mut report,
+        )?;
+        if candidates.is_empty() {
+            return Ok(report);
+        }
+
+        let applied = self.write_register_compaction_candidates(&candidates)?;
+        if applied.is_empty() {
+            return Ok(report);
+        }
+
+        report.registers_compacted = applied.len();
+        let mut tree = self.mst.write().await;
+        for index in applied {
+            let candidate = &candidates[index];
+            tree.upsert(
+                candidate.key.clone(),
+                &Entry::Active(candidate.snapshot.clone()),
+            );
+        }
+        self.bump_change_clock();
+
+        Ok(report)
+    }
+
     /// Collects tombstone index rows older than the exclusive GC cutoff.
     ///
     /// The age index is ordered by big-endian observed time, so scanning can stop
@@ -607,6 +660,86 @@ where
         }
 
         Ok(candidates)
+    }
+
+    /// Collects value rows whose adapter wants to compact their decoded register.
+    ///
+    /// The batch limit bounds rows inspected, not just rows rewritten. This keeps
+    /// a pass predictable even when most domains use the default no-op adapter
+    /// hook or most registers are already within policy.
+    fn collect_register_compaction_candidates(
+        &self,
+        max_values: usize,
+        batch_limit: usize,
+        report: &mut StoreGcReport,
+    ) -> crate::Result<Vec<RegisterCompactionCandidate<C>>> {
+        let r = self.db.begin_read().map_err(into_err)?;
+        let values = r.open_table(T::values()).map_err(into_err)?;
+        let mut candidates = Vec::new();
+        let mut it = values.iter().map_err(into_err)?;
+
+        while report.registers_scanned < batch_limit {
+            let Some(row) = it.next() else {
+                break;
+            };
+            let (key_guard, reg_guard) = row.map_err(into_err)?;
+            let key_bytes = key_guard.value().to_vec();
+            let original_reg_bytes = reg_guard.value().to_vec();
+            let key = Self::decode_key(&key_bytes)?;
+            let reg = Self::decode_reg(&original_reg_bytes)?;
+            report.registers_scanned = report.registers_scanned.saturating_add(1);
+
+            let Some(compacted) = C::compact_reg(reg, max_values)? else {
+                continue;
+            };
+            let snapshot = self.snapshot_reg_for_current_version(&compacted);
+            candidates.push(RegisterCompactionCandidate {
+                key_bytes,
+                original_reg_bytes,
+                key,
+                reg: compacted,
+                snapshot,
+            });
+        }
+
+        Ok(candidates)
+    }
+
+    /// Writes compacted register candidates whose source rows have not changed.
+    ///
+    /// Compaction scans through a read transaction and rewrites later in a write
+    /// transaction. Verifying the original row bytes avoids overwriting a newer
+    /// upsert or sync merge that committed between those two phases.
+    fn write_register_compaction_candidates(
+        &self,
+        candidates: &[RegisterCompactionCandidate<C>],
+    ) -> crate::Result<Vec<usize>> {
+        let w = self.db.begin_write().map_err(into_err)?;
+        let mut applied = Vec::new();
+        {
+            let mut values = w.open_table(T::values()).map_err(into_err)?;
+            for (index, candidate) in candidates.iter().enumerate() {
+                let current_matches = match values
+                    .get(candidate.key_bytes.as_slice())
+                    .map_err(into_err)?
+                {
+                    Some(current) => current.value() == candidate.original_reg_bytes.as_slice(),
+                    None => false,
+                };
+                if !current_matches {
+                    continue;
+                }
+
+                let encoded = Self::encode_reg(&candidate.reg)?;
+                values
+                    .insert(candidate.key_bytes.as_slice(), encoded.as_slice())
+                    .map_err(into_err)?;
+                applied.push(index);
+            }
+        }
+        w.commit().map_err(into_err)?;
+
+        Ok(applied)
     }
 
     /// Removes selected tombstones and advances prune frontiers in one transaction.
@@ -1941,7 +2074,7 @@ mod tests {
     use crate::codec::{MvRegStoreCodec, StoreRegisterCodec, StoreValueCodec, TombstoneRecord};
     use crate::gc::{GcBarrier, StoreGcPolicy, StoreGcReport};
     use crate::hash::XXHash128;
-    use crate::mvreg::{MvReg, MvRegSnapshot};
+    use crate::mvreg::{MvReg, MvRegEntry, MvRegSnapshot, VectorClock};
     use crate::uuid_key::UuidKey;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -2066,6 +2199,70 @@ mod tests {
         }
     }
 
+    struct CompactingAdapter;
+
+    impl RegAdapter for CompactingAdapter {
+        type Key = UuidKey;
+        type Actor = Uuid;
+        type Reg = MvReg<String, Uuid>;
+        type Value = String;
+        type Snapshot = MvRegSnapshot<String>;
+
+        fn upsert_reg(
+            current: Option<Self::Reg>,
+            actor: &Self::Actor,
+            v: Self::Value,
+        ) -> Self::Reg {
+            let mut reg = current.unwrap_or_default();
+            reg.write(*actor, v);
+            reg
+        }
+
+        fn snapshot_reg(reg: &Self::Reg) -> Self::Snapshot {
+            reg.snapshot()
+        }
+
+        fn key_to_bytes(k: &Self::Key) -> Vec<u8> {
+            k.as_ref().to_vec()
+        }
+
+        fn key_from_bytes(b: &[u8]) -> std::io::Result<Self::Key> {
+            UuidKey::try_from(b).map_err(Into::into)
+        }
+
+        fn actor_to_bytes(actor: &Self::Actor) -> Vec<u8> {
+            actor.as_bytes().to_vec()
+        }
+
+        fn actor_from_bytes(bytes: &[u8]) -> std::io::Result<Self::Actor> {
+            Uuid::from_slice(bytes).map_err(|error| std::io::Error::other(error.to_string()))
+        }
+
+        fn encode_reg(reg: &Self::Reg) -> crate::Result<Vec<u8>> {
+            MvRegStoreCodec::<String, Uuid>::encode_store_reg(reg)
+        }
+
+        fn decode_reg(bytes: &[u8]) -> crate::Result<Self::Reg> {
+            MvRegStoreCodec::<String, Uuid>::decode_store_reg(bytes)
+        }
+
+        fn compact_reg(mut reg: Self::Reg, max_values: usize) -> crate::Result<Option<Self::Reg>> {
+            Ok(reg
+                .compact_with(max_values, |entry| entry.value().clone())
+                .then_some(reg))
+        }
+
+        fn merge_regs(current: Option<Self::Reg>, incoming: Self::Reg) -> Self::Reg {
+            match current {
+                Some(mut current) => {
+                    current.merge(incoming);
+                    current
+                }
+                None => incoming,
+            }
+        }
+    }
+
     fn temp_db() -> (TempDir, Arc<redb::Database>) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mst.redb");
@@ -2082,12 +2279,39 @@ mod tests {
         Uuid::from_u128(n)
     }
 
+    fn clock(actor: Uuid, counter: u64) -> VectorClock<Uuid> {
+        let mut clock = VectorClock::new();
+        clock.apply(actor, counter);
+        clock
+    }
+
+    fn reg_entry(actor: Uuid, counter: u64, value: &str) -> MvRegEntry<String, Uuid> {
+        MvRegEntry::new(clock(actor, counter), value.to_string())
+    }
+
+    fn concurrent_reg(values: &[(u128, u64, &str)]) -> MvReg<String, Uuid> {
+        let entries = values
+            .iter()
+            .map(|(actor_id, counter, value)| reg_entry(actor(*actor_id), *counter, value))
+            .collect::<Vec<_>>();
+        MvReg::from_entries(entries)
+    }
+
     fn tombstone_gc_policy(retention_ms: u64, batch_limit: usize) -> StoreGcPolicy {
         StoreGcPolicy {
             tombstone_min_retention_ms: retention_ms,
             tombstone_batch_limit: batch_limit,
             mvreg_batch_limit: 0,
             mvreg_max_values: None,
+        }
+    }
+
+    fn mvreg_compaction_policy(max_values: usize, batch_limit: usize) -> StoreGcPolicy {
+        StoreGcPolicy {
+            tombstone_min_retention_ms: 0,
+            tombstone_batch_limit: 0,
+            mvreg_batch_limit: batch_limit,
+            mvreg_max_values: Some(max_values),
         }
     }
 
@@ -2469,6 +2693,135 @@ mod tests {
         assert_eq!(tombs.len(), 1);
         assert_eq!(tombs[0].0, key(3));
         assert_eq!(store.tombstone_prune_frontier(&origin).unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn register_compaction_rewrites_opt_in_adapter_and_updates_root() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<CompactingAdapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+        let compacted_key = key(1);
+
+        store
+            .apply_delta_chunk_update_mst(
+                vec![(
+                    compacted_key,
+                    concurrent_reg(&[(1, 1, "old"), (2, 1, "winner")]),
+                )],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let report = store
+            .compact_registers(&mvreg_compaction_policy(1, 10))
+            .await
+            .unwrap();
+        let root_after = store.root_hex().await;
+        let reg = store.get_reg(&compacted_key).unwrap().unwrap();
+
+        assert_eq!(
+            report,
+            StoreGcReport {
+                tombstones_scanned: 0,
+                tombstones_pruned: 0,
+                registers_scanned: 1,
+                registers_compacted: 1,
+            }
+        );
+        assert_eq!(reg.read_values(), vec!["winner".to_string()]);
+
+        store.rebuild_mst_from_disk().await.unwrap();
+        assert_eq!(root_after, store.root_hex().await);
+    }
+
+    #[tokio::test]
+    async fn register_compaction_absorbs_stale_values() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<CompactingAdapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+        let compacted_key = key(1);
+
+        store
+            .apply_delta_chunk_update_mst(
+                vec![(
+                    compacted_key,
+                    concurrent_reg(&[(1, 1, "old"), (2, 1, "winner")]),
+                )],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        store
+            .compact_registers(&mvreg_compaction_policy(1, 10))
+            .await
+            .unwrap();
+
+        store
+            .apply_delta_chunk_update_mst(
+                vec![(compacted_key, concurrent_reg(&[(1, 1, "old")]))],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let reg = store.get_reg(&compacted_key).unwrap().unwrap();
+        assert_eq!(reg.read_values(), vec!["winner".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn register_compaction_honors_batch_limit() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<CompactingAdapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+
+        store
+            .apply_delta_chunk_update_mst(
+                vec![
+                    (key(1), concurrent_reg(&[(1, 1, "a"), (2, 1, "z")])),
+                    (key(2), concurrent_reg(&[(1, 1, "b"), (2, 1, "y")])),
+                ],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let report = store
+            .compact_registers(&mvreg_compaction_policy(1, 1))
+            .await
+            .unwrap();
+        let first = store.get_reg(&key(1)).unwrap().unwrap();
+        let second = store.get_reg(&key(2)).unwrap().unwrap();
+
+        assert_eq!(report.registers_scanned, 1);
+        assert_eq!(report.registers_compacted, 1);
+        assert_eq!(first.read_values(), vec!["z".to_string()]);
+        assert_eq!(second.read_values().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn register_compaction_defaults_to_adapter_noop() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+
+        store
+            .apply_delta_chunk_update_mst(
+                vec![(key(1), concurrent_reg(&[(1, 1, "a"), (2, 1, "b")]))],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let report = store
+            .compact_registers(&mvreg_compaction_policy(1, 10))
+            .await
+            .unwrap();
+        let reg = store.get_reg(&key(1)).unwrap().unwrap();
+
+        assert_eq!(report.registers_scanned, 1);
+        assert_eq!(report.registers_compacted, 0);
+        assert_eq!(reg.read_values().len(), 2);
     }
 
     #[tokio::test]

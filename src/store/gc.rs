@@ -78,18 +78,18 @@ impl StoreGcRunner {
         }
     }
 
-    /// Executes one bounded tombstone GC pass across all replicated domains.
+    /// Executes one bounded GC pass across all replicated domains.
     ///
     /// The active peer snapshot is captured once per pass so every domain uses
-    /// the same membership view. Per-domain barriers are still independent
-    /// because sync progress is tracked at domain granularity.
+    /// the same membership view for tombstone barriers. Register compaction does
+    /// not need that barrier because it is propagated as a normal register merge.
     pub async fn run_once(&self) {
         let now_unix_ms = now_unix_ms();
         let active_remote_peers = match self.registry.known_peers() {
-            Ok(peers) => peers,
+            Ok(peers) => Some(peers),
             Err(error) => {
                 error!(target: "store.gc", "failed to load active peer snapshot: {error}");
-                return;
+                None
             }
         };
         let cluster_view = self.cluster_view.active_view();
@@ -108,36 +108,41 @@ impl StoreGcRunner {
         }
 
         for domain in ALL_DOMAINS {
-            let Some(barrier) = self.progress.barrier_for_domain(
-                active_remote_peers.iter().copied(),
-                domain,
-                cluster_view,
-                root_schema_version,
-                now_unix_ms,
-            ) else {
-                trace!(
-                    target: "store.gc",
-                    ?domain,
-                    %cluster_view,
+            if let Some(active_remote_peers) = &active_remote_peers {
+                let Some(barrier) = self.progress.barrier_for_domain(
+                    active_remote_peers.iter().copied(),
+                    domain,
+                    cluster_view,
                     root_schema_version,
-                    "skipping tombstone GC without complete sync barrier"
-                );
-                continue;
-            };
-
-            match self
-                .garbage_collect_domain_tombstones(domain, barrier, now_unix_ms)
-                .await
-            {
-                Ok(report) => self.trace_domain_report(domain, &report),
-                Err(error) => {
-                    error!(
+                    now_unix_ms,
+                ) else {
+                    trace!(
                         target: "store.gc",
                         ?domain,
-                        "tombstone GC failed: {error}"
+                        %cluster_view,
+                        root_schema_version,
+                        "skipping tombstone GC without complete sync barrier"
                     );
+                    self.compact_domain_registers_with_trace(domain).await;
+                    continue;
+                };
+
+                match self
+                    .garbage_collect_domain_tombstones(domain, barrier, now_unix_ms)
+                    .await
+                {
+                    Ok(report) => self.trace_domain_report(domain, &report),
+                    Err(error) => {
+                        error!(
+                            target: "store.gc",
+                            ?domain,
+                            "tombstone GC failed: {error}"
+                        );
+                    }
                 }
             }
+
+            self.compact_domain_registers_with_trace(domain).await;
         }
     }
 
@@ -226,6 +231,50 @@ impl StoreGcRunner {
                 self.stores
                     .scheduler_digests
                     .garbage_collect_tombstones(policy, barrier, now_unix_ms)
+                    .await
+            }
+        }
+    }
+
+    /// Applies register compaction to one sync domain and traces any work done.
+    async fn compact_domain_registers_with_trace(&self, domain: Domain) {
+        match self.compact_domain_registers(domain).await {
+            Ok(report) => self.trace_domain_report(domain, &report),
+            Err(error) => {
+                error!(
+                    target: "store.gc",
+                    ?domain,
+                    "register compaction failed: {error}"
+                );
+            }
+        }
+    }
+
+    /// Applies store-local register compaction to the backing store for one sync domain.
+    async fn compact_domain_registers(&self, domain: Domain) -> crdt_store::Result<StoreGcReport> {
+        let policy = &self.config.policy;
+        match domain {
+            Domain::Peers => self.stores.peers.compact_registers(policy).await,
+            Domain::Workloads => self.stores.workloads.compact_registers(policy).await,
+            Domain::Services => self.stores.services.compact_registers(policy).await,
+            Domain::Jobs => self.stores.jobs.compact_registers(policy).await,
+            Domain::Agents => self.stores.agents.compact_registers(policy).await,
+            Domain::Secrets => self.stores.secrets.compact_registers(policy).await,
+            Domain::Networks => self.stores.networks.compact_registers(policy).await,
+            Domain::NetworkPeers => self.stores.network_peers.compact_registers(policy).await,
+            Domain::NetworkAttachments => {
+                self.stores
+                    .network_attachments
+                    .compact_registers(policy)
+                    .await
+            }
+            Domain::ClusterViews => self.stores.cluster_views.compact_registers(policy).await,
+            Domain::Volumes => self.stores.volumes.compact_registers(policy).await,
+            Domain::VolumeNodes => self.stores.volume_nodes.compact_registers(policy).await,
+            Domain::SchedulerDigests => {
+                self.stores
+                    .scheduler_digests
+                    .compact_registers(policy)
                     .await
             }
         }
