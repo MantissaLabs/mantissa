@@ -1,10 +1,16 @@
-use crate::network::types::{NetworkAttachmentValue, NetworkPeerStateValue, NetworkSpecValue};
+use crate::network::types::{
+    NetworkAttachmentState, NetworkAttachmentValue, NetworkPeerState, NetworkPeerStateValue,
+    NetworkSpecValue,
+};
 use crate::store::open::open_arc_store;
-use crdt_store::adapter::StoreMvRegAdapterSorted;
+use chrono::{DateTime, Utc};
+use crdt_store::adapter::{CompactingStoreMvRegAdapterSorted, MvRegCompactionRanker};
 use crdt_store::hash::XXHash128;
 use crdt_store::mst_store::CrdtMstStore;
+use crdt_store::mvreg::MvRegEntry;
 use crdt_store::table_set::TableSet;
 use crdt_store::uuid_key::UuidKey;
+use std::cmp::Reverse;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -38,32 +44,131 @@ impl TableSet for NetworkAttachmentTables {
     const META: &'static str = "network_attachment_meta";
 }
 
+/// Network-spec ranker that preserves the registry's current canonical snapshot order.
+pub struct NetworkSpecCompactionRank;
+
+impl MvRegCompactionRanker<NetworkSpecValue, Uuid> for NetworkSpecCompactionRank {
+    type Rank = NetworkSpecValue;
+
+    /// Ranks one network spec by its full deterministic value ordering.
+    fn rank(entry: &MvRegEntry<NetworkSpecValue, Uuid>) -> Self::Rank {
+        entry.value().clone()
+    }
+}
+
+/// Network peer-state compaction ranker used by the generic MVReg adapter.
+pub struct NetworkPeerCompactionRank;
+
+impl MvRegCompactionRanker<NetworkPeerStateValue, Uuid> for NetworkPeerCompactionRank {
+    type Rank = (String, u8, NetworkPeerStateValue);
+
+    /// Ranks one peer-state row using the same timestamp and readiness order as the registry.
+    fn rank(entry: &MvRegEntry<NetworkPeerStateValue, Uuid>) -> Self::Rank {
+        let value = entry.value();
+        (
+            value.updated_at.clone(),
+            network_peer_state_rank(value.state),
+            value.clone(),
+        )
+    }
+}
+
+/// Network attachment compaction ranker used by the generic MVReg adapter.
+pub struct NetworkAttachmentCompactionRank;
+
+impl MvRegCompactionRanker<NetworkAttachmentValue, Uuid> for NetworkAttachmentCompactionRank {
+    type Rank = (
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+        u8,
+        bool,
+        Uuid,
+        Reverse<NetworkAttachmentValue>,
+    );
+
+    /// Ranks one attachment using task revision, attachment timestamp, and lifecycle state.
+    fn rank(entry: &MvRegEntry<NetworkAttachmentValue, Uuid>) -> Self::Rank {
+        let value = entry.value();
+        (
+            value.task_updated_at.as_deref().and_then(parse_rfc3339),
+            parse_attachment_timestamp(&value.updated_at, &value.created_at),
+            network_attachment_state_rank(value.state),
+            value.traffic_published,
+            value.node_id,
+            Reverse(value.clone()),
+        )
+    }
+}
+
+/// Ranks peer states so Ready entries win timestamp ties during compaction.
+fn network_peer_state_rank(state: NetworkPeerState) -> u8 {
+    match state {
+        NetworkPeerState::Ready => 5,
+        NetworkPeerState::Configuring => 4,
+        NetworkPeerState::AwaitingSpec => 3,
+        NetworkPeerState::Error => 2,
+        NetworkPeerState::Removing => 1,
+    }
+}
+
+/// Ranks attachment states so terminal or converged rows win timestamp ties.
+fn network_attachment_state_rank(state: NetworkAttachmentState) -> u8 {
+    match state {
+        NetworkAttachmentState::Removing => 5,
+        NetworkAttachmentState::Error => 4,
+        NetworkAttachmentState::Ready => 3,
+        NetworkAttachmentState::Configuring => 2,
+        NetworkAttachmentState::Pending => 1,
+    }
+}
+
+/// Parses the freshest available attachment timestamp used after task revision ordering ties.
+fn parse_attachment_timestamp(updated_at: &str, created_at: &str) -> Option<DateTime<Utc>> {
+    parse_rfc3339(updated_at).or_else(|| parse_rfc3339(created_at))
+}
+
+/// Parses one replicated RFC3339 timestamp into UTC for deterministic attachment ranking.
+fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .ok()
+}
+
+/// Store adapter for network specification registers with compaction enabled.
+pub type NetworkSpecRegAdapter =
+    CompactingStoreMvRegAdapterSorted<UuidKey, NetworkSpecValue, Uuid, NetworkSpecCompactionRank>;
+
 /// Specialized MST/CRDT store for network specifications.
-pub type NetworkSpecStoreInner = CrdtMstStore<
-    StoreMvRegAdapterSorted<UuidKey, NetworkSpecValue, Uuid>,
-    XXHash128,
-    NetworkSpecTables,
->;
+pub type NetworkSpecStoreInner = CrdtMstStore<NetworkSpecRegAdapter, XXHash128, NetworkSpecTables>;
 
 /// Shared handle to the network specification store.
 pub type NetworkSpecStore = Arc<NetworkSpecStoreInner>;
 
-/// Specialized MST/CRDT store for per-peer network state.
-pub type NetworkPeerStoreInner = CrdtMstStore<
-    StoreMvRegAdapterSorted<UuidKey, NetworkPeerStateValue, Uuid>,
-    XXHash128,
-    NetworkPeerTables,
+/// Store adapter for network peer-state registers with compaction enabled.
+pub type NetworkPeerRegAdapter = CompactingStoreMvRegAdapterSorted<
+    UuidKey,
+    NetworkPeerStateValue,
+    Uuid,
+    NetworkPeerCompactionRank,
 >;
+
+/// Specialized MST/CRDT store for per-peer network state.
+pub type NetworkPeerStoreInner = CrdtMstStore<NetworkPeerRegAdapter, XXHash128, NetworkPeerTables>;
 
 /// Shared handle to the network peer state store.
 pub type NetworkPeerStore = Arc<NetworkPeerStoreInner>;
 
-/// Specialized MST/CRDT store for network attachment state.
-pub type NetworkAttachmentStoreInner = CrdtMstStore<
-    StoreMvRegAdapterSorted<UuidKey, NetworkAttachmentValue, Uuid>,
-    XXHash128,
-    NetworkAttachmentTables,
+/// Store adapter for network attachment registers with compaction enabled.
+pub type NetworkAttachmentRegAdapter = CompactingStoreMvRegAdapterSorted<
+    UuidKey,
+    NetworkAttachmentValue,
+    Uuid,
+    NetworkAttachmentCompactionRank,
 >;
+
+/// Specialized MST/CRDT store for network attachment state.
+pub type NetworkAttachmentStoreInner =
+    CrdtMstStore<NetworkAttachmentRegAdapter, XXHash128, NetworkAttachmentTables>;
 
 /// Shared handle to the network attachment store.
 pub type NetworkAttachmentStore = Arc<NetworkAttachmentStoreInner>;

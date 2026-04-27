@@ -1,8 +1,9 @@
 use crate::secrets::types::SecretValue;
 use crate::store::open::open_arc_store;
-use crdt_store::adapter::StoreMvRegAdapterSorted;
+use crdt_store::adapter::{CompactingStoreMvRegAdapterSorted, MvRegCompactionRanker};
 use crdt_store::hash::XXHash128;
 use crdt_store::mst_store::CrdtMstStore;
+use crdt_store::mvreg::MvRegEntry;
 use crdt_store::table_set::TableSet;
 use crdt_store::uuid_key::UuidKey;
 use std::sync::Arc;
@@ -17,8 +18,23 @@ impl TableSet for SecretTables {
     const META: &'static str = "secret_meta";
 }
 
-pub type SecretStoreInner =
-    CrdtMstStore<StoreMvRegAdapterSorted<UuidKey, SecretValue, Uuid>, XXHash128, SecretTables>;
+/// Secret compaction ranker that preserves the registry's current canonical snapshot order.
+pub struct SecretCompactionRank;
+
+impl MvRegCompactionRanker<SecretValue, Uuid> for SecretCompactionRank {
+    type Rank = SecretValue;
+
+    /// Ranks one secret by its full deterministic value ordering.
+    fn rank(entry: &MvRegEntry<SecretValue, Uuid>) -> Self::Rank {
+        entry.value().clone()
+    }
+}
+
+/// Store adapter for secret registers with domain-aware compaction enabled.
+pub type SecretRegAdapter =
+    CompactingStoreMvRegAdapterSorted<UuidKey, SecretValue, Uuid, SecretCompactionRank>;
+
+pub type SecretStoreInner = CrdtMstStore<SecretRegAdapter, XXHash128, SecretTables>;
 
 pub type SecretStore = Arc<SecretStoreInner>;
 
