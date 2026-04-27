@@ -274,6 +274,32 @@ does not automatically make every old Redb payload readable by every future
 binary, and it does not make every new payload meaningful to an older rollback
 binary.
 
+## Store GC Operations
+
+Mantissa runs background logical GC for replicated stores when
+`storage.gc.enabled` is true.
+
+Tombstone GC is deliberately conservative. A domain can prune tombstones only
+after every active peer has an equal-root observation for the current cluster
+view and root schema, and only after the tombstones are older than
+`storage.gc.tombstone_min_retention_ms`. A stopped daemon that remains an active
+member blocks pruning until it returns and syncs.
+
+MVReg compaction is separate from tombstone GC. It is disabled unless
+`storage.gc.mvreg_max_values` is configured. Domains that opt in use explicit
+ranking rules and merge the vector clocks of dropped values into the retained
+winner so stale compacted values do not reappear during later anti-entropy.
+
+For production maintenance, prefer drain and restart over leave and later
+reuse. A peer that has left the cluster is outside the active-peer GC barrier.
+If that data directory is reused after the tombstone retention window, treat
+the node as requiring bootstrap from an active peer or reset replicated stores
+before it can safely publish state again.
+
+Logical GC lets Redb reuse pages, but it is not a physical file compaction
+workflow. Shrinking the database file should be treated as a separate offline
+maintenance operation.
+
 ## Root-Schema Change Checklist
 
 When introducing a new root schema:
@@ -316,7 +342,11 @@ maintenance knob without rewriting the workload spec.
 - `src/topology/service.rs`
 - `src/topology/sync.rs`
 - `src/cluster/root_schema.rs`
+- `src/sync/gc_progress.rs`
+- `src/store/gc.rs`
+- `src/config.rs`
 - `crates/crdt_store/src/codec.rs`
+- `crates/crdt_store/src/gc.rs`
 - `crates/crdt_store/src/mst_store.rs`
 - `src/services/slot_reconcile.rs`
 - `src/workload/manager/state.rs`

@@ -65,7 +65,7 @@ Mantissa uses `crdt_store::mst_store::CrdtMstStore` for replicated domains.
 Each store combines:
 
 - an MVReg-backed register for active values,
-- a tombstone table for deletes,
+- a tombstone table and observed-time index for deletes,
 - an MST leaf per key representing either an active snapshot or a delete
   marker.
 
@@ -138,6 +138,12 @@ Most control-plane writes follow the same pattern:
 Deletes write durable tombstones instead of silently removing the key. That
 lets remote replicas learn that a key was intentionally removed.
 
+Tombstones carry the origin actor and origin sequence that produced the delete.
+When a node later proves a tombstone is safe to prune, it advances a per-origin
+prune frontier in the same Redb transaction that removes the tombstone rows.
+That frontier lets the store reject stale tombstone deltas from peers that have
+not run GC yet.
+
 Some stores are opened with `preserve_local_tombs(true)` so stale remote
 register deltas cannot immediately resurrect a locally deleted row. Current
 examples include:
@@ -190,6 +196,80 @@ sequenceDiagram
 This is why Mantissa does not need to ship whole maps or full snapshots on
 every reconciliation pass. A matching root skips the domain entirely; a
 mismatched root narrows work down to only the differing key ranges.
+
+## Store GC
+
+Store GC has two independent jobs:
+
+- tombstone GC removes delete markers after they are safe to forget,
+- MVReg compaction rewrites selected registers so bounded conflict history is
+  retained.
+
+The generic store owns only local mechanics. It scans Redb rows, applies batch
+limits, updates the in-memory MST, and advances prune frontiers. Distributed
+safety stays outside the store in the sync layer.
+
+Tombstone GC requires a complete sync-derived barrier for each domain. For a
+multi-node cluster, every active remote peer must have an equal-root
+observation for the current cluster view and root schema before that domain can
+prune tombstones. If any active peer is offline, unreachable, or still missing
+an equal-root observation, tombstone GC skips that domain. Single-node clusters
+can build the barrier locally.
+
+After the barrier exists, the store still applies
+`storage.gc.tombstone_min_retention_ms`. The effective cutoff is the older of:
+
+- the oldest equal-root observation across active peers,
+- the local retention window.
+
+This means an active but offline peer blocks tombstone pruning instead of being
+silently excluded from the safety calculation.
+
+## MVReg Compaction
+
+MVReg compaction is disabled unless `storage.gc.mvreg_max_values` is set and
+`storage.gc.mvreg_batch_limit` is greater than zero.
+
+Compaction is adapter-driven by domain. The shared store code does not sort
+values generically because deterministic ordering is not always semantic
+recency. Each opted-in domain supplies a ranking rule that is meaningful for
+that value type. Domains without a safe ranking rule keep all concurrent MVReg
+values.
+
+When a register is compacted, clocks from dropped values are merged into the
+best retained value. That clock absorption is what prevents an old peer from
+streaming a dropped value later and making it appear concurrent again.
+
+Compaction propagates through normal anti-entropy as a register rewrite. It
+does not need the tombstone GC barrier because it does not forget a delete
+marker.
+
+## Stale Peers
+
+Tombstone GC is safe for peers that remain active in membership, even when they
+are temporarily offline, because those peers stay in the barrier and prevent
+pruning until they converge again.
+
+The risky case is a peer that intentionally left the cluster or was otherwise
+removed from active membership. Once it is no longer active, the rest of the
+cluster can eventually prune tombstones without waiting for that peer. If that
+old data directory is reused much later, it must not publish its stale
+replicated rows directly.
+
+The operational rule is:
+
+- active-but-offline peers may restart normally and will block tombstone GC
+  until they sync,
+- peers that have left for longer than the tombstone retention window must
+  rejoin through bootstrap from an active peer or start from a reset replicated
+  store,
+- reusing an old left-node data directory without bootstrap/reset is unsafe
+  after tombstones may have been pruned.
+
+In practice, production maintenance should drain and restart nodes rather than
+leave and later reuse stale replicated state. If a node is intentionally removed
+for longer than the configured retention window, treat reintroduction as a
+fresh bootstrap operation.
 
 ## View Scoping
 
@@ -245,10 +325,13 @@ Older replication sketches no longer matched the implementation:
 ## Code Map
 
 - `crates/crdt_store/src/mst_store.rs`
+- `crates/crdt_store/src/gc.rs`
 - `crates/crdt_store/src/hash.rs`
 - `src/gossip/mod.rs`
 - `src/sync/mod.rs`
 - `src/sync/delta.rs`
+- `src/sync/gc_progress.rs`
+- `src/store/gc.rs`
 - `src/topology/mod.rs`
 - `src/store/*.rs`
 

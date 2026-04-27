@@ -28,6 +28,19 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 
 ```ron
 (
+    storage: (
+        local_volume_root: "/var/lib/mantissa/volumes",
+        local_volume_enforce_capacity: true,
+        gc: (
+            enabled: true,
+            interval_ms: 60000,
+            tombstone_min_retention_ms: 604800000,
+            tombstone_batch_limit: 1024,
+            mvreg_batch_limit: 0,
+            mvreg_max_values: None,
+            stale_peer_rejoin_after_ms: 604800000,
+        ),
+    ),
     network: (
         advertise_addr: "node-1.example.com:6578",
         wireguard: (
@@ -81,6 +94,15 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 
 ## Config keys (and legacy env vars)
 
+- `storage.local_volume_root`
+- `storage.local_volume_enforce_capacity`
+- `storage.gc.enabled`
+- `storage.gc.interval_ms`
+- `storage.gc.tombstone_min_retention_ms`
+- `storage.gc.tombstone_batch_limit`
+- `storage.gc.mvreg_batch_limit`
+- `storage.gc.mvreg_max_values`
+- `storage.gc.stale_peer_rejoin_after_ms`
 - `network.advertise_addr` (env: `MANTISSA_ADVERTISE_ADDR`)
 - `network.default_ip_family` (env: `MANTISSA_DEFAULT_IP_FAMILY`)
 - `network.wireguard.enabled` (legacy: `MANTISSA_WIREGUARD_DISABLE`)
@@ -112,6 +134,32 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 - `replication.global_metadata_sync_tick_ms` (legacy: `MANTISSA_GLOBAL_METADATA_SYNC_TICK_MS`)
 - `replication.global_metadata_sync_fanout` (legacy: `MANTISSA_GLOBAL_METADATA_SYNC_FANOUT`)
 - `replication.workload_repair_fanout` (legacy: `MANTISSA_WORKLOAD_REPAIR_FANOUT`)
+
+## Storage GC Guidance
+
+`storage.gc` controls logical cleanup of replicated Redb domain rows. Logical
+cleanup deletes safe tombstones and can compact selected MVReg registers, but
+it does not guarantee that the Redb file shrinks immediately.
+
+- `enabled`
+  Starts or disables the background GC runner.
+- `interval_ms`
+  Sets the delay between bounded maintenance passes.
+- `tombstone_min_retention_ms`
+  Keeps tombstones locally for at least this long, even after every active peer
+  has observed the same domain root.
+- `tombstone_batch_limit`
+  Bounds tombstones processed per domain in one pass.
+- `mvreg_max_values`
+  Enables MVReg compaction when set. Leave it unset unless the domain ranking
+  policies are acceptable for the deployment.
+- `mvreg_batch_limit`
+  Bounds register rows inspected per domain in one pass. It must be greater
+  than zero when `mvreg_max_values` is set.
+- `stale_peer_rejoin_after_ms`
+  Defines the stale-peer horizon operators should use for old left-node data
+  directories. Keep this less than or equal to tombstone retention. Nodes that
+  remained active but offline already block tombstone GC until they converge.
 
 ## NodePort guidance
 
