@@ -14,6 +14,7 @@ pub struct SchedulerDigestTables;
 impl TableSet for SchedulerDigestTables {
     const VALUES: &'static str = "scheduler_digest_values";
     const TOMBS: &'static str = "scheduler_digest_tombs";
+    const TOMBS_BY_OBSERVED: &'static str = "scheduler_digest_tombs_by_observed";
     const META: &'static str = "scheduler_digest_meta";
 }
 

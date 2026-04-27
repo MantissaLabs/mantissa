@@ -32,6 +32,7 @@ pub struct ClusterViewDomainTables;
 impl TableSet for ClusterViewDomainTables {
     const VALUES: &'static str = "cluster_view_values";
     const TOMBS: &'static str = "cluster_view_tombs";
+    const TOMBS_BY_OBSERVED: &'static str = "cluster_view_tombs_by_observed";
     const META: &'static str = "cluster_view_meta";
 }
 

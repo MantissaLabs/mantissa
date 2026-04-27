@@ -18,6 +18,7 @@ pub struct PeerTables;
 impl TableSet for PeerTables {
     const VALUES: &'static str = "peer_values";
     const TOMBS: &'static str = "peer_tombs";
+    const TOMBS_BY_OBSERVED: &'static str = "peer_tombs_by_observed";
     const META: &'static str = "peer_meta";
 }
 
@@ -63,6 +64,16 @@ impl RegAdapter for PeerRegAdapter {
     /// Decodes one peer key from raw Redb bytes.
     fn key_from_bytes(b: &[u8]) -> std::io::Result<Self::Key> {
         UuidKey::try_from(b).map_err(Into::into)
+    }
+
+    /// Encodes a peer actor into the tombstone metadata byte form.
+    fn actor_to_bytes(actor: &Self::Actor) -> Vec<u8> {
+        actor.as_bytes().to_vec()
+    }
+
+    /// Decodes a peer actor from tombstone metadata bytes.
+    fn actor_from_bytes(bytes: &[u8]) -> std::io::Result<Self::Actor> {
+        Uuid::from_slice(bytes).map_err(|error| std::io::Error::other(error.to_string()))
     }
 
     /// Encodes one peer register into the Cap'n Proto-backed store payload.

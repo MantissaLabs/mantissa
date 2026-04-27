@@ -14,6 +14,7 @@ pub struct VolumeSpecTables;
 impl TableSet for VolumeSpecTables {
     const VALUES: &'static str = "volume_spec_values";
     const TOMBS: &'static str = "volume_spec_tombs";
+    const TOMBS_BY_OBSERVED: &'static str = "volume_spec_tombs_by_observed";
     const META: &'static str = "volume_spec_meta";
 }
 
@@ -23,6 +24,7 @@ pub struct VolumeNodeTables;
 impl TableSet for VolumeNodeTables {
     const VALUES: &'static str = "volume_node_values";
     const TOMBS: &'static str = "volume_node_tombs";
+    const TOMBS_BY_OBSERVED: &'static str = "volume_node_tombs_by_observed";
     const META: &'static str = "volume_node_meta";
 }
 

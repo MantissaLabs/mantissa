@@ -34,7 +34,7 @@ pub use delta::{SyncRunner, SyncTraceContext};
 
 type EncodedRegister = (Vec<u8>, Vec<u8>);
 type EncodedRegisters = Vec<EncodedRegister>;
-type EncodedTombstone = (Vec<u8>, u64);
+type EncodedTombstone = (Vec<u8>, u64, Vec<u8>);
 type EncodedTombstones = Vec<EncodedTombstone>;
 
 /// Canonical full-sync domain set shared by both client and server sync paths.
@@ -473,7 +473,13 @@ impl sync::Server for SyncService {
 fn encode_tombstones(tombs: Tombstones<UuidKey>) -> EncodedTombstones {
     tombs
         .into_iter()
-        .map(|(k, ts)| (k.as_ref().to_vec(), ts))
+        .map(|(k, tombstone)| {
+            (
+                k.as_ref().to_vec(),
+                tombstone.sequence,
+                tombstone.origin_actor,
+            )
+        })
         .collect()
 }
 
@@ -489,8 +495,10 @@ fn encoded_register_payload_bytes((key, reg): &EncodedRegister) -> usize {
 ///
 /// The timestamp is fixed-width on the wire, so the estimate only needs the key length plus
 /// the replicated tombstone scalar payload.
-fn encoded_tombstone_payload_bytes((key, _ts): &EncodedTombstone) -> usize {
-    key.len().saturating_add(std::mem::size_of::<u64>())
+fn encoded_tombstone_payload_bytes((key, _ts, origin_actor): &EncodedTombstone) -> usize {
+    key.len()
+        .saturating_add(std::mem::size_of::<u64>())
+        .saturating_add(origin_actor.len())
 }
 
 /// Selects the next delta chunk prefix using both entry and approximate payload limits.
@@ -597,10 +605,11 @@ async fn send_chunks(
             let mut tombs_builder = chunk_builder
                 .reborrow()
                 .init_tombs(tombs_chunk.len() as u32);
-            for (idx, (key, ts)) in tombs_chunk.iter().enumerate() {
+            for (idx, (key, ts, origin_actor)) in tombs_chunk.iter().enumerate() {
                 let mut entry = tombs_builder.reborrow().get(idx as u32);
                 entry.set_key(key);
                 entry.set_ts(*ts);
+                entry.set_origin_actor(origin_actor);
             }
         }
         req.send().await?;
@@ -642,7 +651,7 @@ mod tests {
 
     /// Returns one synthetic encoded tombstone entry for chunk-planning tests.
     fn encoded_tombstone(key_len: usize) -> EncodedTombstone {
-        (vec![0u8; key_len], 7)
+        (vec![0u8; key_len], 7, vec![1u8; 16])
     }
 
     /// The planner must still honor the entry cap when the payload target is generous.
@@ -695,6 +704,6 @@ mod tests {
             take_delta_chunk_prefix(&regs, &tombs, 3, 1024);
         assert_eq!(regs_len, 1);
         assert_eq!(tombs_len, 2);
-        assert_eq!(approx_payload_bytes, 56);
+        assert_eq!(approx_payload_bytes, 88);
     }
 }

@@ -155,7 +155,10 @@ struct TombItem {
   # Raw key bytes.
 
   ts  @1 :UInt64;
-  # Tombstone timestamp or version.
+  # Origin-local tombstone sequence.
+
+  originActor @2 :Data;
+  # Stable actor bytes for the node that allocated `ts`.
 }
 
 struct ViewRequest {

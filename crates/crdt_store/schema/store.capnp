@@ -14,6 +14,17 @@ struct MvRegEntry {
   value @1 :Data;
 }
 
+struct TombstoneRow {
+  sequence @0 :UInt64;
+  # Origin-local tombstone sequence.
+
+  originActor @1 :Data;
+  # Stable actor bytes for the node that allocated `sequence`.
+
+  observedAtUnixMs @2 :UInt64;
+  # Local Unix millisecond timestamp for the first observation on this node.
+}
+
 struct ClockEntry {
   actor @0 :Data;
   # Actor identifier bytes. Mantissa replicated stores use 16-byte UUIDs.

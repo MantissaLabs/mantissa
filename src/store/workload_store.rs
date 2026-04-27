@@ -13,6 +13,7 @@ pub struct WorkloadTables;
 impl TableSet for WorkloadTables {
     const VALUES: &'static str = "workload_values";
     const TOMBS: &'static str = "workload_tombs";
+    const TOMBS_BY_OBSERVED: &'static str = "workload_tombs_by_observed";
     const META: &'static str = "workload_meta";
 }
 

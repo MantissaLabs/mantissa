@@ -1,5 +1,6 @@
 use crate::store::peer_store::PeersStore;
 use crate::topology::peers::PeerValue;
+use crdt_store::codec::TombstoneRecord;
 use crdt_store::mvreg::MvReg;
 use crdt_store::uuid_key::UuidKey;
 use std::sync::Arc;
@@ -23,7 +24,7 @@ pub(super) struct PeerSnapshotCache {
     entries: Arc<Vec<PeerCacheEntry>>,
     /// Reusable vectors backing snapshot extraction to avoid per-tick allocations.
     actives: Vec<(UuidKey, MvReg<PeerValue, Uuid>)>,
-    tombstones: Vec<(UuidKey, u64)>,
+    tombstones: Vec<(UuidKey, TombstoneRecord)>,
 }
 
 impl PeerSnapshotCache {

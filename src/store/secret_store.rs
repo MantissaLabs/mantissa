@@ -13,6 +13,7 @@ pub struct SecretTables;
 impl TableSet for SecretTables {
     const VALUES: &'static str = "secret_values";
     const TOMBS: &'static str = "secret_tombs";
+    const TOMBS_BY_OBSERVED: &'static str = "secret_tombs_by_observed";
     const META: &'static str = "secret_meta";
 }
 

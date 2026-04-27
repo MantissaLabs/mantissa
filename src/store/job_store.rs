@@ -14,6 +14,7 @@ pub struct JobTables;
 impl TableSet for JobTables {
     const VALUES: &'static str = "job_values";
     const TOMBS: &'static str = "job_tombs";
+    const TOMBS_BY_OBSERVED: &'static str = "job_tombs_by_observed";
     const META: &'static str = "job_meta";
 }
 

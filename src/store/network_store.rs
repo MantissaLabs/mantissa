@@ -14,6 +14,7 @@ pub struct NetworkSpecTables;
 impl TableSet for NetworkSpecTables {
     const VALUES: &'static str = "network_spec_values";
     const TOMBS: &'static str = "network_spec_tombs";
+    const TOMBS_BY_OBSERVED: &'static str = "network_spec_tombs_by_observed";
     const META: &'static str = "network_spec_meta";
 }
 
@@ -23,6 +24,7 @@ pub struct NetworkPeerTables;
 impl TableSet for NetworkPeerTables {
     const VALUES: &'static str = "network_peer_values";
     const TOMBS: &'static str = "network_peer_tombs";
+    const TOMBS_BY_OBSERVED: &'static str = "network_peer_tombs_by_observed";
     const META: &'static str = "network_peer_meta";
 }
 
@@ -32,6 +34,7 @@ pub struct NetworkAttachmentTables;
 impl TableSet for NetworkAttachmentTables {
     const VALUES: &'static str = "network_attachment_values";
     const TOMBS: &'static str = "network_attachment_tombs";
+    const TOMBS_BY_OBSERVED: &'static str = "network_attachment_tombs_by_observed";
     const META: &'static str = "network_attachment_meta";
 }
 

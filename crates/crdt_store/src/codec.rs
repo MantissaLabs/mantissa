@@ -5,6 +5,31 @@ use crate::error::Error;
 use crate::mvreg::{MvReg, MvRegEntry, VectorClock};
 use crate::store_capnp;
 
+/// Durable tombstone metadata stored for one deleted CRDT-store key.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct TombstoneRecord {
+    pub sequence: u64,
+    pub origin_actor: Vec<u8>,
+    pub observed_at_unix_ms: u64,
+}
+
+impl TombstoneRecord {
+    /// Builds one tombstone record from explicit origin and observation metadata.
+    pub fn new(sequence: u64, origin_actor: Vec<u8>, observed_at_unix_ms: u64) -> Self {
+        Self {
+            sequence,
+            origin_actor,
+            observed_at_unix_ms,
+        }
+    }
+
+    /// Returns true when this record wins over `other` for one deleted key.
+    pub fn dominates(&self, other: &Self) -> bool {
+        self.sequence > other.sequence
+            || (self.sequence == other.sequence && self.origin_actor > other.origin_actor)
+    }
+}
+
 /// Codec implemented by domain values stored inside Cap'n Proto register rows.
 pub trait StoreValueCodec: Sized {
     /// Encodes one domain value into its stable store payload bytes.
@@ -149,6 +174,35 @@ where
     Ok(MvReg::from_entries(decoded_entries))
 }
 
+/// Encodes one tombstone metadata row into its Cap'n Proto store payload.
+pub fn encode_tombstone_row(record: &TombstoneRecord) -> crate::Result<Vec<u8>> {
+    let mut message = capnp::message::Builder::new_default();
+    {
+        let mut row = message.init_root::<store_capnp::tombstone_row::Builder>();
+        row.set_sequence(record.sequence);
+        row.set_origin_actor(&record.origin_actor);
+        row.set_observed_at_unix_ms(record.observed_at_unix_ms);
+    }
+
+    Ok(capnp::serialize::write_message_to_words(&message))
+}
+
+/// Decodes one tombstone metadata row from its Cap'n Proto store payload.
+pub fn decode_tombstone_row(bytes: &[u8]) -> crate::Result<TombstoneRecord> {
+    let mut cursor = Cursor::new(bytes);
+    let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+        .map_err(capnp_store_error)?;
+    let row = reader
+        .get_root::<store_capnp::tombstone_row::Reader>()
+        .map_err(capnp_store_error)?;
+
+    Ok(TombstoneRecord::new(
+        row.get_sequence(),
+        row.get_origin_actor().map_err(capnp_store_error)?.to_vec(),
+        row.get_observed_at_unix_ms(),
+    ))
+}
+
 /// Converts Cap'n Proto read errors into the store crate error type.
 fn capnp_store_error(error: capnp::Error) -> Error {
     Error::Other(format!("capnp store payload error: {error}"))
@@ -156,7 +210,7 @@ fn capnp_store_error(error: capnp::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{MvRegStoreCodec, StoreRegisterCodec};
+    use super::{MvRegStoreCodec, StoreRegisterCodec, TombstoneRecord};
     use crate::mvreg::{MvReg, MvRegEntry, VectorClock};
     use uuid::Uuid;
 
@@ -231,5 +285,28 @@ mod tests {
             error.to_string().contains("expected 16-byte UUID actor"),
             "unexpected error: {error}"
         );
+    }
+
+    /// Tombstone metadata rows must preserve origin actor and observation metadata.
+    #[test]
+    fn capnp_tombstone_row_roundtrips_metadata() {
+        let record = TombstoneRecord::new(42, vec![1, 2, 3, 4], 1_700_000_000_123);
+
+        let encoded = super::encode_tombstone_row(&record).expect("encode tombstone row");
+        let decoded = super::decode_tombstone_row(&encoded).expect("decode tombstone row");
+
+        assert_eq!(decoded, record);
+    }
+
+    /// Tombstone dominance uses sequence first and actor bytes as a deterministic tie-breaker.
+    #[test]
+    fn tombstone_dominance_tiebreaks_by_origin_actor() {
+        let low_actor = TombstoneRecord::new(7, vec![1], 10);
+        let high_actor = TombstoneRecord::new(7, vec![2], 20);
+        let high_sequence = TombstoneRecord::new(8, vec![0], 30);
+
+        assert!(high_actor.dominates(&low_actor));
+        assert!(high_sequence.dominates(&high_actor));
+        assert!(!low_actor.dominates(&high_actor));
     }
 }

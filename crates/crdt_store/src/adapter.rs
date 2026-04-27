@@ -32,6 +32,12 @@ pub trait RegAdapter {
     fn key_to_bytes(k: &Self::Key) -> Vec<u8>;
     fn key_from_bytes(b: &[u8]) -> io::Result<Self::Key>;
 
+    /// Encodes one actor into stable bytes for tombstone metadata.
+    fn actor_to_bytes(actor: &Self::Actor) -> Vec<u8>;
+
+    /// Decodes one actor from stable bytes stored in tombstone metadata.
+    fn actor_from_bytes(bytes: &[u8]) -> io::Result<Self::Actor>;
+
     /// Encodes one register into its durable/wire row representation.
     fn encode_reg(reg: &Self::Reg) -> crate::Result<Vec<u8>>;
 
@@ -78,6 +84,14 @@ where
 
     fn key_from_bytes(b: &[u8]) -> io::Result<Self::Key> {
         UuidKey::try_from(b).map_err(Into::into)
+    }
+
+    fn actor_to_bytes(actor: &Self::Actor) -> Vec<u8> {
+        actor.encode_store_actor()
+    }
+
+    fn actor_from_bytes(bytes: &[u8]) -> io::Result<Self::Actor> {
+        A::decode_store_actor(bytes).map_err(|error| io::Error::other(error.to_string()))
     }
 
     fn encode_reg(reg: &Self::Reg) -> crate::Result<Vec<u8>> {

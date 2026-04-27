@@ -9,6 +9,7 @@ use crate::cluster::{ClusterViewId, RootSchemaState};
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use capnp_rpc::new_client;
 use crdt_store::adapter::RegAdapter;
+use crdt_store::codec::TombstoneRecord;
 use crdt_store::mst_store::CrdtMstStore;
 use crdt_store::{Entry, PageDigestRange, TableSet, compute_want_from_have, uuid_key::UuidKey};
 use merkle_search_tree::digest::Hasher as MstHasher;
@@ -19,7 +20,7 @@ use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 type RegisterDelta<C> = Vec<(UuidKey, <C as RegAdapter>::Reg)>;
-type TombstoneDelta = Vec<(UuidKey, u64)>;
+type TombstoneDelta = Vec<(UuidKey, TombstoneRecord)>;
 
 /// Carries one peer-scoped context for anti-entropy diagnostics.
 #[derive(Clone, Debug)]
@@ -444,7 +445,7 @@ where
     // Registers and tombstones share the same chunk envelope, but the register payload must be
     // deserialized by the destination store's CRDT adapter.
     let regs = decode_register::<C>(chunk)?;
-    let tombs = collect_tombstones(chunk)?;
+    let tombs = collect_tombstones::<C>(chunk)?;
 
     store
         .apply_delta_chunk_update_mst(regs, tombs)
@@ -453,12 +454,20 @@ where
 }
 
 /// Extracts tombstone rows from a wire chunk.
-fn collect_tombstones(chunk: &delta_chunk::Reader<'_>) -> Result<TombstoneDelta, capnp::Error> {
+fn collect_tombstones<C>(chunk: &delta_chunk::Reader<'_>) -> Result<TombstoneDelta, capnp::Error>
+where
+    C: RegAdapter<Key = UuidKey>,
+{
     let mut tombs = Vec::new();
     for entry in chunk.get_tombs()?.iter() {
         let key =
             UuidKey::try_from(entry.get_key()?).map_err(|e| capnp::Error::failed(e.to_string()))?;
-        tombs.push((key, entry.get_ts()));
+        let origin_actor = entry.get_origin_actor().map_err(to_capnp)?.to_vec();
+        let actor = C::actor_from_bytes(&origin_actor).map_err(to_capnp)?;
+        tombs.push((
+            key,
+            TombstoneRecord::new(entry.get_ts(), C::actor_to_bytes(&actor), 0),
+        ));
     }
     Ok(tombs)
 }

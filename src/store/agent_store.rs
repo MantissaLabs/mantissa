@@ -14,6 +14,7 @@ pub struct AgentTables;
 impl TableSet for AgentTables {
     const VALUES: &'static str = "agent_values";
     const TOMBS: &'static str = "agent_tombs";
+    const TOMBS_BY_OBSERVED: &'static str = "agent_tombs_by_observed";
     const META: &'static str = "agent_meta";
 }
 

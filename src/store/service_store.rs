@@ -13,6 +13,7 @@ pub struct ServiceTables;
 impl TableSet for ServiceTables {
     const VALUES: &'static str = "service_values";
     const TOMBS: &'static str = "service_tombs";
+    const TOMBS_BY_OBSERVED: &'static str = "service_tombs_by_observed";
     const META: &'static str = "service_meta";
 }
 
