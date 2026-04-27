@@ -6,6 +6,7 @@
 
 use super::{ALL_DOMAINS, SyncStores};
 use crate::cluster::{ClusterViewId, RootSchemaState};
+use crate::sync::gc_progress::SyncGcProgress;
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use capnp_rpc::new_client;
 use crdt_store::adapter::RegAdapter;
@@ -41,6 +42,13 @@ impl SyncTraceContext {
     }
 }
 
+/// Extra client-side state shared across one selected-domain sync pass.
+struct SyncClientContext {
+    trace: Option<SyncTraceContext>,
+    gc_progress: SyncGcProgress,
+    attachment_sync_notify: Option<Arc<Notify>>,
+}
+
 #[derive(Clone)]
 /// Client-side anti-entropy runner that owns the local replicated domain stores.
 ///
@@ -49,6 +57,7 @@ impl SyncTraceContext {
 pub struct SyncRunner {
     stores: SyncStores,
     root_schema: RootSchemaState,
+    gc_progress: SyncGcProgress,
     attachment_sync_notify: Option<Arc<Notify>>,
 }
 
@@ -62,8 +71,14 @@ impl SyncRunner {
         Self {
             stores,
             root_schema,
+            gc_progress: SyncGcProgress::new(),
             attachment_sync_notify,
         }
+    }
+
+    /// Returns the sync-derived root equality tracker used by store GC.
+    pub fn gc_progress(&self) -> SyncGcProgress {
+        self.gc_progress.clone()
     }
 
     /// Runs anti-entropy for every replicated domain against one peer.
@@ -102,8 +117,11 @@ impl SyncRunner {
             cluster_view,
             root_schema_version,
             domains,
-            trace,
-            self.attachment_sync_notify.clone(),
+            SyncClientContext {
+                trace,
+                gc_progress: self.gc_progress.clone(),
+                attachment_sync_notify: self.attachment_sync_notify.clone(),
+            },
         )
         .await;
     }
@@ -503,8 +521,7 @@ async fn sync_selected_domains_with_stores(
     cluster_view: ClusterViewId,
     root_schema_version: u32,
     domains: &[Domain],
-    trace: Option<SyncTraceContext>,
-    attachment_sync_notify: Option<Arc<Notify>>,
+    context: SyncClientContext,
 ) {
     if domains.is_empty() {
         return;
@@ -554,10 +571,19 @@ async fn sync_selected_domains_with_stores(
             let remote_root = remote_roots
                 .iter()
                 .find(|(candidate, _)| candidate == domain)
-                .map(|(_, digest)| *digest)
-                .unwrap_or_default();
-            if remote_root != local_root {
-                domains_to_sync.push(*domain);
+                .map(|(_, digest)| *digest);
+            match remote_root {
+                Some(remote_root) if remote_root == local_root => {
+                    if let Some(ctx) = context.trace.as_ref() {
+                        context.gc_progress.record_equal_root_now(
+                            ctx.peer_id,
+                            *domain,
+                            cluster_view,
+                            root_schema_version,
+                        );
+                    }
+                }
+                Some(_) | None => domains_to_sync.push(*domain),
             }
         }
 
@@ -646,7 +672,7 @@ async fn sync_selected_domains_with_stores(
         );
         od.send().promise.await?;
         if should_notify_network_attachment_sync(&domains_wants)
-            && let Some(notify) = attachment_sync_notify.as_ref()
+            && let Some(notify) = context.attachment_sync_notify.as_ref()
         {
             // Remote nodes otherwise only notice replicated attachment changes on the slow
             // attachment-refresh poll. Wake the network controller immediately so forwarding
@@ -664,7 +690,7 @@ async fn sync_selected_domains_with_stores(
             domains_requested = requested_domains.len(),
             "sync_selected_domains error: {e}"
         );
-        if let Some(ctx) = trace.as_ref() {
+        if let Some(ctx) = context.trace.as_ref() {
             warn!(
                 target: "diag.sync.peer",
                 cluster_view = %cluster_view,

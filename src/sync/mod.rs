@@ -28,9 +28,11 @@ use std::rc::Rc;
 use tracing::{debug, trace};
 
 pub mod delta;
+pub mod gc_progress;
 pub mod ranges;
 
 pub use delta::{SyncRunner, SyncTraceContext};
+pub use gc_progress::{GcBarrier, SyncGcProgress};
 
 type EncodedRegister = (Vec<u8>, Vec<u8>);
 type EncodedRegisters = Vec<EncodedRegister>;
