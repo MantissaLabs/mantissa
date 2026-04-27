@@ -44,6 +44,15 @@ pub trait RegAdapter {
     /// Decodes one register from its durable/wire row representation.
     fn decode_reg(bytes: &[u8]) -> crate::Result<Self::Reg>;
 
+    /// Compacts one register according to adapter-specific domain semantics.
+    ///
+    /// The default is intentionally a no-op. Register compaction may discard
+    /// visible concurrent values, so each adapter must opt in only when it has
+    /// a deterministic and domain-correct way to rank retained entries.
+    fn compact_reg(_reg: Self::Reg, _max_values: usize) -> crate::Result<Option<Self::Reg>> {
+        Ok(None)
+    }
+
     /// Merge current and incoming registers into one.
     fn merge_regs(current: Option<Self::Reg>, incoming: Self::Reg) -> Self::Reg;
 }

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
 /// Stable, hashable snapshot of the active values stored in one MVReg.
@@ -305,6 +305,104 @@ where
 
         self.entries.extend(incoming);
     }
+
+    /// Compacts this register by keeping the highest-ranked active entries.
+    ///
+    /// The rank function must be deterministic from durable register state.
+    /// Dropped entries are not simply removed: their vector clocks are merged
+    /// into the highest-ranked retained entry so stale peers cannot later
+    /// reintroduce those dropped values as concurrent register entries.
+    pub fn compact_with<F, R>(&mut self, max_values: usize, mut rank: F) -> bool
+    where
+        A: Clone,
+        V: Clone + Ord,
+        F: FnMut(&MvRegEntry<V, A>) -> R,
+        R: Ord,
+    {
+        if max_values == 0 || self.entries.len() <= max_values {
+            return false;
+        }
+
+        let mut ranked = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| RankedEntry {
+                index,
+                rank: rank(entry),
+                value: entry.value.clone(),
+                clock: entry.clock.clone(),
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(compare_ranked_entries_desc);
+
+        let absorb_index = ranked[0].index;
+        let retained = ranked
+            .iter()
+            .take(max_values)
+            .map(|entry| entry.index)
+            .collect::<BTreeSet<_>>();
+        let mut absorbed_clock = VectorClock::new();
+
+        let mut compacted_entries = Vec::with_capacity(max_values);
+        for (index, entry) in self.entries.drain(..).enumerate() {
+            if retained.contains(&index) {
+                compacted_entries.push((index, entry));
+            } else {
+                absorbed_clock.merge(&entry.clock);
+            }
+        }
+
+        for (index, entry) in &mut compacted_entries {
+            if *index == absorb_index {
+                entry.clock.merge(&absorbed_clock);
+                break;
+            }
+        }
+
+        for (_, entry) in compacted_entries {
+            self.apply_put(entry.clock, entry.value);
+        }
+
+        true
+    }
+}
+
+/// Cached ranking data used to choose MVReg compaction winners deterministically.
+struct RankedEntry<R, V, A>
+where
+    A: Ord,
+{
+    index: usize,
+    rank: R,
+    value: V,
+    clock: VectorClock<A>,
+}
+
+/// Sorts higher-ranked entries first, with deterministic durable-state tie breaks.
+fn compare_ranked_entries_desc<R, V, A>(
+    left: &RankedEntry<R, V, A>,
+    right: &RankedEntry<R, V, A>,
+) -> Ordering
+where
+    R: Ord,
+    V: Ord,
+    A: Ord,
+{
+    right
+        .rank
+        .cmp(&left.rank)
+        .then_with(|| right.value.cmp(&left.value))
+        .then_with(|| total_clock_cmp_desc(&left.clock, &right.clock))
+        .then_with(|| left.index.cmp(&right.index))
+}
+
+/// Compares vector clocks as sorted maps instead of using causal partial order.
+fn total_clock_cmp_desc<A>(left: &VectorClock<A>, right: &VectorClock<A>) -> Ordering
+where
+    A: Ord,
+{
+    right.dots.cmp(&left.dots)
 }
 
 impl<V, A> Default for MvReg<V, A>
@@ -318,13 +416,25 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{MvReg, MvRegSnapshot};
+    use super::{MvReg, MvRegEntry, MvRegSnapshot, VectorClock};
     use crdts::{CmRDT, CvRDT, MVReg};
     use uuid::Uuid;
 
     /// Builds a deterministic test actor id from a small integer.
     fn actor(n: u128) -> Uuid {
         Uuid::from_u128(n)
+    }
+
+    /// Builds a one-actor vector clock for deterministic compaction fixtures.
+    fn clock(actor: Uuid, counter: u64) -> VectorClock<Uuid> {
+        let mut clock = VectorClock::new();
+        clock.apply(actor, counter);
+        clock
+    }
+
+    /// Builds one explicit MVReg entry for deterministic compaction fixtures.
+    fn entry(actor: Uuid, counter: u64, value: &str) -> MvRegEntry<String, Uuid> {
+        MvRegEntry::new(clock(actor, counter), value.to_string())
     }
 
     /// Applies one write to the oracle MVReg from the `crdts` crate.
@@ -470,5 +580,84 @@ mod tests {
             reg.snapshot().as_slice(),
             &["a".to_string(), "z".to_string()]
         );
+    }
+
+    /// Compaction should be a no-op when the register is already within policy.
+    #[test]
+    fn mvreg_compaction_noops_below_limit() {
+        let mut reg = MvReg::from_entries(vec![entry(actor(1), 1, "a"), entry(actor(2), 1, "b")]);
+        let before = reg.clone();
+
+        assert!(!reg.compact_with(2, |entry| entry.value().clone()));
+        assert_eq!(reg, before);
+    }
+
+    /// Compaction should keep the highest-ranked values and drop older winners.
+    #[test]
+    fn mvreg_compaction_keeps_highest_ranked_values() {
+        let mut reg = MvReg::from_entries(vec![
+            entry(actor(1), 1, "a"),
+            entry(actor(2), 1, "b"),
+            entry(actor(3), 1, "c"),
+        ]);
+
+        assert!(reg.compact_with(2, |entry| entry.value().clone()));
+        assert_eq!(
+            mantissa_values(&reg),
+            vec!["b".to_string(), "c".to_string()]
+        );
+    }
+
+    /// Dropped clocks must be absorbed so stale peers cannot revive dropped values.
+    #[test]
+    fn mvreg_compaction_absorbs_dropped_clocks() {
+        let dropped_actor = actor(1);
+        let winner_actor = actor(2);
+        let mut reg = MvReg::from_entries(vec![
+            entry(dropped_actor, 1, "old"),
+            entry(winner_actor, 1, "winner"),
+        ]);
+
+        assert!(reg.compact_with(1, |entry| entry.value().clone()));
+
+        let winner = reg
+            .entries()
+            .iter()
+            .find(|entry| entry.value() == "winner")
+            .unwrap();
+        assert_eq!(winner.clock().get(&dropped_actor), 1);
+        assert_eq!(winner.clock().get(&winner_actor), 1);
+    }
+
+    /// A stale peer sending a dropped entry should be dominated after compaction.
+    #[test]
+    fn mvreg_compaction_prevents_stale_value_reintroduction() {
+        let dropped_actor = actor(1);
+        let winner_actor = actor(2);
+        let mut compacted = MvReg::from_entries(vec![
+            entry(dropped_actor, 1, "old"),
+            entry(winner_actor, 1, "winner"),
+        ]);
+        let stale = MvReg::from_entries(vec![entry(dropped_actor, 1, "old")]);
+
+        compacted.compact_with(1, |entry| entry.value().clone());
+        compacted.merge(stale);
+
+        assert_eq!(mantissa_values(&compacted), vec!["winner".to_string()]);
+    }
+
+    /// Equal ranks should still compact deterministically from durable state.
+    #[test]
+    fn mvreg_compaction_breaks_rank_ties_deterministically() {
+        let entry_a = entry(actor(1), 1, "a");
+        let entry_b = entry(actor(2), 1, "b");
+        let mut left = MvReg::from_entries(vec![entry_a.clone(), entry_b.clone()]);
+        let mut right = MvReg::from_entries(vec![entry_b, entry_a]);
+
+        left.compact_with(1, |_| 0u8);
+        right.compact_with(1, |_| 0u8);
+
+        assert_eq!(left, right);
+        assert_eq!(mantissa_values(&left), vec!["b".to_string()]);
     }
 }
