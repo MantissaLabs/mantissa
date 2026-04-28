@@ -13,6 +13,7 @@ IMAGE_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-gener
 CREATED_COUNT=0
 SKIPPED_COUNT=0
 LIMA_ENABLE_VZNAT="${LIMA_ENABLE_VZNAT:-0}"
+HOST_SUPPORTS_VZ_NESTED=0
 
 usage() {
   cat >&2 <<USAGE
@@ -20,6 +21,7 @@ Usage: $0 [-n COUNT] [-r /abs/path/to/mantissa] [-P SSH_BASE] [-c CPUS] [-m MEM]
 Defaults: COUNT=2, REPO=\$HOME/dev/mantissa, SSH_BASE=7200, CPUS=10, MEM=24GiB, DISK=100GiB
 Notes:
   - Prefers VZ + virtiofs on supported macOS hosts and falls back to QEMU + 9p otherwise.
+  - Enables Lima nested virtualization automatically on supported M3+ macOS 15+ hosts.
   - Mounts "~" read-write, and mounts the repo at /mantissa inside each VM.
   - Enables shared VM <-> VM network (user-v2) so VMs can ping each other.
   - Set LIMA_ENABLE_VZNAT=1 to add a secondary vzNAT interface on supported macOS hosts.
@@ -52,16 +54,20 @@ if [[ ! -d "$REPO" ]]; then
   exit 1
 fi
 
-# Returns success when the current host can use Lima's VZ + virtiofs stack.
+# Returns success when the current macOS version is at least the requested version.
 #
-# Lima documents VZ as supported on macOS 13.0+ and uses it by default on
-# compatible macOS hosts. We keep the check local so the generated YAML stays
-# valid on Linux and older macOS releases.
-host_supports_vz_stack() {
+# Keeping version parsing in one place avoids repeating fragile product-version
+# string handling across the Lima feature probes below.
+macos_version_at_least() {
+  local REQUIRED_MAJOR
+  local REQUIRED_MINOR
   local PRODUCT_VERSION
   local MAJOR
   local MINOR
   local REST
+
+  REQUIRED_MAJOR="$1"
+  REQUIRED_MINOR="$2"
 
   if [[ "$(uname -s)" != "Darwin" ]]; then
     return 1
@@ -74,32 +80,107 @@ host_supports_vz_stack() {
 
   MAJOR="${PRODUCT_VERSION%%.*}"
   MINOR=0
-  REST=""
   if [[ "${PRODUCT_VERSION}" == *.* ]]; then
     REST="${PRODUCT_VERSION#*.}"
     MINOR="${REST%%.*}"
   fi
 
-  if (( MAJOR > 13 )); then
+  if [[ ! "${MAJOR}" =~ ^[0-9]+$ || ! "${MINOR}" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+
+  if (( MAJOR > REQUIRED_MAJOR )); then
     return 0
   fi
-  if (( MAJOR == 13 && MINOR >= 0 )); then
+  if (( MAJOR == REQUIRED_MAJOR && MINOR >= REQUIRED_MINOR )); then
     return 0
   fi
   return 1
+}
+
+# Returns success when the current host can use Lima's VZ + virtiofs stack.
+#
+# Lima documents VZ as supported on macOS 13.0+ and uses it by default on
+# compatible macOS hosts. We keep the check local so the generated YAML stays
+# valid on Linux and older macOS releases.
+host_supports_vz_stack() {
+  macos_version_at_least 13 0
+}
+
+# Returns success when this Lima binary accepts nested virtualization config.
+#
+# Older Lima releases reject the nestedVirtualization YAML key. Checking the CLI
+# capability first lets us keep VZ enabled without emitting unsupported YAML.
+lima_supports_nested_virtualization_config() {
+  limactl create --help 2>/dev/null | grep -q -- '--nested-virt'
+}
+
+# Returns success when macOS reports an Apple M3 or newer host.
+#
+# This is a fallback for hosts without Swift available. Apple's Virtualization
+# API below is still the authoritative probe when the local toolchain can run it.
+host_is_apple_m3_or_newer() {
+  local CHIP
+  local GENERATION
+
+  if ! command -v system_profiler >/dev/null 2>&1; then
+    return 1
+  fi
+
+  CHIP="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Chip: Apple M[0-9]/ { print $2; exit }')"
+  if [[ "${CHIP}" =~ Apple[[:space:]]M([0-9]+) ]]; then
+    GENERATION="${BASH_REMATCH[1]}"
+    (( GENERATION >= 3 ))
+    return
+  fi
+
+  return 1
+}
+
+# Returns success when the current host supports VZ nested virtualization.
+#
+# macOS exposes the exact capability through Virtualization.framework on
+# macOS 15+. When Swift is unavailable, we fall back to Apple's documented
+# hardware/OS gate: Apple Silicon M3 or newer on macOS 15 or newer.
+host_supports_vz_nested_virtualization() {
+  local RESULT
+
+  if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+    return 1
+  fi
+  if ! macos_version_at_least 15 0; then
+    return 1
+  fi
+
+  if command -v swift >/dev/null 2>&1; then
+    RESULT="$(CLANG_MODULE_CACHE_PATH="${TMPDIR:-/tmp}/mantissa-swift-module-cache" swift -e 'import Virtualization
+if #available(macOS 15.0, *) {
+  print(VZGenericPlatformConfiguration.isNestedVirtualizationSupported ? "1" : "0")
+} else {
+  print("0")
+}' 2>/dev/null || true)"
+    case "${RESULT}" in
+      1) return 0 ;;
+      0) return 1 ;;
+    esac
+  fi
+
+  host_is_apple_m3_or_newer
 }
 
 # Writes the Lima instance YAML using the requested virtualization settings.
 #
 # user-v2 remains the primary network because Lima documents it as the
 # multi-node path for VM-to-VM communication. vzNAT is optional because it
-# changes routing behavior and should be an explicit choice.
+# changes routing behavior and should be an explicit choice. Nested
+# virtualization is emitted only after host and Lima capability probes pass.
 write_vm_yaml() {
   local NAME
   local SSHPORT
   local VM_TYPE
   local MOUNT_TYPE
   local ENABLE_VZNAT
+  local ENABLE_NESTED_VIRT
   local DEST
 
   NAME="$1"
@@ -107,7 +188,8 @@ write_vm_yaml() {
   VM_TYPE="$3"
   MOUNT_TYPE="$4"
   ENABLE_VZNAT="$5"
-  DEST="$6"
+  ENABLE_NESTED_VIRT="$6"
+  DEST="$7"
 
   cat > "${DEST}" <<EOF
 # ${NAME}
@@ -116,7 +198,13 @@ vmType: "${VM_TYPE}"
 cpus: ${CPUS}
 memory: "${MEM}"
 disk: "${DISK}"
+EOF
 
+  if [[ "${ENABLE_NESTED_VIRT}" == "1" ]]; then
+    printf '%s\n' 'nestedVirtualization: true' >> "${DEST}"
+  fi
+
+  cat >> "${DEST}" <<EOF
 images:
   - location: "${IMAGE_URL}"
     arch: "${ARCH}"
@@ -287,6 +375,8 @@ start_vm() {
   local VM_TYPE
   local MOUNT_TYPE
   local ENABLE_VZNAT
+  local ENABLE_NESTED_VIRT
+  local YAML_VALID
 
   NAME="$1"
   SSHPORT="$2"
@@ -312,21 +402,41 @@ start_vm() {
     ENABLE_VZNAT=1
   fi
 
-  write_vm_yaml "${NAME}" "${SSHPORT}" "${VM_TYPE}" "${MOUNT_TYPE}" "${ENABLE_VZNAT}" "${TMPYAML}"
-  if ! validate_vm_yaml "${TMPYAML}"; then
-    if [[ "${VM_TYPE}" != "qemu" || "${MOUNT_TYPE}" != "9p" || "${ENABLE_VZNAT}" != "0" ]]; then
+  ENABLE_NESTED_VIRT=0
+  if [[ "${VM_TYPE}" == "vz" && "${HOST_SUPPORTS_VZ_NESTED}" == "1" ]]; then
+    ENABLE_NESTED_VIRT=1
+  fi
+
+  write_vm_yaml "${NAME}" "${SSHPORT}" "${VM_TYPE}" "${MOUNT_TYPE}" "${ENABLE_VZNAT}" "${ENABLE_NESTED_VIRT}" "${TMPYAML}"
+  YAML_VALID=0
+  if validate_vm_yaml "${TMPYAML}"; then
+    YAML_VALID=1
+  else
+    if [[ "${ENABLE_NESTED_VIRT}" == "1" ]]; then
+      echo "Nested virtualization config for ${NAME} failed validation; retrying with nested virtualization disabled." >&2
+      ENABLE_NESTED_VIRT=0
+      write_vm_yaml "${NAME}" "${SSHPORT}" "${VM_TYPE}" "${MOUNT_TYPE}" "${ENABLE_VZNAT}" "${ENABLE_NESTED_VIRT}" "${TMPYAML}"
+      if validate_vm_yaml "${TMPYAML}"; then
+        YAML_VALID=1
+      fi
+    fi
+  fi
+
+  if [[ "${YAML_VALID}" != "1" ]]; then
+    if [[ "${VM_TYPE}" != "qemu" || "${MOUNT_TYPE}" != "9p" || "${ENABLE_VZNAT}" != "0" || "${ENABLE_NESTED_VIRT}" != "0" ]]; then
       echo "Preferred Lima config for ${NAME} failed validation; falling back to qemu + 9p + user-v2." >&2
       VM_TYPE="qemu"
       MOUNT_TYPE="9p"
       ENABLE_VZNAT=0
-      write_vm_yaml "${NAME}" "${SSHPORT}" "${VM_TYPE}" "${MOUNT_TYPE}" "${ENABLE_VZNAT}" "${TMPYAML}"
+      ENABLE_NESTED_VIRT=0
+      write_vm_yaml "${NAME}" "${SSHPORT}" "${VM_TYPE}" "${MOUNT_TYPE}" "${ENABLE_VZNAT}" "${ENABLE_NESTED_VIRT}" "${TMPYAML}"
       if ! validate_vm_yaml "${TMPYAML}"; then
         echo "Generated fallback Lima config for ${NAME} could not be validated." >&2
       fi
     fi
   fi
 
-  echo "Starting ${NAME} (SSH port ${SSHPORT}, vmType=${VM_TYPE}, mountType=${MOUNT_TYPE}, vzNAT=${ENABLE_VZNAT})..."
+  echo "Starting ${NAME} (SSH port ${SSHPORT}, vmType=${VM_TYPE}, mountType=${MOUNT_TYPE}, vzNAT=${ENABLE_VZNAT}, nestedVirtualization=${ENABLE_NESTED_VIRT})..."
   limactl start --name="${NAME}" "${TMPYAML}"
   CREATED_COUNT=$((CREATED_COUNT + 1))
   rm -f "${TMPYAML}"
@@ -338,6 +448,10 @@ start_vm() {
     ssh -F "${SSH_CONFIG}" -O exit "lima-${NAME}" >/dev/null 2>&1 || true
   fi
 }
+
+if host_supports_vz_stack && lima_supports_nested_virtualization_config && host_supports_vz_nested_virtualization; then
+  HOST_SUPPORTS_VZ_NESTED=1
+fi
 
 # Ensure the first N VM slots exist; create only missing instances.
 for i in $(seq 1 "${COUNT}"); do
