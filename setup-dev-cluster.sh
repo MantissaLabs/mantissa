@@ -332,6 +332,10 @@ provision:
       rustup toolchain install nightly-aarch64-unknown-linux-gnu
       rustup component add rust-src --toolchain nightly-aarch64-unknown-linux-gnu
 
+      if ! command -v bpf-linker >/dev/null 2>&1; then
+        cargo +nightly-aarch64-unknown-linux-gnu install bpf-linker
+      fi
+
       if ! cargo install --list | grep -q '^flamegraph v'; then
         cargo install flamegraph
       fi
