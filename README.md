@@ -35,7 +35,6 @@ for scenarios where upgrades and maintenance are becoming a bottleneck.
 - Durable state via CRDT + Merkle Search Tree (backed by Redb) for fault tolerance and convergence.
 - Support for cluster split/merge operations (creating cluster views).
 - Cluster dataplane encryption using Noise, vxlan traffic encrypted via wireguard.
-- No exposed API surface, tightened security model with Capn'proto capabilities.
 
 ## Quickstart (Dev Cluster)
 

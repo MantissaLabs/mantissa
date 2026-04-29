@@ -1,4 +1,4 @@
-use crate::paths::{ensure_mantissa_group, running_as_root};
+use crate::paths::{STATE_DIR_ENV, ensure_mantissa_group, running_as_root};
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 use protocol::server::cluster_session;
@@ -17,22 +17,67 @@ pub fn candidate_unix_socket_paths() -> Vec<PathBuf> {
     v.push(PathBuf::from("/var/run/mantissa.sock")); // default
     v.push(PathBuf::from("/run/mantissa.sock"));
     if let Ok(dir) = env::var("XDG_RUNTIME_DIR") {
-        v.push(Path::new(&dir).join("mantissa.sock"));
+        v.push(Path::new(&dir).join("mantissa").join("mantissa.sock"));
     }
-    v.push(PathBuf::from("/tmp/mantissa.sock")); // last resort
+    if let Some(path) = user_state_socket_path() {
+        v.push(path);
+    }
+    if !running_as_root() {
+        v.push(private_tmp_socket_path());
+    }
     v
+}
+
+/// Return the unprivileged state-directory socket path when the environment can resolve it.
+fn user_state_socket_path() -> Option<PathBuf> {
+    if let Some(dir) = env::var_os(STATE_DIR_ENV).filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(dir).join("mantissa.sock"));
+    }
+
+    if running_as_root() {
+        return None;
+    }
+
+    env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(".mantissa").join("mantissa.sock"))
+}
+
+/// Return the private temp-directory fallback used when no runtime/state path exists.
+fn private_tmp_socket_path() -> PathBuf {
+    env::temp_dir()
+        .join(format!("mantissa-{}", effective_uid_string()))
+        .join("mantissa.sock")
+}
+
+/// Return the effective uid string for per-user runtime socket paths.
+fn effective_uid_string() -> String {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() }.to_string()
+    }
+    #[cfg(not(unix))]
+    {
+        "0".to_string()
+    }
+}
+
+/// Return true for shared system directories that Mantissa must not chmod.
+fn is_shared_socket_parent(parent: &Path) -> bool {
+    parent == Path::new("/var/run") || parent == Path::new("/run") || parent == env::temp_dir()
 }
 
 /// Remove lingering socket files and pre-create parent directories with sane permissions.
 fn prepare_socket_file(path: &Path) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent()
+        && !is_shared_socket_parent(parent)
+    {
         fs::create_dir_all(parent)?;
-        if parent != Path::new("/var/run") && parent != Path::new("/run") {
-            let mode = if running_as_root() { 0o770 } else { 0o700 };
-            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(mode));
-            if running_as_root() {
-                ensure_mantissa_group(parent);
-            }
+        let mode = if running_as_root() { 0o770 } else { 0o700 };
+        fs::set_permissions(parent, fs::Permissions::from_mode(mode))?;
+        if running_as_root() {
+            ensure_mantissa_group(parent);
         }
     }
     if path.exists() {
@@ -44,8 +89,7 @@ fn prepare_socket_file(path: &Path) -> io::Result<()> {
 /// This method starts a Unix socket server using the provided server handle.
 /// One important thing to note is while the TCP server serves a Server handle,
 /// here we serve a ClusterSession handle to avoid the gating on token/session
-/// tickets. This way, only a local privileged user could connect and issue
-/// commands on the node/cluster.
+/// tickets. Access to this socket is therefore cluster-admin equivalent.
 pub async fn start_unix_socket_server_auto(
     server_handle: cluster_session::Client,
 ) -> io::Result<PathBuf> {
@@ -64,7 +108,11 @@ pub async fn start_unix_socket_server_auto(
                 } else {
                     let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
                 }
-                info!(target: "server", "Local UnixSocket listening at {}", path.display());
+                info!(
+                    target: "server",
+                    "Local admin UnixSocket listening at {}; access grants cluster control",
+                    path.display()
+                );
                 tokio::task::spawn_local(accept_loop(listener, server_handle.clone()));
                 return Ok(path);
             }
@@ -103,5 +151,64 @@ async fn handle_unix_conn(stream: UnixStream, server_handle: cluster_session::Cl
 
     if let Err(e) = rpc_system.await {
         eprintln!("UnixSocket RPC error: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_paths_do_not_use_public_tmp_socket() {
+        let public_tmp_socket = PathBuf::from("/tmp/mantissa.sock");
+
+        assert!(
+            !candidate_unix_socket_paths()
+                .iter()
+                .any(|path| path == &public_tmp_socket),
+            "local control socket must not fall back to a shared /tmp path"
+        );
+    }
+
+    #[test]
+    fn private_tmp_socket_path_is_uid_scoped() {
+        let path = private_tmp_socket_path();
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("mantissa.sock")
+        );
+        assert!(
+            path.parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("mantissa-")),
+            "private temp fallback should live below a per-user directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_socket_file_sets_private_parent_permissions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parent = dir.path().join("mantissa-runtime");
+        let socket = parent.join("mantissa.sock");
+
+        prepare_socket_file(&socket).expect("prepare socket path");
+
+        let mode = fs::metadata(&parent)
+            .expect("parent metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let expected = if running_as_root() { 0o770 } else { 0o700 };
+        assert_eq!(mode, expected);
+    }
+
+    #[test]
+    fn shared_socket_parents_are_recognized() {
+        assert!(is_shared_socket_parent(Path::new("/var/run")));
+        assert!(is_shared_socket_parent(Path::new("/run")));
+        assert!(is_shared_socket_parent(&env::temp_dir()));
     }
 }

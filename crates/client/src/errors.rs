@@ -28,7 +28,7 @@ impl fmt::Display for ClientSocketError {
             PermissionDenied { path } => {
                 write!(
                     f,
-                    "Permission denied opening {}. Try running the daemon as the same user, or check file permissions (expected 0600).",
+                    "Permission denied opening {}. The local Mantissa socket is an admin control socket; run the daemon as the same user, use sudo, or join the mantissa group for a root daemon.",
                     path.display()
                 )
             }
