@@ -2094,8 +2094,15 @@ impl ArtifactResolver {
         if let Some(dir) = config::bpf_artifact_dir() {
             roots.push(dir);
         }
+        if let Some(target_dir) = cargo_target_dir_from_env() {
+            roots.push(target_dir.join("bpf"));
+            roots.push(target_dir.join("bpfel-unknown-none/release"));
+            roots.push(target_dir.join("bpfeb-unknown-none/release"));
+        }
         if let Ok(pwd) = env::current_dir() {
             roots.push(pwd.join("target/bpf"));
+            roots.push(pwd.join("target/bpfel-unknown-none/release"));
+            roots.push(pwd.join("target/bpfeb-unknown-none/release"));
             roots.push(pwd.join("assets/bpf"));
         }
         Self {
@@ -2135,6 +2142,16 @@ impl ArtifactResolver {
             out.push(root.join(format!("{name}.o")));
         }
         dedup(out)
+    }
+}
+
+/// Resolve Cargo's optional target-dir override for runtime artifact lookup.
+fn cargo_target_dir_from_env() -> Option<PathBuf> {
+    let path = PathBuf::from(env::var_os("CARGO_TARGET_DIR")?);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        env::current_dir().ok().map(|pwd| pwd.join(path))
     }
 }
 

@@ -215,17 +215,85 @@ pub fn privileged_artifact_dir(label: &str, required_artifacts: &[&str]) -> Opti
         return None;
     }
 
-    let artifact_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/bpf");
-    for artifact in required_artifacts {
-        let candidate = artifact_dir.join(artifact);
-        assert!(
-            candidate.exists(),
-            "missing required BPF artifact at {}",
-            candidate.display()
-        );
+    let artifact_dirs = candidate_bpf_artifact_dirs();
+    for artifact_dir in &artifact_dirs {
+        if required_artifacts
+            .iter()
+            .all(|artifact| bpf_artifact_exists(artifact_dir, artifact))
+        {
+            return Some(artifact_dir.clone());
+        }
     }
 
-    Some(artifact_dir)
+    let searched = artifact_dirs
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    panic!(
+        "missing required BPF artifacts for privileged {label} tests; searched [{searched}]. \
+         Run `cargo build` from the workspace root, or set MANTISSA_BPF_DIR to a directory \
+         containing the compiled BPF objects."
+    );
+}
+
+/// Return all artifact directories understood by privileged networking tests.
+fn candidate_bpf_artifact_dirs() -> Vec<PathBuf> {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut dirs = Vec::new();
+
+    if let Some(path) = std::env::var_os("MANTISSA_BPF_DIR") {
+        dirs.push(PathBuf::from(path));
+    }
+
+    if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
+        push_bpf_target_dirs(&mut dirs, resolve_target_dir(&repo_root, target_dir));
+    }
+
+    push_bpf_target_dirs(&mut dirs, repo_root.join("target"));
+    dedup_paths(dirs)
+}
+
+/// Resolve Cargo target-dir values relative to the workspace root when needed.
+fn resolve_target_dir(repo_root: &Path, path: OsString) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    }
+}
+
+/// Push both packaged and raw eBPF Cargo output locations for one target directory.
+fn push_bpf_target_dirs(dirs: &mut Vec<PathBuf>, target_dir: PathBuf) {
+    dirs.push(target_dir.join("bpf"));
+    dirs.push(target_dir.join("bpfel-unknown-none/release"));
+    dirs.push(target_dir.join("bpfeb-unknown-none/release"));
+}
+
+/// Return whether `dir` contains an artifact in either packaged or raw cargo-output form.
+fn bpf_artifact_exists(dir: &Path, artifact: &str) -> bool {
+    if dir.join(artifact).exists() {
+        return true;
+    }
+
+    let Some(stem) = artifact.strip_suffix(".bpf.o") else {
+        return false;
+    };
+
+    dir.join(stem).exists() || dir.join(format!("{stem}.o")).exists()
+}
+
+/// Deduplicate candidate paths while preserving their priority order.
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for path in paths {
+        if seen.insert(path.clone()) {
+            deduped.push(path);
+        }
+    }
+    deduped
 }
 
 /// Start one real headless node with fast control-plane ticks for privileged dataplane tests.

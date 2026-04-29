@@ -220,10 +220,28 @@ fn track_ebpf_path(path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+/// Resolve the public eBPF artifact directory that runtime code and privileged tests search.
+fn packaged_bpf_artifact_dir(manifest_dir: &Path) -> PathBuf {
+    let target_dir = env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                manifest_dir.join(path)
+            }
+        })
+        .unwrap_or_else(|| manifest_dir.join("target"));
+
+    target_dir.join("bpf")
+}
+
+#[cfg(target_os = "linux")]
 /// Build the eBPF programs when compiling on Linux, ensuring artifacts are
 /// available for runtime networking features.
 fn build_bpf() -> Result<()> {
     println!("cargo:rerun-if-env-changed=MANTISSA_SKIP_BPF");
+    println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
 
     if env::var_os("MANTISSA_SKIP_BPF").is_some() {
         return Ok(());
@@ -303,7 +321,7 @@ fn build_bpf() -> Result<()> {
         env::var_os("OUT_DIR")
             .ok_or_else(|| anyhow!("OUT_DIR missing while copying compiled eBPF artifacts"))?,
     );
-    let dest_dir = manifest_dir.join("target/bpf");
+    let dest_dir = packaged_bpf_artifact_dir(&manifest_dir);
     fs::create_dir_all(&dest_dir)?;
 
     for program in [
