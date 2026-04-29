@@ -7,9 +7,10 @@ use anyhow::Context;
 use aya::Pod;
 use aya::maps::{HashMap as BpfHashMap, Map, MapData};
 use common::privileged_networking::{
-    PrivilegedTestGuard, command_stdout, create_privileged_network, create_privileged_node,
-    delete_privileged_network, link_exists, privileged_artifact_dir, privileged_network_interfaces,
-    privileged_test_network, privileged_test_subnet, privileged_test_subnet_v6,
+    PrivilegedBpfArtifacts, PrivilegedTestGuard, command_stdout, create_privileged_network,
+    create_privileged_node, delete_privileged_network, link_exists, privileged_artifact_dir,
+    privileged_network_interfaces, privileged_test_network, privileged_test_subnet,
+    privileged_test_subnet_v6,
 };
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
@@ -49,8 +50,8 @@ struct BridgeRuntimeConfigValue {
 
 unsafe impl Pod for BridgeRuntimeConfigValue {}
 
-/// Resolve the compiled overlay dataplane artifacts for the privileged eBPF validation lane.
-fn privileged_ebpf_artifact_dir() -> Option<PathBuf> {
+/// Resolve optional overlay dataplane artifact overrides for the privileged eBPF validation lane.
+fn privileged_ebpf_artifact_dir() -> Option<PrivilegedBpfArtifacts> {
     privileged_artifact_dir(
         "eBPF overlay",
         &[
@@ -742,7 +743,7 @@ local_test!(ebpf_overlay_attaches_programs_and_tears_down_cleanly, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = false;
         config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
     });
@@ -813,7 +814,7 @@ local_test!(ebpf_overlay_programs_runtime_mss_for_small_mtu, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = false;
         config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
     });
@@ -904,7 +905,7 @@ local_test!(ebpf_overlay_multiple_networks_attach_and_cleanup_cleanly, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = false;
         config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
     });
@@ -1004,7 +1005,7 @@ local_test!(ebpf_overlay_host_vip_reaches_service_from_host_access, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = false;
         config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
     });
@@ -1113,7 +1114,7 @@ local_test!(ebpf_overlay_status_reports_programmed_vip_traffic, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = false;
         config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
     });
@@ -1223,7 +1224,7 @@ local_test!(
             config.network.wireguard.enabled = false;
             config.network.wireguard.manage_firewall = false;
             config.network.bpf.attach = true;
-            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            artifact_dir.apply_to(config);
             config.network.nodeport.enabled = false;
             config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
         });
@@ -1350,7 +1351,7 @@ local_test!(ebpf_overlay_task_dns_reaches_service_vip, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = false;
         config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
     });
@@ -1521,7 +1522,7 @@ local_test!(ebpf_overlay_ipv6_task_dns_reaches_service_vip, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = false;
         config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
     });
@@ -1692,7 +1693,7 @@ local_test!(ebpf_overlay_vip_load_balances_across_local_replicas, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = false;
         config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
     });
@@ -1785,7 +1786,7 @@ local_test!(
             config.network.wireguard.enabled = false;
             config.network.wireguard.manage_firewall = false;
             config.network.bpf.attach = true;
-            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            artifact_dir.apply_to(config);
             config.network.nodeport.enabled = false;
             config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
         });
@@ -1878,7 +1879,7 @@ local_test!(ebpf_overlay_return_path_preserves_vip_identity, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = false;
         config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
     });
@@ -1968,7 +1969,7 @@ local_test!(ebpf_overlay_udp_service_reaches_host_access_vip, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = false;
         config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
     });
@@ -2071,7 +2072,7 @@ local_test!(
             config.network.wireguard.enabled = false;
             config.network.wireguard.manage_firewall = false;
             config.network.bpf.attach = true;
-            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            artifact_dir.apply_to(config);
             config.network.nodeport.enabled = false;
             config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
         });
@@ -2223,7 +2224,7 @@ local_test!(
             config.network.wireguard.enabled = false;
             config.network.wireguard.manage_firewall = false;
             config.network.bpf.attach = true;
-            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            artifact_dir.apply_to(config);
             config.network.nodeport.enabled = false;
             config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
         });
@@ -2336,7 +2337,7 @@ local_test!(ebpf_overlay_heals_after_lb_map_removal, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = false;
         config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
     });
@@ -2440,7 +2441,7 @@ local_test!(
             config.network.wireguard.enabled = false;
             config.network.wireguard.manage_firewall = false;
             config.network.bpf.attach = true;
-            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            artifact_dir.apply_to(config);
             config.network.nodeport.enabled = false;
             config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
         });

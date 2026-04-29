@@ -3,6 +3,7 @@ mod linux {
     use super::super::NetworkInterfaceContext;
     use crate::config;
     use crate::network::allocator::{OverlayIpFamily, parse_overlay_cidr};
+    use crate::network::embedded_bpf::{BpfObject, BpfObjectResolver};
     use crate::network::types::{BpfAttachPoint, BpfProgramSpec, NetworkSpecValue};
     use anyhow::{Context, Result, anyhow};
     use aya::maps::MapData;
@@ -17,7 +18,6 @@ mod linux {
     use nix::mount::{MsFlags, mount};
     use nix::sys::statfs::{BPF_FS_MAGIC, statfs};
     use std::collections::{HashMap, HashSet};
-    use std::env;
     use std::ffi::CString;
     use std::fs;
     use std::io;
@@ -66,7 +66,7 @@ mod linux {
             &self,
             spec: &BpfProgramSpec,
             target: AttachTarget<'_>,
-            artifact: &Path,
+            object: &BpfObject,
             map_pin_path: &Path,
             lb_family: Option<OverlayIpFamily>,
         ) -> Result<ProgramHandle>;
@@ -137,7 +137,7 @@ mod linux {
     struct LoadedProgram {
         spec: BpfProgramSpec,
         target: OwnedAttachTarget,
-        _artifact: PathBuf,
+        _object: BpfObject,
         handle: ProgramHandle,
     }
 
@@ -387,12 +387,13 @@ mod linux {
                             desired_attachment.attach_point
                         )
                     })?;
-                let artifact = self
+                let object = self
                     .resolver
                     .resolve(spec, network)
                     .with_context(|| format!("resolve artifact for program '{}'", spec))?;
                 let attach_target = desired_target(&desired_attachment);
                 let program_lb_family = program_load_balancer_family(spec, lb_family);
+                let object_label = object.label();
 
                 info!(
                     target: "network",
@@ -400,7 +401,7 @@ mod linux {
                     program = %spec,
                     attach_point = %spec.attach_point(),
                     interface = %desired_attachment.interface,
-                    artifact = %artifact.display(),
+                    artifact = %object_label,
                     "attaching bpf program"
                 );
 
@@ -408,7 +409,7 @@ mod linux {
                     &*self.loader,
                     spec,
                     attach_target,
-                    &artifact,
+                    &object,
                     &map_pin_path,
                     program_lb_family,
                 ) {
@@ -428,7 +429,7 @@ mod linux {
                 loaded_network.push(LoadedProgram {
                     spec: spec.clone(),
                     target: own_target(attach_target),
-                    _artifact: artifact,
+                    _object: object,
                     handle,
                 });
             }
@@ -672,12 +673,13 @@ mod linux {
                             desired_attachment.attach_point
                         )
                     })?;
-                let artifact = self
+                let object = self
                     .resolver
                     .resolve(spec, network)
                     .with_context(|| format!("resolve artifact for program '{}'", spec))?;
                 let attach_target = desired_target(&desired_attachment);
                 let program_lb_family = program_load_balancer_family(spec, lb_family);
+                let object_label = object.label();
 
                 info!(
                     target: "network",
@@ -685,7 +687,7 @@ mod linux {
                     program = %spec,
                     attach_point = %spec.attach_point(),
                     interface = %desired_attachment.interface,
-                    artifact = %artifact.display(),
+                    artifact = %object_label,
                     "incrementally attaching bpf program"
                 );
 
@@ -693,7 +695,7 @@ mod linux {
                     &*self.loader,
                     spec,
                     attach_target,
-                    &artifact,
+                    &object,
                     map_pin_path,
                     program_lb_family,
                 )?;
@@ -701,7 +703,7 @@ mod linux {
                 attached_programs.push(LoadedProgram {
                     spec: spec.clone(),
                     target: own_target(attach_target),
-                    _artifact: artifact,
+                    _object: object,
                     handle,
                 });
             }
@@ -756,13 +758,13 @@ mod linux {
 
     #[derive(Clone)]
     struct ArtifactResolver {
-        search_roots: Vec<PathBuf>,
+        inner: BpfObjectResolver,
     }
 
     impl ArtifactResolver {
         /// # Description:
         ///
-        /// Build an artifact resolver using configured search roots so BPF bytecode can be found.
+        /// Build an artifact resolver using configured overrides and embedded BPF bytecode.
         fn new() -> Self {
             Self::new_with_config(&config::global_config())
         }
@@ -771,71 +773,19 @@ mod linux {
         ///
         /// Build an artifact resolver using the provided configuration snapshot.
         fn new_with_config(config: &crate::config::Config) -> Self {
-            let mut roots = Vec::new();
-            if let Some(dir) = config.network.bpf.artifact_dir.clone() {
-                roots.push(PathBuf::from(dir));
-            }
-            if let Some(target_dir) = cargo_target_dir_from_env() {
-                roots.push(target_dir.join("bpf"));
-                roots.push(target_dir.join("bpfel-unknown-none/release"));
-                roots.push(target_dir.join("bpfeb-unknown-none/release"));
-            }
-            if let Ok(pwd) = env::current_dir() {
-                roots.push(pwd.join("target/bpf"));
-                roots.push(pwd.join("target/bpfel-unknown-none/release"));
-                roots.push(pwd.join("target/bpfeb-unknown-none/release"));
-                roots.push(pwd.join("assets/bpf"));
-            }
             Self {
-                search_roots: roots,
+                inner: BpfObjectResolver::new(
+                    config.network.bpf.artifact_dir.clone().map(PathBuf::from),
+                ),
             }
         }
 
-        /// Resolve the best BPF object path for one declared program and network family.
-        fn resolve(&self, spec: &BpfProgramSpec, network: &NetworkSpecValue) -> Result<PathBuf> {
+        /// Resolve the best BPF object for one declared program and network family.
+        fn resolve(&self, spec: &BpfProgramSpec, network: &NetworkSpecValue) -> Result<BpfObject> {
             let family_specific_name = load_balancer_map_family(network)?
                 .and_then(|family| bridge_tc_artifact_name(spec, family));
-            for candidate in self.candidates(family_specific_name.unwrap_or(spec.name.as_str())) {
-                if candidate.exists() {
-                    return Ok(candidate);
-                }
-            }
-            Err(anyhow!(
-                "unable to locate bpf artifact '{}' (searched {:?})",
-                spec.name,
-                self.search_roots
-            ))
-        }
-
-        /// Produce candidate artifact paths from explicit paths and configured search roots.
-        fn candidates(&self, name: &str) -> Vec<PathBuf> {
-            let mut out = Vec::new();
-            let path = PathBuf::from(name);
-            if path.is_absolute() || name.contains(std::path::MAIN_SEPARATOR) {
-                out.push(path.clone());
-                if path.extension().is_none() {
-                    out.push(path.with_extension("bpf.o"));
-                }
-                return dedup(out);
-            }
-
-            for root in &self.search_roots {
-                out.push(root.join(name));
-                out.push(root.join(format!("{name}.bpf.o")));
-                out.push(root.join(format!("{name}.o")));
-            }
-
-            dedup(out)
-        }
-    }
-
-    /// Resolve Cargo's optional target-dir override for runtime artifact lookup.
-    fn cargo_target_dir_from_env() -> Option<PathBuf> {
-        let path = PathBuf::from(env::var_os("CARGO_TARGET_DIR")?);
-        if path.is_absolute() {
-            Some(path)
-        } else {
-            env::current_dir().ok().map(|pwd| pwd.join(path))
+            self.inner
+                .resolve(family_specific_name.unwrap_or(spec.name.as_str()))
         }
     }
 
@@ -848,18 +798,6 @@ mod linux {
         } else {
             Arc::new(AyaProgramLoader)
         }
-    }
-
-    /// Preserve candidate order while removing duplicate filesystem paths.
-    fn dedup(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for path in paths {
-            if seen.insert(path.clone()) {
-                out.push(path);
-            }
-        }
-        out
     }
 
     /// Expand one logical BPF program declaration into the concrete interface attachments it needs.
@@ -1497,7 +1435,7 @@ mod linux {
         loader: &dyn ProgramLoader,
         spec: &BpfProgramSpec,
         target: AttachTarget<'_>,
-        artifact: &Path,
+        object: &BpfObject,
         map_pin_path: &Path,
         lb_family: Option<OverlayIpFamily>,
     ) -> Result<ProgramHandle> {
@@ -1505,14 +1443,9 @@ mod linux {
         loop {
             attempt += 1;
             match loader
-                .load_and_attach(spec, target, artifact, map_pin_path, lb_family)
-                .with_context(|| {
-                    format!(
-                        "load and attach program '{}' ({})",
-                        spec,
-                        artifact.display()
-                    )
-                }) {
+                .load_and_attach(spec, target, object, map_pin_path, lb_family)
+                .with_context(|| format!("load and attach program '{}' ({})", spec, object.label()))
+            {
                 Ok(handle) => return Ok(handle),
                 Err(err) => {
                     if attempt == 1
@@ -1747,7 +1680,7 @@ mod linux {
             &self,
             _spec: &BpfProgramSpec,
             _target: AttachTarget<'_>,
-            _artifact: &Path,
+            _object: &BpfObject,
             _map_pin_path: &Path,
             _lb_family: Option<OverlayIpFamily>,
         ) -> Result<ProgramHandle> {
@@ -1764,6 +1697,14 @@ mod linux {
         }
     }
 
+    /// Load one resolved BPF object from embedded bytes or an explicit file override.
+    fn load_bpf_object(loader: &mut EbpfLoader<'_>, object: &BpfObject) -> Result<Ebpf> {
+        match object {
+            BpfObject::Embedded { bytes, .. } => Ok(loader.load(bytes)?),
+            BpfObject::File { path } => Ok(loader.load_file(path)?),
+        }
+    }
+
     struct AyaProgramLoader;
 
     impl ProgramLoader for AyaProgramLoader {
@@ -1772,7 +1713,7 @@ mod linux {
             &self,
             spec: &BpfProgramSpec,
             target: AttachTarget<'_>,
-            artifact: &Path,
+            object: &BpfObject,
             map_pin_path: &Path,
             lb_family: Option<OverlayIpFamily>,
         ) -> Result<ProgramHandle> {
@@ -1780,9 +1721,8 @@ mod linux {
             loader.map_pin_path(map_pin_path);
             configure_overlay_flow_map_capacities(&mut loader, lb_family)
                 .context("configure overlay bpf map capacities")?;
-            let mut bpf = loader
-                .load_file(artifact)
-                .with_context(|| format!("load bpf object {}", artifact.display()))?;
+            let mut bpf = load_bpf_object(&mut loader, object)
+                .with_context(|| format!("load bpf object {}", object.label()))?;
             ensure_lb_maps_pinned(&mut bpf, map_pin_path, lb_family)
                 .context("pin load balancer maps")?;
 
@@ -2023,7 +1963,7 @@ mod linux {
                 bpf_programs: vec![spec.clone()],
             });
             let resolved = resolver.resolve(&spec, &network)?;
-            assert_eq!(resolved, artifact_path);
+            assert_eq!(resolved.file_path(), Some(artifact_path.as_path()));
 
             Ok(())
         }
@@ -2050,7 +1990,7 @@ mod linux {
                 bpf_programs: vec![spec.clone()],
             });
             let resolved = resolver.resolve(&spec, &network)?;
-            assert_eq!(resolved, artifact_path);
+            assert_eq!(resolved.file_path(), Some(artifact_path.as_path()));
 
             Ok(())
         }
@@ -2092,8 +2032,14 @@ mod linux {
                 bpf_programs: vec![spec.clone()],
             });
 
-            assert_eq!(resolver.resolve(&spec, &ipv4_network)?, v4_artifact);
-            assert_eq!(resolver.resolve(&spec, &ipv6_network)?, v6_artifact);
+            assert_eq!(
+                resolver.resolve(&spec, &ipv4_network)?.file_path(),
+                Some(v4_artifact.as_path())
+            );
+            assert_eq!(
+                resolver.resolve(&spec, &ipv6_network)?.file_path(),
+                Some(v6_artifact.as_path())
+            );
 
             Ok(())
         }
@@ -2196,7 +2142,9 @@ mod linux {
                 target: OwnedAttachTarget::Xdp {
                     interface: "vxlan-test".to_string(),
                 },
-                _artifact: PathBuf::new(),
+                _object: BpfObject::File {
+                    path: PathBuf::new(),
+                },
                 handle: Box::new(NoopHandle),
             });
             manager
@@ -2280,7 +2228,9 @@ mod linux {
                     interface: "lo".to_string(),
                     attach_type: TcAttachType::Ingress,
                 },
-                _artifact: PathBuf::new(),
+                _object: BpfObject::File {
+                    path: PathBuf::new(),
+                },
                 handle: Box::new(NoopHandle),
             });
             loaded.push(LoadedProgram {
@@ -2292,7 +2242,9 @@ mod linux {
                     interface: "mnth-stale".to_string(),
                     attach_type: TcAttachType::Ingress,
                 },
-                _artifact: PathBuf::new(),
+                _object: BpfObject::File {
+                    path: PathBuf::new(),
+                },
                 handle: Box::new(NoopHandle),
             });
 
@@ -2324,7 +2276,9 @@ mod linux {
                     interface: "mnhp-demo".to_string(),
                     attach_type: TcAttachType::Ingress,
                 },
-                _artifact: PathBuf::new(),
+                _object: BpfObject::File {
+                    path: PathBuf::new(),
+                },
                 handle: Box::new(NoopHandle),
             });
 

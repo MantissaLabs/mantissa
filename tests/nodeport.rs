@@ -6,10 +6,10 @@ mod common;
 use anyhow::Context;
 use common::convergence::wait_until;
 use common::privileged_networking::{
-    PrivilegedTestGuard, command_output, command_stdout, create_privileged_network,
-    create_privileged_node, delete_privileged_network, privileged_artifact_dir,
-    privileged_headless_config, privileged_network_interfaces, privileged_test_network,
-    privileged_test_subnet, privileged_test_subnet_v6,
+    PrivilegedBpfArtifacts, PrivilegedTestGuard, command_output, command_stdout,
+    create_privileged_network, create_privileged_node, delete_privileged_network,
+    privileged_artifact_dir, privileged_headless_config, privileged_network_interfaces,
+    privileged_test_network, privileged_test_subnet, privileged_test_subnet_v6,
 };
 use futures::TryStreamExt;
 use mantissa::config::NodePortSourceMode;
@@ -69,8 +69,8 @@ fn iface_has_usable_ipv6(iface: &str) -> bool {
         .any(|token| token.starts_with("fd") || token.starts_with("2") || token.starts_with("3"))
 }
 
-/// Resolve the compiled NodePort dataplane artifacts for the privileged validation lane.
-fn privileged_nodeport_artifact_dir() -> Option<std::path::PathBuf> {
+/// Resolve optional NodePort dataplane artifact overrides for the privileged validation lane.
+fn privileged_nodeport_artifact_dir() -> Option<PrivilegedBpfArtifacts> {
     privileged_artifact_dir(
         "NodePort",
         &["nodeport_tc_ingress.bpf.o", "nodeport_tc_egress.bpf.o"],
@@ -620,7 +620,7 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = true;
         config.network.nodeport.iface = Some("lo".to_string());
         config.network.nodeport.ip = Some("127.0.0.1".to_string());
@@ -826,7 +826,7 @@ local_test!(nodeport_restart_restores_public_service_publication, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = true;
         config.network.nodeport.iface = Some("lo".to_string());
         config.network.nodeport.ip = Some("127.0.0.1".to_string());
@@ -1108,7 +1108,7 @@ local_test!(nodeport_tcp_syn_mss_clamps_to_host_access_mtu, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = true;
         config.network.nodeport.iface = Some("lo".to_string());
         config.network.nodeport.ip = Some("127.0.0.1".to_string());
@@ -1250,7 +1250,7 @@ local_test!(
             config.network.wireguard.enabled = false;
             config.network.wireguard.manage_firewall = false;
             config.network.bpf.attach = true;
-            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            artifact_dir.apply_to(config);
             config.network.nodeport.enabled = true;
             config.network.nodeport.iface = Some("lo".to_string());
             config.network.nodeport.ip = Some(loopback_ip.to_string());
@@ -1395,7 +1395,7 @@ local_test!(
             config.network.wireguard.enabled = false;
             config.network.wireguard.manage_firewall = false;
             config.network.bpf.attach = true;
-            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            artifact_dir.apply_to(config);
             config.network.nodeport.enabled = true;
             config.network.nodeport.iface = Some("lo".to_string());
             config.network.nodeport.ip = Some("127.0.0.1".to_string());
@@ -1535,7 +1535,7 @@ local_test!(nodeport_udp_public_service_reaches_backend_and_cleans_up, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = true;
         config.network.nodeport.iface = Some("lo".to_string());
         config.network.nodeport.ip = Some("127.0.0.1".to_string());
@@ -1697,7 +1697,7 @@ local_test!(nodeport_udp_service_removal_clears_stale_flow_maps, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = true;
         config.network.nodeport.iface = Some("lo".to_string());
         config.network.nodeport.ip = Some("127.0.0.1".to_string());
@@ -1813,7 +1813,7 @@ local_test!(nodeport_udp_public_port_remap_clears_stale_flow_maps, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = true;
         config.network.nodeport.iface = Some("lo".to_string());
         config.network.nodeport.ip = Some("127.0.0.1".to_string());
@@ -1973,7 +1973,7 @@ local_test!(nodeport_small_flow_capacity_reports_estimated_evictions, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = true;
         config.network.nodeport.iface = Some("lo".to_string());
         config.network.nodeport.ip = Some("127.0.0.1".to_string());
@@ -2097,7 +2097,7 @@ local_test!(
             config.network.wireguard.enabled = false;
             config.network.wireguard.manage_firewall = false;
             config.network.bpf.attach = true;
-            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            artifact_dir.apply_to(config);
             config.network.nodeport.enabled = true;
             config.network.nodeport.iface = Some("lo".to_string());
             config.network.nodeport.ip = Some("127.0.0.1".to_string());
@@ -2212,7 +2212,7 @@ local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = true;
         config.network.nodeport.iface = Some("lo".to_string());
         config.network.nodeport.ip = Some("127.0.0.1".to_string());
@@ -2316,7 +2316,7 @@ local_test!(
             config.network.wireguard.enabled = false;
             config.network.wireguard.manage_firewall = false;
             config.network.bpf.attach = true;
-            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            artifact_dir.apply_to(config);
             config.network.nodeport.enabled = true;
             config.network.nodeport.iface = Some(missing_iface.to_string());
             config.network.nodeport.ip = Some("127.0.0.1".to_string());
@@ -2436,7 +2436,7 @@ local_test!(nodeport_runtime_autodetects_identity_by_default, {
         config.network.wireguard.enabled = false;
         config.network.wireguard.manage_firewall = false;
         config.network.bpf.attach = true;
-        config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+        artifact_dir.apply_to(config);
         config.network.nodeport.enabled = true;
         config.network.nodeport.iface = None;
         config.network.nodeport.ip = None;
@@ -2545,7 +2545,7 @@ local_test!(
             config.network.wireguard.enabled = false;
             config.network.wireguard.manage_firewall = false;
             config.network.bpf.attach = true;
-            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            artifact_dir.apply_to(config);
             config.network.nodeport.enabled = true;
             config.network.nodeport.iface = Some("lo".to_string());
             config.network.nodeport.ip = Some("127.0.0.1".to_string());
@@ -2651,7 +2651,7 @@ local_test!(
             config.network.wireguard.enabled = false;
             config.network.wireguard.manage_firewall = false;
             config.network.bpf.attach = true;
-            config.network.bpf.artifact_dir = Some(artifact_dir.display().to_string());
+            artifact_dir.apply_to(config);
             config.network.nodeport.enabled = true;
             config.network.nodeport.iface = Some(external_iface.clone());
             config.network.nodeport.ip = None;

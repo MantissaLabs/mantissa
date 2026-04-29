@@ -209,66 +209,53 @@ pub fn privileged_networking_enabled(label: &str) -> bool {
     true
 }
 
-/// Resolve the compiled BPF artifact directory for one privileged networking lane.
-pub fn privileged_artifact_dir(label: &str, required_artifacts: &[&str]) -> Option<PathBuf> {
+/// Carries the optional external BPF artifact override for privileged networking tests.
+pub struct PrivilegedBpfArtifacts {
+    artifact_dir: Option<PathBuf>,
+}
+
+impl PrivilegedBpfArtifacts {
+    /// Apply the artifact override to a test-scoped configuration snapshot.
+    pub fn apply_to(&self, config: &mut Config) {
+        config.network.bpf.artifact_dir = self
+            .artifact_dir
+            .as_ref()
+            .map(|path| path.display().to_string());
+    }
+}
+
+/// Resolve BPF artifacts for one privileged networking lane.
+pub fn privileged_artifact_dir(
+    label: &str,
+    required_artifacts: &[&str],
+) -> Option<PrivilegedBpfArtifacts> {
     if !privileged_networking_enabled(label) {
         return None;
     }
 
-    let artifact_dirs = candidate_bpf_artifact_dirs();
-    for artifact_dir in &artifact_dirs {
-        if required_artifacts
-            .iter()
-            .all(|artifact| bpf_artifact_exists(artifact_dir, artifact))
-        {
-            return Some(artifact_dir.clone());
-        }
+    let Some(artifact_dir) = std::env::var_os("MANTISSA_BPF_DIR").map(PathBuf::from) else {
+        return Some(PrivilegedBpfArtifacts { artifact_dir: None });
+    };
+
+    if required_artifacts
+        .iter()
+        .all(|artifact| bpf_artifact_exists(&artifact_dir, artifact))
+    {
+        return Some(PrivilegedBpfArtifacts {
+            artifact_dir: Some(artifact_dir),
+        });
     }
 
-    let searched = artifact_dirs
+    let missing = required_artifacts
         .iter()
-        .map(|path| path.display().to_string())
+        .filter(|artifact| !bpf_artifact_exists(&artifact_dir, artifact))
+        .copied()
         .collect::<Vec<_>>()
         .join(", ");
     panic!(
-        "missing required BPF artifacts for privileged {label} tests; searched [{searched}]. \
-         Run `cargo build` from the workspace root, or set MANTISSA_BPF_DIR to a directory \
-         containing the compiled BPF objects."
+        "MANTISSA_BPF_DIR={} is missing required BPF artifacts for privileged {label} tests: {missing}",
+        artifact_dir.display()
     );
-}
-
-/// Return all artifact directories understood by privileged networking tests.
-fn candidate_bpf_artifact_dirs() -> Vec<PathBuf> {
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut dirs = Vec::new();
-
-    if let Some(path) = std::env::var_os("MANTISSA_BPF_DIR") {
-        dirs.push(PathBuf::from(path));
-    }
-
-    if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
-        push_bpf_target_dirs(&mut dirs, resolve_target_dir(&repo_root, target_dir));
-    }
-
-    push_bpf_target_dirs(&mut dirs, repo_root.join("target"));
-    dedup_paths(dirs)
-}
-
-/// Resolve Cargo target-dir values relative to the workspace root when needed.
-fn resolve_target_dir(repo_root: &Path, path: OsString) -> PathBuf {
-    let path = PathBuf::from(path);
-    if path.is_absolute() {
-        path
-    } else {
-        repo_root.join(path)
-    }
-}
-
-/// Push both packaged and raw eBPF Cargo output locations for one target directory.
-fn push_bpf_target_dirs(dirs: &mut Vec<PathBuf>, target_dir: PathBuf) {
-    dirs.push(target_dir.join("bpf"));
-    dirs.push(target_dir.join("bpfel-unknown-none/release"));
-    dirs.push(target_dir.join("bpfeb-unknown-none/release"));
 }
 
 /// Return whether `dir` contains an artifact in either packaged or raw cargo-output form.
@@ -282,18 +269,6 @@ fn bpf_artifact_exists(dir: &Path, artifact: &str) -> bool {
     };
 
     dir.join(stem).exists() || dir.join(format!("{stem}.o")).exists()
-}
-
-/// Deduplicate candidate paths while preserving their priority order.
-fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut seen = BTreeSet::new();
-    let mut deduped = Vec::new();
-    for path in paths {
-        if seen.insert(path.clone()) {
-            deduped.push(path);
-        }
-    }
-    deduped
 }
 
 /// Start one real headless node with fast control-plane ticks for privileged dataplane tests.

@@ -18,6 +18,18 @@ use std::{
 use anyhow::Result;
 
 #[cfg(target_os = "linux")]
+const BPF_PROGRAMS: &[&str] = &[
+    "vxlan_xdp",
+    "bridge_xdp",
+    "bridge_tc_ingress_v4",
+    "bridge_tc_egress_v4",
+    "bridge_tc_ingress_v6",
+    "bridge_tc_egress_v6",
+    "nodeport_tc_ingress",
+    "nodeport_tc_egress",
+];
+
+#[cfg(target_os = "linux")]
 /// Normalize the architecture string used for BPF compilation so cache keys
 /// remain stable across closely related targets.
 fn target_arch_fixup(target_arch: Cow<'_, str>) -> Cow<'_, str> {
@@ -220,20 +232,45 @@ fn track_ebpf_path(path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-/// Resolve the public eBPF artifact directory that runtime code and privileged tests search.
-fn packaged_bpf_artifact_dir(manifest_dir: &Path) -> PathBuf {
-    let target_dir = env::var_os("CARGO_TARGET_DIR")
+/// Write the Rust module that embeds any BPF programs compiled by this build.
+fn write_embedded_bpf_module(programs: &[(&str, PathBuf)]) -> Result<()> {
+    let out_dir = env::var_os("OUT_DIR")
         .map(PathBuf::from)
-        .map(|path| {
-            if path.is_absolute() {
-                path
-            } else {
-                manifest_dir.join(path)
-            }
-        })
-        .unwrap_or_else(|| manifest_dir.join("target"));
+        .context("OUT_DIR not set while preparing embedded eBPF module")?;
+    let destination = out_dir.join("embedded_bpf.rs");
+    let mut source = String::from("const PROGRAMS: &[EmbeddedBpfProgram] = &[\n");
 
-    target_dir.join("bpf")
+    for (name, path) in programs {
+        source.push_str("    EmbeddedBpfProgram {\n");
+        source.push_str(&format!("        name: {},\n", rust_string_literal(name)));
+        source.push_str(&format!(
+            "        bytes: aya::include_bytes_aligned!({}),\n",
+            rust_string_literal(path.to_string_lossy().as_ref())
+        ));
+        source.push_str("    },\n");
+    }
+
+    source.push_str("];\n");
+    fs::write(destination, source).context("write generated embedded eBPF module")
+}
+
+#[cfg(target_os = "linux")]
+/// Escape one value as a Rust string literal for generated source.
+fn rust_string_literal(value: &str) -> String {
+    let mut literal = String::with_capacity(value.len() + 2);
+    literal.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => literal.push_str("\\\\"),
+            '"' => literal.push_str("\\\""),
+            '\n' => literal.push_str("\\n"),
+            '\r' => literal.push_str("\\r"),
+            '\t' => literal.push_str("\\t"),
+            _ => literal.push(ch),
+        }
+    }
+    literal.push('"');
+    literal
 }
 
 #[cfg(target_os = "linux")]
@@ -241,7 +278,9 @@ fn packaged_bpf_artifact_dir(manifest_dir: &Path) -> PathBuf {
 /// available for runtime networking features.
 fn build_bpf() -> Result<()> {
     println!("cargo:rerun-if-env-changed=MANTISSA_SKIP_BPF");
-    println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
+    println!("cargo:rerun-if-env-changed=MANTISSA_BPF_TOOLCHAIN");
+
+    write_embedded_bpf_module(&[])?;
 
     if env::var_os("MANTISSA_SKIP_BPF").is_some() {
         return Ok(());
@@ -302,7 +341,7 @@ fn build_bpf() -> Result<()> {
     }
 
     if let Err(err) = ensure_bpf_linker() {
-        eprintln!("Skipping eBPF build: {err}");
+        eprintln!("building without embedded eBPF programs: {err}");
         return Ok(());
     }
 
@@ -319,39 +358,37 @@ fn build_bpf() -> Result<()> {
 
     let out_dir = PathBuf::from(
         env::var_os("OUT_DIR")
-            .ok_or_else(|| anyhow!("OUT_DIR missing while copying compiled eBPF artifacts"))?,
+            .ok_or_else(|| anyhow!("OUT_DIR missing while embedding compiled eBPF artifacts"))?,
     );
-    let dest_dir = packaged_bpf_artifact_dir(&manifest_dir);
-    fs::create_dir_all(&dest_dir)?;
+    let mut embedded = Vec::new();
 
-    for program in [
-        "vxlan_xdp",
-        "bridge_xdp",
-        "bridge_tc_ingress_v4",
-        "bridge_tc_egress_v4",
-        "bridge_tc_ingress_v6",
-        "bridge_tc_egress_v6",
-        "nodeport_tc_ingress",
-        "nodeport_tc_egress",
-    ] {
+    for program in BPF_PROGRAMS {
         let source = out_dir.join(program);
         if source.exists() {
-            let destination = dest_dir.join(format!("{program}.bpf.o"));
-            fs::copy(&source, &destination)?;
+            embedded.push((*program, source));
         } else {
             println!(
-                "cargo:warning=compiled eBPF artifact for {program} not found at {}",
+                "cargo:warning=compiled eBPF artifact for {program} was not embedded because it was not found at {}",
                 source.display()
             );
         }
     }
 
+    write_embedded_bpf_module(&embedded)?;
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
 /// No-op build hook on non-Linux hosts; eBPF programs are not compiled here.
 fn build_bpf() -> Result<()> {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && let Some(out_dir) = std::env::var_os("OUT_DIR")
+    {
+        std::fs::write(
+            std::path::PathBuf::from(out_dir).join("embedded_bpf.rs"),
+            "const PROGRAMS: &[EmbeddedBpfProgram] = &[];\n",
+        )?;
+    }
     println!("cargo:warning=skipping eBPF compilation on non-Linux host");
     Ok(())
 }
@@ -361,7 +398,7 @@ fn build_bpf() -> Result<()> {
 fn main() {
     if let Err(err) = build_bpf() {
         println!(
-            "cargo:warning=skipping eBPF build (will fall back to DNS-only VIP behavior): {err:#}"
+            "cargo:warning=building without embedded eBPF programs; networking will use non-BPF fallbacks where available: {err:#}"
         );
     }
 }

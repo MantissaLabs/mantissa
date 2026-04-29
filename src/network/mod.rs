@@ -4,6 +4,8 @@ pub mod attachment;
 pub mod bpf;
 pub mod controller;
 pub mod discovery;
+#[cfg(target_os = "linux")]
+pub(crate) mod embedded_bpf;
 pub mod events;
 pub mod gossip;
 pub mod lb;

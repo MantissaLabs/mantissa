@@ -10,6 +10,7 @@ use super::{
 use crate::config;
 use crate::ip_family::{IpFamily, infer_default_ip_family};
 use crate::network::attachment::host_access_host_iface_name;
+use crate::network::embedded_bpf::{BpfObject, BpfObjectResolver};
 use crate::network::wireguard::MANTISSA_WIREGUARD_IFNAME;
 use anyhow::{Context, Result, anyhow};
 use aya::Pod;
@@ -25,7 +26,6 @@ use rtnetlink::new_connection;
 use rtnetlink::packet_route::address::AddressAttribute;
 use rtnetlink::packet_route::link::{LinkAttribute, LinkFlags};
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::ffi::CString;
 use std::fs;
 use std::io;
@@ -1994,10 +1994,10 @@ fn configure_nodeport_loader_capacities(
     Ok(())
 }
 
-/// Load a tc program from the local BPF artifact directory.
+/// Load a tc program from embedded bytecode or an explicit BPF artifact override.
 fn load_program(name: &str, capacities: NodePortMapCapacities) -> Result<Ebpf> {
     let resolver = ArtifactResolver::new();
-    let path = resolver
+    let object = resolver
         .resolve(name)
         .with_context(|| format!("resolve nodeport artifact {name}"))?;
     let map_pin_path = map_pin_dir()?;
@@ -2005,8 +2005,17 @@ fn load_program(name: &str, capacities: NodePortMapCapacities) -> Result<Ebpf> {
     loader.map_pin_path(&map_pin_path);
     configure_nodeport_loader_capacities(&mut loader, capacities)
         .context("configure nodeport bpf map capacities")?;
-    let bpf = loader.load_file(path).context("load nodeport ebpf")?;
+    let bpf = load_bpf_object(&mut loader, &object)
+        .with_context(|| format!("load nodeport ebpf object {}", object.label()))?;
     Ok(bpf)
+}
+
+/// Load one resolved NodePort BPF object from embedded bytes or an explicit file override.
+fn load_bpf_object(loader: &mut EbpfLoader<'_>, object: &BpfObject) -> Result<Ebpf> {
+    match object {
+        BpfObject::Embedded { bytes, .. } => Ok(loader.load(bytes)?),
+        BpfObject::File { path } => Ok(loader.load_file(path)?),
+    }
 }
 
 /// Ensure a clsact qdisc exists so tc programs can attach on an interface.
@@ -2084,87 +2093,21 @@ fn detach_tc(iface: &str, attach_type: TcAttachType, program_name: &str) -> Resu
 }
 
 struct ArtifactResolver {
-    search_roots: Vec<PathBuf>,
+    inner: BpfObjectResolver,
 }
 
 impl ArtifactResolver {
-    /// Build a resolver using the same search roots as the core BPF loader.
+    /// Build a resolver that prefers explicit BPF artifacts before embedded bytecode.
     fn new() -> Self {
-        let mut roots = Vec::new();
-        if let Some(dir) = config::bpf_artifact_dir() {
-            roots.push(dir);
-        }
-        if let Some(target_dir) = cargo_target_dir_from_env() {
-            roots.push(target_dir.join("bpf"));
-            roots.push(target_dir.join("bpfel-unknown-none/release"));
-            roots.push(target_dir.join("bpfeb-unknown-none/release"));
-        }
-        if let Ok(pwd) = env::current_dir() {
-            roots.push(pwd.join("target/bpf"));
-            roots.push(pwd.join("target/bpfel-unknown-none/release"));
-            roots.push(pwd.join("target/bpfeb-unknown-none/release"));
-            roots.push(pwd.join("assets/bpf"));
-        }
         Self {
-            search_roots: roots,
+            inner: BpfObjectResolver::new(config::bpf_artifact_dir()),
         }
     }
 
     /// Find a compiled BPF object for the requested program name.
-    fn resolve(&self, name: &str) -> Result<PathBuf> {
-        for candidate in self.candidates(name) {
-            if candidate.exists() {
-                return Ok(candidate);
-            }
-        }
-        Err(anyhow!(
-            "unable to locate nodeport artifact '{}' (searched {:?})",
-            name,
-            self.search_roots
-        ))
+    fn resolve(&self, name: &str) -> Result<BpfObject> {
+        self.inner.resolve(name)
     }
-
-    /// Enumerate candidate paths for a BPF program artifact.
-    fn candidates(&self, name: &str) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        let path = PathBuf::from(name);
-        if path.is_absolute() || name.contains(std::path::MAIN_SEPARATOR) {
-            out.push(path.clone());
-            if path.extension().is_none() {
-                out.push(path.with_extension("bpf.o"));
-            }
-            return dedup(out);
-        }
-
-        for root in &self.search_roots {
-            out.push(root.join(name));
-            out.push(root.join(format!("{name}.bpf.o")));
-            out.push(root.join(format!("{name}.o")));
-        }
-        dedup(out)
-    }
-}
-
-/// Resolve Cargo's optional target-dir override for runtime artifact lookup.
-fn cargo_target_dir_from_env() -> Option<PathBuf> {
-    let path = PathBuf::from(env::var_os("CARGO_TARGET_DIR")?);
-    if path.is_absolute() {
-        Some(path)
-    } else {
-        env::current_dir().ok().map(|pwd| pwd.join(path))
-    }
-}
-
-/// Deduplicate candidate artifact paths while preserving order.
-fn dedup(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for path in paths {
-        if seen.insert(path.clone()) {
-            out.push(path);
-        }
-    }
-    out
 }
 
 /// Return the nodeport map pin directory and ensure it exists.
