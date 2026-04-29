@@ -15,7 +15,7 @@ use std::fs::File;
 use std::net::IpAddr;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::task::spawn_blocking;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::config;
@@ -35,7 +35,16 @@ pub struct AttachmentProvisioner {
 impl Default for AttachmentProvisioner {
     /// Build a privileged Linux provisioner for tests and callers that need `Default`.
     fn default() -> Self {
-        Self::new().expect("attachment provisioner initialization")
+        match Self::new() {
+            Ok(provisioner) => provisioner,
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    "failed to initialize default attachment provisioner: {err}"
+                );
+                Self::unavailable()
+            }
+        }
     }
 }
 

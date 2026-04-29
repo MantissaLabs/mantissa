@@ -89,9 +89,13 @@ pub async fn run_many(cfg: &ClientConfig, tasks: Vec<TaskStartParams>) -> Result
                     }
                 };
                 policy_builder.set_name(name);
-                policy_builder.set_max_retry_count(policy.max_retry_count.map_or(-1, |value| {
-                    i32::try_from(value).expect("validated restart policy bound")
-                }));
+                let max_retry_count = match policy.max_retry_count {
+                    Some(value) => i32::try_from(value).map_err(|_| {
+                        anyhow!("restart policy max_retry_count must be <= {}", i32::MAX)
+                    })?,
+                    None => -1,
+                };
+                policy_builder.set_max_retry_count(max_retry_count);
             }
         }
     }

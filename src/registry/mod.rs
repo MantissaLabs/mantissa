@@ -1472,11 +1472,18 @@ impl Registry {
     ) -> Option<cluster_session::Client> {
         let cred_bytes = {
             let sk_guard = self.signing_key.lock().await;
+            let nonce = match crate::crypto::rand::try_nonce16() {
+                Ok(nonce) => nonce,
+                Err(error) => {
+                    error!(target: "sync", "credential nonce generation failed: {error}");
+                    return None;
+                }
+            };
             let cred = crate::server::credential::ClusterCredential::sign(
                 &sk_guard,
                 self.node_id,
                 3600,
-                crate::crypto::rand::nonce16(),
+                nonce,
             );
             match cred.to_bytes() {
                 Ok(b) => b,

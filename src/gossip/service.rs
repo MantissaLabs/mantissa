@@ -143,7 +143,17 @@ impl gossip::Server for Gossip {
                     continue;
                 }
             }
-            let which = msg.reborrow().which().expect("failed to read variant");
+            let which = match msg.reborrow().which() {
+                Ok(which) => which,
+                Err(err) => {
+                    debug!(
+                        target: "gossip",
+                        gossip_id = %id,
+                        "dropping gossip message with unreadable variant: {err}"
+                    );
+                    continue;
+                }
+            };
             let message_type = match &which {
                 Void(_) => "void",
                 Topology(_) => "topology",

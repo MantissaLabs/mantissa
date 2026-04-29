@@ -899,7 +899,7 @@ async fn refresh_backend_catalog_if_needed(
 /// to node liveness changes that affect candidate filtering.
 fn health_snapshot_fingerprint(snapshot: &HashMap<Uuid, HealthStatus>) -> u64 {
     let mut entries: Vec<(Uuid, HealthStatus)> = snapshot.iter().map(|(k, v)| (*k, *v)).collect();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    entries.sort_by_key(|(peer, _)| *peer);
     let mut hasher = Hasher::new();
     for (peer_id, status) in entries {
         hasher.update(peer_id.as_bytes());

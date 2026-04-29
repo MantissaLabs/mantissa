@@ -1031,10 +1031,8 @@ fn validate_constraint(constraint: &PlacementConstraint) -> std::result::Result<
     }
 
     match &constraint.selector {
-        PlacementConstraintSelector::NodeLabel { key } => {
-            if key.trim().is_empty() {
-                return Err("node_label selector requires a non-empty key".to_string());
-            }
+        PlacementConstraintSelector::NodeLabel { key } if key.trim().is_empty() => {
+            return Err("node_label selector requires a non-empty key".to_string());
         }
         PlacementConstraintSelector::NodeIp if !is_valid_ip_or_cidr(value) => {
             return Err(format!(

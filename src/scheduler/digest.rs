@@ -192,7 +192,7 @@ impl SchedulerDigestRegistry {
             }
         }
 
-        values.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        values.sort_by_key(|value| value.node_id);
         Ok(values)
     }
 

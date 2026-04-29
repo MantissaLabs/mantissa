@@ -23,14 +23,14 @@ impl TokenStoreInMemory {
     }
 
     /// Generate a brand-new token `MNTISA-1-<base32lower_nopad>` and store it.
-    pub async fn generate(&self) -> String {
-        let token = generate_token();
+    pub async fn generate(&self) -> io::Result<String> {
+        let token = generate_token()?;
         *self.inner.write().await = token.clone();
-        token
+        Ok(token)
     }
 
     /// Rotate to a new token (alias of `generate`).
-    pub async fn rotate(&self) -> String {
+    pub async fn rotate(&self) -> io::Result<String> {
         self.generate().await
     }
 
@@ -54,17 +54,19 @@ impl TokenStoreInMemory {
 }
 
 /// Produce `MNTISA-1-<longtoken>` where `<longtoken>` is base32 (lowercase, no padding).
-fn generate_token() -> String {
+fn generate_token() -> io::Result<String> {
     let mut bytes = [0u8; 48];
-    getrandom(&mut bytes).expect("CSPRNG failed");
+    getrandom(&mut bytes)?;
 
     let mut spec = Specification::new();
     spec.symbols.push_str("abcdefghijklmnopqrstuvwxyz234567");
     spec.padding = None;
-    let enc = spec.encoding().expect("valid base32 spec");
+    let enc = spec
+        .encoding()
+        .map_err(|error| io::Error::other(format!("invalid token encoding: {error}")))?;
 
     let encoded = enc.encode(&bytes);
-    format!("{TOKEN_PREFIX}{encoded}")
+    Ok(format!("{TOKEN_PREFIX}{encoded}"))
 }
 
 /// Optional format check (lowercase base32, no padding).
@@ -93,7 +95,7 @@ impl TokenStore {
             Some(saved) if is_valid_format(&saved) => saved,
             _ => {
                 // We are inside token.rs so we can call the private generator directly.
-                let fresh = generate_token();
+                let fresh = generate_token()?;
                 local_store.write(&fresh)?;
                 fresh
             }
@@ -120,7 +122,7 @@ impl TokenStore {
 
     /// Rotate, persist, and return the new token.
     pub async fn rotate_and_persist(&self) -> io::Result<String> {
-        let new_token = self.in_memory.rotate().await;
+        let new_token = self.in_memory.rotate().await?;
         self.local_store.write(&new_token)?;
         Ok(new_token)
     }

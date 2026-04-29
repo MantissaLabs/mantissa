@@ -790,7 +790,13 @@ pub fn render_config_ron(config: &Config) -> Result<String> {
 pub fn spawn_config_watcher() -> Option<std::thread::JoinHandle<()>> {
     let source = global_config_source();
     let path = source.path?;
-    Some(start_config_watch_thread(path))
+    match start_config_watch_thread(path) {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            warn!(target: "config", "failed to spawn config watcher thread: {err}");
+            None
+        }
+    }
 }
 
 /// # Description:
@@ -1502,7 +1508,7 @@ fn apply_positive_u64_env_override(name: &str, dest: &mut u64) -> bool {
 /// # Description:
 ///
 /// Start a watcher thread for the provided config path and reload on changes.
-fn start_config_watch_thread(path: PathBuf) -> std::thread::JoinHandle<()> {
+fn start_config_watch_thread(path: PathBuf) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("mantissa-config-watch".to_string())
         .spawn(move || {
@@ -1573,7 +1579,6 @@ fn start_config_watch_thread(path: PathBuf) -> std::thread::JoinHandle<()> {
                 }
             }
         })
-        .expect("failed to spawn config watcher thread")
 }
 
 /// # Description:

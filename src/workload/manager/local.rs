@@ -49,7 +49,7 @@ impl WorkloadManager {
             Ok(specs) => {
                 let ordered = plans
                     .iter()
-                    .zip(specs.into_iter())
+                    .zip(specs)
                     .map(|(plan, spec)| (plan.index, spec))
                     .collect();
                 Ok(ordered)

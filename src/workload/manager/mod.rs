@@ -606,9 +606,9 @@ impl WorkloadManager {
         };
 
         let mut specs = self.start_workloads_batch(vec![request]).await?;
-        Ok(specs
+        specs
             .pop()
-            .expect("batch start with single request should yield one spec"))
+            .ok_or_else(|| anyhow!("batch start returned no workload spec"))
     }
 
     /// Starts one workload batch using the default transient scheduling retry policy for the caller.
@@ -764,14 +764,16 @@ impl WorkloadManager {
                     reserved_remote.clear();
                     let mut ordered: Vec<Option<WorkloadSpec>> = vec![None; intents.len()];
 
-                    for (idx, spec) in remote_specs.into_iter().chain(local_specs.into_iter()) {
+                    for (idx, spec) in remote_specs.into_iter().chain(local_specs) {
                         ordered[idx] = Some(spec);
                     }
 
                     let specs: Vec<WorkloadSpec> = ordered
                         .into_iter()
-                        .map(|spec| spec.expect("missing workload spec after execution"))
-                        .collect();
+                        .map(|spec| {
+                            spec.ok_or_else(|| anyhow!("missing workload spec after execution"))
+                        })
+                        .collect::<Result<_, _>>()?;
 
                     return Ok(specs);
                 }
@@ -1628,8 +1630,13 @@ fn resolve_secret_runtime_root(local_node_id: Uuid) -> PathBuf {
     }
 
     let fallback_base = tmp_root.join(format!("mantissa-fallback-{}", Uuid::new_v4()));
-    ensure_dir_writable(&fallback_base)
-        .expect("unable to provision writable secret staging base directory");
+    if let Err(err) = ensure_dir_writable(&fallback_base) {
+        warn!(
+            target: "task",
+            "failed to provision fallback secret staging base {}: {err}",
+            fallback_base.display()
+        );
+    }
     fallback_base.join(local_node_id.to_string())
 }
 

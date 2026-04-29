@@ -297,7 +297,7 @@ fn build_bpf() -> Result<()> {
     };
 
     // Forward child cargo output to stderr to avoid clogging the host build with warnings.
-    build_ebpf_without_warnings(packages.into_iter(), toolchain)?;
+    build_ebpf_without_warnings(packages, toolchain)?;
 
     let out_dir = PathBuf::from(
         env::var_os("OUT_DIR")

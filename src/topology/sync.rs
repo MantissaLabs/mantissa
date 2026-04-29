@@ -148,7 +148,7 @@ impl Topology {
                 root_hash: Default::default(),
             });
         }
-        population.sort_by(|left, right| left.id.cmp(&right.id));
+        population.sort_by_key(|peer| peer.id);
 
         let target = gossip_warm_target(population.len(), fanout_hint);
         if target == 0 {
@@ -698,7 +698,7 @@ fn select_sync_peers_round_robin_for_node<'a>(
         return Vec::new();
     }
 
-    candidates.sort_by(|left, right| left.peer_id.cmp(&right.peer_id));
+    candidates.sort_by_key(|candidate| candidate.peer_id);
 
     let target = if sync_fanout == 0 {
         candidates.len()

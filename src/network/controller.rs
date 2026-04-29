@@ -18,7 +18,7 @@ use crate::network::wireguard::{self, WireGuardUnderlayState};
 use crate::registry::Registry;
 use crate::services::registry::ServiceRegistry;
 use crate::store::workload_store::WorkloadStore;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_channel::Sender;
 #[cfg(target_os = "linux")]
 use aya::{programs::ProgramError, sys::SyscallError};
@@ -1032,7 +1032,7 @@ impl NetworkController {
             }
         }
 
-        Err(last_error.expect("discovery retry loop should capture one startup error"))
+        Err(last_error.unwrap_or_else(|| anyhow!("discovery retry loop did not run")))
     }
 
     /// Build the current bridge-port attachment context for one network.

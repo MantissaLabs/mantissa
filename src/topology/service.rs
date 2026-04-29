@@ -43,11 +43,11 @@ impl JoinInputs {
         let anchor = request
             .get_anchor()?
             .to_string()
-            .expect("expected anchor address");
+            .map_err(|error| Error::failed(format!("invalid join anchor text: {error}")))?;
         let join_token = request
             .get_join_token()?
             .to_string()
-            .expect("expected join token");
+            .map_err(|error| Error::failed(format!("invalid join token text: {error}")))?;
 
         Ok(Self { anchor, join_token })
     }

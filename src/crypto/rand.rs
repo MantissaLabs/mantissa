@@ -15,12 +15,6 @@ pub fn try_nonce16() -> io::Result<[u8; 16]> {
     Ok(n)
 }
 
-/// Generate a 16-byte random nonce. (panics on RNG failure)
-#[inline]
-pub fn nonce16() -> [u8; 16] {
-    try_nonce16().expect("secure RNG unavailable")
-}
-
 /// Generate a random byte vector of length `len`. (non-panicking)
 #[inline]
 pub fn random_vec(len: usize) -> io::Result<Vec<u8>> {

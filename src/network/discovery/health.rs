@@ -177,11 +177,11 @@ pub(super) fn select_backends_for_active_probe(
                 eager.push((probe_priority(entry), backend.ip, backend.clone()));
             }
             ProbePriority::Healthy => {
-                healthy.push((
-                    checked_at.expect("healthy backend probes should carry a cached timestamp"),
-                    backend.ip,
-                    backend.clone(),
-                ));
+                if let Some(checked_at) = checked_at {
+                    healthy.push((checked_at, backend.ip, backend.clone()));
+                } else {
+                    eager.push((ProbePriority::Unknown, backend.ip, backend.clone()));
+                }
             }
         }
     }

@@ -643,7 +643,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
 
         networks.push(TaskTemplateNetworkRequirement::new(raw, network_id));
     }
-    networks.sort_by(|a, b| a.network_id.cmp(&b.network_id));
+    networks.sort_by_key(|network| network.network_id);
     let readiness = if reader.has_readiness() {
         Some(read_readiness_probe(reader.get_readiness()?)?)
     } else {

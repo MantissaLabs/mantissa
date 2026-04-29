@@ -594,6 +594,9 @@ pub enum SchedulerError {
         devices: Vec<String>,
         snapshot: SchedulerSnapshot,
     },
+
+    #[error("scheduler snapshot version overflow")]
+    SnapshotVersionOverflow { snapshot: SchedulerSnapshot },
 }
 
 #[derive(Clone)]
@@ -731,6 +734,16 @@ impl Scheduler {
             digest_publisher: SyncRwLock::new(None),
             digest_registry: SyncRwLock::new(None),
         })
+    }
+
+    /// Returns the next scheduler snapshot version without panicking on counter exhaustion.
+    fn next_snapshot_version(snapshot: &SchedulerSnapshot) -> Result<u64, SchedulerError> {
+        snapshot
+            .version
+            .checked_add(1)
+            .ok_or_else(|| SchedulerError::SnapshotVersionOverflow {
+                snapshot: snapshot.clone(),
+            })
     }
 
     /// Attaches the scheduler digest publisher used to replicate shortlist metadata.
@@ -1249,10 +1262,7 @@ impl Scheduler {
 
             let mut new_snapshot = current.snapshot.clone();
             new_snapshot.gpu_devices = Self::materialize_gpu_devices(gpu_devices.clone());
-            new_snapshot.version = new_snapshot
-                .version
-                .checked_add(1)
-                .expect("scheduler snapshot version overflow");
+            new_snapshot.version = Self::next_snapshot_version(&new_snapshot)?;
 
             let new_state_arc = Arc::new(SchedulerState::new(new_snapshot.clone()));
             let prev = self
@@ -1440,10 +1450,7 @@ impl Scheduler {
 
             // Monotonic versioning gives downstream consumers a simple way to detect updates and
             // mirrors the MVReg behaviour in the backing store.
-            new_snapshot.version = new_snapshot
-                .version
-                .checked_add(1)
-                .expect("scheduler snapshot version overflow");
+            new_snapshot.version = Self::next_snapshot_version(&new_snapshot)?;
 
             let new_state_arc = Arc::new(SchedulerState::new(new_snapshot.clone()));
 
@@ -1564,10 +1571,7 @@ impl Scheduler {
                 });
             }
 
-            new_snapshot.version = new_snapshot
-                .version
-                .checked_add(1)
-                .expect("scheduler snapshot version overflow");
+            new_snapshot.version = Self::next_snapshot_version(&new_snapshot)?;
 
             let new_state_arc = Arc::new(SchedulerState::new(new_snapshot.clone()));
             let prev = self
@@ -1659,10 +1663,7 @@ impl Scheduler {
                     });
             }
 
-            new_snapshot.version = new_snapshot
-                .version
-                .checked_add(1)
-                .expect("scheduler snapshot version overflow");
+            new_snapshot.version = Self::next_snapshot_version(&new_snapshot)?;
 
             let new_state_arc = Arc::new(SchedulerState::new(new_snapshot.clone()));
             let prev = self
@@ -1749,10 +1750,7 @@ impl Scheduler {
                 return Ok(current.snapshot.clone());
             }
 
-            new_snapshot.version = new_snapshot
-                .version
-                .checked_add(1)
-                .expect("scheduler snapshot version overflow");
+            new_snapshot.version = Self::next_snapshot_version(&new_snapshot)?;
 
             let new_state_arc = Arc::new(SchedulerState::new(new_snapshot.clone()));
             let prev = self
@@ -1794,10 +1792,7 @@ impl Scheduler {
                 return Ok(Vec::new());
             }
 
-            new_snapshot.version = new_snapshot
-                .version
-                .checked_add(1)
-                .expect("scheduler snapshot version overflow");
+            new_snapshot.version = Self::next_snapshot_version(&new_snapshot)?;
 
             let new_state_arc = Arc::new(SchedulerState::new(new_snapshot.clone()));
             let prev = self
@@ -1906,7 +1901,9 @@ impl Scheduler {
             }
         }
 
-        unreachable!("retry loop bounded to two iterations");
+        Err(capnp::Error::failed(
+            "scheduler summary retry loop ended without a result".into(),
+        ))
     }
 
     pub async fn free_slots<I>(
@@ -2024,10 +2021,7 @@ impl Scheduler {
                 new_snapshot.gpu_devices[idx].state = GpuDeviceState::Free;
             }
 
-            new_snapshot.version = new_snapshot
-                .version
-                .checked_add(1)
-                .expect("scheduler snapshot version overflow");
+            new_snapshot.version = Self::next_snapshot_version(&new_snapshot)?;
 
             let new_state_arc = Arc::new(SchedulerState::new(new_snapshot.clone()));
 

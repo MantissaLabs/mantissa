@@ -514,7 +514,7 @@ impl ClusterViewStore {
             out.push((ClusterId::from_uuid(cluster_key.to_uuid()), record));
         }
 
-        out.sort_by(|(left_id, _), (right_id, _)| left_id.cmp(right_id));
+        out.sort_by_key(|(view_id, _)| *view_id);
         Ok(out)
     }
 

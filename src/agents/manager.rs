@@ -440,7 +440,9 @@ impl AgentController {
             return self.ensure_run_started(session, run).await;
         }
 
-        let workload_id = run.workload_id.expect("checked workload id");
+        let Some(workload_id) = run.workload_id else {
+            return self.ensure_run_started(session, run).await;
+        };
         let spec = match self.workload_manager.inspect_workload(workload_id).await {
             Ok(spec) => spec,
             Err(error) => {

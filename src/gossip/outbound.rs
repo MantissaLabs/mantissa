@@ -630,7 +630,7 @@ fn select_fanout_window(
         return peers;
     }
 
-    peers.sort_by(|a, b| a.id.cmp(&b.id));
+    peers.sort_by_key(|peer| peer.id);
     let target = if fanout == 0 {
         peers.len()
     } else {
