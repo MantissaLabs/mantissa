@@ -41,6 +41,9 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
             stale_peer_rejoin_after_ms: 604800000,
         ),
     ),
+    security: (
+        session_ticket_ttl_secs: 86400,
+    ),
     network: (
         advertise_addr: "node-1.example.com:6578",
         wireguard: (
@@ -103,6 +106,7 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 - `storage.gc.mvreg_batch_limit`
 - `storage.gc.mvreg_max_values`
 - `storage.gc.stale_peer_rejoin_after_ms`
+- `security.session_ticket_ttl_secs` (env: `MANTISSA_SESSION_TICKET_TTL_SECS`)
 - `network.advertise_addr` (env: `MANTISSA_ADVERTISE_ADDR`)
 - `network.default_ip_family` (env: `MANTISSA_DEFAULT_IP_FAMILY`)
 - `network.wireguard.enabled` (legacy: `MANTISSA_WIREGUARD_DISABLE`)
@@ -160,6 +164,15 @@ it does not guarantee that the Redb file shrinks immediately.
   Defines the stale-peer horizon operators should use for old left-node data
   directories. Keep this less than or equal to tombstone retention. Nodes that
   remained active but offline already block tombstone GC until they converge.
+
+## Security Guidance
+
+- `security.session_ticket_ttl_secs`
+  Sets the maximum lifetime for durable peer session tickets. These tickets are
+  bearer credentials used to reopen cluster sessions after reconnects and
+  restarts. The default is `86400` seconds. Lower values reduce the usefulness
+  of leaked tickets; higher values make long offline windows less likely to need
+  credential-based renewal.
 
 ## NodePort guidance
 

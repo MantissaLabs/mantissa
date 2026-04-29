@@ -2,7 +2,7 @@ use super::BootstrapResult;
 use crate::crypto::signing::{load_or_generate_sign_keys, resolve_signing_key_path};
 use crate::node;
 use crate::store::local::load_or_create_node_id;
-use crate::store::path::default_db_path;
+use crate::store::path::open_default_database;
 use ed25519_dalek::SigningKey;
 use net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};
 use std::sync::Arc;
@@ -59,8 +59,7 @@ impl BootstrapContext {
         let sign_keys = load_or_generate_sign_keys(sign_path)?;
         let signing_key = sign_keys.sk;
 
-        let db_path = default_db_path()?;
-        let db = Arc::new(redb::Database::create(db_path)?);
+        let db = Arc::new(open_default_database()?);
 
         let self_id = load_or_create_node_id(&db)?;
 

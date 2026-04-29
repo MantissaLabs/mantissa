@@ -100,6 +100,7 @@ impl JoinRequest {
 /// keeps response population separate from issuance logic.
 struct ClusterSession {
     ticket: Vec<u8>,
+    ticket_expires_at_unix_secs: u64,
     credential: Vec<u8>,
     session: protocol::server::cluster_session::Client,
 }
@@ -184,7 +185,7 @@ impl Server {
     /// Keeping this logic together makes the register flow read as "validate,
     /// persist, issue, respond, gossip" instead of one interleaved procedure.
     fn issue_join_session(&self, joiner_id: uuid::Uuid) -> Result<ClusterSession, capnp::Error> {
-        let ticket = self
+        let issued_ticket = self
             .auth
             .sessions
             .issue_ticket(joiner_id)
@@ -198,7 +199,8 @@ impl Server {
                 .map_err(capnp::Error::failed)?;
 
         Ok(ClusterSession {
-            ticket,
+            ticket: issued_ticket.ticket,
+            ticket_expires_at_unix_secs: issued_ticket.expires_at_unix_secs,
             credential,
             session: self.sessions.new_client(),
         })
@@ -217,6 +219,7 @@ impl Server {
         let mut out = results.get();
         out.set_session(cluster_session.session.clone());
         out.set_ticket(&cluster_session.ticket);
+        out.set_ticket_expires_at_unix_secs(cluster_session.ticket_expires_at_unix_secs);
 
         let node_info = out.reborrow().init_node_info();
         self.topology.populate_self_node_info(node_info);
@@ -344,7 +347,7 @@ impl protocol::server::Server for Server {
 
         debug!(target: "server", "Peer {} authenticated", cred.subject);
 
-        let ticket = self
+        let issued_ticket = self
             .auth
             .sessions
             .issue_ticket(cred.subject)
@@ -352,7 +355,8 @@ impl protocol::server::Server for Server {
 
         let mut out = results.get();
         out.set_session(self.sessions.new_client());
-        out.set_ticket(&ticket);
+        out.set_ticket(&issued_ticket.ticket);
+        out.set_ticket_expires_at_unix_secs(issued_ticket.expires_at_unix_secs);
 
         let node_info = out.reborrow().init_node_info();
         self.topology.populate_self_node_info(node_info);

@@ -1,4 +1,7 @@
-use crate::store::tx::{into_io, with_read_tx, with_write_tx};
+use crate::{
+    config::DEFAULT_SESSION_TICKET_TTL_SECS,
+    store::tx::{into_io, with_read_tx, with_write_tx},
+};
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit},
@@ -34,7 +37,7 @@ fn now_secs() -> u64 {
 pub struct TicketRecord {
     ticket: Vec<u8>,
     issued_at: u64,
-    /// Optional absolute expiry (unix seconds). `None` = no expiry.
+    /// Optional absolute expiry; legacy `None` records fall back to the store default lifetime.
     expires_at: Option<u64>,
     /// Optional human hint (e.g., “anchor 192.168.1.10:6578”).
     note: Option<String>,
@@ -141,31 +144,51 @@ fn open(kek: &[u8; 32], blob: &[u8]) -> io::Result<Vec<u8>> {
 pub struct LocalSessionStore {
     db: Arc<Database>,
     kek: [u8; 32],
+    ticket_ttl_secs: u64,
 }
 
 impl LocalSessionStore {
     /// Open or create the table and derive the local KEK from Noise keys.
     pub fn open(db: Arc<Database>, noise_keys: &NoiseKeys) -> io::Result<Self> {
+        Self::open_with_ticket_ttl(db, noise_keys, DEFAULT_SESSION_TICKET_TTL_SECS)
+    }
+
+    /// Open or create the table with an explicit default ticket lifetime.
+    pub fn open_with_ticket_ttl(
+        db: Arc<Database>,
+        noise_keys: &NoiseKeys,
+        ticket_ttl_secs: u64,
+    ) -> io::Result<Self> {
+        if ticket_ttl_secs == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "local session ticket ttl must be greater than zero",
+            ));
+        }
+
         let kek = derive_local_key(&noise_keys.to_private_bytes());
         with_write_tx(&db, |tx| {
             let _ = tx.open_table(T_SESS).map_err(into_io)?;
             Ok(())
         })?;
-        Ok(Self { db, kek })
+        Ok(Self {
+            db,
+            kek,
+            ticket_ttl_secs,
+        })
     }
 
-    /// Put/replace ticket for `peer`. (no expiry, no note)
+    /// Put/replace ticket for `peer` using the store's default lifetime.
     pub fn put(&self, peer: Uuid, ticket: &[u8]) -> io::Result<()> {
-        self.put_with_meta(peer, ticket, None, None)
+        self.put_with_meta(peer, ticket, self.default_expires_at()?, None)
     }
 
-    /// Get ticket bytes for `peer` (returns even if expired).
+    /// Get valid ticket bytes for `peer`, purging the cached value when expired.
     pub fn get(&self, peer: Uuid) -> io::Result<Option<Vec<u8>>> {
-        Ok(self.get_record(peer)?.map(|m| m.ticket))
+        Ok(self.get_valid_record(peer, true)?.map(|m| m.ticket))
     }
 
     /// Remove ticket for `peer`.
-    #[allow(dead_code)]
     pub fn remove(&self, peer: Uuid) -> io::Result<()> {
         with_write_tx(&self.db, |tx| {
             let mut table = tx.open_table(T_SESS).map_err(into_io)?;
@@ -195,18 +218,17 @@ impl LocalSessionStore {
         })
     }
 
-    /// List all peers with their ticket bytes (returns even if expired).
-    #[allow(dead_code)]
+    /// List all peers with valid ticket bytes, purging expired cached values.
     pub fn list(&self) -> io::Result<Vec<(Uuid, Vec<u8>)>> {
         Ok(self
-            .list_records()?
+            .list_valid_records(true)?
             .into_iter()
             .map(|(p, m)| (p, m.ticket))
             .collect())
     }
 
     /// Put/replace with metadata.
-    /// - `expires_at`: absolute unix seconds; `None` = no expiry
+    /// - `expires_at`: absolute unix seconds; `None` falls back to the default lifetime
     /// - `note`: optional human hint
     pub fn put_with_meta(
         &self,
@@ -233,7 +255,7 @@ impl LocalSessionStore {
         })
     }
 
-    // Return full record (even if expired).
+    /// Return full record without applying expiry checks.
     pub fn get_record(&self, peer: Uuid) -> io::Result<Option<TicketRecord>> {
         with_read_tx(&self.db, |tx| {
             let table = tx.open_table(T_SESS).map_err(into_io)?;
@@ -250,8 +272,7 @@ impl LocalSessionStore {
         })
     }
 
-    // Return full record only if not expired (and optionally auto-purge).
-    #[allow(dead_code)]
+    /// Return full record only if not expired, optionally purging an expired value.
     pub fn get_valid_record(
         &self,
         peer: Uuid,
@@ -261,15 +282,11 @@ impl LocalSessionStore {
         let now = now_secs();
         Ok(match maybe {
             Some(rec) => {
-                if let Some(exp) = rec.expires_at {
-                    if exp <= now {
-                        if auto_purge {
-                            let _ = self.remove(peer);
-                        }
-                        None
-                    } else {
-                        Some(rec)
+                if self.record_is_expired(&rec, now) {
+                    if auto_purge {
+                        let _ = self.remove(peer);
                     }
+                    None
                 } else {
                     Some(rec)
                 }
@@ -278,13 +295,13 @@ impl LocalSessionStore {
         })
     }
 
-    // List all records (even if expired).
+    /// List all records without applying expiry checks.
     pub fn list_records(&self) -> io::Result<Vec<(Uuid, TicketRecord)>> {
         with_read_tx(&self.db, |tx| {
             let table = tx.open_table(T_SESS).map_err(into_io)?;
-            let mut it = table.iter().map_err(into_io)?;
             let mut out = Vec::new();
-            while let Some(Ok((key, value))) = it.next() {
+            for entry in table.iter().map_err(into_io)? {
+                let (key, value) = entry.map_err(into_io)?;
                 let peer = Uuid::from_bytes(key.value());
                 let blob = value.value();
                 let pt = open(&self.kek, blob)?;
@@ -295,16 +312,40 @@ impl LocalSessionStore {
         })
     }
 
+    /// List valid records, optionally purging expired cached values.
+    pub fn list_valid_records(&self, auto_purge: bool) -> io::Result<Vec<(Uuid, TicketRecord)>> {
+        let now = now_secs();
+        let mut expired = Vec::new();
+        let mut valid = Vec::new();
+
+        for (peer, record) in self.list_records()? {
+            if self.record_is_expired(&record, now) {
+                expired.push(peer);
+            } else {
+                valid.push((peer, record));
+            }
+        }
+
+        if auto_purge && !expired.is_empty() {
+            with_write_tx(&self.db, |tx| {
+                let mut table = tx.open_table(T_SESS).map_err(into_io)?;
+                for peer in &expired {
+                    let _ = table.remove(*peer.as_bytes()).map_err(into_io)?;
+                }
+                Ok(())
+            })?;
+        }
+
+        Ok(valid)
+    }
+
     /// Purge expired entries; returns the number removed.
-    #[allow(dead_code)]
     pub fn purge_expired(&self) -> io::Result<usize> {
+        let now = now_secs();
         let peers = self
             .list_records()?
             .into_iter()
-            .filter_map(|(p, m)| match m.expires_at {
-                Some(exp) if exp <= now_secs() => Some(p),
-                _ => None,
-            })
+            .filter_map(|(p, m)| self.record_is_expired(&m, now).then_some(p))
             .collect::<Vec<_>>();
 
         if peers.is_empty() {
@@ -318,6 +359,28 @@ impl LocalSessionStore {
             }
             Ok(peers.len())
         })
+    }
+
+    /// Return the default absolute expiry timestamp used for newly cached tickets.
+    fn default_expires_at(&self) -> io::Result<Option<u64>> {
+        now_secs()
+            .checked_add(self.ticket_ttl_secs)
+            .map(Some)
+            .ok_or_else(|| io::Error::other("local session ticket expiry overflow"))
+    }
+
+    /// Return the effective expiry for a record, including legacy records without explicit TTL.
+    fn effective_expires_at(&self, record: &TicketRecord) -> Option<u64> {
+        record
+            .expires_at
+            .or_else(|| record.issued_at.checked_add(self.ticket_ttl_secs))
+    }
+
+    /// Return true when a record has expired or cannot derive a bounded expiry.
+    fn record_is_expired(&self, record: &TicketRecord, now: u64) -> bool {
+        self.effective_expires_at(record)
+            .map(|expires_at| expires_at <= now)
+            .unwrap_or(true)
     }
 }
 

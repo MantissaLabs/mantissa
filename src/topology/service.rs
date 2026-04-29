@@ -109,6 +109,7 @@ struct JoinResponse {
     peer_value: PeerValue,
     peer_incarnation: u64,
     ticket: Vec<u8>,
+    ticket_expires_at_unix_secs: Option<u64>,
     credential: Vec<u8>,
     session: cluster_session::Client,
 }
@@ -204,6 +205,10 @@ impl Topology {
 
         let session = resp.get_session()?;
         let ticket = resp.get_ticket()?.to_vec();
+        let ticket_expires_at_unix_secs = match resp.get_ticket_expires_at_unix_secs() {
+            0 => None,
+            expires_at => Some(expires_at),
+        };
         let credential = resp.get_credential()?.to_vec();
         let node_info = resp.get_node_info()?;
         let peer_id = read_node_id(node_info.get_id()?)?;
@@ -215,33 +220,40 @@ impl Topology {
             peer_value,
             peer_incarnation,
             ticket,
+            ticket_expires_at_unix_secs,
             credential,
             session,
         })
     }
 
+    /// Persists the anchor peer row and renewable join credentials returned by a successful join.
     async fn persist_join_state(
         peers: &PeersStore,
         local_sessions: &LocalSessionStore,
         local_creds: &LocalCredentialStore,
-        peer_id: Uuid,
-        peer_value: &PeerValue,
-        ticket: &[u8],
-        credential: &[u8],
+        response: &JoinResponse,
     ) -> Result<(), Error> {
         if let Err(e) = peers
-            .upsert(&UuidKey::from(peer_id), peer_value.clone())
+            .upsert(
+                &UuidKey::from(response.peer_id),
+                response.peer_value.clone(),
+            )
             .await
         {
             log::warn!(target: "topology", "join: upsert of anchor NodeInfo failed: {e}");
         }
 
         local_sessions
-            .put(peer_id, ticket)
+            .put_with_meta(
+                response.peer_id,
+                &response.ticket,
+                response.ticket_expires_at_unix_secs,
+                None,
+            )
             .map_err(|e| Error::failed(format!("ticket persist failed: {e}")))?;
 
         local_creds
-            .put(peer_id, credential)
+            .put(response.peer_id, &response.credential)
             .map_err(|e| Error::failed(format!("credential persist failed: {e}")))?;
 
         Ok(())
@@ -396,17 +408,9 @@ impl topology::Server for Topology {
         )
         .await?;
 
-        let JoinResponse {
-            peer_id,
-            peer_value,
-            peer_incarnation,
-            ticket,
-            credential,
-            session,
-        } = response;
         let root_schema_version = super::sync::negotiated_sync_root_schema_version(
             self.root_schema_info(),
-            peer_value.root_schema,
+            response.peer_value.root_schema,
         )
         .ok_or_else(|| {
             Error::failed("anchor and joiner do not share a compatible root schema version".into())
@@ -418,28 +422,31 @@ impl topology::Server for Topology {
             &self.stores.peers,
             &self.stores.local_sessions,
             &self.stores.local_credential_store,
-            peer_id,
-            &peer_value,
-            &ticket,
-            &credential,
+            &response,
         )
         .await?;
 
-        self.install_master_key_from_anchor(session.clone()).await?;
+        self.install_master_key_from_anchor(response.session.clone())
+            .await?;
 
-        ClusterCredential::from_bytes_verified(&credential).map_err(Error::failed)?;
+        ClusterCredential::from_bytes_verified(&response.credential).map_err(Error::failed)?;
 
-        self.swim_record_join(peer_id, peer_incarnation);
+        self.swim_record_join(response.peer_id, response.peer_incarnation);
 
-        self.attach_handle_only(peer_id, anchor_handle).await;
+        self.attach_handle_only(response.peer_id, anchor_handle)
+            .await;
 
         let sync_cap = {
-            let req = session.get_sync_request();
+            let req = response.session.get_sync_request();
             let resp = req.send().promise.await?;
             resp.get()?.get_sync()?
         };
 
-        let sync_trace = SyncTraceContext::peer(peer_id, peer_value.address.clone(), "join");
+        let sync_trace = SyncTraceContext::peer(
+            response.peer_id,
+            response.peer_value.address.clone(),
+            "join",
+        );
         tokio::task::spawn_local({
             let topology = self.clone();
             let cluster_view = self.active_cluster_view();

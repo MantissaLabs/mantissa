@@ -54,6 +54,19 @@ plaintext value, and file projections mount a read-only bind of staged secret ma
 container. Once the task stops or is rescheduled, Mantissa scrubs the temporary host-side staging
 area.
 
+## At-Rest Security Model
+
+Mantissa encrypts stored secret values with the cluster secret master key before
+replicating them through the control plane. The current short-term release model
+stores that 32-byte master key directly in the local Redb state database so the
+daemon can restart unattended and continue decrypting cluster secrets.
+
+The state database is created with owner-only file permissions (`0600` on Unix),
+but the master key is not currently wrapped by an external OS keychain, TPM, or
+KMS provider. A host or root compromise of a Mantissa node should therefore be
+treated as a compromise of the cluster secret material available to that node.
+Use host disk encryption and restrict local administrative access accordingly.
+
 After creating the secrets, deploy the manifest and inspect the resulting tasks:
 
 ```bash

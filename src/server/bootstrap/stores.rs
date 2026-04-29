@@ -80,8 +80,13 @@ impl BootstrapStores {
         let cluster_view = ClusterViewStore::new(ctx.db.clone(), ctx.self_id)?;
         cluster_view.rebuild_cluster_view_domain_mst().await?;
 
-        let session_auth = AuthStore::new(ctx.db.clone())?;
-        let local_sessions = LocalSessionStore::open(ctx.db.clone(), &ctx.noise_keys)?;
+        let session_ticket_ttl_secs = crate::config::session_ticket_ttl_secs();
+        let session_auth = AuthStore::with_ticket_ttl(ctx.db.clone(), session_ticket_ttl_secs)?;
+        let local_sessions = LocalSessionStore::open_with_ticket_ttl(
+            ctx.db.clone(),
+            &ctx.noise_keys,
+            session_ticket_ttl_secs,
+        )?;
         let local_creds = LocalCredentialStore::new(ctx.db.clone())?;
 
         let token_store = TokenStore::load(ctx.db.clone())

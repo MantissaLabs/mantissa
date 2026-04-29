@@ -18,7 +18,7 @@ using import "volumes.capnp".Volumes;
 using import "topology.capnp".ClusterViewId;
 
 interface Server {
-  registerNode @0 (info :NodeInfo, token :Text) -> (session :ClusterSession, ticket :Data, nodeInfo :NodeInfo, credential :Data);
+  registerNode @0 (info :NodeInfo, token :Text) -> (session :ClusterSession, ticket :Data, nodeInfo :NodeInfo, credential :Data, ticketExpiresAtUnixSecs :UInt64);
   # First-time join. Adding the node to the trusted set of peers if the token
   # is valid. On failure, returns a capnp error.
 
@@ -26,7 +26,7 @@ interface Server {
   # Get a session given a ticket returned by registerNode. Returns a capnp
   # error on failure (unknown/expired/not-registered).
 
-  getWithCredential @2 (credential :Data) -> (session :ClusterSession, ticket :Data, nodeInfo :NodeInfo);
+  getWithCredential @2 (credential :Data) -> (session :ClusterSession, ticket :Data, nodeInfo :NodeInfo, ticketExpiresAtUnixSecs :UInt64);
   # Bootstrap to (re)open a session on this node using a short-lived credential.
   # Used after join to contact other neighbors in the mesh/network.
 }

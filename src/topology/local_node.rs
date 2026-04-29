@@ -352,7 +352,12 @@ impl Topology {
             return Ok(false);
         }
 
-        if !self.stores.local_sessions.list_records()?.is_empty() {
+        if !self
+            .stores
+            .local_sessions
+            .list_valid_records(true)?
+            .is_empty()
+        {
             return Ok(true);
         }
 

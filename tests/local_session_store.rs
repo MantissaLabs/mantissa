@@ -16,11 +16,11 @@ fn local_sessions_seal_open_and_purge() {
     let keys = fixed_noise_keys(42);
     let store = LocalSessionStore::open(db.clone(), &keys).expect("open");
 
-    let peer_kek_bound = Uuid::new_v4(); // stays non-expiring for KEK-mismatch check
+    let peer_kek_bound = Uuid::new_v4(); // stays valid long enough for KEK-mismatch check
     let peer_expired = Uuid::new_v4(); // used to test purge
     let ticket = b"super-secret-ticket".to_vec();
 
-    // A) Put non-expiring record (will remain to test KEK binding)
+    // A) Put a default-lifetime record (will remain to test KEK binding)
     store.put(peer_kek_bound, &ticket).expect("put A");
 
     // B) Put an already-expired record and purge it (no sleep needed)
@@ -42,6 +42,40 @@ fn local_sessions_seal_open_and_purge() {
     // Expired peer should be gone
     let none = reopened.get(peer_expired).expect("ok(None) on missing");
     assert!(none.is_none());
+}
+
+#[test]
+fn local_sessions_get_and_list_skip_expired_records() {
+    let tmp = temp_db_dir();
+    let db_path = tmp.path().join("state.redb");
+    let db = temp_db(&db_path);
+    let keys = fixed_noise_keys(42);
+    let store = LocalSessionStore::open_with_ticket_ttl(db, &keys, 60).expect("open");
+
+    let valid_peer = Uuid::new_v4();
+    let expired_peer = Uuid::new_v4();
+    let ticket = b"resume-ticket".to_vec();
+    let now = now();
+
+    store
+        .put_with_meta(valid_peer, &ticket, Some(now + 60), None)
+        .expect("put valid");
+    store
+        .put_with_meta(expired_peer, &ticket, Some(now - 1), None)
+        .expect("put expired");
+
+    assert_eq!(store.get(valid_peer).expect("get valid"), Some(ticket));
+    assert!(store.get(expired_peer).expect("get expired").is_none());
+
+    let listed = store.list().expect("list valid");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].0, valid_peer);
+    assert!(
+        store
+            .get_record(expired_peer)
+            .expect("expired purged")
+            .is_none()
+    );
 }
 
 fn now() -> u64 {

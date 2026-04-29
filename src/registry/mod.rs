@@ -1447,6 +1447,12 @@ impl Registry {
                 Ok(r) => r.get_session().ok(),
                 Err(e) => {
                     error!(target: "sync", "get_session response error: {e}");
+                    if let Err(remove_err) = self.sessions.remove(peer_id) {
+                        error!(
+                            target: "sync",
+                            "failed to remove rejected session ticket for {peer_id}: {remove_err}"
+                        );
+                    }
                     self.record_session_failure_telemetry(
                         peer_id,
                         "ticket.response",
@@ -1523,7 +1529,16 @@ impl Registry {
                     error!(target: "sync", "upsert nodeInfo failed for {peer_id}: {e}");
                 }
 
-                if let Err(e) = self.sessions.put(peer_id, r.get_ticket().ok()?) {
+                let ticket_expires_at_unix_secs = match r.get_ticket_expires_at_unix_secs() {
+                    0 => None,
+                    expires_at => Some(expires_at),
+                };
+                if let Err(e) = self.sessions.put_with_meta(
+                    peer_id,
+                    r.get_ticket().ok()?,
+                    ticket_expires_at_unix_secs,
+                    None,
+                ) {
                     error!(target: "sync", "ticket persist failed for {peer_id}: {e}");
                 }
 

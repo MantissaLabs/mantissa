@@ -6,6 +6,11 @@ or as an unprivileged user.
 - Root: writes cluster state to `/var/lib/mantissa` and exposes its control socket under `/var/run`.
 - Unprivileged: uses `~/.mantissa` for state and local sockets.
 
+The state directory may be group-traversable for privileged local workflows, but
+the Redb state database itself is owner-only (`0600` on Unix). It contains local
+credentials and the cluster secret master key, so membership in the `mantissa`
+group should not grant offline read access to `state.redb`.
+
 To mimic Docker's developer workflow (build as your user, run the daemon with sudo), set up the
 shared `mantissa` group once:
 

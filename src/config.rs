@@ -23,6 +23,8 @@ pub struct Config {
     #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
+    pub security: SecurityConfig,
+    #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
     pub health: HealthConfig,
@@ -113,6 +115,26 @@ impl StoreGcConfig {
                 mvreg_batch_limit: self.mvreg_batch_limit,
                 mvreg_max_values: self.mvreg_max_values,
             },
+        }
+    }
+}
+
+/// # Description:
+///
+/// Security-sensitive local credential and bearer-ticket policy.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct SecurityConfig {
+    #[serde(default = "default_session_ticket_ttl_secs")]
+    pub session_ticket_ttl_secs: u64,
+}
+
+impl Default for SecurityConfig {
+    /// # Description:
+    ///
+    /// Returns conservative defaults for durable session tickets.
+    fn default() -> Self {
+        Self {
+            session_ticket_ttl_secs: default_session_ticket_ttl_secs(),
         }
     }
 }
@@ -527,6 +549,11 @@ pub const DEFAULT_STORE_GC_TOMBSTONE_MIN_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 
 
 /// # Description:
 ///
+/// Default bearer session ticket lifetime used by remote and local session stores.
+pub const DEFAULT_SESSION_TICKET_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// # Description:
+///
 /// Default maximum tombstone rows pruned from one domain in one GC pass.
 pub const DEFAULT_STORE_GC_TOMBSTONE_BATCH_LIMIT: usize = 1024;
 
@@ -721,6 +748,13 @@ pub fn store_gc_runtime_config() -> RuntimeStoreGcConfig {
 
 /// # Description:
 ///
+/// Resolve the maximum lifetime for durable cluster session tickets.
+pub fn session_ticket_ttl_secs() -> u64 {
+    global_config().security.session_ticket_ttl_secs
+}
+
+/// # Description:
+///
 /// Resolve whether WireGuard underlay is enabled on this node.
 pub fn wireguard_enabled() -> bool {
     global_config().network.wireguard.enabled
@@ -881,6 +915,13 @@ fn default_store_gc_tombstone_batch_limit() -> usize {
 /// Returns the default offline-peer guard window paired with tombstone retention.
 fn default_store_gc_stale_peer_rejoin_after_ms() -> u64 {
     DEFAULT_STORE_GC_TOMBSTONE_MIN_RETENTION_MS
+}
+
+/// # Description:
+///
+/// Returns the default durable session ticket lifetime in seconds.
+fn default_session_ticket_ttl_secs() -> u64 {
+    DEFAULT_SESSION_TICKET_TTL_SECS
 }
 
 /// # Description:
@@ -1224,6 +1265,11 @@ impl Config {
             self.storage.local_volume_enforce_capacity = true;
         }
 
+        applied |= apply_positive_u64_env_override(
+            "MANTISSA_SESSION_TICKET_TTL_SECS",
+            &mut self.security.session_ticket_ttl_secs,
+        );
+
         applied |= apply_u64_env_override(
             "MANTISSA_SCHEDULER_RESERVED_CPU_MILLIS",
             &mut self.scheduler.reserved_cpu_millis,
@@ -1369,6 +1415,10 @@ impl Config {
             anyhow::bail!(
                 "storage.gc.stale_peer_rejoin_after_ms must be less than or equal to storage.gc.tombstone_min_retention_ms"
             );
+        }
+
+        if self.security.session_ticket_ttl_secs == 0 {
+            anyhow::bail!("security.session_ticket_ttl_secs must be greater than zero");
         }
 
         if self.health.probe_fanout == 0 {
@@ -1617,6 +1667,10 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
         changes.push("storage.gc".to_string());
     }
 
+    if old.security.session_ticket_ttl_secs != new.security.session_ticket_ttl_secs {
+        changes.push("security.session_ticket_ttl_secs".to_string());
+    }
+
     if old.scheduler.reserved_cpu_millis != new.scheduler.reserved_cpu_millis {
         changes.push("scheduler.reserved_cpu_millis".to_string());
     }
@@ -1778,6 +1832,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_session_ticket_ttl() {
+        let mut config = Config::default();
+        config.security.session_ticket_ttl_secs = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn rejects_invalid_wireguard_port() {
         let mut config = Config::default();
         config.network.wireguard.port = Some(0);
@@ -1920,6 +1981,7 @@ mod tests {
             std::env::set_var("MANTISSA_RUNTIME_OCI_HOST", "unix:///var/run/docker.sock");
             std::env::set_var("MANTISSA_GPU_DEVICE_OVERRIDES", "uuid:GPU-abc=id:GPU-abc");
             std::env::set_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY", "1");
+            std::env::set_var("MANTISSA_SESSION_TICKET_TTL_SECS", "7200");
             std::env::set_var("MANTISSA_SCHEDULER_RESERVED_CPU_MILLIS", "750");
             std::env::set_var("MANTISSA_SCHEDULER_RESERVED_MEMORY_BYTES", "134217728");
             std::env::set_var("MANTISSA_GOSSIP_CHANNEL_CAPACITY", "256");
@@ -1965,6 +2027,7 @@ mod tests {
             Some("uuid:GPU-abc=id:GPU-abc")
         );
         assert!(config.storage.local_volume_enforce_capacity);
+        assert_eq!(config.security.session_ticket_ttl_secs, 7200);
         assert_eq!(config.scheduler.reserved_cpu_millis, 750);
         assert_eq!(config.scheduler.reserved_memory_bytes, 134_217_728);
         assert_eq!(config.replication.gossip_channel_capacity, 256);
@@ -1991,6 +2054,7 @@ mod tests {
             std::env::remove_var("MANTISSA_RUNTIME_OCI_HOST");
             std::env::remove_var("MANTISSA_GPU_DEVICE_OVERRIDES");
             std::env::remove_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY");
+            std::env::remove_var("MANTISSA_SESSION_TICKET_TTL_SECS");
             std::env::remove_var("MANTISSA_SCHEDULER_RESERVED_CPU_MILLIS");
             std::env::remove_var("MANTISSA_SCHEDULER_RESERVED_MEMORY_BYTES");
             std::env::remove_var("MANTISSA_GOSSIP_CHANNEL_CAPACITY");

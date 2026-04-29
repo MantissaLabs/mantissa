@@ -18,8 +18,10 @@ fn auth_issue_lookup_revoke() {
     let peer = Uuid::new_v4();
 
     // Issue a ticket
-    let ticket = store.issue_ticket(peer).expect("issue");
+    let issued = store.issue_ticket(peer).expect("issue");
+    let ticket = issued.ticket;
     assert_eq!(ticket.len(), 32, "ticket should be 32 random bytes");
+    assert!(issued.expires_at_unix_secs > 0);
 
     // Lookup returns the peer
     let got = store.lookup(&ticket).expect("lookup").expect("some");
@@ -30,7 +32,7 @@ fn auth_issue_lookup_revoke() {
     assert!(store.lookup(&ticket).expect("lookup2").is_none());
 
     // Issue again and revoke by ticket this time
-    let ticket2 = store.issue_ticket(peer).expect("issue2");
+    let ticket2 = store.issue_ticket(peer).expect("issue2").ticket;
     store.revoke_by_ticket(&ticket2).expect("revoke-by-ticket");
     assert!(store.lookup(&ticket2).expect("lookup3").is_none());
 

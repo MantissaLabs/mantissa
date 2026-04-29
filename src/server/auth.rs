@@ -1,84 +1,244 @@
-use crate::crypto::rand;
-use redb::{Database, ReadableDatabase, TableDefinition};
-use std::{io, sync::Arc};
+use crate::{config::DEFAULT_SESSION_TICKET_TTL_SECS, crypto::rand};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use std::{
+    io,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use uuid::Uuid;
 
-const T_TICKETS: TableDefinition<&'static [u8], [u8; 16]> = TableDefinition::new("session_tickets"); // ticket -> peer uuid bytes (fixed 16)
-const T_REVERSE: TableDefinition<[u8; 16], &'static [u8]> = TableDefinition::new("peer_to_ticket"); // peer uuid bytes -> ticket (bytes)
+const T_TICKETS: TableDefinition<&'static [u8], &'static [u8]> =
+    TableDefinition::new("session_ticket_records_v2");
+const T_REVERSE: TableDefinition<[u8; 16], &'static [u8]> =
+    TableDefinition::new("peer_to_ticket_v2");
+const SERVER_TICKET_RECORD_LEN: usize = 32;
 
+/// Convert one Redb error into the store's I/O error surface.
 #[inline]
 fn ioerr<E: std::error::Error>(e: E) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+/// Return the current Unix time used for ticket expiry comparisons.
+fn now_secs() -> io::Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|dur| dur.as_secs())
+        .map_err(|err| io::Error::other(format!("system clock before unix epoch: {err}")))
+}
+
+/// Durable server-side metadata bound to one opaque bearer ticket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TicketRecord {
+    peer: Uuid,
+    issued_at: u64,
+    expires_at: u64,
+}
+
+impl TicketRecord {
+    /// Encode the ticket record as a fixed-width durable table value.
+    fn encode(self) -> [u8; SERVER_TICKET_RECORD_LEN] {
+        let mut out = [0u8; SERVER_TICKET_RECORD_LEN];
+        out[..16].copy_from_slice(self.peer.as_bytes());
+        out[16..24].copy_from_slice(&self.issued_at.to_be_bytes());
+        out[24..32].copy_from_slice(&self.expires_at.to_be_bytes());
+        out
+    }
+
+    /// Decode the ticket record from the fixed-width durable table value.
+    fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() != SERVER_TICKET_RECORD_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session ticket record length invalid",
+            ));
+        }
+
+        let mut peer = [0u8; 16];
+        peer.copy_from_slice(&bytes[..16]);
+
+        let mut issued_at = [0u8; 8];
+        issued_at.copy_from_slice(&bytes[16..24]);
+
+        let mut expires_at = [0u8; 8];
+        expires_at.copy_from_slice(&bytes[24..32]);
+
+        Ok(Self {
+            peer: Uuid::from_bytes(peer),
+            issued_at: u64::from_be_bytes(issued_at),
+            expires_at: u64::from_be_bytes(expires_at),
+        })
+    }
+
+    /// Return true once the record has reached its absolute expiry timestamp.
+    fn is_expired(self, now: u64) -> bool {
+        self.expires_at <= now
+    }
+}
+
+/// Session ticket issued by the server authority with its absolute expiry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IssuedSessionTicket {
+    pub ticket: Vec<u8>,
+    pub expires_at_unix_secs: u64,
+}
+
+/// Durable server-side authority for peer session bearer tickets.
 #[derive(Clone)]
 pub struct AuthStore {
     db: Arc<Database>,
+    ticket_ttl_secs: u64,
 }
 
 impl AuthStore {
+    /// Opens the auth tables with the default durable ticket lifetime.
     pub fn new(db: Arc<Database>) -> io::Result<Self> {
+        Self::with_ticket_ttl(db, DEFAULT_SESSION_TICKET_TTL_SECS)
+    }
+
+    /// Opens the auth tables with an explicit durable ticket lifetime.
+    pub fn with_ticket_ttl(db: Arc<Database>, ticket_ttl_secs: u64) -> io::Result<Self> {
+        if ticket_ttl_secs == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session ticket ttl must be greater than zero",
+            ));
+        }
+
         let w = db.begin_write().map_err(ioerr)?;
         {
             let _ = w.open_table(T_TICKETS).map_err(ioerr)?;
             let _ = w.open_table(T_REVERSE).map_err(ioerr)?;
-        } // drop tables before commit
+        }
         w.commit().map_err(ioerr)?;
-        Ok(Self { db })
+
+        let store = Self {
+            db,
+            ticket_ttl_secs,
+        };
+        store.reap_expired()?;
+        Ok(store)
     }
 
     /// Issue a random 32-byte session ticket for `peer` and persist both maps.
-    pub fn issue_ticket(&self, peer: Uuid) -> io::Result<Vec<u8>> {
+    pub fn issue_ticket(&self, peer: Uuid) -> io::Result<IssuedSessionTicket> {
         let ticket = rand::random_vec(32)?;
+        let issued_at = now_secs()?;
+        let expires_at = issued_at
+            .checked_add(self.ticket_ttl_secs)
+            .ok_or_else(|| io::Error::other("session ticket expiry overflow"))?;
+        let record = TicketRecord {
+            peer,
+            issued_at,
+            expires_at,
+        };
+        let record_bytes = record.encode();
 
         let w = self.db.begin_write().map_err(ioerr)?;
+        let previous_ticket = {
+            let rev = w.open_table(T_REVERSE).map_err(ioerr)?;
+            rev.get(*peer.as_bytes())
+                .map_err(ioerr)?
+                .map(|guard| guard.value().to_vec())
+        };
+
         {
-            // ticket -> peer
-            let mut t = w.open_table(T_TICKETS).map_err(ioerr)?;
-            t.insert(ticket.as_slice(), *peer.as_bytes())
+            let mut fwd = w.open_table(T_TICKETS).map_err(ioerr)?;
+            if let Some(previous) = previous_ticket {
+                let _ = fwd.remove(previous.as_slice()).map_err(ioerr)?;
+            }
+            fwd.insert(ticket.as_slice(), record_bytes.as_slice())
                 .map_err(ioerr)?;
         }
+
         {
-            // peer -> ticket
-            let mut r = w.open_table(T_REVERSE).map_err(ioerr)?;
-            r.insert(*peer.as_bytes(), ticket.as_slice())
+            let mut rev = w.open_table(T_REVERSE).map_err(ioerr)?;
+            rev.insert(*peer.as_bytes(), ticket.as_slice())
                 .map_err(ioerr)?;
+        }
+
+        w.commit().map_err(ioerr)?;
+
+        Ok(IssuedSessionTicket {
+            ticket,
+            expires_at_unix_secs: expires_at,
+        })
+    }
+
+    /// Resolve a non-expired ticket to its peer UUID.
+    pub fn lookup(&self, ticket: &[u8]) -> io::Result<Option<Uuid>> {
+        let Some(record) = self.load_ticket_record(ticket)? else {
+            return Ok(None);
+        };
+
+        if record.is_expired(now_secs()?) {
+            self.revoke_by_ticket(ticket)?;
+            return Ok(None);
+        }
+
+        Ok(Some(record.peer))
+    }
+
+    /// Remove expired tickets from both forward and reverse indexes.
+    pub fn reap_expired(&self) -> io::Result<usize> {
+        let now = now_secs()?;
+        let expired = {
+            let r = self.db.begin_read().map_err(ioerr)?;
+            let table = r.open_table(T_TICKETS).map_err(ioerr)?;
+            let mut expired = Vec::new();
+            for entry in table.iter().map_err(ioerr)? {
+                let (ticket, raw_record) = entry.map_err(ioerr)?;
+                let record = TicketRecord::decode(raw_record.value())?;
+                if record.is_expired(now) {
+                    expired.push((ticket.value().to_vec(), record.peer));
+                }
+            }
+            expired
+        };
+
+        if expired.is_empty() {
+            return Ok(0);
+        }
+
+        let w = self.db.begin_write().map_err(ioerr)?;
+        let mut removed = 0usize;
+        {
+            let mut fwd = w.open_table(T_TICKETS).map_err(ioerr)?;
+            for (ticket, _) in &expired {
+                if fwd.remove(ticket.as_slice()).map_err(ioerr)?.is_some() {
+                    removed = removed.saturating_add(1);
+                }
+            }
+        }
+        {
+            let mut rev = w.open_table(T_REVERSE).map_err(ioerr)?;
+            for (ticket, peer) in &expired {
+                let reverse_matches = rev
+                    .get(*peer.as_bytes())
+                    .map_err(ioerr)?
+                    .map(|guard| guard.value() == ticket.as_slice())
+                    .unwrap_or(false);
+                if reverse_matches {
+                    let _ = rev.remove(*peer.as_bytes()).map_err(ioerr)?;
+                }
+            }
         }
         w.commit().map_err(ioerr)?;
 
-        Ok(ticket)
-    }
-
-    /// Resolve a ticket to its peer UUID, if it exists.
-    pub fn lookup(&self, ticket: &[u8]) -> io::Result<Option<Uuid>> {
-        let r = self.db.begin_read().map_err(ioerr)?;
-        let t = r.open_table(T_TICKETS).map_err(ioerr)?;
-
-        // g.value() returns [u8;16] by value for fixed-size types.
-        let out = t
-            .get(ticket)
-            .map_err(ioerr)?
-            .map(|g| Uuid::from_bytes(g.value()));
-
-        Ok(out)
+        Ok(removed)
     }
 
     /// Revoke by peer UUID: remove reverse mapping and then forward mapping.
-    #[allow(dead_code)]
     pub fn revoke_by_peer(&self, peer: Uuid) -> io::Result<()> {
         let w = self.db.begin_write().map_err(ioerr)?;
 
-        // 1) peer -> ticket: remove, copy ticket bytes, drop guard & table
-        let ticket_opt: Option<Vec<u8>> = {
+        let ticket_opt = {
             let mut rev = w.open_table(T_REVERSE).map_err(ioerr)?;
-            let key: [u8; 16] = *peer.as_bytes();
-
-            // inner scope ensures AccessGuard is dropped before `rev`
-            let removed = rev.remove(&key).map_err(ioerr)?;
-            removed.map(|g| g.value().to_vec()) // copy &[u8] -> Vec<u8>
+            rev.remove(*peer.as_bytes())
+                .map_err(ioerr)?
+                .map(|guard| guard.value().to_vec())
         };
 
-        // 2) ticket -> peer: remove using the copied ticket bytes
         if let Some(ticket) = ticket_opt {
             let mut fwd = w.open_table(T_TICKETS).map_err(ioerr)?;
             let _ = fwd.remove(ticket.as_slice()).map_err(ioerr)?;
@@ -89,25 +249,109 @@ impl AuthStore {
     }
 
     /// Revoke by ticket: remove forward mapping and then reverse mapping.
-    #[allow(dead_code)]
     pub fn revoke_by_ticket(&self, ticket: &[u8]) -> io::Result<()> {
         let w = self.db.begin_write().map_err(ioerr)?;
 
-        // 1) ticket -> peer: remove, copy peer bytes, drop guard & table
-        let peer_opt: Option<[u8; 16]> = {
+        let peer_opt = {
             let mut fwd = w.open_table(T_TICKETS).map_err(ioerr)?;
-
             let removed = fwd.remove(ticket).map_err(ioerr)?;
-            removed.map(|g| g.value()) // returns [u8;16] by value
+            removed
+                .map(|guard| TicketRecord::decode(guard.value()).map(|record| record.peer))
+                .transpose()?
         };
 
-        // 2) peer -> ticket: remove using the copied peer bytes
-        if let Some(peer_arr) = peer_opt {
+        if let Some(peer) = peer_opt {
             let mut rev = w.open_table(T_REVERSE).map_err(ioerr)?;
-            let _ = rev.remove(&peer_arr).map_err(ioerr)?;
+            let _ = rev.remove(*peer.as_bytes()).map_err(ioerr)?;
         }
 
         w.commit().map_err(ioerr)?;
         Ok(())
+    }
+
+    /// Load one ticket record directly from the forward index.
+    fn load_ticket_record(&self, ticket: &[u8]) -> io::Result<Option<TicketRecord>> {
+        let r = self.db.begin_read().map_err(ioerr)?;
+        let table = r.open_table(T_TICKETS).map_err(ioerr)?;
+        table
+            .get(ticket)
+            .map_err(ioerr)?
+            .map(|guard| TicketRecord::decode(guard.value()))
+            .transpose()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuthStore, T_REVERSE, T_TICKETS, TicketRecord, ioerr, now_secs};
+    use redb::Database;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use uuid::Uuid;
+
+    /// Build an auth store backed by a fresh temporary Redb database.
+    fn temp_store(ttl_secs: u64) -> (AuthStore, tempfile::TempDir) {
+        let dir = tempdir().expect("temp dir");
+        let db_path = dir.path().join("state.redb");
+        let db = Arc::new(Database::create(db_path).expect("create db"));
+        (
+            AuthStore::with_ticket_ttl(db, ttl_secs).expect("open auth store"),
+            dir,
+        )
+    }
+
+    /// Insert a server ticket record directly so expiry behavior does not rely on sleeps.
+    fn insert_ticket_record(store: &AuthStore, ticket: &[u8], record: TicketRecord) {
+        let record_bytes = record.encode();
+        let w = store.db.begin_write().map_err(ioerr).expect("begin write");
+        {
+            let mut tickets = w.open_table(T_TICKETS).map_err(ioerr).expect("tickets");
+            tickets
+                .insert(ticket, record_bytes.as_slice())
+                .map_err(ioerr)
+                .expect("insert ticket");
+        }
+        {
+            let mut reverse = w.open_table(T_REVERSE).map_err(ioerr).expect("reverse");
+            reverse
+                .insert(*record.peer.as_bytes(), ticket)
+                .map_err(ioerr)
+                .expect("insert reverse");
+        }
+        w.commit().map_err(ioerr).expect("commit");
+    }
+
+    #[test]
+    fn lookup_rejects_and_purges_expired_ticket() {
+        let (store, _dir) = temp_store(60);
+        let peer = Uuid::new_v4();
+        let ticket = b"expired-ticket";
+        let now = now_secs().expect("now");
+        let record = TicketRecord {
+            peer,
+            issued_at: now.saturating_sub(120),
+            expires_at: now.saturating_sub(1),
+        };
+
+        insert_ticket_record(&store, ticket, record);
+
+        assert!(store.lookup(ticket).expect("lookup").is_none());
+        assert!(store.load_ticket_record(ticket).expect("load").is_none());
+    }
+
+    #[test]
+    fn issuing_new_ticket_invalidates_previous_ticket_for_peer() {
+        let (store, _dir) = temp_store(60);
+        let peer = Uuid::new_v4();
+
+        let first = store.issue_ticket(peer).expect("first ticket");
+        let second = store.issue_ticket(peer).expect("second ticket");
+
+        assert_ne!(first.ticket, second.ticket);
+        assert!(store.lookup(&first.ticket).expect("old lookup").is_none());
+        assert_eq!(
+            store.lookup(&second.ticket).expect("new lookup"),
+            Some(peer)
+        );
     }
 }
