@@ -14,9 +14,35 @@ pub async fn read_framed_len<R>(rd: &mut R, buf: &mut Vec<u8>) -> io::Result<usi
 where
     R: AsyncRead + Unpin,
 {
+    read_framed_len_inner(rd, buf, true).await
+}
+
+/// Read one length-prefixed handshake frame without emitting transport diagnostics.
+///
+/// Some callers intentionally translate a disconnect into a higher-level
+/// authentication error, so logging the raw I/O error first would produce a
+/// misleading operator-facing trail.
+pub(super) async fn read_framed_len_silent<R>(rd: &mut R, buf: &mut Vec<u8>) -> io::Result<usize>
+where
+    R: AsyncRead + Unpin,
+{
+    read_framed_len_inner(rd, buf, false).await
+}
+
+/// Shared implementation for the public and context-mapped handshake readers.
+async fn read_framed_len_inner<R>(
+    rd: &mut R,
+    buf: &mut Vec<u8>,
+    emit_diagnostics: bool,
+) -> io::Result<usize>
+where
+    R: AsyncRead + Unpin,
+{
     let mut len = [0u8; 2];
     if let Err(e) = rd.read_exact(&mut len).await {
-        log_transport_io("handshake.read.len_prefix", "read", &e);
+        if emit_diagnostics {
+            log_transport_io("handshake.read.len_prefix", "read", &e);
+        }
         return Err(e);
     }
     let n = u16::from_be_bytes(len) as usize;
@@ -40,7 +66,9 @@ where
         buf.resize(n, 0);
     }
     if let Err(e) = rd.read_exact(&mut buf[..n]).await {
-        log_transport_io("handshake.read.frame", "read", &e);
+        if emit_diagnostics {
+            log_transport_io("handshake.read.frame", "read", &e);
+        }
         return Err(e);
     }
     Ok(n)

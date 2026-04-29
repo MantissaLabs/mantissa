@@ -2,10 +2,10 @@
 
 use async_trait::async_trait;
 use net::noise::{
-    ClientJoinHandshake, HandshakeKind, NoisePeerVerifier, client_handshake_join,
-    client_handshake_join_with_probe, client_handshake_peer, join_probe_client, join_probe_server,
-    read_framed_len, server_handshake_join, server_handshake_peer_with_first_frame,
-    server_handshake_select, write_framed,
+    ClientJoinHandshake, HandshakeKind, NoisePeerVerifier, ServerHandshakeError,
+    client_handshake_join, client_handshake_join_with_probe, client_handshake_peer,
+    join_probe_client, join_probe_server, read_framed_len, server_handshake_join,
+    server_handshake_peer_with_first_frame, server_handshake_select, write_framed,
 };
 use snow::params::NoiseParams;
 use std::io::ErrorKind;
@@ -267,6 +267,57 @@ async fn noise_ik_peer_handshake_and_echo() {
         .unwrap()
         .unwrap();
     assert_eq!(&buf, b"ping");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn noise_ik_unknown_peer_reports_membership_hint() {
+    let server_keys = fixed_noise_keys(11);
+    let client_keys = fixed_noise_keys(22);
+    let server_pk = server_keys.public_bytes();
+    let psk = net::noise::derive_psk_from_token("MNTISA-1-denied-peer").expect("derive psk");
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().unwrap();
+
+    let server_task = async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let (mut rd, wr) = sock.into_split();
+        let mut first = vec![0u8; 65535];
+        let nread = read_framed_len(&mut rd, &mut first).await.unwrap();
+        server_handshake_select(
+            rd,
+            wr,
+            &server_keys,
+            &psk,
+            &first[..nread],
+            Rc::new(DenyPeer),
+        )
+        .await
+    };
+
+    let client_task = async move {
+        let sock = TcpStream::connect(addr).await.unwrap();
+        client_handshake_peer(sock, &client_keys, &server_pk).await
+    };
+
+    let (server_res, client_res) = timeout(Duration::from_secs(2), async {
+        tokio::join!(server_task, client_task)
+    })
+    .await
+    .expect("handshake timed out");
+
+    assert!(matches!(server_res, Err(ServerHandshakeError::UnknownPeer)));
+    let Err(err) = client_res else {
+        panic!("unknown peer should reject client handshake");
+    };
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    assert!(
+        err.to_string()
+            .contains("remote may not know this node yet"),
+        "unexpected error: {err}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

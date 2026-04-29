@@ -8,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::timeout;
 
-use super::framing::{read_framed_len, write_framed};
+use super::framing::{read_framed_len, read_framed_len_silent, write_framed};
 use super::keys::NoiseKeys;
 use super::transport::NoiseStream;
 use super::{
@@ -281,7 +281,9 @@ pub async fn client_handshake_peer(
     write_framed(&mut wr, &out[..n]).await?;
 
     let mut inb = vec![0u8; 65535];
-    let nread = read_framed_len(&mut rd, &mut inb).await?;
+    let nread = read_framed_len_silent(&mut rd, &mut inb)
+        .await
+        .map_err(map_peer_response_read_error)?;
     hs.read_message(&inb[..nread], &mut out).map_err(|e| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -294,6 +296,18 @@ pub async fn client_handshake_peer(
         .map_err(|e| io::Error::other(e.to_string()))?;
 
     Ok(NoiseStream::new(rd, wr, transport))
+}
+
+/// Convert an early peer-handshake disconnect into an operator-facing auth hint.
+fn map_peer_response_read_error(err: io::Error) -> io::Error {
+    if err.kind() == io::ErrorKind::UnexpectedEof {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "peer handshake rejected before session setup; remote may not know this node yet",
+        )
+    } else {
+        err
+    }
 }
 
 /// Run the server side of the join handshake using a fresh TCP stream.
