@@ -660,6 +660,7 @@ fn build_topology_stores(stores: &BootstrapStores) -> TopologyStorage {
     TopologyStorage {
         local_credential_store: stores.local_creds.clone(),
         local_sessions: stores.local_sessions.clone(),
+        session_auth: stores.session_auth.clone(),
         peers: stores.peers.clone(),
         cluster_operations: stores.cluster_operations.clone(),
         cluster_view_store: stores.cluster_view.clone(),

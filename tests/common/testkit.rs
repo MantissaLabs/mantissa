@@ -538,6 +538,14 @@ impl TestNode {
         Ok(())
     }
 
+    /// Ask this node to evict `node_id` through its local Topology capability.
+    pub async fn evict(&self, node_id: Uuid) -> Result<(), capnp::Error> {
+        let mut req = self.node.topology_client.evict_node_request();
+        req.get().init_node_id().set_bytes(node_id.as_bytes());
+        let _ = req.send().promise.await?;
+        Ok(())
+    }
+
     /// Stop accepting new connections (simulate node down).
     /// - Inproc: unregister from registry.
     /// - TCP: abort the listener task.

@@ -142,6 +142,11 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     ))
                     .await?;
             }
+            NodesCommand::Evict(args) => {
+                local
+                    .run_until(client::node::evict(&cfg, args.node_id))
+                    .await?;
+            }
             NodesCommand::Resume(args) => {
                 local
                     .run_until(client::node::resume(&cfg, args.node_id))

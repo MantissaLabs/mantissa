@@ -10,6 +10,7 @@ use crate::registry::Registry;
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::scheduler::Scheduler;
 use crate::secrets::crypto::SecretKeyring;
+use crate::server::auth::AuthStore;
 use crate::services::ServiceRegistry;
 use crate::store::cluster_operation_store::ClusterOperationStore;
 use crate::store::cluster_view_store::ClusterNameRecord;
@@ -152,6 +153,7 @@ pub struct TopologyConfig {
 pub struct TopologyStorage {
     pub local_credential_store: LocalCredentialStore,
     pub local_sessions: LocalSessionStore,
+    pub session_auth: AuthStore,
     pub peers: PeersStore,
     pub cluster_operations: ClusterOperationStore,
     pub cluster_view_store: ClusterViewStore,

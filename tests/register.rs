@@ -192,6 +192,96 @@ local_test!(node_leave_tcp, {
         .expect("roots equal after leave");
 });
 
+local_test!(node_evict_stopped_peer_inproc, {
+    let anchor = TestNode::new_with_tick_ms(100).await;
+    let second = TestNode::new_with_tick_ms(100).await;
+    let mut stale = TestNode::new_with_tick_ms(100).await;
+
+    second.join(&anchor).await.expect("second join ok");
+    stale.join(&anchor).await.expect("stale join ok");
+
+    for node in [&anchor, &second, &stale] {
+        node.assert_cluster_size(3, "initial cluster size should converge to 3")
+            .await;
+    }
+    TestNode::wait_roots_equal(&anchor, &second, Duration::from_secs(5))
+        .await
+        .expect("anchor and second roots equal initially");
+
+    let stale_id = stale.id();
+    stale.node.stop_cluster_background_tasks();
+    stale.stop().await.expect("stale node stops");
+
+    anchor.evict(stale_id).await.expect("evict ok");
+
+    anchor
+        .assert_cluster_size(2, "anchor should exclude evicted node")
+        .await;
+    second
+        .assert_cluster_size(2, "second should exclude evicted node")
+        .await;
+
+    let mut expected = vec![anchor.id(), second.id()];
+    expected.sort();
+    assert_eq!(
+        anchor.list_ids().await,
+        expected,
+        "anchor membership should exclude evicted node"
+    );
+    assert_eq!(
+        second.list_ids().await,
+        expected,
+        "second membership should exclude evicted node"
+    );
+    TestNode::wait_roots_equal(&anchor, &second, Duration::from_secs(5))
+        .await
+        .expect("remaining roots equal after evict");
+});
+
+local_test!(node_evict_revokes_existing_peer_session_inproc, {
+    let anchor = TestNode::new_with_tick_ms(100).await;
+    let second = TestNode::new_with_tick_ms(100).await;
+    let stale = TestNode::new_with_tick_ms(100).await;
+
+    second.join(&anchor).await.expect("second join ok");
+    stale.join(&anchor).await.expect("stale join ok");
+
+    for node in [&anchor, &second, &stale] {
+        node.assert_cluster_size(3, "initial cluster size should converge to 3")
+            .await;
+    }
+
+    let stale_session_to_anchor = stale
+        .node
+        .registry
+        .session_for_peer(anchor.id())
+        .await
+        .expect("stale should have a session to anchor");
+
+    let stale_id = stale.id();
+    anchor.evict(stale_id).await.expect("evict ok");
+
+    anchor
+        .assert_cluster_size(2, "anchor should exclude evicted node")
+        .await;
+    second
+        .assert_cluster_size(2, "second should exclude evicted node")
+        .await;
+
+    let result = stale_session_to_anchor
+        .get_topology_request()
+        .send()
+        .promise
+        .await;
+    let Err(err) = result else {
+        panic!("evicted peer session should be revoked");
+    };
+    assert!(
+        err.to_string().contains("peer session revoked"),
+        "unexpected revoked session error: {err}"
+    );
+});
+
 // Leaving should clear locally cached peer auth material so the node does not
 // keep reconnecting or auto-resume the old cluster after restart.
 local_test!(node_leave_clears_local_peer_auth_tcp, {

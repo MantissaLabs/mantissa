@@ -337,7 +337,7 @@ impl Topology {
                     warn!(
                         target: "topology",
                         peer_id = %entry.peer_id,
-                        "leave: failed to resolve gossip capability for immediate broadcast: {err}"
+                        "topology: failed to resolve gossip capability for immediate broadcast: {err}"
                     );
                     continue;
                 }
@@ -355,7 +355,7 @@ impl Topology {
                 warn!(
                     target: "topology",
                     peer_id = %entry.peer_id,
-                    "leave: immediate topology broadcast failed: {err}"
+                    "topology: immediate topology broadcast failed: {err}"
                 );
             }
         }
@@ -509,6 +509,44 @@ impl topology::Server for Topology {
         self.stop_cluster_background_tasks();
         self.deps.registry.clear().await;
         self.clear_local_cluster_auth_state();
+
+        Ok(())
+    }
+
+    /// Evicts one stale peer identity from the cluster by publishing a newer left membership.
+    async fn evict_node(
+        self: Rc<Self>,
+        params: topology::EvictNodeParams,
+        _results: topology::EvictNodeResults,
+    ) -> Result<(), capnp::Error> {
+        let request = params.get()?;
+        let node_id = read_node_id(request.get_node_id()?)?;
+        if node_id == self.local.node.id {
+            return Err(capnp::Error::failed(
+                "cannot evict the local node; use `mantissa leave` instead".into(),
+            ));
+        }
+
+        let Some(membership) = self.peer_membership_unscoped(node_id)? else {
+            return Err(capnp::Error::failed(format!("node '{node_id}' not found")));
+        };
+        let evict_incarnation = if membership.is_active() {
+            let incarnation = membership.incarnation.checked_add(1).ok_or_else(|| {
+                capnp::Error::failed(format!("node '{node_id}' is already at max incarnation"))
+            })?;
+            self.mark_peer_left(node_id, incarnation)
+                .await
+                .map_err(|e| capnp::Error::failed(format!("evict: mark-left failed: {e}")))?;
+            incarnation
+        } else {
+            membership.incarnation
+        };
+        let evict_event = TopologyEvent::Leave {
+            id: node_id,
+            incarnation: evict_incarnation,
+        };
+        self.broadcast_topology_event_now(&evict_event).await;
+        self.gossip_topology_event(evict_event).await?;
 
         Ok(())
     }

@@ -36,6 +36,16 @@ Clear the maintenance fence:
 mantissa nodes resume <node-id>
 ```
 
+Retire a stopped or stale identity:
+
+```bash
+mantissa nodes evict <node-id>
+```
+
+Evict is for nodes that will not keep running under that identity, such as a
+replaced host or a pre-reset identity left behind after disaster recovery. Use
+drain or leave for normal planned maintenance.
+
 ## What Drain Changes
 
 A drain request writes a timestamped peer scheduling state:

@@ -89,10 +89,15 @@ mantissa join --anchor <peer-addr>:6578 --join-token <token>
 ```
 
 The copied peer rows may still include the source node. If that source node is
-gone permanently, remove or leave it through normal cluster maintenance once
-the restored node is healthy. The identity reset intentionally does not rewrite
-or tombstone peer rows because it cannot know whether the source node is still
-valid elsewhere.
+gone permanently, retire it from any active cluster member once the restored
+node is healthy:
+
+```bash
+mantissa nodes evict <old-node-id>
+```
+
+The identity reset intentionally does not rewrite or tombstone peer rows
+because it cannot know whether the source node is still valid elsewhere.
 
 ### Whole-Cluster Loss
 
@@ -118,3 +123,8 @@ not publish stale replicated rows directly.
 
 For reintroducing an old removed node, either restore it through a fresh join or
 start it with `mantissa init --reset-identity`.
+
+Use `mantissa nodes evict <node-id>` only for stopped, replaced, or otherwise
+stale identities. If a process is still running with that identity, stop or
+reset it before eviction so it does not keep trying to participate with retired
+credentials.

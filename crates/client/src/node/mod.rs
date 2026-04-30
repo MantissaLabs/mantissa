@@ -1,4 +1,5 @@
 pub mod drain;
+pub mod evict;
 pub mod info;
 pub mod join;
 pub mod labels;
@@ -8,6 +9,7 @@ pub mod resume;
 pub mod status;
 
 pub use self::drain::drain;
+pub use self::evict::evict;
 pub use self::info::info;
 pub use self::join::join;
 pub use self::labels::labels;

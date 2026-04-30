@@ -115,7 +115,25 @@ impl Topology {
         Ok(())
     }
 
-    /// Marks one peer as gracefully left without tombstoning the reusable identity row.
+    /// Returns the converged membership state for one peer without active-member filtering.
+    pub(super) fn peer_membership_unscoped(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<PeerMembership>, capnp::Error> {
+        let reg = self
+            .stores
+            .peers
+            .get_reg(&UuidKey::from(id))
+            .map_err(|err| {
+                capnp::Error::failed(format!("failed to load peer membership for '{id}': {err}"))
+            })?;
+        Ok(reg
+            .as_ref()
+            .and_then(PeerValue::select_reg)
+            .map(|value| value.membership))
+    }
+
+    /// Marks one peer as left without tombstoning the reusable identity row.
     pub async fn mark_peer_left(
         &self,
         id: Uuid,
@@ -150,6 +168,13 @@ impl Topology {
         });
         value.membership = PeerMembership::left(incarnation);
         self.stores.peers.upsert(&UuidKey::from(id), value).await?;
+        if let Err(err) = self.stores.session_auth.revoke_by_peer(id) {
+            warn!(
+                target: "topology",
+                peer_id = %id,
+                "failed to revoke server session ticket for left peer: {err}"
+            );
+        }
         if let Err(err) = self.stores.local_sessions.remove(id) {
             warn!(
                 target: "topology",

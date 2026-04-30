@@ -202,7 +202,7 @@ impl Server {
             ticket: issued_ticket.ticket,
             ticket_expires_at_unix_secs: issued_ticket.expires_at_unix_secs,
             credential,
-            session: self.sessions.new_client(),
+            session: self.sessions.new_client(Some(joiner_id)),
         })
     }
 
@@ -306,7 +306,9 @@ impl protocol::server::Server for Server {
         {
             return Err(capnp::Error::failed("peer not registered".to_string()));
         }
-        results.get().set_session(self.sessions.new_client());
+        results
+            .get()
+            .set_session(self.sessions.new_client(Some(peer_id)));
         Ok(())
     }
 
@@ -354,7 +356,7 @@ impl protocol::server::Server for Server {
             .map_err(|error| capnp::Error::failed(error.to_string()))?;
 
         let mut out = results.get();
-        out.set_session(self.sessions.new_client());
+        out.set_session(self.sessions.new_client(Some(cred.subject)));
         out.set_ticket(&issued_ticket.ticket);
         out.set_ticket_expires_at_unix_secs(issued_ticket.expires_at_unix_secs);
 

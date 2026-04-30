@@ -80,6 +80,9 @@ interface Topology {
     replace :Bool
   ) -> ();
   # Applies node labels to one peer entry and relays the converged update through topology gossip.
+
+  evictNode @18 (nodeId :Node.NodeId) -> ();
+  # Evicts a node or one stale peer identity from the cluster given a node ID.
 }
 
 enum NodeDrainState {

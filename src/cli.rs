@@ -273,6 +273,9 @@ pub enum NodesCommand {
     /// Mark one node unschedulable for maintenance
     Drain(NodesDrainArgs),
 
+    /// Retire a stale node identity from the cluster
+    Evict(NodesEvictArgs),
+
     /// Clear maintenance fencing for one node
     Resume(NodesResumeArgs),
 
@@ -345,6 +348,13 @@ pub struct NodesDrainArgs {
 #[derive(Args, Debug)]
 pub struct NodesResumeArgs {
     /// Identifier of the node to resume
+    #[arg(index = 1, value_name = "NODE-ID")]
+    pub node_id: Uuid,
+}
+
+#[derive(Args, Debug)]
+pub struct NodesEvictArgs {
+    /// Identifier of the stale node identity to retire
     #[arg(index = 1, value_name = "NODE-ID")]
     pub node_id: Uuid,
 }

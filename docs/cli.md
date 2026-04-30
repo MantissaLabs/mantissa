@@ -9,6 +9,7 @@ Common commands:
 - `mantissa leave` - gracefully leave the cluster
 - `mantissa nodes list [cluster-id]` - inspect known peers
 - `mantissa nodes drain <node-id> [--reason <text>]` - fence a node and evacuate service work
+- `mantissa nodes evict <node-id>` - retire a stopped or stale node identity
 - `mantissa nodes status <node-id>` - inspect detailed drain progress and blockers
 - `mantissa nodes resume <node-id>` - clear a maintenance fence
 - `mantissa clusters list` - list known clusters and node counts
