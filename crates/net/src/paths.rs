@@ -3,6 +3,7 @@ use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -13,6 +14,8 @@ const SYSTEM_STATE_DIR: &str = "/var/lib/mantissa";
 const USER_STATE_SUBDIR: &str = ".mantissa";
 const MANTISSA_GROUP: &str = "mantissa";
 pub const STATE_DIR_ENV: &str = "MANTISSA_STATE_DIR";
+
+static STATE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Returns true when the effective uid has root privileges.
 pub fn running_as_root() -> bool {
@@ -26,21 +29,52 @@ pub fn running_as_root() -> bool {
     }
 }
 
-/// Resolve the persistent state directory and ensure it exists with useful permissions.
-/// Root uses `/var/lib/mantissa`; unprivileged users fall back to `~/.mantissa`.
-pub fn ensure_state_dir() -> io::Result<PathBuf> {
-    let path =
-        if let Some(override_dir) = env::var_os(STATE_DIR_ENV).filter(|value| !value.is_empty()) {
-            PathBuf::from(override_dir)
-        } else if running_as_root() {
-            PathBuf::from(SYSTEM_STATE_DIR)
-        } else {
-            let home = env::var_os("HOME")
-                .map(PathBuf::from)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
-            home.join(USER_STATE_SUBDIR)
-        };
+/// Set a process-local state directory override for daemon startup.
+///
+/// This is used by `mantissa init --state-dir` so every subsystem that resolves
+/// local state during startup observes the same directory without mutating the
+/// process environment.
+pub fn set_state_dir_override(path: PathBuf) -> io::Result<()> {
+    match STATE_DIR_OVERRIDE.set(path.clone()) {
+        Ok(()) => Ok(()),
+        Err(_) if STATE_DIR_OVERRIDE.get() == Some(&path) => Ok(()),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "state directory override was already set to a different path",
+        )),
+    }
+}
 
+/// Return the process-local state directory override, if one has been configured.
+pub fn state_dir_override() -> Option<PathBuf> {
+    STATE_DIR_OVERRIDE.get().cloned()
+}
+
+/// Resolve the persistent state directory path without creating it.
+///
+/// Root uses `/var/lib/mantissa`; unprivileged users fall back to `~/.mantissa`.
+pub fn resolve_state_dir_path() -> io::Result<PathBuf> {
+    if let Some(path) = state_dir_override() {
+        return Ok(path);
+    }
+
+    if let Some(override_dir) = env::var_os(STATE_DIR_ENV).filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(override_dir));
+    }
+
+    if running_as_root() {
+        return Ok(PathBuf::from(SYSTEM_STATE_DIR));
+    }
+
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
+    Ok(home.join(USER_STATE_SUBDIR))
+}
+
+/// Ensure an explicit persistent state directory exists with useful permissions.
+pub fn ensure_state_dir_at(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let path = path.as_ref().to_path_buf();
     fs::create_dir_all(&path)?;
 
     #[cfg(unix)]
@@ -56,6 +90,11 @@ pub fn ensure_state_dir() -> io::Result<PathBuf> {
     }
 
     Ok(path)
+}
+
+/// Resolve the persistent state directory and ensure it exists with useful permissions.
+pub fn ensure_state_dir() -> io::Result<PathBuf> {
+    ensure_state_dir_at(resolve_state_dir_path()?)
 }
 
 /// Helper to change a filesystem object's group to `mantissa`.

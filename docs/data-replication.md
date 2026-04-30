@@ -261,15 +261,16 @@ The operational rule is:
 - active-but-offline peers may restart normally and will block tombstone GC
   until they sync,
 - peers that have left for longer than the tombstone retention window must
-  rejoin through bootstrap from an active peer or start from a reset replicated
-  store,
+  rejoin through bootstrap from an active peer or start from a state directory
+  prepared with `mantissa init --reset-identity`,
 - reusing an old left-node data directory without bootstrap/reset is unsafe
   after tombstones may have been pruned.
 
 In practice, production maintenance should drain and restart nodes rather than
 leave and later reuse stale replicated state. If a node is intentionally removed
 for longer than the configured retention window, treat reintroduction as a
-fresh bootstrap operation.
+fresh bootstrap operation. See `docs/disaster-recovery.md` for the offline
+restore workflow.
 
 ## View Scoping
 

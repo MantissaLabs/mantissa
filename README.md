@@ -81,6 +81,7 @@ mantissa tasks logs <id-task>
 6. Play around and bring nodes up/down
 
 See `docs/quickstart.md` for the full local and multi-VM workflow.
+See `docs/disaster-recovery.md` for backup and restore workflows.
 
 ## Contributing
 

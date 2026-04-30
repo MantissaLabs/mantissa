@@ -78,6 +78,13 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
     let config_path = config_arg.as_deref().map(Path::new);
     let (resolved_config, source) = config::load_config_with_source(config_path)?;
     config::set_global_config_with_source(resolved_config, source);
+
+    if let Command::Init(init) = &cmd
+        && let Some(state_dir) = &init.state_dir
+    {
+        net::paths::set_state_dir_override(state_dir.clone())?;
+    }
+
     let _config_watcher = config::spawn_config_watcher();
 
     // Global listen address (only used by `init`/daemon start)
@@ -88,6 +95,14 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
 
     match cmd {
         Command::Init(init) => {
+            if init.reset_identity {
+                let report =
+                    crate::recovery::reset_identity(crate::recovery::ResetIdentityOptions {
+                        state_dir: init.state_dir.clone(),
+                    })?;
+                print!("{report}");
+            }
+
             let advertise_addr = init.advertise.or_else(config::advertise_addr);
             local
                 .run_until(crate::server::bootstrap::start(

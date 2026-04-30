@@ -217,6 +217,14 @@ pub struct InitArgs {
     /// Publish this address to peers instead of inferring it from local routing
     #[arg(long = "advertise", value_name = "HOST:PORT")]
     pub advertise: Option<String>,
+
+    /// Reset local identity in this state directory before starting
+    #[arg(long = "reset-identity", action = ArgAction::SetTrue)]
+    pub reset_identity: bool,
+
+    /// State directory to initialize, defaults to Mantissa's root/user state directory
+    #[arg(long = "state-dir", value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

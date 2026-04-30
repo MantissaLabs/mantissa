@@ -20,6 +20,7 @@ pub mod jobs;
 pub mod logger;
 pub mod network;
 pub mod node;
+mod recovery;
 pub mod registry;
 pub mod runtime;
 pub mod scheduler;

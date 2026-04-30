@@ -293,8 +293,9 @@ winner so stale compacted values do not reappear during later anti-entropy.
 For production maintenance, prefer drain and restart over leave and later
 reuse. A peer that has left the cluster is outside the active-peer GC barrier.
 If that data directory is reused after the tombstone retention window, treat
-the node as requiring bootstrap from an active peer or reset replicated stores
-before it can safely publish state again.
+the node as requiring bootstrap from an active peer or prepare the copied state
+with `mantissa init --reset-identity` before it can safely publish state
+again. See `docs/disaster-recovery.md` for the restore procedure.
 
 Logical GC lets Redb reuse pages, but it is not a physical file compaction
 workflow. Shrinking the database file should be treated as a separate offline

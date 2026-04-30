@@ -1,4 +1,4 @@
-use crate::paths::{STATE_DIR_ENV, ensure_mantissa_group, running_as_root};
+use crate::paths::{STATE_DIR_ENV, ensure_mantissa_group, running_as_root, state_dir_override};
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 use protocol::server::cluster_session;
@@ -28,8 +28,12 @@ pub fn candidate_unix_socket_paths() -> Vec<PathBuf> {
     v
 }
 
-/// Return the unprivileged state-directory socket path when the environment can resolve it.
+/// Return the state-directory socket path when a state directory can be resolved.
 fn user_state_socket_path() -> Option<PathBuf> {
+    if let Some(dir) = state_dir_override() {
+        return Some(dir.join("mantissa.sock"));
+    }
+
     if let Some(dir) = env::var_os(STATE_DIR_ENV).filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(dir).join("mantissa.sock"));
     }

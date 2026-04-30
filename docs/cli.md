@@ -3,6 +3,7 @@
 Common commands:
 
 - `mantissa init` - bootstrap a standalone node (blocking until interrupted)
+- `mantissa init --reset-identity --state-dir <dir>` - reset copied node identity before bootstrap
 - `mantissa token show` / `mantissa token rotate` - view or rotate join tokens
 - `mantissa join --anchor <addr> --join-token <token>` - join an existing cluster
 - `mantissa leave` - gracefully leave the cluster
@@ -26,5 +27,6 @@ Common commands:
 
 For rollout fields and manifest examples, see `docs/service-rollouts.md`.
 For node drain behavior, see `docs/node-maintenance.md`.
+For backup and restore behavior, see `docs/disaster-recovery.md`.
 For volume semantics, see `docs/volumes.md`.
 For cluster view operations, see `docs/cluster-views-and-operations.md`.
