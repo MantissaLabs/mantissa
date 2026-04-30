@@ -358,7 +358,7 @@ impl MetricsSampler {
         }
     }
 
-    /// Samples aggregate sync convergence and GC barrier gauges.
+    /// Samples aggregate sync GC barrier gauges.
     fn sample_sync_progress(&self) {
         let cluster_view = self.inputs.cluster_view.active_view();
         let root_schema_version = self.inputs.root_schema.supported_version();
@@ -381,14 +381,15 @@ impl MetricsSampler {
                 now_unix_ms,
             ) {
                 Some(barrier) => {
-                    let lag_ms = now_unix_ms.saturating_sub(barrier.safe_observed_before_unix_ms);
+                    let barrier_age_ms =
+                        now_unix_ms.saturating_sub(barrier.safe_observed_before_unix_ms);
                     gauge!("mantissa_sync_gc_barrier_available", "domain" => label).set(1.0);
-                    gauge!("mantissa_sync_convergence_lag_seconds", "domain" => label)
-                        .set(Duration::from_millis(lag_ms).as_secs_f64());
+                    gauge!("mantissa_sync_gc_barrier_age_seconds", "domain" => label)
+                        .set(Duration::from_millis(barrier_age_ms).as_secs_f64());
                 }
                 None => {
                     gauge!("mantissa_sync_gc_barrier_available", "domain" => label).set(0.0);
-                    gauge!("mantissa_sync_convergence_lag_seconds", "domain" => label).set(0.0);
+                    gauge!("mantissa_sync_gc_barrier_age_seconds", "domain" => label).set(0.0);
                 }
             }
         }
@@ -433,9 +434,9 @@ fn describe_metrics() {
         "Peers selected for the latest sync tick."
     );
     describe_gauge!(
-        "mantissa_sync_convergence_lag_seconds",
+        "mantissa_sync_gc_barrier_age_seconds",
         Unit::Seconds,
-        "Aggregate sync convergence lag by replicated domain."
+        "Age of the oldest equal-root observation used by the current sync GC barrier."
     );
     describe_gauge!(
         "mantissa_sync_gc_barrier_available",
