@@ -1,9 +1,13 @@
 use crate::store::path::open_state_database;
+use crate::store::peer_store::open_peers_store;
 use anyhow::{Context, Result, bail};
-use redb::{Database, ReadableTable, TableDefinition};
+use crdt_store::uuid_key::UuidKey;
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableError};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use uuid::Uuid;
 
 const STATE_DB_FILE: &str = "state.redb";
 const LOCAL_NODE_ID_KEY: &str = "node_id";
@@ -48,6 +52,8 @@ pub struct ResetTableReport {
 pub struct ResetIdentityReport {
     state_dir: PathBuf,
     db_path: PathBuf,
+    previous_node_id: Option<Uuid>,
+    local_peer_row_purged: bool,
     present_identity_files: Vec<PathBuf>,
     absent_identity_files: Vec<PathBuf>,
     removed_local_records: usize,
@@ -62,6 +68,19 @@ impl fmt::Display for ResetIdentityReport {
             self.state_dir.display()
         )?;
         writeln!(f, "state database: {}", self.db_path.display())?;
+        match self.previous_node_id {
+            Some(node_id) => {
+                writeln!(f, "previous node id: {node_id}")?;
+                writeln!(
+                    f,
+                    "previous local peer row purged: {}",
+                    self.local_peer_row_purged
+                )?;
+            }
+            None => {
+                writeln!(f, "previous node id: none")?;
+            }
+        }
 
         if self.present_identity_files.is_empty() {
             writeln!(f, "identity files: none present")?;
@@ -99,7 +118,7 @@ impl fmt::Display for ResetIdentityReport {
 }
 
 /// Prepare a copied state directory to start as a distinct node.
-pub fn reset_identity(options: ResetIdentityOptions) -> Result<ResetIdentityReport> {
+pub async fn reset_identity(options: ResetIdentityOptions) -> Result<ResetIdentityReport> {
     let state_dir = match options.state_dir {
         Some(path) => path,
         None => net::paths::resolve_state_dir_path().context("resolve default state directory")?,
@@ -123,7 +142,12 @@ pub fn reset_identity(options: ResetIdentityOptions) -> Result<ResetIdentityRepo
             .with_context(|| format!("remove identity file {}", path.display()))?;
     }
 
-    let db = open_state_database(&db_path).context("open state database for identity reset")?;
+    let db =
+        Arc::new(open_state_database(&db_path).context("open state database for identity reset")?);
+    let previous_node_id = read_local_node_id(&db).context("read previous local node id")?;
+    let local_peer_row_purged = purge_previous_local_peer(&db, previous_node_id)
+        .await
+        .context("purge previous local peer row")?;
     let removed_local_records =
         reset_local_identity_records(&db).context("reset local identity records")?;
     let cleared_tables = vec![
@@ -140,6 +164,8 @@ pub fn reset_identity(options: ResetIdentityOptions) -> Result<ResetIdentityRepo
     Ok(ResetIdentityReport {
         state_dir,
         db_path,
+        previous_node_id,
+        local_peer_row_purged,
         present_identity_files,
         absent_identity_files,
         removed_local_records,
@@ -162,6 +188,47 @@ fn identity_file_status(state_dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     }
 
     (present, absent)
+}
+
+/// Read the node id that belongs to the copied state before identity reset clears it.
+fn read_local_node_id(db: &Database) -> std::io::Result<Option<Uuid>> {
+    let r = db.begin_read().map_err(into_io)?;
+    let table = match r.open_table(T_LOCAL) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(error) => return Err(into_io(error)),
+    };
+    let Some(raw) = table.get(LOCAL_NODE_ID_KEY).map_err(into_io)? else {
+        return Ok(None);
+    };
+
+    Uuid::parse_str(raw.value())
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))
+}
+
+/// Locally forget the copied node's old peer row without publishing a CRDT tombstone.
+async fn purge_previous_local_peer(
+    db: &Arc<Database>,
+    previous_node_id: Option<Uuid>,
+) -> Result<bool> {
+    let Some(previous_node_id) = previous_node_id else {
+        return Ok(false);
+    };
+
+    let key = UuidKey::from(previous_node_id);
+    let peers = open_peers_store(db.clone(), previous_node_id).context("open peer store")?;
+    let existed = peers
+        .exists(&key)
+        .context("check previous local peer row")?
+        || peers
+            .has_tombstone(&key)
+            .context("check previous local peer tombstone")?;
+    peers
+        .purge_local(&key)
+        .await
+        .context("purge previous local peer row")?;
+    Ok(existed)
 }
 
 /// Remove local identity rows that must not survive clone-based restore.
@@ -248,9 +315,29 @@ fn clear_bytes_keyed_table(
 mod tests {
     use super::*;
     use crate::store::local::{LocalTokenStore, SecretMasterStore, load_or_create_node_id};
+    use crate::topology::peers::{PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue};
     use redb::ReadableDatabase;
     use std::sync::Arc;
     use uuid::Uuid;
+
+    /// Build one deterministic peer row for reset fixtures.
+    fn peer_value(node_id: Uuid, address: &str, byte: u8) -> PeerValue {
+        PeerValue {
+            address: address.to_string(),
+            hostname: format!("node-{byte}"),
+            platform_os: "linux".to_string(),
+            platform_arch: "aarch64".to_string(),
+            noise_static_pub: [byte; 32],
+            signing_pub: [byte.saturating_add(1); 32],
+            identity_sig: vec![byte.saturating_add(2); 64],
+            wireguard: None,
+            scheduling: PeerSchedulingState::schedulable_default(node_id),
+            labels: PeerLabelState::default(),
+            runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
+            membership: PeerMembership::active(1),
+        }
+    }
 
     /// Write representative clone-sensitive rows into the recovery tables.
     fn seed_recovery_state(db: &Database) {
@@ -309,19 +396,36 @@ mod tests {
         table.iter().expect("iter").count()
     }
 
-    #[test]
-    fn reset_identity_removes_local_identity_and_preserves_cluster_secrets() {
+    #[tokio::test]
+    async fn reset_identity_removes_local_identity_and_preserves_cluster_secrets() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_dir = dir.path();
         let db_path = state_dir.join(STATE_DB_FILE);
+        let remote_id = Uuid::new_v4();
+        let original_id;
 
         {
             let db = Arc::new(redb::Database::create(&db_path).expect("create db"));
-            let original_id = load_or_create_node_id(&db).expect("node id");
+            original_id = load_or_create_node_id(&db).expect("node id");
             let token_store = LocalTokenStore::new(db.clone()).expect("token store");
             token_store.write("MNTISA-1-abc234").expect("write token");
             let master_store = SecretMasterStore::new(db.clone()).expect("master store");
             let master = master_store.ensure_current().expect("master key");
+            let peers = open_peers_store(db.clone(), original_id).expect("open peers");
+            peers
+                .upsert(
+                    &UuidKey::from(original_id),
+                    peer_value(original_id, "10.0.0.1:6578", 0x11),
+                )
+                .await
+                .expect("write local peer");
+            peers
+                .upsert(
+                    &UuidKey::from(remote_id),
+                    peer_value(remote_id, "10.0.0.2:6578", 0x22),
+                )
+                .await
+                .expect("write remote peer");
             seed_recovery_state(&db);
             assert_ne!(original_id, Uuid::nil());
             assert_eq!(master.version, 1);
@@ -334,8 +438,11 @@ mod tests {
         let report = reset_identity(ResetIdentityOptions {
             state_dir: Some(state_dir.to_path_buf()),
         })
+        .await
         .expect("reset identity");
 
+        assert_eq!(report.previous_node_id, Some(original_id));
+        assert!(report.local_peer_row_purged);
         assert_eq!(
             report.present_identity_files.len(),
             IDENTITY_FILE_NAMES.len()
@@ -348,6 +455,7 @@ mod tests {
         let db = Arc::new(redb::Database::open(&db_path).expect("open db"));
         let new_id = load_or_create_node_id(&db).expect("new node id");
         assert_ne!(new_id, Uuid::nil());
+        assert_ne!(new_id, original_id);
 
         let token_store = LocalTokenStore::new(db.clone()).expect("token store");
         assert_eq!(
@@ -361,5 +469,22 @@ mod tests {
         assert_eq!(count_uuid_table(&db, T_LOCAL_CREDS), 0);
         assert_eq!(count_bytes_table(&db, T_SERVER_TICKETS), 0);
         assert_eq!(count_uuid_table(&db, T_SERVER_REVERSE), 0);
+
+        let peers = open_peers_store(db.clone(), new_id).expect("reopen peers");
+        let old_key = UuidKey::from(original_id);
+        assert!(
+            !peers.exists(&old_key).expect("check old peer value"),
+            "old local peer value must be purged without becoming a remote peer"
+        );
+        assert!(
+            !peers.has_tombstone(&old_key).expect("check old peer tomb"),
+            "identity reset must not publish a tombstone for the copied source peer"
+        );
+        assert!(
+            peers
+                .exists(&UuidKey::from(remote_id))
+                .expect("check remote peer value"),
+            "other peer rows from the copied store should be preserved"
+        );
     }
 }

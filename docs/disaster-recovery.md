@@ -75,10 +75,12 @@ mantissa init --reset-identity --state-dir ~/.mantissa
 ```
 
 The reset removes local key files, clears local session-ticket caches, clears
-server-issued session-ticket tables, and removes the stored node id. It keeps
-replicated CRDT rows, cluster view metadata, join token state, and secret master
-keys. Passing `--reset-identity` is the confirmation; there is no interactive
-prompt so this flow is usable from provisioning and recovery automation.
+server-issued session-ticket tables, removes the stored node id, and locally
+purges the copied node's old peer row without writing a replicated tombstone. It
+keeps other replicated CRDT rows, cluster view metadata, join token state, and
+secret master keys. Passing `--reset-identity` is the confirmation; there is no
+interactive prompt so this flow is usable from provisioning and recovery
+automation.
 
 4. Join an active cluster through the normal join path:
 

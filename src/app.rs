@@ -99,7 +99,8 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                 let report =
                     crate::recovery::reset_identity(crate::recovery::ResetIdentityOptions {
                         state_dir: init.state_dir.clone(),
-                    })?;
+                    })
+                    .await?;
                 print!("{report}");
             }
 
