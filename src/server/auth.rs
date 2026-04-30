@@ -8,9 +8,9 @@ use std::{
 use uuid::Uuid;
 
 const T_TICKETS: TableDefinition<&'static [u8], &'static [u8]> =
-    TableDefinition::new("session_ticket_records_v2");
+    TableDefinition::new("session_ticket_records");
 const T_REVERSE: TableDefinition<[u8; 16], &'static [u8]> =
-    TableDefinition::new("peer_to_ticket_v2");
+    TableDefinition::new("peer_to_session_ticket");
 const SERVER_TICKET_RECORD_LEN: usize = 32;
 
 /// Convert one Redb error into the store's I/O error surface.

@@ -25,9 +25,9 @@ const T_LOCAL_SESSIONS: TableDefinition<[u8; 16], &'static [u8]> =
 const T_LOCAL_CREDS: TableDefinition<[u8; 16], &'static [u8]> =
     TableDefinition::new("session_credentials_local");
 const T_SERVER_TICKETS: TableDefinition<&'static [u8], &'static [u8]> =
-    TableDefinition::new("session_ticket_records_v2");
+    TableDefinition::new("session_ticket_records");
 const T_SERVER_REVERSE: TableDefinition<[u8; 16], &'static [u8]> =
-    TableDefinition::new("peer_to_ticket_v2");
+    TableDefinition::new("peer_to_session_ticket");
 
 /// Convert one Redb error into the identity reset I/O surface.
 fn into_io<E: std::error::Error>(error: E) -> std::io::Error {
@@ -155,9 +155,9 @@ pub async fn reset_identity(options: ResetIdentityOptions) -> Result<ResetIdenti
             .context("clear local session tickets")?,
         clear_uuid_keyed_table(&db, T_LOCAL_CREDS, "session_credentials_local")
             .context("clear local credentials")?,
-        clear_bytes_keyed_table(&db, T_SERVER_TICKETS, "session_ticket_records_v2")
+        clear_bytes_keyed_table(&db, T_SERVER_TICKETS, "session_ticket_records")
             .context("clear server session tickets")?,
-        clear_uuid_keyed_table(&db, T_SERVER_REVERSE, "peer_to_ticket_v2")
+        clear_uuid_keyed_table(&db, T_SERVER_REVERSE, "peer_to_session_ticket")
             .context("clear server session reverse index")?,
     ];
 
