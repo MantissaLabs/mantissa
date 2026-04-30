@@ -158,6 +158,20 @@ fn write_stress_config(root: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Resolves the local admin socket path created when the daemon sees the given XDG runtime dir.
+fn stress_socket_path(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join("mantissa").join("mantissa.sock")
+}
+
+/// Reads a bounded tail from one daemon log file for startup diagnostics.
+fn read_log_tail(path: &Path, max_bytes: usize) -> String {
+    let Ok(bytes) = fs::read(path) else {
+        return format!("{} is not readable", path.display());
+    };
+    let start = bytes.len().saturating_sub(max_bytes);
+    String::from_utf8_lossy(&bytes[start..]).trim().to_string()
+}
+
 /// Builds one minimal service manifest used by the stress deployment.
 fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
     ServiceManifest {
@@ -277,6 +291,8 @@ async fn wait_for_session_ready(
     child: &mut Child,
     cfg: &ClientConfig,
     timeout: Duration,
+    socket_path: &Path,
+    stdout_log: &Path,
     stderr_log: &Path,
 ) -> Result<protocol::server::cluster_session::Client> {
     let deadline = Instant::now() + timeout;
@@ -284,8 +300,10 @@ async fn wait_for_session_ready(
     loop {
         if let Some(status) = child.try_wait().context("check daemon exit state")? {
             bail!(
-                "daemon exited early with status {status}; inspect {}",
-                stderr_log.display()
+                "daemon exited early with status {status}; socket={}; stdout_tail='{}'; stderr_tail='{}'",
+                socket_path.display(),
+                read_log_tail(stdout_log, 4096),
+                read_log_tail(stderr_log, 4096),
             );
         }
 
@@ -294,9 +312,11 @@ async fn wait_for_session_ready(
             Err(_) => {
                 if Instant::now() >= deadline {
                     bail!(
-                        "daemon session did not become ready within {:?}; inspect {}",
+                        "daemon session did not become ready within {:?}; socket={}; stdout_tail='{}'; stderr_tail='{}'",
                         timeout,
-                        stderr_log.display()
+                        socket_path.display(),
+                        read_log_tail(stdout_log, 4096),
+                        read_log_tail(stderr_log, 4096),
                     );
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -396,7 +416,7 @@ impl ProcessNode {
             .with_context(|| format!("create {}", stderr_log.display()))?;
 
         let listen_addr = format!("127.0.0.1:{}", pick_free_port()?);
-        let socket_path = runtime_dir.join("mantissa.sock");
+        let socket_path = stress_socket_path(&runtime_dir);
 
         let node_rust_log =
             std::env::var("MANTISSA_STRESS_NODE_RUST_LOG").unwrap_or_else(|_| "warn".to_string());
@@ -428,10 +448,16 @@ impl ProcessNode {
             socket: Some(socket_path.clone()),
             ..ClientConfig::default()
         };
-        let session =
-            wait_for_session_ready(&mut child, &cfg, Duration::from_secs(30), &stderr_log)
-                .await
-                .with_context(|| format!("wait for node {node_name} readiness"))?;
+        let session = wait_for_session_ready(
+            &mut child,
+            &cfg,
+            Duration::from_secs(30),
+            &socket_path,
+            &stdout_log,
+            &stderr_log,
+        )
+        .await
+        .with_context(|| format!("wait for node {node_name} readiness"))?;
         let node_id = Self::wait_for_local_id(&session, &listen_addr, Duration::from_secs(15))
             .await
             .with_context(|| format!("resolve node id for {node_name}"))?;
@@ -891,48 +917,67 @@ impl ProcessCluster {
         assert!(n >= 1, "cluster size must be >= 1");
 
         let temp_dir = tempfile::tempdir().context("create stress tempdir")?;
+        let temp_root = temp_dir.path().to_path_buf();
         let config_path = write_stress_config(temp_dir.path())?;
         let bin = mantissa_bin_path()?;
 
-        let mut nodes = Vec::with_capacity(n);
-        let anchor = ProcessNode::spawn(&bin, &config_path, temp_dir.path(), 0)
-            .await
-            .context("spawn anchor node")?;
-        let anchor_addr = anchor.listen_addr.clone();
-        let join_token = anchor.show_join_token().await.context("read join token")?;
-        nodes.push(anchor);
-
-        for idx in 1..n {
-            let node = ProcessNode::spawn(&bin, &config_path, temp_dir.path(), idx)
+        let result = async {
+            let mut nodes = Vec::with_capacity(n);
+            let anchor = ProcessNode::spawn(&bin, &config_path, &temp_root, 0)
                 .await
-                .with_context(|| format!("spawn node index {idx}"))?;
+                .context("spawn anchor node")?;
+            let anchor_addr = anchor.listen_addr.clone();
+            let join_token = anchor.show_join_token().await.context("read join token")?;
+            nodes.push(anchor);
 
-            let deadline = Instant::now() + Duration::from_secs(30);
-            let mut last_err: Option<anyhow::Error> = None;
-            while Instant::now() < deadline {
-                match node.join_anchor(&anchor_addr, &join_token).await {
-                    Ok(_) => {
-                        last_err = None;
-                        break;
-                    }
-                    Err(err) => {
-                        last_err = Some(err);
-                        sleep(Duration::from_millis(200)).await;
+            for idx in 1..n {
+                let node = ProcessNode::spawn(&bin, &config_path, &temp_root, idx)
+                    .await
+                    .with_context(|| format!("spawn node index {idx}"))?;
+
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let mut last_err: Option<anyhow::Error> = None;
+                while Instant::now() < deadline {
+                    match node.join_anchor(&anchor_addr, &join_token).await {
+                        Ok(_) => {
+                            last_err = None;
+                            break;
+                        }
+                        Err(err) => {
+                            last_err = Some(err);
+                            sleep(Duration::from_millis(200)).await;
+                        }
                     }
                 }
+
+                if let Some(err) = last_err {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "node {} failed to join anchor {}",
+                            node.node_name, anchor_addr
+                        )
+                    });
+                }
+
+                nodes.push(node);
             }
 
-            if let Some(err) = last_err {
-                return Err(err).with_context(|| {
+            Ok(nodes)
+        }
+        .await;
+
+        let nodes = match result {
+            Ok(nodes) => nodes,
+            Err(error) => {
+                let preserved = temp_dir.keep();
+                return Err(error).with_context(|| {
                     format!(
-                        "node {} failed to join anchor {}",
-                        node.node_name, anchor_addr
+                        "stress cluster startup failed; preserved logs at {}",
+                        preserved.display()
                     )
                 });
             }
-
-            nodes.push(node);
-        }
+        };
 
         Ok(Self {
             _temp_dir: temp_dir,
