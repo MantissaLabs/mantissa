@@ -3,6 +3,47 @@ mod common;
 use std::time::Duration;
 
 use common::testkit::TestNode;
+use mantissa::cluster::ClusterViewId;
+
+async fn split_candidate_ids(node: &TestNode) -> Vec<uuid::Uuid> {
+    let view_response = node
+        .topology()
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("get cluster view");
+    let source_view = ClusterViewId::from_capnp(
+        view_response
+            .get()
+            .expect("cluster view response")
+            .get_view()
+            .expect("cluster view reader"),
+    )
+    .expect("decode cluster view");
+
+    let mut request = node.topology().list_split_candidates_request();
+    source_view.write_capnp(request.get().init_source_view());
+    let response = request.send().promise.await.expect("list split candidates");
+    let rows = response
+        .get()
+        .expect("split candidate response")
+        .get_nodes()
+        .expect("split candidate nodes");
+
+    let mut ids = Vec::with_capacity(rows.len() as usize);
+    for idx in 0..rows.len() {
+        let row = rows.get(idx);
+        let bytes = row
+            .get_node_id()
+            .expect("split candidate node id")
+            .get_bytes()
+            .expect("split candidate node id bytes");
+        ids.push(uuid::Uuid::from_slice(bytes).expect("split candidate uuid"));
+    }
+    ids.sort();
+    ids
+}
 
 local_test!(register_node_inproc, {
     let anchor = TestNode::new_with_tick_ms(100).await;
@@ -232,6 +273,16 @@ local_test!(node_evict_stopped_peer_inproc, {
         second.list_ids().await,
         expected,
         "second membership should exclude evicted node"
+    );
+    assert_eq!(
+        split_candidate_ids(&anchor).await,
+        expected,
+        "anchor split candidates should exclude evicted node"
+    );
+    assert_eq!(
+        split_candidate_ids(&second).await,
+        expected,
+        "second split candidates should exclude evicted node"
     );
     TestNode::wait_roots_equal(&anchor, &second, Duration::from_secs(5))
         .await

@@ -3,6 +3,7 @@ use crate::cluster::operations::{
     SplitNodeAssignment, SplitNodeCandidate, SplitTargetSpec, build_split_assignments_for_nodes,
 };
 use crate::topology::Topology;
+use crate::topology::peers::PeerValue;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -73,12 +74,12 @@ impl Topology {
         let (actives, _) = self
             .stores
             .peers
-            .load_all()
+            .load_all_regs()
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
         let mut candidates: HashMap<Uuid, SplitNodeCandidate> = HashMap::new();
-        for (key, snapshots) in actives {
-            let Some(value) = snapshots.as_slice().last() else {
+        for (key, reg) in actives {
+            let Some(value) = PeerValue::select_reg(&reg).filter(|value| value.is_active()) else {
                 continue;
             };
 

@@ -273,7 +273,7 @@ pub enum NodesCommand {
     /// Mark one node unschedulable for maintenance
     Drain(NodesDrainArgs),
 
-    /// Retire a stale node identity from the cluster
+    /// Evicts a node or one stale peer identity from the cluster
     Evict(NodesEvictArgs),
 
     /// Clear maintenance fencing for one node
