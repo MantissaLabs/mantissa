@@ -181,6 +181,12 @@ async fn accept_loop(
                 let psk = match psk_provider.psk().await {
                     Ok(psk) => psk,
                     Err(e) => {
+                        metrics::counter!(
+                            "mantissa_auth_failures_total",
+                            "stage" => "noise",
+                            "reason" => "psk"
+                        )
+                        .increment(1);
                         error!(target: "server", "Noise PSK derivation failed: {e}");
                         return;
                     }
@@ -191,6 +197,12 @@ async fn accept_loop(
                 let nread = match crate::noise::read_framed_len(&mut rd, &mut first).await {
                     Ok(n) => n,
                     Err(e) => {
+                        metrics::counter!(
+                            "mantissa_auth_failures_total",
+                            "stage" => "noise",
+                            "reason" => "read"
+                        )
+                        .increment(1);
                         error!(target: "server", "Noise handshake read failed: {e}");
                         return;
                     }
@@ -210,12 +222,24 @@ async fn accept_loop(
                     Err(crate::noise::ServerHandshakeError::UnknownPeer) => {
                         let allowed = rate_limiter.lock().await.allow(peer_ip, Instant::now());
                         if !allowed {
+                            metrics::counter!(
+                                "mantissa_auth_failures_total",
+                                "stage" => "noise",
+                                "reason" => "unknown_peer_rate_limited"
+                            )
+                            .increment(1);
                             warn!(
                                 target: "server",
                                 "rate-limited unknown peer from {peer_ip}"
                             );
                             return;
                         }
+                        metrics::counter!(
+                            "mantissa_auth_failures_total",
+                            "stage" => "noise",
+                            "reason" => "unknown_peer"
+                        )
+                        .increment(1);
                         warn!(target: "server", "Noise peer rejected: unknown static key");
                         return;
                     }
@@ -226,17 +250,35 @@ async fn accept_loop(
                                 .await
                                 .allow(peer_ip, Instant::now());
                             if !allowed {
+                                metrics::counter!(
+                                    "mantissa_auth_failures_total",
+                                    "stage" => "noise",
+                                    "reason" => "invalid_join_token_rate_limited"
+                                )
+                                .increment(1);
                                 warn!(
                                     target: "server",
                                     "rate-limited invalid join token from {peer_ip}"
                                 );
                                 return;
                             }
+                            metrics::counter!(
+                                "mantissa_auth_failures_total",
+                                "stage" => "noise",
+                                "reason" => "invalid_join_token"
+                            )
+                            .increment(1);
                             warn!(
                                 target: "server",
                                 "Noise join handshake failed: invalid join token"
                             );
                         } else {
+                            metrics::counter!(
+                                "mantissa_auth_failures_total",
+                                "stage" => "noise",
+                                "reason" => "handshake"
+                            )
+                            .increment(1);
                             error!(target: "server", "Noise handshake failed: {e}");
                         }
                         return;
@@ -247,6 +289,12 @@ async fn accept_loop(
             if matches!(handshake.kind, HandshakeKind::Join) {
                 let allowed = rate_limiter.lock().await.allow(peer_ip, Instant::now());
                 if !allowed {
+                    metrics::counter!(
+                        "mantissa_auth_failures_total",
+                        "stage" => "noise",
+                        "reason" => "join_rate_limited"
+                    )
+                    .increment(1);
                     warn!(
                         target: "server",
                         "rate-limited join attempt from {peer_ip}"
@@ -259,6 +307,12 @@ async fn accept_loop(
                 && handshake.join_probe
                 && let Err(e) = crate::noise::join_probe_server(&mut handshake.stream).await
             {
+                metrics::counter!(
+                    "mantissa_auth_failures_total",
+                    "stage" => "noise",
+                    "reason" => "join_probe"
+                )
+                .increment(1);
                 warn!(target: "server", "Noise join probe failed: {e}");
                 return;
             }

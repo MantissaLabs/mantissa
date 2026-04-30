@@ -142,16 +142,35 @@ impl RuntimeSet {
         &self,
         request: RuntimeCreateRequest,
     ) -> RuntimeResult<RuntimeInstanceRef> {
-        let entry = self.select_backend_for_request(&request)?;
-        let handle = entry.backend.create_instance(request).await?;
-        Ok(RuntimeInstanceRef::new(entry.kind.clone(), handle))
+        let entry = match self.select_backend_for_request(&request) {
+            Ok(entry) => entry,
+            Err(error) => {
+                crate::observability::metrics::record_runtime_failure("create", &error);
+                return Err(error);
+            }
+        };
+        match entry.backend.create_instance(request).await {
+            Ok(handle) => Ok(RuntimeInstanceRef::new(entry.kind.clone(), handle)),
+            Err(error) => {
+                crate::observability::metrics::record_runtime_failure("create", &error);
+                Err(error)
+            }
+        }
     }
 
     /// Starts one known runtime instance.
     pub async fn start_instance(&self, runtime: &RuntimeInstanceRef) -> RuntimeResult<()> {
-        self.backend_for_runtime(runtime)?
+        match self
+            .backend_for_runtime(runtime)?
             .start_instance(&runtime.handle)
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                crate::observability::metrics::record_runtime_failure("start", &error);
+                Err(error)
+            }
+        }
     }
 
     /// Stops one known runtime instance.
@@ -160,9 +179,17 @@ impl RuntimeSet {
         runtime: &RuntimeInstanceRef,
         timeout: Option<Duration>,
     ) -> RuntimeResult<()> {
-        self.backend_for_runtime(runtime)?
+        match self
+            .backend_for_runtime(runtime)?
             .stop_instance(&runtime.handle, timeout)
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                crate::observability::metrics::record_runtime_failure("stop", &error);
+                Err(error)
+            }
+        }
     }
 
     /// Restarts one known runtime instance.
@@ -171,9 +198,17 @@ impl RuntimeSet {
         runtime: &RuntimeInstanceRef,
         timeout: Option<Duration>,
     ) -> RuntimeResult<()> {
-        self.backend_for_runtime(runtime)?
+        match self
+            .backend_for_runtime(runtime)?
             .restart_instance(&runtime.handle, timeout)
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                crate::observability::metrics::record_runtime_failure("restart", &error);
+                Err(error)
+            }
+        }
     }
 
     /// Removes one known runtime instance.
@@ -183,9 +218,17 @@ impl RuntimeSet {
         force: bool,
         remove_volumes: bool,
     ) -> RuntimeResult<()> {
-        self.backend_for_runtime(runtime)?
+        match self
+            .backend_for_runtime(runtime)?
             .remove_instance(&runtime.handle, force, remove_volumes)
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                crate::observability::metrics::record_runtime_failure("remove", &error);
+                Err(error)
+            }
+        }
     }
 
     /// Executes one non-interactive command inside one known runtime instance.
@@ -195,9 +238,17 @@ impl RuntimeSet {
         command: &[String],
         timeout: Option<Duration>,
     ) -> RuntimeResult<RuntimeExecResult> {
-        self.backend_for_runtime(runtime)?
+        match self
+            .backend_for_runtime(runtime)?
             .exec_instance(&runtime.handle, command, timeout)
             .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                crate::observability::metrics::record_runtime_failure("exec", &error);
+                Err(error)
+            }
+        }
     }
 
     /// Starts one interactive exec session inside one known runtime instance.
@@ -243,9 +294,17 @@ impl RuntimeSet {
         &self,
         runtime: &RuntimeInstanceRef,
     ) -> RuntimeResult<RuntimeInfo> {
-        self.backend_for_runtime(runtime)?
+        match self
+            .backend_for_runtime(runtime)?
             .inspect_instance(&runtime.handle)
             .await
+        {
+            Ok(info) => Ok(info),
+            Err(error) => {
+                crate::observability::metrics::record_runtime_failure("inspect", &error);
+                Err(error)
+            }
+        }
     }
 
     /// Returns inspect metadata for one named runtime instance across matching backends.
@@ -343,7 +402,13 @@ impl RuntimeSet {
     ) -> RuntimeResult<Vec<RuntimeDiscoveredInstance>> {
         let mut instances = Vec::new();
         for entry in self.entries.iter() {
-            let listed = entry.backend.list_instances(filters.clone()).await?;
+            let listed = match entry.backend.list_instances(filters.clone()).await {
+                Ok(listed) => listed,
+                Err(error) => {
+                    crate::observability::metrics::record_runtime_failure("list", &error);
+                    return Err(error);
+                }
+            };
             for info in listed {
                 let handle = if info.id.is_empty() {
                     info.name.clone()

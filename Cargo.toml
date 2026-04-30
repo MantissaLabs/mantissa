@@ -106,6 +106,8 @@ anyhow = "1"
 arc-swap = "1.6"
 
 # Logging
+metrics = "0.24.5"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
 tracing = "0.1"
 tracing-log = "0.2"
 tracing-subscriber = { version = "0.3.18", features = [

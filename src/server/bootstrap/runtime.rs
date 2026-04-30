@@ -7,6 +7,7 @@ use crate::network::controller::NetworkController;
 use crate::network::gossip::NetworkGossiper;
 use crate::network::registry::NetworkRegistry;
 use crate::network::service::NetworksRpc;
+use crate::observability::metrics::{self as runtime_metrics, MetricsSamplerInputs};
 use crate::registry::Registry;
 use crate::runtime::oci::DockerRuntimeBackend;
 use crate::runtime::set::RuntimeSet;
@@ -23,6 +24,7 @@ use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
 use crate::store::gc::StoreGcRunner;
+use crate::store::path::default_db_path;
 use crate::store::registry::{ReplicatedStoreHandles, replicated_store_registry};
 use crate::sync::{SyncGcProgress, SyncRunner, SyncService, SyncStores};
 use crate::task::service::TaskService;
@@ -1002,6 +1004,35 @@ async fn spawn_runtime_tasks(
     let topology_for_gossip = components.topology.clone();
     let gossip_tick = topology_for_gossip.gossip_interval();
     let mut tasks = Vec::new();
+
+    match config::metrics_runtime_config() {
+        Ok(metrics_config) => {
+            let state_db_path = match default_db_path() {
+                Ok(path) => path,
+                Err(error) => {
+                    error!(target: "metrics", "failed to resolve state database path: {error}");
+                    std::path::PathBuf::from("state.redb")
+                }
+            };
+            if let Some(task) = runtime_metrics::spawn_metrics(
+                metrics_config,
+                MetricsSamplerInputs {
+                    scheduler: components.scheduler.clone(),
+                    registry: components.registry.clone(),
+                    nodeport: components.network_controller.nodeport_manager(),
+                    progress: components.sync_gc_progress.clone(),
+                    cluster_view: components.cluster_view.clone(),
+                    root_schema: components.root_schema,
+                    state_db_path,
+                },
+            ) {
+                tasks.push(task);
+            }
+        }
+        Err(error) => {
+            error!(target: "metrics", "invalid metrics configuration: {error}");
+        }
+    }
 
     let mut workload_runner = components.workload_manager.clone();
     tasks.push(tokio::task::spawn_local(async move {

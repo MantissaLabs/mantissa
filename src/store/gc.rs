@@ -85,10 +85,13 @@ impl StoreGcRunner {
     /// the same membership view for tombstone barriers. Register compaction does
     /// not need that barrier because it is propagated as a normal register merge.
     pub async fn run_once(&self) {
+        let started_at = std::time::Instant::now();
+        let mut pass_failed = false;
         let now_unix_ms = now_unix_ms();
         let active_remote_peers = match self.registry.known_peers() {
             Ok(peers) => Some(peers),
             Err(error) => {
+                pass_failed = true;
                 error!(target: "store.gc", "failed to load active peer snapshot: {error}");
                 None
             }
@@ -125,7 +128,11 @@ impl StoreGcRunner {
                         root_schema_version,
                         "skipping tombstone GC without complete sync barrier"
                     );
-                    self.compact_domain_registers_with_trace(entry).await;
+                    crate::observability::metrics::record_store_gc_skipped_domain(
+                        domain,
+                        "no_barrier",
+                    );
+                    pass_failed |= self.compact_domain_registers_with_trace(entry).await;
                     continue;
                 };
 
@@ -135,6 +142,7 @@ impl StoreGcRunner {
                 {
                     Ok(report) => self.trace_domain_report(domain, &report),
                     Err(error) => {
+                        pass_failed = true;
                         error!(
                             target: "store.gc",
                             ?domain,
@@ -144,8 +152,14 @@ impl StoreGcRunner {
                 }
             }
 
-            self.compact_domain_registers_with_trace(entry).await;
+            pass_failed |= self.compact_domain_registers_with_trace(entry).await;
         }
+        crate::observability::metrics::set_store_gc_last_duration(started_at.elapsed());
+        crate::observability::metrics::record_store_gc_run(if pass_failed {
+            "failure"
+        } else {
+            "success"
+        });
     }
 
     /// Applies store-local tombstone GC to the backing store for one sync domain.
@@ -162,21 +176,33 @@ impl StoreGcRunner {
     }
 
     /// Applies register compaction to one sync domain and traces any work done.
-    async fn compact_domain_registers_with_trace(&self, entry: &ReplicatedStoreEntry) {
+    async fn compact_domain_registers_with_trace(&self, entry: &ReplicatedStoreEntry) -> bool {
         match entry.store.compact_registers(&self.config.policy).await {
-            Ok(report) => self.trace_domain_report(entry.domain, &report),
+            Ok(report) => {
+                self.trace_domain_report(entry.domain, &report);
+                false
+            }
             Err(error) => {
                 error!(
                     target: "store.gc",
                     domain = ?entry.domain,
                     "register compaction failed: {error}"
                 );
+                true
             }
         }
     }
 
     /// Emits one compact trace line for domains where a GC pass did work.
     fn trace_domain_report(&self, domain: Domain, report: &StoreGcReport) {
+        crate::observability::metrics::record_store_gc_tombstones_pruned(
+            domain,
+            report.tombstones_pruned,
+        );
+        crate::observability::metrics::record_store_gc_registers_compacted(
+            domain,
+            report.registers_compacted,
+        );
         if report.tombstones_scanned == 0
             && report.tombstones_pruned == 0
             && report.registers_scanned == 0

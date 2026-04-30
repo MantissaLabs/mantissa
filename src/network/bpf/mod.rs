@@ -125,7 +125,13 @@ impl NetworkBpfManager {
         if spec.bpf_programs.is_empty() {
             return Ok(());
         }
-        self.platform.ensure_programs(spec, interfaces).await
+        match self.platform.ensure_programs(spec, interfaces).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                crate::observability::metrics::record_network_bpf_failure("ensure", "failed");
+                Err(error)
+            }
+        }
     }
 
     /// Report whether ensuring this network will detach and rebuild local eBPF state.
@@ -141,13 +147,28 @@ impl NetworkBpfManager {
         if spec.bpf_programs.is_empty() {
             return Ok(false);
         }
-        self.platform.requires_reload(spec, interfaces).await
+        match self.platform.requires_reload(spec, interfaces).await {
+            Ok(requires_reload) => Ok(requires_reload),
+            Err(error) => {
+                crate::observability::metrics::record_network_bpf_failure(
+                    "requires_reload",
+                    "failed",
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Tear down any previously attached programs for the network so the kernel datapath stays
     /// clean when the overlay is removed or reconfigured.
     pub async fn teardown_network(&self, interfaces: &NetworkInterfaceContext) -> Result<()> {
-        self.platform.teardown_programs(interfaces).await
+        match self.platform.teardown_programs(interfaces).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                crate::observability::metrics::record_network_bpf_failure("teardown", "failed");
+                Err(error)
+            }
+        }
     }
 }
 

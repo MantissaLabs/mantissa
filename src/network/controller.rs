@@ -360,6 +360,11 @@ impl NetworkController {
         .await
         {
             Ok(state) => {
+                crate::observability::metrics::set_wireguard_underlay(
+                    state.underlay_active,
+                    state.required_peer_count,
+                    state.configured_peer_ids.len(),
+                );
                 let mut guard = self.inner.wireguard.lock().await;
                 let changed = guard.underlay_active != state.underlay_active
                     || guard.required_peer_count != state.required_peer_count
@@ -381,6 +386,7 @@ impl NetworkController {
                 Ok(changed)
             }
             Err(err) => {
+                crate::observability::metrics::record_network_reconcile_failure("startup_state");
                 warn!(
                     target: "network",
                     "wireguard underlay reconcile failed; blocking encrypted network provisioning: {err:#}"
@@ -545,6 +551,7 @@ impl NetworkController {
             }
             Ok(_) => {}
             Err(err) => {
+                crate::observability::metrics::record_network_reconcile_failure("startup_specs");
                 warn!(
                     target: "network",
                     "failed to demote persisted peer readiness on startup: {err:#}"
@@ -562,6 +569,7 @@ impl NetworkController {
             }
             Ok(_) => {}
             Err(err) => {
+                crate::observability::metrics::record_network_reconcile_failure("wireguard");
                 warn!(
                     target: "network",
                     "failed to queue persisted network specs on startup: {err:#}"
@@ -570,12 +578,16 @@ impl NetworkController {
         }
 
         if let Err(err) = self.reconcile_pending_forwarding().await {
+            crate::observability::metrics::record_network_reconcile_failure("startup_forwarding");
             warn!(
                 target: "network",
                 "pending forwarding reconcile failed on startup: {err:#}"
             );
         }
         if let Err(err) = self.reconcile_pending_specs().await {
+            crate::observability::metrics::record_network_reconcile_failure(
+                "startup_pending_specs",
+            );
             warn!(
                 target: "network",
                 "pending spec reconcile failed on startup: {err:#}"
@@ -588,11 +600,13 @@ impl NetworkController {
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(err) = self.reconcile_once().await {
+                        crate::observability::metrics::record_network_reconcile_failure("drift");
                         warn!(target: "network", "network reconciliation failed: {err:#}");
                     }
                 }
                 _ = attachment_refresh.tick() => {
                     if let Err(err) = self.refresh_forwarding_from_attachments().await {
+                        crate::observability::metrics::record_network_reconcile_failure("attachment_refresh");
                         warn!(
                             target: "network",
                             "attachment forwarding refresh failed: {err:#}"
@@ -611,6 +625,7 @@ impl NetworkController {
                     // first traffic to those newly replicated backends does not wait on the
                     // slow poll cadence.
                     if let Err(err) = self.refresh_forwarding_from_attachments().await {
+                        crate::observability::metrics::record_network_reconcile_failure("attachment_sync");
                         warn!(
                             target: "network",
                             "attachment forwarding refresh after sync failed: {err:#}"
@@ -619,12 +634,14 @@ impl NetworkController {
                 }
                 _ = self.inner.wake.notified() => {
                     if let Err(err) = self.reconcile_pending_forwarding().await {
+                        crate::observability::metrics::record_network_reconcile_failure("pending_forwarding");
                         warn!(
                             target: "network",
                             "pending forwarding reconcile failed: {err:#}"
                         );
                     }
                     if let Err(err) = self.reconcile_pending_specs().await {
+                        crate::observability::metrics::record_network_reconcile_failure("pending_specs");
                         warn!(target: "network", "pending spec reconcile failed: {err:#}");
                     }
                 }

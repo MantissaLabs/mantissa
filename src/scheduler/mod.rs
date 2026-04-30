@@ -1490,6 +1490,7 @@ impl Scheduler {
         intents: Vec<TaskLeaseIntent>,
     ) -> Result<PreparedTaskLeaseBatch, SchedulerError> {
         if intents.is_empty() {
+            crate::observability::metrics::record_scheduler_prepare("success", "empty");
             return Ok(PreparedTaskLeaseBatch { leases: Vec::new() });
         }
 
@@ -1497,7 +1498,14 @@ impl Scheduler {
             let current_opt = self.state.load_full();
             let current_arc = match current_opt.as_ref() {
                 Some(state) => state.clone(),
-                None => return Err(SchedulerError::Uninitialized),
+                None => {
+                    let error = SchedulerError::Uninitialized;
+                    crate::observability::metrics::record_scheduler_prepare(
+                        "failure",
+                        crate::observability::metrics::scheduler_error_reason(&error),
+                    );
+                    return Err(error);
+                }
             };
             let current = current_arc.as_ref();
 
@@ -1518,20 +1526,30 @@ impl Scheduler {
                     intent.memory_bytes,
                 ) else {
                     failed_tasks.push(intent.task_id);
-                    return Err(SchedulerError::InsufficientResources {
+                    let error = SchedulerError::InsufficientResources {
                         task_ids: failed_tasks,
                         snapshot: current.snapshot.clone(),
-                    });
+                    };
+                    crate::observability::metrics::record_scheduler_prepare(
+                        "failure",
+                        crate::observability::metrics::scheduler_error_reason(&error),
+                    );
+                    return Err(error);
                 };
 
                 let Some(gpu_indices) =
                     Self::select_gpu_indices(&free_gpu_indices, intent.gpu_count)
                 else {
                     failed_tasks.push(intent.task_id);
-                    return Err(SchedulerError::InsufficientResources {
+                    let error = SchedulerError::InsufficientResources {
                         task_ids: failed_tasks,
                         snapshot: current.snapshot.clone(),
-                    });
+                    };
+                    crate::observability::metrics::record_scheduler_prepare(
+                        "failure",
+                        crate::observability::metrics::scheduler_error_reason(&error),
+                    );
+                    return Err(error);
                 };
 
                 let slot_index_set: HashSet<usize> = slot_indices.iter().copied().collect();
@@ -1590,10 +1608,16 @@ impl Scheduler {
                 let _ = self
                     .state
                     .compare_and_swap(&Some(new_state_arc.clone()), current_opt.clone());
-                return Err(SchedulerError::Store(e));
+                let error = SchedulerError::Store(e);
+                crate::observability::metrics::record_scheduler_prepare(
+                    "failure",
+                    crate::observability::metrics::scheduler_error_reason(&error),
+                );
+                return Err(error);
             }
 
             self.publish_digest_from_snapshot(&new_snapshot).await;
+            crate::observability::metrics::record_scheduler_prepare("success", "ok");
             return Ok(PreparedTaskLeaseBatch { leases });
         }
     }
@@ -1814,6 +1838,7 @@ impl Scheduler {
             }
 
             self.publish_digest_from_snapshot(&new_snapshot).await;
+            crate::observability::metrics::record_scheduler_expired_leases_reaped(expired.len());
             return Ok(expired);
         }
     }

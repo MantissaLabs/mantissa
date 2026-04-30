@@ -1,5 +1,5 @@
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -36,6 +36,8 @@ pub struct Config {
     pub scheduler: SchedulerConfig,
     #[serde(default)]
     pub replication: ReplicationConfig,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 /// # Description:
@@ -136,6 +138,80 @@ impl Default for SecurityConfig {
         Self {
             session_ticket_ttl_secs: default_session_ticket_ttl_secs(),
         }
+    }
+}
+
+/// # Description:
+///
+/// Observability subsystem configuration for local production telemetry.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ObservabilityConfig {
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+/// # Description:
+///
+/// Prometheus/OpenMetrics exporter and low-cost sampler configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct MetricsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_metrics_listen_addr")]
+    pub listen_addr: String,
+    #[serde(default = "default_metrics_sample_interval_ms")]
+    pub sample_interval_ms: u64,
+    #[serde(default = "default_metrics_state_db_sample_interval_ms")]
+    pub state_db_sample_interval_ms: u64,
+}
+
+impl Default for MetricsConfig {
+    /// # Description:
+    ///
+    /// Keeps metrics disabled until operators explicitly enable the local scrape endpoint.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_addr: default_metrics_listen_addr(),
+            sample_interval_ms: default_metrics_sample_interval_ms(),
+            state_db_sample_interval_ms: default_metrics_state_db_sample_interval_ms(),
+        }
+    }
+}
+
+/// # Description:
+///
+/// Runtime metrics configuration with parsed addresses and intervals.
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeMetricsConfig {
+    pub enabled: bool,
+    pub listen_addr: SocketAddr,
+    pub sample_interval: Duration,
+    pub state_db_sample_interval: Duration,
+}
+
+impl MetricsConfig {
+    /// # Description:
+    ///
+    /// Converts persisted metrics settings into runtime values after validation.
+    fn as_runtime(&self) -> Result<RuntimeMetricsConfig> {
+        let listen_addr = if self.enabled {
+            self.listen_addr.parse().with_context(|| {
+                format!(
+                    "observability.metrics.listen_addr must be a socket address (got '{}')",
+                    self.listen_addr
+                )
+            })?
+        } else {
+            default_metrics_socket_addr()
+        };
+
+        Ok(RuntimeMetricsConfig {
+            enabled: self.enabled,
+            listen_addr,
+            sample_interval: Duration::from_millis(self.sample_interval_ms),
+            state_db_sample_interval: Duration::from_millis(self.state_db_sample_interval_ms),
+        })
     }
 }
 
@@ -559,6 +635,21 @@ pub const DEFAULT_STORE_GC_TOMBSTONE_BATCH_LIMIT: usize = 1024;
 
 /// # Description:
 ///
+/// Default local Prometheus/OpenMetrics scrape address for enabled metrics.
+pub const DEFAULT_METRICS_LISTEN_ADDR: &str = "127.0.0.1:9600";
+
+/// # Description:
+///
+/// Default interval for cheap runtime metrics sampling.
+pub const DEFAULT_METRICS_SAMPLE_INTERVAL_MS: u64 = 10_000;
+
+/// # Description:
+///
+/// Default interval for filesystem-backed state database size sampling.
+pub const DEFAULT_METRICS_STATE_DB_SAMPLE_INTERVAL_MS: u64 = 60_000;
+
+/// # Description:
+///
 /// Tracks the origin metadata for the current configuration snapshot.
 #[derive(Clone, Debug, Default)]
 pub struct ConfigSource {
@@ -755,6 +846,13 @@ pub fn session_ticket_ttl_secs() -> u64 {
 
 /// # Description:
 ///
+/// Resolve the configured metrics exporter and sampler settings.
+pub fn metrics_runtime_config() -> Result<RuntimeMetricsConfig> {
+    global_config().observability.metrics.as_runtime()
+}
+
+/// # Description:
+///
 /// Resolve whether WireGuard underlay is enabled on this node.
 pub fn wireguard_enabled() -> bool {
     global_config().network.wireguard.enabled
@@ -922,6 +1020,34 @@ fn default_store_gc_stale_peer_rejoin_after_ms() -> u64 {
 /// Returns the default durable session ticket lifetime in seconds.
 fn default_session_ticket_ttl_secs() -> u64 {
     DEFAULT_SESSION_TICKET_TTL_SECS
+}
+
+/// # Description:
+///
+/// Returns the default local metrics scrape listener.
+fn default_metrics_listen_addr() -> String {
+    DEFAULT_METRICS_LISTEN_ADDR.to_string()
+}
+
+/// # Description:
+///
+/// Returns the parsed default metrics listener without relying on fallible parsing.
+fn default_metrics_socket_addr() -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::LOCALHOST, 9600))
+}
+
+/// # Description:
+///
+/// Returns the default cheap metrics sampler interval.
+fn default_metrics_sample_interval_ms() -> u64 {
+    DEFAULT_METRICS_SAMPLE_INTERVAL_MS
+}
+
+/// # Description:
+///
+/// Returns the default slow state database size sampler interval.
+fn default_metrics_state_db_sample_interval_ms() -> u64 {
+    DEFAULT_METRICS_STATE_DB_SAMPLE_INTERVAL_MS
 }
 
 /// # Description:
@@ -1270,6 +1396,28 @@ impl Config {
             &mut self.security.session_ticket_ttl_secs,
         );
 
+        if std::env::var_os("MANTISSA_METRICS_ENABLE").is_some() {
+            applied = true;
+            self.observability.metrics.enabled = true;
+        }
+
+        if let Ok(addr) = std::env::var("MANTISSA_METRICS_LISTEN_ADDR") {
+            applied = true;
+            let addr = addr.trim();
+            if !addr.is_empty() {
+                self.observability.metrics.listen_addr = addr.to_string();
+            }
+        }
+
+        applied |= apply_positive_u64_env_override(
+            "MANTISSA_METRICS_SAMPLE_INTERVAL_MS",
+            &mut self.observability.metrics.sample_interval_ms,
+        );
+        applied |= apply_positive_u64_env_override(
+            "MANTISSA_METRICS_STATE_DB_SAMPLE_INTERVAL_MS",
+            &mut self.observability.metrics.state_db_sample_interval_ms,
+        );
+
         applied |= apply_u64_env_override(
             "MANTISSA_SCHEDULER_RESERVED_CPU_MILLIS",
             &mut self.scheduler.reserved_cpu_millis,
@@ -1419,6 +1567,29 @@ impl Config {
 
         if self.security.session_ticket_ttl_secs == 0 {
             anyhow::bail!("security.session_ticket_ttl_secs must be greater than zero");
+        }
+
+        if self.observability.metrics.enabled {
+            self.observability
+                .metrics
+                .listen_addr
+                .parse::<SocketAddr>()
+                .with_context(|| {
+                    format!(
+                        "observability.metrics.listen_addr must be a socket address (got '{}')",
+                        self.observability.metrics.listen_addr
+                    )
+                })?;
+        }
+
+        if self.observability.metrics.sample_interval_ms == 0 {
+            anyhow::bail!("observability.metrics.sample_interval_ms must be greater than zero");
+        }
+
+        if self.observability.metrics.state_db_sample_interval_ms == 0 {
+            anyhow::bail!(
+                "observability.metrics.state_db_sample_interval_ms must be greater than zero"
+            );
         }
 
         if self.health.probe_fanout == 0 {
@@ -1671,6 +1842,10 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
         changes.push("security.session_ticket_ttl_secs".to_string());
     }
 
+    if old.observability.metrics != new.observability.metrics {
+        changes.push("observability.metrics".to_string());
+    }
+
     if old.scheduler.reserved_cpu_millis != new.scheduler.reserved_cpu_millis {
         changes.push("scheduler.reserved_cpu_millis".to_string());
     }
@@ -1839,6 +2014,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_metrics_config() {
+        let mut config = Config::default();
+        config.observability.metrics.enabled = true;
+        config.observability.metrics.listen_addr = "127.0.0.1".to_string();
+        assert!(config.validate().is_err());
+
+        config = Config::default();
+        config.observability.metrics.sample_interval_ms = 0;
+        assert!(config.validate().is_err());
+
+        config = Config::default();
+        config.observability.metrics.state_db_sample_interval_ms = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn disabled_metrics_ignore_invalid_runtime_listener() {
+        let mut config = Config::default();
+        config.observability.metrics.listen_addr = "not-a-socket".to_string();
+
+        assert!(config.validate().is_ok());
+        let runtime = config
+            .observability
+            .metrics
+            .as_runtime()
+            .expect("disabled metrics runtime config");
+
+        assert!(!runtime.enabled);
+        assert_eq!(runtime.listen_addr, default_metrics_socket_addr());
+    }
+
+    #[test]
     fn rejects_invalid_wireguard_port() {
         let mut config = Config::default();
         config.network.wireguard.port = Some(0);
@@ -1982,6 +2189,10 @@ mod tests {
             std::env::set_var("MANTISSA_GPU_DEVICE_OVERRIDES", "uuid:GPU-abc=id:GPU-abc");
             std::env::set_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY", "1");
             std::env::set_var("MANTISSA_SESSION_TICKET_TTL_SECS", "7200");
+            std::env::set_var("MANTISSA_METRICS_ENABLE", "1");
+            std::env::set_var("MANTISSA_METRICS_LISTEN_ADDR", "127.0.0.1:19600");
+            std::env::set_var("MANTISSA_METRICS_SAMPLE_INTERVAL_MS", "15000");
+            std::env::set_var("MANTISSA_METRICS_STATE_DB_SAMPLE_INTERVAL_MS", "75000");
             std::env::set_var("MANTISSA_SCHEDULER_RESERVED_CPU_MILLIS", "750");
             std::env::set_var("MANTISSA_SCHEDULER_RESERVED_MEMORY_BYTES", "134217728");
             std::env::set_var("MANTISSA_GOSSIP_CHANNEL_CAPACITY", "256");
@@ -2028,6 +2239,16 @@ mod tests {
         );
         assert!(config.storage.local_volume_enforce_capacity);
         assert_eq!(config.security.session_ticket_ttl_secs, 7200);
+        assert!(config.observability.metrics.enabled);
+        assert_eq!(
+            config.observability.metrics.listen_addr.as_str(),
+            "127.0.0.1:19600"
+        );
+        assert_eq!(config.observability.metrics.sample_interval_ms, 15_000);
+        assert_eq!(
+            config.observability.metrics.state_db_sample_interval_ms,
+            75_000
+        );
         assert_eq!(config.scheduler.reserved_cpu_millis, 750);
         assert_eq!(config.scheduler.reserved_memory_bytes, 134_217_728);
         assert_eq!(config.replication.gossip_channel_capacity, 256);
@@ -2055,6 +2276,10 @@ mod tests {
             std::env::remove_var("MANTISSA_GPU_DEVICE_OVERRIDES");
             std::env::remove_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY");
             std::env::remove_var("MANTISSA_SESSION_TICKET_TTL_SECS");
+            std::env::remove_var("MANTISSA_METRICS_ENABLE");
+            std::env::remove_var("MANTISSA_METRICS_LISTEN_ADDR");
+            std::env::remove_var("MANTISSA_METRICS_SAMPLE_INTERVAL_MS");
+            std::env::remove_var("MANTISSA_METRICS_STATE_DB_SAMPLE_INTERVAL_MS");
             std::env::remove_var("MANTISSA_SCHEDULER_RESERVED_CPU_MILLIS");
             std::env::remove_var("MANTISSA_SCHEDULER_RESERVED_MEMORY_BYTES");
             std::env::remove_var("MANTISSA_GOSSIP_CHANNEL_CAPACITY");

@@ -97,6 +97,8 @@ impl WorkloadManager {
                         );
                     }
                     if should_restart_after_exit(working, exit_code) {
+                        crate::observability::metrics::record_runtime_task_exit(exit_code, true);
+                        crate::observability::metrics::record_runtime_restart("exit_policy");
                         warn!(
                             target: "task",
                             task = %working.id,
@@ -104,6 +106,7 @@ impl WorkloadManager {
                             "running task instance exited; restarting task runtime per restart policy"
                         );
                     } else {
+                        crate::observability::metrics::record_runtime_task_exit(exit_code, false);
                         let detail = exit_error
                             .as_deref()
                             .map(str::trim)
@@ -166,6 +169,7 @@ impl WorkloadManager {
                     task = %working.id,
                     "running task instance missing locally; restarting task runtime"
                 );
+                crate::observability::metrics::record_runtime_restart("missing_instance");
                 working.phase_version = working.phase_version.saturating_add(1);
                 working.state = WorkloadPhase::Pending;
                 working.phase_reason = None;
@@ -208,6 +212,7 @@ impl WorkloadManager {
         };
         match probe.kind {
             WorkloadLivenessProbeKind::Exec if probe.command.is_empty() => {
+                crate::observability::metrics::record_liveness_probe_failure("exec", "malformed");
                 self.local_state
                     .liveness_probes
                     .lock()
@@ -221,6 +226,10 @@ impl WorkloadManager {
                 return Ok(true);
             }
             WorkloadLivenessProbeKind::Http | WorkloadLivenessProbeKind::Tcp if probe.port == 0 => {
+                crate::observability::metrics::record_liveness_probe_failure(
+                    liveness_probe_kind_label(probe.kind),
+                    "malformed",
+                );
                 self.local_state
                     .liveness_probes
                     .lock()
@@ -278,6 +287,10 @@ impl WorkloadManager {
             }
             Err(reason) => reason,
         };
+        crate::observability::metrics::record_liveness_probe_failure(
+            liveness_probe_kind_label(probe.kind),
+            liveness_failure_reason(&failure_reason),
+        );
 
         let next_failures = cached
             .map(|entry| entry.consecutive_failures)
@@ -349,6 +362,7 @@ impl WorkloadManager {
             threshold = probe.failure_threshold(),
             "{failure_reason}; restarting task runtime"
         );
+        crate::observability::metrics::record_runtime_restart("liveness_probe");
         working.phase_version = working.phase_version.saturating_add(1);
         working.state = WorkloadPhase::Pending;
         working.phase_reason = Some(failure_reason);
@@ -3706,6 +3720,30 @@ fn should_restart_after_exit(spec: &WorkloadSpec, exit_code: i32) -> bool {
         WorkloadRestartPolicyKind::No => false,
         WorkloadRestartPolicyKind::Always | WorkloadRestartPolicyKind::UnlessStopped => true,
         WorkloadRestartPolicyKind::OnFailure => exit_code != 0,
+    }
+}
+
+/// Returns one bounded metrics label for a liveness probe kind.
+fn liveness_probe_kind_label(kind: WorkloadLivenessProbeKind) -> &'static str {
+    match kind {
+        WorkloadLivenessProbeKind::Exec => "exec",
+        WorkloadLivenessProbeKind::Http => "http",
+        WorkloadLivenessProbeKind::Tcp => "tcp",
+    }
+}
+
+/// Returns one bounded metrics reason for a liveness probe failure message.
+fn liveness_failure_reason(reason: &str) -> &'static str {
+    if reason.contains("timed out") {
+        "timeout"
+    } else if reason.contains("disappeared") || reason.contains("not found") {
+        "not_found"
+    } else if reason.contains("missing") || reason.contains("no local target") {
+        "unavailable"
+    } else if reason.contains("status code") {
+        "nonzero_exit"
+    } else {
+        "probe_failed"
     }
 }
 

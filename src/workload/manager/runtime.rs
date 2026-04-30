@@ -432,7 +432,9 @@ impl WorkloadManager {
             return Ok(());
         }
 
-        if task_policy_allows_runtime_restart(&spec, exit_code) {
+        let restartable = task_policy_allows_runtime_restart(&spec, exit_code);
+        crate::observability::metrics::record_runtime_task_exit(exit_code, restartable);
+        if restartable {
             debug!(
                 target: "task",
                 task = %task_id,

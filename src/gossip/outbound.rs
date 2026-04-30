@@ -22,7 +22,7 @@ use async_channel::Receiver;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
@@ -202,7 +202,7 @@ pub(crate) async fn start<C>(
 {
     use tokio::time::interval;
     let mut ticker = interval(tick);
-    let mut buffer: Vec<Message> = Vec::new();
+    let mut buffer: Vec<QueuedMessage> = Vec::new();
     let dispatch_batch_max = gossip_dispatch_batch_max_from_env(DEFAULT_GOSSIP_DISPATCH_BATCH_MAX);
     let rpc_batch_max = gossip_rpc_batch_max_from_env(DEFAULT_GOSSIP_RPC_BATCH_MAX);
     let send_parallelism = gossip_send_parallelism_from_env(DEFAULT_GOSSIP_SEND_PARALLELISM);
@@ -213,6 +213,13 @@ pub(crate) async fn start<C>(
         tokio::select! {
             _ = ticker.tick() => {
                 let pending = std::mem::take(&mut buffer);
+                let pending_count = pending.len();
+                let oldest_age = pending
+                    .iter()
+                    .map(|message| message.enqueued_at.elapsed())
+                    .max()
+                    .unwrap_or(Duration::ZERO);
+                crate::observability::metrics::set_gossip_backlog(pending_count, oldest_age);
 
                 if pending.is_empty() {
                     // Idle ticks no longer emit synthetic void gossip messages. Health probing
@@ -223,6 +230,7 @@ pub(crate) async fn start<C>(
                     continue;
                 }
 
+                let pending: Vec<Message> = pending.into_iter().map(|queued| queued.message).collect();
                 let before_count = pending.len();
                 let (pending, coalesced_task_updates) = coalesce_pending_messages(pending);
                 if coalesced_task_updates > 0 {
@@ -281,13 +289,21 @@ pub(crate) async fn start<C>(
                 let active_view = context.active_cluster_view();
                 let mut dedupe = dedupe_state.lock().await;
                 dedupe.record_outbound(active_view, msg.id());
-                buffer.push(msg);
+                buffer.push(QueuedMessage {
+                    enqueued_at: Instant::now(),
+                    message: msg,
+                });
             }
 
             // channel closed
             else => break,
         }
     }
+}
+
+struct QueuedMessage {
+    enqueued_at: Instant,
+    message: Message,
 }
 
 /// Partitions pending outbound messages by gossip plane.
@@ -435,6 +451,7 @@ async fn send_gossip_to_peer<C>(
             {
                 Ok(result) => result,
                 Err(_) => {
+                    crate::observability::metrics::record_gossip_send_failure("timeout");
                     warn!(
                         target: "diag.gossip.send",
                         cluster_view = %cluster_view,
@@ -455,6 +472,7 @@ async fn send_gossip_to_peer<C>(
         match send_result {
             Ok(()) => {}
             Err(e) => {
+                crate::observability::metrics::record_gossip_send_failure(capnp_failure_reason(&e));
                 error!("Gossip to {} failed: {:?}", peer.address, e);
                 warn!(
                     target: "diag.gossip.send",
@@ -571,6 +589,13 @@ where
 fn is_disconnected_capnp(error: &capnp::Error) -> bool {
     let text = error.to_string();
     text.contains("Disconnected") || text.contains("disconnected")
+}
+
+/// # Description:
+///
+/// Classifies one Cap'n Proto gossip send failure using bounded metrics labels.
+fn capnp_failure_reason(error: &capnp::Error) -> &'static str {
+    crate::observability::metrics::capnp_error_reason(error)
 }
 
 /// Returns true when one telemetry counter sample should emit a diagnostic log.

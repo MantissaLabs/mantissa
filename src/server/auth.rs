@@ -159,6 +159,7 @@ impl AuthStore {
 
         w.commit().map_err(ioerr)?;
 
+        crate::observability::metrics::record_session_ticket_event("issued");
         Ok(IssuedSessionTicket {
             ticket,
             expires_at_unix_secs: expires_at,
@@ -172,7 +173,9 @@ impl AuthStore {
         };
 
         if record.is_expired(now_secs()?) {
-            self.revoke_by_ticket(ticket)?;
+            if self.remove_ticket(ticket)? {
+                crate::observability::metrics::record_session_ticket_event("expired");
+            }
             return Ok(None);
         }
 
@@ -225,6 +228,7 @@ impl AuthStore {
         }
         w.commit().map_err(ioerr)?;
 
+        crate::observability::metrics::record_session_ticket_events("expired", removed);
         Ok(removed)
     }
 
@@ -239,17 +243,29 @@ impl AuthStore {
                 .map(|guard| guard.value().to_vec())
         };
 
+        let removed = ticket_opt.is_some();
         if let Some(ticket) = ticket_opt {
             let mut fwd = w.open_table(T_TICKETS).map_err(ioerr)?;
             let _ = fwd.remove(ticket.as_slice()).map_err(ioerr)?;
         }
 
         w.commit().map_err(ioerr)?;
+        if removed {
+            crate::observability::metrics::record_session_ticket_event("revoked");
+        }
         Ok(())
     }
 
     /// Revoke by ticket: remove forward mapping and then reverse mapping.
     pub fn revoke_by_ticket(&self, ticket: &[u8]) -> io::Result<()> {
+        if self.remove_ticket(ticket)? {
+            crate::observability::metrics::record_session_ticket_event("revoked");
+        }
+        Ok(())
+    }
+
+    /// Remove a ticket from both durable indexes and return whether it existed.
+    fn remove_ticket(&self, ticket: &[u8]) -> io::Result<bool> {
         let w = self.db.begin_write().map_err(ioerr)?;
 
         let peer_opt = {
@@ -260,13 +276,14 @@ impl AuthStore {
                 .transpose()?
         };
 
+        let removed = peer_opt.is_some();
         if let Some(peer) = peer_opt {
             let mut rev = w.open_table(T_REVERSE).map_err(ioerr)?;
             let _ = rev.remove(*peer.as_bytes()).map_err(ioerr)?;
         }
 
         w.commit().map_err(ioerr)?;
-        Ok(())
+        Ok(removed)
     }
 
     /// Load one ticket record directly from the forward index.

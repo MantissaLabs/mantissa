@@ -112,17 +112,23 @@ impl Server {
     /// session side effects.
     async fn validate_join_request(&self, request: &JoinRequest) -> Result<(), capnp::Error> {
         if !self.auth.join_tokens.matches(&request.join_token).await {
+            crate::observability::metrics::record_auth_failure("join", "invalid_token");
             return Err(capnp::Error::failed("invalid join token".to_string()));
         }
 
-        self.topology.ensure_join_allowed()?;
+        if let Err(error) = self.topology.ensure_join_allowed() {
+            crate::observability::metrics::record_auth_failure("join", "not_allowed");
+            return Err(error);
+        }
 
         if request.joiner_id == self.identity.id {
+            crate::observability::metrics::record_auth_failure("join", "self_join");
             return Err(capnp::Error::failed("cannot join self".to_string()));
         }
 
         let active_view = self.topology.active_cluster_view();
         if request.active_view != active_view {
+            crate::observability::metrics::record_auth_failure("join", "view_mismatch");
             return Err(capnp::Error::failed(format!(
                 "register_node view mismatch: joiner {}, local {active_view}",
                 request.active_view
@@ -134,6 +140,7 @@ impl Server {
             .peer_exists(request.joiner_id)
             .map_err(|error| capnp::Error::failed(error.to_string()))?;
         if exists {
+            crate::observability::metrics::record_auth_failure("join", "already_registered");
             return Err(capnp::Error::failed("node already registered".to_string()));
         }
 
@@ -143,6 +150,7 @@ impl Server {
         )
         .is_none()
         {
+            crate::observability::metrics::record_auth_failure("join", "root_schema_mismatch");
             return Err(capnp::Error::failed(
                 "register_node root schema mismatch: no compatible version overlap".to_string(),
             ));
@@ -296,6 +304,7 @@ impl protocol::server::Server for Server {
             .lookup(ticket)
             .map_err(|error| capnp::Error::failed(error.to_string()))?
         else {
+            crate::observability::metrics::record_auth_failure("session_ticket", "unknown");
             return Err(capnp::Error::failed("unknown session ticket".to_string()));
         };
 
@@ -304,6 +313,10 @@ impl protocol::server::Server for Server {
             .peer_exists(peer_id)
             .map_err(|error| capnp::Error::failed(error.to_string()))?
         {
+            crate::observability::metrics::record_auth_failure(
+                "session_ticket",
+                "peer_not_registered",
+            );
             return Err(capnp::Error::failed("peer not registered".to_string()));
         }
         results
@@ -321,26 +334,34 @@ impl protocol::server::Server for Server {
         self.ensure_local_cluster_membership_active()?;
 
         let cred_bytes = params.get()?.get_credential()?;
-        let cred =
-            ClusterCredential::from_bytes_verified(cred_bytes).map_err(capnp::Error::failed)?;
+        let cred = match ClusterCredential::from_bytes_verified(cred_bytes) {
+            Ok(credential) => credential,
+            Err(error) => {
+                crate::observability::metrics::record_auth_failure("credential", "invalid");
+                return Err(capnp::Error::failed(error));
+            }
+        };
 
         if !self
             .topology
             .peer_exists(cred.subject)
             .map_err(|error| capnp::Error::failed(error.to_string()))?
         {
+            crate::observability::metrics::record_auth_failure("credential", "peer_not_registered");
             return Err(capnp::Error::failed(
                 "peer not registered on this node".to_string(),
             ));
         }
         if let Some(expected_vk) = self.topology.signing_vk_for(cred.subject) {
             if expected_vk != cred.issuer {
+                crate::observability::metrics::record_auth_failure("credential", "issuer_mismatch");
                 debug!(target: "server", subject=%cred.subject, "issuer mismatch for");
                 return Err(capnp::Error::failed(
                     "issuer mismatch for subject".to_string(),
                 ));
             }
         } else {
+            crate::observability::metrics::record_auth_failure("credential", "issuer_unknown");
             debug!(target: "server", subject=%cred.subject, "issuer unknown (not yet synced)");
             return Err(capnp::Error::failed(
                 "issuer unknown (not yet synced)".to_string(),

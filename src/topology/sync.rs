@@ -252,6 +252,7 @@ impl Topology {
         );
 
         let selected_entries = self.select_sync_peers(entries, sync_fanout);
+        crate::observability::metrics::set_sync_selected_peers("view", selected_entries.len());
         let selected_peer_ids: HashSet<Uuid> =
             selected_entries.iter().map(|entry| entry.peer_id).collect();
         let sync_parallelism = sync_parallelism_from_env(DEFAULT_SYNC_PARALLELISM);
@@ -267,7 +268,13 @@ impl Topology {
         }
         while inflight.next().await.is_some() {}
 
-        for entry in self.select_workload_repair_peers(entries, &selected_peer_ids) {
+        let workload_repair_entries =
+            self.select_workload_repair_peers(entries, &selected_peer_ids);
+        crate::observability::metrics::set_sync_selected_peers(
+            "workload",
+            workload_repair_entries.len(),
+        );
+        for entry in workload_repair_entries {
             if excluded_peers.contains(&entry.peer_id) {
                 continue;
             }
@@ -335,6 +342,11 @@ impl Topology {
         let Some(root_schema_version) =
             negotiated_sync_root_schema_version(self.root_schema_info(), value.root_schema)
         else {
+            crate::observability::metrics::record_sync_attempt(
+                "view",
+                "failure",
+                "no_common_schema",
+            );
             warn!(
                 target: "sync",
                 peer = %peer_id,
@@ -353,8 +365,16 @@ impl Topology {
             .await
         {
             Ok(Some(cap)) => cap,
-            Ok(None) => return,
+            Ok(None) => {
+                crate::observability::metrics::record_sync_attempt(
+                    "view",
+                    "failure",
+                    "cap_unavailable",
+                );
+                return;
+            }
             Err(e) => {
+                crate::observability::metrics::record_sync_attempt("view", "failure", "cap_error");
                 error!(target: "sync", "get_sync failed for {}: {e}", value.address);
                 return;
             }
@@ -365,6 +385,7 @@ impl Topology {
             .sync
             .sync_all_domains(sync_cap, cluster_view, root_schema_version, Some(trace))
             .await;
+        crate::observability::metrics::record_sync_attempt("view", "success", "ok");
     }
 
     /// Executes one targeted workload-only repair exchange against a selected peer.
@@ -377,6 +398,11 @@ impl Topology {
         let Some(root_schema_version) =
             negotiated_sync_root_schema_version(self.root_schema_info(), value.root_schema)
         else {
+            crate::observability::metrics::record_sync_attempt(
+                "workload",
+                "failure",
+                "no_common_schema",
+            );
             return;
         };
 
@@ -387,8 +413,20 @@ impl Topology {
             .await
         {
             Ok(Some(cap)) => cap,
-            Ok(None) => return,
+            Ok(None) => {
+                crate::observability::metrics::record_sync_attempt(
+                    "workload",
+                    "failure",
+                    "cap_unavailable",
+                );
+                return;
+            }
             Err(e) => {
+                crate::observability::metrics::record_sync_attempt(
+                    "workload",
+                    "failure",
+                    "cap_error",
+                );
                 error!(target: "sync", "get_sync failed for {}: {e}", value.address);
                 return;
             }
@@ -405,6 +443,7 @@ impl Topology {
                 Some(trace),
             )
             .await;
+        crate::observability::metrics::record_sync_attempt("workload", "success", "ok");
     }
 
     /// Runs one unscoped metadata anti-entropy exchange against a peer.
@@ -418,6 +457,11 @@ impl Topology {
         let Some(root_schema_version) =
             negotiated_sync_root_schema_version(self.root_schema_info(), value.root_schema)
         else {
+            crate::observability::metrics::record_sync_attempt(
+                "global_metadata",
+                "failure",
+                "no_common_schema",
+            );
             return;
         };
 
@@ -428,8 +472,20 @@ impl Topology {
             .await
         {
             Ok(Some(resolved)) => resolved,
-            Ok(None) => return,
+            Ok(None) => {
+                crate::observability::metrics::record_sync_attempt(
+                    "global_metadata",
+                    "failure",
+                    "cap_unavailable",
+                );
+                return;
+            }
             Err(e) => {
+                crate::observability::metrics::record_sync_attempt(
+                    "global_metadata",
+                    "failure",
+                    "cap_error",
+                );
                 error!(
                     target: "sync",
                     peer = %peer_id,
@@ -452,6 +508,7 @@ impl Topology {
                 Some(trace),
             )
             .await;
+        crate::observability::metrics::record_sync_attempt("global_metadata", "success", "ok");
     }
 
     /// Run one cross-view metadata sync tick.
@@ -494,6 +551,10 @@ impl Topology {
         );
 
         let selected_entries = self.select_metadata_sync_peers(entries, sync_fanout);
+        crate::observability::metrics::set_sync_selected_peers(
+            "global_metadata",
+            selected_entries.len(),
+        );
         let sync_parallelism =
             global_metadata_sync_parallelism_from_env(DEFAULT_GLOBAL_METADATA_SYNC_PARALLELISM);
         let mut inflight = FuturesUnordered::new();

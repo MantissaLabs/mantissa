@@ -87,12 +87,14 @@ impl gossip::Server for Gossip {
                     match <[u8; 16]>::try_from(bytes.as_slice()) {
                         Ok(arr) => Uuid::from_bytes(arr),
                         Err(_) => {
+                            crate::observability::metrics::record_gossip_drop("invalid_id");
                             eprintln!("Invalid gossip id length");
                             continue;
                         }
                     }
                 }
                 Err(e) => {
+                    crate::observability::metrics::record_gossip_drop("missing_id");
                     eprintln!("Missing gossip id: {e}");
                     continue;
                 }
@@ -101,6 +103,7 @@ impl gossip::Server for Gossip {
                 Ok(view) => match ClusterViewId::from_capnp(view) {
                     Ok(parsed) => parsed,
                     Err(err) => {
+                        crate::observability::metrics::record_gossip_drop("invalid_view");
                         debug!(
                             target: "gossip",
                             gossip_id = %id,
@@ -110,6 +113,7 @@ impl gossip::Server for Gossip {
                     }
                 },
                 Err(_) => {
+                    crate::observability::metrics::record_gossip_drop("missing_view");
                     debug!(
                         target: "gossip",
                         gossip_id = %id,
@@ -121,6 +125,7 @@ impl gossip::Server for Gossip {
             let gossip_plane = gossip_plane_for_wire_message(msg.reborrow());
             let active_view = self.cluster_view.active_view();
             if !gossip_plane.allows_cross_view() && message_view != active_view {
+                crate::observability::metrics::record_gossip_drop("wrong_view");
                 debug!(
                     target: "gossip",
                     gossip_id = %id,
@@ -134,6 +139,7 @@ impl gossip::Server for Gossip {
             {
                 let mut dedupe = self.dedupe_state.lock().await;
                 if !dedupe.record_inbound(active_view, id) {
+                    crate::observability::metrics::record_gossip_drop("duplicate");
                     debug!(
                         target: "gossip",
                         gossip_id = %id,
@@ -146,6 +152,7 @@ impl gossip::Server for Gossip {
             let which = match msg.reborrow().which() {
                 Ok(which) => which,
                 Err(err) => {
+                    crate::observability::metrics::record_gossip_drop("unreadable_variant");
                     debug!(
                         target: "gossip",
                         gossip_id = %id,
@@ -403,6 +410,7 @@ fn forward_inbound_message(outbound_tx: &Sender<Message>, message: Option<Messag
     match outbound_tx.try_send(message) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
+            crate::observability::metrics::record_gossip_drop("relay_queue_full");
             debug!(
                 target: "gossip",
                 gossip_id = %message_id,
@@ -410,6 +418,7 @@ fn forward_inbound_message(outbound_tx: &Sender<Message>, message: Option<Messag
             );
         }
         Err(TrySendError::Closed(_)) => {
+            crate::observability::metrics::record_gossip_drop("relay_queue_closed");
             warn!(
                 target: "gossip",
                 gossip_id = %message_id,
