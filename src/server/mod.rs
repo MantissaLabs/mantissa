@@ -306,7 +306,7 @@ impl Server {
         self.refresh_bound_addr(bound).await?;
 
         let unix_task = if enable_unix_socket {
-            let local_session = self.sessions.new_client(None);
+            let local_session = self.sessions.new_local_client();
             Some(tokio::task::spawn_local(async move {
                 if let Err(error) =
                     net::unix_socket::start_unix_socket_server_auto(local_session).await

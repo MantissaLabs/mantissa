@@ -67,21 +67,48 @@ impl SessionFactory {
         capnp_rpc::new_client(health)
     }
 
+    /// Creates a new local cluster session capability for the Unix socket.
+    ///
+    /// Local clients are already authorized by filesystem access to the socket,
+    /// so they do not carry a peer ticket scope.
+    pub(crate) fn new_local_client(&self) -> cluster_session::Client {
+        self.new_client(None)
+    }
+
+    /// Creates a new peer cluster session bound to the ticket that authorized it.
+    ///
+    /// The ticket binding makes eviction and ticket expiry revoke already-minted
+    /// session gateways instead of only blocking future `getSession` calls.
+    pub(crate) fn new_peer_client(
+        &self,
+        peer_id: Uuid,
+        ticket: Vec<u8>,
+    ) -> cluster_session::Client {
+        self.new_client(Some(PeerSessionScope { peer_id, ticket }))
+    }
+
     /// Creates a new cluster session capability for a connected peer or client.
     ///
     /// Each session snapshots the active cluster view while sharing the common
     /// exported service capabilities and liveness state.
-    pub(crate) fn new_client(&self, peer_id: Option<Uuid>) -> cluster_session::Client {
+    fn new_client(&self, peer_scope: Option<PeerSessionScope>) -> cluster_session::Client {
         let session = ClusterSessionImpl::new(
             self.services.clone(),
             self.health_client(),
             self.liveness.clone(),
             self.topology.active_cluster_view(),
             self.topology.clone(),
-            peer_id,
+            peer_scope,
         );
         capnp_rpc::new_client(session)
     }
+}
+
+/// Peer authorization material captured when a cluster session is minted.
+#[derive(Clone)]
+struct PeerSessionScope {
+    peer_id: Uuid,
+    ticket: Vec<u8>,
 }
 
 /// Cap'n Proto implementation serving the per-connection cluster session.
@@ -95,7 +122,7 @@ pub struct ClusterSessionImpl {
     liveness: Liveness,
     cluster_view: ClusterViewId,
     topology: Topology,
-    peer_id: Option<Uuid>,
+    peer_scope: Option<PeerSessionScope>,
 }
 
 impl ClusterSessionImpl {
@@ -103,13 +130,13 @@ impl ClusterSessionImpl {
     ///
     /// The server uses this for both authenticated peer sessions and the local
     /// Unix socket session served to the CLI.
-    pub(crate) fn new(
+    fn new(
         services: ClusterSessionServices,
         health: health::Client,
         liveness: Liveness,
         cluster_view: ClusterViewId,
         topology: Topology,
-        peer_id: Option<Uuid>,
+        peer_scope: Option<PeerSessionScope>,
     ) -> Self {
         Self {
             services,
@@ -117,7 +144,7 @@ impl ClusterSessionImpl {
             liveness,
             cluster_view,
             topology,
-            peer_id,
+            peer_scope,
         }
     }
 
@@ -127,10 +154,18 @@ impl ClusterSessionImpl {
     /// evicts the peer identity that originally authenticated the session.
     fn ensure_online(&self) -> Result<(), capnp::Error> {
         self.liveness.ensure_online()?;
-        if let Some(peer_id) = self.peer_id {
+        if let Some(scope) = &self.peer_scope {
+            let ticket_authorized = self
+                .topology
+                .session_ticket_authorizes(scope.peer_id, &scope.ticket)
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            if !ticket_authorized {
+                return Err(capnp::Error::failed("peer session revoked".to_string()));
+            }
+
             let active = self
                 .topology
-                .peer_exists(peer_id)
+                .peer_exists(scope.peer_id)
                 .map_err(|error| capnp::Error::failed(error.to_string()))?;
             if !active {
                 return Err(capnp::Error::failed("peer session revoked".to_string()));

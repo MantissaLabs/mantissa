@@ -207,10 +207,12 @@ impl Server {
                 .map_err(capnp::Error::failed)?;
 
         Ok(ClusterSession {
+            session: self
+                .sessions
+                .new_peer_client(joiner_id, issued_ticket.ticket.clone()),
             ticket: issued_ticket.ticket,
             ticket_expires_at_unix_secs: issued_ticket.expires_at_unix_secs,
             credential,
-            session: self.sessions.new_client(Some(joiner_id)),
         })
     }
 
@@ -321,7 +323,7 @@ impl protocol::server::Server for Server {
         }
         results
             .get()
-            .set_session(self.sessions.new_client(Some(peer_id)));
+            .set_session(self.sessions.new_peer_client(peer_id, ticket.to_vec()));
         Ok(())
     }
 
@@ -377,7 +379,10 @@ impl protocol::server::Server for Server {
             .map_err(|error| capnp::Error::failed(error.to_string()))?;
 
         let mut out = results.get();
-        out.set_session(self.sessions.new_client(Some(cred.subject)));
+        out.set_session(
+            self.sessions
+                .new_peer_client(cred.subject, issued_ticket.ticket.clone()),
+        );
         out.set_ticket(&issued_ticket.ticket);
         out.set_ticket_expires_at_unix_secs(issued_ticket.expires_at_unix_secs);
 

@@ -221,6 +221,20 @@ impl Topology {
             .unwrap_or(false))
     }
 
+    /// Return true when `ticket` is still the active server-issued ticket for `peer_id`.
+    pub(crate) fn session_ticket_authorizes(
+        &self,
+        peer_id: Uuid,
+        ticket: &[u8],
+    ) -> io::Result<bool> {
+        Ok(self
+            .stores
+            .session_auth
+            .lookup(ticket)?
+            .map(|subject| subject == peer_id)
+            .unwrap_or(false))
+    }
+
     /// Removes one peer row and clears all runtime state associated with that peer.
     pub async fn remove_peer(&self, id: Uuid) -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = self.stores.peers.remove(&UuidKey::from(id)).await {
