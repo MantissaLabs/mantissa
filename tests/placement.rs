@@ -20,7 +20,9 @@ use mantissa::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata,
     WorkloadSpec, WorkloadVolumeMount,
 };
-use mantissa::workload::types::{ExecutionSpec, ResolvedExecutionSpec};
+use mantissa::workload::types::{
+    ExecutionSpec, ResolvedExecutionSpec, WorkloadPortBinding, WorkloadPortProtocol,
+};
 use protocol::volumes::{LocalVolumeSourceKind, volumes};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -628,6 +630,112 @@ local_test!(
         );
     }
 );
+
+local_test!(services_static_host_port_replicas_spread_across_nodes, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(2, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes").await;
+
+    let service_name = "placement-static-host-port-spread";
+    let mut template = demo_backend_task_template("backend", 2);
+    template.execution.ports = vec![static_host_port("http", 8080, 18080)];
+
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
+        .await
+        .expect("submit static-host-port deployment");
+
+    assert!(
+        wait_for_service_status(
+            &cluster[0].node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "service should reach running with one same-port replica per node"
+    );
+    assert!(
+        wait_for_service_running_tasks_stable_all(
+            &cluster,
+            service_name,
+            2,
+            4,
+            Duration::from_secs(15)
+        )
+        .await,
+        "static host-port placement should converge consistently across the cluster"
+    );
+
+    let tasks = list_active_service_tasks(&cluster[0].node.workload_manager, service_name).await;
+    let placements = workload_counts_by_node(&tasks);
+    assert_eq!(
+        placements.len(),
+        2,
+        "same static host port should force replicas onto distinct nodes"
+    );
+    assert!(
+        placements.values().all(|count| *count == 1),
+        "each node should host exactly one same-port replica: {placements:?}"
+    );
+});
+
+local_test!(services_static_host_port_exhaustion_blocks_extra_replica, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(2, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes").await;
+
+    let service_name = "placement-static-host-port-exhausted";
+    let mut template = demo_backend_task_template("backend", 3);
+    template.execution.ports = vec![static_host_port("http", 8080, 18081)];
+
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
+        .await
+        .expect("submit overcommitted static-host-port deployment");
+
+    let saw_exhaustion_detail = wait_for_service_status_detail(
+        &cluster[0].node.service_controller,
+        service_id,
+        "host ports unavailable",
+    )
+    .await;
+    let service_snapshot = cluster[0]
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("service registry should be readable");
+    assert!(
+        saw_exhaustion_detail,
+        "service should surface host-port exhaustion; got {service_snapshot:?}"
+    );
+    assert!(
+        wait_for_service_task_count_all(&cluster, service_name, 0, Duration::from_secs(10)).await,
+        "host-port exhaustion should block the initial batch before creating tasks"
+    );
+});
 
 local_test!(services_placement_service_affinity_overrides_spread, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
@@ -1292,6 +1400,17 @@ fn demo_backend_task_template(name: &str, replicas: u16) -> TaskTemplateSpecValu
         readiness: None,
         public_port: None,
         public_protocol: None,
+    }
+}
+
+/// Builds one static node-local host port binding for scheduler placement tests.
+fn static_host_port(name: &str, target_port: u16, host_port: u16) -> WorkloadPortBinding {
+    WorkloadPortBinding {
+        name: name.to_string(),
+        target_port,
+        host_port,
+        host_ip: "0.0.0.0".to_string(),
+        protocol: WorkloadPortProtocol::Tcp,
     }
 }
 

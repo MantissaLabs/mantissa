@@ -829,7 +829,7 @@ impl ServiceController {
                     "service generation execution failed: {err:#}"
                 );
                 controller
-                    .record_generation_execution_error(&spec, err.to_string())
+                    .record_generation_execution_error(&spec, service_error_detail(&err))
                     .await;
             }
             controller.finish_generation_execution(key).await;
@@ -845,6 +845,13 @@ impl ServiceController {
             || current.service_epoch != spec.service_epoch
             || current.status() != ServiceStatus::Deploying
         {
+            return;
+        }
+
+        let Some(detail) = normalize_service_status_detail(detail) else {
+            return;
+        };
+        if current.status_detail.as_deref() == Some(detail.as_str()) {
             return;
         }
 
@@ -1011,6 +1018,7 @@ impl ServiceController {
                 }
 
                 let service_id = compute_service_id(&service_name);
+                let detail = service_error_detail(&err);
                 match self.registry.get(service_id) {
                     Ok(Some(mut persisted_spec)) if is_local_volume_unavailable_error(&err) => {
                         persisted_spec.replica_ids = desired_task_ids.clone();
@@ -1033,10 +1041,8 @@ impl ServiceController {
                         }
                     }
                     Ok(Some(persisted_spec)) => {
-                        let controller = self.clone();
-                        tokio::task::spawn_local(async move {
-                            controller.await_service_readiness(persisted_spec).await;
-                        });
+                        self.persist_deploying_launch_error(persisted_spec, detail.clone())
+                            .await;
                     }
                     Ok(None) if is_local_volume_unavailable_error(&err) => {
                         let mut blocked_spec = ServiceSpecValue::new(
@@ -1079,8 +1085,12 @@ impl ServiceController {
                             Vec::new(),
                         );
                         failed_spec.update_strategy = update_strategy.clone();
-                        failed_spec.set_rollout(ServiceRolloutState::default());
+                        failed_spec.set_rollout(ServiceRolloutState {
+                            last_error: Some(detail.clone()),
+                            ..ServiceRolloutState::default()
+                        });
                         failed_spec.set_status(ServiceStatus::Failed);
+                        failed_spec.set_status_detail(Some(detail));
                         if let Err(upsert_err) = self.apply_upsert(failed_spec.clone()).await {
                             tracing::warn!(
                                 target: "services",
@@ -1325,6 +1335,37 @@ impl ServiceController {
         );
 
         Ok(())
+    }
+
+    /// Persists the latest startup scheduling failure while keeping the deployment recoverable.
+    async fn persist_deploying_launch_error(&self, mut spec: ServiceSpecValue, detail: String) {
+        if spec.status() != ServiceStatus::Deploying {
+            return;
+        }
+
+        let Some(detail) = normalize_service_status_detail(detail) else {
+            return;
+        };
+        if spec.status_detail.as_deref() == Some(detail.as_str()) {
+            return;
+        }
+
+        spec.set_status_detail(Some(detail));
+        if let Err(err) = self.apply_upsert(spec.clone()).await {
+            tracing::warn!(
+                target: "services",
+                "failed to persist deployment launch detail for '{}': {err}",
+                spec.service_name
+            );
+            return;
+        }
+        if let Err(err) = self.broadcast(ServiceEvent::Upsert(spec.clone())).await {
+            tracing::warn!(
+                target: "services",
+                "failed to broadcast deployment launch detail for '{}': {err}",
+                spec.service_name
+            );
+        }
     }
 
     /// Waits until one template's dependency task ids are running and ready to receive traffic.
@@ -1636,6 +1677,7 @@ impl ServiceController {
         }
 
         let service_id = compute_service_id(deployment.service_name);
+        let detail = service_error_detail(err);
         match self.registry.get(service_id) {
             Ok(Some(mut persisted_spec)) if is_local_volume_unavailable_error(err) => {
                 persisted_spec.replica_ids = desired_task_ids.to_vec();
@@ -1659,10 +1701,8 @@ impl ServiceController {
                 }
             }
             Ok(Some(persisted_spec)) => {
-                let controller = self.clone();
-                tokio::task::spawn_local(async move {
-                    controller.await_service_readiness(persisted_spec).await;
-                });
+                self.persist_deploying_launch_error(persisted_spec, detail.clone())
+                    .await;
             }
             Ok(None) if is_local_volume_unavailable_error(err) => {
                 let mut blocked_spec = ServiceSpecValue::new(
@@ -1707,8 +1747,12 @@ impl ServiceController {
                 );
                 failed_spec.update_strategy = deployment.update_strategy.clone();
                 failed_spec.previous_generation = None;
-                failed_spec.set_rollout(ServiceRolloutState::default());
+                failed_spec.set_rollout(ServiceRolloutState {
+                    last_error: Some(detail.clone()),
+                    ..ServiceRolloutState::default()
+                });
                 failed_spec.set_status(ServiceStatus::Failed);
+                failed_spec.set_status_detail(Some(detail));
                 if let Err(upsert_err) = self.apply_upsert(failed_spec.clone()).await {
                     tracing::warn!(
                         target: "services",
@@ -2487,6 +2531,27 @@ fn deploying_assignment_incomplete(spec: &ServiceSpecValue) -> bool {
 fn service_generation_requires_execution(spec: &ServiceSpecValue) -> bool {
     spec.status() == ServiceStatus::Deploying
         && (deploying_assignment_incomplete(spec) || spec.previous_generation.is_some())
+}
+
+/// Builds a compact service status detail from an error and its causal chain.
+fn service_error_detail(err: &anyhow::Error) -> String {
+    let parts: Vec<String> = err
+        .chain()
+        .map(ToString::to_string)
+        .filter(|part| !part.trim().is_empty())
+        .collect();
+
+    if parts.is_empty() {
+        return err.to_string();
+    }
+
+    parts.join(": ")
+}
+
+/// Normalizes one service-facing status detail before persisting it.
+fn normalize_service_status_detail(detail: String) -> Option<String> {
+    let detail = detail.trim();
+    (!detail.is_empty()).then(|| detail.to_string())
 }
 
 /// Returns true when a submission matches the active running service spec exactly.
