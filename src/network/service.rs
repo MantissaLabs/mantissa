@@ -130,6 +130,21 @@ fn validate_driver_request(
     Ok(())
 }
 
+/// Validate that live network updates do not change the dataplane driver.
+fn validate_driver_transition(
+    current: &NetworkSpecValue,
+    requested: NetworkDriver,
+) -> Result<(), Error> {
+    if current.driver != requested {
+        return Err(Error::failed(format!(
+            "network '{}' already uses driver {:?} and cannot be changed to {:?}",
+            current.name, current.driver, requested
+        )));
+    }
+
+    Ok(())
+}
+
 /// Serialize one replicated network spec into the Cap'n Proto response shape.
 fn write_network_spec(mut builder: network_spec::Builder<'_>, spec: &NetworkSpecValue) {
     builder.set_id(spec.id.as_bytes());
@@ -520,6 +535,7 @@ impl networks::Server for NetworksRpc {
                         current.name
                     )));
                 }
+                validate_driver_transition(&current, driver)?;
                 current.apply_update(update.clone());
                 (current, false)
             }
@@ -723,6 +739,63 @@ mod tests {
                 BpfAttachPoint::BridgeTcIngress,
             )],
         }
+    }
+
+    /// Bridge network requests must not carry VXLAN-specific dataplane fields.
+    #[test]
+    fn bridge_driver_rejects_vni_and_bpf_programs() {
+        assert!(validate_driver_request(NetworkDriver::Bridge, 42, &[]).is_err());
+        assert!(
+            validate_driver_request(
+                NetworkDriver::Bridge,
+                0,
+                &[BpfProgramSpec::with_attach_point(
+                    "bridge_tc_ingress",
+                    BpfAttachPoint::BridgeTcIngress,
+                )],
+            )
+            .is_err()
+        );
+        assert!(validate_driver_request(NetworkDriver::Bridge, 0, &[]).is_ok());
+        assert!(
+            validate_driver_request(
+                NetworkDriver::Vxlan,
+                42,
+                &[BpfProgramSpec::with_attach_point(
+                    "bridge_tc_ingress",
+                    BpfAttachPoint::BridgeTcIngress,
+                )],
+            )
+            .is_ok()
+        );
+    }
+
+    /// Live network updates must keep the original driver to avoid stale kernel dataplane state.
+    #[test]
+    fn live_network_update_rejects_driver_change() {
+        let current = sample_network_spec();
+
+        assert!(validate_driver_transition(&current, NetworkDriver::Vxlan).is_ok());
+        assert!(validate_driver_transition(&current, NetworkDriver::Bridge).is_err());
+    }
+
+    /// Direct spec updates preserve driver identity even if a caller forgets the RPC guard.
+    #[test]
+    fn network_spec_update_preserves_existing_driver() {
+        let mut current = sample_network_spec();
+        current.sealed = false;
+        current.apply_update(NetworkSpecUpdate {
+            description: "updated".to_string(),
+            driver: NetworkDriver::Bridge,
+            subnet_cidr: "10.77.0.0/24".to_string(),
+            vni: 0,
+            mtu: 1500,
+            sealed: false,
+            bpf_programs: Vec::new(),
+        });
+
+        assert_eq!(current.driver, NetworkDriver::Vxlan);
+        assert_eq!(current.subnet_cidr, "10.77.0.0/24");
     }
 
     /// Builds one deterministic network peer row used by store codec tests.

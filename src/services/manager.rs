@@ -459,28 +459,7 @@ impl ServiceController {
         service_name: &str,
         task_templates: &[TaskTemplateSpecValue],
     ) -> anyhow::Result<()> {
-        for template in task_templates {
-            if template.public_port().is_none() {
-                continue;
-            }
-
-            for network_id in template.required_network_ids() {
-                let Some(network) = self.network_registry.get_spec(network_id)? else {
-                    continue;
-                };
-                if network.driver.is_node_local() {
-                    return Err(anyhow!(
-                        "service '{}' template '{}' cannot set public_port on bridge network '{}' ({})",
-                        service_name,
-                        template.name,
-                        network.name,
-                        network.id
-                    ));
-                }
-            }
-        }
-
-        Ok(())
+        validate_network_contracts(service_name, task_templates, &self.network_registry)
     }
 
     /// Validates that the incoming public endpoint claims do not overlap an existing service.
@@ -2505,6 +2484,36 @@ fn public_port_protocol_label(protocol: ServicePortProtocol) -> &'static str {
     }
 }
 
+/// Validates service declarations whose behavior depends on referenced network drivers.
+fn validate_network_contracts(
+    service_name: &str,
+    task_templates: &[TaskTemplateSpecValue],
+    network_registry: &NetworkRegistry,
+) -> anyhow::Result<()> {
+    for template in task_templates {
+        if template.public_port().is_none() {
+            continue;
+        }
+
+        for network_id in template.required_network_ids() {
+            let Some(network) = network_registry.get_spec(network_id)? else {
+                continue;
+            };
+            if network.driver.is_node_local() {
+                return Err(anyhow!(
+                    "service '{}' template '{}' cannot set public_port on bridge network '{}' ({})",
+                    service_name,
+                    template.name,
+                    network.name,
+                    network.id
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 struct ServiceDeploymentJob {
     manifest_id: Uuid,
     manifest_name: String,
@@ -3236,6 +3245,28 @@ mod tests {
             err.to_string()
                 .contains("must attach to exactly one network when public_port is set")
         );
+    }
+
+    /// Public endpoint admission must reject node-local bridge networks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_contracts_reject_public_port_on_bridge_network() {
+        let network_registry = make_test_network_registry().await;
+        let bridge = make_bridge_network_spec("local-app");
+        network_registry
+            .registry
+            .upsert_spec(bridge.clone())
+            .await
+            .expect("persist bridge network");
+
+        let mut template =
+            make_public_template("api", 0, Some(8080), Some(ServicePortProtocol::Tcp));
+        template.execution.networks = vec![make_template_network(&bridge.name, bridge.id)];
+
+        let err =
+            validate_network_contracts("demo-service", &[template], &network_registry.registry)
+                .expect_err("bridge network must reject public_port");
+
+        assert!(err.to_string().contains("cannot set public_port on bridge"));
     }
 
     /// Services in non-terminal states should keep exclusive ownership of their declared ports.

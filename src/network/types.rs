@@ -327,7 +327,6 @@ impl NetworkSpecValue {
         let mut update = update;
         update.bpf_programs.sort();
         self.description = update.description;
-        self.driver = update.driver;
         self.subnet_cidr = update.subnet_cidr;
         self.vni = update.vni;
         self.mtu = update.mtu;
