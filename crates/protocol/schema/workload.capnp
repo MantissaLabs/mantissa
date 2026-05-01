@@ -60,6 +60,31 @@ struct VolumeMount {
   # Mount the volume read-only inside the runtime instance.
 }
 
+enum PortProtocol {
+  tcp @0;
+  # TCP host binding.
+
+  udp @1;
+  # UDP host binding.
+}
+
+struct PortBinding {
+  name @0 :Text;
+  # Human-readable port label scoped to the workload template.
+
+  targetPort @1 :UInt16;
+  # Port inside the runtime instance.
+
+  hostPort @2 :UInt16;
+  # Static node-local host port bound on the node running the workload.
+
+  hostIp @3 :Text;
+  # Host IP to bind, usually 0.0.0.0 or 127.0.0.1.
+
+  protocol @4 :PortProtocol;
+  # Transport protocol for this binding.
+}
+
 struct ServiceMetadata {
   serviceName @0 :Text;
   # Name of the service that owns this workload replica.
@@ -267,6 +292,9 @@ struct WorkloadSpec {
 
   isolationProfile @34 :Text;
   # Optional named isolation profile used when the workload requests sandboxed execution.
+
+  ports @35 :List(PortBinding);
+  # Node-local host port bindings requested by the workload.
 
 }
 

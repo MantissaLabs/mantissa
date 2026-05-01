@@ -12,7 +12,7 @@ use crate::workload_submit::{
     DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec, ResolvedDeclaredVolume,
     compute_network_id, ensure_declared_volumes, ensure_named_networks,
 };
-use crate::workload_wire::write_local_volume_ownership;
+use crate::workload_wire::{write_local_volume_ownership, write_port_bindings};
 use anyhow::{Context, Result, anyhow};
 use capnp::{Error as CapnpError, struct_list};
 use protocol::services::{placement_constraint, placement_constraint_selector, task_template};
@@ -341,6 +341,9 @@ fn write_task_template(
         network_builder.set_name(trimmed);
         network_builder.set_network_id(compute_network_id(trimmed).as_bytes());
     }
+
+    let mut ports_builder = builder.reborrow().init_ports(template.ports.len() as u32);
+    write_port_bindings(&mut ports_builder, &template.ports);
 
     if let Some(readiness) = template.readiness.as_ref() {
         let builder = builder.reborrow().init_readiness();

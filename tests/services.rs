@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use capnp::Error as CapnpError;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use client::services::manifest::{
-    RestartPolicyName as ManifestRestartPolicyName, SecretReference, ServiceManifest,
-    load_manifest_from_path,
+    ManifestPortProtocol, RestartPolicyName as ManifestRestartPolicyName, SecretReference,
+    ServiceManifest, load_manifest_from_path,
 };
 use common::convergence::{
     current_cluster_view, swim_down_transition_timeout, wait_for_cluster_view,
@@ -49,7 +49,7 @@ use mantissa::topology_capnp::topology;
 use mantissa::workload::manager::WorkloadManager;
 use mantissa::workload::model::WorkloadPhase;
 use mantissa::workload::model::WorkloadSpec;
-use mantissa::workload::types::ExecutionSpec;
+use mantissa::workload::types::{ExecutionSpec, WorkloadPortBinding, WorkloadPortProtocol};
 use parking_lot::{Mutex, MutexGuard};
 use protocol::health::NodeStatus;
 use protocol::secrets::secrets;
@@ -4404,6 +4404,7 @@ fn empty_service_execution(image: &str) -> ExecutionSpec<TaskTemplateNetworkRequ
         secret_files: Vec::new(),
         volumes: Vec::new(),
         networks: Vec::new(),
+        ports: Vec::new(),
         placement: Default::default(),
     }
 }
@@ -5776,6 +5777,7 @@ fn task_spec_to_value(spec: &WorkloadSpec) -> TaskValue {
         secret_files: spec.secret_files.clone(),
         volumes: Vec::new(),
         networks: spec.networks.clone(),
+        ports: Vec::new(),
         owner: spec.owner.clone(),
         lease_id: spec.lease_id,
         lease_coordinator_node_id: spec.lease_coordinator_node_id,
@@ -6130,6 +6132,20 @@ fn manifest_to_task_templates(manifest: &ServiceManifest) -> Vec<TaskTemplateSpe
                         .collect(),
                     volumes: Vec::new(),
                     networks,
+                    ports: task
+                        .ports
+                        .iter()
+                        .map(|port| WorkloadPortBinding {
+                            name: port.name.clone(),
+                            target_port: port.target,
+                            host_port: port.host,
+                            host_ip: port.host_ip.clone(),
+                            protocol: match port.protocol {
+                                ManifestPortProtocol::Tcp => WorkloadPortProtocol::Tcp,
+                                ManifestPortProtocol::Udp => WorkloadPortProtocol::Udp,
+                            },
+                        })
+                        .collect(),
                     placement: Default::default(),
                 },
                 depends_on: task.depends_on.clone(),

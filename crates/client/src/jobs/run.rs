@@ -10,11 +10,12 @@ use crate::runtime_contract::{
 use crate::tasks::uuid_to_string;
 use crate::volumes;
 use crate::workload_submit::{
-    ResolvedDeclaredVolume, compute_network_id, ensure_declared_volumes, ensure_named_networks,
+    ManifestPortBinding, ResolvedDeclaredVolume, compute_network_id, ensure_declared_volumes,
+    ensure_named_networks,
 };
 use crate::workload_wire::{
     PreparedVolumeMount, prepared_volume_mount_from_resolved, write_env_vars, write_liveness_probe,
-    write_secret_files, write_volume_mounts,
+    write_port_bindings, write_secret_files, write_volume_mounts,
 };
 use anyhow::{Result, anyhow};
 use protocol::jobs::{job_execution, job_retry_policy, job_submit_spec};
@@ -80,6 +81,7 @@ struct PreparedJobExecution {
     secret_files: Vec<SecretFileProjection>,
     volumes: Vec<PreparedVolumeMount>,
     networks: Vec<Uuid>,
+    ports: Vec<ManifestPortBinding>,
     liveness: Option<LivenessProbe>,
 }
 
@@ -180,6 +182,7 @@ async fn prepare_raw_submit_spec(
                 .map(prepared_volume_mount_from_resolved)
                 .collect(),
             networks: Vec::new(),
+            ports: Vec::new(),
             liveness: None,
         },
         retry_policy: PreparedJobRetryPolicy {
@@ -256,6 +259,7 @@ fn prepared_execution_from_manifest(
             .iter()
             .map(|network| compute_network_id(network.trim()))
             .collect(),
+        ports: execution.ports.clone(),
         liveness: execution.liveness.clone(),
     })
 }
@@ -320,6 +324,9 @@ fn write_job_execution(
     for (index, network_id) in execution.networks.iter().enumerate() {
         networks.set(index as u32, network_id.as_bytes());
     }
+
+    let mut ports = builder.reborrow().init_ports(execution.ports.len() as u32);
+    write_port_bindings(&mut ports, &execution.ports);
 
     if let Some(liveness) = execution.liveness.as_ref() {
         write_liveness_probe(builder.reborrow().init_liveness(), liveness);

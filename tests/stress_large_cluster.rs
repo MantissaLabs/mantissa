@@ -202,6 +202,7 @@ fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
+            ports: Vec::new(),
             readiness: None,
             liveness: None,
             tty: false,

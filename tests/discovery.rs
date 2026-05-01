@@ -165,6 +165,7 @@ fn running_task(task_id: Uuid, node_id: Uuid, service_name: &str, network_id: Uu
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
+        ports: Vec::new(),
         owner: Some(WorkloadOwner::ServiceReplica(TaskServiceMetadata::new(
             service_name,
             "backend",
@@ -285,6 +286,7 @@ async fn upsert_service_with_readiness(
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: vec![TaskTemplateNetworkRequirement::new("default", network_id)],
+                ports: Vec::new(),
                 placement: Default::default(),
             },
             depends_on: Vec::new(),

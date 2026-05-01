@@ -3137,6 +3137,7 @@ mod tests {
                         TaskTemplateNetworkRequirement::new(format!("net-{idx}"), Uuid::new_v4())
                     })
                     .collect(),
+                ports: Vec::new(),
                 placement: Default::default(),
             },
             depends_on: Vec::new(),
@@ -3337,6 +3338,7 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
+            ports: Vec::new(),
             placement: Default::default(),
         }
     }
@@ -3358,6 +3360,7 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
+            ports: Vec::new(),
             placement: Default::default(),
         }
     }
@@ -3445,6 +3448,7 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
+            ports: Vec::new(),
             owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
                 service_name,
                 template,

@@ -296,12 +296,38 @@ pub struct RuntimeCreateRequest {
     pub tty: bool,
     pub open_stdin: bool,
     pub env_vars: Option<Vec<String>>,
-    pub ports: Option<HashMap<String, Vec<HashMap<String, String>>>>,
+    pub ports: Vec<RuntimePortBinding>,
     pub volumes: Option<Vec<String>>,
     pub restart_policy: Option<RestartPolicyConfig>,
     pub resource_limits: ResourceLimits,
     pub dns_servers: Option<Vec<String>>,
     pub gpu_device_ids: Option<Vec<String>>,
+}
+
+/// Runtime-neutral host port binding passed to OCI-like backends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimePortBinding {
+    pub target_port: u16,
+    pub host_port: u16,
+    pub host_ip: String,
+    pub protocol: RuntimePortProtocol,
+}
+
+/// Runtime-neutral transport protocol for a port binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimePortProtocol {
+    Tcp,
+    Udp,
+}
+
+impl RuntimePortProtocol {
+    /// Returns the suffix expected by OCI/Docker port maps.
+    pub const fn as_port_key_suffix(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
 }
 
 /// Configuration for runtime restart policy.

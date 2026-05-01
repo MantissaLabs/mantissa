@@ -659,6 +659,7 @@ mod tests {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
+                ports: Vec::new(),
                 placement: PlacementPolicy {
                     constraints,
                     preferences: vec![PlacementPreference::ServiceAffinity],

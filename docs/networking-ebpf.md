@@ -32,6 +32,11 @@ Cluster-wide service reachability requires `vxlan`. Use `bridge` when local
 pod-like composition is enough and cross-node networking should stay out of the
 dataplane.
 
+Services and jobs can also request static node-local host ports with `ports`.
+This is separate from `public_port`: a host port binds only on the node that
+runs the workload, while `public_port` is a VXLAN-only cluster NodePort
+contract.
+
 Manifest-backed services, jobs, and agents can declare the driver on the
 top-level network entry:
 
@@ -176,6 +181,35 @@ unavailable.
   - VIPs use even host offsets to avoid colliding with resolver IPs, which occupy odd offsets.
   - If the candidate VIP collides with an existing backend IP, it walks forward.
 - A deterministic locally administered VIP MAC (`02:...`), also derived from the hash.
+
+### Node-local host ports
+
+Service task templates and job executions can declare static host port
+bindings:
+
+```ron
+ports: [
+    (
+        name: "http",
+        target: 8080,
+        host: 18080,
+        host_ip: "0.0.0.0",
+        protocol: tcp,
+    ),
+]
+```
+
+`target` is the container port. `host` is the static port reserved on the node
+that runs the workload. `host_ip` defaults to `0.0.0.0`, and `protocol`
+defaults to `tcp`.
+
+The scheduler avoids placing two active workloads with conflicting host port
+bindings on the same node. This is intentionally node-local: replicated
+services that declare a host port can still spread across nodes, but two
+replicas cannot land on the same node if they reserve the same local socket.
+Dynamic host ports are not part of the current contract because Mantissa does
+not yet expose an allocation-reporting field for operators or dependent
+workloads.
 
 ### Public endpoints (NodePort contract)
 

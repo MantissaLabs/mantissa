@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 use blake3::Hasher;
 use serde::{Deserialize, Deserializer};
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use uuid::Uuid;
 
 /// Driver families accepted by shared manifest-side volume provisioning helpers.
@@ -59,6 +60,27 @@ pub struct RequestedNetworkSpec {
     pub name: String,
     pub driver: networks::NetworkDriver,
     pub ip_family: Option<NetworkIpFamily>,
+}
+
+/// Transport protocol for one manifest-declared node-local host port binding.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestPortProtocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+/// Static node-local host port binding shared by service and job manifests.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ManifestPortBinding {
+    pub name: String,
+    pub target: u16,
+    pub host: u16,
+    #[serde(default = "default_host_port_ip")]
+    pub host_ip: String,
+    #[serde(default)]
+    pub protocol: ManifestPortProtocol,
 }
 
 /// Derive the canonical network UUID from the manifest-facing network name.
@@ -156,6 +178,102 @@ where
     }
 
     Ok(requested)
+}
+
+/// Validate one manifest host port list before submitting it to the coordinator.
+pub fn validate_manifest_ports(ports: &[ManifestPortBinding], context: &str) -> Result<()> {
+    let mut names = HashSet::new();
+    let mut requests = Vec::new();
+    for port in ports {
+        let name = port.name.trim();
+        if name.is_empty() {
+            return Err(anyhow!("{context} declares a port with an empty name"));
+        }
+        if !names.insert(name.to_string()) {
+            return Err(anyhow!("{context} declares port '{}' multiple times", name));
+        }
+        if port.target == 0 {
+            return Err(anyhow!(
+                "{context} port '{}' must set target to a non-zero container port",
+                name
+            ));
+        }
+        if port.host == 0 {
+            return Err(anyhow!(
+                "{context} port '{}' must set host to a non-zero static host port",
+                name
+            ));
+        }
+        let host_ip = port.host_ip.trim().parse::<IpAddr>().map_err(|_| {
+            anyhow!(
+                "{context} port '{}' has invalid host_ip '{}'",
+                name,
+                port.host_ip
+            )
+        })?;
+        let request = ManifestHostPortRequest {
+            name: name.to_string(),
+            host_ip,
+            host: port.host,
+            protocol: port.protocol,
+        };
+        if let Some(existing) = requests
+            .iter()
+            .find(|existing| manifest_host_ports_conflict(existing, &request))
+        {
+            return Err(anyhow!(
+                "{context} ports '{}' and '{}' both reserve {}/{}",
+                existing.name,
+                request.name,
+                request.host,
+                manifest_port_protocol_label(request.protocol)
+            ));
+        }
+        requests.push(request);
+    }
+    Ok(())
+}
+
+/// Return the default host bind address for node-local host ports.
+fn default_host_port_ip() -> String {
+    "0.0.0.0".to_string()
+}
+
+/// Normalized host port request used for duplicate and wildcard conflict detection.
+struct ManifestHostPortRequest {
+    name: String,
+    host_ip: IpAddr,
+    host: u16,
+    protocol: ManifestPortProtocol,
+}
+
+/// Return true when two host port requests would contend for the same local socket.
+fn manifest_host_ports_conflict(
+    left: &ManifestHostPortRequest,
+    right: &ManifestHostPortRequest,
+) -> bool {
+    left.host == right.host
+        && left.protocol == right.protocol
+        && same_ip_family(left.host_ip, right.host_ip)
+        && (left.host_ip == right.host_ip
+            || left.host_ip.is_unspecified()
+            || right.host_ip.is_unspecified())
+}
+
+/// Return true when two IP addresses belong to the same address family.
+fn same_ip_family(left: IpAddr, right: IpAddr) -> bool {
+    matches!(
+        (left, right),
+        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+    )
+}
+
+/// Render one manifest host port protocol for operator-facing validation errors.
+fn manifest_port_protocol_label(protocol: ManifestPortProtocol) -> &'static str {
+    match protocol {
+        ManifestPortProtocol::Tcp => "tcp",
+        ManifestPortProtocol::Udp => "udp",
+    }
 }
 
 /// Ensure every referenced manifest network exists before submission.

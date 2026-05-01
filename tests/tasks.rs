@@ -38,6 +38,7 @@ fn replicated_service_task_value(task_id: Uuid, owner_id: Uuid, owner_name: &str
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
+        ports: Vec::new(),
         owner: Some(WorkloadOwner::ServiceReplica(TaskServiceMetadata::new(
             "demo-service",
             "backend",

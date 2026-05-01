@@ -58,6 +58,9 @@ struct JobExecution {
 
   liveness @12 :WorkloadSchema.LivenessProbe;
   # Optional local liveness probe executed by the hosting runtime.
+
+  ports @13 :List(WorkloadSchema.PortBinding);
+  # Node-local host port bindings for each job attempt.
 }
 
 struct JobRetryPolicy {

@@ -3,12 +3,12 @@ use crate::workload::model::{
     WorkloadEnvironmentVariable, WorkloadSecretFile, WorkloadSecretReference, WorkloadVolumeMount,
 };
 use crate::workload::types::{
-    WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadRestartPolicy,
-    WorkloadRestartPolicyKind,
+    WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadPortBinding, WorkloadPortProtocol,
+    WorkloadRestartPolicy, WorkloadRestartPolicyKind,
 };
 use capnp::{Error, struct_list};
 use protocol::volumes::local_volume_ownership;
-use protocol::workload::{environment_var, secret_file, secret_ref, volume_mount};
+use protocol::workload::{environment_var, port_binding, secret_file, secret_ref, volume_mount};
 use uuid::Uuid;
 
 /// Encodes one secret reference into the task schema payload.
@@ -209,6 +209,46 @@ pub fn decode_volume_mounts(
         });
     }
     Ok(mounts)
+}
+
+/// Encodes task host port bindings into the shared workload schema list.
+pub fn encode_port_bindings(
+    builder: &mut struct_list::Builder<port_binding::Owned>,
+    ports: &[WorkloadPortBinding],
+) {
+    for (idx, port) in ports.iter().enumerate() {
+        let mut entry = builder.reborrow().get(idx as u32);
+        entry.set_name(&port.name);
+        entry.set_target_port(port.target_port);
+        entry.set_host_port(port.host_port);
+        entry.set_host_ip(&port.host_ip);
+        let protocol = match port.protocol {
+            WorkloadPortProtocol::Tcp => protocol::workload::PortProtocol::Tcp,
+            WorkloadPortProtocol::Udp => protocol::workload::PortProtocol::Udp,
+        };
+        entry.set_protocol(protocol);
+    }
+}
+
+/// Decodes task host port bindings from the shared workload schema list.
+pub fn decode_port_bindings(
+    list: struct_list::Reader<port_binding::Owned>,
+) -> Result<Vec<WorkloadPortBinding>, Error> {
+    let mut ports = Vec::with_capacity(list.len() as usize);
+    for entry in list.iter() {
+        let protocol = match entry.get_protocol()? {
+            protocol::workload::PortProtocol::Tcp => WorkloadPortProtocol::Tcp,
+            protocol::workload::PortProtocol::Udp => WorkloadPortProtocol::Udp,
+        };
+        ports.push(WorkloadPortBinding {
+            name: entry.get_name()?.to_str()?.to_string(),
+            target_port: entry.get_target_port(),
+            host_port: entry.get_host_port(),
+            host_ip: entry.get_host_ip()?.to_str()?.to_string(),
+            protocol,
+        });
+    }
+    Ok(ports)
 }
 
 /// Encodes one task liveness probe into the task wire payload.

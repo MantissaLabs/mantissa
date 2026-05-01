@@ -86,6 +86,9 @@ struct TaskTemplate {
 
   placementPreferences @22 :List(PlacementPreference);
   # Soft best-effort hints evaluated before the strategy breaks ties.
+
+  ports @23 :List(WorkloadSchema.PortBinding);
+  # Node-local host port bindings for each replica of this template.
 }
 
 struct TaskTemplateNetwork {

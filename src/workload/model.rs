@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::volumes::types::LocalVolumeOwnership;
-use crate::workload::types::{WorkloadLivenessProbe, WorkloadRestartPolicy};
+use crate::workload::types::{WorkloadLivenessProbe, WorkloadPortBinding, WorkloadRestartPolicy};
 
 /// Internal workload categories supported by the control plane.
 ///
@@ -410,6 +410,8 @@ pub struct WorkloadSpec {
     #[serde(default)]
     pub networks: Vec<Uuid>,
     #[serde(default)]
+    pub ports: Vec<WorkloadPortBinding>,
+    #[serde(default)]
     pub owner: Option<WorkloadOwner>,
     #[serde(default)]
     pub lease_id: Option<Uuid>,
@@ -635,6 +637,8 @@ pub struct WorkloadValue {
     #[serde(default)]
     pub networks: Vec<Uuid>,
     #[serde(default)]
+    pub ports: Vec<WorkloadPortBinding>,
+    #[serde(default)]
     pub owner: Option<WorkloadOwner>,
     #[serde(default)]
     pub lease_id: Option<Uuid>,
@@ -682,6 +686,7 @@ pub struct WorkloadValueDraft {
     pub env: Vec<WorkloadEnvironmentVariable>,
     pub secret_files: Vec<WorkloadSecretFile>,
     pub volumes: Vec<WorkloadVolumeMount>,
+    pub ports: Vec<WorkloadPortBinding>,
     pub owner: Option<WorkloadOwner>,
     pub lease_id: Option<Uuid>,
     pub lease_coordinator_node_id: Option<Uuid>,
@@ -725,6 +730,7 @@ impl WorkloadValue {
             env: draft.env,
             secret_files: draft.secret_files,
             volumes: draft.volumes,
+            ports: draft.ports,
             owner: draft.owner,
             lease_id: draft.lease_id,
             lease_coordinator_node_id: draft.lease_coordinator_node_id,
@@ -1092,6 +1098,7 @@ pub(crate) fn value_to_spec(id: Uuid, value: WorkloadValue) -> WorkloadSpec {
         secret_files: value.secret_files,
         volumes: value.volumes,
         networks: value.networks,
+        ports: value.ports,
         owner: value.owner,
         lease_id: value.lease_id,
         lease_coordinator_node_id: value.lease_coordinator_node_id,
@@ -1163,6 +1170,7 @@ pub(crate) fn merge_status_into_value(
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
+        ports: Vec::new(),
         owner: status.owner.clone(),
         lease_id: None,
         lease_coordinator_node_id: None,
@@ -1223,6 +1231,7 @@ pub(crate) fn spec_to_value(spec: &WorkloadSpec) -> WorkloadValue {
         env: spec.env.clone(),
         secret_files: spec.secret_files.clone(),
         volumes: spec.volumes.clone(),
+        ports: spec.ports.clone(),
         owner: spec.owner.clone(),
         lease_id: spec.lease_id,
         lease_coordinator_node_id: spec.lease_coordinator_node_id,
@@ -1280,6 +1289,7 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
+            ports: Vec::new(),
             owner: None,
             lease_id: None,
             lease_coordinator_node_id: None,

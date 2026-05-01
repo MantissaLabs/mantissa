@@ -7,6 +7,41 @@ use crate::workload::model::{
     WorkloadEnvironmentVariable, WorkloadSecretFile, WorkloadVolumeMount,
 };
 
+/// Transport protocol used by one node-local runtime port binding.
+#[derive(
+    Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadPortProtocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+impl WorkloadPortProtocol {
+    /// Returns the Docker-compatible wire suffix for this port protocol.
+    pub const fn as_runtime_suffix(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+/// Node-local host port binding attached to one workload execution.
+///
+/// This is intentionally distinct from service `public_port`: a host port binds on the node that
+/// runs the workload, while `public_port` represents a cluster-level NodePort endpoint.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorkloadPortBinding {
+    pub name: String,
+    pub target_port: u16,
+    pub host_port: u16,
+    pub host_ip: String,
+    #[serde(default)]
+    pub protocol: WorkloadPortProtocol,
+}
+
 /// Shared execution-side launch shape reused by every controller.
 ///
 /// Terminology:
@@ -45,6 +80,8 @@ pub struct ExecutionSpec<N> {
     #[serde(default)]
     pub networks: Vec<N>,
     #[serde(default)]
+    pub ports: Vec<WorkloadPortBinding>,
+    #[serde(default)]
     pub placement: PlacementPolicy,
 }
 
@@ -69,6 +106,7 @@ impl<N> ExecutionSpec<N> {
             secret_files: self.secret_files.clone(),
             volumes: self.volumes.clone(),
             networks: self.networks.iter().map(&mut mapper).collect(),
+            ports: self.ports.clone(),
             placement: self.placement.clone(),
         }
     }

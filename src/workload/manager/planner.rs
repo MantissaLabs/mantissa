@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
@@ -23,7 +24,9 @@ use crate::workload::model::{
     WorkloadOwner, WorkloadPhase, WorkloadSecretFile, WorkloadValue,
     WorkloadVolumeMount as TaskVolumeMount,
 };
-use crate::workload::types::{WorkloadLivenessProbe, WorkloadRestartPolicy};
+use crate::workload::types::{
+    WorkloadLivenessProbe, WorkloadPortBinding, WorkloadPortProtocol, WorkloadRestartPolicy,
+};
 
 use super::remote_advisory::{
     RemoteCandidateHint, compare_remote_candidate_hints, current_unix_ms,
@@ -60,6 +63,8 @@ pub(super) enum SchedulingError {
         isolation_profile: Option<String>,
         feature_flags: Vec<String>,
     },
+    #[error("scheduler reservation failed: host ports unavailable for task '{task}'")]
+    HostPortsBlocked { task: String },
 }
 
 type SeedLocalPlans<'a> = (
@@ -74,6 +79,14 @@ struct LocalPlacementPrereqs<'a> {
     runtime_support: &'a RuntimeSupportProfile,
     gpu_ready: bool,
     gpu_reason: Option<&'a str>,
+}
+
+/// Normalized node-local host port key used to detect local socket conflicts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostPortKey {
+    host_ip: IpAddr,
+    host_port: u16,
+    protocol: WorkloadPortProtocol,
 }
 
 /// Execution plan for a single local task launch, holding the target slots and runtime metadata.
@@ -104,6 +117,7 @@ pub(super) struct BatchStartPlan {
     pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
+    pub(super) ports: Vec<WorkloadPortBinding>,
     pub(super) owner: Option<WorkloadOwner>,
 }
 
@@ -141,6 +155,7 @@ pub(super) struct StartIntent {
     pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
+    pub(super) ports: Vec<WorkloadPortBinding>,
     pub(super) placement: PlacementPolicy,
     pub(super) owner: Option<WorkloadOwner>,
     pub(super) target_node: Option<Uuid>,
@@ -210,6 +225,7 @@ struct Candidate {
     slots: Vec<SlotChoice>,
     gpu_devices: Vec<GpuChoice>,
     ready_networks: HashSet<Uuid>,
+    occupied_host_ports: Vec<HostPortKey>,
     runtime_support: RuntimeSupportProfile,
     free_slot_count: u32,
     free_cpu_millis: u64,
@@ -226,6 +242,7 @@ impl Candidate {
         slots: Vec<SlotChoice>,
         gpu_devices: Vec<GpuChoice>,
         ready_networks: HashSet<Uuid>,
+        occupied_host_ports: Vec<HostPortKey>,
         runtime_support: RuntimeSupportProfile,
     ) -> Option<Self> {
         if slots.is_empty() {
@@ -237,6 +254,7 @@ impl Candidate {
                 slots,
                 gpu_devices,
                 ready_networks,
+                occupied_host_ports,
                 runtime_support,
                 free_slot_count: 0,
                 free_cpu_millis: 0,
@@ -256,6 +274,7 @@ impl Candidate {
         placement: PlacementNode,
         digest: SchedulerDigestValue,
         ready_networks: HashSet<Uuid>,
+        occupied_host_ports: Vec<HostPortKey>,
         runtime_support: RuntimeSupportProfile,
     ) -> Option<Self> {
         if digest.free_slot_count == 0 {
@@ -267,6 +286,7 @@ impl Candidate {
                 slots: Vec::new(),
                 gpu_devices: Vec::new(),
                 ready_networks,
+                occupied_host_ports,
                 runtime_support,
                 free_slot_count: digest.free_slot_count,
                 free_cpu_millis: digest.free_cpu_millis,
@@ -304,6 +324,16 @@ impl Candidate {
 
     fn can_host(&self, networks: &[Uuid]) -> bool {
         networks.iter().all(|net| self.ready_networks.contains(net))
+    }
+
+    /// Returns true when the candidate has no conflicting host port reservations.
+    fn can_bind_ports(&self, ports: &[WorkloadPortBinding]) -> bool {
+        host_ports_available(&self.occupied_host_ports, ports)
+    }
+
+    /// Records host port reservations after a successful scheduling decision.
+    fn reserve_ports(&mut self, ports: &[WorkloadPortBinding]) {
+        record_host_ports(&mut self.occupied_host_ports, ports);
     }
 
     /// Returns true when this candidate satisfies one intent's hard placement policy.
@@ -376,7 +406,7 @@ impl Candidate {
     /// contributes the largest share of the remaining requirement. The
     /// allocation only succeeds when the accumulated capacity fully covers the
     /// requested resources.
-    fn allocate(
+    fn allocate_resources(
         &mut self,
         cpu_millis: u64,
         memory_bytes: u64,
@@ -482,6 +512,17 @@ impl Candidate {
         })
     }
 
+    /// Attempts to reserve this candidate for one intent, including node-local host ports.
+    fn allocate_intent(&mut self, intent: &StartIntent) -> Option<ResourceAllocation> {
+        if !self.can_bind_ports(&intent.ports) {
+            return None;
+        }
+        let allocation =
+            self.allocate_resources(intent.cpu_millis, intent.memory_bytes, intent.gpu_count)?;
+        self.reserve_ports(&intent.ports);
+        Some(allocation)
+    }
+
     fn is_empty(&self) -> bool {
         self.free_slot_count == 0
     }
@@ -507,7 +548,7 @@ impl Candidate {
     /// Simulates one allocation to score how tightly this candidate can pack the intent.
     fn binpack_score(&self, intent: &StartIntent) -> Option<BinpackScore> {
         let mut simulated = self.clone();
-        simulated.allocate(intent.cpu_millis, intent.memory_bytes, intent.gpu_count)?;
+        simulated.allocate_intent(intent)?;
         let remaining = simulated.capacity();
         Some(BinpackScore {
             free_slot_count: remaining.free_slot_count,
@@ -712,6 +753,129 @@ fn workload_counts_toward_preferences(workload: &WorkloadValue) -> bool {
     )
 }
 
+/// Returns true when one workload state should reserve its declared host ports.
+fn workload_reserves_host_ports(workload: &WorkloadValue) -> bool {
+    workload_counts_toward_preferences(workload)
+}
+
+/// Normalizes one workload port binding into the scheduler conflict key.
+fn host_port_key(binding: &WorkloadPortBinding) -> Option<HostPortKey> {
+    Some(HostPortKey {
+        host_ip: binding.host_ip.trim().parse().ok()?,
+        host_port: binding.host_port,
+        protocol: binding.protocol,
+    })
+}
+
+/// Returns true when two host port keys contend for the same node-local socket.
+fn host_port_keys_conflict(left: HostPortKey, right: HostPortKey) -> bool {
+    left.host_port == right.host_port
+        && left.protocol == right.protocol
+        && same_ip_family(left.host_ip, right.host_ip)
+        && (left.host_ip == right.host_ip
+            || left.host_ip.is_unspecified()
+            || right.host_ip.is_unspecified())
+}
+
+/// Returns true when both addresses belong to the same IP family.
+fn same_ip_family(left: IpAddr, right: IpAddr) -> bool {
+    matches!(
+        (left, right),
+        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+    )
+}
+
+/// Returns true when the requested ports have no conflicts with current node reservations.
+fn host_ports_available(occupied: &[HostPortKey], ports: &[WorkloadPortBinding]) -> bool {
+    let mut requested = Vec::new();
+    for binding in ports {
+        let Some(key) = host_port_key(binding) else {
+            return false;
+        };
+        if occupied
+            .iter()
+            .any(|existing| host_port_keys_conflict(*existing, key))
+            || requested
+                .iter()
+                .any(|existing| host_port_keys_conflict(*existing, key))
+        {
+            return false;
+        }
+        requested.push(key);
+    }
+    true
+}
+
+/// Appends normalized port keys for one accepted workload or planned allocation.
+fn record_host_ports(occupied: &mut Vec<HostPortKey>, ports: &[WorkloadPortBinding]) {
+    occupied.extend(ports.iter().filter_map(host_port_key));
+}
+
+/// Builds the per-node host port reservations visible from the replicated workload set.
+fn build_occupied_host_ports(
+    workloads: &HashMap<Uuid, WorkloadValue>,
+) -> HashMap<Uuid, Vec<HostPortKey>> {
+    let mut occupied: HashMap<Uuid, Vec<HostPortKey>> = HashMap::new();
+    for workload in workloads.values() {
+        if workload.ports.is_empty() || !workload_reserves_host_ports(workload) {
+            continue;
+        }
+        let entry = occupied.entry(workload.node_id).or_default();
+        record_host_ports(entry, &workload.ports);
+    }
+    occupied
+}
+
+/// Validates one incoming start intent host port set before it reaches placement.
+fn validate_workload_ports(ports: &[WorkloadPortBinding], task: &str) -> anyhow::Result<()> {
+    let mut names = HashSet::new();
+    let mut requested = Vec::new();
+    for binding in ports {
+        let name = binding.name.trim();
+        if name.is_empty() {
+            return Err(anyhow!(
+                "task '{task}' declares a host port with an empty name"
+            ));
+        }
+        if !names.insert(name.to_string()) {
+            return Err(anyhow!(
+                "task '{task}' declares host port '{}' multiple times",
+                name
+            ));
+        }
+        if binding.target_port == 0 {
+            return Err(anyhow!(
+                "task '{task}' host port '{}' must set a non-zero target port",
+                name
+            ));
+        }
+        if binding.host_port == 0 {
+            return Err(anyhow!(
+                "task '{task}' host port '{}' must set a non-zero host port",
+                name
+            ));
+        }
+        let Some(key) = host_port_key(binding) else {
+            return Err(anyhow!(
+                "task '{task}' host port '{}' has invalid host_ip '{}'",
+                name,
+                binding.host_ip
+            ));
+        };
+        if requested
+            .iter()
+            .any(|existing| host_port_keys_conflict(*existing, key))
+        {
+            return Err(anyhow!(
+                "task '{task}' declares conflicting host port {}",
+                binding.host_port
+            ));
+        }
+        requested.push(key);
+    }
+    Ok(())
+}
+
 /// Builds the current service-replica inventory used by soft placement preferences.
 fn build_preference_inventory(
     workloads: &HashMap<Uuid, WorkloadValue>,
@@ -798,6 +962,7 @@ pub(super) struct RemoteStartPlan {
     pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
+    pub(super) ports: Vec<WorkloadPortBinding>,
     pub(super) owner: Option<WorkloadOwner>,
 }
 
@@ -828,6 +993,7 @@ pub(super) struct PreparedRemoteStartPlan {
     pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
+    pub(super) ports: Vec<WorkloadPortBinding>,
     pub(super) owner: Option<WorkloadOwner>,
 }
 
@@ -935,6 +1101,8 @@ impl WorkloadManager {
                 ));
             }
 
+            validate_workload_ports(&execution.ports, &name)?;
+
             intents.push(StartIntent {
                 index,
                 id: id.unwrap_or_else(Uuid::new_v4),
@@ -962,6 +1130,7 @@ impl WorkloadManager {
                 secret_files: execution.secret_files,
                 volumes: execution.volumes,
                 networks: execution.networks,
+                ports: execution.ports,
                 placement: execution.placement,
                 owner,
                 target_node,
@@ -995,6 +1164,7 @@ impl WorkloadManager {
         let readiness_map = self.collect_network_readiness()?;
         let workload_values = self.load_workload_value_index().await?;
         let mut preference_inventory = build_preference_inventory(workload_values.as_ref());
+        let mut occupied_host_ports = build_occupied_host_ports(workload_values.as_ref());
         let local_ready = readiness_map
             .get(&self.local_node_id)
             .cloned()
@@ -1012,6 +1182,7 @@ impl WorkloadManager {
                     gpu_ready: local_gpu_ready,
                     gpu_reason: local_gpu_reason.as_deref(),
                 },
+                &mut occupied_host_ports,
             )?;
 
         if remaining_intents.is_empty() {
@@ -1024,6 +1195,7 @@ impl WorkloadManager {
             available_gpus,
             &readiness_map,
             &local_ready,
+            &occupied_host_ports,
             &remaining_intents,
         )?;
         if candidates.is_empty() {
@@ -1050,6 +1222,7 @@ impl WorkloadManager {
         snapshot: &SchedulerSnapshot,
         local_version: u64,
         prereqs: LocalPlacementPrereqs<'_>,
+        occupied_host_ports: &mut HashMap<Uuid, Vec<HostPortKey>>,
     ) -> Result<SeedLocalPlans<'a>, anyhow::Error> {
         let mut slot_lookup = HashMap::new();
         let mut available_local_slots = Vec::new();
@@ -1105,6 +1278,14 @@ impl WorkloadManager {
                 .all(|net| prereqs.ready_networks.contains(net))
             {
                 return Err(SchedulingError::LocalNetworksBlocked {
+                    task: intent.name.clone(),
+                }
+                .into());
+            }
+
+            let local_ports = occupied_host_ports.entry(self.local_node_id).or_default();
+            if !host_ports_available(local_ports, &intent.ports) {
+                return Err(SchedulingError::HostPortsBlocked {
                     task: intent.name.clone(),
                 }
                 .into());
@@ -1219,6 +1400,7 @@ impl WorkloadManager {
                 }
             }
 
+            record_host_ports(local_ports, &intent.ports);
             local_plans.push(BatchStartPlan {
                 id: intent.id,
                 name: intent.name.clone(),
@@ -1245,6 +1427,7 @@ impl WorkloadManager {
                 secret_files: intent.secret_files.clone(),
                 volumes: intent.volumes.clone(),
                 networks: intent.networks.clone(),
+                ports: intent.ports.clone(),
                 owner: intent.owner.clone(),
             });
         }
@@ -1370,6 +1553,7 @@ impl WorkloadManager {
         local_gpus: Vec<GpuChoice>,
         readiness: &HashMap<Uuid, HashSet<Uuid>>,
         local_ready: &HashSet<Uuid>,
+        occupied_host_ports: &HashMap<Uuid, Vec<HostPortKey>>,
         intents: &[&StartIntent],
     ) -> Result<VecDeque<Candidate>, anyhow::Error> {
         let mut queue = VecDeque::new();
@@ -1405,6 +1589,10 @@ impl WorkloadManager {
                 local_slots,
                 local_gpus,
                 local_ready.clone(),
+                occupied_host_ports
+                    .get(&self.local_node_id)
+                    .cloned()
+                    .unwrap_or_default(),
                 local_runtime_support,
             )
         {
@@ -1460,6 +1648,10 @@ impl WorkloadManager {
                 placement,
                 hint.digest.clone(),
                 hint.ready_networks.clone(),
+                occupied_host_ports
+                    .get(&hint.peer_id)
+                    .cloned()
+                    .unwrap_or_default(),
                 self.core
                     .registry
                     .peer_runtime_support(hint.peer_id)
@@ -1532,9 +1724,15 @@ impl WorkloadManager {
             .into());
         }
 
-        if let Some(allocation) =
-            candidate.allocate(intent.cpu_millis, intent.memory_bytes, intent.gpu_count)
-        {
+        if !candidate.can_bind_ports(&intent.ports) {
+            candidates.push_back(candidate);
+            return Err(SchedulingError::HostPortsBlocked {
+                task: intent.name.clone(),
+            }
+            .into());
+        }
+
+        if let Some(allocation) = candidate.allocate_intent(intent) {
             let location = candidate.location.clone();
             if !candidate.is_empty() {
                 candidates.push_back(candidate);
@@ -1568,6 +1766,7 @@ impl WorkloadManager {
         let mut skipped_for_constraints = false;
         let mut skipped_for_networks = false;
         let mut skipped_for_runtime = false;
+        let mut skipped_for_ports = false;
 
         for (idx, candidate) in candidates.iter().enumerate() {
             let node_id = candidate.node_id(self.local_node_id);
@@ -1587,11 +1786,12 @@ impl WorkloadManager {
                 continue;
             }
 
-            if candidate
-                .clone()
-                .allocate(intent.cpu_millis, intent.memory_bytes, intent.gpu_count)
-                .is_none()
-            {
+            if !candidate.can_bind_ports(&intent.ports) {
+                skipped_for_ports = true;
+                continue;
+            }
+
+            if candidate.clone().allocate_intent(intent).is_none() {
                 continue;
             }
 
@@ -1635,6 +1835,11 @@ impl WorkloadManager {
                     networks: intent.networks.clone(),
                 }
                 .into());
+            } else if skipped_for_ports {
+                return Err(SchedulingError::HostPortsBlocked {
+                    task: intent.name.clone(),
+                }
+                .into());
             } else {
                 return Err(SchedulingError::InsufficientCapacityForBatch.into());
             }
@@ -1644,7 +1849,7 @@ impl WorkloadManager {
             .remove(best_index)
             .expect("selected spread candidate index should remain valid");
         let allocation = candidate
-            .allocate(intent.cpu_millis, intent.memory_bytes, intent.gpu_count)
+            .allocate_intent(intent)
             .expect("spread candidate should allocate after preflight");
         let location = candidate.location.clone();
         if !candidate.is_empty() {
@@ -1672,6 +1877,7 @@ impl WorkloadManager {
         let mut skipped_for_constraints = false;
         let mut skipped_for_networks = false;
         let mut skipped_for_runtime = false;
+        let mut skipped_for_ports = false;
 
         for (idx, candidate) in candidates.iter().enumerate() {
             if !candidate.matches_placement(intent) {
@@ -1686,6 +1892,11 @@ impl WorkloadManager {
 
             if !candidate.can_host(&intent.networks) {
                 skipped_for_networks = true;
+                continue;
+            }
+
+            if !candidate.can_bind_ports(&intent.ports) {
+                skipped_for_ports = true;
                 continue;
             }
 
@@ -1726,6 +1937,11 @@ impl WorkloadManager {
                     networks: intent.networks.clone(),
                 }
                 .into());
+            } else if skipped_for_ports {
+                return Err(SchedulingError::HostPortsBlocked {
+                    task: intent.name.clone(),
+                }
+                .into());
             } else {
                 return Err(SchedulingError::InsufficientCapacityForBatch.into());
             }
@@ -1735,7 +1951,7 @@ impl WorkloadManager {
             .remove(best_index)
             .expect("selected candidate index should remain valid");
         let allocation = candidate
-            .allocate(intent.cpu_millis, intent.memory_bytes, intent.gpu_count)
+            .allocate_intent(intent)
             .expect("binpack candidate should allocate after scoring");
         let location = candidate.location.clone();
         if !candidate.is_empty() {
@@ -1780,6 +1996,7 @@ impl WorkloadManager {
                     secret_files: intent.secret_files.clone(),
                     volumes: intent.volumes.clone(),
                     networks: intent.networks.clone(),
+                    ports: intent.ports.clone(),
                     owner: intent.owner.clone(),
                 });
             }
@@ -1806,6 +2023,7 @@ impl WorkloadManager {
                     secret_files: intent.secret_files.clone(),
                     volumes: intent.volumes.clone(),
                     networks: intent.networks.clone(),
+                    ports: intent.ports.clone(),
                     owner: intent.owner.clone(),
                 });
             }
@@ -1858,13 +2076,14 @@ impl WorkloadManager {
 #[cfg(test)]
 mod tests {
     use super::{
-        Candidate, CandidateCapacity, StartIntent, WorkloadDemand, capacity_covers_workload,
-        digest_can_host_intent,
+        Candidate, CandidateCapacity, HostPortKey, StartIntent, WorkloadDemand,
+        capacity_covers_workload, digest_can_host_intent, host_ports_available,
     };
     use crate::runtime::types::RuntimeSupportProfile;
     use crate::scheduler::digest::SchedulerDigestValue;
     use crate::scheduler::placement::PlacementNode;
     use crate::workload::model::{ExecutionPlatform, IsolationMode};
+    use crate::workload::types::{WorkloadPortBinding, WorkloadPortProtocol};
     use std::collections::HashSet;
     use uuid::Uuid;
 
@@ -1896,6 +2115,7 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: vec![required_network],
+            ports: Vec::new(),
             placement: Default::default(),
             owner: None,
             target_node: None,
@@ -1970,6 +2190,7 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
+            ports: Vec::new(),
             placement: Default::default(),
             owner: None,
             target_node: None,
@@ -2039,6 +2260,25 @@ mod tests {
         assert!(capacity_covers_workload(complete, demand));
     }
 
+    /// Host port availability should treat wildcard binds as conflicts with specific IP binds.
+    #[test]
+    fn host_port_availability_rejects_wildcard_conflicts() {
+        let occupied = vec![HostPortKey {
+            host_ip: "0.0.0.0".parse().expect("valid ip"),
+            host_port: 18080,
+            protocol: WorkloadPortProtocol::Tcp,
+        }];
+        let requested = vec![WorkloadPortBinding {
+            name: "http".to_string(),
+            target_port: 8080,
+            host_port: 18080,
+            host_ip: "127.0.0.1".to_string(),
+            protocol: WorkloadPortProtocol::Tcp,
+        }];
+
+        assert!(!host_ports_available(&occupied, &requested));
+    }
+
     /// Remote digest candidates should consume aggregate advisory capacity as placements are assigned.
     #[test]
     fn remote_digest_candidate_tracks_aggregate_capacity() {
@@ -2059,12 +2299,13 @@ mod tests {
                 gpu_runtime_ready: true,
             },
             HashSet::new(),
+            Vec::new(),
             RuntimeSupportProfile::default(),
         )
         .expect("remote candidate");
 
         let allocation = candidate
-            .allocate(500, 512 * 1_024 * 1_024, 1)
+            .allocate_resources(500, 512 * 1_024 * 1_024, 1)
             .expect("first remote placement should fit");
         assert!(allocation.slots.is_empty());
         assert!(allocation.gpu_device_ids.is_empty());
@@ -2096,10 +2337,15 @@ mod tests {
                 gpu_runtime_ready: true,
             },
             HashSet::new(),
+            Vec::new(),
             RuntimeSupportProfile::default(),
         )
         .expect("remote candidate");
 
-        assert!(candidate.allocate(900, 128 * 1_024 * 1_024, 0).is_none());
+        assert!(
+            candidate
+                .allocate_resources(900, 128 * 1_024 * 1_024, 0)
+                .is_none()
+        );
     }
 }

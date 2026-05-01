@@ -13,9 +13,10 @@ use crate::services::types::{
 };
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
-    decode_env_vars, decode_secret_files, decode_service_liveness_probe,
-    decode_service_restart_policy, decode_volume_mounts, encode_env_vars, encode_secret_files,
-    encode_service_liveness_probe, encode_service_restart_policy, encode_volume_mounts,
+    decode_env_vars, decode_port_bindings, decode_secret_files, decode_service_liveness_probe,
+    decode_service_restart_policy, decode_volume_mounts, encode_env_vars, encode_port_bindings,
+    encode_secret_files, encode_service_liveness_probe, encode_service_restart_policy,
+    encode_volume_mounts,
 };
 use crate::workload::types::ExecutionSpec;
 use capnp::Error;
@@ -704,6 +705,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
             placement_preferences.push(placement_preference_from_proto(entry?));
         }
     }
+    let ports = decode_port_bindings(reader.get_ports()?)?;
 
     Ok(TaskTemplateSpecValue {
         name: reader.get_name()?.to_str()?.to_string(),
@@ -725,6 +727,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
             secret_files,
             volumes,
             networks,
+            ports,
             placement: PlacementPolicy {
                 constraints: placement_constraints,
                 preferences: placement_preferences,
@@ -946,6 +949,9 @@ fn write_task_template(
         .init_volumes(template.volumes.len() as u32);
     encode_volume_mounts(&mut volume_builder, &template.volumes);
 
+    let mut ports_builder = builder.reborrow().init_ports(template.ports.len() as u32);
+    encode_port_bindings(&mut ports_builder, &template.ports);
+
     if let Some(readiness) = template.readiness() {
         let builder = builder.reborrow().init_readiness();
         write_readiness_probe(builder, readiness);
@@ -1043,6 +1049,7 @@ mod tests {
         TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskVolumeMount,
     };
     use crate::workload::types::ExecutionSpec;
+    use crate::workload::types::{WorkloadPortBinding, WorkloadPortProtocol};
     use capnp::message::Builder;
     use crdt_store::codec::StoreValueCodec;
     use protocol::services::{service_spec, task_template};
@@ -1077,6 +1084,7 @@ mod tests {
                     secret_files: Vec::new(),
                     volumes: Vec::new(),
                     networks: Vec::new(),
+                    ports: Vec::new(),
                     placement: Default::default(),
                 },
                 depends_on: Vec::new(),
@@ -1116,6 +1124,7 @@ mod tests {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: vec![TaskTemplateNetworkRequirement::new("default", network_id)],
+                ports: Vec::new(),
                 placement: PlacementPolicy {
                     constraints: vec![
                         PlacementConstraint::eq(
@@ -1220,6 +1229,13 @@ mod tests {
                     "public",
                     task_network_id,
                 )],
+                ports: vec![WorkloadPortBinding {
+                    name: "http".to_string(),
+                    target_port: 8080,
+                    host_port: 18080,
+                    host_ip: "127.0.0.1".to_string(),
+                    protocol: WorkloadPortProtocol::Tcp,
+                }],
                 liveness: Some(ServiceLivenessProbe {
                     kind: ServiceLivenessProbeKind::Exec,
                     command: vec!["/usr/bin/check".to_string()],
@@ -1270,6 +1286,7 @@ mod tests {
                         "backend",
                         previous_network_id,
                     )],
+                    ports: Vec::new(),
                     placement: Default::default(),
                 },
                 depends_on: Vec::new(),

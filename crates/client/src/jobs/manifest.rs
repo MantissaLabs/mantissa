@@ -5,7 +5,9 @@ use crate::runtime_contract::{
 use crate::workload_submit::{
     DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec, ManifestNetworkSpec,
     RequestedNetworkSpec, resolve_requested_networks, validate_declared_networks,
+    validate_manifest_ports,
 };
+pub use crate::workload_submit::{ManifestPortBinding, ManifestPortProtocol};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -241,6 +243,8 @@ pub struct JobExecutionSpec {
     pub volumes: Vec<VolumeMount>,
     #[serde(default)]
     pub networks: Vec<String>,
+    #[serde(default)]
+    pub ports: Vec<ManifestPortBinding>,
     #[serde(default)]
     pub liveness: Option<LivenessProbe>,
 }
@@ -552,6 +556,8 @@ fn validate_execution(
         }
     }
 
+    validate_manifest_ports(&execution.ports, "job manifest execution")?;
+
     if let Some(liveness) = &execution.liveness {
         match liveness.kind {
             LivenessKind::Exec if liveness.command.is_empty() => {
@@ -698,6 +704,7 @@ mod tests {
                     read_only: false,
                 }],
                 networks: vec!["jobs".to_string()],
+                ports: Vec::new(),
                 liveness: None,
             },
             retry_policy: JobRetryPolicySpec::default(),
@@ -764,6 +771,45 @@ mod tests {
             requested[0].ip_family,
             Some(crate::config::NetworkIpFamily::Ipv6)
         );
+    }
+
+    /// Accepts the shared static host port shape for finite job attempts.
+    #[test]
+    fn manifest_accepts_static_host_port_binding() {
+        let raw = r#"(
+            name: "demo-job",
+            execution: (
+                image: "alpine:3.20",
+                ports: [(
+                    name: "metrics",
+                    target: 9100,
+                    host: 19100,
+                    host_ip: "127.0.0.1",
+                    protocol: tcp,
+                )],
+            ),
+        )"#;
+        let manifest: JobManifest = ron::from_str(raw).expect("parse manifest");
+
+        manifest.validate().expect("valid job host port manifest");
+        assert_eq!(manifest.execution.ports[0].name, "metrics");
+        assert_eq!(manifest.execution.ports[0].host, 19100);
+    }
+
+    /// Rejects dynamic host ports until Mantissa has an allocation reporting contract.
+    #[test]
+    fn manifest_rejects_zero_host_port_binding() {
+        let mut manifest = base_manifest();
+        manifest.execution.ports = vec![ManifestPortBinding {
+            name: "metrics".to_string(),
+            target: 9100,
+            host: 0,
+            host_ip: "127.0.0.1".to_string(),
+            protocol: ManifestPortProtocol::Tcp,
+        }];
+
+        let error = manifest.validate().expect_err("zero host port must fail");
+        assert!(error.to_string().contains("non-zero static host port"));
     }
 
     /// Rejects unknown execution platform values before submission.

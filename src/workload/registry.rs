@@ -114,6 +114,7 @@ mod tests {
             env: Vec::new(),
             secret_files: Vec::new(),
             volumes: Vec::new(),
+            ports: Vec::new(),
             owner: None,
             lease_id: None,
             lease_coordinator_node_id: None,

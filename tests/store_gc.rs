@@ -182,6 +182,7 @@ fn workload_value(id: Uuid, node_id: Uuid, version: u64) -> WorkloadValue {
         env: Vec::new(),
         secret_files: Vec::new(),
         volumes: Vec::new(),
+        ports: Vec::new(),
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
@@ -209,6 +210,7 @@ fn execution_spec() -> ResolvedExecutionSpec {
         secret_files: Vec::new(),
         volumes: Vec::new(),
         networks: Vec::new(),
+        ports: Vec::new(),
         placement: Default::default(),
     }
 }

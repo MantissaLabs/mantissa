@@ -2,8 +2,9 @@ use crate::jobs::manager::{JobController, JobSubmission};
 use crate::jobs::types::{JobEvent, JobRetryPolicy, JobSpecValue, JobStatus};
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
-    decode_env_vars, decode_secret_files, decode_task_liveness_probe, decode_volume_mounts,
-    encode_env_vars, encode_secret_files, encode_task_liveness_probe, encode_volume_mounts,
+    decode_env_vars, decode_port_bindings, decode_secret_files, decode_task_liveness_probe,
+    decode_volume_mounts, encode_env_vars, encode_port_bindings, encode_secret_files,
+    encode_task_liveness_probe, encode_volume_mounts,
 };
 use crate::workload::model::{ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec};
 use crate::workload::types::ResolvedExecutionSpec;
@@ -226,6 +227,9 @@ fn write_job_execution(
         networks.set(index as u32, network_id.as_bytes());
     }
 
+    let mut ports = builder.reborrow().init_ports(execution.ports.len() as u32);
+    encode_port_bindings(&mut ports, &execution.ports);
+
     builder.set_termination_grace_period_secs(execution.termination_grace_period_secs.unwrap_or(0));
     let pre_stop = execution.pre_stop_command.as_deref().unwrap_or(&[]);
     let mut pre_stop_builder = builder
@@ -261,6 +265,7 @@ fn read_job_execution(reader: job_execution::Reader<'_>) -> Result<ResolvedExecu
     for entry in reader.get_networks()?.iter() {
         networks.push(read_uuid(entry?)?);
     }
+    let ports = decode_port_bindings(reader.get_ports()?)?;
     let termination_grace_period_secs = match reader.get_termination_grace_period_secs() {
         0 => None,
         value => Some(value),
@@ -286,6 +291,7 @@ fn read_job_execution(reader: job_execution::Reader<'_>) -> Result<ResolvedExecu
         secret_files,
         volumes,
         networks,
+        ports,
         placement: Default::default(),
     })
 }
@@ -638,6 +644,7 @@ fn workload_phase_exit_code(state: &WorkloadPhase) -> Option<i32> {
 mod tests {
     use super::*;
     use crate::store::job_store::open_job_store;
+    use crate::workload::types::{WorkloadPortBinding, WorkloadPortProtocol};
     use crdt_store::uuid_key::UuidKey;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -659,6 +666,13 @@ mod tests {
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
+            ports: vec![WorkloadPortBinding {
+                name: "debug".to_string(),
+                target_port: 8080,
+                host_port: 18080,
+                host_ip: "127.0.0.1".to_string(),
+                protocol: WorkloadPortProtocol::Tcp,
+            }],
             placement: Default::default(),
         }
     }

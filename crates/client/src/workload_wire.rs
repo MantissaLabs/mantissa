@@ -3,9 +3,12 @@ use crate::jobs::manifest::{
 };
 use crate::volumes::LocalVolumeOwnership;
 use crate::volumes::ResolvedVolumeMount;
+use crate::workload_submit::{ManifestPortBinding, ManifestPortProtocol};
 use capnp::struct_list;
 use protocol::volumes::local_volume_ownership;
-use protocol::workload::{environment_var, liveness_probe, secret_file, secret_ref, volume_mount};
+use protocol::workload::{
+    environment_var, liveness_probe, port_binding, secret_file, secret_ref, volume_mount,
+};
 use uuid::Uuid;
 
 /// One prepared named volume mount resolved to the cluster volume identity.
@@ -101,6 +104,25 @@ pub fn write_volume_mounts(
         entry.set_volume_name(&mount.volume_name);
         entry.set_target(&mount.target);
         entry.set_read_only(mount.read_only);
+    }
+}
+
+/// Encodes one manifest host port list into the shared workload wire builder.
+pub fn write_port_bindings(
+    builder: &mut struct_list::Builder<port_binding::Owned>,
+    ports: &[ManifestPortBinding],
+) {
+    for (index, port) in ports.iter().enumerate() {
+        let mut entry = builder.reborrow().get(index as u32);
+        entry.set_name(port.name.trim());
+        entry.set_target_port(port.target);
+        entry.set_host_port(port.host);
+        entry.set_host_ip(port.host_ip.trim());
+        let protocol = match port.protocol {
+            ManifestPortProtocol::Tcp => protocol::workload::PortProtocol::Tcp,
+            ManifestPortProtocol::Udp => protocol::workload::PortProtocol::Udp,
+        };
+        entry.set_protocol(protocol);
     }
 }
 

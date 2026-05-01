@@ -1245,6 +1245,7 @@ fn empty_service_execution(image: &str) -> ExecutionSpec<TaskTemplateNetworkRequ
         secret_files: Vec::new(),
         volumes: Vec::new(),
         networks: Vec::new(),
+        ports: Vec::new(),
         placement: Default::default(),
     }
 }
@@ -1266,6 +1267,7 @@ fn empty_workload_execution(image: &str) -> ResolvedExecutionSpec {
         secret_files: Vec::new(),
         volumes: Vec::new(),
         networks: Vec::new(),
+        ports: Vec::new(),
         placement: Default::default(),
     }
 }

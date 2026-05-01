@@ -1,7 +1,8 @@
 use crate::workload::capnp_codec::{
-    decode_env_vars, decode_secret_files, decode_task_liveness_probe, decode_task_restart_policy,
-    decode_volume_mounts, encode_env_vars, encode_secret_files, encode_task_liveness_probe,
-    encode_task_restart_policy, encode_volume_mounts,
+    decode_env_vars, decode_port_bindings, decode_secret_files, decode_task_liveness_probe,
+    decode_task_restart_policy, decode_volume_mounts, encode_env_vars, encode_port_bindings,
+    encode_secret_files, encode_task_liveness_probe, encode_task_restart_policy,
+    encode_volume_mounts,
 };
 use crate::workload::manager::WorkloadManager;
 use crate::workload::model::{
@@ -306,6 +307,9 @@ pub fn write_spec(mut builder: workload_spec::Builder<'_>, spec: &WorkloadSpec) 
     let mut volumes = builder.reborrow().init_volumes(spec.volumes.len() as u32);
     encode_volume_mounts(&mut volumes, &spec.volumes);
 
+    let mut ports = builder.reborrow().init_ports(spec.ports.len() as u32);
+    encode_port_bindings(&mut ports, &spec.ports);
+
     write_owner(builder.reborrow().init_owner(), spec.owner.as_ref());
 }
 
@@ -403,6 +407,7 @@ pub fn read_spec(reader: workload_spec::Reader<'_>) -> Result<WorkloadSpec, Erro
         secret_files: decode_secret_files(reader.get_secret_files()?)?,
         volumes: decode_volume_mounts(reader.get_volumes()?)?,
         networks,
+        ports: decode_port_bindings(reader.get_ports()?)?,
         owner: read_owner(reader.get_owner()?)?,
         lease_id,
         lease_coordinator_node_id,
@@ -666,8 +671,8 @@ mod tests {
         spec_to_status, value_to_spec,
     };
     use crate::workload::types::{
-        WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadRestartPolicy,
-        WorkloadRestartPolicyKind,
+        WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadPortBinding,
+        WorkloadPortProtocol, WorkloadRestartPolicy, WorkloadRestartPolicyKind,
     };
     use crdt_store::codec::StoreValueCodec;
     use crdt_store::uuid_key::UuidKey;
@@ -744,6 +749,13 @@ mod tests {
                 volume_name: "data".to_string(),
                 target: "/var/lib/data".to_string(),
                 read_only: false,
+            }],
+            ports: vec![WorkloadPortBinding {
+                name: "metrics".to_string(),
+                target_port: 9100,
+                host_port: 19100,
+                host_ip: "127.0.0.1".to_string(),
+                protocol: WorkloadPortProtocol::Tcp,
             }],
             owner: Some(WorkloadOwner::JobAttempt(WorkloadJobMetadata::new(
                 Uuid::new_v4(),

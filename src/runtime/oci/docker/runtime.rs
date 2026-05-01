@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use bollard::container::AttachContainerResults;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, DeviceRequest, EventMessageTypeEnum, HostConfig, RestartPolicy,
-    RestartPolicyNameEnum,
+    ContainerCreateBody, DeviceRequest, EventMessageTypeEnum, HostConfig, PortBinding,
+    RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     AttachContainerOptionsBuilder, CreateContainerOptions, CreateImageOptions, EventsOptions,
@@ -26,7 +26,8 @@ use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender, Unbounde
 use crate::runtime::types::{
     RestartPolicyType, RuntimeAttachOptions, RuntimeBackend, RuntimeCapabilities,
     RuntimeCreateRequest, RuntimeError, RuntimeEvent, RuntimeExecOptions, RuntimeExecResult,
-    RuntimeInfo, RuntimeLogFrame, RuntimeLogsOptions, RuntimeResult, RuntimeSupportProfile,
+    RuntimeInfo, RuntimeLogFrame, RuntimeLogsOptions, RuntimePortBinding, RuntimeResult,
+    RuntimeSupportProfile,
 };
 
 use super::conversions::{
@@ -126,6 +127,12 @@ impl RuntimeBackend for DockerRuntimeBackend {
             );
         }
 
+        let exposed_ports = exposed_port_keys(&ports);
+        let port_bindings = docker_port_bindings(&ports);
+        if !port_bindings.is_empty() {
+            host_config.port_bindings = Some(port_bindings);
+        }
+
         // Create container config
         let config = ContainerCreateBody {
             image: Some(image.clone()),
@@ -135,7 +142,7 @@ impl RuntimeBackend for DockerRuntimeBackend {
             env: prepared_launch.env_vars,
             cmd: prepared_launch.command,
             entrypoint: prepared_launch.entrypoint,
-            exposed_ports: ports.map(|ports_map| ports_map.into_keys().collect()),
+            exposed_ports: (!exposed_ports.is_empty()).then_some(exposed_ports),
             host_config: Some(host_config),
             ..Default::default()
         };
@@ -549,5 +556,80 @@ impl RuntimeBackend for DockerRuntimeBackend {
         }
 
         Ok(())
+    }
+}
+
+/// Builds the Docker `ExposedPorts` key list for one runtime port binding set.
+fn exposed_port_keys(bindings: &[RuntimePortBinding]) -> Vec<String> {
+    let mut keys: Vec<String> = bindings
+        .iter()
+        .map(|binding| {
+            format!(
+                "{}/{}",
+                binding.target_port,
+                binding.protocol.as_port_key_suffix()
+            )
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Builds Docker host port bindings keyed by `<container-port>/<protocol>`.
+fn docker_port_bindings(
+    bindings: &[RuntimePortBinding],
+) -> HashMap<String, Option<Vec<PortBinding>>> {
+    let mut map: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
+    for binding in bindings {
+        let key = format!(
+            "{}/{}",
+            binding.target_port,
+            binding.protocol.as_port_key_suffix()
+        );
+        let entries = map.entry(key).or_insert_with(|| Some(Vec::new()));
+        if let Some(entries) = entries.as_mut() {
+            entries.push(PortBinding {
+                host_ip: Some(binding.host_ip.clone()),
+                host_port: Some(binding.host_port.to_string()),
+            });
+        }
+    }
+    map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::types::RuntimePortProtocol;
+
+    /// Docker port helper output should expose unique target keys and bind static host ports.
+    #[test]
+    fn docker_port_helpers_encode_static_bindings() {
+        let bindings = vec![
+            RuntimePortBinding {
+                target_port: 8080,
+                host_port: 18080,
+                host_ip: "127.0.0.1".to_string(),
+                protocol: RuntimePortProtocol::Tcp,
+            },
+            RuntimePortBinding {
+                target_port: 8080,
+                host_port: 28080,
+                host_ip: "127.0.0.1".to_string(),
+                protocol: RuntimePortProtocol::Tcp,
+            },
+        ];
+
+        assert_eq!(exposed_port_keys(&bindings), vec!["8080/tcp".to_string()]);
+        let port_bindings = docker_port_bindings(&bindings);
+        let entries = port_bindings
+            .get("8080/tcp")
+            .and_then(Option::as_ref)
+            .expect("tcp binding entries");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].host_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(entries[0].host_port.as_deref(), Some("18080"));
+        assert_eq!(entries[1].host_port.as_deref(), Some("28080"));
     }
 }

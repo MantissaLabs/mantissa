@@ -860,6 +860,7 @@ fn task_spec_to_value(spec: &WorkloadSpec) -> TaskValue {
         secret_files: spec.secret_files.clone(),
         volumes: spec.volumes.clone(),
         networks: spec.networks.clone(),
+        ports: Vec::new(),
         owner: spec.owner.clone(),
         lease_id: spec.lease_id,
         lease_coordinator_node_id: spec.lease_coordinator_node_id,

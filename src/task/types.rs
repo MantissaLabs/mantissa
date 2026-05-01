@@ -10,7 +10,7 @@ use crate::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec, WorkloadStateFilter,
     WorkloadStateKind,
 };
-use crate::workload::types::{WorkloadLivenessProbe, WorkloadRestartPolicy};
+use crate::workload::types::{WorkloadLivenessProbe, WorkloadPortBinding, WorkloadRestartPolicy};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -80,6 +80,8 @@ pub struct TaskSpec {
     #[serde(default)]
     pub networks: Vec<Uuid>,
     #[serde(default)]
+    pub ports: Vec<WorkloadPortBinding>,
+    #[serde(default)]
     pub lease_id: Option<Uuid>,
     #[serde(default)]
     pub lease_coordinator_node_id: Option<Uuid>,
@@ -126,6 +128,7 @@ impl TaskSpec {
             secret_files: spec.secret_files.clone(),
             volumes: spec.volumes.clone(),
             networks: spec.networks.clone(),
+            ports: spec.ports.clone(),
             lease_id: spec.lease_id,
             lease_coordinator_node_id: spec.lease_coordinator_node_id,
             task_epoch: spec.task_epoch,

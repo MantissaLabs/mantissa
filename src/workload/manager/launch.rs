@@ -9,14 +9,16 @@ use crate::agents::types::{
 };
 use crate::runtime::types::{
     ResourceLimits, RestartPolicyConfig, RestartPolicyType, RuntimeCreateRequest,
-    RuntimeInstanceRef, RuntimeSandboxAccessMode, RuntimeSandboxNetworkMode,
-    RuntimeSandboxPathRule, RuntimeSandboxPolicy,
+    RuntimeInstanceRef, RuntimePortBinding, RuntimePortProtocol, RuntimeSandboxAccessMode,
+    RuntimeSandboxNetworkMode, RuntimeSandboxPathRule, RuntimeSandboxPolicy,
 };
 use crate::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadEnvironmentVariable as TaskEnvironmentVariable,
     WorkloadOwner, WorkloadSecretFile, WorkloadVolumeMount as TaskVolumeMount,
 };
-use crate::workload::types::{WorkloadRestartPolicy, WorkloadRestartPolicyKind};
+use crate::workload::types::{
+    WorkloadPortBinding, WorkloadPortProtocol, WorkloadRestartPolicy, WorkloadRestartPolicyKind,
+};
 
 use super::secrets::ResolvedTaskSecrets;
 use super::{
@@ -45,6 +47,7 @@ pub(super) struct InstanceLaunchRequest<'a> {
     pub secret_files: &'a [WorkloadSecretFile],
     pub volume_mounts: &'a [TaskVolumeMount],
     pub networks: &'a [Uuid],
+    pub ports: &'a [WorkloadPortBinding],
     pub owner: Option<&'a WorkloadOwner>,
 }
 
@@ -170,7 +173,11 @@ impl WorkloadManager {
             // other interactive entrypoints after the runtime instance has already been started.
             open_stdin: true,
             env_vars,
-            ports: None,
+            ports: request
+                .ports
+                .iter()
+                .map(runtime_port_binding_from_workload)
+                .collect(),
             volumes,
             restart_policy,
             resource_limits,
@@ -425,6 +432,19 @@ fn widen_sandbox_access(
         (Read, Write) | (Write, Read) => ReadWrite,
         (Write, Write) => Write,
         _ => Read,
+    }
+}
+
+/// Converts one workload port binding into the runtime backend create request format.
+fn runtime_port_binding_from_workload(binding: &WorkloadPortBinding) -> RuntimePortBinding {
+    RuntimePortBinding {
+        target_port: binding.target_port,
+        host_port: binding.host_port,
+        host_ip: binding.host_ip.clone(),
+        protocol: match binding.protocol {
+            WorkloadPortProtocol::Tcp => RuntimePortProtocol::Tcp,
+            WorkloadPortProtocol::Udp => RuntimePortProtocol::Udp,
+        },
     }
 }
 

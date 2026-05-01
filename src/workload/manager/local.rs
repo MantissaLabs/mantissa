@@ -141,6 +141,7 @@ impl WorkloadManager {
                 secret_files: plan.secret_files.clone(),
                 volumes: plan.volumes.clone(),
                 networks: plan.networks.clone(),
+                ports: plan.ports.clone(),
                 owner: plan.owner.clone(),
                 lease_id: None,
                 lease_coordinator_node_id: None,
@@ -260,6 +261,7 @@ impl WorkloadManager {
                     secret_files: &plan.secret_files,
                     volume_mounts: &plan.volumes,
                     networks: &plan.networks,
+                    ports: &plan.ports,
                     owner: plan.owner.as_ref(),
                 })
                 .await?;
@@ -343,6 +345,7 @@ impl WorkloadManager {
                 secret_files: plan.secret_files.clone(),
                 volumes: plan.volumes.clone(),
                 networks: plan.networks.clone(),
+                ports: plan.ports.clone(),
                 owner: plan.owner.clone(),
                 lease_id: None,
                 lease_coordinator_node_id: None,

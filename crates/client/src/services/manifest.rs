@@ -8,8 +8,9 @@ use uuid::Uuid;
 
 use crate::workload_submit::{
     ManifestNetworkSpec, RequestedNetworkSpec, resolve_requested_networks,
-    validate_declared_networks,
+    validate_declared_networks, validate_manifest_ports,
 };
+pub use crate::workload_submit::{ManifestPortBinding, ManifestPortProtocol};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -366,6 +367,8 @@ pub struct TaskTemplateSpec {
     #[serde(default)]
     pub networks: Vec<String>,
     #[serde(default)]
+    pub ports: Vec<ManifestPortBinding>,
+    #[serde(default)]
     pub readiness: Option<ReadinessProbe>,
     #[serde(default)]
     pub liveness: Option<LivenessProbe>,
@@ -531,6 +534,7 @@ impl ServiceManifest {
             }
 
             validate_template_placement(template)?;
+            validate_manifest_ports(&template.ports, &format!("template '{}'", template.name))?;
 
             if let Some(readiness) = template.readiness.as_ref()
                 && readiness.port == 0
@@ -1350,6 +1354,52 @@ mod tests {
     }
 
     #[test]
+    fn manifest_parses_static_host_port_bindings() {
+        let raw = r#"(
+            name: "demo",
+            tasks: [(
+                name: "api",
+                image: "ghcr.io/demo/api:latest",
+                ports: [(
+                    name: "http",
+                    target: 8080,
+                    host: 18080,
+                    protocol: tcp,
+                )],
+            )],
+        )"#;
+        let manifest: ServiceManifest = ron::from_str(raw).expect("parse manifest");
+
+        manifest.validate().expect("valid host port manifest");
+        let port = &manifest.task_templates[0].ports[0];
+        assert_eq!(port.name, "http");
+        assert_eq!(port.target, 8080);
+        assert_eq!(port.host, 18080);
+        assert_eq!(port.host_ip, "0.0.0.0");
+    }
+
+    #[test]
+    fn manifest_rejects_conflicting_static_host_ports() {
+        let raw = r#"(
+            name: "demo",
+            tasks: [(
+                name: "api",
+                image: "ghcr.io/demo/api:latest",
+                ports: [
+                    (name: "public", target: 8080, host: 18080, host_ip: "0.0.0.0"),
+                    (name: "local", target: 8081, host: 18080, host_ip: "127.0.0.1"),
+                ],
+            )],
+        )"#;
+        let manifest: ServiceManifest = ron::from_str(raw).expect("parse manifest");
+
+        let error = manifest
+            .validate()
+            .expect_err("wildcard host port conflict must fail");
+        assert!(error.to_string().contains("both reserve 18080/tcp"));
+    }
+
+    #[test]
     fn manifest_rejects_empty_pre_stop_command() {
         let manifest = ServiceManifest {
             name: "demo".into(),
@@ -1369,6 +1419,7 @@ mod tests {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
+                ports: Vec::new(),
                 readiness: None,
                 liveness: None,
                 public_port: None,
@@ -1406,6 +1457,7 @@ mod tests {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
+                ports: Vec::new(),
                 readiness: Some(ReadinessProbe {
                     kind: ReadinessKind::Http,
                     port: 8080,
@@ -1452,6 +1504,7 @@ mod tests {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
+                ports: Vec::new(),
                 readiness: None,
                 liveness: Some(LivenessProbe {
                     kind: LivenessKind::Exec,
@@ -1504,6 +1557,7 @@ mod tests {
                     read_only: false,
                 }],
                 networks: Vec::new(),
+                ports: Vec::new(),
                 readiness: None,
                 liveness: None,
                 public_port: None,
@@ -1543,6 +1597,7 @@ mod tests {
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
+                ports: Vec::new(),
                 readiness: None,
                 liveness: None,
                 public_port: None,
@@ -1600,6 +1655,7 @@ mod tests {
                     read_only: false,
                 }],
                 networks: Vec::new(),
+                ports: Vec::new(),
                 readiness: None,
                 liveness: None,
                 public_port: None,
@@ -1640,6 +1696,7 @@ mod tests {
                     secret_files: Vec::new(),
                     volumes: Vec::new(),
                     networks: Vec::new(),
+                    ports: Vec::new(),
                     readiness: None,
                     liveness: None,
                     public_port: None,
@@ -1660,6 +1717,7 @@ mod tests {
                     secret_files: Vec::new(),
                     volumes: Vec::new(),
                     networks: Vec::new(),
+                    ports: Vec::new(),
                     readiness: None,
                     liveness: None,
                     public_port: None,
