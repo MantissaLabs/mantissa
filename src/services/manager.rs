@@ -22,6 +22,7 @@ use crate::workload::manager::{
     WorkloadStartRequest, workload_start_error_requires_service_requeue,
 };
 use crate::workload::model::{WorkloadPhase, WorkloadSpec, WorkloadVolumeMount};
+use crate::workload::types::{WorkloadPortBinding, WorkloadPortProtocol};
 use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -305,6 +306,7 @@ impl ServiceController {
     ) -> anyhow::Result<ServiceDeploymentSubmission> {
         let manifest_name = manifest_name.into();
         let service_name = service_name.into();
+        let service_id = compute_service_id(&service_name);
         build_template_dependency_stages(&task_templates).map_err(|err| {
             anyhow!(
                 "invalid task dependency graph for service '{}': {err}",
@@ -314,7 +316,21 @@ impl ServiceController {
         self.ensure_network_contracts(&service_name, task_templates.as_slice())?;
         let desired_public_claims =
             collect_public_port_claims(&service_name, task_templates.as_slice())?;
-        let service_id = compute_service_id(&service_name);
+        ensure_public_ports_do_not_overlap_template_host_ports(
+            &service_name,
+            desired_public_claims.as_slice(),
+            task_templates.as_slice(),
+        )?;
+        self.ensure_public_ports_do_not_overlap_active_host_ports(
+            &service_name,
+            desired_public_claims.as_slice(),
+        )
+        .await?;
+        self.ensure_host_ports_do_not_overlap_existing_public_ports(
+            service_id,
+            &service_name,
+            task_templates.as_slice(),
+        )?;
 
         if let Some(existing) = self.registry.get(service_id)? {
             match existing.status() {
@@ -502,6 +518,96 @@ impl ServiceController {
                         existing.service_name,
                         conflict.template_name
                     ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validates that desired public endpoints do not overlap active workload host ports.
+    async fn ensure_public_ports_do_not_overlap_active_host_ports(
+        &self,
+        service_name: &str,
+        desired_claims: &[PublicPortClaim],
+    ) -> anyhow::Result<()> {
+        if desired_claims.is_empty() {
+            return Ok(());
+        }
+
+        let workloads = self
+            .workload_manager
+            .list_workloads(&TaskStateFilter::active_only())
+            .await?;
+        for workload in workloads {
+            for port in &workload.ports {
+                if let Some(public_claim) = desired_claims
+                    .iter()
+                    .find(|claim| public_claim_conflicts_host_port(claim, port))
+                {
+                    return Err(anyhow!(
+                        "service '{service_name}' template '{}' cannot claim public port {} because active workload '{}' ({}) already reserves host port {}/{}",
+                        public_claim.template_name,
+                        public_claim.selector,
+                        workload.name,
+                        workload.id,
+                        port.host_port,
+                        workload_port_protocol_label(port.protocol)
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validates that desired static host ports do not overlap existing public endpoints.
+    fn ensure_host_ports_do_not_overlap_existing_public_ports(
+        &self,
+        service_id: Uuid,
+        service_name: &str,
+        task_templates: &[TaskTemplateSpecValue],
+    ) -> anyhow::Result<()> {
+        let has_host_ports = task_templates
+            .iter()
+            .any(|template| !template.execution.ports.is_empty());
+        if !has_host_ports {
+            return Ok(());
+        }
+
+        let existing_specs = self.registry.list()?;
+        for existing in existing_specs {
+            if existing.id == service_id || !service_reserves_public_ports(existing.status()) {
+                continue;
+            }
+
+            let existing_claims = collect_public_port_claims(
+                &existing.service_name,
+                existing.task_templates.as_slice(),
+            )
+            .map_err(|err| {
+                anyhow!(
+                    "existing service '{}' has invalid public endpoint metadata: {err}",
+                    existing.service_name
+                )
+            })?;
+
+            for template in task_templates {
+                for port in &template.execution.ports {
+                    if let Some(public_claim) = existing_claims
+                        .iter()
+                        .find(|claim| public_claim_conflicts_host_port(claim, port))
+                    {
+                        return Err(anyhow!(
+                            "service '{service_name}' template '{}' cannot reserve host port {}/{} because service '{}' template '{}' already claims public port {}",
+                            template.name,
+                            port.host_port,
+                            workload_port_protocol_label(port.protocol),
+                            existing.service_name,
+                            public_claim.template_name,
+                            public_claim.selector
+                        ));
+                    }
                 }
             }
         }
@@ -2470,6 +2576,55 @@ fn collect_public_port_claims(
     Ok(claims)
 }
 
+/// Validates that one service does not declare overlapping public and static host ports.
+fn ensure_public_ports_do_not_overlap_template_host_ports(
+    service_name: &str,
+    public_claims: &[PublicPortClaim],
+    task_templates: &[TaskTemplateSpecValue],
+) -> anyhow::Result<()> {
+    if public_claims.is_empty() {
+        return Ok(());
+    }
+
+    for template in task_templates {
+        for port in &template.execution.ports {
+            if let Some(public_claim) = public_claims
+                .iter()
+                .find(|claim| public_claim_conflicts_host_port(claim, port))
+            {
+                return Err(anyhow!(
+                    "service '{service_name}' template '{}' cannot reserve host port {}/{} because template '{}' already claims public port {}",
+                    template.name,
+                    port.host_port,
+                    workload_port_protocol_label(port.protocol),
+                    public_claim.template_name,
+                    public_claim.selector
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns true when one public endpoint and one workload host port share a socket namespace.
+fn public_claim_conflicts_host_port(claim: &PublicPortClaim, port: &WorkloadPortBinding) -> bool {
+    claim.selector.port == port.host_port
+        && public_protocol_conflicts_workload(claim.selector.protocol, port.protocol)
+}
+
+/// Returns true when one service public protocol includes one workload transport protocol.
+fn public_protocol_conflicts_workload(
+    public: ServicePortProtocol,
+    workload: WorkloadPortProtocol,
+) -> bool {
+    match public {
+        ServicePortProtocol::Tcp => workload == WorkloadPortProtocol::Tcp,
+        ServicePortProtocol::Udp => workload == WorkloadPortProtocol::Udp,
+        ServicePortProtocol::TcpUdp => true,
+    }
+}
+
 /// Returns whether a service state still reserves its declared public endpoint claims.
 fn service_reserves_public_ports(status: ServiceStatus) -> bool {
     !matches!(status, ServiceStatus::Stopping | ServiceStatus::Stopped)
@@ -2481,6 +2636,14 @@ fn public_port_protocol_label(protocol: ServicePortProtocol) -> &'static str {
         ServicePortProtocol::Tcp => "tcp",
         ServicePortProtocol::Udp => "udp",
         ServicePortProtocol::TcpUdp => "tcp+udp",
+    }
+}
+
+/// Renders one workload host-port protocol label for conflict messages.
+fn workload_port_protocol_label(protocol: WorkloadPortProtocol) -> &'static str {
+    match protocol {
+        WorkloadPortProtocol::Tcp => "tcp",
+        WorkloadPortProtocol::Udp => "udp",
     }
 }
 
@@ -3245,6 +3408,34 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("must attach to exactly one network when public_port is set")
+        );
+    }
+
+    /// Public endpoints and static host ports share one node socket ownership namespace.
+    #[test]
+    fn public_port_claims_reject_template_host_port_overlap() {
+        let mut template =
+            make_public_template("api", 1, Some(18080), Some(ServicePortProtocol::Tcp));
+        template.execution.ports = vec![WorkloadPortBinding {
+            name: "http".to_string(),
+            target_port: 8080,
+            host_port: 18080,
+            host_ip: "127.0.0.1".to_string(),
+            protocol: WorkloadPortProtocol::Tcp,
+        }];
+        let claims = collect_public_port_claims("demo-service", &[template.clone()])
+            .expect("collect public claims");
+
+        let err = ensure_public_ports_do_not_overlap_template_host_ports(
+            "demo-service",
+            claims.as_slice(),
+            &[template],
+        )
+        .expect_err("host port should conflict with public port");
+
+        assert!(
+            err.to_string()
+                .contains("already claims public port 18080/tcp")
         );
     }
 

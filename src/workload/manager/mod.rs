@@ -11,6 +11,7 @@ use crate::runtime::types::{
 use crate::scheduler::{Scheduler, SlotId};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
+use crate::services::registry::ServiceRegistry;
 use crate::store::workload_store::WorkloadStore;
 use crate::volumes::VolumeRegistry;
 use crate::workload::model::{
@@ -212,6 +213,8 @@ struct WorkloadManagerCore {
     rx: Receiver<Message>,
     // Cluster registry used for peer metadata and scheduling/drain lookups.
     registry: Registry,
+    // Service registry used to reserve public NodePort sockets during placement.
+    service_registry: ServiceRegistry,
     // Distributed scheduler handle used for slot snapshots/reservations.
     scheduler: Rc<Scheduler>,
 }
@@ -359,6 +362,7 @@ pub struct WorkloadManagerConfig {
     pub scheduler: Rc<Scheduler>,
     pub runtime_set: RuntimeSet,
     pub registry: Registry,
+    pub service_registry: ServiceRegistry,
     pub network_registry: NetworkRegistry,
     pub volume_registry: VolumeRegistry,
     pub secret_registry: SecretRegistry,
@@ -381,6 +385,7 @@ impl WorkloadManager {
             scheduler,
             runtime_set,
             registry,
+            service_registry,
             network_registry,
             volume_registry,
             secret_registry,
@@ -415,6 +420,7 @@ impl WorkloadManager {
                 tx,
                 rx,
                 registry,
+                service_registry,
                 scheduler,
             },
             runtime: WorkloadManagerRuntime {

@@ -530,6 +530,7 @@ async fn build_runtime_components(
         scheduler: scheduler.clone(),
         runtime_set,
         registry: registry.clone(),
+        service_registry: service_registry.clone(),
         network_registry: network_registry.clone(),
         volume_registry: volume_registry.clone(),
         secret_registry: secret_registry.clone(),

@@ -18,6 +18,7 @@ use mantissa::secrets::gossip::SecretReplicator;
 use mantissa::secrets::registry::SecretRegistry;
 use mantissa::secrets::service::SecretsService;
 use mantissa::secrets::types::{SecretMetadata, SecretValue, SecretVersion, compute_secret_id};
+use mantissa::services::registry::ServiceRegistry;
 use mantissa::store::local::{LocalSessionStore, SecretMasterStore};
 use mantissa::store::network_store::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
@@ -25,6 +26,7 @@ use mantissa::store::network_store::{
 use mantissa::store::peer_store::open_peers_store;
 use mantissa::store::scheduler_store::open_scheduler_store;
 use mantissa::store::secret_store::open_secret_store;
+use mantissa::store::service_store::open_service_store;
 use mantissa::store::volume_store::{open_volume_node_store, open_volume_spec_store};
 use mantissa::store::workload_store::open_workload_store;
 use mantissa::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
@@ -245,6 +247,17 @@ async fn setup_workload_manager() -> TestHarness {
         .rebuild_mst_from_disk()
         .await
         .expect("rebuild workload store");
+    let service_dir = tempdir().expect("service tempdir");
+    let service_path = service_dir
+        .path()
+        .join(format!("service-{}.redb", Uuid::new_v4()));
+    let service_db = Arc::new(redb::Database::create(service_path).expect("create service db"));
+    let service_store = open_service_store(service_db.clone(), actor).expect("open service store");
+    service_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild service store");
+    let service_registry = ServiceRegistry::new(service_store);
 
     let network_dir = tempdir().expect("network tempdir");
     let network_path = network_dir
@@ -342,6 +355,7 @@ async fn setup_workload_manager() -> TestHarness {
         scheduler: scheduler.clone(),
         runtime_set: RuntimeSet::singleton(IN_MEMORY_RUNTIME_BACKEND_KIND, runtime_backend.clone()),
         registry,
+        service_registry,
         network_registry: NetworkRegistry::new(
             network_spec_store,
             network_peer_store,

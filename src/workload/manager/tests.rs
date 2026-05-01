@@ -28,6 +28,7 @@ use crate::scheduler::digest::SchedulerDigestRegistry;
 use crate::scheduler::{SlotCapacity, SlotReservationRequest, SlotSpec, SlotState};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
+use crate::services::registry::ServiceRegistry;
 use crate::store::local::{LocalSessionStore, SecretMasterStore};
 use crate::store::network_store::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
@@ -36,6 +37,7 @@ use crate::store::peer_store::open_peers_store;
 use crate::store::scheduler_digest_store::open_scheduler_digest_store;
 use crate::store::scheduler_store::open_scheduler_store;
 use crate::store::secret_store::open_secret_store;
+use crate::store::service_store::open_service_store;
 use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
 use crate::store::workload_store::open_workload_store;
 use crate::task::types::{TaskStateFilter, TaskStateKind};
@@ -802,6 +804,13 @@ async fn setup_manager_with_forwarding(
         .rebuild_mst_from_disk()
         .await
         .expect("rebuild workload store");
+    let (service_db, _service_dir) = temp_db("services");
+    let service_store = open_service_store(service_db.clone(), actor).expect("open service store");
+    service_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild service store");
+    let service_registry = ServiceRegistry::new(service_store);
 
     let (network_db, _network_dir) = temp_db("networks");
     let network_spec_store =
@@ -895,6 +904,7 @@ async fn setup_manager_with_forwarding(
         scheduler: scheduler.clone(),
         runtime_set: RuntimeSet::singleton("mock", mock_cm.clone()),
         registry,
+        service_registry,
         network_registry: network_registry.clone(),
         volume_registry,
         secret_registry,

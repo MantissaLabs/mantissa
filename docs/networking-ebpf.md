@@ -207,6 +207,9 @@ The scheduler avoids placing two active workloads with conflicting host port
 bindings on the same node. This is intentionally node-local: replicated
 services that declare a host port can still spread across nodes, but two
 replicas cannot land on the same node if they reserve the same local socket.
+Static host ports also share the ownership namespace with `public_port`
+NodePort endpoints, so Mantissa rejects or avoids placements that would make a
+host-port binding overlap a cluster public endpoint.
 Dynamic host ports are not part of the current contract because Mantissa does
 not yet expose an allocation-reporting field for operators or dependent
 workloads.

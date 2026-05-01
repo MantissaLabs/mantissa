@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
@@ -19,6 +19,7 @@ use crate::scheduler::placement::{
 use crate::scheduler::{
     GpuDeviceReservation, GpuDeviceState, SchedulerSnapshot, SlotCapacity, SlotId, SlotState,
 };
+use crate::services::types::{ServicePortProtocol, ServiceSpecValue, ServiceStatus};
 use crate::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadEnvironmentVariable as TaskEnvironmentVariable,
     WorkloadOwner, WorkloadPhase, WorkloadSecretFile, WorkloadValue,
@@ -79,6 +80,11 @@ struct LocalPlacementPrereqs<'a> {
     runtime_support: &'a RuntimeSupportProfile,
     gpu_ready: bool,
     gpu_reason: Option<&'a str>,
+}
+
+struct HostPortReservations<'a> {
+    occupied: &'a HashMap<Uuid, Vec<HostPortKey>>,
+    public: &'a [HostPortKey],
 }
 
 /// Normalized node-local host port key used to detect local socket conflicts.
@@ -811,6 +817,35 @@ fn record_host_ports(occupied: &mut Vec<HostPortKey>, ports: &[WorkloadPortBindi
     occupied.extend(ports.iter().filter_map(host_port_key));
 }
 
+/// Appends already-normalized host port keys while keeping the reservation list stable.
+fn record_host_port_keys(occupied: &mut Vec<HostPortKey>, keys: &[HostPortKey]) {
+    for key in keys {
+        if !occupied.contains(key) {
+            occupied.push(*key);
+        }
+    }
+}
+
+/// Appends normalized host port keys for one node in the scheduler reservation map.
+fn record_host_ports_for_node(
+    occupied: &mut HashMap<Uuid, Vec<HostPortKey>>,
+    node_id: Uuid,
+    keys: &[HostPortKey],
+) {
+    record_host_port_keys(occupied.entry(node_id).or_default(), keys);
+}
+
+/// Returns host port reservations for one node plus cluster-wide public port reservations.
+fn node_host_ports(
+    occupied: &HashMap<Uuid, Vec<HostPortKey>>,
+    node_id: Uuid,
+    public_host_ports: &[HostPortKey],
+) -> Vec<HostPortKey> {
+    let mut ports = occupied.get(&node_id).cloned().unwrap_or_default();
+    record_host_port_keys(&mut ports, public_host_ports);
+    ports
+}
+
 /// Builds the per-node host port reservations visible from the replicated workload set.
 fn build_occupied_host_ports(
     workloads: &HashMap<Uuid, WorkloadValue>,
@@ -824,6 +859,68 @@ fn build_occupied_host_ports(
         record_host_ports(entry, &workload.ports);
     }
     occupied
+}
+
+/// Builds wildcard host port reservations for public NodePort endpoints.
+fn build_public_host_ports(services: &[ServiceSpecValue]) -> Vec<HostPortKey> {
+    let mut keys = Vec::new();
+    for service in services {
+        if !service_reserves_public_ports(service.status()) {
+            continue;
+        }
+        for template in &service.task_templates {
+            let Some(port) = template.public_port() else {
+                continue;
+            };
+            for protocol in public_port_protocols(template.public_protocols()) {
+                push_public_host_port_keys(&mut keys, port, protocol);
+            }
+        }
+    }
+    keys.sort_by_key(|key| (key.host_ip, key.host_port, key.protocol));
+    keys.dedup();
+    keys
+}
+
+/// Returns true when one service status still owns its public endpoint claims.
+fn service_reserves_public_ports(status: ServiceStatus) -> bool {
+    !matches!(status, ServiceStatus::Stopping | ServiceStatus::Stopped)
+}
+
+/// Expands one service public protocol into workload-level transport protocols.
+fn public_port_protocols(protocols: Vec<ServicePortProtocol>) -> Vec<WorkloadPortProtocol> {
+    let mut expanded = Vec::new();
+    for protocol in protocols {
+        match protocol {
+            ServicePortProtocol::Tcp => expanded.push(WorkloadPortProtocol::Tcp),
+            ServicePortProtocol::Udp => expanded.push(WorkloadPortProtocol::Udp),
+            ServicePortProtocol::TcpUdp => {
+                expanded.push(WorkloadPortProtocol::Tcp);
+                expanded.push(WorkloadPortProtocol::Udp);
+            }
+        }
+    }
+    expanded.sort();
+    expanded.dedup();
+    expanded
+}
+
+/// Adds IPv4 and IPv6 wildcard reservations for one public NodePort socket.
+fn push_public_host_port_keys(
+    keys: &mut Vec<HostPortKey>,
+    host_port: u16,
+    protocol: WorkloadPortProtocol,
+) {
+    keys.push(HostPortKey {
+        host_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        host_port,
+        protocol,
+    });
+    keys.push(HostPortKey {
+        host_ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        host_port,
+        protocol,
+    });
 }
 
 /// Validates one incoming start intent host port set before it reaches placement.
@@ -1140,6 +1237,12 @@ impl WorkloadManager {
         Ok(intents)
     }
 
+    /// Collects active public NodePort reservations as scheduler-visible host port keys.
+    fn collect_public_host_ports(&self) -> Result<Vec<HostPortKey>, anyhow::Error> {
+        let services = self.core.service_registry.list()?;
+        Ok(build_public_host_ports(services.as_slice()))
+    }
+
     /// Computes the full placement assignment for a batch of tasks across local and remote nodes.
     pub(super) async fn compute_assignment(
         &self,
@@ -1165,6 +1268,12 @@ impl WorkloadManager {
         let workload_values = self.load_workload_value_index().await?;
         let mut preference_inventory = build_preference_inventory(workload_values.as_ref());
         let mut occupied_host_ports = build_occupied_host_ports(workload_values.as_ref());
+        let public_host_ports = self.collect_public_host_ports()?;
+        record_host_ports_for_node(
+            &mut occupied_host_ports,
+            self.local_node_id,
+            public_host_ports.as_slice(),
+        );
         let local_ready = readiness_map
             .get(&self.local_node_id)
             .cloned()
@@ -1195,7 +1304,10 @@ impl WorkloadManager {
             available_gpus,
             &readiness_map,
             &local_ready,
-            &occupied_host_ports,
+            HostPortReservations {
+                occupied: &occupied_host_ports,
+                public: public_host_ports.as_slice(),
+            },
             &remaining_intents,
         )?;
         if candidates.is_empty() {
@@ -1553,7 +1665,7 @@ impl WorkloadManager {
         local_gpus: Vec<GpuChoice>,
         readiness: &HashMap<Uuid, HashSet<Uuid>>,
         local_ready: &HashSet<Uuid>,
-        occupied_host_ports: &HashMap<Uuid, Vec<HostPortKey>>,
+        host_ports: HostPortReservations<'_>,
         intents: &[&StartIntent],
     ) -> Result<VecDeque<Candidate>, anyhow::Error> {
         let mut queue = VecDeque::new();
@@ -1589,7 +1701,8 @@ impl WorkloadManager {
                 local_slots,
                 local_gpus,
                 local_ready.clone(),
-                occupied_host_ports
+                host_ports
+                    .occupied
                     .get(&self.local_node_id)
                     .cloned()
                     .unwrap_or_default(),
@@ -1648,10 +1761,7 @@ impl WorkloadManager {
                 placement,
                 hint.digest.clone(),
                 hint.ready_networks.clone(),
-                occupied_host_ports
-                    .get(&hint.peer_id)
-                    .cloned()
-                    .unwrap_or_default(),
+                node_host_ports(host_ports.occupied, hint.peer_id, host_ports.public),
                 self.core
                     .registry
                     .peer_runtime_support(hint.peer_id)
@@ -2077,13 +2187,18 @@ impl WorkloadManager {
 mod tests {
     use super::{
         Candidate, CandidateCapacity, HostPortKey, StartIntent, WorkloadDemand,
-        capacity_covers_workload, digest_can_host_intent, host_ports_available,
+        build_public_host_ports, capacity_covers_workload, digest_can_host_intent,
+        host_ports_available,
     };
     use crate::runtime::types::RuntimeSupportProfile;
     use crate::scheduler::digest::SchedulerDigestValue;
     use crate::scheduler::placement::PlacementNode;
+    use crate::services::types::{
+        ServicePortProtocol, ServiceSpecValue, TaskTemplateNetworkRequirement,
+        TaskTemplateSpecValue,
+    };
     use crate::workload::model::{ExecutionPlatform, IsolationMode};
-    use crate::workload::types::{WorkloadPortBinding, WorkloadPortProtocol};
+    use crate::workload::types::{ExecutionSpec, WorkloadPortBinding, WorkloadPortProtocol};
     use std::collections::HashSet;
     use uuid::Uuid;
 
@@ -2268,6 +2383,56 @@ mod tests {
             host_port: 18080,
             protocol: WorkloadPortProtocol::Tcp,
         }];
+        let requested = vec![WorkloadPortBinding {
+            name: "http".to_string(),
+            target_port: 8080,
+            host_port: 18080,
+            host_ip: "127.0.0.1".to_string(),
+            protocol: WorkloadPortProtocol::Tcp,
+        }];
+
+        assert!(!host_ports_available(&occupied, &requested));
+    }
+
+    /// Public NodePort reservations should block matching static workload host ports.
+    #[test]
+    fn public_host_ports_block_static_host_port_requests() {
+        let service = ServiceSpecValue::new(
+            Uuid::new_v4(),
+            "demo",
+            "demo",
+            vec![TaskTemplateSpecValue {
+                name: "api".to_string(),
+                execution: ExecutionSpec {
+                    image: "ghcr.io/demo/api:latest".to_string(),
+                    command: Vec::new(),
+                    tty: false,
+                    cpu_millis: 100,
+                    memory_bytes: 64 * 1_024 * 1_024,
+                    gpu_count: 0,
+                    restart_policy: None,
+                    termination_grace_period_secs: None,
+                    pre_stop_command: None,
+                    liveness: None,
+                    env: Vec::new(),
+                    secret_files: Vec::new(),
+                    volumes: Vec::new(),
+                    networks: vec![TaskTemplateNetworkRequirement::new(
+                        "default",
+                        Uuid::new_v4(),
+                    )],
+                    ports: Vec::new(),
+                    placement: Default::default(),
+                },
+                depends_on: Vec::new(),
+                replicas: 1,
+                readiness: None,
+                public_port: Some(18080),
+                public_protocol: Some(ServicePortProtocol::TcpUdp),
+            }],
+            Vec::new(),
+        );
+        let occupied = build_public_host_ports(&[service]);
         let requested = vec![WorkloadPortBinding {
             name: "http".to_string(),
             target_port: 8080,
