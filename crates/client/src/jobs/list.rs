@@ -1,4 +1,5 @@
 use crate::config::ClientConfig;
+use crate::host_ports::render_host_ports;
 use crate::jobs::snapshot::{fetch_jobs, format_optional_uuid};
 use crate::output;
 use anyhow::Result;
@@ -18,12 +19,12 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "ID\tNAME\tIMAGE\tSTATUS\tPLATFORM\tISOLATION\tATTEMPTS\tACTIVE WORKLOAD\tSTARTED\tCOMPLETED\tEXIT"
+        "ID\tNAME\tIMAGE\tSTATUS\tPLATFORM\tISOLATION\tHOST PORTS\tATTEMPTS\tACTIVE WORKLOAD\tSTARTED\tCOMPLETED\tEXIT"
     )?;
     for row in rows {
         writeln!(
             &mut tw,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.id,
             row.name,
             row.image,
@@ -33,6 +34,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
                 || row.isolation_mode.clone(),
                 |profile| format!("{} ({profile})", row.isolation_mode),
             ),
+            render_host_ports(&row.ports),
             row.attempts_started,
             format_optional_uuid(row.active_workload_id),
             row.started_at.unwrap_or_else(|| "-".to_string()),

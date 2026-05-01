@@ -6,9 +6,10 @@ use crate::runtime::types::{
 use crate::task::types::{TaskSpec, TaskStateFilter, TaskStateKind};
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
-    decode_env_vars, decode_secret_files, decode_task_liveness_probe, decode_task_restart_policy,
-    decode_volume_mounts, encode_env_vars, encode_secret_files, encode_task_liveness_probe,
-    encode_task_restart_policy, encode_volume_mounts,
+    decode_env_vars, decode_port_bindings, decode_secret_files, decode_task_liveness_probe,
+    decode_task_restart_policy, decode_volume_mounts, encode_env_vars, encode_port_bindings,
+    encode_secret_files, encode_task_liveness_probe, encode_task_restart_policy,
+    encode_volume_mounts,
 };
 use crate::workload::manager::{WorkloadManager, WorkloadStartRequest, match_task_id_prefix};
 use crate::workload::model::{ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec};
@@ -146,6 +147,9 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
         networks_builder.set(idx as u32, network_id.as_bytes());
     }
 
+    let mut ports_builder = builder.reborrow().init_ports(spec.ports.len() as u32);
+    encode_port_bindings(&mut ports_builder, &spec.ports);
+
     let mut files_builder = builder
         .reborrow()
         .init_secret_files(spec.secret_files.len() as u32);
@@ -255,6 +259,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         bytes.copy_from_slice(data);
         networks.push(Uuid::from_bytes(bytes));
     }
+    let ports = decode_port_bindings(reader.get_ports()?)?;
 
     let updated_at = if updated_at.is_empty() {
         created_at.clone()
@@ -300,7 +305,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         secret_files,
         volumes,
         networks,
-        ports: Vec::new(),
+        ports,
         lease_id,
         lease_coordinator_node_id,
         task_epoch,

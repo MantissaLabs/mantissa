@@ -275,6 +275,9 @@ struct TaskSpec {
 
   isolationProfile @33 :Text;
   # Optional named isolation profile used when the task requests sandboxed execution.
+
+  ports @34 :List(WorkloadSchema.PortBinding);
+  # Node-local host port bindings requested by the task.
 }
 
 struct TaskStartRequest {

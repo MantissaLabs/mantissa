@@ -1,5 +1,6 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::host_ports::{HostPortView, decode_host_ports, render_host_ports};
 use crate::networks;
 use crate::networks::{NetworkAttachment, NetworkAttachmentState, NetworkSummary};
 use crate::output;
@@ -54,7 +55,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "SERVICE\tSTATUS\tROLLOUT\tREASON\tTASK TEMPLATES\tPUBLIC\tREPLICAS\tUPDATED\tID"
+        "SERVICE\tSTATUS\tROLLOUT\tREASON\tTASK TEMPLATES\tPUBLIC\tHOST PORTS\tREPLICAS\tUPDATED\tID"
     )?;
 
     for row in display_rows {
@@ -76,13 +77,14 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
 
         writeln!(
             &mut tw,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.service_name,
             row.status,
             row.rollout_summary(),
             row.rollout_reason_summary(),
             templates_summary,
             public_summary,
+            row.host_ports_summary(),
             row.replica_ids.len(),
             row.updated_at,
             row.id,
@@ -169,6 +171,20 @@ impl ServiceRow {
         }
         self.rollout.reason_summary()
     }
+
+    /// Returns every static node-local host port declared by the service templates.
+    pub(crate) fn host_ports_summary(&self) -> String {
+        let summaries: Vec<String> = self
+            .task_templates
+            .iter()
+            .filter_map(TaskTemplateRow::host_ports_summary)
+            .collect();
+        if summaries.is_empty() {
+            "-".to_string()
+        } else {
+            summaries.join(", ")
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +197,7 @@ pub struct TaskTemplateRow {
     pub public_port: Option<u16>,
     pub readiness_port: Option<u16>,
     pub liveness_port: Option<u16>,
+    pub(crate) ports: Vec<HostPortView>,
 }
 
 impl TaskTemplateRow {
@@ -236,6 +253,7 @@ impl TaskTemplateRow {
             public_port,
             readiness_port,
             liveness_port,
+            ports: decode_host_ports(reader.get_ports()?)?,
         })
     }
 
@@ -249,6 +267,12 @@ impl TaskTemplateRow {
         self.readiness_port
             .or(self.liveness_port)
             .or(self.public_port)
+    }
+
+    /// Returns the node-local host ports declared by this template.
+    fn host_ports_summary(&self) -> Option<String> {
+        (!self.ports.is_empty())
+            .then(|| format!("{}: {}", self.name, render_host_ports(&self.ports)))
     }
 }
 
@@ -700,6 +724,18 @@ mod tests {
             public_port,
             readiness_port,
             liveness_port,
+            ports: Vec::new(),
+        }
+    }
+
+    /// Builds one decoded host-port row for service-list summary tests.
+    fn test_host_port(name: &str, host_port: u16) -> HostPortView {
+        HostPortView {
+            name: name.to_string(),
+            target_port: 8080,
+            host_port,
+            host_ip: "0.0.0.0".to_string(),
+            protocol: crate::host_ports::HostPortProtocolView::Tcp,
         }
     }
 
@@ -794,6 +830,20 @@ mod tests {
         let template = test_template(Some(8001), None, None);
 
         assert_eq!(template.public_target_port(), Some(8001));
+    }
+
+    #[test]
+    /// Includes static host ports in the service summary so operators can find node-local exposure.
+    fn service_host_ports_summary_includes_template_ports() {
+        let mut row = test_row(None, None);
+        let mut template = test_template(None, None, None);
+        template.ports = vec![test_host_port("http", 18080)];
+        row.task_templates = vec![template];
+
+        assert_eq!(
+            row.host_ports_summary(),
+            "backend: http 0.0.0.0:18080->8080/tcp"
+        );
     }
 
     #[test]

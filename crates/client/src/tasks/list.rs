@@ -1,5 +1,6 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::host_ports::{HostPortView, decode_host_ports, render_host_ports};
 use crate::output;
 use crate::tasks::{uuid_short, uuid_to_string};
 use anyhow::Result;
@@ -14,6 +15,7 @@ const SLOT_MAX_CHARS: usize = 20;
 const NODE_MAX_CHARS: usize = 28;
 const COMMAND_MAX_CHARS: usize = 64;
 const CREATED_MAX_CHARS: usize = 30;
+const HOST_PORTS_MAX_CHARS: usize = 48;
 
 /// Output presets for `mantissa tasks list`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -80,13 +82,13 @@ pub async fn list(
         TasksListOutput::Table => {
             writeln!(
                 &mut tw,
-                "ID\tNAME\tIMAGE\tSLOT\tCPU(m)\tMEM(MiB)\tGPU\tSTATUS\tNODE"
+                "ID\tNAME\tIMAGE\tSLOT\tCPU(m)\tMEM(MiB)\tGPU\tSTATUS\tNODE\tHOST PORTS"
             )?;
         }
         TasksListOutput::Wide => {
             writeln!(
                 &mut tw,
-                "ID\tNAME\tIMAGE\tSLOT\tCPU(m)\tMEM(MiB)\tGPU\tSTATUS\tNODE\tCREATED\tCOMMAND"
+                "ID\tNAME\tIMAGE\tSLOT\tCPU(m)\tMEM(MiB)\tGPU\tSTATUS\tNODE\tHOST PORTS\tCREATED\tCOMMAND"
             )?;
         }
     }
@@ -97,7 +99,7 @@ pub async fn list(
             TasksListOutput::Table => {
                 writeln!(
                     &mut tw,
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     rendered.id,
                     rendered.name,
                     rendered.image,
@@ -107,12 +109,13 @@ pub async fn list(
                     rendered.gpu_count,
                     rendered.state,
                     rendered.node,
+                    rendered.host_ports,
                 )?;
             }
             TasksListOutput::Wide => {
                 writeln!(
                     &mut tw,
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     rendered.id,
                     rendered.name,
                     rendered.image,
@@ -122,6 +125,7 @@ pub async fn list(
                     rendered.gpu_count,
                     rendered.state,
                     rendered.node,
+                    rendered.host_ports,
                     rendered.created_at,
                     rendered.command,
                 )?;
@@ -146,6 +150,7 @@ struct TaskRow {
     gpu_count: u32,
     command: String,
     node: String,
+    ports: Vec<HostPortView>,
     state: String,
     created_at: String,
 }
@@ -160,6 +165,7 @@ struct RenderedTaskRow {
     gpu_count: u32,
     command: String,
     node: String,
+    host_ports: String,
     state: String,
     created_at: String,
 }
@@ -177,6 +183,11 @@ impl TaskRow {
             gpu_count: self.gpu_count,
             command: truncate_field(&self.command, COMMAND_MAX_CHARS, no_trunc),
             node: truncate_field(&self.node, NODE_MAX_CHARS, no_trunc),
+            host_ports: truncate_field(
+                &render_host_ports(&self.ports),
+                HOST_PORTS_MAX_CHARS,
+                no_trunc,
+            ),
             state: self.state.clone(),
             created_at: truncate_field(&self.created_at, CREATED_MAX_CHARS, no_trunc),
         }
@@ -232,6 +243,7 @@ impl TaskRow {
                 command.join(" ")
             },
             node,
+            ports: decode_host_ports(spec.get_ports()?)?,
             state,
             created_at,
         })
@@ -299,7 +311,8 @@ impl From<TasksListState> for TaskStateFilter {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_task_id, truncate_field};
+    use super::{TaskRow, render_task_id, truncate_field};
+    use crate::host_ports::{HostPortProtocolView, HostPortView};
 
     #[test]
     fn render_task_id_compacts_uuid_prefix_by_default() {
@@ -323,5 +336,31 @@ mod tests {
     fn truncate_field_returns_input_when_no_trunc_enabled() {
         let rendered = truncate_field("0123456789abcdef", 10, true);
         assert_eq!(rendered, "0123456789abcdef");
+    }
+
+    #[test]
+    fn render_task_row_includes_host_ports() {
+        let row = TaskRow {
+            id: "a911bc95-fe38-4509-8c6c-5edde24dd5e4".to_string(),
+            name: "api".to_string(),
+            image: "demo/api:latest".to_string(),
+            slot: "1".to_string(),
+            cpu_millis: 100,
+            memory_mib: 64,
+            gpu_count: 0,
+            command: "-".to_string(),
+            node: "node-a".to_string(),
+            ports: vec![HostPortView {
+                name: "http".to_string(),
+                target_port: 8080,
+                host_port: 18080,
+                host_ip: "0.0.0.0".to_string(),
+                protocol: HostPortProtocolView::Tcp,
+            }],
+            state: "running".to_string(),
+            created_at: "2026-03-12T00:00:00Z".to_string(),
+        };
+
+        assert_eq!(row.render(false).host_ports, "http 0.0.0.0:18080->8080/tcp");
     }
 }

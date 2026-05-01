@@ -64,8 +64,12 @@ fn render_rollout_status(row: &ServiceRow) -> String {
         .unwrap_or("-");
 
     format!(
-        "service: {}\nid: {}\nstatus: {}\nstatus detail: {status_detail}\nrollout outcome: {outcome}\nrollout phase: {phase}\nrollout progress: {progress}\nrollout failures: {failures}\nlast error: {last_error}\nupdated: {}",
-        row.service_name, row.id, row.status, row.updated_at,
+        "service: {}\nid: {}\nstatus: {}\nstatus detail: {status_detail}\nhost ports: {}\nrollout outcome: {outcome}\nrollout phase: {phase}\nrollout progress: {progress}\nrollout failures: {failures}\nlast error: {last_error}\nupdated: {}",
+        row.service_name,
+        row.id,
+        row.status,
+        row.host_ports_summary(),
+        row.updated_at,
     )
 }
 
@@ -121,6 +125,8 @@ fn rollout_failures_label(rollout: &ServiceRolloutRow) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_ports::{HostPortProtocolView, HostPortView};
+    use crate::services::list::TaskTemplateRow;
 
     /// Builds a minimal service row so helper behaviors can be unit-tested.
     fn test_row(
@@ -221,5 +227,38 @@ mod tests {
 
         let rendered = render_rollout_status(&row);
         assert!(rendered.contains("status detail: waiting for backend to publish traffic"));
+    }
+
+    #[test]
+    /// Ensures rollout status includes node-local host ports for the selected service.
+    fn render_rollout_status_includes_host_ports() {
+        let mut row = test_row(
+            ServiceStatusRow::Running,
+            ServiceRolloutPhaseRow::Idle,
+            0,
+            3,
+            None,
+            None,
+        );
+        row.task_templates = vec![TaskTemplateRow {
+            name: "api".to_string(),
+            image: "demo/api:latest".to_string(),
+            command: Vec::new(),
+            replicas: 1,
+            networks: Vec::new(),
+            public_port: None,
+            readiness_port: None,
+            liveness_port: None,
+            ports: vec![HostPortView {
+                name: "http".to_string(),
+                target_port: 8080,
+                host_port: 18080,
+                host_ip: "0.0.0.0".to_string(),
+                protocol: HostPortProtocolView::Tcp,
+            }],
+        }];
+
+        let rendered = render_rollout_status(&row);
+        assert!(rendered.contains("host ports: api: http 0.0.0.0:18080->8080/tcp"));
     }
 }

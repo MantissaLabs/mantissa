@@ -5,6 +5,7 @@ pub mod clusters;
 pub mod config;
 pub mod connection;
 mod errors;
+mod host_ports;
 pub mod jobs;
 pub mod networks;
 pub mod node;

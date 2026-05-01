@@ -1,5 +1,6 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::host_ports::{HostPortView, decode_host_ports, render_host_ports};
 use crate::tasks::uuid_to_string;
 use anyhow::Result;
 use capnp::Error as CapnpError;
@@ -65,6 +66,7 @@ pub struct JobSnapshotView {
     pub cpu_millis: u64,
     pub memory_bytes: u64,
     pub gpu_count: u32,
+    pub(crate) ports: Vec<HostPortView>,
     pub updated_at: String,
     pub created_at: String,
     pub started_at: Option<String>,
@@ -92,6 +94,8 @@ impl JobSnapshotView {
             command.push(arg?.to_str()?.to_string());
         }
 
+        let ports = decode_host_ports(execution.get_ports()?)?;
+
         Ok(Self {
             id: read_uuid(reader.get_id()?)?,
             name: reader.get_name()?.to_str()?.to_string(),
@@ -100,6 +104,7 @@ impl JobSnapshotView {
             cpu_millis: execution.get_cpu_millis(),
             memory_bytes: execution.get_memory_bytes(),
             gpu_count: execution.get_gpu_count(),
+            ports,
             updated_at: reader.get_updated_at()?.to_str()?.to_string(),
             created_at: reader.get_created_at()?.to_str()?.to_string(),
             started_at: read_optional_text(reader.get_started_at()?),
@@ -298,6 +303,11 @@ pub fn render_job_snapshot(snapshot: &JobSnapshotView) -> Result<String> {
     writeln!(&mut tw, "cpu (m)\t{}", snapshot.cpu_millis)?;
     writeln!(&mut tw, "memory (bytes)\t{}", snapshot.memory_bytes)?;
     writeln!(&mut tw, "gpu count\t{}", snapshot.gpu_count)?;
+    writeln!(
+        &mut tw,
+        "host ports\t{}",
+        render_host_ports(&snapshot.ports)
+    )?;
     writeln!(
         &mut tw,
         "execution platform\t{}",
