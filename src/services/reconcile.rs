@@ -134,8 +134,81 @@ fn template_attributes_changed(
         || current.secret_files != desired.secret_files
         || current.volumes != desired.volumes
         || current.networks != desired.networks
+        || current.ports != desired.ports
         || current.readiness != desired.readiness
         || current.liveness != desired.liveness
         || current.public_port != desired.public_port
         || current.public_protocol != desired.public_protocol
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::types::TaskTemplateNetworkRequirement;
+    use crate::workload::types::{ExecutionSpec, WorkloadPortBinding, WorkloadPortProtocol};
+
+    /// Builds one minimal task template for service reconciliation tests.
+    fn template(name: &str) -> TaskTemplateSpecValue {
+        TaskTemplateSpecValue {
+            name: name.to_string(),
+            execution: ExecutionSpec {
+                image: "ghcr.io/demo/api:latest".to_string(),
+                command: Vec::new(),
+                tty: false,
+                cpu_millis: 100,
+                memory_bytes: 64 * 1_024 * 1_024,
+                gpu_count: 0,
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                liveness: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: vec![TaskTemplateNetworkRequirement::new(
+                    "default",
+                    Uuid::new_v4(),
+                )],
+                ports: Vec::new(),
+                placement: Default::default(),
+            },
+            depends_on: Vec::new(),
+            replicas: 1,
+            readiness: None,
+            public_port: None,
+            public_protocol: None,
+        }
+    }
+
+    /// Changing static host ports should replace existing service replicas.
+    #[test]
+    fn host_port_changes_replace_service_replica() {
+        let current = template("api");
+        let mut desired = current.clone();
+        desired.execution.ports = vec![WorkloadPortBinding {
+            name: "http".to_string(),
+            target_port: 8080,
+            host_port: 18080,
+            host_ip: "0.0.0.0".to_string(),
+            protocol: WorkloadPortProtocol::Tcp,
+        }];
+        let previous_task = Uuid::new_v4();
+
+        let plan = compute_change_plan(
+            &[current],
+            &[desired],
+            vec![ServiceReplicaAssignment {
+                task_id: previous_task,
+                template: "api".to_string(),
+                replica: 1,
+            }],
+        );
+
+        assert_eq!(plan.retain.len(), 0);
+        assert_eq!(plan.replace.len(), 1);
+        assert_eq!(
+            plan.replace[0].previous.as_ref().map(|prior| prior.task_id),
+            Some(previous_task)
+        );
+    }
 }

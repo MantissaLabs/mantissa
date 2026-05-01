@@ -29,6 +29,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use health::{HealthMonitor, Status as HealthStatus};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
@@ -2623,6 +2624,43 @@ fn public_protocol_conflicts_workload(
         ServicePortProtocol::Udp => workload == WorkloadPortProtocol::Udp,
         ServicePortProtocol::TcpUdp => true,
     }
+}
+
+/// Returns true when two workload host port bindings contend for the same local socket.
+fn workload_host_ports_conflict(left: &WorkloadPortBinding, right: &WorkloadPortBinding) -> bool {
+    if left.host_port != right.host_port || left.protocol != right.protocol {
+        return false;
+    }
+
+    let Ok(left_ip) = left.host_ip.trim().parse::<IpAddr>() else {
+        return true;
+    };
+    let Ok(right_ip) = right.host_ip.trim().parse::<IpAddr>() else {
+        return true;
+    };
+
+    same_ip_family(left_ip, right_ip)
+        && (left_ip == right_ip || left_ip.is_unspecified() || right_ip.is_unspecified())
+}
+
+/// Returns true when any host port in both sets would contend on one node.
+fn workload_host_port_sets_conflict(
+    left: &[WorkloadPortBinding],
+    right: &[WorkloadPortBinding],
+) -> bool {
+    left.iter().any(|left_port| {
+        right
+            .iter()
+            .any(|right_port| workload_host_ports_conflict(left_port, right_port))
+    })
+}
+
+/// Returns true when two IP addresses belong to the same family.
+fn same_ip_family(left: IpAddr, right: IpAddr) -> bool {
+    matches!(
+        (left, right),
+        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+    )
 }
 
 /// Returns whether a service state still reserves its declared public endpoint claims.

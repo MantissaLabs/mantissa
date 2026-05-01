@@ -126,6 +126,24 @@ impl ReplacementChunk<'_> {
     }
 }
 
+/// Returns true when a start-first replacement would contend with the previous replica's ports.
+fn replacement_chunk_requires_stop_first(
+    chunk: &ReplacementChunk<'_>,
+    old_templates_by_name: &HashMap<String, TaskTemplateSpecValue>,
+) -> bool {
+    chunk.replacements.iter().any(|replacement| {
+        replacement.previous.is_some()
+            && old_templates_by_name
+                .get(&replacement.template.name)
+                .is_some_and(|old_template| {
+                    workload_host_port_sets_conflict(
+                        &old_template.execution.ports,
+                        &replacement.template.execution.ports,
+                    )
+                })
+    })
+}
+
 /// Outcome of one rollout chunk attempt.
 enum ChunkProgress {
     Advanced,
@@ -859,7 +877,26 @@ impl ServiceController {
         progress: &mut RolloutProgress,
         artifacts: &mut RolloutArtifacts,
     ) -> Result<ChunkProgress, anyhow::Error> {
-        if matches!(phase.rollout.settings.order, ServiceRolloutOrder::StopFirst)
+        let requires_stop_first =
+            replacement_chunk_requires_stop_first(chunk, &artifacts.old_templates_by_name);
+        let effective_stop_first =
+            matches!(phase.rollout.settings.order, ServiceRolloutOrder::StopFirst)
+                || requires_stop_first;
+
+        if requires_stop_first
+            && matches!(
+                phase.rollout.settings.order,
+                ServiceRolloutOrder::StartFirst
+            )
+        {
+            tracing::info!(
+                target: "services",
+                "service '{}' rollout chunk is using stop-first order because replacement host ports overlap previous replicas",
+                phase.rollout.service_name
+            );
+        }
+
+        if effective_stop_first
             && let Err(err) = self
                 .stop_replacement_chunk_previous_tasks(
                     phase.rollout.service_name,
@@ -919,16 +956,14 @@ impl ServiceController {
                 .await;
         }
 
-        if matches!(
-            phase.rollout.settings.order,
-            ServiceRolloutOrder::StartFirst
-        ) && let Err(err) = self
-            .stop_replacement_chunk_previous_tasks(
-                phase.rollout.service_name,
-                &chunk.replacements,
-                artifacts,
-            )
-            .await
+        if !effective_stop_first
+            && let Err(err) = self
+                .stop_replacement_chunk_previous_tasks(
+                    phase.rollout.service_name,
+                    &chunk.replacements,
+                    artifacts,
+                )
+                .await
         {
             return self
                 .retry_or_abort_rollout_step(phase.rollout, progress, err)
@@ -1574,5 +1609,106 @@ impl ServiceController {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workload::types::{ExecutionSpec, WorkloadPortBinding, WorkloadPortProtocol};
+
+    /// Builds one minimal task template with optional static host ports.
+    fn template(name: &str, ports: Vec<WorkloadPortBinding>) -> TaskTemplateSpecValue {
+        TaskTemplateSpecValue {
+            name: name.to_string(),
+            execution: ExecutionSpec {
+                image: "ghcr.io/demo/api:latest".to_string(),
+                command: Vec::new(),
+                tty: false,
+                cpu_millis: 100,
+                memory_bytes: 64 * 1_024 * 1_024,
+                gpu_count: 0,
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                liveness: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: Vec::new(),
+                ports,
+                placement: Default::default(),
+            },
+            depends_on: Vec::new(),
+            replicas: 1,
+            readiness: None,
+            public_port: None,
+            public_protocol: None,
+        }
+    }
+
+    /// Builds one static host-port binding for rollout ordering tests.
+    fn host_port(name: &str, host_port: u16) -> WorkloadPortBinding {
+        WorkloadPortBinding {
+            name: name.to_string(),
+            target_port: 8080,
+            host_port,
+            host_ip: "0.0.0.0".to_string(),
+            protocol: WorkloadPortProtocol::Tcp,
+        }
+    }
+
+    /// Overlapping old and new host ports require stop-first replacement.
+    #[test]
+    fn overlapping_host_ports_force_stop_first_chunk() {
+        let old_template = template("api", vec![host_port("http", 18080)]);
+        let new_template = template("api", vec![host_port("http", 18080)]);
+        let replacement = ReplicaReplacement {
+            template: new_template,
+            replica: 1,
+            previous: Some(ServiceReplicaAssignment {
+                task_id: Uuid::new_v4(),
+                template: "api".to_string(),
+                replica: 1,
+            }),
+            desired_id: Uuid::new_v4(),
+        };
+        let chunk = ReplacementChunk {
+            replacements: vec![&replacement],
+            requests: Vec::new(),
+        };
+        let old_templates_by_name = HashMap::from([("api".to_string(), old_template)]);
+
+        assert!(replacement_chunk_requires_stop_first(
+            &chunk,
+            &old_templates_by_name
+        ));
+    }
+
+    /// Non-overlapping host ports can keep the configured rollout order.
+    #[test]
+    fn distinct_host_ports_do_not_force_stop_first_chunk() {
+        let old_template = template("api", vec![host_port("http", 18080)]);
+        let new_template = template("api", vec![host_port("http", 28080)]);
+        let replacement = ReplicaReplacement {
+            template: new_template,
+            replica: 1,
+            previous: Some(ServiceReplicaAssignment {
+                task_id: Uuid::new_v4(),
+                template: "api".to_string(),
+                replica: 1,
+            }),
+            desired_id: Uuid::new_v4(),
+        };
+        let chunk = ReplacementChunk {
+            replacements: vec![&replacement],
+            requests: Vec::new(),
+        };
+        let old_templates_by_name = HashMap::from([("api".to_string(), old_template)]);
+
+        assert!(!replacement_chunk_requires_stop_first(
+            &chunk,
+            &old_templates_by_name
+        ));
     }
 }

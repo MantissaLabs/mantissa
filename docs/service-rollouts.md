@@ -66,6 +66,13 @@ replica or stops first and then starts the replacement.
   avoids temporary surge but can reduce availability while the replacement
   starts.
 
+If a replacement declares static node-local host ports that overlap the
+previous replica's static host ports, Mantissa executes that replacement chunk
+as stop-first even when the service strategy says `start_first`. The old
+container owns the node socket until it stops, so this is the only reliable
+way to replace the replica on its deterministic slot target. Chunks without
+overlapping host ports still follow the configured order.
+
 `monitor_secs`
 
 The number of seconds a replacement replica must remain `Running` before the
@@ -99,6 +106,9 @@ Controls what happens when `max_failures` is exhausted.
   convergence across nodes uses the same CRDT ordering as normal deployment.
 - `parallelism > 1` can temporarily increase the number of active replicas when
   `order` is `start_first`.
+- Services with static host ports should keep `parallelism` conservative. Each
+  overlapping replacement chunk drains the previous replica first, so high
+  parallelism can intentionally take more same-port replicas down at once.
 
 ## Example
 

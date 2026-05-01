@@ -210,6 +210,9 @@ replicas cannot land on the same node if they reserve the same local socket.
 Static host ports also share the ownership namespace with `public_port`
 NodePort endpoints, so Mantissa rejects or avoids placements that would make a
 host-port binding overlap a cluster public endpoint.
+During rolling updates, a replacement whose static host ports overlap the
+previous replica's host ports is executed stop-first for that rollout chunk,
+even when the service update strategy is otherwise `start_first`.
 Dynamic host ports are not part of the current contract because Mantissa does
 not yet expose an allocation-reporting field for operators or dependent
 workloads.
