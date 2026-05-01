@@ -1,5 +1,6 @@
 use super::{DEFAULT_MTU, NetworkInterfaceContext};
 use crate::network::naming::{bridge_name, vxlan_name};
+use crate::network::types::NetworkDriver;
 use blake3::Hasher;
 use std::net::IpAddr;
 use uuid::Uuid;
@@ -13,6 +14,7 @@ use uuid::Uuid;
 #[derive(Clone, Debug)]
 pub(super) struct NetworkPlan {
     pub(super) network_id: Uuid,
+    pub(super) driver: NetworkDriver,
     pub(super) vxlan_name: String,
     pub(super) bridge_name: String,
     pub(super) vni: u32,
@@ -30,6 +32,7 @@ impl NetworkPlan {
     pub(super) fn from_id(network_id: Uuid) -> Self {
         Self {
             network_id,
+            driver: NetworkDriver::Vxlan,
             vxlan_name: vxlan_name(network_id),
             bridge_name: bridge_name(network_id),
             vni: compute_deterministic_vni(network_id),
@@ -40,6 +43,13 @@ impl NetworkPlan {
             underlay_ip: None,
             host_access_mac: None,
         }
+    }
+}
+
+impl NetworkPlan {
+    /// Return whether this local plan needs a VXLAN device and remote FDB reconciliation.
+    pub(super) fn uses_vxlan(&self) -> bool {
+        matches!(self.driver, NetworkDriver::Vxlan)
     }
 }
 

@@ -4,7 +4,7 @@ use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
 use crate::network::lb::{BackendAddress, BpfLoadBalancer};
 use crate::network::nodeport::{NodePortManager, NodePortMapping, NodePortProtocol};
 use crate::network::registry::NetworkRegistry;
-use crate::network::types::{NetworkAttachmentState, NetworkSpecValue};
+use crate::network::types::{NetworkAttachmentState, NetworkDriver, NetworkSpecValue};
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
     ServicePortProtocol, ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceSpecValue,
@@ -77,6 +77,7 @@ pub struct ServiceDiscovery {
     services: ServiceRegistry,
     bpf: NetworkBpfManager,
     health_monitor: Arc<HealthMonitor>,
+    local_node_id: Uuid,
     servers: Arc<AsyncMutex<HashMap<Uuid, DnsServerHandle>>>,
     load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: Arc<AsyncMutex<BackendHealth>>,
@@ -106,6 +107,7 @@ struct DiscoveryRuntime {
     bpf: NetworkBpfManager,
     network_id: Uuid,
     network_name: String,
+    local_node_id: Uuid,
     load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: Arc<AsyncMutex<BackendHealth>>,
     health_monitor: Arc<HealthMonitor>,
@@ -183,8 +185,17 @@ impl ServiceDiscovery {
         services: ServiceRegistry,
         bpf: NetworkBpfManager,
         health_monitor: Arc<HealthMonitor>,
+        local_node_id: Uuid,
     ) -> Self {
-        Self::new_with_dns_port(registry, workloads, services, bpf, health_monitor, 53)
+        Self::new_with_dns_port(
+            registry,
+            workloads,
+            services,
+            bpf,
+            health_monitor,
+            local_node_id,
+            53,
+        )
     }
 
     /// Build service discovery with an explicit DNS bind port.
@@ -196,6 +207,7 @@ impl ServiceDiscovery {
         services: ServiceRegistry,
         bpf: NetworkBpfManager,
         health_monitor: Arc<HealthMonitor>,
+        local_node_id: Uuid,
         dns_port: u16,
     ) -> Self {
         Self {
@@ -204,6 +216,7 @@ impl ServiceDiscovery {
             services,
             bpf,
             health_monitor,
+            local_node_id,
             servers: Arc::new(AsyncMutex::new(HashMap::new())),
             load_balancer: Arc::new(AsyncMutex::new(ServiceLoadBalancer::default())),
             health: Arc::new(AsyncMutex::new(BackendHealth::default())),
@@ -233,6 +246,7 @@ impl ServiceDiscovery {
             bpf: self.bpf.clone(),
             network_id,
             network_name,
+            local_node_id: self.local_node_id,
             load_balancer: self.load_balancer.clone(),
             health: self.health.clone(),
             health_monitor: self.health_monitor.clone(),
@@ -349,13 +363,15 @@ struct ServiceBackendResolver<'a> {
 impl ServiceBackendResolver<'_> {
     /// Resolve the currently routable backend attachment set for one service template name.
     async fn resolve(&self, service_name: &str) -> Result<Vec<BackendAddress>> {
-        let expected_family = self
-            .runtime
-            .registry
-            .get_spec(self.runtime.network_id)?
+        let network_spec = self.runtime.registry.get_spec(self.runtime.network_id)?;
+        let expected_family = network_spec
+            .as_ref()
             .map(|spec| parse_overlay_cidr(&spec.subnet_cidr))
             .transpose()?
             .map(|subnet| subnet.family);
+        let local_only = network_spec
+            .as_ref()
+            .is_some_and(|spec| spec.driver.is_node_local());
         let ready_peers: HashSet<Uuid> = self
             .runtime
             .registry
@@ -381,6 +397,17 @@ impl ServiceBackendResolver<'_> {
         );
 
         for attachment in attachments {
+            if local_only && attachment.node_id != self.runtime.local_node_id {
+                tracing::trace!(
+                    target: "network",
+                    network = %self.runtime.network_id,
+                    attachment = %attachment.id,
+                    node = %attachment.node_id,
+                    local_node = %self.runtime.local_node_id,
+                    "skipping remote attachment on node-local bridge network"
+                );
+                continue;
+            }
             if !ready_peers.contains(&attachment.node_id) {
                 tracing::trace!(
                     target: "network",
@@ -631,6 +658,14 @@ fn ip_family(ip: IpAddr) -> OverlayIpFamily {
         IpAddr::V4(_) => OverlayIpFamily::Ipv4,
         IpAddr::V6(_) => OverlayIpFamily::Ipv6,
     }
+}
+
+/// Resolve the driver backing one discovery network.
+fn network_driver(registry: &NetworkRegistry, network_id: Uuid) -> Result<NetworkDriver> {
+    let Some(spec) = registry.get_spec(network_id)? else {
+        bail!("network {network_id} is missing while resolving service records");
+    };
+    Ok(spec.driver)
 }
 
 /// Keep backend ordering stable across nodes by comparing family first and octets second.
@@ -1007,6 +1042,23 @@ async fn refresh_single_service(
         service.readiness.is_some(),
         "refresh",
     );
+
+    let driver = network_driver(&runtime.registry, runtime.network_id)?;
+    if !driver.supports_service_vip() {
+        return Ok(ServiceRefreshResult {
+            nodeport_mappings: Vec::new(),
+            public_endpoint: service.public_port.map(|port| PublicEndpointObservation {
+                service_id: service.service_id,
+                template_name: service.template_name.clone(),
+                port,
+                detail: Some(format!(
+                    "template '{}' public port {} requires a vxlan network; bridge networks only publish node-local DNS backends",
+                    service.template_name, port
+                )),
+            }),
+            host_vip: None,
+        });
+    }
 
     if backends.is_empty() {
         let _ = sync_service_vip_for_backends(runtime, service_name, &[], service.expose_to_host)

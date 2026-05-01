@@ -297,10 +297,16 @@ struct CatalogHarness {
     services: ServiceRegistry,
     network: NetworkSpecValue,
     runtime: DiscoveryRuntime,
+    local_node_id: Uuid,
 }
 
 /// Creates isolated stores backing one discovery catalog test harness.
 async fn setup_catalog_harness() -> CatalogHarness {
+    setup_catalog_harness_with_driver(NetworkDriver::Vxlan).await
+}
+
+/// Creates isolated stores backing one discovery catalog test harness for one driver.
+async fn setup_catalog_harness_with_driver(driver: NetworkDriver) -> CatalogHarness {
     let actor = Uuid::new_v4();
 
     let network_dir = tempdir().expect("network tempdir");
@@ -354,10 +360,18 @@ async fn setup_catalog_harness() -> CatalogHarness {
     let network = NetworkSpecValue::new(NetworkSpecDraft {
         name: format!("catalog-net-{}", Uuid::new_v4()),
         description: "discovery catalog test".to_string(),
-        driver: NetworkDriver::Vxlan,
+        driver,
         subnet_cidr: "10.88.0.0/16".to_string(),
-        vni: 4242,
-        mtu: 1350,
+        vni: if driver == NetworkDriver::Vxlan {
+            4242
+        } else {
+            0
+        },
+        mtu: if driver == NetworkDriver::Vxlan {
+            1350
+        } else {
+            1500
+        },
         sealed: false,
         bpf_programs: Vec::new(),
     });
@@ -372,6 +386,7 @@ async fn setup_catalog_harness() -> CatalogHarness {
         services.clone(),
         NetworkBpfManager::unavailable(),
         HealthMonitor::new(actor),
+        actor,
         5_353,
     );
     let runtime = discovery.build_runtime(
@@ -386,6 +401,7 @@ async fn setup_catalog_harness() -> CatalogHarness {
         services,
         network,
         runtime,
+        local_node_id: actor,
     }
 }
 
@@ -730,6 +746,73 @@ async fn backend_catalog_refresh_invalidates_on_peer_change_clock() {
         1,
         "ready peer state should re-admit the backend into discovery"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn backend_catalog_filters_remote_backends_for_bridge_network() {
+    let harness = setup_catalog_harness_with_driver(NetworkDriver::Bridge).await;
+    let service_name = "backend-service";
+    let local_node_id = harness.local_node_id;
+    let remote_node_id = Uuid::new_v4();
+    let local_task_id = Uuid::new_v4();
+    let remote_task_id = Uuid::new_v4();
+    upsert_catalog_service(
+        &harness.services,
+        service_name,
+        harness.network.id,
+        vec![local_task_id, remote_task_id],
+    )
+    .await;
+
+    for (task_id, node_id, ip) in [
+        (local_task_id, local_node_id, Ipv4Addr::new(10, 88, 1, 10)),
+        (remote_task_id, remote_node_id, Ipv4Addr::new(10, 88, 1, 11)),
+    ] {
+        harness
+            .workloads
+            .upsert(
+                &UuidKey::from(task_id),
+                catalog_task(task_id, node_id, service_name, harness.network.id),
+            )
+            .await
+            .expect("upsert running task");
+        harness
+            .registry
+            .upsert_attachment(catalog_attachment(
+                task_id,
+                node_id,
+                harness.network.id,
+                ip,
+                service_name,
+            ))
+            .await
+            .expect("upsert ready attachment");
+        harness
+            .registry
+            .upsert_peer_state(NetworkPeerStateValue::new(
+                harness.network.id,
+                node_id,
+                "backend-node",
+                NetworkPeerState::Ready,
+                None,
+            ))
+            .await
+            .expect("upsert ready peer state");
+    }
+
+    let mut health = HashMap::new();
+    health.insert(local_node_id, HealthStatus::Alive);
+    health.insert(remote_node_id, HealthStatus::Alive);
+    refresh_catalog(&harness, &health).await;
+
+    let guard = harness.runtime.backend_catalog.lock().await;
+    let candidates = guard
+        .services
+        .get("backend")
+        .map(|entry| entry.candidates.clone())
+        .unwrap_or_default();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].ip, IpAddr::V4(Ipv4Addr::new(10, 88, 1, 10)));
 }
 
 #[tokio::test(flavor = "current_thread")]

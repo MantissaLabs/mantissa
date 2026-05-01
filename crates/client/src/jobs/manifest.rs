@@ -753,6 +753,7 @@ mod tests {
         let mut manifest = base_manifest();
         manifest.networks = vec![ManifestNetworkSpec {
             name: "jobs".to_string(),
+            driver: None,
             ip_family: Some(crate::config::NetworkIpFamily::Ipv6),
         }];
 

@@ -590,6 +590,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             NetworksCommand::Create(args) => {
                 let driver = match args.driver {
                     NetworkDriverOpt::Vxlan => client::networks::NetworkDriver::Vxlan,
+                    NetworkDriverOpt::Bridge => client::networks::NetworkDriver::Bridge,
                 };
                 let subnet_cidr = match args.subnet.clone() {
                     Some(subnet) => subnet,

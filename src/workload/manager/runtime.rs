@@ -13,7 +13,7 @@ use crate::config;
 use crate::gossip::Message;
 use crate::network::allocator::{OverlayAddressAllocator, parse_overlay_cidr};
 use crate::network::attachment::{AttachmentProvisioningRequest, bridge_name};
-use crate::network::controller::DEFAULT_MTU;
+use crate::network::controller::{DEFAULT_BRIDGE_MTU, DEFAULT_MTU};
 use crate::network::events::ForwardingEvent;
 use crate::network::types::{
     NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue,
@@ -892,8 +892,16 @@ impl WorkloadManager {
 
             let prefix = parse_overlay_cidr(&spec.subnet_cidr)
                 .context("failed to parse network subnet for attachment")?;
-            let mut mtu = if spec.mtu == 0 { DEFAULT_MTU } else { spec.mtu };
-            if config::wireguard_enabled() {
+            let mut mtu = if spec.mtu == 0 {
+                if spec.driver.requires_wireguard_underlay() {
+                    DEFAULT_MTU
+                } else {
+                    DEFAULT_BRIDGE_MTU
+                }
+            } else {
+                spec.mtu
+            };
+            if spec.driver.requires_wireguard_underlay() && config::wireguard_enabled() {
                 mtu = mtu.min(wireguard::MANTISSA_WIREGUARD_VXLAN_MTU);
             }
             let bridge = bridge_name(spec.id);

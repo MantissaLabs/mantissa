@@ -356,11 +356,22 @@ impl NetworkRegistry {
     /// is only relevant when both sides report the same network as Ready, which means this node may
     /// legitimately forward VXLAN traffic to that peer.
     pub fn wireguard_scope_peers(&self, local_peer_id: Uuid) -> Result<HashSet<Uuid>> {
+        let vxlan_networks: HashSet<Uuid> = self
+            .list_specs()?
+            .into_iter()
+            .filter(|spec| !spec.is_deleted() && spec.driver.requires_wireguard_underlay())
+            .map(|spec| spec.id)
+            .collect();
+        if vxlan_networks.is_empty() {
+            return Ok(HashSet::new());
+        }
+
         self.refresh_peer_cache_if_needed()?;
         let cache = self.cache_read();
         Ok(collect_shared_ready_peers(
             &cache.peer_states_by_network,
             local_peer_id,
+            Some(&vxlan_networks),
         ))
     }
 
@@ -607,10 +618,16 @@ fn attachment_state_rank(state: crate::network::types::NetworkAttachmentState) -
 fn collect_shared_ready_peers(
     peer_states_by_network: &HashMap<Uuid, Vec<NetworkPeerStateValue>>,
     local_peer_id: Uuid,
+    network_filter: Option<&HashSet<Uuid>>,
 ) -> HashSet<Uuid> {
     let mut peers = HashSet::new();
 
-    for states in peer_states_by_network.values() {
+    for (network_id, states) in peer_states_by_network {
+        if let Some(filter) = network_filter
+            && !filter.contains(network_id)
+        {
+            continue;
+        }
         let local_ready = states
             .iter()
             .any(|state| state.peer_id == local_peer_id && state.state.is_ready());
@@ -877,7 +894,7 @@ mod tests {
             ],
         );
 
-        let peers = collect_shared_ready_peers(&by_network, local_peer_id);
+        let peers = collect_shared_ready_peers(&by_network, local_peer_id, None);
 
         assert_eq!(peers.len(), 2);
         assert!(peers.contains(&peer_a));

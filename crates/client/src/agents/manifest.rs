@@ -801,6 +801,7 @@ mod tests {
         manifest.execution.networks = vec!["agents".to_string()];
         manifest.networks = vec![ManifestNetworkSpec {
             name: "agents".to_string(),
+            driver: None,
             ip_family: Some(crate::config::NetworkIpFamily::Ipv6),
         }];
 

@@ -1,4 +1,6 @@
 use crate::gossip::Message;
+use crate::network::registry::NetworkRegistry;
+use crate::network::types::NetworkDriver;
 use crate::registry::Registry;
 use crate::scheduler::placement::{PlacementNode, PlacementPreferenceInventory};
 use crate::services::dependencies::{TemplateDependencyStage, build_template_dependency_stages};
@@ -86,6 +88,7 @@ pub struct ServiceController {
     registry: ServiceRegistry,
     workload_manager: WorkloadManager,
     cluster_registry: Registry,
+    network_registry: NetworkRegistry,
     volume_registry: VolumeRegistry,
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
@@ -121,6 +124,7 @@ pub struct ServiceControllerConfig {
     pub registry: ServiceRegistry,
     pub workload_manager: WorkloadManager,
     pub cluster_registry: Registry,
+    pub network_registry: NetworkRegistry,
     pub volume_registry: VolumeRegistry,
     pub gossip_tx: Sender<Message>,
     pub gossip_rx: Receiver<Message>,
@@ -135,6 +139,7 @@ impl ServiceController {
             registry,
             workload_manager,
             cluster_registry,
+            network_registry,
             volume_registry,
             gossip_tx,
             gossip_rx,
@@ -145,6 +150,7 @@ impl ServiceController {
             registry,
             workload_manager,
             cluster_registry,
+            network_registry,
             volume_registry,
             gossip_tx,
             gossip_rx,
@@ -305,6 +311,7 @@ impl ServiceController {
                 service_name
             )
         })?;
+        self.ensure_network_contracts(&service_name, task_templates.as_slice())?;
         let desired_public_claims =
             collect_public_port_claims(&service_name, task_templates.as_slice())?;
         let service_id = compute_service_id(&service_name);
@@ -444,6 +451,36 @@ impl ServiceController {
             service_id,
             outcome: ServiceDeploymentOutcome::Accepted,
         })
+    }
+
+    /// Validate service declarations whose behavior depends on the referenced network drivers.
+    fn ensure_network_contracts(
+        &self,
+        service_name: &str,
+        task_templates: &[TaskTemplateSpecValue],
+    ) -> anyhow::Result<()> {
+        for template in task_templates {
+            if template.public_port().is_none() {
+                continue;
+            }
+
+            for network_id in template.required_network_ids() {
+                let Some(network) = self.network_registry.get_spec(network_id)? else {
+                    continue;
+                };
+                if network.driver.is_node_local() {
+                    return Err(anyhow!(
+                        "service '{}' template '{}' cannot set public_port on bridge network '{}' ({})",
+                        service_name,
+                        template.name,
+                        network.name,
+                        network.id
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Validates that the incoming public endpoint claims do not overlap an existing service.
@@ -826,15 +863,16 @@ impl ServiceController {
         let placement_nodes = self.placement_nodes_for(&eligible_nodes);
         let preference_inventory =
             build_placement_preference_inventory(&self.workload_manager).await?;
-        let requests = build_start_requests(
-            &service_name,
+        let requests = build_start_requests(SlotTargetContext {
+            service_name: &service_name,
             service_id,
-            &task_templates,
-            &eligible_nodes,
-            &placement_nodes,
-            &preference_inventory,
-            &self.volume_registry,
-        )?;
+            task_templates: &task_templates,
+            eligible_nodes: &eligible_nodes,
+            placement_nodes: &placement_nodes,
+            preference_inventory: &preference_inventory,
+            network_registry: &self.network_registry,
+            volume_registry: &self.volume_registry,
+        })?;
 
         if requests.is_empty() {
             let spec = ServiceSpecValue::new(
@@ -1092,15 +1130,16 @@ impl ServiceController {
         let placement_nodes = self.placement_nodes_for(&eligible_nodes);
         let preference_inventory =
             build_placement_preference_inventory(&self.workload_manager).await?;
-        let slot_targets = compute_effective_slot_targets(
-            &service_name,
+        let slot_targets = compute_effective_slot_targets(&SlotTargetContext {
+            service_name: &service_name,
             service_id,
-            &task_templates,
-            &eligible_nodes,
-            &placement_nodes,
-            &preference_inventory,
-            &self.volume_registry,
-        )?;
+            task_templates: &task_templates,
+            eligible_nodes: &eligible_nodes,
+            placement_nodes: &placement_nodes,
+            preference_inventory: &preference_inventory,
+            network_registry: &self.network_registry,
+            volume_registry: &self.volume_registry,
+        })?;
 
         for template_index in ordered_indices {
             let template = task_templates[template_index].clone();
@@ -1824,7 +1863,11 @@ impl ServiceController {
         let has_targets = requests.iter().any(|request| request.target_node.is_some());
         let allow_untargeted_fallback = allow_untargeted_fallback(&requests);
         let requires_pinned_targets = if has_targets {
-            requests_require_pinned_targets(&self.volume_registry, &requests)?
+            requests_require_pinned_targets(
+                &self.volume_registry,
+                &self.network_registry,
+                &requests,
+            )?
         } else {
             false
         };
@@ -1837,7 +1880,7 @@ impl ServiceController {
             Err(err) if has_targets && requires_pinned_targets => {
                 tracing::warn!(
                     target: "services",
-                    "pinned placement failed for {context}; bound local volumes disable fallback retries: {err:#}"
+                    "pinned placement failed for {context}; local resources require preserving target nodes: {err:#}"
                 );
                 Err(err)
             }
@@ -2547,34 +2590,32 @@ fn format_dependency_gate_stability_detail(
     )
 }
 
+/// Immutable inputs used to derive deterministic service slot targets.
+struct SlotTargetContext<'a> {
+    service_name: &'a str,
+    service_id: Uuid,
+    task_templates: &'a [TaskTemplateSpecValue],
+    eligible_nodes: &'a [Uuid],
+    placement_nodes: &'a [PlacementNode],
+    preference_inventory: &'a PlacementPreferenceInventory,
+    network_registry: &'a NetworkRegistry,
+    volume_registry: &'a VolumeRegistry,
+}
+
 /// Builds the individual workload start requests for every replica defined in the service manifest.
 fn build_start_requests(
-    service_name: &str,
-    service_id: Uuid,
-    task_templates: &[TaskTemplateSpecValue],
-    eligible_nodes: &[Uuid],
-    placement_nodes: &[PlacementNode],
-    preference_inventory: &PlacementPreferenceInventory,
-    volume_registry: &VolumeRegistry,
+    context: SlotTargetContext<'_>,
 ) -> anyhow::Result<Vec<WorkloadStartRequest>> {
-    let slot_targets = compute_effective_slot_targets(
-        service_name,
-        service_id,
-        task_templates,
-        eligible_nodes,
-        placement_nodes,
-        preference_inventory,
-        volume_registry,
-    )?;
+    let slot_targets = compute_effective_slot_targets(&context)?;
     let mut requests = Vec::new();
-    for template in task_templates {
+    for template in context.task_templates {
         for replica_idx in 0..template.replicas {
             let replica_number = replica_idx + 1;
             let desired_id = Uuid::new_v4();
-            let key = SlotKey::new(service_id, &template.name, replica_number);
+            let key = SlotKey::new(context.service_id, &template.name, replica_number);
             let target_node = slot_targets.get(&key).copied();
             requests.push(template.replica_start_request(
-                service_name,
+                context.service_name,
                 replica_number,
                 desired_id,
                 target_node,
@@ -2613,35 +2654,181 @@ fn build_missing_template_requests(
 
 /// Computes effective slot targets after applying any hard local-volume locality overrides.
 fn compute_effective_slot_targets(
-    service_name: &str,
-    service_id: Uuid,
-    task_templates: &[TaskTemplateSpecValue],
-    eligible_nodes: &[Uuid],
-    placement_nodes: &[PlacementNode],
-    preference_inventory: &PlacementPreferenceInventory,
-    volume_registry: &VolumeRegistry,
+    context: &SlotTargetContext<'_>,
 ) -> anyhow::Result<HashMap<SlotKey, Uuid>> {
     let mut targets = compute_slot_targets_with_placement(
-        service_id,
-        service_name,
-        task_templates,
-        eligible_nodes,
-        placement_nodes,
-        preference_inventory,
+        context.service_id,
+        context.service_name,
+        context.task_templates,
+        context.eligible_nodes,
+        context.placement_nodes,
+        context.preference_inventory,
     )?;
-    for template in task_templates {
-        let Some(target_node) = resolve_template_volume_target(volume_registry, &template.volumes)?
+    let mut hard_targets: HashMap<SlotKey, Uuid> = HashMap::new();
+    for template in context.task_templates {
+        let Some(target_node) =
+            resolve_template_volume_target(context.volume_registry, &template.volumes)?
         else {
             continue;
         };
         for replica in 1..=template.replicas {
-            targets.insert(
-                SlotKey::new(service_id, &template.name, replica),
-                target_node,
-            );
+            let key = SlotKey::new(context.service_id, &template.name, replica);
+            hard_targets.insert(key.clone(), target_node);
+            targets.insert(key, target_node);
         }
     }
+    apply_bridge_dependency_targets(context, &hard_targets, &mut targets)?;
     Ok(targets)
+}
+
+/// Co-locate dependent templates when their dependency edge relies on a node-local bridge network.
+///
+/// Bridge networks do not provide cross-node reachability. If a downstream template depends on an
+/// upstream template over the same bridge network, every downstream replica must be pinned to a node
+/// that also hosts one upstream replica. Conflicts with hard volume locality or placement
+/// constraints fail deployment instead of silently producing unreachable service DNS answers.
+fn apply_bridge_dependency_targets(
+    context: &SlotTargetContext<'_>,
+    hard_targets: &HashMap<SlotKey, Uuid>,
+    targets: &mut HashMap<SlotKey, Uuid>,
+) -> anyhow::Result<()> {
+    let templates_by_name: HashMap<&str, &TaskTemplateSpecValue> = context
+        .task_templates
+        .iter()
+        .map(|template| (template.name.as_str(), template))
+        .collect();
+    let mut bridge_targets: HashMap<SlotKey, Uuid> = HashMap::new();
+
+    for _ in 0..context.task_templates.len().max(1) {
+        let mut changed = false;
+        for template in context.task_templates {
+            for dependency_name in &template.depends_on {
+                let Some(dependency) = templates_by_name.get(dependency_name.as_str()).copied()
+                else {
+                    continue;
+                };
+                if !templates_share_bridge_network(template, dependency, context.network_registry)?
+                {
+                    continue;
+                }
+                if dependency.replicas == 0 && template.replicas > 0 {
+                    return Err(anyhow!(
+                        "service '{}' template '{}' depends on bridge-local template '{}' but the dependency has no replicas",
+                        context.service_name,
+                        template.name,
+                        dependency.name
+                    ));
+                }
+
+                for replica in 1..=template.replicas {
+                    let dependency_replica = ((replica - 1) % dependency.replicas) + 1;
+                    let dependency_key =
+                        SlotKey::new(context.service_id, &dependency.name, dependency_replica);
+                    let Some(target_node) = targets.get(&dependency_key).copied() else {
+                        return Err(anyhow!(
+                            "service '{}' template '{}' depends on bridge-local template '{}' but dependency replica {} has no target node",
+                            context.service_name,
+                            template.name,
+                            dependency.name,
+                            dependency_replica
+                        ));
+                    };
+
+                    if !template_can_run_on_node(
+                        template,
+                        target_node,
+                        context.eligible_nodes,
+                        context.placement_nodes,
+                    ) {
+                        return Err(anyhow!(
+                            "service '{}' template '{}' depends on bridge-local template '{}' but placement constraints exclude dependency node {}",
+                            context.service_name,
+                            template.name,
+                            dependency.name,
+                            target_node
+                        ));
+                    }
+
+                    let key = SlotKey::new(context.service_id, &template.name, replica);
+                    if let Some(hard_target) = hard_targets.get(&key)
+                        && *hard_target != target_node
+                    {
+                        return Err(anyhow!(
+                            "service '{}' template '{}' replica {} cannot be co-located with bridge-local dependency '{}' because a local volume pins it to node {} while the dependency is on node {}",
+                            context.service_name,
+                            template.name,
+                            replica,
+                            dependency.name,
+                            hard_target,
+                            target_node
+                        ));
+                    }
+                    if let Some(existing_bridge_target) = bridge_targets.get(&key)
+                        && *existing_bridge_target != target_node
+                    {
+                        return Err(anyhow!(
+                            "service '{}' template '{}' replica {} has bridge-local dependencies on different nodes",
+                            context.service_name,
+                            template.name,
+                            replica
+                        ));
+                    }
+
+                    bridge_targets.insert(key.clone(), target_node);
+                    if targets.get(&key).copied() != Some(target_node) {
+                        targets.insert(key, target_node);
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        if !changed {
+            return Ok(());
+        }
+    }
+
+    Ok(())
+}
+
+/// Return whether two templates share at least one node-local bridge network.
+fn templates_share_bridge_network(
+    left: &TaskTemplateSpecValue,
+    right: &TaskTemplateSpecValue,
+    network_registry: &NetworkRegistry,
+) -> anyhow::Result<bool> {
+    let right_networks: HashSet<Uuid> = right.required_network_ids().into_iter().collect();
+    for network_id in left.required_network_ids() {
+        if !right_networks.contains(&network_id) {
+            continue;
+        }
+        let Some(spec) = network_registry.get_spec(network_id)? else {
+            continue;
+        };
+        if matches!(spec.driver, NetworkDriver::Bridge) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Return whether a bridge co-location target also satisfies the template's placement policy.
+fn template_can_run_on_node(
+    template: &TaskTemplateSpecValue,
+    node_id: Uuid,
+    eligible_nodes: &[Uuid],
+    placement_nodes: &[PlacementNode],
+) -> bool {
+    if !eligible_nodes.contains(&node_id) {
+        return false;
+    }
+    if template.placement().is_unconstrained() || placement_nodes.is_empty() {
+        return true;
+    }
+    placement_nodes
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .is_some_and(|node| template.placement().matches(node))
 }
 
 /// Builds the active service-replica inventory used by soft affinity and anti-affinity hints.
@@ -2717,14 +2904,31 @@ pub(super) fn mounted_local_volumes_require_pinned_target(
 /// Returns true when any task request in the batch must preserve its explicit node target.
 fn requests_require_pinned_targets(
     volume_registry: &VolumeRegistry,
+    network_registry: &NetworkRegistry,
     requests: &[WorkloadStartRequest],
 ) -> anyhow::Result<bool> {
     for request in requests {
         if mounted_local_volumes_require_pinned_target(volume_registry, &request.volumes)? {
             return Ok(true);
         }
+        if request.target_node.is_some()
+            && request
+                .networks
+                .iter()
+                .any(|network_id| network_is_node_local(network_registry, *network_id))
+        {
+            return Ok(true);
+        }
     }
     Ok(false)
+}
+
+/// Return true when a known network id is backed by a node-local driver.
+fn network_is_node_local(network_registry: &NetworkRegistry, network_id: Uuid) -> bool {
+    matches!(
+        network_registry.get_spec(network_id),
+        Ok(Some(spec)) if spec.driver.is_node_local()
+    )
 }
 
 /// Returns true when the error chain represents a recoverable node-local volume availability issue.
@@ -2880,7 +3084,11 @@ fn should_stop_tasks(current: Option<&ServiceSpecValue>, incoming: &ServiceSpecV
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::types::{NetworkSpecDraft, NetworkSpecValue};
     use crate::services::types::TaskTemplateNetworkRequirement;
+    use crate::store::network_store::{
+        open_network_attachment_store, open_network_peer_store, open_network_spec_store,
+    };
     use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
     use crate::volumes::types::{
         LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode,
@@ -2935,6 +3143,11 @@ mod tests {
         _dir: TempDir,
     }
 
+    struct TestNetworkRegistry {
+        registry: NetworkRegistry,
+        _dir: TempDir,
+    }
+
     /// Builds one isolated volume registry backed by temporary stores.
     async fn make_test_volume_registry() -> TestVolumeRegistry {
         let dir = tempfile::tempdir().expect("create volume tempdir");
@@ -2953,6 +3166,36 @@ mod tests {
             .expect("rebuild volume node store");
         TestVolumeRegistry {
             registry: VolumeRegistry::new(spec_store, node_store),
+            _dir: dir,
+        }
+    }
+
+    /// Builds one isolated network registry backed by temporary stores.
+    async fn make_test_network_registry() -> TestNetworkRegistry {
+        let dir = tempfile::tempdir().expect("create network tempdir");
+        let db_path = dir.path().join("networks.redb");
+        let db = Arc::new(redb::Database::create(db_path).expect("create network db"));
+        let actor = Uuid::new_v4();
+        let spec_store =
+            open_network_spec_store(db.clone(), actor).expect("open network spec store");
+        spec_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild network spec store");
+        let peer_store =
+            open_network_peer_store(db.clone(), actor).expect("open network peer store");
+        peer_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild network peer store");
+        let attachment_store =
+            open_network_attachment_store(db, actor).expect("open network attachment store");
+        attachment_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild network attachment store");
+        TestNetworkRegistry {
+            registry: NetworkRegistry::new(spec_store, peer_store, attachment_store),
             _dir: dir,
         }
     }
@@ -3025,6 +3268,25 @@ mod tests {
             bound_node_id,
             bound_node_name: bound_node_id.map(|_| "node-a".to_string()),
         })
+    }
+
+    /// Builds one node-local bridge network spec for placement and fallback tests.
+    fn make_bridge_network_spec(name: &str) -> NetworkSpecValue {
+        NetworkSpecValue::new(NetworkSpecDraft {
+            name: name.to_string(),
+            description: "node-local bridge test network".to_string(),
+            driver: NetworkDriver::Bridge,
+            subnet_cidr: "10.77.0.0/24".to_string(),
+            vni: 0,
+            mtu: 0,
+            sealed: false,
+            bpf_programs: Vec::new(),
+        })
+    }
+
+    /// Builds one service network requirement pointing at a known test network.
+    fn make_template_network(name: &str, network_id: Uuid) -> TaskTemplateNetworkRequirement {
+        TaskTemplateNetworkRequirement::new(name.to_string(), network_id)
     }
 
     /// Builds one default resolved execution spec for test request setup.
@@ -3358,6 +3620,134 @@ mod tests {
         assert_eq!(counts.get(&node_a).copied().unwrap_or(0), 1);
         assert_eq!(counts.get(&node_b).copied().unwrap_or(0), 1);
         assert_eq!(counts.get(&node_c).copied().unwrap_or(0), 1);
+    }
+
+    /// Bridge dependencies must co-locate downstream replicas with their upstream backend.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridge_dependencies_colocate_replica_targets() {
+        let network_registry = make_test_network_registry().await;
+        let volume_registry = make_test_volume_registry().await;
+        let bridge = make_bridge_network_spec("local-app");
+        network_registry
+            .registry
+            .upsert_spec(bridge.clone())
+            .await
+            .expect("persist bridge network");
+
+        let service_id = Uuid::new_v4();
+        let node_a = Uuid::from_bytes([1u8; 16]);
+        let node_b = Uuid::from_bytes([2u8; 16]);
+        let candidates = vec![node_a, node_b];
+        let mut backend_execution = empty_service_execution("ghcr.io/demo/backend:latest");
+        backend_execution.networks = vec![make_template_network("local-app", bridge.id)];
+        let mut worker_execution = empty_service_execution("ghcr.io/demo/worker:latest");
+        worker_execution.networks = vec![make_template_network("local-app", bridge.id)];
+        let task_templates = vec![
+            TaskTemplateSpecValue {
+                name: "backend".into(),
+                execution: backend_execution,
+                depends_on: Vec::new(),
+                replicas: 2,
+                readiness: None,
+                public_port: None,
+                public_protocol: None,
+            },
+            TaskTemplateSpecValue {
+                name: "worker".into(),
+                execution: worker_execution,
+                depends_on: vec!["backend".to_string()],
+                replicas: 2,
+                readiness: None,
+                public_port: None,
+                public_protocol: None,
+            },
+        ];
+
+        let targets = compute_effective_slot_targets(&SlotTargetContext {
+            service_name: "demo-service",
+            service_id,
+            task_templates: &task_templates,
+            eligible_nodes: &candidates,
+            placement_nodes: &[],
+            preference_inventory: &PlacementPreferenceInventory::default(),
+            network_registry: &network_registry.registry,
+            volume_registry: &volume_registry.registry,
+        })
+        .expect("compute bridge-aware slot targets");
+
+        for replica in 1..=2 {
+            let backend_key = SlotKey::new(service_id, "backend", replica);
+            let worker_key = SlotKey::new(service_id, "worker", replica);
+            assert_eq!(targets.get(&worker_key), targets.get(&backend_key));
+        }
+    }
+
+    /// Bridge dependency co-location must fail when a local volume pins the replica elsewhere.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridge_dependency_rejects_conflicting_local_volume_target() {
+        let network_registry = make_test_network_registry().await;
+        let volume_registry = make_test_volume_registry().await;
+        let bridge = make_bridge_network_spec("local-app");
+        network_registry
+            .registry
+            .upsert_spec(bridge.clone())
+            .await
+            .expect("persist bridge network");
+
+        let node_a = Uuid::from_bytes([1u8; 16]);
+        let node_b = Uuid::from_bytes([2u8; 16]);
+        let volume = make_local_volume_spec("worker-data", Some(node_b));
+        volume_registry
+            .registry
+            .upsert_spec(volume.clone())
+            .await
+            .expect("persist local volume");
+
+        let mut backend_execution = empty_service_execution("ghcr.io/demo/backend:latest");
+        backend_execution.networks = vec![make_template_network("local-app", bridge.id)];
+        let mut worker_execution = empty_service_execution("ghcr.io/demo/worker:latest");
+        worker_execution.networks = vec![make_template_network("local-app", bridge.id)];
+        worker_execution.volumes = vec![WorkloadVolumeMount {
+            volume_id: volume.id,
+            volume_name: volume.name.clone(),
+            target: "/data".to_string(),
+            read_only: false,
+        }];
+        let task_templates = vec![
+            TaskTemplateSpecValue {
+                name: "backend".into(),
+                execution: backend_execution,
+                depends_on: Vec::new(),
+                replicas: 1,
+                readiness: None,
+                public_port: None,
+                public_protocol: None,
+            },
+            TaskTemplateSpecValue {
+                name: "worker".into(),
+                execution: worker_execution,
+                depends_on: vec!["backend".to_string()],
+                replicas: 1,
+                readiness: None,
+                public_port: None,
+                public_protocol: None,
+            },
+        ];
+
+        let eligible_nodes = [node_a];
+        let err = compute_effective_slot_targets(&SlotTargetContext {
+            service_name: "demo-service",
+            service_id: Uuid::new_v4(),
+            task_templates: &task_templates,
+            eligible_nodes: &eligible_nodes,
+            placement_nodes: &[],
+            preference_inventory: &PlacementPreferenceInventory::default(),
+            network_registry: &network_registry.registry,
+            volume_registry: &volume_registry.registry,
+        })
+        .expect_err("conflicting bridge co-location should fail");
+
+        assert!(err.to_string().contains("cannot be co-located"));
     }
 
     /// Unschedulable nodes must be excluded from deterministic placement targets.
@@ -3929,6 +4319,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn bound_local_volume_requests_disable_target_fallback() {
         let test_registry = make_test_volume_registry().await;
+        let network_registry = make_test_network_registry().await;
         let bound_node_id = Uuid::new_v4();
         let volume = make_local_volume_spec("pgdata", Some(bound_node_id));
         test_registry
@@ -3938,8 +4329,12 @@ mod tests {
             .expect("persist volume spec");
 
         let request = make_volume_request(volume.id, &volume.name, Some(bound_node_id));
-        let requires_pinned = requests_require_pinned_targets(&test_registry.registry, &[request])
-            .expect("evaluate fallback policy");
+        let requires_pinned = requests_require_pinned_targets(
+            &test_registry.registry,
+            &network_registry.registry,
+            &[request],
+        )
+        .expect("evaluate fallback policy");
 
         assert!(requires_pinned);
     }
@@ -3948,6 +4343,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn unbound_local_volume_requests_allow_target_fallback() {
         let test_registry = make_test_volume_registry().await;
+        let network_registry = make_test_network_registry().await;
         let target_node = Uuid::new_v4();
         let volume = make_local_volume_spec("cache", None);
         test_registry
@@ -3957,10 +4353,38 @@ mod tests {
             .expect("persist volume spec");
 
         let request = make_volume_request(volume.id, &volume.name, Some(target_node));
-        let requires_pinned = requests_require_pinned_targets(&test_registry.registry, &[request])
-            .expect("evaluate fallback policy");
+        let requires_pinned = requests_require_pinned_targets(
+            &test_registry.registry,
+            &network_registry.registry,
+            &[request],
+        )
+        .expect("evaluate fallback policy");
 
         assert!(!requires_pinned);
+    }
+
+    /// Targeted bridge-network requests must keep the target during fallback handling.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridge_network_requests_disable_target_fallback() {
+        let volume_registry = make_test_volume_registry().await;
+        let network_registry = make_test_network_registry().await;
+        let bridge = make_bridge_network_spec("local-app");
+        network_registry
+            .registry
+            .upsert_spec(bridge.clone())
+            .await
+            .expect("persist bridge network");
+
+        let mut request = make_request(Some(Uuid::new_v4()));
+        request.execution.networks = vec![bridge.id];
+        let requires_pinned = requests_require_pinned_targets(
+            &volume_registry.registry,
+            &network_registry.registry,
+            &[request],
+        )
+        .expect("evaluate fallback policy");
+
+        assert!(requires_pinned);
     }
 
     /// Multi-target rollout batches should keep deterministic spread instead of dropping targets.

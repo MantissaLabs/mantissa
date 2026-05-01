@@ -1242,6 +1242,7 @@ pub struct SecretsShowArgs {
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum NetworkDriverOpt {
     Vxlan,
+    Bridge,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -1341,7 +1342,11 @@ impl NetworksCreateArgs {
     /// Merge user-provided programs with the defaults so dataplane maps and load-balancing remain
     /// available even when no BPF flags are specified on the CLI.
     pub fn resolved_bpf_programs(&self) -> Vec<String> {
-        let mut programs = client::networks::default_network_bpf_programs();
+        let driver = match self.driver {
+            NetworkDriverOpt::Vxlan => client::networks::NetworkDriver::Vxlan,
+            NetworkDriverOpt::Bridge => client::networks::NetworkDriver::Bridge,
+        };
+        let mut programs = client::networks::default_network_bpf_programs_for_driver(driver);
         programs.extend(self.bpf_programs.iter().cloned());
         programs.sort();
         programs.dedup();

@@ -108,6 +108,28 @@ fn collect_bpf_programs(
     Ok(programs)
 }
 
+/// Validate driver-specific request fields before persisting replicated network intent.
+fn validate_driver_request(
+    driver: NetworkDriver,
+    vni: u32,
+    bpf_programs: &[BpfProgramSpec],
+) -> Result<(), Error> {
+    if matches!(driver, NetworkDriver::Bridge) {
+        if vni != 0 {
+            return Err(Error::failed(
+                "bridge networks do not support a VXLAN VNI".to_string(),
+            ));
+        }
+        if !bpf_programs.is_empty() {
+            return Err(Error::failed(
+                "bridge networks do not support overlay eBPF programs".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Serialize one replicated network spec into the Cap'n Proto response shape.
 fn write_network_spec(mut builder: network_spec::Builder<'_>, spec: &NetworkSpecValue) {
     builder.set_id(spec.id.as_bytes());
@@ -471,6 +493,7 @@ impl networks::Server for NetworksRpc {
         let mtu = spec_reader.get_mtu();
         let sealed = spec_reader.get_sealed();
         let programs = collect_bpf_programs(&spec_reader)?;
+        validate_driver_request(driver, vni, &programs)?;
 
         let network_id = compute_network_id(&name);
         let existing_spec = self.registry.get_spec(network_id).map_err(to_capnp)?;

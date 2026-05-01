@@ -23,6 +23,9 @@ interface Networks {
 enum NetworkDriver {
   vxlan @0;
   # VXLAN-based overlay network.
+
+  bridge @1;
+  # Node-local Linux bridge network.
 }
 
 enum NetworkStatus {
@@ -87,13 +90,13 @@ struct NetworkCreateSpec {
   # Free-form description for operators.
 
   driver @2 :NetworkDriver;
-  # Overlay driver used for the network.
+  # Driver used for the network.
 
   subnetCidr @3 :Text;
   # IPv4/IPv6 CIDR for the overlay subnet.
 
   vni @4 :UInt32;
-  # VXLAN Network Identifier (0 means auto-allocate).
+  # VXLAN Network Identifier (0 means auto-allocate, unused for bridge).
 
   mtu @5 :UInt32;
   # MTU for the overlay (0 uses default MTU, typically 1450).
@@ -125,7 +128,7 @@ struct NetworkSpec {
   # VXLAN Network Identifier.
 
   mtu @6 :UInt32;
-  # Overlay MTU.
+  # Network MTU.
 
   createdAt @7 :Text;
   # RFC3339 timestamp when the network was created.
@@ -151,7 +154,7 @@ struct NetworkSummary {
   # Human-readable network name.
 
   driver @2 :NetworkDriver;
-  # Overlay driver in use.
+  # Network driver in use.
 
   status @3 :NetworkStatus;
   # Current lifecycle status.

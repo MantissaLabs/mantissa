@@ -1,6 +1,9 @@
-# Networking: VXLAN Overlay + eBPF Load Balancer + Host/Public Endpoints
+# Networking: VXLAN/Bridge Networks + eBPF Load Balancer + Host/Public Endpoints
 
-This document explains how Mantissa wires overlay networks (VXLAN + Linux bridge), how service discovery (DNS) publishes service backends and VIPs, and how the eBPF datapath implements a host-reachable “public endpoint” that load-balances across replicas without breaking intra-overlay connectivity.
+This document explains how Mantissa wires container networks, how service
+discovery (DNS) publishes service backends and VIPs, and how the eBPF datapath
+implements a host-reachable “public endpoint” that load-balances across
+replicas without breaking intra-overlay connectivity.
 
 If you want to follow along in the code, the main entry points are:
 
@@ -14,15 +17,46 @@ If you want to follow along in the code, the main entry points are:
 
 ## Quick mental model
 
-1. Each overlay network is a Linux bridge (`mnt-br-*`) with a VXLAN port (`mvx-*`) attached to it.
+Mantissa has two network drivers:
+
+- `vxlan`: cluster-scoped overlay networking. Containers on different nodes can
+  reach each other through VXLAN, optionally carried over WireGuard. VIPs and
+  `public_port` NodePort exposure require this driver.
+- `bridge`: node-local Linux bridge networking. Containers attached to the same
+  bridge can reach each other only when they are on the same node. DNS returns
+  only local-node backends, and templates that use `depends_on` across the same
+  bridge network are co-located or rejected when placement makes that
+  impossible.
+
+Cluster-wide service reachability requires `vxlan`. Use `bridge` when local
+pod-like composition is enough and cross-node networking should stay out of the
+dataplane.
+
+Manifest-backed services, jobs, and agents can declare the driver on the
+top-level network entry:
+
+```ron
+networks: [
+    (
+        name: "local-app",
+        driver: bridge,
+    ),
+]
+```
+
+1. Each network is a Linux bridge (`mnt-br-*`). VXLAN networks also attach a
+   VXLAN port (`mvx-*`) to that bridge.
 2. Each container gets a veth pair: host side (`mnth-*`) is plugged into the bridge; container side (`mntc-*`) lives in the container netns with an overlay IP and MAC.
-3. Each overlay network also gets a special host-access veth pair:
+3. Each network also gets a special host-access veth pair:
    - `mnhost-*` (host namespace, L3, owns the connected route for the overlay subnet)
    - `mnhp-*` (bridge peer, enslaved to the bridge)
 4. Service discovery runs a per-network DNS server bound to the `mnhost-*` IP (not the bridge). DNS answers provide:
    - Rotated backend IP A records (so “normal” service discovery always works).
-   - Optionally, a VIP A record (stable virtual IP) when the eBPF dataplane has been programmed.
-5. Public endpoints are implemented by making the VIP reachable from the host namespace via `mnhost-*`, and then applying VIP→backend DNAT/SNAT in TC eBPF programs attached to `mnhp-*`.
+   - For VXLAN networks only, optionally a VIP A record (stable virtual IP)
+     when the eBPF dataplane has been programmed.
+5. Public endpoints are implemented on VXLAN networks by making the VIP
+   reachable from the host namespace via `mnhost-*`, and then applying
+   VIP→backend DNAT/SNAT in TC eBPF programs attached to `mnhp-*`.
 
 ## Glossary (minimal)
 
@@ -74,7 +108,8 @@ Implemented in `src/network/controller.rs` (Linux backend in the `platform` modu
 On Linux (root required), Mantissa provisions and configures:
 
 - A bridge `mnt-br-*`.
-- A VXLAN device `mvx-*` with learning disabled (Mantissa programs FDB entries instead).
+- For VXLAN networks, a VXLAN device `mvx-*` with learning disabled (Mantissa
+  programs FDB entries instead).
 - A per-network host-access veth pair `mnhost-*` ↔ `mnhp-*`:
   - `mnhp-*` is enslaved to the bridge so host-originated frames enter the bridge as “port ingress”.
   - Hairpin mode is enabled on relevant bridge ports so synthetic replies can egress back out the ingress port.
@@ -86,6 +121,9 @@ On Linux (root required), Mantissa provisions and configures:
 Implemented via `src/network/attachment/linux.rs` (methods like `ensure_remote_fdb` / `ensure_flood_entry`).
 
 Because VXLAN learning is disabled, Mantissa programs static “MAC → remote node IP” entries on `mvx-*`. This allows the bridge to forward unicast frames to remote containers (and remote host-access endpoints) without relying on flooding/learning.
+
+Bridge networks do not create a VXLAN device and do not program remote FDB
+entries. They are intentionally node-local.
 
 ### Container attachments (veth into the container netns)
 
@@ -117,15 +155,18 @@ The DNS server for a network binds to the resolver IP on `mnhost-*` (UDP/53).
 For a service name lookup, Mantissa:
 
 1. Lists “ready” network attachments for the network.
-2. Filters them to tasks that match the service/template label.
+2. Filters them to tasks that match the service/template label. Bridge networks
+   also filter out attachments from other nodes.
 3. Optionally probes health (if configured) and refreshes backend MACs.
 4. Returns:
-   - one stable VIP record when the eBPF dataplane is programmed successfully,
+   - one stable VIP record for VXLAN networks when the eBPF dataplane is programmed successfully,
    - otherwise a rotated list of backend attachment IPs as the fallback path.
 
 Normal service discovery should prefer the stable VIP whenever Mantissa can
-program it. The backend-only DNS path exists so discovery still works during
-degraded startup or in environments where VIP programming is unavailable.
+program it. Bridge networks always use backend-only DNS and only publish
+local-node backends. The backend-only DNS path also exists so VXLAN discovery
+still works during degraded startup or in environments where VIP programming is
+unavailable.
 
 ### VIP computation (deterministic)
 
@@ -140,6 +181,9 @@ degraded startup or in environments where VIP programming is unavailable.
 
 Services opt into external exposure per task template via `public_port` in the
 RON manifest (see `examples/service_discovery_demo.ron`).
+
+`public_port` is accepted only on VXLAN networks. Bridge networks are
+node-local and do not have a cluster-wide VIP or NodePort datapath.
 
 When a template declares `public_port`, Mantissa keeps two related datapaths in
 sync:

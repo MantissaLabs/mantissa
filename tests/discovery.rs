@@ -106,6 +106,7 @@ async fn setup_discovery_harness_with_subnet(dns_port: u16, subnet_cidr: &str) -
         services.clone(),
         mantissa::network::bpf::NetworkBpfManager::unavailable(),
         health::HealthMonitor::new(Uuid::nil()),
+        actor,
         dns_port,
     );
 

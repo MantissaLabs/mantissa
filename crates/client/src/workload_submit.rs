@@ -47,6 +47,8 @@ pub struct ResolvedDeclaredVolume {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct ManifestNetworkSpec {
     pub name: String,
+    #[serde(default, deserialize_with = "deserialize_optional_network_driver")]
+    pub driver: Option<networks::NetworkDriver>,
     #[serde(default, deserialize_with = "deserialize_optional_network_ip_family")]
     pub ip_family: Option<NetworkIpFamily>,
 }
@@ -55,6 +57,7 @@ pub struct ManifestNetworkSpec {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestedNetworkSpec {
     pub name: String,
+    pub driver: networks::NetworkDriver,
     pub ip_family: Option<NetworkIpFamily>,
 }
 
@@ -66,6 +69,16 @@ pub fn compute_network_id(name: &str) -> Uuid {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest.as_bytes()[..16]);
     Uuid::from_bytes(bytes)
+}
+
+/// Deserialize one optional manifest network driver while accepting bare `vxlan` / `bridge` syntax.
+fn deserialize_optional_network_driver<'de, D>(
+    deserializer: D,
+) -> Result<Option<networks::NetworkDriver>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    networks::NetworkDriver::deserialize(deserializer).map(Some)
 }
 
 /// Deserialize one optional manifest network family while accepting bare `ipv4` / `ipv6` syntax.
@@ -113,7 +126,13 @@ where
 
     let mut overrides = HashMap::new();
     for network in declared_networks {
-        overrides.insert(network.name.trim().to_string(), network.ip_family);
+        overrides.insert(
+            network.name.trim().to_string(),
+            (
+                network.driver.unwrap_or(networks::NetworkDriver::Vxlan),
+                network.ip_family,
+            ),
+        );
     }
 
     let mut requested = Vec::new();
@@ -124,9 +143,14 @@ where
             continue;
         }
         if seen.insert(trimmed.to_string()) {
+            let (driver, ip_family) = overrides
+                .get(trimmed)
+                .copied()
+                .unwrap_or((networks::NetworkDriver::Vxlan, None));
             requested.push(RequestedNetworkSpec {
                 name: trimmed.to_string(),
-                ip_family: overrides.get(trimmed).copied().flatten(),
+                driver,
+                ip_family,
             });
         }
     }
@@ -146,8 +170,15 @@ pub async fn ensure_named_networks(
         if trimmed.is_empty() {
             continue;
         }
-        if let Some(existing_family) = seen.get(trimmed).copied().flatten() {
-            if let Some(requested_family) = network.ip_family
+        if let Some((existing_driver, existing_family)) = seen.get(trimmed).copied() {
+            if existing_driver != network.driver {
+                return Err(anyhow!(
+                    "manifest requests network '{}' with conflicting drivers",
+                    trimmed
+                ));
+            }
+            if let (Some(existing_family), Some(requested_family)) =
+                (existing_family, network.ip_family)
                 && existing_family != requested_family
             {
                 return Err(anyhow!(
@@ -157,9 +188,10 @@ pub async fn ensure_named_networks(
             }
             continue;
         }
-        seen.insert(trimmed.to_string(), network.ip_family);
+        seen.insert(trimmed.to_string(), (network.driver, network.ip_family));
         required.push(RequestedNetworkSpec {
             name: trimmed.to_string(),
+            driver: network.driver,
             ip_family: network.ip_family,
         });
     }
@@ -169,20 +201,33 @@ pub async fn ensure_named_networks(
     }
 
     let existing = networks::list_raw(cfg).await?;
-    let existing_names: HashSet<String> = existing.iter().map(|net| net.name.clone()).collect();
+    let existing_by_name: HashMap<String, networks::NetworkSummary> = existing
+        .iter()
+        .cloned()
+        .map(|net| (net.name.clone(), net))
+        .collect();
     let mut known_subnets: HashSet<String> =
         existing.iter().map(|net| net.subnet_cidr.clone()).collect();
 
     for requested in required {
-        if existing_names.contains(&requested.name) {
+        if let Some(existing) = existing_by_name.get(&requested.name) {
+            if existing.driver != requested.driver {
+                return Err(anyhow!(
+                    "manifest requests network '{}' with driver {} but an existing network uses driver {}",
+                    requested.name,
+                    requested.driver,
+                    existing.driver
+                ));
+            }
             continue;
         }
 
         let family = requested.ip_family.unwrap_or(cfg.default_network_ip_family);
-        let request = networks::default_network_create_request(
+        let request = networks::default_network_create_request_for_driver(
             requested.name.clone(),
             known_subnets.iter().map(String::as_str),
             family,
+            requested.driver,
         );
         match networks::create_raw(cfg, &request).await {
             Ok(network_id) => {

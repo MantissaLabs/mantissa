@@ -4,11 +4,12 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use uuid::Uuid;
 
-/// Supported overlay driver for network provisioning.
+/// Supported driver for network provisioning.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkDriver {
     Vxlan,
+    Bridge,
 }
 
 impl NetworkDriver {
@@ -16,6 +17,7 @@ impl NetworkDriver {
     pub fn from_proto(driver: protocol::network::NetworkDriver) -> Self {
         match driver {
             protocol::network::NetworkDriver::Vxlan => NetworkDriver::Vxlan,
+            protocol::network::NetworkDriver::Bridge => NetworkDriver::Bridge,
         }
     }
 
@@ -23,7 +25,33 @@ impl NetworkDriver {
     pub fn to_proto(self) -> protocol::network::NetworkDriver {
         match self {
             NetworkDriver::Vxlan => protocol::network::NetworkDriver::Vxlan,
+            NetworkDriver::Bridge => protocol::network::NetworkDriver::Bridge,
         }
+    }
+
+    /// Return whether this driver creates a cluster-wide routable dataplane.
+    pub fn is_cluster_scoped(self) -> bool {
+        matches!(self, NetworkDriver::Vxlan)
+    }
+
+    /// Return whether this driver is confined to the local node.
+    pub fn is_node_local(self) -> bool {
+        matches!(self, NetworkDriver::Bridge)
+    }
+
+    /// Return whether this driver needs encrypted remote underlay peer state.
+    pub fn requires_wireguard_underlay(self) -> bool {
+        matches!(self, NetworkDriver::Vxlan)
+    }
+
+    /// Return whether this driver supports remote forwarding entries.
+    pub fn supports_remote_forwarding(self) -> bool {
+        matches!(self, NetworkDriver::Vxlan)
+    }
+
+    /// Return whether this driver supports Mantissa's cluster service VIP path.
+    pub fn supports_service_vip(self) -> bool {
+        matches!(self, NetworkDriver::Vxlan)
     }
 }
 

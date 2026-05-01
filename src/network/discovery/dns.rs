@@ -274,23 +274,28 @@ async fn answer_query(query: &Query, runtime: &DiscoveryRuntime) -> Result<Looku
         "dns",
     );
 
+    let driver = network_driver(&runtime.registry, runtime.network_id)?;
     if backends.is_empty() {
-        let _ = sync_service_vip_for_backends(
-            runtime,
-            &service_name,
-            &[],
-            catalog_entry.expose_to_host,
-        )
-        .await?;
+        if driver.supports_service_vip() {
+            let _ = sync_service_vip_for_backends(
+                runtime,
+                &service_name,
+                &[],
+                catalog_entry.expose_to_host,
+            )
+            .await?;
+        }
         return Ok(LookupOutcome::NxDomain);
     }
-    if let Some((vip, programmed)) = sync_service_vip_for_backends(
-        runtime,
-        &service_name,
-        &backends,
-        catalog_entry.expose_to_host,
-    )
-    .await?
+
+    if driver.supports_service_vip()
+        && let Some((vip, programmed)) = sync_service_vip_for_backends(
+            runtime,
+            &service_name,
+            &backends,
+            catalog_entry.expose_to_host,
+        )
+        .await?
         && programmed
     {
         // Service names should resolve to one stable VIP whenever the dataplane is available so

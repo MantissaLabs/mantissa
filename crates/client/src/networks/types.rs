@@ -4,18 +4,22 @@ use protocol::network::{
     NetworkStatus as ProtoNetworkStatus, PeerState as ProtoPeerState, network_attachment_spec,
     network_inspect, network_peer_status, network_spec, network_summary,
 };
+use serde::Deserialize;
 use uuid::Uuid;
 
-/// Overlay networking driver supported by the orchestrator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Networking driver supported by the orchestrator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NetworkDriver {
     Vxlan,
+    Bridge,
 }
 
 impl std::fmt::Display for NetworkDriver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NetworkDriver::Vxlan => write!(f, "vxlan"),
+            NetworkDriver::Bridge => write!(f, "bridge"),
         }
     }
 }
@@ -24,6 +28,7 @@ impl From<NetworkDriver> for ProtoNetworkDriver {
     fn from(value: NetworkDriver) -> Self {
         match value {
             NetworkDriver::Vxlan => ProtoNetworkDriver::Vxlan,
+            NetworkDriver::Bridge => ProtoNetworkDriver::Bridge,
         }
     }
 }
@@ -32,6 +37,7 @@ impl From<ProtoNetworkDriver> for NetworkDriver {
     fn from(value: ProtoNetworkDriver) -> Self {
         match value {
             ProtoNetworkDriver::Vxlan => NetworkDriver::Vxlan,
+            ProtoNetworkDriver::Bridge => NetworkDriver::Bridge,
         }
     }
 }

@@ -11,8 +11,8 @@ use crate::network::naming::{
 use crate::network::nodeport::NodePortManager;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
-    BpfProgramSpec, NetworkAttachmentState, NetworkEvent, NetworkPeerState, NetworkPeerStateValue,
-    NetworkSpecValue, NetworkStatus,
+    BpfProgramSpec, NetworkAttachmentState, NetworkDriver, NetworkEvent, NetworkPeerState,
+    NetworkPeerStateValue, NetworkSpecValue, NetworkStatus,
 };
 use crate::network::wireguard::{self, WireGuardUnderlayState};
 use crate::registry::Registry;
@@ -41,6 +41,8 @@ const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const DISCOVERY_RETRY_ATTEMPTS: usize = 10;
 /// Default overlay MTU used when a network spec omits an explicit MTU.
 pub(crate) const DEFAULT_MTU: u32 = 1450;
+/// Default MTU for node-local bridge networks when the operator omits an explicit value.
+pub(crate) const DEFAULT_BRIDGE_MTU: u32 = 1500;
 #[cfg(target_os = "linux")]
 /// UDP destination port used by Linux VXLAN devices created for Mantissa overlays.
 const VXLAN_PORT: u16 = 4789;
@@ -148,6 +150,7 @@ impl NetworkController {
             service_registry,
             bpf.clone(),
             cluster_registry.health_monitor(),
+            node_id,
         );
 
         Ok(Self {
@@ -251,6 +254,20 @@ impl NetworkController {
             .collect())
     }
 
+    /// List every active VXLAN network that needs encrypted underlay reconciliation.
+    fn active_vxlan_network_ids(&self) -> Result<Vec<Uuid>> {
+        let specs = self
+            .inner
+            .registry
+            .list_specs()
+            .context("list network specs for vxlan scope")?;
+        Ok(specs
+            .into_iter()
+            .filter(|spec| !spec.is_deleted() && spec.driver.requires_wireguard_underlay())
+            .map(|spec| spec.id)
+            .collect())
+    }
+
     /// Snapshot every currently visible cluster peer except the local node.
     ///
     /// This acts as a bootstrap fallback while network peer readiness is still converging and the
@@ -283,7 +300,7 @@ impl NetworkController {
             return Ok(scoped);
         }
 
-        let active_network_ids = self.active_network_ids()?;
+        let active_network_ids = self.active_vxlan_network_ids()?;
         if active_network_ids.is_empty() {
             return Ok(scoped);
         }
@@ -310,7 +327,7 @@ impl NetworkController {
             *guard = WireGuardUnderlayState::default();
         }
 
-        for network_id in self.active_network_ids()? {
+        for network_id in self.active_vxlan_network_ids()? {
             self.update_peer_state_error(network_id, message.to_string())
                 .await?;
         }
@@ -764,17 +781,22 @@ impl NetworkController {
                 continue;
             }
             let (mut plan, _) = self.prepare_plan(&mut spec)?;
-            self.apply_wireguard_overrides(&mut plan).await?;
-            self.inner
-                .provisioner
-                .apply_plan_underlay_constraints(&mut plan)
-                .await?;
-            if let Err(err) = self.reconcile_remote_forwarding(&plan).await {
-                warn!(
-                    target: "network",
-                    network = %plan.network_id,
-                    "attachment-triggered forwarding reconcile failed: {err:#}"
-                );
+            if spec.driver.supports_remote_forwarding() {
+                self.apply_wireguard_overrides(&mut plan).await?;
+                self.inner
+                    .provisioner
+                    .apply_plan_underlay_constraints(&mut plan)
+                    .await?;
+                if let Err(err) = self.reconcile_remote_forwarding(&plan).await {
+                    warn!(
+                        target: "network",
+                        network = %plan.network_id,
+                        "attachment-triggered forwarding reconcile failed: {err:#}"
+                    );
+                }
+            } else {
+                self.clear_forwarding_caches(plan.network_id).await;
+                self.refresh_publication(plan.network_id).await;
             }
         }
 
@@ -880,11 +902,13 @@ impl NetworkController {
     /// Reconcile one active network from replicated spec through local dataplane readiness.
     async fn reconcile_network(&self, mut spec: NetworkSpecValue) -> Result<()> {
         let (mut plan, spec_changed) = self.prepare_plan(&mut spec)?;
-        self.apply_wireguard_overrides(&mut plan).await?;
-        self.inner
-            .provisioner
-            .apply_plan_underlay_constraints(&mut plan)
-            .await?;
+        if spec.driver.requires_wireguard_underlay() {
+            self.apply_wireguard_overrides(&mut plan).await?;
+            self.inner
+                .provisioner
+                .apply_plan_underlay_constraints(&mut plan)
+                .await?;
+        }
         if spec_changed {
             self.inner
                 .registry
@@ -904,6 +928,7 @@ impl NetworkController {
                 node = %self.inner.node_name,
                 vxlan = %plan.vxlan_name,
                 bridge = %plan.bridge_name,
+                driver = ?plan.driver,
                 vni = plan.vni,
                 mtu = plan.mtu,
                 "ensuring network resources"
@@ -913,12 +938,15 @@ impl NetworkController {
                 .ensure_network(&plan)
                 .await
                 .with_context(|| format!("ensure network {}", plan.network_id))?;
-            self.observe_vxlan_ifindex(&plan).await;
+            if plan.uses_vxlan() {
+                self.observe_vxlan_ifindex(&plan).await;
+            }
             debug!(
                 target: "network",
                 network_id = %plan.network_id,
                 vxlan = %plan.vxlan_name,
                 bridge = %plan.bridge_name,
+                driver = ?plan.driver,
                 "network resources ensured"
             );
 
@@ -1004,7 +1032,11 @@ impl NetworkController {
             );
         }
 
-        self.reconcile_remote_forwarding(&plan).await?;
+        if spec.driver.supports_remote_forwarding() {
+            self.reconcile_remote_forwarding(&plan).await?;
+        } else {
+            self.clear_forwarding_caches(plan.network_id).await;
+        }
         self.mark_peer_ready(plan.network_id).await?;
 
         if spec.status != NetworkStatus::Ready {
@@ -1249,18 +1281,29 @@ impl NetworkController {
         let mut changed = false;
 
         // Normalize defaults to keep the CRDT state consistent across nodes.
-        if spec.vni == 0 {
+        if spec.driver == NetworkDriver::Vxlan && spec.vni == 0 {
             let computed_vni = compute_deterministic_vni(spec.id);
             spec.vni = computed_vni;
+            changed = true;
+        } else if spec.driver == NetworkDriver::Bridge && spec.vni != 0 {
+            spec.vni = 0;
             changed = true;
         }
 
         if spec.mtu == 0 {
-            spec.mtu = DEFAULT_MTU;
+            spec.mtu = match spec.driver {
+                NetworkDriver::Vxlan => DEFAULT_MTU,
+                NetworkDriver::Bridge => DEFAULT_BRIDGE_MTU,
+            };
             changed = true;
         }
 
-        changed |= Self::ensure_default_bpf_programs(&mut spec.bpf_programs);
+        if spec.driver == NetworkDriver::Vxlan {
+            changed |= Self::ensure_default_bpf_programs(&mut spec.bpf_programs);
+        } else if !spec.bpf_programs.is_empty() {
+            spec.bpf_programs.clear();
+            changed = true;
+        }
         spec.bpf_programs.sort();
 
         let resolver_ip = match resolver_ip_address(spec, self.inner.node_id) {
@@ -1297,6 +1340,7 @@ impl NetworkController {
         let suffix = managed_interface_suffix(spec.id);
         let plan = NetworkPlan {
             network_id: spec.id,
+            driver: spec.driver,
             vxlan_name: format!("mvx-{suffix}"),
             bridge_name: format!("mnt-br-{suffix}"),
             vni: spec.vni,
@@ -1535,6 +1579,11 @@ impl NetworkController {
 
     /// Reconcile VXLAN FDB entries for remote task and host-access MAC forwarding.
     async fn reconcile_remote_forwarding(&self, plan: &NetworkPlan) -> Result<()> {
+        if !plan.driver.supports_remote_forwarding() {
+            self.clear_forwarding_caches(plan.network_id).await;
+            return Ok(());
+        }
+
         let attachments = self
             .inner
             .registry

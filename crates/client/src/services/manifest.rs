@@ -1175,6 +1175,7 @@ mod tests {
                 networks: [
                     (
                         name: "frontend",
+                        driver: bridge,
                         ip_family: ipv6,
                     ),
                 ],
@@ -1193,6 +1194,7 @@ mod tests {
         let requested = manifest.requested_networks().expect("network requests");
         assert_eq!(requested.len(), 1);
         assert_eq!(requested[0].name, "frontend");
+        assert_eq!(requested[0].driver, crate::networks::NetworkDriver::Bridge);
         assert_eq!(
             requested[0].ip_family,
             Some(crate::config::NetworkIpFamily::Ipv6)

@@ -593,6 +593,7 @@ mod linux {
                 target: "network",
                 vxlan = %plan.vxlan_name,
                 bridge = %plan.bridge_name,
+                driver = ?plan.driver,
                 vni = plan.vni,
                 mtu = plan.mtu,
                 "provisioner: ensuring kernel interfaces"
@@ -608,21 +609,23 @@ mod linux {
                 "provisioner: bridge interface ready"
             );
 
-            let vxlan_index = self
-                .ensure_vxlan_bridge_port(plan, bridge_index)
-                .await
-                .with_context(|| {
-                    format!(
-                        "ensure vxlan {} is attached and configured on bridge {}",
-                        plan.vxlan_name, plan.bridge_name
-                    )
-                })?;
-            debug!(
-                target: "network",
-                vxlan = %plan.vxlan_name,
-                vxlan_index,
-                "provisioner: vxlan interface ready"
-            );
+            if plan.uses_vxlan() {
+                let vxlan_index = self
+                    .ensure_vxlan_bridge_port(plan, bridge_index)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "ensure vxlan {} is attached and configured on bridge {}",
+                            plan.vxlan_name, plan.bridge_name
+                        )
+                    })?;
+                debug!(
+                    target: "network",
+                    vxlan = %plan.vxlan_name,
+                    vxlan_index,
+                    "provisioner: vxlan interface ready"
+                );
+            }
 
             let host_access = if plan.resolver_ip.is_some() && plan.subnet_prefix.is_some() {
                 Some(
@@ -749,6 +752,7 @@ mod linux {
                 target: "network",
                 vxlan = %plan.vxlan_name,
                 bridge = %plan.bridge_name,
+                driver = ?plan.driver,
                 "provisioner: kernel interfaces ensured"
             );
             Ok(())
@@ -2414,6 +2418,9 @@ mod linux {
         /// still needs one concrete local underlay interface and one effective MTU derived from
         /// the host's current routing state before it touches kernel links.
         pub async fn apply_plan_underlay_constraints(&self, plan: &mut NetworkPlan) -> Result<()> {
+            if !plan.uses_vxlan() {
+                return Ok(());
+            }
             if self.handle.is_none() {
                 return Ok(());
             }
@@ -2666,8 +2673,9 @@ mod stub {
         pub async fn ensure_network(&self, plan: &NetworkPlan) -> Result<()> {
             info!(
                 target: "network",
-                "network provisioning is not supported on this platform, marking '{}' ready without kernel changes",
-                plan.vxlan_name
+                "network provisioning is not supported on this platform, marking '{}' ({:?}) ready without kernel changes",
+                plan.bridge_name,
+                plan.driver
             );
             Ok(())
         }

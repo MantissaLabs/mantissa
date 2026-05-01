@@ -62,6 +62,7 @@ struct ReplacementRequestContext<'a> {
     eligible_nodes: &'a [Uuid],
     placement_nodes: &'a [PlacementNode],
     preference_inventory: &'a PlacementPreferenceInventory,
+    network_registry: &'a NetworkRegistry,
     volume_registry: &'a VolumeRegistry,
 }
 
@@ -280,15 +281,16 @@ fn build_replacement_requests(
     context: ReplacementRequestContext<'_>,
     replacements: &[ReplicaReplacement],
 ) -> anyhow::Result<Vec<WorkloadStartRequest>> {
-    let slot_targets = compute_effective_slot_targets(
-        context.service_name,
-        context.service_id,
-        context.task_templates,
-        context.eligible_nodes,
-        context.placement_nodes,
-        context.preference_inventory,
-        context.volume_registry,
-    )?;
+    let slot_targets = compute_effective_slot_targets(&SlotTargetContext {
+        service_name: context.service_name,
+        service_id: context.service_id,
+        task_templates: context.task_templates,
+        eligible_nodes: context.eligible_nodes,
+        placement_nodes: context.placement_nodes,
+        preference_inventory: context.preference_inventory,
+        network_registry: context.network_registry,
+        volume_registry: context.volume_registry,
+    })?;
     Ok(replacements
         .iter()
         .map(|replacement| {
@@ -521,6 +523,7 @@ impl ServiceController {
                 eligible_nodes: &eligible_nodes,
                 placement_nodes: &placement_nodes,
                 preference_inventory: &preference_inventory,
+                network_registry: &self.network_registry,
                 volume_registry: &self.volume_registry,
             },
             replace,
@@ -1273,15 +1276,16 @@ impl ServiceController {
         let placement_nodes = self.placement_nodes_for(&eligible_nodes);
         let preference_inventory =
             build_placement_preference_inventory(&self.workload_manager).await?;
-        let slot_targets = compute_effective_slot_targets(
+        let slot_targets = compute_effective_slot_targets(&SlotTargetContext {
             service_name,
-            current_spec.id,
-            &current_spec.task_templates,
-            &eligible_nodes,
-            &placement_nodes,
-            &preference_inventory,
-            &self.volume_registry,
-        )?;
+            service_id: current_spec.id,
+            task_templates: &current_spec.task_templates,
+            eligible_nodes: &eligible_nodes,
+            placement_nodes: &placement_nodes,
+            preference_inventory: &preference_inventory,
+            network_registry: &self.network_registry,
+            volume_registry: &self.volume_registry,
+        })?;
 
         for step in current_graph.rollback_steps(&current_spec.task_templates, rollback_old_tasks) {
             let template = old_templates_by_name.get(&step.template).ok_or_else(|| {

@@ -28,6 +28,15 @@ const DEFAULT_NETWORK_SUBNET_CANDIDATES_V6: u32 = 1 << 16;
 /// Return the baseline dataplane programs required for VXLAN overlays so auto-provisioned
 /// networks behave consistently with CLI defaults.
 pub fn default_network_bpf_programs() -> Vec<String> {
+    default_network_bpf_programs_for_driver(NetworkDriver::Vxlan)
+}
+
+/// Return the baseline dataplane programs required by the requested network driver.
+pub fn default_network_bpf_programs_for_driver(driver: NetworkDriver) -> Vec<String> {
+    if matches!(driver, NetworkDriver::Bridge) {
+        return Vec::new();
+    }
+
     vec![
         "vxlan_xdp".to_string(),
         "bridge_xdp@bridge_xdp".to_string(),
@@ -121,15 +130,29 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    default_network_create_request_for_driver(name, existing_subnets, family, NetworkDriver::Vxlan)
+}
+
+/// Build a default network creation request for the requested driver.
+pub fn default_network_create_request_for_driver<I, S>(
+    name: impl Into<String>,
+    existing_subnets: I,
+    family: NetworkIpFamily,
+    driver: NetworkDriver,
+) -> NetworkCreateRequest
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let name = name.into();
-    let mut programs = default_network_bpf_programs();
+    let mut programs = default_network_bpf_programs_for_driver(driver);
     programs.sort();
     programs.dedup();
 
     NetworkCreateRequest {
         name: name.clone(),
         description: None,
-        driver: NetworkDriver::Vxlan,
+        driver,
         subnet_cidr: default_network_subnet(&name, existing_subnets, family),
         vni: None,
         mtu: None,
