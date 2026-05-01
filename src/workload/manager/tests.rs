@@ -7488,6 +7488,10 @@ async fn workload_start_service_requeue_excludes_capacity_shortage() {
         !workload_start_error_requires_service_requeue(&result),
         "services should consume rollout failure budget for pure capacity starvation"
     );
+    assert!(
+        workload_start_error_consumes_service_failure_budget(&result),
+        "capacity starvation should consume the service failure budget"
+    );
 }
 
 #[tokio::test]

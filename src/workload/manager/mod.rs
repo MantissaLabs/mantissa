@@ -1606,6 +1606,20 @@ pub(crate) fn workload_start_error_requires_service_requeue(err: &anyhow::Error)
         })
 }
 
+/// Returns true when a service launch failure should consume its failure budget.
+pub(crate) fn workload_start_error_consumes_service_failure_budget(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<SchedulingError>())
+        .is_some_and(|cause| {
+            matches!(
+                cause,
+                SchedulingError::NoCapacityAcrossCluster
+                    | SchedulingError::InsufficientCapacityForBatch
+                    | SchedulingError::InsufficientCapacityOnTarget { .. }
+            )
+        })
+}
+
 /// Pick a smaller scheduling retry budget for targeted starts so callers can fall back quickly.
 fn scheduling_retry_max_attempts_for_intents(intents: &[planner::StartIntent]) -> usize {
     const DEFAULT_MAX_ATTEMPTS: usize = 30;

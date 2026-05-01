@@ -19,7 +19,8 @@ use crate::volumes::types::VolumeDriver;
 use crate::volumes::{LocalVolumeAccessError, VolumeRegistry};
 use crate::workload::manager::WorkloadManager;
 use crate::workload::manager::{
-    WorkloadStartRequest, workload_start_error_requires_service_requeue,
+    WorkloadStartRequest, workload_start_error_consumes_service_failure_budget,
+    workload_start_error_requires_service_requeue,
 };
 use crate::workload::model::{WorkloadPhase, WorkloadSpec, WorkloadVolumeMount};
 use crate::workload::types::{WorkloadPortBinding, WorkloadPortProtocol};
@@ -1041,8 +1042,14 @@ impl ServiceController {
                         }
                     }
                     Ok(Some(persisted_spec)) => {
-                        self.persist_deploying_launch_error(persisted_spec, detail.clone())
+                        self.persist_deploying_launch_error(persisted_spec.clone(), detail.clone())
                             .await;
+                        if workload_start_error_consumes_service_failure_budget(&err) {
+                            let controller = self.clone();
+                            tokio::task::spawn_local(async move {
+                                controller.await_service_readiness(persisted_spec).await;
+                            });
+                        }
                     }
                     Ok(None) if is_local_volume_unavailable_error(&err) => {
                         let mut blocked_spec = ServiceSpecValue::new(
@@ -1701,8 +1708,14 @@ impl ServiceController {
                 }
             }
             Ok(Some(persisted_spec)) => {
-                self.persist_deploying_launch_error(persisted_spec, detail.clone())
+                self.persist_deploying_launch_error(persisted_spec.clone(), detail.clone())
                     .await;
+                if workload_start_error_consumes_service_failure_budget(err) {
+                    let controller = self.clone();
+                    tokio::task::spawn_local(async move {
+                        controller.await_service_readiness(persisted_spec).await;
+                    });
+                }
             }
             Ok(None) if is_local_volume_unavailable_error(err) => {
                 let mut blocked_spec = ServiceSpecValue::new(
