@@ -1,14 +1,19 @@
+use super::inventory::{ServiceReplicaSnapshot, TaskInventory};
 use super::ownership::{
     ReplicaSlot, SlotKey, build_replica_slots, select_slot_owner, select_task_owner,
 };
-use super::{
-    SERVICE_ENABLE_PROACTIVE_REBALANCE, SERVICE_REBALANCE_COOLDOWN_SECS,
-    SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController, ServiceReplicaSnapshot, SlotTargetContext,
-    TaskInventory, build_placement_preference_inventory, compute_effective_slot_targets,
-    deploying_assignment_incomplete, expected_task_id_count, is_local_volume_unavailable_error,
-    mounted_local_volumes_require_pinned_target, node_is_down,
+use super::placement::{
+    SlotTargetContext, build_placement_preference_inventory, compute_effective_slot_targets,
+    is_local_volume_unavailable_error, mounted_local_volumes_require_pinned_target,
+};
+use super::state::{
+    deploying_assignment_incomplete, expected_task_id_count, node_is_down,
     should_restart_missing_slot_immediately, task_age_allows_cleanup, task_age_allows_rebalance,
     task_state_healthy, task_state_rebalanceable,
+};
+use super::{
+    SERVICE_ENABLE_PROACTIVE_REBALANCE, SERVICE_REBALANCE_COOLDOWN_SECS,
+    SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController,
 };
 use crate::services::types::{ServiceSpecValue, ServiceStatus};
 use crate::workload::model::{WorkloadPhase, WorkloadSpec};

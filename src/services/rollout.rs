@@ -3,7 +3,14 @@
 //! This module intentionally keeps behavior 1:1 with the original manager
 //! implementation while isolating rolling-update/rollback flow for maintenance.
 
+use super::admission::workload_host_port_sets_conflict;
+use super::deployment::{DependencyGateContext, ServiceRedeploymentJob, order_task_ids};
+use super::placement::{
+    SlotTargetContext, build_placement_preference_inventory, compute_effective_slot_targets,
+};
+use super::state::rollout_task_stopped_or_absent;
 use super::*;
+use std::future::Future;
 
 #[derive(Clone, Debug)]
 struct RollbackTaskRecord {
@@ -1610,6 +1617,69 @@ impl ServiceController {
             }
         }
     }
+}
+
+/// Waits for one rollout task to become running and remain stable during monitoring.
+///
+/// The state fetcher indirection allows deterministic timeout tests without requiring
+/// multi-node task orchestration in every test case.
+pub(super) async fn wait_rollout_task_running_with_state_fetcher<F, Fut>(
+    service_name: &str,
+    task_id: Uuid,
+    startup_timeout_secs: u32,
+    monitor_secs: u32,
+    mut fetch_state: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<Option<WorkloadPhase>>>,
+{
+    let readiness_deadline = Instant::now() + Duration::from_secs(startup_timeout_secs as u64);
+    loop {
+        if Instant::now() >= readiness_deadline {
+            return Err(anyhow!(
+                "timed out waiting for rollout task {} in service '{}' to reach running",
+                task_id,
+                service_name
+            ));
+        }
+
+        let state = fetch_state().await?;
+        match state {
+            Some(WorkloadPhase::Running) => break,
+            Some(WorkloadPhase::Pending)
+            | Some(WorkloadPhase::Pulling)
+            | Some(WorkloadPhase::Creating) => {}
+            Some(other) => {
+                return Err(anyhow!(
+                    "rollout task {} for service '{}' entered terminal state {:?}",
+                    task_id,
+                    service_name,
+                    other
+                ));
+            }
+            None => {}
+        }
+
+        sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+    }
+
+    let monitor_deadline = Instant::now() + Duration::from_secs(monitor_secs as u64);
+    while Instant::now() < monitor_deadline {
+        let state = fetch_state().await?;
+        if !matches!(state, Some(WorkloadPhase::Running)) {
+            return Err(anyhow!(
+                "rollout task {} for service '{}' became unstable during monitor window: {:?}",
+                task_id,
+                service_name,
+                state
+            ));
+        }
+
+        sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
