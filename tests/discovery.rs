@@ -2,7 +2,6 @@
 mod common;
 
 use anyhow::Context;
-use crdt_store::uuid_key::UuidKey;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use mantissa::network::discovery::ServiceDiscovery;
@@ -24,6 +23,7 @@ use mantissa::store::workload_store::open_workload_store;
 use mantissa::task::types::{TaskServiceMetadata, TaskValue, TaskValueDraft};
 use mantissa::workload::model::{WorkloadOwner, WorkloadPhase};
 use mantissa::workload::types::ExecutionSpec;
+use mantissa_store::uuid_key::UuidKey;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -105,7 +105,7 @@ async fn setup_discovery_harness_with_subnet(dns_port: u16, subnet_cidr: &str) -
         workloads.clone(),
         services.clone(),
         mantissa::network::bpf::NetworkBpfManager::unavailable(),
-        health::HealthMonitor::new(Uuid::nil()),
+        mantissa_health::HealthMonitor::new(Uuid::nil()),
         actor,
         dns_port,
     );

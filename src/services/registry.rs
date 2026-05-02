@@ -2,7 +2,7 @@ use crate::services::ordering::compare_service_specs;
 use crate::services::types::{ServiceSpecValue, ServiceStatus, compute_service_id};
 use crate::store::service_store::ServiceStore;
 use anyhow::{Result, anyhow};
-use crdt_store::uuid_key::UuidKey;
+use mantissa_store::uuid_key::UuidKey;
 use std::collections::HashSet;
 use uuid::Uuid;
 

@@ -69,7 +69,10 @@ impl ClusterViewId {
     }
 
     /// Encodes this view into a Cap'n Proto `ClusterViewId` builder.
-    pub fn write_capnp(self, mut builder: protocol::topology::cluster_view_id::Builder<'_>) {
+    pub fn write_capnp(
+        self,
+        mut builder: mantissa_protocol::topology::cluster_view_id::Builder<'_>,
+    ) {
         builder
             .reborrow()
             .init_cluster_id()
@@ -79,7 +82,7 @@ impl ClusterViewId {
 
     /// Decodes a `ClusterViewId` from a Cap'n Proto reader.
     pub fn from_capnp(
-        reader: protocol::topology::cluster_view_id::Reader<'_>,
+        reader: mantissa_protocol::topology::cluster_view_id::Reader<'_>,
     ) -> Result<Self, String> {
         let cluster = reader
             .get_cluster_id()

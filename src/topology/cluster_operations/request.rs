@@ -27,31 +27,41 @@ pub(in crate::topology) struct SplitOperationBuildInput<'a> {
 impl Topology {
     /// Converts the merge request policy from the Cap'n Proto enum into local durable policy state.
     pub(in crate::topology) fn merge_service_policy_from_capnp(
-        policy: protocol::topology::MergeServicePolicy,
+        policy: mantissa_protocol::topology::MergeServicePolicy,
     ) -> MergeServicePolicy {
         match policy {
-            protocol::topology::MergeServicePolicy::Rebalance => MergeServicePolicy::Rebalance,
-            protocol::topology::MergeServicePolicy::Preserve => MergeServicePolicy::Preserve,
+            mantissa_protocol::topology::MergeServicePolicy::Rebalance => {
+                MergeServicePolicy::Rebalance
+            }
+            mantissa_protocol::topology::MergeServicePolicy::Preserve => {
+                MergeServicePolicy::Preserve
+            }
         }
     }
 
     /// Converts the split request service policy into local durable policy state.
     pub(in crate::topology) fn split_service_policy_from_capnp(
-        policy: protocol::topology::SplitServicePolicy,
+        policy: mantissa_protocol::topology::SplitServicePolicy,
     ) -> SplitServicePolicy {
         match policy {
-            protocol::topology::SplitServicePolicy::Partitioned => SplitServicePolicy::Partitioned,
-            protocol::topology::SplitServicePolicy::Preserve => SplitServicePolicy::Preserve,
+            mantissa_protocol::topology::SplitServicePolicy::Partitioned => {
+                SplitServicePolicy::Partitioned
+            }
+            mantissa_protocol::topology::SplitServicePolicy::Preserve => {
+                SplitServicePolicy::Preserve
+            }
         }
     }
 
     /// Converts the split request network policy into local durable policy state.
     pub(in crate::topology) fn split_network_policy_from_capnp(
-        policy: protocol::topology::SplitNetworkPolicy,
+        policy: mantissa_protocol::topology::SplitNetworkPolicy,
     ) -> SplitNetworkPolicy {
         match policy {
-            protocol::topology::SplitNetworkPolicy::Isolate => SplitNetworkPolicy::Isolate,
-            protocol::topology::SplitNetworkPolicy::Preserve => SplitNetworkPolicy::Preserve,
+            mantissa_protocol::topology::SplitNetworkPolicy::Isolate => SplitNetworkPolicy::Isolate,
+            mantissa_protocol::topology::SplitNetworkPolicy::Preserve => {
+                SplitNetworkPolicy::Preserve
+            }
         }
     }
 
@@ -59,7 +69,7 @@ impl Topology {
     pub(in crate::topology) fn parse_split_target_specs(
         &self,
         source_view: ClusterViewId,
-        targets: capnp::struct_list::Reader<'_, protocol::topology::split_target::Owned>,
+        targets: capnp::struct_list::Reader<'_, mantissa_protocol::topology::split_target::Owned>,
     ) -> Result<ParsedSplitTargets, capnp::Error> {
         if targets.is_empty() {
             return Err(capnp::Error::failed(

@@ -13,11 +13,11 @@ use crate::workload::capnp_codec::{
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
 use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
-use crdt_store::codec::StoreValueCodec;
-use protocol::agents::{
+use mantissa_protocol::agents::{
     agent_event, agent_event_entry, agent_run_spec, agent_session_spec, agents,
 };
-use protocol::gossip::gossip_message;
+use mantissa_protocol::gossip::gossip_message;
+use mantissa_store::codec::StoreValueCodec;
 use std::io::Cursor;
 use std::rc::Rc;
 use uuid::Uuid;
@@ -215,15 +215,15 @@ pub fn write_agent_event(
 ) -> Result<(), Error> {
     match event {
         AgentEvent::UpsertSession(session) => {
-            builder.set_event(protocol::agents::EventType::UpsertSession);
+            builder.set_event(mantissa_protocol::agents::EventType::UpsertSession);
             write_agent_session_spec(builder.reborrow().init_session(), session.as_ref())?;
         }
         AgentEvent::UpsertRun(run) => {
-            builder.set_event(protocol::agents::EventType::UpsertRun);
+            builder.set_event(mantissa_protocol::agents::EventType::UpsertRun);
             write_agent_run_spec(builder.reborrow().init_run(), run.as_ref())?;
         }
         AgentEvent::Remove { id } => {
-            builder.set_event(protocol::agents::EventType::Remove);
+            builder.set_event(mantissa_protocol::agents::EventType::Remove);
             builder.set_id(id.as_bytes());
         }
     }
@@ -233,13 +233,13 @@ pub fn write_agent_event(
 /// Decodes one agent event from the shared gossip message union payload.
 pub fn read_agent_event(reader: agent_event::Reader<'_>) -> Result<AgentEvent, Error> {
     match reader.get_event()? {
-        protocol::agents::EventType::UpsertSession => Ok(AgentEvent::UpsertSession(Box::new(
-            read_agent_session_spec(reader.get_session()?)?,
-        ))),
-        protocol::agents::EventType::UpsertRun => Ok(AgentEvent::UpsertRun(Box::new(
+        mantissa_protocol::agents::EventType::UpsertSession => Ok(AgentEvent::UpsertSession(
+            Box::new(read_agent_session_spec(reader.get_session()?)?),
+        )),
+        mantissa_protocol::agents::EventType::UpsertRun => Ok(AgentEvent::UpsertRun(Box::new(
             read_agent_run_spec(reader.get_run()?)?,
         ))),
-        protocol::agents::EventType::Remove => Ok(AgentEvent::Remove {
+        mantissa_protocol::agents::EventType::Remove => Ok(AgentEvent::Remove {
             id: read_uuid(reader.get_id()?)?,
         }),
     }
@@ -256,7 +256,7 @@ pub fn add_event(
 
 impl StoreValueCodec for AgentRecordValue {
     /// Encodes one agent record as the stable Cap'n Proto store value.
-    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
         let event = match self {
             AgentRecordValue::Session(session) => AgentEvent::UpsertSession(session.clone()),
             AgentRecordValue::Run(run) => AgentEvent::UpsertRun(run.clone()),
@@ -269,7 +269,7 @@ impl StoreValueCodec for AgentRecordValue {
     }
 
     /// Decodes one agent record from the stable Cap'n Proto store value.
-    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let reader =
             capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
@@ -282,16 +282,16 @@ impl StoreValueCodec for AgentRecordValue {
         match event {
             AgentEvent::UpsertSession(session) => Ok(AgentRecordValue::Session(session)),
             AgentEvent::UpsertRun(run) => Ok(AgentRecordValue::Run(run)),
-            AgentEvent::Remove { id } => Err(Box::new(crdt_store::error::Error::Other(format!(
-                "agent store value cannot decode remove event for {id}"
-            )))),
+            AgentEvent::Remove { id } => Err(Box::new(mantissa_store::error::Error::Other(
+                format!("agent store value cannot decode remove event for {id}"),
+            ))),
         }
     }
 }
 
 /// Converts agent store-codec errors into the CRDT store error type.
-fn agent_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
-    Box::new(crdt_store::error::Error::Other(format!(
+fn agent_store_codec_error<E: std::fmt::Display>(error: E) -> Box<mantissa_store::error::Error> {
+    Box::new(mantissa_store::error::Error::Other(format!(
         "agent store codec error: {error}"
     )))
 }
@@ -632,7 +632,7 @@ fn read_uuid_list(list: capnp::data_list::Reader<'_>) -> Result<Vec<Uuid>, Error
 }
 
 fn write_workspace_policy(
-    mut builder: protocol::agents::agent_workspace_policy::Builder<'_>,
+    mut builder: mantissa_protocol::agents::agent_workspace_policy::Builder<'_>,
     value: &AgentWorkspacePolicy,
 ) -> Result<(), Error> {
     write_optional_mount(builder.reborrow().init_mount(), value.mount.as_ref());
@@ -642,7 +642,7 @@ fn write_workspace_policy(
 }
 
 fn read_workspace_policy(
-    reader: protocol::agents::agent_workspace_policy::Reader<'_>,
+    reader: mantissa_protocol::agents::agent_workspace_policy::Reader<'_>,
 ) -> Result<AgentWorkspacePolicy, Error> {
     Ok(AgentWorkspacePolicy {
         mount: read_optional_mount(reader.get_mount()?)?,
@@ -652,7 +652,7 @@ fn read_workspace_policy(
 }
 
 fn write_tool_policy(
-    mut builder: protocol::agents::agent_tool_policy::Builder<'_>,
+    mut builder: mantissa_protocol::agents::agent_tool_policy::Builder<'_>,
     value: &AgentToolPolicy,
 ) {
     let mut tools = builder
@@ -667,7 +667,7 @@ fn write_tool_policy(
 }
 
 fn read_tool_policy(
-    reader: protocol::agents::agent_tool_policy::Reader<'_>,
+    reader: mantissa_protocol::agents::agent_tool_policy::Reader<'_>,
 ) -> Result<AgentToolPolicy, Error> {
     let mut allowed_tools = Vec::new();
     for tool in reader.get_allowed_tools()?.iter() {
@@ -682,7 +682,7 @@ fn read_tool_policy(
 }
 
 fn write_checkpoint_policy(
-    mut builder: protocol::agents::agent_checkpoint_policy::Builder<'_>,
+    mut builder: mantissa_protocol::agents::agent_checkpoint_policy::Builder<'_>,
     value: &AgentCheckpointPolicy,
 ) -> Result<(), Error> {
     builder.set_enabled(value.enabled);
@@ -692,7 +692,7 @@ fn write_checkpoint_policy(
 }
 
 fn read_checkpoint_policy(
-    reader: protocol::agents::agent_checkpoint_policy::Reader<'_>,
+    reader: mantissa_protocol::agents::agent_checkpoint_policy::Reader<'_>,
 ) -> Result<AgentCheckpointPolicy, Error> {
     Ok(AgentCheckpointPolicy {
         enabled: reader.get_enabled(),
@@ -705,7 +705,7 @@ fn read_checkpoint_policy(
 }
 
 fn write_interaction_policy(
-    mut builder: protocol::agents::agent_interaction_policy::Builder<'_>,
+    mut builder: mantissa_protocol::agents::agent_interaction_policy::Builder<'_>,
     value: &crate::agents::types::AgentInteractionPolicy,
 ) {
     builder.set_require_user_input_between_runs(value.require_user_input_between_runs);
@@ -714,7 +714,7 @@ fn write_interaction_policy(
 }
 
 fn read_interaction_policy(
-    reader: protocol::agents::agent_interaction_policy::Reader<'_>,
+    reader: mantissa_protocol::agents::agent_interaction_policy::Reader<'_>,
 ) -> Result<crate::agents::types::AgentInteractionPolicy, Error> {
     Ok(crate::agents::types::AgentInteractionPolicy {
         require_user_input_between_runs: reader.get_require_user_input_between_runs(),
@@ -756,7 +756,7 @@ fn read_agent_events(
 }
 
 fn write_optional_mount(
-    mut builder: protocol::workload::volume_mount::Builder<'_>,
+    mut builder: mantissa_protocol::workload::volume_mount::Builder<'_>,
     mount: Option<&crate::workload::model::WorkloadVolumeMount>,
 ) {
     if let Some(mount) = mount {
@@ -773,7 +773,7 @@ fn write_optional_mount(
 }
 
 fn read_optional_mount(
-    reader: protocol::workload::volume_mount::Reader<'_>,
+    reader: mantissa_protocol::workload::volume_mount::Reader<'_>,
 ) -> Result<Option<crate::workload::model::WorkloadVolumeMount>, Error> {
     let data = reader.get_volume_id()?;
     if data.is_empty() {
@@ -794,81 +794,89 @@ fn read_optional_mount(
 
 fn agent_session_status_to_proto(
     status: AgentSessionStatus,
-) -> protocol::agents::AgentSessionStatus {
+) -> mantissa_protocol::agents::AgentSessionStatus {
     match status {
-        AgentSessionStatus::WaitingInput => protocol::agents::AgentSessionStatus::WaitingInput,
-        AgentSessionStatus::Queued => protocol::agents::AgentSessionStatus::Queued,
-        AgentSessionStatus::Running => protocol::agents::AgentSessionStatus::Running,
-        AgentSessionStatus::Failed => protocol::agents::AgentSessionStatus::Failed,
-        AgentSessionStatus::Closing => protocol::agents::AgentSessionStatus::Closing,
-        AgentSessionStatus::Closed => protocol::agents::AgentSessionStatus::Closed,
+        AgentSessionStatus::WaitingInput => {
+            mantissa_protocol::agents::AgentSessionStatus::WaitingInput
+        }
+        AgentSessionStatus::Queued => mantissa_protocol::agents::AgentSessionStatus::Queued,
+        AgentSessionStatus::Running => mantissa_protocol::agents::AgentSessionStatus::Running,
+        AgentSessionStatus::Failed => mantissa_protocol::agents::AgentSessionStatus::Failed,
+        AgentSessionStatus::Closing => mantissa_protocol::agents::AgentSessionStatus::Closing,
+        AgentSessionStatus::Closed => mantissa_protocol::agents::AgentSessionStatus::Closed,
     }
 }
 
 fn proto_to_agent_session_status(
-    status: protocol::agents::AgentSessionStatus,
+    status: mantissa_protocol::agents::AgentSessionStatus,
 ) -> AgentSessionStatus {
     match status {
-        protocol::agents::AgentSessionStatus::WaitingInput => AgentSessionStatus::WaitingInput,
-        protocol::agents::AgentSessionStatus::Queued => AgentSessionStatus::Queued,
-        protocol::agents::AgentSessionStatus::Running => AgentSessionStatus::Running,
-        protocol::agents::AgentSessionStatus::Failed => AgentSessionStatus::Failed,
-        protocol::agents::AgentSessionStatus::Closing => AgentSessionStatus::Closing,
-        protocol::agents::AgentSessionStatus::Closed => AgentSessionStatus::Closed,
+        mantissa_protocol::agents::AgentSessionStatus::WaitingInput => {
+            AgentSessionStatus::WaitingInput
+        }
+        mantissa_protocol::agents::AgentSessionStatus::Queued => AgentSessionStatus::Queued,
+        mantissa_protocol::agents::AgentSessionStatus::Running => AgentSessionStatus::Running,
+        mantissa_protocol::agents::AgentSessionStatus::Failed => AgentSessionStatus::Failed,
+        mantissa_protocol::agents::AgentSessionStatus::Closing => AgentSessionStatus::Closing,
+        mantissa_protocol::agents::AgentSessionStatus::Closed => AgentSessionStatus::Closed,
     }
 }
 
-fn agent_run_status_to_proto(status: AgentRunStatus) -> protocol::agents::AgentRunStatus {
+fn agent_run_status_to_proto(status: AgentRunStatus) -> mantissa_protocol::agents::AgentRunStatus {
     match status {
-        AgentRunStatus::Pending => protocol::agents::AgentRunStatus::Pending,
-        AgentRunStatus::Running => protocol::agents::AgentRunStatus::Running,
-        AgentRunStatus::Succeeded => protocol::agents::AgentRunStatus::Succeeded,
-        AgentRunStatus::Failed => protocol::agents::AgentRunStatus::Failed,
-        AgentRunStatus::Cancelled => protocol::agents::AgentRunStatus::Cancelled,
+        AgentRunStatus::Pending => mantissa_protocol::agents::AgentRunStatus::Pending,
+        AgentRunStatus::Running => mantissa_protocol::agents::AgentRunStatus::Running,
+        AgentRunStatus::Succeeded => mantissa_protocol::agents::AgentRunStatus::Succeeded,
+        AgentRunStatus::Failed => mantissa_protocol::agents::AgentRunStatus::Failed,
+        AgentRunStatus::Cancelled => mantissa_protocol::agents::AgentRunStatus::Cancelled,
     }
 }
 
-fn proto_to_agent_run_status(status: protocol::agents::AgentRunStatus) -> AgentRunStatus {
+fn proto_to_agent_run_status(status: mantissa_protocol::agents::AgentRunStatus) -> AgentRunStatus {
     match status {
-        protocol::agents::AgentRunStatus::Pending => AgentRunStatus::Pending,
-        protocol::agents::AgentRunStatus::Running => AgentRunStatus::Running,
-        protocol::agents::AgentRunStatus::Succeeded => AgentRunStatus::Succeeded,
-        protocol::agents::AgentRunStatus::Failed => AgentRunStatus::Failed,
-        protocol::agents::AgentRunStatus::Cancelled => AgentRunStatus::Cancelled,
+        mantissa_protocol::agents::AgentRunStatus::Pending => AgentRunStatus::Pending,
+        mantissa_protocol::agents::AgentRunStatus::Running => AgentRunStatus::Running,
+        mantissa_protocol::agents::AgentRunStatus::Succeeded => AgentRunStatus::Succeeded,
+        mantissa_protocol::agents::AgentRunStatus::Failed => AgentRunStatus::Failed,
+        mantissa_protocol::agents::AgentRunStatus::Cancelled => AgentRunStatus::Cancelled,
     }
 }
 
-fn agent_event_kind_to_proto(kind: AgentEventKind) -> protocol::agents::AgentEventKind {
+fn agent_event_kind_to_proto(kind: AgentEventKind) -> mantissa_protocol::agents::AgentEventKind {
     match kind {
-        AgentEventKind::UserInput => protocol::agents::AgentEventKind::UserInput,
-        AgentEventKind::NeedInput => protocol::agents::AgentEventKind::NeedInput,
-        AgentEventKind::RunQueued => protocol::agents::AgentEventKind::RunQueued,
-        AgentEventKind::RunStarted => protocol::agents::AgentEventKind::RunStarted,
-        AgentEventKind::RunCompleted => protocol::agents::AgentEventKind::RunCompleted,
-        AgentEventKind::RunFailed => protocol::agents::AgentEventKind::RunFailed,
-        AgentEventKind::RunCancelled => protocol::agents::AgentEventKind::RunCancelled,
-        AgentEventKind::ToolCall => protocol::agents::AgentEventKind::ToolCall,
-        AgentEventKind::ToolResult => protocol::agents::AgentEventKind::ToolResult,
-        AgentEventKind::CheckpointSaved => protocol::agents::AgentEventKind::CheckpointSaved,
-        AgentEventKind::SessionOpened => protocol::agents::AgentEventKind::SessionOpened,
-        AgentEventKind::SessionClosed => protocol::agents::AgentEventKind::SessionClosed,
+        AgentEventKind::UserInput => mantissa_protocol::agents::AgentEventKind::UserInput,
+        AgentEventKind::NeedInput => mantissa_protocol::agents::AgentEventKind::NeedInput,
+        AgentEventKind::RunQueued => mantissa_protocol::agents::AgentEventKind::RunQueued,
+        AgentEventKind::RunStarted => mantissa_protocol::agents::AgentEventKind::RunStarted,
+        AgentEventKind::RunCompleted => mantissa_protocol::agents::AgentEventKind::RunCompleted,
+        AgentEventKind::RunFailed => mantissa_protocol::agents::AgentEventKind::RunFailed,
+        AgentEventKind::RunCancelled => mantissa_protocol::agents::AgentEventKind::RunCancelled,
+        AgentEventKind::ToolCall => mantissa_protocol::agents::AgentEventKind::ToolCall,
+        AgentEventKind::ToolResult => mantissa_protocol::agents::AgentEventKind::ToolResult,
+        AgentEventKind::CheckpointSaved => {
+            mantissa_protocol::agents::AgentEventKind::CheckpointSaved
+        }
+        AgentEventKind::SessionOpened => mantissa_protocol::agents::AgentEventKind::SessionOpened,
+        AgentEventKind::SessionClosed => mantissa_protocol::agents::AgentEventKind::SessionClosed,
     }
 }
 
-fn proto_to_agent_event_kind(kind: protocol::agents::AgentEventKind) -> AgentEventKind {
+fn proto_to_agent_event_kind(kind: mantissa_protocol::agents::AgentEventKind) -> AgentEventKind {
     match kind {
-        protocol::agents::AgentEventKind::UserInput => AgentEventKind::UserInput,
-        protocol::agents::AgentEventKind::NeedInput => AgentEventKind::NeedInput,
-        protocol::agents::AgentEventKind::RunQueued => AgentEventKind::RunQueued,
-        protocol::agents::AgentEventKind::RunStarted => AgentEventKind::RunStarted,
-        protocol::agents::AgentEventKind::RunCompleted => AgentEventKind::RunCompleted,
-        protocol::agents::AgentEventKind::RunFailed => AgentEventKind::RunFailed,
-        protocol::agents::AgentEventKind::RunCancelled => AgentEventKind::RunCancelled,
-        protocol::agents::AgentEventKind::ToolCall => AgentEventKind::ToolCall,
-        protocol::agents::AgentEventKind::ToolResult => AgentEventKind::ToolResult,
-        protocol::agents::AgentEventKind::CheckpointSaved => AgentEventKind::CheckpointSaved,
-        protocol::agents::AgentEventKind::SessionOpened => AgentEventKind::SessionOpened,
-        protocol::agents::AgentEventKind::SessionClosed => AgentEventKind::SessionClosed,
+        mantissa_protocol::agents::AgentEventKind::UserInput => AgentEventKind::UserInput,
+        mantissa_protocol::agents::AgentEventKind::NeedInput => AgentEventKind::NeedInput,
+        mantissa_protocol::agents::AgentEventKind::RunQueued => AgentEventKind::RunQueued,
+        mantissa_protocol::agents::AgentEventKind::RunStarted => AgentEventKind::RunStarted,
+        mantissa_protocol::agents::AgentEventKind::RunCompleted => AgentEventKind::RunCompleted,
+        mantissa_protocol::agents::AgentEventKind::RunFailed => AgentEventKind::RunFailed,
+        mantissa_protocol::agents::AgentEventKind::RunCancelled => AgentEventKind::RunCancelled,
+        mantissa_protocol::agents::AgentEventKind::ToolCall => AgentEventKind::ToolCall,
+        mantissa_protocol::agents::AgentEventKind::ToolResult => AgentEventKind::ToolResult,
+        mantissa_protocol::agents::AgentEventKind::CheckpointSaved => {
+            AgentEventKind::CheckpointSaved
+        }
+        mantissa_protocol::agents::AgentEventKind::SessionOpened => AgentEventKind::SessionOpened,
+        mantissa_protocol::agents::AgentEventKind::SessionClosed => AgentEventKind::SessionClosed,
     }
 }
 
@@ -908,7 +916,7 @@ mod tests {
     use super::*;
     use crate::agents::types::AgentInteractionPolicy;
     use crate::store::agent_store::open_agent_store;
-    use crdt_store::uuid_key::UuidKey;
+    use mantissa_store::uuid_key::UuidKey;
     use std::sync::Arc;
     use tempfile::tempdir;
 

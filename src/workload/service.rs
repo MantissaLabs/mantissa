@@ -12,12 +12,12 @@ use crate::workload::model::{
     spec_to_value, value_to_spec,
 };
 use capnp::Error;
-use crdt_store::codec::StoreValueCodec;
-use protocol::gossip::gossip_message;
-use protocol::workload::{
+use mantissa_protocol::gossip::gossip_message;
+use mantissa_protocol::workload::{
     WorkloadStateFilter as ProtoWorkloadStateFilter, workload, workload_event,
     workload_list_request, workload_spec, workload_status,
 };
+use mantissa_store::codec::StoreValueCodec;
 use std::io::Cursor;
 use std::rc::Rc;
 use uuid::Uuid;
@@ -119,7 +119,7 @@ pub fn read_event(reader: workload_event::Reader<'_>) -> Result<WorkloadEvent, E
 
 impl StoreValueCodec for WorkloadValue {
     /// Encodes one workload value as the stable Cap'n Proto store value.
-    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
         let mut message = capnp::message::Builder::new_default();
         let mut event = message.init_root::<workload_event::Builder<'_>>();
         let spec = value_to_spec(self.id, self.clone());
@@ -137,14 +137,14 @@ impl StoreValueCodec for WorkloadValue {
     }
 
     /// Decodes one workload value from the stable Cap'n Proto store value.
-    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
         let event = decode_workload_store_event(bytes)?;
         match event {
             WorkloadEvent::UpsertSpec(spec) => Ok(spec_to_value(spec.as_ref())),
             WorkloadEvent::UpsertStatus(status) => {
                 Ok(merge_status_into_value(None, status.as_ref()))
             }
-            WorkloadEvent::Remove { id } => Err(Box::new(crdt_store::error::Error::Other(
+            WorkloadEvent::Remove { id } => Err(Box::new(mantissa_store::error::Error::Other(
                 format!("workload store value cannot decode remove event for {id}"),
             ))),
         }
@@ -152,7 +152,7 @@ impl StoreValueCodec for WorkloadValue {
 }
 
 /// Decodes one workload store event payload.
-fn decode_workload_store_event(bytes: &[u8]) -> crdt_store::Result<WorkloadEvent> {
+fn decode_workload_store_event(bytes: &[u8]) -> mantissa_store::Result<WorkloadEvent> {
     let mut cursor = Cursor::new(bytes);
     let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
         .map_err(workload_store_codec_error)?;
@@ -163,8 +163,8 @@ fn decode_workload_store_event(bytes: &[u8]) -> crdt_store::Result<WorkloadEvent
 }
 
 /// Converts workload store-codec errors into the CRDT store error type.
-fn workload_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
-    Box::new(crdt_store::error::Error::Other(format!(
+fn workload_store_codec_error<E: std::fmt::Display>(error: E) -> Box<mantissa_store::error::Error> {
+    Box::new(mantissa_store::error::Error::Other(format!(
         "workload store codec error: {error}"
     )))
 }
@@ -423,7 +423,7 @@ pub fn read_spec(reader: workload_spec::Reader<'_>) -> Result<WorkloadSpec, Erro
 
 /// Encodes one exclusive workload owner into the workload wire payload.
 fn write_owner(
-    mut builder: protocol::workload::workload_owner::Builder<'_>,
+    mut builder: mantissa_protocol::workload::workload_owner::Builder<'_>,
     owner: Option<&WorkloadOwner>,
 ) {
     match owner {
@@ -447,28 +447,28 @@ fn write_owner(
 
 /// Decodes one exclusive workload owner from the workload wire payload.
 fn read_owner(
-    reader: protocol::workload::workload_owner::Reader<'_>,
+    reader: mantissa_protocol::workload::workload_owner::Reader<'_>,
 ) -> Result<Option<WorkloadOwner>, Error> {
     match reader.which()? {
-        protocol::workload::workload_owner::Which::None(()) => Ok(None),
-        protocol::workload::workload_owner::Which::ServiceReplica(Ok(reader)) => Ok(Some(
+        mantissa_protocol::workload::workload_owner::Which::None(()) => Ok(None),
+        mantissa_protocol::workload::workload_owner::Which::ServiceReplica(Ok(reader)) => Ok(Some(
             WorkloadOwner::ServiceReplica(read_service_metadata(reader)?),
         )),
-        protocol::workload::workload_owner::Which::ServiceReplica(Err(err)) => Err(err),
-        protocol::workload::workload_owner::Which::JobAttempt(Ok(reader)) => {
+        mantissa_protocol::workload::workload_owner::Which::ServiceReplica(Err(err)) => Err(err),
+        mantissa_protocol::workload::workload_owner::Which::JobAttempt(Ok(reader)) => {
             Ok(Some(WorkloadOwner::JobAttempt(read_job_metadata(reader)?)))
         }
-        protocol::workload::workload_owner::Which::JobAttempt(Err(err)) => Err(err),
-        protocol::workload::workload_owner::Which::AgentRun(Ok(reader)) => Ok(Some(
+        mantissa_protocol::workload::workload_owner::Which::JobAttempt(Err(err)) => Err(err),
+        mantissa_protocol::workload::workload_owner::Which::AgentRun(Ok(reader)) => Ok(Some(
             WorkloadOwner::AgentRun(read_agent_run_metadata(reader)?),
         )),
-        protocol::workload::workload_owner::Which::AgentRun(Err(err)) => Err(err),
+        mantissa_protocol::workload::workload_owner::Which::AgentRun(Err(err)) => Err(err),
     }
 }
 
 /// Encodes service ownership metadata into a workload wire payload.
 fn write_service_metadata(
-    mut builder: protocol::workload::service_metadata::Builder<'_>,
+    mut builder: mantissa_protocol::workload::service_metadata::Builder<'_>,
     metadata: &WorkloadServiceMetadata,
 ) {
     builder.set_service_name(&metadata.service_name);
@@ -477,7 +477,7 @@ fn write_service_metadata(
 
 /// Decodes service ownership metadata from a workload wire payload.
 fn read_service_metadata(
-    reader: protocol::workload::service_metadata::Reader<'_>,
+    reader: mantissa_protocol::workload::service_metadata::Reader<'_>,
 ) -> Result<WorkloadServiceMetadata, Error> {
     let service_name = reader.get_service_name()?.to_str()?.to_string();
     let template = reader.get_template_name()?.to_str()?.to_string();
@@ -492,7 +492,7 @@ fn read_service_metadata(
 
 /// Encodes job ownership metadata into a workload wire payload.
 fn write_job_metadata(
-    mut builder: protocol::workload::job_metadata::Builder<'_>,
+    mut builder: mantissa_protocol::workload::job_metadata::Builder<'_>,
     metadata: &WorkloadJobMetadata,
 ) {
     builder.set_job_id(metadata.job_id.as_bytes());
@@ -501,7 +501,7 @@ fn write_job_metadata(
 
 /// Decodes job ownership metadata from a workload wire payload.
 fn read_job_metadata(
-    reader: protocol::workload::job_metadata::Reader<'_>,
+    reader: mantissa_protocol::workload::job_metadata::Reader<'_>,
 ) -> Result<WorkloadJobMetadata, Error> {
     let job_id = match reader.get_job_id() {
         Ok(bytes) if bytes.len() == 16 => read_id_from_data(bytes)?,
@@ -523,7 +523,7 @@ fn read_job_metadata(
 
 /// Encodes agent-run ownership metadata into a workload wire payload.
 fn write_agent_run_metadata(
-    mut builder: protocol::workload::agent_run_metadata::Builder<'_>,
+    mut builder: mantissa_protocol::workload::agent_run_metadata::Builder<'_>,
     metadata: &WorkloadAgentRunMetadata,
 ) {
     builder.set_session_id(metadata.session_id.as_bytes());
@@ -533,7 +533,7 @@ fn write_agent_run_metadata(
 
 /// Decodes agent-run ownership metadata from a workload wire payload.
 fn read_agent_run_metadata(
-    reader: protocol::workload::agent_run_metadata::Reader<'_>,
+    reader: mantissa_protocol::workload::agent_run_metadata::Reader<'_>,
 ) -> Result<WorkloadAgentRunMetadata, Error> {
     let session_id = match reader.get_session_id() {
         Ok(bytes) if bytes.len() == 16 => read_id_from_data(bytes)?,
@@ -674,8 +674,8 @@ mod tests {
         WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadPortBinding,
         WorkloadPortProtocol, WorkloadRestartPolicy, WorkloadRestartPolicyKind,
     };
-    use crdt_store::codec::StoreValueCodec;
-    use crdt_store::uuid_key::UuidKey;
+    use mantissa_store::codec::StoreValueCodec;
+    use mantissa_store::uuid_key::UuidKey;
     use std::sync::Arc;
     use tempfile::tempdir;
 

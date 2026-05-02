@@ -10,8 +10,8 @@ use crate::config::RuntimeStoreGcConfig;
 use crate::registry::Registry;
 use crate::store::registry::ReplicatedStoreEntry;
 use crate::sync::{SyncGcProgress, SyncStores};
-use crdt_store::gc::{GcBarrier, StoreGcReport};
-use protocol::sync::Domain;
+use mantissa_protocol::sync::Domain;
+use mantissa_store::gc::{GcBarrier, StoreGcReport};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
@@ -168,7 +168,7 @@ impl StoreGcRunner {
         entry: &ReplicatedStoreEntry,
         barrier: GcBarrier,
         now_unix_ms: u64,
-    ) -> crdt_store::Result<StoreGcReport> {
+    ) -> mantissa_store::Result<StoreGcReport> {
         entry
             .store
             .garbage_collect_tombstones(&self.config.policy, barrier, now_unix_ms)

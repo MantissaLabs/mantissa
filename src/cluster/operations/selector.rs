@@ -2,7 +2,7 @@ use crate::cluster::ClusterViewId;
 use crate::cluster::operations::SplitNodeAssignment;
 use crate::topology::peers::PeerLabel;
 use capnp::Error;
-use protocol::topology::split_selector_clause::Operator as SplitOperator;
+use mantissa_protocol::topology::split_selector_clause::Operator as SplitOperator;
 use std::collections::HashSet;
 use uuid::Uuid;
 

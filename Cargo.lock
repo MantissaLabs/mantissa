@@ -689,30 +689,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d728cc89cf3aee9ff92b05e62b19ee65a02b5702cff7d5a377e32c6ae29d8d"
 
 [[package]]
-name = "client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "blake3",
- "capnp",
- "capnp-futures",
- "capnp-rpc",
- "crossterm",
- "futures",
- "net",
- "parking_lot",
- "protocol",
- "ron",
- "serde",
- "tabwriter",
- "tokio",
- "tokio-util",
- "ui",
- "uuid",
-]
-
-[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -846,25 +822,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "crdt_store"
-version = "0.1.0"
-dependencies = [
- "base64",
- "capnp",
- "capnpc",
- "crdts",
- "merkle-search-tree",
- "redb",
- "serde",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "twox-hash",
- "uuid",
 ]
 
 [[package]]
@@ -1721,15 +1678,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "health"
-version = "0.1.0"
-dependencies = [
- "parking_lot",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2394,8 +2342,6 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "clap",
- "client",
- "crdt_store",
  "crdts",
  "data-encoding",
  "defguard_wireguard_rs",
@@ -2404,16 +2350,19 @@ dependencies = [
  "etherparse",
  "futures",
  "getrandom 0.2.16",
- "health",
  "hickory-proto",
  "hkdf",
  "iptables",
  "libc",
  "log",
+ "mantissa-client",
+ "mantissa-health",
+ "mantissa-net",
+ "mantissa-protocol",
+ "mantissa-store",
  "merkle-search-tree",
  "metrics",
  "metrics-exporter-prometheus",
- "net",
  "netlink-packet-core 0.8.1",
  "netlink-packet-route 0.19.0",
  "netlink-packet-utils 0.5.2",
@@ -2422,7 +2371,6 @@ dependencies = [
  "nvml-wrapper",
  "once_cell",
  "parking_lot",
- "protocol",
  "rand 0.9.2",
  "raw-cpuid",
  "redb",
@@ -2448,6 +2396,83 @@ dependencies = [
 ]
 
 [[package]]
+name = "mantissa-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "blake3",
+ "capnp",
+ "capnp-futures",
+ "capnp-rpc",
+ "crossterm",
+ "futures",
+ "mantissa-net",
+ "mantissa-protocol",
+ "mantissa-ui",
+ "parking_lot",
+ "ron",
+ "serde",
+ "tabwriter",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "mantissa-ebpf"
+version = "0.1.0"
+dependencies = [
+ "aya-ebpf",
+ "aya-ebpf-macros",
+]
+
+[[package]]
+name = "mantissa-health"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "mantissa-net"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "capnp",
+ "capnp-futures",
+ "capnp-rpc",
+ "ed25519-dalek",
+ "futures",
+ "getrandom 0.2.16",
+ "hkdf",
+ "libc",
+ "mantissa-protocol",
+ "metrics",
+ "parking_lot",
+ "serde",
+ "sha2",
+ "snow",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "mantissa-protocol"
+version = "0.1.0"
+dependencies = [
+ "capnp",
+ "capnpc",
+]
+
+[[package]]
 name = "mantissa-sandbox"
 version = "0.1.0"
 dependencies = [
@@ -2457,6 +2482,35 @@ dependencies = [
  "nono",
  "tempfile",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "mantissa-store"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "capnp",
+ "capnpc",
+ "crdts",
+ "merkle-search-tree",
+ "redb",
+ "serde",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "twox-hash",
+ "uuid",
+]
+
+[[package]]
+name = "mantissa-ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "ratatui",
+ "uuid",
 ]
 
 [[package]]
@@ -2569,34 +2623,6 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "net"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "capnp",
- "capnp-futures",
- "capnp-rpc",
- "ed25519-dalek",
- "futures",
- "getrandom 0.2.16",
- "hkdf",
- "libc",
- "metrics",
- "parking_lot",
- "protocol",
- "serde",
- "sha2",
- "snow",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "x25519-dalek",
 ]
 
 [[package]]
@@ -2714,14 +2740,6 @@ dependencies = [
  "libc",
  "log",
  "tokio",
-]
-
-[[package]]
-name = "network-ebpf"
-version = "0.1.0"
-dependencies = [
- "aya-ebpf",
- "aya-ebpf-macros",
 ]
 
 [[package]]
@@ -3240,14 +3258,6 @@ dependencies = [
  "quote",
  "syn",
  "version_check",
-]
-
-[[package]]
-name = "protocol"
-version = "0.1.0"
-dependencies = [
- "capnp",
- "capnpc",
 ]
 
 [[package]]
@@ -4696,16 +4706,6 @@ dependencies = [
  "serde_tokenstream",
  "syn",
  "typify-impl",
-]
-
-[[package]]
-name = "ui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "ratatui",
- "uuid",
 ]
 
 [[package]]

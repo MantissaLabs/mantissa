@@ -15,7 +15,7 @@ use crate::workload::manager::{WorkloadManager, WorkloadStartRequest, match_task
 use crate::workload::model::{ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec};
 use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
-use protocol::task::{
+use mantissa_protocol::task::{
     TaskLogStream as CapnpTaskLogStream, TaskStateFilter as CapnpTaskStateFilter, task,
     task_attach_options, task_attach_session, task_exec_options, task_exec_session,
     task_list_request, task_log_sink, task_logs_options, task_spec, task_start_request,

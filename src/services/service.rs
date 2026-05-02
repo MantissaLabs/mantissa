@@ -20,11 +20,11 @@ use crate::workload::capnp_codec::{
 };
 use crate::workload::types::ExecutionSpec;
 use capnp::Error;
-use crdt_store::codec::StoreValueCodec;
-use protocol::services::{
+use mantissa_protocol::services::{
     placement_constraint, placement_constraint_selector, service_event, service_spec, services,
     task_template,
 };
+use mantissa_store::codec::StoreValueCodec;
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::rc::Rc;
@@ -84,8 +84,12 @@ impl services::Server for ServicesRPC {
         let mut result = results.get();
         result.set_service_id(submission.service_id.as_bytes());
         let outcome = match submission.outcome {
-            ServiceDeploymentOutcome::Accepted => protocol::services::DeployOutcome::Accepted,
-            ServiceDeploymentOutcome::Unchanged => protocol::services::DeployOutcome::Unchanged,
+            ServiceDeploymentOutcome::Accepted => {
+                mantissa_protocol::services::DeployOutcome::Accepted
+            }
+            ServiceDeploymentOutcome::Unchanged => {
+                mantissa_protocol::services::DeployOutcome::Unchanged
+            }
         };
         result.set_outcome(outcome);
         if matches!(submission.outcome, ServiceDeploymentOutcome::Unchanged) {
@@ -188,7 +192,7 @@ pub(crate) fn write_service_spec(
 
 impl StoreValueCodec for ServiceSpecValue {
     /// Encodes one service spec as the stable Cap'n Proto store value.
-    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
         let mut message = capnp::message::Builder::new_default();
         {
             let mut builder = message.init_root::<service_spec::Builder<'_>>();
@@ -198,7 +202,7 @@ impl StoreValueCodec for ServiceSpecValue {
     }
 
     /// Decodes one service spec from the stable Cap'n Proto store value.
-    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let reader =
             capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
@@ -211,8 +215,8 @@ impl StoreValueCodec for ServiceSpecValue {
 }
 
 /// Converts service store-codec errors into the CRDT store error type.
-fn service_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
-    Box::new(crdt_store::error::Error::Other(format!(
+fn service_store_codec_error<E: std::fmt::Display>(error: E) -> Box<mantissa_store::error::Error> {
+    Box::new(mantissa_store::error::Error::Other(format!(
         "service store codec error: {error}"
     )))
 }
@@ -312,14 +316,16 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
 
 /// Encodes rollout diagnostics and progress counters into the service wire payload.
 fn write_rollout_state(
-    mut builder: protocol::services::rollout_state::Builder<'_>,
+    mut builder: mantissa_protocol::services::rollout_state::Builder<'_>,
     rollout: &ServiceRolloutState,
 ) {
     let phase = match rollout.phase {
-        ServiceRolloutPhase::Idle => protocol::services::RolloutPhase::Idle,
-        ServiceRolloutPhase::RollingForward => protocol::services::RolloutPhase::RollingForward,
-        ServiceRolloutPhase::RollingBack => protocol::services::RolloutPhase::RollingBack,
-        ServiceRolloutPhase::Failed => protocol::services::RolloutPhase::Failed,
+        ServiceRolloutPhase::Idle => mantissa_protocol::services::RolloutPhase::Idle,
+        ServiceRolloutPhase::RollingForward => {
+            mantissa_protocol::services::RolloutPhase::RollingForward
+        }
+        ServiceRolloutPhase::RollingBack => mantissa_protocol::services::RolloutPhase::RollingBack,
+        ServiceRolloutPhase::Failed => mantissa_protocol::services::RolloutPhase::Failed,
     };
     builder.set_phase(phase);
     builder.set_total_steps(rollout.total_steps);
@@ -335,13 +341,17 @@ fn write_rollout_state(
 
 /// Decodes rollout diagnostics and progress counters from the service wire payload.
 fn read_rollout_state(
-    reader: protocol::services::rollout_state::Reader<'_>,
+    reader: mantissa_protocol::services::rollout_state::Reader<'_>,
 ) -> Result<ServiceRolloutState, Error> {
     let phase = match reader.get_phase() {
-        Ok(protocol::services::RolloutPhase::Idle) => ServiceRolloutPhase::Idle,
-        Ok(protocol::services::RolloutPhase::RollingForward) => ServiceRolloutPhase::RollingForward,
-        Ok(protocol::services::RolloutPhase::RollingBack) => ServiceRolloutPhase::RollingBack,
-        Ok(protocol::services::RolloutPhase::Failed) => ServiceRolloutPhase::Failed,
+        Ok(mantissa_protocol::services::RolloutPhase::Idle) => ServiceRolloutPhase::Idle,
+        Ok(mantissa_protocol::services::RolloutPhase::RollingForward) => {
+            ServiceRolloutPhase::RollingForward
+        }
+        Ok(mantissa_protocol::services::RolloutPhase::RollingBack) => {
+            ServiceRolloutPhase::RollingBack
+        }
+        Ok(mantissa_protocol::services::RolloutPhase::Failed) => ServiceRolloutPhase::Failed,
         Err(_) => ServiceRolloutPhase::Idle,
     };
     let last_error = reader.get_last_error()?.to_str()?.trim().to_string();
@@ -361,7 +371,7 @@ fn read_rollout_state(
 
 /// Encodes the prior generation snapshot so rollout adoption can reconstruct old service state.
 fn write_previous_generation(
-    mut builder: protocol::services::previous_generation::Builder<'_>,
+    mut builder: mantissa_protocol::services::previous_generation::Builder<'_>,
     previous: &ServicePreviousGeneration,
 ) -> Result<(), Error> {
     builder.set_manifest_id(previous.manifest_id.as_bytes());
@@ -392,7 +402,7 @@ fn write_previous_generation(
 
 /// Decodes the prior generation snapshot used by deterministic rollout owner adoption.
 fn read_previous_generation(
-    reader: protocol::services::previous_generation::Reader<'_>,
+    reader: mantissa_protocol::services::previous_generation::Reader<'_>,
 ) -> Result<ServicePreviousGeneration, Error> {
     let manifest_id = read_uuid(reader.get_manifest_id()?)?;
     let manifest_name = reader.get_manifest_name()?.to_str()?.to_string();
@@ -425,11 +435,11 @@ fn read_previous_generation(
 
 /// Decodes one readiness probe definition from the service wire payload.
 fn read_readiness_probe(
-    reader: protocol::services::readiness_probe::Reader<'_>,
+    reader: mantissa_protocol::services::readiness_probe::Reader<'_>,
 ) -> Result<ServiceReadinessProbe, Error> {
     let kind = match reader.get_kind()? {
-        protocol::services::ReadinessProbeKind::Http => ServiceReadinessProbeKind::Http,
-        protocol::services::ReadinessProbeKind::Tcp => ServiceReadinessProbeKind::Tcp,
+        mantissa_protocol::services::ReadinessProbeKind::Http => ServiceReadinessProbeKind::Http,
+        mantissa_protocol::services::ReadinessProbeKind::Tcp => ServiceReadinessProbeKind::Tcp,
     };
     let path = reader.get_path()?.to_str()?.trim().to_string();
 
@@ -445,41 +455,57 @@ fn read_readiness_probe(
 
 /// Decodes the placement strategy stored in the wire payload, defaulting conservatively.
 fn placement_strategy_from_proto(
-    strategy: protocol::services::PlacementStrategy,
+    strategy: mantissa_protocol::services::PlacementStrategy,
 ) -> SchedulerPlacementStrategy {
     match strategy {
-        protocol::services::PlacementStrategy::Spread => SchedulerPlacementStrategy::Spread,
-        protocol::services::PlacementStrategy::Binpack => SchedulerPlacementStrategy::Binpack,
+        mantissa_protocol::services::PlacementStrategy::Spread => {
+            SchedulerPlacementStrategy::Spread
+        }
+        mantissa_protocol::services::PlacementStrategy::Binpack => {
+            SchedulerPlacementStrategy::Binpack
+        }
     }
 }
 
 /// Encodes the internal placement strategy into the replicated wire enum.
 fn placement_strategy_to_proto(
     strategy: SchedulerPlacementStrategy,
-) -> protocol::services::PlacementStrategy {
+) -> mantissa_protocol::services::PlacementStrategy {
     match strategy {
-        SchedulerPlacementStrategy::Spread => protocol::services::PlacementStrategy::Spread,
-        SchedulerPlacementStrategy::Binpack => protocol::services::PlacementStrategy::Binpack,
+        SchedulerPlacementStrategy::Spread => {
+            mantissa_protocol::services::PlacementStrategy::Spread
+        }
+        SchedulerPlacementStrategy::Binpack => {
+            mantissa_protocol::services::PlacementStrategy::Binpack
+        }
     }
 }
 
 /// Decodes the placement comparison operator stored in the wire payload.
 fn placement_constraint_operator_from_proto(
-    operator: protocol::services::PlacementConstraintOperator,
+    operator: mantissa_protocol::services::PlacementConstraintOperator,
 ) -> PlacementConstraintOperator {
     match operator {
-        protocol::services::PlacementConstraintOperator::Eq => PlacementConstraintOperator::Eq,
-        protocol::services::PlacementConstraintOperator::Ne => PlacementConstraintOperator::Ne,
+        mantissa_protocol::services::PlacementConstraintOperator::Eq => {
+            PlacementConstraintOperator::Eq
+        }
+        mantissa_protocol::services::PlacementConstraintOperator::Ne => {
+            PlacementConstraintOperator::Ne
+        }
     }
 }
 
 /// Encodes the internal placement comparison operator into the replicated wire enum.
 fn placement_constraint_operator_to_proto(
     operator: PlacementConstraintOperator,
-) -> protocol::services::PlacementConstraintOperator {
+) -> mantissa_protocol::services::PlacementConstraintOperator {
     match operator {
-        PlacementConstraintOperator::Eq => protocol::services::PlacementConstraintOperator::Eq,
-        PlacementConstraintOperator::Ne => protocol::services::PlacementConstraintOperator::Ne,
+        PlacementConstraintOperator::Eq => {
+            mantissa_protocol::services::PlacementConstraintOperator::Eq
+        }
+        PlacementConstraintOperator::Ne => {
+            mantissa_protocol::services::PlacementConstraintOperator::Ne
+        }
     }
 }
 
@@ -554,19 +580,19 @@ fn write_placement_constraint(
 
 /// Decodes one soft placement preference stored in the wire payload.
 fn placement_preference_from_proto(
-    preference: protocol::services::PlacementPreference,
+    preference: mantissa_protocol::services::PlacementPreference,
 ) -> SchedulerPlacementPreference {
     match preference {
-        protocol::services::PlacementPreference::ServiceAffinity => {
+        mantissa_protocol::services::PlacementPreference::ServiceAffinity => {
             SchedulerPlacementPreference::ServiceAffinity
         }
-        protocol::services::PlacementPreference::ServiceAntiAffinity => {
+        mantissa_protocol::services::PlacementPreference::ServiceAntiAffinity => {
             SchedulerPlacementPreference::ServiceAntiAffinity
         }
-        protocol::services::PlacementPreference::TaskAffinity => {
+        mantissa_protocol::services::PlacementPreference::TaskAffinity => {
             SchedulerPlacementPreference::TaskAffinity
         }
-        protocol::services::PlacementPreference::TaskAntiAffinity => {
+        mantissa_protocol::services::PlacementPreference::TaskAntiAffinity => {
             SchedulerPlacementPreference::TaskAntiAffinity
         }
     }
@@ -575,19 +601,19 @@ fn placement_preference_from_proto(
 /// Encodes one internal soft placement preference into the replicated wire enum.
 fn placement_preference_to_proto(
     preference: SchedulerPlacementPreference,
-) -> protocol::services::PlacementPreference {
+) -> mantissa_protocol::services::PlacementPreference {
     match preference {
         SchedulerPlacementPreference::ServiceAffinity => {
-            protocol::services::PlacementPreference::ServiceAffinity
+            mantissa_protocol::services::PlacementPreference::ServiceAffinity
         }
         SchedulerPlacementPreference::ServiceAntiAffinity => {
-            protocol::services::PlacementPreference::ServiceAntiAffinity
+            mantissa_protocol::services::PlacementPreference::ServiceAntiAffinity
         }
         SchedulerPlacementPreference::TaskAffinity => {
-            protocol::services::PlacementPreference::TaskAffinity
+            mantissa_protocol::services::PlacementPreference::TaskAffinity
         }
         SchedulerPlacementPreference::TaskAntiAffinity => {
-            protocol::services::PlacementPreference::TaskAntiAffinity
+            mantissa_protocol::services::PlacementPreference::TaskAntiAffinity
         }
     }
 }
@@ -680,13 +706,13 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
             Ok(proto) => proto,
             Err(_) => {
                 warn!("service public protocol missing or invalid; defaulting to tcp");
-                protocol::services::PublicProtocol::Tcp
+                mantissa_protocol::services::PublicProtocol::Tcp
             }
         };
         Some(match proto {
-            protocol::services::PublicProtocol::Tcp => ServicePortProtocol::Tcp,
-            protocol::services::PublicProtocol::Udp => ServicePortProtocol::Udp,
-            protocol::services::PublicProtocol::TcpUdp => ServicePortProtocol::TcpUdp,
+            mantissa_protocol::services::PublicProtocol::Tcp => ServicePortProtocol::Tcp,
+            mantissa_protocol::services::PublicProtocol::Udp => ServicePortProtocol::Udp,
+            mantissa_protocol::services::PublicProtocol::TcpUdp => ServicePortProtocol::TcpUdp,
         })
     } else {
         None
@@ -742,43 +768,49 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
     })
 }
 
-fn service_status_to_proto(status: ServiceStatus) -> protocol::services::ServiceStatus {
+fn service_status_to_proto(status: ServiceStatus) -> mantissa_protocol::services::ServiceStatus {
     match status {
-        ServiceStatus::Deploying => protocol::services::ServiceStatus::Deploying,
-        ServiceStatus::VolumeUnavailable => protocol::services::ServiceStatus::VolumeUnavailable,
-        ServiceStatus::Running => protocol::services::ServiceStatus::Running,
-        ServiceStatus::Stopping => protocol::services::ServiceStatus::Stopping,
-        ServiceStatus::Stopped => protocol::services::ServiceStatus::Stopped,
-        ServiceStatus::Failed => protocol::services::ServiceStatus::Failed,
+        ServiceStatus::Deploying => mantissa_protocol::services::ServiceStatus::Deploying,
+        ServiceStatus::VolumeUnavailable => {
+            mantissa_protocol::services::ServiceStatus::VolumeUnavailable
+        }
+        ServiceStatus::Running => mantissa_protocol::services::ServiceStatus::Running,
+        ServiceStatus::Stopping => mantissa_protocol::services::ServiceStatus::Stopping,
+        ServiceStatus::Stopped => mantissa_protocol::services::ServiceStatus::Stopped,
+        ServiceStatus::Failed => mantissa_protocol::services::ServiceStatus::Failed,
     }
 }
 
-fn proto_to_service_status(status: protocol::services::ServiceStatus) -> ServiceStatus {
+fn proto_to_service_status(status: mantissa_protocol::services::ServiceStatus) -> ServiceStatus {
     match status {
-        protocol::services::ServiceStatus::Deploying => ServiceStatus::Deploying,
-        protocol::services::ServiceStatus::VolumeUnavailable => ServiceStatus::VolumeUnavailable,
-        protocol::services::ServiceStatus::Running => ServiceStatus::Running,
-        protocol::services::ServiceStatus::Stopping => ServiceStatus::Stopping,
-        protocol::services::ServiceStatus::Stopped => ServiceStatus::Stopped,
-        protocol::services::ServiceStatus::Failed => ServiceStatus::Failed,
+        mantissa_protocol::services::ServiceStatus::Deploying => ServiceStatus::Deploying,
+        mantissa_protocol::services::ServiceStatus::VolumeUnavailable => {
+            ServiceStatus::VolumeUnavailable
+        }
+        mantissa_protocol::services::ServiceStatus::Running => ServiceStatus::Running,
+        mantissa_protocol::services::ServiceStatus::Stopping => ServiceStatus::Stopping,
+        mantissa_protocol::services::ServiceStatus::Stopped => ServiceStatus::Stopped,
+        mantissa_protocol::services::ServiceStatus::Failed => ServiceStatus::Failed,
     }
 }
 
 /// Encodes the service update strategy so rollout behavior is replicated with the service spec.
 fn write_update_strategy(
-    mut builder: protocol::services::update_strategy::Builder<'_>,
+    mut builder: mantissa_protocol::services::update_strategy::Builder<'_>,
     strategy: &ServiceUpdateStrategy,
 ) {
     let mode = match strategy.mode {
-        ServiceUpdateStrategyMode::Rolling => protocol::services::UpdateStrategyMode::Rolling,
+        ServiceUpdateStrategyMode::Rolling => {
+            mantissa_protocol::services::UpdateStrategyMode::Rolling
+        }
     };
     builder.set_mode(mode);
 
     let mut rolling = builder.reborrow().init_rolling();
     rolling.set_parallelism(strategy.rolling.parallelism);
     let order = match strategy.rolling.order {
-        ServiceRolloutOrder::StartFirst => protocol::services::RolloutOrder::StartFirst,
-        ServiceRolloutOrder::StopFirst => protocol::services::RolloutOrder::StopFirst,
+        ServiceRolloutOrder::StartFirst => mantissa_protocol::services::RolloutOrder::StartFirst,
+        ServiceRolloutOrder::StopFirst => mantissa_protocol::services::RolloutOrder::StopFirst,
     };
     rolling.set_order(order);
     rolling.set_startup_timeout_secs(strategy.rolling.startup_timeout_secs);
@@ -789,18 +821,24 @@ fn write_update_strategy(
 
 /// Decodes the service rollout strategy from the deployment wire payload.
 fn read_update_strategy(
-    reader: protocol::services::update_strategy::Reader<'_>,
+    reader: mantissa_protocol::services::update_strategy::Reader<'_>,
 ) -> Result<ServiceUpdateStrategy, Error> {
     let mode = match reader.get_mode() {
-        Ok(protocol::services::UpdateStrategyMode::Rolling) => ServiceUpdateStrategyMode::Rolling,
+        Ok(mantissa_protocol::services::UpdateStrategyMode::Rolling) => {
+            ServiceUpdateStrategyMode::Rolling
+        }
         Err(_) => ServiceUpdateStrategyMode::Rolling,
     };
 
     let rolling = if reader.has_rolling() {
         let rolling_reader = reader.get_rolling()?;
         let order = match rolling_reader.get_order() {
-            Ok(protocol::services::RolloutOrder::StartFirst) => ServiceRolloutOrder::StartFirst,
-            Ok(protocol::services::RolloutOrder::StopFirst) => ServiceRolloutOrder::StopFirst,
+            Ok(mantissa_protocol::services::RolloutOrder::StartFirst) => {
+                ServiceRolloutOrder::StartFirst
+            }
+            Ok(mantissa_protocol::services::RolloutOrder::StopFirst) => {
+                ServiceRolloutOrder::StopFirst
+            }
             Err(_) => ServiceRolloutOrder::StartFirst,
         };
         let startup_timeout_secs = rolling_reader.get_startup_timeout_secs();
@@ -828,36 +866,36 @@ fn read_update_strategy(
 /// Maps an internal reschedule reason into the protocol wire enum.
 fn reschedule_reason_to_proto(
     reason: ServiceRescheduleReason,
-) -> protocol::services::RescheduleReason {
+) -> mantissa_protocol::services::RescheduleReason {
     match reason {
         ServiceRescheduleReason::MissingReplicas => {
-            protocol::services::RescheduleReason::MissingReplicas
+            mantissa_protocol::services::RescheduleReason::MissingReplicas
         }
         ServiceRescheduleReason::ExcessReplicas => {
-            protocol::services::RescheduleReason::ExcessReplicas
+            mantissa_protocol::services::RescheduleReason::ExcessReplicas
         }
-        ServiceRescheduleReason::Drift => protocol::services::RescheduleReason::Drift,
+        ServiceRescheduleReason::Drift => mantissa_protocol::services::RescheduleReason::Drift,
     }
 }
 
 /// Decodes the protocol reschedule reason into the internal representation.
 fn proto_to_reschedule_reason(
-    reason: protocol::services::RescheduleReason,
+    reason: mantissa_protocol::services::RescheduleReason,
 ) -> ServiceRescheduleReason {
     match reason {
-        protocol::services::RescheduleReason::MissingReplicas => {
+        mantissa_protocol::services::RescheduleReason::MissingReplicas => {
             ServiceRescheduleReason::MissingReplicas
         }
-        protocol::services::RescheduleReason::ExcessReplicas => {
+        mantissa_protocol::services::RescheduleReason::ExcessReplicas => {
             ServiceRescheduleReason::ExcessReplicas
         }
-        protocol::services::RescheduleReason::Drift => ServiceRescheduleReason::Drift,
+        mantissa_protocol::services::RescheduleReason::Drift => ServiceRescheduleReason::Drift,
     }
 }
 
 /// Encodes the service reschedule lock into the wire schema so it can be gossiped.
 fn write_reschedule_lock(
-    mut builder: protocol::services::reschedule_lock::Builder<'_>,
+    mut builder: mantissa_protocol::services::reschedule_lock::Builder<'_>,
     lock: &ServiceRescheduleLock,
 ) -> Result<(), Error> {
     builder.set_holder_id(lock.holder_id.as_bytes());
@@ -871,7 +909,7 @@ fn write_reschedule_lock(
 
 /// Decodes the reschedule lock metadata that coordinates service reconciler ownership.
 fn read_reschedule_lock(
-    reader: protocol::services::reschedule_lock::Reader<'_>,
+    reader: mantissa_protocol::services::reschedule_lock::Reader<'_>,
 ) -> Result<ServiceRescheduleLock, Error> {
     let holder_id = read_uuid(reader.get_holder_id()?)?;
     let holder_name = reader.get_holder_name()?.to_str()?.to_string();
@@ -964,9 +1002,9 @@ fn write_task_template(
     builder.set_public_port(template.public_port().unwrap_or(0));
     let public_protocol = template.public_protocol.unwrap_or_default();
     let proto = match public_protocol {
-        ServicePortProtocol::Tcp => protocol::services::PublicProtocol::Tcp,
-        ServicePortProtocol::Udp => protocol::services::PublicProtocol::Udp,
-        ServicePortProtocol::TcpUdp => protocol::services::PublicProtocol::TcpUdp,
+        ServicePortProtocol::Tcp => mantissa_protocol::services::PublicProtocol::Tcp,
+        ServicePortProtocol::Udp => mantissa_protocol::services::PublicProtocol::Udp,
+        ServicePortProtocol::TcpUdp => mantissa_protocol::services::PublicProtocol::TcpUdp,
     };
     builder.set_public_protocol(proto);
     builder.set_tty(template.tty);
@@ -990,12 +1028,12 @@ fn write_task_template(
 
 /// Encodes one readiness probe into the service wire payload.
 fn write_readiness_probe(
-    mut builder: protocol::services::readiness_probe::Builder<'_>,
+    mut builder: mantissa_protocol::services::readiness_probe::Builder<'_>,
     probe: &ServiceReadinessProbe,
 ) {
     let kind = match probe.kind {
-        ServiceReadinessProbeKind::Http => protocol::services::ReadinessProbeKind::Http,
-        ServiceReadinessProbeKind::Tcp => protocol::services::ReadinessProbeKind::Tcp,
+        ServiceReadinessProbeKind::Http => mantissa_protocol::services::ReadinessProbeKind::Http,
+        ServiceReadinessProbeKind::Tcp => mantissa_protocol::services::ReadinessProbeKind::Tcp,
     };
     builder.set_kind(kind);
     builder.set_port(probe.port);
@@ -1051,8 +1089,8 @@ mod tests {
     use crate::workload::types::ExecutionSpec;
     use crate::workload::types::{WorkloadPortBinding, WorkloadPortProtocol};
     use capnp::message::Builder;
-    use crdt_store::codec::StoreValueCodec;
-    use protocol::services::{service_spec, task_template};
+    use mantissa_protocol::services::{service_spec, task_template};
+    use mantissa_store::codec::StoreValueCodec;
     use std::sync::Arc;
     use tempfile::tempdir;
     use uuid::Uuid;

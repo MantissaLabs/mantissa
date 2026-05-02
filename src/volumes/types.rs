@@ -18,16 +18,16 @@ pub enum VolumeAccessMode {
 
 impl VolumeAccessMode {
     /// Converts one protocol enum into the internal representation.
-    pub fn from_proto(mode: protocol::volumes::VolumeAccessMode) -> Self {
+    pub fn from_proto(mode: mantissa_protocol::volumes::VolumeAccessMode) -> Self {
         match mode {
-            protocol::volumes::VolumeAccessMode::ReadWriteOnce => Self::ReadWriteOnce,
+            mantissa_protocol::volumes::VolumeAccessMode::ReadWriteOnce => Self::ReadWriteOnce,
         }
     }
 
     /// Converts the internal representation into the protocol enum.
-    pub fn to_proto(self) -> protocol::volumes::VolumeAccessMode {
+    pub fn to_proto(self) -> mantissa_protocol::volumes::VolumeAccessMode {
         match self {
-            Self::ReadWriteOnce => protocol::volumes::VolumeAccessMode::ReadWriteOnce,
+            Self::ReadWriteOnce => mantissa_protocol::volumes::VolumeAccessMode::ReadWriteOnce,
         }
     }
 }
@@ -42,21 +42,21 @@ pub enum VolumeBindingMode {
 
 impl VolumeBindingMode {
     /// Converts one protocol enum into the internal representation.
-    pub fn from_proto(mode: protocol::volumes::VolumeBindingMode) -> Self {
+    pub fn from_proto(mode: mantissa_protocol::volumes::VolumeBindingMode) -> Self {
         match mode {
-            protocol::volumes::VolumeBindingMode::Immediate => Self::Immediate,
-            protocol::volumes::VolumeBindingMode::WaitForFirstConsumer => {
+            mantissa_protocol::volumes::VolumeBindingMode::Immediate => Self::Immediate,
+            mantissa_protocol::volumes::VolumeBindingMode::WaitForFirstConsumer => {
                 Self::WaitForFirstConsumer
             }
         }
     }
 
     /// Converts the internal representation into the protocol enum.
-    pub fn to_proto(self) -> protocol::volumes::VolumeBindingMode {
+    pub fn to_proto(self) -> mantissa_protocol::volumes::VolumeBindingMode {
         match self {
-            Self::Immediate => protocol::volumes::VolumeBindingMode::Immediate,
+            Self::Immediate => mantissa_protocol::volumes::VolumeBindingMode::Immediate,
             Self::WaitForFirstConsumer => {
-                protocol::volumes::VolumeBindingMode::WaitForFirstConsumer
+                mantissa_protocol::volumes::VolumeBindingMode::WaitForFirstConsumer
             }
         }
     }
@@ -72,18 +72,18 @@ pub enum VolumeReclaimPolicy {
 
 impl VolumeReclaimPolicy {
     /// Converts one protocol enum into the internal representation.
-    pub fn from_proto(policy: protocol::volumes::VolumeReclaimPolicy) -> Self {
+    pub fn from_proto(policy: mantissa_protocol::volumes::VolumeReclaimPolicy) -> Self {
         match policy {
-            protocol::volumes::VolumeReclaimPolicy::Retain => Self::Retain,
-            protocol::volumes::VolumeReclaimPolicy::Delete => Self::Delete,
+            mantissa_protocol::volumes::VolumeReclaimPolicy::Retain => Self::Retain,
+            mantissa_protocol::volumes::VolumeReclaimPolicy::Delete => Self::Delete,
         }
     }
 
     /// Converts the internal representation into the protocol enum.
-    pub fn to_proto(self) -> protocol::volumes::VolumeReclaimPolicy {
+    pub fn to_proto(self) -> mantissa_protocol::volumes::VolumeReclaimPolicy {
         match self {
-            Self::Retain => protocol::volumes::VolumeReclaimPolicy::Retain,
-            Self::Delete => protocol::volumes::VolumeReclaimPolicy::Delete,
+            Self::Retain => mantissa_protocol::volumes::VolumeReclaimPolicy::Retain,
+            Self::Delete => mantissa_protocol::volumes::VolumeReclaimPolicy::Delete,
         }
     }
 }
@@ -105,26 +105,26 @@ pub enum VolumeStatus {
 
 impl VolumeStatus {
     /// Converts one protocol enum into the internal representation.
-    pub fn from_proto(status: protocol::volumes::VolumeStatus) -> Self {
+    pub fn from_proto(status: mantissa_protocol::volumes::VolumeStatus) -> Self {
         match status {
-            protocol::volumes::VolumeStatus::Pending => Self::Pending,
-            protocol::volumes::VolumeStatus::Bound => Self::Bound,
-            protocol::volumes::VolumeStatus::Ready => Self::Ready,
-            protocol::volumes::VolumeStatus::InUse => Self::InUse,
-            protocol::volumes::VolumeStatus::Deleting => Self::Deleting,
-            protocol::volumes::VolumeStatus::Failed => Self::Failed,
+            mantissa_protocol::volumes::VolumeStatus::Pending => Self::Pending,
+            mantissa_protocol::volumes::VolumeStatus::Bound => Self::Bound,
+            mantissa_protocol::volumes::VolumeStatus::Ready => Self::Ready,
+            mantissa_protocol::volumes::VolumeStatus::InUse => Self::InUse,
+            mantissa_protocol::volumes::VolumeStatus::Deleting => Self::Deleting,
+            mantissa_protocol::volumes::VolumeStatus::Failed => Self::Failed,
         }
     }
 
     /// Converts the internal representation into the protocol enum.
-    pub fn to_proto(self) -> protocol::volumes::VolumeStatus {
+    pub fn to_proto(self) -> mantissa_protocol::volumes::VolumeStatus {
         match self {
-            Self::Pending => protocol::volumes::VolumeStatus::Pending,
-            Self::Bound => protocol::volumes::VolumeStatus::Bound,
-            Self::Ready => protocol::volumes::VolumeStatus::Ready,
-            Self::InUse => protocol::volumes::VolumeStatus::InUse,
-            Self::Deleting => protocol::volumes::VolumeStatus::Deleting,
-            Self::Failed => protocol::volumes::VolumeStatus::Failed,
+            Self::Pending => mantissa_protocol::volumes::VolumeStatus::Pending,
+            Self::Bound => mantissa_protocol::volumes::VolumeStatus::Bound,
+            Self::Ready => mantissa_protocol::volumes::VolumeStatus::Ready,
+            Self::InUse => mantissa_protocol::volumes::VolumeStatus::InUse,
+            Self::Deleting => mantissa_protocol::volumes::VolumeStatus::Deleting,
+            Self::Failed => mantissa_protocol::volumes::VolumeStatus::Failed,
         }
     }
 }
@@ -146,26 +146,26 @@ pub enum VolumeNodeState {
 
 impl VolumeNodeState {
     /// Converts one protocol enum into the internal representation.
-    pub fn from_proto(state: protocol::volumes::VolumeNodeState) -> Self {
+    pub fn from_proto(state: mantissa_protocol::volumes::VolumeNodeState) -> Self {
         match state {
-            protocol::volumes::VolumeNodeState::Pending => Self::Pending,
-            protocol::volumes::VolumeNodeState::Provisioning => Self::Provisioning,
-            protocol::volumes::VolumeNodeState::Ready => Self::Ready,
-            protocol::volumes::VolumeNodeState::Published => Self::Published,
-            protocol::volumes::VolumeNodeState::Deleting => Self::Deleting,
-            protocol::volumes::VolumeNodeState::Error => Self::Error,
+            mantissa_protocol::volumes::VolumeNodeState::Pending => Self::Pending,
+            mantissa_protocol::volumes::VolumeNodeState::Provisioning => Self::Provisioning,
+            mantissa_protocol::volumes::VolumeNodeState::Ready => Self::Ready,
+            mantissa_protocol::volumes::VolumeNodeState::Published => Self::Published,
+            mantissa_protocol::volumes::VolumeNodeState::Deleting => Self::Deleting,
+            mantissa_protocol::volumes::VolumeNodeState::Error => Self::Error,
         }
     }
 
     /// Converts the internal representation into the protocol enum.
-    pub fn to_proto(self) -> protocol::volumes::VolumeNodeState {
+    pub fn to_proto(self) -> mantissa_protocol::volumes::VolumeNodeState {
         match self {
-            Self::Pending => protocol::volumes::VolumeNodeState::Pending,
-            Self::Provisioning => protocol::volumes::VolumeNodeState::Provisioning,
-            Self::Ready => protocol::volumes::VolumeNodeState::Ready,
-            Self::Published => protocol::volumes::VolumeNodeState::Published,
-            Self::Deleting => protocol::volumes::VolumeNodeState::Deleting,
-            Self::Error => protocol::volumes::VolumeNodeState::Error,
+            Self::Pending => mantissa_protocol::volumes::VolumeNodeState::Pending,
+            Self::Provisioning => mantissa_protocol::volumes::VolumeNodeState::Provisioning,
+            Self::Ready => mantissa_protocol::volumes::VolumeNodeState::Ready,
+            Self::Published => mantissa_protocol::volumes::VolumeNodeState::Published,
+            Self::Deleting => mantissa_protocol::volumes::VolumeNodeState::Deleting,
+            Self::Error => mantissa_protocol::volumes::VolumeNodeState::Error,
         }
     }
 }

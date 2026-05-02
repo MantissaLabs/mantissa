@@ -1,0 +1,30 @@
+[package]
+name = "mantissa-store"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Generic Redb-backed CRDT store with Merkle Search Tree summaries"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+capnp = { workspace = true }
+redb = "3.1.1"
+merkle-search-tree = "0.8.0"
+crdts = "7.3.2"
+tokio = { version = "1", features = ["sync"], default-features = false }
+tracing = "0.1"
+uuid = { version = "1", features = ["serde"] }
+base64 = "0.22.1"
+twox-hash = "2.1.1"
+thiserror = "1"
+
+[build-dependencies]
+capnpc = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+tempfile = "3"
+uuid = { version = "1", features = ["v4", "v7", "fast-rng", "serde"] }

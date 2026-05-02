@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow};
 use async_channel::Sender;
 use chrono::Utc;
-use crdt_store::uuid_key::UuidKey;
+use mantissa_store::uuid_key::UuidKey;
 use rand::Rng;
 use tokio::time::{Instant, sleep, timeout};
 use tracing::{debug, warn};

@@ -1,6 +1,6 @@
 use crate::topology::Topology;
-use health::Status;
-use protocol::health::NodeStatus;
+use mantissa_health::Status;
+use mantissa_protocol::health::NodeStatus;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

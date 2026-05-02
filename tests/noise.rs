@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use async_trait::async_trait;
-use net::noise::{
+use mantissa_net::noise::{
     ClientJoinHandshake, HandshakeKind, NoisePeerVerifier, ServerHandshakeError,
     client_handshake_join, client_handshake_join_with_probe, client_handshake_peer,
     join_probe_client, join_probe_server, read_framed_len, server_handshake_join,
@@ -43,7 +43,7 @@ const NOISE_PARAMS_JOIN: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s";
 
 async fn legacy_client_handshake_no_hello(
     mut tcp: TcpStream,
-    keys: &net::noise::NoiseKeys,
+    keys: &mantissa_net::noise::NoiseKeys,
     psk: &[u8; 32],
 ) -> std::io::Result<()> {
     let pk_bytes = keys.private.to_bytes();
@@ -82,7 +82,7 @@ async fn legacy_client_handshake_no_hello(
 
 async fn legacy_server_handshake_no_probe(
     tcp: TcpStream,
-    keys: &net::noise::NoiseKeys,
+    keys: &mantissa_net::noise::NoiseKeys,
     psk: &[u8; 32],
 ) -> std::io::Result<()> {
     let pk_bytes = keys.private.to_bytes();
@@ -123,7 +123,8 @@ async fn noise_xx_handshake_and_echo_both_directions() {
     // Deterministic keys, different for server/client
     let server_keys = fixed_noise_keys(11);
     let client_keys = fixed_noise_keys(22);
-    let psk = net::noise::derive_psk_from_token("MNTISA-1-test-token").expect("derive psk");
+    let psk =
+        mantissa_net::noise::derive_psk_from_token("MNTISA-1-test-token").expect("derive psk");
 
     // Listener on ephemeral port
     let listener = match TcpListener::bind("127.0.0.1:0").await {
@@ -180,10 +181,10 @@ async fn noise_xx_handshake_and_echo_both_directions() {
 async fn noise_xx_psk_rejects_wrong_token() {
     let server_keys = fixed_noise_keys(11);
     let client_keys = fixed_noise_keys(22);
-    let server_psk =
-        net::noise::derive_psk_from_token("MNTISA-1-server-token").expect("derive server psk");
-    let client_psk =
-        net::noise::derive_psk_from_token("MNTISA-1-client-token").expect("derive client psk");
+    let server_psk = mantissa_net::noise::derive_psk_from_token("MNTISA-1-server-token")
+        .expect("derive server psk");
+    let client_psk = mantissa_net::noise::derive_psk_from_token("MNTISA-1-client-token")
+        .expect("derive client psk");
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -274,7 +275,8 @@ async fn noise_ik_unknown_peer_reports_membership_hint() {
     let server_keys = fixed_noise_keys(11);
     let client_keys = fixed_noise_keys(22);
     let server_pk = server_keys.public_bytes();
-    let psk = net::noise::derive_psk_from_token("MNTISA-1-denied-peer").expect("derive psk");
+    let psk =
+        mantissa_net::noise::derive_psk_from_token("MNTISA-1-denied-peer").expect("derive psk");
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -324,7 +326,8 @@ async fn noise_ik_unknown_peer_reports_membership_hint() {
 async fn noise_join_probe_negotiation_enabled() {
     let server_keys = fixed_noise_keys(11);
     let client_keys = fixed_noise_keys(22);
-    let psk = net::noise::derive_psk_from_token("MNTISA-1-probe-token").expect("derive psk");
+    let psk =
+        mantissa_net::noise::derive_psk_from_token("MNTISA-1-probe-token").expect("derive psk");
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -375,7 +378,8 @@ async fn noise_join_probe_negotiation_enabled() {
 async fn noise_join_probe_legacy_server_ignored() {
     let server_keys = fixed_noise_keys(11);
     let client_keys = fixed_noise_keys(22);
-    let psk = net::noise::derive_psk_from_token("MNTISA-1-legacy-server").expect("derive psk");
+    let psk =
+        mantissa_net::noise::derive_psk_from_token("MNTISA-1-legacy-server").expect("derive psk");
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -405,7 +409,8 @@ async fn noise_join_probe_legacy_server_ignored() {
 async fn noise_join_probe_legacy_client_no_hello() {
     let server_keys = fixed_noise_keys(11);
     let client_keys = fixed_noise_keys(22);
-    let psk = net::noise::derive_psk_from_token("MNTISA-1-legacy-client").expect("derive psk");
+    let psk =
+        mantissa_net::noise::derive_psk_from_token("MNTISA-1-legacy-client").expect("derive psk");
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await

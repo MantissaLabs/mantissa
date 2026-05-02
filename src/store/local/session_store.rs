@@ -7,7 +7,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use hkdf::Hkdf;
-use net::noise::NoiseKeys;
+use mantissa_net::noise::NoiseKeys;
 use redb::{Database, ReadableTable, TableDefinition};
 use sha2::Sha256;
 use std::{
@@ -48,7 +48,7 @@ impl TicketRecord {
     fn encode_capnp(&self) -> Vec<u8> {
         let mut message = capnp::message::Builder::new_default();
         let mut builder =
-            message.init_root::<protocol::server::session_ticket_record::Builder<'_>>();
+            message.init_root::<mantissa_protocol::server::session_ticket_record::Builder<'_>>();
         builder.set_ticket(&self.ticket);
         builder.set_issued_at_unix_secs(self.issued_at);
 
@@ -72,7 +72,7 @@ impl TicketRecord {
             capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
                 .map_err(into_io)?;
         let record = reader
-            .get_root::<protocol::server::session_ticket_record::Reader<'_>>()
+            .get_root::<mantissa_protocol::server::session_ticket_record::Reader<'_>>()
             .map_err(into_io)?;
         let note = if record.get_has_note() {
             Some(

@@ -5,14 +5,14 @@ use async_trait::async_trait;
 use capnp_rpc::new_client as capnp_new_client;
 use chrono::Utc;
 use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
-use crdt_store::uuid_key::UuidKey;
 use mantissa::runtime::types::{
     RuntimeAttachOptions, RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError,
     RuntimeInfo, RuntimeLogFrame, RuntimeLogStream, RuntimeStateInfo,
 };
 use mantissa::task::types::{TaskValue, TaskValueDraft};
 use mantissa::workload::model::WorkloadPhase;
-use protocol::task::task_log_sink;
+use mantissa_protocol::task::task_log_sink;
+use mantissa_store::uuid_key::UuidKey;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -169,9 +169,9 @@ impl task_log_sink::Server for CollectingTaskAttachSink {
             .map_err(|_| capnp::Error::failed("unknown task log stream".into()))?;
         let bytes = frame.get_data()?.to_owned();
         let label = match stream {
-            protocol::task::TaskLogStream::Stdout => "stdout",
-            protocol::task::TaskLogStream::Stderr => "stderr",
-            protocol::task::TaskLogStream::Console => "console",
+            mantissa_protocol::task::TaskLogStream::Stdout => "stdout",
+            mantissa_protocol::task::TaskLogStream::Stderr => "stderr",
+            mantissa_protocol::task::TaskLogStream::Console => "console",
         };
         self.frames
             .lock()

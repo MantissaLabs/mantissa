@@ -11,7 +11,7 @@ use crate::workload::model::{
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
 use chrono::Utc;
-use health::{HealthMonitor, Status as HealthStatus};
+use mantissa_health::{HealthMonitor, Status as HealthStatus};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;

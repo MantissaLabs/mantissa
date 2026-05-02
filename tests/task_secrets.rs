@@ -35,8 +35,8 @@ use mantissa::volumes::types::LocalVolumeOwnership;
 use mantissa::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadStartRequest};
 use mantissa::workload::model::ExecutionPlatform;
 use mantissa::workload::types::ResolvedExecutionSpec;
-use net::noise::NoiseKeys;
-use protocol::secrets::secrets;
+use mantissa_net::noise::NoiseKeys;
+use mantissa_protocol::secrets::secrets;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -336,7 +336,7 @@ async fn setup_workload_manager() -> TestHarness {
         signing_key,
         noise_keys.clone(),
         actor,
-        ::health::HealthMonitor::new(actor),
+        ::mantissa_health::HealthMonitor::new(actor),
     );
 
     let scheduler = Rc::new(

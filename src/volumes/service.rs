@@ -10,12 +10,12 @@ use crate::volumes::types::{
 use anyhow::Result;
 use capnp::Error;
 use capnp::struct_list;
-use crdt_store::codec::StoreValueCodec;
-use protocol::volumes::{
+use mantissa_protocol::volumes::{
     LocalVolumeSourceKind, local_volume_ownership, local_volume_spec, volume_driver_spec,
     volume_event, volume_inspect, volume_label, volume_node_status, volume_spec, volume_summary,
     volumes,
 };
+use mantissa_store::codec::StoreValueCodec;
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
@@ -333,14 +333,14 @@ fn read_volume_spec(reader: volume_spec::Reader<'_>) -> Result<VolumeSpecValue, 
 
 impl StoreValueCodec for VolumeSpecValue {
     /// Encodes one volume spec as the stable Cap'n Proto store value.
-    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
         let mut message = capnp::message::Builder::new_default();
         write_volume_spec(message.init_root::<volume_spec::Builder<'_>>(), self);
         Ok(capnp::serialize::write_message_to_words(&message))
     }
 
     /// Decodes one volume spec from the stable Cap'n Proto store value.
-    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let reader =
             capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
@@ -401,14 +401,14 @@ fn read_volume_node_status(
 
 impl StoreValueCodec for VolumeNodeStateValue {
     /// Encodes one volume node-state row as the stable Cap'n Proto store value.
-    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
         let mut message = capnp::message::Builder::new_default();
         write_volume_node_status(message.init_root::<volume_node_status::Builder<'_>>(), self);
         Ok(capnp::serialize::write_message_to_words(&message))
     }
 
     /// Decodes one volume node-state row from the stable Cap'n Proto store value.
-    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let reader =
             capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
@@ -421,8 +421,8 @@ impl StoreValueCodec for VolumeNodeStateValue {
 }
 
 /// Converts volume store-codec errors into the CRDT store error type.
-fn volume_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
-    Box::new(crdt_store::error::Error::Other(format!(
+fn volume_store_codec_error<E: std::fmt::Display>(error: E) -> Box<mantissa_store::error::Error> {
+    Box::new(mantissa_store::error::Error::Other(format!(
         "volume store codec error: {error}"
     )))
 }
@@ -888,7 +888,7 @@ mod tests {
     use super::*;
     use crate::store::volume_store::{open_volume_node_store, open_volume_spec_store};
     use crate::volumes::types::VolumeStatus;
-    use crdt_store::uuid_key::UuidKey;
+    use mantissa_store::uuid_key::UuidKey;
     use std::sync::Arc;
     use tempfile::tempdir;
 

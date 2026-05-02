@@ -1,7 +1,7 @@
 use crate::store::path::open_state_database;
 use crate::store::peer_store::open_peers_store;
 use anyhow::{Context, Result, bail};
-use crdt_store::uuid_key::UuidKey;
+use mantissa_store::uuid_key::UuidKey;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableError};
 use std::fmt;
 use std::fs;
@@ -121,7 +121,8 @@ impl fmt::Display for ResetIdentityReport {
 pub async fn reset_identity(options: ResetIdentityOptions) -> Result<ResetIdentityReport> {
     let state_dir = match options.state_dir {
         Some(path) => path,
-        None => net::paths::resolve_state_dir_path().context("resolve default state directory")?,
+        None => mantissa_net::paths::resolve_state_dir_path()
+            .context("resolve default state directory")?,
     };
 
     if !state_dir.exists() {

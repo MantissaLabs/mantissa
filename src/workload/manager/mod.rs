@@ -27,7 +27,7 @@ use crate::workload::types::WorkloadRestartPolicy;
 use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Utc};
-use crdt_store::uuid_key::UuidKey;
+use mantissa_store::uuid_key::UuidKey;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};

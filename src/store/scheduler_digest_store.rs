@@ -1,11 +1,11 @@
 use crate::scheduler::digest::SchedulerDigestValue;
 use crate::store::open::open_arc_store;
-use crdt_store::adapter::{CompactingStoreMvRegAdapterSorted, MvRegCompactionRanker};
-use crdt_store::hash::XXHash128;
-use crdt_store::mst_store::CrdtMstStore;
-use crdt_store::mvreg::MvRegEntry;
-use crdt_store::table_set::TableSet;
-use crdt_store::uuid_key::UuidKey;
+use mantissa_store::adapter::{CompactingStoreMvRegAdapterSorted, MvRegCompactionRanker};
+use mantissa_store::hash::XXHash128;
+use mantissa_store::mst_store::CrdtMstStore;
+use mantissa_store::mvreg::MvRegEntry;
+use mantissa_store::table_set::TableSet;
+use mantissa_store::uuid_key::UuidKey;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -71,8 +71,8 @@ pub fn open_scheduler_digest_store(
 #[cfg(test)]
 mod tests {
     use super::{SchedulerDigestRegAdapter, SchedulerDigestValue};
-    use crdt_store::adapter::RegAdapter;
-    use crdt_store::mvreg::{MvReg, MvRegEntry, VectorClock};
+    use mantissa_store::adapter::RegAdapter;
+    use mantissa_store::mvreg::{MvReg, MvRegEntry, VectorClock};
     use uuid::Uuid;
 
     /// Builds a deterministic UUID from a small integer for adapter tests.

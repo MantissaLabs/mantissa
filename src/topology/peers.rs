@@ -4,13 +4,13 @@ use crate::topology::{PeerHandle, Topology, peer_provider::PeerProvider};
 use async_trait::async_trait;
 use capnp::Error as CapnpError;
 use capnp::text_list;
-use crdt_store::codec::StoreValueCodec;
-use crdt_store::mvreg::MvReg;
 use ed25519_dalek::VerifyingKey;
-use protocol::topology::{
+use mantissa_protocol::topology::{
     PeerMembershipState as CapnpPeerMembershipState, node_info as node_info_capnp,
     peer as peer_capnp,
 };
+use mantissa_store::codec::StoreValueCodec;
+use mantissa_store::mvreg::MvReg;
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use uuid::Uuid;
@@ -393,7 +393,7 @@ pub struct PeerValue {
 
 impl StoreValueCodec for PeerValue {
     /// Encodes one peer value into the stable Cap'n Proto store payload.
-    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
         let mut message = capnp::message::Builder::new_default();
         let builder = message.init_root::<peer_capnp::Builder<'_>>();
         write_peer(builder, self);
@@ -401,7 +401,7 @@ impl StoreValueCodec for PeerValue {
     }
 
     /// Decodes one peer value from the stable Cap'n Proto store payload.
-    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let reader =
             capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
@@ -612,8 +612,8 @@ fn read_uuid_or_nil(data: capnp::data::Reader<'_>, field_name: &str) -> Result<U
 }
 
 /// Converts peer store-codec errors into the CRDT store error type.
-fn peer_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
-    Box::new(crdt_store::error::Error::Other(format!(
+fn peer_store_codec_error<E: std::fmt::Display>(error: E) -> Box<mantissa_store::error::Error> {
+    Box::new(mantissa_store::error::Error::Other(format!(
         "peer store codec error: {error}"
     )))
 }
@@ -1165,10 +1165,11 @@ mod tests {
             membership: super::PeerMembership::left(44),
         };
 
-        let encoded = <PeerValue as crdt_store::codec::StoreValueCodec>::encode_store_value(&peer)
-            .expect("encode peer store value");
+        let encoded =
+            <PeerValue as mantissa_store::codec::StoreValueCodec>::encode_store_value(&peer)
+                .expect("encode peer store value");
         let decoded =
-            <PeerValue as crdt_store::codec::StoreValueCodec>::decode_store_value(&encoded)
+            <PeerValue as mantissa_store::codec::StoreValueCodec>::decode_store_value(&encoded)
                 .expect("decode peer store value");
 
         assert_eq!(decoded, peer);

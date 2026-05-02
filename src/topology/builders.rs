@@ -5,9 +5,9 @@ use crate::runtime::types::RuntimeSupportProfile;
 use crate::topology::peers::{
     PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue, write_peer,
 };
-use protocol::gossip::gossip_message;
-use protocol::server;
-use protocol::topology::{
+use mantissa_protocol::gossip::gossip_message;
+use mantissa_protocol::server;
+use mantissa_protocol::topology::{
     PeerMembershipState as CapnpPeerMembershipState, cluster_view_summary, node_drain_status,
     node_info as node_info_capnp, peer as peer_capnp, split_candidate, topology_event,
 };
@@ -47,13 +47,13 @@ pub(super) enum DrainStatusState {
 
 impl DrainStatusState {
     /// Converts the internal drain state into the Cap'n Proto enum used by RPC clients.
-    pub(super) fn as_capnp(self) -> protocol::topology::NodeDrainState {
+    pub(super) fn as_capnp(self) -> mantissa_protocol::topology::NodeDrainState {
         match self {
-            DrainStatusState::Open => protocol::topology::NodeDrainState::Open,
-            DrainStatusState::Fenced => protocol::topology::NodeDrainState::Fenced,
-            DrainStatusState::Draining => protocol::topology::NodeDrainState::Draining,
-            DrainStatusState::Drained => protocol::topology::NodeDrainState::Drained,
-            DrainStatusState::Blocked => protocol::topology::NodeDrainState::Blocked,
+            DrainStatusState::Open => mantissa_protocol::topology::NodeDrainState::Open,
+            DrainStatusState::Fenced => mantissa_protocol::topology::NodeDrainState::Fenced,
+            DrainStatusState::Draining => mantissa_protocol::topology::NodeDrainState::Draining,
+            DrainStatusState::Drained => mantissa_protocol::topology::NodeDrainState::Drained,
+            DrainStatusState::Blocked => mantissa_protocol::topology::NodeDrainState::Blocked,
         }
     }
 }
@@ -81,15 +81,15 @@ pub(super) struct NodeDrainStatusSnapshot {
 pub(super) struct ListedNodeRow {
     pub(super) id: Uuid,
     pub(super) value: PeerValue,
-    pub(super) health: protocol::health::NodeStatus,
-    pub(super) drain_state: protocol::topology::NodeDrainState,
+    pub(super) health: mantissa_protocol::health::NodeStatus,
+    pub(super) drain_state: mantissa_protocol::topology::NodeDrainState,
 }
 
 /// Prepared split-candidate row after attaching health and best-known view metadata.
 #[derive(Clone, Debug)]
 pub(super) struct SplitCandidateRow {
     pub(super) candidate: SplitNodeCandidate,
-    pub(super) health: protocol::health::NodeStatus,
+    pub(super) health: mantissa_protocol::health::NodeStatus,
     pub(super) active_cluster_view: ClusterViewId,
 }
 
@@ -108,11 +108,11 @@ pub(super) struct ClusterViewSummaryRow {
 /// derived a live drain-progress view.
 pub(super) fn drain_state_from_scheduling(
     scheduling: &PeerSchedulingState,
-) -> protocol::topology::NodeDrainState {
+) -> mantissa_protocol::topology::NodeDrainState {
     if scheduling.schedulable {
-        protocol::topology::NodeDrainState::Open
+        mantissa_protocol::topology::NodeDrainState::Open
     } else {
-        protocol::topology::NodeDrainState::Fenced
+        mantissa_protocol::topology::NodeDrainState::Fenced
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::store::workload_store::WorkloadStore;
 use crate::workload::model::{WorkloadValue, select_best_workload_value};
 use anyhow::{Result, anyhow};
-use crdt_store::uuid_key::UuidKey;
+use mantissa_store::uuid_key::UuidKey;
 use std::collections::HashSet;
 use uuid::Uuid;
 

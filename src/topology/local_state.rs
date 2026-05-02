@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 
 use ed25519_dalek::SigningKey;
+use mantissa_protocol::server::ServerClient;
 use parking_lot::Mutex;
-use protocol::server::ServerClient;
 use x25519_dalek::PublicKey;
 
 use crate::cluster::{ClusterViewState, RootSchemaState};

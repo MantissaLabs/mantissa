@@ -10,10 +10,10 @@ use crate::store::registry::{EncodedRegisters, EncodedTombstones};
 use crate::sync::gc_progress::SyncGcProgress;
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use capnp_rpc::new_client;
-use crdt_store::PageDigestRange;
-use crdt_store::compute_want_from_have;
-use crdt_store::mst_store::TombstonePruneFrontiers;
-use protocol::sync::{self, Domain, delta_chunk, delta_sink};
+use mantissa_protocol::sync::{self, Domain, delta_chunk, delta_sink};
+use mantissa_store::PageDigestRange;
+use mantissa_store::compute_want_from_have;
+use mantissa_store::mst_store::TombstonePruneFrontiers;
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -133,9 +133,9 @@ impl SyncRunner {
     pub async fn rebuild_msts_for_root_schema_version(
         &self,
         root_schema_version: u32,
-    ) -> crdt_store::Result<()> {
+    ) -> mantissa_store::Result<()> {
         if !self.root_schema.supports(root_schema_version) {
-            return Err(Box::new(crdt_store::error::Error::Other(format!(
+            return Err(Box::new(mantissa_store::error::Error::Other(format!(
                 "unsupported root schema version {root_schema_version}"
             ))));
         }
@@ -497,8 +497,8 @@ fn read_root_digest(bytes: &[u8]) -> Result<[u8; 16], capnp::Error> {
 #[cfg(test)]
 mod tests {
     use super::should_notify_network_attachment_sync;
-    use crdt_store::PageDigestRange;
-    use protocol::sync::Domain;
+    use mantissa_protocol::sync::Domain;
+    use mantissa_store::PageDigestRange;
 
     /// Attachment deltas should wake the network controller on the receiving node immediately.
     #[test]

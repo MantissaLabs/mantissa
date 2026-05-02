@@ -5,7 +5,7 @@ mod common;
 
 use common::convergence::{current_cluster_view, swim_down_transition_timeout};
 use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
-use protocol::health::NodeStatus;
+use mantissa_protocol::health::NodeStatus;
 
 local_test!(health_alive_then_down_inproc, {
     let _guard = RuntimeBackendOverrideGuard::install_default();

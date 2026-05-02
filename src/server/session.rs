@@ -1,6 +1,6 @@
 use super::Liveness;
 use crate::{cluster::ClusterViewId, topology::Topology};
-use protocol::{
+use mantissa_protocol::{
     agents::agents, gossip::gossip, health::health, jobs::jobs, network::networks, node::node,
     scheduling::scheduler, secrets::secrets, server::cluster_session, services::services,
     sync::sync, task::task, topology::topology, volumes::volumes, workload::workload,

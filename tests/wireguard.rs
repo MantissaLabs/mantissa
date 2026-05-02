@@ -10,7 +10,6 @@ use common::privileged_networking::{
     privileged_network_interfaces, privileged_networking_enabled, privileged_test_network,
     privileged_test_subnet,
 };
-use crdt_store::uuid_key::UuidKey;
 use futures::TryStreamExt;
 use mantissa::network::types::{NetworkPeerState, NetworkStatus};
 use mantissa::network::wireguard::{MANTISSA_WIREGUARD_IFNAME, MANTISSA_WIREGUARD_VXLAN_MTU};
@@ -19,6 +18,7 @@ use mantissa::server::headless::{HeadlessKeys, HeadlessNode};
 use mantissa::topology::peers::{
     PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
 };
+use mantissa_store::uuid_key::UuidKey;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -303,8 +303,8 @@ local_test!(wireguard_scoped_peer_gate_blocks_until_peer_enabled, {
         "local peer should only advertise enabled WireGuard state after configuring mnwg0"
     );
 
-    let local_tunnel = net::wireguard::wireguard_tunnel_ipv6(node.id);
-    let remote_tunnel = net::wireguard::wireguard_tunnel_ipv6(remote_peer_id);
+    let local_tunnel = mantissa_net::wireguard::wireguard_tunnel_ipv6(node.id);
+    let remote_tunnel = mantissa_net::wireguard::wireguard_tunnel_ipv6(remote_peer_id);
     let [vxlan_ifname, ..] = privileged_network_interfaces(network.id);
 
     let underlay_details = command_stdout(
@@ -430,7 +430,9 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
     let db_path = temp_dir.path().join("wireguard-restart.redb");
     let db = Arc::new(redb::Database::create(db_path).expect("create persisted redb"));
     let self_id = Uuid::new_v4();
-    let noise_keys = Arc::new(net::noise::NoiseKeys::from_private_bytes([0x71; 32]));
+    let noise_keys = Arc::new(mantissa_net::noise::NoiseKeys::from_private_bytes(
+        [0x71; 32],
+    ));
     let signing = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]);
     let network = privileged_test_network(
         "wireguard-restart",
@@ -479,9 +481,9 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
         .registry
         .peer_wireguard(node.id)
         .expect("first start should publish local WireGuard metadata");
-    let key_path =
-        net::wireguard::resolve_wireguard_key_path().expect("resolve persisted WireGuard key path");
-    let port_path = net::wireguard::resolve_wireguard_port_path()
+    let key_path = mantissa_net::wireguard::resolve_wireguard_key_path()
+        .expect("resolve persisted WireGuard key path");
+    let port_path = mantissa_net::wireguard::resolve_wireguard_port_path()
         .expect("resolve persisted WireGuard port path");
     let key_bytes_before =
         std::fs::read(&key_path).expect("read persisted WireGuard key material before restart");
@@ -541,7 +543,7 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
         "wireguard listen port should persist unchanged across restart"
     );
 
-    let tunnel_addr = net::wireguard::wireguard_tunnel_ipv6(self_id);
+    let tunnel_addr = mantissa_net::wireguard::wireguard_tunnel_ipv6(self_id);
     let underlay_addr = command_stdout(
         "ip",
         &["-6", "addr", "show", "dev", MANTISSA_WIREGUARD_IFNAME],

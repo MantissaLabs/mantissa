@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use mantissa_protocol::sync::Domain;
 use metrics::{Unit, counter, describe_counter, describe_gauge, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use protocol::sync::Domain;
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
 use tracing::{info, warn};

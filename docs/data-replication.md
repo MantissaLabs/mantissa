@@ -71,10 +71,10 @@ Each store combines:
 
 The generic implementation lives in:
 
-- `crates/crdt_store/src/mst_store.rs`
-- `crates/crdt_store/src/adapter.rs`
-- `crates/crdt_store/src/mvreg.rs`
-- `crates/crdt_store/src/hash.rs`
+- `crates/mantissa-store/src/mst_store.rs`
+- `crates/mantissa-store/src/adapter.rs`
+- `crates/mantissa-store/src/mvreg.rs`
+- `crates/mantissa-store/src/hash.rs`
 
 Domain wrappers live under `src/store/` such as:
 
@@ -123,8 +123,8 @@ because Redb happened to store rows in a different physical layout.
 
 Relevant code:
 
-- `crates/crdt_store/src/mvreg.rs`
-- `crates/crdt_store/src/hash.rs`
+- `crates/mantissa-store/src/mvreg.rs`
+- `crates/mantissa-store/src/hash.rs`
 
 ## Write Path
 
@@ -325,9 +325,9 @@ Older replication sketches no longer matched the implementation:
 
 ## Code Map
 
-- `crates/crdt_store/src/mst_store.rs`
-- `crates/crdt_store/src/gc.rs`
-- `crates/crdt_store/src/hash.rs`
+- `crates/mantissa-store/src/mst_store.rs`
+- `crates/mantissa-store/src/gc.rs`
+- `crates/mantissa-store/src/hash.rs`
 - `src/gossip/mod.rs`
 - `src/sync/mod.rs`
 - `src/sync/delta.rs`

@@ -5,7 +5,7 @@ use crate::node::id::new_node_id_v7;
 use crate::node::info::NodeInfo;
 use capnp::Error;
 use capnp::message::Builder;
-use protocol::node;
+use mantissa_protocol::node;
 use std::cell::RefCell;
 use std::rc::Rc;
 use tracing::info;

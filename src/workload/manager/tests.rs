@@ -58,13 +58,13 @@ use crate::workload::types::{
     ResolvedExecutionSpec, WorkloadLivenessProbe, WorkloadLivenessProbeKind,
     WorkloadRestartPolicyKind,
 };
-use ::health::HealthMonitor;
+use ::mantissa_health::HealthMonitor;
 use anyhow::{Result, anyhow};
 use async_channel::bounded;
 use async_trait::async_trait;
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
-use net::noise::NoiseKeys;
+use mantissa_net::noise::NoiseKeys;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::rc::Rc;

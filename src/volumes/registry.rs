@@ -2,7 +2,7 @@ use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
 use crate::volumes::types::{VolumeNodeStateValue, VolumeSpecValue, compute_volume_id};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use crdt_store::uuid_key::UuidKey;
+use mantissa_store::uuid_key::UuidKey;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use uuid::Uuid;

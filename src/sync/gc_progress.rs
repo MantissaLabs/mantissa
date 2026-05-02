@@ -7,9 +7,9 @@
 
 use crate::cluster::ClusterViewId;
 use crate::store::registry::domain_key;
-use crdt_store::gc::GcBarrier;
+use mantissa_protocol::sync::Domain;
+use mantissa_store::gc::GcBarrier;
 use parking_lot::Mutex;
-use protocol::sync::Domain;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -9,7 +9,7 @@ use mantissa::network::types::{
     BpfProgramSpec, NetworkDriver, NetworkSpecDraft, NetworkSpecValue, NetworkStatus,
 };
 use mantissa::server::headless::{HeadlessConfig, HeadlessNode, HeadlessTransport};
-use net::paths::STATE_DIR_ENV;
+use mantissa_net::paths::STATE_DIR_ENV;
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::BTreeSet;
 use std::ffi::OsString;

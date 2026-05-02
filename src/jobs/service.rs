@@ -9,12 +9,12 @@ use crate::workload::capnp_codec::{
 use crate::workload::model::{ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec};
 use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
-use crdt_store::codec::StoreValueCodec;
-use protocol::gossip::gossip_message;
-use protocol::jobs::{
+use mantissa_protocol::gossip::gossip_message;
+use mantissa_protocol::jobs::{
     job_attempt_snapshot, job_detail, job_event, job_execution, job_record, job_retry_policy,
     job_snapshot, job_submit_spec, jobs,
 };
+use mantissa_store::codec::StoreValueCodec;
 use std::io::Cursor;
 use std::rc::Rc;
 use uuid::Uuid;
@@ -153,11 +153,11 @@ impl jobs::Server for JobsRpc {
 pub fn write_job_event(mut builder: job_event::Builder<'_>, event: &JobEvent) -> Result<(), Error> {
     match event {
         JobEvent::Upsert(spec) => {
-            builder.set_event(protocol::jobs::EventType::Upsert);
+            builder.set_event(mantissa_protocol::jobs::EventType::Upsert);
             write_job_record(builder.reborrow().init_record(), spec.as_ref())?;
         }
         JobEvent::Remove { id } => {
-            builder.set_event(protocol::jobs::EventType::Remove);
+            builder.set_event(mantissa_protocol::jobs::EventType::Remove);
             builder.set_id(id.as_bytes());
         }
     }
@@ -167,10 +167,10 @@ pub fn write_job_event(mut builder: job_event::Builder<'_>, event: &JobEvent) ->
 /// Decodes one job event from the shared gossip message union payload.
 pub fn read_job_event(reader: job_event::Reader<'_>) -> Result<JobEvent, Error> {
     match reader.get_event()? {
-        protocol::jobs::EventType::Upsert => Ok(JobEvent::Upsert(Box::new(read_job_record(
-            reader.get_record()?,
-        )?))),
-        protocol::jobs::EventType::Remove => {
+        mantissa_protocol::jobs::EventType::Upsert => Ok(JobEvent::Upsert(Box::new(
+            read_job_record(reader.get_record()?)?,
+        ))),
+        mantissa_protocol::jobs::EventType::Remove => {
             let data = reader.get_id()?;
             Ok(JobEvent::Remove {
                 id: read_uuid(data)?,
@@ -365,7 +365,7 @@ fn write_job_record(
 
 impl StoreValueCodec for JobSpecValue {
     /// Encodes one job spec as the stable Cap'n Proto store value.
-    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
         let mut message = capnp::message::Builder::new_default();
         write_job_record(message.init_root::<job_record::Builder<'_>>(), self)
             .map_err(job_store_codec_error)?;
@@ -373,7 +373,7 @@ impl StoreValueCodec for JobSpecValue {
     }
 
     /// Decodes one job spec from the stable Cap'n Proto store value.
-    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let reader =
             capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
@@ -386,8 +386,8 @@ impl StoreValueCodec for JobSpecValue {
 }
 
 /// Converts job store-codec errors into the CRDT store error type.
-fn job_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
-    Box::new(crdt_store::error::Error::Other(format!(
+fn job_store_codec_error<E: std::fmt::Display>(error: E) -> Box<mantissa_store::error::Error> {
+    Box::new(mantissa_store::error::Error::Other(format!(
         "job store codec error: {error}"
     )))
 }
@@ -538,28 +538,28 @@ fn read_job_submit_spec(
 }
 
 /// Maps one internal job status to the schema enum used by jobs RPCs.
-fn job_status_to_proto(status: JobStatus) -> protocol::jobs::JobStatus {
+fn job_status_to_proto(status: JobStatus) -> mantissa_protocol::jobs::JobStatus {
     match status {
-        JobStatus::Pending => protocol::jobs::JobStatus::Pending,
-        JobStatus::Running => protocol::jobs::JobStatus::Running,
-        JobStatus::Retrying => protocol::jobs::JobStatus::Retrying,
-        JobStatus::Cancelling => protocol::jobs::JobStatus::Cancelling,
-        JobStatus::Succeeded => protocol::jobs::JobStatus::Succeeded,
-        JobStatus::Failed => protocol::jobs::JobStatus::Failed,
-        JobStatus::Cancelled => protocol::jobs::JobStatus::Cancelled,
+        JobStatus::Pending => mantissa_protocol::jobs::JobStatus::Pending,
+        JobStatus::Running => mantissa_protocol::jobs::JobStatus::Running,
+        JobStatus::Retrying => mantissa_protocol::jobs::JobStatus::Retrying,
+        JobStatus::Cancelling => mantissa_protocol::jobs::JobStatus::Cancelling,
+        JobStatus::Succeeded => mantissa_protocol::jobs::JobStatus::Succeeded,
+        JobStatus::Failed => mantissa_protocol::jobs::JobStatus::Failed,
+        JobStatus::Cancelled => mantissa_protocol::jobs::JobStatus::Cancelled,
     }
 }
 
 /// Maps one schema job status enum back into the internal controller lifecycle enum.
-fn proto_to_job_status(status: protocol::jobs::JobStatus) -> JobStatus {
+fn proto_to_job_status(status: mantissa_protocol::jobs::JobStatus) -> JobStatus {
     match status {
-        protocol::jobs::JobStatus::Pending => JobStatus::Pending,
-        protocol::jobs::JobStatus::Running => JobStatus::Running,
-        protocol::jobs::JobStatus::Retrying => JobStatus::Retrying,
-        protocol::jobs::JobStatus::Cancelling => JobStatus::Cancelling,
-        protocol::jobs::JobStatus::Succeeded => JobStatus::Succeeded,
-        protocol::jobs::JobStatus::Failed => JobStatus::Failed,
-        protocol::jobs::JobStatus::Cancelled => JobStatus::Cancelled,
+        mantissa_protocol::jobs::JobStatus::Pending => JobStatus::Pending,
+        mantissa_protocol::jobs::JobStatus::Running => JobStatus::Running,
+        mantissa_protocol::jobs::JobStatus::Retrying => JobStatus::Retrying,
+        mantissa_protocol::jobs::JobStatus::Cancelling => JobStatus::Cancelling,
+        mantissa_protocol::jobs::JobStatus::Succeeded => JobStatus::Succeeded,
+        mantissa_protocol::jobs::JobStatus::Failed => JobStatus::Failed,
+        mantissa_protocol::jobs::JobStatus::Cancelled => JobStatus::Cancelled,
     }
 }
 
@@ -645,7 +645,7 @@ mod tests {
     use super::*;
     use crate::store::job_store::open_job_store;
     use crate::workload::types::{WorkloadPortBinding, WorkloadPortProtocol};
-    use crdt_store::uuid_key::UuidKey;
+    use mantissa_store::uuid_key::UuidKey;
     use std::sync::Arc;
     use tempfile::tempdir;
 

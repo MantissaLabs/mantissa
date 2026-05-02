@@ -21,7 +21,7 @@ use mantissa::services::types::{
     TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
 };
 use mantissa::workload::types::ExecutionSpec;
-use protocol::services::services;
+use mantissa_protocol::services::services;
 use rtnetlink::packet_route::address::AddressAttribute;
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -841,7 +841,9 @@ local_test!(nodeport_restart_restores_public_service_publication, {
     let db_path = temp_dir.path().join("nodeport-restart.redb");
     let db = Arc::new(redb::Database::create(db_path).expect("create persisted redb"));
     let self_id = Uuid::new_v4();
-    let noise_keys = Arc::new(net::noise::NoiseKeys::from_private_bytes([0x72; 32]));
+    let noise_keys = Arc::new(mantissa_net::noise::NoiseKeys::from_private_bytes(
+        [0x72; 32],
+    ));
     let signing = ed25519_dalek::SigningKey::from_bytes(&[0x92; 32]);
 
     let node = HeadlessNode::new_with(

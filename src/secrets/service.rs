@@ -9,10 +9,10 @@ use crate::topology::Topology;
 use capnp::Error;
 use capnp::struct_list;
 use chrono::Utc;
-use crdt_store::codec::StoreValueCodec;
-use protocol::secrets::{
+use mantissa_protocol::secrets::{
     secret_ciphertext, secret_event, secret_metadata_entry, secret_record, secret_spec, secrets,
 };
+use mantissa_store::codec::StoreValueCodec;
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::rc::Rc;
@@ -184,7 +184,7 @@ fn read_secret_record(reader: secret_record::Reader<'_>) -> Result<SecretValue, 
 
 impl StoreValueCodec for SecretValue {
     /// Encodes one secret value as the stable Cap'n Proto store value.
-    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
         let mut message = capnp::message::Builder::new_default();
         {
             let mut record = message.init_root::<secret_record::Builder<'_>>();
@@ -198,7 +198,7 @@ impl StoreValueCodec for SecretValue {
     }
 
     /// Decodes one secret value from the stable Cap'n Proto store value.
-    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let reader =
             capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
@@ -211,8 +211,8 @@ impl StoreValueCodec for SecretValue {
 }
 
 /// Converts secret store-codec errors into the CRDT store error type.
-fn secret_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
-    Box::new(crdt_store::error::Error::Other(format!(
+fn secret_store_codec_error<E: std::fmt::Display>(error: E) -> Box<mantissa_store::error::Error> {
+    Box::new(mantissa_store::error::Error::Other(format!(
         "secret store codec error: {error}"
     )))
 }
@@ -689,7 +689,7 @@ async fn distribute_master_key(topology: Topology, record: MasterKeyRecord) -> R
 mod tests {
     use super::*;
     use crate::store::secret_store::open_secret_store;
-    use crdt_store::uuid_key::UuidKey;
+    use mantissa_store::uuid_key::UuidKey;
     use std::sync::Arc;
     use tempfile::tempdir;
 

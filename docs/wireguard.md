@@ -4,7 +4,7 @@ This document describes Mantissa's WireGuard integration, how it is advertised a
 
 If you want to follow along in the code, the primary entry points are:
 
-- WireGuard keys, ports, and tunnel addressing: `crates/net/src/wireguard.rs`
+- WireGuard keys, ports, and tunnel addressing: `crates/mantissa-net/src/wireguard.rs`
 - Underlay reconciliation and interface provisioning: `src/network/wireguard.rs`
 - VXLAN integration (underlay selection, FDB, MTU): `src/network/controller.rs`, `src/network/attachment/linux.rs`
 - Peer metadata and gossip: `src/topology/mod.rs`, `src/topology/service.rs`, `src/topology/peers.rs`
@@ -36,7 +36,7 @@ WireGuard metadata is carried alongside peer data:
   - `port: u16` (0 means reuse the port from the advertised address)
   - `enabled: bool` (true when the local WireGuard interface is configured)
 
-The same fields are carried in `NodeInfo` (Cap'n Proto) to allow peers to insert metadata quickly during joins and syncs (`crates/protocol/schema/topology.capnp`).
+The same fields are carried in `NodeInfo` (Cap'n Proto) to allow peers to insert metadata quickly during joins and syncs (`crates/mantissa-protocol/schema/topology.capnp`).
 
 ## On-disk state
 

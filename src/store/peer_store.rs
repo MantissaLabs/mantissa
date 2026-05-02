@@ -1,16 +1,16 @@
 use crate::store::open::open_arc_store;
 use crate::topology::peers::{PeerRootSnapshot, PeerValue};
-use crdt_store::adapter::RegAdapter;
-use crdt_store::codec::{MvRegStoreCodec, StoreRegisterCodec};
-use crdt_store::mst_store::CrdtMstStore;
-use crdt_store::mvreg::{MvReg, MvRegSnapshot};
-use crdt_store::table_set::TableSet;
-use crdt_store::uuid_key::UuidKey;
+use mantissa_store::adapter::RegAdapter;
+use mantissa_store::codec::{MvRegStoreCodec, StoreRegisterCodec};
+use mantissa_store::mst_store::CrdtMstStore;
+use mantissa_store::mvreg::{MvReg, MvRegSnapshot};
+use mantissa_store::table_set::TableSet;
+use mantissa_store::uuid_key::UuidKey;
 use std::sync::Arc;
 use uuid::Uuid;
 
 // Hasher for MST leaves/keys (your existing implementation)
-use crdt_store::hash::XXHash128;
+use mantissa_store::hash::XXHash128;
 
 // The tables for the peer store.
 pub struct PeerTables;
@@ -84,12 +84,12 @@ impl RegAdapter for PeerRegAdapter {
     }
 
     /// Encodes one peer register into the Cap'n Proto-backed store payload.
-    fn encode_reg(reg: &Self::Reg) -> crdt_store::Result<Vec<u8>> {
+    fn encode_reg(reg: &Self::Reg) -> mantissa_store::Result<Vec<u8>> {
         MvRegStoreCodec::<PeerValue, Uuid>::encode_store_reg(reg)
     }
 
     /// Decodes one peer register from the Cap'n Proto-backed store payload.
-    fn decode_reg(bytes: &[u8]) -> crdt_store::Result<Self::Reg> {
+    fn decode_reg(bytes: &[u8]) -> mantissa_store::Result<Self::Reg> {
         MvRegStoreCodec::<PeerValue, Uuid>::decode_store_reg(bytes)
     }
 
@@ -120,7 +120,7 @@ mod tests {
     use crate::topology::peers::{
         PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
     };
-    use crdt_store::adapter::RegAdapter;
+    use mantissa_store::adapter::RegAdapter;
     use uuid::Uuid;
 
     /// Builds a deterministic peer value for peer-store codec tests.

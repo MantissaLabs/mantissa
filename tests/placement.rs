@@ -3,7 +3,6 @@ mod common;
 
 use common::convergence::wait_until;
 use common::testkit::{ClusterConfig, RuntimeBackendOverrideGuard, TestNode};
-use crdt_store::uuid_key::UuidKey;
 use mantissa::node::id::set_node_id;
 use mantissa::registry::Registry;
 use mantissa::scheduler::placement::{
@@ -23,7 +22,8 @@ use mantissa::workload::model::{
 use mantissa::workload::types::{
     ExecutionSpec, ResolvedExecutionSpec, WorkloadPortBinding, WorkloadPortProtocol,
 };
-use protocol::volumes::{LocalVolumeSourceKind, volumes};
+use mantissa_protocol::volumes::{LocalVolumeSourceKind, volumes};
+use mantissa_store::uuid_key::UuidKey;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -1719,9 +1719,9 @@ async fn create_immediate_managed_volume_on_node(
         let mut local = driver.reborrow().init_local();
         local.set_source_kind(LocalVolumeSourceKind::Managed);
         local.set_imported_path("");
-        inner.set_access_mode(protocol::volumes::VolumeAccessMode::ReadWriteOnce);
-        inner.set_binding_mode(protocol::volumes::VolumeBindingMode::Immediate);
-        inner.set_reclaim_policy(protocol::volumes::VolumeReclaimPolicy::Retain);
+        inner.set_access_mode(mantissa_protocol::volumes::VolumeAccessMode::ReadWriteOnce);
+        inner.set_binding_mode(mantissa_protocol::volumes::VolumeBindingMode::Immediate);
+        inner.set_reclaim_policy(mantissa_protocol::volumes::VolumeReclaimPolicy::Retain);
         inner.set_requested_bytes(0);
         inner.set_bound_node_id(node_id.as_bytes());
     }

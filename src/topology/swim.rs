@@ -1,6 +1,6 @@
 use super::{Topology, TopologyEvent};
 use crate::cluster::ClusterViewId;
-use health::{Action as HealthAction, SwimEvent as HealthSwimEvent};
+use mantissa_health::{Action as HealthAction, SwimEvent as HealthSwimEvent};
 use std::time::Duration;
 use tracing::debug;
 use uuid::Uuid;

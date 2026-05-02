@@ -15,8 +15,8 @@ use mantissa::runtime::types::{
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode, HeadlessTransport};
 use mantissa::task::types::TaskStateFilter;
 use mantissa::workload::model::{ExecutionPlatform, IsolationMode};
-use net::noise::NoiseKeys;
-use protocol::jobs::{JobStatus as ProtoJobStatus, jobs};
+use mantissa_net::noise::NoiseKeys;
+use mantissa_protocol::jobs::{JobStatus as ProtoJobStatus, jobs};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{

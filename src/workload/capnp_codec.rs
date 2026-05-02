@@ -7,8 +7,10 @@ use crate::workload::types::{
     WorkloadRestartPolicy, WorkloadRestartPolicyKind,
 };
 use capnp::{Error, struct_list};
-use protocol::volumes::local_volume_ownership;
-use protocol::workload::{environment_var, port_binding, secret_file, secret_ref, volume_mount};
+use mantissa_protocol::volumes::local_volume_ownership;
+use mantissa_protocol::workload::{
+    environment_var, port_binding, secret_file, secret_ref, volume_mount,
+};
 use uuid::Uuid;
 
 /// Encodes one secret reference into the task schema payload.
@@ -223,8 +225,8 @@ pub fn encode_port_bindings(
         entry.set_host_port(port.host_port);
         entry.set_host_ip(&port.host_ip);
         let protocol = match port.protocol {
-            WorkloadPortProtocol::Tcp => protocol::workload::PortProtocol::Tcp,
-            WorkloadPortProtocol::Udp => protocol::workload::PortProtocol::Udp,
+            WorkloadPortProtocol::Tcp => mantissa_protocol::workload::PortProtocol::Tcp,
+            WorkloadPortProtocol::Udp => mantissa_protocol::workload::PortProtocol::Udp,
         };
         entry.set_protocol(protocol);
     }
@@ -237,8 +239,8 @@ pub fn decode_port_bindings(
     let mut ports = Vec::with_capacity(list.len() as usize);
     for entry in list.iter() {
         let protocol = match entry.get_protocol()? {
-            protocol::workload::PortProtocol::Tcp => WorkloadPortProtocol::Tcp,
-            protocol::workload::PortProtocol::Udp => WorkloadPortProtocol::Udp,
+            mantissa_protocol::workload::PortProtocol::Tcp => WorkloadPortProtocol::Tcp,
+            mantissa_protocol::workload::PortProtocol::Udp => WorkloadPortProtocol::Udp,
         };
         ports.push(WorkloadPortBinding {
             name: entry.get_name()?.to_str()?.to_string(),
@@ -253,13 +255,13 @@ pub fn decode_port_bindings(
 
 /// Encodes one task liveness probe into the task wire payload.
 pub fn encode_task_liveness_probe(
-    mut builder: protocol::workload::liveness_probe::Builder<'_>,
+    mut builder: mantissa_protocol::workload::liveness_probe::Builder<'_>,
     probe: &WorkloadLivenessProbe,
 ) {
     let kind = match probe.kind {
-        WorkloadLivenessProbeKind::Exec => protocol::workload::LivenessProbeKind::Exec,
-        WorkloadLivenessProbeKind::Http => protocol::workload::LivenessProbeKind::Http,
-        WorkloadLivenessProbeKind::Tcp => protocol::workload::LivenessProbeKind::Tcp,
+        WorkloadLivenessProbeKind::Exec => mantissa_protocol::workload::LivenessProbeKind::Exec,
+        WorkloadLivenessProbeKind::Http => mantissa_protocol::workload::LivenessProbeKind::Http,
+        WorkloadLivenessProbeKind::Tcp => mantissa_protocol::workload::LivenessProbeKind::Tcp,
     };
     builder.set_kind(kind);
     let mut command_builder = builder.reborrow().init_command(probe.command.len() as u32);
@@ -276,12 +278,12 @@ pub fn encode_task_liveness_probe(
 
 /// Decodes one task liveness probe from the task wire payload.
 pub fn decode_task_liveness_probe(
-    reader: protocol::workload::liveness_probe::Reader<'_>,
+    reader: mantissa_protocol::workload::liveness_probe::Reader<'_>,
 ) -> Result<WorkloadLivenessProbe, Error> {
     let kind = match reader.get_kind()? {
-        protocol::workload::LivenessProbeKind::Exec => WorkloadLivenessProbeKind::Exec,
-        protocol::workload::LivenessProbeKind::Http => WorkloadLivenessProbeKind::Http,
-        protocol::workload::LivenessProbeKind::Tcp => WorkloadLivenessProbeKind::Tcp,
+        mantissa_protocol::workload::LivenessProbeKind::Exec => WorkloadLivenessProbeKind::Exec,
+        mantissa_protocol::workload::LivenessProbeKind::Http => WorkloadLivenessProbeKind::Http,
+        mantissa_protocol::workload::LivenessProbeKind::Tcp => WorkloadLivenessProbeKind::Tcp,
     };
     let mut command = Vec::new();
     for arg in reader.get_command()?.iter() {
@@ -306,13 +308,13 @@ pub fn decode_task_liveness_probe(
 
 /// Encodes one service liveness probe into the service wire payload.
 pub fn encode_service_liveness_probe(
-    mut builder: protocol::services::liveness_probe::Builder<'_>,
+    mut builder: mantissa_protocol::services::liveness_probe::Builder<'_>,
     probe: &WorkloadLivenessProbe,
 ) {
     let kind = match probe.kind {
-        WorkloadLivenessProbeKind::Exec => protocol::services::LivenessProbeKind::Exec,
-        WorkloadLivenessProbeKind::Http => protocol::services::LivenessProbeKind::Http,
-        WorkloadLivenessProbeKind::Tcp => protocol::services::LivenessProbeKind::Tcp,
+        WorkloadLivenessProbeKind::Exec => mantissa_protocol::services::LivenessProbeKind::Exec,
+        WorkloadLivenessProbeKind::Http => mantissa_protocol::services::LivenessProbeKind::Http,
+        WorkloadLivenessProbeKind::Tcp => mantissa_protocol::services::LivenessProbeKind::Tcp,
     };
     builder.set_kind(kind);
     let mut command_builder = builder.reborrow().init_command(probe.command.len() as u32);
@@ -329,12 +331,12 @@ pub fn encode_service_liveness_probe(
 
 /// Decodes one service liveness probe from the service wire payload.
 pub fn decode_service_liveness_probe(
-    reader: protocol::services::liveness_probe::Reader<'_>,
+    reader: mantissa_protocol::services::liveness_probe::Reader<'_>,
 ) -> Result<WorkloadLivenessProbe, Error> {
     let kind = match reader.get_kind()? {
-        protocol::services::LivenessProbeKind::Exec => WorkloadLivenessProbeKind::Exec,
-        protocol::services::LivenessProbeKind::Http => WorkloadLivenessProbeKind::Http,
-        protocol::services::LivenessProbeKind::Tcp => WorkloadLivenessProbeKind::Tcp,
+        mantissa_protocol::services::LivenessProbeKind::Exec => WorkloadLivenessProbeKind::Exec,
+        mantissa_protocol::services::LivenessProbeKind::Http => WorkloadLivenessProbeKind::Http,
+        mantissa_protocol::services::LivenessProbeKind::Tcp => WorkloadLivenessProbeKind::Tcp,
     };
     let mut command = Vec::new();
     for arg in reader.get_command()?.iter() {
@@ -359,15 +361,17 @@ pub fn decode_service_liveness_probe(
 
 /// Encodes one task restart policy into the task wire payload.
 pub fn encode_task_restart_policy(
-    mut builder: protocol::workload::restart_policy::Builder<'_>,
+    mut builder: mantissa_protocol::workload::restart_policy::Builder<'_>,
     policy: &WorkloadRestartPolicy,
 ) {
     let name = match policy.name {
-        WorkloadRestartPolicyKind::No => protocol::workload::RestartPolicyName::No,
-        WorkloadRestartPolicyKind::Always => protocol::workload::RestartPolicyName::Always,
-        WorkloadRestartPolicyKind::OnFailure => protocol::workload::RestartPolicyName::OnFailure,
+        WorkloadRestartPolicyKind::No => mantissa_protocol::workload::RestartPolicyName::No,
+        WorkloadRestartPolicyKind::Always => mantissa_protocol::workload::RestartPolicyName::Always,
+        WorkloadRestartPolicyKind::OnFailure => {
+            mantissa_protocol::workload::RestartPolicyName::OnFailure
+        }
         WorkloadRestartPolicyKind::UnlessStopped => {
-            protocol::workload::RestartPolicyName::UnlessStopped
+            mantissa_protocol::workload::RestartPolicyName::UnlessStopped
         }
     };
     builder.set_name(name);
@@ -376,13 +380,15 @@ pub fn encode_task_restart_policy(
 
 /// Decodes one task restart policy from the task wire payload.
 pub fn decode_task_restart_policy(
-    reader: protocol::workload::restart_policy::Reader<'_>,
+    reader: mantissa_protocol::workload::restart_policy::Reader<'_>,
 ) -> Result<WorkloadRestartPolicy, Error> {
     let name = match reader.get_name()? {
-        protocol::workload::RestartPolicyName::No => WorkloadRestartPolicyKind::No,
-        protocol::workload::RestartPolicyName::Always => WorkloadRestartPolicyKind::Always,
-        protocol::workload::RestartPolicyName::OnFailure => WorkloadRestartPolicyKind::OnFailure,
-        protocol::workload::RestartPolicyName::UnlessStopped => {
+        mantissa_protocol::workload::RestartPolicyName::No => WorkloadRestartPolicyKind::No,
+        mantissa_protocol::workload::RestartPolicyName::Always => WorkloadRestartPolicyKind::Always,
+        mantissa_protocol::workload::RestartPolicyName::OnFailure => {
+            WorkloadRestartPolicyKind::OnFailure
+        }
+        mantissa_protocol::workload::RestartPolicyName::UnlessStopped => {
             WorkloadRestartPolicyKind::UnlessStopped
         }
     };
@@ -400,15 +406,17 @@ pub fn decode_task_restart_policy(
 
 /// Encodes one service restart policy into the service wire payload.
 pub fn encode_service_restart_policy(
-    mut builder: protocol::services::restart_policy::Builder<'_>,
+    mut builder: mantissa_protocol::services::restart_policy::Builder<'_>,
     policy: &WorkloadRestartPolicy,
 ) {
     let name = match policy.name {
-        WorkloadRestartPolicyKind::No => protocol::services::RestartPolicyName::No,
-        WorkloadRestartPolicyKind::Always => protocol::services::RestartPolicyName::Always,
-        WorkloadRestartPolicyKind::OnFailure => protocol::services::RestartPolicyName::OnFailure,
+        WorkloadRestartPolicyKind::No => mantissa_protocol::services::RestartPolicyName::No,
+        WorkloadRestartPolicyKind::Always => mantissa_protocol::services::RestartPolicyName::Always,
+        WorkloadRestartPolicyKind::OnFailure => {
+            mantissa_protocol::services::RestartPolicyName::OnFailure
+        }
         WorkloadRestartPolicyKind::UnlessStopped => {
-            protocol::services::RestartPolicyName::UnlessStopped
+            mantissa_protocol::services::RestartPolicyName::UnlessStopped
         }
     };
     builder.set_name(name);
@@ -417,13 +425,15 @@ pub fn encode_service_restart_policy(
 
 /// Decodes one service restart policy from the service wire payload.
 pub fn decode_service_restart_policy(
-    reader: protocol::services::restart_policy::Reader<'_>,
+    reader: mantissa_protocol::services::restart_policy::Reader<'_>,
 ) -> Result<WorkloadRestartPolicy, Error> {
     let name = match reader.get_name()? {
-        protocol::services::RestartPolicyName::No => WorkloadRestartPolicyKind::No,
-        protocol::services::RestartPolicyName::Always => WorkloadRestartPolicyKind::Always,
-        protocol::services::RestartPolicyName::OnFailure => WorkloadRestartPolicyKind::OnFailure,
-        protocol::services::RestartPolicyName::UnlessStopped => {
+        mantissa_protocol::services::RestartPolicyName::No => WorkloadRestartPolicyKind::No,
+        mantissa_protocol::services::RestartPolicyName::Always => WorkloadRestartPolicyKind::Always,
+        mantissa_protocol::services::RestartPolicyName::OnFailure => {
+            WorkloadRestartPolicyKind::OnFailure
+        }
+        mantissa_protocol::services::RestartPolicyName::UnlessStopped => {
             WorkloadRestartPolicyKind::UnlessStopped
         }
     };

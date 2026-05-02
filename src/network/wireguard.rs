@@ -99,7 +99,7 @@ struct WireGuardPeerPlan {
 #[cfg(target_os = "linux")]
 struct LocalWireGuardConfig {
     ifname: String,
-    keys: net::wireguard::WireGuardKeys,
+    keys: mantissa_net::wireguard::WireGuardKeys,
     listen_port: u16,
     tunnel_v6: Ipv6Addr,
     tunnel_ip: IpAddr,
@@ -161,7 +161,7 @@ fn should_reconfigure_wireguard(
 /// plaintext underlay selection.
 #[cfg(target_os = "linux")]
 fn load_wireguard_underlay_preference_or_default() -> bool {
-    match net::wireguard::load_wireguard_underlay_preference() {
+    match mantissa_net::wireguard::load_wireguard_underlay_preference() {
         Ok(value) => value,
         Err(err) => {
             tracing::warn!(
@@ -178,17 +178,17 @@ fn load_wireguard_underlay_preference_or_default() -> bool {
 /// These inputs are stable across reconciliations and are shared by every later step.
 #[cfg(target_os = "linux")]
 fn load_local_wireguard_config(self_id: Uuid) -> Result<LocalWireGuardConfig> {
-    let keys_path =
-        net::wireguard::resolve_wireguard_key_path().context("resolve wireguard key path")?;
-    let keys = net::wireguard::load_or_generate_wireguard_keys(keys_path)
+    let keys_path = mantissa_net::wireguard::resolve_wireguard_key_path()
+        .context("resolve wireguard key path")?;
+    let keys = mantissa_net::wireguard::load_or_generate_wireguard_keys(keys_path)
         .context("load wireguard keys")?;
     let listen_port =
-        net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
+        mantissa_net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
             None,
             config::wireguard_port_override(),
         )
         .context("load wireguard listen port")?;
-    let tunnel_v6 = net::wireguard::wireguard_tunnel_ipv6(self_id);
+    let tunnel_v6 = mantissa_net::wireguard::wireguard_tunnel_ipv6(self_id);
 
     Ok(LocalWireGuardConfig {
         ifname: MANTISSA_WIREGUARD_IFNAME.to_string(),
@@ -244,7 +244,7 @@ fn build_wireguard_peer_plan(
             peer_id: *peer_id,
             public_key: wg.public_key,
             endpoint,
-            allowed_ip: net::wireguard::wireguard_tunnel_ipv6(*peer_id),
+            allowed_ip: mantissa_net::wireguard::wireguard_tunnel_ipv6(*peer_id),
             keepalive: 25,
         });
     }
@@ -436,7 +436,7 @@ fn persist_wireguard_underlay_preference_if_ready(
         && ready
         && peer_plan.desired_peer_count > 0
         && !prefer_underlay
-        && let Err(err) = net::wireguard::persist_wireguard_underlay_preference(true)
+        && let Err(err) = mantissa_net::wireguard::persist_wireguard_underlay_preference(true)
     {
         tracing::warn!(
             target: "network",
@@ -613,7 +613,7 @@ fn build_wireguard_endpoint(advertise: &str, listen_port: u16) -> Option<String>
         .map(|(host, port)| (host, port.parse::<u16>().ok()))
         .unwrap_or((advertise, None));
     let port = if listen_port == 0 {
-        advertised_port.unwrap_or(net::wireguard::DEFAULT_WIREGUARD_LISTEN_PORT)
+        advertised_port.unwrap_or(mantissa_net::wireguard::DEFAULT_WIREGUARD_LISTEN_PORT)
     } else {
         listen_port
     };

@@ -4,10 +4,6 @@ mod common;
 use async_trait::async_trait;
 use capnp::Error as CapnpError;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use client::services::manifest::{
-    ManifestPortProtocol, RestartPolicyName as ManifestRestartPolicyName, SecretReference,
-    ServiceManifest, load_manifest_from_path,
-};
 use common::convergence::{
     current_cluster_view, swim_down_transition_timeout, wait_for_cluster_view,
     wait_for_operation_stage, wait_until,
@@ -15,7 +11,6 @@ use common::convergence::{
 use common::testkit::{
     ClusterConfig, InMemoryRuntimeBackend, RuntimeBackendOverrideGuard, TestNode,
 };
-use crdt_store::uuid_key::UuidKey;
 use mantissa::cluster::ClusterViewId;
 use mantissa::config::{
     Config, ConfigSource, global_config, global_config_source, set_global_config_with_source,
@@ -50,12 +45,17 @@ use mantissa::workload::manager::WorkloadManager;
 use mantissa::workload::model::WorkloadPhase;
 use mantissa::workload::model::WorkloadSpec;
 use mantissa::workload::types::{ExecutionSpec, WorkloadPortBinding, WorkloadPortProtocol};
+use mantissa_client::services::manifest::{
+    ManifestPortProtocol, RestartPolicyName as ManifestRestartPolicyName, SecretReference,
+    ServiceManifest, load_manifest_from_path,
+};
+use mantissa_protocol::health::NodeStatus;
+use mantissa_protocol::secrets::secrets;
+use mantissa_protocol::services::services;
+use mantissa_protocol::topology::{ClusterOperationStage, NodeDrainState};
+use mantissa_protocol::volumes::volumes;
+use mantissa_store::uuid_key::UuidKey;
 use parking_lot::{Mutex, MutexGuard};
-use protocol::health::NodeStatus;
-use protocol::secrets::secrets;
-use protocol::services::services;
-use protocol::topology::{ClusterOperationStage, NodeDrainState};
-use protocol::volumes::volumes;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
@@ -71,7 +71,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use net::noise::NoiseKeys;
+use mantissa_net::noise::NoiseKeys;
 
 /// Restores the global Mantissa config after a test-scoped override.
 struct ConfigOverrideGuard {
@@ -6112,16 +6112,17 @@ fn manifest_to_task_templates(manifest: &ServiceManifest) -> Vec<TaskTemplateSpe
                             },
                             mode: file.mode,
                             ownership: match &file.ownership {
-                                client::volumes::LocalVolumeOwnership::Daemon => {
+                                mantissa_client::volumes::LocalVolumeOwnership::Daemon => {
                                     mantissa::volumes::types::LocalVolumeOwnership::Daemon
                                 }
-                                client::volumes::LocalVolumeOwnership::User { uid, gid } => {
-                                    mantissa::volumes::types::LocalVolumeOwnership::User {
-                                        uid: *uid,
-                                        gid: *gid,
-                                    }
-                                }
-                                client::volumes::LocalVolumeOwnership::FsGroup { gid } => {
+                                mantissa_client::volumes::LocalVolumeOwnership::User {
+                                    uid,
+                                    gid,
+                                } => mantissa::volumes::types::LocalVolumeOwnership::User {
+                                    uid: *uid,
+                                    gid: *gid,
+                                },
+                                mantissa_client::volumes::LocalVolumeOwnership::FsGroup { gid } => {
                                     mantissa::volumes::types::LocalVolumeOwnership::FsGroup {
                                         gid: *gid,
                                     }

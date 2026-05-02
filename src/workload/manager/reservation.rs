@@ -3,8 +3,8 @@ use std::collections::HashSet;
 
 use anyhow::Context;
 use chrono::Utc;
-use protocol::scheduling::{self, prepare_leases_response, scheduler as scheduler_rpc};
-use protocol::server::cluster_session;
+use mantissa_protocol::scheduling::{self, prepare_leases_response, scheduler as scheduler_rpc};
+use mantissa_protocol::server::cluster_session;
 use tracing::warn;
 use uuid::Uuid;
 

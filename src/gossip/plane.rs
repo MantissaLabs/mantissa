@@ -1,7 +1,7 @@
 use super::Message;
 use crate::topology::TopologyEvent;
-use protocol::gossip;
-use protocol::gossip::gossip_message::Which::Topology;
+use mantissa_protocol::gossip;
+use mantissa_protocol::gossip::gossip_message::Which::Topology;
 
 /// Gossip transport plane selector.
 ///
@@ -46,7 +46,7 @@ pub(super) fn gossip_plane_for_wire_message(
 ) -> GossipPlane {
     match message.which() {
         Ok(Topology(Ok(reader))) => match reader.get_event() {
-            Ok(protocol::topology::topology_event::EventType::ClusterNameUpdated) => {
+            Ok(mantissa_protocol::topology::topology_event::EventType::ClusterNameUpdated) => {
                 GossipPlane::GlobalMetadata
             }
             _ => GossipPlane::ViewScoped,

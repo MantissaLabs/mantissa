@@ -1,4 +1,4 @@
-use protocol::scheduling::{self, summary as summary_capnp};
+use mantissa_protocol::scheduling::{self, summary as summary_capnp};
 use uuid::Uuid;
 
 use crate::gpu::gpu_runtime_status;

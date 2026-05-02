@@ -4,7 +4,7 @@ use crate::server::session::{ClusterSessionServices, SessionFactory};
 use crate::token::TokenStore;
 use crate::topology::Topology;
 use ed25519_dalek::SigningKey;
-use net::noise::NoiseKeys;
+use mantissa_net::noise::NoiseKeys;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::error;
 use uuid::Uuid;
 
-use protocol::{
+use mantissa_protocol::{
     agents::AgentsClient, gossip::GossipClient, jobs::JobsClient, network::NetworksClient,
     node::NodeClient, scheduling::scheduler::Client as SchedulerClient,
     secrets::secrets::Client as SecretsClient, services::ServicesClient, sync::SyncClient,
@@ -287,13 +287,15 @@ impl Server {
         listen_addr: String,
         enable_unix_socket: bool,
     ) -> std::io::Result<RunHandles> {
-        let server_handle: protocol::server::server::Client = capnp_rpc::new_client(self.clone());
-        let psk_provider: Arc<dyn net::noise::NoisePskProvider> =
+        let server_handle: mantissa_protocol::server::server::Client =
+            capnp_rpc::new_client(self.clone());
+        let psk_provider: Arc<dyn mantissa_net::noise::NoisePskProvider> =
             Arc::new(self.auth.join_tokens.clone());
-        let peer_verifier: Rc<dyn net::noise::NoisePeerVerifier> = Rc::new(self.topology.clone());
+        let peer_verifier: Rc<dyn mantissa_net::noise::NoisePeerVerifier> =
+            Rc::new(self.topology.clone());
 
         let (tcp_task, tcp_ready, bound) =
-            net::tcp_secure::start_tcp_secure_listener_nonblocking_with_ready(
+            mantissa_net::tcp_secure::start_tcp_secure_listener_nonblocking_with_ready(
                 listen_addr,
                 server_handle,
                 self.transport.noise_keys.clone(),
@@ -309,7 +311,7 @@ impl Server {
             let local_session = self.sessions.new_local_client();
             Some(tokio::task::spawn_local(async move {
                 if let Err(error) =
-                    net::unix_socket::start_unix_socket_server_auto(local_session).await
+                    mantissa_net::unix_socket::start_unix_socket_server_auto(local_session).await
                 {
                     error!(target: "server", "UnixSocket listener error: {error}");
                 }

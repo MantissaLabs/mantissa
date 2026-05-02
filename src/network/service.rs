@@ -8,11 +8,11 @@ use crate::network::types::{
 };
 use crate::topology::Topology;
 use capnp::Error;
-use crdt_store::codec::StoreValueCodec;
-use protocol::network::{
+use mantissa_protocol::network::{
     network_attachment_spec, network_create_spec, network_event, network_peer_status, network_spec,
     network_summary, networks,
 };
+use mantissa_store::codec::StoreValueCodec;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::Cursor;
@@ -92,7 +92,7 @@ fn read_uuid(bytes: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
 }
 
 /// Convert the protocol driver enum into the replicated network driver enum.
-fn convert_driver(driver: protocol::network::NetworkDriver) -> NetworkDriver {
+fn convert_driver(driver: mantissa_protocol::network::NetworkDriver) -> NetworkDriver {
     NetworkDriver::from_proto(driver)
 }
 
@@ -339,14 +339,14 @@ fn read_network_attachment(
 
 impl StoreValueCodec for NetworkSpecValue {
     /// Encodes one network spec as the stable Cap'n Proto store value.
-    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
         let mut message = capnp::message::Builder::new_default();
         write_network_spec(message.init_root::<network_spec::Builder<'_>>(), self);
         Ok(capnp::serialize::write_message_to_words(&message))
     }
 
     /// Decodes one network spec from the stable Cap'n Proto store value.
-    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let reader =
             capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
@@ -360,7 +360,7 @@ impl StoreValueCodec for NetworkSpecValue {
 
 impl StoreValueCodec for NetworkPeerStateValue {
     /// Encodes one network peer-state row as the stable Cap'n Proto store value.
-    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
         let mut message = capnp::message::Builder::new_default();
         write_network_event(
             message.init_root::<network_event::Builder<'_>>(),
@@ -371,12 +371,12 @@ impl StoreValueCodec for NetworkPeerStateValue {
     }
 
     /// Decodes one network peer-state row from the stable Cap'n Proto store value.
-    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
         let event = decode_network_store_event(bytes)?;
         match event {
             NetworkEvent::PeerUpsert(value) => Ok(value),
             NetworkEvent::Upsert(_) | NetworkEvent::PeerRemove(_) => {
-                Err(Box::new(crdt_store::error::Error::Other(
+                Err(Box::new(mantissa_store::error::Error::Other(
                     "network peer store value had wrong event type".to_string(),
                 )))
             }
@@ -386,7 +386,7 @@ impl StoreValueCodec for NetworkPeerStateValue {
 
 impl StoreValueCodec for NetworkAttachmentValue {
     /// Encodes one network attachment row as the stable Cap'n Proto store value.
-    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
         let mut message = capnp::message::Builder::new_default();
         write_network_attachment(
             message.init_root::<network_attachment_spec::Builder<'_>>(),
@@ -396,7 +396,7 @@ impl StoreValueCodec for NetworkAttachmentValue {
     }
 
     /// Decodes one network attachment row from the stable Cap'n Proto store value.
-    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let reader =
             capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
@@ -409,7 +409,7 @@ impl StoreValueCodec for NetworkAttachmentValue {
 }
 
 /// Decodes one network store event payload.
-fn decode_network_store_event(bytes: &[u8]) -> crdt_store::Result<NetworkEvent> {
+fn decode_network_store_event(bytes: &[u8]) -> mantissa_store::Result<NetworkEvent> {
     let mut cursor = Cursor::new(bytes);
     let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
         .map_err(network_store_codec_error)?;
@@ -420,8 +420,8 @@ fn decode_network_store_event(bytes: &[u8]) -> crdt_store::Result<NetworkEvent> 
 }
 
 /// Converts network store-codec errors into the CRDT store error type.
-fn network_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
-    Box::new(crdt_store::error::Error::Other(format!(
+fn network_store_codec_error<E: std::fmt::Display>(error: E) -> Box<mantissa_store::error::Error> {
+    Box::new(mantissa_store::error::Error::Other(format!(
         "network store codec error: {error}"
     )))
 }
@@ -716,7 +716,7 @@ mod tests {
     use crate::store::network_store::{
         open_network_attachment_store, open_network_peer_store, open_network_spec_store,
     };
-    use crdt_store::uuid_key::UuidKey;
+    use mantissa_store::uuid_key::UuidKey;
     use std::sync::Arc;
     use tempfile::tempdir;
 

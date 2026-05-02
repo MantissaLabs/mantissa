@@ -356,13 +356,13 @@ maintenance knob without rewriting the workload spec.
 - `src/sync/gc_progress.rs`
 - `src/store/gc.rs`
 - `src/config.rs`
-- `crates/crdt_store/src/codec.rs`
-- `crates/crdt_store/src/gc.rs`
-- `crates/crdt_store/src/mst_store.rs`
+- `crates/mantissa-store/src/codec.rs`
+- `crates/mantissa-store/src/gc.rs`
+- `crates/mantissa-store/src/mst_store.rs`
 - `src/services/slot_reconcile.rs`
 - `src/workload/manager/state.rs`
-- `crates/client/src/node/drain.rs`
-- `crates/client/src/node/status.rs`
+- `crates/mantissa-client/src/node/drain.rs`
+- `crates/mantissa-client/src/node/status.rs`
 
 ## Related Documents
 

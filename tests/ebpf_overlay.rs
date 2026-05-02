@@ -24,7 +24,7 @@ use mantissa::services::types::{
 };
 use mantissa::workload::model::WorkloadStateFilter;
 use mantissa::workload::types::ExecutionSpec;
-use protocol::services::services;
+use mantissa_protocol::services::services;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;

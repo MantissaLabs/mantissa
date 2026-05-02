@@ -1,7 +1,7 @@
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use protocol::scheduling::{self, scheduler};
+use mantissa_protocol::scheduling::{self, scheduler};
 use uuid::Uuid;
 
 use super::digest::{SchedulerDigestValue, write_scheduler_digest};
@@ -237,11 +237,11 @@ mod tests {
     use crate::store::local::LocalSessionStore;
     use crate::store::peer_store::open_peers_store;
     use crate::store::scheduler_store::open_scheduler_store;
-    use ::health::HealthMonitor;
+    use ::mantissa_health::HealthMonitor;
     use capnp_rpc::new_client as capnp_new_client;
     use ed25519_dalek::SigningKey;
-    use net::noise::NoiseKeys;
-    use protocol::scheduling::{self, scheduler};
+    use mantissa_net::noise::NoiseKeys;
+    use mantissa_protocol::scheduling::{self, scheduler};
     use std::rc::Rc;
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};

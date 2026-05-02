@@ -13,7 +13,7 @@ use mantissa::{
     node,
     server::headless::{HeadlessConfig, HeadlessNode, HeadlessTransport},
 };
-use protocol::health::NodeStatus;
+use mantissa_protocol::health::NodeStatus;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;

@@ -4,7 +4,7 @@ use crate::node;
 use crate::store::local::load_or_create_node_id;
 use crate::store::path::open_default_database;
 use ed25519_dalek::SigningKey;
-use net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};
+use mantissa_net::noise::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -19,7 +19,7 @@ pub struct BootstrapContext {
     pub signing_key: SigningKey,
     pub db: Arc<redb::Database>,
     pub node: node::Node,
-    pub node_client: protocol::node::node::Client,
+    pub node_client: mantissa_protocol::node::node::Client,
 }
 
 impl BootstrapContext {

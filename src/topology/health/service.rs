@@ -1,5 +1,5 @@
 use super::Health;
-use protocol::health::health;
+use mantissa_protocol::health::health;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 

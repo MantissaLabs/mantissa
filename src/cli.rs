@@ -1,6 +1,6 @@
 // src/cli.rs
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
-use client::tasks::{TasksListOutput, TasksListState};
+use mantissa_client::tasks::{TasksListOutput, TasksListState};
 use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
@@ -1343,10 +1343,11 @@ impl NetworksCreateArgs {
     /// available even when no BPF flags are specified on the CLI.
     pub fn resolved_bpf_programs(&self) -> Vec<String> {
         let driver = match self.driver {
-            NetworkDriverOpt::Vxlan => client::networks::NetworkDriver::Vxlan,
-            NetworkDriverOpt::Bridge => client::networks::NetworkDriver::Bridge,
+            NetworkDriverOpt::Vxlan => mantissa_client::networks::NetworkDriver::Vxlan,
+            NetworkDriverOpt::Bridge => mantissa_client::networks::NetworkDriver::Bridge,
         };
-        let mut programs = client::networks::default_network_bpf_programs_for_driver(driver);
+        let mut programs =
+            mantissa_client::networks::default_network_bpf_programs_for_driver(driver);
         programs.extend(self.bpf_programs.iter().cloned());
         programs.sort();
         programs.dedup();
@@ -1628,44 +1629,56 @@ pub enum SplitNetworkPolicyOpt {
     Preserve,
 }
 
-impl From<SplitFilterOpt> for client::clusters::SplitFilterKind {
+impl From<SplitFilterOpt> for mantissa_client::clusters::SplitFilterKind {
     /// Convert CLI split-filter selectors to client split-filter selectors.
     fn from(value: SplitFilterOpt) -> Self {
         match value {
-            SplitFilterOpt::GpuVendor => client::clusters::SplitFilterKind::GpuVendor,
-            SplitFilterOpt::GpuModel => client::clusters::SplitFilterKind::GpuModel,
-            SplitFilterOpt::CpuVendor => client::clusters::SplitFilterKind::CpuVendor,
-            SplitFilterOpt::CpuBrand => client::clusters::SplitFilterKind::CpuBrand,
-            SplitFilterOpt::GpuCount => client::clusters::SplitFilterKind::GpuCount,
-            SplitFilterOpt::CpuCores => client::clusters::SplitFilterKind::CpuCores,
-            SplitFilterOpt::CpuLogical => client::clusters::SplitFilterKind::CpuLogical,
-            SplitFilterOpt::MemoryTotalKb => client::clusters::SplitFilterKind::MemoryTotalKb,
-            SplitFilterOpt::MemoryTotalBytes => client::clusters::SplitFilterKind::MemoryTotalBytes,
+            SplitFilterOpt::GpuVendor => mantissa_client::clusters::SplitFilterKind::GpuVendor,
+            SplitFilterOpt::GpuModel => mantissa_client::clusters::SplitFilterKind::GpuModel,
+            SplitFilterOpt::CpuVendor => mantissa_client::clusters::SplitFilterKind::CpuVendor,
+            SplitFilterOpt::CpuBrand => mantissa_client::clusters::SplitFilterKind::CpuBrand,
+            SplitFilterOpt::GpuCount => mantissa_client::clusters::SplitFilterKind::GpuCount,
+            SplitFilterOpt::CpuCores => mantissa_client::clusters::SplitFilterKind::CpuCores,
+            SplitFilterOpt::CpuLogical => mantissa_client::clusters::SplitFilterKind::CpuLogical,
+            SplitFilterOpt::MemoryTotalKb => {
+                mantissa_client::clusters::SplitFilterKind::MemoryTotalKb
+            }
+            SplitFilterOpt::MemoryTotalBytes => {
+                mantissa_client::clusters::SplitFilterKind::MemoryTotalBytes
+            }
         }
     }
 }
 
-impl From<SplitServicePolicyOpt> for client::clusters::SplitServicePolicy {
+impl From<SplitServicePolicyOpt> for mantissa_client::clusters::SplitServicePolicy {
     /// Convert CLI split service-policy options to client split service-policy values.
     fn from(value: SplitServicePolicyOpt) -> Self {
         match value {
-            SplitServicePolicyOpt::Partitioned => client::clusters::SplitServicePolicy::Partitioned,
-            SplitServicePolicyOpt::Preserve => client::clusters::SplitServicePolicy::Preserve,
+            SplitServicePolicyOpt::Partitioned => {
+                mantissa_client::clusters::SplitServicePolicy::Partitioned
+            }
+            SplitServicePolicyOpt::Preserve => {
+                mantissa_client::clusters::SplitServicePolicy::Preserve
+            }
         }
     }
 }
 
-impl From<SplitNetworkPolicyOpt> for client::clusters::SplitNetworkPolicy {
+impl From<SplitNetworkPolicyOpt> for mantissa_client::clusters::SplitNetworkPolicy {
     /// Convert CLI split network-policy options to client split network-policy values.
     fn from(value: SplitNetworkPolicyOpt) -> Self {
         match value {
-            SplitNetworkPolicyOpt::Isolate => client::clusters::SplitNetworkPolicy::Isolate,
-            SplitNetworkPolicyOpt::Preserve => client::clusters::SplitNetworkPolicy::Preserve,
+            SplitNetworkPolicyOpt::Isolate => {
+                mantissa_client::clusters::SplitNetworkPolicy::Isolate
+            }
+            SplitNetworkPolicyOpt::Preserve => {
+                mantissa_client::clusters::SplitNetworkPolicy::Preserve
+            }
         }
     }
 }
 
-impl From<SplitArgs> for client::clusters::SplitCommandRequest {
+impl From<SplitArgs> for mantissa_client::clusters::SplitCommandRequest {
     /// Convert split CLI arguments into the client request consumed by split orchestration.
     fn from(value: SplitArgs) -> Self {
         Self {

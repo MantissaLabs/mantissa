@@ -121,14 +121,14 @@ impl Topology {
             &signing_pub,
         );
 
-        let wireguard = if !config::wireguard_enabled() || !net::paths::running_as_root() {
+        let wireguard = if !config::wireguard_enabled() || !mantissa_net::paths::running_as_root() {
             None
         } else {
-            match net::wireguard::resolve_wireguard_key_path()
-                .and_then(net::wireguard::load_or_generate_wireguard_keys)
+            match mantissa_net::wireguard::resolve_wireguard_key_path()
+                .and_then(mantissa_net::wireguard::load_or_generate_wireguard_keys)
             {
                 Ok(keys) => {
-                    match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
+                    match mantissa_net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
                         preferred_wireguard_port,
                         config::wireguard_port_override(),
                     ) {
@@ -283,12 +283,12 @@ impl Topology {
         info.set_drain_state(drain_state_from_scheduling(&scheduling));
         let labels = self.current_label_state();
 
-        let wireguard = if config::wireguard_enabled() && net::paths::running_as_root() {
-            match net::wireguard::resolve_wireguard_key_path()
-                .and_then(net::wireguard::load_or_generate_wireguard_keys)
+        let wireguard = if config::wireguard_enabled() && mantissa_net::paths::running_as_root() {
+            match mantissa_net::wireguard::resolve_wireguard_key_path()
+                .and_then(mantissa_net::wireguard::load_or_generate_wireguard_keys)
             {
                 Ok(keys) => {
-                    match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
+                    match mantissa_net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
                         preferred_wireguard_port,
                         config::wireguard_port_override(),
                     ) {

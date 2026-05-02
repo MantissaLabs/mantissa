@@ -1850,7 +1850,9 @@ impl NetworkController {
                 );
                 return None;
             }
-            return Some(IpAddr::V6(net::wireguard::wireguard_tunnel_ipv6(peer_id)));
+            return Some(IpAddr::V6(mantissa_net::wireguard::wireguard_tunnel_ipv6(
+                peer_id,
+            )));
         }
 
         let address = self.inner.cluster_registry.peer_address(peer_id)?;

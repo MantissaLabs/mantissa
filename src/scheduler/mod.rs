@@ -2,14 +2,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::Result as AnyhowResult;
 use arc_swap::ArcSwapOption;
-use crdt_store::codec::StoreValueCodec;
-use crdt_store::uuid_key::UuidKey;
-use parking_lot::RwLock as SyncRwLock;
-use protocol::scheduling::{
+use mantissa_protocol::scheduling::{
     scheduler_store_gpu_device, scheduler_store_gpu_device_reservation,
     scheduler_store_lease_reservation, scheduler_store_slot, scheduler_store_slot_reservation,
     scheduler_store_snapshot,
 };
+use mantissa_store::codec::StoreValueCodec;
+use mantissa_store::uuid_key::UuidKey;
+use parking_lot::RwLock as SyncRwLock;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::sync::Arc;
@@ -130,7 +130,7 @@ pub struct SchedulerSnapshot {
 
 impl StoreValueCodec for SchedulerSnapshot {
     /// Encodes one scheduler snapshot as the stable Cap'n Proto store value.
-    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
         let mut message = capnp::message::Builder::new_default();
         write_scheduler_store_snapshot(
             message.init_root::<scheduler_store_snapshot::Builder<'_>>(),
@@ -140,7 +140,7 @@ impl StoreValueCodec for SchedulerSnapshot {
     }
 
     /// Decodes one scheduler snapshot from the stable Cap'n Proto store value.
-    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let reader =
             capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
@@ -397,8 +397,10 @@ fn read_optional_store_text(reader: capnp::text::Reader<'_>) -> Option<String> {
 }
 
 /// Converts scheduler store-codec errors into the CRDT store error type.
-fn scheduler_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
-    Box::new(crdt_store::error::Error::Other(format!(
+fn scheduler_store_codec_error<E: std::fmt::Display>(
+    error: E,
+) -> Box<mantissa_store::error::Error> {
+    Box::new(mantissa_store::error::Error::Other(format!(
         "scheduler store codec error: {error}"
     )))
 }
@@ -508,7 +510,7 @@ struct LeaseAllocation {
 #[derive(Debug, Error)]
 pub enum SchedulerError {
     #[error("scheduler store error: {0}")]
-    Store(#[from] Box<crdt_store::error::Error>),
+    Store(#[from] Box<mantissa_store::error::Error>),
 
     #[error("scheduler already initialised")]
     AlreadyInitialized { snapshot: SchedulerSnapshot },
@@ -1845,7 +1847,7 @@ impl Scheduler {
 
     async fn fetch_remote_summary_via_handle(
         registry: &Registry,
-        client: &protocol::server::Client,
+        client: &mantissa_protocol::server::Client,
         peer_id: Uuid,
         include_details: bool,
     ) -> Result<SchedulerSummary, capnp::Error> {
@@ -2087,9 +2089,9 @@ mod tests {
     use crate::store::local::LocalSessionStore;
     use crate::store::peer_store::open_peers_store;
     use crate::store::scheduler_store::open_scheduler_store;
-    use ::health::HealthMonitor;
+    use ::mantissa_health::HealthMonitor;
     use ed25519_dalek::SigningKey;
-    use net::noise::NoiseKeys;
+    use mantissa_net::noise::NoiseKeys;
     use tempfile::tempdir;
 
     /// Builds one synthetic node with fixed CPU and memory capacity so slot

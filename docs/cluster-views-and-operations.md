@@ -227,7 +227,7 @@ scope that the durable topology history implies.
 - `src/topology/operation_rpc.rs`
 - `src/topology/operation_progress.rs`
 - `src/topology/service.rs`
-- `crates/client/src/clusters/*.rs`
+- `crates/mantissa-client/src/clusters/*.rs`
 
 ## Related Documents
 

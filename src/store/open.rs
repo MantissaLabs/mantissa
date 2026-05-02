@@ -12,7 +12,7 @@ pub fn open_arc_store<Store, Open>(
     open: Open,
 ) -> io::Result<Arc<Store>>
 where
-    Open: FnOnce(Arc<redb::Database>, Uuid) -> Result<Store, Box<crdt_store::error::Error>>,
+    Open: FnOnce(Arc<redb::Database>, Uuid) -> Result<Store, Box<mantissa_store::error::Error>>,
 {
     open(db, actor).map(Arc::new).map_err(io::Error::other)
 }

@@ -329,7 +329,7 @@ mod platform {
 
     /// Maximum backends programmed per VIP in eBPF maps.
     ///
-    /// Keep this in sync with `network_ebpf::lb::MAX_BACKENDS_PER_VIP`.
+    /// Keep this in sync with `mantissa_ebpf::lb::MAX_BACKENDS_PER_VIP`.
     const MAX_BACKENDS_PER_VIP: usize = 1024;
     /// bpf(2) command used to upsert VIP and backend map entries.
     const BPF_MAP_UPDATE_ELEM: libc::c_uint = 2;

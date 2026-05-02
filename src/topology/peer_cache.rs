@@ -1,8 +1,8 @@
 use crate::store::peer_store::PeersStore;
 use crate::topology::peers::PeerValue;
-use crdt_store::codec::TombstoneRecord;
-use crdt_store::mvreg::MvReg;
-use crdt_store::uuid_key::UuidKey;
+use mantissa_store::codec::TombstoneRecord;
+use mantissa_store::mvreg::MvReg;
+use mantissa_store::uuid_key::UuidKey;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -39,7 +39,7 @@ impl PeerSnapshotCache {
     }
 
     /// Return a cached snapshot, refreshing from the store when the change clock advanced.
-    pub(super) fn snapshot(&mut self, store: &PeersStore) -> crdt_store::Result<PeerSnapshot> {
+    pub(super) fn snapshot(&mut self, store: &PeersStore) -> mantissa_store::Result<PeerSnapshot> {
         let current_generation = store.change_clock();
         if current_generation == self.last_generation {
             return Ok(PeerSnapshot {

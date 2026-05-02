@@ -142,11 +142,11 @@ impl TokenStore {
 }
 
 #[async_trait(?Send)]
-impl net::noise::NoisePskProvider for TokenStore {
+impl mantissa_net::noise::NoisePskProvider for TokenStore {
     /// Derive the active Noise PSK from the current join token.
     async fn psk(&self) -> io::Result<[u8; 32]> {
         let token = self.current_token().await;
-        net::noise::derive_psk_from_token(&token)
+        mantissa_net::noise::derive_psk_from_token(&token)
     }
 }
 

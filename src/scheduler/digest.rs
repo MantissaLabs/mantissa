@@ -4,9 +4,9 @@ use crate::store::scheduler_digest_store::SchedulerDigestStore;
 use anyhow::{Result as AnyhowResult, anyhow};
 use async_channel::{Receiver, Sender};
 use capnp::Error;
-use crdt_store::codec::StoreValueCodec;
+use mantissa_protocol::scheduling::{scheduler_digest, scheduler_digest_event};
+use mantissa_store::codec::StoreValueCodec;
 use parking_lot::Mutex;
-use protocol::scheduling::{scheduler_digest, scheduler_digest_event};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -80,14 +80,14 @@ impl SchedulerDigestValue {
 
 impl StoreValueCodec for SchedulerDigestValue {
     /// Encodes one scheduler digest as the stable Cap'n Proto store value.
-    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
         let mut message = capnp::message::Builder::new_default();
         write_scheduler_digest(message.init_root::<scheduler_digest::Builder>(), self);
         Ok(capnp::serialize::write_message_to_words(&message))
     }
 
     /// Decodes one scheduler digest from the stable Cap'n Proto store value.
-    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let reader =
             capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
@@ -100,8 +100,8 @@ impl StoreValueCodec for SchedulerDigestValue {
 }
 
 /// Converts scheduler store-codec errors into the CRDT store error type.
-fn store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
-    Box::new(crdt_store::error::Error::Other(format!(
+fn store_codec_error<E: std::fmt::Display>(error: E) -> Box<mantissa_store::error::Error> {
+    Box::new(mantissa_store::error::Error::Other(format!(
         "scheduler digest store codec error: {error}"
     )))
 }
@@ -140,7 +140,7 @@ impl SchedulerDigestRegistry {
     pub async fn upsert(&self, value: SchedulerDigestValue) -> AnyhowResult<()> {
         let node_id = value.node_id;
         self.store
-            .upsert(&crdt_store::uuid_key::UuidKey::from(node_id), value)
+            .upsert(&mantissa_store::uuid_key::UuidKey::from(node_id), value)
             .await
             .map_err(|e| anyhow!("scheduler digest upsert failed: {e}"))?;
         self.record_observed_now(node_id);
@@ -150,7 +150,7 @@ impl SchedulerDigestRegistry {
     /// Removes one scheduler digest row from the replicated store.
     pub async fn remove(&self, node_id: Uuid) -> AnyhowResult<()> {
         self.store
-            .remove(&crdt_store::uuid_key::UuidKey::from(node_id))
+            .remove(&mantissa_store::uuid_key::UuidKey::from(node_id))
             .await
             .map_err(|e| anyhow!("scheduler digest remove failed: {e}"))?;
         self.clear_observed(node_id);
@@ -159,7 +159,7 @@ impl SchedulerDigestRegistry {
 
     /// Reads the canonical digest for one node identifier.
     pub fn get(&self, node_id: Uuid) -> AnyhowResult<Option<SchedulerDigestValue>> {
-        let key = crdt_store::uuid_key::UuidKey::from(node_id);
+        let key = mantissa_store::uuid_key::UuidKey::from(node_id);
         let snapshot = self
             .store
             .get_snapshot(&key)
@@ -465,7 +465,7 @@ mod tests {
         should_replace_scheduler_digest_event,
     };
     use crate::store::scheduler_digest_store::open_scheduler_digest_store;
-    use crdt_store::codec::StoreValueCodec;
+    use mantissa_store::codec::StoreValueCodec;
     use std::sync::Arc;
     use tempfile::tempdir;
     use uuid::Uuid;

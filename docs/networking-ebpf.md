@@ -13,7 +13,7 @@ If you want to follow along in the code, the main entry points are:
 - Service discovery + VIP programming: `src/network/discovery.rs`
 - Userspace LB map writer: `src/network/lb.rs`
 - eBPF loader/attacher (TC/XDP) + pinning: `src/network/bpf/mod.rs`
-- eBPF programs + shared structs: `crates/network-ebpf/src/bin/*`, `crates/network-ebpf/src/lib.rs`
+- eBPF programs + shared structs: `crates/mantissa-ebpf/src/bin/*`, `crates/mantissa-ebpf/src/lib.rs`
 
 ## Quick mental model
 
@@ -278,7 +278,7 @@ upstream load balancer configuration remain operator responsibilities.
 
 ## eBPF datapath (VIP load balancing)
 
-eBPF programs live in `crates/network-ebpf/src/bin/*.rs` and are loaded/attached by `src/network/bpf/mod.rs`.
+eBPF programs live in `crates/mantissa-ebpf/src/bin/*.rs` and are loaded/attached by `src/network/bpf/mod.rs`.
 
 ### Programs and attach points
 
@@ -325,7 +325,7 @@ because some kernels/Aya configurations pin TC maps under `tc/globals` (see
 
 ### LB maps (layout)
 
-Shared structs are defined in `crates/network-ebpf/src/lib.rs` under the `lb` module.
+Shared structs are defined in `crates/mantissa-ebpf/src/lib.rs` under the `lb` module.
 
 - `LB_VIPS` (`HashMap<VipKey, VipEntry>`)
   - Key: `VipKey { vip: u32 }`

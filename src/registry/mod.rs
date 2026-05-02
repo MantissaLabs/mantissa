@@ -4,19 +4,19 @@ use crate::store::local::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
 use crate::topology::peers::{PeerLabelState, PeerSchedulingState, PeerValue, WireGuardPeerValue};
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
-use ::health::HealthMonitor;
+use ::mantissa_health::HealthMonitor;
 use anyhow::{Result as AnyResult, anyhow};
-use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::SigningKey;
-use net::noise::NoiseKeys;
+use mantissa_net::noise::NoiseKeys;
+use mantissa_protocol::gossip::gossip::Client as GossipClient;
+use mantissa_protocol::health;
+use mantissa_protocol::server::{self, cluster_session};
+use mantissa_protocol::sync;
+use mantissa_store::uuid_key::UuidKey;
 use parking_lot::{
     RwLock as SyncRwLock, RwLockReadGuard as SyncRwLockReadGuard,
     RwLockWriteGuard as SyncRwLockWriteGuard,
 };
-use protocol::gossip::gossip::Client as GossipClient;
-use protocol::health;
-use protocol::server::{self, cluster_session};
-use protocol::sync;
 use std::collections::{HashMap, HashSet};
 use std::panic::Location;
 use std::sync::Arc;
@@ -1523,7 +1523,7 @@ impl Registry {
                     && let Ok(v) = PeerValue::from_node_info(peer_id, ni)
                     && let Err(e) = self
                         .peers
-                        .upsert(&crdt_store::uuid_key::UuidKey::from(peer_id), v)
+                        .upsert(&mantissa_store::uuid_key::UuidKey::from(peer_id), v)
                         .await
                 {
                     error!(target: "sync", "upsert nodeInfo failed for {peer_id}: {e}");
@@ -1647,7 +1647,7 @@ impl Registry {
         addr: &str,
         peer_static: &[u8; 32],
     ) -> Result<server::Client, String> {
-        client::connection::get_client_secure_peer_with_keys(
+        mantissa_client::connection::get_client_secure_peer_with_keys(
             addr,
             peer_static,
             self.noise_keys.as_ref(),

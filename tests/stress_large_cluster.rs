@@ -3,18 +3,18 @@
 mod common;
 
 use anyhow::{Context, Result, bail};
-use client::config::ClientConfig;
-use client::connection;
-use client::services::manifest::{
-    ServiceManifest, ServiceUpdateStrategy, TaskTemplateResources, TaskTemplateSpec,
-};
-use client::services::{ServiceDeploymentHandle, deploy_manifest};
 use common::convergence::wait_until;
 use mantissa::cluster::ClusterViewId;
-use protocol::health::NodeStatus;
-use protocol::services::ServiceStatus as ProtoServiceStatus;
-use protocol::sync::Domain;
-use protocol::workload::WorkloadStateFilter as ProtoWorkloadStateFilter;
+use mantissa_client::config::ClientConfig;
+use mantissa_client::connection;
+use mantissa_client::services::manifest::{
+    ServiceManifest, ServiceUpdateStrategy, TaskTemplateResources, TaskTemplateSpec,
+};
+use mantissa_client::services::{ServiceDeploymentHandle, deploy_manifest};
+use mantissa_protocol::health::NodeStatus;
+use mantissa_protocol::services::ServiceStatus as ProtoServiceStatus;
+use mantissa_protocol::sync::Domain;
+use mantissa_protocol::workload::WorkloadStateFilter as ProtoWorkloadStateFilter;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::net::TcpListener;
@@ -221,7 +221,7 @@ enum TaskFilterMode {
 
 impl TaskFilterMode {
     /// Encodes the selected lifecycle states into a workload list request builder.
-    fn write(self, mut builder: protocol::workload::workload_list_request::Builder<'_>) {
+    fn write(self, mut builder: mantissa_protocol::workload::workload_list_request::Builder<'_>) {
         let states: &[ProtoWorkloadStateFilter] = match self {
             TaskFilterMode::Active => &[
                 ProtoWorkloadStateFilter::Pending,
@@ -295,7 +295,7 @@ async fn wait_for_session_ready(
     socket_path: &Path,
     stdout_log: &Path,
     stderr_log: &Path,
-) -> Result<protocol::server::cluster_session::Client> {
+) -> Result<mantissa_protocol::server::cluster_session::Client> {
     let deadline = Instant::now() + timeout;
 
     loop {
@@ -333,14 +333,14 @@ struct ProcessNode {
     listen_addr: String,
     socket_path: PathBuf,
     _stderr_log: PathBuf,
-    session: protocol::server::cluster_session::Client,
+    session: mantissa_protocol::server::cluster_session::Client,
     child: Option<Child>,
 }
 
 impl ProcessNode {
     /// Waits until topology rows include the current node address and returns its stable node id.
     async fn wait_for_local_id(
-        session: &protocol::server::cluster_session::Client,
+        session: &mantissa_protocol::server::cluster_session::Client,
         listen_addr: &str,
         timeout: Duration,
     ) -> Result<Uuid> {
@@ -657,7 +657,8 @@ impl ProcessNode {
         let mut request = topology.join_request();
         let mut message = capnp::message::Builder::new_default();
         {
-            let mut join_request = message.init_root::<protocol::topology::join_request::Builder>();
+            let mut join_request =
+                message.init_root::<mantissa_protocol::topology::join_request::Builder>();
             join_request.set_anchor(anchor_addr);
             join_request.set_join_token(join_token);
         }
@@ -666,7 +667,7 @@ impl ProcessNode {
             .get()
             .set_request(
                 message
-                    .get_root::<protocol::topology::join_request::Builder>()?
+                    .get_root::<mantissa_protocol::topology::join_request::Builder>()?
                     .into_reader(),
             )
             .context("encode topology join request")?;
@@ -810,14 +811,16 @@ impl ProcessNode {
         let mut out = Vec::with_capacity(tasks.len() as usize);
         for task in tasks.iter() {
             let service_name = match task.get_owner()?.which()? {
-                protocol::workload::workload_owner::Which::ServiceReplica(Ok(meta)) => Some(
-                    meta.get_service_name()
-                        .context("read workload service owner name")?
-                        .to_str()
-                        .context("decode workload service owner name")?
-                        .to_string(),
-                ),
-                protocol::workload::workload_owner::Which::ServiceReplica(Err(err)) => {
+                mantissa_protocol::workload::workload_owner::Which::ServiceReplica(Ok(meta)) => {
+                    Some(
+                        meta.get_service_name()
+                            .context("read workload service owner name")?
+                            .to_str()
+                            .context("decode workload service owner name")?
+                            .to_string(),
+                    )
+                }
+                mantissa_protocol::workload::workload_owner::Which::ServiceReplica(Err(err)) => {
                     return Err(anyhow::Error::new(err).context("read workload service owner"));
                 }
                 _ => None,

@@ -1,6 +1,6 @@
 use ed25519_dalek::{SECRET_KEY_LENGTH, SigningKey};
 use getrandom::getrandom;
-use net::paths::{ensure_mantissa_group, ensure_state_dir, running_as_root};
+use mantissa_net::paths::{ensure_mantissa_group, ensure_state_dir, running_as_root};
 use std::{fs, io, path::Path};
 
 pub struct SignKeys {

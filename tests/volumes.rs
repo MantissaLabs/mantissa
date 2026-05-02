@@ -22,8 +22,8 @@ use mantissa::volumes::types::{
 use mantissa::workload::manager::{WorkloadRuntimeConfig, WorkloadStartRequest};
 use mantissa::workload::model::ExecutionPlatform;
 use mantissa::workload::types::ResolvedExecutionSpec;
-use protocol::topology::topology;
-use protocol::volumes::{LocalVolumeSourceKind, volumes};
+use mantissa_protocol::topology::topology;
+use mantissa_protocol::volumes::{LocalVolumeSourceKind, volumes};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -33,7 +33,7 @@ use tempfile::tempdir;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-use net::noise::NoiseKeys;
+use mantissa_net::noise::NoiseKeys;
 
 #[derive(Clone, Default)]
 struct RecordingRuntimeBackend {
@@ -217,8 +217,8 @@ fn headless_config_with_in_memory_runtime() -> HeadlessConfig {
 async fn create_managed_volume_with(
     client: &volumes::Client,
     name: &str,
-    binding_mode: protocol::volumes::VolumeBindingMode,
-    reclaim_policy: protocol::volumes::VolumeReclaimPolicy,
+    binding_mode: mantissa_protocol::volumes::VolumeBindingMode,
+    reclaim_policy: mantissa_protocol::volumes::VolumeReclaimPolicy,
 ) -> Uuid {
     let mut request = client.create_request();
     {
@@ -228,7 +228,7 @@ async fn create_managed_volume_with(
         let mut local = driver.reborrow().init_local();
         local.set_source_kind(LocalVolumeSourceKind::Managed);
         local.set_imported_path("");
-        inner.set_access_mode(protocol::volumes::VolumeAccessMode::ReadWriteOnce);
+        inner.set_access_mode(mantissa_protocol::volumes::VolumeAccessMode::ReadWriteOnce);
         inner.set_binding_mode(binding_mode);
         inner.set_reclaim_policy(reclaim_policy);
         inner.set_requested_bytes(0);
@@ -249,8 +249,8 @@ async fn create_managed_volume(client: &volumes::Client, name: &str) -> Uuid {
     create_managed_volume_with(
         client,
         name,
-        protocol::volumes::VolumeBindingMode::WaitForFirstConsumer,
-        protocol::volumes::VolumeReclaimPolicy::Retain,
+        mantissa_protocol::volumes::VolumeBindingMode::WaitForFirstConsumer,
+        mantissa_protocol::volumes::VolumeReclaimPolicy::Retain,
     )
     .await
 }
@@ -260,7 +260,7 @@ async fn create_immediate_managed_volume_on_node(
     client: &volumes::Client,
     name: &str,
     node_id: Uuid,
-    reclaim_policy: protocol::volumes::VolumeReclaimPolicy,
+    reclaim_policy: mantissa_protocol::volumes::VolumeReclaimPolicy,
 ) -> Uuid {
     let mut request = client.create_request();
     {
@@ -270,8 +270,8 @@ async fn create_immediate_managed_volume_on_node(
         let mut local = driver.reborrow().init_local();
         local.set_source_kind(LocalVolumeSourceKind::Managed);
         local.set_imported_path("");
-        inner.set_access_mode(protocol::volumes::VolumeAccessMode::ReadWriteOnce);
-        inner.set_binding_mode(protocol::volumes::VolumeBindingMode::Immediate);
+        inner.set_access_mode(mantissa_protocol::volumes::VolumeAccessMode::ReadWriteOnce);
+        inner.set_binding_mode(mantissa_protocol::volumes::VolumeBindingMode::Immediate);
         inner.set_reclaim_policy(reclaim_policy);
         inner.set_requested_bytes(0);
         inner.set_bound_node_id(node_id.as_bytes());
@@ -1078,8 +1078,8 @@ local_test!(volume_delete_delete_removes_managed_path, {
     let volume_id = create_managed_volume_with(
         &node.volumes_client,
         "delete-data",
-        protocol::volumes::VolumeBindingMode::WaitForFirstConsumer,
-        protocol::volumes::VolumeReclaimPolicy::Delete,
+        mantissa_protocol::volumes::VolumeBindingMode::WaitForFirstConsumer,
+        mantissa_protocol::volumes::VolumeReclaimPolicy::Delete,
     )
     .await;
     let task = start_standalone_volume_task(&node, volume_id, "delete-data", "/var/lib/data").await;
@@ -1135,7 +1135,7 @@ local_test!(volume_delete_delete_requires_owning_node, {
         &cluster[0].node.volumes_client,
         "remote-delete",
         cluster[1].id(),
-        protocol::volumes::VolumeReclaimPolicy::Delete,
+        mantissa_protocol::volumes::VolumeReclaimPolicy::Delete,
     )
     .await;
 

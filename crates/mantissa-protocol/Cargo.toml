@@ -1,0 +1,15 @@
+[package]
+name = "mantissa-protocol"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+license.workspace = true
+
+[lints]
+workspace = true
+
+[build-dependencies]
+capnpc = { workspace = true }
+
+[dependencies]
+capnp = { workspace = true }

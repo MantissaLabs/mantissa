@@ -313,13 +313,13 @@ fn build_bpf() -> Result<()> {
     let packages: Vec<_> = metadata
         .packages
         .iter()
-        .filter(|pkg| pkg.name == "network-ebpf")
+        .filter(|pkg| pkg.name == "mantissa-ebpf")
         .map(|pkg| {
             let root_dir = pkg
                 .manifest_path
                 .parent()
                 .ok_or_else(|| {
-                    io::Error::other("network-ebpf manifest path does not have a parent directory")
+                    io::Error::other("mantissa-ebpf manifest path does not have a parent directory")
                 })?
                 .as_str();
 

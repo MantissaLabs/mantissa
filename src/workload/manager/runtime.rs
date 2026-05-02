@@ -3,7 +3,7 @@ use std::net::IpAddr;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use crdt_store::uuid_key::UuidKey;
+use mantissa_store::uuid_key::UuidKey;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
 use tracing::{debug, warn};

@@ -1,12 +1,12 @@
 use crate::jobs::types::{JobSpecValue, JobStatus, parse_timestamp};
 use crate::store::open::open_arc_store;
 use chrono::{DateTime, Utc};
-use crdt_store::adapter::{CompactingStoreMvRegAdapterSorted, MvRegCompactionRanker};
-use crdt_store::hash::XXHash128;
-use crdt_store::mst_store::CrdtMstStore;
-use crdt_store::mvreg::MvRegEntry;
-use crdt_store::table_set::TableSet;
-use crdt_store::uuid_key::UuidKey;
+use mantissa_store::adapter::{CompactingStoreMvRegAdapterSorted, MvRegCompactionRanker};
+use mantissa_store::hash::XXHash128;
+use mantissa_store::mst_store::CrdtMstStore;
+use mantissa_store::mvreg::MvRegEntry;
+use mantissa_store::table_set::TableSet;
+use mantissa_store::uuid_key::UuidKey;
 use std::cmp::Reverse;
 use std::sync::Arc;
 use uuid::Uuid;

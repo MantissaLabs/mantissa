@@ -1,5 +1,5 @@
 use ed25519_dalek::VerifyingKey;
-use protocol::server;
+use mantissa_protocol::server;
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 

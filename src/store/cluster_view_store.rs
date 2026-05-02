@@ -1,16 +1,16 @@
 use crate::cluster::{ClusterId, ClusterViewId};
 use crate::store::open::open_arc_store;
 use crate::store::tx::{into_io, with_read_tx, with_write_tx};
-use crdt_store::adapter::StoreMvRegAdapterSorted;
-use crdt_store::codec::StoreValueCodec;
-use crdt_store::hash::XXHash128;
-use crdt_store::mst_store::CrdtMstStore;
-use crdt_store::mvreg::MvRegSnapshot;
-use crdt_store::table_set::TableSet;
-use crdt_store::uuid_key::UuidKey;
-use protocol::topology::{
+use mantissa_protocol::topology::{
     cluster_name_record, cluster_node_count_record, cluster_view_id, cluster_view_metadata_record,
 };
+use mantissa_store::adapter::StoreMvRegAdapterSorted;
+use mantissa_store::codec::StoreValueCodec;
+use mantissa_store::hash::XXHash128;
+use mantissa_store::mst_store::CrdtMstStore;
+use mantissa_store::mvreg::MvRegSnapshot;
+use mantissa_store::table_set::TableSet;
+use mantissa_store::uuid_key::UuidKey;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -155,7 +155,7 @@ impl ClusterViewMetadataRecord {
 
 impl StoreValueCodec for ClusterViewMetadataRecord {
     /// Encodes one cluster-view metadata record as the stable Cap'n Proto store value.
-    fn encode_store_value(&self) -> crdt_store::Result<Vec<u8>> {
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
         let mut message = capnp::message::Builder::new_default();
         write_cluster_view_metadata_record(
             message.init_root::<cluster_view_metadata_record::Builder<'_>>(),
@@ -165,7 +165,7 @@ impl StoreValueCodec for ClusterViewMetadataRecord {
     }
 
     /// Decodes one cluster-view metadata record from the stable Cap'n Proto store value.
-    fn decode_store_value(bytes: &[u8]) -> crdt_store::Result<Self> {
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let reader =
             capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
@@ -281,8 +281,10 @@ fn read_uuid_data(data: capnp::data::Reader<'_>, field: &str) -> Result<Uuid, ca
 }
 
 /// Converts cluster-view store-codec errors into the CRDT store error type.
-fn cluster_view_store_codec_error<E: std::fmt::Display>(error: E) -> Box<crdt_store::error::Error> {
-    Box::new(crdt_store::error::Error::Other(format!(
+fn cluster_view_store_codec_error<E: std::fmt::Display>(
+    error: E,
+) -> Box<mantissa_store::error::Error> {
+    Box::new(mantissa_store::error::Error::Other(format!(
         "cluster-view store codec error: {error}"
     )))
 }
@@ -531,7 +533,7 @@ impl ClusterViewStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crdt_store::codec::StoreValueCodec;
+    use mantissa_store::codec::StoreValueCodec;
     use tempfile::tempdir;
 
     /// Builds one metadata row that exercises every cluster-view store field.

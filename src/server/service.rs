@@ -19,7 +19,7 @@ struct JoinRequest {
     joiner_id: uuid::Uuid,
     active_view: ClusterViewId,
     root_hash: String,
-    server_handle: protocol::server::server::Client,
+    server_handle: mantissa_protocol::server::server::Client,
     peer: PeerValue,
     noise_static_pub: PublicKey,
     signing_vk: ed25519_dalek::VerifyingKey,
@@ -32,7 +32,9 @@ impl JoinRequest {
     ///
     /// This converts the wire format into strongly typed Rust values before the
     /// server mutates topology state or issues any server session handle.
-    fn from_params(params: protocol::server::RegisterNodeParams) -> Result<Self, capnp::Error> {
+    fn from_params(
+        params: mantissa_protocol::server::RegisterNodeParams,
+    ) -> Result<Self, capnp::Error> {
         let params = params.get()?;
         let info = params.get_info()?;
         let joiner_id = id::read_node_id(info.get_id()?)?;
@@ -102,7 +104,7 @@ struct ClusterSession {
     ticket: Vec<u8>,
     ticket_expires_at_unix_secs: u64,
     credential: Vec<u8>,
-    session: protocol::server::cluster_session::Client,
+    session: mantissa_protocol::server::cluster_session::Client,
 }
 
 impl Server {
@@ -223,7 +225,7 @@ impl Server {
     /// flow and ensures all successful joins return the same response shape.
     fn write_join_response(
         &self,
-        results: &mut protocol::server::RegisterNodeResults,
+        results: &mut mantissa_protocol::server::RegisterNodeResults,
         cluster_session: &ClusterSession,
     ) -> Result<(), capnp::Error> {
         let mut out = results.get();
@@ -268,11 +270,11 @@ impl Server {
     }
 }
 
-impl protocol::server::Server for Server {
+impl mantissa_protocol::server::Server for Server {
     async fn register_node(
         self: Rc<Self>,
-        params: protocol::server::RegisterNodeParams,
-        mut results: protocol::server::RegisterNodeResults,
+        params: mantissa_protocol::server::RegisterNodeParams,
+        mut results: mantissa_protocol::server::RegisterNodeResults,
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
         self.ensure_local_cluster_membership_active()?;
@@ -293,8 +295,8 @@ impl protocol::server::Server for Server {
 
     async fn get_session(
         self: Rc<Self>,
-        params: protocol::server::GetSessionParams,
-        mut results: protocol::server::GetSessionResults,
+        params: mantissa_protocol::server::GetSessionParams,
+        mut results: mantissa_protocol::server::GetSessionResults,
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
         self.ensure_local_cluster_membership_active()?;
@@ -329,8 +331,8 @@ impl protocol::server::Server for Server {
 
     async fn get_with_credential(
         self: Rc<Self>,
-        params: protocol::server::GetWithCredentialParams,
-        mut results: protocol::server::GetWithCredentialResults,
+        params: mantissa_protocol::server::GetWithCredentialParams,
+        mut results: mantissa_protocol::server::GetWithCredentialResults,
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
         self.ensure_local_cluster_membership_active()?;

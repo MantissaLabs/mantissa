@@ -2,7 +2,7 @@ use crate::cluster::ClusterViewId;
 use crate::topology::PeerHandle;
 use crate::topology::peer_provider::PeerProvider;
 use async_trait::async_trait;
-use protocol::gossip::gossip::Client as GossipClient;
+use mantissa_protocol::gossip::gossip::Client as GossipClient;
 use uuid::Uuid;
 
 #[async_trait(?Send)]

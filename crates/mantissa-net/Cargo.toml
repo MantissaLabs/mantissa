@@ -1,0 +1,37 @@
+[package]
+name = "mantissa-net"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Network and communication utilities"
+
+[lints]
+workspace = true
+
+[dependencies]
+mantissa-protocol = { path = "../mantissa-protocol" }
+serde = { version = "1", features = ["derive"] }
+metrics = "0.24.5"
+tracing = "0.1"
+uuid = { version = "1", features = ["serde"] }
+thiserror = "1"
+capnp = { workspace = true }
+capnp-rpc = { workspace = true }
+capnp-futures = { workspace = true }
+parking_lot = { workspace = true }
+snow = { version = "0.9.6", default-features = false, features = ["ring-accelerated"] }
+hkdf = "0.12.4"
+sha2 = "0.10.9"
+async-trait = "0.1.88"
+futures = "0.3.31"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", default-features = false, features = [
+    "alloc",
+] }
+getrandom = "0.2"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -3,9 +3,9 @@ mod common;
 
 use chrono::Utc;
 use common::testkit::TestNode;
-use crdt_store::uuid_key::UuidKey;
 use mantissa::task::types::{TaskServiceMetadata, TaskValue, TaskValueDraft};
 use mantissa::workload::model::{WorkloadOwner, WorkloadPhase};
+use mantissa_store::uuid_key::UuidKey;
 use uuid::Uuid;
 
 /// Builds one replicated service-owned task value for the public task RPC regression test.

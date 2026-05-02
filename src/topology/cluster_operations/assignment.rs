@@ -11,7 +11,7 @@ impl Topology {
     /// Applies host resource metadata from an `Info` payload onto one split node candidate.
     fn apply_split_node_info(
         candidate: &mut SplitNodeCandidate,
-        info: protocol::info_capnp::info::Reader<'_>,
+        info: mantissa_protocol::info_capnp::info::Reader<'_>,
     ) {
         if let Ok(cpu) = info.get_cpu() {
             if let Ok(vendor) = cpu.get_vendor() {

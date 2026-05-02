@@ -242,7 +242,7 @@ back to another node.
 - `src/volumes/registry.rs`
 - `src/volumes/controller.rs`
 - `src/workload/manager/volumes.rs`
-- `crates/client/src/volumes/*.rs`
+- `crates/mantissa-client/src/volumes/*.rs`
 
 ## Related Documents
 

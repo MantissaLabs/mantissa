@@ -82,7 +82,7 @@ around reconciliation and replication. One should not leak directly into the
 other.
 
 The wire surface lives in
-[crates/protocol/schema/jobs.capnp](/Users/abronan/hack/mantissa/crates/protocol/schema/jobs.capnp),
+[crates/mantissa-protocol/schema/jobs.capnp](/Users/abronan/hack/mantissa/crates/mantissa-protocol/schema/jobs.capnp),
 the RPC service lives in
 [src/jobs/service.rs](/Users/abronan/hack/mantissa/src/jobs/service.rs),
 and the controller lives in
@@ -238,9 +238,9 @@ The manifest path is the production-oriented one. It supports:
 - local liveness probes.
 
 The parser and submit path live in
-[crates/client/src/jobs/manifest.rs](/Users/abronan/hack/mantissa/crates/client/src/jobs/manifest.rs)
+[crates/mantissa-client/src/jobs/manifest.rs](/Users/abronan/hack/mantissa/crates/mantissa-client/src/jobs/manifest.rs)
 and
-[crates/client/src/jobs/run.rs](/Users/abronan/hack/mantissa/crates/client/src/jobs/run.rs).
+[crates/mantissa-client/src/jobs/run.rs](/Users/abronan/hack/mantissa/crates/mantissa-client/src/jobs/run.rs).
 
 The shipped examples in `examples/` are also parsed in tests, which means they
 are treated as maintained assets rather than as prose-only examples.
@@ -288,13 +288,13 @@ If you need to work on jobs, this is the shortest useful map:
 | Area | Primary code |
 | --- | --- |
 | Public operator docs | [docs/jobs.md](/Users/abronan/hack/mantissa/docs/jobs.md) |
-| Public jobs protocol | [crates/protocol/schema/jobs.capnp](/Users/abronan/hack/mantissa/crates/protocol/schema/jobs.capnp) |
+| Public jobs protocol | [crates/mantissa-protocol/schema/jobs.capnp](/Users/abronan/hack/mantissa/crates/mantissa-protocol/schema/jobs.capnp) |
 | Jobs RPC service | [src/jobs/service.rs](/Users/abronan/hack/mantissa/src/jobs/service.rs) |
 | Durable job model | [src/jobs/types.rs](/Users/abronan/hack/mantissa/src/jobs/types.rs) |
 | Job reconciliation | [src/jobs/manager.rs](/Users/abronan/hack/mantissa/src/jobs/manager.rs) |
-| Client submit path | [crates/client/src/jobs/run.rs](/Users/abronan/hack/mantissa/crates/client/src/jobs/run.rs) |
-| Client manifest parser | [crates/client/src/jobs/manifest.rs](/Users/abronan/hack/mantissa/crates/client/src/jobs/manifest.rs) |
-| Client inspect/list rendering | [crates/client/src/jobs/snapshot.rs](/Users/abronan/hack/mantissa/crates/client/src/jobs/snapshot.rs) |
+| Client submit path | [crates/mantissa-client/src/jobs/run.rs](/Users/abronan/hack/mantissa/crates/mantissa-client/src/jobs/run.rs) |
+| Client manifest parser | [crates/mantissa-client/src/jobs/manifest.rs](/Users/abronan/hack/mantissa/crates/mantissa-client/src/jobs/manifest.rs) |
+| Client inspect/list rendering | [crates/mantissa-client/src/jobs/snapshot.rs](/Users/abronan/hack/mantissa/crates/mantissa-client/src/jobs/snapshot.rs) |
 | Shared workload layer | [src/workload](/Users/abronan/hack/mantissa/src/workload) |
 | Integration coverage | [tests/jobs.rs](/Users/abronan/hack/mantissa/tests/jobs.rs) |
 

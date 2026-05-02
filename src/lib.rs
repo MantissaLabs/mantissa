@@ -1,7 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 pub use crate::app::{run_cli, run_cli_with_args};
-pub use protocol::{
+pub use mantissa_protocol::{
     gossip_capnp, health_capnp, info_capnp, node_capnp, scheduling_capnp, server_capnp, sync_capnp,
     topology_capnp, volumes_capnp,
 };

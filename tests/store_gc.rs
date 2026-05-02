@@ -2,10 +2,6 @@
 mod common;
 
 use common::testkit::{ClusterConfig, TestNode};
-use crdt_store::adapter::RegAdapter;
-use crdt_store::gc::{GcBarrier, StoreGcPolicy};
-use crdt_store::mvreg::{MvReg, MvRegEntry, VectorClock};
-use crdt_store::uuid_key::UuidKey;
 use mantissa::agents::types::{
     AgentCheckpointPolicy, AgentInteractionPolicy, AgentRecordValue, AgentSessionSpecValue,
     AgentSessionStatus, AgentToolPolicy, AgentWorkspacePolicy,
@@ -39,6 +35,10 @@ use mantissa::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadValue, WorkloadValueDraft,
 };
 use mantissa::workload::types::ResolvedExecutionSpec;
+use mantissa_store::adapter::RegAdapter;
+use mantissa_store::gc::{GcBarrier, StoreGcPolicy};
+use mantissa_store::mvreg::{MvReg, MvRegEntry, VectorClock};
+use mantissa_store::uuid_key::UuidKey;
 use parking_lot::{Mutex, MutexGuard};
 use std::future::Future;
 use std::sync::{Arc, OnceLock};

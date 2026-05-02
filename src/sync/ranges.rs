@@ -1,11 +1,11 @@
 //! Helpers for converting MST page summaries to and from the sync protocol wire format.
 
-use crdt_store::PageDigestRange;
+use mantissa_store::PageDigestRange;
 
 /// Encodes one page-summary slice into the Cap'n Proto representation used by sync RPCs.
 pub fn capnp_fill_ranges(
     ranges: &[PageDigestRange],
-    mut out: protocol::sync::page_range_summary::Builder,
+    mut out: mantissa_protocol::sync::page_range_summary::Builder,
 ) -> Result<(), capnp::Error> {
     let mut lst = out.reborrow().init_ranges(ranges.len() as u32);
     for (i, r) in ranges.iter().enumerate() {
@@ -19,7 +19,7 @@ pub fn capnp_fill_ranges(
 
 /// Decodes a Cap'n Proto page summary back into the store-facing range type.
 pub fn page_ranges_from_capnp(
-    reader: protocol::sync::page_range_summary::Reader,
+    reader: mantissa_protocol::sync::page_range_summary::Reader,
 ) -> Result<Vec<PageDigestRange>, capnp::Error> {
     let ranges = reader.get_ranges()?;
     let mut out = Vec::with_capacity(ranges.len() as usize);

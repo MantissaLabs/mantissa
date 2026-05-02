@@ -1,7 +1,7 @@
 use crate::secrets::types::{SecretValue, compute_secret_id};
 use crate::store::secret_store::SecretStore;
 use anyhow::{Result, anyhow};
-use crdt_store::uuid_key::UuidKey;
+use mantissa_store::uuid_key::UuidKey;
 use std::collections::HashSet;
 use uuid::Uuid;
 

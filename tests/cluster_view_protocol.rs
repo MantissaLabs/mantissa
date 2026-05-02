@@ -3,7 +3,6 @@ mod common;
 
 use common::convergence::{current_cluster_view, wait_for_cluster_view, wait_for_operation_stage};
 use common::testkit::TestNode;
-use crdt_store::uuid_key::UuidKey;
 use mantissa::cluster::operations::{
     ClusterOperationKind as StoredOperationKind, ClusterOperationRecord,
     ClusterOperationStage as StoredOperationStage, SplitNodeAssignment,
@@ -20,8 +19,9 @@ use mantissa::store::cluster_view_store::ClusterViewStore;
 use mantissa::store::peer_store::open_peers_store;
 use mantissa::sync::VIEW_SCOPED_DOMAIN_COUNT;
 use mantissa::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue};
-use net::noise::NoiseKeys;
-use protocol::topology::{ClusterOperationKind, ClusterOperationStage, NodeDrainState};
+use mantissa_net::noise::NoiseKeys;
+use mantissa_protocol::topology::{ClusterOperationKind, ClusterOperationStage, NodeDrainState};
+use mantissa_store::uuid_key::UuidKey;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
@@ -834,7 +834,7 @@ local_test!(cluster_view_split_resource_selector_assigns_peers, {
         let mut clauses_a = selector_a.reborrow().init_clauses(1);
         let mut clause_a = clauses_a.reborrow().get(0);
         clause_a.set_key("resources.cpu.logical");
-        clause_a.set_op(protocol::topology::split_selector_clause::Operator::Gte);
+        clause_a.set_op(mantissa_protocol::topology::split_selector_clause::Operator::Gte);
         clause_a.set_value("1");
         selector_a.reborrow().init_explicit_nodes(0);
 
@@ -844,7 +844,7 @@ local_test!(cluster_view_split_resource_selector_assigns_peers, {
         let mut clauses_b = selector_b.reborrow().init_clauses(1);
         let mut clause_b = clauses_b.reborrow().get(0);
         clause_b.set_key("node.id");
-        clause_b.set_op(protocol::topology::split_selector_clause::Operator::Eq);
+        clause_b.set_op(mantissa_protocol::topology::split_selector_clause::Operator::Eq);
         clause_b.set_value(joiner.id().to_string());
         let mut explicit_b = selector_b.reborrow().init_explicit_nodes(1);
         set_node_id(explicit_b.reborrow().get(0), &joiner.id());
@@ -1010,7 +1010,7 @@ local_test!(cluster_view_split_label_selector_assigns_peers, {
         let mut clauses_a = selector_a.reborrow().init_clauses(1);
         let mut clause_a = clauses_a.reborrow().get(0);
         clause_a.set_key("node.labels.topology.zone");
-        clause_a.set_op(protocol::topology::split_selector_clause::Operator::Eq);
+        clause_a.set_op(mantissa_protocol::topology::split_selector_clause::Operator::Eq);
         clause_a.set_value("east");
         selector_a.reborrow().init_explicit_nodes(0);
 
@@ -1020,7 +1020,7 @@ local_test!(cluster_view_split_label_selector_assigns_peers, {
         let mut clauses_b = selector_b.reborrow().init_clauses(1);
         let mut clause_b = clauses_b.reborrow().get(0);
         clause_b.set_key("node.labels.topology.zone");
-        clause_b.set_op(protocol::topology::split_selector_clause::Operator::Eq);
+        clause_b.set_op(mantissa_protocol::topology::split_selector_clause::Operator::Eq);
         clause_b.set_value("west");
         selector_b.reborrow().init_explicit_nodes(0);
 
@@ -3036,7 +3036,7 @@ local_test!(cluster_view_split_selector_with_fallback_target, {
         let mut clauses = selector_a.reborrow().init_clauses(1);
         let mut clause = clauses.reborrow().get(0);
         clause.set_key("node.id");
-        clause.set_op(protocol::topology::split_selector_clause::Operator::Eq);
+        clause.set_op(mantissa_protocol::topology::split_selector_clause::Operator::Eq);
         clause.set_value(joiner.id().to_string());
         selector_a.reborrow().init_explicit_nodes(0);
 

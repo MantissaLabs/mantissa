@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crdt_store::gc::StoreGcPolicy;
-use net::paths::ensure_state_dir;
+use mantissa_net::paths::ensure_state_dir;
+use mantissa_store::gc::StoreGcPolicy;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;

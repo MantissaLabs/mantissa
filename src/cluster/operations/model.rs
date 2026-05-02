@@ -13,18 +13,18 @@ pub enum ClusterOperationKind {
 
 impl ClusterOperationKind {
     /// Converts the internal operation kind to the Cap'n Proto representation for RPC responses.
-    fn to_capnp(self) -> protocol::topology::ClusterOperationKind {
+    fn to_capnp(self) -> mantissa_protocol::topology::ClusterOperationKind {
         match self {
-            Self::Merge => protocol::topology::ClusterOperationKind::Merge,
-            Self::Split => protocol::topology::ClusterOperationKind::Split,
+            Self::Merge => mantissa_protocol::topology::ClusterOperationKind::Merge,
+            Self::Split => mantissa_protocol::topology::ClusterOperationKind::Split,
         }
     }
 
     /// Converts the Cap'n Proto operation kind into internal durable state.
-    fn from_capnp(value: protocol::topology::ClusterOperationKind) -> Self {
+    fn from_capnp(value: mantissa_protocol::topology::ClusterOperationKind) -> Self {
         match value {
-            protocol::topology::ClusterOperationKind::Merge => Self::Merge,
-            protocol::topology::ClusterOperationKind::Split => Self::Split,
+            mantissa_protocol::topology::ClusterOperationKind::Merge => Self::Merge,
+            mantissa_protocol::topology::ClusterOperationKind::Split => Self::Split,
         }
     }
 }
@@ -78,24 +78,24 @@ pub struct SplitNodeAssignment {
 
 impl ClusterOperationStage {
     /// Converts the internal stage value to the Cap'n Proto representation for RPC responses.
-    fn to_capnp(self) -> protocol::topology::ClusterOperationStage {
+    fn to_capnp(self) -> mantissa_protocol::topology::ClusterOperationStage {
         match self {
-            Self::Proposed => protocol::topology::ClusterOperationStage::Proposed,
-            Self::Prepared => protocol::topology::ClusterOperationStage::Prepared,
-            Self::Committed => protocol::topology::ClusterOperationStage::Committed,
-            Self::Finalized => protocol::topology::ClusterOperationStage::Finalized,
-            Self::Aborted => protocol::topology::ClusterOperationStage::Aborted,
+            Self::Proposed => mantissa_protocol::topology::ClusterOperationStage::Proposed,
+            Self::Prepared => mantissa_protocol::topology::ClusterOperationStage::Prepared,
+            Self::Committed => mantissa_protocol::topology::ClusterOperationStage::Committed,
+            Self::Finalized => mantissa_protocol::topology::ClusterOperationStage::Finalized,
+            Self::Aborted => mantissa_protocol::topology::ClusterOperationStage::Aborted,
         }
     }
 
     /// Converts the Cap'n Proto stage value into internal durable state.
-    fn from_capnp(value: protocol::topology::ClusterOperationStage) -> Self {
+    fn from_capnp(value: mantissa_protocol::topology::ClusterOperationStage) -> Self {
         match value {
-            protocol::topology::ClusterOperationStage::Proposed => Self::Proposed,
-            protocol::topology::ClusterOperationStage::Prepared => Self::Prepared,
-            protocol::topology::ClusterOperationStage::Committed => Self::Committed,
-            protocol::topology::ClusterOperationStage::Finalized => Self::Finalized,
-            protocol::topology::ClusterOperationStage::Aborted => Self::Aborted,
+            mantissa_protocol::topology::ClusterOperationStage::Proposed => Self::Proposed,
+            mantissa_protocol::topology::ClusterOperationStage::Prepared => Self::Prepared,
+            mantissa_protocol::topology::ClusterOperationStage::Committed => Self::Committed,
+            mantissa_protocol::topology::ClusterOperationStage::Finalized => Self::Finalized,
+            mantissa_protocol::topology::ClusterOperationStage::Aborted => Self::Aborted,
         }
     }
 }
@@ -123,7 +123,9 @@ impl ClusterOperationRecord {
     /// Encodes this operation record into its stable Cap'n Proto durable payload.
     pub fn encode_capnp(&self) -> Result<Vec<u8>, CapnpError> {
         let mut message = capnp::message::Builder::new_default();
-        self.write_capnp(message.init_root::<protocol::topology::cluster_operation::Builder<'_>>());
+        self.write_capnp(
+            message.init_root::<mantissa_protocol::topology::cluster_operation::Builder<'_>>(),
+        );
         Ok(capnp::serialize::write_message_to_words(&message))
     }
 
@@ -132,12 +134,16 @@ impl ClusterOperationRecord {
         let mut cursor = Cursor::new(bytes);
         let reader =
             capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
-        let operation = reader.get_root::<protocol::topology::cluster_operation::Reader<'_>>()?;
+        let operation =
+            reader.get_root::<mantissa_protocol::topology::cluster_operation::Reader<'_>>()?;
         Self::read_capnp(operation)
     }
 
     /// Encodes this operation record into a Cap'n Proto builder for topology RPC responses.
-    pub fn write_capnp(&self, mut builder: protocol::topology::cluster_operation::Builder<'_>) {
+    pub fn write_capnp(
+        &self,
+        mut builder: mantissa_protocol::topology::cluster_operation::Builder<'_>,
+    ) {
         builder.set_id(self.id.as_bytes());
         builder.set_kind(self.kind.to_capnp());
         builder.set_stage(self.stage.to_capnp());
@@ -184,7 +190,7 @@ impl ClusterOperationRecord {
 
     /// Decodes one operation record from a Cap'n Proto topology payload.
     fn read_capnp(
-        reader: protocol::topology::cluster_operation::Reader<'_>,
+        reader: mantissa_protocol::topology::cluster_operation::Reader<'_>,
     ) -> Result<Self, CapnpError> {
         let id = uuid_from_data(reader.get_id()?, "cluster operation id")?;
         let source_views = read_cluster_views(reader.get_source_views()?)?;
@@ -219,60 +225,64 @@ impl ClusterOperationRecord {
 /// Converts one split service policy to its Cap'n Proto representation.
 fn split_service_policy_to_capnp(
     value: SplitServicePolicy,
-) -> protocol::topology::SplitServicePolicy {
+) -> mantissa_protocol::topology::SplitServicePolicy {
     match value {
-        SplitServicePolicy::Partitioned => protocol::topology::SplitServicePolicy::Partitioned,
-        SplitServicePolicy::Preserve => protocol::topology::SplitServicePolicy::Preserve,
+        SplitServicePolicy::Partitioned => {
+            mantissa_protocol::topology::SplitServicePolicy::Partitioned
+        }
+        SplitServicePolicy::Preserve => mantissa_protocol::topology::SplitServicePolicy::Preserve,
     }
 }
 
 /// Converts one Cap'n Proto split service policy into durable state.
 fn split_service_policy_from_capnp(
-    value: protocol::topology::SplitServicePolicy,
+    value: mantissa_protocol::topology::SplitServicePolicy,
 ) -> SplitServicePolicy {
     match value {
-        protocol::topology::SplitServicePolicy::Partitioned => SplitServicePolicy::Partitioned,
-        protocol::topology::SplitServicePolicy::Preserve => SplitServicePolicy::Preserve,
+        mantissa_protocol::topology::SplitServicePolicy::Partitioned => {
+            SplitServicePolicy::Partitioned
+        }
+        mantissa_protocol::topology::SplitServicePolicy::Preserve => SplitServicePolicy::Preserve,
     }
 }
 
 /// Converts one split network policy to its Cap'n Proto representation.
 fn split_network_policy_to_capnp(
     value: SplitNetworkPolicy,
-) -> protocol::topology::SplitNetworkPolicy {
+) -> mantissa_protocol::topology::SplitNetworkPolicy {
     match value {
-        SplitNetworkPolicy::Isolate => protocol::topology::SplitNetworkPolicy::Isolate,
-        SplitNetworkPolicy::Preserve => protocol::topology::SplitNetworkPolicy::Preserve,
+        SplitNetworkPolicy::Isolate => mantissa_protocol::topology::SplitNetworkPolicy::Isolate,
+        SplitNetworkPolicy::Preserve => mantissa_protocol::topology::SplitNetworkPolicy::Preserve,
     }
 }
 
 /// Converts one Cap'n Proto split network policy into durable state.
 fn split_network_policy_from_capnp(
-    value: protocol::topology::SplitNetworkPolicy,
+    value: mantissa_protocol::topology::SplitNetworkPolicy,
 ) -> SplitNetworkPolicy {
     match value {
-        protocol::topology::SplitNetworkPolicy::Isolate => SplitNetworkPolicy::Isolate,
-        protocol::topology::SplitNetworkPolicy::Preserve => SplitNetworkPolicy::Preserve,
+        mantissa_protocol::topology::SplitNetworkPolicy::Isolate => SplitNetworkPolicy::Isolate,
+        mantissa_protocol::topology::SplitNetworkPolicy::Preserve => SplitNetworkPolicy::Preserve,
     }
 }
 
 /// Converts one merge service policy to its Cap'n Proto representation.
 fn merge_service_policy_to_capnp(
     value: MergeServicePolicy,
-) -> protocol::topology::MergeServicePolicy {
+) -> mantissa_protocol::topology::MergeServicePolicy {
     match value {
-        MergeServicePolicy::Rebalance => protocol::topology::MergeServicePolicy::Rebalance,
-        MergeServicePolicy::Preserve => protocol::topology::MergeServicePolicy::Preserve,
+        MergeServicePolicy::Rebalance => mantissa_protocol::topology::MergeServicePolicy::Rebalance,
+        MergeServicePolicy::Preserve => mantissa_protocol::topology::MergeServicePolicy::Preserve,
     }
 }
 
 /// Converts one Cap'n Proto merge service policy into durable state.
 fn merge_service_policy_from_capnp(
-    value: protocol::topology::MergeServicePolicy,
+    value: mantissa_protocol::topology::MergeServicePolicy,
 ) -> MergeServicePolicy {
     match value {
-        protocol::topology::MergeServicePolicy::Rebalance => MergeServicePolicy::Rebalance,
-        protocol::topology::MergeServicePolicy::Preserve => MergeServicePolicy::Preserve,
+        mantissa_protocol::topology::MergeServicePolicy::Rebalance => MergeServicePolicy::Rebalance,
+        mantissa_protocol::topology::MergeServicePolicy::Preserve => MergeServicePolicy::Preserve,
     }
 }
 
@@ -288,7 +298,7 @@ fn uuid_from_data(data: capnp::data::Reader<'_>, field_name: &str) -> Result<Uui
 
 /// Decodes one cluster-view list from a Cap'n Proto operation payload.
 fn read_cluster_views(
-    reader: capnp::struct_list::Reader<'_, protocol::topology::cluster_view_id::Owned>,
+    reader: capnp::struct_list::Reader<'_, mantissa_protocol::topology::cluster_view_id::Owned>,
 ) -> Result<Vec<ClusterViewId>, CapnpError> {
     let mut views = Vec::with_capacity(reader.len() as usize);
     for item in reader.iter() {
@@ -308,7 +318,10 @@ fn read_text_list(reader: capnp::text_list::Reader<'_>) -> Result<Vec<String>, C
 
 /// Decodes split node assignments from a Cap'n Proto operation payload.
 fn read_split_assignments(
-    reader: capnp::struct_list::Reader<'_, protocol::topology::split_node_assignment::Owned>,
+    reader: capnp::struct_list::Reader<
+        '_,
+        mantissa_protocol::topology::split_node_assignment::Owned,
+    >,
 ) -> Result<Vec<SplitNodeAssignment>, CapnpError> {
     let mut assignments = Vec::with_capacity(reader.len() as usize);
     for item in reader.iter() {

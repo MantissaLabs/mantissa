@@ -14,7 +14,7 @@ use crate::store::registry::{
     EncodedRegister, EncodedRegisters, EncodedTombstone, EncodedTombstones,
 };
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
-use protocol::sync::{Domain, delta_sink, sync};
+use mantissa_protocol::sync::{Domain, delta_sink, sync};
 use std::rc::Rc;
 use tracing::{debug, trace};
 
@@ -25,9 +25,9 @@ pub mod ranges;
 pub use crate::store::registry::{
     REPLICATED_DOMAINS as ALL_DOMAINS, ReplicatedStoreRegistry as SyncStores,
 };
-pub use crdt_store::gc::GcBarrier;
 pub use delta::{SyncRunner, SyncTraceContext};
 pub use gc_progress::SyncGcProgress;
+pub use mantissa_store::gc::GcBarrier;
 
 /// Number of replicated domains exposed through view-scoped sync RPCs.
 pub const VIEW_SCOPED_DOMAIN_COUNT: usize = ALL_DOMAINS.len();

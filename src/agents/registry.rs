@@ -4,7 +4,7 @@ use crate::agents::types::{
 };
 use crate::store::agent_store::AgentStore;
 use anyhow::{Result, anyhow};
-use crdt_store::uuid_key::UuidKey;
+use mantissa_store::uuid_key::UuidKey;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use uuid::Uuid;

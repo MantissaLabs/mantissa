@@ -1,5 +1,5 @@
 use mantissa::cluster::ClusterViewId;
-use protocol::topology::ClusterOperationStage;
+use mantissa_protocol::topology::ClusterOperationStage;
 use std::future::Future;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;

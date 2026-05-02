@@ -109,7 +109,7 @@ unsafe impl Pod for NodePortPacketCounters {}
 /// Userspace mirror of the IPv4 flow key layout pinned by the NodePort tc programs.
 ///
 /// The cleanup path iterates pinned flow maps directly, so these fields must stay byte-for-
-/// byte aligned with `network_ebpf::lb::Flow4`.
+/// byte aligned with `mantissa_ebpf::lb::Flow4`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Flow4 {

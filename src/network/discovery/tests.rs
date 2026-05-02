@@ -17,7 +17,7 @@ use crate::workload::model::{
     WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata, WorkloadValue, WorkloadValueDraft,
 };
 use crate::workload::types::ExecutionSpec;
-use crdt_store::uuid_key::UuidKey;
+use mantissa_store::uuid_key::UuidKey;
 use std::sync::Arc;
 use tempfile::tempdir;
 

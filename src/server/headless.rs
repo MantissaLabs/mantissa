@@ -21,10 +21,10 @@ use crate::{
     store::scheduler_digest_store::SchedulerDigestStore,
     workload::manager::{WorkloadManager, WorkloadRuntimeConfig},
 };
-use net::noise::NoiseKeys;
-use protocol::secrets::secrets;
-use protocol::sync::Domain;
-use protocol::topology::topology;
+use mantissa_net::noise::NoiseKeys;
+use mantissa_protocol::secrets::secrets;
+use mantissa_protocol::sync::Domain;
+use mantissa_protocol::topology::topology;
 
 /// Formats raw digest bytes as lowercase hex for human-readable test diagnostics.
 fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -101,14 +101,14 @@ pub struct HeadlessNode {
 
     // Handy handles for tests
     pub topology_client: topology::Client,
-    pub server_client: protocol::server::server::Client,
-    pub sync_client: protocol::sync::sync::Client,
-    pub task_client: protocol::task::task::Client,
-    pub jobs_client: protocol::jobs::jobs::Client,
-    pub agents_client: protocol::agents::agents::Client,
-    pub services_client: protocol::services::services::Client,
+    pub server_client: mantissa_protocol::server::server::Client,
+    pub sync_client: mantissa_protocol::sync::sync::Client,
+    pub task_client: mantissa_protocol::task::task::Client,
+    pub jobs_client: mantissa_protocol::jobs::jobs::Client,
+    pub agents_client: mantissa_protocol::agents::agents::Client,
+    pub services_client: mantissa_protocol::services::services::Client,
     pub secrets_client: secrets::Client,
-    pub volumes_client: protocol::volumes::volumes::Client,
+    pub volumes_client: mantissa_protocol::volumes::volumes::Client,
     pub job_controller: JobController,
     pub agent_controller: AgentController,
     pub service_controller: ServiceController,
@@ -223,7 +223,8 @@ impl HeadlessNode {
         } = boot(ctx, options).await?;
 
         // Cap’n Proto Server capability
-        let server_client: protocol::server::server::Client = capnp_rpc::new_client(server.clone());
+        let server_client: mantissa_protocol::server::server::Client =
+            capnp_rpc::new_client(server.clone());
 
         // Keep a clone to use start/stop server on.
         let stored_server = server.clone();
@@ -232,7 +233,7 @@ impl HeadlessNode {
         let (handles, effective_transport) = match transport {
             HeadlessTransport::Inproc => {
                 // Register in-process so get_client_secure_join/get_client_secure_peer resolves here
-                net::inproc::register(self_id.to_string(), server_client.clone());
+                mantissa_net::inproc::register(self_id.to_string(), server_client.clone());
 
                 (None, HeadlessTransport::Inproc)
             }
@@ -622,7 +623,7 @@ impl HeadlessNode {
             HeadlessTransport::Inproc => {
                 #[cfg(any(test, feature = "testkit"))]
                 {
-                    net::inproc::unregister(self.id.to_string());
+                    mantissa_net::inproc::unregister(self.id.to_string());
                 }
                 Ok(())
             }
@@ -658,7 +659,7 @@ impl HeadlessNode {
             HeadlessTransport::Inproc => {
                 #[cfg(any(test, feature = "testkit"))]
                 {
-                    net::inproc::register(self.id.to_string(), self.server_client.clone());
+                    mantissa_net::inproc::register(self.id.to_string(), self.server_client.clone());
                 }
                 self.server.set_online(true);
                 Ok(())
@@ -703,7 +704,7 @@ impl Drop for HeadlessNode {
             HeadlessTransport::Inproc => {
                 #[cfg(any(test, feature = "testkit"))]
                 {
-                    net::inproc::unregister(self.id.to_string());
+                    mantissa_net::inproc::unregister(self.id.to_string());
                 }
             }
             HeadlessTransport::Tcp { .. } => {

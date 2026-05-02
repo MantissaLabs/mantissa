@@ -27,7 +27,7 @@ use crate::workload::types::{WorkloadPortBinding, WorkloadPortProtocol};
 use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use health::{HealthMonitor, Status as HealthStatus};
+use mantissa_health::{HealthMonitor, Status as HealthStatus};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::net::IpAddr;

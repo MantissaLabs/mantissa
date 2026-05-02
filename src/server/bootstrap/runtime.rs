@@ -35,16 +35,16 @@ use crate::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadR
 use crate::workload::service::WorkloadService;
 use crate::{config, gossip, services};
 use async_channel::{Receiver, Sender};
-use protocol::agents::agents::Client as AgentsClient;
-use protocol::gossip::gossip::Client as GossipClient;
-use protocol::jobs::jobs::Client as JobsClient;
-use protocol::network::networks::Client as NetworksClient;
-use protocol::scheduling::scheduler::Client as SchedulerClient;
-use protocol::secrets::secrets::Client as SecretsClient;
-use protocol::server::server::Client as ServerClient;
-use protocol::services::services::Client as ServicesClient;
-use protocol::topology::topology::Client as TopologyClient;
-use protocol::volumes::volumes::Client as VolumesClient;
+use mantissa_protocol::agents::agents::Client as AgentsClient;
+use mantissa_protocol::gossip::gossip::Client as GossipClient;
+use mantissa_protocol::jobs::jobs::Client as JobsClient;
+use mantissa_protocol::network::networks::Client as NetworksClient;
+use mantissa_protocol::scheduling::scheduler::Client as SchedulerClient;
+use mantissa_protocol::secrets::secrets::Client as SecretsClient;
+use mantissa_protocol::server::server::Client as ServerClient;
+use mantissa_protocol::services::services::Client as ServicesClient;
+use mantissa_protocol::topology::topology::Client as TopologyClient;
+use mantissa_protocol::volumes::volumes::Client as VolumesClient;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -102,10 +102,10 @@ pub struct RuntimeComponents {
     gossip_client: GossipClient,
     pub topology: Topology,
     pub topology_client: TopologyClient,
-    pub sync_client: protocol::sync::sync::Client,
+    pub sync_client: mantissa_protocol::sync::sync::Client,
     pub workload_manager: WorkloadManager,
-    pub task_client: protocol::task::task::Client,
-    workload_client: protocol::workload::workload::Client,
+    pub task_client: mantissa_protocol::task::task::Client,
+    workload_client: mantissa_protocol::workload::workload::Client,
     pub job_controller: JobController,
     pub jobs_client: JobsClient,
     pub agent_controller: AgentController,
@@ -412,7 +412,7 @@ async fn build_runtime_components(
     let (gossip_client, gossip_dedupe) = build_gossip_client(&cluster_view, &gossip_routes);
 
     let runtime_health = config::health_runtime_config();
-    let health_monitor = health::HealthMonitor::new(ctx.self_id);
+    let health_monitor = mantissa_health::HealthMonitor::new(ctx.self_id);
     let topology_stores = build_topology_stores(stores);
     let sync_stores = build_sync_stores(stores);
     sync_stores
@@ -730,7 +730,7 @@ fn build_gossip_client(
 fn build_registry(
     ctx: &BootstrapContext,
     stores: &BootstrapStores,
-    health_monitor: Arc<health::HealthMonitor>,
+    health_monitor: Arc<mantissa_health::HealthMonitor>,
 ) -> Registry {
     Registry::new(
         stores.peers.clone(),
@@ -845,7 +845,7 @@ fn build_sync_client(
     cluster_view: ClusterViewState,
     root_schema: RootSchemaState,
     stores: SyncStores,
-) -> protocol::sync::sync::Client {
+) -> mantissa_protocol::sync::sync::Client {
     let sync_service = SyncService::new(cluster_view, root_schema, stores);
     capnp_rpc::new_client(sync_service)
 }

@@ -67,7 +67,8 @@ impl ClusterCredential {
     /// Serializes this credential into its stable Cap'n Proto payload.
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
         let mut message = capnp::message::Builder::new_default();
-        let mut builder = message.init_root::<protocol::server::cluster_credential::Builder<'_>>();
+        let mut builder =
+            message.init_root::<mantissa_protocol::server::cluster_credential::Builder<'_>>();
         builder.set_issuer(&self.issuer.to_bytes());
         set_node_id(builder.reborrow().init_subject(), &self.subject);
         builder.set_not_after_unix_secs(self.not_after);
@@ -90,14 +91,14 @@ impl ClusterCredential {
             capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
                 .map_err(|e| e.to_string())?;
         let credential = reader
-            .get_root::<protocol::server::cluster_credential::Reader<'_>>()
+            .get_root::<mantissa_protocol::server::cluster_credential::Reader<'_>>()
             .map_err(|e| e.to_string())?;
         Self::from_capnp(credential)
     }
 
     /// Decodes one credential from a Cap'n Proto reader.
     fn from_capnp(
-        reader: protocol::server::cluster_credential::Reader<'_>,
+        reader: mantissa_protocol::server::cluster_credential::Reader<'_>,
     ) -> Result<Self, String> {
         let issuer = read_fixed_bytes::<32>(reader.get_issuer().map_err(|e| e.to_string())?)
             .and_then(|bytes| VerifyingKey::from_bytes(&bytes).map_err(|e| e.to_string()))?;

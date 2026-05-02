@@ -14,18 +14,18 @@ pub enum NetworkDriver {
 
 impl NetworkDriver {
     /// Convert a protocol enum into an internal driver representation.
-    pub fn from_proto(driver: protocol::network::NetworkDriver) -> Self {
+    pub fn from_proto(driver: mantissa_protocol::network::NetworkDriver) -> Self {
         match driver {
-            protocol::network::NetworkDriver::Vxlan => NetworkDriver::Vxlan,
-            protocol::network::NetworkDriver::Bridge => NetworkDriver::Bridge,
+            mantissa_protocol::network::NetworkDriver::Vxlan => NetworkDriver::Vxlan,
+            mantissa_protocol::network::NetworkDriver::Bridge => NetworkDriver::Bridge,
         }
     }
 
     /// Convert the internal driver into the protocol enumeration.
-    pub fn to_proto(self) -> protocol::network::NetworkDriver {
+    pub fn to_proto(self) -> mantissa_protocol::network::NetworkDriver {
         match self {
-            NetworkDriver::Vxlan => protocol::network::NetworkDriver::Vxlan,
-            NetworkDriver::Bridge => protocol::network::NetworkDriver::Bridge,
+            NetworkDriver::Vxlan => mantissa_protocol::network::NetworkDriver::Vxlan,
+            NetworkDriver::Bridge => mantissa_protocol::network::NetworkDriver::Bridge,
         }
     }
 
@@ -73,26 +73,26 @@ pub enum NetworkStatus {
 impl NetworkStatus {
     /// Convert from protocol enumeration into the internal representation.
     #[allow(dead_code)]
-    pub fn from_proto(status: protocol::network::NetworkStatus) -> Self {
+    pub fn from_proto(status: mantissa_protocol::network::NetworkStatus) -> Self {
         match status {
-            protocol::network::NetworkStatus::Pending => NetworkStatus::Pending,
-            protocol::network::NetworkStatus::Provisioning => NetworkStatus::Provisioning,
-            protocol::network::NetworkStatus::Ready => NetworkStatus::Ready,
-            protocol::network::NetworkStatus::Degraded => NetworkStatus::Degraded,
-            protocol::network::NetworkStatus::Deleting => NetworkStatus::Deleting,
-            protocol::network::NetworkStatus::Deleted => NetworkStatus::Deleted,
+            mantissa_protocol::network::NetworkStatus::Pending => NetworkStatus::Pending,
+            mantissa_protocol::network::NetworkStatus::Provisioning => NetworkStatus::Provisioning,
+            mantissa_protocol::network::NetworkStatus::Ready => NetworkStatus::Ready,
+            mantissa_protocol::network::NetworkStatus::Degraded => NetworkStatus::Degraded,
+            mantissa_protocol::network::NetworkStatus::Deleting => NetworkStatus::Deleting,
+            mantissa_protocol::network::NetworkStatus::Deleted => NetworkStatus::Deleted,
         }
     }
 
     /// Convert to the protocol enumeration for Cap'n Proto responses.
-    pub fn to_proto(self) -> protocol::network::NetworkStatus {
+    pub fn to_proto(self) -> mantissa_protocol::network::NetworkStatus {
         match self {
-            NetworkStatus::Pending => protocol::network::NetworkStatus::Pending,
-            NetworkStatus::Provisioning => protocol::network::NetworkStatus::Provisioning,
-            NetworkStatus::Ready => protocol::network::NetworkStatus::Ready,
-            NetworkStatus::Degraded => protocol::network::NetworkStatus::Degraded,
-            NetworkStatus::Deleting => protocol::network::NetworkStatus::Deleting,
-            NetworkStatus::Deleted => protocol::network::NetworkStatus::Deleted,
+            NetworkStatus::Pending => mantissa_protocol::network::NetworkStatus::Pending,
+            NetworkStatus::Provisioning => mantissa_protocol::network::NetworkStatus::Provisioning,
+            NetworkStatus::Ready => mantissa_protocol::network::NetworkStatus::Ready,
+            NetworkStatus::Degraded => mantissa_protocol::network::NetworkStatus::Degraded,
+            NetworkStatus::Deleting => mantissa_protocol::network::NetworkStatus::Deleting,
+            NetworkStatus::Deleted => mantissa_protocol::network::NetworkStatus::Deleted,
         }
     }
 }
@@ -119,24 +119,24 @@ impl NetworkPeerState {
 
     /// Convert from the protocol enumeration into the internal representation.
     #[allow(dead_code)]
-    pub fn from_proto(state: protocol::network::PeerState) -> Self {
+    pub fn from_proto(state: mantissa_protocol::network::PeerState) -> Self {
         match state {
-            protocol::network::PeerState::AwaitingSpec => NetworkPeerState::AwaitingSpec,
-            protocol::network::PeerState::Configuring => NetworkPeerState::Configuring,
-            protocol::network::PeerState::Ready => NetworkPeerState::Ready,
-            protocol::network::PeerState::Error => NetworkPeerState::Error,
-            protocol::network::PeerState::Removing => NetworkPeerState::Removing,
+            mantissa_protocol::network::PeerState::AwaitingSpec => NetworkPeerState::AwaitingSpec,
+            mantissa_protocol::network::PeerState::Configuring => NetworkPeerState::Configuring,
+            mantissa_protocol::network::PeerState::Ready => NetworkPeerState::Ready,
+            mantissa_protocol::network::PeerState::Error => NetworkPeerState::Error,
+            mantissa_protocol::network::PeerState::Removing => NetworkPeerState::Removing,
         }
     }
 
     /// Convert the internal representation into the protocol enumeration.
-    pub fn to_proto(self) -> protocol::network::PeerState {
+    pub fn to_proto(self) -> mantissa_protocol::network::PeerState {
         match self {
-            NetworkPeerState::AwaitingSpec => protocol::network::PeerState::AwaitingSpec,
-            NetworkPeerState::Configuring => protocol::network::PeerState::Configuring,
-            NetworkPeerState::Ready => protocol::network::PeerState::Ready,
-            NetworkPeerState::Error => protocol::network::PeerState::Error,
-            NetworkPeerState::Removing => protocol::network::PeerState::Removing,
+            NetworkPeerState::AwaitingSpec => mantissa_protocol::network::PeerState::AwaitingSpec,
+            NetworkPeerState::Configuring => mantissa_protocol::network::PeerState::Configuring,
+            NetworkPeerState::Ready => mantissa_protocol::network::PeerState::Ready,
+            NetworkPeerState::Error => mantissa_protocol::network::PeerState::Error,
+            NetworkPeerState::Removing => mantissa_protocol::network::PeerState::Removing,
         }
     }
 }
@@ -469,25 +469,33 @@ pub enum NetworkAttachmentState {
 
 impl NetworkAttachmentState {
     /// Convert the replicated attachment state into its Cap'n Proto enum value.
-    pub fn to_proto(self) -> protocol::network::AttachmentState {
+    pub fn to_proto(self) -> mantissa_protocol::network::AttachmentState {
         match self {
-            NetworkAttachmentState::Pending => protocol::network::AttachmentState::Pending,
-            NetworkAttachmentState::Configuring => protocol::network::AttachmentState::Configuring,
-            NetworkAttachmentState::Ready => protocol::network::AttachmentState::Ready,
-            NetworkAttachmentState::Removing => protocol::network::AttachmentState::Removing,
-            NetworkAttachmentState::Error => protocol::network::AttachmentState::Error,
+            NetworkAttachmentState::Pending => mantissa_protocol::network::AttachmentState::Pending,
+            NetworkAttachmentState::Configuring => {
+                mantissa_protocol::network::AttachmentState::Configuring
+            }
+            NetworkAttachmentState::Ready => mantissa_protocol::network::AttachmentState::Ready,
+            NetworkAttachmentState::Removing => {
+                mantissa_protocol::network::AttachmentState::Removing
+            }
+            NetworkAttachmentState::Error => mantissa_protocol::network::AttachmentState::Error,
         }
     }
 
     #[allow(dead_code)]
     /// Convert a Cap'n Proto attachment state into the replicated enum used by the registry.
-    pub fn from_proto(state: protocol::network::AttachmentState) -> Self {
+    pub fn from_proto(state: mantissa_protocol::network::AttachmentState) -> Self {
         match state {
-            protocol::network::AttachmentState::Pending => NetworkAttachmentState::Pending,
-            protocol::network::AttachmentState::Configuring => NetworkAttachmentState::Configuring,
-            protocol::network::AttachmentState::Ready => NetworkAttachmentState::Ready,
-            protocol::network::AttachmentState::Removing => NetworkAttachmentState::Removing,
-            protocol::network::AttachmentState::Error => NetworkAttachmentState::Error,
+            mantissa_protocol::network::AttachmentState::Pending => NetworkAttachmentState::Pending,
+            mantissa_protocol::network::AttachmentState::Configuring => {
+                NetworkAttachmentState::Configuring
+            }
+            mantissa_protocol::network::AttachmentState::Ready => NetworkAttachmentState::Ready,
+            mantissa_protocol::network::AttachmentState::Removing => {
+                NetworkAttachmentState::Removing
+            }
+            mantissa_protocol::network::AttachmentState::Error => NetworkAttachmentState::Error,
         }
     }
 }

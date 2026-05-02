@@ -13,7 +13,7 @@ use super::{
 use crate::services::types::{ServiceSpecValue, ServiceStatus};
 use crate::workload::model::{WorkloadPhase, WorkloadSpec};
 use anyhow::anyhow;
-use health::Status as HealthStatus;
+use mantissa_health::Status as HealthStatus;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

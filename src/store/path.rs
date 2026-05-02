@@ -1,4 +1,4 @@
-use net::paths::ensure_state_dir;
+use mantissa_net::paths::ensure_state_dir;
 use redb::Database;
 use std::{
     fs::{self, OpenOptions},

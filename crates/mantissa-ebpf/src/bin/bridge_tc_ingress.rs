@@ -1,0 +1,611 @@
+#![no_std]
+#![allow(static_mut_refs)]
+#![cfg_attr(not(test), no_main)]
+
+use core::ptr;
+
+use aya_ebpf::{
+    bindings::{BPF_F_NO_PREALLOC, BPF_F_PSEUDO_HDR, TC_ACT_OK, TC_ACT_SHOT},
+    helpers::bpf_ktime_get_ns,
+    macros::{classifier, map},
+    maps::{HashMap, LruHashMap, PerCpuArray},
+    programs::TcContext,
+};
+use mantissa_ebpf::{
+    lb::{
+        Backend, BridgeRuntimeConfig, ConntrackMetadata, ConntrackVerdict, Flow4, NatEntry,
+        VipBackendKey, VipEntry, VipKey, MAX_BACKENDS_PER_VIP, MAX_VIPS,
+    },
+    net::{self, EthernetHeader, Ipv4Header, TcpHeader, UdpHeader},
+    stats::{self, PacketStats},
+};
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct ArpHeader {
+    htype: u16,
+    ptype: u16,
+    hlen: u8,
+    plen: u8,
+    oper: u16,
+    sha: [u8; 6],
+    spa: u32,
+    tha: [u8; 6],
+    tpa: u32,
+}
+
+const ETH_P_IPV4: u16 = 0x0800;
+const ETH_P_ARP: u16 = 0x0806;
+const ARP_HTYPE_ETHERNET: u16 = 1;
+const ARP_OPER_REQUEST: u16 = 1;
+const ARP_OPER_REPLY: u16 = 2;
+const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
+const SPARSE_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC as u32;
+
+#[map(name = "BRIDGE_TC_INGRESS_STATS")]
+static mut BRIDGE_TC_INGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_entries(1, 0);
+
+#[map(name = "LB_VIPS")]
+static mut LB_VIPS: HashMap<VipKey, VipEntry> = HashMap::pinned(MAX_VIPS as u32, SPARSE_MAP_FLAGS);
+
+#[map(name = "LB_BACKENDS")]
+static mut LB_BACKENDS: HashMap<VipBackendKey, Backend> =
+    HashMap::pinned((MAX_BACKENDS_PER_VIP * MAX_VIPS) as u32, SPARSE_MAP_FLAGS);
+
+#[map(name = "LB_FWD")]
+static mut LB_FWD: LruHashMap<Flow4, NatEntry> = LruHashMap::pinned(1024, 0);
+
+#[map(name = "LB_REV")]
+static mut LB_REV: LruHashMap<Flow4, NatEntry> = LruHashMap::pinned(1024, 0);
+
+#[map(name = "LB_RUNTIME_V4")]
+static mut LB_RUNTIME_V4: HashMap<u32, BridgeRuntimeConfig> = HashMap::pinned(1, 0);
+
+#[classifier]
+pub fn bridge_tc_ingress(ctx: TcContext) -> i32 {
+    let mut ctx = ctx;
+    // GRO can coalesce ingress traffic into skbs larger than the interface MTU,
+    // so we must not drop by length before deciding whether the frame matches a VIP path.
+    let len = ctx.len() as usize;
+
+    match handle_packet(&mut ctx) {
+        Ok(TC_ACT_OK) => unsafe {
+            stats::record_pass(ptr::addr_of_mut!(BRIDGE_TC_INGRESS_STATS), len);
+            TC_ACT_OK
+        },
+        Ok(action) => unsafe {
+            stats::record_pass(ptr::addr_of_mut!(BRIDGE_TC_INGRESS_STATS), len);
+            action
+        },
+        Err(_) => unsafe {
+            stats::record_drop(ptr::addr_of_mut!(BRIDGE_TC_INGRESS_STATS), len);
+            TC_ACT_SHOT
+        },
+    }
+}
+
+/// Dispatch one bridge ingress frame to the IPv4 VIP or ARP handler.
+fn handle_packet(ctx: &mut TcContext) -> Result<i32, ()> {
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    let eth: *mut EthernetHeader = unsafe { net::mut_ptr_at(data, data_end, 0).map_err(|_| ())? };
+    let eth_hdr = unsafe { &mut *eth };
+
+    match eth_hdr.protocol() {
+        ETH_P_IPV4 => handle_ipv4_packet(ctx, data, data_end),
+        ETH_P_ARP => handle_arp(ctx, data, data_end, eth_hdr),
+        _ => Ok(TC_ACT_OK),
+    }
+}
+
+/// Process IPv4 VIP traffic and update the cached reverse flow state for return-path SNAT.
+fn handle_ipv4_packet(ctx: &mut TcContext, data: usize, data_end: usize) -> Result<i32, ()> {
+    let ip_offset = net::ETH_HDR_LEN;
+    let eth: *mut EthernetHeader = unsafe { net::mut_ptr_at(data, data_end, 0).map_err(|_| ())? };
+    let eth_hdr = unsafe { &mut *eth };
+    let ip: *mut Ipv4Header =
+        unsafe { net::mut_ptr_at(data, data_end, ip_offset).map_err(|_| ())? };
+    let ip_hdr = unsafe { &mut *ip };
+    if ip_hdr.version() != 4 {
+        return Ok(TC_ACT_OK);
+    }
+    let ihl = ip_hdr.header_len();
+    if ihl < 20 {
+        return Err(());
+    }
+
+    let l4_offset = ip_offset + ihl;
+    let proto = ip_hdr.protocol;
+    if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
+        return Ok(TC_ACT_OK);
+    }
+    let has_more_fragments = ip_hdr.has_more_fragments();
+    if ip_hdr.fragment_offset() != 0 {
+        return Ok(TC_ACT_OK);
+    }
+
+    let (src_port, dst_port) = parse_ports(data, data_end, l4_offset, proto)?;
+    let tcp_flags = parse_tcp_flags(data, data_end, l4_offset, proto)?;
+    let now_ns = flow_now_ns();
+    let reverse_key = Flow4 {
+        src: ip_hdr.src,
+        dst: ip_hdr.dst,
+        src_port,
+        dst_port,
+        proto,
+        pad: 0,
+        padding: [0u8; 2],
+    };
+
+    if let Some(mut entry) = unsafe { LB_REV.get(&reverse_key).copied() } {
+        if has_more_fragments {
+            return Err(());
+        }
+        let forward_key = forward_key_from_reverse_flow(&reverse_key, entry.vip);
+        match entry.conntrack.advance_reverse(tcp_flags, now_ns) {
+            ConntrackVerdict::Reject => return Ok(TC_ACT_OK),
+            ConntrackVerdict::Remove => {
+                remove_flow_pair(&forward_key, &reverse_key);
+                return Ok(TC_ACT_OK);
+            }
+            ConntrackVerdict::Allow(updated) => entry.conntrack = updated,
+            ConntrackVerdict::AllowAndRemove(updated) => {
+                entry.conntrack = updated;
+                apply_snat_v4(ctx, eth_hdr, ip_hdr, ip_offset, l4_offset, proto, &entry)?;
+                remove_flow_pair(&forward_key, &reverse_key);
+                return Ok(TC_ACT_OK);
+            }
+        }
+
+        apply_snat_v4(ctx, eth_hdr, ip_hdr, ip_offset, l4_offset, proto, &entry)?;
+        persist_flow_pair(&forward_key, &reverse_key, &entry)?;
+        return Ok(TC_ACT_OK);
+    }
+
+    let client_flow = Flow4 {
+        src: ip_hdr.src,
+        dst: ip_hdr.dst,
+        src_port,
+        dst_port,
+        proto,
+        pad: 0,
+        padding: [0u8; 2],
+    };
+    if has_more_fragments {
+        let vip_key = VipKey { vip: ip_hdr.dst };
+        if unsafe { LB_VIPS.get(&vip_key) }.is_some() {
+            return Err(());
+        }
+        return Ok(TC_ACT_OK);
+    }
+
+    let choice = if let Some(mut entry) = unsafe { LB_FWD.get(&client_flow).copied() } {
+        let reverse_key = reverse_key_from_forward_flow(&client_flow, entry.backend_ip);
+        match entry.conntrack.advance_forward(tcp_flags, now_ns) {
+            ConntrackVerdict::Reject => return Ok(TC_ACT_OK),
+            ConntrackVerdict::Remove => {
+                remove_flow_pair(&client_flow, &reverse_key);
+                return Ok(TC_ACT_OK);
+            }
+            ConntrackVerdict::Allow(updated) => {
+                entry.conntrack = updated;
+                entry
+            }
+            ConntrackVerdict::AllowAndRemove(updated) => {
+                entry.conntrack = updated;
+                apply_dnat_v4(ctx, eth_hdr, ip_hdr, ip_offset, l4_offset, proto, &entry)?;
+                remove_flow_pair(&client_flow, &reverse_key);
+                return Ok(TC_ACT_OK);
+            }
+        }
+    } else {
+        let Some(conntrack) = ConntrackMetadata::begin_flow(proto, tcp_flags, now_ns) else {
+            return Ok(TC_ACT_OK);
+        };
+        let Some(mut entry) = select_backend_v4(&client_flow, ip_hdr.dst) else {
+            return Ok(TC_ACT_OK);
+        };
+        entry.conntrack = conntrack;
+        entry
+    };
+
+    if proto == IPPROTO_TCP && (tcp_flags & net::TCP_FLAG_SYN) != 0 {
+        clamp_tcp_mss(ctx, l4_offset, configured_tcp_mss())?;
+    }
+    // `ctx.store` and checksum helpers invalidate packet pointers under tc verifier rules, so the
+    // DNAT rewrite must reload fresh headers after any MSS clamp touched the skb.
+    let data = ctx.data();
+    let data_end = ctx.data_end();
+    let eth: *mut EthernetHeader = unsafe { net::mut_ptr_at(data, data_end, 0).map_err(|_| ())? };
+    let eth_hdr = unsafe { &mut *eth };
+    let ip: *mut Ipv4Header =
+        unsafe { net::mut_ptr_at(data, data_end, ip_offset).map_err(|_| ())? };
+    let ip_hdr = unsafe { &mut *ip };
+    apply_dnat_v4(ctx, eth_hdr, ip_hdr, ip_offset, l4_offset, proto, &choice)?;
+
+    let reverse_key = reverse_key_from_forward_flow(&client_flow, choice.backend_ip);
+    persist_flow_pair(&client_flow, &reverse_key, &choice)?;
+
+    Ok(TC_ACT_OK)
+}
+
+/// Reply to ARP requests targeting one configured IPv4 VIP.
+///
+/// Mantissa assigns VIPs per service and publishes them through DNS. Clients must resolve the VIP
+/// into a stable MAC address before they can send IP traffic. This handler synthesizes an ARP
+/// reply in-place and uses `clone_redirect` so the reply is delivered back to the ingress port
+/// (veth, vxlan, or host access) without relying on bridge hairpin forwarding.
+fn handle_arp(
+    ctx: &mut TcContext,
+    data: usize,
+    data_end: usize,
+    eth: &mut EthernetHeader,
+) -> Result<i32, ()> {
+    let hdr: *mut ArpHeader =
+        unsafe { net::mut_ptr_at(data, data_end, net::ETH_HDR_LEN).map_err(|_| ())? };
+    let arp = unsafe { &mut *hdr };
+
+    if u16::from_be(arp.htype) != ARP_HTYPE_ETHERNET
+        || u16::from_be(arp.ptype) != ETH_P_IPV4
+        || arp.hlen != 6
+        || arp.plen != 4
+    {
+        return Ok(TC_ACT_OK);
+    }
+
+    let vip_key = VipKey { vip: arp.tpa };
+    let Some(config) = (unsafe { LB_VIPS.get(&vip_key) }) else {
+        return Ok(TC_ACT_OK);
+    };
+
+    if u16::from_be(arp.oper) != ARP_OPER_REQUEST {
+        return Ok(TC_ACT_OK);
+    }
+
+    let sender_mac = arp.sha;
+    let sender_ip = arp.spa;
+
+    arp.oper = ARP_OPER_REPLY.to_be();
+    arp.sha = config.vip_mac;
+    arp.spa = arp.tpa;
+    arp.tha = sender_mac;
+    arp.tpa = sender_ip;
+
+    eth.dst = sender_mac;
+    eth.src = config.vip_mac;
+
+    // Redirect the synthesized reply back out of the ingress interface so hosts (and remote
+    // peers via VXLAN) can learn the VIP MAC even when the bridge would otherwise drop same-port
+    // egress frames.
+    let ingress = unsafe { (*ctx.skb.skb).ingress_ifindex };
+    if ingress != 0 && ctx.clone_redirect(ingress, 0).is_ok() {
+        return Ok(TC_ACT_SHOT);
+    }
+
+    Ok(TC_ACT_OK)
+}
+
+/// Select one IPv4 backend for the provided VIP in O(1) by hashing into a precomputed ring.
+fn select_backend_v4(flow: &Flow4, vip: u32) -> Option<NatEntry> {
+    let vip_key = VipKey { vip };
+    let config = unsafe { LB_VIPS.get(&vip_key)?.clone() };
+    let count = config.backend_count as usize;
+    if count == 0 || count > MAX_BACKENDS_PER_VIP {
+        return None;
+    }
+
+    let ring_slot = (hash_flow_v4(flow, vip) % (count as u64)) as u32;
+    let key = VipBackendKey {
+        vip,
+        slot: ring_slot,
+    };
+    let backend = unsafe { LB_BACKENDS.get(&key)?.clone() };
+
+    Some(NatEntry {
+        vip,
+        vip_mac: config.vip_mac,
+        _pad0: [0u8; 2],
+        backend_ip: backend.ip,
+        backend_mac: backend.mac,
+        _pad1: [0u8; 2],
+        conntrack: ConntrackMetadata::untracked(flow.proto),
+    })
+}
+
+/// Return a monotonic dataplane timestamp for conntrack refresh decisions.
+///
+/// The overlay state machine records last-seen activity per flow so later aging and diagnostics do
+/// not have to rely solely on opaque LRU eviction behavior.
+#[inline(always)]
+fn flow_now_ns() -> u64 {
+    unsafe { bpf_ktime_get_ns() }
+}
+
+/// Hash an IPv4 5-tuple plus VIP into one deterministic backend ring slot.
+fn hash_flow_v4(flow: &Flow4, vip: u32) -> u64 {
+    let mut acc = (flow.src as u64) ^ ((flow.dst as u64) << 7);
+    acc ^= ((flow.src_port as u64) << 32) ^ ((flow.dst_port as u64) << 19);
+    acc ^= (flow.proto as u64) << 48;
+    acc ^= (vip as u64) << 5;
+    mix64(acc)
+}
+
+/// Apply a lightweight 64-bit mix to spread hash values for rendezvous hashing.
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+    x ^= x >> 33;
+    x
+}
+
+/// Load and validate the fixed TCP header prefix at the provided transport offset.
+///
+/// Conntrack hardening only needs the first 20 bytes of the TCP header, but it still validates the
+/// advertised header length so malformed packets do not create or refresh state.
+fn read_tcp_header(data: usize, data_end: usize, l4_offset: usize) -> Result<TcpHeader, ()> {
+    let tcp: TcpHeader = unsafe { net::read_at(data, data_end, l4_offset).map_err(|_| ())? };
+    let header_len = tcp.data_offset();
+    if header_len < core::mem::size_of::<TcpHeader>() || data + l4_offset + header_len > data_end {
+        return Err(());
+    }
+    Ok(tcp)
+}
+
+/// Return the configured TCP MSS ceiling for the IPv4 overlay bridge dataplane.
+///
+/// Userspace programs this per-network value from the effective overlay MTU so ingress can clamp
+/// SYN MSS without duplicating MTU math or service-level policy in the tc program.
+#[inline(always)]
+fn configured_tcp_mss() -> u16 {
+    let key = 0u32;
+    unsafe {
+        LB_RUNTIME_V4
+            .get(&key)
+            .map(|config| config.tcp_mss)
+            .unwrap_or(0)
+    }
+}
+
+/// Parse one TCP or UDP header so the dataplane can build its flow key.
+fn parse_ports(
+    data: usize,
+    data_end: usize,
+    l4_offset: usize,
+    proto: u8,
+) -> Result<(u16, u16), ()> {
+    if proto == IPPROTO_TCP {
+        let tcp = read_tcp_header(data, data_end, l4_offset)?;
+        return Ok((tcp.source, tcp.dest));
+    }
+    if proto == IPPROTO_UDP {
+        let udp: UdpHeader = unsafe { net::read_at(data, data_end, l4_offset).map_err(|_| ())? };
+        return Ok((udp.source, udp.dest));
+    }
+    Err(())
+}
+
+/// Return the TCP flags byte for the current packet, or zero for UDP packets.
+///
+/// UDP flows do not have per-packet handshake flags, so the conntrack state machine treats zero
+/// as "not applicable" and only branches on flags for TCP packets.
+fn parse_tcp_flags(data: usize, data_end: usize, l4_offset: usize, proto: u8) -> Result<u8, ()> {
+    if proto == IPPROTO_TCP {
+        return Ok(read_tcp_header(data, data_end, l4_offset)?.flags());
+    }
+    Ok(0)
+}
+
+/// Clamp one TCP SYN MSS option to the configured overlay ceiling before DNAT reaches a backend.
+///
+/// The bridge VIP dataplane cannot translate ICMP fragmentation feedback today, so lowering SYN
+/// MSS is the least-complex way to keep TCP payloads within the configured overlay MTU.
+fn clamp_tcp_mss(ctx: &mut TcContext, l4_offset: usize, max_mss: u16) -> Result<(), ()> {
+    if max_mss == 0 {
+        return Ok(());
+    }
+
+    let tcp = read_tcp_header(ctx.data(), ctx.data_end(), l4_offset)?;
+    let header_len = tcp.data_offset();
+    if header_len <= core::mem::size_of::<TcpHeader>() {
+        return Ok(());
+    }
+
+    let Some((option_offset, current_mss)) = find_tcp_mss_option(ctx, l4_offset, header_len)?
+    else {
+        return Ok(());
+    };
+    if current_mss <= max_mss {
+        return Ok(());
+    }
+
+    let old_wire = current_mss.to_be();
+    let new_wire = max_mss.to_be();
+    ctx.store(option_offset, &new_wire, 0).map_err(|_| ())?;
+    ctx.l4_csum_replace(
+        l4_offset + l4_checksum_offset(IPPROTO_TCP),
+        old_wire as u64,
+        new_wire as u64,
+        2,
+    )
+    .map_err(|_| ())?;
+    Ok(())
+}
+
+/// Scan one TCP options block for the first MSS option using verifier-friendly packet loads.
+///
+/// Bridge tc ingress runs under the kernel verifier, so each option access is expressed through
+/// `ctx.load` on bounded offsets instead of generic pointer arithmetic.
+fn find_tcp_mss_option(
+    ctx: &TcContext,
+    l4_offset: usize,
+    header_len: usize,
+) -> Result<Option<(usize, u16)>, ()> {
+    let mut cursor = core::mem::size_of::<TcpHeader>();
+
+    for _ in 0..net::TCP_OPTION_SCAN_LIMIT {
+        if cursor >= header_len {
+            return Ok(None);
+        }
+
+        let kind: u8 = ctx.load(l4_offset + cursor).map_err(|_| ())?;
+        match kind {
+            net::TCP_OPTION_END => return Ok(None),
+            net::TCP_OPTION_NOP => {
+                cursor = cursor.saturating_add(1);
+            }
+            net::TCP_OPTION_MSS => {
+                let len: u8 = ctx.load(l4_offset + cursor + 1).map_err(|_| ())?;
+                if len as usize != net::TCP_OPTION_MSS_LEN
+                    || cursor.saturating_add(net::TCP_OPTION_MSS_LEN) > header_len
+                {
+                    return Ok(None);
+                }
+                let mss_wire: u16 = ctx.load(l4_offset + cursor + 2).map_err(|_| ())?;
+                return Ok(Some((l4_offset + cursor + 2, u16::from_be(mss_wire))));
+            }
+            _ => {
+                let len: u8 = ctx.load(l4_offset + cursor + 1).map_err(|_| ())?;
+                if len < 2 {
+                    return Ok(None);
+                }
+                cursor = cursor.saturating_add(len as usize);
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Return the TCP or UDP checksum field offset within the transport header.
+fn l4_checksum_offset(proto: u8) -> usize {
+    if proto == IPPROTO_TCP {
+        16
+    } else {
+        6
+    }
+}
+
+/// Derive the backend-to-client reverse key for one cached client-to-VIP flow.
+///
+/// The forward and reverse maps share the same conntrack metadata, so bridge ingress can refresh
+/// or retire both directions together after it chooses a backend for a client flow.
+fn reverse_key_from_forward_flow(flow: &Flow4, backend_ip: u32) -> Flow4 {
+    Flow4 {
+        src: backend_ip,
+        dst: flow.src,
+        src_port: flow.dst_port,
+        dst_port: flow.src_port,
+        proto: flow.proto,
+        pad: 0,
+        padding: [0u8; 2],
+    }
+}
+
+/// Reconstruct the client-to-VIP key that pairs with one reverse cache entry.
+///
+/// Same-node return traffic hits bridge ingress first, so that hook needs to find and refresh the
+/// forward cache entry even though the packet it is currently processing is already on the reverse
+/// backend-to-client direction.
+fn forward_key_from_reverse_flow(reverse_key: &Flow4, vip: u32) -> Flow4 {
+    Flow4 {
+        src: reverse_key.dst,
+        dst: vip,
+        src_port: reverse_key.dst_port,
+        dst_port: reverse_key.src_port,
+        proto: reverse_key.proto,
+        pad: 0,
+        padding: [0u8; 2],
+    }
+}
+
+/// Persist matching forward and reverse cache entries after one conntrack update.
+///
+/// Overlay ingress owns both maps, so it keeps the shared conntrack metadata aligned across both
+/// directions whenever a packet refreshes or advances the flow lifecycle.
+fn persist_flow_pair(forward_key: &Flow4, reverse_key: &Flow4, entry: &NatEntry) -> Result<(), ()> {
+    unsafe {
+        LB_FWD.insert(forward_key, entry, 0).map_err(|_| ())?;
+        LB_REV.insert(reverse_key, entry, 0).map_err(|_| ())?;
+    }
+    Ok(())
+}
+
+/// Best-effort remove both directions of one cached flow pair.
+///
+/// Connection teardown should retire both NAT entries, but cleanup must not fail the current
+/// packet if one side was already evicted by the LRU map.
+fn remove_flow_pair(forward_key: &Flow4, reverse_key: &Flow4) {
+    unsafe {
+        let _ = LB_FWD.remove(forward_key);
+        let _ = LB_REV.remove(reverse_key);
+    }
+}
+
+/// Rewrite one IPv4 packet to the chosen backend while preserving the original client identity.
+fn apply_dnat_v4(
+    ctx: &mut TcContext,
+    eth: &mut EthernetHeader,
+    ip: &mut Ipv4Header,
+    ip_offset: usize,
+    l4_offset: usize,
+    proto: u8,
+    choice: &NatEntry,
+) -> Result<(), ()> {
+    eth.dst = choice.backend_mac;
+
+    let old_dst = ip.dst;
+    ip.dst = choice.backend_ip;
+    ctx.l3_csum_replace(ip_offset + 10, old_dst as u64, ip.dst as u64, 4)
+        .map_err(|_| ())?;
+    ctx.l4_csum_replace(
+        l4_offset + l4_checksum_offset(proto),
+        old_dst as u64,
+        ip.dst as u64,
+        (BPF_F_PSEUDO_HDR as u64) | 4,
+    )
+    .map_err(|_| ())?;
+
+    Ok(())
+}
+
+/// Rewrite one IPv4 return-path packet so local bridge forwarding still presents the VIP.
+///
+/// Same-node task traffic can be forwarded directly between local bridge ports. Applying the
+/// reverse rewrite on ingress keeps those replies on the stable VIP identity even if the packet
+/// never traverses a tc egress hook before re-entering the client task.
+fn apply_snat_v4(
+    ctx: &mut TcContext,
+    eth: &mut EthernetHeader,
+    ip: &mut Ipv4Header,
+    ip_offset: usize,
+    l4_offset: usize,
+    proto: u8,
+    entry: &NatEntry,
+) -> Result<(), ()> {
+    let old_src = ip.src;
+    ip.src = entry.vip;
+    eth.src = entry.vip_mac;
+    ctx.l3_csum_replace(ip_offset + 10, old_src as u64, ip.src as u64, 4)
+        .map_err(|_| ())?;
+    ctx.l4_csum_replace(
+        l4_offset + l4_checksum_offset(proto),
+        old_src as u64,
+        ip.src as u64,
+        (BPF_F_PSEUDO_HDR as u64) | 4,
+    )
+    .map_err(|_| ())?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+fn main() {}
+
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}

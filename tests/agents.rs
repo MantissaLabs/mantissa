@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use chrono::Utc;
 use common::convergence::wait_until;
 use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
-use crdt_store::uuid_key::UuidKey;
 use mantissa::runtime::testing::InMemoryRuntimeBackend;
 use mantissa::runtime::types::{
     RuntimeAttachOptions, RuntimeBackend, RuntimeCreateRequest, RuntimeEvent, RuntimeExecOptions,
@@ -16,9 +15,10 @@ use mantissa::task::types::TaskValue;
 use mantissa::workload::model::WorkloadPhase;
 use mantissa::workload::model::WorkloadSpec;
 use mantissa::workload::model::{ExecutionPlatform, IsolationMode};
-use protocol::agents::{
+use mantissa_protocol::agents::{
     AgentRunStatus as ProtoAgentRunStatus, AgentSessionStatus as ProtoAgentSessionStatus, agents,
 };
+use mantissa_store::uuid_key::UuidKey;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;

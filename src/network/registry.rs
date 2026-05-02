@@ -5,7 +5,7 @@ use crate::network::types::{
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use crdt_store::uuid_key::UuidKey;
+use mantissa_store::uuid_key::UuidKey;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};

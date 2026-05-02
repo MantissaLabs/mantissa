@@ -8,7 +8,7 @@ use crate::topology::cluster_operations::{
     CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT, COMMIT_PRECONDITION_FAILURE_PREFIX,
 };
 use crate::topology::peers::PeerValue;
-use protocol::server::cluster_session;
+use mantissa_protocol::server::cluster_session;
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
@@ -227,7 +227,7 @@ impl Topology {
 
     /// Decodes one raw Cap'n Proto cluster lineage identifier into internal `ClusterId` bytes.
     pub(in crate::topology) fn cluster_id_from_capnp(
-        reader: protocol::topology::cluster_id::Reader<'_>,
+        reader: mantissa_protocol::topology::cluster_id::Reader<'_>,
     ) -> Result<ClusterId, capnp::Error> {
         let value = reader.get_value()?;
         if value.len() != 16 {

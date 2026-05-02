@@ -20,10 +20,10 @@ use crate::topology::peers::{
     labels_from_peer,
 };
 use capnp::Error;
-use crdt_store::uuid_key::UuidKey;
 use ed25519_dalek::VerifyingKey;
-use protocol::server::{self, cluster_session};
-use protocol::topology::{topology, topology_event};
+use mantissa_protocol::server::{self, cluster_session};
+use mantissa_protocol::topology::{topology, topology_event};
+use mantissa_store::uuid_key::UuidKey;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use tracing::{info, warn};
@@ -134,14 +134,14 @@ impl Topology {
             .clone()
             .ok_or_else(|| Error::failed("hostname not set".into()))?;
 
-        let wireguard = if !config::wireguard_enabled() || !net::paths::running_as_root() {
+        let wireguard = if !config::wireguard_enabled() || !mantissa_net::paths::running_as_root() {
             None
         } else {
-            match net::wireguard::resolve_wireguard_key_path()
-                .and_then(net::wireguard::load_or_generate_wireguard_keys)
+            match mantissa_net::wireguard::resolve_wireguard_key_path()
+                .and_then(mantissa_net::wireguard::load_or_generate_wireguard_keys)
             {
                 Ok(keys) => {
-                    match net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
+                    match mantissa_net::wireguard::load_or_choose_wireguard_listen_port_with_preferred_and_override(
                         preferred_wireguard_port,
                         config::wireguard_port_override(),
                     ) {
@@ -382,7 +382,7 @@ impl topology::Server for Topology {
         }
 
         let noise_keys = self.deps.registry.noise_keys();
-        let client = client::connection::get_client_secure_join_with_keys(
+        let client = mantissa_client::connection::get_client_secure_join_with_keys(
             &inputs.anchor,
             &inputs.join_token,
             noise_keys.as_ref(),
@@ -589,7 +589,7 @@ impl topology::Server for Topology {
             let health_status = health_snapshot
                 .get(&id)
                 .cloned()
-                .unwrap_or(::health::Status::Unknown);
+                .unwrap_or(::mantissa_health::Status::Unknown);
             let node_status = status_to_node_status(health_status);
             let Some(value) = PeerValue::select_reg(&reg).filter(|value| value.is_active()) else {
                 continue;
@@ -679,7 +679,7 @@ impl topology::Server for Topology {
                     health_snapshot
                         .get(&candidate.node_id)
                         .cloned()
-                        .unwrap_or(::health::Status::Unknown),
+                        .unwrap_or(::mantissa_health::Status::Unknown),
                 ),
                 active_cluster_view,
                 candidate,
@@ -1212,7 +1212,7 @@ fn read_optional_uuid_data(
 }
 
 fn cluster_id_from_topology_event(
-    reader: protocol::topology::cluster_id::Reader<'_>,
+    reader: mantissa_protocol::topology::cluster_id::Reader<'_>,
 ) -> Result<ClusterId, capnp::Error> {
     let value = reader.get_value()?;
     if value.len() != 16 {
