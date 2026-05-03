@@ -46,10 +46,10 @@ pub async fn run_manifest(
     match handle.outcome {
         ServiceDeployOutcome::Accepted => {
             output::emit_line(format!(
-                "service '{}' accepted with id {}",
+                "service {} accepted (id {})",
                 manifest.name, handle.service_id
             ));
-            output::emit_line("tracking deployment; use --detach to return immediately");
+            output::emit_line("tracking deployment (use --detach to return after submission)");
             output::emit_line("");
             follow_deployment(cfg, manifest, &handle, options.timeout).await
         }
@@ -96,10 +96,7 @@ async fn follow_deployment(
 
         match classify_deployment(&row, handle) {
             DeploymentState::Succeeded => {
-                output::emit_line(format!(
-                    "service '{}' deployed successfully",
-                    row.service_name
-                ));
+                output::emit_line(format!("service {} deployment complete", row.service_name));
                 return Ok(());
             }
             DeploymentState::Failed(reason) => {
@@ -284,36 +281,51 @@ impl From<&ServiceRow> for ProgressKey {
     }
 }
 
-/// Renders one compact deployment progress tree.
+/// Renders one compact deployment progress panel and task-template progress tree.
 fn render_progress_block(row: &ServiceRow, spinner: char) -> Result<String> {
     let task_progress = task_progress_for_render(row);
     let name_width = task_progress
         .iter()
         .map(|task| task.name.chars().count())
         .max()
-        .unwrap_or(0)
-        .max(row.service_name.chars().count());
+        .unwrap_or(0);
     let mut out = String::new();
 
+    writeln!(&mut out, "deployment {}  {spinner}", row.service_name,)?;
+    writeln!(&mut out, "  status    {}", row.status)?;
+    if let Some(rollout) = rollout_progress_for_render(&row.rollout) {
+        writeln!(&mut out, "  rollout   {rollout}")?;
+    }
     writeln!(
         &mut out,
-        "service {:<name_width$}  {} {}  rollout {}  replicas {}  {}  {}",
-        row.service_name,
-        spinner,
-        row.status,
-        rollout_label(&row.rollout),
+        "  replicas  {}  {}",
         replica_label(row),
-        progress_bar(row),
-        progress_detail(row),
+        progress_bar(row)
     )?;
+    if let Some(detail) = progress_detail_for_render(row) {
+        writeln!(&mut out, "  detail    {detail}")?;
+    }
 
-    for task in &task_progress {
+    if task_progress.is_empty() {
+        writeln!(&mut out, "  tasks     -")?;
+        return Ok(out);
+    }
+
+    writeln!(&mut out)?;
+    writeln!(&mut out, "  tasks")?;
+    for (idx, task) in task_progress.iter().enumerate() {
+        let is_last = idx + 1 == task_progress.len();
+        let branch = if is_last { "`--" } else { "|--" };
+        let detail_prefix = if is_last { "   " } else { "|  " };
         writeln!(
             &mut out,
-            "   |-- {:<name_width$}  {}",
+            "  {branch} {:<name_width$}  {}",
             task.name,
             task_progress_summary(task),
         )?;
+        if let Some(detail) = task_detail_for_render(task) {
+            writeln!(&mut out, "  {detail_prefix} detail  {detail}")?;
+        }
     }
 
     Ok(out)
@@ -370,7 +382,7 @@ fn progress_bar(row: &ServiceRow) -> String {
     };
 
     if total == 0 {
-        return "[............]".to_string();
+        return format!("[{}]", "-".repeat(PROGRESS_BAR_WIDTH));
     }
 
     let done = done.min(total);
@@ -378,13 +390,19 @@ fn progress_bar(row: &ServiceRow) -> String {
     format!(
         "[{}{}]",
         "#".repeat(filled),
-        ".".repeat(PROGRESS_BAR_WIDTH.saturating_sub(filled))
+        "-".repeat(PROGRESS_BAR_WIDTH.saturating_sub(filled))
     )
 }
 
-/// Renders the most useful detail for the current progress row.
-fn progress_detail(row: &ServiceRow) -> String {
-    failure_detail(row).unwrap_or("-").to_string()
+/// Renders rollout progress only when there is useful rollout state to show.
+fn rollout_progress_for_render(rollout: &ServiceRolloutRow) -> Option<String> {
+    let label = rollout_label(rollout);
+    (label != "-").then_some(label)
+}
+
+/// Renders the most useful detail for the current progress row when present.
+fn progress_detail_for_render(row: &ServiceRow) -> Option<String> {
+    failure_detail(row).map(|value| truncate_detail(value, 120))
 }
 
 /// Returns decoded task progress or falls back to manifest-declared templates for rendering.
@@ -423,11 +441,11 @@ fn task_progress_summary(task: &ServiceTaskProgressRow) -> String {
 
     let mut parts = vec![format!("{}/{} running", task.running, task.desired)];
     let unassigned = task.desired.saturating_sub(task.assigned);
-    push_count(&mut parts, unassigned, "unassigned");
+    push_count(&mut parts, unassigned, "waiting");
     push_count(&mut parts, task.pending, "pending");
     push_count(&mut parts, task.pulling, "pulling");
     push_count(&mut parts, task.creating, "creating");
-    push_count(&mut parts, task.volume_unavailable, "volume_unavailable");
+    push_count(&mut parts, task.volume_unavailable, "volume-blocked");
     push_count(&mut parts, task.paused, "paused");
     push_count(&mut parts, task.stopping, "stopping");
     push_count(&mut parts, task.stopped, "stopped");
@@ -435,19 +453,7 @@ fn task_progress_summary(task: &ServiceTaskProgressRow) -> String {
     push_count(&mut parts, task.exited, "exited");
     push_count(&mut parts, task.unknown, "unknown");
 
-    let mut summary = parts.join(", ");
-    if let Some(detail) = task
-        .detail
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let detail = truncate_detail(detail, 80);
-        summary.push_str(" (");
-        summary.push_str(&detail);
-        summary.push(')');
-    }
-    summary
+    parts.join("  ")
 }
 
 /// Appends one non-zero lifecycle count to a task progress summary.
@@ -455,6 +461,15 @@ fn push_count(parts: &mut Vec<String>, count: u32, label: &str) {
     if count > 0 {
         parts.push(format!("{count} {label}"));
     }
+}
+
+/// Returns a task-template detail line when the service status carries one.
+fn task_detail_for_render(task: &ServiceTaskProgressRow) -> Option<String> {
+    task.detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| truncate_detail(value, 100))
 }
 
 /// Truncates one status detail so the progress tree remains readable.
@@ -481,7 +496,7 @@ fn render_last_observed(row: &ServiceRow) -> String {
         row.status,
         rollout_label(&row.rollout),
         replica_label(row),
-        progress_detail(row)
+        failure_detail(row).unwrap_or("-")
     )
 }
 
@@ -624,30 +639,58 @@ mod tests {
             Some("waiting for readiness"),
             None,
         );
-        row.task_progress = vec![ServiceTaskProgressRow {
-            name: "web".to_string(),
-            desired: 3,
-            assigned: 2,
-            pending: 0,
-            pulling: 0,
-            creating: 1,
-            volume_unavailable: 0,
-            running: 1,
-            paused: 0,
-            stopping: 0,
-            stopped: 0,
-            failed: 0,
-            exited: 0,
-            unknown: 0,
-            detail: Some("starting container".to_string()),
-        }];
+        row.task_templates.push(TaskTemplateRow {
+            name: "worker".to_string(),
+            image: "busybox:latest".to_string(),
+            command: Vec::new(),
+            replicas: 1,
+            networks: Vec::new(),
+            public_port: None,
+            readiness_port: None,
+            liveness_port: None,
+            ports: Vec::new(),
+        });
+        row.task_progress = vec![
+            ServiceTaskProgressRow {
+                name: "web".to_string(),
+                desired: 3,
+                assigned: 2,
+                pending: 0,
+                pulling: 0,
+                creating: 1,
+                volume_unavailable: 0,
+                running: 1,
+                paused: 0,
+                stopping: 0,
+                stopped: 0,
+                failed: 0,
+                exited: 0,
+                unknown: 0,
+                detail: Some("starting container".to_string()),
+            },
+            ServiceTaskProgressRow {
+                name: "worker".to_string(),
+                desired: 1,
+                assigned: 1,
+                pending: 1,
+                pulling: 0,
+                creating: 0,
+                volume_unavailable: 0,
+                running: 0,
+                paused: 0,
+                stopping: 0,
+                stopped: 0,
+                failed: 0,
+                exited: 0,
+                unknown: 0,
+                detail: None,
+            },
+        ];
 
         let rendered = render_progress_block(&row, '|').expect("render progress block");
-        assert!(rendered.contains("1/3"));
-        assert!(rendered.contains("[####........]"));
-        assert!(rendered.contains("waiting for readiness"));
-        assert!(rendered.contains("|-- web"));
-        assert!(rendered.contains("1/3 running, 1 unassigned, 1 creating"));
-        assert!(rendered.contains("starting container"));
+        assert_eq!(
+            rendered,
+            "deployment svc  |\n  status    deploying\n  rollout   forward 1/3\n  replicas  1/4  [####--------]\n  detail    waiting for readiness\n\n  tasks\n  |-- web     1/3 running  1 waiting  1 creating\n  |   detail  starting container\n  `-- worker  0/1 running  1 pending\n"
+        );
     }
 }
