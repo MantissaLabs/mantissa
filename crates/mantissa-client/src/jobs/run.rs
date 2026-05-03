@@ -10,12 +10,12 @@ use crate::runtime_contract::{
 use crate::tasks::uuid_to_string;
 use crate::volumes;
 use crate::workload_submit::{
-    ManifestPortBinding, ResolvedDeclaredVolume, compute_network_id, ensure_declared_volumes,
-    ensure_named_networks,
+    ManifestPortBinding, RequestedNetworkSpec, ResolvedDeclaredVolume, compute_network_id,
+    ensure_declared_volumes,
 };
 use crate::workload_wire::{
     PreparedVolumeMount, prepared_volume_mount_from_resolved, write_env_vars, write_liveness_probe,
-    write_port_bindings, write_secret_files, write_volume_mounts,
+    write_network_requirements, write_port_bindings, write_secret_files, write_volume_mounts,
 };
 use anyhow::{Result, anyhow};
 use mantissa_protocol::jobs::{job_execution, job_retry_policy, job_submit_spec};
@@ -65,6 +65,7 @@ struct PreparedJobSubmitSpec {
     execution_platform: String,
     isolation_mode: String,
     isolation_profile: Option<String>,
+    required_networks: Vec<RequestedNetworkSpec>,
 }
 
 /// One prepared execution template ready for jobs wire encoding.
@@ -194,6 +195,7 @@ async fn prepare_raw_submit_spec(
         execution_platform,
         isolation_mode,
         isolation_profile,
+        required_networks: Vec::new(),
     })
 }
 
@@ -203,7 +205,7 @@ async fn prepare_manifest_submit_spec(
     path: &Path,
 ) -> Result<PreparedJobSubmitSpec> {
     let manifest = load_manifest_from_path(path)?;
-    ensure_named_networks(cfg, manifest.requested_networks()?).await?;
+    let required_networks = manifest.requested_networks()?;
     let resolved_volumes = ensure_declared_volumes(cfg, &manifest.declared_volume_specs()).await?;
 
     Ok(PreparedJobSubmitSpec {
@@ -216,6 +218,7 @@ async fn prepare_manifest_submit_spec(
         execution_platform: manifest.execution_platform.clone(),
         isolation_mode: manifest.isolation_mode.clone(),
         isolation_profile: manifest.isolation_profile.clone(),
+        required_networks,
     })
 }
 
@@ -275,6 +278,12 @@ fn write_job_submit_spec(
     builder.set_execution_platform(&spec.execution_platform);
     builder.set_isolation_mode(&spec.isolation_mode);
     builder.set_isolation_profile(spec.isolation_profile.as_deref().unwrap_or(""));
+    write_network_requirements(
+        &mut builder
+            .reborrow()
+            .init_required_networks(spec.required_networks.len() as u32),
+        &spec.required_networks,
+    );
     Ok(())
 }
 

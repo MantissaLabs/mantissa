@@ -131,6 +131,14 @@ impl JobSpecValue {
         self.touch();
     }
 
+    /// Updates the pending launch detail without consuming another retry attempt.
+    pub fn mark_pending_detail(&mut self, detail: Option<String>) {
+        self.phase_version = self.phase_version.saturating_add(1);
+        self.status = JobStatus::Pending;
+        self.status_detail = normalize_detail(detail);
+        self.touch();
+    }
+
     /// Marks one reserved or adopted workload as the current running attempt.
     pub fn mark_running(&mut self, workload_id: Uuid, detail: Option<String>) {
         self.phase_version = self.phase_version.saturating_add(1);

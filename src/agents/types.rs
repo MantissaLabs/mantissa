@@ -529,6 +529,14 @@ impl AgentRunSpecValue {
         self.updated_at = current_timestamp();
     }
 
+    /// Updates the pending run detail without binding a workload.
+    pub fn mark_pending_detail(&mut self, detail: Option<String>) {
+        self.phase_version = self.phase_version.saturating_add(1);
+        self.status = AgentRunStatus::Pending;
+        self.status_detail = normalize_optional_text(detail);
+        self.touch();
+    }
+
     /// Records the underlying scheduled workload identifier bound to this run after scheduling
     /// succeeds.
     pub fn bind_workload(&mut self, workload_id: Uuid, detail: Option<String>) {

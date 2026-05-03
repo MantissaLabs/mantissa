@@ -12,6 +12,9 @@ use crate::workload::model::WorkloadPhase;
 use crate::workload::model::{
     WorkloadAgentRunMetadata, WorkloadEnvironmentVariable, WorkloadOwner, WorkloadVolumeMount,
 };
+use crate::workload::network_prerequisites::{
+    WorkloadNetworkPrerequisites, WorkloadNetworkRequirement,
+};
 use crate::workload::types::ResolvedExecutionSpec;
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
@@ -45,6 +48,7 @@ pub struct AgentSubmission {
 pub struct AgentControllerConfig {
     pub registry: AgentRegistry,
     pub workload_manager: WorkloadManager,
+    pub network_prerequisites: WorkloadNetworkPrerequisites,
     pub cluster_registry: Registry,
     pub gossip_tx: Sender<Message>,
     pub gossip_rx: Receiver<Message>,
@@ -57,6 +61,7 @@ pub struct AgentControllerConfig {
 pub struct AgentController {
     registry: AgentRegistry,
     workload_manager: WorkloadManager,
+    network_prerequisites: WorkloadNetworkPrerequisites,
     cluster_registry: Registry,
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
@@ -71,6 +76,7 @@ impl AgentController {
         let AgentControllerConfig {
             registry,
             workload_manager,
+            network_prerequisites,
             cluster_registry,
             gossip_tx,
             gossip_rx,
@@ -80,6 +86,7 @@ impl AgentController {
         Self {
             registry,
             workload_manager,
+            network_prerequisites,
             cluster_registry,
             gossip_tx,
             gossip_rx,
@@ -126,8 +133,12 @@ impl AgentController {
         checkpoint: AgentCheckpointPolicy,
         interaction: crate::agents::types::AgentInteractionPolicy,
         initial_input: Option<String>,
+        required_networks: Vec<WorkloadNetworkRequirement>,
     ) -> Result<AgentSubmission> {
         validate_agent_execution(&execution)?;
+        self.network_prerequisites
+            .ensure_required_networks("agent session submission", &required_networks)
+            .await?;
 
         let session = AgentSessionSpecValue::new(
             Uuid::new_v4(),
@@ -663,6 +674,20 @@ impl AgentController {
             ))),
             target_node: None,
         };
+
+        if let Some(detail) = self
+            .network_prerequisites
+            .launch_readiness_detail(std::slice::from_ref(&request))?
+        {
+            let mut pending = run.clone();
+            if pending.status_detail.as_deref() != Some(detail.as_str()) {
+                pending.mark_pending_detail(Some(detail));
+                self.apply_run(pending.clone()).await?;
+                self.broadcast(AgentEvent::UpsertRun(Box::new(pending)))
+                    .await?;
+            }
+            return Ok(());
+        }
 
         match self
             .workload_manager

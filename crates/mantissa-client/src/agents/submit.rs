@@ -7,9 +7,11 @@ use crate::runtime_contract::{
 };
 use crate::tasks::uuid_to_string;
 use crate::volumes;
+use crate::workload_submit::RequestedNetworkSpec;
 use crate::workload_wire::{
     PreparedVolumeMount, prepared_volume_mount_from_resolved, write_env_vars, write_liveness_probe,
-    write_optional_volume_mount, write_secret_files, write_volume_mounts,
+    write_network_requirements, write_optional_volume_mount, write_secret_files,
+    write_volume_mounts,
 };
 use anyhow::{Result, anyhow};
 use mantissa_protocol::agents::agent_session_spec;
@@ -57,6 +59,7 @@ pub(crate) struct PreparedAgentSessionSpec {
     pub checkpoint: PreparedAgentCheckpointPolicy,
     pub interaction: PreparedAgentInteractionPolicy,
     pub pending_input: Option<String>,
+    pub required_networks: Vec<RequestedNetworkSpec>,
 }
 
 /// One prepared execution template ready for agents wire encoding.
@@ -175,6 +178,7 @@ async fn prepare_raw_submit_spec(
             idle_timeout_secs: options.idle_timeout_secs,
         },
         pending_input: normalize_optional_text(options.initial_input),
+        required_networks: Vec::new(),
     })
 }
 
@@ -234,6 +238,12 @@ pub(crate) fn write_agent_session_spec(
     write_tool_policy(builder.reborrow(), &spec.tools);
     write_checkpoint_policy(builder.reborrow(), &spec.checkpoint);
     write_interaction_policy(builder.reborrow(), &spec.interaction);
+    write_network_requirements(
+        &mut builder
+            .reborrow()
+            .init_required_networks(spec.required_networks.len() as u32),
+        &spec.required_networks,
+    );
 
     builder.reborrow().init_events(0);
     Ok(())

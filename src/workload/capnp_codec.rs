@@ -2,6 +2,7 @@ use crate::volumes::types::LocalVolumeOwnership;
 use crate::workload::model::{
     WorkloadEnvironmentVariable, WorkloadSecretFile, WorkloadSecretReference, WorkloadVolumeMount,
 };
+use crate::workload::network_prerequisites::{WorkloadNetworkIpFamily, WorkloadNetworkRequirement};
 use crate::workload::types::{
     WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadPortBinding, WorkloadPortProtocol,
     WorkloadRestartPolicy, WorkloadRestartPolicyKind,
@@ -9,7 +10,7 @@ use crate::workload::types::{
 use capnp::{Error, struct_list};
 use mantissa_protocol::volumes::local_volume_ownership;
 use mantissa_protocol::workload::{
-    environment_var, port_binding, secret_file, secret_ref, volume_mount,
+    environment_var, network_requirement, port_binding, secret_file, secret_ref, volume_mount,
 };
 use uuid::Uuid;
 
@@ -83,6 +84,48 @@ pub fn decode_env_vars(
         });
     }
     Ok(env)
+}
+
+/// Decodes manifest-level network requirements from the shared workload schema list.
+pub fn decode_network_requirements(
+    list: struct_list::Reader<network_requirement::Owned>,
+) -> Result<Vec<WorkloadNetworkRequirement>, Error> {
+    let mut required = Vec::with_capacity(list.len() as usize);
+    for network in list.iter() {
+        required.push(decode_network_requirement(network)?);
+    }
+    Ok(required)
+}
+
+/// Decodes one manifest-level network requirement from the shared workload schema.
+pub fn decode_network_requirement(
+    reader: network_requirement::Reader<'_>,
+) -> Result<WorkloadNetworkRequirement, Error> {
+    let name = reader.get_name()?.to_str()?.trim().to_string();
+    if name.is_empty() {
+        return Err(Error::failed(
+            "required network name cannot be empty".to_string(),
+        ));
+    }
+
+    let driver = crate::network::types::NetworkDriver::from_proto(reader.get_driver()?);
+    let ip_family = match reader.get_ip_family() {
+        Ok(mantissa_protocol::workload::NetworkRequirementIpFamily::Default) | Err(_) => {
+            WorkloadNetworkIpFamily::Default
+        }
+        Ok(mantissa_protocol::workload::NetworkRequirementIpFamily::Ipv4) => {
+            WorkloadNetworkIpFamily::Ipv4
+        }
+        Ok(mantissa_protocol::workload::NetworkRequirementIpFamily::Ipv6) => {
+            WorkloadNetworkIpFamily::Ipv6
+        }
+    };
+
+    Ok(WorkloadNetworkRequirement {
+        name,
+        driver,
+        ip_family,
+    })
 }
 
 /// Encodes task secret files into the task schema list.

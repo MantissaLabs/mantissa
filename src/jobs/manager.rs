@@ -8,6 +8,9 @@ use crate::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadJobMetadata, WorkloadOwner, WorkloadPhase,
     WorkloadSpec, WorkloadStateFilter,
 };
+use crate::workload::network_prerequisites::{
+    WorkloadNetworkPrerequisites, WorkloadNetworkRequirement,
+};
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
 use chrono::Utc;
@@ -29,10 +32,22 @@ pub struct JobSubmission {
     pub job_id: Uuid,
 }
 
+/// Controller-facing payload for one new first-class job submission.
+pub struct JobSubmitRequest {
+    pub name: String,
+    pub execution: crate::workload::types::ResolvedExecutionSpec,
+    pub execution_platform: ExecutionPlatform,
+    pub isolation_mode: IsolationMode,
+    pub isolation_profile: Option<String>,
+    pub retry_policy: JobRetryPolicy,
+    pub required_networks: Vec<WorkloadNetworkRequirement>,
+}
+
 /// Dependencies used to construct one job controller.
 pub struct JobControllerConfig {
     pub registry: JobRegistry,
     pub workload_manager: WorkloadManager,
+    pub network_prerequisites: WorkloadNetworkPrerequisites,
     pub cluster_registry: Registry,
     pub gossip_tx: Sender<Message>,
     pub gossip_rx: Receiver<Message>,
@@ -45,6 +60,7 @@ pub struct JobControllerConfig {
 pub struct JobController {
     registry: JobRegistry,
     workload_manager: WorkloadManager,
+    network_prerequisites: WorkloadNetworkPrerequisites,
     cluster_registry: Registry,
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
@@ -59,6 +75,7 @@ impl JobController {
         let JobControllerConfig {
             registry,
             workload_manager,
+            network_prerequisites,
             cluster_registry,
             gossip_tx,
             gossip_rx,
@@ -68,6 +85,7 @@ impl JobController {
         Self {
             registry,
             workload_manager,
+            network_prerequisites,
             cluster_registry,
             gossip_tx,
             gossip_rx,
@@ -101,25 +119,20 @@ impl JobController {
     }
 
     /// Submits one new finite job using the shared workload execution template.
-    pub async fn submit(
-        &self,
-        name: impl Into<String>,
-        execution: crate::workload::types::ResolvedExecutionSpec,
-        execution_platform: ExecutionPlatform,
-        isolation_mode: IsolationMode,
-        isolation_profile: Option<String>,
-        retry_policy: JobRetryPolicy,
-    ) -> Result<JobSubmission> {
-        validate_job_execution(&execution)?;
+    pub async fn submit(&self, request: JobSubmitRequest) -> Result<JobSubmission> {
+        validate_job_execution(&request.execution)?;
+        self.network_prerequisites
+            .ensure_required_networks("job submission", &request.required_networks)
+            .await?;
 
         let spec = JobSpecValue::new(
             Uuid::new_v4(),
-            name,
-            execution,
-            execution_platform,
-            isolation_mode,
-            isolation_profile,
-            retry_policy,
+            request.name,
+            request.execution,
+            request.execution_platform,
+            request.isolation_mode,
+            request.isolation_profile,
+            request.retry_policy,
         );
         self.apply_upsert(spec.clone()).await?;
         self.broadcast(JobEvent::Upsert(Box::new(spec.clone())))
@@ -531,6 +544,25 @@ impl JobController {
             ))),
             target_node: None,
         };
+
+        if let Some(detail) = self
+            .network_prerequisites
+            .launch_readiness_detail(std::slice::from_ref(&request))?
+        {
+            let mut current = match self.registry.get(spec.id)? {
+                Some(current) => current,
+                None => return Ok(()),
+            };
+            if current.is_terminal() || current.active_workload_id != Some(workload_id) {
+                return Ok(());
+            }
+            if current.status_detail.as_deref() != Some(detail.as_str()) {
+                current.mark_pending_detail(Some(detail));
+                self.apply_upsert(current.clone()).await?;
+                self.broadcast(JobEvent::Upsert(Box::new(current))).await?;
+            }
+            return Ok(());
+        }
 
         match self
             .workload_manager

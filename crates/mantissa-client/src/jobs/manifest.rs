@@ -270,7 +270,7 @@ impl JobManifest {
         Ok(())
     }
 
-    /// Resolves the manifest network references into auto-provision requests.
+    /// Resolves the manifest network references into server-side provisioning requirements.
     pub(crate) fn requested_networks(&self) -> Result<Vec<RequestedNetworkSpec>> {
         resolve_requested_networks(
             self.execution.networks.iter().map(String::as_str),

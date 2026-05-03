@@ -6,9 +6,9 @@ use crate::agents::types::{
 };
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
-    decode_env_vars, decode_secret_files, decode_task_liveness_probe, decode_task_restart_policy,
-    decode_volume_mounts, encode_env_vars, encode_secret_files, encode_task_liveness_probe,
-    encode_task_restart_policy, encode_volume_mounts,
+    decode_env_vars, decode_network_requirements, decode_secret_files, decode_task_liveness_probe,
+    decode_task_restart_policy, decode_volume_mounts, encode_env_vars, encode_secret_files,
+    encode_task_liveness_probe, encode_task_restart_policy, encode_volume_mounts,
 };
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
 use crate::workload::types::ResolvedExecutionSpec;
@@ -46,6 +46,7 @@ impl agents::Server for AgentsRpc {
             .ensure_no_active_cluster_operation("submit agent sessions")?;
 
         let reader = params.get()?.get_session()?;
+        let required_networks = decode_network_requirements(reader.get_required_networks()?)?;
         let session = read_agent_session_spec(reader)?;
         let AgentSubmission { session_id } = self
             .manager
@@ -60,6 +61,7 @@ impl agents::Server for AgentsRpc {
                 session.checkpoint,
                 session.interaction,
                 session.pending_input,
+                required_networks,
             )
             .await
             .map_err(|error| Error::failed(error.to_string()))?;

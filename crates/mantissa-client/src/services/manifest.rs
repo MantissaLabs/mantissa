@@ -910,7 +910,7 @@ impl ServiceManifest {
         Ok(())
     }
 
-    /// Resolves the set of manifest network references into auto-provision requests.
+    /// Resolves the set of manifest network references into server-side provisioning requirements.
     pub(crate) fn requested_networks(&self) -> Result<Vec<RequestedNetworkSpec>> {
         resolve_requested_networks(
             self.task_templates

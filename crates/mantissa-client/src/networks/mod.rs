@@ -114,50 +114,9 @@ fn default_network_subnet_candidate_v6(hash: u32, offset: u32) -> String {
     format!("fd42:{group:04x}:{bucket:04x}::/{DEFAULT_NETWORK_SUBNET_PREFIX_V6}")
 }
 
-/// Build a default network creation request used by manifest clients that auto-provision networks.
-pub fn default_network_create_request<I, S>(
-    name: impl Into<String>,
-    existing_subnets: I,
-    family: NetworkIpFamily,
-) -> NetworkCreateRequest
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    default_network_create_request_for_driver(name, existing_subnets, family, NetworkDriver::Vxlan)
-}
-
-/// Build a default network creation request for the requested driver.
-pub fn default_network_create_request_for_driver<I, S>(
-    name: impl Into<String>,
-    existing_subnets: I,
-    family: NetworkIpFamily,
-    driver: NetworkDriver,
-) -> NetworkCreateRequest
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let name = name.into();
-    let mut programs = default_network_bpf_programs_for_driver(driver);
-    programs.sort();
-    programs.dedup();
-
-    NetworkCreateRequest {
-        name: name.clone(),
-        description: None,
-        driver,
-        subnet_cidr: default_network_subnet(&name, existing_subnets, family),
-        vni: None,
-        mtu: None,
-        bpf_programs: programs,
-        sealed: false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{default_network_create_request, default_network_subnet};
+    use super::default_network_subnet;
     use crate::config::NetworkIpFamily;
 
     #[test]
@@ -215,30 +174,6 @@ mod tests {
         assert_ne!(
             initial, resolved,
             "IPv6 default subnet selection should probe away from an already used default range"
-        );
-    }
-
-    #[test]
-    fn default_network_create_request_uses_resolved_default_subnet_for_ipv4() {
-        let request =
-            default_network_create_request("demo", ["10.0.0.0/20"], NetworkIpFamily::Ipv4);
-        assert!(
-            request.subnet_cidr.ends_with("/20"),
-            "auto-provisioned networks should use the deterministic /20 default range"
-        );
-    }
-
-    #[test]
-    fn default_network_create_request_uses_resolved_default_subnet_for_ipv6() {
-        let request =
-            default_network_create_request("demo", ["fd42:1234:5678::/64"], NetworkIpFamily::Ipv6);
-        assert!(
-            request.subnet_cidr.starts_with("fd42:"),
-            "auto-provisioned IPv6 networks should stay inside the default ULA range"
-        );
-        assert!(
-            request.subnet_cidr.ends_with("/64"),
-            "auto-provisioned IPv6 networks should use deterministic /64 defaults"
         );
     }
 }

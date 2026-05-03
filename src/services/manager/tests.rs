@@ -7,7 +7,7 @@ use super::readiness::{ReadinessClass, classify_readiness_states};
 use super::rollout::wait_rollout_task_running_with_state_fetcher;
 use super::state::*;
 use super::*;
-use crate::network::types::{NetworkSpecDraft, NetworkSpecValue};
+use crate::network::types::{NetworkDriver, NetworkSpecDraft, NetworkSpecValue};
 use crate::services::types::TaskTemplateNetworkRequirement;
 use crate::store::network_store::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,

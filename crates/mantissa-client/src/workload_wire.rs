@@ -3,11 +3,12 @@ use crate::jobs::manifest::{
 };
 use crate::volumes::LocalVolumeOwnership;
 use crate::volumes::ResolvedVolumeMount;
-use crate::workload_submit::{ManifestPortBinding, ManifestPortProtocol};
+use crate::workload_submit::{ManifestPortBinding, ManifestPortProtocol, RequestedNetworkSpec};
 use capnp::struct_list;
 use mantissa_protocol::volumes::local_volume_ownership;
 use mantissa_protocol::workload::{
-    environment_var, liveness_probe, port_binding, secret_file, secret_ref, volume_mount,
+    environment_var, liveness_probe, network_requirement, port_binding, secret_file, secret_ref,
+    volume_mount,
 };
 use uuid::Uuid;
 
@@ -104,6 +105,28 @@ pub fn write_volume_mounts(
         entry.set_volume_name(&mount.volume_name);
         entry.set_target(&mount.target);
         entry.set_read_only(mount.read_only);
+    }
+}
+
+/// Encodes manifest network requirements into the shared workload wire builder.
+pub fn write_network_requirements(
+    builder: &mut struct_list::Builder<network_requirement::Owned>,
+    requirements: &[RequestedNetworkSpec],
+) {
+    for (index, network) in requirements.iter().enumerate() {
+        let mut entry = builder.reborrow().get(index as u32);
+        entry.set_name(&network.name);
+        entry.set_driver(network.driver.into());
+        let family = match network.ip_family {
+            Some(crate::config::NetworkIpFamily::Ipv4) => {
+                mantissa_protocol::workload::NetworkRequirementIpFamily::Ipv4
+            }
+            Some(crate::config::NetworkIpFamily::Ipv6) => {
+                mantissa_protocol::workload::NetworkRequirementIpFamily::Ipv6
+            }
+            None => mantissa_protocol::workload::NetworkRequirementIpFamily::Default,
+        };
+        entry.set_ip_family(family);
     }
 }
 

@@ -89,6 +89,9 @@ struct JobSubmitSpec {
 
   isolationProfile @5 :Text;
   # Optional isolation profile requested for each workload attempt.
+
+  requiredNetworks @6 :List(WorkloadSchema.NetworkRequirement);
+  # Networks referenced by the manifest that the job controller must provision before placement.
 }
 
 struct JobSnapshot {

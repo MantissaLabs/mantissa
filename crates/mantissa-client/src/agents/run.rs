@@ -5,9 +5,7 @@ use crate::agents::submit::{
     submit_prepared_session,
 };
 use crate::config::ClientConfig;
-use crate::workload_submit::{
-    ResolvedDeclaredVolume, compute_network_id, ensure_declared_volumes, ensure_named_networks,
-};
+use crate::workload_submit::{ResolvedDeclaredVolume, compute_network_id, ensure_declared_volumes};
 use crate::workload_wire::PreparedVolumeMount;
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
@@ -30,7 +28,7 @@ async fn prepare_manifest_submit_spec(
     path: &Path,
 ) -> Result<PreparedAgentSessionSpec> {
     let manifest = load_manifest_from_path(path)?;
-    ensure_named_networks(cfg, manifest.requested_networks()?).await?;
+    let required_networks = manifest.requested_networks()?;
     let resolved_volumes = ensure_declared_volumes(cfg, &manifest.declared_volume_specs()).await?;
 
     Ok(PreparedAgentSessionSpec {
@@ -69,6 +67,7 @@ async fn prepare_manifest_submit_spec(
             idle_timeout_secs: manifest.interaction.idle_timeout_secs,
         },
         pending_input: manifest.pending_input.clone(),
+        required_networks,
     })
 }
 

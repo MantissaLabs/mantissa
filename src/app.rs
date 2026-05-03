@@ -46,10 +46,10 @@ fn resolve_local_volume_ownership(
     }
 }
 
-/// Resolves the preferred family for auto-created overlay networks from explicit node addressing.
+/// Resolves the preferred family for default `networks create` subnets from node addressing.
 ///
-/// Automatic network creation should follow the operator's declared node IP family so service and
-/// job manifests can produce IPv6 overlays without an extra manual network creation step.
+/// The CLI default should follow the operator's declared node IP family so manual network creation
+/// produces the same address family the daemon would choose for manifest-created networks.
 fn resolve_default_network_ip_family() -> NetworkIpFamily {
     let (has_ipv4, has_ipv6) = crate::node::address::detect_local_ip_families();
     match infer_default_ip_family(

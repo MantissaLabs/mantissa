@@ -1,4 +1,5 @@
 use super::*;
+use crate::network::types::NetworkDriver;
 
 /// Immutable inputs used to derive deterministic service slot targets.
 pub(super) struct SlotTargetContext<'a> {

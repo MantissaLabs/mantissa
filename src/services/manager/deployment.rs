@@ -10,21 +10,7 @@ use super::placement::{
 };
 use super::state::deploying_assignment_incomplete;
 use super::*;
-use crate::config;
-use crate::ip_family::{IpFamily, infer_default_ip_family};
-use crate::network::bpf::overlay_bpf_program_specs;
-use crate::network::types::{
-    NetworkEvent, NetworkSpecDraft, NetworkSpecUpdate, NetworkSpecValue, NetworkStatus,
-};
-
-/// IPv4 prefix used by deterministic auto-provisioned service networks.
-const SERVICE_DEFAULT_NETWORK_SUBNET_PREFIX_V4: u8 = 20;
-/// Number of non-overlapping `/20` candidates inside the default IPv4 `10.0.0.0/8` range.
-const SERVICE_DEFAULT_NETWORK_SUBNET_CANDIDATES_V4: u32 = 1 << 12;
-/// IPv6 prefix used by deterministic auto-provisioned service networks.
-const SERVICE_DEFAULT_NETWORK_SUBNET_PREFIX_V6: u8 = 64;
-/// Number of deterministic IPv6 ULA subnet candidates probed before falling back to the first.
-const SERVICE_DEFAULT_NETWORK_SUBNET_CANDIDATES_V6: u32 = 1 << 16;
+use crate::workload::network_prerequisites::WorkloadNetworkRequirement;
 
 impl ServiceController {
     /// Schedules an asynchronous deployment for the provided service manifest and returns
@@ -99,7 +85,7 @@ impl ServiceController {
         service_name: impl Into<String>,
         task_templates: Vec<TaskTemplateSpecValue>,
         update_strategy: ServiceUpdateStrategy,
-        required_networks: Vec<ServiceRequiredNetworkSpec>,
+        required_networks: Vec<WorkloadNetworkRequirement>,
     ) -> anyhow::Result<ServiceDeploymentSubmission> {
         let manifest_name = manifest_name.into();
         let service_name = service_name.into();
@@ -110,7 +96,9 @@ impl ServiceController {
                 service_name
             )
         })?;
-        self.ensure_required_networks(&required_networks).await?;
+        self.network_prerequisites
+            .ensure_required_networks("service deployment", &required_networks)
+            .await?;
         self.ensure_network_contracts(&service_name, task_templates.as_slice())?;
         let desired_public_claims =
             collect_public_port_claims(&service_name, task_templates.as_slice())?;
@@ -265,217 +253,6 @@ impl ServiceController {
             service_id,
             outcome: ServiceDeploymentOutcome::Accepted,
         })
-    }
-
-    /// Ensures every network declared by the deployment request exists before service admission.
-    async fn ensure_required_networks(
-        &self,
-        required_networks: &[ServiceRequiredNetworkSpec],
-    ) -> anyhow::Result<()> {
-        let required = normalize_required_networks(required_networks)?;
-        if required.is_empty() {
-            return Ok(());
-        }
-
-        let existing = self.network_registry.list_specs()?;
-        let existing_by_name: HashMap<String, NetworkSpecValue> = existing
-            .iter()
-            .cloned()
-            .map(|spec| (spec.name.clone(), spec))
-            .collect();
-        let mut known_subnets: BTreeSet<String> = existing
-            .iter()
-            .filter(|spec| !spec.is_deleted())
-            .map(|spec| spec.subnet_cidr.clone())
-            .collect();
-
-        for requested in required {
-            if let Some(existing) = existing_by_name.get(&requested.name)
-                && !existing.is_deleted()
-            {
-                self.validate_existing_required_network(existing, &requested)?;
-                continue;
-            }
-
-            let mut spec = self.build_required_network_spec(&requested, &known_subnets);
-            if let Some(mut deleted) = existing_by_name.get(&requested.name).cloned()
-                && deleted.is_deleted()
-            {
-                deleted.reset_for_recreate(NetworkSpecUpdate {
-                    description: spec.description.clone(),
-                    driver: spec.driver,
-                    subnet_cidr: spec.subnet_cidr.clone(),
-                    vni: spec.vni,
-                    mtu: spec.mtu,
-                    sealed: spec.sealed,
-                    bpf_programs: spec.bpf_programs.clone(),
-                });
-                spec = deleted;
-            }
-
-            spec.set_status(NetworkStatus::Pending);
-            self.network_registry.upsert_spec(spec.clone()).await?;
-            self.gossip_tx
-                .send(Message::Network {
-                    id: Uuid::new_v4(),
-                    event: NetworkEvent::Upsert(spec.clone()),
-                })
-                .await
-                .map_err(|err| anyhow!("failed to broadcast network upsert: {err}"))?;
-            self.network_controller.schedule_spec_change(spec.id).await;
-            known_subnets.insert(spec.subnet_cidr.clone());
-            tracing::info!(
-                target: "services",
-                "network '{}' auto-provisioned for service deployment with id {}",
-                spec.name,
-                spec.id
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Validates that a named network already in the registry satisfies the deployment request.
-    fn validate_existing_required_network(
-        &self,
-        existing: &NetworkSpecValue,
-        requested: &ServiceRequiredNetworkSpec,
-    ) -> anyhow::Result<()> {
-        if existing.status == NetworkStatus::Deleting {
-            return Err(anyhow!(
-                "service deployment requests network '{}' but the existing network is deleting",
-                requested.name
-            ));
-        }
-        if existing.driver != requested.driver {
-            return Err(anyhow!(
-                "service deployment requests network '{}' with driver {:?} but existing network uses {:?}",
-                requested.name,
-                requested.driver,
-                existing.driver
-            ));
-        }
-        Ok(())
-    }
-
-    /// Builds the replicated network spec used when a service deployment auto-provisions a network.
-    fn build_required_network_spec(
-        &self,
-        requested: &ServiceRequiredNetworkSpec,
-        known_subnets: &BTreeSet<String>,
-    ) -> NetworkSpecValue {
-        let family = match requested.ip_family {
-            ServiceRequiredNetworkIpFamily::Ipv4 => ServiceRequiredNetworkIpFamily::Ipv4,
-            ServiceRequiredNetworkIpFamily::Ipv6 => ServiceRequiredNetworkIpFamily::Ipv6,
-            ServiceRequiredNetworkIpFamily::Default => default_required_network_family(),
-        };
-        let bpf_programs = match requested.driver {
-            NetworkDriver::Vxlan => overlay_bpf_program_specs(),
-            NetworkDriver::Bridge => Vec::new(),
-        };
-
-        NetworkSpecValue::new(NetworkSpecDraft {
-            name: requested.name.clone(),
-            description: String::new(),
-            driver: requested.driver,
-            subnet_cidr: default_required_network_subnet(
-                &requested.name,
-                known_subnets.iter().map(String::as_str),
-                family,
-            ),
-            vni: 0,
-            mtu: 0,
-            sealed: false,
-            bpf_programs,
-        })
-    }
-
-    /// Builds a human-readable readiness blocker when targeted task nodes lack required networks.
-    fn deployment_network_readiness_detail(
-        &self,
-        requests: &[WorkloadStartRequest],
-    ) -> anyhow::Result<Option<String>> {
-        let mut blockers = BTreeSet::new();
-        for request in requests {
-            for network_id in &request.networks {
-                match request.target_node {
-                    Some(node_id) => {
-                        if !self.network_ready_on_node(*network_id, node_id)? {
-                            blockers.insert(format!(
-                                "network '{}' not ready on node '{}'",
-                                self.network_label(*network_id)?,
-                                self.node_label(node_id)
-                            ));
-                        }
-                    }
-                    None => {
-                        if !self.network_ready_on_any_peer(*network_id)? {
-                            blockers.insert(format!(
-                                "network '{}' has no ready schedulable peer",
-                                self.network_label(*network_id)?
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        if blockers.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(format!(
-                "waiting for network readiness: {}",
-                format_service_network_readiness_blockers(&blockers)
-            )))
-        }
-    }
-
-    /// Returns true once the given peer has reconciled the requested network locally.
-    fn network_ready_on_node(&self, network_id: Uuid, node_id: Uuid) -> anyhow::Result<bool> {
-        let Some(spec) = self.network_registry.get_spec(network_id)? else {
-            return Ok(false);
-        };
-        if spec.is_deleted() {
-            return Ok(false);
-        }
-        Ok(self
-            .network_registry
-            .get_peer_state(network_id, node_id)?
-            .is_some_and(|state| state.state.is_ready()))
-    }
-
-    /// Returns true once any schedulable peer can host workloads for the requested network.
-    fn network_ready_on_any_peer(&self, network_id: Uuid) -> anyhow::Result<bool> {
-        let Some(spec) = self.network_registry.get_spec(network_id)? else {
-            return Ok(false);
-        };
-        if spec.is_deleted() {
-            return Ok(false);
-        }
-        for state in self.network_registry.list_peer_states(Some(network_id))? {
-            if state.state.is_ready() && self.cluster_registry.peer_schedulable(state.peer_id) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Renders one network id as a stable operator-facing label for service status details.
-    fn network_label(&self, network_id: Uuid) -> anyhow::Result<String> {
-        Ok(self
-            .network_registry
-            .get_spec(network_id)?
-            .map(|spec| spec.name)
-            .unwrap_or_else(|| short_uuid(network_id)))
-    }
-
-    /// Renders one node id as a compact hostname-or-id label for service status details.
-    fn node_label(&self, node_id: Uuid) -> String {
-        self.cluster_registry
-            .peer_hostname(node_id)
-            .map(|hostname| hostname.trim().to_string())
-            .filter(|hostname| !hostname.is_empty())
-            .unwrap_or_else(|| short_uuid(node_id))
     }
 
     /// Validate service declarations whose behavior depends on the referenced network drivers.
@@ -836,7 +613,10 @@ impl ServiceController {
             return Ok(());
         }
 
-        if let Some(detail) = self.deployment_network_readiness_detail(&requests)? {
+        if let Some(detail) = self
+            .network_prerequisites
+            .launch_readiness_detail(&requests)?
+        {
             self.update_service_status_detail_if_current(service_id, manifest_id, Some(detail))
                 .await;
             tracing::info!(
@@ -1138,7 +918,10 @@ impl ServiceController {
                 continue;
             }
 
-            if let Some(detail) = self.deployment_network_readiness_detail(&requests)? {
+            if let Some(detail) = self
+                .network_prerequisites
+                .launch_readiness_detail(&requests)?
+            {
                 self.update_service_status_detail_if_current(service_id, manifest_id, Some(detail))
                     .await;
                 tracing::info!(
@@ -2051,163 +1834,6 @@ fn is_running_deployment_noop(
         && existing.update_strategy == *update_strategy
 }
 
-/// Deduplicates service-required networks while rejecting conflicting driver or family requests.
-fn normalize_required_networks(
-    required_networks: &[ServiceRequiredNetworkSpec],
-) -> anyhow::Result<Vec<ServiceRequiredNetworkSpec>> {
-    let mut normalized: BTreeMap<String, ServiceRequiredNetworkSpec> = BTreeMap::new();
-    for network in required_networks {
-        let name = network.name.trim();
-        if name.is_empty() {
-            continue;
-        }
-
-        if let Some(existing) = normalized.get_mut(name) {
-            if existing.driver != network.driver {
-                return Err(anyhow!(
-                    "service deployment requests network '{}' with conflicting drivers",
-                    name
-                ));
-            }
-            match (existing.ip_family, network.ip_family) {
-                (ServiceRequiredNetworkIpFamily::Ipv4, ServiceRequiredNetworkIpFamily::Ipv6)
-                | (ServiceRequiredNetworkIpFamily::Ipv6, ServiceRequiredNetworkIpFamily::Ipv4) => {
-                    return Err(anyhow!(
-                        "service deployment requests network '{}' with conflicting IP families",
-                        name
-                    ));
-                }
-                (ServiceRequiredNetworkIpFamily::Default, explicit)
-                    if explicit != ServiceRequiredNetworkIpFamily::Default =>
-                {
-                    existing.ip_family = explicit;
-                }
-                _ => {}
-            }
-            continue;
-        }
-
-        normalized.insert(
-            name.to_string(),
-            ServiceRequiredNetworkSpec {
-                name: name.to_string(),
-                driver: network.driver,
-                ip_family: network.ip_family,
-            },
-        );
-    }
-
-    Ok(normalized.into_values().collect())
-}
-
-/// Resolves the daemon's default network IP family for service-side auto-provisioning.
-fn default_required_network_family() -> ServiceRequiredNetworkIpFamily {
-    let (has_ipv4, has_ipv6) = crate::node::address::detect_local_ip_families();
-    match infer_default_ip_family(
-        config::nodeport_ip(),
-        config::advertise_addr().as_deref(),
-        config::default_ip_family_policy(),
-        has_ipv4,
-        has_ipv6,
-    ) {
-        IpFamily::Ipv4 => ServiceRequiredNetworkIpFamily::Ipv4,
-        IpFamily::Ipv6 => ServiceRequiredNetworkIpFamily::Ipv6,
-    }
-}
-
-/// Computes a deterministic default subnet for an auto-provisioned service network.
-fn default_required_network_subnet<I, S>(
-    name: &str,
-    existing_subnets: I,
-    family: ServiceRequiredNetworkIpFamily,
-) -> String
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let used: BTreeSet<String> = existing_subnets
-        .into_iter()
-        .map(|subnet| subnet.as_ref().trim().to_string())
-        .collect();
-    let hash = default_required_network_subnet_hash(name);
-    let candidates = default_required_network_subnet_candidate_count(family);
-
-    for offset in 0..candidates {
-        let candidate = default_required_network_subnet_candidate(hash, offset, family);
-        if !used.contains(&candidate) {
-            return candidate;
-        }
-    }
-
-    default_required_network_subnet_candidate(hash, 0, family)
-}
-
-/// Hashes a network name into a stable default-subnet selection seed.
-fn default_required_network_subnet_hash(name: &str) -> u32 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(name.as_bytes());
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; 4];
-    bytes.copy_from_slice(&digest.as_bytes()[..4]);
-    u32::from_le_bytes(bytes)
-}
-
-/// Returns the number of deterministic subnet candidates in the requested family.
-fn default_required_network_subnet_candidate_count(family: ServiceRequiredNetworkIpFamily) -> u32 {
-    match family {
-        ServiceRequiredNetworkIpFamily::Default | ServiceRequiredNetworkIpFamily::Ipv4 => {
-            SERVICE_DEFAULT_NETWORK_SUBNET_CANDIDATES_V4
-        }
-        ServiceRequiredNetworkIpFamily::Ipv6 => SERVICE_DEFAULT_NETWORK_SUBNET_CANDIDATES_V6,
-    }
-}
-
-/// Converts a deterministic subnet candidate offset into a concrete CIDR string.
-fn default_required_network_subnet_candidate(
-    hash: u32,
-    offset: u32,
-    family: ServiceRequiredNetworkIpFamily,
-) -> String {
-    match family {
-        ServiceRequiredNetworkIpFamily::Default | ServiceRequiredNetworkIpFamily::Ipv4 => {
-            default_required_network_subnet_candidate_v4(hash, offset)
-        }
-        ServiceRequiredNetworkIpFamily::Ipv6 => {
-            default_required_network_subnet_candidate_v6(hash, offset)
-        }
-    }
-}
-
-/// Converts one candidate offset into a unique `10.0.0.0/8` `/20` subnet.
-fn default_required_network_subnet_candidate_v4(hash: u32, offset: u32) -> String {
-    let seed = hash & (SERVICE_DEFAULT_NETWORK_SUBNET_CANDIDATES_V4 - 1);
-    let bucket = seed.wrapping_add(offset) & (SERVICE_DEFAULT_NETWORK_SUBNET_CANDIDATES_V4 - 1);
-    let second_octet = (bucket >> 4) as u8;
-    let third_octet = ((bucket & 0x0f) << 4) as u8;
-    format!("10.{second_octet}.{third_octet}.0/{SERVICE_DEFAULT_NETWORK_SUBNET_PREFIX_V4}")
-}
-
-/// Converts one candidate offset into a unique `fd42::/16` `/64` subnet.
-fn default_required_network_subnet_candidate_v6(hash: u32, offset: u32) -> String {
-    let group = (hash >> 16) as u16;
-    let seed = hash as u16;
-    let bucket = seed.wrapping_add(offset as u16);
-    format!("fd42:{group:04x}:{bucket:04x}::/{SERVICE_DEFAULT_NETWORK_SUBNET_PREFIX_V6}")
-}
-
-/// Formats a bounded list of network readiness blockers for service status details.
-fn format_service_network_readiness_blockers(blockers: &BTreeSet<String>) -> String {
-    let mut parts = Vec::new();
-    for blocker in blockers.iter().take(3) {
-        parts.push(blocker.clone());
-    }
-    if blockers.len() > parts.len() {
-        let remaining = blockers.len() - parts.len();
-        parts.push(format!("{remaining} more blocker(s)"));
-    }
-    parts.join("; ")
-}
-
 struct ServiceDeploymentJob {
     manifest_id: Uuid,
     manifest_name: String,
@@ -2257,71 +1883,6 @@ enum DependencyGateBlock {
     Assigned,
     Running,
     Published,
-}
-
-#[cfg(test)]
-mod deployment_tests {
-    use super::*;
-
-    #[test]
-    /// Required network normalization rejects driver conflicts for the same network name.
-    fn normalize_required_networks_rejects_conflicting_drivers() {
-        let err = normalize_required_networks(&[
-            ServiceRequiredNetworkSpec {
-                name: "shared".to_string(),
-                driver: NetworkDriver::Vxlan,
-                ip_family: ServiceRequiredNetworkIpFamily::Default,
-            },
-            ServiceRequiredNetworkSpec {
-                name: "shared".to_string(),
-                driver: NetworkDriver::Bridge,
-                ip_family: ServiceRequiredNetworkIpFamily::Default,
-            },
-        ])
-        .expect_err("conflicting drivers should fail");
-
-        assert!(
-            err.to_string().contains("conflicting drivers"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    /// Default-subnet selection probes away from an already used IPv4 candidate.
-    fn default_required_network_subnet_skips_used_ipv4_candidate() {
-        let initial = default_required_network_subnet(
-            "alpha",
-            std::iter::empty::<&str>(),
-            ServiceRequiredNetworkIpFamily::Ipv4,
-        );
-        let resolved = default_required_network_subnet(
-            "alpha",
-            [initial.as_str()],
-            ServiceRequiredNetworkIpFamily::Ipv4,
-        );
-
-        assert_ne!(initial, resolved);
-        assert!(resolved.ends_with("/20"));
-    }
-
-    #[test]
-    /// Default-subnet selection probes away from an already used IPv6 candidate.
-    fn default_required_network_subnet_skips_used_ipv6_candidate() {
-        let initial = default_required_network_subnet(
-            "alpha",
-            std::iter::empty::<&str>(),
-            ServiceRequiredNetworkIpFamily::Ipv6,
-        );
-        let resolved = default_required_network_subnet(
-            "alpha",
-            [initial.as_str()],
-            ServiceRequiredNetworkIpFamily::Ipv6,
-        );
-
-        assert_ne!(initial, resolved);
-        assert!(resolved.starts_with("fd42:"));
-        assert!(resolved.ends_with("/64"));
-    }
 }
 
 /// Formats one human-readable dependency wait reason for persisted service status details.

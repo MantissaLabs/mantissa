@@ -4,8 +4,7 @@ use crate::scheduler::placement::{
     PlacementStrategy as SchedulerPlacementStrategy,
 };
 use crate::services::manager::{
-    ServiceController, ServiceDeploymentOutcome, ServiceRequiredNetworkIpFamily,
-    ServiceRequiredNetworkSpec, ServiceTaskProgressSnapshot,
+    ServiceController, ServiceDeploymentOutcome, ServiceTaskProgressSnapshot,
 };
 use crate::services::types::{
     ServiceEvent, ServicePortProtocol, ServicePreviousGeneration, ServiceReadinessProbe,
@@ -16,16 +15,16 @@ use crate::services::types::{
 };
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
-    decode_env_vars, decode_port_bindings, decode_secret_files, decode_service_liveness_probe,
-    decode_service_restart_policy, decode_volume_mounts, encode_env_vars, encode_port_bindings,
-    encode_secret_files, encode_service_liveness_probe, encode_service_restart_policy,
-    encode_volume_mounts,
+    decode_env_vars, decode_network_requirements, decode_port_bindings, decode_secret_files,
+    decode_service_liveness_probe, decode_service_restart_policy, decode_volume_mounts,
+    encode_env_vars, encode_port_bindings, encode_secret_files, encode_service_liveness_probe,
+    encode_service_restart_policy, encode_volume_mounts,
 };
 use crate::workload::types::ExecutionSpec;
 use capnp::Error;
 use mantissa_protocol::services::{
-    placement_constraint, placement_constraint_selector, service_event, service_required_network,
-    service_spec, service_task_progress, services, task_template,
+    placement_constraint, placement_constraint_selector, service_event, service_spec,
+    service_task_progress, services, task_template,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::collections::HashSet;
@@ -67,10 +66,7 @@ impl services::Server for ServicesRPC {
             task_templates.push(read_task_template(tmpl)?);
         }
 
-        let mut required_networks = Vec::new();
-        for network in spec.get_required_networks()?.iter() {
-            required_networks.push(read_required_network(network)?);
-        }
+        let required_networks = decode_network_requirements(spec.get_required_networks()?)?;
 
         let update_strategy = if spec.has_update_strategy() {
             read_update_strategy(spec.get_update_strategy()?)?
@@ -713,37 +709,6 @@ fn placement_preference_to_proto(
             mantissa_protocol::services::PlacementPreference::TaskAntiAffinity
         }
     }
-}
-
-/// Decodes one deployment-level network dependency from the service RPC payload.
-fn read_required_network(
-    reader: service_required_network::Reader<'_>,
-) -> Result<ServiceRequiredNetworkSpec, Error> {
-    let name = reader.get_name()?.to_str()?.trim().to_string();
-    if name.is_empty() {
-        return Err(Error::failed(
-            "required network name cannot be empty".to_string(),
-        ));
-    }
-
-    let driver = crate::network::types::NetworkDriver::from_proto(reader.get_driver()?);
-    let ip_family = match reader.get_ip_family() {
-        Ok(mantissa_protocol::services::ServiceNetworkIpFamily::Default) | Err(_) => {
-            ServiceRequiredNetworkIpFamily::Default
-        }
-        Ok(mantissa_protocol::services::ServiceNetworkIpFamily::Ipv4) => {
-            ServiceRequiredNetworkIpFamily::Ipv4
-        }
-        Ok(mantissa_protocol::services::ServiceNetworkIpFamily::Ipv6) => {
-            ServiceRequiredNetworkIpFamily::Ipv6
-        }
-    };
-
-    Ok(ServiceRequiredNetworkSpec {
-        name,
-        driver,
-        ip_family,
-    })
 }
 
 fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateSpecValue, Error> {

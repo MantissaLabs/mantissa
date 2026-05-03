@@ -1,12 +1,13 @@
-use crate::jobs::manager::{JobController, JobSubmission};
+use crate::jobs::manager::{JobController, JobSubmission, JobSubmitRequest};
 use crate::jobs::types::{JobEvent, JobRetryPolicy, JobSpecValue, JobStatus};
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
-    decode_env_vars, decode_port_bindings, decode_secret_files, decode_task_liveness_probe,
-    decode_volume_mounts, encode_env_vars, encode_port_bindings, encode_secret_files,
-    encode_task_liveness_probe, encode_volume_mounts,
+    decode_env_vars, decode_network_requirements, decode_port_bindings, decode_secret_files,
+    decode_task_liveness_probe, decode_volume_mounts, encode_env_vars, encode_port_bindings,
+    encode_secret_files, encode_task_liveness_probe, encode_volume_mounts,
 };
 use crate::workload::model::{ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec};
+use crate::workload::network_prerequisites::WorkloadNetworkRequirement;
 use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
 use mantissa_protocol::gossip::gossip_message;
@@ -33,6 +34,7 @@ struct DecodedJobSubmitSpec {
     isolation_mode: IsolationMode,
     isolation_profile: Option<String>,
     retry_policy: JobRetryPolicy,
+    required_networks: Vec<WorkloadNetworkRequirement>,
 }
 
 impl JobsRpc {
@@ -56,14 +58,15 @@ impl jobs::Server for JobsRpc {
         let spec = read_job_submit_spec(reader)?;
         let JobSubmission { job_id } = self
             .manager
-            .submit(
-                spec.name,
-                spec.execution,
-                spec.execution_platform,
-                spec.isolation_mode,
-                spec.isolation_profile,
-                spec.retry_policy,
-            )
+            .submit(JobSubmitRequest {
+                name: spec.name,
+                execution: spec.execution,
+                execution_platform: spec.execution_platform,
+                isolation_mode: spec.isolation_mode,
+                isolation_profile: spec.isolation_profile,
+                retry_policy: spec.retry_policy,
+                required_networks: spec.required_networks,
+            })
             .await
             .map_err(|error| Error::failed(error.to_string()))?;
 
@@ -534,6 +537,7 @@ fn read_job_submit_spec(
         isolation_mode: parse_isolation_mode(reader.get_isolation_mode()?.to_str()?)?,
         isolation_profile: read_optional_text(reader.get_isolation_profile()?.to_str()?),
         retry_policy: read_job_retry_policy(reader.get_retry_policy()?),
+        required_networks: decode_network_requirements(reader.get_required_networks()?)?,
     })
 }
 

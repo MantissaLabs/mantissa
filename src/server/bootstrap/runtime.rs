@@ -32,6 +32,7 @@ use crate::topology::{Keys, Topology, TopologyConfig, TopologyDependencies, Topo
 use crate::volumes::{VolumeController, VolumeRegistry, VolumeReplicator, VolumesRpc};
 use crate::workload::WorkloadRegistry;
 use crate::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadRuntimeConfig};
+use crate::workload::network_prerequisites::WorkloadNetworkPrerequisites;
 use crate::workload::service::WorkloadService;
 use crate::{config, gossip, services};
 use async_channel::{Receiver, Sender};
@@ -546,10 +547,17 @@ async fn build_runtime_components(
     let task_client = capnp_rpc::new_client(task_service);
     let workload_service = WorkloadService::new(workload_manager.clone());
     let workload_client = capnp_rpc::new_client(workload_service);
+    let network_prerequisites = WorkloadNetworkPrerequisites::new(
+        network_registry.clone(),
+        network_controller.clone(),
+        registry.clone(),
+        gossip_tx.clone(),
+    );
 
     let job_controller = JobController::new(JobControllerConfig {
         registry: job_registry,
         workload_manager: workload_manager.clone(),
+        network_prerequisites: network_prerequisites.clone(),
         cluster_registry: registry.clone(),
         gossip_tx: gossip_tx.clone(),
         gossip_rx: job_rx,
@@ -562,6 +570,7 @@ async fn build_runtime_components(
     let agent_controller = AgentController::new(AgentControllerConfig {
         registry: agent_registry,
         workload_manager: workload_manager.clone(),
+        network_prerequisites: network_prerequisites.clone(),
         cluster_registry: registry.clone(),
         gossip_tx: gossip_tx.clone(),
         gossip_rx: agent_rx,
@@ -576,7 +585,7 @@ async fn build_runtime_components(
         workload_manager: workload_manager.clone(),
         cluster_registry: registry.clone(),
         network_registry: network_registry.clone(),
-        network_controller: network_controller.clone(),
+        network_prerequisites,
         volume_registry: volume_registry.clone(),
         gossip_tx: gossip_tx.clone(),
         gossip_rx: service_rx,

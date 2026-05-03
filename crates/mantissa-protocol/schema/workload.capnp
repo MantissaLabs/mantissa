@@ -1,6 +1,7 @@
 @0xbe8f6b7fd1e7ca42;
 
 using VolumeSchema = import "volumes.capnp";
+using import "network.capnp".NetworkDriver;
 
 interface Workload {
   stop @0 (request :WorkloadStopRequest) -> (spec :WorkloadSpec);
@@ -58,6 +59,28 @@ struct VolumeMount {
 
   readOnly @3 :Bool;
   # Mount the volume read-only inside the runtime instance.
+}
+
+struct NetworkRequirement {
+  name @0 :Text;
+  # Human-readable network name referenced by a workload manifest.
+
+  driver @1 :NetworkDriver;
+  # Requested network driver.
+
+  ipFamily @2 :NetworkRequirementIpFamily;
+  # Optional family override for deterministic auto-created subnets.
+}
+
+enum NetworkRequirementIpFamily {
+  default @0;
+  # Use the daemon's configured default network family.
+
+  ipv4 @1;
+  # Create the network in the default IPv4 range.
+
+  ipv6 @2;
+  # Create the network in the default IPv6 ULA range.
 }
 
 enum PortProtocol {

@@ -1,7 +1,5 @@
 use crate::gossip::Message;
-use crate::network::controller::NetworkController;
 use crate::network::registry::NetworkRegistry;
-use crate::network::types::NetworkDriver;
 use crate::registry::Registry;
 use crate::scheduler::placement::{PlacementNode, PlacementPreferenceInventory};
 use crate::services::dependencies::{TemplateDependencyStage, build_template_dependency_stages};
@@ -24,6 +22,7 @@ use crate::workload::manager::{
     workload_start_error_requires_service_requeue, workload_start_retryable_detail,
 };
 use crate::workload::model::{WorkloadPhase, WorkloadSpec, WorkloadVolumeMount};
+use crate::workload::network_prerequisites::WorkloadNetworkPrerequisites;
 use crate::workload::types::{WorkloadPortBinding, WorkloadPortProtocol};
 use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
@@ -169,29 +168,13 @@ impl ServiceTaskProgressSnapshot {
     }
 }
 
-/// Address family requested for a service auto-provisioned network.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ServiceRequiredNetworkIpFamily {
-    Default,
-    Ipv4,
-    Ipv6,
-}
-
-/// Network dependency declared by a service deployment request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ServiceRequiredNetworkSpec {
-    pub name: String,
-    pub driver: NetworkDriver,
-    pub ip_family: ServiceRequiredNetworkIpFamily,
-}
-
 #[derive(Clone)]
 pub struct ServiceController {
     registry: ServiceRegistry,
     workload_manager: WorkloadManager,
     cluster_registry: Registry,
     network_registry: NetworkRegistry,
-    network_controller: NetworkController,
+    network_prerequisites: WorkloadNetworkPrerequisites,
     volume_registry: VolumeRegistry,
     gossip_tx: Sender<Message>,
     gossip_rx: Receiver<Message>,
@@ -228,7 +211,7 @@ pub struct ServiceControllerConfig {
     pub workload_manager: WorkloadManager,
     pub cluster_registry: Registry,
     pub network_registry: NetworkRegistry,
-    pub network_controller: NetworkController,
+    pub network_prerequisites: WorkloadNetworkPrerequisites,
     pub volume_registry: VolumeRegistry,
     pub gossip_tx: Sender<Message>,
     pub gossip_rx: Receiver<Message>,
@@ -244,7 +227,7 @@ impl ServiceController {
             workload_manager,
             cluster_registry,
             network_registry,
-            network_controller,
+            network_prerequisites,
             volume_registry,
             gossip_tx,
             gossip_rx,
@@ -256,7 +239,7 @@ impl ServiceController {
             workload_manager,
             cluster_registry,
             network_registry,
-            network_controller,
+            network_prerequisites,
             volume_registry,
             gossip_tx,
             gossip_rx,

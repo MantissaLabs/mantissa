@@ -124,6 +124,9 @@ struct AgentSessionSpec {
 
   liveness @31 :WorkloadSchema.LivenessProbe;
   # Optional local liveness probe evaluated by the hosting runtime.
+
+  requiredNetworks @32 :List(WorkloadSchema.NetworkRequirement);
+  # Networks referenced by the manifest that the agent controller must provision before placement.
 }
 
 struct AgentRunSpec {
