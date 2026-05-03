@@ -1,7 +1,5 @@
 use crate::network::controller::NetworkController;
-use crate::network::defaults::{
-    default_network_ip_family, default_network_subnet, merge_driver_default_bpf_programs,
-};
+use crate::network::defaults::{default_network_ip_family, merge_driver_default_bpf_programs};
 use crate::network::gossip::NetworkGossiper;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
@@ -177,17 +175,10 @@ fn explicit_or_existing_create_subnet(
 }
 
 /// Select the deterministic server-owned subnet for a new or revived network.
-fn default_create_subnet(
-    name: &str,
-    network_id: Uuid,
-    existing_specs: &[NetworkSpecValue],
-) -> String {
-    let existing_subnets = existing_specs
-        .iter()
-        .filter(|spec| !spec.is_deleted())
-        .filter(|spec| spec.id != network_id)
-        .map(|spec| spec.subnet_cidr.as_str());
-    default_network_subnet(name, existing_subnets, default_network_ip_family())
+fn default_create_subnet(name: &str, registry: &NetworkRegistry) -> Result<String, Error> {
+    registry
+        .unused_default_subnet(name, default_network_ip_family())
+        .map_err(to_capnp)
 }
 
 /// Serialize one replicated network spec into the Cap'n Proto response shape.
@@ -561,10 +552,7 @@ impl networks::Server for NetworksRpc {
         let subnet =
             match explicit_or_existing_create_subnet(requested_subnet, existing_spec.as_ref()) {
                 Some(subnet) => subnet,
-                None => {
-                    let existing_specs = self.registry.list_specs().map_err(to_capnp)?;
-                    default_create_subnet(&name, network_id, &existing_specs)
-                }
+                None => default_create_subnet(&name, &self.registry)?,
             };
 
         let update = NetworkSpecUpdate {

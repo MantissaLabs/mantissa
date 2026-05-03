@@ -55,12 +55,23 @@ where
         .into_iter()
         .map(|subnet| subnet.as_ref().trim().to_string())
         .collect();
+    default_network_subnet_with_membership(name, family, |candidate| used.contains(candidate))
+}
+
+/// Computes a deterministic default subnet using a caller-provided exact-CIDR membership test.
+pub fn default_network_subnet_with_membership<F>(
+    name: &str,
+    family: DefaultNetworkIpFamily,
+    mut is_used: F,
+) -> String
+where
+    F: FnMut(&str) -> bool,
+{
     let hash = default_network_subnet_hash(name);
     let candidates = default_network_subnet_candidate_count(family);
-
     for offset in 0..candidates {
         let candidate = default_network_subnet_candidate(hash, offset, family);
-        if !used.contains(&candidate) {
+        if !is_used(&candidate) {
             return candidate;
         }
     }

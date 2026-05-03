@@ -1,3 +1,4 @@
+use crate::network::defaults::{DefaultNetworkIpFamily, default_network_subnet_with_membership};
 use crate::network::types::{
     NetworkAttachmentValue, NetworkPeerState, NetworkPeerStateValue, NetworkSpecValue,
     compute_network_peer_state_id,
@@ -12,8 +13,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Cached projections over network peer/attachment stores keyed by store generation.
+/// Cached projections over network stores keyed by store generation.
 struct NetworkRegistryCache {
+    spec_generation: Option<u64>,
+    specs_all: Vec<NetworkSpecValue>,
+    spec_positions: HashMap<Uuid, usize>,
+    active_subnet_counts: HashMap<String, usize>,
     attachment_generation: u64,
     attachments_all: Vec<NetworkAttachmentValue>,
     attachments_by_network: HashMap<Uuid, Vec<NetworkAttachmentValue>>,
@@ -29,6 +34,10 @@ impl NetworkRegistryCache {
     /// Build an empty cache before any store reads are requested.
     fn new() -> Self {
         Self {
+            spec_generation: None,
+            specs_all: Vec::new(),
+            spec_positions: HashMap::new(),
+            active_subnet_counts: HashMap::new(),
             attachment_generation: 0,
             attachments_all: Vec::new(),
             attachments_by_network: HashMap::new(),
@@ -39,6 +48,66 @@ impl NetworkRegistryCache {
             peer_states_by_network: HashMap::new(),
             peer_counts: HashMap::new(),
         }
+    }
+
+    /// Add one active network spec subnet to the exact-CIDR usage index.
+    fn add_active_subnet(&mut self, subnet: String) {
+        *self.active_subnet_counts.entry(subnet).or_insert(0) += 1;
+    }
+
+    /// Remove one active network spec subnet from the exact-CIDR usage index.
+    fn remove_active_subnet(&mut self, subnet: &str) {
+        if let Some(count) = self.active_subnet_counts.get_mut(subnet) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.active_subnet_counts.remove(subnet);
+            }
+        }
+    }
+
+    /// Apply one locally written spec to initialized projections without reloading the store.
+    fn apply_spec_upsert(&mut self, value: NetworkSpecValue) {
+        if let Some(position) = self.spec_positions.get(&value.id).copied() {
+            if let Some(subnet) = active_subnet_key(&self.specs_all[position]) {
+                self.remove_active_subnet(&subnet);
+            }
+            self.specs_all[position] = value.clone();
+        } else {
+            self.spec_positions.insert(value.id, self.specs_all.len());
+            self.specs_all.push(value.clone());
+        }
+
+        if let Some(subnet) = active_subnet_key(&value) {
+            self.add_active_subnet(subnet);
+        }
+    }
+
+    /// Remove one locally deleted spec from initialized projections without reloading the store.
+    fn apply_spec_remove(&mut self, id: Uuid) {
+        if let Some(position) = self.spec_positions.remove(&id) {
+            let existing = self.specs_all.swap_remove(position);
+            if position < self.specs_all.len() {
+                let moved_id = self.specs_all[position].id;
+                self.spec_positions.insert(moved_id, position);
+            }
+            if let Some(subnet) = active_subnet_key(&existing) {
+                self.remove_active_subnet(&subnet);
+            }
+        }
+    }
+}
+
+/// Return the exact-CIDR key used by default-subnet selection for active specs.
+fn active_subnet_key(spec: &NetworkSpecValue) -> Option<String> {
+    if spec.is_deleted() {
+        return None;
+    }
+
+    let subnet = spec.subnet_cidr.trim();
+    if subnet.is_empty() {
+        None
+    } else {
+        Some(subnet.to_string())
     }
 }
 
@@ -84,6 +153,86 @@ impl NetworkRegistry {
     /// Acquire a write guard for cached derived views.
     fn cache_write(&self) -> RwLockWriteGuard<'_, NetworkRegistryCache> {
         self.cache.write()
+    }
+
+    /// Refresh cached network-spec projections when the underlying store generation advanced.
+    fn refresh_spec_cache_if_needed(&self) -> Result<()> {
+        let generation = self.specs.change_clock();
+        {
+            let cache = self.cache_read();
+            if cache.spec_generation == Some(generation) {
+                return Ok(());
+            }
+        }
+
+        let mut cache = self.cache_write();
+        if cache.spec_generation == Some(generation) {
+            return Ok(());
+        }
+
+        let (entries, _) = self
+            .specs
+            .load_all()
+            .map_err(|e| anyhow!("network spec load_all failed: {e}"))?;
+
+        let mut seen = HashSet::new();
+        let mut specs = Vec::with_capacity(entries.len());
+        let mut spec_positions = HashMap::new();
+        let mut active_subnet_counts = HashMap::new();
+        for (key, snapshot) in entries {
+            let id = key.to_uuid();
+            if let Some(value) = snapshot.as_slice().last().cloned()
+                && seen.insert(id)
+            {
+                if let Some(subnet) = active_subnet_key(&value) {
+                    *active_subnet_counts.entry(subnet).or_insert(0) += 1;
+                }
+                spec_positions.insert(id, specs.len());
+                specs.push(value);
+            }
+        }
+
+        cache.spec_generation = Some(generation);
+        cache.specs_all = specs;
+        cache.spec_positions = spec_positions;
+        cache.active_subnet_counts = active_subnet_counts;
+
+        Ok(())
+    }
+
+    /// Write through a successful local spec upsert when the cached generation is current.
+    fn write_through_spec_upsert_cache(
+        &self,
+        value: NetworkSpecValue,
+        previous_generation: u64,
+        generation: u64,
+    ) {
+        if generation != previous_generation.saturating_add(1) {
+            return;
+        }
+
+        let mut cache = self.cache_write();
+        if cache.spec_generation != Some(previous_generation) {
+            return;
+        }
+
+        cache.apply_spec_upsert(value);
+        cache.spec_generation = Some(generation);
+    }
+
+    /// Write through a successful local spec removal when the cached generation is current.
+    fn write_through_spec_remove_cache(&self, id: Uuid, previous_generation: u64, generation: u64) {
+        if generation != previous_generation.saturating_add(1) {
+            return;
+        }
+
+        let mut cache = self.cache_write();
+        if cache.spec_generation != Some(previous_generation) {
+            return;
+        }
+
+        cache.apply_spec_remove(id);
+        cache.spec_generation = Some(generation);
     }
 
     /// Refresh cached peer-state projections when the underlying store generation advanced.
@@ -202,10 +351,14 @@ impl NetworkRegistry {
     /// Upsert a network specification into the replicated store.
     pub async fn upsert_spec(&self, mut value: NetworkSpecValue) -> Result<()> {
         value.touch();
+        let previous_generation = self.specs.change_clock();
         self.specs
-            .upsert(&UuidKey::from(value.id), value)
+            .upsert(&UuidKey::from(value.id), value.clone())
             .await
-            .map_err(|e| anyhow!("network spec upsert failed: {e}"))
+            .map_err(|e| anyhow!("network spec upsert failed: {e}"))?;
+        let generation = self.specs.change_clock();
+        self.write_through_spec_upsert_cache(value, previous_generation, generation);
+        Ok(())
     }
 
     /// Retrieve a network specification by identifier, returning the last committed value.
@@ -220,24 +373,26 @@ impl NetworkRegistry {
 
     /// List every known network specification, sorted alphabetically by name.
     pub fn list_specs(&self) -> Result<Vec<NetworkSpecValue>> {
-        let (entries, _) = self
-            .specs
-            .load_all()
-            .map_err(|e| anyhow!("network spec load_all failed: {e}"))?;
-
-        let mut seen = HashSet::new();
-        let mut specs = Vec::with_capacity(entries.len());
-        for (key, snapshot) in entries {
-            let id = key.to_uuid();
-            if let Some(value) = snapshot.as_slice().last().cloned()
-                && seen.insert(id)
-            {
-                specs.push(value);
-            }
-        }
-
+        self.refresh_spec_cache_if_needed()?;
+        let cache = self.cache_read();
+        let mut specs = cache.specs_all.clone();
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(specs)
+    }
+
+    /// Select an unused deterministic default subnet using the active exact-CIDR index.
+    pub fn unused_default_subnet(
+        &self,
+        name: &str,
+        family: DefaultNetworkIpFamily,
+    ) -> Result<String> {
+        self.refresh_spec_cache_if_needed()?;
+        let cache = self.cache_read();
+        Ok(default_network_subnet_with_membership(
+            name,
+            family,
+            |candidate| cache.active_subnet_counts.contains_key(candidate),
+        ))
     }
 
     /// Retrieve the latest peer state entry for a specific network and peer identifier.
@@ -269,10 +424,13 @@ impl NetworkRegistry {
     /// Delete the specified network and cascade removal to its peer state entries.
     #[allow(dead_code)]
     pub async fn remove_spec(&self, id: Uuid) -> Result<()> {
+        let previous_generation = self.specs.change_clock();
         self.specs
             .remove(&UuidKey::from(id))
             .await
             .map_err(|e| anyhow!("network spec remove failed: {e}"))?;
+        let generation = self.specs.change_clock();
+        self.write_through_spec_remove_cache(id, previous_generation, generation);
         self.remove_peer_states_for_network(id).await?;
         self.remove_attachments_for_network(id).await
     }
@@ -649,6 +807,8 @@ fn collect_shared_ready_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::defaults::{DefaultNetworkIpFamily, default_network_subnet};
+    use crate::network::types::{NetworkDriver, NetworkSpecDraft};
     use crate::store::network_store::{
         open_network_attachment_store, open_network_peer_store, open_network_spec_store,
     };
@@ -667,6 +827,120 @@ mod tests {
         let attachments =
             open_network_attachment_store(db, actor).expect("open network attachment store");
         NetworkRegistry::new(specs, peers, attachments)
+    }
+
+    /// Builds one deterministic spec row used by registry projection tests.
+    fn test_network_spec(name: &str, subnet_cidr: &str) -> NetworkSpecValue {
+        NetworkSpecValue::new(NetworkSpecDraft {
+            name: name.to_string(),
+            description: String::new(),
+            driver: NetworkDriver::Vxlan,
+            subnet_cidr: subnet_cidr.to_string(),
+            vni: 0,
+            mtu: 0,
+            sealed: false,
+            bpf_programs: Vec::new(),
+        })
+    }
+
+    /// Exact-CIDR subnet selection writes local spec upserts through to its active-subnet index.
+    #[tokio::test]
+    async fn unused_default_subnet_updates_active_subnet_index_after_upsert() {
+        let registry = temp_registry();
+        let initial = registry
+            .unused_default_subnet("alpha", DefaultNetworkIpFamily::Ipv4)
+            .expect("select initial subnet");
+        let initial_generation = registry.specs.change_clock();
+
+        registry
+            .upsert_spec(test_network_spec("existing", &initial))
+            .await
+            .expect("upsert existing network");
+        let generation = registry.specs.change_clock();
+
+        {
+            let cache = registry.cache_read();
+            assert_eq!(cache.spec_generation, Some(generation));
+            assert_eq!(generation, initial_generation + 1);
+            assert_eq!(cache.active_subnet_counts.get(&initial).copied(), Some(1));
+        }
+
+        let resolved = registry
+            .unused_default_subnet("alpha", DefaultNetworkIpFamily::Ipv4)
+            .expect("select non-conflicting subnet");
+
+        assert_ne!(initial, resolved);
+    }
+
+    /// Exact-CIDR subnet counts remain present until the last local duplicate is removed.
+    #[tokio::test]
+    async fn unused_default_subnet_updates_active_subnet_index_after_remove() {
+        let registry = temp_registry();
+        let initial = registry
+            .unused_default_subnet("alpha", DefaultNetworkIpFamily::Ipv4)
+            .expect("select initial subnet");
+        let first = test_network_spec("first", &initial);
+        let second = test_network_spec("second", &initial);
+        let first_id = first.id;
+        let second_id = second.id;
+
+        registry.upsert_spec(first).await.expect("upsert first");
+        registry.upsert_spec(second).await.expect("upsert second");
+        assert_ne!(
+            initial,
+            registry
+                .unused_default_subnet("alpha", DefaultNetworkIpFamily::Ipv4)
+                .expect("select non-conflicting subnet")
+        );
+
+        registry
+            .remove_spec(first_id)
+            .await
+            .expect("remove first network");
+        {
+            let cache = registry.cache_read();
+            assert_eq!(cache.active_subnet_counts.get(&initial).copied(), Some(1));
+        }
+
+        registry
+            .remove_spec(second_id)
+            .await
+            .expect("remove second network");
+        {
+            let cache = registry.cache_read();
+            assert_eq!(cache.spec_generation, Some(registry.specs.change_clock()));
+            assert!(!cache.active_subnet_counts.contains_key(&initial));
+        }
+
+        let resolved = registry
+            .unused_default_subnet("alpha", DefaultNetworkIpFamily::Ipv4)
+            .expect("select default subnet");
+
+        assert_eq!(initial, resolved);
+    }
+
+    /// Exact-CIDR subnet selection ignores deleted specs in its active-subnet index.
+    #[tokio::test]
+    async fn unused_default_subnet_ignores_deleted_network_subnets() {
+        let registry = temp_registry();
+        let initial = default_network_subnet(
+            "alpha",
+            std::iter::empty::<&str>(),
+            DefaultNetworkIpFamily::Ipv4,
+        );
+        let mut deleted = test_network_spec("deleted", &initial);
+        deleted.mark_deleted();
+
+        registry
+            .upsert_spec(deleted)
+            .await
+            .expect("upsert deleted network");
+
+        let resolved = registry
+            .unused_default_subnet("alpha", DefaultNetworkIpFamily::Ipv4)
+            .expect("select default subnet");
+
+        assert_eq!(initial, resolved);
     }
 
     /// Ensure the selector returns the entry with the most recent timestamp so readiness counts do
