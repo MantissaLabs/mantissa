@@ -1,46 +1,14 @@
-use super::list::fetch_service_rows;
+use super::list::inspect_service_row;
 use super::list::{ServiceRolloutPhaseRow, ServiceRolloutRow, ServiceRow, ServiceStatusRow};
 use crate::config::ClientConfig;
 use crate::output;
-use anyhow::{Result, bail};
-use uuid::Uuid;
+use anyhow::Result;
 
 /// Resolves one service by id or name and prints its rollout status snapshot.
 pub async fn status(cfg: &ClientConfig, selector: &str) -> Result<()> {
-    let rows = fetch_service_rows(cfg).await?;
-    let row = select_service(rows, selector)?;
+    let row = inspect_service_row(cfg, selector).await?;
     output::emit_block(render_rollout_status(&row));
     Ok(())
-}
-
-/// Selects exactly one service row from the current registry snapshot.
-fn select_service(rows: Vec<ServiceRow>, selector: &str) -> Result<ServiceRow> {
-    let selector = selector.trim();
-    if selector.is_empty() {
-        bail!("service selector cannot be empty");
-    }
-
-    if let Ok(id) = Uuid::parse_str(selector) {
-        if let Some(row) = rows
-            .into_iter()
-            .find(|candidate| candidate.id.eq_ignore_ascii_case(&id.to_string()))
-        {
-            return Ok(row);
-        }
-        bail!("service '{selector}' not found");
-    }
-
-    let mut matches: Vec<ServiceRow> = rows
-        .into_iter()
-        .filter(|candidate| candidate.service_name == selector)
-        .collect();
-    match matches.len() {
-        1 => Ok(matches.remove(0)),
-        0 => bail!("service '{selector}' not found"),
-        count => {
-            bail!("service selector '{selector}' is ambiguous ({count} matches); use a service id")
-        }
-    }
 }
 
 /// Renders a human-readable rollout status snapshot for one service.
@@ -127,6 +95,7 @@ mod tests {
     use super::*;
     use crate::host_ports::{HostPortProtocolView, HostPortView};
     use crate::services::list::TaskTemplateRow;
+    use uuid::Uuid;
 
     /// Builds a minimal service row so helper behaviors can be unit-tested.
     fn test_row(
@@ -139,6 +108,7 @@ mod tests {
     ) -> ServiceRow {
         ServiceRow {
             id: Uuid::nil().to_string(),
+            manifest_id: Uuid::nil(),
             service_name: "svc".to_string(),
             task_templates: Vec::new(),
             updated_at: "2026-03-07T00:00:00Z".to_string(),

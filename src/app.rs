@@ -521,7 +521,14 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             ServicesCommand::Run(args) => {
                 let manifest = mantissa_client::services::load_manifest_from_path(&args.manifest)?;
                 local
-                    .run_until(mantissa_client::services::deploy_manifest(&cfg, &manifest))
+                    .run_until(mantissa_client::services::run_manifest(
+                        &cfg,
+                        &manifest,
+                        mantissa_client::services::ServiceRunOptions {
+                            detach: args.detach,
+                            timeout: args.timeout,
+                        },
+                    ))
                     .await?;
             }
             ServicesCommand::List(_) => {

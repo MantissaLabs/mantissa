@@ -27,11 +27,13 @@ use uuid::Uuid;
 pub struct ServiceDeploymentHandle {
     pub service_id: Uuid,
     pub manifest_id: Uuid,
+    pub outcome: ServiceDeployOutcome,
+    pub detail: Option<String>,
 }
 
 /// Simplified deploy outcomes surfaced by the services RPC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeployOutcome {
+pub enum ServiceDeployOutcome {
     Accepted,
     Unchanged,
 }
@@ -120,7 +122,7 @@ fn write_secret_files(
     Ok(())
 }
 
-/// Submits a service manifest to the local coordinator, returning immediately with the service id.
+/// Submits a service manifest to the local coordinator and returns its deployment handle.
 pub async fn deploy_manifest(
     cfg: &ClientConfig,
     manifest: &ServiceManifest,
@@ -243,34 +245,11 @@ pub async fn deploy_manifest(
         .filter(|text| !text.is_empty())
         .map(str::to_string);
 
-    match outcome {
-        DeployOutcome::Accepted => {
-            println!(
-                "service '{}' accepted with id {}",
-                manifest.name, service_id
-            );
-            println!(
-                "deployment is running in the background; track it with `mantissa services list` or stop it with `mantissa services stop {service_id}`"
-            );
-        }
-        DeployOutcome::Unchanged => {
-            if let Some(detail) = detail {
-                println!(
-                    "service '{}' unchanged (id {}): {}",
-                    manifest.name, service_id, detail
-                );
-            } else {
-                println!(
-                    "service '{}' unchanged (id {}): already deployed at desired spec",
-                    manifest.name, service_id
-                );
-            }
-        }
-    }
-
     Ok(ServiceDeploymentHandle {
         service_id,
         manifest_id,
+        outcome,
+        detail,
     })
 }
 
@@ -521,9 +500,11 @@ fn map_deploy_rpc_error(err: CapnpError) -> anyhow::Error {
 }
 
 /// Converts protocol deploy outcomes into a compact client-side representation.
-fn parse_deploy_outcome(outcome: mantissa_protocol::services::DeployOutcome) -> DeployOutcome {
+fn parse_deploy_outcome(
+    outcome: mantissa_protocol::services::DeployOutcome,
+) -> ServiceDeployOutcome {
     match outcome {
-        mantissa_protocol::services::DeployOutcome::Accepted => DeployOutcome::Accepted,
-        mantissa_protocol::services::DeployOutcome::Unchanged => DeployOutcome::Unchanged,
+        mantissa_protocol::services::DeployOutcome::Accepted => ServiceDeployOutcome::Accepted,
+        mantissa_protocol::services::DeployOutcome::Unchanged => ServiceDeployOutcome::Unchanged,
     }
 }

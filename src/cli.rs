@@ -1155,6 +1155,19 @@ pub struct ServicesRunArgs {
     /// Path to the RON manifest describing the services to deploy
     #[arg(index = 1, value_name = "MANIFEST")]
     pub manifest: PathBuf,
+
+    /// Return immediately after submitting the deployment
+    #[arg(short = 'd', long = "detach", action = ArgAction::SetTrue)]
+    pub detach: bool,
+
+    /// Maximum time to follow deployment progress before returning an error
+    #[arg(
+        long = "timeout",
+        value_name = "DURATION",
+        value_parser = parse_cli_duration,
+        conflicts_with = "detach"
+    )]
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Args, Debug, Default)]

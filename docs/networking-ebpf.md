@@ -489,8 +489,10 @@ Prerequisites: Linux host, kernel with XDP+TC and BPF enabled, and `bpf-linker` 
 2. Deploy the manifest:
    ```bash
    mantissa services run examples/service_discovery_demo.ron
-   mantissa services list
    ```
+   The command follows deployment progress until the service reaches `running`;
+   use `--detach` if you want to inspect status separately with
+   `mantissa services list`.
    The `PUBLIC` column currently shows the internal VIP used behind the public
    dataplane, not the final NodePort socket.
 3. Pick one node IP:

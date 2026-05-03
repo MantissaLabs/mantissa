@@ -4,7 +4,7 @@ use crate::host_ports::{HostPortView, decode_host_ports, render_host_ports};
 use crate::networks;
 use crate::networks::{NetworkAttachment, NetworkAttachmentState, NetworkSummary};
 use crate::output;
-use crate::tasks::uuid_to_string;
+use crate::tasks::{uuid_from_data, uuid_to_string};
 use anyhow::Result;
 use blake3::Hasher;
 use capnp::Error as CapnpError;
@@ -33,6 +33,31 @@ pub(crate) async fn fetch_service_rows(cfg: &ClientConfig) -> Result<Vec<Service
         rows.push(ServiceRow::from_reader(spec)?);
     }
     Ok(rows)
+}
+
+/// Fetches one service row by service id through the targeted status RPC.
+pub(crate) async fn fetch_service_row_by_id(
+    cfg: &ClientConfig,
+    service_id: Uuid,
+) -> Result<ServiceRow> {
+    let client = connection::get_local_session(cfg).await?;
+    let request = client.get_services_request();
+    let services = request.send().pipeline.get_services();
+    let mut request = services.status_request();
+    request.get().set_service_id(service_id.as_bytes());
+    let response = request.send().promise.await?;
+    ServiceRow::from_reader(response.get()?.get_service()?).map_err(Into::into)
+}
+
+/// Inspects one service row by UUID text or exact service name.
+pub(crate) async fn inspect_service_row(cfg: &ClientConfig, selector: &str) -> Result<ServiceRow> {
+    let client = connection::get_local_session(cfg).await?;
+    let request = client.get_services_request();
+    let services = request.send().pipeline.get_services();
+    let mut request = services.inspect_request();
+    request.get().set_selector(selector.trim());
+    let response = request.send().promise.await?;
+    ServiceRow::from_reader(response.get()?.get_service()?).map_err(Into::into)
 }
 
 pub async fn list(cfg: &ClientConfig) -> Result<()> {
@@ -101,6 +126,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
 #[derive(Clone, Debug)]
 pub struct ServiceRow {
     pub id: String,
+    pub manifest_id: Uuid,
     pub service_name: String,
     pub task_templates: Vec<TaskTemplateRow>,
     pub updated_at: String,
@@ -115,6 +141,7 @@ impl ServiceRow {
     /// Builds a printable service row from one protocol reader payload.
     pub fn from_reader(spec: service_spec::Reader<'_>) -> Result<Self, CapnpError> {
         let id = uuid_to_string(spec.get_id()?)?;
+        let manifest_id = uuid_from_data(spec.get_manifest_id()?)?;
         let service_name = spec.get_service_name()?.to_str()?.to_string();
 
         let mut task_templates = Vec::new();
@@ -140,6 +167,7 @@ impl ServiceRow {
 
         Ok(Self {
             id,
+            manifest_id,
             service_name,
             task_templates,
             updated_at: spec.get_updated_at()?.to_str()?.to_string(),
@@ -691,6 +719,7 @@ mod tests {
     fn test_row(status_detail: Option<&str>, rollout_error: Option<&str>) -> ServiceRow {
         ServiceRow {
             id: Uuid::nil().to_string(),
+            manifest_id: Uuid::nil(),
             service_name: "svc".to_string(),
             task_templates: Vec::new(),
             updated_at: "2026-03-12T00:00:00Z".to_string(),

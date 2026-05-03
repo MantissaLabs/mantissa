@@ -15,6 +15,12 @@ interface Services {
     detail :Text
   );
   # Deploy or update a service and return the resolved outcome.
+
+  inspect @3 (selector :Text) -> (service :ServiceSpec);
+  # Inspect one service by UUID text or exact service name.
+
+  status @4 (serviceId :Data) -> (service :ServiceSpec);
+  # Fetch one service by deterministic UUID for efficient deployment polling.
 }
 
 struct TaskTemplate {

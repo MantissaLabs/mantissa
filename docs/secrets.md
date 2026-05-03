@@ -72,9 +72,11 @@ After creating the secrets, deploy the manifest and inspect the resulting tasks:
 ```bash
 mantissa networks list
 mantissa services run examples/replicated_service.ron
-mantissa services list
 mantissa tasks list --state running
 ```
+
+`services run` follows deployment progress by default, so a missing secret is
+reported directly before the command exits.
 
 If a secret is missing, the deployment fails fast with a descriptive error so you can seed it
 before retrying.

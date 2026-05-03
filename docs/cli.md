@@ -21,7 +21,10 @@ Common commands:
 - `mantissa tasks list --state running` - filter tasks by lifecycle state
 - `mantissa tasks start <name> --image <img> --command <arg>...` - launch a task
 - `mantissa scheduler slots [peer-id] --details` - inspect reserved slots
-- `mantissa services run|list|stop ...` - manage RON service manifests
+- `mantissa services run <manifest>` - deploy a RON service manifest and follow progress
+- `mantissa services run <manifest> --detach` - submit a service deployment and print the service id
+- `mantissa services run <manifest> --timeout 10m` - bound how long progress following waits
+- `mantissa services list|stop ...` - inspect or stop services
 - `mantissa volumes create|import|list|inspect|status|delete ...` - manage named local volumes
 - `mantissa info` - emit local system and capacity diagnostics
 - `mantissa config show|validate|path` - inspect configuration

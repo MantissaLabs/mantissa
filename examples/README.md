@@ -15,6 +15,10 @@ backing workload runs over time.
 mantissa services run examples/replicated_service.ron
 ```
 
+`services run` follows deployment progress until the submitted manifest reaches
+`running`; add `--detach` when you only want the service id and will inspect
+progress separately.
+
 This manifest defines two task entries:
 - `echo` runs two replicas of a simple Alpine container emitting log lines with a 500m CPU / 128MiB request.
 - `api` runs a single nginx replica requesting 300m CPU / 256MiB of memory.
@@ -28,6 +32,9 @@ You can tweak the RON file to adjust container images, commands, or replica coun
 ```sh
 mantissa services run examples/rolling_update.ron
 ```
+
+The command follows rollout progress and reports rollback or failure as a
+non-zero CLI result.
 
 This manifest shows the full `update.rolling` surface:
 

@@ -43,6 +43,7 @@ impl ServicesRPC {
 }
 
 impl services::Server for ServicesRPC {
+    /// Handles service deployment submission over RPC and returns the accepted service id.
     async fn deploy(
         self: Rc<Self>,
         params: services::DeployParams,
@@ -100,6 +101,7 @@ impl services::Server for ServicesRPC {
         Ok(())
     }
 
+    /// Lists every known service spec for operator-facing table output.
     async fn list(
         self: Rc<Self>,
         _params: services::ListParams,
@@ -119,6 +121,46 @@ impl services::Server for ServicesRPC {
         Ok(())
     }
 
+    /// Inspects one service by exact name or UUID text for operator diagnostics.
+    async fn inspect(
+        self: Rc<Self>,
+        params: services::InspectParams,
+        mut results: services::InspectResults,
+    ) -> Result<(), Error> {
+        let selector = params.get()?.get_selector()?.to_str()?.trim().to_string();
+        if selector.is_empty() {
+            return Err(Error::failed(
+                "service selector cannot be empty".to_string(),
+            ));
+        }
+
+        let service = self
+            .select_service(&selector)
+            .map_err(|err| Error::failed(err.to_string()))?;
+        let mut builder = results.get().init_service();
+        write_service_spec(&mut builder, &service)?;
+        Ok(())
+    }
+
+    /// Fetches one service by deterministic UUID for efficient client-side status polling.
+    async fn status(
+        self: Rc<Self>,
+        params: services::StatusParams,
+        mut results: services::StatusResults,
+    ) -> Result<(), Error> {
+        let service_id = read_uuid(params.get()?.get_service_id()?)?;
+        let service = self
+            .manager
+            .registry()
+            .get(service_id)
+            .map_err(|err| Error::failed(err.to_string()))?
+            .ok_or_else(|| Error::failed(format!("service '{service_id}' not found")))?;
+        let mut builder = results.get().init_service();
+        write_service_spec(&mut builder, &service)?;
+        Ok(())
+    }
+
+    /// Starts asynchronous service deletion for each requested service id.
     async fn delete(
         self: Rc<Self>,
         params: services::DeleteParams,
@@ -141,6 +183,38 @@ impl services::Server for ServicesRPC {
             });
         }
         Ok(())
+    }
+}
+
+impl ServicesRPC {
+    /// Selects exactly one service from the registry using UUID text or exact service name.
+    ///
+    /// TODO(abronan): services need to be cached and selected by their ID instead of looping
+    /// through all services.
+    fn select_service(&self, selector: &str) -> anyhow::Result<ServiceSpecValue> {
+        if let Ok(service_id) = Uuid::parse_str(selector) {
+            return self
+                .manager
+                .registry()
+                .get(service_id)?
+                .ok_or_else(|| anyhow::anyhow!("service '{selector}' not found"));
+        }
+
+        let mut matches: Vec<ServiceSpecValue> = self
+            .manager
+            .registry()
+            .list()?
+            .into_iter()
+            .filter(|service| service.service_name == selector)
+            .collect();
+
+        match matches.len() {
+            1 => Ok(matches.remove(0)),
+            0 => Err(anyhow::anyhow!("service '{selector}' not found")),
+            count => Err(anyhow::anyhow!(
+                "service selector '{selector}' is ambiguous ({count} matches); use a service id"
+            )),
+        }
     }
 }
 
