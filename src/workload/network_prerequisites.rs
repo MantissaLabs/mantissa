@@ -1,8 +1,8 @@
 use crate::gossip::Message;
 use crate::network::controller::NetworkController;
 use crate::network::defaults::{
-    DefaultNetworkIpFamily, default_bpf_programs_for_driver, default_network_ip_family,
-    default_network_subnet,
+    CidrOverlapIndex, DefaultNetworkIpFamily, default_bpf_programs_for_driver,
+    default_network_ip_family, default_network_subnet_with_conflict_check,
 };
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
@@ -74,11 +74,10 @@ impl WorkloadNetworkPrerequisites {
             .cloned()
             .map(|spec| (spec.name.clone(), spec))
             .collect();
-        let mut known_subnets: BTreeSet<String> = existing
-            .iter()
-            .filter(|spec| !spec.is_deleted())
-            .map(|spec| spec.subnet_cidr.clone())
-            .collect();
+        let mut known_subnets = CidrOverlapIndex::new();
+        for spec in existing.iter().filter(|spec| !spec.is_deleted()) {
+            let _ = known_subnets.insert_cidr(&spec.subnet_cidr);
+        }
 
         for requested in required {
             if let Some(existing) = existing_by_name.get(&requested.name)
@@ -88,7 +87,7 @@ impl WorkloadNetworkPrerequisites {
                 continue;
             }
 
-            let mut spec = build_required_network_spec(&requested, &known_subnets);
+            let mut spec = build_required_network_spec(&requested, &known_subnets)?;
             if let Some(mut deleted) = existing_by_name.get(&requested.name).cloned()
                 && deleted.is_deleted()
             {
@@ -114,7 +113,9 @@ impl WorkloadNetworkPrerequisites {
                 .await
                 .map_err(|err| anyhow!("failed to broadcast network upsert: {err}"))?;
             self.network_controller.schedule_spec_change(spec.id).await;
-            known_subnets.insert(spec.subnet_cidr.clone());
+            known_subnets
+                .insert_cidr(&spec.subnet_cidr)
+                .map_err(|err| anyhow!("network subnet index update failed: {err}"))?;
             tracing::info!(
                 target: "workload",
                 "network '{}' auto-provisioned for {context} with id {}",
@@ -241,25 +242,31 @@ fn validate_existing_required_network(
 /// Builds the replicated network spec used for manifest-side auto-provisioning.
 fn build_required_network_spec(
     requested: &WorkloadNetworkRequirement,
-    known_subnets: &BTreeSet<String>,
-) -> NetworkSpecValue {
+    known_subnets: &CidrOverlapIndex,
+) -> Result<NetworkSpecValue> {
     let family = default_subnet_family_for_requirement(requested.ip_family);
     let bpf_programs = default_bpf_programs_for_driver(requested.driver);
+    let subnet_cidr =
+        default_network_subnet_with_conflict_check(&requested.name, family, |candidate| {
+            known_subnets.overlaps_cidr(candidate)
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "failed to auto-provision network '{}': no default subnet is available",
+                requested.name
+            )
+        })?;
 
-    NetworkSpecValue::new(NetworkSpecDraft {
+    Ok(NetworkSpecValue::new(NetworkSpecDraft {
         name: requested.name.clone(),
         description: String::new(),
         driver: requested.driver,
-        subnet_cidr: default_network_subnet(
-            &requested.name,
-            known_subnets.iter().map(String::as_str),
-            family,
-        ),
+        subnet_cidr,
         vni: 0,
         mtu: 0,
         sealed: false,
         bpf_programs,
-    })
+    }))
 }
 
 /// Deduplicates required networks while rejecting conflicting driver or family requests.

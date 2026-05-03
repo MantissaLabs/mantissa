@@ -181,6 +181,24 @@ fn default_create_subnet(name: &str, registry: &NetworkRegistry) -> Result<Strin
         .map_err(to_capnp)
 }
 
+/// Reject explicit network subnets that overlap active networks other than the current network.
+fn validate_create_subnet_available(
+    registry: &NetworkRegistry,
+    network_id: Uuid,
+    subnet: &str,
+) -> Result<(), Error> {
+    if registry
+        .subnet_overlaps_active(subnet, Some(network_id))
+        .map_err(to_capnp)?
+    {
+        return Err(Error::failed(format!(
+            "network subnet '{subnet}' overlaps an existing active network"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Serialize one replicated network spec into the Cap'n Proto response shape.
 fn write_network_spec(mut builder: network_spec::Builder<'_>, spec: &NetworkSpecValue) {
     builder.set_id(spec.id.as_bytes());
@@ -540,6 +558,7 @@ impl networks::Server for NetworksRpc {
         let description = Self::read_optional_text(spec_reader.get_description()?)?;
         let driver = Self::driver_from_request(&spec_reader)?;
         let requested_subnet = Self::read_optional_trimmed_text(spec_reader.get_subnet_cidr()?)?;
+        let has_requested_subnet = requested_subnet.is_some();
         let vni = spec_reader.get_vni();
         let mtu = spec_reader.get_mtu();
         let sealed = spec_reader.get_sealed();
@@ -551,7 +570,12 @@ impl networks::Server for NetworksRpc {
         let existing_spec = self.registry.get_spec(network_id).map_err(to_capnp)?;
         let subnet =
             match explicit_or_existing_create_subnet(requested_subnet, existing_spec.as_ref()) {
-                Some(subnet) => subnet,
+                Some(subnet) => {
+                    if has_requested_subnet {
+                        validate_create_subnet_available(&self.registry, network_id, &subnet)?;
+                    }
+                    subnet
+                }
                 None => default_create_subnet(&name, &self.registry)?,
             };
 

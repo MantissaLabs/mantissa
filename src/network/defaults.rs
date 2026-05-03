@@ -3,7 +3,7 @@ use crate::ip_family::{IpFamily, infer_default_ip_family};
 use crate::network::bpf::overlay_bpf_program_specs;
 use crate::network::types::{BpfProgramSpec, NetworkDriver};
 use blake3::Hasher;
-use std::collections::BTreeSet;
+use std::net::IpAddr;
 
 /// IPv4 prefix used by deterministic server-selected overlay networks.
 const DEFAULT_NETWORK_SUBNET_PREFIX_V4: u8 = 20;
@@ -19,6 +19,203 @@ const DEFAULT_NETWORK_SUBNET_CANDIDATES_V6: u32 = 1 << 16;
 pub enum DefaultNetworkIpFamily {
     Ipv4,
     Ipv6,
+}
+
+impl DefaultNetworkIpFamily {
+    /// Return the address width in bits for prefix and trie arithmetic.
+    fn address_bits(self) -> u8 {
+        match self {
+            DefaultNetworkIpFamily::Ipv4 => 32,
+            DefaultNetworkIpFamily::Ipv6 => 128,
+        }
+    }
+
+    /// Render the address family label used in CIDR parse diagnostics.
+    fn label(self) -> &'static str {
+        match self {
+            DefaultNetworkIpFamily::Ipv4 => "IPv4",
+            DefaultNetworkIpFamily::Ipv6 => "IPv6",
+        }
+    }
+}
+
+/// Parsed CIDR block normalized to its network address for overlap detection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CidrBlock {
+    family: DefaultNetworkIpFamily,
+    network: u128,
+    prefix: u8,
+}
+
+impl CidrBlock {
+    /// Parse and normalize one CIDR block for default subnet conflict checks.
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
+        let cidr = raw.trim();
+        let (base_text, prefix_text) = cidr
+            .split_once('/')
+            .ok_or_else(|| format!("invalid subnet CIDR '{cidr}': missing '/' delimiter"))?;
+
+        let prefix = prefix_text
+            .parse::<u8>()
+            .map_err(|_| format!("invalid subnet CIDR '{cidr}': prefix is not a number"))?;
+        let base = base_text
+            .parse::<IpAddr>()
+            .map_err(|_| format!("invalid subnet CIDR '{cidr}': base address is not valid"))?;
+
+        let (family, raw_network) = match base {
+            IpAddr::V4(addr) => (DefaultNetworkIpFamily::Ipv4, u32::from(addr) as u128),
+            IpAddr::V6(addr) => (DefaultNetworkIpFamily::Ipv6, u128::from(addr)),
+        };
+        if prefix > family.address_bits() {
+            return Err(format!(
+                "invalid subnet CIDR '{cidr}': prefix {prefix} exceeds /{} for {}",
+                family.address_bits(),
+                family.label()
+            ));
+        }
+
+        Ok(Self {
+            family,
+            network: normalize_network(raw_network, prefix, family.address_bits()),
+            prefix,
+        })
+    }
+
+    /// Return true when this CIDR block intersects the other CIDR block.
+    pub(crate) fn overlaps(self, other: Self) -> bool {
+        if self.family != other.family {
+            return false;
+        }
+
+        let prefix = self.prefix.min(other.prefix);
+        self.network_at_prefix(prefix) == other.network_at_prefix(prefix)
+    }
+
+    /// Read one prefix bit from the normalized network address, starting at the most significant.
+    fn bit_at(self, depth: u8) -> usize {
+        let shift = self
+            .family
+            .address_bits()
+            .saturating_sub(1)
+            .saturating_sub(depth);
+        ((self.network >> shift) & 1) as usize
+    }
+
+    /// Return the normalized network address truncated to the requested prefix.
+    fn network_at_prefix(self, prefix: u8) -> u128 {
+        normalize_network(self.network, prefix, self.family.address_bits())
+    }
+}
+
+/// Prefix-trie index used to check whether CIDR blocks overlap existing network subnets.
+#[derive(Default)]
+pub(crate) struct CidrOverlapIndex {
+    ipv4: CidrTrie,
+    ipv6: CidrTrie,
+}
+
+impl CidrOverlapIndex {
+    /// Build an empty CIDR overlap index.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parse and insert one CIDR block into the overlap index.
+    pub(crate) fn insert_cidr(&mut self, cidr: &str) -> Result<CidrBlock, String> {
+        let block = CidrBlock::parse(cidr)?;
+        self.insert(block);
+        Ok(block)
+    }
+
+    /// Insert one pre-parsed CIDR block into the overlap index.
+    pub(crate) fn insert(&mut self, block: CidrBlock) {
+        self.trie_mut(block.family).insert(block);
+    }
+
+    /// Remove one pre-parsed CIDR block from the overlap index.
+    pub(crate) fn remove(&mut self, block: CidrBlock) {
+        self.trie_mut(block.family).remove(block);
+    }
+
+    /// Count indexed CIDR blocks that overlap the provided CIDR block.
+    pub(crate) fn overlap_count(&self, block: CidrBlock) -> usize {
+        self.trie(block.family).overlap_count(block)
+    }
+
+    /// Return true when the provided CIDR string overlaps an indexed CIDR block.
+    pub(crate) fn overlaps_cidr(&self, cidr: &str) -> bool {
+        CidrBlock::parse(cidr)
+            .map(|block| self.overlap_count(block) > 0)
+            .unwrap_or(false)
+    }
+
+    /// Select the family-specific trie for read-only overlap checks.
+    fn trie(&self, family: DefaultNetworkIpFamily) -> &CidrTrie {
+        match family {
+            DefaultNetworkIpFamily::Ipv4 => &self.ipv4,
+            DefaultNetworkIpFamily::Ipv6 => &self.ipv6,
+        }
+    }
+
+    /// Select the family-specific trie for index mutations.
+    fn trie_mut(&mut self, family: DefaultNetworkIpFamily) -> &mut CidrTrie {
+        match family {
+            DefaultNetworkIpFamily::Ipv4 => &mut self.ipv4,
+            DefaultNetworkIpFamily::Ipv6 => &mut self.ipv6,
+        }
+    }
+}
+
+/// Family-specific prefix trie storing CIDR block counts by prefix path.
+#[derive(Default)]
+struct CidrTrie {
+    root: CidrTrieNode,
+}
+
+impl CidrTrie {
+    /// Insert one CIDR block into the trie and update subtree counts on the prefix path.
+    fn insert(&mut self, block: CidrBlock) {
+        let mut node = &mut self.root;
+        node.subtree_count = node.subtree_count.saturating_add(1);
+        for depth in 0..block.prefix {
+            let bit = block.bit_at(depth);
+            let child =
+                child_slot_mut(node, bit).get_or_insert_with(|| Box::new(CidrTrieNode::default()));
+            node = child.as_mut();
+            node.subtree_count = node.subtree_count.saturating_add(1);
+        }
+        node.exact_count = node.exact_count.saturating_add(1);
+    }
+
+    /// Remove one CIDR block from the trie when present.
+    fn remove(&mut self, block: CidrBlock) {
+        remove_from_trie(&mut self.root, block, 0);
+    }
+
+    /// Count ancestor, exact, and descendant CIDR blocks that overlap the provided block.
+    fn overlap_count(&self, block: CidrBlock) -> usize {
+        let mut count = self.root.exact_count;
+        let mut node = &self.root;
+        for depth in 0..block.prefix {
+            let bit = block.bit_at(depth);
+            let Some(child) = child_slot(node, bit).as_deref() else {
+                return count;
+            };
+            node = child;
+            count = count.saturating_add(node.exact_count);
+        }
+
+        count.saturating_add(node.subtree_count.saturating_sub(node.exact_count))
+    }
+}
+
+/// Trie node with exact-prefix and subtree counts for overlap queries.
+#[derive(Default)]
+struct CidrTrieNode {
+    exact_count: usize,
+    subtree_count: usize,
+    zero: Option<Box<CidrTrieNode>>,
+    one: Option<Box<CidrTrieNode>>,
 }
 
 /// Resolves the daemon's default network IP family for server-owned subnet selection.
@@ -41,29 +238,31 @@ pub fn default_network_ip_family() -> DefaultNetworkIpFamily {
 /// Automatic network provisioning must not hand out the same CIDR to unrelated overlays, or
 /// host-side readiness probes and resolver ownership can race on overlapping connected routes.
 /// This derives a private subnet from the network name hash in the requested family and linearly
-/// probes until it finds one default-range CIDR that is not already taken.
+/// probes until it finds one default-range CIDR that does not overlap an existing subnet.
 pub fn default_network_subnet<I, S>(
     name: &str,
     existing_subnets: I,
     family: DefaultNetworkIpFamily,
-) -> String
+) -> Option<String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let used: BTreeSet<String> = existing_subnets
-        .into_iter()
-        .map(|subnet| subnet.as_ref().trim().to_string())
-        .collect();
-    default_network_subnet_with_membership(name, family, |candidate| used.contains(candidate))
+    let mut used = CidrOverlapIndex::new();
+    for subnet in existing_subnets {
+        let _ = used.insert_cidr(subnet.as_ref());
+    }
+    default_network_subnet_with_conflict_check(name, family, |candidate| {
+        used.overlaps_cidr(candidate)
+    })
 }
 
-/// Computes a deterministic default subnet using a caller-provided exact-CIDR membership test.
-pub fn default_network_subnet_with_membership<F>(
+/// Computes a deterministic default subnet using a caller-provided conflict test.
+pub fn default_network_subnet_with_conflict_check<F>(
     name: &str,
     family: DefaultNetworkIpFamily,
-    mut is_used: F,
-) -> String
+    mut has_conflict: F,
+) -> Option<String>
 where
     F: FnMut(&str) -> bool,
 {
@@ -71,12 +270,73 @@ where
     let candidates = default_network_subnet_candidate_count(family);
     for offset in 0..candidates {
         let candidate = default_network_subnet_candidate(hash, offset, family);
-        if !is_used(&candidate) {
-            return candidate;
+        if !has_conflict(&candidate) {
+            return Some(candidate);
         }
     }
 
-    default_network_subnet_candidate(hash, 0, family)
+    None
+}
+
+/// Normalize one integer address to its CIDR network prefix.
+fn normalize_network(value: u128, prefix: u8, bits: u8) -> u128 {
+    if prefix == 0 {
+        return 0;
+    }
+
+    let host_bits = bits.saturating_sub(prefix);
+    value & (!0u128 << host_bits)
+}
+
+/// Return the immutable child slot selected by one trie bit.
+fn child_slot(node: &CidrTrieNode, bit: usize) -> &Option<Box<CidrTrieNode>> {
+    if bit == 0 { &node.zero } else { &node.one }
+}
+
+/// Return the mutable child slot selected by one trie bit.
+fn child_slot_mut(node: &mut CidrTrieNode, bit: usize) -> &mut Option<Box<CidrTrieNode>> {
+    if bit == 0 {
+        &mut node.zero
+    } else {
+        &mut node.one
+    }
+}
+
+/// Remove one CIDR block from a trie node while pruning empty descendants.
+fn remove_from_trie(node: &mut CidrTrieNode, block: CidrBlock, depth: u8) -> bool {
+    if depth == block.prefix {
+        if node.exact_count == 0 {
+            return false;
+        }
+        node.exact_count = node.exact_count.saturating_sub(1);
+        node.subtree_count = node.subtree_count.saturating_sub(1);
+        return true;
+    }
+
+    let removed = if block.bit_at(depth) == 0 {
+        remove_from_child(&mut node.zero, block, depth.saturating_add(1))
+    } else {
+        remove_from_child(&mut node.one, block, depth.saturating_add(1))
+    };
+    if removed {
+        node.subtree_count = node.subtree_count.saturating_sub(1);
+    }
+
+    removed
+}
+
+/// Remove one CIDR block from a child slot and prune the child when it becomes empty.
+fn remove_from_child(slot: &mut Option<Box<CidrTrieNode>>, block: CidrBlock, depth: u8) -> bool {
+    let Some(child) = slot.as_mut() else {
+        return false;
+    };
+
+    let removed = remove_from_trie(child, block, depth);
+    if removed && child.subtree_count == 0 {
+        *slot = None;
+    }
+
+    removed
 }
 
 /// Returns the server-owned default BPF program set for a network driver.
@@ -168,10 +428,36 @@ fn default_network_subnet_candidate_v6(hash: u32, offset: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DefaultNetworkIpFamily, default_bpf_programs_for_driver, default_network_subnet,
+        CidrBlock, DefaultNetworkIpFamily, default_bpf_programs_for_driver, default_network_subnet,
         merge_driver_default_bpf_programs,
     };
     use crate::network::types::{BpfAttachPoint, BpfProgramSpec, NetworkDriver};
+
+    /// Derive a broad IPv4 supernet that covers the generated default subnet.
+    fn ipv4_supernet(cidr: &str) -> String {
+        let mut octets = cidr.split('.');
+        let first = octets.next().expect("first octet");
+        let second = octets.next().expect("second octet");
+        format!("{first}.{second}.0.0/16")
+    }
+
+    /// Derive a narrower IPv4 child subnet inside the generated default subnet.
+    fn ipv4_child(cidr: &str) -> String {
+        let mut octets = cidr.split('.');
+        let first = octets.next().expect("first octet");
+        let second = octets.next().expect("second octet");
+        let third = octets.next().expect("third octet");
+        format!("{first}.{second}.{third}.0/24")
+    }
+
+    /// Derive a broad IPv6 supernet that covers the generated default subnet.
+    fn ipv6_supernet(cidr: &str) -> String {
+        let mut groups = cidr.split(':');
+        let first = groups.next().expect("first group");
+        let second = groups.next().expect("second group");
+        let third = groups.next().expect("third group");
+        format!("{first}:{second}:{third}::/48")
+    }
 
     #[test]
     /// Default-subnet selection varies by name for IPv4 networks.
@@ -180,12 +466,14 @@ mod tests {
             "discovery-demo",
             std::iter::empty::<&str>(),
             DefaultNetworkIpFamily::Ipv4,
-        );
+        )
+        .expect("left subnet");
         let right = default_network_subnet(
             "discovery-demo-2",
             std::iter::empty::<&str>(),
             DefaultNetworkIpFamily::Ipv4,
-        );
+        )
+        .expect("right subnet");
 
         assert_ne!(left, right);
         assert!(left.starts_with("10."));
@@ -199,12 +487,14 @@ mod tests {
             "discovery-demo",
             std::iter::empty::<&str>(),
             DefaultNetworkIpFamily::Ipv6,
-        );
+        )
+        .expect("left subnet");
         let right = default_network_subnet(
             "discovery-demo-2",
             std::iter::empty::<&str>(),
             DefaultNetworkIpFamily::Ipv6,
-        );
+        )
+        .expect("right subnet");
 
         assert_ne!(left, right);
         assert!(left.starts_with("fd42:"));
@@ -218,9 +508,11 @@ mod tests {
             "alpha",
             std::iter::empty::<&str>(),
             DefaultNetworkIpFamily::Ipv4,
-        );
+        )
+        .expect("initial subnet");
         let resolved =
-            default_network_subnet("alpha", [initial.as_str()], DefaultNetworkIpFamily::Ipv4);
+            default_network_subnet("alpha", [initial.as_str()], DefaultNetworkIpFamily::Ipv4)
+                .expect("resolved subnet");
 
         assert_ne!(initial, resolved);
         assert!(resolved.ends_with("/20"));
@@ -233,13 +525,81 @@ mod tests {
             "alpha",
             std::iter::empty::<&str>(),
             DefaultNetworkIpFamily::Ipv6,
-        );
+        )
+        .expect("initial subnet");
         let resolved =
-            default_network_subnet("alpha", [initial.as_str()], DefaultNetworkIpFamily::Ipv6);
+            default_network_subnet("alpha", [initial.as_str()], DefaultNetworkIpFamily::Ipv6)
+                .expect("resolved subnet");
 
         assert_ne!(initial, resolved);
         assert!(resolved.starts_with("fd42:"));
         assert!(resolved.ends_with("/64"));
+    }
+
+    #[test]
+    /// Default-subnet selection probes away from an IPv4 supernet overlap.
+    fn default_network_subnet_skips_ipv4_supernet_overlap() {
+        let initial = default_network_subnet(
+            "alpha",
+            std::iter::empty::<&str>(),
+            DefaultNetworkIpFamily::Ipv4,
+        )
+        .expect("initial subnet");
+        let supernet = ipv4_supernet(&initial);
+        let resolved =
+            default_network_subnet("alpha", [supernet.as_str()], DefaultNetworkIpFamily::Ipv4)
+                .expect("resolved subnet");
+
+        assert_ne!(initial, resolved);
+        assert!(
+            !CidrBlock::parse(&resolved)
+                .expect("resolved cidr")
+                .overlaps(CidrBlock::parse(&supernet).expect("supernet cidr"))
+        );
+    }
+
+    #[test]
+    /// Default-subnet selection probes away from an IPv4 child subnet overlap.
+    fn default_network_subnet_skips_ipv4_child_overlap() {
+        let initial = default_network_subnet(
+            "alpha",
+            std::iter::empty::<&str>(),
+            DefaultNetworkIpFamily::Ipv4,
+        )
+        .expect("initial subnet");
+        let child = ipv4_child(&initial);
+        let resolved =
+            default_network_subnet("alpha", [child.as_str()], DefaultNetworkIpFamily::Ipv4)
+                .expect("resolved subnet");
+
+        assert_ne!(initial, resolved);
+        assert!(
+            !CidrBlock::parse(&resolved)
+                .expect("resolved cidr")
+                .overlaps(CidrBlock::parse(&child).expect("child cidr"))
+        );
+    }
+
+    #[test]
+    /// Default-subnet selection probes away from an IPv6 supernet overlap.
+    fn default_network_subnet_skips_ipv6_supernet_overlap() {
+        let initial = default_network_subnet(
+            "alpha",
+            std::iter::empty::<&str>(),
+            DefaultNetworkIpFamily::Ipv6,
+        )
+        .expect("initial subnet");
+        let supernet = ipv6_supernet(&initial);
+        let resolved =
+            default_network_subnet("alpha", [supernet.as_str()], DefaultNetworkIpFamily::Ipv6)
+                .expect("resolved subnet");
+
+        assert_ne!(initial, resolved);
+        assert!(
+            !CidrBlock::parse(&resolved)
+                .expect("resolved cidr")
+                .overlaps(CidrBlock::parse(&supernet).expect("supernet cidr"))
+        );
     }
 
     #[test]

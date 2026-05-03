@@ -1,4 +1,6 @@
-use crate::network::defaults::{DefaultNetworkIpFamily, default_network_subnet_with_membership};
+use crate::network::defaults::{
+    CidrBlock, CidrOverlapIndex, DefaultNetworkIpFamily, default_network_subnet_with_conflict_check,
+};
 use crate::network::types::{
     NetworkAttachmentValue, NetworkPeerState, NetworkPeerStateValue, NetworkSpecValue,
     compute_network_peer_state_id,
@@ -18,7 +20,8 @@ struct NetworkRegistryCache {
     spec_generation: Option<u64>,
     specs_all: Vec<NetworkSpecValue>,
     spec_positions: HashMap<Uuid, usize>,
-    active_subnet_counts: HashMap<String, usize>,
+    active_subnet_index: CidrOverlapIndex,
+    active_cidrs_by_spec: HashMap<Uuid, CidrBlock>,
     attachment_generation: u64,
     attachments_all: Vec<NetworkAttachmentValue>,
     attachments_by_network: HashMap<Uuid, Vec<NetworkAttachmentValue>>,
@@ -37,7 +40,8 @@ impl NetworkRegistryCache {
             spec_generation: None,
             specs_all: Vec::new(),
             spec_positions: HashMap::new(),
-            active_subnet_counts: HashMap::new(),
+            active_subnet_index: CidrOverlapIndex::new(),
+            active_cidrs_by_spec: HashMap::new(),
             attachment_generation: 0,
             attachments_all: Vec::new(),
             attachments_by_network: HashMap::new(),
@@ -50,27 +54,24 @@ impl NetworkRegistryCache {
         }
     }
 
-    /// Add one active network spec subnet to the exact-CIDR usage index.
-    fn add_active_subnet(&mut self, subnet: String) {
-        *self.active_subnet_counts.entry(subnet).or_insert(0) += 1;
+    /// Add one active network spec subnet to the CIDR overlap index.
+    fn add_active_subnet(&mut self, spec_id: Uuid, subnet: &str) {
+        if let Ok(block) = self.active_subnet_index.insert_cidr(subnet) {
+            self.active_cidrs_by_spec.insert(spec_id, block);
+        }
     }
 
-    /// Remove one active network spec subnet from the exact-CIDR usage index.
-    fn remove_active_subnet(&mut self, subnet: &str) {
-        if let Some(count) = self.active_subnet_counts.get_mut(subnet) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.active_subnet_counts.remove(subnet);
-            }
+    /// Remove one active network spec subnet from the CIDR overlap index.
+    fn remove_active_subnet(&mut self, spec_id: Uuid) {
+        if let Some(block) = self.active_cidrs_by_spec.remove(&spec_id) {
+            self.active_subnet_index.remove(block);
         }
     }
 
     /// Apply one locally written spec to initialized projections without reloading the store.
     fn apply_spec_upsert(&mut self, value: NetworkSpecValue) {
         if let Some(position) = self.spec_positions.get(&value.id).copied() {
-            if let Some(subnet) = active_subnet_key(&self.specs_all[position]) {
-                self.remove_active_subnet(&subnet);
-            }
+            self.remove_active_subnet(value.id);
             self.specs_all[position] = value.clone();
         } else {
             self.spec_positions.insert(value.id, self.specs_all.len());
@@ -78,7 +79,7 @@ impl NetworkRegistryCache {
         }
 
         if let Some(subnet) = active_subnet_key(&value) {
-            self.add_active_subnet(subnet);
+            self.add_active_subnet(value.id, &subnet);
         }
     }
 
@@ -90,9 +91,7 @@ impl NetworkRegistryCache {
                 let moved_id = self.specs_all[position].id;
                 self.spec_positions.insert(moved_id, position);
             }
-            if let Some(subnet) = active_subnet_key(&existing) {
-                self.remove_active_subnet(&subnet);
-            }
+            self.remove_active_subnet(existing.id);
         }
     }
 }
@@ -178,14 +177,17 @@ impl NetworkRegistry {
         let mut seen = HashSet::new();
         let mut specs = Vec::with_capacity(entries.len());
         let mut spec_positions = HashMap::new();
-        let mut active_subnet_counts = HashMap::new();
+        let mut active_subnet_index = CidrOverlapIndex::new();
+        let mut active_cidrs_by_spec = HashMap::new();
         for (key, snapshot) in entries {
             let id = key.to_uuid();
             if let Some(value) = snapshot.as_slice().last().cloned()
                 && seen.insert(id)
             {
                 if let Some(subnet) = active_subnet_key(&value) {
-                    *active_subnet_counts.entry(subnet).or_insert(0) += 1;
+                    if let Ok(block) = active_subnet_index.insert_cidr(&subnet) {
+                        active_cidrs_by_spec.insert(id, block);
+                    }
                 }
                 spec_positions.insert(id, specs.len());
                 specs.push(value);
@@ -195,7 +197,8 @@ impl NetworkRegistry {
         cache.spec_generation = Some(generation);
         cache.specs_all = specs;
         cache.spec_positions = spec_positions;
-        cache.active_subnet_counts = active_subnet_counts;
+        cache.active_subnet_index = active_subnet_index;
+        cache.active_cidrs_by_spec = active_cidrs_by_spec;
 
         Ok(())
     }
@@ -380,7 +383,7 @@ impl NetworkRegistry {
         Ok(specs)
     }
 
-    /// Select an unused deterministic default subnet using the active exact-CIDR index.
+    /// Select an unused deterministic default subnet using the active CIDR overlap index.
     pub fn unused_default_subnet(
         &self,
         name: &str,
@@ -388,11 +391,28 @@ impl NetworkRegistry {
     ) -> Result<String> {
         self.refresh_spec_cache_if_needed()?;
         let cache = self.cache_read();
-        Ok(default_network_subnet_with_membership(
-            name,
-            family,
-            |candidate| cache.active_subnet_counts.contains_key(candidate),
-        ))
+        default_network_subnet_with_conflict_check(name, family, |candidate| {
+            cache.active_subnet_index.overlaps_cidr(candidate)
+        })
+        .ok_or_else(|| anyhow!("no available default subnet for network '{name}'"))
+    }
+
+    /// Return true when `subnet` overlaps an active network other than the optional exclusion.
+    pub fn subnet_overlaps_active(&self, subnet: &str, excluded_id: Option<Uuid>) -> Result<bool> {
+        let block = CidrBlock::parse(subnet).map_err(anyhow::Error::msg)?;
+        self.refresh_spec_cache_if_needed()?;
+        let cache = self.cache_read();
+        let mut count = cache.active_subnet_index.overlap_count(block);
+        if let Some(excluded_id) = excluded_id
+            && cache
+                .active_cidrs_by_spec
+                .get(&excluded_id)
+                .is_some_and(|excluded| excluded.overlaps(block))
+        {
+            count = count.saturating_sub(1);
+        }
+
+        Ok(count > 0)
     }
 
     /// Retrieve the latest peer state entry for a specific network and peer identifier.
@@ -807,7 +827,7 @@ fn collect_shared_ready_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::defaults::{DefaultNetworkIpFamily, default_network_subnet};
+    use crate::network::defaults::{CidrBlock, DefaultNetworkIpFamily, default_network_subnet};
     use crate::network::types::{NetworkDriver, NetworkSpecDraft};
     use crate::store::network_store::{
         open_network_attachment_store, open_network_peer_store, open_network_spec_store,
@@ -843,7 +863,15 @@ mod tests {
         })
     }
 
-    /// Exact-CIDR subnet selection writes local spec upserts through to its active-subnet index.
+    /// Derive a broad IPv4 supernet that covers the generated default subnet.
+    fn ipv4_supernet(cidr: &str) -> String {
+        let mut octets = cidr.split('.');
+        let first = octets.next().expect("first octet");
+        let second = octets.next().expect("second octet");
+        format!("{first}.{second}.0.0/16")
+    }
+
+    /// CIDR subnet selection writes local spec upserts through to its active-subnet index.
     #[tokio::test]
     async fn unused_default_subnet_updates_active_subnet_index_after_upsert() {
         let registry = temp_registry();
@@ -862,7 +890,8 @@ mod tests {
             let cache = registry.cache_read();
             assert_eq!(cache.spec_generation, Some(generation));
             assert_eq!(generation, initial_generation + 1);
-            assert_eq!(cache.active_subnet_counts.get(&initial).copied(), Some(1));
+            let initial_block = CidrBlock::parse(&initial).expect("initial cidr");
+            assert_eq!(cache.active_subnet_index.overlap_count(initial_block), 1);
         }
 
         let resolved = registry
@@ -872,7 +901,7 @@ mod tests {
         assert_ne!(initial, resolved);
     }
 
-    /// Exact-CIDR subnet counts remain present until the last local duplicate is removed.
+    /// CIDR subnet counts remain present until the last local duplicate is removed.
     #[tokio::test]
     async fn unused_default_subnet_updates_active_subnet_index_after_remove() {
         let registry = temp_registry();
@@ -899,7 +928,8 @@ mod tests {
             .expect("remove first network");
         {
             let cache = registry.cache_read();
-            assert_eq!(cache.active_subnet_counts.get(&initial).copied(), Some(1));
+            let initial_block = CidrBlock::parse(&initial).expect("initial cidr");
+            assert_eq!(cache.active_subnet_index.overlap_count(initial_block), 1);
         }
 
         registry
@@ -909,7 +939,8 @@ mod tests {
         {
             let cache = registry.cache_read();
             assert_eq!(cache.spec_generation, Some(registry.specs.change_clock()));
-            assert!(!cache.active_subnet_counts.contains_key(&initial));
+            let initial_block = CidrBlock::parse(&initial).expect("initial cidr");
+            assert_eq!(cache.active_subnet_index.overlap_count(initial_block), 0);
         }
 
         let resolved = registry
@@ -919,7 +950,71 @@ mod tests {
         assert_eq!(initial, resolved);
     }
 
-    /// Exact-CIDR subnet selection ignores deleted specs in its active-subnet index.
+    /// CIDR subnet selection probes away from a broader overlapping active subnet.
+    #[tokio::test]
+    async fn unused_default_subnet_skips_overlapping_network_subnets() {
+        let registry = temp_registry();
+        let initial = registry
+            .unused_default_subnet("alpha", DefaultNetworkIpFamily::Ipv4)
+            .expect("select initial subnet");
+        let supernet = ipv4_supernet(&initial);
+
+        registry
+            .upsert_spec(test_network_spec("existing", &supernet))
+            .await
+            .expect("upsert existing network");
+
+        let resolved = registry
+            .unused_default_subnet("alpha", DefaultNetworkIpFamily::Ipv4)
+            .expect("select non-overlapping subnet");
+
+        assert_ne!(initial, resolved);
+        assert!(
+            !CidrBlock::parse(&resolved)
+                .expect("resolved cidr")
+                .overlaps(CidrBlock::parse(&supernet).expect("supernet cidr"))
+        );
+    }
+
+    /// CIDR overlap checks ignore the current network id during explicit subnet updates.
+    #[tokio::test]
+    async fn subnet_overlap_check_excludes_requested_network_id() {
+        let registry = temp_registry();
+        let initial = registry
+            .unused_default_subnet("alpha", DefaultNetworkIpFamily::Ipv4)
+            .expect("select initial subnet");
+        let supernet = ipv4_supernet(&initial);
+        let first = test_network_spec("first", &initial);
+        let second = test_network_spec("second", &supernet);
+        let first_id = first.id;
+        let second_id = second.id;
+
+        registry.upsert_spec(first).await.expect("upsert first");
+        assert!(
+            registry
+                .subnet_overlaps_active(&supernet, None)
+                .expect("check overlap")
+        );
+        assert!(
+            !registry
+                .subnet_overlaps_active(&supernet, Some(first_id))
+                .expect("check self-excluded overlap")
+        );
+
+        registry.upsert_spec(second).await.expect("upsert second");
+        assert!(
+            registry
+                .subnet_overlaps_active(&supernet, Some(first_id))
+                .expect("check other overlap")
+        );
+        assert!(
+            registry
+                .subnet_overlaps_active(&initial, Some(second_id))
+                .expect("check reciprocal overlap")
+        );
+    }
+
+    /// CIDR subnet selection ignores deleted specs in its active-subnet index.
     #[tokio::test]
     async fn unused_default_subnet_ignores_deleted_network_subnets() {
         let registry = temp_registry();
@@ -927,7 +1022,8 @@ mod tests {
             "alpha",
             std::iter::empty::<&str>(),
             DefaultNetworkIpFamily::Ipv4,
-        );
+        )
+        .expect("initial subnet");
         let mut deleted = test_network_spec("deleted", &initial);
         deleted.mark_deleted();
 
