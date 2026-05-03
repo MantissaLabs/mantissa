@@ -1328,8 +1328,7 @@ pub struct NetworksCreateArgs {
     #[arg(long = "driver", value_enum, default_value = "vxlan")]
     pub driver: NetworkDriverOpt,
 
-    /// CIDR range allocated to the overlay (e.g. 10.24.0.0/16).
-    /// Defaults to a deterministic private subnet derived from the network name when omitted.
+    /// CIDR range allocated to the overlay (server selects a deterministic default when omitted).
     #[arg(long = "subnet", value_name = "CIDR")]
     pub subnet: Option<String>,
 

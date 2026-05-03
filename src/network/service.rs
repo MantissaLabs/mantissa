@@ -1,4 +1,5 @@
 use crate::network::controller::NetworkController;
+use crate::network::defaults::{default_network_ip_family, default_network_subnet};
 use crate::network::gossip::NetworkGossiper;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
@@ -63,6 +64,20 @@ impl NetworksRpc {
             .to_str()
             .map_err(|e| Error::failed(e.to_string()))?
             .to_string())
+    }
+
+    /// Read an optional request text field where blank or whitespace means no value was supplied.
+    fn read_optional_trimmed_text(text: capnp::text::Reader<'_>) -> Result<Option<String>, Error> {
+        let value = text
+            .to_str()
+            .map_err(|e| Error::failed(e.to_string()))?
+            .trim()
+            .to_string();
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(value))
+        }
     }
 
     /// Convert the requested wire driver into the local network driver enum.
@@ -143,6 +158,34 @@ fn validate_driver_transition(
     }
 
     Ok(())
+}
+
+/// Resolve a caller-supplied or existing subnet before falling back to server defaulting.
+fn explicit_or_existing_create_subnet(
+    requested_subnet: Option<String>,
+    existing_spec: Option<&NetworkSpecValue>,
+) -> Option<String> {
+    if let Some(subnet) = requested_subnet {
+        return Some(subnet);
+    }
+
+    existing_spec
+        .filter(|spec| !spec.is_deleted())
+        .map(|spec| spec.subnet_cidr.clone())
+}
+
+/// Select the deterministic server-owned subnet for a new or revived network.
+fn default_create_subnet(
+    name: &str,
+    network_id: Uuid,
+    existing_specs: &[NetworkSpecValue],
+) -> String {
+    let existing_subnets = existing_specs
+        .iter()
+        .filter(|spec| !spec.is_deleted())
+        .filter(|spec| spec.id != network_id)
+        .map(|spec| spec.subnet_cidr.as_str());
+    default_network_subnet(name, existing_subnets, default_network_ip_family())
 }
 
 /// Serialize one replicated network spec into the Cap'n Proto response shape.
@@ -503,7 +546,7 @@ impl networks::Server for NetworksRpc {
         let name = Self::read_non_empty_text(spec_reader.get_name()?, "network name")?;
         let description = Self::read_optional_text(spec_reader.get_description()?)?;
         let driver = Self::driver_from_request(&spec_reader)?;
-        let subnet = Self::read_non_empty_text(spec_reader.get_subnet_cidr()?, "subnet")?;
+        let requested_subnet = Self::read_optional_trimmed_text(spec_reader.get_subnet_cidr()?)?;
         let vni = spec_reader.get_vni();
         let mtu = spec_reader.get_mtu();
         let sealed = spec_reader.get_sealed();
@@ -512,6 +555,14 @@ impl networks::Server for NetworksRpc {
 
         let network_id = compute_network_id(&name);
         let existing_spec = self.registry.get_spec(network_id).map_err(to_capnp)?;
+        let subnet =
+            match explicit_or_existing_create_subnet(requested_subnet, existing_spec.as_ref()) {
+                Some(subnet) => subnet,
+                None => {
+                    let existing_specs = self.registry.list_specs().map_err(to_capnp)?;
+                    default_create_subnet(&name, network_id, &existing_specs)
+                }
+            };
 
         let update = NetworkSpecUpdate {
             description: description.clone(),
@@ -777,6 +828,27 @@ mod tests {
 
         assert!(validate_driver_transition(&current, NetworkDriver::Vxlan).is_ok());
         assert!(validate_driver_transition(&current, NetworkDriver::Bridge).is_err());
+    }
+
+    /// Omitted create subnets preserve the current subnet for live network updates.
+    #[test]
+    fn omitted_create_subnet_preserves_existing_live_subnet() {
+        let current = sample_network_spec();
+        let subnet = explicit_or_existing_create_subnet(None, Some(&current))
+            .expect("live network subnet should be preserved");
+
+        assert_eq!(subnet, current.subnet_cidr);
+    }
+
+    /// Explicit create subnets win over existing values so intentional updates stay possible.
+    #[test]
+    fn explicit_create_subnet_overrides_existing_live_subnet() {
+        let current = sample_network_spec();
+        let subnet =
+            explicit_or_existing_create_subnet(Some("10.99.0.0/24".to_string()), Some(&current))
+                .expect("explicit subnet should be returned");
+
+        assert_eq!(subnet, "10.99.0.0/24");
     }
 
     /// Direct spec updates preserve driver identity even if a caller forgets the RPC guard.

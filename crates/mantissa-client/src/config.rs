@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Preferred IP family for CLI-created overlay networks when no subnet is supplied.
+/// IP family requested by a workload manifest network dependency.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkIpFamily {
@@ -21,6 +21,4 @@ pub struct ClientConfig {
     pub socket: Option<PathBuf>,
     /// If set, defines the cluster to filter results for.
     pub cluster: Option<String>,
-    /// Preferred family used when `networks create` chooses a default subnet.
-    pub default_network_ip_family: NetworkIpFamily,
 }

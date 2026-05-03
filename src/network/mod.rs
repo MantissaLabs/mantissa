@@ -3,6 +3,7 @@ pub mod allocator;
 pub mod attachment;
 pub mod bpf;
 pub mod controller;
+pub mod defaults;
 pub mod discovery;
 #[cfg(target_os = "linux")]
 pub(crate) mod embedded_bpf;

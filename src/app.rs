@@ -1,13 +1,11 @@
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use mantissa_client::config::ClientConfig;
-use mantissa_client::config::NetworkIpFamily;
 use std::path::Path;
 use tokio::task::LocalSet;
 
 use crate::cli::*;
 use crate::config;
-use crate::ip_family::{IpFamily, infer_default_ip_family};
 use crate::server::RunMode;
 
 /// Parses process arguments, initializes shared runtime state, and dispatches CLI commands.
@@ -46,24 +44,6 @@ fn resolve_local_volume_ownership(
     }
 }
 
-/// Resolves the preferred family for default `networks create` subnets from node addressing.
-///
-/// The CLI default should follow the operator's declared node IP family so manual network creation
-/// produces the same address family the daemon would choose for manifest-created networks.
-fn resolve_default_network_ip_family() -> NetworkIpFamily {
-    let (has_ipv4, has_ipv6) = crate::node::address::detect_local_ip_families();
-    match infer_default_ip_family(
-        config::nodeport_ip(),
-        config::advertise_addr().as_deref(),
-        config::default_ip_family_policy(),
-        has_ipv4,
-        has_ipv6,
-    ) {
-        IpFamily::Ipv4 => NetworkIpFamily::Ipv4,
-        IpFamily::Ipv6 => NetworkIpFamily::Ipv6,
-    }
-}
-
 /// Executes the CLI command dispatcher for pre-parsed arguments.
 ///
 /// Keeping this path in the library avoids compiling the application module graph through
@@ -90,10 +70,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
     let _config_watcher = config::spawn_config_watcher();
 
     // Global listen address (only used by `init`/daemon start)
-    let mut cfg = ClientConfig {
-        default_network_ip_family: resolve_default_network_ip_family(),
-        ..ClientConfig::default()
-    };
+    let mut cfg = ClientConfig::default();
 
     match cmd {
         Command::Init(init) => {
@@ -620,23 +597,11 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     NetworkDriverOpt::Vxlan => mantissa_client::networks::NetworkDriver::Vxlan,
                     NetworkDriverOpt::Bridge => mantissa_client::networks::NetworkDriver::Bridge,
                 };
-                let subnet_cidr = match args.subnet.clone() {
-                    Some(subnet) => subnet,
-                    None => {
-                        let existing = mantissa_client::networks::list_raw(&cfg).await?;
-                        mantissa_client::networks::default_network_subnet(
-                            &args.name,
-                            existing.iter().map(|net| net.subnet_cidr.as_str()),
-                            cfg.default_network_ip_family,
-                        )
-                    }
-                };
-
                 let request = mantissa_client::networks::NetworkCreateRequest {
                     name: args.name.clone(),
                     description: args.description.clone(),
                     driver,
-                    subnet_cidr,
+                    subnet_cidr: args.subnet.clone(),
                     vni: args.vni,
                     mtu: args.mtu,
                     bpf_programs: args.resolved_bpf_programs(),

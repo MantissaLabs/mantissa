@@ -93,7 +93,7 @@ struct NetworkCreateSpec {
   # Driver used for the network.
 
   subnetCidr @3 :Text;
-  # IPv4/IPv6 CIDR for the overlay subnet.
+  # IPv4/IPv6 CIDR for the overlay subnet; empty asks the server to choose.
 
   vni @4 :UInt32;
   # VXLAN Network Identifier (0 means auto-allocate, unused for bridge).

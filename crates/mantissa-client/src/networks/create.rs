@@ -11,7 +11,7 @@ pub struct NetworkCreateRequest {
     pub name: String,
     pub description: Option<String>,
     pub driver: NetworkDriver,
-    pub subnet_cidr: String,
+    pub subnet_cidr: Option<String>,
     pub vni: Option<u32>,
     pub mtu: Option<u32>,
     pub bpf_programs: Vec<String>,
@@ -30,7 +30,7 @@ pub async fn create_raw(cfg: &ClientConfig, request: &NetworkCreateRequest) -> R
         spec.set_name(&request.name);
         spec.set_description(request.description.as_deref().unwrap_or(""));
         spec.set_driver(request.driver.into());
-        spec.set_subnet_cidr(&request.subnet_cidr);
+        spec.set_subnet_cidr(request.subnet_cidr.as_deref().unwrap_or(""));
         spec.set_vni(request.vni.unwrap_or(0));
         spec.set_mtu(request.mtu.unwrap_or(0));
         spec.set_sealed(request.sealed);

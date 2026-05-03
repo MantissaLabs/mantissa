@@ -1,8 +1,9 @@
-use crate::config;
 use crate::gossip::Message;
-use crate::ip_family::{IpFamily, infer_default_ip_family};
 use crate::network::bpf::overlay_bpf_program_specs;
 use crate::network::controller::NetworkController;
+use crate::network::defaults::{
+    DefaultNetworkIpFamily, default_network_ip_family, default_network_subnet,
+};
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
     NetworkDriver, NetworkEvent, NetworkSpecDraft, NetworkSpecUpdate, NetworkSpecValue,
@@ -14,15 +15,6 @@ use anyhow::{Result, anyhow};
 use async_channel::Sender;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use uuid::Uuid;
-
-/// IPv4 prefix used by deterministic auto-provisioned manifest networks.
-const DEFAULT_NETWORK_SUBNET_PREFIX_V4: u8 = 20;
-/// Number of non-overlapping `/20` candidates inside the default IPv4 `10.0.0.0/8` range.
-const DEFAULT_NETWORK_SUBNET_CANDIDATES_V4: u32 = 1 << 12;
-/// IPv6 prefix used by deterministic auto-provisioned manifest networks.
-const DEFAULT_NETWORK_SUBNET_PREFIX_V6: u8 = 64;
-/// Number of deterministic IPv6 ULA subnet candidates probed before falling back to the first.
-const DEFAULT_NETWORK_SUBNET_CANDIDATES_V6: u32 = 1 << 16;
 
 /// Address family requested for a manifest-declared network dependency.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,11 +243,7 @@ fn build_required_network_spec(
     requested: &WorkloadNetworkRequirement,
     known_subnets: &BTreeSet<String>,
 ) -> NetworkSpecValue {
-    let family = match requested.ip_family {
-        WorkloadNetworkIpFamily::Ipv4 => WorkloadNetworkIpFamily::Ipv4,
-        WorkloadNetworkIpFamily::Ipv6 => WorkloadNetworkIpFamily::Ipv6,
-        WorkloadNetworkIpFamily::Default => default_required_network_family(),
-    };
+    let family = default_subnet_family_for_requirement(requested.ip_family);
     let bpf_programs = match requested.driver {
         NetworkDriver::Vxlan => overlay_bpf_program_specs(),
         NetworkDriver::Bridge => Vec::new(),
@@ -265,7 +253,7 @@ fn build_required_network_spec(
         name: requested.name.clone(),
         description: String::new(),
         driver: requested.driver,
-        subnet_cidr: default_required_network_subnet(
+        subnet_cidr: default_network_subnet(
             &requested.name,
             known_subnets.iter().map(String::as_str),
             family,
@@ -327,97 +315,15 @@ fn normalize_required_networks(
     Ok(normalized.into_values().collect())
 }
 
-/// Resolves the daemon's default network IP family for server-side auto-provisioning.
-fn default_required_network_family() -> WorkloadNetworkIpFamily {
-    let (has_ipv4, has_ipv6) = crate::node::address::detect_local_ip_families();
-    match infer_default_ip_family(
-        config::nodeport_ip(),
-        config::advertise_addr().as_deref(),
-        config::default_ip_family_policy(),
-        has_ipv4,
-        has_ipv6,
-    ) {
-        IpFamily::Ipv4 => WorkloadNetworkIpFamily::Ipv4,
-        IpFamily::Ipv6 => WorkloadNetworkIpFamily::Ipv6,
-    }
-}
-
-/// Computes a deterministic default subnet for an auto-provisioned manifest network.
-fn default_required_network_subnet<I, S>(
-    name: &str,
-    existing_subnets: I,
+/// Maps a workload network family request to the concrete family used for default subnet choice.
+fn default_subnet_family_for_requirement(
     family: WorkloadNetworkIpFamily,
-) -> String
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let used: BTreeSet<String> = existing_subnets
-        .into_iter()
-        .map(|subnet| subnet.as_ref().trim().to_string())
-        .collect();
-    let hash = default_required_network_subnet_hash(name);
-    let candidates = default_required_network_subnet_candidate_count(family);
-
-    for offset in 0..candidates {
-        let candidate = default_required_network_subnet_candidate(hash, offset, family);
-        if !used.contains(&candidate) {
-            return candidate;
-        }
-    }
-
-    default_required_network_subnet_candidate(hash, 0, family)
-}
-
-/// Hashes a network name into a stable default-subnet selection seed.
-fn default_required_network_subnet_hash(name: &str) -> u32 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(name.as_bytes());
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; 4];
-    bytes.copy_from_slice(&digest.as_bytes()[..4]);
-    u32::from_le_bytes(bytes)
-}
-
-/// Returns the number of deterministic subnet candidates in the requested family.
-fn default_required_network_subnet_candidate_count(family: WorkloadNetworkIpFamily) -> u32 {
+) -> DefaultNetworkIpFamily {
     match family {
-        WorkloadNetworkIpFamily::Default | WorkloadNetworkIpFamily::Ipv4 => {
-            DEFAULT_NETWORK_SUBNET_CANDIDATES_V4
-        }
-        WorkloadNetworkIpFamily::Ipv6 => DEFAULT_NETWORK_SUBNET_CANDIDATES_V6,
+        WorkloadNetworkIpFamily::Default => default_network_ip_family(),
+        WorkloadNetworkIpFamily::Ipv4 => DefaultNetworkIpFamily::Ipv4,
+        WorkloadNetworkIpFamily::Ipv6 => DefaultNetworkIpFamily::Ipv6,
     }
-}
-
-/// Converts a deterministic subnet candidate offset into a concrete CIDR string.
-fn default_required_network_subnet_candidate(
-    hash: u32,
-    offset: u32,
-    family: WorkloadNetworkIpFamily,
-) -> String {
-    match family {
-        WorkloadNetworkIpFamily::Default | WorkloadNetworkIpFamily::Ipv4 => {
-            default_required_network_subnet_candidate_v4(hash, offset)
-        }
-        WorkloadNetworkIpFamily::Ipv6 => default_required_network_subnet_candidate_v6(hash, offset),
-    }
-}
-
-/// Converts one candidate offset into a unique `10.0.0.0/8` `/20` subnet.
-fn default_required_network_subnet_candidate_v4(hash: u32, offset: u32) -> String {
-    let seed = hash & (DEFAULT_NETWORK_SUBNET_CANDIDATES_V4 - 1);
-    let bucket = seed.wrapping_add(offset) & (DEFAULT_NETWORK_SUBNET_CANDIDATES_V4 - 1);
-    let second_octet = (bucket >> 4) as u8;
-    let third_octet = ((bucket & 0x0f) << 4) as u8;
-    format!("10.{second_octet}.{third_octet}.0/{DEFAULT_NETWORK_SUBNET_PREFIX_V4}")
-}
-
-/// Converts one candidate offset into a unique `fd42::/16` `/64` subnet.
-fn default_required_network_subnet_candidate_v6(hash: u32, offset: u32) -> String {
-    let group = (hash >> 16) as u16;
-    let seed = hash as u16;
-    let bucket = seed.wrapping_add(offset as u16);
-    format!("fd42:{group:04x}:{bucket:04x}::/{DEFAULT_NETWORK_SUBNET_PREFIX_V6}")
 }
 
 /// Formats a bounded list of network readiness blockers for status details.
@@ -466,42 +372,5 @@ mod tests {
             err.to_string().contains("conflicting drivers"),
             "unexpected error: {err}"
         );
-    }
-
-    #[test]
-    /// Default-subnet selection probes away from an already used IPv4 candidate.
-    fn default_required_network_subnet_skips_used_ipv4_candidate() {
-        let initial = default_required_network_subnet(
-            "alpha",
-            std::iter::empty::<&str>(),
-            WorkloadNetworkIpFamily::Ipv4,
-        );
-        let resolved = default_required_network_subnet(
-            "alpha",
-            [initial.as_str()],
-            WorkloadNetworkIpFamily::Ipv4,
-        );
-
-        assert_ne!(initial, resolved);
-        assert!(resolved.ends_with("/20"));
-    }
-
-    #[test]
-    /// Default-subnet selection probes away from an already used IPv6 candidate.
-    fn default_required_network_subnet_skips_used_ipv6_candidate() {
-        let initial = default_required_network_subnet(
-            "alpha",
-            std::iter::empty::<&str>(),
-            WorkloadNetworkIpFamily::Ipv6,
-        );
-        let resolved = default_required_network_subnet(
-            "alpha",
-            [initial.as_str()],
-            WorkloadNetworkIpFamily::Ipv6,
-        );
-
-        assert_ne!(initial, resolved);
-        assert!(resolved.starts_with("fd42:"));
-        assert!(resolved.ends_with("/64"));
     }
 }
