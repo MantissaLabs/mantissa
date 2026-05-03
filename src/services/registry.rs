@@ -48,6 +48,18 @@ impl ServiceRegistry {
         Ok(snapshot.and_then(|snap| select_best_service_spec(snap.as_slice())))
     }
 
+    /// Returns one service by its exact deterministic service name.
+    ///
+    /// Service identifiers are derived from service names, so exact-name lookup can use the
+    /// same keyed store path as UUID lookup. The name check guards the selector contract if a
+    /// future service-id scheme changes or an unexpected hash collision is ever observed.
+    pub fn get_by_name(&self, service_name: &str) -> Result<Option<ServiceSpecValue>> {
+        let id = compute_service_id(service_name);
+        Ok(self
+            .get(id)?
+            .filter(|service| service.service_name == service_name))
+    }
+
     pub fn list(&self) -> Result<Vec<ServiceSpecValue>> {
         let (entries, _) = self
             .store
@@ -186,6 +198,23 @@ mod tests {
         let fetched = registry.get(spec.id).expect("get").expect("value");
         assert_eq!(fetched.task_templates.len(), 1);
         assert_eq!(fetched.task_templates[0].image, "ghcr.io/demo/web:latest");
+
+        let fetched_by_name = registry
+            .get_by_name("demo-service")
+            .expect("get by name")
+            .expect("value by name");
+        assert_eq!(fetched_by_name.id, spec.id);
+        assert_eq!(
+            fetched_by_name.task_templates[0].image,
+            "ghcr.io/demo/web:latest"
+        );
+        assert!(
+            registry
+                .get_by_name("missing-service")
+                .expect("get missing by name")
+                .is_none(),
+            "missing service names should return no row"
+        );
 
         let listed = registry.list().expect("list");
         assert_eq!(listed.len(), 1);

@@ -1,6 +1,6 @@
 use crate::config::ClientConfig;
 use crate::connection;
-use crate::services::list::ServiceRow;
+use crate::services::list::{ServiceRow, fetch_service_row_by_id};
 use anyhow::{Result, anyhow};
 use uuid::Uuid;
 
@@ -40,20 +40,7 @@ pub async fn stop(cfg: &ClientConfig, service_id: &str) -> Result<()> {
 }
 
 async fn fetch_service(cfg: &ClientConfig, id: Uuid) -> Result<ServiceRow> {
-    let client = connection::get_local_session(cfg).await?;
-    let request = client.get_services_request();
-    let services = request.send().pipeline.get_services();
-
-    let response = services.list_request().send().promise.await?;
-    let reader = response.get()?;
-    let specs = reader.get_services()?;
-
-    for spec in specs.iter() {
-        let row = ServiceRow::from_reader(spec)?;
-        if row.id == id.to_string() {
-            return Ok(row);
-        }
-    }
-
-    Err(anyhow!("unknown service {id}"))
+    fetch_service_row_by_id(cfg, id)
+        .await
+        .map_err(|err| anyhow!("unknown service {id}: {err}"))
 }

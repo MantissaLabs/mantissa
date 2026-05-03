@@ -188,33 +188,14 @@ impl services::Server for ServicesRPC {
 
 impl ServicesRPC {
     /// Selects exactly one service from the registry using UUID text or exact service name.
-    ///
-    /// TODO(abronan): services need to be cached and selected by their ID instead of looping
-    /// through all services.
     fn select_service(&self, selector: &str) -> anyhow::Result<ServiceSpecValue> {
-        if let Ok(service_id) = Uuid::parse_str(selector) {
-            return self
-                .manager
-                .registry()
-                .get(service_id)?
-                .ok_or_else(|| anyhow::anyhow!("service '{selector}' not found"));
-        }
+        let service = if let Ok(service_id) = Uuid::parse_str(selector) {
+            self.manager.registry().get(service_id)?
+        } else {
+            self.manager.registry().get_by_name(selector)?
+        };
 
-        let mut matches: Vec<ServiceSpecValue> = self
-            .manager
-            .registry()
-            .list()?
-            .into_iter()
-            .filter(|service| service.service_name == selector)
-            .collect();
-
-        match matches.len() {
-            1 => Ok(matches.remove(0)),
-            0 => Err(anyhow::anyhow!("service '{selector}' not found")),
-            count => Err(anyhow::anyhow!(
-                "service selector '{selector}' is ambiguous ({count} matches); use a service id"
-            )),
-        }
+        service.ok_or_else(|| anyhow::anyhow!("service '{selector}' not found"))
     }
 }
 
