@@ -1,8 +1,10 @@
 use super::dedupe::GossipDedupeState;
 use super::message::Message;
 use super::outbound::{coalesce_pending_messages, fanout_sample};
+use super::plane::should_relay_inbound_message;
 use super::service::message_for_forwarding;
 use crate::cluster::{ClusterId, ClusterViewId};
+use crate::network::types::NetworkEvent;
 use crate::topology::PeerHandle;
 use crate::topology::TopologyEvent;
 use crate::topology::peer_provider::PeerProvider;
@@ -128,6 +130,17 @@ fn message_for_forwarding_strips_join_client_capability() {
         } => assert!(client.is_none()),
         _ => panic!("unexpected forwarded message variant"),
     }
+}
+
+/// Network metadata is low-volume and should relay epidemically for fast peer convergence.
+#[test]
+fn network_gossip_relays_without_generic_relay_flag() {
+    let message = Message::Network {
+        id: Uuid::new_v4(),
+        event: NetworkEvent::PeerRemove(Uuid::new_v4()),
+    };
+
+    assert!(should_relay_inbound_message(false, &message));
 }
 
 /// Task coalescing should keep the causally newest upsert and drop stale updates.

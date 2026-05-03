@@ -61,5 +61,7 @@ pub(super) fn gossip_plane_for_wire_message(
 /// so cluster lineage names converge quickly without enabling high-volume relay for all
 /// task/service update traffic.
 pub(super) fn should_relay_inbound_message(relay_inbound: bool, message: &Message) -> bool {
-    relay_inbound || gossip_plane_for_message(message).allows_cross_view()
+    relay_inbound
+        || gossip_plane_for_message(message).allows_cross_view()
+        || matches!(message, Message::Network { .. })
 }
