@@ -1340,31 +1340,13 @@ pub struct NetworksCreateArgs {
     #[arg(long = "mtu", value_name = "BYTES")]
     pub mtu: Option<u32>,
 
-    /// Optional BPF program identifiers to attach (repeat flag).
-    /// Defaults to the standard VXLAN and bridge programs; provided entries are appended.
+    /// Optional BPF program identifiers to add or use in place of driver defaults (repeat flag).
     #[arg(long = "bpf-program", value_name = "PROGRAM", action = ArgAction::Append)]
     pub bpf_programs: Vec<String>,
 
     /// Mark the network spec read-only after creation
     #[arg(long = "sealed", action = ArgAction::SetTrue)]
     pub sealed: bool,
-}
-
-impl NetworksCreateArgs {
-    /// Merge user-provided programs with the defaults so dataplane maps and load-balancing remain
-    /// available even when no BPF flags are specified on the CLI.
-    pub fn resolved_bpf_programs(&self) -> Vec<String> {
-        let driver = match self.driver {
-            NetworkDriverOpt::Vxlan => mantissa_client::networks::NetworkDriver::Vxlan,
-            NetworkDriverOpt::Bridge => mantissa_client::networks::NetworkDriver::Bridge,
-        };
-        let mut programs =
-            mantissa_client::networks::default_network_bpf_programs_for_driver(driver);
-        programs.extend(self.bpf_programs.iter().cloned());
-        programs.sort();
-        programs.dedup();
-        programs
-    }
 }
 
 #[derive(Args, Debug)]

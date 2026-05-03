@@ -3,6 +3,7 @@ use crate::gossip::Message;
 use crate::network::allocator::{parse_overlay_cidr, resolver_ip_address};
 use crate::network::attachment::{PlatformAttachmentProvisioner, host_iface_name};
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext, overlay_bpf_program_specs};
+use crate::network::defaults::merge_default_bpf_programs;
 use crate::network::discovery::ServiceDiscovery;
 use crate::network::events::ForwardingEvent;
 use crate::network::naming::{
@@ -1441,32 +1442,17 @@ impl NetworkController {
         }
     }
 
-    /// Guarantee the dataplane programs required for VIP load-balancing are present with the
-    /// correct attach points so LB maps are always created and pinned.
+    /// Guarantee each required dataplane attach point has a declared program.
     fn ensure_default_bpf_programs(programs: &mut Vec<BpfProgramSpec>) -> bool {
-        let mut changed = false;
         let defaults = default_bpf_programs();
         if defaults.is_empty() {
             return false;
         }
 
-        for default in defaults {
-            match programs.iter_mut().find(|p| p.name == default.name) {
-                Some(existing) => {
-                    if existing.attach_point != default.attach_point {
-                        existing.attach_point = default.attach_point;
-                        changed = true;
-                    }
-                }
-                None => {
-                    programs.push(default);
-                    changed = true;
-                }
-            }
-        }
-
-        programs.sort();
-        programs.dedup();
+        let original = std::mem::take(programs);
+        let merged = merge_default_bpf_programs(defaults, original.clone());
+        let changed = original != merged;
+        *programs = merged;
         changed
     }
 

@@ -604,7 +604,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     subnet_cidr: args.subnet.clone(),
                     vni: args.vni,
                     mtu: args.mtu,
-                    bpf_programs: args.resolved_bpf_programs(),
+                    bpf_programs: args.bpf_programs.clone(),
                     sealed: args.sealed,
                 };
 

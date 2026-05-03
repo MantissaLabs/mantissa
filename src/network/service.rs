@@ -1,5 +1,7 @@
 use crate::network::controller::NetworkController;
-use crate::network::defaults::{default_network_ip_family, default_network_subnet};
+use crate::network::defaults::{
+    default_network_ip_family, default_network_subnet, merge_driver_default_bpf_programs,
+};
 use crate::network::gossip::NetworkGossiper;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
@@ -550,8 +552,9 @@ impl networks::Server for NetworksRpc {
         let vni = spec_reader.get_vni();
         let mtu = spec_reader.get_mtu();
         let sealed = spec_reader.get_sealed();
-        let programs = collect_bpf_programs(&spec_reader)?;
-        validate_driver_request(driver, vni, &programs)?;
+        let requested_programs = collect_bpf_programs(&spec_reader)?;
+        validate_driver_request(driver, vni, &requested_programs)?;
+        let programs = merge_driver_default_bpf_programs(driver, requested_programs);
 
         let network_id = compute_network_id(&name);
         let existing_spec = self.registry.get_spec(network_id).map_err(to_capnp)?;

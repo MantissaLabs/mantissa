@@ -1,5 +1,7 @@
 use crate::config;
 use crate::ip_family::{IpFamily, infer_default_ip_family};
+use crate::network::bpf::overlay_bpf_program_specs;
+use crate::network::types::{BpfProgramSpec, NetworkDriver};
 use blake3::Hasher;
 use std::collections::BTreeSet;
 
@@ -66,6 +68,45 @@ where
     default_network_subnet_candidate(hash, 0, family)
 }
 
+/// Returns the server-owned default BPF program set for a network driver.
+pub fn default_bpf_programs_for_driver(driver: NetworkDriver) -> Vec<BpfProgramSpec> {
+    match driver {
+        NetworkDriver::Vxlan => overlay_bpf_program_specs(),
+        NetworkDriver::Bridge => Vec::new(),
+    }
+}
+
+/// Merges driver defaults with user-requested BPF programs.
+///
+/// Defaults are keyed by attach point so an explicit user program for the same attach point
+/// replaces the driver default, while new attach points are appended as additional declarations.
+pub fn merge_default_bpf_programs(
+    defaults: Vec<BpfProgramSpec>,
+    requested: Vec<BpfProgramSpec>,
+) -> Vec<BpfProgramSpec> {
+    let mut merged = defaults;
+    for program in requested {
+        match merged
+            .iter_mut()
+            .find(|existing| existing.attach_point == program.attach_point)
+        {
+            Some(existing) => *existing = program,
+            None => merged.push(program),
+        }
+    }
+    merged.sort();
+    merged.dedup();
+    merged
+}
+
+/// Expands user-requested BPF programs with the defaults required by the selected driver.
+pub fn merge_driver_default_bpf_programs(
+    driver: NetworkDriver,
+    requested: Vec<BpfProgramSpec>,
+) -> Vec<BpfProgramSpec> {
+    merge_default_bpf_programs(default_bpf_programs_for_driver(driver), requested)
+}
+
 /// Hashes a network name into a stable default-subnet selection seed.
 fn default_network_subnet_hash(name: &str) -> u32 {
     let mut hasher = Hasher::new();
@@ -115,7 +156,11 @@ fn default_network_subnet_candidate_v6(hash: u32, offset: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DefaultNetworkIpFamily, default_network_subnet};
+    use super::{
+        DefaultNetworkIpFamily, default_bpf_programs_for_driver, default_network_subnet,
+        merge_driver_default_bpf_programs,
+    };
+    use crate::network::types::{BpfAttachPoint, BpfProgramSpec, NetworkDriver};
 
     #[test]
     /// Default-subnet selection varies by name for IPv4 networks.
@@ -184,5 +229,65 @@ mod tests {
         assert_ne!(initial, resolved);
         assert!(resolved.starts_with("fd42:"));
         assert!(resolved.ends_with("/64"));
+    }
+
+    #[test]
+    /// VXLAN networks get the canonical BPF program bundle by default.
+    fn vxlan_driver_default_bpf_programs_include_overlay_bundle() {
+        let programs = default_bpf_programs_for_driver(NetworkDriver::Vxlan);
+
+        assert_eq!(programs.len(), 4);
+        assert!(
+            programs
+                .iter()
+                .any(|program| program.attach_point == BpfAttachPoint::VxlanXdp)
+        );
+        assert!(
+            programs
+                .iter()
+                .any(|program| program.attach_point == BpfAttachPoint::BridgeXdp)
+        );
+        assert!(
+            programs
+                .iter()
+                .any(|program| program.attach_point == BpfAttachPoint::BridgeTcIngress)
+        );
+        assert!(
+            programs
+                .iter()
+                .any(|program| program.attach_point == BpfAttachPoint::BridgeTcEgress)
+        );
+    }
+
+    #[test]
+    /// Bridge networks do not carry overlay BPF programs by default.
+    fn bridge_driver_default_bpf_programs_are_empty() {
+        assert!(default_bpf_programs_for_driver(NetworkDriver::Bridge).is_empty());
+    }
+
+    #[test]
+    /// User-provided programs replace driver defaults for the same attach point.
+    fn merge_driver_default_bpf_programs_replaces_default_attach_point() {
+        let programs = merge_driver_default_bpf_programs(
+            NetworkDriver::Vxlan,
+            vec![BpfProgramSpec::with_attach_point(
+                "custom_bridge_ingress",
+                BpfAttachPoint::BridgeTcIngress,
+            )],
+        );
+
+        assert!(
+            programs
+                .iter()
+                .any(|program| program.name == "custom_bridge_ingress"
+                    && program.attach_point == BpfAttachPoint::BridgeTcIngress)
+        );
+        assert!(
+            !programs
+                .iter()
+                .any(|program| program.name == "bridge_tc_ingress"
+                    && program.attach_point == BpfAttachPoint::BridgeTcIngress)
+        );
+        assert_eq!(programs.len(), 4);
     }
 }

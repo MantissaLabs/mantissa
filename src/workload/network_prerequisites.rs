@@ -1,8 +1,8 @@
 use crate::gossip::Message;
-use crate::network::bpf::overlay_bpf_program_specs;
 use crate::network::controller::NetworkController;
 use crate::network::defaults::{
-    DefaultNetworkIpFamily, default_network_ip_family, default_network_subnet,
+    DefaultNetworkIpFamily, default_bpf_programs_for_driver, default_network_ip_family,
+    default_network_subnet,
 };
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
@@ -244,10 +244,7 @@ fn build_required_network_spec(
     known_subnets: &BTreeSet<String>,
 ) -> NetworkSpecValue {
     let family = default_subnet_family_for_requirement(requested.ip_family);
-    let bpf_programs = match requested.driver {
-        NetworkDriver::Vxlan => overlay_bpf_program_specs(),
-        NetworkDriver::Bridge => Vec::new(),
-    };
+    let bpf_programs = default_bpf_programs_for_driver(requested.driver);
 
     NetworkSpecValue::new(NetworkSpecDraft {
         name: requested.name.clone(),

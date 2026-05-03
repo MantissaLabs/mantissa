@@ -102,7 +102,7 @@ struct NetworkCreateSpec {
   # MTU for the overlay (0 uses default MTU, typically 1450).
 
   bpfPrograms @6 :List(Text);
-  # eBPF program identifiers to attach for datapath processing.
+  # User-requested eBPF program identifiers; the server adds driver defaults.
 
   sealed @7 :Bool;
   # True once the network spec should be treated as immutable.
