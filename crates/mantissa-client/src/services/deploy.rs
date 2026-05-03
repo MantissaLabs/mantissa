@@ -9,8 +9,8 @@ use crate::config::ClientConfig;
 use crate::connection;
 use crate::volumes;
 use crate::workload_submit::{
-    DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec, ResolvedDeclaredVolume,
-    compute_network_id, ensure_declared_volumes, ensure_named_networks,
+    DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec, RequestedNetworkSpec,
+    ResolvedDeclaredVolume, compute_network_id, ensure_declared_volumes,
 };
 use crate::workload_wire::{write_local_volume_ownership, write_port_bindings};
 use anyhow::{Context, Result, anyhow};
@@ -128,7 +128,7 @@ pub async fn deploy_manifest(
     manifest: &ServiceManifest,
 ) -> Result<ServiceDeploymentHandle> {
     let manifest_id = Uuid::new_v4();
-    ensure_named_networks(cfg, manifest.requested_networks()?).await?;
+    let required_networks = manifest.requested_networks()?;
     let resolved_volumes = ensure_declared_volumes(
         cfg,
         &manifest
@@ -204,6 +204,12 @@ pub async fn deploy_manifest(
         spec.set_manifest_name(&manifest.name);
         spec.set_service_name(&manifest.name);
         write_update_strategy(spec.reborrow().init_update_strategy(), &manifest.update);
+        write_required_networks(
+            &mut spec
+                .reborrow()
+                .init_required_networks(required_networks.len() as u32),
+            &required_networks,
+        );
 
         let mut templates_builder = spec
             .reborrow()
@@ -251,6 +257,30 @@ pub async fn deploy_manifest(
         outcome,
         detail,
     })
+}
+
+/// Writes manifest-required networks into the service deployment request.
+fn write_required_networks(
+    builder: &mut capnp::struct_list::Builder<
+        mantissa_protocol::services::service_required_network::Owned,
+    >,
+    required_networks: &[RequestedNetworkSpec],
+) {
+    for (idx, network) in required_networks.iter().enumerate() {
+        let mut entry = builder.reborrow().get(idx as u32);
+        entry.set_name(&network.name);
+        entry.set_driver(network.driver.into());
+        let family = match network.ip_family {
+            Some(crate::config::NetworkIpFamily::Ipv4) => {
+                mantissa_protocol::services::ServiceNetworkIpFamily::Ipv4
+            }
+            Some(crate::config::NetworkIpFamily::Ipv6) => {
+                mantissa_protocol::services::ServiceNetworkIpFamily::Ipv6
+            }
+            None => mantissa_protocol::services::ServiceNetworkIpFamily::Default,
+        };
+        entry.set_ip_family(family);
+    }
 }
 
 /// Writes one manifest task template into the Cap'n Proto builder for submission.

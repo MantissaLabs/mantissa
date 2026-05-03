@@ -576,6 +576,7 @@ async fn build_runtime_components(
         workload_manager: workload_manager.clone(),
         cluster_registry: registry.clone(),
         network_registry: network_registry.clone(),
+        network_controller: network_controller.clone(),
         volume_registry: volume_registry.clone(),
         gossip_tx: gossip_tx.clone(),
         gossip_rx: service_rx,

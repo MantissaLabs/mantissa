@@ -475,7 +475,8 @@ address does not have an equivalent `route_localnet` escape hatch.
 
 Prerequisites: Linux host, kernel with XDP+TC and BPF enabled, and `bpf-linker` (`cargo install --git https://github.com/aya-rs/bpf-linker bpf-linker`).
 
-1. Ensure a network exists with eBPF programs enabled:
+1. Optional: pre-create the network if you want to override the manifest's
+   default auto-provisioned subnet:
    ```bash
    mantissa networks create \
      --name discovery-demo \

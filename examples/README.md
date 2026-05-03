@@ -96,7 +96,7 @@ mantissa jobs run --file examples/job_with_volume.ron
 ```
 
 This manifest demonstrates the production-shaped job path where the client
-auto-provisions declared assets before submission:
+auto-provisions declared job assets before submission:
 
 - a managed local volume declared at the top level
 - a mounted workspace under `execution.volumes`

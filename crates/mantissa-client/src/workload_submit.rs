@@ -369,7 +369,7 @@ fn manifest_port_protocol_label(protocol: ManifestPortProtocol) -> &'static str 
     }
 }
 
-/// Ensure every referenced manifest network exists before submission.
+/// Ensure every referenced job or agent manifest network exists before workload submission.
 pub async fn ensure_named_networks(
     cfg: &ClientConfig,
     required_networks: impl IntoIterator<Item = RequestedNetworkSpec>,

@@ -1,6 +1,7 @@
 @0xf934ee53cdab0910;
 
 using WorkloadSchema = import "workload.capnp";
+using import "network.capnp".NetworkDriver;
 
 interface Services {
   list @0 () -> (services :List(ServiceSpec));
@@ -551,6 +552,31 @@ struct ServiceDeploySpec {
 
   updateStrategy @4 :UpdateStrategy;
   # Desired rollout strategy for this deployment generation.
+
+  requiredNetworks @5 :List(ServiceRequiredNetwork);
+  # Networks referenced by the manifest that the service controller must provision before placement.
+}
+
+struct ServiceRequiredNetwork {
+  name @0 :Text;
+  # Human-readable network name referenced by task templates.
+
+  driver @1 :NetworkDriver;
+  # Requested network driver.
+
+  ipFamily @2 :ServiceNetworkIpFamily;
+  # Optional family override for deterministic auto-created subnets.
+}
+
+enum ServiceNetworkIpFamily {
+  default @0;
+  # Use the daemon's configured default network family.
+
+  ipv4 @1;
+  # Use an IPv4 overlay subnet.
+
+  ipv6 @2;
+  # Use an IPv6 overlay subnet.
 }
 
 enum DeployOutcome {

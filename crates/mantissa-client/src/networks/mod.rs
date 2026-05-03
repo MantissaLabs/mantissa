@@ -25,12 +25,6 @@ const DEFAULT_NETWORK_SUBNET_CANDIDATES_V4: u32 = 1 << 12;
 const DEFAULT_NETWORK_SUBNET_PREFIX_V6: u8 = 64;
 const DEFAULT_NETWORK_SUBNET_CANDIDATES_V6: u32 = 1 << 16;
 
-/// Return the baseline dataplane programs required for VXLAN overlays so auto-provisioned
-/// networks behave consistently with CLI defaults.
-pub fn default_network_bpf_programs() -> Vec<String> {
-    default_network_bpf_programs_for_driver(NetworkDriver::Vxlan)
-}
-
 /// Return the baseline dataplane programs required by the requested network driver.
 pub fn default_network_bpf_programs_for_driver(driver: NetworkDriver) -> Vec<String> {
     if matches!(driver, NetworkDriver::Bridge) {
@@ -120,7 +114,7 @@ fn default_network_subnet_candidate_v6(hash: u32, offset: u32) -> String {
     format!("fd42:{group:04x}:{bucket:04x}::/{DEFAULT_NETWORK_SUBNET_PREFIX_V6}")
 }
 
-/// Build a default network creation request used by service deployments to auto-provision networks.
+/// Build a default network creation request used by manifest clients that auto-provision networks.
 pub fn default_network_create_request<I, S>(
     name: impl Into<String>,
     existing_subnets: I,
