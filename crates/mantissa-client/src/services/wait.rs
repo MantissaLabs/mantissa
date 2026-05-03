@@ -15,10 +15,13 @@ use crossterm::{
 use std::fmt::Write as FmtWrite;
 use std::io::{self, IsTerminal, Write as IoWrite};
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{MissedTickBehavior, interval};
 
 /// Default polling cadence used while following service deployment progress.
 const SERVICE_DEPLOYMENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Terminal-only redraw cadence for the deployment spinner.
+const SERVICE_DEPLOYMENT_SPINNER_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Width of the ASCII progress bar shown in service deployment progress output.
 const PROGRESS_BAR_WIDTH: usize = 12;
@@ -76,58 +79,78 @@ async fn follow_deployment(
 ) -> Result<()> {
     let started = tokio::time::Instant::now();
     let mut renderer = DeploymentProgressRenderer::new();
+    let mut last_row = None;
+    let mut poll = interval(SERVICE_DEPLOYMENT_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut spinner = interval(SERVICE_DEPLOYMENT_SPINNER_INTERVAL);
+    spinner.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    spinner.tick().await;
 
     loop {
-        let row = match fetch_service_row_by_id(cfg, handle.service_id).await {
-            Ok(row) => row,
-            Err(err) => {
-                output::emit_line(format!(
-                    "inspect rollout: mantissa services rollout status {}",
-                    handle.service_id
-                ));
-                return Err(anyhow!(
-                    "service '{}' disappeared or could not be inspected while tracking deployment: {err}",
-                    manifest.name
-                ));
-            }
-        };
+        tokio::select! {
+            _ = poll.tick() => {
+                let row = match fetch_service_row_by_id(cfg, handle.service_id).await {
+                    Ok(row) => row,
+                    Err(err) => {
+                        if let Some(row) = last_row.as_ref() {
+                            renderer.render_final(row)?;
+                        }
+                        output::emit_line(format!(
+                            "inspect rollout: mantissa services rollout status {}",
+                            handle.service_id
+                        ));
+                        return Err(anyhow!(
+                            "service '{}' disappeared or could not be inspected while tracking deployment: {err}",
+                            manifest.name
+                        ));
+                    }
+                };
 
-        renderer.render(&row)?;
+                match classify_deployment(&row, handle) {
+                    DeploymentState::Succeeded => {
+                        renderer.render_final(&row)?;
+                        output::emit_line(format!("service {} deployment complete", row.service_name));
+                        return Ok(());
+                    }
+                    DeploymentState::Failed(reason) => {
+                        renderer.render_final(&row)?;
+                        output::emit_line(format!(
+                            "inspect rollout: mantissa services rollout status {}",
+                            handle.service_id
+                        ));
+                        return Err(anyhow!(
+                            "service '{}' deployment failed: {reason}",
+                            row.service_name
+                        ));
+                    }
+                    DeploymentState::InProgress => {}
+                }
 
-        match classify_deployment(&row, handle) {
-            DeploymentState::Succeeded => {
-                output::emit_line(format!("service {} deployment complete", row.service_name));
-                return Ok(());
+                if let Some(timeout) = timeout
+                    && started.elapsed() >= timeout
+                {
+                    renderer.render_final(&row)?;
+                    output::emit_line(format!(
+                        "inspect rollout: mantissa services rollout status {}",
+                        handle.service_id
+                    ));
+                    return Err(anyhow!(
+                        "timed out waiting for service '{}' deployment after {}; last observed: {}",
+                        row.service_name,
+                        format_duration(timeout),
+                        render_last_observed(&row)
+                    ));
+                }
+
+                renderer.render_active(&row)?;
+                last_row = Some(row);
             }
-            DeploymentState::Failed(reason) => {
-                output::emit_line(format!(
-                    "inspect rollout: mantissa services rollout status {}",
-                    handle.service_id
-                ));
-                return Err(anyhow!(
-                    "service '{}' deployment failed: {reason}",
-                    row.service_name
-                ));
+            _ = spinner.tick(), if last_row.is_some() => {
+                if let Some(row) = last_row.as_ref() {
+                    renderer.render_spinner(row)?;
+                }
             }
-            DeploymentState::InProgress => {}
         }
-
-        if let Some(timeout) = timeout
-            && started.elapsed() >= timeout
-        {
-            output::emit_line(format!(
-                "inspect rollout: mantissa services rollout status {}",
-                handle.service_id
-            ));
-            return Err(anyhow!(
-                "timed out waiting for service '{}' deployment after {}; last observed: {}",
-                row.service_name,
-                format_duration(timeout),
-                render_last_observed(&row)
-            ));
-        }
-
-        sleep(SERVICE_DEPLOYMENT_POLL_INTERVAL).await;
     }
 }
 
@@ -215,16 +238,37 @@ impl DeploymentProgressRenderer {
         }
     }
 
+    /// Renders one active progress snapshot with a spinner frame.
+    fn render_active(&mut self, row: &ServiceRow) -> Result<()> {
+        self.render(row, true, false)
+    }
+
+    /// Redraws the active terminal progress snapshot with a fresh spinner frame.
+    fn render_spinner(&mut self, row: &ServiceRow) -> Result<()> {
+        if !self.interactive {
+            return Ok(());
+        }
+        self.render(row, true, true)
+    }
+
+    /// Renders one terminal progress snapshot without an active spinner.
+    fn render_final(&mut self, row: &ServiceRow) -> Result<()> {
+        self.render(row, false, true)
+    }
+
     /// Renders one progress snapshot, redrawing terminals and deduplicating log output.
-    fn render(&mut self, row: &ServiceRow) -> Result<()> {
+    fn render(&mut self, row: &ServiceRow, show_spinner: bool, force: bool) -> Result<()> {
         let key = ProgressKey::from(row);
         let changed = self.last_key.as_ref() != Some(&key);
-        if !self.interactive && !changed {
+        if !self.interactive && !changed && !force {
             return Ok(());
         }
 
-        let spinner = spinner_frame(self.spinner_index);
-        self.spinner_index = self.spinner_index.wrapping_add(1);
+        let spinner = show_spinner.then(|| {
+            let frame = spinner_frame(self.spinner_index);
+            self.spinner_index = self.spinner_index.wrapping_add(1);
+            frame
+        });
         let block = render_progress_block(row, spinner)?;
 
         if self.interactive {
@@ -282,7 +326,7 @@ impl From<&ServiceRow> for ProgressKey {
 }
 
 /// Renders one compact deployment progress panel and task-template progress tree.
-fn render_progress_block(row: &ServiceRow, spinner: char) -> Result<String> {
+fn render_progress_block(row: &ServiceRow, spinner: Option<char>) -> Result<String> {
     let task_progress = task_progress_for_render(row);
     let name_width = task_progress
         .iter()
@@ -291,7 +335,11 @@ fn render_progress_block(row: &ServiceRow, spinner: char) -> Result<String> {
         .unwrap_or(0);
     let mut out = String::new();
 
-    writeln!(&mut out, "deployment {}  {spinner}", row.service_name,)?;
+    if let Some(spinner) = spinner {
+        writeln!(&mut out, "deployment {}  {spinner}", row.service_name,)?;
+    } else {
+        writeln!(&mut out, "deployment {}", row.service_name)?;
+    }
     writeln!(&mut out, "  status    {}", row.status)?;
     if let Some(rollout) = rollout_progress_for_render(&row.rollout) {
         writeln!(&mut out, "  rollout   {rollout}")?;
@@ -315,8 +363,8 @@ fn render_progress_block(row: &ServiceRow, spinner: char) -> Result<String> {
     writeln!(&mut out, "  tasks")?;
     for (idx, task) in task_progress.iter().enumerate() {
         let is_last = idx + 1 == task_progress.len();
-        let branch = if is_last { "`--" } else { "|--" };
-        let detail_prefix = if is_last { "   " } else { "|  " };
+        let branch = if is_last { "└─" } else { "├─" };
+        let detail_prefix = if is_last { "  " } else { "│ " };
         writeln!(
             &mut out,
             "  {branch} {:<name_width$}  {}",
@@ -515,9 +563,10 @@ fn format_duration(duration: Duration) -> String {
     format!("{}ms", duration.as_millis())
 }
 
-/// Returns one ASCII spinner frame for interactive progress output.
+/// Returns one low-noise Braille spinner frame for interactive progress output.
 fn spinner_frame(index: usize) -> char {
-    ['|', '/', '-', '\\'][index % 4]
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    FRAMES[index % FRAMES.len()]
 }
 
 #[cfg(test)]
@@ -687,10 +736,26 @@ mod tests {
             },
         ];
 
-        let rendered = render_progress_block(&row, '|').expect("render progress block");
+        let rendered = render_progress_block(&row, Some('⠋')).expect("render progress block");
         assert_eq!(
             rendered,
-            "deployment svc  |\n  status    deploying\n  rollout   forward 1/3\n  replicas  1/4  [####--------]\n  detail    waiting for readiness\n\n  tasks\n  |-- web     1/3 running  1 waiting  1 creating\n  |   detail  starting container\n  `-- worker  0/1 running  1 pending\n"
+            "deployment svc  ⠋\n  status    deploying\n  rollout   forward 1/3\n  replicas  1/4  [####--------]\n  detail    waiting for readiness\n\n  tasks\n  ├─ web     1/3 running  1 waiting  1 creating\n  │  detail  starting container\n  └─ worker  0/1 running  1 pending\n"
         );
+    }
+
+    #[test]
+    /// Renders terminal snapshots without a spinner when deployment tracking finishes.
+    fn render_progress_final_omits_spinner() {
+        let manifest_id = Uuid::new_v4();
+        let row = test_row(
+            manifest_id,
+            ServiceStatusRow::Running,
+            ServiceRolloutPhaseRow::Idle,
+            None,
+            None,
+        );
+
+        let rendered = render_progress_block(&row, None).expect("render final progress block");
+        assert!(rendered.starts_with("deployment svc\n"));
     }
 }
