@@ -5,16 +5,14 @@ use crate::output;
 use anyhow::{Context, Result, anyhow};
 use uuid::Uuid;
 
-/// Retrieve full details for a given network and render them for CLI output.
-pub async fn inspect(cfg: &ClientConfig, id: &str) -> Result<()> {
-    let uuid = Uuid::parse_str(id).map_err(|e| anyhow!("invalid network id '{id}': {e}"))?;
-
+/// Retrieve full details for a given network identifier without rendering CLI output.
+pub async fn inspect_raw(cfg: &ClientConfig, id: Uuid) -> Result<NetworkInspect> {
     let client = connection::get_local_session(cfg).await?;
     let request = client.get_networks_request();
     let networks = request.send().pipeline.get_networks();
     let mut inspect = networks.inspect_request();
 
-    inspect.get().set_id(uuid.as_bytes());
+    inspect.get().set_id(id.as_bytes());
 
     let response = inspect
         .send()
@@ -28,8 +26,14 @@ pub async fn inspect(cfg: &ClientConfig, id: &str) -> Result<()> {
         .get_network()
         .context("network inspect response missing payload")?;
 
-    let info = NetworkInspect::from_reader(inspect_reader)
-        .map_err(|e| anyhow!("failed to decode network inspect response: {e}"))?;
+    NetworkInspect::from_reader(inspect_reader)
+        .map_err(|e| anyhow!("failed to decode network inspect response: {e}"))
+}
+
+/// Retrieve full details for a given network and render them for CLI output.
+pub async fn inspect(cfg: &ClientConfig, id: &str) -> Result<()> {
+    let uuid = Uuid::parse_str(id).map_err(|e| anyhow!("invalid network id '{id}': {e}"))?;
+    let info = inspect_raw(cfg, uuid).await?;
 
     render_inspect(&info);
     Ok(())

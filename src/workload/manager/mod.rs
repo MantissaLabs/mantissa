@@ -1606,6 +1606,37 @@ pub(crate) fn workload_start_error_requires_service_requeue(err: &anyhow::Error)
         })
 }
 
+/// Builds a concise service-facing detail for retryable workload start failures.
+pub(crate) fn workload_start_retryable_detail(err: &anyhow::Error) -> Option<String> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<SchedulingError>())
+        .and_then(|cause| match cause {
+            SchedulingError::SnapshotMissing => {
+                Some("waiting for scheduler snapshot convergence".to_string())
+            }
+            SchedulingError::NetworksBlocked { networks } => Some(format!(
+                "waiting for network readiness on at least one schedulable node: {}",
+                format_scheduling_networks(networks)
+            )),
+            SchedulingError::LocalNetworksBlocked { task } => Some(format!(
+                "waiting for local network readiness before starting task '{task}'"
+            )),
+            _ => None,
+        })
+}
+
+/// Render scheduling network identifiers for compact service status details.
+fn format_scheduling_networks(networks: &[Uuid]) -> String {
+    if networks.is_empty() {
+        return "none".to_string();
+    }
+    networks
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Returns true when a service launch failure should consume its failure budget.
 pub(crate) fn workload_start_error_consumes_service_failure_budget(err: &anyhow::Error) -> bool {
     err.chain()

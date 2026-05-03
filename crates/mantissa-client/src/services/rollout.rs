@@ -124,6 +124,7 @@ mod tests {
                 last_error: last_error.map(str::to_string),
             },
             public_endpoints: Vec::new(),
+            task_progress: Vec::new(),
         }
     }
 

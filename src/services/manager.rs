@@ -20,7 +20,7 @@ use crate::volumes::{LocalVolumeAccessError, VolumeRegistry};
 use crate::workload::manager::WorkloadManager;
 use crate::workload::manager::{
     WorkloadStartRequest, workload_start_error_consumes_service_failure_budget,
-    workload_start_error_requires_service_requeue,
+    workload_start_error_requires_service_requeue, workload_start_retryable_detail,
 };
 use crate::workload::model::{WorkloadPhase, WorkloadSpec, WorkloadVolumeMount};
 use crate::workload::types::{WorkloadPortBinding, WorkloadPortProtocol};
@@ -90,6 +90,82 @@ pub enum ServiceDeploymentOutcome {
 pub struct ServiceDeploymentSubmission {
     pub service_id: Uuid,
     pub outcome: ServiceDeploymentOutcome,
+}
+
+/// Aggregated task-template rollout progress returned by targeted service status calls.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceTaskProgressSnapshot {
+    pub name: String,
+    pub desired: u32,
+    pub assigned: u32,
+    pub pending: u32,
+    pub pulling: u32,
+    pub creating: u32,
+    pub volume_unavailable: u32,
+    pub running: u32,
+    pub paused: u32,
+    pub stopping: u32,
+    pub stopped: u32,
+    pub failed: u32,
+    pub exited: u32,
+    pub unknown: u32,
+    pub detail: Option<String>,
+}
+
+impl ServiceTaskProgressSnapshot {
+    /// Builds an empty aggregate row for one desired task template.
+    fn new(name: impl Into<String>, desired: u32) -> Self {
+        Self {
+            name: name.into(),
+            desired,
+            ..Self::default()
+        }
+    }
+
+    /// Records one visible workload phase into this template aggregate.
+    fn record_phase(
+        &mut self,
+        phase: &WorkloadPhase,
+        phase_reason: Option<&str>,
+        phase_progress: Option<&str>,
+    ) {
+        match phase {
+            WorkloadPhase::Pending => self.pending = self.pending.saturating_add(1),
+            WorkloadPhase::Pulling => self.pulling = self.pulling.saturating_add(1),
+            WorkloadPhase::Creating => self.creating = self.creating.saturating_add(1),
+            WorkloadPhase::VolumeUnavailable => {
+                self.volume_unavailable = self.volume_unavailable.saturating_add(1);
+            }
+            WorkloadPhase::Running => self.running = self.running.saturating_add(1),
+            WorkloadPhase::Paused => self.paused = self.paused.saturating_add(1),
+            WorkloadPhase::Stopping => self.stopping = self.stopping.saturating_add(1),
+            WorkloadPhase::Stopped => self.stopped = self.stopped.saturating_add(1),
+            WorkloadPhase::Failed => self.failed = self.failed.saturating_add(1),
+            WorkloadPhase::Exited(_) => self.exited = self.exited.saturating_add(1),
+            WorkloadPhase::Unknown => self.unknown = self.unknown.saturating_add(1),
+        }
+
+        self.remember_detail(phase_reason.or(phase_progress));
+    }
+
+    /// Records one assigned workload id whose replicated row is not visible yet.
+    fn record_unknown(&mut self, task_id: Uuid, reason: &dyn std::fmt::Display) {
+        self.unknown = self.unknown.saturating_add(1);
+        let task_id = short_uuid(task_id);
+        self.remember_detail(Some(&format!("task {task_id} not visible: {reason}")));
+    }
+
+    /// Records one human-readable detail without replacing an earlier useful reason.
+    fn remember_detail(&mut self, detail: Option<&str>) {
+        if self.detail.is_some() {
+            return;
+        }
+
+        self.detail = detail
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+    }
 }
 
 #[derive(Clone)]
@@ -257,6 +333,71 @@ impl ServiceController {
         let mut specs = self.registry.list()?;
         specs.retain(|spec| spec.status() != ServiceStatus::Stopped);
         Ok(specs)
+    }
+
+    /// Builds task-template aggregate progress for one service using only its replica ids.
+    pub async fn task_progress_for_service(
+        &self,
+        service: &ServiceSpecValue,
+    ) -> anyhow::Result<Vec<ServiceTaskProgressSnapshot>> {
+        let mut rows: Vec<ServiceTaskProgressSnapshot> = service
+            .task_templates
+            .iter()
+            .map(|template| {
+                ServiceTaskProgressSnapshot::new(&template.name, u32::from(template.replicas))
+            })
+            .collect();
+
+        let template_lookup: HashMap<String, usize> = rows
+            .iter()
+            .enumerate()
+            .map(|(idx, row)| (row.name.clone(), idx))
+            .collect();
+        let slot_templates = service_slot_template_names(service);
+
+        for (slot_idx, task_id) in service.replica_ids.iter().enumerate() {
+            let Some(expected_template) = slot_templates.get(slot_idx) else {
+                continue;
+            };
+            let Some(mut row_idx) = template_lookup.get(expected_template).copied() else {
+                continue;
+            };
+
+            rows[row_idx].assigned = rows[row_idx].assigned.saturating_add(1);
+
+            match self.workload_manager.inspect_workload(*task_id).await {
+                Ok(workload) => {
+                    if let Some(owner) = workload
+                        .service_owner()
+                        .filter(|owner| owner.service_name == service.service_name)
+                        && let Some(owner_idx) = template_lookup.get(&owner.template).copied()
+                        && owner_idx != row_idx
+                    {
+                        rows[row_idx].assigned = rows[row_idx].assigned.saturating_sub(1);
+                        rows[owner_idx].assigned = rows[owner_idx].assigned.saturating_add(1);
+                        row_idx = owner_idx;
+                    }
+
+                    rows[row_idx].record_phase(
+                        &workload.state,
+                        workload.phase_reason.as_deref(),
+                        workload.phase_progress.as_deref(),
+                    );
+                }
+                Err(err) => rows[row_idx].record_unknown(*task_id, &err),
+            }
+        }
+
+        for row in &mut rows {
+            if row.assigned < row.desired {
+                let missing = row.desired.saturating_sub(row.assigned);
+                row.remember_detail(Some(&format!(
+                    "{missing} replica slot(s) waiting for assignment"
+                )));
+            }
+        }
+
+        Ok(rows)
     }
 
     async fn handle_event(&self, event: ServiceEvent) -> anyhow::Result<()> {
@@ -615,6 +756,27 @@ impl ServiceController {
     pub fn registry(&self) -> &ServiceRegistry {
         &self.registry
     }
+}
+
+/// Builds the template name associated with each flattened service replica slot.
+fn service_slot_template_names(service: &ServiceSpecValue) -> Vec<String> {
+    let desired: usize = service
+        .task_templates
+        .iter()
+        .map(|template| template.replicas as usize)
+        .sum();
+    let mut slots = Vec::with_capacity(desired);
+    for template in &service.task_templates {
+        for _ in 0..template.replicas {
+            slots.push(template.name.clone());
+        }
+    }
+    slots
+}
+
+/// Returns a short stable workload id for status details.
+fn short_uuid(id: Uuid) -> String {
+    id.to_string().chars().take(8).collect()
 }
 
 #[cfg(test)]

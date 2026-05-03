@@ -1,13 +1,19 @@
 use crate::config::ClientConfig;
 use crate::config::NetworkIpFamily;
 use crate::networks;
+use crate::output;
 use crate::volumes;
 use anyhow::{Result, anyhow};
 use blake3::Hasher;
 use serde::{Deserialize, Deserializer};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::time::Duration;
+use tokio::time::{Instant, sleep};
 use uuid::Uuid;
+
+const NETWORK_PROVISION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const NETWORK_PROVISION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Driver families accepted by shared manifest-side volume provisioning helpers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +66,93 @@ pub struct RequestedNetworkSpec {
     pub name: String,
     pub driver: networks::NetworkDriver,
     pub ip_family: Option<NetworkIpFamily>,
+}
+
+/// One manifest-required network that must be schedulable before workload submission.
+#[derive(Clone, Debug)]
+struct NetworkProvisionTarget {
+    id: Uuid,
+    name: String,
+}
+
+/// Last observed readiness projection for one network during manifest auto-provisioning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NetworkReadinessObservation {
+    status: networks::NetworkStatus,
+    peer_count: u32,
+    ready_peers: u32,
+    error_peers: u32,
+    first_error: Option<String>,
+}
+
+impl NetworkReadinessObservation {
+    /// Build a scheduler-facing readiness snapshot from a network inspect response.
+    fn from_inspect(info: &networks::NetworkInspect) -> Self {
+        let peer_count = u32::try_from(info.peers.len()).map_or(u32::MAX, |value| value);
+        let ready_peers = u32::try_from(
+            info.peers
+                .iter()
+                .filter(|peer| peer.state == networks::NetworkPeerState::Ready)
+                .count(),
+        )
+        .map_or(u32::MAX, |value| value);
+        let error_peers = u32::try_from(
+            info.peers
+                .iter()
+                .filter(|peer| peer.state == networks::NetworkPeerState::Error)
+                .count(),
+        )
+        .map_or(u32::MAX, |value| value);
+        let first_error = info
+            .peers
+            .iter()
+            .find_map(|peer| peer.error.as_ref().filter(|error| !error.trim().is_empty()))
+            .cloned();
+
+        Self {
+            status: info.spec.status,
+            peer_count,
+            ready_peers,
+            error_peers,
+            first_error,
+        }
+    }
+
+    /// Return true once at least one peer can satisfy scheduler network readiness.
+    fn is_schedulable(&self) -> bool {
+        self.ready_peers > 0
+            && !matches!(
+                self.status,
+                networks::NetworkStatus::Deleting | networks::NetworkStatus::Deleted
+            )
+    }
+
+    /// Return a terminal readiness error when every observed peer has failed reconciliation.
+    fn terminal_error(&self) -> Option<String> {
+        if matches!(self.status, networks::NetworkStatus::Deleting) {
+            return Some("network is deleting".to_string());
+        }
+        if matches!(self.status, networks::NetworkStatus::Deleted) {
+            return Some("network is deleted".to_string());
+        }
+        if self.peer_count > 0 && self.ready_peers == 0 && self.error_peers == self.peer_count {
+            return Some(self.first_error.clone().unwrap_or_else(|| {
+                "all peers reported network reconciliation errors".to_string()
+            }));
+        }
+        None
+    }
+
+    /// Render a compact status summary for prerequisite wait output and timeout errors.
+    fn summary(&self) -> String {
+        if self.peer_count == 0 {
+            return format!("status {}, no peer state reported", self.status);
+        }
+        format!(
+            "status {}, ready peers {}/{}",
+            self.status, self.ready_peers, self.peer_count
+        )
+    }
 }
 
 /// Transport protocol for one manifest-declared node-local host port binding.
@@ -326,17 +419,15 @@ pub async fn ensure_named_networks(
         .collect();
     let mut known_subnets: HashSet<String> =
         existing.iter().map(|net| net.subnet_cidr.clone()).collect();
+    let mut targets = Vec::with_capacity(required.len());
 
     for requested in required {
         if let Some(existing) = existing_by_name.get(&requested.name) {
-            if existing.driver != requested.driver {
-                return Err(anyhow!(
-                    "manifest requests network '{}' with driver {} but an existing network uses driver {}",
-                    requested.name,
-                    requested.driver,
-                    existing.driver
-                ));
-            }
+            validate_existing_manifest_network(existing, &requested)?;
+            targets.push(NetworkProvisionTarget {
+                id: existing.id,
+                name: existing.name.clone(),
+            });
             continue;
         }
 
@@ -349,19 +440,28 @@ pub async fn ensure_named_networks(
         );
         match networks::create_raw(cfg, &request).await {
             Ok(network_id) => {
-                println!(
+                output::emit_line(format!(
                     "network '{}' created with id {network_id} (auto-provisioned)",
                     requested.name
-                );
+                ));
                 known_subnets.insert(request.subnet_cidr.clone());
+                targets.push(NetworkProvisionTarget {
+                    id: network_id,
+                    name: requested.name.clone(),
+                });
             }
             Err(error) => {
                 let fallback = networks::list_raw(cfg).await?;
-                if fallback.iter().any(|net| net.name == requested.name) {
+                if let Some(existing) = fallback.iter().find(|net| net.name == requested.name) {
+                    validate_existing_manifest_network(existing, &requested)?;
+                    let network_name = &requested.name;
                     eprintln!(
-                        "warning: auto-provision for network '{}' failed but it already exists: {error}",
-                        requested.name
+                        "warning: auto-provision for network '{network_name}' failed but it already exists: {error}"
                     );
+                    targets.push(NetworkProvisionTarget {
+                        id: existing.id,
+                        name: existing.name.clone(),
+                    });
                     continue;
                 }
                 return Err(error);
@@ -369,7 +469,116 @@ pub async fn ensure_named_networks(
         }
     }
 
+    wait_for_manifest_network_readiness(cfg, &targets).await?;
     Ok(())
+}
+
+/// Validate that an existing network can satisfy one manifest network request.
+fn validate_existing_manifest_network(
+    existing: &networks::NetworkSummary,
+    requested: &RequestedNetworkSpec,
+) -> Result<()> {
+    if existing.driver != requested.driver {
+        return Err(anyhow!(
+            "manifest requests network '{}' with driver {} but an existing network uses driver {}",
+            requested.name,
+            requested.driver,
+            existing.driver
+        ));
+    }
+    Ok(())
+}
+
+/// Wait until all manifest-required networks have at least one scheduler-eligible peer.
+async fn wait_for_manifest_network_readiness(
+    cfg: &ClientConfig,
+    targets: &[NetworkProvisionTarget],
+) -> Result<()> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + NETWORK_PROVISION_TIMEOUT;
+    let mut pending = targets.to_vec();
+    let mut announced = HashSet::new();
+    let mut last_observed = HashMap::new();
+
+    loop {
+        let mut remaining = Vec::new();
+        for target in pending {
+            let info = networks::inspect_raw(cfg, target.id).await?;
+            let observed = NetworkReadinessObservation::from_inspect(&info);
+            if observed.is_schedulable() {
+                if announced.remove(&target.id) {
+                    output::emit_line(format!(
+                        "network '{}' ready ({}/{})",
+                        target.name, observed.ready_peers, observed.peer_count
+                    ));
+                }
+                continue;
+            }
+
+            if let Some(error) = observed.terminal_error() {
+                return Err(anyhow!(
+                    "network '{}' ({}) failed to become ready: {error}",
+                    target.name,
+                    target.id
+                ));
+            }
+
+            if announced.insert(target.id) {
+                output::emit_line(format!(
+                    "network '{}' waiting for readiness ({})",
+                    target.name,
+                    observed.summary()
+                ));
+            }
+            last_observed.insert(target.id, observed);
+            remaining.push(target);
+        }
+
+        if remaining.is_empty() {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "timed out waiting for manifest networks to become ready after {}: {}",
+                format_network_wait_duration(NETWORK_PROVISION_TIMEOUT),
+                render_network_wait_timeout(&remaining, &last_observed)
+            ));
+        }
+
+        pending = remaining;
+        sleep(NETWORK_PROVISION_POLL_INTERVAL).await;
+    }
+}
+
+/// Render the last observed state for every network that did not become schedulable in time.
+fn render_network_wait_timeout(
+    targets: &[NetworkProvisionTarget],
+    observations: &HashMap<Uuid, NetworkReadinessObservation>,
+) -> String {
+    targets
+        .iter()
+        .map(|target| {
+            let summary = observations
+                .get(&target.id)
+                .map(NetworkReadinessObservation::summary)
+                .unwrap_or_else(|| "no status observed".to_string());
+            format!("{} ({}) {}", target.name, target.id, summary)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Format one fixed network readiness timeout for operator-facing error messages.
+fn format_network_wait_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs > 0 {
+        return format!("{secs}s");
+    }
+    format!("{}ms", duration.as_millis())
 }
 
 /// Ensure every declared manifest volume exists as a cluster volume object.
@@ -480,4 +689,73 @@ fn validate_declared_volume_compatibility(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ready network status alone must not pass the manifest prerequisite gate.
+    #[test]
+    fn network_readiness_requires_ready_peer() {
+        let observed = NetworkReadinessObservation {
+            status: networks::NetworkStatus::Ready,
+            peer_count: 1,
+            ready_peers: 0,
+            error_peers: 0,
+            first_error: None,
+        };
+
+        assert!(!observed.is_schedulable());
+
+        let observed = NetworkReadinessObservation {
+            ready_peers: 1,
+            ..observed
+        };
+
+        assert!(observed.is_schedulable());
+    }
+
+    /// A network whose observed peers all errored should surface the platform failure immediately.
+    #[test]
+    fn network_readiness_reports_terminal_peer_errors() {
+        let observed = NetworkReadinessObservation {
+            status: networks::NetworkStatus::Provisioning,
+            peer_count: 1,
+            ready_peers: 0,
+            error_peers: 1,
+            first_error: Some("failed to attach bpf program".to_string()),
+        };
+
+        assert_eq!(
+            observed.terminal_error().as_deref(),
+            Some("failed to attach bpf program")
+        );
+    }
+
+    /// Timeout details should include each pending network name and last observed readiness state.
+    #[test]
+    fn network_wait_timeout_renders_last_observed_state() {
+        let network_id = Uuid::new_v4();
+        let targets = vec![NetworkProvisionTarget {
+            id: network_id,
+            name: "frontend".to_string(),
+        }];
+        let mut observations = HashMap::new();
+        observations.insert(
+            network_id,
+            NetworkReadinessObservation {
+                status: networks::NetworkStatus::Pending,
+                peer_count: 1,
+                ready_peers: 0,
+                error_peers: 0,
+                first_error: None,
+            },
+        );
+
+        let rendered = render_network_wait_timeout(&targets, &observations);
+
+        assert!(rendered.contains("frontend"));
+        assert!(rendered.contains("ready peers 0/1"));
+    }
 }

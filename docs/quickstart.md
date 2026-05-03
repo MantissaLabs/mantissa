@@ -58,8 +58,9 @@ mantissa services run examples/replicated_service.ron
 ```
 
 `services run` follows deployment progress by default and exits when the
-submitted service reaches `running`. Use `--detach` to return immediately after
-submission, then inspect progress later with `mantissa services list` or
+submitted service reaches `running`. Its progress view shows the service line
+with task-template aggregates underneath. Use `--detach` to return immediately
+after submission, then inspect progress later with `mantissa services list` or
 `mantissa services rollout status <SERVICE_ID>`.
 
 Stop each node with `Ctrl+C` when finished.

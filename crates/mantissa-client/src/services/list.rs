@@ -11,7 +11,7 @@ use capnp::Error as CapnpError;
 use mantissa_protocol::services::{
     LivenessProbeKind as ProtoLivenessProbeKind, ReadinessProbeKind as ProtoReadinessProbeKind,
     RolloutPhase as ProtoRolloutPhase, ServiceStatus as ProtoServiceStatus, service_spec,
-    task_template,
+    service_task_progress, task_template,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -46,7 +46,10 @@ pub(crate) async fn fetch_service_row_by_id(
     let mut request = services.status_request();
     request.get().set_service_id(service_id.as_bytes());
     let response = request.send().promise.await?;
-    ServiceRow::from_reader(response.get()?.get_service()?).map_err(Into::into)
+    let snapshot = response.get()?.get_snapshot()?;
+    let mut row = ServiceRow::from_reader(snapshot.get_service()?)?;
+    row.task_progress = read_service_task_progress(snapshot.get_tasks()?)?;
+    Ok(row)
 }
 
 /// Inspects one service row by UUID text or exact service name.
@@ -135,6 +138,7 @@ pub struct ServiceRow {
     pub status_detail: Option<String>,
     pub rollout: ServiceRolloutRow,
     pub public_endpoints: Vec<String>,
+    pub task_progress: Vec<ServiceTaskProgressRow>,
 }
 
 impl ServiceRow {
@@ -180,6 +184,7 @@ impl ServiceRow {
             },
             rollout,
             public_endpoints: Vec::new(),
+            task_progress: Vec::new(),
         })
     }
 
@@ -213,6 +218,64 @@ impl ServiceRow {
             summaries.join(", ")
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceTaskProgressRow {
+    pub name: String,
+    pub desired: u32,
+    pub assigned: u32,
+    pub pending: u32,
+    pub pulling: u32,
+    pub creating: u32,
+    pub volume_unavailable: u32,
+    pub running: u32,
+    pub paused: u32,
+    pub stopping: u32,
+    pub stopped: u32,
+    pub failed: u32,
+    pub exited: u32,
+    pub unknown: u32,
+    pub detail: Option<String>,
+}
+
+impl ServiceTaskProgressRow {
+    /// Builds one task-template progress row from the service status payload.
+    fn from_reader(reader: service_task_progress::Reader<'_>) -> Result<Self, CapnpError> {
+        let detail = reader.get_detail()?.to_str()?.trim().to_string();
+        Ok(Self {
+            name: reader.get_name()?.to_str()?.to_string(),
+            desired: reader.get_desired(),
+            assigned: reader.get_assigned(),
+            pending: reader.get_pending(),
+            pulling: reader.get_pulling(),
+            creating: reader.get_creating(),
+            volume_unavailable: reader.get_volume_unavailable(),
+            running: reader.get_running(),
+            paused: reader.get_paused(),
+            stopping: reader.get_stopping(),
+            stopped: reader.get_stopped(),
+            failed: reader.get_failed(),
+            exited: reader.get_exited(),
+            unknown: reader.get_unknown(),
+            detail: if detail.is_empty() {
+                None
+            } else {
+                Some(detail)
+            },
+        })
+    }
+}
+
+/// Decodes task-template progress rows from one service status snapshot.
+fn read_service_task_progress(
+    reader: capnp::struct_list::Reader<'_, service_task_progress::Owned>,
+) -> Result<Vec<ServiceTaskProgressRow>, CapnpError> {
+    let mut rows = Vec::with_capacity(reader.len() as usize);
+    for entry in reader.iter() {
+        rows.push(ServiceTaskProgressRow::from_reader(entry)?);
+    }
+    Ok(rows)
 }
 
 #[derive(Clone, Debug)]
@@ -735,6 +798,7 @@ mod tests {
                 last_error: rollout_error.map(str::to_string),
             },
             public_endpoints: Vec::new(),
+            task_progress: Vec::new(),
         }
     }
 

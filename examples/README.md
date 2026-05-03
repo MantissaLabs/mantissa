@@ -16,8 +16,9 @@ mantissa services run examples/replicated_service.ron
 ```
 
 `services run` follows deployment progress until the submitted manifest reaches
-`running`; add `--detach` when you only want the service id and will inspect
-progress separately.
+`running`, showing task-template aggregates beneath the service line; add
+`--detach` when you only want the service id and will inspect progress
+separately.
 
 This manifest defines two task entries:
 - `echo` runs two replicas of a simple Alpine container emitting log lines with a 500m CPU / 128MiB request.

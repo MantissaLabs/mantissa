@@ -3,7 +3,9 @@ use crate::scheduler::placement::{
     PlacementPreference as SchedulerPlacementPreference,
     PlacementStrategy as SchedulerPlacementStrategy,
 };
-use crate::services::manager::{ServiceController, ServiceDeploymentOutcome};
+use crate::services::manager::{
+    ServiceController, ServiceDeploymentOutcome, ServiceTaskProgressSnapshot,
+};
 use crate::services::types::{
     ServiceEvent, ServicePortProtocol, ServicePreviousGeneration, ServiceReadinessProbe,
     ServiceReadinessProbeKind, ServiceRescheduleLock, ServiceRescheduleReason,
@@ -21,8 +23,8 @@ use crate::workload::capnp_codec::{
 use crate::workload::types::ExecutionSpec;
 use capnp::Error;
 use mantissa_protocol::services::{
-    placement_constraint, placement_constraint_selector, service_event, service_spec, services,
-    task_template,
+    placement_constraint, placement_constraint_selector, service_event, service_spec,
+    service_task_progress, services, task_template,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::collections::HashSet;
@@ -142,7 +144,7 @@ impl services::Server for ServicesRPC {
         Ok(())
     }
 
-    /// Fetches one service by deterministic UUID for efficient client-side status polling.
+    /// Fetches one service plus task-template progress for efficient client-side status polling.
     async fn status(
         self: Rc<Self>,
         params: services::StatusParams,
@@ -155,8 +157,19 @@ impl services::Server for ServicesRPC {
             .get(service_id)
             .map_err(|err| Error::failed(err.to_string()))?
             .ok_or_else(|| Error::failed(format!("service '{service_id}' not found")))?;
-        let mut builder = results.get().init_service();
-        write_service_spec(&mut builder, &service)?;
+        let task_progress = self
+            .manager
+            .task_progress_for_service(&service)
+            .await
+            .map_err(|err| Error::failed(err.to_string()))?;
+
+        let mut snapshot = results.get().init_snapshot();
+        let mut service_builder = snapshot.reborrow().init_service();
+        write_service_spec(&mut service_builder, &service)?;
+        let mut tasks = snapshot.reborrow().init_tasks(task_progress.len() as u32);
+        for (idx, progress) in task_progress.iter().enumerate() {
+            write_service_task_progress(tasks.reborrow().get(idx as u32), progress);
+        }
         Ok(())
     }
 
@@ -243,6 +256,28 @@ pub(crate) fn write_service_spec(
     }
 
     Ok(())
+}
+
+/// Encodes one task-template progress aggregate into the service status wire payload.
+fn write_service_task_progress(
+    mut builder: service_task_progress::Builder<'_>,
+    value: &ServiceTaskProgressSnapshot,
+) {
+    builder.set_name(&value.name);
+    builder.set_desired(value.desired);
+    builder.set_assigned(value.assigned);
+    builder.set_pending(value.pending);
+    builder.set_pulling(value.pulling);
+    builder.set_creating(value.creating);
+    builder.set_volume_unavailable(value.volume_unavailable);
+    builder.set_running(value.running);
+    builder.set_paused(value.paused);
+    builder.set_stopping(value.stopping);
+    builder.set_stopped(value.stopped);
+    builder.set_failed(value.failed);
+    builder.set_exited(value.exited);
+    builder.set_unknown(value.unknown);
+    builder.set_detail(value.detail.as_deref().unwrap_or(""));
 }
 
 impl StoreValueCodec for ServiceSpecValue {

@@ -19,8 +19,8 @@ interface Services {
   inspect @3 (selector :Text) -> (service :ServiceSpec);
   # Inspect one service by UUID text or exact service name.
 
-  status @4 (serviceId :Data) -> (service :ServiceSpec);
-  # Fetch one service by deterministic UUID for efficient deployment polling.
+  status @4 (serviceId :Data) -> (snapshot :ServiceStatusSnapshot);
+  # Fetch one service and its task-template progress by deterministic UUID.
 }
 
 struct TaskTemplate {
@@ -362,6 +362,61 @@ struct RolloutState {
 
   lastError @5 :Text;
   # Most recent rollout failure reason when one is known.
+}
+
+struct ServiceTaskProgress {
+  name @0 :Text;
+  # Task template name.
+
+  desired @1 :UInt32;
+  # Desired replica count declared by the template.
+
+  assigned @2 :UInt32;
+  # Replica slots currently assigned to workload identifiers.
+
+  pending @3 :UInt32;
+  # Assigned replicas waiting for scheduling or launch.
+
+  pulling @4 :UInt32;
+  # Assigned replicas pulling their image.
+
+  creating @5 :UInt32;
+  # Assigned replicas being created by a runtime.
+
+  volumeUnavailable @6 :UInt32;
+  # Assigned replicas blocked on node-local volume availability.
+
+  running @7 :UInt32;
+  # Assigned replicas currently running.
+
+  paused @8 :UInt32;
+  # Assigned replicas paused by the runtime.
+
+  stopping @9 :UInt32;
+  # Assigned replicas stopping.
+
+  stopped @10 :UInt32;
+  # Assigned replicas stopped.
+
+  failed @11 :UInt32;
+  # Assigned replicas that failed.
+
+  exited @12 :UInt32;
+  # Assigned replicas that exited with a code.
+
+  unknown @13 :UInt32;
+  # Assigned replicas whose current phase could not be resolved.
+
+  detail @14 :Text;
+  # First useful phase reason or progress detail observed for this template.
+}
+
+struct ServiceStatusSnapshot {
+  service @0 :ServiceSpec;
+  # Current service spec.
+
+  tasks @1 :List(ServiceTaskProgress);
+  # Task-template aggregate progress for the current service generation.
 }
 
 enum RescheduleReason {

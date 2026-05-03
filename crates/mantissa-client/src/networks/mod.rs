@@ -12,7 +12,7 @@ use blake3::Hasher;
 pub use attachments::{attachments, attachments_raw};
 pub use create::{NetworkCreateRequest, create, create_raw};
 pub use delete::delete;
-pub use inspect::inspect;
+pub use inspect::{inspect, inspect_raw};
 pub use list::{list, list_raw};
 pub use status::peer_status;
 pub use types::{

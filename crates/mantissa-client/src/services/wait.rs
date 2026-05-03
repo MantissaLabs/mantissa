@@ -1,7 +1,7 @@
 use super::deploy::{ServiceDeployOutcome, ServiceDeploymentHandle, deploy_manifest};
 use super::list::{
     ServiceRolloutPhaseRow, ServiceRolloutRow, ServiceRow, ServiceStatusRow,
-    fetch_service_row_by_id,
+    ServiceTaskProgressRow, fetch_service_row_by_id,
 };
 use super::manifest::ServiceManifest;
 use crate::config::ClientConfig;
@@ -12,9 +12,9 @@ use crossterm::{
     execute,
     terminal::{Clear, ClearType},
 };
-use std::io::{self, IsTerminal, Write};
+use std::fmt::Write as FmtWrite;
+use std::io::{self, IsTerminal, Write as IoWrite};
 use std::time::Duration;
-use tabwriter::TabWriter;
 use tokio::time::sleep;
 
 /// Default polling cadence used while following service deployment progress.
@@ -263,6 +263,7 @@ struct ProgressKey {
     rollout_last_error: Option<String>,
     assigned_replicas: usize,
     desired_replicas: usize,
+    task_progress: Vec<ServiceTaskProgressRow>,
 }
 
 impl From<&ServiceRow> for ProgressKey {
@@ -278,20 +279,25 @@ impl From<&ServiceRow> for ProgressKey {
             rollout_last_error: row.rollout.last_error.clone(),
             assigned_replicas: row.replica_ids.len(),
             desired_replicas: desired_replicas(row),
+            task_progress: row.task_progress.clone(),
         }
     }
 }
 
-/// Renders one compact deployment progress table.
+/// Renders one compact deployment progress tree.
 fn render_progress_block(row: &ServiceRow, spinner: char) -> Result<String> {
-    let mut tw = TabWriter::new(Vec::new());
+    let task_progress = task_progress_for_render(row);
+    let name_width = task_progress
+        .iter()
+        .map(|task| task.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(row.service_name.chars().count());
+    let mut out = String::new();
+
     writeln!(
-        &mut tw,
-        "SERVICE\tSTATUS\tROLLOUT\tREPLICAS\tPROGRESS\tDETAIL"
-    )?;
-    writeln!(
-        &mut tw,
-        "{}\t{} {}\t{}\t{}\t{}\t{}",
+        &mut out,
+        "service {:<name_width$}  {} {}  rollout {}  replicas {}  {}  {}",
         row.service_name,
         spinner,
         row.status,
@@ -300,8 +306,17 @@ fn render_progress_block(row: &ServiceRow, spinner: char) -> Result<String> {
         progress_bar(row),
         progress_detail(row),
     )?;
-    tw.flush()?;
-    Ok(String::from_utf8(tw.into_inner()?)?)
+
+    for task in &task_progress {
+        writeln!(
+            &mut out,
+            "   |-- {:<name_width$}  {}",
+            task.name,
+            task_progress_summary(task),
+        )?;
+    }
+
+    Ok(out)
 }
 
 /// Returns the total desired replicas declared across all task templates.
@@ -370,6 +385,93 @@ fn progress_bar(row: &ServiceRow) -> String {
 /// Renders the most useful detail for the current progress row.
 fn progress_detail(row: &ServiceRow) -> String {
     failure_detail(row).unwrap_or("-").to_string()
+}
+
+/// Returns decoded task progress or falls back to manifest-declared templates for rendering.
+fn task_progress_for_render(row: &ServiceRow) -> Vec<ServiceTaskProgressRow> {
+    if !row.task_progress.is_empty() {
+        return row.task_progress.clone();
+    }
+
+    row.task_templates
+        .iter()
+        .map(|template| ServiceTaskProgressRow {
+            name: template.name.clone(),
+            desired: u32::from(template.replicas),
+            assigned: 0,
+            pending: 0,
+            pulling: 0,
+            creating: 0,
+            volume_unavailable: 0,
+            running: 0,
+            paused: 0,
+            stopping: 0,
+            stopped: 0,
+            failed: 0,
+            exited: 0,
+            unknown: 0,
+            detail: None,
+        })
+        .collect()
+}
+
+/// Renders one task-template aggregate as a compact human-readable status line.
+fn task_progress_summary(task: &ServiceTaskProgressRow) -> String {
+    if task.desired == 0 {
+        return "disabled".to_string();
+    }
+
+    let mut parts = vec![format!("{}/{} running", task.running, task.desired)];
+    let unassigned = task.desired.saturating_sub(task.assigned);
+    push_count(&mut parts, unassigned, "unassigned");
+    push_count(&mut parts, task.pending, "pending");
+    push_count(&mut parts, task.pulling, "pulling");
+    push_count(&mut parts, task.creating, "creating");
+    push_count(&mut parts, task.volume_unavailable, "volume_unavailable");
+    push_count(&mut parts, task.paused, "paused");
+    push_count(&mut parts, task.stopping, "stopping");
+    push_count(&mut parts, task.stopped, "stopped");
+    push_count(&mut parts, task.failed, "failed");
+    push_count(&mut parts, task.exited, "exited");
+    push_count(&mut parts, task.unknown, "unknown");
+
+    let mut summary = parts.join(", ");
+    if let Some(detail) = task
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let detail = truncate_detail(detail, 80);
+        summary.push_str(" (");
+        summary.push_str(&detail);
+        summary.push(')');
+    }
+    summary
+}
+
+/// Appends one non-zero lifecycle count to a task progress summary.
+fn push_count(parts: &mut Vec<String>, count: u32, label: &str) {
+    if count > 0 {
+        parts.push(format!("{count} {label}"));
+    }
+}
+
+/// Truncates one status detail so the progress tree remains readable.
+fn truncate_detail(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    let mut out = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx >= max_chars.saturating_sub(3) {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
 }
 
 /// Renders the last observed state in a single timeout/error sentence.
@@ -445,6 +547,7 @@ mod tests {
                 last_error: rollout_error.map(str::to_string),
             },
             public_endpoints: Vec::new(),
+            task_progress: Vec::new(),
         }
     }
 
@@ -514,17 +617,37 @@ mod tests {
     /// Renders progress with both a replica counter and ASCII progress bar.
     fn render_progress_includes_visual_progress() {
         let manifest_id = Uuid::new_v4();
-        let row = test_row(
+        let mut row = test_row(
             manifest_id,
             ServiceStatusRow::Deploying,
             ServiceRolloutPhaseRow::RollingForward,
             Some("waiting for readiness"),
             None,
         );
+        row.task_progress = vec![ServiceTaskProgressRow {
+            name: "web".to_string(),
+            desired: 3,
+            assigned: 2,
+            pending: 0,
+            pulling: 0,
+            creating: 1,
+            volume_unavailable: 0,
+            running: 1,
+            paused: 0,
+            stopping: 0,
+            stopped: 0,
+            failed: 0,
+            exited: 0,
+            unknown: 0,
+            detail: Some("starting container".to_string()),
+        }];
 
         let rendered = render_progress_block(&row, '|').expect("render progress block");
         assert!(rendered.contains("1/3"));
         assert!(rendered.contains("[####........]"));
         assert!(rendered.contains("waiting for readiness"));
+        assert!(rendered.contains("|-- web"));
+        assert!(rendered.contains("1/3 running, 1 unassigned, 1 creating"));
+        assert!(rendered.contains("starting container"));
     }
 }

@@ -610,6 +610,8 @@ impl ServiceController {
                 );
 
                 if workload_start_error_requires_service_requeue(&err) {
+                    self.persist_retryable_deployment_launch_error(service_id, &service_name, &err)
+                        .await;
                     tracing::info!(
                         target: "services",
                         "deferring deployment retry for '{}' until scheduling prerequisites converge",
@@ -618,7 +620,6 @@ impl ServiceController {
                     return Ok(());
                 }
 
-                let service_id = compute_service_id(&service_name);
                 let detail = service_error_detail(&err);
                 match self.registry.get(service_id) {
                     Ok(Some(mut persisted_spec)) if is_local_volume_unavailable_error(&err) => {
@@ -975,6 +976,36 @@ impl ServiceController {
         }
     }
 
+    /// Persists a retryable launch blocker so deployment progress explains why assignment paused.
+    async fn persist_retryable_deployment_launch_error(
+        &self,
+        service_id: Uuid,
+        service_name: &str,
+        err: &anyhow::Error,
+    ) {
+        let detail =
+            workload_start_retryable_detail(err).unwrap_or_else(|| service_error_detail(err));
+        match self.registry.get(service_id) {
+            Ok(Some(spec)) => {
+                self.persist_deploying_launch_error(spec, detail).await;
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    target: "services",
+                    "unable to persist retryable deployment detail for '{}' because the service spec is missing",
+                    service_name
+                );
+            }
+            Err(fetch_err) => {
+                tracing::warn!(
+                    target: "services",
+                    "unable to load service '{}' while persisting retryable deployment detail: {fetch_err}",
+                    service_name
+                );
+            }
+        }
+    }
+
     /// Waits until one template's dependency task ids are running and ready to receive traffic.
     ///
     /// Both initial staged deployment and dependency-aware rolling updates use this to keep one
@@ -1275,6 +1306,12 @@ impl ServiceController {
         );
 
         if workload_start_error_requires_service_requeue(err) {
+            self.persist_retryable_deployment_launch_error(
+                compute_service_id(deployment.service_name),
+                deployment.service_name,
+                err,
+            )
+            .await;
             tracing::info!(
                 target: "services",
                 "deferring deployment retry for '{}' until scheduling prerequisites converge",
