@@ -11,9 +11,13 @@ const T_MASTER_KEY_ENVELOPES: TableDefinition<u64, &'static [u8]> =
     TableDefinition::new("secret_master_key_envelopes");
 const T_MASTER_META: TableDefinition<&'static str, &'static [u8]> =
     TableDefinition::new("secret_master_meta");
+/// Metadata key pointing at the locally active master-key version.
 const CURRENT_VERSION_KEY: &str = "current_version";
+/// Metadata key marking whether the initial v1 key is still a join bootstrap key.
 const BOOTSTRAP_PENDING_KEY: &str = "bootstrap_pending";
+/// Compact boolean marker for Redb metadata values.
 const META_TRUE: &[u8] = b"1";
+/// Compact boolean marker for Redb metadata values.
 const META_FALSE: &[u8] = b"0";
 
 /// Immutable plaintext snapshot of one master key version after local envelope unwrap.
@@ -330,10 +334,9 @@ mod tests {
     use redb::Database;
     use std::sync::Arc;
     use tempfile::tempdir;
-    use uuid::Uuid;
 
     fn test_protector() -> crate::secrets::master_key_protector::MasterKeyProtectorHandle {
-        Arc::new(PassphraseMasterKeyProtector::for_test(Uuid::new_v4()).expect("protector"))
+        Arc::new(PassphraseMasterKeyProtector::for_test().expect("protector"))
     }
 
     #[test]

@@ -15,23 +15,43 @@ use uuid::Uuid;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
+/// Size in bytes for all symmetric master-key material.
+///
+/// This is a 256-bit cryptographic key size, not a passphrase length. It also
+/// matches the X25519 key size used by Noise identities and transfer wrapping.
 pub const MASTER_KEY_SIZE: usize = 32;
 
+/// Current schema version for locally persisted wrapped master-key records.
 const WRAPPED_SCHEMA_VERSION: u16 = 1;
+/// Open-ended local provider id for passphrase-backed envelopes.
 const PASSPHRASE_PROVIDER: &str = "passphrase";
+/// Stable key id for the single local passphrase provider in v1.
 const PASSPHRASE_PROVIDER_KEY_ID: &str = "local-passphrase";
+/// Stable on-disk cipher-suite identifier for wrapped master-key envelopes.
 const XCHACHA20_POLY1305: &str = "xchacha20poly1305";
+/// Domain separator for AEAD authenticated data on durable local envelopes.
 const ENVELOPE_AAD_PREFIX: &[u8] = b"mantissa.secret-master.v1";
+/// Domain separator for deriving the local wrapping key from Argon2id output.
 const PASSPHRASE_HKDF_SALT: &[u8] = b"mantissa.secret-master.passphrase.v1";
+/// HKDF info string for the local passphrase-derived wrapping key.
 const PASSPHRASE_HKDF_INFO: &[u8] = b"mantissa.secret-master.passphrase.wrap-key.v1";
+/// Domain separator for AEAD authenticated data on node-to-node transfers.
 const TRANSFER_AAD_PREFIX: &[u8] = b"mantissa.secret-master.transfer.v1";
+/// Domain separator for deriving transfer AEAD keys from X25519 shared secrets.
 const TRANSFER_HKDF_SALT: &[u8] = b"mantissa.secret-master.transfer.hkdf.v1";
+/// HKDF info string for node-to-node master-key transfer AEAD keys.
 const TRANSFER_HKDF_INFO: &[u8] = b"mantissa.secret-master.transfer.aead-key.v1";
+/// Random Argon2id salt size persisted in passphrase provider metadata.
 const PASSPHRASE_SALT_SIZE: usize = 16;
+/// Nonce size required by XChaCha20-Poly1305.
 const XCHACHA_NONCE_SIZE: usize = 24;
+/// Maximum decoded provider metadata accepted before any KDF work begins.
 const MAX_PASSPHRASE_METADATA_SIZE: usize = 256;
+/// Upper bound for stored Argon2id memory cost to prevent local DB DoS.
 const MAX_ARGON2_MEMORY_COST_KIB: u32 = 256 * 1024;
+/// Upper bound for stored Argon2id iterations to prevent local DB DoS.
 const MAX_ARGON2_TIME_COST: u32 = 10;
+/// Upper bound for stored Argon2id lanes to prevent local DB DoS.
 const MAX_ARGON2_PARALLELISM: u32 = 8;
 
 /// Plaintext cluster master key material kept out of durable storage.
@@ -276,28 +296,20 @@ pub struct PassphraseMasterKeyProtector {
 }
 
 impl PassphraseMasterKeyProtector {
-    /// Creates a production passphrase protector for one local node.
-    pub fn new(passphrase: SecretPassphrase, local_node_id: Uuid) -> Self {
-        Self::with_params(passphrase, local_node_id, PassphraseKdfParams::production())
+    /// Creates a production passphrase protector for locally persisted envelopes.
+    pub fn new(passphrase: SecretPassphrase) -> Self {
+        Self::with_params(passphrase, PassphraseKdfParams::production())
     }
 
     /// Creates a passphrase protector with explicit KDF parameters.
-    pub fn with_params(
-        passphrase: SecretPassphrase,
-        _local_node_id: Uuid,
-        params: PassphraseKdfParams,
-    ) -> Self {
+    pub fn with_params(passphrase: SecretPassphrase, params: PassphraseKdfParams) -> Self {
         Self { passphrase, params }
     }
 
     /// Creates a deterministic low-cost protector used by tests and headless harnesses.
-    pub fn for_test(local_node_id: Uuid) -> io::Result<Self> {
+    pub fn for_test() -> io::Result<Self> {
         let passphrase = SecretPassphrase::new(b"mantissa-test-master-key-passphrase".to_vec())?;
-        Ok(Self::with_params(
-            passphrase,
-            local_node_id,
-            PassphraseKdfParams::test(),
-        ))
+        Ok(Self::with_params(passphrase, PassphraseKdfParams::test()))
     }
 }
 
@@ -715,14 +727,13 @@ mod tests {
 
     #[test]
     fn passphrase_provider_reopens_wrapped_key() {
-        let node_id = Uuid::new_v4();
         let passphrase =
             SecretPassphrase::new(b"correct horse battery staple".to_vec()).expect("passphrase");
-        let provider = PassphraseMasterKeyProtector::new(passphrase.clone(), node_id);
+        let provider = PassphraseMasterKeyProtector::new(passphrase.clone());
         let key = MasterKeyPlaintext::generate().expect("key");
 
         let wrapped = provider.wrap(1, &key).expect("wrap");
-        let reopened = PassphraseMasterKeyProtector::new(passphrase, node_id);
+        let reopened = PassphraseMasterKeyProtector::new(passphrase);
         let unwrapped = reopened.unwrap(&wrapped).expect("unwrap");
 
         assert_eq!(key.as_bytes(), unwrapped.as_bytes());
@@ -730,16 +741,15 @@ mod tests {
 
     #[test]
     fn passphrase_provider_rejects_wrong_passphrase() {
-        let node_id = Uuid::new_v4();
         let passphrase =
             SecretPassphrase::new(b"correct horse battery staple".to_vec()).expect("passphrase");
-        let provider = PassphraseMasterKeyProtector::new(passphrase, node_id);
+        let provider = PassphraseMasterKeyProtector::new(passphrase);
         let key = MasterKeyPlaintext::generate().expect("key");
         let wrapped = provider.wrap(1, &key).expect("wrap");
 
         let wrong = SecretPassphrase::new(b"incorrect horse battery staple".to_vec())
             .expect("wrong passphrase");
-        let reopened = PassphraseMasterKeyProtector::new(wrong, node_id);
+        let reopened = PassphraseMasterKeyProtector::new(wrong);
         assert!(reopened.unwrap(&wrapped).is_err());
     }
 
@@ -799,10 +809,9 @@ mod tests {
 
     #[test]
     fn passphrase_provider_rejects_excessive_kdf_params() {
-        let node_id = Uuid::new_v4();
         let passphrase =
             SecretPassphrase::new(b"correct horse battery staple".to_vec()).expect("passphrase");
-        let provider = PassphraseMasterKeyProtector::new(passphrase, node_id);
+        let provider = PassphraseMasterKeyProtector::new(passphrase);
         let key = MasterKeyPlaintext::generate().expect("key");
         let mut wrapped = provider.wrap(1, &key).expect("wrap");
         let salt = [1u8; PASSPHRASE_SALT_SIZE];

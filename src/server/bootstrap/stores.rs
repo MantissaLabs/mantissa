@@ -102,8 +102,7 @@ impl BootstrapStores {
                 "master key passphrase source is required",
             )
         })?;
-        let secret_master_protector =
-            Arc::new(PassphraseMasterKeyProtector::new(passphrase, ctx.self_id));
+        let secret_master_protector = Arc::new(PassphraseMasterKeyProtector::new(passphrase));
         let secret_master_store =
             SecretMasterStore::new(ctx.db.clone(), secret_master_protector)
                 .map_err(|error| store_error("open secret master key store", error))?;

@@ -322,7 +322,7 @@ async fn setup_workload_manager() -> TestHarness {
         .join(format!("master-{}.redb", Uuid::new_v4()));
     let master_db = Arc::new(redb::Database::create(master_path).expect("create master db"));
     let master_protector =
-        Arc::new(PassphraseMasterKeyProtector::for_test(actor).expect("master protector"));
+        Arc::new(PassphraseMasterKeyProtector::for_test().expect("master protector"));
     let master_store =
         SecretMasterStore::new(master_db.clone(), master_protector).expect("open master store");
     let master_record = master_store

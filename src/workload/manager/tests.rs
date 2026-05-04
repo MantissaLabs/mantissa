@@ -857,7 +857,7 @@ async fn setup_manager_with_forwarding(
     let volume_registry = VolumeRegistry::new(volume_spec_store, volume_node_store);
     let (master_db, _master_dir) = temp_db("master");
     let master_protector = Arc::new(
-        crate::secrets::master_key_protector::PassphraseMasterKeyProtector::for_test(actor)
+        crate::secrets::master_key_protector::PassphraseMasterKeyProtector::for_test()
             .expect("master protector"),
     );
     let master_store =

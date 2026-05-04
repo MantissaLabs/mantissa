@@ -60,6 +60,10 @@ mantissa init
 mantissa token show
 ```
 
+`mantissa init` prompts for the local master-key envelope passphrase when run
+interactively. Non-interactive deployments should provide it through
+`--master-key-passphrase-file` or `--master-key-passphrase-fd`.
+
 4. Join a second node (replace `<vm1-ip>` and `<TOKEN>`):
 
 ```bash

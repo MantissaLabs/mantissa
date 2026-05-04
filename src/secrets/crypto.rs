@@ -184,7 +184,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let db = Arc::new(Database::create(db_path).unwrap());
-        let protector = Arc::new(PassphraseMasterKeyProtector::for_test(Uuid::new_v4()).unwrap());
+        let protector = Arc::new(PassphraseMasterKeyProtector::for_test().unwrap());
         let store = SecretMasterStore::new(db, protector).expect("open store");
         (store, dir)
     }

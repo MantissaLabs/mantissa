@@ -411,10 +411,8 @@ mod tests {
             let token_store = LocalTokenStore::new(db.clone()).expect("token store");
             token_store.write("MNTISA-1-abc234").expect("write token");
             let master_protector = Arc::new(
-                crate::secrets::master_key_protector::PassphraseMasterKeyProtector::for_test(
-                    original_id,
-                )
-                .expect("master protector"),
+                crate::secrets::master_key_protector::PassphraseMasterKeyProtector::for_test()
+                    .expect("master protector"),
             );
             let master_store =
                 SecretMasterStore::new(db.clone(), master_protector.clone()).expect("master store");
@@ -471,10 +469,8 @@ mod tests {
             Some("MNTISA-1-abc234")
         );
         let master_protector = Arc::new(
-            crate::secrets::master_key_protector::PassphraseMasterKeyProtector::for_test(
-                original_id,
-            )
-            .expect("master protector"),
+            crate::secrets::master_key_protector::PassphraseMasterKeyProtector::for_test()
+                .expect("master protector"),
         );
         let master_store =
             SecretMasterStore::new(db.clone(), master_protector).expect("master store");

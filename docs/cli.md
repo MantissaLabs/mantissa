@@ -3,6 +3,8 @@
 Common commands:
 
 - `mantissa init` - bootstrap a standalone node (blocking until interrupted)
+- `mantissa init --master-key-passphrase-file <file>` - read the local master-key envelope passphrase from an owner-protected file
+- `mantissa init --master-key-passphrase-fd <fd>` - read the local master-key envelope passphrase from an inherited file descriptor
 - `mantissa init --reset-identity --state-dir <dir>` - reset copied node identity before bootstrap
 - `mantissa token show` / `mantissa token rotate` - view or rotate join tokens
 - `mantissa join --anchor <addr> --join-token <token>` - join an existing cluster

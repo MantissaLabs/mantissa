@@ -4,7 +4,7 @@ Mantissa state is durable, but a state directory is not a portable node image by
 default. It contains both replicated cluster data and node-local identity:
 
 - `state.redb`: replicated CRDT rows, local node id, session tickets, join token,
-  secret master keys, and other durable control-plane state.
+  wrapped secret master-key envelopes, and other durable control-plane state.
 - `noise.key`: static Noise identity used for peer transport authentication.
 - `ed25519.key`: signing identity used for renewable cluster credentials.
 - `wireguard.key` and `wireguard.port`: local WireGuard underlay identity and
@@ -33,10 +33,11 @@ For an unprivileged daemon, the default state directory is:
 ~/.mantissa
 ```
 
-Backups contain cluster secrets and node private keys. Store them as sensitive
-material. Anyone who can read a full backup can potentially recover workload
-secrets and impersonate the backed-up node unless the restore workflow below
-regenerates identity before startup.
+Backups contain encrypted cluster secrets, wrapped master-key envelopes, and
+node private keys. Store them as sensitive material. Anyone who can read a full
+backup and obtain or guess the master-key passphrase can potentially recover
+workload secrets, and anyone with the identity keys can impersonate the backed-up
+node unless the restore workflow below regenerates identity before startup.
 
 ## Restore Modes
 
@@ -48,7 +49,8 @@ replacement, and only when the old copy of that node will never run again.
 1. Stop Mantissa on the target host.
 2. Restore the full state directory, including `state.redb`, `noise.key`,
    `ed25519.key`, and WireGuard files.
-3. Start `mantissa init` normally.
+3. Start `mantissa init` normally and provide the same master-key passphrase
+   used for the restored local envelope.
 4. Verify the node converges with peers.
 
 This preserves the node id and keys, so peers recognize it as the same member.
@@ -57,8 +59,8 @@ It is unsafe if the original node can still reappear.
 ### Clone as a New Node
 
 Use this when copying another node's state directory as a seed for a new node.
-This preserves replicated cluster data and secret master keys, but removes
-local identity so the daemon starts as a distinct node.
+This preserves replicated cluster data and wrapped secret master-key envelopes,
+but removes local identity so the daemon starts as a distinct node.
 
 1. Stop Mantissa on the target host.
 2. Copy the source state directory to the target state directory.
@@ -78,9 +80,10 @@ The reset removes local key files, clears local session-ticket caches, clears
 server-issued session-ticket tables, removes the stored node id, and locally
 purges the copied node's old peer row without writing a replicated tombstone. It
 keeps other replicated CRDT rows, cluster view metadata, join token state, and
-secret master keys. Passing `--reset-identity` is the confirmation; there is no
-interactive prompt so this flow is usable from provisioning and recovery
-automation.
+wrapped secret master-key envelopes. Passing `--reset-identity` is the
+confirmation; there is no interactive prompt so this flow is usable from
+provisioning and recovery automation. The next `mantissa init` still needs the
+passphrase for the preserved local envelope.
 
 4. Join an active cluster through the normal join path:
 

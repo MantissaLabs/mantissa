@@ -20,6 +20,10 @@ This guide covers the two fastest ways to spin up a Mantissa cluster:
 mantissa init
 ```
 
+`mantissa init` prompts for the local master-key envelope passphrase when run
+interactively. For non-interactive starts, use
+`--master-key-passphrase-file <file>` or `--master-key-passphrase-fd <fd>`.
+
 2) In a second terminal, fetch the join token:
 
 ```bash
@@ -86,6 +90,10 @@ cargo build
 mantissa init
 mantissa token show
 ```
+
+Use the same interactive prompt or passphrase source options described above on
+each VM. The passphrase protects each node's local master-key envelope; joined
+nodes still receive the cluster master key from the anchor during `mantissa join`.
 
 4) On VM 2, join the cluster:
 

@@ -57,15 +57,44 @@ area.
 ## At-Rest Security Model
 
 Mantissa encrypts stored secret values with the cluster secret master key before
-replicating them through the control plane. The current short-term release model
-stores that 32-byte master key directly in the local Redb state database so the
-daemon can restart unattended and continue decrypting cluster secrets.
+replicating them through the control plane. The master key itself is stored as a
+local envelope: Redb contains only encrypted master-key records plus metadata,
+not the plaintext 32-byte key.
 
-The state database is created with owner-only file permissions (`0600` on Unix),
-but the master key is not currently wrapped by an external OS keychain, TPM, or
-KMS provider. A host or root compromise of a Mantissa node should therefore be
-treated as a compromise of the cluster secret material available to that node.
-Use host disk encryption and restrict local administrative access accordingly.
+The first envelope provider is passphrase-backed. On `mantissa init`, Mantissa
+prompts for the master-key passphrase when attached to a terminal. For
+non-interactive starts, provide the passphrase through one of these sources:
+
+```bash
+mantissa init --master-key-passphrase-file /run/mantissa/master-key-passphrase
+mantissa init --master-key-passphrase-fd 3
+```
+
+Do not pass the passphrase as a command-line value. Process arguments are easy
+to expose through shell history, process listings, service-manager metadata, and
+logs. File and file-descriptor sources still contain plaintext at read time, but
+they keep it out of argv and can be backed by owner-protected files, tmpfs,
+systemd credentials, named pipes, or secret-manager wrappers. On Unix, regular
+passphrase files are rejected if they are readable by group or other users.
+
+Every node may use a different local passphrase. The passphrase protects only
+that node's at-rest master-key envelope; it is not the cluster master key. When
+a node joins or receives a master-key rotation, the current cluster master key
+is transferred in an authenticated envelope encrypted to the recipient node's
+Noise static key, then re-wrapped locally with the recipient's passphrase.
+
+Fresh standalone nodes create a temporary local v1 master key during bootstrap.
+If the node joins an existing cluster, it may replace that temporary key with
+the authenticated anchor key. If the node first serves its key to another peer,
+that key is committed as the cluster key and later conflicting same-version
+imports are rejected. This prevents split-key races where one node could give a
+peer key A while concurrently adopting key B from another anchor.
+
+The state database is still sensitive. A copied Redb file allows offline
+passphrase guessing against the envelope, and a live privileged compromise of a
+joined node can read decrypted key material from process memory. Use strong
+generated passphrases, host disk encryption, and tight local administrative
+access controls.
 
 After creating the secrets, deploy the manifest and inspect the resulting tasks:
 
