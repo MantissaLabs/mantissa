@@ -705,12 +705,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
 /// Resolves the passphrase used to unlock or initialize the local master key envelope.
 fn resolve_master_key_passphrase(init: &InitArgs) -> Result<SecretPassphrase> {
     let bytes = if let Some(path) = &init.master_key_passphrase_file {
-        std::fs::read(path).map_err(|error| {
-            anyhow!(
-                "failed to read master key passphrase file {}: {error}",
-                path.display()
-            )
-        })?
+        read_passphrase_file(path)?
     } else if let Some(fd) = init.master_key_passphrase_fd {
         read_passphrase_fd(fd)?
     } else {
@@ -748,6 +743,52 @@ fn prompt_master_key_passphrase() -> Result<Vec<u8>> {
 /// Reads one secret line from stdin without echo through the terminal helper crate.
 fn read_secret_line(prompt: &str) -> Result<String> {
     rpassword::prompt_password(prompt).map_err(|error| anyhow!("{error}"))
+}
+
+/// Reads passphrase bytes from a file after validating regular file permissions.
+fn read_passphrase_file(path: &Path) -> Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        anyhow!(
+            "failed to open master key passphrase file {}: {error}",
+            path.display()
+        )
+    })?;
+    validate_passphrase_file_permissions(path, &file)?;
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        anyhow!(
+            "failed to read master key passphrase file {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(bytes)
+}
+
+/// Rejects regular passphrase files readable by group or other users on Unix hosts.
+#[cfg(unix)]
+fn validate_passphrase_file_permissions(path: &Path, file: &std::fs::File) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = file.metadata().map_err(|error| {
+        anyhow!(
+            "failed to inspect master key passphrase file {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_file() && metadata.permissions().mode() & 0o044 != 0 {
+        return Err(anyhow!(
+            "master key passphrase file {} must not be readable by group or other users",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Accepts passphrase file permissions on platforms without Unix mode bits.
+#[cfg(not(unix))]
+fn validate_passphrase_file_permissions(_path: &Path, _file: &std::fs::File) -> Result<()> {
+    Ok(())
 }
 
 /// Reads passphrase bytes from an inherited file descriptor on Unix hosts.
