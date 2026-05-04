@@ -308,7 +308,7 @@ impl Topology {
 
         self.stores
             .secret_master_store
-            .import_current(&record)
+            .import_join_current(&record)
             .map_err(|e| Error::failed(format!("failed to persist master key: {e}")))?;
 
         {

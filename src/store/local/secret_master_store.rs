@@ -11,6 +11,9 @@ const T_MASTER_KEY_ENVELOPES: TableDefinition<u64, &'static [u8]> =
 const T_MASTER_META: TableDefinition<&'static str, &'static [u8]> =
     TableDefinition::new("secret_master_meta");
 const CURRENT_VERSION_KEY: &str = "current_version";
+const BOOTSTRAP_PENDING_KEY: &str = "bootstrap_pending";
+const META_TRUE: &[u8] = b"1";
+const META_FALSE: &[u8] = b"0";
 
 /// Immutable plaintext snapshot of one master key version after local envelope unwrap.
 #[derive(Debug, Clone)]
@@ -58,7 +61,7 @@ impl SecretMasterStore {
         }
 
         let generated = MasterKeyPlaintext::generate()?;
-        self.persist_new_version(1, &generated)?;
+        self.persist_new_version(1, &generated, true)?;
 
         MasterKeyRecord::new(1, generated)
     }
@@ -85,6 +88,20 @@ impl SecretMasterStore {
 
     /// Imports an externally provided master key as the active version.
     pub fn import_current(&self, record: &MasterKeyRecord) -> io::Result<()> {
+        self.import_current_with_policy(record, false)
+    }
+
+    /// Imports the anchor's cluster master key while replacing a local bootstrap key if needed.
+    pub fn import_join_current(&self, record: &MasterKeyRecord) -> io::Result<()> {
+        self.import_current_with_policy(record, true)
+    }
+
+    /// Imports an external master key while enforcing version and replay policy.
+    fn import_current_with_policy(
+        &self,
+        record: &MasterKeyRecord,
+        allow_bootstrap_replacement: bool,
+    ) -> io::Result<()> {
         if let Some(current_version) = self.current_version()? {
             match record.version.cmp(&current_version) {
                 Ordering::Less => {
@@ -100,19 +117,27 @@ impl SecretMasterStore {
                             "secret master key envelope missing for recorded version",
                         )
                     })?;
-                    if current.key != record.key {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "conflicting secret master key transfer rejected",
-                        ));
+                    if current.key == record.key {
+                        self.set_bootstrap_pending(false)?;
+                        return Ok(());
                     }
-                    return Ok(());
+                    if allow_bootstrap_replacement
+                        && current_version == 1
+                        && self.bootstrap_replacement_pending()?
+                    {
+                        self.persist_new_version(record.version, &record.key, false)?;
+                        return Ok(());
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "conflicting secret master key transfer rejected",
+                    ));
                 }
                 Ordering::Greater => {}
             }
         }
 
-        self.persist_new_version(record.version, &record.key)?;
+        self.persist_new_version(record.version, &record.key, false)?;
         Ok(())
     }
 
@@ -127,7 +152,7 @@ impl SecretMasterStore {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("master key version overflow"))?;
         let new_key = MasterKeyPlaintext::generate()?;
-        self.persist_new_version(next_version, &new_key)?;
+        self.persist_new_version(next_version, &new_key, false)?;
         MasterKeyRecord::new(next_version, new_key)
     }
 
@@ -182,6 +207,28 @@ impl SecretMasterStore {
         })
     }
 
+    /// Returns true while the local v1 key may be replaced by an authenticated join anchor key.
+    fn bootstrap_replacement_pending(&self) -> io::Result<bool> {
+        with_read_tx(&self.db, |tx| {
+            let meta = tx.open_table(T_MASTER_META).map_err(into_io)?;
+            let Some(raw) = meta.get(BOOTSTRAP_PENDING_KEY).map_err(into_io)? else {
+                return Ok(None);
+            };
+            Ok(Some(raw.value() == META_TRUE))
+        })
+        .map(|marker| marker.unwrap_or(true))
+    }
+
+    /// Updates whether the current local key is still a replaceable bootstrap key.
+    fn set_bootstrap_pending(&self, pending: bool) -> io::Result<()> {
+        with_write_tx(&self.db, |tx| {
+            let mut meta = tx.open_table(T_MASTER_META).map_err(into_io)?;
+            let value = if pending { META_TRUE } else { META_FALSE };
+            meta.insert(BOOTSTRAP_PENDING_KEY, value).map_err(into_io)?;
+            Ok(())
+        })
+    }
+
     /// Loads the wrapped envelope associated with `version` if one has been persisted.
     fn load_wrapped_version(&self, version: u64) -> io::Result<Option<WrappedMasterKeyRecord>> {
         with_read_tx(&self.db, |tx| {
@@ -194,7 +241,12 @@ impl SecretMasterStore {
     }
 
     /// Persists `key` as an envelope under `version` and advances the metadata pointer atomically.
-    fn persist_new_version(&self, version: u64, key: &MasterKeyPlaintext) -> io::Result<()> {
+    fn persist_new_version(
+        &self,
+        version: u64,
+        key: &MasterKeyPlaintext,
+        bootstrap_pending: bool,
+    ) -> io::Result<()> {
         if version == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -215,6 +267,13 @@ impl SecretMasterStore {
 
             let mut meta = tx.open_table(T_MASTER_META).map_err(into_io)?;
             meta.insert(CURRENT_VERSION_KEY, version_bytes.as_slice())
+                .map_err(into_io)?;
+            let bootstrap_value = if bootstrap_pending {
+                META_TRUE
+            } else {
+                META_FALSE
+            };
+            meta.insert(BOOTSTRAP_PENDING_KEY, bootstrap_value)
                 .map_err(into_io)?;
             Ok(())
         })
@@ -294,6 +353,35 @@ mod tests {
             .import_current(&conflicting)
             .expect_err("same-version conflict must fail");
         assert_eq!(conflict_err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn join_import_replaces_only_the_initial_bootstrap_key() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let db = Arc::new(Database::create(db_path).unwrap());
+        let store = SecretMasterStore::new(db, test_protector()).expect("open store");
+
+        let bootstrap = store.ensure_current().expect("ensure master key");
+        let anchor = MasterKeyRecord::new(
+            bootstrap.version,
+            MasterKeyPlaintext::generate().expect("anchor key"),
+        )
+        .expect("anchor record");
+        store
+            .import_join_current(&anchor)
+            .expect("join import replaces bootstrap key");
+        assert_eq!(store.current().expect("current").key, anchor.key);
+
+        let other = MasterKeyRecord::new(
+            anchor.version,
+            MasterKeyPlaintext::generate().expect("other key"),
+        )
+        .expect("other record");
+        let err = store
+            .import_join_current(&other)
+            .expect_err("adopted cluster key must not be replaced again");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]
