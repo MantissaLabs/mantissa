@@ -96,6 +96,32 @@ impl fmt::Debug for MasterKeyPlaintext {
     }
 }
 
+/// Supported AEAD suite for wrapped durable master-key envelopes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MasterKeyCipherSuite {
+    XChaCha20Poly1305,
+}
+
+impl MasterKeyCipherSuite {
+    /// Returns the stable on-disk identifier for this cipher suite.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::XChaCha20Poly1305 => XCHACHA20_POLY1305,
+        }
+    }
+
+    /// Parses a stable on-disk cipher suite identifier.
+    fn from_str(value: &str) -> io::Result<Self> {
+        match value {
+            XCHACHA20_POLY1305 => Ok(Self::XChaCha20Poly1305),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "wrapped master key cipher suite mismatch",
+            )),
+        }
+    }
+}
+
 /// Durable encrypted envelope for one cluster master key version.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WrappedMasterKeyRecord {
@@ -103,7 +129,7 @@ pub struct WrappedMasterKeyRecord {
     pub master_key_version: u64,
     pub provider: String,
     pub provider_key_id: String,
-    pub cipher_suite: String,
+    pub cipher_suite: MasterKeyCipherSuite,
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
     pub created_at_unix_secs: u64,
@@ -120,7 +146,7 @@ impl WrappedMasterKeyRecord {
             builder.set_master_key_version(self.master_key_version);
             builder.set_provider(&self.provider);
             builder.set_provider_key_id(&self.provider_key_id);
-            builder.set_cipher_suite(&self.cipher_suite);
+            builder.set_cipher_suite(self.cipher_suite.as_str());
             builder.set_nonce(&self.nonce);
             builder.set_ciphertext(&self.ciphertext);
             builder.set_created_at_unix_secs(self.created_at_unix_secs);
@@ -153,12 +179,13 @@ impl WrappedMasterKeyRecord {
                 .to_str()
                 .map_err(capnp_to_io)?
                 .to_string(),
-            cipher_suite: record
-                .get_cipher_suite()
-                .map_err(capnp_to_io)?
-                .to_str()
-                .map_err(capnp_to_io)?
-                .to_string(),
+            cipher_suite: MasterKeyCipherSuite::from_str(
+                record
+                    .get_cipher_suite()
+                    .map_err(capnp_to_io)?
+                    .to_str()
+                    .map_err(capnp_to_io)?,
+            )?,
             nonce: record.get_nonce().map_err(capnp_to_io)?.to_vec(),
             ciphertext: record.get_ciphertext().map_err(capnp_to_io)?.to_vec(),
             created_at_unix_secs: record.get_created_at_unix_secs(),
@@ -298,7 +325,7 @@ impl MasterKeyProtector for PassphraseMasterKeyProtector {
             master_key_version: version,
             provider: PASSPHRASE_PROVIDER.to_string(),
             provider_key_id: PASSPHRASE_PROVIDER_KEY_ID.to_string(),
-            cipher_suite: XCHACHA20_POLY1305.to_string(),
+            cipher_suite: MasterKeyCipherSuite::XChaCha20Poly1305,
             nonce: nonce.to_vec(),
             ciphertext: Vec::new(),
             created_at_unix_secs,
@@ -337,12 +364,6 @@ impl MasterKeyProtector for PassphraseMasterKeyProtector {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "wrapped master key provider mismatch",
-            ));
-        }
-        if record.cipher_suite != XCHACHA20_POLY1305 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "wrapped master key cipher suite mismatch",
             ));
         }
         if record.nonce.len() != XCHACHA_NONCE_SIZE {
@@ -625,7 +646,7 @@ fn envelope_aad(record: &WrappedMasterKeyRecord) -> Vec<u8> {
     aad.extend_from_slice(&record.master_key_version.to_be_bytes());
     extend_bytes(&mut aad, record.provider.as_bytes());
     extend_bytes(&mut aad, record.provider_key_id.as_bytes());
-    extend_bytes(&mut aad, record.cipher_suite.as_bytes());
+    extend_bytes(&mut aad, record.cipher_suite.as_str().as_bytes());
     aad.extend_from_slice(&record.created_at_unix_secs.to_be_bytes());
     extend_bytes(&mut aad, &record.provider_metadata);
     aad
