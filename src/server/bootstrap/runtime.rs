@@ -20,6 +20,7 @@ use crate::scheduler::digest::{
     SchedulerDigestPublisher, SchedulerDigestRegistry, SchedulerDigestReplicator,
 };
 use crate::scheduler::service::SchedulerService;
+use crate::secrets::master_key_protector::SecretPassphrase;
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
@@ -73,6 +74,7 @@ pub struct BootstrapOptions {
     pub global_metadata_sync_fanout: Option<usize>,
     pub gossip_tick: Option<Duration>,
     pub advertise_override: Option<String>,
+    pub master_key_passphrase: Option<SecretPassphrase>,
 }
 
 impl Default for BootstrapOptions {
@@ -91,6 +93,7 @@ impl Default for BootstrapOptions {
             global_metadata_sync_fanout: None,
             gossip_tick: None,
             advertise_override: None,
+            master_key_passphrase: None,
         }
     }
 }
@@ -315,7 +318,7 @@ pub async fn boot(
     ctx: BootstrapContext,
     options: BootstrapOptions,
 ) -> BootstrapResult<BootedRuntime> {
-    let stores = BootstrapStores::open(&ctx).await?;
+    let stores = BootstrapStores::open(&ctx, &options).await?;
     // This async assembly path carries a large future state machine during
     // headless startup. Boxing it keeps current-thread test stacks bounded.
     let (components, actors, gossip_rx, gossip_dedupe) =
@@ -609,6 +612,8 @@ async fn build_runtime_components(
         stores.secret_master_store.clone(),
         Some(topology.clone()),
         secret_replicator.clone(),
+        ctx.self_id,
+        ctx.noise_keys.clone(),
     );
     let secrets_client = capnp_rpc::new_client(secrets_service);
 

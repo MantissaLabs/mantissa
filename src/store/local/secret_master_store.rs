@@ -1,24 +1,26 @@
-use crate::secrets::crypto::SecretKeyring;
+use crate::secrets::master_key_protector::{
+    MasterKeyPlaintext, MasterKeyProtectorHandle, WrappedMasterKeyRecord,
+};
 use crate::store::tx::{into_io, with_read_tx, with_write_tx};
 use redb::{Database, TableDefinition};
 use std::{io, sync::Arc};
 
-const T_MASTER_KEYS: TableDefinition<u64, &'static [u8]> =
-    TableDefinition::new("secret_master_keys");
+const T_MASTER_KEY_ENVELOPES: TableDefinition<u64, &'static [u8]> =
+    TableDefinition::new("secret_master_key_envelopes");
 const T_MASTER_META: TableDefinition<&'static str, &'static [u8]> =
     TableDefinition::new("secret_master_meta");
 const CURRENT_VERSION_KEY: &str = "current_version";
 
-/// Immutable snapshot of a master key version stored in the durable key vault.
-#[derive(Debug, Clone, Copy)]
+/// Immutable plaintext snapshot of one master key version after local envelope unwrap.
+#[derive(Debug, Clone)]
 pub struct MasterKeyRecord {
     pub version: u64,
-    pub key: [u8; 32],
+    pub key: MasterKeyPlaintext,
 }
 
 impl MasterKeyRecord {
     /// Creates a record from raw parts after validating the version value.
-    pub fn new(version: u64, key: [u8; 32]) -> io::Result<Self> {
+    pub fn new(version: u64, key: MasterKeyPlaintext) -> io::Result<Self> {
         if version == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -29,31 +31,32 @@ impl MasterKeyRecord {
     }
 }
 
-/// Durable storage for the cluster-wide secret encryption root key.
+/// Durable storage for locally wrapped cluster secret master keys.
 #[derive(Clone)]
 pub struct SecretMasterStore {
     db: Arc<Database>,
+    protector: MasterKeyProtectorHandle,
 }
 
 impl SecretMasterStore {
-    /// Opens (or creates) the secret master key tables without generating a key.
-    pub fn new(db: Arc<Database>) -> io::Result<Self> {
+    /// Opens (or creates) the wrapped secret master key tables without generating a key.
+    pub fn new(db: Arc<Database>, protector: MasterKeyProtectorHandle) -> io::Result<Self> {
         with_write_tx(&db, |tx| {
-            let _ = tx.open_table(T_MASTER_KEYS).map_err(into_io)?;
+            let _ = tx.open_table(T_MASTER_KEY_ENVELOPES).map_err(into_io)?;
             let _ = tx.open_table(T_MASTER_META).map_err(into_io)?;
             Ok(())
         })?;
 
-        Ok(Self { db })
+        Ok(Self { db, protector })
     }
 
-    /// Ensures a current master key exists, generating and persisting one when missing.
+    /// Ensures a current wrapped master key exists, generating and persisting one when missing.
     pub fn ensure_current(&self) -> io::Result<MasterKeyRecord> {
         if let Some(existing) = self.load_current()? {
             return Ok(existing);
         }
 
-        let generated = SecretKeyring::generate_master_key()?;
+        let generated = MasterKeyPlaintext::generate()?;
         self.persist_new_version(1, &generated)?;
 
         MasterKeyRecord::new(1, generated)
@@ -72,22 +75,11 @@ impl SecretMasterStore {
     /// have installed the newer key, older entries can be garbage-collected
     /// separately.
     pub fn load_version(&self, version: u64) -> io::Result<Option<MasterKeyRecord>> {
-        with_read_tx(&self.db, |tx| {
-            let table = tx.open_table(T_MASTER_KEYS).map_err(into_io)?;
-            let Some(raw_key) = table.get(version).map_err(into_io)? else {
-                return Ok(None);
-            };
-            let bytes = raw_key.value();
-            if bytes.len() != 32 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "secret master key length invalid",
-                ));
-            }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(bytes);
-            MasterKeyRecord::new(version, key).map(Some)
-        })
+        let Some(wrapped) = self.load_wrapped_version(version)? else {
+            return Ok(None);
+        };
+        let key = self.protector.unwrap(&wrapped)?;
+        MasterKeyRecord::new(version, key).map(Some)
     }
 
     /// Imports an externally provided master key as the active version.
@@ -106,7 +98,7 @@ impl SecretMasterStore {
         let next_version = current_version
             .checked_add(1)
             .ok_or_else(|| io::Error::other("master key version overflow"))?;
-        let new_key = SecretKeyring::generate_master_key()?;
+        let new_key = MasterKeyPlaintext::generate()?;
         self.persist_new_version(next_version, &new_key)?;
         MasterKeyRecord::new(next_version, new_key)
     }
@@ -129,25 +121,17 @@ impl SecretMasterStore {
             version_buf.copy_from_slice(&version_bytes);
             let version = u64::from_be_bytes(version_buf);
 
-            let table = tx.open_table(T_MASTER_KEYS).map_err(into_io)?;
-            let Some(raw_key) = table.get(version).map_err(into_io)? else {
-                return Err(io::Error::new(
+            Ok(Some(version))
+        })?
+        .map(|version| {
+            self.load_version(version)?.ok_or_else(|| {
+                io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "secret master key missing for recorded version",
-                ));
-            };
-
-            let bytes = raw_key.value();
-            if bytes.len() != 32 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "secret master key length invalid",
-                ));
-            }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(bytes);
-            MasterKeyRecord::new(version, key).map(Some)
+                    "secret master key envelope missing for recorded version",
+                )
+            })
         })
+        .transpose()
     }
 
     /// Reads the version pointer from metadata, returning `None` when uninitialized.
@@ -170,8 +154,19 @@ impl SecretMasterStore {
         })
     }
 
-    /// Persists `key` under `version` and advances the metadata pointer atomically.
-    fn persist_new_version(&self, version: u64, key: &[u8; 32]) -> io::Result<()> {
+    /// Loads the wrapped envelope associated with `version` if one has been persisted.
+    fn load_wrapped_version(&self, version: u64) -> io::Result<Option<WrappedMasterKeyRecord>> {
+        with_read_tx(&self.db, |tx| {
+            let table = tx.open_table(T_MASTER_KEY_ENVELOPES).map_err(into_io)?;
+            let Some(raw_envelope) = table.get(version).map_err(into_io)? else {
+                return Ok(None);
+            };
+            WrappedMasterKeyRecord::decode(raw_envelope.value()).map(Some)
+        })
+    }
+
+    /// Persists `key` as an envelope under `version` and advances the metadata pointer atomically.
+    fn persist_new_version(&self, version: u64, key: &MasterKeyPlaintext) -> io::Result<()> {
         if version == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -181,10 +176,14 @@ impl SecretMasterStore {
 
         let mut version_bytes = [0u8; 8];
         version_bytes.copy_from_slice(&version.to_be_bytes());
+        let wrapped = self.protector.wrap(version, key)?;
+        let encoded = wrapped.encode()?;
 
         with_write_tx(&self.db, |tx| {
-            let mut keys = tx.open_table(T_MASTER_KEYS).map_err(into_io)?;
-            keys.insert(version, key.as_slice()).map_err(into_io)?;
+            let mut envelopes = tx.open_table(T_MASTER_KEY_ENVELOPES).map_err(into_io)?;
+            envelopes
+                .insert(version, encoded.as_slice())
+                .map_err(into_io)?;
 
             let mut meta = tx.open_table(T_MASTER_META).map_err(into_io)?;
             meta.insert(CURRENT_VERSION_KEY, version_bytes.as_slice())
@@ -197,26 +196,33 @@ impl SecretMasterStore {
 #[cfg(test)]
 mod tests {
     use super::SecretMasterStore;
+    use crate::secrets::master_key_protector::PassphraseMasterKeyProtector;
     use redb::Database;
     use std::sync::Arc;
     use tempfile::tempdir;
+    use uuid::Uuid;
+
+    fn test_protector() -> crate::secrets::master_key_protector::MasterKeyProtectorHandle {
+        Arc::new(PassphraseMasterKeyProtector::for_test(Uuid::new_v4()).expect("protector"))
+    }
 
     #[test]
     fn ensure_current_generates_and_persists_key() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let db = Arc::new(Database::create(db_path).unwrap());
-        let store = SecretMasterStore::new(db.clone()).expect("open store");
+        let protector = test_protector();
+        let store = SecretMasterStore::new(db.clone(), protector.clone()).expect("open store");
 
         let first = store.ensure_current().expect("ensure master key");
         assert_eq!(first.version, 1);
-        assert_eq!(first.key.len(), 32);
+        assert_eq!(first.key.as_bytes().len(), 32);
 
         let again = store.ensure_current().expect("reuse master key");
         assert_eq!(first.version, again.version);
         assert_eq!(first.key, again.key);
 
-        let reopened = SecretMasterStore::new(db).expect("reopen store");
+        let reopened = SecretMasterStore::new(db, protector).expect("reopen store");
         let current = reopened.current().expect("load master key");
         assert_eq!(current.version, again.version);
         assert_eq!(current.key, again.key);
@@ -227,12 +233,32 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let db = Arc::new(Database::create(db_path).unwrap());
-        let store = SecretMasterStore::new(db).expect("open store");
+        let store = SecretMasterStore::new(db, test_protector()).expect("open store");
 
         let base = store.ensure_current().expect("ensure master key");
         let rotated = store.rotate().expect("rotate master key");
 
         assert_eq!(rotated.version, base.version + 1);
         assert_ne!(rotated.key, base.key);
+    }
+
+    #[test]
+    fn persisted_store_does_not_contain_plaintext_master_key() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let db = Arc::new(Database::create(&db_path).unwrap());
+        let store = SecretMasterStore::new(db.clone(), test_protector()).expect("open store");
+
+        let record = store.ensure_current().expect("ensure master key");
+        drop(store);
+        drop(db);
+
+        let bytes = std::fs::read(&db_path).expect("read redb");
+        assert!(
+            !bytes
+                .windows(record.key.as_bytes().len())
+                .any(|window| window == &record.key.as_bytes()[..]),
+            "wrapped master key store must not contain the raw master key"
+        );
     }
 }

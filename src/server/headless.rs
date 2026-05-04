@@ -13,6 +13,7 @@ use crate::{
     registry::Registry,
     runtime::set::RuntimeSet,
     scheduler::Scheduler,
+    secrets::master_key_protector::SecretPassphrase,
     server::{
         RunHandles, Server,
         bootstrap::{BootedRuntime, BootstrapContext, BootstrapOptions, RuntimeTaskHandles, boot},
@@ -213,6 +214,9 @@ impl HeadlessNode {
             gossip_tick,
             advertise_override: matches!(&transport, HeadlessTransport::Inproc)
                 .then(|| format!("inproc://{self_id}")),
+            master_key_passphrase: Some(SecretPassphrase::new(
+                b"mantissa-headless-master-key-passphrase".to_vec(),
+            )?),
         };
 
         let BootedRuntime {

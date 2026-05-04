@@ -16,11 +16,11 @@ interface Secrets {
   get @4 (name :Text, versionId :Data) -> (version :SecretVersionData);
   # Fetch a secret version (plaintext returned to authorized caller).
 
-  getMasterKey @5 () -> (envelope :SecretMasterKey);
-  # Fetch the current cluster master key envelope.
+  getMasterKeyTransfer @5 (request :SecretMasterKeyTransferRequest) -> (envelope :SecretMasterKeyTransfer);
+  # Fetch the current cluster master key encrypted to the requested node key.
 
-  installMasterKey @6 (envelope :SecretMasterKey);
-  # Install or replace the cluster master key envelope.
+  installMasterKeyTransfer @6 (envelope :SecretMasterKeyTransfer);
+  # Install or replace the cluster master key from an encrypted transfer envelope.
 
   rotateMasterKey @7 () -> (version :UInt64);
   # Rotate the master key and return the new version.
@@ -115,12 +115,78 @@ struct SecretUpsertRequest {
   # User-defined metadata entries.
 }
 
-struct SecretMasterKey {
+struct SecretMasterKeyTransferRequest {
+  recipientNodeId @0 :Data;
+  # 16-byte node UUID that will receive and unwrap the transfer.
+
+  recipientNoiseStaticPub @1 :Data;
+  # 32-byte X25519 static public key advertised by the recipient node.
+}
+
+struct SecretMasterKeyTransfer {
   version @0 :UInt64;
   # Master key version number.
 
-  key @1 :Data;
-  # 32-byte cluster master key.
+  senderNodeId @1 :Data;
+  # 16-byte node UUID that encrypted the transfer.
+
+  recipientNodeId @2 :Data;
+  # 16-byte node UUID allowed to decrypt the transfer.
+
+  transferPublicKey @3 :Data;
+  # 32-byte ephemeral X25519 public key used for this transfer.
+
+  recipientNoiseStaticPub @4 :Data;
+  # 32-byte X25519 static public key the transfer was encrypted to.
+
+  nonce @5 :Data;
+  # 24-byte XChaCha20-Poly1305 nonce.
+
+  ciphertext @6 :Data;
+  # Encrypted 32-byte master key payload including the Poly1305 tag.
+}
+
+struct WrappedSecretMasterKey {
+  schemaVersion @0 :UInt16;
+  # Durable envelope schema version.
+
+  masterKeyVersion @1 :UInt64;
+  # Master key version number.
+
+  provider @2 :Text;
+  # Local key-protection provider identifier.
+
+  providerKeyId @3 :Text;
+  # Provider-specific local key identifier.
+
+  cipherSuite @4 :Text;
+  # AEAD used for the envelope ciphertext.
+
+  nonce @5 :Data;
+  # AEAD nonce used to wrap the master key.
+
+  ciphertext @6 :Data;
+  # Encrypted 32-byte master key payload including the authentication tag.
+
+  createdAtUnixSecs @7 :UInt64;
+  # Unix timestamp when this envelope was created.
+
+  providerMetadata @8 :Data;
+  # Opaque provider-specific durable metadata.
+}
+
+struct PassphraseMasterKeyMetadata {
+  salt @0 :Data;
+  # Random Argon2id salt bytes.
+
+  argon2MemoryCostKib @1 :UInt32;
+  # Argon2id memory cost in KiB.
+
+  argon2TimeCost @2 :UInt32;
+  # Argon2id iteration count.
+
+  argon2Parallelism @3 :UInt32;
+  # Argon2id parallelism parameter.
 }
 
 struct SecretRecord {

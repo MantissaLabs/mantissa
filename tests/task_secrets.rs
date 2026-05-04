@@ -15,6 +15,7 @@ use mantissa::scheduler::Scheduler;
 use mantissa::scheduler::{SlotCapacity, SlotSpec};
 use mantissa::secrets::crypto::SecretKeyring;
 use mantissa::secrets::gossip::SecretReplicator;
+use mantissa::secrets::master_key_protector::PassphraseMasterKeyProtector;
 use mantissa::secrets::registry::SecretRegistry;
 use mantissa::secrets::service::SecretsService;
 use mantissa::secrets::types::{SecretMetadata, SecretValue, SecretVersion, compute_secret_id};
@@ -320,7 +321,10 @@ async fn setup_workload_manager() -> TestHarness {
         .path()
         .join(format!("master-{}.redb", Uuid::new_v4()));
     let master_db = Arc::new(redb::Database::create(master_path).expect("create master db"));
-    let master_store = SecretMasterStore::new(master_db.clone()).expect("open master store");
+    let master_protector =
+        Arc::new(PassphraseMasterKeyProtector::for_test(actor).expect("master protector"));
+    let master_store =
+        SecretMasterStore::new(master_db.clone(), master_protector).expect("open master store");
     let master_record = master_store
         .ensure_current()
         .expect("ensure master key record");
@@ -668,6 +672,7 @@ local_test!(rotate_master_key_rewraps_secrets, {
         secret_master_store,
         secret_keyring,
         secret_keyring_handle,
+        node_id,
         ..
     } = harness;
 
@@ -712,6 +717,8 @@ local_test!(rotate_master_key_rewraps_secrets, {
         secret_master_store.clone(),
         None,
         secret_replicator,
+        node_id,
+        Arc::new(NoiseKeys::from_private_bytes([9u8; 32])),
     );
     let client: secrets::Client = capnp_new_client(service);
     let response = client

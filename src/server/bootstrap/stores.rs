@@ -1,9 +1,10 @@
-use super::{BootstrapContext, BootstrapResult};
+use super::{BootstrapContext, BootstrapResult, runtime::BootstrapOptions};
 use crate::cluster::{
     ClusterViewId, ClusterViewState, MIN_SUPPORTED_ROOT_SCHEMA_VERSION, RootSchemaState,
     SUPPORTED_ROOT_SCHEMA_VERSION,
 };
 use crate::secrets::crypto::SecretKeyring;
+use crate::secrets::master_key_protector::PassphraseMasterKeyProtector;
 use crate::server::auth::AuthStore;
 use crate::store::agent_store::{AgentStore, open_agent_store};
 use crate::store::cluster_operation_store::ClusterOperationStore;
@@ -72,7 +73,10 @@ impl BootstrapStores {
     ///
     /// This isolates storage concerns from runtime assembly so later bootstrap
     /// phases can work with a fully prepared persistent state view.
-    pub(super) async fn open(ctx: &BootstrapContext) -> BootstrapResult<Self> {
+    pub(super) async fn open(
+        ctx: &BootstrapContext,
+        options: &BootstrapOptions,
+    ) -> BootstrapResult<Self> {
         let peers = open_peers_store(ctx.db.clone(), ctx.self_id)?;
         peers.rebuild_mst_from_disk().await?;
 
@@ -92,8 +96,17 @@ impl BootstrapStores {
         let token_store = TokenStore::load(ctx.db.clone())
             .map_err(|error| store_error("load persistent join token", error))?;
 
-        let secret_master_store = SecretMasterStore::new(ctx.db.clone())
-            .map_err(|error| store_error("open secret master key store", error))?;
+        let passphrase = options.master_key_passphrase.clone().ok_or_else(|| {
+            store_error(
+                "open secret master key store",
+                "master key passphrase source is required",
+            )
+        })?;
+        let secret_master_protector =
+            Arc::new(PassphraseMasterKeyProtector::new(passphrase, ctx.self_id));
+        let secret_master_store =
+            SecretMasterStore::new(ctx.db.clone(), secret_master_protector)
+                .map_err(|error| store_error("open secret master key store", error))?;
         let master_record = secret_master_store
             .ensure_current()
             .map_err(|error| store_error("ensure current secret master record", error))?;

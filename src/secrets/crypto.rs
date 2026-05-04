@@ -1,3 +1,4 @@
+use crate::secrets::master_key_protector::{MASTER_KEY_SIZE, MasterKeyPlaintext};
 use crate::secrets::types::SecretCiphertext;
 use crate::store::local::{MasterKeyRecord, SecretMasterStore};
 use blake3::Hash;
@@ -13,7 +14,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
 const AAD_PREFIX: &[u8] = b"mantissa.secret.v1";
-const MASTER_KEY_SIZE: usize = 32;
 
 /// In-memory key material used to encrypt and decrypt secret payloads.
 #[derive(Clone)]
@@ -23,7 +23,7 @@ pub struct SecretKeyring {
 
 struct Inner {
     master_store: SecretMasterStore,
-    cache: RwLock<HashMap<u64, [u8; MASTER_KEY_SIZE]>>,
+    cache: RwLock<HashMap<u64, MasterKeyPlaintext>>,
     current_version: AtomicU64,
 }
 
@@ -42,38 +42,36 @@ impl SecretKeyring {
         }
     }
 
-    /// Generates a fresh cryptographically random master key suitable for cluster-wide use.
-    pub fn generate_master_key() -> io::Result<[u8; MASTER_KEY_SIZE]> {
-        let mut master_key = [0u8; MASTER_KEY_SIZE];
-        getrandom::getrandom(&mut master_key)?;
-        Ok(master_key)
-    }
-
     /// Returns the current encrypted master key version identifier.
     pub fn current_version(&self) -> u64 {
         self.inner.current_version.load(Ordering::SeqCst)
     }
 
     /// Installs `record` as the new active master key while caching its material.
-    pub fn install_current(&self, record: MasterKeyRecord) {
+    pub fn install_current(&self, record: &MasterKeyRecord) {
         // NOTE: we intentionally preserve older key versions in the cache/store so peers can
         // still decrypt ciphertext that was encrypted before they applied the new version.
         // Rotation re-wraps secrets with `record.version`, but remote nodes might serve reads
         // against the previous version until they receive the broadcast.
         {
             let mut cache = self.inner.cache.write();
-            cache.insert(record.version, record.key);
+            cache.insert(record.version, record.key.clone());
         }
         self.inner
             .current_version
             .store(record.version, Ordering::SeqCst);
     }
 
-    fn master_key_for(&self, version: u64) -> io::Result<[u8; MASTER_KEY_SIZE]> {
+    /// Borrows one master key version for immediate cryptographic use.
+    fn with_master_key<R>(
+        &self,
+        version: u64,
+        f: impl FnOnce(&[u8; MASTER_KEY_SIZE]) -> io::Result<R>,
+    ) -> io::Result<R> {
         {
             let cache = self.inner.cache.read();
             if let Some(key) = cache.get(&version) {
-                return Ok(*key);
+                return f(key.as_bytes());
             }
         }
 
@@ -85,7 +83,7 @@ impl SecretKeyring {
 
         let mut cache = self.inner.cache.write();
         let entry = cache.entry(record.version).or_insert(record.key);
-        Ok(*entry)
+        f(entry.as_bytes())
     }
 
     /// Encrypts `plaintext` for the provided secret/version identifiers.
@@ -97,18 +95,18 @@ impl SecretKeyring {
     ) -> io::Result<SecretCiphertext> {
         let nonce = Self::random_nonce()?;
         let version = self.current_version();
-        let master_key = self.master_key_for(version)?;
-        let aead = ChaCha20Poly1305::new(Key::from_slice(&master_key));
         let aad = Self::aad(secret_id, version_id);
-        let ciphertext = aead
-            .encrypt(
+        let ciphertext = self.with_master_key(version, |master_key| {
+            let aead = ChaCha20Poly1305::new(Key::from_slice(master_key));
+            aead.encrypt(
                 Nonce::from_slice(&nonce),
                 Payload {
                     msg: plaintext,
                     aad: &aad,
                 },
             )
-            .map_err(|_| io::Error::other("secret encryption failed"))?;
+            .map_err(|_| io::Error::other("secret encryption failed"))
+        })?;
 
         let digest = Self::digest_bytes(blake3::hash(plaintext));
 
@@ -127,20 +125,18 @@ impl SecretKeyring {
         version_id: Uuid,
         envelope: &SecretCiphertext,
     ) -> io::Result<Vec<u8>> {
-        let master_key = self.master_key_for(envelope.master_key_version)?;
-        let aead = ChaCha20Poly1305::new(Key::from_slice(&master_key));
         let aad = Self::aad(secret_id, version_id);
-        let plaintext = aead
-            .decrypt(
+        let plaintext = self.with_master_key(envelope.master_key_version, |master_key| {
+            let aead = ChaCha20Poly1305::new(Key::from_slice(master_key));
+            aead.decrypt(
                 Nonce::from_slice(&envelope.nonce),
                 Payload {
                     msg: envelope.ciphertext.as_slice(),
                     aad: &aad,
                 },
             )
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::PermissionDenied, "secret decrypt failed")
-            })?;
+            .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "secret decrypt failed"))
+        })?;
 
         let digest = blake3::hash(&plaintext);
         if Self::digest_bytes(digest) != envelope.digest {
@@ -177,6 +173,7 @@ impl SecretKeyring {
 #[cfg(test)]
 mod tests {
     use super::SecretKeyring;
+    use crate::secrets::master_key_protector::PassphraseMasterKeyProtector;
     use crate::store::local::SecretMasterStore;
     use redb::Database;
     use std::sync::Arc;
@@ -187,7 +184,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let db = Arc::new(Database::create(db_path).unwrap());
-        let store = SecretMasterStore::new(db).expect("open store");
+        let protector = Arc::new(PassphraseMasterKeyProtector::for_test(Uuid::new_v4()).unwrap());
+        let store = SecretMasterStore::new(db, protector).expect("open store");
         (store, dir)
     }
 
@@ -233,6 +231,7 @@ mod tests {
     fn installing_new_master_keeps_previous_material_available() {
         let (store, _dir) = temp_store();
         let initial = store.ensure_current().expect("ensure master");
+        let initial_version = initial.version;
         let keyring = SecretKeyring::new(store.clone(), initial);
 
         let secret_id = Uuid::new_v4();
@@ -242,15 +241,16 @@ mod tests {
         let cipher_old = keyring
             .encrypt(secret_id, version_id, payload)
             .expect("encrypt with initial key");
-        assert_eq!(cipher_old.master_key_version, initial.version);
+        assert_eq!(cipher_old.master_key_version, initial_version);
 
         let rotated = store.rotate().expect("rotate master key");
-        keyring.install_current(rotated);
+        let rotated_version = rotated.version;
+        keyring.install_current(&rotated);
 
         let cipher_new = keyring
             .encrypt(secret_id, version_id, payload)
             .expect("encrypt with rotated key");
-        assert_eq!(cipher_new.master_key_version, rotated.version);
+        assert_eq!(cipher_new.master_key_version, rotated_version);
 
         let plain_old = keyring
             .decrypt(secret_id, version_id, &cipher_old)

@@ -224,6 +224,22 @@ pub struct InitArgs {
     /// State directory to initialize, defaults to Mantissa's root/user state directory
     #[arg(long = "state-dir", value_name = "DIR")]
     pub state_dir: Option<PathBuf>,
+
+    /// Read the secret master key passphrase from an owner-protected file
+    #[arg(
+        long = "master-key-passphrase-file",
+        value_name = "FILE",
+        conflicts_with = "master_key_passphrase_fd"
+    )]
+    pub master_key_passphrase_file: Option<PathBuf>,
+
+    /// Read the secret master key passphrase from an already-open file descriptor
+    #[arg(
+        long = "master-key-passphrase-fd",
+        value_name = "FD",
+        conflicts_with = "master_key_passphrase_file"
+    )]
+    pub master_key_passphrase_fd: Option<i32>,
 }
 
 #[derive(Args, Debug)]

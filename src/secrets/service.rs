@@ -1,5 +1,6 @@
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::gossip::SecretReplicator;
+use crate::secrets::master_key_protector::MasterKeyTransfer;
 use crate::secrets::registry::SecretRegistry;
 use crate::secrets::types::{
     SecretCiphertext, SecretEvent, SecretMetadata, SecretValue, SecretVersion, compute_secret_id,
@@ -9,8 +10,10 @@ use crate::topology::Topology;
 use capnp::Error;
 use capnp::struct_list;
 use chrono::Utc;
+use mantissa_net::noise::NoiseKeys;
 use mantissa_protocol::secrets::{
-    secret_ciphertext, secret_event, secret_metadata_entry, secret_record, secret_spec, secrets,
+    secret_ciphertext, secret_event, secret_master_key_transfer, secret_metadata_entry,
+    secret_record, secret_spec, secrets,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::collections::BTreeMap;
@@ -27,6 +30,8 @@ pub struct SecretsService {
     master_store: SecretMasterStore,
     topology: Option<Topology>,
     replicator: SecretReplicator,
+    local_node_id: Uuid,
+    noise_keys: Arc<NoiseKeys>,
 }
 
 impl SecretsService {
@@ -37,6 +42,8 @@ impl SecretsService {
         master_store: SecretMasterStore,
         topology: Option<Topology>,
         replicator: SecretReplicator,
+        local_node_id: Uuid,
+        noise_keys: Arc<NoiseKeys>,
     ) -> Self {
         Self {
             registry,
@@ -44,6 +51,8 @@ impl SecretsService {
             master_store,
             topology,
             replicator,
+            local_node_id,
+            noise_keys,
         }
     }
 
@@ -65,6 +74,14 @@ impl SecretsService {
 
     fn replicator(&self) -> SecretReplicator {
         self.replicator.clone()
+    }
+
+    fn local_node_id(&self) -> Uuid {
+        self.local_node_id
+    }
+
+    fn noise_keys(&self) -> Arc<NoiseKeys> {
+        self.noise_keys.clone()
     }
 
     /// Rejects secret mutations while split/merge topology operations are in progress.
@@ -290,6 +307,50 @@ fn read_secret_ciphertext(
     })
 }
 
+/// Writes one encrypted master-key transfer into the RPC response envelope.
+pub(crate) fn write_master_key_transfer(
+    mut builder: secret_master_key_transfer::Builder<'_>,
+    transfer: &MasterKeyTransfer,
+) {
+    builder.set_version(transfer.version);
+    builder.set_sender_node_id(transfer.sender_node_id.as_bytes());
+    builder.set_recipient_node_id(transfer.recipient_node_id.as_bytes());
+    builder.set_transfer_public_key(&transfer.transfer_public_key);
+    builder.set_recipient_noise_static_pub(&transfer.recipient_noise_static_pub);
+    builder.set_nonce(&transfer.nonce);
+    builder.set_ciphertext(&transfer.ciphertext);
+}
+
+/// Reads and validates one encrypted master-key transfer from an RPC request.
+pub(crate) fn read_master_key_transfer(
+    reader: secret_master_key_transfer::Reader<'_>,
+) -> Result<MasterKeyTransfer, Error> {
+    let transfer_public_key =
+        read_fixed_32(reader.get_transfer_public_key()?, "transfer public key")?;
+    let recipient_noise_static_pub = read_fixed_32(
+        reader.get_recipient_noise_static_pub()?,
+        "recipient noise static key",
+    )?;
+    let nonce_reader = reader.get_nonce()?;
+    if nonce_reader.len() != 24 {
+        return Err(Error::failed(
+            "master key transfer nonce must be 24 bytes".into(),
+        ));
+    }
+    let mut nonce = [0u8; 24];
+    nonce.copy_from_slice(nonce_reader);
+
+    Ok(MasterKeyTransfer {
+        version: reader.get_version(),
+        sender_node_id: read_uuid(reader.get_sender_node_id()?)?,
+        recipient_node_id: read_uuid(reader.get_recipient_node_id()?)?,
+        transfer_public_key,
+        recipient_noise_static_pub,
+        nonce,
+        ciphertext: reader.get_ciphertext()?.to_vec(),
+    })
+}
+
 fn read_uuid(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
     if data.len() != 16 {
         return Err(Error::failed("uuid must be 16 bytes".into()));
@@ -297,6 +358,15 @@ fn read_uuid(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(data);
     Ok(Uuid::from_bytes(bytes))
+}
+
+fn read_fixed_32(data: capnp::data::Reader<'_>, label: &str) -> Result<[u8; 32], Error> {
+    if data.len() != 32 {
+        return Err(Error::failed(format!("{label} must be 32 bytes")));
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(data);
+    Ok(bytes)
 }
 
 fn secret_ciphertext_from_encryption(result: SecretCiphertext) -> SecretCiphertext {
@@ -542,20 +612,48 @@ impl secrets::Server for SecretsService {
         Ok(())
     }
 
-    /// Exposes the currently active master key so authenticated peers can bootstrap.
-    async fn get_master_key(
+    /// Exposes the current master key encrypted to a registered recipient node.
+    async fn get_master_key_transfer(
         self: Rc<Self>,
-        _params: secrets::GetMasterKeyParams,
-        mut results: secrets::GetMasterKeyResults,
+        params: secrets::GetMasterKeyTransferParams,
+        mut results: secrets::GetMasterKeyTransferResults,
     ) -> Result<(), Error> {
         let store = self.master_store();
+        let request = params.get()?.get_request()?;
+        let recipient_node_id = read_uuid(request.get_recipient_node_id()?)?;
+        let recipient_noise_static_pub = read_fixed_32(
+            request.get_recipient_noise_static_pub()?,
+            "recipient noise static key",
+        )?;
+
+        if let Some(topology) = self.topology() {
+            let registry = topology.registry();
+            let peer = registry
+                .peer_value_unscoped(recipient_node_id)
+                .ok_or_else(|| {
+                    Error::failed(format!(
+                        "recipient node {recipient_node_id} is not registered"
+                    ))
+                })?;
+            if peer.noise_static_pub != recipient_noise_static_pub {
+                return Err(Error::failed(format!(
+                    "recipient node {recipient_node_id} noise key mismatch"
+                )));
+            }
+        }
 
         let record = store
             .current()
             .map_err(|e| Error::failed(format!("failed to load master key: {e}")))?;
-        let mut envelope = results.get().init_envelope();
-        envelope.set_version(record.version);
-        envelope.set_key(&record.key);
+        let transfer = MasterKeyTransfer::encrypt(
+            record.version,
+            &record.key,
+            self.local_node_id(),
+            recipient_node_id,
+            recipient_noise_static_pub,
+        )
+        .map_err(|e| Error::failed(format!("failed to encrypt master key transfer: {e}")))?;
+        write_master_key_transfer(results.get().init_envelope(), &transfer);
         Ok(())
     }
 
@@ -581,7 +679,7 @@ impl secrets::Server for SecretsService {
 
         let keyring_clone = {
             let guard = keyring_handle.write().await;
-            guard.install_current(new_record);
+            guard.install_current(&new_record);
             guard.clone()
         };
 
@@ -612,7 +710,7 @@ impl secrets::Server for SecretsService {
         }
 
         if let Some(topology) = topology
-            && let Err(e) = distribute_master_key(topology, new_record).await
+            && let Err(e) = distribute_master_key(topology, self.local_node_id(), &new_record).await
         {
             warn!(target: "secrets", "failed to distribute master key v{}: {e}", new_record.version);
         }
@@ -621,25 +719,20 @@ impl secrets::Server for SecretsService {
         Ok(())
     }
 
-    async fn install_master_key(
+    async fn install_master_key_transfer(
         self: Rc<Self>,
-        params: secrets::InstallMasterKeyParams,
-        _results: secrets::InstallMasterKeyResults,
+        params: secrets::InstallMasterKeyTransferParams,
+        _results: secrets::InstallMasterKeyTransferResults,
     ) -> Result<(), Error> {
         let store = self.master_store();
         let keyring = self.keyring();
+        let noise_keys = self.noise_keys();
 
-        let envelope = params.get()?.get_envelope()?;
-        let key_bytes = envelope.get_key()?;
-        if key_bytes.len() != 32 {
-            return Err(Error::failed(
-                "master key payload must be exactly 32 bytes".into(),
-            ));
-        }
-
-        let mut key = [0u8; 32];
-        key.copy_from_slice(key_bytes);
-        let record = MasterKeyRecord::new(envelope.get_version(), key)
+        let transfer = read_master_key_transfer(params.get()?.get_envelope()?)?;
+        let plaintext = transfer
+            .decrypt(self.local_node_id(), noise_keys.as_ref())
+            .map_err(|e| Error::failed(format!("failed to decrypt master key transfer: {e}")))?;
+        let record = MasterKeyRecord::new(transfer.version, plaintext)
             .map_err(|e| Error::failed(e.to_string()))?;
 
         store
@@ -648,29 +741,42 @@ impl secrets::Server for SecretsService {
 
         {
             let guard = keyring.write().await;
-            guard.install_current(record);
+            guard.install_current(&record);
         }
 
         Ok(())
     }
 }
 
-async fn distribute_master_key(topology: Topology, record: MasterKeyRecord) -> Result<(), Error> {
+async fn distribute_master_key(
+    topology: Topology,
+    sender_node_id: Uuid,
+    record: &MasterKeyRecord,
+) -> Result<(), Error> {
     let registry = topology.registry();
     let peers = registry
         .known_peers()
         .map_err(|e| Error::failed(format!("failed to load peer list: {e}")))?;
 
     for peer in peers {
+        let Some(peer_value) = registry.peer_value_unscoped(peer) else {
+            continue;
+        };
         let Some(session) = registry.session_for_peer(peer).await else {
             continue;
         };
+        let transfer = MasterKeyTransfer::encrypt(
+            record.version,
+            &record.key,
+            sender_node_id,
+            peer,
+            peer_value.noise_static_pub,
+        )
+        .map_err(|e| Error::failed(format!("failed to encrypt master key transfer: {e}")))?;
         let request = session.get_secrets_request();
         let secrets_client = request.send().pipeline.get_secrets();
-        let mut install = secrets_client.install_master_key_request();
-        let mut envelope = install.get().init_envelope();
-        envelope.set_version(record.version);
-        envelope.set_key(&record.key);
+        let mut install = secrets_client.install_master_key_transfer_request();
+        write_master_key_transfer(install.get().init_envelope(), &transfer);
 
         if let Err(e) = install.send().promise.await {
             warn!(

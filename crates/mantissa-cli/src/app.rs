@@ -1,8 +1,11 @@
 use anyhow::{Result, anyhow};
 use clap::Parser;
+use mantissa::secrets::master_key_protector::SecretPassphrase;
 use mantissa_client::config::ClientConfig;
+use std::io::{IsTerminal, Read};
 use std::path::Path;
 use tokio::task::LocalSet;
+use zeroize::Zeroize;
 
 use crate::cli::*;
 use mantissa::config;
@@ -83,6 +86,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                 print!("{report}");
             }
 
+            let master_key_passphrase = resolve_master_key_passphrase(&init)?;
             let advertise_addr = init.advertise.or_else(config::advertise_addr);
             local
                 .run_until(mantissa::server::bootstrap::start(
@@ -90,6 +94,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     advertise_addr,
                     RunMode::Blocking,
                     true,
+                    master_key_passphrase,
                 ))
                 .await
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -695,4 +700,91 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolves the passphrase used to unlock or initialize the local master key envelope.
+fn resolve_master_key_passphrase(init: &InitArgs) -> Result<SecretPassphrase> {
+    let bytes = if let Some(path) = &init.master_key_passphrase_file {
+        std::fs::read(path).map_err(|error| {
+            anyhow!(
+                "failed to read master key passphrase file {}: {error}",
+                path.display()
+            )
+        })?
+    } else if let Some(fd) = init.master_key_passphrase_fd {
+        read_passphrase_fd(fd)?
+    } else {
+        prompt_master_key_passphrase()?
+    };
+
+    SecretPassphrase::new(strip_trailing_newlines(bytes)).map_err(|error| anyhow!("{error}"))
+}
+
+/// Prompts for a passphrase when Mantissa is attached to an interactive terminal.
+fn prompt_master_key_passphrase() -> Result<Vec<u8>> {
+    if !std::io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "master key passphrase is required; use --master-key-passphrase-file or --master-key-passphrase-fd in non-interactive mode"
+        ));
+    }
+
+    let state_exists = mantissa::store::path::default_db_path()
+        .map(|path| path.exists())
+        .unwrap_or(false);
+    let passphrase = read_secret_line("Master key passphrase: ")
+        .map_err(|error| anyhow!("failed to read master key passphrase: {error}"))?;
+    if !state_exists {
+        let mut confirm = read_secret_line("Confirm master key passphrase: ")
+            .map_err(|error| anyhow!("failed to confirm master key passphrase: {error}"))?;
+        if passphrase != confirm {
+            confirm.zeroize();
+            return Err(anyhow!("master key passphrases did not match"));
+        }
+        confirm.zeroize();
+    }
+    Ok(passphrase.into_bytes())
+}
+
+/// Reads one secret line from stdin without echo through the terminal helper crate.
+fn read_secret_line(prompt: &str) -> Result<String> {
+    rpassword::prompt_password(prompt).map_err(|error| anyhow!("{error}"))
+}
+
+/// Reads passphrase bytes from an inherited file descriptor on Unix hosts.
+#[cfg(unix)]
+fn read_passphrase_fd(fd: i32) -> Result<Vec<u8>> {
+    use std::os::unix::io::FromRawFd;
+
+    if fd < 0 {
+        return Err(anyhow!("--master-key-passphrase-fd must be non-negative"));
+    }
+    let duplicated = unsafe { libc::dup(fd) };
+    if duplicated < 0 {
+        return Err(anyhow!(
+            "failed to duplicate master key passphrase fd {fd}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut file = unsafe { std::fs::File::from_raw_fd(duplicated) };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| anyhow!("failed to read master key passphrase fd {fd}: {error}"))?;
+    Ok(bytes)
+}
+
+/// Rejects file descriptor passphrase sources on unsupported platforms.
+#[cfg(not(unix))]
+fn read_passphrase_fd(_fd: i32) -> Result<Vec<u8>> {
+    Err(anyhow!(
+        "--master-key-passphrase-fd is only supported on Unix hosts"
+    ))
+}
+
+/// Removes line terminators commonly left by files, pipes, and secret managers.
+fn strip_trailing_newlines(mut bytes: Vec<u8>) -> Vec<u8> {
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes.pop();
+    }
+    bytes
 }

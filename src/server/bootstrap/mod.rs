@@ -3,6 +3,7 @@ mod runtime;
 mod stores;
 mod transport;
 
+use crate::secrets::master_key_protector::SecretPassphrase;
 use crate::server;
 
 pub(crate) use context::BootstrapContext;
@@ -20,9 +21,14 @@ pub async fn start(
     advertise_addr: Option<String>,
     mode: server::RunMode,
     enable_unix_socket: bool,
+    master_key_passphrase: SecretPassphrase,
 ) -> BootstrapResult<Option<server::RunHandles>> {
     let ctx = BootstrapContext::init_base(listen_addr).await?;
-    let runtime = boot(ctx, transport::daemon_bootstrap_options(advertise_addr)).await?;
+    let runtime = boot(
+        ctx,
+        transport::daemon_bootstrap_options(advertise_addr, master_key_passphrase),
+    )
+    .await?;
     match mode {
         server::RunMode::Blocking => {
             runtime.server.run_blocking(enable_unix_socket).await?;

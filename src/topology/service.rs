@@ -10,6 +10,7 @@ use crate::config;
 use crate::node::address::extract_port;
 use crate::node::id::read_node_id;
 use crate::runtime::types::RuntimeSupportProfile;
+use crate::secrets::service::read_master_key_transfer;
 use crate::server::credential::ClusterCredential;
 use crate::store::local::{LocalCredentialStore, LocalSessionStore, MasterKeyRecord};
 use crate::store::peer_store::PeersStore;
@@ -274,7 +275,7 @@ impl Topology {
         Ok(())
     }
 
-    /// Retrieves and installs the cluster master key returned by the anchor during join.
+    /// Retrieves and installs the cluster master key transfer returned by the anchor during join.
     async fn install_master_key_from_anchor(
         &self,
         session: cluster_session::Client,
@@ -283,21 +284,19 @@ impl Topology {
         let response = request.send().promise.await?;
         let secrets_client = response.get()?.get_secrets()?;
 
-        let mk_request = secrets_client.get_master_key_request();
-        let mk_response = mk_request.send().promise.await?;
-        let envelope = mk_response.get()?.get_envelope()?;
-
-        let version = envelope.get_version();
-        let key_bytes = envelope.get_key()?;
-        if key_bytes.len() != 32 {
-            return Err(Error::failed(
-                "anchor provided master key with invalid length".to_string(),
-            ));
+        let mut mk_request = secrets_client.get_master_key_transfer_request();
+        {
+            let mut inner = mk_request.get().init_request();
+            inner.set_recipient_node_id(self.local.node.id.as_bytes());
+            inner.set_recipient_noise_static_pub(self.local.public_key.as_bytes());
         }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(key_bytes);
-
-        let record = MasterKeyRecord::new(version, key)
+        let mk_response = mk_request.send().promise.await?;
+        let transfer = read_master_key_transfer(mk_response.get()?.get_envelope()?)?;
+        let noise_keys = self.deps.registry.noise_keys();
+        let plaintext = transfer
+            .decrypt(self.local.node.id, noise_keys.as_ref())
+            .map_err(|e| Error::failed(format!("failed to decrypt master key transfer: {e}")))?;
+        let record = MasterKeyRecord::new(transfer.version, plaintext)
             .map_err(|e| Error::failed(format!("invalid master key payload: {e}")))?;
 
         self.stores
@@ -307,7 +306,7 @@ impl Topology {
 
         {
             let guard = self.stores.secret_keyring.write().await;
-            guard.install_current(record);
+            guard.install_current(&record);
         }
 
         Ok(())
