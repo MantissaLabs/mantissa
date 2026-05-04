@@ -1,21 +1,12 @@
 use crate::config::ClientConfig;
-use crate::output;
 use anyhow::{Context, Result, anyhow};
 use mantissa_protocol::topology::split_selector_clause::Operator as SplitOperator;
-use mantissa_ui::split_interactive::{
-    SplitCandidate as UiSplitCandidate, SplitCandidateList as UiSplitCandidateList,
-    run_split_planner,
-};
 use std::collections::HashSet;
 use uuid::Uuid;
 
-use super::list::{
-    SplitCandidate as ClientSplitCandidate, SplitCandidateList as ClientSplitCandidateList,
-    active_cluster_view, list_split_candidates, resolve_cluster_view_by_cluster_id,
-};
+use super::list::{active_cluster_view, resolve_cluster_view_by_cluster_id};
 use super::operations::{
-    ClusterOperationSummary, ClusterViewSpec, emit_operation_summary, parse_cluster_id,
-    topology_capability,
+    ClusterOperationSummary, ClusterViewSpec, parse_cluster_id, topology_capability,
 };
 
 /// Operator-friendly split filters supported by the simplified CLI.
@@ -241,77 +232,15 @@ fn normalize_split_values(values: &[String], expects_numeric: bool) -> Result<Ve
     Ok(normalized)
 }
 
-/// Convert one client split candidate into a UI-facing candidate without coupling crates.
-fn to_ui_candidate(candidate: ClientSplitCandidate) -> UiSplitCandidate {
-    UiSplitCandidate {
-        node_id: candidate.node_id,
-        hostname: candidate.hostname,
-        address: candidate.address,
-        health: candidate.health,
-        active_view: candidate.active_view.to_string(),
-        cpu_vendor: candidate.cpu_vendor,
-        cpu_brand: candidate.cpu_brand,
-        cpu_logical: candidate.cpu_logical,
-        cpu_cores: candidate.cpu_cores,
-        memory_total_kb: candidate.memory_total_kb,
-        gpu_vendor: candidate.gpu_vendor,
-        gpu_count: candidate.gpu_count,
-        gpu_models: candidate.gpu_models,
-        wireguard_enabled: candidate.wireguard_enabled,
-        labels: candidate.labels,
-    }
-}
-
-/// Convert one split-candidate payload from client types to UI-local types.
-fn to_ui_payload(payload: ClientSplitCandidateList) -> UiSplitCandidateList {
-    let source_view = format!(
-        "{} ({})",
-        payload.source_view.cluster_id, payload.source_view.epoch
-    );
-    let candidates = payload
-        .candidates
-        .into_iter()
-        .map(to_ui_candidate)
-        .collect();
-    UiSplitCandidateList {
-        source_view,
-        candidates,
-    }
-}
-
-/// Resolve split mode and execute either interactive-node assignment or filter-based splitting.
-pub async fn split(cfg: &ClientConfig, request: &SplitCommandRequest) -> Result<()> {
+/// Resolves one non-interactive split mode and submits the split operation.
+pub async fn split(
+    cfg: &ClientConfig,
+    request: &SplitCommandRequest,
+) -> Result<ClusterOperationSummary> {
     if request.interactive {
-        let payload = list_split_candidates(cfg, request.source_cluster_id.as_deref()).await?;
-        if payload.candidates.is_empty() {
-            return Err(anyhow!("no split candidates found in the selected cluster"));
-        }
-
-        let initial_group_names = vec![request.left_name.clone(), request.right_name.clone()];
-        let selection = run_split_planner(to_ui_payload(payload), &initial_group_names)?;
-        if selection.cancelled {
-            output::emit_line("split cancelled");
-            return Ok(());
-        }
-
-        let targets = selection
-            .targets
-            .into_iter()
-            .map(|target| ExplicitSplitTarget {
-                name: target.name,
-                node_ids: target.node_ids,
-            })
-            .collect::<Vec<_>>();
-
-        return split_by_explicit_targets(
-            cfg,
-            request.source_cluster_id.as_deref(),
-            &targets,
-            request.dry_run,
-            request.service_policy,
-            request.network_policy,
-        )
-        .await;
+        return Err(anyhow!(
+            "interactive split planning is handled by mantissa-cli"
+        ));
     }
 
     if let Some(label_key) = request.label_key.as_deref() {
@@ -405,7 +334,7 @@ pub async fn split_by_filter(
     dry_run: bool,
     service_policy: SplitServicePolicy,
     network_policy: SplitNetworkPolicy,
-) -> Result<()> {
+) -> Result<ClusterOperationSummary> {
     let source_view = resolve_source_view(cfg, source_cluster_id).await?;
     let targets = build_value_split_targets(
         filter.selector_key(),
@@ -415,7 +344,7 @@ pub async fn split_by_filter(
         remainder_name,
     )?;
 
-    let summary = submit_split_request(
+    submit_split_request(
         cfg,
         source_view,
         &targets,
@@ -423,9 +352,7 @@ pub async fn split_by_filter(
         service_policy,
         network_policy,
     )
-    .await?;
-    emit_operation_summary(&summary);
-    Ok(())
+    .await
 }
 
 /// Submits a split request driven by one dynamic node-label key and value list.
@@ -439,7 +366,7 @@ async fn split_by_label(
     dry_run: bool,
     service_policy: SplitServicePolicy,
     network_policy: SplitNetworkPolicy,
-) -> Result<()> {
+) -> Result<ClusterOperationSummary> {
     let source_view = resolve_source_view(cfg, source_cluster_id).await?;
     let normalized_key = label_key.trim();
     if normalized_key.is_empty() {
@@ -450,7 +377,7 @@ async fn split_by_label(
     let target_prefix = format!("label-{}", slugify_split_value(normalized_key));
     let targets =
         build_value_split_targets(&selector_key, &target_prefix, values, false, remainder_name)?;
-    let summary = submit_split_request(
+    submit_split_request(
         cfg,
         source_view,
         &targets,
@@ -458,9 +385,7 @@ async fn split_by_label(
         service_policy,
         network_policy,
     )
-    .await?;
-    emit_operation_summary(&summary);
-    Ok(())
+    .await
 }
 
 /// Submits a split request from explicit named-target assignments selected by interactive tooling.
@@ -471,7 +396,7 @@ pub async fn split_by_explicit_targets(
     dry_run: bool,
     service_policy: SplitServicePolicy,
     network_policy: SplitNetworkPolicy,
-) -> Result<()> {
+) -> Result<ClusterOperationSummary> {
     if targets.len() < 2 {
         return Err(anyhow!(
             "interactive split requires at least two named targets"
@@ -528,7 +453,7 @@ pub async fn split_by_explicit_targets(
         });
     }
 
-    let summary = submit_split_request(
+    submit_split_request(
         cfg,
         source_view,
         &prepared_targets,
@@ -536,9 +461,7 @@ pub async fn split_by_explicit_targets(
         service_policy,
         network_policy,
     )
-    .await?;
-    emit_operation_summary(&summary);
-    Ok(())
+    .await
 }
 
 /// Submits a split request from exactly two explicit target partitions.
@@ -553,7 +476,7 @@ pub async fn split_by_explicit_nodes(
     dry_run: bool,
     service_policy: SplitServicePolicy,
     network_policy: SplitNetworkPolicy,
-) -> Result<()> {
+) -> Result<ClusterOperationSummary> {
     let targets = vec![
         ExplicitSplitTarget {
             name: left_name.to_string(),

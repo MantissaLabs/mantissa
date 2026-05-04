@@ -13,6 +13,5 @@ pub async fn evict(cfg: &ClientConfig, node_id: Uuid) -> Result<()> {
     request.get().init_node_id().set_bytes(node_id.as_bytes());
     request.send().promise.await?;
 
-    println!("evicted node {node_id}");
     Ok(())
 }

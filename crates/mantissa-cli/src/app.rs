@@ -5,15 +5,15 @@ use std::path::Path;
 use tokio::task::LocalSet;
 
 use crate::cli::*;
-use crate::config;
-use crate::server::RunMode;
+use mantissa::config;
+use mantissa::server::RunMode;
 
 /// Parses process arguments, initializes shared runtime state, and dispatches CLI commands.
 ///
 /// This keeps the binary crate thin while making the full command dispatcher reusable from
 /// the library for tests and headless callers.
 pub async fn run_cli() -> Result<()> {
-    if let Err(error) = crate::logger::init() {
+    if let Err(error) = mantissa::logger::init() {
         eprintln!("logger init failed: {error}");
     }
 
@@ -76,7 +76,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
         Command::Init(init) => {
             if init.reset_identity {
                 let report =
-                    crate::recovery::reset_identity(crate::recovery::ResetIdentityOptions {
+                    mantissa::recovery::reset_identity(mantissa::recovery::ResetIdentityOptions {
                         state_dir: init.state_dir.clone(),
                     })
                     .await?;
@@ -85,7 +85,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
 
             let advertise_addr = init.advertise.or_else(config::advertise_addr);
             local
-                .run_until(crate::server::bootstrap::start(
+                .run_until(mantissa::server::bootstrap::start(
                     listen,
                     advertise_addr,
                     RunMode::Blocking,
@@ -96,22 +96,22 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
         }
 
         Command::Info(_info) => {
-            local.run_until(mantissa_client::nodes::info(&cfg)).await?;
+            local.run_until(crate::nodes::info(&cfg)).await?;
         }
 
         Command::Nodes { cmd } => match cmd {
             NodesCommand::List(n) => {
                 cfg.cluster = n.cluster.clone();
-                local.run_until(mantissa_client::nodes::list(&cfg)).await?;
+                local.run_until(crate::nodes::list(&cfg)).await?;
             }
             NodesCommand::Status(args) => {
                 local
-                    .run_until(mantissa_client::nodes::status(&cfg, args.node_id))
+                    .run_until(crate::nodes::status(&cfg, args.node_id))
                     .await?;
             }
             NodesCommand::Drain(args) => {
                 local
-                    .run_until(mantissa_client::nodes::drain(
+                    .run_until(crate::nodes::drain(
                         &cfg,
                         args.node_id,
                         args.reason.as_deref(),
@@ -123,17 +123,17 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
             NodesCommand::Evict(args) => {
                 local
-                    .run_until(mantissa_client::nodes::evict(&cfg, args.node_id))
+                    .run_until(crate::nodes::evict(&cfg, args.node_id))
                     .await?;
             }
             NodesCommand::Resume(args) => {
                 local
-                    .run_until(mantissa_client::nodes::resume(&cfg, args.node_id))
+                    .run_until(crate::nodes::resume(&cfg, args.node_id))
                     .await?;
             }
             NodesCommand::Labels(args) => {
                 local
-                    .run_until(mantissa_client::nodes::labels(
+                    .run_until(crate::nodes::labels(
                         &cfg,
                         args.node_id,
                         &args.labels,
@@ -147,12 +147,12 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
         Command::Clusters { cmd } => match cmd {
             ClustersCommand::List => {
                 local
-                    .run_until(mantissa_client::clusters::list_clusters(&cfg))
+                    .run_until(crate::clusters::list_clusters(&cfg))
                     .await?;
             }
             ClustersCommand::Name(n) => {
                 local
-                    .run_until(mantissa_client::clusters::set_cluster_name(
+                    .run_until(crate::clusters::set_cluster_name(
                         &cfg,
                         &n.cluster_id,
                         &n.name,
@@ -169,7 +169,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     }
                 };
                 local
-                    .run_until(mantissa_client::clusters::merge_by_cluster_id(
+                    .run_until(crate::clusters::merge_by_cluster_id(
                         &cfg,
                         &m.source_cluster_id,
                         &m.destination_cluster_id,
@@ -181,30 +181,26 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             ClustersCommand::Split(s) => {
                 let request: mantissa_client::clusters::SplitCommandRequest = s.into();
                 local
-                    .run_until(mantissa_client::clusters::split(&cfg, &request))
+                    .run_until(crate::clusters::split(&cfg, &request))
                     .await?;
             }
         },
 
         Command::Token { cmd } => match cmd {
-            TokenCommand::Show => local.run_until(mantissa_client::token::show(&cfg)).await?,
-            TokenCommand::Rotate => {
-                local
-                    .run_until(mantissa_client::token::rotate(&cfg))
-                    .await?
-            }
+            TokenCommand::Show => local.run_until(crate::token::show(&cfg)).await?,
+            TokenCommand::Rotate => local.run_until(crate::token::rotate(&cfg)).await?,
         },
 
         Command::Tasks { cmd } => match cmd {
             TasksCommand::List(args) => {
                 cfg.cluster = args.cluster.clone();
-                let states: Vec<mantissa_client::tasks::TasksListState> =
+                let states: Vec<crate::tasks::TasksListState> =
                     args.states.iter().copied().map(Into::into).collect();
                 local
-                    .run_until(mantissa_client::tasks::list(
+                    .run_until(crate::tasks::list(
                         &cfg,
                         &states,
-                        mantissa_client::tasks::TasksListOptions {
+                        crate::tasks::TasksListOptions {
                             output: args.output.into(),
                             no_trunc: args.no_trunc,
                         },
@@ -213,10 +209,10 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
             TasksCommand::Logs(args) => {
                 local
-                    .run_until(mantissa_client::tasks::logs(
+                    .run_until(crate::tasks::logs(
                         &cfg,
                         &args.id,
-                        &mantissa_client::tasks::TaskLogsOptions {
+                        &crate::tasks::TaskLogsOptions {
                             follow: args.follow,
                             tail: &args.tail,
                             stdout: args.stdout,
@@ -228,10 +224,10 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
             TasksCommand::Attach(args) => {
                 local
-                    .run_until(mantissa_client::tasks::attach(
+                    .run_until(crate::tasks::attach(
                         &cfg,
                         &args.id,
-                        &mantissa_client::tasks::TaskAttachOptions {
+                        &crate::tasks::TaskAttachOptions {
                             logs: args.logs,
                             stream: !args.no_stream,
                             stdin: !args.no_stdin,
@@ -244,10 +240,10 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
             TasksCommand::Exec(args) => {
                 local
-                    .run_until(mantissa_client::tasks::exec(
+                    .run_until(crate::tasks::exec(
                         &cfg,
                         &args.id,
-                        &mantissa_client::tasks::TaskExecOptions {
+                        &crate::tasks::TaskExecOptions {
                             command: &args.command,
                             stdin: !args.no_stdin,
                             stdout: args.stdout,
@@ -260,9 +256,9 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
             TasksCommand::Start(args) => {
                 local
-                    .run_until(mantissa_client::tasks::start(
+                    .run_until(crate::tasks::start(
                         &cfg,
-                        &mantissa_client::tasks::TaskStartOptions {
+                        &crate::tasks::TaskStartOptions {
                             name: &args.name,
                             image: &args.image,
                             command: &args.command,
@@ -275,22 +271,20 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     .await?;
             }
             TasksCommand::Stop(args) => {
-                local
-                    .run_until(mantissa_client::tasks::stop(&cfg, &args.id))
-                    .await?;
+                local.run_until(crate::tasks::stop(&cfg, &args.id)).await?;
             }
         },
 
         Command::Jobs { cmd } => match cmd {
             JobsCommand::List => {
-                local.run_until(mantissa_client::jobs::list(&cfg)).await?;
+                local.run_until(crate::jobs::list(&cfg)).await?;
             }
             JobsCommand::Logs(args) => {
                 local
-                    .run_until(mantissa_client::jobs::logs(
+                    .run_until(crate::jobs::logs(
                         &cfg,
                         &args.id,
-                        &mantissa_client::jobs::JobLogsOptions {
+                        &crate::jobs::JobLogsOptions {
                             follow: args.follow,
                             tail: &args.tail,
                             stdout: args.stdout,
@@ -302,19 +296,19 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
             JobsCommand::Inspect(args) => {
                 local
-                    .run_until(mantissa_client::jobs::inspect(&cfg, &args.id))
+                    .run_until(crate::jobs::inspect(&cfg, &args.id))
                     .await?;
             }
             JobsCommand::Wait(args) => {
                 local
-                    .run_until(mantissa_client::jobs::wait(&cfg, &args.id, args.timeout))
+                    .run_until(crate::jobs::wait(&cfg, &args.id, args.timeout))
                     .await?;
             }
             JobsCommand::Run(args) => {
                 local
-                    .run_until(mantissa_client::jobs::run(
+                    .run_until(crate::jobs::run(
                         &cfg,
-                        &mantissa_client::jobs::JobRunOptions {
+                        &crate::jobs::JobRunOptions {
                             manifest_path: args.manifest.as_deref(),
                             name: args.name.as_deref(),
                             image: args.image.as_deref(),
@@ -334,39 +328,33 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     .await?;
             }
             JobsCommand::Cancel(args) => {
-                local
-                    .run_until(mantissa_client::jobs::cancel(&cfg, &args.id))
-                    .await?;
+                local.run_until(crate::jobs::cancel(&cfg, &args.id)).await?;
             }
             JobsCommand::Delete(args) => {
-                local
-                    .run_until(mantissa_client::jobs::delete(&cfg, &args.id))
-                    .await?;
+                local.run_until(crate::jobs::delete(&cfg, &args.id)).await?;
             }
         },
 
         Command::Agents { cmd } => match cmd {
             AgentsCommand::List => {
-                local
-                    .run_until(mantissa_client::agents::list_sessions(&cfg))
-                    .await?;
+                local.run_until(crate::agents::list_sessions(&cfg)).await?;
             }
             AgentsCommand::Inspect(args) => {
                 local
-                    .run_until(mantissa_client::agents::inspect(&cfg, &args.id))
+                    .run_until(crate::agents::inspect(&cfg, &args.id))
                     .await?;
             }
             AgentsCommand::Wait(args) => {
                 local
-                    .run_until(mantissa_client::agents::wait(&cfg, &args.id, args.timeout))
+                    .run_until(crate::agents::wait(&cfg, &args.id, args.timeout))
                     .await?;
             }
             AgentsCommand::Logs(args) => {
                 local
-                    .run_until(mantissa_client::agents::logs(
+                    .run_until(crate::agents::logs(
                         &cfg,
                         &args.id,
-                        &mantissa_client::agents::AgentLogsOptions {
+                        &crate::agents::AgentLogsOptions {
                             follow: args.follow,
                             tail: &args.tail,
                             stdout: args.stdout,
@@ -378,9 +366,9 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
             AgentsCommand::Run(args) => {
                 local
-                    .run_until(mantissa_client::agents::run(
+                    .run_until(crate::agents::run(
                         &cfg,
-                        &mantissa_client::agents::AgentRunOptions {
+                        &crate::agents::AgentRunOptions {
                             manifest_path: &args.manifest,
                         },
                     ))
@@ -388,9 +376,9 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
             AgentsCommand::Submit(args) => {
                 local
-                    .run_until(mantissa_client::agents::submit(
+                    .run_until(crate::agents::submit(
                         &cfg,
-                        &mantissa_client::agents::AgentSubmitOptions {
+                        &crate::agents::AgentSubmitOptions {
                             name: &args.name,
                             image: &args.image,
                             command: &args.command,
@@ -424,12 +412,12 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
             AgentsCommand::Runs(args) => {
                 local
-                    .run_until(mantissa_client::agents::list_runs(&cfg, args.session_id))
+                    .run_until(crate::agents::list_runs(&cfg, args.session_id))
                     .await?;
             }
             AgentsCommand::Input(args) => {
                 local
-                    .run_until(mantissa_client::agents::submit_input(
+                    .run_until(crate::agents::submit_input(
                         &cfg,
                         args.session_id,
                         &args.input,
@@ -438,17 +426,17 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
             AgentsCommand::Cancel(args) => {
                 local
-                    .run_until(mantissa_client::agents::cancel(&cfg, &args.id))
+                    .run_until(crate::agents::cancel(&cfg, &args.id))
                     .await?;
             }
             AgentsCommand::Close(args) => {
                 local
-                    .run_until(mantissa_client::agents::close(&cfg, &args.id))
+                    .run_until(crate::agents::close(&cfg, &args.id))
                     .await?;
             }
             AgentsCommand::Delete(args) => {
                 local
-                    .run_until(mantissa_client::agents::delete(&cfg, &args.id))
+                    .run_until(crate::agents::delete(&cfg, &args.id))
                     .await?;
             }
         },
@@ -456,7 +444,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
         Command::Scheduler { cmd } => match cmd {
             SchedulerCommand::Slots(args) => {
                 local
-                    .run_until(mantissa_client::scheduler::slots(
+                    .run_until(crate::scheduler::slots(
                         &cfg,
                         args.peer_id.as_deref(),
                         args.details,
@@ -496,12 +484,12 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
 
         Command::Services { cmd } => match cmd {
             ServicesCommand::Run(args) => {
-                let manifest = mantissa_client::services::load_manifest_from_path(&args.manifest)?;
+                let manifest = crate::services::load_manifest_from_path(&args.manifest)?;
                 local
-                    .run_until(mantissa_client::services::run_manifest(
+                    .run_until(crate::services::run_manifest(
                         &cfg,
                         &manifest,
-                        mantissa_client::services::ServiceRunOptions {
+                        crate::services::ServiceRunOptions {
                             detach: args.detach,
                             timeout: args.timeout,
                         },
@@ -509,23 +497,18 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     .await?;
             }
             ServicesCommand::List(_) => {
-                local
-                    .run_until(mantissa_client::services::list(&cfg))
-                    .await?;
+                local.run_until(crate::services::list(&cfg)).await?;
             }
             ServicesCommand::Rollout { cmd } => match cmd {
                 ServicesRolloutCommand::Status(args) => {
                     local
-                        .run_until(mantissa_client::services::rollout_status(
-                            &cfg,
-                            &args.service,
-                        ))
+                        .run_until(crate::services::rollout_status(&cfg, &args.service))
                         .await?;
                 }
             },
             ServicesCommand::Stop(args) => {
                 local
-                    .run_until(mantissa_client::services::stop(&cfg, &args.id))
+                    .run_until(crate::services::stop(&cfg, &args.id))
                     .await?;
             }
         },
@@ -539,7 +522,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     labels,
                 } = args;
                 local
-                    .run_until(mantissa_client::secrets::create(
+                    .run_until(crate::secrets::create(
                         &cfg,
                         &name,
                         value,
@@ -556,7 +539,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     labels,
                 } = args;
                 local
-                    .run_until(mantissa_client::secrets::update(
+                    .run_until(crate::secrets::update(
                         &cfg,
                         &name,
                         value,
@@ -566,27 +549,21 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     .await?;
             }
             SecretsCommand::List => {
-                local
-                    .run_until(mantissa_client::secrets::list(&cfg))
-                    .await?;
+                local.run_until(crate::secrets::list(&cfg)).await?;
             }
             SecretsCommand::Delete(args) => {
                 local
-                    .run_until(mantissa_client::secrets::delete(&cfg, &args.names))
+                    .run_until(crate::secrets::delete(&cfg, &args.names))
                     .await?;
             }
             SecretsCommand::RotateMasterKey => {
                 local
-                    .run_until(mantissa_client::secrets::rotate_master_key(&cfg))
+                    .run_until(crate::secrets::rotate_master_key(&cfg))
                     .await?;
             }
             SecretsCommand::Show(args) => {
                 local
-                    .run_until(mantissa_client::secrets::show(
-                        &cfg,
-                        &args.name,
-                        args.version,
-                    ))
+                    .run_until(crate::secrets::show(&cfg, &args.name, args.version))
                     .await?;
             }
         },
@@ -609,32 +586,30 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                 };
 
                 local
-                    .run_until(mantissa_client::networks::create(&cfg, &request))
+                    .run_until(crate::networks::create(&cfg, &request))
                     .await?;
             }
             NetworksCommand::Delete(args) => {
                 local
-                    .run_until(mantissa_client::networks::delete(&cfg, &args.ids))
+                    .run_until(crate::networks::delete(&cfg, &args.ids))
                     .await?;
             }
             NetworksCommand::List(_) => {
-                local
-                    .run_until(mantissa_client::networks::list(&cfg))
-                    .await?;
+                local.run_until(crate::networks::list(&cfg)).await?;
             }
             NetworksCommand::Inspect(args) => {
                 local
-                    .run_until(mantissa_client::networks::inspect(&cfg, &args.id))
+                    .run_until(crate::networks::inspect(&cfg, &args.id))
                     .await?;
             }
             NetworksCommand::Status(args) => {
                 local
-                    .run_until(mantissa_client::networks::peer_status(&cfg, &args.id))
+                    .run_until(crate::networks::peer_status(&cfg, &args.id))
                     .await?;
             }
             NetworksCommand::Attachments(args) => {
                 local
-                    .run_until(mantissa_client::networks::attachments(&cfg, &args.id))
+                    .run_until(crate::networks::attachments(&cfg, &args.id))
                     .await?;
             }
         },
@@ -659,9 +634,9 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     }
                 };
                 local
-                    .run_until(mantissa_client::volumes::create(
+                    .run_until(crate::volumes::create(
                         &cfg,
-                        mantissa_client::volumes::VolumeCreateRequest {
+                        crate::volumes::VolumeCreateRequest {
                             name: args.name,
                             ownership,
                             binding_mode: binding,
@@ -678,7 +653,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
             VolumesCommand::Import(args) => {
                 local
-                    .run_until(mantissa_client::volumes::import(
+                    .run_until(crate::volumes::import(
                         &cfg,
                         &args.name,
                         &args.node,
@@ -689,23 +664,21 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     .await?;
             }
             VolumesCommand::List => {
-                local
-                    .run_until(mantissa_client::volumes::list(&cfg))
-                    .await?;
+                local.run_until(crate::volumes::list(&cfg)).await?;
             }
             VolumesCommand::Inspect(args) => {
                 local
-                    .run_until(mantissa_client::volumes::inspect(&cfg, &args.selector))
+                    .run_until(crate::volumes::inspect(&cfg, &args.selector))
                     .await?;
             }
             VolumesCommand::Status(args) => {
                 local
-                    .run_until(mantissa_client::volumes::status(&cfg, &args.selector))
+                    .run_until(crate::volumes::status(&cfg, &args.selector))
                     .await?;
             }
             VolumesCommand::Delete(args) => {
                 local
-                    .run_until(mantissa_client::volumes::delete(&cfg, &args.selector))
+                    .run_until(crate::volumes::delete(&cfg, &args.selector))
                     .await?;
             }
         },
@@ -713,11 +686,11 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
         Command::Join(join_args) => {
             cfg.join_token = join_args.join_token.clone();
             cfg.anchor = Some(join_args.anchor.clone());
-            local.run_until(mantissa_client::nodes::join(&cfg)).await?;
+            local.run_until(crate::nodes::join(&cfg)).await?;
         }
 
         Command::Leave(_) => {
-            local.run_until(mantissa_client::nodes::leave(&cfg)).await?;
+            local.run_until(crate::nodes::leave(&cfg)).await?;
         }
     }
 

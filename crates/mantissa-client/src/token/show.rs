@@ -1,7 +1,8 @@
-use crate::{config::ClientConfig, connection, output};
+use crate::{config::ClientConfig, connection};
 use anyhow::Result;
 
-pub async fn show(cfg: &ClientConfig) -> Result<()> {
+/// Fetches the current cluster join token from the local coordinator.
+pub async fn show(cfg: &ClientConfig) -> Result<String> {
     let client = connection::get_local_session(cfg).await?;
 
     let request = client.get_topology_request();
@@ -9,8 +10,5 @@ pub async fn show(cfg: &ClientConfig) -> Result<()> {
     let request = topology.show_token_request();
 
     let response = request.send().promise.await?;
-    let token = response.get()?.get_token()?.to_string()?;
-    output::emit_line(token);
-
-    Ok(())
+    Ok(response.get()?.get_token()?.to_string()?)
 }

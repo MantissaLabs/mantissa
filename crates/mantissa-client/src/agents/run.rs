@@ -1,8 +1,8 @@
 use crate::agents::manifest::{AgentManifest, load_manifest_from_path};
 use crate::agents::submit::{
-    PreparedAgentCheckpointPolicy, PreparedAgentExecution, PreparedAgentInteractionPolicy,
-    PreparedAgentSessionSpec, PreparedAgentToolPolicy, PreparedAgentWorkspacePolicy,
-    submit_prepared_session,
+    AgentSubmitResult, PreparedAgentCheckpointPolicy, PreparedAgentExecution,
+    PreparedAgentInteractionPolicy, PreparedAgentSessionSpec, PreparedAgentToolPolicy,
+    PreparedAgentWorkspacePolicy, submit_prepared_session,
 };
 use crate::config::ClientConfig;
 use crate::workload_submit::{ResolvedDeclaredVolume, compute_network_id, ensure_declared_volumes};
@@ -17,7 +17,7 @@ pub struct AgentRunOptions<'a> {
 }
 
 /// Submits one manifest-backed durable agent session.
-pub async fn run(cfg: &ClientConfig, options: &AgentRunOptions<'_>) -> Result<()> {
+pub async fn run(cfg: &ClientConfig, options: &AgentRunOptions<'_>) -> Result<AgentSubmitResult> {
     let prepared = prepare_manifest_submit_spec(cfg, options.manifest_path).await?;
     submit_prepared_session(cfg, &prepared).await
 }

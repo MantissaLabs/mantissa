@@ -1,7 +1,6 @@
 use crate::config::ClientConfig;
 use crate::connection;
 use crate::jobs::manifest::{EnvironmentVariable, LivenessProbe, SecretFileProjection};
-use crate::output;
 use crate::runtime_contract::{
     normalize_execution_platform, normalize_isolation_mode, normalize_isolation_profile,
 };
@@ -15,7 +14,6 @@ use crate::workload_wire::{
 };
 use anyhow::{Result, anyhow};
 use mantissa_protocol::agents::agent_session_spec;
-use std::io::Write;
 use uuid::Uuid;
 
 /// Options accepted by `mantissa agents submit`.
@@ -45,6 +43,20 @@ pub struct AgentSubmitOptions<'a> {
     pub max_turns_per_run: u16,
     pub idle_timeout_secs: Option<u32>,
     pub initial_input: Option<&'a str>,
+}
+
+/// Result returned after submitting one durable agent session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSubmitResult {
+    pub session_id: String,
+    pub name: String,
+    pub image: String,
+    pub cpu_millis: u64,
+    pub memory_mib: u64,
+    pub gpu_count: u32,
+    pub execution_platform: String,
+    pub isolation_mode: String,
+    pub isolation_profile: Option<String>,
 }
 
 /// One prepared agent submission after CLI and manifest normalization.
@@ -109,7 +121,10 @@ pub(crate) struct PreparedAgentInteractionPolicy {
 }
 
 /// Submits one durable agent session through the agents control-plane capability.
-pub async fn submit(cfg: &ClientConfig, options: &AgentSubmitOptions<'_>) -> Result<()> {
+pub async fn submit(
+    cfg: &ClientConfig,
+    options: &AgentSubmitOptions<'_>,
+) -> Result<AgentSubmitResult> {
     let prepared = prepare_raw_submit_spec(cfg, options).await?;
     submit_prepared_session(cfg, &prepared).await
 }
@@ -186,7 +201,7 @@ async fn prepare_raw_submit_spec(
 pub(crate) async fn submit_prepared_session(
     cfg: &ClientConfig,
     spec: &PreparedAgentSessionSpec,
-) -> Result<()> {
+) -> Result<AgentSubmitResult> {
     let session = connection::get_local_session(cfg).await?;
     let request = session.get_agents_request();
     let agents = request.send().pipeline.get_agents();
@@ -197,29 +212,17 @@ pub(crate) async fn submit_prepared_session(
     let reader = response.get()?;
     let session_id = uuid_to_string(reader.get_session_id()?)?;
 
-    let mut tw = tabwriter::TabWriter::new(Vec::new());
-    writeln!(
-        &mut tw,
-        "SESSION ID\tNAME\tIMAGE\tCPU(m)\tMEM(MiB)\tGPU\tPLATFORM\tMODE\tPROFILE"
-    )?;
-    writeln!(
-        &mut tw,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+    Ok(AgentSubmitResult {
         session_id,
-        spec.name,
-        spec.execution.image,
-        spec.execution.cpu_millis,
-        spec.execution.memory_bytes / (1024 * 1024),
-        spec.execution.gpu_count,
-        spec.execution_platform,
-        spec.isolation_mode,
-        spec.isolation_profile.as_deref().unwrap_or("default"),
-    )?;
-    tw.flush()?;
-
-    let output = String::from_utf8(tw.into_inner()?)?;
-    output::emit_block(format!("submitted agent session:\n{output}"));
-    Ok(())
+        name: spec.name.clone(),
+        image: spec.execution.image.clone(),
+        cpu_millis: spec.execution.cpu_millis,
+        memory_mib: spec.execution.memory_bytes / (1024 * 1024),
+        gpu_count: spec.execution.gpu_count,
+        execution_platform: spec.execution_platform.clone(),
+        isolation_mode: spec.isolation_mode.clone(),
+        isolation_profile: spec.isolation_profile.clone(),
+    })
 }
 
 /// Encodes one prepared agent session payload into the agents wire builder.

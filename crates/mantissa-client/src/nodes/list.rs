@@ -1,15 +1,43 @@
 use crate::config::ClientConfig;
 use crate::connection;
-use crate::output;
 use anyhow::Result;
 use mantissa_protocol::topology::{
     NodeDrainState, node_info::Reader as NodeInfo, peer::Reader as PeerInfo,
 };
-use std::io::Write;
-use tabwriter::TabWriter;
 use uuid::Uuid;
 
-pub async fn list(cfg: &ClientConfig) -> Result<()> {
+/// One node entry returned by the topology list RPC.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeListEntry {
+    pub id: Uuid,
+    pub hostname: String,
+    pub endpoint: String,
+    pub health: String,
+    pub schedulable: bool,
+    pub drain_state: NodeDrainState,
+    pub labels: Vec<String>,
+    pub scheduling_reason: Option<String>,
+}
+
+impl NodeListEntry {
+    /// Decodes one topology node payload into an owned client result.
+    fn from_reader(reader: NodeInfo) -> Result<Self> {
+        let peer = reader.get_peer()?;
+        Ok(Self {
+            id: id_from_node(&reader)?,
+            hostname: peer.get_hostname()?.to_str()?.to_string(),
+            endpoint: peer.get_address()?.to_str()?.to_string(),
+            health: format!("{:?}", reader.get_health()?),
+            schedulable: peer.get_schedulable(),
+            drain_state: reader.get_drain_state()?,
+            labels: labels_from_peer(&peer)?,
+            scheduling_reason: optional_peer_reason(&peer)?,
+        })
+    }
+}
+
+/// Loads the current topology node list from the local coordinator.
+pub async fn list(cfg: &ClientConfig) -> Result<Vec<NodeListEntry>> {
     let client = connection::get_local_session(cfg).await?;
 
     let request = client.get_topology_request();
@@ -17,96 +45,26 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     let request = topology.list_request();
 
     let response = request.send().promise.await?;
-
     let reader = response.get()?.get_nodes()?;
-    let mut tw = TabWriter::new(Vec::new());
-    writeln!(
-        &mut tw,
-        "ID\tHOSTNAME\tENDPOINT\tHEALTH\tSCHED\tDRAIN\tLABELS\tREASON"
-    )?;
+    let nodes = reader.get_nodes()?;
 
-    let mut list: Vec<NodeInfo> = reader.get_nodes()?.iter().collect();
-    list.sort_by_key(id_sort_key_uuid_bytes);
-
-    for n in &list {
-        let peer = n.get_peer()?;
-        writeln!(
-            &mut tw,
-            "{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}",
-            id_string(n)?,
-            peer.get_hostname()?.to_str()?,
-            peer.get_address()?.to_str()?,
-            n.get_health()?,
-            sched_label(&peer),
-            drain_label(n)?,
-            labels_label(&peer)?,
-            reason_label(&peer)?,
-        )?;
+    let mut entries = Vec::with_capacity(nodes.len() as usize);
+    for node in nodes.iter() {
+        entries.push(NodeListEntry::from_reader(node)?);
     }
 
-    tw.flush()?;
-    let output = String::from_utf8(tw.into_inner()?)?;
-    output::emit_block(output);
-
-    Ok(())
+    Ok(entries)
 }
 
-#[inline]
-fn id_sort_key_uuid_bytes(n: &NodeInfo) -> u128 {
-    match n
-        .get_id()
-        .and_then(|id| id.get_bytes())
-        .ok()
-        .and_then(|b| Uuid::from_slice(b).ok())
-    {
-        Some(u) => u128::from_be_bytes(*u.as_bytes()),
-        None => u128::MAX,
-    }
+/// Decodes one node UUID from the topology payload.
+fn id_from_node(node: &NodeInfo) -> Result<Uuid> {
+    let bytes = node.get_id()?.get_bytes()?;
+    Uuid::from_slice(bytes).map_err(|err| anyhow::anyhow!(err.to_string()))
 }
 
-#[inline]
-fn id_string(n: &NodeInfo) -> anyhow::Result<String> {
-    let bytes = n.get_id()?.get_bytes()?;
-    let u = Uuid::from_slice(bytes).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    Ok(u.to_string())
-}
-
-#[inline]
-fn sched_label(peer: &PeerInfo) -> &'static str {
-    if peer.get_schedulable() {
-        "open"
-    } else {
-        "fenced"
-    }
-}
-
-#[inline]
-fn drain_label(n: &NodeInfo) -> anyhow::Result<&'static str> {
-    Ok(match n.get_drain_state()? {
-        NodeDrainState::Open | NodeDrainState::Fenced => "-",
-        NodeDrainState::Draining => "draining",
-        NodeDrainState::Drained => "drained",
-        NodeDrainState::Blocked => "blocked",
-    })
-}
-
-#[inline]
-fn reason_label(peer: &PeerInfo) -> anyhow::Result<String> {
-    let reason = peer.get_scheduling_reason()?.to_str()?.trim().to_string();
-    if reason.is_empty() {
-        Ok("-".to_string())
-    } else {
-        Ok(reason)
-    }
-}
-
-#[inline]
-fn labels_label(peer: &PeerInfo) -> anyhow::Result<String> {
+/// Decodes peer labels into an owned stable vector.
+fn labels_from_peer(peer: &PeerInfo) -> Result<Vec<String>> {
     let labels = peer.get_labels()?;
-    if labels.is_empty() {
-        return Ok("-".to_string());
-    }
-
     let mut out = Vec::with_capacity(labels.len() as usize);
     for label in labels.iter() {
         let text = label?.to_str()?.trim().to_string();
@@ -114,10 +72,11 @@ fn labels_label(peer: &PeerInfo) -> anyhow::Result<String> {
             out.push(text);
         }
     }
+    Ok(out)
+}
 
-    if out.is_empty() {
-        Ok("-".to_string())
-    } else {
-        Ok(out.join(","))
-    }
+/// Decodes one optional scheduling reason from the peer payload.
+fn optional_peer_reason(peer: &PeerInfo) -> Result<Option<String>> {
+    let reason = peer.get_scheduling_reason()?.to_str()?.trim().to_string();
+    Ok((!reason.is_empty()).then_some(reason))
 }

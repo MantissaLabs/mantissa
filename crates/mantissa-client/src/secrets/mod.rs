@@ -1,9 +1,7 @@
-use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use anyhow::{Result, anyhow};
 use mantissa_protocol::secrets::secret_metadata_entry;
 use mantissa_protocol::secrets::{secret_spec, secret_version_data};
 use std::collections::BTreeMap;
-use std::io::{self, Read};
 use uuid::Uuid;
 
 pub mod create;
@@ -103,57 +101,4 @@ pub(super) fn normalize_labels(raw: &[(String, String)]) -> Vec<(String, String)
         map.insert(key.trim().to_string(), value.trim().to_string());
     }
     map.into_iter().collect()
-}
-
-/// Parse `KEY=VALUE` labels from CLI arguments into normalized key/value pairs.
-pub(super) fn parse_secret_labels(labels: &[String]) -> Result<Vec<(String, String)>> {
-    let mut pairs = Vec::with_capacity(labels.len());
-    for raw in labels {
-        let mut parts = raw.splitn(2, '=');
-        let key = parts.next().unwrap_or_default().trim().to_string();
-        let value = parts
-            .next()
-            .ok_or_else(|| anyhow!("invalid label '{}': expected KEY=VALUE", raw))?
-            .trim()
-            .to_string();
-
-        if key.is_empty() {
-            return Err(anyhow!("label key cannot be empty in '{}'", raw));
-        }
-
-        pairs.push((key, value));
-    }
-    Ok(pairs)
-}
-
-/// Resolve a secret plaintext payload from `--value` or fall back to stdin when omitted.
-pub(super) fn resolve_secret_plaintext(value: Option<String>) -> Result<Vec<u8>> {
-    if let Some(val) = value {
-        return Ok(val.into_bytes());
-    }
-
-    let mut buffer = Vec::new();
-    io::stdin()
-        .read_to_end(&mut buffer)
-        .context("failed to read secret value from stdin")?;
-
-    while buffer.ends_with(b"\n") || buffer.ends_with(b"\r") {
-        buffer.pop();
-    }
-
-    if buffer.is_empty() {
-        Err(anyhow!(
-            "secret value is empty; pass --value or provide data on stdin"
-        ))
-    } else {
-        Ok(buffer)
-    }
-}
-
-/// Render plaintext as UTF-8 when possible, otherwise emit a base64-prefixed representation.
-pub(super) fn display_secret_plaintext(data: &[u8]) -> String {
-    match std::str::from_utf8(data) {
-        Ok(text) => text.to_string(),
-        Err(_) => format!("base64:{}", BASE64_STANDARD.encode(data)),
-    }
 }

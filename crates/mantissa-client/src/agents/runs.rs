@@ -1,16 +1,13 @@
 use crate::config::ClientConfig;
 use crate::connection;
-use crate::output;
 use crate::tasks::{uuid_short, uuid_to_string};
 use anyhow::Result;
 use capnp::Error as CapnpError;
 use mantissa_protocol::agents::{AgentRunStatus as ProtoAgentRunStatus, agent_run_spec};
-use std::io::Write;
-use tabwriter::TabWriter;
 use uuid::Uuid;
 
 /// Lists first-class agent runs through the agents control-plane capability.
-pub async fn list_runs(cfg: &ClientConfig, session_id: Option<Uuid>) -> Result<()> {
+pub async fn list_runs(cfg: &ClientConfig, session_id: Option<Uuid>) -> Result<Vec<AgentRunRow>> {
     let session = connection::get_local_session(cfg).await?;
     let request = session.get_agents_request();
     let agents = request.send().pipeline.get_agents();
@@ -34,50 +31,20 @@ pub async fn list_runs(cfg: &ClientConfig, session_id: Option<Uuid>) -> Result<(
             .then(left.id.cmp(&right.id))
     });
 
-    if rows.is_empty() {
-        println!("no agent runs registered");
-        return Ok(());
-    }
-
-    let mut tw = TabWriter::new(Vec::new());
-    writeln!(
-        &mut tw,
-        "RUN ID\tSESSION\tSTATUS\tWORKLOAD\tEXIT\tPLATFORM\tMODE\tPROFILE\tUPDATED"
-    )?;
-    for row in rows {
-        writeln!(
-            &mut tw,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            row.id,
-            row.session_name,
-            row.status,
-            row.workload_id.unwrap_or_else(|| "-".to_string()),
-            row.exit_code
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "-".to_string()),
-            row.execution_platform,
-            row.isolation_mode,
-            row.isolation_profile
-                .unwrap_or_else(|| "default".to_string()),
-            row.updated_at,
-        )?;
-    }
-    tw.flush()?;
-    let output = String::from_utf8(tw.into_inner()?)?;
-    output::emit_block(output);
-    Ok(())
+    Ok(rows)
 }
 
-struct AgentRunRow {
-    id: String,
-    session_name: String,
-    status: &'static str,
-    workload_id: Option<String>,
-    exit_code: Option<i32>,
-    execution_platform: String,
-    isolation_mode: String,
-    isolation_profile: Option<String>,
-    updated_at: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentRunRow {
+    pub id: String,
+    pub session_name: String,
+    pub status: &'static str,
+    pub workload_id: Option<String>,
+    pub exit_code: Option<i32>,
+    pub execution_platform: String,
+    pub isolation_mode: String,
+    pub isolation_profile: Option<String>,
+    pub updated_at: String,
 }
 
 impl AgentRunRow {

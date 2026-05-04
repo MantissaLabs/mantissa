@@ -1,13 +1,10 @@
 use crate::config::ClientConfig;
 use crate::jobs::inspect::parse_job_id;
-use crate::jobs::snapshot::{delete_job, render_job_snapshot};
-use crate::output;
+use crate::jobs::snapshot::{JobSnapshotView, delete_job};
 use anyhow::Result;
 
-/// Deletes one terminal first-class job and prints the removed public snapshot.
-pub async fn delete(cfg: &ClientConfig, id: &str) -> Result<()> {
+/// Deletes one terminal first-class job and returns the removed public snapshot.
+pub async fn delete(cfg: &ClientConfig, id: &str) -> Result<JobSnapshotView> {
     let job_id = parse_job_id(id)?;
-    let snapshot = delete_job(cfg, job_id).await?;
-    output::emit_block(format!("deleted job:\n{}", render_job_snapshot(&snapshot)?));
-    Ok(())
+    delete_job(cfg, job_id).await
 }

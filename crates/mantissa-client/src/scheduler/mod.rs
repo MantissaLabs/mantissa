@@ -1,3 +1,6 @@
 pub mod slots;
 
-pub use slots::slots;
+pub use slots::{
+    SchedulerGpuDetail, SchedulerGpuState, SchedulerSlotDetail, SchedulerSlotState,
+    SchedulerSlotsSummary, slots,
+};

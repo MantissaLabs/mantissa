@@ -1,15 +1,12 @@
 use crate::config::ClientConfig;
-use crate::jobs::snapshot::{inspect_job_detail, render_job_detail};
-use crate::output;
+use crate::jobs::snapshot::{JobDetailView, inspect_job_detail};
 use anyhow::{Result, anyhow};
 use uuid::Uuid;
 
-/// Inspects one first-class job by its durable UUID and prints its public snapshot.
-pub async fn inspect(cfg: &ClientConfig, id: &str) -> Result<()> {
+/// Inspects one first-class job by its durable UUID.
+pub async fn inspect(cfg: &ClientConfig, id: &str) -> Result<JobDetailView> {
     let job_id = parse_job_id(id)?;
-    let detail = inspect_job_detail(cfg, job_id).await?;
-    output::emit_block(format!("job:\n{}", render_job_detail(&detail)?));
-    Ok(())
+    inspect_job_detail(cfg, job_id).await
 }
 
 /// Parses one operator-provided job UUID string.

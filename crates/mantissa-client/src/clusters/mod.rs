@@ -12,6 +12,6 @@ pub use merge::{MergeServicePolicy, merge_by_cluster_id};
 pub use name::set_cluster_name;
 pub use operations::{ClusterOperationSummary, ClusterViewSpec};
 pub use split::{
-    SplitCommandRequest, SplitFilterKind, SplitNetworkPolicy, SplitServicePolicy, split,
-    split_by_explicit_nodes, split_by_filter,
+    ExplicitSplitTarget, SplitCommandRequest, SplitFilterKind, SplitNetworkPolicy,
+    SplitServicePolicy, split, split_by_explicit_nodes, split_by_explicit_targets, split_by_filter,
 };

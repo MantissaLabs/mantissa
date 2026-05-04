@@ -4,7 +4,6 @@ use super::{
 };
 use crate::config::ClientConfig;
 use crate::connection;
-use crate::output;
 use anyhow::{Context, Result, anyhow};
 
 /// Data required to create one managed local volume object.
@@ -20,7 +19,29 @@ pub struct VolumeCreateRequest {
 }
 
 /// Submits one managed local volume create request and returns the persisted spec.
-pub async fn create_raw(cfg: &ClientConfig, request: &VolumeCreateRequest) -> Result<VolumeSpec> {
+pub async fn create(
+    cfg: &ClientConfig,
+    request: VolumeCreateRequest,
+    labels: &[String],
+) -> Result<VolumeSpec> {
+    if matches!(request.binding_mode, VolumeBindingMode::Immediate)
+        && request.node_selector.is_none()
+    {
+        return Err(anyhow!("immediate local volumes require --node"));
+    }
+
+    let request = VolumeCreateRequest {
+        labels: parse_volume_labels(labels)?,
+        ..request
+    };
+    create_with_request(cfg, &request).await
+}
+
+/// Submits one managed local volume create request and returns the persisted spec.
+pub async fn create_with_request(
+    cfg: &ClientConfig,
+    request: &VolumeCreateRequest,
+) -> Result<VolumeSpec> {
     let session = connection::get_local_session(cfg).await?;
     let volumes_cap = session.get_volumes_request();
     let volumes = volumes_cap.send().pipeline.get_volumes();
@@ -91,28 +112,4 @@ pub async fn create_raw(cfg: &ClientConfig, request: &VolumeCreateRequest) -> Re
         .context("volume create request failed")?;
     let reader = response.get()?.get_volume()?;
     VolumeSpec::from_reader(reader)
-}
-
-/// Creates one managed local volume and renders the result for CLI usage.
-pub async fn create(
-    cfg: &ClientConfig,
-    request: VolumeCreateRequest,
-    labels: &[String],
-) -> Result<()> {
-    if matches!(request.binding_mode, VolumeBindingMode::Immediate)
-        && request.node_selector.is_none()
-    {
-        return Err(anyhow!("immediate local volumes require --node"));
-    }
-
-    let request = VolumeCreateRequest {
-        labels: parse_volume_labels(labels)?,
-        ..request
-    };
-    let volume = create_raw(cfg, &request).await?;
-    output::emit_line(format!(
-        "volume '{}' created with id {} ({}, {})",
-        volume.name, volume.id, volume.driver, volume.access_mode
-    ));
-    Ok(())
 }

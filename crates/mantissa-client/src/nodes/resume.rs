@@ -12,6 +12,5 @@ pub async fn resume(cfg: &ClientConfig, node_id: Uuid) -> Result<()> {
     request.get().init_node_id().set_bytes(node_id.as_bytes());
     request.send().promise.await?;
 
-    println!("resume requested for node {node_id}");
     Ok(())
 }

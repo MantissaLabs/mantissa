@@ -285,7 +285,7 @@ pub async fn ensure_declared_volumes(
         return Ok(HashMap::new());
     }
 
-    let existing = volumes::list_raw(cfg).await?;
+    let existing = volumes::list(cfg).await?;
     let existing_by_name: HashMap<String, volumes::VolumeSummary> = existing
         .into_iter()
         .map(|volume| (volume.name.clone(), volume))
@@ -311,9 +311,9 @@ pub async fn ensure_declared_volumes(
 
         let spec = if let Some(existing) = existing_by_name.get(&volume.name) {
             validate_declared_volume_compatibility(existing, volume)?;
-            volumes::inspect_raw(cfg, &volume.name).await?.spec
+            volumes::inspect(cfg, &volume.name).await?.spec
         } else {
-            volumes::create_raw(
+            volumes::create_with_request(
                 cfg,
                 &volumes::VolumeCreateRequest {
                     name: volume.name.clone(),

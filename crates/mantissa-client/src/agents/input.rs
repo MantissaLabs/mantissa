@@ -1,6 +1,5 @@
 use crate::config::ClientConfig;
 use crate::connection;
-use crate::output;
 use anyhow::Result;
 use uuid::Uuid;
 
@@ -16,6 +15,5 @@ pub async fn submit_input(cfg: &ClientConfig, session_id: Uuid, input: &str) -> 
         builder.set_input(input);
     }
     request.send().promise.await?;
-    output::emit_line(format!("queued input for agent session {session_id}"));
     Ok(())
 }

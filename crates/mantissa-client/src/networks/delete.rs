@@ -1,13 +1,12 @@
 use crate::config::ClientConfig;
 use crate::connection;
-use crate::output;
 use anyhow::{Context, Result, anyhow};
 use uuid::Uuid;
 
 /// Delete the provided networks by identifier.
-pub async fn delete(cfg: &ClientConfig, ids: &[String]) -> Result<()> {
+pub async fn delete(cfg: &ClientConfig, ids: &[String]) -> Result<usize> {
     if ids.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     let mut parsed = Vec::with_capacity(ids.len());
@@ -33,6 +32,5 @@ pub async fn delete(cfg: &ClientConfig, ids: &[String]) -> Result<()> {
         .promise
         .await
         .context("network delete request failed")?;
-    output::emit_line(format!("requested deletion of {} network(s)", ids.len()));
-    Ok(())
+    Ok(ids.len())
 }

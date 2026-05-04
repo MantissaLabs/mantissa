@@ -1,10 +1,7 @@
 use crate::config::ClientConfig;
 use crate::connection;
-use crate::tasks::util::write_frame;
 use anyhow::{Result, anyhow};
-use capnp_rpc::new_client;
 use mantissa_protocol::task::task_log_sink;
-use std::rc::Rc;
 
 /// Rendering options for `mantissa tasks logs`.
 pub struct TaskLogsOptions<'a> {
@@ -54,39 +51,18 @@ impl TaskLogsOptions<'_> {
     }
 }
 
-/// Sink used by the CLI to render streamed task log frames as they arrive.
-struct CliTaskLogSink;
-
-impl task_log_sink::Server for CliTaskLogSink {
-    async fn push_frame(
-        self: Rc<Self>,
-        params: task_log_sink::PushFrameParams,
-    ) -> Result<(), capnp::Error> {
-        let frame = params.get()?.get_frame()?;
-        let stream = frame
-            .get_stream()
-            .map_err(|_| capnp::Error::failed("unknown task log stream".into()))?;
-        let bytes = frame.get_data()?.to_owned();
-        write_frame(stream, bytes.as_slice())
-    }
-
-    async fn end(
-        self: Rc<Self>,
-        _params: task_log_sink::EndParams,
-        _results: task_log_sink::EndResults,
-    ) -> Result<(), capnp::Error> {
-        Ok(())
-    }
-}
-
 /// Streams task logs from the local node or the current remote owner.
-pub async fn logs(cfg: &ClientConfig, id: &str, options: &TaskLogsOptions<'_>) -> Result<()> {
+pub async fn logs_with_sink(
+    cfg: &ClientConfig,
+    id: &str,
+    options: &TaskLogsOptions<'_>,
+    sink: task_log_sink::Client,
+) -> Result<()> {
     let options = options.normalized()?;
     let client = connection::get_local_session(cfg).await?;
 
     let request = client.get_task_request();
     let task = request.send().pipeline.get_task();
-    let sink = new_client(CliTaskLogSink);
     let mut request = task.logs_request();
     {
         let mut builder = request.get().init_request();

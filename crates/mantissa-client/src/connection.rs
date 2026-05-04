@@ -51,9 +51,7 @@ async fn rpc_client_from_stream(noise_stream: NoiseStream) -> Result<server::Cli
     let mut rpc = RpcSystem::new(network, None);
     let client: server::Client = rpc.bootstrap(rpc_twoparty_capnp::Side::Server);
     tokio::task::spawn_local(async move {
-        if let Err(e) = rpc.await {
-            eprintln!("capnp rpc system shutdown: {e}");
-        }
+        let _ = rpc.await;
     });
     Ok(client)
 }
@@ -147,9 +145,7 @@ async fn client_from_unix_stream(
     let mut rpc = RpcSystem::new(Box::new(network), None);
     let client: cluster_session::Client = rpc.bootstrap(rpc_twoparty_capnp::Side::Server);
     tokio::task::spawn_local(async move {
-        if let Err(e) = rpc.await {
-            eprintln!("capnp rpc system shutdown: {e}");
-        }
+        let _ = rpc.await;
     });
     Ok(client)
 }

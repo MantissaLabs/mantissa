@@ -1,7 +1,6 @@
 use super::types::NetworkDriver;
 use crate::config::ClientConfig;
 use crate::connection;
-use crate::output;
 use anyhow::{Context, Result, anyhow};
 use uuid::Uuid;
 
@@ -19,7 +18,7 @@ pub struct NetworkCreateRequest {
 }
 
 /// Submit a network creation request to the local node and return the new network identifier.
-pub async fn create_raw(cfg: &ClientConfig, request: &NetworkCreateRequest) -> Result<Uuid> {
+pub async fn create(cfg: &ClientConfig, request: &NetworkCreateRequest) -> Result<Uuid> {
     let client = connection::get_local_session(cfg).await?;
     let networks_cap = client.get_networks_request();
     let networks = networks_cap.send().pipeline.get_networks();
@@ -66,14 +65,4 @@ pub async fn create_raw(cfg: &ClientConfig, request: &NetworkCreateRequest) -> R
     let network_id =
         Uuid::from_slice(&id_bytes).context("failed to decode network id from response")?;
     Ok(network_id)
-}
-
-/// Submit a network creation request to the local node and render the created identifier.
-pub async fn create(cfg: &ClientConfig, request: &NetworkCreateRequest) -> Result<()> {
-    let network_id = create_raw(cfg, request).await?;
-    output::emit_line(format!(
-        "network '{}' created with id {}",
-        request.name, network_id
-    ));
-    Ok(())
 }

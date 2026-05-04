@@ -1,11 +1,15 @@
 use crate::config::ClientConfig;
-use crate::output;
 use anyhow::{Context, Result, anyhow};
+use uuid::Uuid;
 
 use super::operations::{parse_cluster_id, topology_capability};
 
 /// Sets one friendly cluster lineage name and relays the update through topology peers.
-pub async fn set_cluster_name(cfg: &ClientConfig, cluster_id: &str, name: &str) -> Result<()> {
+pub async fn set_cluster_name(
+    cfg: &ClientConfig,
+    cluster_id: &str,
+    name: &str,
+) -> Result<SetClusterNameResult> {
     let cluster_id = parse_cluster_id(cluster_id, "cluster id")?;
     let normalized = name.trim();
     if normalized.is_empty() {
@@ -28,6 +32,15 @@ pub async fn set_cluster_name(cfg: &ClientConfig, cluster_id: &str, name: &str) 
         .await
         .context("setClusterName RPC failed")?;
 
-    output::emit_line(format!("cluster {cluster_id} named '{normalized}'"));
-    Ok(())
+    Ok(SetClusterNameResult {
+        cluster_id,
+        name: normalized.to_string(),
+    })
+}
+
+/// Result returned after naming a cluster lineage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetClusterNameResult {
+    pub cluster_id: Uuid,
+    pub name: String,
 }

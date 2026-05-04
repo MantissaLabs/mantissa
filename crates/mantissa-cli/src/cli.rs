@@ -1,6 +1,6 @@
 // src/cli.rs
+use crate::tasks::{TasksListOutput, TasksListState};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
-use mantissa_client::tasks::{TasksListOutput, TasksListState};
 use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;

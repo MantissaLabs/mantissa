@@ -6,11 +6,11 @@ mod list;
 mod status;
 mod types;
 
-pub use attachments::{attachments, attachments_raw};
-pub use create::{NetworkCreateRequest, create, create_raw};
+pub use attachments::attachments;
+pub use create::{NetworkCreateRequest, create};
 pub use delete::delete;
-pub use inspect::{inspect, inspect_raw};
-pub use list::{list, list_raw};
+pub use inspect::{inspect, inspect_by_id};
+pub use list::list;
 pub use status::peer_status;
 pub use types::{
     NetworkAttachment, NetworkAttachmentState, NetworkDriver, NetworkInspect, NetworkPeerState,

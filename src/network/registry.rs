@@ -184,10 +184,10 @@ impl NetworkRegistry {
             if let Some(value) = snapshot.as_slice().last().cloned()
                 && seen.insert(id)
             {
-                if let Some(subnet) = active_subnet_key(&value) {
-                    if let Ok(block) = active_subnet_index.insert_cidr(&subnet) {
-                        active_cidrs_by_spec.insert(id, block);
-                    }
+                if let Some(subnet) = active_subnet_key(&value)
+                    && let Ok(block) = active_subnet_index.insert_cidr(&subnet)
+                {
+                    active_cidrs_by_spec.insert(id, block);
                 }
                 spec_positions.insert(id, specs.len());
                 specs.push(value);

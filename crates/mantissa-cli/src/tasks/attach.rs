@@ -1,9 +1,9 @@
-use crate::config::ClientConfig;
-use crate::connection;
 use crate::tasks::util::write_frame;
 use anyhow::{Result, anyhow};
 use capnp_rpc::new_client;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
+use mantissa_client::config::ClientConfig;
+use mantissa_client::connection;
 use mantissa_protocol::task::{TaskLogStream, task_attach_session, task_log_sink};
 use parking_lot::Mutex;
 use std::io::{self, IsTerminal, Read, Write};

@@ -1,0 +1,29 @@
+[package]
+name = "mantissa-cli"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[[bin]]
+name = "mantissa"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22.1"
+capnp = { workspace = true }
+capnp-rpc = { workspace = true }
+clap = { version = "4.5.45", features = ["derive", "cargo"] }
+crossterm = "0.29.0"
+mantissa = { path = "../.." }
+mantissa-client = { path = "../mantissa-client" }
+mantissa-net = { path = "../mantissa-net" }
+mantissa-protocol = { path = "../mantissa-protocol" }
+mantissa-ui = { path = "../mantissa-ui" }
+parking_lot = { workspace = true }
+tabwriter = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4", "serde"] }

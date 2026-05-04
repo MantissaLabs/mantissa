@@ -1,7 +1,6 @@
 use super::{VolumeLabel, VolumeSpec, parse_volume_labels, resolve_node_selector};
 use crate::config::ClientConfig;
 use crate::connection;
-use crate::output;
 use anyhow::{Context, Result};
 
 /// Data required to import one existing host path as a volume object.
@@ -15,7 +14,10 @@ pub struct VolumeImportRequest {
 }
 
 /// Submits one volume import request and returns the persisted spec.
-pub async fn import_raw(cfg: &ClientConfig, request: &VolumeImportRequest) -> Result<VolumeSpec> {
+pub async fn import_with_request(
+    cfg: &ClientConfig,
+    request: &VolumeImportRequest,
+) -> Result<VolumeSpec> {
     let session = connection::get_local_session(cfg).await?;
     let volumes_cap = session.get_volumes_request();
     let volumes = volumes_cap.send().pipeline.get_volumes();
@@ -44,7 +46,7 @@ pub async fn import_raw(cfg: &ClientConfig, request: &VolumeImportRequest) -> Re
     VolumeSpec::from_reader(response.get()?.get_volume()?)
 }
 
-/// Imports one existing host path and renders the result for CLI usage.
+/// Imports one existing host path and returns the persisted spec.
 pub async fn import(
     cfg: &ClientConfig,
     name: &str,
@@ -52,7 +54,7 @@ pub async fn import(
     path: &str,
     capacity_mb: Option<u64>,
     labels: &[String],
-) -> Result<()> {
+) -> Result<VolumeSpec> {
     let request = VolumeImportRequest {
         name: name.to_string(),
         node_selector: node_selector.to_string(),
@@ -60,12 +62,5 @@ pub async fn import(
         requested_bytes: capacity_mb.map(|value| value.saturating_mul(1_048_576)),
         labels: parse_volume_labels(labels)?,
     };
-    let volume = import_raw(cfg, &request).await?;
-    output::emit_line(format!(
-        "volume '{}' imported with id {} on {}",
-        volume.name,
-        volume.id,
-        volume.bound_node_name.as_deref().unwrap_or("unknown")
-    ));
-    Ok(())
+    import_with_request(cfg, &request).await
 }

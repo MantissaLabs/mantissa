@@ -4,7 +4,8 @@ use anyhow::{Result, anyhow};
 use capnp::message::Builder;
 use mantissa_protocol::topology::join_request as JoinRequest;
 
-pub async fn join(cfg: &ClientConfig) -> Result<()> {
+/// Joins this node to a remote anchor through the local topology service.
+pub async fn join(cfg: &ClientConfig) -> Result<String> {
     let client = connection::get_local_session(cfg).await?;
 
     let request = client.get_topology_request();
@@ -48,7 +49,5 @@ pub async fn join(cfg: &ClientConfig) -> Result<()> {
         return Err(anyhow!(err.to_string()));
     }
 
-    println!("join succeeded via {}", anchor);
-
-    Ok(())
+    Ok(anchor.to_string())
 }

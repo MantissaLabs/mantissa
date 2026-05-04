@@ -1,9 +1,8 @@
 use crate::config::ClientConfig;
 use crate::connection;
-use crate::host_ports::{HostPortView, decode_host_ports, render_host_ports};
+use crate::host_ports::{HostPortView, decode_host_ports};
 use crate::networks;
 use crate::networks::{NetworkAttachment, NetworkAttachmentState, NetworkSummary};
-use crate::output;
 use crate::tasks::{uuid_from_data, uuid_to_string};
 use anyhow::Result;
 use blake3::Hasher;
@@ -14,13 +13,11 @@ use mantissa_protocol::services::{
     service_task_progress, task_template,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use tabwriter::TabWriter;
 use uuid::Uuid;
 
 /// Fetches and decodes service specs from the daemon into client-facing rows.
-pub(crate) async fn fetch_service_rows(cfg: &ClientConfig) -> Result<Vec<ServiceRow>> {
+pub async fn fetch_service_rows(cfg: &ClientConfig) -> Result<Vec<ServiceRow>> {
     let client = connection::get_local_session(cfg).await?;
     let request = client.get_services_request();
     let services = request.send().pipeline.get_services();
@@ -36,10 +33,7 @@ pub(crate) async fn fetch_service_rows(cfg: &ClientConfig) -> Result<Vec<Service
 }
 
 /// Fetches one service row by service id through the targeted status RPC.
-pub(crate) async fn fetch_service_row_by_id(
-    cfg: &ClientConfig,
-    service_id: Uuid,
-) -> Result<ServiceRow> {
+pub async fn fetch_service_row_by_id(cfg: &ClientConfig, service_id: Uuid) -> Result<ServiceRow> {
     let client = connection::get_local_session(cfg).await?;
     let request = client.get_services_request();
     let services = request.send().pipeline.get_services();
@@ -53,7 +47,7 @@ pub(crate) async fn fetch_service_row_by_id(
 }
 
 /// Inspects one service row by UUID text or exact service name.
-pub(crate) async fn inspect_service_row(cfg: &ClientConfig, selector: &str) -> Result<ServiceRow> {
+pub async fn inspect_service_row(cfg: &ClientConfig, selector: &str) -> Result<ServiceRow> {
     let client = connection::get_local_session(cfg).await?;
     let request = client.get_services_request();
     let services = request.send().pipeline.get_services();
@@ -63,7 +57,7 @@ pub(crate) async fn inspect_service_row(cfg: &ClientConfig, selector: &str) -> R
     ServiceRow::from_reader(response.get()?.get_service()?).map_err(Into::into)
 }
 
-pub async fn list(cfg: &ClientConfig) -> Result<()> {
+pub async fn list(cfg: &ClientConfig) -> Result<Vec<ServiceRow>> {
     let mut rows = fetch_service_rows(cfg).await?;
 
     rows.sort_by(|a, b| a.service_name.cmp(&b.service_name));
@@ -73,57 +67,11 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
         .filter(|row| row.status != ServiceStatusRow::Stopped)
         .collect();
 
-    if display_rows.is_empty() {
-        println!("no services registered");
-        return Ok(());
+    if !display_rows.is_empty() {
+        hydrate_public_endpoints(cfg, &mut display_rows).await;
     }
 
-    hydrate_public_endpoints(cfg, &mut display_rows).await;
-
-    let mut tw = TabWriter::new(Vec::new());
-    writeln!(
-        &mut tw,
-        "SERVICE\tSTATUS\tROLLOUT\tREASON\tTASK TEMPLATES\tPUBLIC\tHOST PORTS\tREPLICAS\tUPDATED\tID"
-    )?;
-
-    for row in display_rows {
-        let templates_summary = if row.task_templates.is_empty() {
-            "-".to_string()
-        } else {
-            row.task_templates
-                .iter()
-                .map(|template| format!("{} ({}x)", template.name, template.replicas))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-
-        let public_summary = if row.public_endpoints.is_empty() {
-            "-".to_string()
-        } else {
-            row.public_endpoints.join(", ")
-        };
-
-        writeln!(
-            &mut tw,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            row.service_name,
-            row.status,
-            row.rollout_summary(),
-            row.rollout_reason_summary(),
-            templates_summary,
-            public_summary,
-            row.host_ports_summary(),
-            row.replica_ids.len(),
-            row.updated_at,
-            row.id,
-        )?;
-    }
-
-    tw.flush()?;
-    let output = String::from_utf8(tw.into_inner()?)?;
-    output::emit_block(output);
-
-    Ok(())
+    Ok(display_rows)
 }
 
 #[derive(Clone, Debug)]
@@ -186,37 +134,6 @@ impl ServiceRow {
             public_endpoints: Vec::new(),
             task_progress: Vec::new(),
         })
-    }
-
-    /// Returns a compact rollout progress label for tabular list output.
-    fn rollout_summary(&self) -> String {
-        self.rollout.progress_summary()
-    }
-
-    /// Returns the latest rollout error summary, truncated for table readability.
-    fn rollout_reason_summary(&self) -> String {
-        const MAX_REASON_CHARS: usize = 80;
-        if let Some(detail) = self.status_detail.as_deref() {
-            let trimmed = detail.trim();
-            if !trimmed.is_empty() {
-                return truncate_for_table(trimmed, MAX_REASON_CHARS);
-            }
-        }
-        self.rollout.reason_summary()
-    }
-
-    /// Returns every static node-local host port declared by the service templates.
-    pub(crate) fn host_ports_summary(&self) -> String {
-        let summaries: Vec<String> = self
-            .task_templates
-            .iter()
-            .filter_map(TaskTemplateRow::host_ports_summary)
-            .collect();
-        if summaries.is_empty() {
-            "-".to_string()
-        } else {
-            summaries.join(", ")
-        }
     }
 }
 
@@ -288,7 +205,7 @@ pub struct TaskTemplateRow {
     pub public_port: Option<u16>,
     pub readiness_port: Option<u16>,
     pub liveness_port: Option<u16>,
-    pub(crate) ports: Vec<HostPortView>,
+    pub ports: Vec<HostPortView>,
 }
 
 impl TaskTemplateRow {
@@ -359,12 +276,6 @@ impl TaskTemplateRow {
             .or(self.liveness_port)
             .or(self.public_port)
     }
-
-    /// Returns the node-local host ports declared by this template.
-    fn host_ports_summary(&self) -> Option<String> {
-        (!self.ports.is_empty())
-            .then(|| format!("{}: {}", self.name, render_host_ports(&self.ports)))
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -434,45 +345,6 @@ impl ServiceRolloutRow {
             },
         })
     }
-
-    /// Returns a compact rollout progress label used by `services list`.
-    fn progress_summary(&self) -> String {
-        match self.phase {
-            ServiceRolloutPhaseRow::RollingForward => {
-                format!("forward {}/{}", self.completed_steps, self.total_steps)
-            }
-            ServiceRolloutPhaseRow::RollingBack => {
-                format!("rollback {}/{}", self.completed_steps, self.total_steps)
-            }
-            ServiceRolloutPhaseRow::Failed => {
-                if self.max_failures == 0 {
-                    "failed".to_string()
-                } else {
-                    format!("failed {}/{}", self.failed_steps, self.max_failures)
-                }
-            }
-            ServiceRolloutPhaseRow::Idle => {
-                if self.failed_steps > 0 || self.last_error.is_some() {
-                    "rolled-back".to_string()
-                } else {
-                    "-".to_string()
-                }
-            }
-        }
-    }
-
-    /// Returns a compact rollout failure reason for `services list` table output.
-    fn reason_summary(&self) -> String {
-        const MAX_REASON_CHARS: usize = 80;
-        let Some(reason) = self.last_error.as_deref() else {
-            return "-".to_string();
-        };
-        let trimmed = reason.trim();
-        if trimmed.is_empty() {
-            return "-".to_string();
-        }
-        truncate_for_table(trimmed, MAX_REASON_CHARS)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -495,25 +367,6 @@ impl ServiceRolloutPhaseRow {
     }
 }
 
-/// Truncates verbose values to keep tabular output readable in narrow terminals.
-fn truncate_for_table(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    if max_chars <= 3 {
-        return "...".to_string();
-    }
-    let mut out = String::new();
-    for (idx, ch) in value.chars().enumerate() {
-        if idx >= max_chars.saturating_sub(3) {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push_str("...");
-    out
-}
-
 /// Best-effort enrichment that computes per-service public VIP endpoints so operators can
 /// `curl` services from the host without issuing manual DNS lookups.
 async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
@@ -525,12 +378,9 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
         return;
     }
 
-    let network_list = match networks::list_raw(cfg).await {
+    let network_list = match networks::list(cfg).await {
         Ok(list) => list,
-        Err(err) => {
-            eprintln!("warning: failed to list networks for public endpoints: {err}");
-            return;
-        }
+        Err(_err) => return,
     };
 
     let mut by_name: HashMap<String, NetworkSummary> = HashMap::new();
@@ -570,17 +420,9 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
             let attachments = match attachments_cache.get(&network.id) {
                 Some(existing) => existing,
                 None => {
-                    let fetched = match networks::attachments_raw(cfg, &network.id.to_string())
-                        .await
-                    {
+                    let fetched = match networks::attachments(cfg, &network.id.to_string()).await {
                         Ok(list) => list,
-                        Err(err) => {
-                            eprintln!(
-                                "warning: failed to list attachments for network {} ({}): {err}",
-                                network.name, network.id
-                            );
-                            continue;
-                        }
+                        Err(_err) => continue,
                     };
                     attachments_cache.insert(network.id, fetched);
                     attachments_cache
@@ -778,30 +620,6 @@ fn render_socket_endpoint(ip: IpAddr, port: u16) -> String {
 mod tests {
     use super::*;
 
-    /// Builds a minimal service row so reason rendering can be tested without RPC payloads.
-    fn test_row(status_detail: Option<&str>, rollout_error: Option<&str>) -> ServiceRow {
-        ServiceRow {
-            id: Uuid::nil().to_string(),
-            manifest_id: Uuid::nil(),
-            service_name: "svc".to_string(),
-            task_templates: Vec::new(),
-            updated_at: "2026-03-12T00:00:00Z".to_string(),
-            replica_ids: Vec::new(),
-            status: ServiceStatusRow::Deploying,
-            status_detail: status_detail.map(str::to_string),
-            rollout: ServiceRolloutRow {
-                phase: ServiceRolloutPhaseRow::Idle,
-                total_steps: 0,
-                completed_steps: 0,
-                failed_steps: u32::from(rollout_error.is_some()),
-                max_failures: 1,
-                last_error: rollout_error.map(str::to_string),
-            },
-            public_endpoints: Vec::new(),
-            task_progress: Vec::new(),
-        }
-    }
-
     /// Builds a minimal template row so endpoint rendering heuristics can be tested directly.
     fn test_template(
         public_port: Option<u16>,
@@ -819,39 +637,6 @@ mod tests {
             liveness_port,
             ports: Vec::new(),
         }
-    }
-
-    /// Builds one decoded host-port row for service-list summary tests.
-    fn test_host_port(name: &str, host_port: u16) -> HostPortView {
-        HostPortView {
-            name: name.to_string(),
-            target_port: 8080,
-            host_port,
-            host_ip: "0.0.0.0".to_string(),
-            protocol: crate::host_ports::HostPortProtocolView::Tcp,
-        }
-    }
-
-    #[test]
-    /// Ensures the services list reason column prefers the current lifecycle detail over rollout history.
-    fn rollout_reason_summary_prefers_status_detail() {
-        let row = test_row(
-            Some("waiting for dependency template 'backend' before launching template 'frontend'"),
-            Some("old rollout failure"),
-        );
-
-        assert!(
-            row.rollout_reason_summary()
-                .contains("waiting for dependency template")
-        );
-    }
-
-    #[test]
-    /// Ensures the services list still falls back to rollout failure details when no status detail exists.
-    fn rollout_reason_summary_falls_back_to_rollout_error() {
-        let row = test_row(None, Some("old rollout failure"));
-
-        assert_eq!(row.rollout_reason_summary(), "old rollout failure");
     }
 
     #[test]
@@ -923,20 +708,6 @@ mod tests {
         let template = test_template(Some(8001), None, None);
 
         assert_eq!(template.public_target_port(), Some(8001));
-    }
-
-    #[test]
-    /// Includes static host ports in the service summary so operators can find node-local exposure.
-    fn service_host_ports_summary_includes_template_ports() {
-        let mut row = test_row(None, None);
-        let mut template = test_template(None, None, None);
-        template.ports = vec![test_host_port("http", 18080)];
-        row.task_templates = vec![template];
-
-        assert_eq!(
-            row.host_ports_summary(),
-            "backend: http 0.0.0.0:18080->8080/tcp"
-        );
     }
 
     #[test]

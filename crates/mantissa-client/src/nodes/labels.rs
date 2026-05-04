@@ -1,6 +1,5 @@
 use crate::config::ClientConfig;
 use crate::connection;
-use crate::output;
 use anyhow::{Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
@@ -12,7 +11,7 @@ pub async fn labels(
     labels: &[String],
     remove: &[String],
     replace: bool,
-) -> Result<()> {
+) -> Result<NodeLabelsResult> {
     if !replace && labels.is_empty() && remove.is_empty() {
         return Err(anyhow!(
             "label update requires at least one --label, --remove, or --replace"
@@ -46,13 +45,17 @@ pub async fn labels(
     }
     request.send().promise.await?;
 
-    let message = if replace && assignments.is_empty() {
-        format!("cleared labels on node {node_id}")
-    } else {
-        format!("updated labels on node {node_id}")
-    };
-    output::emit_line(message);
-    Ok(())
+    Ok(NodeLabelsResult {
+        node_id,
+        cleared: replace && assignments.is_empty(),
+    })
+}
+
+/// Result returned after applying one node label mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeLabelsResult {
+    pub node_id: Uuid,
+    pub cleared: bool,
 }
 
 /// Normalizes repeated `key=value` assignments while letting later values win.

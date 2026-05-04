@@ -6,7 +6,15 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use super::status::fetch_drain_status_via_topology;
+use super::status::{DrainStatusView, fetch_drain_status_via_topology};
+
+/// Result returned after requesting a node drain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DrainResult {
+    pub node_id: Uuid,
+    pub waited: bool,
+    pub progress: Vec<DrainStatusView>,
+}
 
 /// Requests maintenance drain for one node and optionally waits for completion.
 pub async fn drain(
@@ -16,7 +24,7 @@ pub async fn drain(
     task_stop_timeout: Option<Duration>,
     timeout: Duration,
     no_wait: bool,
-) -> Result<()> {
+) -> Result<DrainResult> {
     let client = connection::get_local_session(cfg).await?;
 
     let request = client.get_topology_request();
@@ -32,15 +40,21 @@ pub async fn drain(
     request.send().promise.await?;
 
     if no_wait {
-        println!("drain requested for node {node_id}");
-        return Ok(());
+        return Ok(DrainResult {
+            node_id,
+            waited: false,
+            progress: Vec::new(),
+        });
     }
 
-    println!("drain requested for node {node_id}; waiting for completion");
-    wait_for_drain_completion(&topology, node_id, timeout).await
+    Ok(DrainResult {
+        node_id,
+        waited: true,
+        progress: wait_for_drain_completion(&topology, node_id, timeout).await?,
+    })
 }
 
-/// Converts one optional CLI duration into the wire-level seconds field.
+/// Converts one optional duration into the wire-level seconds field.
 fn duration_to_wire_secs(duration: Option<Duration>) -> Result<u32> {
     let Some(duration) = duration else {
         return Ok(0);
@@ -54,28 +68,28 @@ async fn wait_for_drain_completion(
     topology: &topology::topology::Client,
     node_id: Uuid,
     timeout: Duration,
-) -> Result<()> {
+) -> Result<Vec<DrainStatusView>> {
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
     let deadline = Instant::now() + timeout;
-    let mut last_progress_line: Option<String> = None;
+    let mut progress = Vec::new();
+    let mut last_progress: Option<DrainStatusView> = None;
 
     loop {
         let status = fetch_drain_status_via_topology(topology, node_id).await?;
-        let progress_line = status.compact_progress_line();
-        if last_progress_line.as_deref() != Some(progress_line.as_str()) {
-            println!("{progress_line}");
-            last_progress_line = Some(progress_line);
+        if last_progress.as_ref() != Some(&status) {
+            last_progress = Some(status.clone());
+            progress.push(status.clone());
         }
 
         if status.is_drained() {
-            return Ok(());
+            return Ok(progress);
         }
 
         if Instant::now() >= deadline {
             return Err(anyhow!(
                 "node {node_id} drain timed out after {timeout:?}; node remains unschedulable: {}",
-                status.message()
+                status.message
             ));
         }
 

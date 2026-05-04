@@ -1,9 +1,8 @@
 use crate::agents::inspect::parse_session_id;
 use crate::agents::snapshot::{
-    AgentSessionStatusView, inspect_session_detail, render_agent_detail,
+    AgentSessionDetailView, AgentSessionStatusView, inspect_session_detail,
 };
 use crate::config::ClientConfig;
-use crate::output;
 use anyhow::{Result, anyhow};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -12,7 +11,11 @@ use tokio::time::sleep;
 const AGENT_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Waits until one agent session reaches a stable non-executing state.
-pub async fn wait(cfg: &ClientConfig, id: &str, timeout: Option<Duration>) -> Result<()> {
+pub async fn wait(
+    cfg: &ClientConfig,
+    id: &str,
+    timeout: Option<Duration>,
+) -> Result<AgentSessionDetailView> {
     let session_id = parse_session_id(id)?;
     let started = tokio::time::Instant::now();
 
@@ -20,17 +23,9 @@ pub async fn wait(cfg: &ClientConfig, id: &str, timeout: Option<Duration>) -> Re
         let detail = inspect_session_detail(cfg, session_id).await?;
         match detail.snapshot.status {
             AgentSessionStatusView::WaitingInput | AgentSessionStatusView::Closed => {
-                output::emit_block(format!(
-                    "agent session reached a stable state:\n{}",
-                    render_agent_detail(&detail)?
-                ));
-                return Ok(());
+                return Ok(detail);
             }
             AgentSessionStatusView::Failed => {
-                output::emit_block(format!(
-                    "agent session reached a stable state:\n{}",
-                    render_agent_detail(&detail)?
-                ));
                 return Err(anyhow!(wait_failure_message(&detail)));
             }
             AgentSessionStatusView::Queued
@@ -52,7 +47,7 @@ pub async fn wait(cfg: &ClientConfig, id: &str, timeout: Option<Duration>) -> Re
 }
 
 /// Builds one operator-facing failure message from the latest visible session state.
-fn wait_failure_message(detail: &crate::agents::snapshot::AgentSessionDetailView) -> String {
+fn wait_failure_message(detail: &AgentSessionDetailView) -> String {
     if let Some(run) = detail.last_run() {
         let mut message = format!(
             "agent session {} ({}) failed on run {}",

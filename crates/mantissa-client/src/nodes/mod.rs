@@ -8,12 +8,15 @@ pub mod list;
 pub mod resume;
 pub mod status;
 
-pub use self::drain::drain;
+pub use self::drain::{DrainResult, drain};
 pub use self::evict::evict;
-pub use self::info::info;
+pub use self::info::{
+    LoadBalancerFlowDiagnosticsView, NodeInfoView, NodePortFlowDiagnosticsView,
+    NodePortIngressDropReasonsView, info,
+};
 pub use self::join::join;
-pub use self::labels::labels;
+pub use self::labels::{NodeLabelsResult, labels};
 pub use self::leave::leave;
-pub use self::list::list;
+pub use self::list::{NodeListEntry, list};
 pub use self::resume::resume;
-pub use self::status::status;
+pub use self::status::{DrainStatusView, status};

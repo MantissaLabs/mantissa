@@ -1,5 +1,3 @@
-use crate::config::ClientConfig;
-use crate::connection;
 use crate::tasks::attach::{
     CliTaskAttachSink, DEFAULT_DETACH_KEYS, DetachSequence, DetachSequenceMatcher,
     InputPumpOutcome, RawModeGuard, StdinEvent, consume_detach_input, sanitize_terminal_size,
@@ -8,6 +6,8 @@ use crate::tasks::attach::{
 use anyhow::{Result, anyhow};
 use capnp_rpc::new_client;
 use crossterm::terminal::size as terminal_size;
+use mantissa_client::config::ClientConfig;
+use mantissa_client::connection;
 use mantissa_protocol::task::task_exec_session;
 use std::io::{self, IsTerminal};
 

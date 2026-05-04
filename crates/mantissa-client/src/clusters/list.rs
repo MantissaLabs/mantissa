@@ -1,9 +1,6 @@
 use crate::config::ClientConfig;
-use crate::output;
 use anyhow::{Context, Result, anyhow};
 use std::collections::BTreeMap;
-use std::io::Write;
-use tabwriter::TabWriter;
 use uuid::Uuid;
 
 use super::operations::{ClusterViewSpec, parse_cluster_id, topology_capability};
@@ -74,7 +71,7 @@ pub(crate) fn resolve_view_from_summaries(
 }
 
 /// Aggregates view rows into one deterministic summary per cluster lineage id.
-fn aggregate_cluster_summaries(view_rows: &[ClusterViewSummary]) -> Vec<ClusterSummary> {
+pub(crate) fn aggregate_cluster_summaries(view_rows: &[ClusterViewSummary]) -> Vec<ClusterSummary> {
     let mut grouped = BTreeMap::<Uuid, Vec<&ClusterViewSummary>>::new();
     for row in view_rows {
         grouped.entry(row.view.cluster_id).or_default().push(row);
@@ -149,36 +146,10 @@ pub async fn list_cluster_views(cfg: &ClientConfig) -> Result<Vec<ClusterViewSum
     Ok(out)
 }
 
-/// Queries the local node for cluster lineages and renders a concise table for CLI output.
-pub async fn list_clusters(cfg: &ClientConfig) -> Result<()> {
+/// Queries the local node for cluster lineage summaries.
+pub async fn list_clusters(cfg: &ClientConfig) -> Result<Vec<ClusterSummary>> {
     let views = list_cluster_views(cfg).await?;
-    let summaries = aggregate_cluster_summaries(&views);
-    if summaries.is_empty() {
-        output::emit_line("no clusters known");
-        return Ok(());
-    }
-
-    let mut tw = TabWriter::new(Vec::new());
-    writeln!(
-        &mut tw,
-        "CLUSTER_ID\tNAME\tEPOCH\tNODES\tACTIVE_ON_THIS_NODE"
-    )?;
-    for summary in summaries {
-        writeln!(
-            &mut tw,
-            "{}\t{}\t{}\t{}\t{}",
-            summary.cluster_id,
-            summary.cluster_name.as_deref().unwrap_or("-"),
-            summary.epoch,
-            summary.node_count,
-            if summary.local_active { "yes" } else { "no" }
-        )?;
-    }
-
-    tw.flush()?;
-    let rendered = String::from_utf8(tw.into_inner()?)?;
-    output::emit_block(rendered);
-    Ok(())
+    Ok(aggregate_cluster_summaries(&views))
 }
 
 /// Returns the currently active cluster view on the local node.

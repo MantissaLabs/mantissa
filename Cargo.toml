@@ -16,11 +16,12 @@ members = [
     "crates/mantissa-protocol",
     "crates/mantissa-net",
     "crates/mantissa-client",
+    "crates/mantissa-cli",
     "crates/mantissa-health",
     "crates/mantissa-ui",
     "crates/mantissa-ebpf",
 ]
-default-members = [".", "crates/mantissa-sandbox"]
+default-members = [".", "crates/mantissa-cli", "crates/mantissa-sandbox"]
 
 [workspace.package]
 license = "Apache-2.0"

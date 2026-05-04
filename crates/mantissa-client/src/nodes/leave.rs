@@ -2,14 +2,13 @@ use crate::config::ClientConfig;
 use crate::connection;
 use anyhow::Result;
 
+/// Requests this node to leave its current cluster.
 pub async fn leave(cfg: &ClientConfig) -> Result<()> {
     let client = connection::get_local_session(cfg).await?;
 
     let request = client.get_topology_request();
     let topology = request.send().pipeline.get_topology();
     topology.leave_request().send().promise.await?;
-
-    println!("leave succeeded");
 
     Ok(())
 }

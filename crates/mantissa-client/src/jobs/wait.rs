@@ -1,7 +1,6 @@
 use crate::config::ClientConfig;
 use crate::jobs::inspect::parse_job_id;
-use crate::jobs::snapshot::{inspect_job_detail, render_job_detail};
-use crate::output;
+use crate::jobs::snapshot::{JobDetailView, inspect_job_detail};
 use anyhow::{Result, anyhow};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -10,19 +9,19 @@ use tokio::time::sleep;
 const JOB_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Waits until one job reaches a terminal controller state by polling the public inspect API.
-pub async fn wait(cfg: &ClientConfig, id: &str, timeout: Option<Duration>) -> Result<()> {
+pub async fn wait(
+    cfg: &ClientConfig,
+    id: &str,
+    timeout: Option<Duration>,
+) -> Result<JobDetailView> {
     let job_id = parse_job_id(id)?;
     let started = tokio::time::Instant::now();
 
     loop {
         let detail = inspect_job_detail(cfg, job_id).await?;
         if detail.snapshot.status.is_terminal() {
-            output::emit_block(format!(
-                "job reached a terminal state:\n{}",
-                render_job_detail(&detail)?
-            ));
             if detail.snapshot.status.is_success() {
-                return Ok(());
+                return Ok(detail);
             }
             return Err(anyhow!(
                 "job {} ({job_id}) finished with status {}",

@@ -12,16 +12,16 @@ use anyhow::{Result, anyhow};
 use mantissa_protocol::topology::node_info;
 use uuid::Uuid;
 
-pub use create::{VolumeCreateRequest, create, create_raw};
-pub use delete::{delete, delete_raw};
-pub use import::{VolumeImportRequest, import, import_raw};
-pub use inspect::{inspect, inspect_raw};
-pub use list::{list, list_raw};
-pub use status::{status, status_raw};
+pub use create::{VolumeCreateRequest, create, create_with_request};
+pub use delete::delete;
+pub use import::{VolumeImportRequest, import, import_with_request};
+pub use inspect::inspect;
+pub use list::list;
+pub use status::status;
 pub use types::{
     LocalVolumeOwnership, VolumeAccessMode, VolumeBindingMode, VolumeDeleteResult, VolumeDriver,
     VolumeInspect, VolumeLabel, VolumeNodeState, VolumeNodeStatus, VolumeReclaimPolicy, VolumeSpec,
-    VolumeStatus, VolumeSummary, format_bytes,
+    VolumeStatus, VolumeSummary,
 };
 
 /// Resolved form of one CLI volume mount after selector lookup and normalization.
@@ -101,7 +101,7 @@ pub(crate) async fn resolve_cli_volume_mounts(
     let mut resolved = Vec::with_capacity(mounts.len());
     for raw in mounts {
         let (selector, target, read_only) = parse_cli_volume_mount(raw)?;
-        let volume = inspect_raw(cfg, &selector).await?.spec;
+        let volume = inspect(cfg, &selector).await?.spec;
         resolved.push(ResolvedVolumeMount {
             volume_id: volume.id,
             volume_name: volume.name,

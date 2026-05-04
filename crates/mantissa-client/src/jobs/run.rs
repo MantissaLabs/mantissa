@@ -3,7 +3,6 @@ use crate::connection;
 use crate::jobs::manifest::{
     EnvironmentVariable, JobManifest, LivenessProbe, SecretFileProjection, load_manifest_from_path,
 };
-use crate::output;
 use crate::runtime_contract::{
     normalize_execution_platform, normalize_isolation_mode, normalize_isolation_profile,
 };
@@ -20,7 +19,6 @@ use crate::workload_wire::{
 use anyhow::{Result, anyhow};
 use mantissa_protocol::jobs::{job_execution, job_retry_policy, job_submit_spec};
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -55,6 +53,21 @@ pub struct JobRunOptions<'a> {
     pub isolation_mode: &'a str,
     pub isolation_profile: Option<&'a str>,
     pub volumes: &'a [String],
+}
+
+/// Result returned after submitting one job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobRunResult {
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    pub cpu_millis: u64,
+    pub memory_mib: u64,
+    pub gpu_count: u32,
+    pub execution_platform: String,
+    pub isolation_mode: String,
+    pub isolation_profile: Option<String>,
+    pub max_retries: u32,
 }
 
 /// One prepared jobs submission after CLI and manifest normalization.
@@ -93,7 +106,7 @@ struct PreparedJobRetryPolicy {
 }
 
 /// Submits one first-class job through the jobs control-plane capability.
-pub async fn run(cfg: &ClientConfig, options: &JobRunOptions<'_>) -> Result<()> {
+pub async fn run(cfg: &ClientConfig, options: &JobRunOptions<'_>) -> Result<JobRunResult> {
     let prepared = prepare_submit_spec(cfg, options).await?;
     let session = connection::get_local_session(cfg).await?;
 
@@ -105,31 +118,18 @@ pub async fn run(cfg: &ClientConfig, options: &JobRunOptions<'_>) -> Result<()> 
     let response = request.send().promise.await?;
     let reader = response.get()?;
     let job_id = uuid_to_string(reader.get_job_id()?)?;
-
-    let mut tw = tabwriter::TabWriter::new(Vec::new());
-    writeln!(
-        &mut tw,
-        "ID\tNAME\tIMAGE\tCPU(m)\tMEM(MiB)\tGPU\tPLATFORM\tMODE\tPROFILE\tRETRIES"
-    )?;
-    writeln!(
-        &mut tw,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        job_id,
-        prepared.name,
-        prepared.execution.image,
-        prepared.execution.cpu_millis,
-        prepared.execution.memory_bytes / (1024 * 1024),
-        prepared.execution.gpu_count,
-        prepared.execution_platform,
-        prepared.isolation_mode,
-        prepared.isolation_profile.as_deref().unwrap_or("default"),
-        prepared.retry_policy.max_retries,
-    )?;
-    tw.flush()?;
-
-    let output = String::from_utf8(tw.into_inner()?)?;
-    output::emit_block(format!("submitted job:\n{output}"));
-    Ok(())
+    Ok(JobRunResult {
+        id: job_id,
+        name: prepared.name,
+        image: prepared.execution.image,
+        cpu_millis: prepared.execution.cpu_millis,
+        memory_mib: prepared.execution.memory_bytes / (1024 * 1024),
+        gpu_count: prepared.execution.gpu_count,
+        execution_platform: prepared.execution_platform,
+        isolation_mode: prepared.isolation_mode,
+        isolation_profile: prepared.isolation_profile,
+        max_retries: prepared.retry_policy.max_retries,
+    })
 }
 
 /// Normalizes one job CLI invocation into the public submit contract.
