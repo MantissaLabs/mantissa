@@ -3,6 +3,7 @@ use crate::secrets::master_key_protector::{
 };
 use crate::store::tx::{into_io, with_read_tx, with_write_tx};
 use redb::{Database, TableDefinition};
+use std::cmp::Ordering;
 use std::{io, sync::Arc};
 
 const T_MASTER_KEY_ENVELOPES: TableDefinition<u64, &'static [u8]> =
@@ -84,6 +85,33 @@ impl SecretMasterStore {
 
     /// Imports an externally provided master key as the active version.
     pub fn import_current(&self, record: &MasterKeyRecord) -> io::Result<()> {
+        if let Some(current_version) = self.current_version()? {
+            match record.version.cmp(&current_version) {
+                Ordering::Less => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "stale secret master key transfer rejected",
+                    ));
+                }
+                Ordering::Equal => {
+                    let current = self.load_version(current_version)?.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "secret master key envelope missing for recorded version",
+                        )
+                    })?;
+                    if current.key != record.key {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "conflicting secret master key transfer rejected",
+                        ));
+                    }
+                    return Ok(());
+                }
+                Ordering::Greater => {}
+            }
+        }
+
         self.persist_new_version(record.version, &record.key)?;
         Ok(())
     }
@@ -195,8 +223,8 @@ impl SecretMasterStore {
 
 #[cfg(test)]
 mod tests {
-    use super::SecretMasterStore;
-    use crate::secrets::master_key_protector::PassphraseMasterKeyProtector;
+    use super::{MasterKeyRecord, SecretMasterStore};
+    use crate::secrets::master_key_protector::{MasterKeyPlaintext, PassphraseMasterKeyProtector};
     use redb::Database;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -240,6 +268,32 @@ mod tests {
 
         assert_eq!(rotated.version, base.version + 1);
         assert_ne!(rotated.key, base.key);
+    }
+
+    #[test]
+    fn import_current_rejects_stale_and_conflicting_versions() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let db = Arc::new(Database::create(db_path).unwrap());
+        let store = SecretMasterStore::new(db, test_protector()).expect("open store");
+
+        let base = store.ensure_current().expect("ensure master key");
+        let rotated = store.rotate().expect("rotate master key");
+
+        let stale_err = store
+            .import_current(&base)
+            .expect_err("stale import must fail");
+        assert_eq!(stale_err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let conflicting = MasterKeyRecord::new(
+            rotated.version,
+            MasterKeyPlaintext::generate().expect("conflicting key"),
+        )
+        .expect("conflicting record");
+        let conflict_err = store
+            .import_current(&conflicting)
+            .expect_err("same-version conflict must fail");
+        assert_eq!(conflict_err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]

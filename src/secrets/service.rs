@@ -315,6 +315,7 @@ pub(crate) fn write_master_key_transfer(
     builder.set_version(transfer.version);
     builder.set_sender_node_id(transfer.sender_node_id.as_bytes());
     builder.set_recipient_node_id(transfer.recipient_node_id.as_bytes());
+    builder.set_sender_noise_static_pub(&transfer.sender_noise_static_pub);
     builder.set_transfer_public_key(&transfer.transfer_public_key);
     builder.set_recipient_noise_static_pub(&transfer.recipient_noise_static_pub);
     builder.set_nonce(&transfer.nonce);
@@ -327,6 +328,10 @@ pub(crate) fn read_master_key_transfer(
 ) -> Result<MasterKeyTransfer, Error> {
     let transfer_public_key =
         read_fixed_32(reader.get_transfer_public_key()?, "transfer public key")?;
+    let sender_noise_static_pub = read_fixed_32(
+        reader.get_sender_noise_static_pub()?,
+        "sender noise static key",
+    )?;
     let recipient_noise_static_pub = read_fixed_32(
         reader.get_recipient_noise_static_pub()?,
         "recipient noise static key",
@@ -344,6 +349,7 @@ pub(crate) fn read_master_key_transfer(
         version: reader.get_version(),
         sender_node_id: read_uuid(reader.get_sender_node_id()?)?,
         recipient_node_id: read_uuid(reader.get_recipient_node_id()?)?,
+        sender_noise_static_pub,
         transfer_public_key,
         recipient_noise_static_pub,
         nonce,
@@ -635,6 +641,11 @@ impl secrets::Server for SecretsService {
                         "recipient node {recipient_node_id} is not registered"
                     ))
                 })?;
+            if !peer.membership.is_active() {
+                return Err(Error::failed(format!(
+                    "recipient node {recipient_node_id} is not active"
+                )));
+            }
             if peer.noise_static_pub != recipient_noise_static_pub {
                 return Err(Error::failed(format!(
                     "recipient node {recipient_node_id} noise key mismatch"
@@ -649,6 +660,7 @@ impl secrets::Server for SecretsService {
             record.version,
             &record.key,
             self.local_node_id(),
+            self.noise_keys().as_ref(),
             recipient_node_id,
             recipient_noise_static_pub,
         )
@@ -710,7 +722,13 @@ impl secrets::Server for SecretsService {
         }
 
         if let Some(topology) = topology
-            && let Err(e) = distribute_master_key(topology, self.local_node_id(), &new_record).await
+            && let Err(e) = distribute_master_key(
+                topology,
+                self.local_node_id(),
+                self.noise_keys(),
+                &new_record,
+            )
+            .await
         {
             warn!(target: "secrets", "failed to distribute master key v{}: {e}", new_record.version);
         }
@@ -727,10 +745,33 @@ impl secrets::Server for SecretsService {
         let store = self.master_store();
         let keyring = self.keyring();
         let noise_keys = self.noise_keys();
+        let topology = self.topology().ok_or_else(|| {
+            Error::failed("topology is required to authenticate master key transfer sender".into())
+        })?;
 
         let transfer = read_master_key_transfer(params.get()?.get_envelope()?)?;
+        let sender = topology
+            .registry()
+            .peer_value_unscoped(transfer.sender_node_id)
+            .ok_or_else(|| {
+                Error::failed(format!(
+                    "master key transfer sender {} is not registered",
+                    transfer.sender_node_id
+                ))
+            })?;
+        if !sender.membership.is_active() {
+            return Err(Error::failed(format!(
+                "master key transfer sender {} is not active",
+                transfer.sender_node_id
+            )));
+        }
         let plaintext = transfer
-            .decrypt(self.local_node_id(), noise_keys.as_ref())
+            .decrypt(
+                self.local_node_id(),
+                noise_keys.as_ref(),
+                transfer.sender_node_id,
+                sender.noise_static_pub,
+            )
             .map_err(|e| Error::failed(format!("failed to decrypt master key transfer: {e}")))?;
         let record = MasterKeyRecord::new(transfer.version, plaintext)
             .map_err(|e| Error::failed(e.to_string()))?;
@@ -751,6 +792,7 @@ impl secrets::Server for SecretsService {
 async fn distribute_master_key(
     topology: Topology,
     sender_node_id: Uuid,
+    sender_noise_keys: Arc<NoiseKeys>,
     record: &MasterKeyRecord,
 ) -> Result<(), Error> {
     let registry = topology.registry();
@@ -769,6 +811,7 @@ async fn distribute_master_key(
             record.version,
             &record.key,
             sender_node_id,
+            sender_noise_keys.as_ref(),
             peer,
             peer_value.noise_static_pub,
         )

@@ -144,6 +144,9 @@ struct SecretMasterKeyTransfer {
 
   ciphertext @6 :Data;
   # Encrypted 32-byte master key payload including the Poly1305 tag.
+
+  senderNoiseStaticPub @7 :Data;
+  # 32-byte X25519 static public key used to authenticate the sender.
 }
 
 struct WrappedSecretMasterKey {

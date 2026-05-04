@@ -29,6 +29,10 @@ const TRANSFER_HKDF_SALT: &[u8] = b"mantissa.secret-master.transfer.hkdf.v1";
 const TRANSFER_HKDF_INFO: &[u8] = b"mantissa.secret-master.transfer.aead-key.v1";
 const PASSPHRASE_SALT_SIZE: usize = 16;
 const XCHACHA_NONCE_SIZE: usize = 24;
+const MAX_PASSPHRASE_METADATA_SIZE: usize = 256;
+const MAX_ARGON2_MEMORY_COST_KIB: u32 = 256 * 1024;
+const MAX_ARGON2_TIME_COST: u32 = 10;
+const MAX_ARGON2_PARALLELISM: u32 = 8;
 
 /// Plaintext cluster master key material kept out of durable storage.
 pub struct MasterKeyPlaintext {
@@ -402,6 +406,7 @@ pub struct MasterKeyTransfer {
     pub version: u64,
     pub sender_node_id: Uuid,
     pub recipient_node_id: Uuid,
+    pub sender_noise_static_pub: [u8; MASTER_KEY_SIZE],
     pub transfer_public_key: [u8; MASTER_KEY_SIZE],
     pub recipient_noise_static_pub: [u8; MASTER_KEY_SIZE],
     pub nonce: [u8; XCHACHA_NONCE_SIZE],
@@ -414,6 +419,7 @@ impl MasterKeyTransfer {
         version: u64,
         plaintext: &MasterKeyPlaintext,
         sender_node_id: Uuid,
+        sender_noise_keys: &NoiseKeys,
         recipient_node_id: Uuid,
         recipient_noise_static_pub: [u8; MASTER_KEY_SIZE],
     ) -> io::Result<Self> {
@@ -422,7 +428,20 @@ impl MasterKeyTransfer {
         let transfer_secret = StaticSecret::from(*transfer_secret_bytes);
         let transfer_public_key = PublicKey::from(&transfer_secret).to_bytes();
         let recipient_public = PublicKey::from(recipient_noise_static_pub);
-        let shared = transfer_secret.diffie_hellman(&recipient_public);
+        let ephemeral_shared = transfer_secret.diffie_hellman(&recipient_public);
+        if !ephemeral_shared.was_contributory() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "recipient noise key is not contributory",
+            ));
+        }
+        let sender_static_shared = sender_noise_keys.private.diffie_hellman(&recipient_public);
+        if !sender_static_shared.was_contributory() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sender static master key transfer exchange is not contributory",
+            ));
+        }
 
         let mut nonce = [0u8; XCHACHA_NONCE_SIZE];
         getrandom::getrandom(&mut nonce)?;
@@ -430,12 +449,17 @@ impl MasterKeyTransfer {
             version,
             sender_node_id,
             recipient_node_id,
+            sender_noise_static_pub: sender_noise_keys.public_bytes(),
             transfer_public_key,
             recipient_noise_static_pub,
             nonce,
             ciphertext: Vec::new(),
         };
-        let mut key = transfer_aead_key(shared.as_bytes(), &transfer)?;
+        let mut key = transfer_aead_key(
+            ephemeral_shared.as_bytes(),
+            sender_static_shared.as_bytes(),
+            &transfer,
+        )?;
         let aead = XChaCha20Poly1305::new(Key::from_slice(key.as_slice()));
         let aad = transfer_aad(&transfer);
         transfer.ciphertext = aead
@@ -457,6 +481,8 @@ impl MasterKeyTransfer {
         &self,
         local_node_id: Uuid,
         noise_keys: &NoiseKeys,
+        expected_sender_node_id: Uuid,
+        expected_sender_noise_static_pub: [u8; MASTER_KEY_SIZE],
     ) -> io::Result<MasterKeyPlaintext> {
         if self.recipient_node_id != local_node_id {
             return Err(io::Error::new(
@@ -470,9 +496,39 @@ impl MasterKeyTransfer {
                 "master key transfer recipient key mismatch",
             ));
         }
+        if self.sender_node_id != expected_sender_node_id {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "master key transfer sender node mismatch",
+            ));
+        }
+        if self.sender_noise_static_pub != expected_sender_noise_static_pub {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "master key transfer sender key mismatch",
+            ));
+        }
         let transfer_public = PublicKey::from(self.transfer_public_key);
-        let shared = noise_keys.private.diffie_hellman(&transfer_public);
-        let mut key = transfer_aead_key(shared.as_bytes(), self)?;
+        let ephemeral_shared = noise_keys.private.diffie_hellman(&transfer_public);
+        if !ephemeral_shared.was_contributory() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "master key transfer public key is not contributory",
+            ));
+        }
+        let sender_public = PublicKey::from(self.sender_noise_static_pub);
+        let sender_static_shared = noise_keys.private.diffie_hellman(&sender_public);
+        if !sender_static_shared.was_contributory() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "master key transfer sender key is not contributory",
+            ));
+        }
+        let mut key = transfer_aead_key(
+            ephemeral_shared.as_bytes(),
+            sender_static_shared.as_bytes(),
+            self,
+        )?;
         let aead = XChaCha20Poly1305::new(Key::from_slice(key.as_slice()));
         let aad = transfer_aad(self);
         let plaintext = aead
@@ -517,6 +573,12 @@ fn encode_passphrase_metadata(
 
 /// Decodes passphrase KDF metadata from a durable envelope.
 fn decode_passphrase_metadata(bytes: &[u8]) -> io::Result<DecodedPassphraseMetadata> {
+    if bytes.len() > MAX_PASSPHRASE_METADATA_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "passphrase master key metadata too large",
+        ));
+    }
     let mut cursor = std::io::Cursor::new(bytes);
     let reader = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
         .map_err(capnp_to_io)?;
@@ -543,6 +605,15 @@ fn decode_passphrase_metadata(bytes: &[u8]) -> io::Result<DecodedPassphraseMetad
             "passphrase master key Argon2id parameters invalid",
         ));
     }
+    if params.memory_cost_kib > MAX_ARGON2_MEMORY_COST_KIB
+        || params.time_cost > MAX_ARGON2_TIME_COST
+        || params.parallelism > MAX_ARGON2_PARALLELISM
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "passphrase master key Argon2id parameters exceed supported limits",
+        ));
+    }
     Ok(DecodedPassphraseMetadata { salt, params })
 }
 
@@ -567,6 +638,7 @@ fn transfer_aad(transfer: &MasterKeyTransfer) -> Vec<u8> {
     aad.extend_from_slice(&transfer.version.to_be_bytes());
     aad.extend_from_slice(transfer.sender_node_id.as_bytes());
     aad.extend_from_slice(transfer.recipient_node_id.as_bytes());
+    aad.extend_from_slice(&transfer.sender_noise_static_pub);
     aad.extend_from_slice(&transfer.transfer_public_key);
     aad.extend_from_slice(&transfer.recipient_noise_static_pub);
     aad
@@ -574,10 +646,15 @@ fn transfer_aad(transfer: &MasterKeyTransfer) -> Vec<u8> {
 
 /// Derives the AEAD key used for one node-to-node transfer.
 fn transfer_aead_key(
-    shared_secret: &[u8; MASTER_KEY_SIZE],
+    ephemeral_shared_secret: &[u8; MASTER_KEY_SIZE],
+    sender_static_shared_secret: &[u8; MASTER_KEY_SIZE],
     transfer: &MasterKeyTransfer,
 ) -> io::Result<Zeroizing<[u8; MASTER_KEY_SIZE]>> {
-    let hkdf = Hkdf::<Sha256>::new(Some(TRANSFER_HKDF_SALT), shared_secret);
+    let mut input = Zeroizing::new([0u8; MASTER_KEY_SIZE * 2]);
+    input[..MASTER_KEY_SIZE].copy_from_slice(ephemeral_shared_secret);
+    input[MASTER_KEY_SIZE..].copy_from_slice(sender_static_shared_secret);
+
+    let hkdf = Hkdf::<Sha256>::new(Some(TRANSFER_HKDF_SALT), input.as_slice());
     let mut info = Vec::from(TRANSFER_HKDF_INFO);
     info.extend_from_slice(&transfer_aad(transfer));
     let mut out = Zeroizing::new([0u8; MASTER_KEY_SIZE]);
@@ -608,8 +685,9 @@ fn capnp_to_io(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        MasterKeyPlaintext, MasterKeyProtector, MasterKeyTransfer, PassphraseMasterKeyProtector,
-        SecretPassphrase,
+        MAX_ARGON2_MEMORY_COST_KIB, MasterKeyPlaintext, MasterKeyProtector, MasterKeyTransfer,
+        PASSPHRASE_SALT_SIZE, PassphraseKdfParams, PassphraseMasterKeyProtector, SecretPassphrase,
+        encode_passphrase_metadata,
     };
     use mantissa_net::noise::NoiseKeys;
     use uuid::Uuid;
@@ -648,16 +726,75 @@ mod tests {
     fn master_key_transfer_roundtrips_to_recipient_noise_key() {
         let sender_id = Uuid::new_v4();
         let recipient_id = Uuid::new_v4();
+        let sender = NoiseKeys::from_private_bytes([3u8; 32]);
         let recipient = NoiseKeys::from_private_bytes([7u8; 32]);
         let key = MasterKeyPlaintext::generate().expect("key");
-        let transfer =
-            MasterKeyTransfer::encrypt(3, &key, sender_id, recipient_id, recipient.public_bytes())
-                .expect("encrypt transfer");
+        let transfer = MasterKeyTransfer::encrypt(
+            3,
+            &key,
+            sender_id,
+            &sender,
+            recipient_id,
+            recipient.public_bytes(),
+        )
+        .expect("encrypt transfer");
 
         let decrypted = transfer
-            .decrypt(recipient_id, &recipient)
+            .decrypt(recipient_id, &recipient, sender_id, sender.public_bytes())
             .expect("decrypt transfer");
 
         assert_eq!(key.as_bytes(), decrypted.as_bytes());
+    }
+
+    #[test]
+    fn master_key_transfer_rejects_wrong_sender_noise_key() {
+        let sender_id = Uuid::new_v4();
+        let recipient_id = Uuid::new_v4();
+        let sender = NoiseKeys::from_private_bytes([3u8; 32]);
+        let wrong_sender = NoiseKeys::from_private_bytes([4u8; 32]);
+        let recipient = NoiseKeys::from_private_bytes([7u8; 32]);
+        let key = MasterKeyPlaintext::generate().expect("key");
+        let transfer = MasterKeyTransfer::encrypt(
+            3,
+            &key,
+            sender_id,
+            &sender,
+            recipient_id,
+            recipient.public_bytes(),
+        )
+        .expect("encrypt transfer");
+
+        assert!(
+            transfer
+                .decrypt(
+                    recipient_id,
+                    &recipient,
+                    sender_id,
+                    wrong_sender.public_bytes()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn passphrase_provider_rejects_excessive_kdf_params() {
+        let node_id = Uuid::new_v4();
+        let passphrase =
+            SecretPassphrase::new(b"correct horse battery staple".to_vec()).expect("passphrase");
+        let provider = PassphraseMasterKeyProtector::new(passphrase, node_id);
+        let key = MasterKeyPlaintext::generate().expect("key");
+        let mut wrapped = provider.wrap(1, &key).expect("wrap");
+        let salt = [1u8; PASSPHRASE_SALT_SIZE];
+        wrapped.provider_metadata = encode_passphrase_metadata(
+            &salt,
+            PassphraseKdfParams {
+                memory_cost_kib: MAX_ARGON2_MEMORY_COST_KIB + 1,
+                time_cost: 1,
+                parallelism: 1,
+            },
+        )
+        .expect("metadata");
+
+        assert!(provider.unwrap(&wrapped).is_err());
     }
 }

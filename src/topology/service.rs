@@ -279,6 +279,8 @@ impl Topology {
     async fn install_master_key_from_anchor(
         &self,
         session: cluster_session::Client,
+        anchor_node_id: Uuid,
+        anchor_noise_static_pub: [u8; 32],
     ) -> Result<(), Error> {
         let request = session.get_secrets_request();
         let response = request.send().promise.await?;
@@ -294,7 +296,12 @@ impl Topology {
         let transfer = read_master_key_transfer(mk_response.get()?.get_envelope()?)?;
         let noise_keys = self.deps.registry.noise_keys();
         let plaintext = transfer
-            .decrypt(self.local.node.id, noise_keys.as_ref())
+            .decrypt(
+                self.local.node.id,
+                noise_keys.as_ref(),
+                anchor_node_id,
+                anchor_noise_static_pub,
+            )
             .map_err(|e| Error::failed(format!("failed to decrypt master key transfer: {e}")))?;
         let record = MasterKeyRecord::new(transfer.version, plaintext)
             .map_err(|e| Error::failed(format!("invalid master key payload: {e}")))?;
@@ -425,8 +432,12 @@ impl topology::Server for Topology {
         )
         .await?;
 
-        self.install_master_key_from_anchor(response.session.clone())
-            .await?;
+        self.install_master_key_from_anchor(
+            response.session.clone(),
+            response.peer_id,
+            response.peer_value.noise_static_pub,
+        )
+        .await?;
 
         ClusterCredential::from_bytes_verified(&response.credential).map_err(Error::failed)?;
 
