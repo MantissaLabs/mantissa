@@ -361,8 +361,10 @@ maintenance knob without rewriting the workload spec.
 - `crates/mantissa-store/src/mst_store.rs`
 - `src/services/slot_reconcile.rs`
 - `src/workload/manager/state.rs`
-- `crates/mantissa-client/src/node/drain.rs`
-- `crates/mantissa-client/src/node/status.rs`
+- `crates/mantissa-client/src/nodes/drain.rs`
+- `crates/mantissa-client/src/nodes/status.rs`
+- `crates/mantissa-cli/src/nodes/drain.rs`
+- `crates/mantissa-cli/src/nodes/status.rs`
 
 ## Related Documents
 

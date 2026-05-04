@@ -11,21 +11,15 @@ workspace = true
 anyhow = "1"
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
-capnp-futures = { workspace = true }
-crossterm = "0.28.1"
 futures = "0.3.31"
 mantissa-protocol = { path = "../mantissa-protocol" }
 mantissa-net = { path = "../mantissa-net" }
-mantissa-ui = { path = "../mantissa-ui" }
-tabwriter = "1"
 tokio = { version = "1", features = ["io-util", "net", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
 ron = "0.10.1"
 blake3 = "1"
-base64 = "0.22.1"
-parking_lot = { workspace = true }
 
 [features]
 default = []

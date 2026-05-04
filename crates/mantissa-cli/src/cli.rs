@@ -1,4 +1,3 @@
-// src/cli.rs
 use crate::tasks::{TasksListOutput, TasksListState};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;

@@ -294,7 +294,8 @@ If you need to work on jobs, this is the shortest useful map:
 | Job reconciliation | [src/jobs/manager.rs](/Users/abronan/hack/mantissa/src/jobs/manager.rs) |
 | Client submit path | [crates/mantissa-client/src/jobs/run.rs](/Users/abronan/hack/mantissa/crates/mantissa-client/src/jobs/run.rs) |
 | Client manifest parser | [crates/mantissa-client/src/jobs/manifest.rs](/Users/abronan/hack/mantissa/crates/mantissa-client/src/jobs/manifest.rs) |
-| Client inspect/list rendering | [crates/mantissa-client/src/jobs/snapshot.rs](/Users/abronan/hack/mantissa/crates/mantissa-client/src/jobs/snapshot.rs) |
+| Client inspect/list data | [crates/mantissa-client/src/jobs/snapshot.rs](/Users/abronan/hack/mantissa/crates/mantissa-client/src/jobs/snapshot.rs) |
+| CLI inspect/list rendering | [crates/mantissa-cli/src/jobs/snapshot.rs](/Users/abronan/hack/mantissa/crates/mantissa-cli/src/jobs/snapshot.rs) |
 | Shared workload layer | [src/workload](/Users/abronan/hack/mantissa/src/workload) |
 | Integration coverage | [tests/jobs.rs](/Users/abronan/hack/mantissa/tests/jobs.rs) |
 

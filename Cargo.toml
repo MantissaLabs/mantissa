@@ -51,9 +51,7 @@ mantissa-protocol = { path = "crates/mantissa-protocol" }
 mantissa-net = { path = "crates/mantissa-net" }
 mantissa-client = { path = "crates/mantissa-client" }
 mantissa-health = { path = "crates/mantissa-health" }
-clap = { version = "4.5.45", features = ["derive", "cargo"] }
 chrono = { version = "0.4", features = ["serde"] }
-tabwriter = "1"
 async-trait = "0.1.88"
 thiserror = "2.0.12"
 async-channel = "2.5.0"

@@ -6,12 +6,12 @@ use crossterm::{
     terminal::{Clear, ClearType},
 };
 use mantissa_client::config::ClientConfig;
+use mantissa_client::services::ServiceDeploymentHandle;
 use mantissa_client::services::list::{
     ServiceRolloutPhaseRow, ServiceRolloutRow, ServiceRow, ServiceStatusRow,
     ServiceTaskProgressRow, fetch_service_row_by_id,
 };
 use mantissa_client::services::manifest::ServiceManifest;
-use mantissa_client::services::{ServiceDeployOutcome, ServiceDeploymentHandle, deploy_manifest};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, IsTerminal, Write as IoWrite};
 use std::time::Duration;
@@ -26,52 +26,8 @@ const SERVICE_DEPLOYMENT_SPINNER_INTERVAL: Duration = Duration::from_millis(100)
 /// Width of the ASCII progress bar shown in service deployment progress output.
 const PROGRESS_BAR_WIDTH: usize = 12;
 
-/// Options accepted by the high-level `mantissa services run` client flow.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ServiceRunOptions {
-    pub detach: bool,
-    pub timeout: Option<Duration>,
-}
-
-/// Submits one service manifest and either follows deployment progress or returns immediately.
-pub async fn run_manifest(
-    cfg: &ClientConfig,
-    manifest: &ServiceManifest,
-    options: ServiceRunOptions,
-) -> Result<()> {
-    let handle = deploy_manifest(cfg, manifest).await?;
-
-    if options.detach {
-        output::emit_line(handle.service_id.to_string());
-        return Ok(());
-    }
-
-    match handle.outcome {
-        ServiceDeployOutcome::Accepted => {
-            output::emit_line(format!(
-                "service {} accepted (id {})",
-                manifest.name, handle.service_id
-            ));
-            output::emit_line("tracking deployment (use --detach to return after submission)");
-            output::emit_line("");
-            follow_deployment(cfg, manifest, &handle, options.timeout).await
-        }
-        ServiceDeployOutcome::Unchanged => {
-            let detail = handle
-                .detail
-                .as_deref()
-                .unwrap_or("already deployed at desired spec");
-            output::emit_line(format!(
-                "service '{}' unchanged (id {}): {detail}",
-                manifest.name, handle.service_id
-            ));
-            Ok(())
-        }
-    }
-}
-
 /// Polls the targeted service status RPC until the submitted deployment reaches a terminal result.
-async fn follow_deployment(
+pub(super) async fn follow_deployment(
     cfg: &ClientConfig,
     manifest: &ServiceManifest,
     handle: &ServiceDeploymentHandle,
@@ -573,6 +529,7 @@ fn spinner_frame(index: usize) -> char {
 mod tests {
     use super::super::list::TaskTemplateRow;
     use super::*;
+    use mantissa_client::services::ServiceDeployOutcome;
     use uuid::Uuid;
 
     /// Builds a minimal service row for follow classification and rendering tests.
