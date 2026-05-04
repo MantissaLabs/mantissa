@@ -653,8 +653,12 @@ impl secrets::Server for SecretsService {
             }
         }
 
+        // Exporting a master key is a cluster-forming decision. The store
+        // finalizes any local bootstrap key before returning it so this node
+        // cannot act as an anchor for one peer and then adopt a different
+        // same-version key from another anchor.
         let record = store
-            .current()
+            .current_for_transfer()
             .map_err(|e| Error::failed(format!("failed to load master key: {e}")))?;
         let transfer = MasterKeyTransfer::encrypt(
             record.version,

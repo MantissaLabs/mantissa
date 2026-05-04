@@ -2,6 +2,7 @@ use crate::secrets::master_key_protector::{
     MasterKeyPlaintext, MasterKeyProtectorHandle, WrappedMasterKeyRecord,
 };
 use crate::store::tx::{into_io, with_read_tx, with_write_tx};
+use parking_lot::{Mutex, MutexGuard};
 use redb::{Database, TableDefinition};
 use std::cmp::Ordering;
 use std::{io, sync::Arc};
@@ -40,6 +41,13 @@ impl MasterKeyRecord {
 pub struct SecretMasterStore {
     db: Arc<Database>,
     protector: MasterKeyProtectorHandle,
+    // Serializes the local cluster-key decision. A fresh node starts with a
+    // temporary v1 key so secrets can work before it joins. The first cluster
+    // action must choose one outcome: adopt an anchor key, serve its own key as
+    // an anchor, or rotate. Without this lock, node 1 could serve its temporary
+    // key to node 3 while concurrently joining node 2 and adopting node 2's
+    // key, leaving node 3 in a different secret domain.
+    policy_lock: Arc<Mutex<()>>,
 }
 
 impl SecretMasterStore {
@@ -51,11 +59,16 @@ impl SecretMasterStore {
             Ok(())
         })?;
 
-        Ok(Self { db, protector })
+        Ok(Self {
+            db,
+            protector,
+            policy_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     /// Ensures a current wrapped master key exists, generating and persisting one when missing.
     pub fn ensure_current(&self) -> io::Result<MasterKeyRecord> {
+        let _guard = self.policy_guard();
         if let Some(existing) = self.load_current()? {
             return Ok(existing);
         }
@@ -96,12 +109,27 @@ impl SecretMasterStore {
         self.import_current_with_policy(record, true)
     }
 
+    /// Returns the current master key and commits it as a cluster key before exporting it.
+    ///
+    /// Serving a transfer makes this node an anchor for the recipient. If the
+    /// current key is still the local bootstrap key, that key stops being
+    /// replaceable before the transfer is encrypted. This intentionally makes
+    /// concurrent "join another anchor" attempts fail instead of allowing this
+    /// node to give one peer key A and then silently switch itself to key B.
+    pub fn current_for_transfer(&self) -> io::Result<MasterKeyRecord> {
+        let _guard = self.policy_guard();
+        let current = self.current()?;
+        self.set_bootstrap_pending(false)?;
+        Ok(current)
+    }
+
     /// Imports an external master key while enforcing version and replay policy.
     fn import_current_with_policy(
         &self,
         record: &MasterKeyRecord,
         allow_bootstrap_replacement: bool,
     ) -> io::Result<()> {
+        let _guard = self.policy_guard();
         if let Some(current_version) = self.current_version()? {
             match record.version.cmp(&current_version) {
                 Ordering::Less => {
@@ -143,9 +171,14 @@ impl SecretMasterStore {
 
     /// Generates, persists, and returns a rotated master key with the next sequential version.
     pub fn rotate(&self) -> io::Result<MasterKeyRecord> {
+        let _guard = self.policy_guard();
         let current_version = match self.current_version()? {
             Some(v) => v,
-            None => return self.ensure_current(),
+            None => {
+                let generated = MasterKeyPlaintext::generate()?;
+                self.persist_new_version(1, &generated, true)?;
+                return MasterKeyRecord::new(1, generated);
+            }
         };
 
         let next_version = current_version
@@ -154,6 +187,16 @@ impl SecretMasterStore {
         let new_key = MasterKeyPlaintext::generate()?;
         self.persist_new_version(next_version, &new_key, false)?;
         MasterKeyRecord::new(next_version, new_key)
+    }
+
+    /// Locks local master-key policy changes so adoption, serving, and rotation cannot race.
+    ///
+    /// Redb transactions keep each individual write atomic, but the policy
+    /// decision spans reads, unwraps, comparisons, and writes. Holding this
+    /// process-local lock makes those multi-step decisions mutually exclusive
+    /// for the single daemon instance that owns the local state directory.
+    fn policy_guard(&self) -> MutexGuard<'_, ()> {
+        self.policy_lock.lock()
     }
 
     /// Loads the currently active master key record if one has been persisted.
@@ -216,7 +259,7 @@ impl SecretMasterStore {
             };
             Ok(Some(raw.value() == META_TRUE))
         })
-        .map(|marker| marker.unwrap_or(true))
+        .map(|marker| marker.unwrap_or(false))
     }
 
     /// Updates whether the current local key is still a replaceable bootstrap key.
@@ -381,6 +424,29 @@ mod tests {
         let err = store
             .import_join_current(&other)
             .expect_err("adopted cluster key must not be replaced again");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn transfer_export_commits_the_initial_bootstrap_key() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let db = Arc::new(Database::create(db_path).unwrap());
+        let store = SecretMasterStore::new(db, test_protector()).expect("open store");
+
+        let bootstrap = store.ensure_current().expect("ensure master key");
+        let exported = store.current_for_transfer().expect("export current key");
+        assert_eq!(exported.version, bootstrap.version);
+        assert_eq!(exported.key, bootstrap.key);
+
+        let anchor = MasterKeyRecord::new(
+            bootstrap.version,
+            MasterKeyPlaintext::generate().expect("anchor key"),
+        )
+        .expect("anchor record");
+        let err = store
+            .import_join_current(&anchor)
+            .expect_err("served bootstrap key must be committed");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
