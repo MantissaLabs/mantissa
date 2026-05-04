@@ -13,7 +13,7 @@ use crate::{
     registry::Registry,
     runtime::set::RuntimeSet,
     scheduler::Scheduler,
-    secrets::master_key_protector::SecretPassphrase,
+    secrets::master_key_protector::{PassphraseKdfParams, SecretPassphrase},
     server::{
         RunHandles, Server,
         bootstrap::{BootedRuntime, BootstrapContext, BootstrapOptions, RuntimeTaskHandles, boot},
@@ -217,6 +217,9 @@ impl HeadlessNode {
             master_key_passphrase: Some(SecretPassphrase::new(
                 b"mantissa-headless-master-key-passphrase".to_vec(),
             )?),
+            // Headless nodes still exercise the real master-key envelope and transfer
+            // code paths, but avoid production Argon2 cost in broad integration tests.
+            master_key_kdf_params: PassphraseKdfParams::test(),
         };
 
         let BootedRuntime {

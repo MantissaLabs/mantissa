@@ -20,7 +20,7 @@ use crate::scheduler::digest::{
     SchedulerDigestPublisher, SchedulerDigestRegistry, SchedulerDigestReplicator,
 };
 use crate::scheduler::service::SchedulerService;
-use crate::secrets::master_key_protector::SecretPassphrase;
+use crate::secrets::master_key_protector::{PassphraseKdfParams, SecretPassphrase};
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
@@ -75,6 +75,11 @@ pub struct BootstrapOptions {
     pub gossip_tick: Option<Duration>,
     pub advertise_override: Option<String>,
     pub master_key_passphrase: Option<SecretPassphrase>,
+    /// KDF cost for passphrase-backed master-key envelopes.
+    ///
+    /// Production uses the hardened default; headless tests lower only this
+    /// cost while preserving the same envelope and transfer behavior.
+    pub master_key_kdf_params: PassphraseKdfParams,
 }
 
 impl Default for BootstrapOptions {
@@ -94,6 +99,7 @@ impl Default for BootstrapOptions {
             gossip_tick: None,
             advertise_override: None,
             master_key_passphrase: None,
+            master_key_kdf_params: PassphraseKdfParams::production(),
         }
     }
 }
