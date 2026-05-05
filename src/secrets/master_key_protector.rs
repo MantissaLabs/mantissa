@@ -120,7 +120,7 @@ impl fmt::Debug for MasterKeyPlaintext {
 }
 
 /// Public metadata that uniquely identifies one secret master key.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct MasterKeyDescriptor {
     pub key_id: Uuid,
     pub generation: u64,
@@ -489,7 +489,7 @@ impl PassphraseMasterKeyProtector {
 }
 
 /// Encrypted master key transfer between trusted nodes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct MasterKeyTransfer {
     pub descriptor: MasterKeyDescriptor,
     pub sender_node_id: Uuid,

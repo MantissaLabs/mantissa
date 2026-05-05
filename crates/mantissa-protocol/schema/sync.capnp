@@ -65,6 +65,9 @@ enum Domain {
 
   schedulerDigests @10;
   # Compact per-node scheduler digest domain.
+
+  secretMasterKeys @13;
+  # Per-recipient encrypted secret master-key grants and activation metadata.
 }
 
 struct PageRange {

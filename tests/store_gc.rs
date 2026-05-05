@@ -6,6 +6,7 @@ use mantissa::agents::types::{
     AgentCheckpointPolicy, AgentInteractionPolicy, AgentRecordValue, AgentSessionSpecValue,
     AgentSessionStatus, AgentToolPolicy, AgentWorkspacePolicy,
 };
+use mantissa::cluster::ClusterViewId;
 use mantissa::config::{
     Config, ConfigSource, global_config, global_config_source, set_global_config_with_source,
 };
@@ -23,6 +24,9 @@ use mantissa::store::network_store::{
     NetworkAttachmentRegAdapter, NetworkPeerRegAdapter, NetworkSpecRegAdapter,
 };
 use mantissa::store::scheduler_digest_store::{SchedulerDigestStore, open_scheduler_digest_store};
+use mantissa::store::secret_master_key_store::{
+    SecretMasterKeyCurrent, SecretMasterKeyRegAdapter, SecretMasterKeySyncRecord,
+};
 use mantissa::store::secret_store::SecretRegAdapter;
 use mantissa::store::volume_store::{VolumeNodeRegAdapter, VolumeSpecRegAdapter};
 use mantissa::store::workload_store::{WorkloadRegAdapter, WorkloadStore, open_workload_store};
@@ -335,6 +339,17 @@ fn secret_value(name: &str, version: u8) -> SecretValue {
     );
     value.touch(format!("2026-04-27T00:08:{version:02}Z"));
     value
+}
+
+/// Builds one current master-key sync row whose rank advances with generation.
+fn secret_master_key_current_value(key_id: Uuid, generation: u64) -> SecretMasterKeySyncRecord {
+    SecretMasterKeySyncRecord::Current(SecretMasterKeyCurrent {
+        scope_view: ClusterViewId::legacy_default(),
+        key_id,
+        generation,
+        created_by_operation_id: None,
+        parent_key_ids: Vec::new(),
+    })
 }
 
 /// Builds one volume spec value whose phase ordering advances with `version`.
@@ -750,6 +765,19 @@ local_test!(store_compaction_rankers_cover_all_replicated_domains, {
         secret_value("gc-secret", 2),
         |retained: SecretValue| {
             assert_eq!(retained.current_version.master_key_generation, 2);
+        }
+    );
+
+    let master_key_id = Uuid::from_u128(50_011);
+    assert_compacts_to_one_value!(
+        SecretMasterKeyRegAdapter,
+        secret_master_key_current_value(master_key_id, 1),
+        secret_master_key_current_value(master_key_id, 2),
+        |retained: SecretMasterKeySyncRecord| {
+            let SecretMasterKeySyncRecord::Current(current) = retained else {
+                panic!("secret master-key compaction should retain a current row");
+            };
+            assert_eq!(current.generation, 2);
         }
     );
 

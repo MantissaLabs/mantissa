@@ -21,6 +21,7 @@ use crate::store::network_store::{
 use crate::store::peer_store::{PeersStore, open_peers_store};
 use crate::store::scheduler_digest_store::{SchedulerDigestStore, open_scheduler_digest_store};
 use crate::store::scheduler_store::{SchedulerStore, open_scheduler_store};
+use crate::store::secret_master_key_store::{SecretMasterKeyStore, open_secret_master_key_store};
 use crate::store::secret_store::{SecretStore, open_secret_store};
 use crate::store::service_store::{ServiceStore, open_service_store};
 use crate::store::volume_store::{
@@ -60,6 +61,7 @@ pub struct BootstrapStores {
     pub scheduler_digests: SchedulerDigestStore,
     pub services: ServiceStore,
     pub secrets: SecretStore,
+    pub secret_master_keys: SecretMasterKeyStore,
     pub networks: NetworkSpecStore,
     pub network_peers: NetworkPeerStore,
     pub network_attachments: NetworkAttachmentStore,
@@ -140,6 +142,9 @@ impl BootstrapStores {
         let secrets = open_secret_store(ctx.db.clone(), ctx.self_id)?;
         secrets.rebuild_mst_from_disk().await?;
 
+        let secret_master_keys = open_secret_master_key_store(ctx.db.clone(), ctx.self_id)?;
+        secret_master_keys.rebuild_mst_from_disk().await?;
+
         let networks = open_network_spec_store(ctx.db.clone(), ctx.self_id)?;
         networks.rebuild_mst_from_disk().await?;
 
@@ -171,6 +176,7 @@ impl BootstrapStores {
             scheduler_digests,
             services,
             secrets,
+            secret_master_keys,
             networks,
             network_peers,
             network_attachments,

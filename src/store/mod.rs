@@ -12,6 +12,7 @@ pub mod peer_store;
 pub mod registry;
 pub mod scheduler_digest_store;
 pub mod scheduler_store;
+pub mod secret_master_key_store;
 pub mod secret_store;
 pub mod service_store;
 mod tx;

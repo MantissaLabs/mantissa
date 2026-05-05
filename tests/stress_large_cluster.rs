@@ -1250,6 +1250,7 @@ fn domain_label(domain: Domain) -> &'static str {
         Domain::Jobs => "jobs",
         Domain::Agents => "agents",
         Domain::Secrets => "secrets",
+        Domain::SecretMasterKeys => "secret_master_keys",
         Domain::Networks => "networks",
         Domain::NetworkPeers => "network_peers",
         Domain::NetworkAttachments => "network_attachments",

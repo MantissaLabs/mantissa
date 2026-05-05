@@ -11,6 +11,7 @@ use crate::store::job_store::JobStore;
 use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
 use crate::store::peer_store::PeersStore;
 use crate::store::scheduler_digest_store::SchedulerDigestStore;
+use crate::store::secret_master_key_store::SecretMasterKeyStore;
 use crate::store::secret_store::SecretStore;
 use crate::store::service_store::ServiceStore;
 use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
@@ -52,7 +53,7 @@ type DecodedRegisters<C> = Registers<UuidKey, <C as RegAdapter>::Reg>;
 type DecodedDelta<C> = (DecodedRegisters<C>, Tombstones<UuidKey>);
 
 /// Canonical full-sync domain set shared by all replicated-store callers.
-pub const REPLICATED_DOMAINS: [Domain; 13] = [
+pub const REPLICATED_DOMAINS: [Domain; 14] = [
     Domain::Peers,
     Domain::Workloads,
     Domain::Services,
@@ -66,6 +67,7 @@ pub const REPLICATED_DOMAINS: [Domain; 13] = [
     Domain::Volumes,
     Domain::VolumeNodes,
     Domain::SchedulerDigests,
+    Domain::SecretMasterKeys,
 ];
 
 /// Returns the debug label associated with one replicated sync domain.
@@ -77,6 +79,7 @@ pub fn domain_label(domain: Domain) -> &'static str {
         Domain::Jobs => "jobs",
         Domain::Agents => "agents",
         Domain::Secrets => "secrets",
+        Domain::SecretMasterKeys => "secret master keys",
         Domain::Networks => "networks",
         Domain::NetworkPeers => "network peers",
         Domain::NetworkAttachments => "network attachments",
@@ -103,6 +106,7 @@ pub fn domain_key(domain: Domain) -> u16 {
         Domain::Volumes => 10,
         Domain::VolumeNodes => 11,
         Domain::SchedulerDigests => 12,
+        Domain::SecretMasterKeys => 13,
     }
 }
 
@@ -426,6 +430,7 @@ pub fn replicated_store_registry(stores: ReplicatedStoreHandles) -> ReplicatedSt
         ReplicatedStoreEntry::new(Domain::Volumes, stores.volumes),
         ReplicatedStoreEntry::new(Domain::VolumeNodes, stores.volume_nodes),
         ReplicatedStoreEntry::new(Domain::SchedulerDigests, stores.scheduler_digests),
+        ReplicatedStoreEntry::new(Domain::SecretMasterKeys, stores.secret_master_keys),
     ])
 }
 
@@ -437,6 +442,7 @@ pub struct ReplicatedStoreHandles {
     pub jobs: JobStore,
     pub agents: AgentStore,
     pub secrets: SecretStore,
+    pub secret_master_keys: SecretMasterKeyStore,
     pub networks: NetworkSpecStore,
     pub network_peers: NetworkPeerStore,
     pub network_attachments: NetworkAttachmentStore,

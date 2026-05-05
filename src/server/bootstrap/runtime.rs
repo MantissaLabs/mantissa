@@ -707,6 +707,7 @@ fn build_sync_stores(stores: &BootstrapStores) -> SyncStores {
         jobs: stores.jobs.clone(),
         agents: stores.agents.clone(),
         secrets: stores.secrets.clone(),
+        secret_master_keys: stores.secret_master_keys.clone(),
         networks: stores.networks.clone(),
         network_peers: stores.network_peers.clone(),
         network_attachments: stores.network_attachments.clone(),

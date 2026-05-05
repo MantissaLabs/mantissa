@@ -183,6 +183,62 @@ struct SecretMasterKeyTransfer {
   # 32-byte X25519 static public key used to authenticate the sender.
 }
 
+struct SecretMasterKeyGrant {
+  descriptor @0 :MasterKeyDescriptor;
+  # Metadata for the granted master key. Contains no key material.
+
+  senderNodeId @1 :Data;
+  # 16-byte node UUID that encrypted the grant.
+
+  recipientNodeId @2 :Data;
+  # 16-byte node UUID allowed to decrypt the grant.
+
+  transferPublicKey @3 :Data;
+  # 32-byte ephemeral X25519 public key used for this grant.
+
+  recipientNoiseStaticPub @4 :Data;
+  # 32-byte X25519 static public key the grant was encrypted to.
+
+  nonce @5 :Data;
+  # 24-byte XChaCha20-Poly1305 nonce.
+
+  ciphertext @6 :Data;
+  # Encrypted 32-byte master key payload including the Poly1305 tag.
+
+  senderNoiseStaticPub @7 :Data;
+  # 32-byte X25519 static public key used to authenticate the sender.
+}
+
+struct SecretMasterKeyCurrent {
+  scopeView @0 :ClusterViewId;
+  # Cluster view for which this key is current.
+
+  keyId @1 :Data;
+  # 16-byte UUID of the current key for the scope.
+
+  generation @2 :UInt64;
+  # Descriptor generation copied here for compact deterministic selection.
+
+  createdByOperationId @3 :Data;
+  # 16-byte split/merge/rotation operation UUID, empty when not applicable.
+
+  parentKeyIds @4 :List(Data);
+  # Parent master-key ids this current pointer supersedes.
+}
+
+struct SecretMasterKeySyncRecord {
+  union {
+    descriptor @0 :MasterKeyDescriptor;
+    # Public metadata for one master key id.
+
+    grant @1 :SecretMasterKeyGrant;
+    # Recipient-specific encrypted key material.
+
+    current @2 :SecretMasterKeyCurrent;
+    # Current-key pointer for one cluster view scope.
+  }
+}
+
 struct WrappedSecretMasterKey {
   schemaVersion @0 :UInt16;
   # Durable envelope schema version.
