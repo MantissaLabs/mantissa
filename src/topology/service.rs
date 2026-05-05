@@ -10,10 +10,14 @@ use crate::config;
 use crate::node::address::extract_port;
 use crate::node::id::read_node_id;
 use crate::runtime::types::RuntimeSupportProfile;
-use crate::secrets::service::read_master_key_transfer;
+use crate::secrets::master_key_reconciler::SecretMasterKeyReconciler;
+use crate::secrets::master_key_sync::SecretMasterKeyGrantRecipient;
 use crate::server::credential::ClusterCredential;
-use crate::store::local::{LocalCredentialStore, LocalSessionStore, MasterKeyRecord};
+use crate::store::local::{LocalCredentialStore, LocalSessionStore};
 use crate::store::peer_store::PeersStore;
+use crate::store::secret_master_key_store::{
+    SecretMasterKeyCurrent, SecretMasterKeySyncRecord, current_for_scope, current_row_id,
+};
 use crate::sync::SyncTraceContext;
 use crate::topology::health::status_to_node_status;
 use crate::topology::peers::{
@@ -23,6 +27,7 @@ use crate::topology::peers::{
 use capnp::Error;
 use ed25519_dalek::VerifyingKey;
 use mantissa_protocol::server::{self, cluster_session};
+use mantissa_protocol::sync::{Domain, sync as sync_capnp};
 use mantissa_protocol::topology::{topology, topology_event};
 use mantissa_store::uuid_key::UuidKey;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -275,56 +280,126 @@ impl Topology {
         Ok(())
     }
 
-    /// Retrieves and installs the cluster master key transfer returned by the anchor during join.
-    async fn install_master_key_from_anchor(
+    /// Publishes replicated master-key rows for a node accepted by this anchor.
+    pub(crate) async fn publish_master_key_grants_for_joiner(
         &self,
-        session: cluster_session::Client,
-        anchor_node_id: Uuid,
-        anchor_noise_static_pub: [u8; 32],
+        joiner_id: Uuid,
+        joiner_noise_static_pub: [u8; 32],
     ) -> Result<(), Error> {
-        let request = session.get_secrets_request();
-        let response = request.send().promise.await?;
-        let secrets_client = response.get()?.get_secrets()?;
+        let recipient = SecretMasterKeyGrantRecipient {
+            node_id: joiner_id,
+            noise_static_pub: joiner_noise_static_pub,
+        };
 
-        let mut mk_request = secrets_client.get_master_key_transfer_request();
-        {
-            let mut inner = mk_request.get().init_request();
-            inner.set_recipient_node_id(self.local.node.id.as_bytes());
-            inner.set_recipient_noise_static_pub(self.local.public_key.as_bytes());
-        }
-        let mk_response = mk_request.send().promise.await?;
-        let transfer = read_master_key_transfer(mk_response.get()?.get_envelope()?)?;
-        let noise_keys = self.deps.registry.noise_keys();
-        let plaintext = transfer
-            .decrypt(
-                self.local.node.id,
-                noise_keys.as_ref(),
-                anchor_node_id,
-                anchor_noise_static_pub,
-            )
-            .map_err(|e| Error::failed(format!("failed to decrypt master key transfer: {e}")))?;
-        let record = MasterKeyRecord::new(transfer.descriptor.clone(), plaintext)
-            .map_err(|e| Error::failed(format!("invalid master key payload: {e}")))?;
-
-        {
-            let guard = self.stores.secret_keyring.write().await;
-            self.stores
-                .secret_master_store
-                .import_join_current(&record)
-                .map_err(|e| Error::failed(format!("failed to persist master key: {e}")))?;
-            guard.install_current(&record);
-        }
-
+        // Keep the keyring read lock until the current row and grants are durable. Otherwise a
+        // rotation or replicated-current adoption could switch the local current key between
+        // "which key did this anchor grant?" and "which current key did the joiner sync?".
+        let keyring = self.stores.secret_keyring.read().await;
+        let current = keyring
+            .current_record()
+            .map_err(|err| Error::failed(format!("load active master key: {err}")))?;
+        self.stores
+            .secret_master_store
+            .commit_current_for_replication(current.key_id())
+            .map_err(|err| Error::failed(format!("commit join master key grant: {err}")))?;
+        let records = self
+            .stores
+            .secret_master_store
+            .load_all_keys()
+            .map_err(|err| Error::failed(format!("load local master keys: {err}")))?;
         self.stores
             .secret_master_key_publisher
-            .publish_transfer(transfer)
+            .publish_current_with_key_grants(&current, &records, &[recipient])
             .await
-            .map_err(|e| {
-                Error::failed(format!(
-                    "failed to persist replicated master key transfer: {e}"
-                ))
-            })?;
+            .map_err(|err| Error::failed(format!("publish join master-key grants: {err}")))?;
+        Ok(())
+    }
 
+    /// Synchronizes and adopts the anchor's replicated master-key current before join returns.
+    async fn sync_master_keys_from_anchor(
+        &self,
+        sync_cap: sync_capnp::Client,
+        root_schema_version: u32,
+        anchor_node_id: Uuid,
+        anchor_addr: String,
+    ) -> Result<(), Error> {
+        let cluster_view = self.active_cluster_view();
+        let trace = SyncTraceContext::peer(anchor_node_id, anchor_addr, "join-master-key");
+        self.deps
+            .sync
+            .sync_selected_domains(
+                sync_cap,
+                cluster_view,
+                root_schema_version,
+                &[Domain::SecretMasterKeys],
+                Some(trace),
+            )
+            .await;
+
+        let reconciler = SecretMasterKeyReconciler::new(
+            self.local.node.id,
+            self.deps.registry.noise_keys(),
+            self.deps.registry.clone(),
+            self.stores.secret_master_keys.clone(),
+            self.stores.secret_master_store.clone(),
+            self.stores.secret_keyring.clone(),
+            self.local.cluster_view.clone(),
+        );
+        let report = reconciler
+            .reconcile_active_view()
+            .await
+            .map_err(|err| Error::failed(format!("reconcile joined master key: {err:#}")))?;
+        if report.current_waiting_for_descriptor || report.current_waiting_for_key {
+            return Err(Error::failed(
+                "joined master key is not yet available from replicated grants".into(),
+            ));
+        }
+
+        let replicated_current = current_for_scope(&self.stores.secret_master_keys, cluster_view)
+            .map_err(|err| Error::failed(format!("load replicated master-key current: {err}")))?
+            .ok_or_else(|| Error::failed("anchor did not publish a master-key current".into()))?;
+        self.ensure_join_current_is_unambiguous(cluster_view, &replicated_current)?;
+        let local_current = self
+            .stores
+            .secret_master_store
+            .current()
+            .map_err(|err| Error::failed(format!("load local master key: {err}")))?;
+        if local_current.key_id() != replicated_current.key_id {
+            return Err(Error::failed(format!(
+                "joined master key {} was not adopted locally",
+                replicated_current.key_id
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Rejects a join when independent current rows are visible for the joined view.
+    fn ensure_join_current_is_unambiguous(
+        &self,
+        cluster_view: ClusterViewId,
+        adopted: &SecretMasterKeyCurrent,
+    ) -> Result<(), Error> {
+        let snapshot = self
+            .stores
+            .secret_master_keys
+            .get_snapshot(&UuidKey::from(current_row_id(cluster_view)))
+            .map_err(|err| Error::failed(format!("load joined master-key currents: {err}")))?;
+        let Some(snapshot) = snapshot else {
+            return Ok(());
+        };
+
+        for record in snapshot.as_slice() {
+            let SecretMasterKeySyncRecord::Current(candidate) = record else {
+                continue;
+            };
+            if join_current_conflicts(candidate, adopted) {
+                return Err(Error::failed(format!(
+                    "conflicting master-key current {} observed while joining {}",
+                    candidate.key_id, cluster_view
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -375,6 +450,33 @@ impl Topology {
             }
         }
     }
+}
+
+/// Returns true when two current rows represent unrelated key identities for join.
+fn join_current_conflicts(
+    candidate: &SecretMasterKeyCurrent,
+    adopted: &SecretMasterKeyCurrent,
+) -> bool {
+    if candidate.key_id == adopted.key_id {
+        return false;
+    }
+    if candidate.created_by_operation_id.is_some() || adopted.created_by_operation_id.is_some() {
+        return false;
+    }
+    !join_currents_share_lineage(candidate, adopted)
+}
+
+/// Checks lineage only from the metadata embedded in the visible current rows.
+fn join_currents_share_lineage(
+    left: &SecretMasterKeyCurrent,
+    right: &SecretMasterKeyCurrent,
+) -> bool {
+    left.parent_key_ids.contains(&right.key_id)
+        || right.parent_key_ids.contains(&left.key_id)
+        || left
+            .parent_key_ids
+            .iter()
+            .any(|parent| right.parent_key_ids.contains(parent))
 }
 
 impl topology::Server for Topology {
@@ -441,13 +543,6 @@ impl topology::Server for Topology {
         )
         .await?;
 
-        self.install_master_key_from_anchor(
-            response.session.clone(),
-            response.peer_id,
-            response.peer_value.noise_static_pub,
-        )
-        .await?;
-
         ClusterCredential::from_bytes_verified(&response.credential).map_err(Error::failed)?;
 
         self.swim_record_join(response.peer_id, response.peer_incarnation);
@@ -460,6 +555,14 @@ impl topology::Server for Topology {
             let resp = req.send().promise.await?;
             resp.get()?.get_sync()?
         };
+
+        self.sync_master_keys_from_anchor(
+            sync_cap.clone(),
+            root_schema_version,
+            response.peer_id,
+            response.peer_value.address.clone(),
+        )
+        .await?;
 
         let sync_trace = SyncTraceContext::peer(
             response.peer_id,
@@ -1357,8 +1460,10 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
 
 #[cfg(test)]
 mod tests {
-    use super::restored_local_peer_value;
+    use super::{join_current_conflicts, restored_local_peer_value};
+    use crate::cluster::ClusterViewId;
     use crate::runtime::types::RuntimeSupportProfile;
+    use crate::store::secret_master_key_store::SecretMasterKeyCurrent;
     use crate::topology::peers::{
         PeerLabel, PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue,
         WireGuardPeerValue,
@@ -1394,6 +1499,39 @@ mod tests {
             root_schema: crate::cluster::RootSchemaInfo::default(),
             membership: PeerMembership::active(10),
         }
+    }
+
+    /// Build one synthetic master-key current row for join conflict tests.
+    fn master_key_current(key_id: Uuid, parent_key_ids: Vec<Uuid>) -> SecretMasterKeyCurrent {
+        SecretMasterKeyCurrent {
+            scope_view: ClusterViewId::legacy_default(),
+            key_id,
+            generation: parent_key_ids.len().saturating_add(1) as u64,
+            created_by_operation_id: None,
+            parent_key_ids,
+        }
+    }
+
+    /// Independent initial current rows should make join fail instead of picking by key id.
+    #[test]
+    fn join_current_conflict_detects_unrelated_initial_keys() {
+        let left = master_key_current(Uuid::from_u128(1), Vec::new());
+        let right = master_key_current(Uuid::from_u128(2), Vec::new());
+
+        assert!(join_current_conflicts(&left, &right));
+        assert!(join_current_conflicts(&right, &left));
+    }
+
+    /// Parent-child current rows are normal rotation convergence, not a join conflict.
+    #[test]
+    fn join_current_conflict_allows_lineage() {
+        let parent_id = Uuid::from_u128(1);
+        let child_id = Uuid::from_u128(2);
+        let parent = master_key_current(parent_id, Vec::new());
+        let child = master_key_current(child_id, vec![parent_id]);
+
+        assert!(!join_current_conflicts(&parent, &child));
+        assert!(!join_current_conflicts(&child, &parent));
     }
 
     /// Restoring the self row should preserve a newer locally published WireGuard advertisement.

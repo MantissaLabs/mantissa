@@ -18,13 +18,7 @@ interface Secrets {
   get @4 (name :Text, versionId :Data) -> (version :SecretVersionData);
   # Fetch a secret version (plaintext returned to authorized caller).
 
-  getMasterKeyTransfer @5 (request :SecretMasterKeyTransferRequest) -> (envelope :SecretMasterKeyTransfer);
-  # Fetch the current cluster master key encrypted to the requested node key.
-
-  installMasterKeyTransfer @6 (envelope :SecretMasterKeyTransfer);
-  # Install or replace the cluster master key from an encrypted transfer envelope.
-
-  rotateMasterKey @7 () -> (keyId :Data, generation :UInt64);
+  rotateMasterKey @5 () -> (keyId :Data, generation :UInt64);
   # Rotate the master key and return the new key identity.
 }
 
@@ -123,14 +117,6 @@ struct SecretUpsertRequest {
   # User-defined metadata entries.
 }
 
-struct SecretMasterKeyTransferRequest {
-  recipientNodeId @0 :Data;
-  # 16-byte node UUID that will receive and unwrap the transfer.
-
-  recipientNoiseStaticPub @1 :Data;
-  # 32-byte X25519 static public key advertised by the recipient node.
-}
-
 struct MasterKeyDescriptor {
   keyId @0 :Data;
   # 16-byte UUID that uniquely identifies this master key.
@@ -155,32 +141,6 @@ struct MasterKeyDescriptor {
 
   createdAtUnixSecs @7 :UInt64;
   # Unix timestamp when this key was created.
-}
-
-struct SecretMasterKeyTransfer {
-  descriptor @0 :MasterKeyDescriptor;
-  # Metadata for the transferred master key. Contains no key material.
-
-  senderNodeId @1 :Data;
-  # 16-byte node UUID that encrypted the transfer.
-
-  recipientNodeId @2 :Data;
-  # 16-byte node UUID allowed to decrypt the transfer.
-
-  transferPublicKey @3 :Data;
-  # 32-byte ephemeral X25519 public key used for this transfer.
-
-  recipientNoiseStaticPub @4 :Data;
-  # 32-byte X25519 static public key the transfer was encrypted to.
-
-  nonce @5 :Data;
-  # 24-byte XChaCha20-Poly1305 nonce.
-
-  ciphertext @6 :Data;
-  # Encrypted 32-byte master key payload including the Poly1305 tag.
-
-  senderNoiseStaticPub @7 :Data;
-  # 32-byte X25519 static public key used to authenticate the sender.
 }
 
 struct SecretMasterKeyGrant {

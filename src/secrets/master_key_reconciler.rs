@@ -264,15 +264,13 @@ impl SecretMasterKeyReconciler {
             );
         }
 
+        let keyring = self.keyring.write().await;
+        let previous_key_id = keyring.current_key_id();
         self.master_store
             .activate_current(&record)
             .context("activate replicated current master key")?;
-        {
-            let keyring = self.keyring.write().await;
-            let previous_key_id = keyring.current_key_id();
-            keyring.install_current(&record);
-            report.current_adopted = previous_key_id != record.key_id();
-        }
+        keyring.install_current(&record);
+        report.current_adopted = previous_key_id != record.key_id();
         Ok(())
     }
 }

@@ -17,7 +17,7 @@ use mantissa::scheduler::{SlotCapacity, SlotSpec};
 use mantissa::secrets::crypto::SecretKeyring;
 use mantissa::secrets::gossip::SecretReplicator;
 use mantissa::secrets::master_key_protector::PassphraseMasterKeyProtector;
-use mantissa::secrets::master_key_sync::SecretMasterKeyPublisher;
+use mantissa::secrets::master_key_sync::{SecretMasterKeyGrantRecipient, SecretMasterKeyPublisher};
 use mantissa::secrets::registry::SecretRegistry;
 use mantissa::secrets::service::{SecretsService, SecretsServiceConfig};
 use mantissa::secrets::types::{SecretMetadata, SecretValue, SecretVersion, compute_secret_id};
@@ -827,122 +827,67 @@ local_test!(rotate_master_key_rewraps_secrets, {
     assert_eq!(legacy.as_slice(), secret_plaintext);
 });
 
-local_test!(
-    get_master_key_transfer_publishes_referenced_historical_grants,
-    {
-        let harness = setup_workload_manager().await;
-        let _secret_runtime_cleanup = SecretRuntimeCleanupGuard::new(harness.node_id);
-        let TestHarness {
-            secret_registry,
-            secret_master_store,
-            secret_keyring,
-            secret_keyring_handle,
+local_test!(publish_current_with_key_grants_includes_historical_keys, {
+    let harness = setup_workload_manager().await;
+    let _secret_runtime_cleanup = SecretRuntimeCleanupGuard::new(harness.node_id);
+    let TestHarness {
+        secret_master_store,
+        node_id,
+        ..
+    } = harness;
+
+    let old_record = secret_master_store.current().expect("load old current key");
+    let old_key_id = old_record.key_id();
+    let new_record = secret_master_store
+        .prepare_rotation(ClusterViewId::legacy_default(), node_id, None)
+        .expect("prepare replacement key");
+    secret_master_store
+        .activate_current(&new_record)
+        .expect("activate replacement key");
+    let all_records = secret_master_store
+        .load_all_keys()
+        .expect("load all local master keys");
+
+    let (gossip_tx, _gossip_rx) = async_channel::unbounded::<Message>();
+    let sender_noise = Arc::new(NoiseKeys::from_private_bytes([9u8; 32]));
+    let (_master_key_sync_dir, secret_master_keys, master_key_publisher) =
+        temp_master_key_sync(node_id, gossip_tx, sender_noise.clone()).await;
+    let recipient_id = Uuid::new_v4();
+    let recipient_noise = Arc::new(NoiseKeys::from_private_bytes([11u8; 32]));
+    let recipient = SecretMasterKeyGrantRecipient {
+        node_id: recipient_id,
+        noise_static_pub: recipient_noise.public_bytes(),
+    };
+
+    master_key_publisher
+        .publish_current_with_key_grants(&new_record, &all_records, &[recipient])
+        .await
+        .expect("publish current and historical grants");
+
+    let current = current_for_scope(&secret_master_keys, ClusterViewId::legacy_default())
+        .expect("load replicated current")
+        .expect("replicated current missing");
+    assert_eq!(current.key_id, new_record.key_id());
+
+    let grant_snapshot = secret_master_keys
+        .get_snapshot(&UuidKey::from(grant_row_id(old_key_id, recipient_id)))
+        .expect("load historical grant")
+        .expect("historical grant missing");
+    let grant = grant_snapshot
+        .as_slice()
+        .iter()
+        .find_map(|row| match row {
+            SecretMasterKeySyncRecord::Grant(grant) => Some(grant),
+            _ => None,
+        })
+        .expect("grant row should contain a grant");
+    let granted_plaintext = grant
+        .decrypt(
+            recipient_id,
+            recipient_noise.as_ref(),
             node_id,
-            ..
-        } = harness;
-
-        let secret_name = "legacy-key-secret";
-        let secret_id = compute_secret_id(secret_name);
-        let version_id = Uuid::new_v4();
-        let old_record = secret_master_store.current().expect("load old current key");
-        let old_key_id = old_record.key_id();
-        let plaintext = b"still-on-old-key";
-        let ciphertext = secret_keyring
-            .encrypt(secret_id, version_id, plaintext)
-            .expect("encrypt with old key");
-        assert_eq!(ciphertext.master_key_id, old_key_id);
-
-        let now = Utc::now().to_rfc3339();
-        let version = SecretVersion::new(
-            version_id,
-            ciphertext,
-            now.clone(),
-            None,
-            old_record.key_id(),
-            old_record.generation(),
-        );
-        let value = SecretValue::new(
-            secret_name.to_string(),
-            SecretMetadata::default(),
-            now,
-            version,
-        );
-        secret_registry
-            .upsert(value)
-            .await
-            .expect("seed old-key secret");
-
-        let new_record = secret_master_store
-            .prepare_rotation(ClusterViewId::legacy_default(), node_id, None)
-            .expect("prepare replacement key");
-        secret_master_store
-            .activate_current(&new_record)
-            .expect("activate replacement key");
-        {
-            let guard = secret_keyring_handle.write().await;
-            guard.install_current(&new_record);
-        }
-
-        let (gossip_tx, _gossip_rx) = async_channel::unbounded::<Message>();
-        let (_secret_tx, secret_rx) = async_channel::unbounded::<Message>();
-        let secret_replicator =
-            SecretReplicator::new(secret_registry.clone(), gossip_tx.clone(), secret_rx);
-        let sender_noise = Arc::new(NoiseKeys::from_private_bytes([9u8; 32]));
-        let (_master_key_sync_dir, secret_master_keys, master_key_publisher) =
-            temp_master_key_sync(node_id, gossip_tx, sender_noise.clone()).await;
-        let service = SecretsService::new(SecretsServiceConfig {
-            registry: secret_registry.clone(),
-            keyring: secret_keyring_handle.clone(),
-            master_store: secret_master_store.clone(),
-            master_key_publisher,
-            topology: None,
-            replicator: secret_replicator,
-            local_node_id: node_id,
-            noise_keys: sender_noise.clone(),
-        });
-        let client: secrets::Client = capnp_new_client(service);
-        let recipient_id = Uuid::new_v4();
-        let recipient_noise = Arc::new(NoiseKeys::from_private_bytes([11u8; 32]));
-
-        let mut request = client.get_master_key_transfer_request();
-        {
-            let mut inner = request.get().init_request();
-            inner.set_recipient_node_id(recipient_id.as_bytes());
-            inner.set_recipient_noise_static_pub(&recipient_noise.public_bytes());
-        }
-        request
-            .send()
-            .promise
-            .await
-            .expect("send transfer request")
-            .get()
-            .expect("get transfer response");
-
-        let current = current_for_scope(&secret_master_keys, ClusterViewId::legacy_default())
-            .expect("load replicated current")
-            .expect("replicated current missing");
-        assert_eq!(current.key_id, new_record.key_id());
-
-        let grant_snapshot = secret_master_keys
-            .get_snapshot(&UuidKey::from(grant_row_id(old_key_id, recipient_id)))
-            .expect("load historical grant")
-            .expect("historical grant missing");
-        let grant = grant_snapshot
-            .as_slice()
-            .iter()
-            .find_map(|row| match row {
-                SecretMasterKeySyncRecord::Grant(grant) => Some(grant),
-                _ => None,
-            })
-            .expect("grant row should contain a grant");
-        let granted_plaintext = grant
-            .decrypt(
-                recipient_id,
-                recipient_noise.as_ref(),
-                node_id,
-                sender_noise.public_bytes(),
-            )
-            .expect("decrypt historical grant");
-        assert_eq!(granted_plaintext, old_record.key);
-    }
-);
+            sender_noise.public_bytes(),
+        )
+        .expect("decrypt historical grant");
+    assert_eq!(granted_plaintext, old_record.key);
+});

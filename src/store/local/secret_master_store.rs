@@ -5,7 +5,7 @@ use crate::secrets::master_key_protector::{
 use crate::store::tx::{into_io, with_read_tx, with_write_tx};
 use parking_lot::{Mutex, MutexGuard};
 use redb::{Database, ReadableTable, TableDefinition};
-use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::{io, sync::Arc};
 use uuid::Uuid;
 
@@ -160,41 +160,28 @@ impl SecretMasterStore {
         self.persist_record(&record.descriptor, &record.key, false, None)
     }
 
-    /// Imports an externally provided key and makes it the active key.
-    pub fn import_current(&self, record: &MasterKeyRecord) -> io::Result<()> {
-        self.import_current_with_policy(record, false)
-    }
-
     /// Activates a key selected by replicated current-key metadata.
     ///
-    /// This intentionally does not apply direct-transfer generation policy:
-    /// once the replicated `current` row has converged, it is the source of
-    /// truth. The key must still match any local envelope already stored for
-    /// the same key id.
+    /// The replicated `current` row is the source of truth after a node has
+    /// joined a cluster, but a fresh bootstrap key can also become committed
+    /// if this node first acts as an anchor for another joiner. In that case
+    /// an unrelated non-operation current must be rejected so a concurrent
+    /// "node 1 joins node 2 while node 3 joins node 1" flow cannot split key
+    /// identity across the newly formed cluster.
     pub fn activate_current(&self, record: &MasterKeyRecord) -> io::Result<()> {
         let _guard = self.policy_guard();
+        self.ensure_replicated_current_allowed(record)?;
         self.persist_record(&record.descriptor, &record.key, true, Some(false))
     }
 
-    /// Imports the anchor key during join without reopening the transfer/adoption race.
+    /// Commits the cached current key before publishing replicated grants for it.
     ///
-    /// A fresh node may either adopt an anchor key or serve its bootstrap key
-    /// to another joiner. Once `commit_current_for_transfer` has served that
-    /// bootstrap key as cluster-forming material, this join path must reject a
-    /// different anchor key. Otherwise node 1 could give key A to node 3 while
-    /// concurrently joining node 2 and adopting key B for itself.
-    pub fn import_join_current(&self, record: &MasterKeyRecord) -> io::Result<()> {
-        self.import_current_with_policy(record, true)
-    }
-
-    /// Commits the cached current key as a cluster key before exporting it.
-    ///
-    /// Serving a transfer makes this node an anchor for the recipient. If the
-    /// current key is still the local bootstrap key, that key stops being
-    /// replaceable before the transfer is encrypted. This intentionally makes
+    /// Granting the current key to a joiner makes this node an anchor for that
+    /// recipient. If the key is still the local bootstrap key, it stops being
+    /// replaceable before the grant rows are written. This intentionally makes
     /// concurrent "join another anchor" attempts fail instead of allowing this
-    /// node to give one peer key A and then silently switch itself to key B.
-    pub fn commit_current_for_transfer(&self, expected_key_id: Uuid) -> io::Result<()> {
+    /// node to grant key A and then silently adopt unrelated key B.
+    pub fn commit_current_for_replication(&self, expected_key_id: Uuid) -> io::Result<()> {
         let _guard = self.policy_guard();
         let current_key_id = self
             .current_key_id()?
@@ -202,7 +189,7 @@ impl SecretMasterStore {
         if current_key_id != expected_key_id {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "secret master key changed before transfer",
+                "secret master key changed before grant publication",
             ));
         }
         self.set_bootstrap_pending(false)?;
@@ -280,53 +267,6 @@ impl SecretMasterStore {
             .transpose()
     }
 
-    /// Imports an external master key while enforcing generation and replay policy.
-    fn import_current_with_policy(
-        &self,
-        record: &MasterKeyRecord,
-        allow_bootstrap_replacement: bool,
-    ) -> io::Result<()> {
-        let _guard = self.policy_guard();
-        if let Some(current_key_id) = self.current_key_id()? {
-            let current = self.load_key(current_key_id)?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "secret master key envelope missing for recorded key id",
-                )
-            })?;
-
-            match record.generation().cmp(&current.generation()) {
-                Ordering::Less => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "stale secret master key transfer rejected",
-                    ));
-                }
-                Ordering::Equal => {
-                    if allow_bootstrap_replacement && self.bootstrap_replacement_pending()? {
-                        self.persist_record(&record.descriptor, &record.key, true, Some(false))?;
-                        if current_key_id != record.key_id() {
-                            self.remove_key(current_key_id)?;
-                        }
-                        return Ok(());
-                    }
-                    if current.descriptor == record.descriptor && current.key == record.key {
-                        self.set_bootstrap_pending(false)?;
-                        return Ok(());
-                    }
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "conflicting secret master key transfer rejected",
-                    ));
-                }
-                Ordering::Greater => {}
-            }
-        }
-
-        self.persist_record(&record.descriptor, &record.key, true, Some(false))?;
-        Ok(())
-    }
-
     /// Loads the locally active key id.
     fn current_key_id(&self) -> io::Result<Option<Uuid>> {
         with_read_tx(&self.db, |tx| {
@@ -350,23 +290,63 @@ impl SecretMasterStore {
         .map(|marker| marker.unwrap_or(false))
     }
 
+    /// Checks whether a replicated current row may replace the local current key.
+    fn ensure_replicated_current_allowed(&self, record: &MasterKeyRecord) -> io::Result<()> {
+        let Some(current_key_id) = self.current_key_id()? else {
+            return Ok(());
+        };
+        if current_key_id == record.key_id() {
+            return Ok(());
+        }
+        if self.bootstrap_replacement_pending()? {
+            return Ok(());
+        }
+        let current = self.load_wrapped_key(current_key_id)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "secret master key envelope missing for recorded key id",
+            )
+        })?;
+        if self.descriptor_descends_from(&record.descriptor, current.descriptor.key_id)? {
+            return Ok(());
+        }
+        if record.descriptor.created_by_operation_id.is_some() {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "conflicting replicated secret master key current rejected",
+        ))
+    }
+
+    /// Returns true when `candidate` descends from `ancestor_key_id` through stored descriptors.
+    fn descriptor_descends_from(
+        &self,
+        candidate: &MasterKeyDescriptor,
+        ancestor_key_id: Uuid,
+    ) -> io::Result<bool> {
+        let mut pending = candidate.parent_key_ids.clone();
+        let mut seen = BTreeSet::new();
+        while let Some(parent_key_id) = pending.pop() {
+            if parent_key_id == ancestor_key_id {
+                return Ok(true);
+            }
+            if !seen.insert(parent_key_id) {
+                continue;
+            }
+            if let Some(parent) = self.load_wrapped_key(parent_key_id)? {
+                pending.extend(parent.descriptor.parent_key_ids);
+            }
+        }
+        Ok(false)
+    }
+
     /// Updates whether the current local key is still a replaceable bootstrap key.
     fn set_bootstrap_pending(&self, pending: bool) -> io::Result<()> {
         with_write_tx(&self.db, |tx| {
             let mut meta = tx.open_table(T_MASTER_META).map_err(into_io)?;
             let value = if pending { META_TRUE } else { META_FALSE };
             meta.insert(BOOTSTRAP_PENDING_KEY, value).map_err(into_io)?;
-            Ok(())
-        })
-    }
-
-    /// Removes one non-current envelope after its bootstrap replacement succeeds.
-    fn remove_key(&self, key_id: Uuid) -> io::Result<()> {
-        with_write_tx(&self.db, |tx| {
-            let mut envelopes = tx.open_table(T_MASTER_KEY_ENVELOPES).map_err(into_io)?;
-            envelopes
-                .remove(key_id.as_bytes().as_slice())
-                .map_err(into_io)?;
             Ok(())
         })
     }
@@ -405,7 +385,7 @@ impl SecretMasterStore {
             }
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "conflicting secret master key transfer rejected",
+                "conflicting secret master key envelope rejected",
             ));
         }
 
@@ -671,126 +651,25 @@ mod tests {
     }
 
     #[test]
-    fn import_current_rejects_stale_and_conflicting_generation() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("state.redb");
-        let db = Arc::new(Database::create(db_path).unwrap());
-        let store = SecretMasterStore::new(db, test_protector()).expect("open store");
-
-        let base = MasterKeyRecord::new(
-            descriptor(2),
-            MasterKeyPlaintext::generate().expect("base key"),
-        )
-        .expect("base record");
-        store.import_current(&base).expect("import base");
-
-        let stale = MasterKeyRecord::new(
-            descriptor(1),
-            MasterKeyPlaintext::generate().expect("stale key"),
-        )
-        .expect("stale record");
-        let stale_err = store
-            .import_current(&stale)
-            .expect_err("stale transfer must fail");
-        assert_eq!(stale_err.kind(), io::ErrorKind::PermissionDenied);
-
-        let conflicting = MasterKeyRecord::new(
-            descriptor(2),
-            MasterKeyPlaintext::generate().expect("conflicting key"),
-        )
-        .expect("conflicting record");
-        let conflict_err = store
-            .import_current(&conflicting)
-            .expect_err("same generation conflict must fail outside bootstrap");
-        assert_eq!(conflict_err.kind(), io::ErrorKind::PermissionDenied);
-    }
-
-    #[test]
-    fn join_import_replaces_only_the_initial_bootstrap_key() {
+    fn committed_bootstrap_rejects_unrelated_replicated_current() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let db = Arc::new(Database::create(db_path).unwrap());
         let store = SecretMasterStore::new(db, test_protector()).expect("open store");
 
         let bootstrap = store.ensure_current().expect("ensure master key");
-        let anchor = MasterKeyRecord::new(
+        store
+            .commit_current_for_replication(bootstrap.key_id())
+            .expect("commit current key for grant publication");
+
+        let unrelated = MasterKeyRecord::new(
             descriptor(bootstrap.generation()),
-            MasterKeyPlaintext::generate().expect("anchor key"),
+            MasterKeyPlaintext::generate().expect("unrelated key"),
         )
-        .expect("anchor record");
-        store
-            .import_join_current(&anchor)
-            .expect("join import replaces bootstrap key");
-        assert_eq!(store.current().expect("current").key_id(), anchor.key_id());
-        store
-            .import_join_current(&anchor)
-            .expect("same join key import should be idempotent");
-        assert!(
-            store
-                .load_key(bootstrap.key_id())
-                .expect("bootstrap lookup")
-                .is_none()
-        );
-
-        let other = MasterKeyRecord::new(
-            descriptor(anchor.generation()),
-            MasterKeyPlaintext::generate().expect("other key"),
-        )
-        .expect("other record");
+        .expect("unrelated record");
         let err = store
-            .import_join_current(&other)
-            .expect_err("adopted join key must not be replaced by another join key");
-        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(store.current().expect("current").key_id(), anchor.key_id());
-    }
-
-    #[test]
-    fn failed_join_import_preserves_bootstrap_key() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("state.redb");
-        let db = Arc::new(Database::create(db_path).unwrap());
-        let store = SecretMasterStore::new(db, test_protector()).expect("open store");
-
-        let bootstrap = store.ensure_current().expect("ensure master key");
-        let conflicting = MasterKeyRecord::new(
-            bootstrap.descriptor.clone(),
-            MasterKeyPlaintext::generate().expect("conflicting key"),
-        )
-        .expect("conflicting record");
-
-        let err = store
-            .import_join_current(&conflicting)
-            .expect_err("conflicting bootstrap replacement must fail");
-        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-
-        let current = store.current().expect("current bootstrap remains");
-        assert_eq!(current.key_id(), bootstrap.key_id());
-        assert_eq!(current.key, bootstrap.key);
-    }
-
-    #[test]
-    fn transfer_export_commits_bootstrap_against_join_replacement() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("state.redb");
-        let db = Arc::new(Database::create(db_path).unwrap());
-        let store = SecretMasterStore::new(db, test_protector()).expect("open store");
-
-        let bootstrap = store.ensure_current().expect("ensure master key");
-        store
-            .commit_current_for_transfer(bootstrap.key_id())
-            .expect("commit current key for export");
-        store
-            .import_join_current(&bootstrap)
-            .expect("same committed key should remain idempotent");
-
-        let anchor = MasterKeyRecord::new(
-            descriptor(bootstrap.generation()),
-            MasterKeyPlaintext::generate().expect("anchor key"),
-        )
-        .expect("anchor record");
-        let err = store
-            .import_join_current(&anchor)
-            .expect_err("served bootstrap key must not be replaced through join");
+            .activate_current(&unrelated)
+            .expect_err("committed bootstrap must reject unrelated current");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
 
         let current = store
@@ -801,7 +680,38 @@ mod tests {
     }
 
     #[test]
-    fn transfer_export_commit_does_not_unwrap_cached_key() {
+    fn committed_current_accepts_descendant_replicated_current() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let db = Arc::new(Database::create(db_path).unwrap());
+        let store = SecretMasterStore::new(db, test_protector()).expect("open store");
+
+        let bootstrap = store.ensure_current().expect("ensure master key");
+        store
+            .commit_current_for_replication(bootstrap.key_id())
+            .expect("commit current key for grant publication");
+        let child_descriptor = MasterKeyDescriptor::child(
+            &bootstrap.descriptor,
+            ClusterViewId::legacy_default(),
+            Uuid::new_v4(),
+            None,
+        )
+        .expect("child descriptor");
+        let child = MasterKeyRecord::new(
+            child_descriptor,
+            MasterKeyPlaintext::generate().expect("child key"),
+        )
+        .expect("child record");
+
+        store
+            .activate_current(&child)
+            .expect("descendant current should activate");
+
+        assert_eq!(store.current().expect("current").key_id(), child.key_id());
+    }
+
+    #[test]
+    fn grant_publication_commit_does_not_unwrap_cached_key() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let db = Arc::new(Database::create(db_path).unwrap());
@@ -810,13 +720,13 @@ mod tests {
 
         let bootstrap = store.ensure_current().expect("ensure master key");
         store
-            .commit_current_for_transfer(bootstrap.key_id())
-            .expect("commit current key for export");
+            .commit_current_for_replication(bootstrap.key_id())
+            .expect("commit current key for grant publication");
 
         assert_eq!(
             protector.unwrap_count(),
             0,
-            "export policy commit should not unwrap the local envelope"
+            "grant policy commit should not unwrap the local envelope"
         );
     }
 

@@ -1,25 +1,21 @@
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::gossip::SecretReplicator;
-use crate::secrets::master_key_protector::{
-    MasterKeyTransfer, read_master_key_descriptor, write_master_key_descriptor,
-};
 use crate::secrets::master_key_sync::{SecretMasterKeyGrantRecipient, SecretMasterKeyPublisher};
 use crate::secrets::registry::SecretRegistry;
 use crate::secrets::types::{
     SecretCiphertext, SecretEvent, SecretMetadata, SecretValue, SecretVersion, compute_secret_id,
 };
-use crate::store::local::{MasterKeyRecord, SecretMasterStore};
+use crate::store::local::SecretMasterStore;
 use crate::topology::Topology;
 use capnp::Error;
 use capnp::struct_list;
 use chrono::Utc;
 use mantissa_net::noise::NoiseKeys;
 use mantissa_protocol::secrets::{
-    secret_ciphertext, secret_event, secret_master_key_transfer, secret_metadata_entry,
-    secret_record, secret_spec, secrets,
+    secret_ciphertext, secret_event, secret_metadata_entry, secret_record, secret_spec, secrets,
 };
 use mantissa_store::codec::StoreValueCodec;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -132,40 +128,6 @@ impl SecretsService {
         }
 
         Ok(recipients)
-    }
-
-    /// Loads non-current keys still referenced by current secret ciphertext.
-    fn referenced_historical_master_keys(
-        &self,
-        current_key_id: Uuid,
-    ) -> Result<Vec<MasterKeyRecord>, Error> {
-        let mut key_ids = BTreeSet::new();
-        for value in self
-            .registry()
-            .list()
-            .map_err(|e| Error::failed(format!("failed to list secrets for key grants: {e}")))?
-        {
-            let ciphertext_key_id = value.current_version.ciphertext.master_key_id;
-            if ciphertext_key_id != current_key_id {
-                key_ids.insert(ciphertext_key_id);
-            }
-        }
-
-        let store = self.master_store();
-        let mut records = Vec::with_capacity(key_ids.len());
-        for key_id in key_ids {
-            let Some(record) = store
-                .load_key(key_id)
-                .map_err(|e| Error::failed(format!("failed to load historical master key: {e}")))?
-            else {
-                return Err(Error::failed(format!(
-                    "secret references unavailable master key {key_id}"
-                )));
-            };
-            records.push(record);
-        }
-
-        Ok(records)
     }
 }
 
@@ -388,57 +350,6 @@ fn read_secret_ciphertext(
     })
 }
 
-/// Writes one encrypted master-key transfer into the RPC response envelope.
-pub(crate) fn write_master_key_transfer(
-    mut builder: secret_master_key_transfer::Builder<'_>,
-    transfer: &MasterKeyTransfer,
-) {
-    write_master_key_descriptor(builder.reborrow().init_descriptor(), &transfer.descriptor);
-    builder.set_sender_node_id(transfer.sender_node_id.as_bytes());
-    builder.set_recipient_node_id(transfer.recipient_node_id.as_bytes());
-    builder.set_sender_noise_static_pub(&transfer.sender_noise_static_pub);
-    builder.set_transfer_public_key(&transfer.transfer_public_key);
-    builder.set_recipient_noise_static_pub(&transfer.recipient_noise_static_pub);
-    builder.set_nonce(&transfer.nonce);
-    builder.set_ciphertext(&transfer.ciphertext);
-}
-
-/// Reads and validates one encrypted master-key transfer from an RPC request.
-pub(crate) fn read_master_key_transfer(
-    reader: secret_master_key_transfer::Reader<'_>,
-) -> Result<MasterKeyTransfer, Error> {
-    let transfer_public_key =
-        read_fixed_32(reader.get_transfer_public_key()?, "transfer public key")?;
-    let sender_noise_static_pub = read_fixed_32(
-        reader.get_sender_noise_static_pub()?,
-        "sender noise static key",
-    )?;
-    let recipient_noise_static_pub = read_fixed_32(
-        reader.get_recipient_noise_static_pub()?,
-        "recipient noise static key",
-    )?;
-    let nonce_reader = reader.get_nonce()?;
-    if nonce_reader.len() != 24 {
-        return Err(Error::failed(
-            "master key transfer nonce must be 24 bytes".into(),
-        ));
-    }
-    let mut nonce = [0u8; 24];
-    nonce.copy_from_slice(nonce_reader);
-
-    Ok(MasterKeyTransfer {
-        descriptor: read_master_key_descriptor(reader.get_descriptor()?)
-            .map_err(|e| Error::failed(e.to_string()))?,
-        sender_node_id: read_uuid(reader.get_sender_node_id()?)?,
-        recipient_node_id: read_uuid(reader.get_recipient_node_id()?)?,
-        sender_noise_static_pub,
-        transfer_public_key,
-        recipient_noise_static_pub,
-        nonce,
-        ciphertext: reader.get_ciphertext()?.to_vec(),
-    })
-}
-
 fn read_uuid(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
     if data.len() != 16 {
         return Err(Error::failed("uuid must be 16 bytes".into()));
@@ -446,15 +357,6 @@ fn read_uuid(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(data);
     Ok(Uuid::from_bytes(bytes))
-}
-
-fn read_fixed_32(data: capnp::data::Reader<'_>, label: &str) -> Result<[u8; 32], Error> {
-    if data.len() != 32 {
-        return Err(Error::failed(format!("{label} must be 32 bytes")));
-    }
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(data);
-    Ok(bytes)
 }
 
 fn secret_ciphertext_from_encryption(result: SecretCiphertext) -> SecretCiphertext {
@@ -704,88 +606,6 @@ impl secrets::Server for SecretsService {
         Ok(())
     }
 
-    /// Exposes the current master key encrypted to a registered recipient node.
-    async fn get_master_key_transfer(
-        self: Rc<Self>,
-        params: secrets::GetMasterKeyTransferParams,
-        mut results: secrets::GetMasterKeyTransferResults,
-    ) -> Result<(), Error> {
-        let store = self.master_store();
-        let request = params.get()?.get_request()?;
-        let recipient_node_id = read_uuid(request.get_recipient_node_id()?)?;
-        let recipient_noise_static_pub = read_fixed_32(
-            request.get_recipient_noise_static_pub()?,
-            "recipient noise static key",
-        )?;
-
-        if let Some(topology) = self.topology() {
-            let registry = topology.registry();
-            let peer = registry
-                .peer_value_unscoped(recipient_node_id)
-                .ok_or_else(|| {
-                    Error::failed(format!(
-                        "recipient node {recipient_node_id} is not registered"
-                    ))
-                })?;
-            if !peer.membership.is_active() {
-                return Err(Error::failed(format!(
-                    "recipient node {recipient_node_id} is not active"
-                )));
-            }
-            if peer.noise_static_pub != recipient_noise_static_pub {
-                return Err(Error::failed(format!(
-                    "recipient node {recipient_node_id} noise key mismatch"
-                )));
-            }
-        }
-
-        // Exporting a master key is a cluster-forming decision. Hold the
-        // keyring read lock while committing the store policy so an import or
-        // rotation cannot swap the cached plaintext between "which key will I
-        // export?" and "is this bootstrap key now final?". This avoids an
-        // extra envelope unwrap on the common join path without reopening the
-        // race where a node could export key A and then adopt key B.
-        let keyring = self.keyring();
-        let transfer = {
-            let guard = keyring.read().await;
-            let record = guard
-                .current_record()
-                .map_err(|e| Error::failed(format!("failed to load master key: {e}")))?;
-            store
-                .commit_current_for_transfer(record.key_id())
-                .map_err(|e| Error::failed(format!("failed to commit master key export: {e}")))?;
-            let transfer = MasterKeyTransfer::encrypt(
-                record.descriptor.clone(),
-                &record.key,
-                self.local_node_id(),
-                self.noise_keys().as_ref(),
-                recipient_node_id,
-                recipient_noise_static_pub,
-            )
-            .map_err(|e| Error::failed(format!("failed to encrypt master key transfer: {e}")))?;
-            let historical_records = self.referenced_historical_master_keys(record.key_id())?;
-            let recipient = SecretMasterKeyGrantRecipient {
-                node_id: recipient_node_id,
-                noise_static_pub: recipient_noise_static_pub,
-            };
-            // Keep rotation blocked until the joiner's replicated grants are
-            // durable. Otherwise a node could receive key A by direct join
-            // transfer while the cluster concurrently rotates and publishes
-            // current metadata that no longer matches the bootstrap payload.
-            self.master_key_publisher()
-                .publish_join_grants(transfer.clone(), &historical_records, recipient)
-                .await
-                .map_err(|e| {
-                    Error::failed(format!(
-                        "failed to publish replicated master key transfer: {e}"
-                    ))
-                })?;
-            transfer
-        };
-        write_master_key_transfer(results.get().init_envelope(), &transfer);
-        Ok(())
-    }
-
     /// Rotates the cluster master key, re-encrypting all stored secrets with the new version.
     async fn rotate_master_key(
         self: Rc<Self>,
@@ -861,17 +681,6 @@ impl secrets::Server for SecretsService {
         results.get().set_key_id(new_record.key_id().as_bytes());
         results.get().set_generation(new_record.generation());
         Ok(())
-    }
-
-    async fn install_master_key_transfer(
-        self: Rc<Self>,
-        params: secrets::InstallMasterKeyTransferParams,
-        _results: secrets::InstallMasterKeyTransferResults,
-    ) -> Result<(), Error> {
-        let _ = params.get()?.get_envelope()?;
-        Err(Error::failed(
-            "direct master-key install is disabled; use replicated grants".into(),
-        ))
     }
 }
 

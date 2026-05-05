@@ -282,6 +282,12 @@ impl mantissa_protocol::server::Server for Server {
         let join_request = JoinRequest::from_params(params)?;
         self.validate_join_request(&join_request).await?;
         self.register_join_request(&join_request).await?;
+        self.topology
+            .publish_master_key_grants_for_joiner(
+                join_request.joiner_id,
+                join_request.peer.noise_static_pub,
+            )
+            .await?;
 
         let cluster_session = self.issue_join_session(join_request.joiner_id)?;
         self.ensure_cluster_background_tasks_after_join();

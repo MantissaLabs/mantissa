@@ -61,17 +61,43 @@ impl SecretMasterKeyPublisher {
         record: &MasterKeyRecord,
         recipients: &[SecretMasterKeyGrantRecipient],
     ) -> Result<()> {
-        let mut records = Vec::with_capacity(recipients.len().saturating_add(2));
-        records.push(SecretMasterKeySyncRecord::Descriptor(
-            record.descriptor.clone(),
-        ));
-        for recipient in recipients {
-            records.push(self.grant_record(record, *recipient)?);
+        self.publish_current_with_key_grants(record, std::slice::from_ref(record), recipients)
+            .await
+    }
+
+    /// Publishes all known key grants for recipients and advances the current pointer.
+    ///
+    /// A joining node needs both the active key and historical keys still
+    /// referenced by replicated secrets. Publishing those rows together keeps
+    /// the join path on the normal sync domain without reviving the old direct
+    /// master-key transfer RPC.
+    pub async fn publish_current_with_key_grants(
+        &self,
+        current: &MasterKeyRecord,
+        records: &[MasterKeyRecord],
+        recipients: &[SecretMasterKeyGrantRecipient],
+    ) -> Result<()> {
+        let mut rows = Vec::with_capacity(
+            records
+                .len()
+                .saturating_add(1)
+                .saturating_mul(recipients.len().saturating_add(1))
+                .saturating_add(1),
+        );
+        let mut included_current = false;
+
+        for record in records {
+            included_current |= record.key_id() == current.key_id();
+            self.append_key_grants(&mut rows, record, recipients)?;
         }
-        records.push(SecretMasterKeySyncRecord::Current(current_from_descriptor(
-            &record.descriptor,
+        if !included_current {
+            self.append_key_grants(&mut rows, current, recipients)?;
+        }
+
+        rows.push(SecretMasterKeySyncRecord::Current(current_from_descriptor(
+            &current.descriptor,
         )));
-        self.publish_records(records).await
+        self.publish_records(rows).await
     }
 
     /// Publishes descriptor and grant rows for existing keys without changing current metadata.
@@ -90,55 +116,9 @@ impl SecretMasterKeyPublisher {
                 .saturating_mul(recipients.len().saturating_add(1)),
         );
         for record in records {
-            rows.push(SecretMasterKeySyncRecord::Descriptor(
-                record.descriptor.clone(),
-            ));
-            for recipient in recipients {
-                rows.push(self.grant_record(record, *recipient)?);
-            }
+            self.append_key_grants(&mut rows, record, recipients)?;
         }
         self.publish_records(rows).await
-    }
-
-    /// Publishes the replicated rows represented by one join bootstrap transfer.
-    pub async fn publish_transfer(&self, transfer: MasterKeyTransfer) -> Result<()> {
-        let descriptor = transfer.descriptor.clone();
-        self.publish_records([
-            SecretMasterKeySyncRecord::Descriptor(descriptor.clone()),
-            SecretMasterKeySyncRecord::Grant(transfer),
-            SecretMasterKeySyncRecord::Current(current_from_descriptor(&descriptor)),
-        ])
-        .await
-    }
-
-    /// Publishes join bootstrap rows plus historical grants for referenced old keys.
-    pub async fn publish_join_grants(
-        &self,
-        current_transfer: MasterKeyTransfer,
-        historical_records: &[MasterKeyRecord],
-        recipient: SecretMasterKeyGrantRecipient,
-    ) -> Result<()> {
-        let current_key_id = current_transfer.descriptor.key_id;
-        let mut records = Vec::with_capacity(historical_records.len().saturating_mul(2) + 3);
-        records.push(SecretMasterKeySyncRecord::Descriptor(
-            current_transfer.descriptor.clone(),
-        ));
-        records.push(SecretMasterKeySyncRecord::Grant(current_transfer.clone()));
-        records.push(SecretMasterKeySyncRecord::Current(current_from_descriptor(
-            &current_transfer.descriptor,
-        )));
-
-        for record in historical_records {
-            if record.key_id() == current_key_id {
-                continue;
-            }
-            records.push(SecretMasterKeySyncRecord::Descriptor(
-                record.descriptor.clone(),
-            ));
-            records.push(self.grant_record(record, recipient)?);
-        }
-
-        self.publish_records(records).await
     }
 
     /// Persists rows first, then queues gossip as an acceleration hint.
@@ -164,6 +144,22 @@ impl SecretMasterKeyPublisher {
                 .map_err(|error| anyhow!("enqueue master-key gossip: {error}"))?;
         }
 
+        Ok(())
+    }
+
+    /// Appends descriptor and recipient grants for one plaintext key record.
+    fn append_key_grants(
+        &self,
+        rows: &mut Vec<SecretMasterKeySyncRecord>,
+        record: &MasterKeyRecord,
+        recipients: &[SecretMasterKeyGrantRecipient],
+    ) -> Result<()> {
+        rows.push(SecretMasterKeySyncRecord::Descriptor(
+            record.descriptor.clone(),
+        ));
+        for recipient in recipients {
+            rows.push(self.grant_record(record, *recipient)?);
+        }
         Ok(())
     }
 
