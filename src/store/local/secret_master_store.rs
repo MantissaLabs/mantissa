@@ -113,18 +113,30 @@ impl SecretMasterStore {
         self.import_current_with_policy(record, true)
     }
 
-    /// Returns the current master key and commits it as a cluster key before exporting it.
+    /// Commits the cached current key as a cluster key before exporting it.
     ///
     /// Serving a transfer makes this node an anchor for the recipient. If the
     /// current key is still the local bootstrap key, that key stops being
     /// replaceable before the transfer is encrypted. This intentionally makes
     /// concurrent "join another anchor" attempts fail instead of allowing this
     /// node to give one peer key A and then silently switch itself to key B.
-    pub fn current_for_transfer(&self) -> io::Result<MasterKeyRecord> {
+    ///
+    /// The caller supplies the version it already has cached in the keyring.
+    /// That avoids an envelope unwrap on the hot join path while still using
+    /// this store lock as the authority for the cluster-key policy decision.
+    pub fn commit_current_for_transfer(&self, expected_version: u64) -> io::Result<()> {
         let _guard = self.policy_guard();
-        let current = self.current()?;
+        let current_version = self
+            .current_version()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "secret master key missing"))?;
+        if current_version != expected_version {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "secret master key changed before transfer",
+            ));
+        }
         self.set_bootstrap_pending(false)?;
-        Ok(current)
+        Ok(())
     }
 
     /// Imports an external master key while enforcing version and replay policy.
@@ -143,6 +155,13 @@ impl SecretMasterStore {
                     ));
                 }
                 Ordering::Equal => {
+                    if allow_bootstrap_replacement
+                        && current_version == 1
+                        && self.bootstrap_replacement_pending()?
+                    {
+                        self.persist_new_version(record.version, &record.key, false)?;
+                        return Ok(());
+                    }
                     let current = self.load_version(current_version)?.ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -151,13 +170,6 @@ impl SecretMasterStore {
                     })?;
                     if current.key == record.key {
                         self.set_bootstrap_pending(false)?;
-                        return Ok(());
-                    }
-                    if allow_bootstrap_replacement
-                        && current_version == 1
-                        && self.bootstrap_replacement_pending()?
-                    {
-                        self.persist_new_version(record.version, &record.key, false)?;
                         return Ok(());
                     }
                     return Err(io::Error::new(
@@ -330,13 +342,60 @@ impl SecretMasterStore {
 #[cfg(test)]
 mod tests {
     use super::{MasterKeyRecord, SecretMasterStore};
-    use crate::secrets::master_key_protector::{MasterKeyPlaintext, PassphraseMasterKeyProtector};
+    use crate::secrets::master_key_protector::{
+        MasterKeyCipherSuite, MasterKeyPlaintext, MasterKeyProtector, PassphraseMasterKeyProtector,
+        WrappedMasterKeyRecord,
+    };
     use redb::Database;
+    use std::io;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
     fn test_protector() -> crate::secrets::master_key_protector::MasterKeyProtectorHandle {
         Arc::new(PassphraseMasterKeyProtector::for_test().expect("protector"))
+    }
+
+    #[derive(Default)]
+    struct CountingProtector {
+        wraps: AtomicUsize,
+        unwraps: AtomicUsize,
+    }
+
+    impl CountingProtector {
+        fn unwrap_count(&self) -> usize {
+            self.unwraps.load(Ordering::SeqCst)
+        }
+    }
+
+    impl MasterKeyProtector for CountingProtector {
+        fn provider(&self) -> &'static str {
+            "counting-test"
+        }
+
+        fn wrap(
+            &self,
+            version: u64,
+            plaintext: &MasterKeyPlaintext,
+        ) -> io::Result<WrappedMasterKeyRecord> {
+            self.wraps.fetch_add(1, Ordering::SeqCst);
+            Ok(WrappedMasterKeyRecord {
+                schema_version: 1,
+                master_key_version: version,
+                provider: self.provider().to_string(),
+                provider_key_id: "local".to_string(),
+                cipher_suite: MasterKeyCipherSuite::XChaCha20Poly1305,
+                nonce: Vec::new(),
+                ciphertext: plaintext.as_bytes().to_vec(),
+                created_at_unix_secs: 0,
+                provider_metadata: Vec::new(),
+            })
+        }
+
+        fn unwrap(&self, record: &WrappedMasterKeyRecord) -> io::Result<MasterKeyPlaintext> {
+            self.unwraps.fetch_add(1, Ordering::SeqCst);
+            MasterKeyPlaintext::from_slice(&record.ciphertext)
+        }
     }
 
     #[test]
@@ -438,9 +497,9 @@ mod tests {
         let store = SecretMasterStore::new(db, test_protector()).expect("open store");
 
         let bootstrap = store.ensure_current().expect("ensure master key");
-        let exported = store.current_for_transfer().expect("export current key");
-        assert_eq!(exported.version, bootstrap.version);
-        assert_eq!(exported.key, bootstrap.key);
+        store
+            .commit_current_for_transfer(bootstrap.version)
+            .expect("commit current key for export");
 
         let anchor = MasterKeyRecord::new(
             bootstrap.version,
@@ -451,6 +510,52 @@ mod tests {
             .import_join_current(&anchor)
             .expect_err("served bootstrap key must be committed");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn transfer_export_commit_does_not_unwrap_cached_key() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let db = Arc::new(Database::create(db_path).unwrap());
+        let protector = Arc::new(CountingProtector::default());
+        let store = SecretMasterStore::new(db, protector.clone()).expect("open store");
+
+        let bootstrap = store.ensure_current().expect("ensure master key");
+        store
+            .commit_current_for_transfer(bootstrap.version)
+            .expect("commit current key for export");
+
+        assert_eq!(
+            protector.unwrap_count(),
+            0,
+            "export policy commit should not unwrap the local envelope"
+        );
+    }
+
+    #[test]
+    fn join_import_replaces_bootstrap_key_without_unwrapping_local_key() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let db = Arc::new(Database::create(db_path).unwrap());
+        let protector = Arc::new(CountingProtector::default());
+        let store = SecretMasterStore::new(db, protector.clone()).expect("open store");
+
+        let bootstrap = store.ensure_current().expect("ensure master key");
+        let anchor = MasterKeyRecord::new(
+            bootstrap.version,
+            MasterKeyPlaintext::generate().expect("anchor key"),
+        )
+        .expect("anchor record");
+        store
+            .import_join_current(&anchor)
+            .expect("join import replaces bootstrap key");
+
+        assert_eq!(
+            protector.unwrap_count(),
+            0,
+            "bootstrap replacement should not unwrap the discarded local envelope"
+        );
+        assert_eq!(store.current().expect("current").key, anchor.key);
     }
 
     #[test]

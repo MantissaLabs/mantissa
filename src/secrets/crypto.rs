@@ -47,6 +47,31 @@ impl SecretKeyring {
         self.inner.current_version.load(Ordering::SeqCst)
     }
 
+    /// Returns the cached active master key record for transfer operations.
+    ///
+    /// The active key should always be in memory after bootstrap or rotation.
+    /// The store fallback is retained for defensive recovery, but the normal
+    /// join path avoids another passphrase KDF by cloning the cached key.
+    pub fn current_record(&self) -> io::Result<MasterKeyRecord> {
+        let version = self.current_version();
+        {
+            let cache = self.inner.cache.read();
+            if let Some(key) = cache.get(&version) {
+                return MasterKeyRecord::new(version, key.clone());
+            }
+        }
+
+        let record = self
+            .inner
+            .master_store
+            .load_version(version)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "master key version missing"))?;
+
+        let mut cache = self.inner.cache.write();
+        let entry = cache.entry(record.version).or_insert(record.key);
+        MasterKeyRecord::new(version, entry.clone())
+    }
+
     /// Installs `record` as the new active master key while caching its material.
     pub fn install_current(&self, record: &MasterKeyRecord) {
         // NOTE: we intentionally preserve older key versions in the cache/store so peers can

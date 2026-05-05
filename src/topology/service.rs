@@ -306,13 +306,12 @@ impl Topology {
         let record = MasterKeyRecord::new(transfer.version, plaintext)
             .map_err(|e| Error::failed(format!("invalid master key payload: {e}")))?;
 
-        self.stores
-            .secret_master_store
-            .import_join_current(&record)
-            .map_err(|e| Error::failed(format!("failed to persist master key: {e}")))?;
-
         {
             let guard = self.stores.secret_keyring.write().await;
+            self.stores
+                .secret_master_store
+                .import_join_current(&record)
+                .map_err(|e| Error::failed(format!("failed to persist master key: {e}")))?;
             guard.install_current(&record);
         }
 

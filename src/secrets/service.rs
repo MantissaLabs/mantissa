@@ -653,13 +653,23 @@ impl secrets::Server for SecretsService {
             }
         }
 
-        // Exporting a master key is a cluster-forming decision. The store
-        // finalizes any local bootstrap key before returning it so this node
-        // cannot act as an anchor for one peer and then adopt a different
-        // same-version key from another anchor.
-        let record = store
-            .current_for_transfer()
-            .map_err(|e| Error::failed(format!("failed to load master key: {e}")))?;
+        // Exporting a master key is a cluster-forming decision. Hold the
+        // keyring read lock while committing the store policy so an import or
+        // rotation cannot swap the cached plaintext between "which key will I
+        // export?" and "is this bootstrap key now final?". This avoids an
+        // extra envelope unwrap on the common join path without reopening the
+        // race where a node could export key A and then adopt key B.
+        let keyring = self.keyring();
+        let record = {
+            let guard = keyring.read().await;
+            let record = guard
+                .current_record()
+                .map_err(|e| Error::failed(format!("failed to load master key: {e}")))?;
+            store
+                .commit_current_for_transfer(record.version)
+                .map_err(|e| Error::failed(format!("failed to commit master key export: {e}")))?;
+            record
+        };
         let transfer = MasterKeyTransfer::encrypt(
             record.version,
             &record.key,
@@ -689,14 +699,13 @@ impl secrets::Server for SecretsService {
         // Note: We keep previous master-key material around after rotation so peers still
         // decrypt pre-rotation ciphertext while convergence happens. We push the new version
         // to every known peer below. Once the cluster settles, the old key can be GC’d later.
-        let new_record = master_store
-            .rotate()
-            .map_err(|e| Error::failed(format!("failed to rotate master key: {e}")))?;
-
-        let keyring_clone = {
+        let (new_record, keyring_clone) = {
             let guard = keyring_handle.write().await;
+            let new_record = master_store
+                .rotate()
+                .map_err(|e| Error::failed(format!("failed to rotate master key: {e}")))?;
             guard.install_current(&new_record);
-            guard.clone()
+            (new_record, guard.clone())
         };
 
         let secrets = registry.list().map_err(|e| Error::failed(e.to_string()))?;
@@ -780,12 +789,11 @@ impl secrets::Server for SecretsService {
         let record = MasterKeyRecord::new(transfer.version, plaintext)
             .map_err(|e| Error::failed(e.to_string()))?;
 
-        store
-            .import_current(&record)
-            .map_err(|e| Error::failed(format!("failed to persist master key: {e}")))?;
-
         {
             let guard = keyring.write().await;
+            store
+                .import_current(&record)
+                .map_err(|e| Error::failed(format!("failed to persist master key: {e}")))?;
             guard.install_current(&record);
         }
 
