@@ -66,16 +66,7 @@ impl SecretMasterKeyPublisher {
             record.descriptor.clone(),
         ));
         for recipient in recipients {
-            let grant = MasterKeyTransfer::encrypt(
-                record.descriptor.clone(),
-                &record.key,
-                self.local_node_id,
-                self.noise_keys.as_ref(),
-                recipient.node_id,
-                recipient.noise_static_pub,
-            )
-            .map_err(|error| anyhow!("encrypt replicated master-key grant: {error}"))?;
-            records.push(SecretMasterKeySyncRecord::Grant(grant));
+            records.push(self.grant_record(record, *recipient)?);
         }
         records.push(SecretMasterKeySyncRecord::Current(current_from_descriptor(
             &record.descriptor,
@@ -92,6 +83,36 @@ impl SecretMasterKeyPublisher {
             SecretMasterKeySyncRecord::Current(current_from_descriptor(&descriptor)),
         ])
         .await
+    }
+
+    /// Publishes join bootstrap rows plus historical grants for referenced old keys.
+    pub async fn publish_join_grants(
+        &self,
+        current_transfer: MasterKeyTransfer,
+        historical_records: &[MasterKeyRecord],
+        recipient: SecretMasterKeyGrantRecipient,
+    ) -> Result<()> {
+        let current_key_id = current_transfer.descriptor.key_id;
+        let mut records = Vec::with_capacity(historical_records.len().saturating_mul(2) + 3);
+        records.push(SecretMasterKeySyncRecord::Descriptor(
+            current_transfer.descriptor.clone(),
+        ));
+        records.push(SecretMasterKeySyncRecord::Grant(current_transfer.clone()));
+        records.push(SecretMasterKeySyncRecord::Current(current_from_descriptor(
+            &current_transfer.descriptor,
+        )));
+
+        for record in historical_records {
+            if record.key_id() == current_key_id {
+                continue;
+            }
+            records.push(SecretMasterKeySyncRecord::Descriptor(
+                record.descriptor.clone(),
+            ));
+            records.push(self.grant_record(record, recipient)?);
+        }
+
+        self.publish_records(records).await
     }
 
     /// Persists rows first, then queues gossip as an acceleration hint.
@@ -118,6 +139,24 @@ impl SecretMasterKeyPublisher {
         }
 
         Ok(())
+    }
+
+    /// Encrypts one local master key into a replicated recipient grant row.
+    fn grant_record(
+        &self,
+        record: &MasterKeyRecord,
+        recipient: SecretMasterKeyGrantRecipient,
+    ) -> Result<SecretMasterKeySyncRecord> {
+        let grant = MasterKeyTransfer::encrypt(
+            record.descriptor.clone(),
+            &record.key,
+            self.local_node_id,
+            self.noise_keys.as_ref(),
+            recipient.node_id,
+            recipient.noise_static_pub,
+        )
+        .map_err(|error| anyhow!("encrypt replicated master-key grant: {error}"))?;
+        Ok(SecretMasterKeySyncRecord::Grant(grant))
     }
 }
 

@@ -8,7 +8,7 @@ use crate::secrets::registry::SecretRegistry;
 use crate::secrets::types::{
     SecretCiphertext, SecretEvent, SecretMetadata, SecretValue, SecretVersion, compute_secret_id,
 };
-use crate::store::local::SecretMasterStore;
+use crate::store::local::{MasterKeyRecord, SecretMasterStore};
 use crate::topology::Topology;
 use capnp::Error;
 use capnp::struct_list;
@@ -19,7 +19,7 @@ use mantissa_protocol::secrets::{
     secret_record, secret_spec, secrets,
 };
 use mantissa_store::codec::StoreValueCodec;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -132,6 +132,40 @@ impl SecretsService {
         }
 
         Ok(recipients)
+    }
+
+    /// Loads non-current keys still referenced by current secret ciphertext.
+    fn referenced_historical_master_keys(
+        &self,
+        current_key_id: Uuid,
+    ) -> Result<Vec<MasterKeyRecord>, Error> {
+        let mut key_ids = BTreeSet::new();
+        for value in self
+            .registry()
+            .list()
+            .map_err(|e| Error::failed(format!("failed to list secrets for key grants: {e}")))?
+        {
+            let ciphertext_key_id = value.current_version.ciphertext.master_key_id;
+            if ciphertext_key_id != current_key_id {
+                key_ids.insert(ciphertext_key_id);
+            }
+        }
+
+        let store = self.master_store();
+        let mut records = Vec::with_capacity(key_ids.len());
+        for key_id in key_ids {
+            let Some(record) = store
+                .load_key(key_id)
+                .map_err(|e| Error::failed(format!("failed to load historical master key: {e}")))?
+            else {
+                return Err(Error::failed(format!(
+                    "secret references unavailable master key {key_id}"
+                )));
+            };
+            records.push(record);
+        }
+
+        Ok(records)
     }
 }
 
@@ -712,7 +746,7 @@ impl secrets::Server for SecretsService {
         // extra envelope unwrap on the common join path without reopening the
         // race where a node could export key A and then adopt key B.
         let keyring = self.keyring();
-        let record = {
+        let transfer = {
             let guard = keyring.read().await;
             let record = guard
                 .current_record()
@@ -720,25 +754,34 @@ impl secrets::Server for SecretsService {
             store
                 .commit_current_for_transfer(record.key_id())
                 .map_err(|e| Error::failed(format!("failed to commit master key export: {e}")))?;
-            record
+            let transfer = MasterKeyTransfer::encrypt(
+                record.descriptor.clone(),
+                &record.key,
+                self.local_node_id(),
+                self.noise_keys().as_ref(),
+                recipient_node_id,
+                recipient_noise_static_pub,
+            )
+            .map_err(|e| Error::failed(format!("failed to encrypt master key transfer: {e}")))?;
+            let historical_records = self.referenced_historical_master_keys(record.key_id())?;
+            let recipient = SecretMasterKeyGrantRecipient {
+                node_id: recipient_node_id,
+                noise_static_pub: recipient_noise_static_pub,
+            };
+            // Keep rotation blocked until the joiner's replicated grants are
+            // durable. Otherwise a node could receive key A by direct join
+            // transfer while the cluster concurrently rotates and publishes
+            // current metadata that no longer matches the bootstrap payload.
+            self.master_key_publisher()
+                .publish_join_grants(transfer.clone(), &historical_records, recipient)
+                .await
+                .map_err(|e| {
+                    Error::failed(format!(
+                        "failed to publish replicated master key transfer: {e}"
+                    ))
+                })?;
+            transfer
         };
-        let transfer = MasterKeyTransfer::encrypt(
-            record.descriptor.clone(),
-            &record.key,
-            self.local_node_id(),
-            self.noise_keys().as_ref(),
-            recipient_node_id,
-            recipient_noise_static_pub,
-        )
-        .map_err(|e| Error::failed(format!("failed to encrypt master key transfer: {e}")))?;
-        self.master_key_publisher()
-            .publish_transfer(transfer.clone())
-            .await
-            .map_err(|e| {
-                Error::failed(format!(
-                    "failed to publish replicated master key transfer: {e}"
-                ))
-            })?;
         write_master_key_transfer(results.get().init_envelope(), &transfer);
         Ok(())
     }
