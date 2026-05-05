@@ -50,6 +50,7 @@ struct SyncClientContext {
     trace: Option<SyncTraceContext>,
     gc_progress: SyncGcProgress,
     attachment_sync_notify: Option<Arc<Notify>>,
+    master_key_sync_notify: Option<Arc<Notify>>,
 }
 
 #[derive(Clone)]
@@ -62,6 +63,7 @@ pub struct SyncRunner {
     root_schema: RootSchemaState,
     gc_progress: SyncGcProgress,
     attachment_sync_notify: Option<Arc<Notify>>,
+    master_key_sync_notify: Option<Arc<Notify>>,
 }
 
 impl SyncRunner {
@@ -70,12 +72,14 @@ impl SyncRunner {
         stores: SyncStores,
         root_schema: RootSchemaState,
         attachment_sync_notify: Option<Arc<Notify>>,
+        master_key_sync_notify: Option<Arc<Notify>>,
     ) -> Self {
         Self {
             stores,
             root_schema,
             gc_progress: SyncGcProgress::new(),
             attachment_sync_notify,
+            master_key_sync_notify,
         }
     }
 
@@ -124,6 +128,7 @@ impl SyncRunner {
                 trace,
                 gc_progress: self.gc_progress.clone(),
                 attachment_sync_notify: self.attachment_sync_notify.clone(),
+                master_key_sync_notify: self.master_key_sync_notify.clone(),
             },
         )
         .await;
@@ -442,6 +447,14 @@ async fn sync_selected_domains_with_stores(
             // catches up as soon as anti-entropy applies the attachment delta locally.
             notify.notify_one();
         }
+        if should_notify_master_key_sync(&domains_wants)
+            && let Some(notify) = context.master_key_sync_notify.as_ref()
+        {
+            // Master-key grants are correctness-critical. Anti-entropy is the
+            // repair path for missed gossip, so wake the reconciler as soon as
+            // this domain receives deltas instead of waiting for another tick.
+            notify.notify_one();
+        }
         Ok(())
     }
     .await;
@@ -484,6 +497,13 @@ fn should_notify_network_attachment_sync(domains_wants: &[(Domain, Vec<PageDiges
         .any(|(domain, _)| *domain == Domain::NetworkAttachments)
 }
 
+/// Returns true when a completed delta stream included secret master-key grants.
+fn should_notify_master_key_sync(domains_wants: &[(Domain, Vec<PageDigestRange>)]) -> bool {
+    domains_wants
+        .iter()
+        .any(|(domain, _)| *domain == Domain::SecretMasterKeys)
+}
+
 /// Decodes one fixed-width XXHash128 root digest from the sync wire format.
 fn read_root_digest(bytes: &[u8]) -> Result<[u8; 16], capnp::Error> {
     bytes.try_into().map_err(|_| {
@@ -496,7 +516,7 @@ fn read_root_digest(bytes: &[u8]) -> Result<[u8; 16], capnp::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::should_notify_network_attachment_sync;
+    use super::{should_notify_master_key_sync, should_notify_network_attachment_sync};
     use mantissa_protocol::sync::Domain;
     use mantissa_store::PageDigestRange;
 
@@ -517,5 +537,21 @@ mod tests {
         ];
 
         assert!(!should_notify_network_attachment_sync(&wants));
+    }
+
+    /// Master-key deltas should wake the grant reconciler immediately.
+    #[test]
+    fn master_key_domain_requests_reconciler_notification() {
+        let wants = vec![(Domain::SecretMasterKeys, Vec::<PageDigestRange>::new())];
+
+        assert!(should_notify_master_key_sync(&wants));
+    }
+
+    /// Non-master-key deltas must not trigger unnecessary reconciler work.
+    #[test]
+    fn non_master_key_domains_skip_reconciler_notification() {
+        let wants = vec![(Domain::Secrets, Vec::<PageDigestRange>::new())];
+
+        assert!(!should_notify_master_key_sync(&wants));
     }
 }

@@ -21,6 +21,7 @@ use crate::scheduler::digest::{
 };
 use crate::scheduler::service::SchedulerService;
 use crate::secrets::master_key_protector::{PassphraseKdfParams, SecretPassphrase};
+use crate::secrets::master_key_reconciler::SecretMasterKeyReconciler;
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
@@ -189,6 +190,8 @@ impl RuntimeTaskHandles {
 struct RuntimeActors {
     runtime_health: config::RuntimeHealthConfig,
     secret_replicator: crate::secrets::gossip::SecretReplicator,
+    secret_master_key_reconciler: SecretMasterKeyReconciler,
+    secret_master_key_sync_notify: Arc<Notify>,
     volume_replicator: VolumeReplicator,
     scheduler_digest_replicator: SchedulerDigestReplicator,
     volume_controller: VolumeController,
@@ -430,10 +433,12 @@ async fn build_runtime_components(
         .await
         .map_err(|error| std::io::Error::other(format!("rebuild sync MSTs: {error}")))?;
     let attachment_sync_notify = Arc::new(Notify::new());
+    let secret_master_key_sync_notify = Arc::new(Notify::new());
     let sync_runner = SyncRunner::new(
         sync_stores.clone(),
         root_schema,
         Some(attachment_sync_notify.clone()),
+        Some(secret_master_key_sync_notify.clone()),
     );
     let sync_gc_progress = sync_runner.gc_progress();
     let network_registry = NetworkRegistry::new(
@@ -479,6 +484,21 @@ async fn build_runtime_components(
         gossip_tx.clone(),
         secret_rx,
     );
+    let secret_master_key_reconciler = SecretMasterKeyReconciler::new(
+        ctx.self_id,
+        ctx.noise_keys.clone(),
+        registry.clone(),
+        stores.secret_master_keys.clone(),
+        stores.secret_master_store.clone(),
+        stores.secret_keyring.clone(),
+        cluster_view.clone(),
+    );
+    if let Err(error) = secret_master_key_reconciler.reconcile_active_view().await {
+        tracing::warn!(
+            target: "secrets",
+            "failed to reconcile replicated secret master keys during startup: {error:#}"
+        );
+    }
 
     let volume_replicator =
         VolumeReplicator::new(volume_registry.clone(), gossip_tx.clone(), volume_rx);
@@ -667,6 +687,8 @@ async fn build_runtime_components(
         RuntimeActors {
             runtime_health,
             secret_replicator,
+            secret_master_key_reconciler,
+            secret_master_key_sync_notify,
             volume_replicator,
             scheduler_digest_replicator,
             volume_controller,
@@ -1017,6 +1039,8 @@ async fn spawn_runtime_tasks(
     let RuntimeActors {
         runtime_health: _runtime_health,
         secret_replicator,
+        secret_master_key_reconciler,
+        secret_master_key_sync_notify,
         volume_replicator,
         scheduler_digest_replicator,
         volume_controller,
@@ -1080,6 +1104,12 @@ async fn spawn_runtime_tasks(
 
     tasks.push(tokio::task::spawn_local(async move {
         secret_replicator.run().await;
+    }));
+
+    tasks.push(tokio::task::spawn_local(async move {
+        secret_master_key_reconciler
+            .run_on_notify(secret_master_key_sync_notify)
+            .await;
     }));
 
     tasks.push(tokio::task::spawn_local(async move {

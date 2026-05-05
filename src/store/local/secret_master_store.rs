@@ -118,9 +118,35 @@ impl SecretMasterStore {
         MasterKeyRecord::new(wrapped.descriptor, key).map(Some)
     }
 
+    /// Returns true when a wrapped envelope exists locally for `key_id`.
+    pub fn contains_key(&self, key_id: Uuid) -> io::Result<bool> {
+        self.load_wrapped_key(key_id).map(|record| record.is_some())
+    }
+
+    /// Imports an externally provided key without changing the local current pointer.
+    ///
+    /// The reconciler uses this for historical grants so ciphertext encrypted
+    /// under older keys stays readable while replicated current metadata
+    /// remains the only authority for current-key selection.
+    pub fn import_key(&self, record: &MasterKeyRecord) -> io::Result<()> {
+        let _guard = self.policy_guard();
+        self.persist_record(&record.descriptor, &record.key, false, None)
+    }
+
     /// Imports an externally provided key and makes it the active key.
     pub fn import_current(&self, record: &MasterKeyRecord) -> io::Result<()> {
         self.import_current_with_policy(record, false)
+    }
+
+    /// Activates a key selected by replicated current-key metadata.
+    ///
+    /// This intentionally does not apply direct-transfer generation policy:
+    /// once the replicated `current` row has converged, it is the source of
+    /// truth. The key must still match any local envelope already stored for
+    /// the same key id.
+    pub fn activate_current(&self, record: &MasterKeyRecord) -> io::Result<()> {
+        let _guard = self.policy_guard();
+        self.persist_record(&record.descriptor, &record.key, true, Some(false))
     }
 
     /// Imports the anchor key during join without reopening the transfer/adoption race.
@@ -518,6 +544,74 @@ mod tests {
                 .expect("old key exists")
                 .key,
             base.key
+        );
+    }
+
+    #[test]
+    fn import_key_preserves_current_key() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let db = Arc::new(Database::create(db_path).unwrap());
+        let store = SecretMasterStore::new(db, test_protector()).expect("open store");
+
+        let current = store.ensure_current().expect("ensure master key");
+        let historical = MasterKeyRecord::new(
+            descriptor(current.generation() + 1),
+            MasterKeyPlaintext::generate().expect("historical key"),
+        )
+        .expect("historical record");
+
+        store
+            .import_key(&historical)
+            .expect("import historical key");
+
+        assert_eq!(store.current().expect("current").key_id(), current.key_id());
+        assert!(
+            store
+                .contains_key(historical.key_id())
+                .expect("contains key")
+        );
+        assert_eq!(
+            store
+                .load_key(historical.key_id())
+                .expect("load imported key")
+                .expect("imported key exists")
+                .key,
+            historical.key
+        );
+    }
+
+    #[test]
+    fn activate_current_uses_replicated_current_authority() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let db = Arc::new(Database::create(db_path).unwrap());
+        let store = SecretMasterStore::new(db, test_protector()).expect("open store");
+
+        let original = store.ensure_current().expect("ensure master key");
+        let replicated_current = MasterKeyRecord::new(
+            descriptor(original.generation()),
+            MasterKeyPlaintext::generate().expect("replicated key"),
+        )
+        .expect("replicated record");
+
+        store
+            .import_key(&replicated_current)
+            .expect("import replicated key");
+        store
+            .activate_current(&replicated_current)
+            .expect("activate replicated key");
+
+        assert_eq!(
+            store.current().expect("current").key_id(),
+            replicated_current.key_id()
+        );
+        assert!(
+            store
+                .load_key(original.key_id())
+                .expect("load original key")
+                .is_some(),
+            "replicated current adoption must not delete historical keys"
         );
     }
 

@@ -85,6 +85,12 @@ impl SecretKeyring {
         *self.inner.current_descriptor.write() = record.descriptor.clone();
     }
 
+    /// Caches one non-current master key for future decrypts by key id.
+    pub fn cache_key(&self, record: &MasterKeyRecord) {
+        let mut cache = self.inner.cache.write();
+        cache.insert(record.key_id(), record.key.clone());
+    }
+
     /// Borrows one master key by id for immediate cryptographic use.
     fn with_master_key<R>(
         &self,
