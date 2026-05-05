@@ -211,17 +211,24 @@ impl SecretMasterStore {
     /// Replicated descriptor and grant rows must be durable before secrets are
     /// re-encrypted under a new key. This preparation step lets the caller
     /// publish those rows first and only then advance local current metadata.
+    /// Cluster transition hooks pass their operation id so replay and merge
+    /// reconciliation can identify operation-created current keys.
     pub fn prepare_rotation(
         &self,
         scope_view: ClusterViewId,
         created_by_node_id: Uuid,
+        operation_id: Option<Uuid>,
     ) -> io::Result<MasterKeyRecord> {
         let _guard = self.policy_guard();
         let parent = self
             .load_current()?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "secret master key missing"))?;
-        let descriptor =
-            MasterKeyDescriptor::child(&parent.descriptor, scope_view, created_by_node_id, None)?;
+        let descriptor = MasterKeyDescriptor::child(
+            &parent.descriptor,
+            scope_view,
+            created_by_node_id,
+            operation_id,
+        )?;
         let key = MasterKeyPlaintext::generate()?;
         self.persist_record(&descriptor, &key, false, None)?;
         MasterKeyRecord::new(descriptor, key)

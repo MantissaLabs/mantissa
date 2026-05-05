@@ -873,7 +873,7 @@ local_test!(
             .expect("seed old-key secret");
 
         let new_record = secret_master_store
-            .prepare_rotation(ClusterViewId::legacy_default(), node_id)
+            .prepare_rotation(ClusterViewId::legacy_default(), node_id, None)
             .expect("prepare replacement key");
         secret_master_store
             .activate_current(&new_record)

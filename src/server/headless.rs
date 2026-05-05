@@ -130,6 +130,8 @@ pub struct HeadlessNode {
     pub scheduler_digests: SchedulerDigestStore,
     pub local_sessions: crate::store::local::LocalSessionStore,
     pub local_creds: crate::store::local::LocalCredentialStore,
+    pub secret_master_store: crate::store::local::SecretMasterStore,
+    pub secret_master_keys: crate::store::secret_master_key_store::SecretMasterKeyStore,
 
     // Keep resources alive
     _db: Arc<redb::Database>,
@@ -293,6 +295,8 @@ impl HeadlessNode {
             scheduler_digests: stores.scheduler_digests.clone(),
             local_sessions: stores.local_sessions.clone(),
             local_creds: stores.local_creds.clone(),
+            secret_master_store: stores.secret_master_store.clone(),
+            secret_master_keys: stores.secret_master_keys.clone(),
             _db: db,
             _noise_keys: noise,
             _signing: signing,

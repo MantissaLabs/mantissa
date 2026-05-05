@@ -816,7 +816,7 @@ impl secrets::Server for SecretsService {
             // key in the middle of a rotation.
             let guard = keyring_handle.write().await;
             let new_record = master_store
-                .prepare_rotation(scope_view, self.local_node_id())
+                .prepare_rotation(scope_view, self.local_node_id(), None)
                 .map_err(|e| Error::failed(format!("failed to rotate master key: {e}")))?;
             self.master_key_publisher()
                 .publish_current_key(&new_record, &recipients)

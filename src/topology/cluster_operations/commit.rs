@@ -6,6 +6,7 @@ use crate::cluster::operations::{
 use crate::cluster::participant::{ClusterParticipantReport, ClusterTransitionParticipant};
 use crate::cluster::transition::ClusterTransition;
 use crate::network::transition::SplitNetworkRuntimeParticipant;
+use crate::secrets::master_key_sync::SecretMasterKeyGrantRecipient;
 use crate::services::ServiceRegistry;
 use crate::topology::Topology;
 use crate::workload::WorkloadRegistry;
@@ -15,6 +16,139 @@ use tracing::warn;
 
 struct PeerScopeParticipant {
     topology: Topology,
+}
+
+struct SplitSecretMasterKeyParticipant {
+    topology: Topology,
+}
+
+#[async_trait(?Send)]
+impl ClusterTransitionParticipant for SplitSecretMasterKeyParticipant {
+    /// Returns the participant identifier used by transition diagnostics.
+    fn name(&self) -> &'static str {
+        "split_secret_master_key"
+    }
+
+    /// Publishes a master-key current row scoped to this node's split target view.
+    async fn on_commit(
+        &self,
+        transition: &ClusterTransition,
+    ) -> Result<ClusterParticipantReport, capnp::Error> {
+        let mut report = ClusterParticipantReport::new(self.name());
+        if !transition.is_split() {
+            return Ok(report);
+        }
+
+        if !transition
+            .retained_node_ids
+            .contains(&self.topology.local.node.id)
+        {
+            return Err(capnp::Error::failed(format!(
+                "split operation {} target view {} does not retain local node {}",
+                transition.operation_id, transition.local_target_view, self.topology.local.node.id
+            )));
+        }
+
+        let recipients = self.split_master_key_recipients(transition)?;
+        let keyring_handle = self.topology.stores.secret_keyring.clone();
+        let keyring = keyring_handle.write().await;
+        let current = keyring
+            .current_record()
+            .map_err(|err| capnp::Error::failed(format!("load active master key: {err}")))?;
+
+        // A crash can happen after the split-scoped key is installed but before
+        // the topology operation reaches Finalized. Startup replay must publish
+        // the same current row again instead of creating a second key for the
+        // same split operation.
+        let (record, generated) = if current.descriptor.scope_view == transition.local_target_view {
+            (current, false)
+        } else {
+            let record = self
+                .topology
+                .stores
+                .secret_master_store
+                .prepare_rotation(
+                    transition.local_target_view,
+                    self.topology.local.node.id,
+                    Some(transition.operation_id),
+                )
+                .map_err(|err| {
+                    capnp::Error::failed(format!("prepare split-scoped master key: {err}"))
+                })?;
+            (record, true)
+        };
+
+        self.topology
+            .stores
+            .secret_master_key_publisher
+            .publish_current_key(&record, &recipients)
+            .await
+            .map_err(|err| {
+                capnp::Error::failed(format!("publish split-scoped master key: {err}"))
+            })?;
+        self.topology
+            .stores
+            .secret_master_store
+            .activate_current(&record)
+            .map_err(|err| capnp::Error::failed(format!("activate split master key: {err}")))?;
+        keyring.install_current(&record);
+
+        report = report
+            .add_detail("scope_view", transition.local_target_view.to_string())
+            .add_detail("key_id", record.key_id().to_string())
+            .add_detail("generation", record.generation().to_string())
+            .add_detail("recipient_count", recipients.len().to_string())
+            .add_detail("generated", generated.to_string());
+        Ok(report)
+    }
+}
+
+impl SplitSecretMasterKeyParticipant {
+    /// Builds the exact recipient grant set for this node's retained split peers.
+    fn split_master_key_recipients(
+        &self,
+        transition: &ClusterTransition,
+    ) -> Result<Vec<SecretMasterKeyGrantRecipient>, capnp::Error> {
+        let mut retained = transition
+            .retained_node_ids
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        retained.sort_unstable();
+
+        let mut recipients = Vec::with_capacity(retained.len());
+        for node_id in retained {
+            if node_id == self.topology.local.node.id {
+                recipients.push(SecretMasterKeyGrantRecipient {
+                    node_id,
+                    noise_static_pub: self.topology.deps.registry.noise_keys().public_bytes(),
+                });
+                continue;
+            }
+
+            let peer = self
+                .topology
+                .deps
+                .registry
+                .peer_value_unscoped(node_id)
+                .ok_or_else(|| {
+                    capnp::Error::failed(format!(
+                        "split retained peer {node_id} has no peer record for master-key grant"
+                    ))
+                })?;
+            if !peer.membership.is_active() {
+                return Err(capnp::Error::failed(format!(
+                    "split retained peer {node_id} is not active for master-key grant"
+                )));
+            }
+            recipients.push(SecretMasterKeyGrantRecipient {
+                node_id,
+                noise_static_pub: peer.noise_static_pub,
+            });
+        }
+
+        Ok(recipients)
+    }
 }
 
 #[async_trait(?Send)]
@@ -240,6 +374,9 @@ impl Topology {
         transition: &ClusterTransition,
     ) -> Result<Vec<ClusterParticipantReport>, capnp::Error> {
         let coordinator = ClusterTransitionCoordinator::new(vec![
+            Box::new(SplitSecretMasterKeyParticipant {
+                topology: self.clone(),
+            }),
             Box::new(PeerScopeParticipant {
                 topology: self.clone(),
             }),
