@@ -1,5 +1,7 @@
 @0xd7f4ffbce9f9a5dd;
 
+using import "topology.capnp".ClusterViewId;
+
 interface Secrets {
   list @0 () -> (secrets :List(SecretSpec));
   # List secret specifications (no plaintext).
@@ -22,8 +24,8 @@ interface Secrets {
   installMasterKeyTransfer @6 (envelope :SecretMasterKeyTransfer);
   # Install or replace the cluster master key from an encrypted transfer envelope.
 
-  rotateMasterKey @7 () -> (version :UInt64);
-  # Rotate the master key and return the new version.
+  rotateMasterKey @7 () -> (keyId :Data, generation :UInt64);
+  # Rotate the master key and return the new key identity.
 }
 
 struct SecretMetadataEntry {
@@ -52,8 +54,11 @@ struct SecretVersion {
   createdBy @2 :Data;
   # 16-byte UUID, optional (empty = unknown).
 
-  masterKeyVersion @3 :UInt64;
-  # Master key version used to encrypt this secret.
+  masterKeyId @3 :Data;
+  # 16-byte UUID of the master key used to encrypt this secret.
+
+  masterKeyGeneration @4 :UInt64;
+  # Human-readable generation for the master key. Not a unique key identity.
 }
 
 struct SecretCiphertext {
@@ -66,8 +71,11 @@ struct SecretCiphertext {
   digest @2 :Data;
   # 32-byte Blake3 digest of plaintext.
 
-  masterKeyVersion @3 :UInt64;
-  # Master key version used to encrypt this payload.
+  masterKeyId @3 :Data;
+  # 16-byte UUID of the master key used to encrypt this payload.
+
+  masterKeyGeneration @4 :UInt64;
+  # Human-readable generation for the master key. Not a unique key identity.
 }
 
 struct SecretSpec {
@@ -123,9 +131,35 @@ struct SecretMasterKeyTransferRequest {
   # 32-byte X25519 static public key advertised by the recipient node.
 }
 
+struct MasterKeyDescriptor {
+  keyId @0 :Data;
+  # 16-byte UUID that uniquely identifies this master key.
+
+  generation @1 :UInt64;
+  # Monotonic generation inside a key lineage/scope, used for display only.
+
+  scopeView @2 :ClusterViewId;
+  # Cluster view this key protects.
+
+  originView @3 :ClusterViewId;
+  # Local active view when the key was created.
+
+  createdByNodeId @4 :Data;
+  # 16-byte node UUID that generated this key.
+
+  createdByOperationId @5 :Data;
+  # 16-byte split/merge operation UUID when applicable, empty otherwise.
+
+  parentKeyIds @6 :List(Data);
+  # Parent master-key ids used to derive lineage and merge diagnostics.
+
+  createdAtUnixSecs @7 :UInt64;
+  # Unix timestamp when this key was created.
+}
+
 struct SecretMasterKeyTransfer {
-  version @0 :UInt64;
-  # Master key version number.
+  descriptor @0 :MasterKeyDescriptor;
+  # Metadata for the transferred master key. Contains no key material.
 
   senderNodeId @1 :Data;
   # 16-byte node UUID that encrypted the transfer.
@@ -153,8 +187,8 @@ struct WrappedSecretMasterKey {
   schemaVersion @0 :UInt16;
   # Durable envelope schema version.
 
-  masterKeyVersion @1 :UInt64;
-  # Master key version number.
+  descriptor @1 :MasterKeyDescriptor;
+  # Metadata for the wrapped master key. Contains no key material.
 
   provider @2 :Text;
   # Local key-protection provider identifier.

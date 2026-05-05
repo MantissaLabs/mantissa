@@ -303,7 +303,7 @@ impl Topology {
                 anchor_noise_static_pub,
             )
             .map_err(|e| Error::failed(format!("failed to decrypt master key transfer: {e}")))?;
-        let record = MasterKeyRecord::new(transfer.version, plaintext)
+        let record = MasterKeyRecord::new(transfer.descriptor, plaintext)
             .map_err(|e| Error::failed(format!("invalid master key payload: {e}")))?;
 
         {

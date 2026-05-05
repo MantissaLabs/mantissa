@@ -49,6 +49,13 @@ use tokio::task::spawn_local;
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
+fn read_uuid_bytes(data: &[u8]) -> Uuid {
+    assert_eq!(data.len(), 16, "uuid must be 16 bytes");
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(data);
+    Uuid::from_bytes(bytes)
+}
+
 #[derive(Default)]
 struct RecordingRuntimeBackend {
     created: Arc<AsyncMutex<Vec<String>>>,
@@ -415,13 +422,15 @@ local_test!(workload_manager_stages_secret_env_and_files, {
         .encrypt(secret_id, version_id, secret_plaintext)
         .expect("encrypt secret");
     let now = Utc::now().to_rfc3339();
-    let master_key_version = ciphertext.master_key_version;
+    let master_key_id = ciphertext.master_key_id;
+    let master_key_generation = ciphertext.master_key_generation;
     let version = SecretVersion::new(
         version_id,
         ciphertext,
         now.clone(),
         None,
-        master_key_version,
+        master_key_id,
+        master_key_generation,
     );
     let value = SecretValue::new(
         secret_name.to_string(),
@@ -680,20 +689,22 @@ local_test!(rotate_master_key_rewraps_secrets, {
     let secret_plaintext = b"rotate-me";
     let secret_id = compute_secret_id(secret_name);
     let version_id = Uuid::new_v4();
-    let old_version = secret_keyring.current_version();
+    let old_key_id = secret_keyring.current_key_id();
 
     let ciphertext = secret_keyring
         .encrypt(secret_id, version_id, secret_plaintext)
         .expect("encrypt secret");
     let old_ciphertext = ciphertext.clone();
-    let master_key_version = ciphertext.master_key_version;
+    let master_key_id = ciphertext.master_key_id;
+    let master_key_generation = ciphertext.master_key_generation;
     let now = Utc::now().to_rfc3339();
     let version = SecretVersion::new(
         version_id,
         ciphertext,
         now.clone(),
         None,
-        master_key_version,
+        master_key_id,
+        master_key_generation,
     );
     let value = SecretValue::new(
         secret_name.to_string(),
@@ -727,19 +738,25 @@ local_test!(rotate_master_key_rewraps_secrets, {
         .promise
         .await
         .expect("rotate master key");
-    let new_version = response.get().expect("response").get_version();
+    let response = response.get().expect("response");
+    let new_key_id = read_uuid_bytes(response.get_key_id().expect("key id"));
+    let new_generation = response.get_generation();
 
-    assert!(new_version > old_version);
+    assert_ne!(new_key_id, old_key_id);
 
     let updated = secret_registry
         .get_by_name(secret_name)
         .expect("fetch secret")
         .expect("secret missing after rotation");
-    assert_eq!(updated.current_version.master_key_version, new_version);
+    assert_eq!(updated.current_version.master_key_id, new_key_id);
+    assert_eq!(
+        updated.current_version.master_key_generation,
+        new_generation
+    );
 
     let maybe_old = secret_master_store
-        .load_version(old_version)
-        .expect("load master key version");
+        .load_key(old_key_id)
+        .expect("load old master key");
     assert!(
         maybe_old.is_some(),
         "previous master key should remain available for convergence"

@@ -110,7 +110,7 @@ impl BootstrapStores {
             SecretMasterStore::new(ctx.db.clone(), secret_master_protector)
                 .map_err(|error| store_error("open secret master key store", error))?;
         let master_record = secret_master_store
-            .ensure_current()
+            .ensure_current_for_node(ClusterViewId::legacy_default(), ctx.self_id)
             .map_err(|error| store_error("ensure current secret master record", error))?;
         let secret_keyring = Arc::new(RwLock::new(SecretKeyring::new(
             secret_master_store.clone(),

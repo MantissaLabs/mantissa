@@ -15,8 +15,10 @@ pub struct SecretMetadata {
 /// Authenticated ciphertext envelope for a single secret version.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SecretCiphertext {
-    /// Identifier of the master key version used for encryption.
-    pub master_key_version: u64,
+    /// Globally unique identifier of the master key used for encryption.
+    pub master_key_id: Uuid,
+    /// Human-readable generation for diagnostics; not a unique key identity.
+    pub master_key_generation: u64,
     /// Random nonce used for ChaCha20-Poly1305.
     pub nonce: [u8; 12],
     /// AEAD ciphertext bytes (contains the Poly1305 tag).
@@ -42,7 +44,8 @@ pub struct SecretVersion {
     pub created_at: String,
     #[serde(default)]
     pub created_by: Option<Uuid>,
-    pub master_key_version: u64,
+    pub master_key_id: Uuid,
+    pub master_key_generation: u64,
 }
 
 impl SecretVersion {
@@ -52,14 +55,16 @@ impl SecretVersion {
         ciphertext: SecretCiphertext,
         created_at: impl Into<String>,
         created_by: Option<Uuid>,
-        master_key_version: u64,
+        master_key_id: Uuid,
+        master_key_generation: u64,
     ) -> Self {
         Self {
             version_id,
             ciphertext,
             created_at: created_at.into(),
             created_by,
-            master_key_version,
+            master_key_id,
+            master_key_generation,
         }
     }
 }
@@ -148,8 +153,10 @@ mod tests {
     #[test]
     fn secret_value_tracks_updates() {
         let metadata = SecretMetadata::default();
+        let master_key_id = uuid::Uuid::new_v4();
         let ciphertext = SecretCiphertext {
-            master_key_version: 1,
+            master_key_id,
+            master_key_generation: 1,
             nonce: [0u8; 12],
             ciphertext: vec![1, 2, 3],
             digest: [9u8; 32],
@@ -159,6 +166,7 @@ mod tests {
             ciphertext,
             Utc::now().to_rfc3339(),
             None,
+            master_key_id,
             1,
         );
 
@@ -175,16 +183,19 @@ mod tests {
         assert_eq!(value.metadata, metadata);
         assert_eq!(value.version().version_id, version.version_id);
 
+        let new_master_key_id = uuid::Uuid::new_v4();
         let new_version = SecretVersion::new(
             uuid::Uuid::new_v4(),
             SecretCiphertext {
-                master_key_version: 2,
+                master_key_id: new_master_key_id,
+                master_key_generation: 2,
                 nonce: [1u8; 12],
                 ciphertext: vec![4, 5, 6],
                 digest: [8u8; 32],
             },
             "2024-02-02T00:00:00Z",
             Some(uuid::Uuid::new_v4()),
+            new_master_key_id,
             2,
         );
         value.set_version(new_version.clone(), "2024-02-02T00:00:00Z");

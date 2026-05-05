@@ -434,7 +434,7 @@ mod tests {
                 .expect("write remote peer");
             seed_recovery_state(&db);
             assert_ne!(original_id, Uuid::nil());
-            assert_eq!(master.version, 1);
+            assert_eq!(master.generation(), 1);
         }
 
         for name in IDENTITY_FILE_NAMES {
@@ -474,7 +474,7 @@ mod tests {
         );
         let master_store =
             SecretMasterStore::new(db.clone(), master_protector).expect("master store");
-        assert_eq!(master_store.current().expect("master").version, 1);
+        assert_eq!(master_store.current().expect("master").generation(), 1);
 
         assert_eq!(count_uuid_table(&db, T_LOCAL_SESSIONS), 0);
         assert_eq!(count_uuid_table(&db, T_LOCAL_CREDS), 0);

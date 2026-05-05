@@ -311,8 +311,10 @@ fn network_attachment_value(
 
 /// Builds one secret value whose deterministic ordering advances with `version`.
 fn secret_value(name: &str, version: u8) -> SecretValue {
+    let master_key_id = Uuid::from_u128(20_000 + u128::from(version));
     let ciphertext = SecretCiphertext {
-        master_key_version: u64::from(version),
+        master_key_id,
+        master_key_generation: u64::from(version),
         nonce: [version; 12],
         ciphertext: vec![version; 4],
         digest: [version; 32],
@@ -322,6 +324,7 @@ fn secret_value(name: &str, version: u8) -> SecretValue {
         ciphertext,
         format!("2026-04-27T00:07:{version:02}Z"),
         Some(Uuid::from_u128(10)),
+        master_key_id,
         u64::from(version),
     );
     let mut value = SecretValue::new(
@@ -746,7 +749,7 @@ local_test!(store_compaction_rankers_cover_all_replicated_domains, {
         secret_value("gc-secret", 1),
         secret_value("gc-secret", 2),
         |retained: SecretValue| {
-            assert_eq!(retained.current_version.master_key_version, 2);
+            assert_eq!(retained.current_version.master_key_generation, 2);
         }
     );
 

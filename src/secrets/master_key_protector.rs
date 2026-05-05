@@ -1,3 +1,4 @@
+use crate::cluster::ClusterViewId;
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
@@ -5,7 +6,9 @@ use chacha20poly1305::{
 };
 use hkdf::Hkdf;
 use mantissa_net::noise::NoiseKeys;
-use mantissa_protocol::secrets::{passphrase_master_key_metadata, wrapped_secret_master_key};
+use mantissa_protocol::secrets::{
+    master_key_descriptor, passphrase_master_key_metadata, wrapped_secret_master_key,
+};
 use sha2::Sha256;
 use std::fmt;
 use std::io;
@@ -116,6 +119,57 @@ impl fmt::Debug for MasterKeyPlaintext {
     }
 }
 
+/// Public metadata that uniquely identifies one secret master key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MasterKeyDescriptor {
+    pub key_id: Uuid,
+    pub generation: u64,
+    pub scope_view: ClusterViewId,
+    pub origin_view: ClusterViewId,
+    pub created_by_node_id: Uuid,
+    pub created_by_operation_id: Option<Uuid>,
+    pub parent_key_ids: Vec<Uuid>,
+    pub created_at_unix_secs: u64,
+}
+
+impl MasterKeyDescriptor {
+    /// Builds the first local key descriptor for a fresh node or cluster.
+    pub fn initial(scope_view: ClusterViewId, created_by_node_id: Uuid) -> io::Result<Self> {
+        Ok(Self {
+            key_id: Uuid::new_v4(),
+            generation: 1,
+            scope_view,
+            origin_view: scope_view,
+            created_by_node_id,
+            created_by_operation_id: None,
+            parent_key_ids: Vec::new(),
+            created_at_unix_secs: unix_now_secs()?,
+        })
+    }
+
+    /// Builds a normal rotation descriptor under the provided active view.
+    pub fn child(
+        parent: &Self,
+        scope_view: ClusterViewId,
+        created_by_node_id: Uuid,
+        operation_id: Option<Uuid>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            key_id: Uuid::new_v4(),
+            generation: parent
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("master key generation overflow"))?,
+            scope_view,
+            origin_view: scope_view,
+            created_by_node_id,
+            created_by_operation_id: operation_id,
+            parent_key_ids: vec![parent.key_id],
+            created_at_unix_secs: unix_now_secs()?,
+        })
+    }
+}
+
 /// Supported AEAD suite for wrapped durable master-key envelopes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MasterKeyCipherSuite {
@@ -142,11 +196,11 @@ impl MasterKeyCipherSuite {
     }
 }
 
-/// Durable encrypted envelope for one cluster master key version.
+/// Durable encrypted envelope for one cluster master key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WrappedMasterKeyRecord {
     pub schema_version: u16,
-    pub master_key_version: u64,
+    pub descriptor: MasterKeyDescriptor,
     pub provider: String,
     pub provider_key_id: String,
     pub cipher_suite: MasterKeyCipherSuite,
@@ -163,7 +217,7 @@ impl WrappedMasterKeyRecord {
         {
             let mut builder = message.init_root::<wrapped_secret_master_key::Builder<'_>>();
             builder.set_schema_version(self.schema_version);
-            builder.set_master_key_version(self.master_key_version);
+            write_master_key_descriptor(builder.reborrow().init_descriptor(), &self.descriptor);
             builder.set_provider(&self.provider);
             builder.set_provider_key_id(&self.provider_key_id);
             builder.set_cipher_suite(self.cipher_suite.as_str());
@@ -186,7 +240,8 @@ impl WrappedMasterKeyRecord {
             .map_err(capnp_to_io)?;
         Ok(Self {
             schema_version: record.get_schema_version(),
-            master_key_version: record.get_master_key_version(),
+            descriptor: read_master_key_descriptor(record.get_descriptor().map_err(capnp_to_io)?)
+                .map_err(capnp_to_io)?,
             provider: record
                 .get_provider()
                 .map_err(capnp_to_io)?
@@ -225,7 +280,7 @@ pub trait MasterKeyProtector: Send + Sync {
     /// Wraps one plaintext cluster master key for local durable storage.
     fn wrap(
         &self,
-        version: u64,
+        descriptor: MasterKeyDescriptor,
         plaintext: &MasterKeyPlaintext,
     ) -> io::Result<WrappedMasterKeyRecord>;
 
@@ -322,7 +377,7 @@ impl MasterKeyProtector for PassphraseMasterKeyProtector {
     /// Wraps a master key with a key derived from the local passphrase.
     fn wrap(
         &self,
-        version: u64,
+        descriptor: MasterKeyDescriptor,
         plaintext: &MasterKeyPlaintext,
     ) -> io::Result<WrappedMasterKeyRecord> {
         let mut salt = [0u8; PASSPHRASE_SALT_SIZE];
@@ -334,7 +389,7 @@ impl MasterKeyProtector for PassphraseMasterKeyProtector {
         let created_at_unix_secs = unix_now_secs()?;
         let mut record = WrappedMasterKeyRecord {
             schema_version: WRAPPED_SCHEMA_VERSION,
-            master_key_version: version,
+            descriptor,
             provider: PASSPHRASE_PROVIDER.to_string(),
             provider_key_id: PASSPHRASE_PROVIDER_KEY_ID.to_string(),
             cipher_suite: MasterKeyCipherSuite::XChaCha20Poly1305,
@@ -436,7 +491,7 @@ impl PassphraseMasterKeyProtector {
 /// Encrypted master key transfer between trusted nodes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MasterKeyTransfer {
-    pub version: u64,
+    pub descriptor: MasterKeyDescriptor,
     pub sender_node_id: Uuid,
     pub recipient_node_id: Uuid,
     pub sender_noise_static_pub: [u8; MASTER_KEY_SIZE],
@@ -449,7 +504,7 @@ pub struct MasterKeyTransfer {
 impl MasterKeyTransfer {
     /// Encrypts one plaintext master key to a recipient node's static X25519 key.
     pub fn encrypt(
-        version: u64,
+        descriptor: MasterKeyDescriptor,
         plaintext: &MasterKeyPlaintext,
         sender_node_id: Uuid,
         sender_noise_keys: &NoiseKeys,
@@ -479,7 +534,7 @@ impl MasterKeyTransfer {
         let mut nonce = [0u8; XCHACHA_NONCE_SIZE];
         getrandom::getrandom(&mut nonce)?;
         let mut transfer = Self {
-            version,
+            descriptor,
             sender_node_id,
             recipient_node_id,
             sender_noise_static_pub: sender_noise_keys.public_bytes(),
@@ -655,7 +710,7 @@ fn envelope_aad(record: &WrappedMasterKeyRecord) -> Vec<u8> {
     let mut aad = Vec::new();
     aad.extend_from_slice(ENVELOPE_AAD_PREFIX);
     aad.extend_from_slice(&record.schema_version.to_be_bytes());
-    aad.extend_from_slice(&record.master_key_version.to_be_bytes());
+    extend_descriptor_aad(&mut aad, &record.descriptor);
     extend_bytes(&mut aad, record.provider.as_bytes());
     extend_bytes(&mut aad, record.provider_key_id.as_bytes());
     extend_bytes(&mut aad, record.cipher_suite.as_str().as_bytes());
@@ -668,7 +723,7 @@ fn envelope_aad(record: &WrappedMasterKeyRecord) -> Vec<u8> {
 fn transfer_aad(transfer: &MasterKeyTransfer) -> Vec<u8> {
     let mut aad = Vec::new();
     aad.extend_from_slice(TRANSFER_AAD_PREFIX);
-    aad.extend_from_slice(&transfer.version.to_be_bytes());
+    extend_descriptor_aad(&mut aad, &transfer.descriptor);
     aad.extend_from_slice(transfer.sender_node_id.as_bytes());
     aad.extend_from_slice(transfer.recipient_node_id.as_bytes());
     aad.extend_from_slice(&transfer.sender_noise_static_pub);
@@ -696,6 +751,106 @@ fn transfer_aead_key(
     Ok(out)
 }
 
+/// Encodes public master-key descriptor metadata into a Cap'n Proto builder.
+pub(crate) fn write_master_key_descriptor(
+    mut builder: master_key_descriptor::Builder<'_>,
+    descriptor: &MasterKeyDescriptor,
+) {
+    builder.set_key_id(descriptor.key_id.as_bytes());
+    builder.set_generation(descriptor.generation);
+    descriptor
+        .scope_view
+        .write_capnp(builder.reborrow().init_scope_view());
+    descriptor
+        .origin_view
+        .write_capnp(builder.reborrow().init_origin_view());
+    builder.set_created_by_node_id(descriptor.created_by_node_id.as_bytes());
+    if let Some(operation_id) = descriptor.created_by_operation_id {
+        builder.set_created_by_operation_id(operation_id.as_bytes());
+    } else {
+        builder.set_created_by_operation_id(&[]);
+    }
+    let mut parents = builder
+        .reborrow()
+        .init_parent_key_ids(descriptor.parent_key_ids.len() as u32);
+    for (idx, parent) in descriptor.parent_key_ids.iter().enumerate() {
+        parents.set(idx as u32, parent.as_bytes());
+    }
+    builder.set_created_at_unix_secs(descriptor.created_at_unix_secs);
+}
+
+/// Decodes public master-key descriptor metadata from Cap'n Proto.
+pub(crate) fn read_master_key_descriptor(
+    reader: master_key_descriptor::Reader<'_>,
+) -> io::Result<MasterKeyDescriptor> {
+    let operation_id = {
+        let raw = reader.get_created_by_operation_id().map_err(capnp_to_io)?;
+        if raw.is_empty() {
+            None
+        } else {
+            Some(uuid_from_data(raw)?)
+        }
+    };
+    let parent_reader = reader.get_parent_key_ids().map_err(capnp_to_io)?;
+    let mut parents = Vec::with_capacity(parent_reader.len() as usize);
+    for parent in parent_reader.iter() {
+        parents.push(uuid_from_data(parent.map_err(capnp_to_io)?)?);
+    }
+
+    Ok(MasterKeyDescriptor {
+        key_id: uuid_from_data(reader.get_key_id().map_err(capnp_to_io)?)?,
+        generation: reader.get_generation(),
+        scope_view: ClusterViewId::from_capnp(reader.get_scope_view().map_err(capnp_to_io)?)
+            .map_err(capnp_to_io)?,
+        origin_view: ClusterViewId::from_capnp(reader.get_origin_view().map_err(capnp_to_io)?)
+            .map_err(capnp_to_io)?,
+        created_by_node_id: uuid_from_data(reader.get_created_by_node_id().map_err(capnp_to_io)?)?,
+        created_by_operation_id: operation_id,
+        parent_key_ids: parents,
+        created_at_unix_secs: reader.get_created_at_unix_secs(),
+    })
+}
+
+/// Appends all descriptor fields to authenticated data in a stable byte order.
+fn extend_descriptor_aad(out: &mut Vec<u8>, descriptor: &MasterKeyDescriptor) {
+    out.extend_from_slice(descriptor.key_id.as_bytes());
+    out.extend_from_slice(&descriptor.generation.to_be_bytes());
+    extend_view_aad(out, descriptor.scope_view);
+    extend_view_aad(out, descriptor.origin_view);
+    out.extend_from_slice(descriptor.created_by_node_id.as_bytes());
+    match descriptor.created_by_operation_id {
+        Some(operation_id) => {
+            out.push(1);
+            out.extend_from_slice(operation_id.as_bytes());
+        }
+        None => out.push(0),
+    }
+    out.extend_from_slice(&(descriptor.parent_key_ids.len() as u64).to_be_bytes());
+    for parent in &descriptor.parent_key_ids {
+        out.extend_from_slice(parent.as_bytes());
+    }
+    out.extend_from_slice(&descriptor.created_at_unix_secs.to_be_bytes());
+}
+
+/// Appends a cluster view id to authenticated data without allocation.
+fn extend_view_aad(out: &mut Vec<u8>, view: ClusterViewId) {
+    out.extend_from_slice(view.cluster_id.as_bytes());
+    out.extend_from_slice(&view.epoch.to_be_bytes());
+}
+
+/// Reads a UUID from a Cap'n Proto data field.
+fn uuid_from_data(data: capnp::data::Reader<'_>) -> io::Result<Uuid> {
+    if data.len() != 16 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "uuid must be 16 bytes",
+        ));
+    }
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(data);
+    Ok(Uuid::from_bytes(bytes))
+}
+
 /// Appends a length-delimited byte string to an AAD buffer.
 fn extend_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
@@ -718,12 +873,26 @@ fn capnp_to_io(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ARGON2_MEMORY_COST_KIB, MasterKeyPlaintext, MasterKeyProtector, MasterKeyTransfer,
-        PASSPHRASE_SALT_SIZE, PassphraseKdfParams, PassphraseMasterKeyProtector, SecretPassphrase,
-        encode_passphrase_metadata,
+        MAX_ARGON2_MEMORY_COST_KIB, MasterKeyDescriptor, MasterKeyPlaintext, MasterKeyProtector,
+        MasterKeyTransfer, PASSPHRASE_SALT_SIZE, PassphraseKdfParams, PassphraseMasterKeyProtector,
+        SecretPassphrase, encode_passphrase_metadata,
     };
+    use crate::cluster::ClusterViewId;
     use mantissa_net::noise::NoiseKeys;
     use uuid::Uuid;
+
+    fn descriptor(generation: u64) -> MasterKeyDescriptor {
+        MasterKeyDescriptor {
+            key_id: Uuid::new_v4(),
+            generation,
+            scope_view: ClusterViewId::legacy_default(),
+            origin_view: ClusterViewId::legacy_default(),
+            created_by_node_id: Uuid::new_v4(),
+            created_by_operation_id: None,
+            parent_key_ids: Vec::new(),
+            created_at_unix_secs: 1,
+        }
+    }
 
     #[test]
     fn passphrase_provider_reopens_wrapped_key() {
@@ -732,7 +901,7 @@ mod tests {
         let provider = PassphraseMasterKeyProtector::new(passphrase.clone());
         let key = MasterKeyPlaintext::generate().expect("key");
 
-        let wrapped = provider.wrap(1, &key).expect("wrap");
+        let wrapped = provider.wrap(descriptor(1), &key).expect("wrap");
         let reopened = PassphraseMasterKeyProtector::new(passphrase);
         let unwrapped = reopened.unwrap(&wrapped).expect("unwrap");
 
@@ -745,7 +914,7 @@ mod tests {
             SecretPassphrase::new(b"correct horse battery staple".to_vec()).expect("passphrase");
         let provider = PassphraseMasterKeyProtector::new(passphrase);
         let key = MasterKeyPlaintext::generate().expect("key");
-        let wrapped = provider.wrap(1, &key).expect("wrap");
+        let wrapped = provider.wrap(descriptor(1), &key).expect("wrap");
 
         let wrong = SecretPassphrase::new(b"incorrect horse battery staple".to_vec())
             .expect("wrong passphrase");
@@ -761,7 +930,7 @@ mod tests {
         let recipient = NoiseKeys::from_private_bytes([7u8; 32]);
         let key = MasterKeyPlaintext::generate().expect("key");
         let transfer = MasterKeyTransfer::encrypt(
-            3,
+            descriptor(3),
             &key,
             sender_id,
             &sender,
@@ -786,7 +955,7 @@ mod tests {
         let recipient = NoiseKeys::from_private_bytes([7u8; 32]);
         let key = MasterKeyPlaintext::generate().expect("key");
         let transfer = MasterKeyTransfer::encrypt(
-            3,
+            descriptor(3),
             &key,
             sender_id,
             &sender,
@@ -813,7 +982,7 @@ mod tests {
             SecretPassphrase::new(b"correct horse battery staple".to_vec()).expect("passphrase");
         let provider = PassphraseMasterKeyProtector::new(passphrase);
         let key = MasterKeyPlaintext::generate().expect("key");
-        let mut wrapped = provider.wrap(1, &key).expect("wrap");
+        let mut wrapped = provider.wrap(descriptor(1), &key).expect("wrap");
         let salt = [1u8; PASSPHRASE_SALT_SIZE];
         wrapped.provider_metadata = encode_passphrase_metadata(
             &salt,

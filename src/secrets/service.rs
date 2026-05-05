@@ -1,6 +1,8 @@
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::gossip::SecretReplicator;
-use crate::secrets::master_key_protector::MasterKeyTransfer;
+use crate::secrets::master_key_protector::{
+    MasterKeyTransfer, read_master_key_descriptor, write_master_key_descriptor,
+};
 use crate::secrets::registry::SecretRegistry;
 use crate::secrets::types::{
     SecretCiphertext, SecretEvent, SecretMetadata, SecretValue, SecretVersion, compute_secret_id,
@@ -146,14 +148,16 @@ fn write_secret_spec(mut builder: secret_spec::Builder<'_>, value: &SecretValue)
     } else {
         version_builder.set_created_by(&[]);
     }
-    version_builder.set_master_key_version(value.current_version.master_key_version);
+    version_builder.set_master_key_id(value.current_version.master_key_id.as_bytes());
+    version_builder.set_master_key_generation(value.current_version.master_key_generation);
 }
 
 fn write_secret_ciphertext(
     mut builder: secret_ciphertext::Builder<'_>,
     ciphertext: &SecretCiphertext,
 ) {
-    builder.set_master_key_version(ciphertext.master_key_version);
+    builder.set_master_key_id(ciphertext.master_key_id.as_bytes());
+    builder.set_master_key_generation(ciphertext.master_key_generation);
     builder.set_nonce(&ciphertext.nonce);
     builder.set_ciphertext(&ciphertext.ciphertext);
     builder.set_digest(&ciphertext.digest);
@@ -262,14 +266,16 @@ fn read_secret_spec_value(
             None
         }
     };
-    let master_key_version = version_reader.get_master_key_version();
+    let master_key_id = read_uuid(version_reader.get_master_key_id()?)?;
+    let master_key_generation = version_reader.get_master_key_generation();
 
     let version = SecretVersion::new(
         version_id,
         ciphertext,
         version_created_at,
         created_by,
-        master_key_version,
+        master_key_id,
+        master_key_generation,
     );
 
     Ok(SecretValue {
@@ -300,7 +306,8 @@ fn read_secret_ciphertext(
     digest.copy_from_slice(digest_reader);
 
     Ok(SecretCiphertext {
-        master_key_version: reader.get_master_key_version(),
+        master_key_id: read_uuid(reader.get_master_key_id()?)?,
+        master_key_generation: reader.get_master_key_generation(),
         nonce,
         ciphertext: reader.get_ciphertext()?.to_vec(),
         digest,
@@ -312,7 +319,7 @@ pub(crate) fn write_master_key_transfer(
     mut builder: secret_master_key_transfer::Builder<'_>,
     transfer: &MasterKeyTransfer,
 ) {
-    builder.set_version(transfer.version);
+    write_master_key_descriptor(builder.reborrow().init_descriptor(), &transfer.descriptor);
     builder.set_sender_node_id(transfer.sender_node_id.as_bytes());
     builder.set_recipient_node_id(transfer.recipient_node_id.as_bytes());
     builder.set_sender_noise_static_pub(&transfer.sender_noise_static_pub);
@@ -346,7 +353,8 @@ pub(crate) fn read_master_key_transfer(
     nonce.copy_from_slice(nonce_reader);
 
     Ok(MasterKeyTransfer {
-        version: reader.get_version(),
+        descriptor: read_master_key_descriptor(reader.get_descriptor()?)
+            .map_err(|e| Error::failed(e.to_string()))?,
         sender_node_id: read_uuid(reader.get_sender_node_id()?)?,
         recipient_node_id: read_uuid(reader.get_recipient_node_id()?)?,
         sender_noise_static_pub,
@@ -443,7 +451,8 @@ impl secrets::Server for SecretsService {
                 .map_err(|e| Error::failed(e.to_string()))?
         };
         let ciphertext = secret_ciphertext_from_encryption(ciphertext);
-        let master_key_version = ciphertext.master_key_version;
+        let master_key_id = ciphertext.master_key_id;
+        let master_key_generation = ciphertext.master_key_generation;
 
         let now = Utc::now().to_rfc3339();
         let version = SecretVersion::new(
@@ -451,7 +460,8 @@ impl secrets::Server for SecretsService {
             ciphertext,
             now.clone(),
             None,
-            master_key_version,
+            master_key_id,
+            master_key_generation,
         );
         let value = SecretValue::new(name.clone(), metadata, now, version);
 
@@ -508,7 +518,8 @@ impl secrets::Server for SecretsService {
                 .map_err(|e| Error::failed(e.to_string()))?
         };
         let ciphertext = secret_ciphertext_from_encryption(ciphertext);
-        let master_key_version = ciphertext.master_key_version;
+        let master_key_id = ciphertext.master_key_id;
+        let master_key_generation = ciphertext.master_key_generation;
 
         let now = Utc::now().to_rfc3339();
         let version = SecretVersion::new(
@@ -516,7 +527,8 @@ impl secrets::Server for SecretsService {
             ciphertext,
             now.clone(),
             None,
-            master_key_version,
+            master_key_id,
+            master_key_generation,
         );
         let mut updated = existing.clone();
         updated.metadata = metadata;
@@ -666,12 +678,12 @@ impl secrets::Server for SecretsService {
                 .current_record()
                 .map_err(|e| Error::failed(format!("failed to load master key: {e}")))?;
             store
-                .commit_current_for_transfer(record.version)
+                .commit_current_for_transfer(record.key_id())
                 .map_err(|e| Error::failed(format!("failed to commit master key export: {e}")))?;
             record
         };
         let transfer = MasterKeyTransfer::encrypt(
-            record.version,
+            record.descriptor.clone(),
             &record.key,
             self.local_node_id(),
             self.noise_keys().as_ref(),
@@ -696,13 +708,18 @@ impl secrets::Server for SecretsService {
         let master_store = self.master_store();
         let topology = self.topology();
 
+        let scope_view = topology
+            .as_ref()
+            .map(Topology::active_cluster_view)
+            .unwrap_or_else(crate::cluster::ClusterViewId::legacy_default);
+
         // Note: We keep previous master-key material around after rotation so peers still
-        // decrypt pre-rotation ciphertext while convergence happens. We push the new version
-        // to every known peer below. Once the cluster settles, the old key can be GC’d later.
+        // decrypt pre-rotation ciphertext while convergence happens. We push the new key
+        // to every known peer below. Once the cluster settles, old keys can be GC'd later.
         let (new_record, keyring_clone) = {
             let guard = keyring_handle.write().await;
             let new_record = master_store
-                .rotate()
+                .rotate(scope_view, self.local_node_id())
                 .map_err(|e| Error::failed(format!("failed to rotate master key: {e}")))?;
             guard.install_current(&new_record);
             (new_record, guard.clone())
@@ -724,7 +741,8 @@ impl secrets::Server for SecretsService {
                 .map_err(|e| Error::failed(e.to_string()))?;
             let ciphertext = secret_ciphertext_from_encryption(ciphertext);
 
-            value.current_version.master_key_version = ciphertext.master_key_version;
+            value.current_version.master_key_id = ciphertext.master_key_id;
+            value.current_version.master_key_generation = ciphertext.master_key_generation;
             value.current_version.ciphertext = ciphertext;
             value.touch(Utc::now().to_rfc3339());
 
@@ -743,10 +761,15 @@ impl secrets::Server for SecretsService {
             )
             .await
         {
-            warn!(target: "secrets", "failed to distribute master key v{}: {e}", new_record.version);
+            warn!(
+                target: "secrets",
+                "failed to distribute master key {}: {e}",
+                new_record.key_id()
+            );
         }
 
-        results.get().set_version(new_record.version);
+        results.get().set_key_id(new_record.key_id().as_bytes());
+        results.get().set_generation(new_record.generation());
         Ok(())
     }
 
@@ -786,7 +809,7 @@ impl secrets::Server for SecretsService {
                 sender.noise_static_pub,
             )
             .map_err(|e| Error::failed(format!("failed to decrypt master key transfer: {e}")))?;
-        let record = MasterKeyRecord::new(transfer.version, plaintext)
+        let record = MasterKeyRecord::new(transfer.descriptor, plaintext)
             .map_err(|e| Error::failed(e.to_string()))?;
 
         {
@@ -820,7 +843,7 @@ async fn distribute_master_key(
             continue;
         };
         let transfer = MasterKeyTransfer::encrypt(
-            record.version,
+            record.descriptor.clone(),
             &record.key,
             sender_node_id,
             sender_noise_keys.as_ref(),
@@ -837,8 +860,8 @@ async fn distribute_master_key(
             warn!(
                 target: "secrets",
                 peer = %peer,
-                "install master key v{} failed: {e}",
-                record.version
+                "install master key {} failed: {e}",
+                record.key_id()
             );
         }
     }
@@ -862,8 +885,10 @@ mod tests {
             description: Some("database password".to_string()),
             labels,
         };
+        let master_key_id = Uuid::new_v4();
         let ciphertext = SecretCiphertext {
-            master_key_version: 7,
+            master_key_id,
+            master_key_generation: 7,
             nonce: [1u8; 12],
             ciphertext: vec![2, 3, 4, 5],
             digest: [6u8; 32],
@@ -873,6 +898,7 @@ mod tests {
             ciphertext,
             "2026-03-25T12:00:00Z",
             Some(Uuid::new_v4()),
+            master_key_id,
             7,
         );
         let mut secret = SecretValue::new("db-password", metadata, "2026-03-25T12:00:00Z", version);
