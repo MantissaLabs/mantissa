@@ -10,6 +10,7 @@ use crate::registry::Registry;
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::scheduler::Scheduler;
 use crate::secrets::crypto::SecretKeyring;
+use crate::secrets::master_key_sync::SecretMasterKeyPublisher;
 use crate::server::auth::AuthStore;
 use crate::services::ServiceRegistry;
 use crate::store::cluster_operation_store::ClusterOperationStore;
@@ -17,6 +18,7 @@ use crate::store::cluster_view_store::ClusterNameRecord;
 use crate::store::cluster_view_store::ClusterViewStore;
 use crate::store::local::{LocalCredentialStore, LocalSessionStore, SecretMasterStore};
 use crate::store::peer_store::PeersStore;
+use crate::store::secret_master_key_store::SecretMasterKeyStore;
 use crate::sync::{SyncRunner, SyncTraceContext};
 use crate::token::TokenStore;
 use crate::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue};
@@ -160,6 +162,8 @@ pub struct TopologyStorage {
     pub token_store: TokenStore,
     pub secret_master_store: SecretMasterStore,
     pub secret_keyring: Arc<RwLock<SecretKeyring>>,
+    pub secret_master_keys: SecretMasterKeyStore,
+    pub secret_master_key_publisher: SecretMasterKeyPublisher,
 }
 
 /// Runtime collaborators used by topology but owned outside its durable stores.

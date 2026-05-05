@@ -22,6 +22,7 @@ use crate::scheduler::digest::{
 use crate::scheduler::service::SchedulerService;
 use crate::secrets::master_key_protector::{PassphraseKdfParams, SecretPassphrase};
 use crate::secrets::master_key_reconciler::SecretMasterKeyReconciler;
+use crate::secrets::master_key_sync::{SecretMasterKeyPublisher, SecretMasterKeyReplicator};
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
@@ -190,6 +191,7 @@ impl RuntimeTaskHandles {
 struct RuntimeActors {
     runtime_health: config::RuntimeHealthConfig,
     secret_replicator: crate::secrets::gossip::SecretReplicator,
+    secret_master_key_replicator: SecretMasterKeyReplicator,
     secret_master_key_reconciler: SecretMasterKeyReconciler,
     secret_master_key_sync_notify: Arc<Notify>,
     volume_replicator: VolumeReplicator,
@@ -219,6 +221,8 @@ struct RuntimeChannels {
     network_rx: Receiver<Message>,
     secret_tx: Sender<Message>,
     secret_rx: Receiver<Message>,
+    secret_master_key_tx: Sender<Message>,
+    secret_master_key_rx: Receiver<Message>,
     volume_tx: Sender<Message>,
     volume_rx: Receiver<Message>,
     scheduler_digest_tx: Sender<Message>,
@@ -237,6 +241,7 @@ struct GossipRoutes {
     service: Sender<Message>,
     network: Sender<Message>,
     secret: Sender<Message>,
+    secret_master_key: Sender<Message>,
     volume: Sender<Message>,
     scheduler_digest: Sender<Message>,
     outbound: Sender<Message>,
@@ -257,6 +262,7 @@ impl RuntimeChannels {
         let (service_tx, service_rx) = async_channel::bounded(capacity);
         let (network_tx, network_rx) = async_channel::bounded(capacity);
         let (secret_tx, secret_rx) = async_channel::bounded(capacity);
+        let (secret_master_key_tx, secret_master_key_rx) = async_channel::bounded(capacity);
         let (volume_tx, volume_rx) = async_channel::bounded(capacity);
         let (scheduler_digest_tx, scheduler_digest_rx) = async_channel::bounded(capacity);
 
@@ -277,6 +283,8 @@ impl RuntimeChannels {
             network_rx,
             secret_tx,
             secret_rx,
+            secret_master_key_tx,
+            secret_master_key_rx,
             volume_tx,
             volume_rx,
             scheduler_digest_tx,
@@ -297,6 +305,7 @@ impl RuntimeChannels {
             service: self.service_tx.clone(),
             network: self.network_tx.clone(),
             secret: self.secret_tx.clone(),
+            secret_master_key: self.secret_master_key_tx.clone(),
             volume: self.volume_tx.clone(),
             scheduler_digest: self.scheduler_digest_tx.clone(),
             outbound: self.gossip_tx.clone(),
@@ -415,6 +424,7 @@ async fn build_runtime_components(
         service_rx,
         network_rx,
         secret_rx,
+        secret_master_key_rx,
         volume_rx,
         scheduler_digest_rx,
         ..
@@ -426,14 +436,21 @@ async fn build_runtime_components(
 
     let runtime_health = config::health_runtime_config();
     let health_monitor = mantissa_health::HealthMonitor::new(ctx.self_id);
-    let topology_stores = build_topology_stores(stores);
+    let secret_master_key_sync_notify = Arc::new(Notify::new());
+    let secret_master_key_publisher = SecretMasterKeyPublisher::new(
+        stores.secret_master_keys.clone(),
+        gossip_tx.clone(),
+        secret_master_key_sync_notify.clone(),
+        ctx.self_id,
+        ctx.noise_keys.clone(),
+    );
+    let topology_stores = build_topology_stores(stores, secret_master_key_publisher.clone());
     let sync_stores = build_sync_stores(stores);
     sync_stores
         .rebuild_msts_for_root_schema_version(root_schema.supported_version())
         .await
         .map_err(|error| std::io::Error::other(format!("rebuild sync MSTs: {error}")))?;
     let attachment_sync_notify = Arc::new(Notify::new());
-    let secret_master_key_sync_notify = Arc::new(Notify::new());
     let sync_runner = SyncRunner::new(
         sync_stores.clone(),
         root_schema,
@@ -483,6 +500,11 @@ async fn build_runtime_components(
         secret_registry.clone(),
         gossip_tx.clone(),
         secret_rx,
+    );
+    let secret_master_key_replicator = SecretMasterKeyReplicator::new(
+        stores.secret_master_keys.clone(),
+        secret_master_key_rx,
+        secret_master_key_sync_notify.clone(),
     );
     let secret_master_key_reconciler = SecretMasterKeyReconciler::new(
         ctx.self_id,
@@ -633,13 +655,16 @@ async fn build_runtime_components(
     let networks_client = capnp_rpc::new_client(networks_service);
 
     let secrets_service = crate::secrets::service::SecretsService::new(
-        secret_registry,
-        stores.secret_keyring.clone(),
-        stores.secret_master_store.clone(),
-        Some(topology.clone()),
-        secret_replicator.clone(),
-        ctx.self_id,
-        ctx.noise_keys.clone(),
+        crate::secrets::service::SecretsServiceConfig {
+            registry: secret_registry,
+            keyring: stores.secret_keyring.clone(),
+            master_store: stores.secret_master_store.clone(),
+            master_key_publisher: secret_master_key_publisher,
+            topology: Some(topology.clone()),
+            replicator: secret_replicator.clone(),
+            local_node_id: ctx.self_id,
+            noise_keys: ctx.noise_keys.clone(),
+        },
     );
     let secrets_client = capnp_rpc::new_client(secrets_service);
 
@@ -687,6 +712,7 @@ async fn build_runtime_components(
         RuntimeActors {
             runtime_health,
             secret_replicator,
+            secret_master_key_replicator,
             secret_master_key_reconciler,
             secret_master_key_sync_notify,
             volume_replicator,
@@ -703,7 +729,10 @@ async fn build_runtime_components(
 ///
 /// This keeps the conversion from bootstrap stores to topology stores local to
 /// the runtime assembly instead of repeating the field mapping elsewhere.
-fn build_topology_stores(stores: &BootstrapStores) -> TopologyStorage {
+fn build_topology_stores(
+    stores: &BootstrapStores,
+    secret_master_key_publisher: SecretMasterKeyPublisher,
+) -> TopologyStorage {
     TopologyStorage {
         local_credential_store: stores.local_creds.clone(),
         local_sessions: stores.local_sessions.clone(),
@@ -714,6 +743,8 @@ fn build_topology_stores(stores: &BootstrapStores) -> TopologyStorage {
         token_store: stores.token_store.clone(),
         secret_master_store: stores.secret_master_store.clone(),
         secret_keyring: stores.secret_keyring.clone(),
+        secret_master_keys: stores.secret_master_keys.clone(),
+        secret_master_key_publisher,
     }
 }
 
@@ -757,6 +788,7 @@ fn build_gossip_client(
             service_events: routes.service.clone(),
             network_events: routes.network.clone(),
             secret_events: routes.secret.clone(),
+            secret_master_key_events: routes.secret_master_key.clone(),
             volume_events: routes.volume.clone(),
             scheduler_digest_events: routes.scheduler_digest.clone(),
             outbound_events: routes.outbound.clone(),
@@ -1039,6 +1071,7 @@ async fn spawn_runtime_tasks(
     let RuntimeActors {
         runtime_health: _runtime_health,
         secret_replicator,
+        secret_master_key_replicator,
         secret_master_key_reconciler,
         secret_master_key_sync_notify,
         volume_replicator,
@@ -1104,6 +1137,10 @@ async fn spawn_runtime_tasks(
 
     tasks.push(tokio::task::spawn_local(async move {
         secret_replicator.run().await;
+    }));
+
+    tasks.push(tokio::task::spawn_local(async move {
+        secret_master_key_replicator.run().await;
     }));
 
     tasks.push(tokio::task::spawn_local(async move {

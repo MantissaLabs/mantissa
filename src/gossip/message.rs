@@ -4,6 +4,7 @@ use crate::network::types::NetworkEvent;
 use crate::scheduler::digest::SchedulerDigestEvent;
 use crate::secrets::types::SecretEvent;
 use crate::services::types::ServiceEvent;
+use crate::store::secret_master_key_store::SecretMasterKeySyncRecord;
 use crate::topology::TopologyEvent;
 use crate::volumes::types::VolumeEvent;
 use crate::workload::model::WorkloadEvent;
@@ -50,6 +51,10 @@ pub enum Message {
         id: Uuid,
         event: SchedulerDigestEvent,
     },
+    SecretMasterKey {
+        id: Uuid,
+        record: SecretMasterKeySyncRecord,
+    },
 }
 
 impl Message {
@@ -65,7 +70,8 @@ impl Message {
             | Message::Network { id, .. }
             | Message::Secret { id, .. }
             | Message::Volume { id, .. }
-            | Message::SchedulerDigest { id, .. } => *id,
+            | Message::SchedulerDigest { id, .. }
+            | Message::SecretMasterKey { id, .. } => *id,
         }
     }
 }

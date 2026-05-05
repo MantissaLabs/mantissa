@@ -55,6 +55,7 @@ impl Topology {
                 Ok(Message::Agent { .. }) => {}
                 Ok(Message::Volume { .. }) => {}
                 Ok(Message::SchedulerDigest { .. }) => {}
+                Ok(Message::SecretMasterKey { .. }) => {}
                 Ok(Message::Topology { id, event }) => {
                     match event {
                         TopologyEvent::Join {

@@ -10,6 +10,7 @@ use crate::scheduler::digest::{
 };
 use crate::secrets::service::write_secret_event;
 use crate::services::service::write_service_event;
+use crate::store::secret_master_key_store::write_secret_master_key_sync_record;
 use crate::timing::jittered_interval;
 use crate::topology;
 use crate::topology::PeerHandle;
@@ -561,6 +562,10 @@ where
                 let digest_builder = builder.init_scheduler_digest();
                 write_scheduler_digest_event(digest_builder, event)?;
             }
+            Message::SecretMasterKey { record, .. } => {
+                let master_key_builder = builder.init_secret_master_key();
+                write_secret_master_key_sync_record(master_key_builder, record);
+            }
         }
     }
 
@@ -626,6 +631,7 @@ fn message_targets_peer(message: &Message, peer_id: Uuid) -> bool {
         Message::Secret { .. } => false,
         Message::Volume { .. } => false,
         Message::SchedulerDigest { event, .. } => scheduler_digest_event_node_id(event) == peer_id,
+        Message::SecretMasterKey { .. } => false,
     }
 }
 

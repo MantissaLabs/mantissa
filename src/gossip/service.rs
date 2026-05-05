@@ -8,6 +8,7 @@ use crate::network::service::read_network_event;
 use crate::scheduler::digest::read_scheduler_digest_event;
 use crate::secrets::service::read_secret_event;
 use crate::services::service::read_service_event;
+use crate::store::secret_master_key_store::read_secret_master_key_sync_record;
 use crate::topology;
 use crate::topology::TopologyEvent;
 use crate::volumes::service::read_volume_event;
@@ -39,6 +40,7 @@ pub struct Channels {
     pub service_events: Sender<Message>,
     pub network_events: Sender<Message>,
     pub secret_events: Sender<Message>,
+    pub secret_master_key_events: Sender<Message>,
     pub volume_events: Sender<Message>,
     pub scheduler_digest_events: Sender<Message>,
     /// Shared outbound queue so newly received gossip can be forwarded to additional peers.
@@ -170,6 +172,7 @@ impl gossip::Server for Gossip {
                 Service(_) => "service",
                 Network(_) => "network",
                 Secret(_) => "secret",
+                SecretMasterKey(_) => "secret_master_key",
                 Volume(_) => "volume",
                 SchedulerDigest(_) => "scheduler_digest",
             };
@@ -339,6 +342,30 @@ impl gossip::Server for Gossip {
                 },
                 Secret(Err(e)) => {
                     eprintln!("Error reading secret: {e}");
+                }
+                SecretMasterKey(Ok(reader)) => match read_secret_master_key_sync_record(reader) {
+                    Ok(record) => {
+                        let message = Message::SecretMasterKey { id, record };
+                        if should_relay_inbound_message(relay_inbound, &message) {
+                            forward_inbound_message(
+                                &self.chans.outbound_events,
+                                message_for_forwarding(&message),
+                            );
+                        }
+                        self.chans
+                            .secret_master_key_events
+                            .send(message)
+                            .await
+                            .map_err(|e| {
+                                capnp::Error::failed(format!(
+                                    "Couldn't send event to secret master keys: {e}"
+                                ))
+                            })?;
+                    }
+                    Err(e) => eprintln!("Failed to convert secret master-key event: {e}"),
+                },
+                SecretMasterKey(Err(e)) => {
+                    eprintln!("Error reading secret master key: {e}");
                 }
                 Volume(Ok(reader)) => match read_volume_event(reader) {
                     Ok(event) => {

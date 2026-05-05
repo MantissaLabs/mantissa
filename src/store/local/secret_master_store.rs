@@ -206,6 +206,27 @@ impl SecretMasterStore {
         MasterKeyRecord::new(descriptor, key)
     }
 
+    /// Generates and stores a rotation key without making it current yet.
+    ///
+    /// Replicated descriptor and grant rows must be durable before secrets are
+    /// re-encrypted under a new key. This preparation step lets the caller
+    /// publish those rows first and only then advance local current metadata.
+    pub fn prepare_rotation(
+        &self,
+        scope_view: ClusterViewId,
+        created_by_node_id: Uuid,
+    ) -> io::Result<MasterKeyRecord> {
+        let _guard = self.policy_guard();
+        let parent = self
+            .load_current()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "secret master key missing"))?;
+        let descriptor =
+            MasterKeyDescriptor::child(&parent.descriptor, scope_view, created_by_node_id, None)?;
+        let key = MasterKeyPlaintext::generate()?;
+        self.persist_record(&descriptor, &key, false, None)?;
+        MasterKeyRecord::new(descriptor, key)
+    }
+
     /// Locks local master-key policy decisions for this daemon instance.
     fn policy_guard(&self) -> MutexGuard<'_, ()> {
         self.policy_lock.lock()

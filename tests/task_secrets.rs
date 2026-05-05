@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use capnp_rpc::new_client as capnp_new_client;
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
+use mantissa::cluster::ClusterViewId;
 use mantissa::gossip::Message;
 use mantissa::network::registry::NetworkRegistry;
 use mantissa::registry::Registry;
@@ -16,8 +17,9 @@ use mantissa::scheduler::{SlotCapacity, SlotSpec};
 use mantissa::secrets::crypto::SecretKeyring;
 use mantissa::secrets::gossip::SecretReplicator;
 use mantissa::secrets::master_key_protector::PassphraseMasterKeyProtector;
+use mantissa::secrets::master_key_sync::SecretMasterKeyPublisher;
 use mantissa::secrets::registry::SecretRegistry;
-use mantissa::secrets::service::SecretsService;
+use mantissa::secrets::service::{SecretsService, SecretsServiceConfig};
 use mantissa::secrets::types::{SecretMetadata, SecretValue, SecretVersion, compute_secret_id};
 use mantissa::services::registry::ServiceRegistry;
 use mantissa::store::local::{LocalSessionStore, SecretMasterStore};
@@ -26,6 +28,7 @@ use mantissa::store::network_store::{
 };
 use mantissa::store::peer_store::open_peers_store;
 use mantissa::store::scheduler_store::open_scheduler_store;
+use mantissa::store::secret_master_key_store::{current_for_scope, open_secret_master_key_store};
 use mantissa::store::secret_store::open_secret_store;
 use mantissa::store::service_store::open_service_store;
 use mantissa::store::volume_store::{open_volume_node_store, open_volume_spec_store};
@@ -44,7 +47,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::fs;
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock};
 use tokio::task::spawn_local;
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
@@ -720,17 +723,43 @@ local_test!(rotate_master_key_rewraps_secrets, {
 
     let (gossip_tx, _gossip_rx) = async_channel::unbounded::<Message>();
     let (_secret_tx, secret_rx) = async_channel::unbounded::<Message>();
-    let secret_replicator = SecretReplicator::new(secret_registry.clone(), gossip_tx, secret_rx);
-
-    let service = SecretsService::new(
-        secret_registry.clone(),
-        secret_keyring_handle.clone(),
-        secret_master_store.clone(),
-        None,
-        secret_replicator,
-        node_id,
-        Arc::new(NoiseKeys::from_private_bytes([9u8; 32])),
+    let secret_replicator =
+        SecretReplicator::new(secret_registry.clone(), gossip_tx.clone(), secret_rx);
+    let _secret_master_key_dir = tempdir().expect("master key sync dir");
+    let secret_master_key_db = Arc::new(
+        redb::Database::create(
+            _secret_master_key_dir
+                .path()
+                .join("secret-master-keys.redb"),
+        )
+        .expect("create master key sync db"),
     );
+    let secret_master_keys = open_secret_master_key_store(secret_master_key_db, node_id)
+        .expect("open master key sync store");
+    secret_master_keys
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild master key sync store");
+    let secret_master_keys_for_assert = secret_master_keys.clone();
+    let noise_keys = Arc::new(NoiseKeys::from_private_bytes([9u8; 32]));
+    let master_key_publisher = SecretMasterKeyPublisher::new(
+        secret_master_keys,
+        gossip_tx,
+        Arc::new(Notify::new()),
+        node_id,
+        noise_keys.clone(),
+    );
+
+    let service = SecretsService::new(SecretsServiceConfig {
+        registry: secret_registry.clone(),
+        keyring: secret_keyring_handle.clone(),
+        master_store: secret_master_store.clone(),
+        master_key_publisher,
+        topology: None,
+        replicator: secret_replicator,
+        local_node_id: node_id,
+        noise_keys,
+    });
     let client: secrets::Client = capnp_new_client(service);
     let response = client
         .rotate_master_key_request()
@@ -743,6 +772,14 @@ local_test!(rotate_master_key_rewraps_secrets, {
     let new_generation = response.get_generation();
 
     assert_ne!(new_key_id, old_key_id);
+    let replicated_current = current_for_scope(
+        &secret_master_keys_for_assert,
+        ClusterViewId::legacy_default(),
+    )
+    .expect("load replicated current")
+    .expect("replicated current missing");
+    assert_eq!(replicated_current.key_id, new_key_id);
+    assert_eq!(replicated_current.generation, new_generation);
 
     let updated = secret_registry
         .get_by_name(secret_name)

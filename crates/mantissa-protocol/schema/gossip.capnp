@@ -8,6 +8,7 @@ using import "agents.capnp".AgentEvent;
 using import "services.capnp".ServiceEvent;
 using import "network.capnp".NetworkEvent;
 using import "secrets.capnp".SecretEvent;
+using import "secrets.capnp".SecretMasterKeySyncRecord;
 using import "scheduling.capnp".SchedulerDigestEvent;
 using import "volumes.capnp".VolumeEvent;
 
@@ -65,6 +66,9 @@ struct GossipMessage {
 
     schedulerDigest @9 :SchedulerDigestEvent;
     # Compact per-node scheduler digest event.
+
+    secretMasterKey @12 :SecretMasterKeySyncRecord;
+    # Secret master-key descriptor/grant/current row.
   }
 }
 

@@ -56,6 +56,17 @@ async fn wait_for_plaintext(
     .await
 }
 
+/// Rotates the cluster master key through the public secrets RPC.
+async fn rotate_master_key(client: &secrets::Client) -> Result<(), capnp::Error> {
+    client
+        .rotate_master_key_request()
+        .send()
+        .promise
+        .await?
+        .get()?;
+    Ok(())
+}
+
 local_test!(master_key_exchange_supports_three_node_secret_decryption, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
 
@@ -130,6 +141,49 @@ local_test!(master_key_exchange_supports_three_node_secret_decryption, {
             )
             .await,
             "node {} should decrypt the third-created secret",
+            node.id()
+        );
+    }
+});
+
+local_test!(master_key_rotation_replicates_through_sync_domain, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+
+    let anchor = TestNode::new_with_tick_ms(100).await;
+    let second = TestNode::new_with_tick_ms(100).await;
+    second.join(&anchor).await.expect("second joins anchor");
+    let cluster = [anchor, second];
+    TestNode::assert_cluster_size_all(&cluster, 2, "two-node cluster before rotation").await;
+
+    let secret = b"rotate-through-sync";
+    create_secret(&cluster[0].node.secrets_client, "rotated-secret", secret)
+        .await
+        .expect("create secret before rotation");
+    assert!(
+        wait_for_plaintext(
+            &cluster[1].node.secrets_client,
+            "rotated-secret",
+            secret,
+            Duration::from_secs(10),
+        )
+        .await,
+        "second node should decrypt the pre-rotation secret"
+    );
+
+    rotate_master_key(&cluster[0].node.secrets_client)
+        .await
+        .expect("rotate master key on anchor");
+
+    for node in &cluster {
+        assert!(
+            wait_for_plaintext(
+                &node.node.secrets_client,
+                "rotated-secret",
+                secret,
+                Duration::from_secs(10),
+            )
+            .await,
+            "node {} should decrypt the rewrapped secret after replicated key sync",
             node.id()
         );
     }

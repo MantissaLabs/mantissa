@@ -303,7 +303,7 @@ impl Topology {
                 anchor_noise_static_pub,
             )
             .map_err(|e| Error::failed(format!("failed to decrypt master key transfer: {e}")))?;
-        let record = MasterKeyRecord::new(transfer.descriptor, plaintext)
+        let record = MasterKeyRecord::new(transfer.descriptor.clone(), plaintext)
             .map_err(|e| Error::failed(format!("invalid master key payload: {e}")))?;
 
         {
@@ -314,6 +314,16 @@ impl Topology {
                 .map_err(|e| Error::failed(format!("failed to persist master key: {e}")))?;
             guard.install_current(&record);
         }
+
+        self.stores
+            .secret_master_key_publisher
+            .publish_transfer(transfer)
+            .await
+            .map_err(|e| {
+                Error::failed(format!(
+                    "failed to persist replicated master key transfer: {e}"
+                ))
+            })?;
 
         Ok(())
     }

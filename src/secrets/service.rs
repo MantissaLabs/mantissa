@@ -3,11 +3,12 @@ use crate::secrets::gossip::SecretReplicator;
 use crate::secrets::master_key_protector::{
     MasterKeyTransfer, read_master_key_descriptor, write_master_key_descriptor,
 };
+use crate::secrets::master_key_sync::{SecretMasterKeyGrantRecipient, SecretMasterKeyPublisher};
 use crate::secrets::registry::SecretRegistry;
 use crate::secrets::types::{
     SecretCiphertext, SecretEvent, SecretMetadata, SecretValue, SecretVersion, compute_secret_id,
 };
-use crate::store::local::{MasterKeyRecord, SecretMasterStore};
+use crate::store::local::SecretMasterStore;
 use crate::topology::Topology;
 use capnp::Error;
 use capnp::struct_list;
@@ -23,38 +24,43 @@ use std::io::Cursor;
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::warn;
 use uuid::Uuid;
 
 pub struct SecretsService {
     registry: SecretRegistry,
     keyring: Arc<RwLock<SecretKeyring>>,
     master_store: SecretMasterStore,
+    master_key_publisher: SecretMasterKeyPublisher,
     topology: Option<Topology>,
     replicator: SecretReplicator,
     local_node_id: Uuid,
     noise_keys: Arc<NoiseKeys>,
 }
 
+/// Constructor inputs for the secrets RPC service.
+pub struct SecretsServiceConfig {
+    pub registry: SecretRegistry,
+    pub keyring: Arc<RwLock<SecretKeyring>>,
+    pub master_store: SecretMasterStore,
+    pub master_key_publisher: SecretMasterKeyPublisher,
+    pub topology: Option<Topology>,
+    pub replicator: SecretReplicator,
+    pub local_node_id: Uuid,
+    pub noise_keys: Arc<NoiseKeys>,
+}
+
 impl SecretsService {
     /// Constructs the secrets RPC surface with access to registry, keyring, and master store.
-    pub fn new(
-        registry: SecretRegistry,
-        keyring: Arc<RwLock<SecretKeyring>>,
-        master_store: SecretMasterStore,
-        topology: Option<Topology>,
-        replicator: SecretReplicator,
-        local_node_id: Uuid,
-        noise_keys: Arc<NoiseKeys>,
-    ) -> Self {
+    pub fn new(config: SecretsServiceConfig) -> Self {
         Self {
-            registry,
-            keyring,
-            master_store,
-            topology,
-            replicator,
-            local_node_id,
-            noise_keys,
+            registry: config.registry,
+            keyring: config.keyring,
+            master_store: config.master_store,
+            master_key_publisher: config.master_key_publisher,
+            topology: config.topology,
+            replicator: config.replicator,
+            local_node_id: config.local_node_id,
+            noise_keys: config.noise_keys,
         }
     }
 
@@ -68,6 +74,10 @@ impl SecretsService {
 
     fn master_store(&self) -> SecretMasterStore {
         self.master_store.clone()
+    }
+
+    fn master_key_publisher(&self) -> SecretMasterKeyPublisher {
+        self.master_key_publisher.clone()
     }
 
     fn topology(&self) -> Option<Topology> {
@@ -92,6 +102,36 @@ impl SecretsService {
             topology.ensure_no_active_cluster_operation(action)?;
         }
         Ok(())
+    }
+
+    /// Builds the active recipient set for a newly replicated master key.
+    fn master_key_recipients(&self) -> Result<Vec<SecretMasterKeyGrantRecipient>, Error> {
+        let mut recipients = vec![SecretMasterKeyGrantRecipient {
+            node_id: self.local_node_id(),
+            noise_static_pub: self.noise_keys().public_bytes(),
+        }];
+
+        let Some(topology) = self.topology() else {
+            return Ok(recipients);
+        };
+        let registry = topology.registry();
+        let peers = registry
+            .known_peers()
+            .map_err(|e| Error::failed(format!("failed to load master-key recipients: {e}")))?;
+        for peer_id in peers {
+            let Some(peer) = registry.peer_value_unscoped(peer_id) else {
+                continue;
+            };
+            if !peer.membership.is_active() {
+                continue;
+            }
+            recipients.push(SecretMasterKeyGrantRecipient {
+                node_id: peer_id,
+                noise_static_pub: peer.noise_static_pub,
+            });
+        }
+
+        Ok(recipients)
     }
 }
 
@@ -691,6 +731,14 @@ impl secrets::Server for SecretsService {
             recipient_noise_static_pub,
         )
         .map_err(|e| Error::failed(format!("failed to encrypt master key transfer: {e}")))?;
+        self.master_key_publisher()
+            .publish_transfer(transfer.clone())
+            .await
+            .map_err(|e| {
+                Error::failed(format!(
+                    "failed to publish replicated master key transfer: {e}"
+                ))
+            })?;
         write_master_key_transfer(results.get().init_envelope(), &transfer);
         Ok(())
     }
@@ -713,14 +761,29 @@ impl secrets::Server for SecretsService {
             .map(Topology::active_cluster_view)
             .unwrap_or_else(crate::cluster::ClusterViewId::legacy_default);
 
+        let recipients = self.master_key_recipients()?;
+
         // Note: We keep previous master-key material around after rotation so peers still
-        // decrypt pre-rotation ciphertext while convergence happens. We push the new key
-        // to every known peer below. Once the cluster settles, old keys can be GC'd later.
+        // decrypt pre-rotation ciphertext while convergence happens. The new key is now
+        // replicated as per-recipient grants before any secret is rewrapped under it.
         let (new_record, keyring_clone) = {
+            // Hold the write lock until the replicated grant/current rows are
+            // durable and the local keyring has switched. This blocks
+            // concurrent secret writes and join exports from observing the old
+            // key in the middle of a rotation.
             let guard = keyring_handle.write().await;
             let new_record = master_store
-                .rotate(scope_view, self.local_node_id())
+                .prepare_rotation(scope_view, self.local_node_id())
                 .map_err(|e| Error::failed(format!("failed to rotate master key: {e}")))?;
+            self.master_key_publisher()
+                .publish_current_key(&new_record, &recipients)
+                .await
+                .map_err(|e| {
+                    Error::failed(format!("failed to publish replicated master key: {e}"))
+                })?;
+            master_store
+                .activate_current(&new_record)
+                .map_err(|e| Error::failed(format!("failed to activate master key: {e}")))?;
             guard.install_current(&new_record);
             (new_record, guard.clone())
         };
@@ -752,22 +815,6 @@ impl secrets::Server for SecretsService {
                 .map_err(|e| Error::failed(e.to_string()))?;
         }
 
-        if let Some(topology) = topology
-            && let Err(e) = distribute_master_key(
-                topology,
-                self.local_node_id(),
-                self.noise_keys(),
-                &new_record,
-            )
-            .await
-        {
-            warn!(
-                target: "secrets",
-                "failed to distribute master key {}: {e}",
-                new_record.key_id()
-            );
-        }
-
         results.get().set_key_id(new_record.key_id().as_bytes());
         results.get().set_generation(new_record.generation());
         Ok(())
@@ -778,95 +825,11 @@ impl secrets::Server for SecretsService {
         params: secrets::InstallMasterKeyTransferParams,
         _results: secrets::InstallMasterKeyTransferResults,
     ) -> Result<(), Error> {
-        let store = self.master_store();
-        let keyring = self.keyring();
-        let noise_keys = self.noise_keys();
-        let topology = self.topology().ok_or_else(|| {
-            Error::failed("topology is required to authenticate master key transfer sender".into())
-        })?;
-
-        let transfer = read_master_key_transfer(params.get()?.get_envelope()?)?;
-        let sender = topology
-            .registry()
-            .peer_value_unscoped(transfer.sender_node_id)
-            .ok_or_else(|| {
-                Error::failed(format!(
-                    "master key transfer sender {} is not registered",
-                    transfer.sender_node_id
-                ))
-            })?;
-        if !sender.membership.is_active() {
-            return Err(Error::failed(format!(
-                "master key transfer sender {} is not active",
-                transfer.sender_node_id
-            )));
-        }
-        let plaintext = transfer
-            .decrypt(
-                self.local_node_id(),
-                noise_keys.as_ref(),
-                transfer.sender_node_id,
-                sender.noise_static_pub,
-            )
-            .map_err(|e| Error::failed(format!("failed to decrypt master key transfer: {e}")))?;
-        let record = MasterKeyRecord::new(transfer.descriptor, plaintext)
-            .map_err(|e| Error::failed(e.to_string()))?;
-
-        {
-            let guard = keyring.write().await;
-            store
-                .import_current(&record)
-                .map_err(|e| Error::failed(format!("failed to persist master key: {e}")))?;
-            guard.install_current(&record);
-        }
-
-        Ok(())
+        let _ = params.get()?.get_envelope()?;
+        Err(Error::failed(
+            "direct master-key install is disabled; use replicated grants".into(),
+        ))
     }
-}
-
-async fn distribute_master_key(
-    topology: Topology,
-    sender_node_id: Uuid,
-    sender_noise_keys: Arc<NoiseKeys>,
-    record: &MasterKeyRecord,
-) -> Result<(), Error> {
-    let registry = topology.registry();
-    let peers = registry
-        .known_peers()
-        .map_err(|e| Error::failed(format!("failed to load peer list: {e}")))?;
-
-    for peer in peers {
-        let Some(peer_value) = registry.peer_value_unscoped(peer) else {
-            continue;
-        };
-        let Some(session) = registry.session_for_peer(peer).await else {
-            continue;
-        };
-        let transfer = MasterKeyTransfer::encrypt(
-            record.descriptor.clone(),
-            &record.key,
-            sender_node_id,
-            sender_noise_keys.as_ref(),
-            peer,
-            peer_value.noise_static_pub,
-        )
-        .map_err(|e| Error::failed(format!("failed to encrypt master key transfer: {e}")))?;
-        let request = session.get_secrets_request();
-        let secrets_client = request.send().pipeline.get_secrets();
-        let mut install = secrets_client.install_master_key_transfer_request();
-        write_master_key_transfer(install.get().init_envelope(), &transfer);
-
-        if let Err(e) = install.send().promise.await {
-            warn!(
-                target: "secrets",
-                peer = %peer,
-                "install master key {} failed: {e}",
-                record.key_id()
-            );
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

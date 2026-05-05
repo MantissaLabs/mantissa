@@ -165,6 +165,20 @@ pub async fn upsert_current(
         .await
 }
 
+/// Upserts one replicated master-key row using the row id implied by its variant.
+pub async fn upsert_record(
+    store: &SecretMasterKeyStoreInner,
+    record: SecretMasterKeySyncRecord,
+) -> mantissa_store::Result<()> {
+    match record {
+        SecretMasterKeySyncRecord::Descriptor(descriptor) => {
+            upsert_descriptor(store, descriptor).await
+        }
+        SecretMasterKeySyncRecord::Grant(grant) => upsert_grant(store, grant).await,
+        SecretMasterKeySyncRecord::Current(current) => upsert_current(store, current).await,
+    }
+}
+
 /// Reads the deterministic current-key winner for one scope, if any row exists.
 pub fn current_for_scope(
     store: &SecretMasterKeyStoreInner,
@@ -175,6 +189,17 @@ pub fn current_for_scope(
         None => return Ok(None),
     };
     Ok(current_from_snapshot(&snapshot))
+}
+
+/// Builds the replicated current pointer that corresponds to one descriptor.
+pub fn current_from_descriptor(descriptor: &MasterKeyDescriptor) -> SecretMasterKeyCurrent {
+    SecretMasterKeyCurrent {
+        scope_view: descriptor.scope_view,
+        key_id: descriptor.key_id,
+        generation: descriptor.generation,
+        created_by_operation_id: descriptor.created_by_operation_id,
+        parent_key_ids: descriptor.parent_key_ids.clone(),
+    }
 }
 
 impl StoreValueCodec for SecretMasterKeySyncRecord {
@@ -288,7 +313,7 @@ fn current_rows_share_lineage(
 }
 
 /// Encodes one replicated master-key row into the wire/store schema.
-fn write_secret_master_key_sync_record(
+pub(crate) fn write_secret_master_key_sync_record(
     mut builder: secret_master_key_sync_record::Builder<'_>,
     record: &SecretMasterKeySyncRecord,
 ) {
@@ -306,7 +331,7 @@ fn write_secret_master_key_sync_record(
 }
 
 /// Decodes one replicated master-key row from the wire/store schema.
-fn read_secret_master_key_sync_record(
+pub(crate) fn read_secret_master_key_sync_record(
     reader: secret_master_key_sync_record::Reader<'_>,
 ) -> Result<SecretMasterKeySyncRecord, Error> {
     match reader.which()? {
