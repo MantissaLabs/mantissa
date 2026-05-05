@@ -4,7 +4,7 @@ use crate::secrets::master_key_protector::{
 };
 use crate::store::tx::{into_io, with_read_tx, with_write_tx};
 use parking_lot::{Mutex, MutexGuard};
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 use std::cmp::Ordering;
 use std::{io, sync::Arc};
 use uuid::Uuid;
@@ -116,6 +116,33 @@ impl SecretMasterStore {
         };
         let key = self.protector.unwrap(&wrapped)?;
         MasterKeyRecord::new(wrapped.descriptor, key).map(Some)
+    }
+
+    /// Loads every locally wrapped master key so rare merge commits can grant them to peers.
+    ///
+    /// This unwraps all local key envelopes and is therefore intentionally used
+    /// only on low-frequency control-plane transitions. Merge needs this broad
+    /// view because secrets created on either side of a split may still refer
+    /// to older key ids after the partitions converge.
+    pub fn load_all_keys(&self) -> io::Result<Vec<MasterKeyRecord>> {
+        let _guard = self.policy_guard();
+        let wrapped_records = with_read_tx(&self.db, |tx| {
+            let table = tx.open_table(T_MASTER_KEY_ENVELOPES).map_err(into_io)?;
+            let mut out = Vec::new();
+            for entry in table.iter().map_err(into_io)? {
+                let (_, raw_envelope) = entry.map_err(into_io)?;
+                out.push(WrappedMasterKeyRecord::decode(raw_envelope.value())?);
+            }
+            Ok(out)
+        })?;
+
+        let mut records = Vec::with_capacity(wrapped_records.len());
+        for wrapped in wrapped_records {
+            let key = self.protector.unwrap(&wrapped)?;
+            records.push(MasterKeyRecord::new(wrapped.descriptor, key)?);
+        }
+        records.sort_by_key(|record| record.key_id());
+        Ok(records)
     }
 
     /// Returns true when a wrapped envelope exists locally for `key_id`.

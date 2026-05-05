@@ -277,6 +277,14 @@ fn current_supersedes(
     candidate: &SecretMasterKeyCurrent,
     current: &SecretMasterKeyCurrent,
 ) -> bool {
+    // First honor explicit ancestry. Split/merge currents are operation-created,
+    // but a later normal rotation descended from them must still advance the
+    // scope current instead of being pinned behind the operation row forever.
+    if current_rows_share_lineage(candidate, current) && candidate.generation != current.generation
+    {
+        return candidate.generation > current.generation;
+    }
+
     match (
         candidate.created_by_operation_id.is_some(),
         current.created_by_operation_id.is_some(),
@@ -284,11 +292,6 @@ fn current_supersedes(
         (true, false) => return true,
         (false, true) => return false,
         _ => {}
-    }
-
-    if current_rows_share_lineage(candidate, current) && candidate.generation != current.generation
-    {
-        return candidate.generation > current.generation;
     }
 
     (candidate.generation, candidate.key_id) > (current.generation, current.key_id)
@@ -605,6 +608,20 @@ mod tests {
         let mut merge = current(Uuid::from_u128(303), 1);
         merge.created_by_operation_id = Some(Uuid::from_u128(304));
         assert!(current_supersedes(&merge, &right));
+    }
+
+    /// A normal rotation descended from a transition-created key must become current.
+    #[test]
+    fn descendant_rotation_supersedes_operation_current() {
+        let operation_key = Uuid::from_u128(310);
+        let rotated_key = Uuid::from_u128(311);
+        let mut operation_current = current(operation_key, 2);
+        operation_current.created_by_operation_id = Some(Uuid::from_u128(312));
+        let mut rotated_current = current(rotated_key, 3);
+        rotated_current.parent_key_ids = vec![operation_key];
+
+        assert!(current_supersedes(&rotated_current, &operation_current));
+        assert!(!current_supersedes(&operation_current, &rotated_current));
     }
 
     /// Replicated master-key rows should converge through normal MST delta exchange.

@@ -8,6 +8,7 @@ use crate::cluster::transition::ClusterTransition;
 use crate::network::transition::SplitNetworkRuntimeParticipant;
 use crate::secrets::master_key_sync::SecretMasterKeyGrantRecipient;
 use crate::services::ServiceRegistry;
+use crate::store::local::MasterKeyRecord;
 use crate::topology::Topology;
 use crate::workload::WorkloadRegistry;
 use async_trait::async_trait;
@@ -118,37 +119,210 @@ impl SplitSecretMasterKeyParticipant {
 
         let mut recipients = Vec::with_capacity(retained.len());
         for node_id in retained {
-            if node_id == self.topology.local.node.id {
-                recipients.push(SecretMasterKeyGrantRecipient {
-                    node_id,
-                    noise_static_pub: self.topology.deps.registry.noise_keys().public_bytes(),
-                });
-                continue;
-            }
-
-            let peer = self
-                .topology
-                .deps
-                .registry
-                .peer_value_unscoped(node_id)
-                .ok_or_else(|| {
-                    capnp::Error::failed(format!(
-                        "split retained peer {node_id} has no peer record for master-key grant"
-                    ))
-                })?;
-            if !peer.membership.is_active() {
-                return Err(capnp::Error::failed(format!(
-                    "split retained peer {node_id} is not active for master-key grant"
-                )));
-            }
-            recipients.push(SecretMasterKeyGrantRecipient {
-                node_id,
-                noise_static_pub: peer.noise_static_pub,
-            });
+            recipients.push(master_key_recipient_for_node(&self.topology, node_id)?);
         }
 
         Ok(recipients)
     }
+}
+
+struct MergeSecretMasterKeyParticipant {
+    topology: Topology,
+}
+
+#[async_trait(?Send)]
+impl ClusterTransitionParticipant for MergeSecretMasterKeyParticipant {
+    /// Returns the participant identifier used by transition diagnostics.
+    fn name(&self) -> &'static str {
+        "merge_secret_master_key"
+    }
+
+    /// Cross-grants local keys and publishes a merge current for the destination view.
+    async fn on_commit(
+        &self,
+        transition: &ClusterTransition,
+    ) -> Result<ClusterParticipantReport, capnp::Error> {
+        let mut report = ClusterParticipantReport::new(self.name());
+        if !transition.is_merge() {
+            return Ok(report);
+        }
+
+        let recipients = self.merge_master_key_recipients()?;
+        let keyring_handle = self.topology.stores.secret_keyring.clone();
+        let keyring = keyring_handle.write().await;
+        let current = keyring
+            .current_record()
+            .map_err(|err| capnp::Error::failed(format!("load active master key: {err}")))?;
+        let mut records = self
+            .topology
+            .stores
+            .secret_master_store
+            .load_all_keys()
+            .map_err(|err| capnp::Error::failed(format!("load local master keys: {err}")))?;
+
+        let (merge_current, current_action) =
+            match self.merge_current_record(transition, &current, &mut records)? {
+                Some((record, generated)) => {
+                    let action = if generated { "generated" } else { "reused" };
+                    (Some(record), action)
+                }
+                None => (None, "retained"),
+            };
+
+        // Publish historical grants before the merge current pointer. If this
+        // hook crashes midway, startup replay can safely repeat the grant
+        // publication and then expose the current row once all known keys are
+        // grantable to the merged peer set.
+        self.topology
+            .stores
+            .secret_master_key_publisher
+            .publish_key_grants(&records, &recipients)
+            .await
+            .map_err(|err| capnp::Error::failed(format!("publish merge key grants: {err}")))?;
+
+        if let Some(record) = merge_current.as_ref() {
+            self.topology
+                .stores
+                .secret_master_key_publisher
+                .publish_current_key(record, &recipients)
+                .await
+                .map_err(|err| {
+                    capnp::Error::failed(format!("publish merge master key current: {err}"))
+                })?;
+            self.topology
+                .stores
+                .secret_master_store
+                .activate_current(record)
+                .map_err(|err| capnp::Error::failed(format!("activate merge master key: {err}")))?;
+            keyring.install_current(record);
+        }
+
+        report = report
+            .add_detail("scope_view", transition.local_target_view.to_string())
+            .add_detail("recipient_count", recipients.len().to_string())
+            .add_detail("granted_key_count", records.len().to_string())
+            .add_detail("current_action", current_action.to_string());
+        if let Some(record) = merge_current {
+            report = report
+                .add_detail("key_id", record.key_id().to_string())
+                .add_detail("generation", record.generation().to_string());
+        }
+        Ok(report)
+    }
+}
+
+impl MergeSecretMasterKeyParticipant {
+    /// Builds the unscoped recipient set for all active peer rows known before merge pruning resets.
+    fn merge_master_key_recipients(
+        &self,
+    ) -> Result<Vec<SecretMasterKeyGrantRecipient>, capnp::Error> {
+        let (active_peers, _) = self
+            .topology
+            .stores
+            .peers
+            .load_all()
+            .map_err(|err| capnp::Error::failed(format!("load merge peers: {err}")))?;
+        let mut node_ids = active_peers
+            .into_iter()
+            .map(|(key, _)| key.to_uuid())
+            .collect::<Vec<_>>();
+        node_ids.push(self.topology.local.node.id);
+        node_ids.sort_unstable();
+        node_ids.dedup();
+
+        let mut recipients = Vec::with_capacity(node_ids.len());
+        for node_id in node_ids {
+            recipients.push(master_key_recipient_for_node(&self.topology, node_id)?);
+        }
+        Ok(recipients)
+    }
+
+    /// Resolves the merge current row to publish, preserving replay idempotence.
+    fn merge_current_record(
+        &self,
+        transition: &ClusterTransition,
+        current: &MasterKeyRecord,
+        records: &mut Vec<MasterKeyRecord>,
+    ) -> Result<Option<(MasterKeyRecord, bool)>, capnp::Error> {
+        if let Some(existing) = records.iter().find(|record| {
+            record.descriptor.scope_view == transition.local_target_view
+                && record.descriptor.created_by_operation_id == Some(transition.operation_id)
+        }) {
+            return Ok(Some((existing.clone(), false)));
+        }
+
+        // A destination-side partition may have rotated while split, leaving
+        // it with a normal current already scoped to the merge destination.
+        // During the live merge operation we still create a merge current so
+        // the unified view has operation-tagged current metadata. Once the
+        // operation is no longer active, a late finalized replay must not roll
+        // back a later user rotation in that same destination view.
+        if current.descriptor.scope_view == transition.local_target_view
+            && current.descriptor.created_by_operation_id.is_none()
+            && !self.merge_operation_is_active(transition)?
+        {
+            return Ok(None);
+        }
+
+        let record = self
+            .topology
+            .stores
+            .secret_master_store
+            .prepare_rotation(
+                transition.local_target_view,
+                self.topology.local.node.id,
+                Some(transition.operation_id),
+            )
+            .map_err(|err| capnp::Error::failed(format!("prepare merge master key: {err}")))?;
+        records.push(record.clone());
+        Ok(Some((record, true)))
+    }
+
+    /// Returns true while this merge operation is still the local operation being progressed.
+    fn merge_operation_is_active(
+        &self,
+        transition: &ClusterTransition,
+    ) -> Result<bool, capnp::Error> {
+        let active = self.topology.active_cluster_operation()?;
+        Ok(active
+            .map(|operation| {
+                operation.id == transition.operation_id
+                    && operation.kind == ClusterOperationKind::Merge
+            })
+            .unwrap_or(false))
+    }
+}
+
+/// Resolves one node id into the Noise static key needed for a replicated grant.
+fn master_key_recipient_for_node(
+    topology: &Topology,
+    node_id: uuid::Uuid,
+) -> Result<SecretMasterKeyGrantRecipient, capnp::Error> {
+    if node_id == topology.local.node.id {
+        return Ok(SecretMasterKeyGrantRecipient {
+            node_id,
+            noise_static_pub: topology.deps.registry.noise_keys().public_bytes(),
+        });
+    }
+
+    let peer = topology
+        .deps
+        .registry
+        .peer_value_unscoped(node_id)
+        .ok_or_else(|| {
+            capnp::Error::failed(format!(
+                "peer {node_id} has no peer record for master-key grant"
+            ))
+        })?;
+    if !peer.membership.is_active() {
+        return Err(capnp::Error::failed(format!(
+            "peer {node_id} is not active for master-key grant"
+        )));
+    }
+    Ok(SecretMasterKeyGrantRecipient {
+        node_id,
+        noise_static_pub: peer.noise_static_pub,
+    })
 }
 
 #[async_trait(?Send)]
@@ -375,6 +549,9 @@ impl Topology {
     ) -> Result<Vec<ClusterParticipantReport>, capnp::Error> {
         let coordinator = ClusterTransitionCoordinator::new(vec![
             Box::new(SplitSecretMasterKeyParticipant {
+                topology: self.clone(),
+            }),
+            Box::new(MergeSecretMasterKeyParticipant {
                 topology: self.clone(),
             }),
             Box::new(PeerScopeParticipant {

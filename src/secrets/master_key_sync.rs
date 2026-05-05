@@ -74,6 +74,32 @@ impl SecretMasterKeyPublisher {
         self.publish_records(records).await
     }
 
+    /// Publishes descriptor and grant rows for existing keys without changing current metadata.
+    pub async fn publish_key_grants(
+        &self,
+        records: &[MasterKeyRecord],
+        recipients: &[SecretMasterKeyGrantRecipient],
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let mut rows = Vec::with_capacity(
+            records
+                .len()
+                .saturating_mul(recipients.len().saturating_add(1)),
+        );
+        for record in records {
+            rows.push(SecretMasterKeySyncRecord::Descriptor(
+                record.descriptor.clone(),
+            ));
+            for recipient in recipients {
+                rows.push(self.grant_record(record, *recipient)?);
+            }
+        }
+        self.publish_records(rows).await
+    }
+
     /// Publishes the replicated rows represented by one join bootstrap transfer.
     pub async fn publish_transfer(&self, transfer: MasterKeyTransfer) -> Result<()> {
         let descriptor = transfer.descriptor.clone();
