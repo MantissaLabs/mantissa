@@ -84,6 +84,27 @@ async fn wait_for_plaintext_all(
     .await
 }
 
+/// Waits until every selected node can fetch and decrypt the same secret plaintext.
+async fn wait_for_plaintext_on_nodes(
+    nodes: &[&TestNode],
+    name: &str,
+    expected: &[u8],
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(50), || async {
+        for node in nodes {
+            if !matches!(
+                fetch_secret_plaintext(&node.node.secrets_client, name).await,
+                Ok(plaintext) if plaintext == expected
+            ) {
+                return false;
+            }
+        }
+        true
+    })
+    .await
+}
+
 /// Rotates the cluster master key through the public secrets RPC.
 async fn rotate_master_key(client: &secrets::Client) -> Result<(), capnp::Error> {
     client
@@ -249,6 +270,31 @@ async fn merge_cluster_views(
     .await;
 
     merge_id
+}
+
+/// Reads cluster-view summary rows so tests can assert split views are retired.
+async fn cluster_view_rows(
+    topology: &mantissa::topology_capnp::topology::Client,
+) -> Vec<(ClusterViewId, u32, bool)> {
+    let response = topology
+        .list_cluster_views_request()
+        .send()
+        .promise
+        .await
+        .expect("listClusterViews send");
+    let rows = response
+        .get()
+        .expect("listClusterViews get")
+        .get_views()
+        .expect("cluster view rows");
+    let mut out = Vec::with_capacity(rows.len() as usize);
+    for idx in 0..rows.len() {
+        let row = rows.get(idx);
+        let view =
+            ClusterViewId::from_capnp(row.get_view().expect("row view")).expect("decode row view");
+        out.push((view, row.get_node_count(), row.get_local_active()));
+    }
+    out
 }
 
 local_test!(master_key_exchange_supports_three_node_secret_decryption, {
@@ -440,6 +486,156 @@ local_test!(split_scopes_secret_master_key_current_to_target_view, {
             .expect("joiner reads right secret"),
         b"right after split"
     );
+});
+
+local_test!(split_merge_after_peer_leave_preserves_secret_decryption, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(4),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(4, cfg)
+        .await
+        .expect("four-node secrets cluster");
+    TestNode::assert_cluster_size_all(&cluster, 4, "four-node cluster before split").await;
+
+    let pre_split = b"peer-leave-secret-created-before-split";
+    create_secret(
+        &cluster[0].node.secrets_client,
+        "peer-leave-secret-before-partition",
+        pre_split,
+    )
+    .await
+    .expect("create pre-split peer-leave secret");
+    assert!(
+        wait_for_plaintext_all(
+            &cluster,
+            "peer-leave-secret-before-partition",
+            pre_split,
+            Duration::from_secs(15),
+        )
+        .await,
+        "all nodes should decrypt the pre-split peer-leave secret"
+    );
+
+    let (_split_id, left_view, right_view) = split_four_node_cluster(&cluster).await;
+    let left_a = &cluster[0];
+    let left_b = &cluster[1];
+    let right_a = &cluster[2];
+    let right_b = &cluster[3];
+    right_b.leave().await.expect("right partition peer leaves");
+    right_a
+        .assert_cluster_size(1, "right partition excludes the left peer")
+        .await;
+
+    assert!(
+        wait_until(
+            Duration::from_secs(15),
+            Duration::from_millis(100),
+            || async {
+                cluster_view_rows(&left_a.topology()).await.iter().any(
+                    |(view, node_count, local_active)| {
+                        *view == right_view && *node_count == 1 && !*local_active
+                    },
+                )
+            }
+        )
+        .await,
+        "source partition should observe the remote split peer leave before merge"
+    );
+
+    rotate_master_key(&left_a.node.secrets_client)
+        .await
+        .expect("rotate left partition master key after peer leave");
+    let left_secret = b"peer-leave-left-secret-after-rotation";
+    create_secret(
+        &left_b.node.secrets_client,
+        "peer-leave-left-partition-secret",
+        left_secret,
+    )
+    .await
+    .expect("create left partition peer-leave secret");
+    assert!(
+        wait_for_plaintext_on_nodes(
+            &[left_a, left_b],
+            "peer-leave-left-partition-secret",
+            left_secret,
+            Duration::from_secs(15),
+        )
+        .await,
+        "left partition should decrypt its rotated secret"
+    );
+
+    rotate_master_key(&right_a.node.secrets_client)
+        .await
+        .expect("rotate surviving right partition master key");
+    let right_secret = b"peer-leave-right-secret-after-rotation";
+    create_secret(
+        &right_a.node.secrets_client,
+        "peer-leave-right-partition-secret",
+        right_secret,
+    )
+    .await
+    .expect("create right partition peer-leave secret");
+    assert!(
+        wait_for_plaintext(
+            &right_a.node.secrets_client,
+            "peer-leave-right-partition-secret",
+            right_secret,
+            Duration::from_secs(15),
+        )
+        .await,
+        "surviving right partition node should decrypt its rotated secret"
+    );
+
+    let _merge_id = merge_cluster_views(left_a, left_view, right_view).await;
+    let survivors = [left_a, left_b, right_a];
+    for node in survivors {
+        wait_for_cluster_view(&node.topology(), right_view, Duration::from_secs(15)).await;
+        node.assert_cluster_size(3, "merged cluster excludes the left peer")
+            .await;
+    }
+
+    assert!(
+        wait_until(
+            Duration::from_secs(15),
+            Duration::from_millis(100),
+            || async {
+                let rows = cluster_view_rows(&right_a.topology()).await;
+                rows.len() == 1 && rows[0] == (right_view, 3, true)
+            }
+        )
+        .await,
+        "merged cluster view listing should retire split rows and exclude the left peer"
+    );
+
+    let survivors = [left_a, left_b, right_a];
+    for (name, plaintext) in [
+        ("peer-leave-secret-before-partition", pre_split.as_slice()),
+        ("peer-leave-left-partition-secret", left_secret.as_slice()),
+        ("peer-leave-right-partition-secret", right_secret.as_slice()),
+    ] {
+        assert!(
+            wait_for_plaintext_on_nodes(&survivors, name, plaintext, Duration::from_secs(30)).await,
+            "surviving merged nodes should decrypt {name}"
+        );
+    }
+
+    rotate_master_key(&left_a.node.secrets_client)
+        .await
+        .expect("rotate merged cluster master key after peer leave");
+    for (name, plaintext) in [
+        ("peer-leave-secret-before-partition", pre_split.as_slice()),
+        ("peer-leave-left-partition-secret", left_secret.as_slice()),
+        ("peer-leave-right-partition-secret", right_secret.as_slice()),
+    ] {
+        assert!(
+            wait_for_plaintext_on_nodes(&survivors, name, plaintext, Duration::from_secs(30)).await,
+            "surviving merged nodes should decrypt {name} after merged rotation"
+        );
+    }
 });
 
 local_test!(split_merge_grants_partition_keys_for_secret_decryption, {
