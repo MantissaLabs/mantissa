@@ -77,6 +77,18 @@ impl SecretMasterKeyPublisher {
         records: &[MasterKeyRecord],
         recipients: &[SecretMasterKeyGrantRecipient],
     ) -> Result<()> {
+        self.publish_current_with_key_grants_returning_records(current, records, recipients)
+            .await
+            .map(|_| ())
+    }
+
+    /// Publishes current rows and returns the exact records written for immediate seeding.
+    pub async fn publish_current_with_key_grants_returning_records(
+        &self,
+        current: &MasterKeyRecord,
+        records: &[MasterKeyRecord],
+        recipients: &[SecretMasterKeyGrantRecipient],
+    ) -> Result<Vec<SecretMasterKeySyncRecord>> {
         let mut rows = Vec::with_capacity(
             records
                 .len()
@@ -97,7 +109,8 @@ impl SecretMasterKeyPublisher {
         rows.push(SecretMasterKeySyncRecord::Current(current_from_descriptor(
             &current.descriptor,
         )));
-        self.publish_records(rows).await
+        self.publish_records(rows.clone()).await?;
+        Ok(rows)
     }
 
     /// Publishes descriptor and grant rows for existing keys without changing current metadata.

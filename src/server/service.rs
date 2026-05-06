@@ -3,6 +3,9 @@ use crate::cluster::ClusterViewId;
 use crate::crypto::rand;
 use crate::node::id;
 use crate::server::credential::ClusterCredential;
+use crate::store::secret_master_key_store::{
+    SecretMasterKeySyncRecord, write_secret_master_key_sync_record,
+};
 use crate::topology::TopologyEvent;
 use crate::topology::peers::PeerValue;
 use std::rc::Rc;
@@ -227,8 +230,9 @@ impl Server {
         &self,
         results: &mut mantissa_protocol::server::RegisterNodeResults,
         cluster_session: &ClusterSession,
+        master_key_records: &[SecretMasterKeySyncRecord],
     ) -> Result<(), capnp::Error> {
-        let mut out = results.get();
+        let mut out = results.get().init_response();
         out.set_session(cluster_session.session.clone());
         out.set_ticket(&cluster_session.ticket);
         out.set_ticket_expires_at_unix_secs(cluster_session.ticket_expires_at_unix_secs);
@@ -236,6 +240,12 @@ impl Server {
         let node_info = out.reborrow().init_node_info();
         self.topology.populate_self_node_info(node_info);
         out.set_credential(&cluster_session.credential);
+        let mut records = out
+            .reborrow()
+            .init_master_key_records(master_key_records.len() as u32);
+        for (idx, record) in master_key_records.iter().enumerate() {
+            write_secret_master_key_sync_record(records.reborrow().get(idx as u32), record);
+        }
         Ok(())
     }
 
@@ -282,7 +292,8 @@ impl mantissa_protocol::server::Server for Server {
         let join_request = JoinRequest::from_params(params)?;
         self.validate_join_request(&join_request).await?;
         self.register_join_request(&join_request).await?;
-        self.topology
+        let master_key_records = self
+            .topology
             .publish_master_key_grants_for_joiner(
                 join_request.joiner_id,
                 join_request.peer.noise_static_pub,
@@ -291,7 +302,7 @@ impl mantissa_protocol::server::Server for Server {
 
         let cluster_session = self.issue_join_session(join_request.joiner_id)?;
         self.ensure_cluster_background_tasks_after_join();
-        self.write_join_response(&mut results, &cluster_session)?;
+        self.write_join_response(&mut results, &cluster_session, &master_key_records)?;
 
         self.topology
             .gossip_topology_event(join_request.to_topology_event())

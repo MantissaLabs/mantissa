@@ -17,6 +17,7 @@ use crate::store::local::{LocalCredentialStore, LocalSessionStore};
 use crate::store::peer_store::PeersStore;
 use crate::store::secret_master_key_store::{
     SecretMasterKeyCurrent, SecretMasterKeySyncRecord, current_for_scope, current_row_id,
+    read_secret_master_key_sync_record, upsert_record,
 };
 use crate::sync::SyncTraceContext;
 use crate::topology::health::status_to_node_status;
@@ -27,7 +28,6 @@ use crate::topology::peers::{
 use capnp::Error;
 use ed25519_dalek::VerifyingKey;
 use mantissa_protocol::server::{self, cluster_session};
-use mantissa_protocol::sync::{Domain, sync as sync_capnp};
 use mantissa_protocol::topology::{topology, topology_event};
 use mantissa_store::uuid_key::UuidKey;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -118,6 +118,7 @@ struct JoinResponse {
     ticket_expires_at_unix_secs: Option<u64>,
     credential: Vec<u8>,
     session: cluster_session::Client,
+    master_key_records: Vec<SecretMasterKeySyncRecord>,
 }
 
 impl Topology {
@@ -207,7 +208,7 @@ impl Topology {
         request.get().set_token(join_token);
 
         let response = request.send().promise.await?;
-        let resp = response.get()?;
+        let resp = response.get()?.get_response()?;
 
         let session = resp.get_session()?;
         let ticket = resp.get_ticket()?.to_vec();
@@ -220,6 +221,11 @@ impl Topology {
         let peer_id = read_node_id(node_info.get_id()?)?;
         let peer_value = PeerValue::from_node_info(peer_id, node_info)?;
         let peer_incarnation = peer_value.membership.incarnation;
+        let records_reader = resp.get_master_key_records()?;
+        let mut master_key_records = Vec::with_capacity(records_reader.len() as usize);
+        for record in records_reader.iter() {
+            master_key_records.push(read_secret_master_key_sync_record(record)?);
+        }
 
         Ok(JoinResponse {
             peer_id,
@@ -229,6 +235,7 @@ impl Topology {
             ticket_expires_at_unix_secs,
             credential,
             session,
+            master_key_records,
         })
     }
 
@@ -285,7 +292,7 @@ impl Topology {
         &self,
         joiner_id: Uuid,
         joiner_noise_static_pub: [u8; 32],
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<SecretMasterKeySyncRecord>, Error> {
         let recipient = SecretMasterKeyGrantRecipient {
             node_id: joiner_id,
             noise_static_pub: joiner_noise_static_pub,
@@ -309,32 +316,22 @@ impl Topology {
             .map_err(|err| Error::failed(format!("load local master keys: {err}")))?;
         self.stores
             .secret_master_key_publisher
-            .publish_current_with_key_grants(&current, &records, &[recipient])
+            .publish_current_with_key_grants_returning_records(&current, &records, &[recipient])
             .await
-            .map_err(|err| Error::failed(format!("publish join master-key grants: {err}")))?;
-        Ok(())
+            .map_err(|err| Error::failed(format!("publish join master-key grants: {err}")))
     }
 
-    /// Synchronizes and adopts the anchor's replicated master-key current before join returns.
-    async fn sync_master_keys_from_anchor(
+    /// Applies registerNode master-key rows and adopts the cluster current before join returns.
+    async fn adopt_join_master_key_records(
         &self,
-        sync_cap: sync_capnp::Client,
-        root_schema_version: u32,
-        anchor_node_id: Uuid,
-        anchor_addr: String,
+        records: &[SecretMasterKeySyncRecord],
     ) -> Result<(), Error> {
         let cluster_view = self.active_cluster_view();
-        let trace = SyncTraceContext::peer(anchor_node_id, anchor_addr, "join-master-key");
-        self.deps
-            .sync
-            .sync_selected_domains(
-                sync_cap,
-                cluster_view,
-                root_schema_version,
-                &[Domain::SecretMasterKeys],
-                Some(trace),
-            )
-            .await;
+        for record in records {
+            upsert_record(&self.stores.secret_master_keys, record.clone())
+                .await
+                .map_err(|err| Error::failed(format!("seed joined master-key row: {err}")))?;
+        }
 
         let reconciler = SecretMasterKeyReconciler::new(
             self.local.node.id,
@@ -556,13 +553,8 @@ impl topology::Server for Topology {
             resp.get()?.get_sync()?
         };
 
-        self.sync_master_keys_from_anchor(
-            sync_cap.clone(),
-            root_schema_version,
-            response.peer_id,
-            response.peer_value.address.clone(),
-        )
-        .await?;
+        self.adopt_join_master_key_records(&response.master_key_records)
+            .await?;
 
         let sync_trace = SyncTraceContext::peer(
             response.peer_id,

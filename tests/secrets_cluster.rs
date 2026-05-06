@@ -311,7 +311,23 @@ local_test!(master_key_exchange_supports_three_node_secret_decryption, {
     .expect("create pre-join secret on anchor");
 
     let second = TestNode::new_with_tick_ms(100).await;
+    let anchor_master_key_id = anchor
+        .node
+        .secret_master_store
+        .current()
+        .expect("anchor current master key before join")
+        .key_id();
     second.join(&anchor).await.expect("second joins anchor");
+    assert_eq!(
+        second
+            .node
+            .secret_master_store
+            .current()
+            .expect("second current master key after join")
+            .key_id(),
+        anchor_master_key_id,
+        "registerNode should seed enough master-key rows for immediate adoption"
+    );
     anchor
         .assert_cluster_size(2, "anchor sees second after first join")
         .await;
@@ -331,10 +347,26 @@ local_test!(master_key_exchange_supports_three_node_secret_decryption, {
     );
 
     let third = TestNode::new_with_tick_ms(100).await;
+    let joined_master_key_id = second
+        .node
+        .secret_master_store
+        .current()
+        .expect("second current master key before chained join")
+        .key_id();
     third
         .join(&second)
         .await
         .expect("third joins through second");
+    assert_eq!(
+        third
+            .node
+            .secret_master_store
+            .current()
+            .expect("third current master key after chained join")
+            .key_id(),
+        joined_master_key_id,
+        "chained join should adopt the anchor master key before join returns"
+    );
     let cluster = [anchor, second, third];
     TestNode::assert_cluster_size_all(&cluster, 3, "three-node cluster after chained join").await;
 

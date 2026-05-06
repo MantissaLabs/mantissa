@@ -13,12 +13,13 @@ using import "agents.capnp".Agents;
 using import "services.capnp".Services;
 using import "scheduling.capnp".Scheduler;
 using import "secrets.capnp".Secrets;
+using import "secrets.capnp".SecretMasterKeySyncRecord;
 using import "network.capnp".Networks;
 using import "volumes.capnp".Volumes;
 using import "topology.capnp".ClusterViewId;
 
 interface Server {
-  registerNode @0 (info :NodeInfo, token :Text) -> (session :ClusterSession, ticket :Data, nodeInfo :NodeInfo, credential :Data, ticketExpiresAtUnixSecs :UInt64);
+  registerNode @0 (info :NodeInfo, token :Text) -> (response :RegisterNodeResponse);
   # First-time join. Adding the node to the trusted set of peers if the token
   # is valid. On failure, returns a capnp error.
 
@@ -29,6 +30,27 @@ interface Server {
   getWithCredential @2 (credential :Data) -> (session :ClusterSession, ticket :Data, nodeInfo :NodeInfo, ticketExpiresAtUnixSecs :UInt64);
   # Bootstrap to (re)open a session on this node using a short-lived credential.
   # Used after join to contact other neighbors in the mesh/network.
+}
+
+struct RegisterNodeResponse {
+  session @0 :ClusterSession;
+  # Cluster session capability granted to the accepted node.
+
+  ticket @1 :Data;
+  # Short-lived session ticket for reconnecting to the anchor.
+
+  nodeInfo @2 :NodeInfo;
+  # Anchor node metadata the joiner should persist locally.
+
+  credential @3 :Data;
+  # Renewable cluster credential signed by the anchor.
+
+  ticketExpiresAtUnixSecs @4 :UInt64;
+  # Absolute ticket expiry timestamp, 0 when no expiry is available.
+
+  masterKeyRecords @5 :List(SecretMasterKeySyncRecord);
+  # Replicated master-key rows seeded into the joiner so join does not wait
+  # for a separate anti-entropy round before it can adopt the cluster key.
 }
 
 struct ClusterCredential {
