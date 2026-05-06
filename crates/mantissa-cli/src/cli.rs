@@ -64,7 +64,7 @@ fn parse_log_tail(raw: &str) -> Result<String, String> {
 #[derive(Parser, Debug)]
 #[command(
     name = "mantissa",
-    version = "0.0.1",
+    version,
     author = "Mantissa Labs",
     about = "Distributed job orchestration and cluster management",
     subcommand_required = true,

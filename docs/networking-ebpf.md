@@ -430,21 +430,21 @@ The node-local runtime view is exposed through:
 mantissa info
 ```
 
-The `NodePort:` section shows whether the runtime is `disabled`, `pending`,
-`ready`, or `degraded`, plus the resolved iface/IP, identity source, active
-port counts, capacity limits, packet counters, and flow diagnostics such as
-active flow pairs, candidate reverse misses, return-path bypass packets,
+The `Network` / `NodePort` section shows whether the runtime is `disabled`,
+`pending`, `ready`, or `degraded`, plus the resolved iface/IP, identity source,
+active port counts, capacity limits, packet counters, and flow diagnostics such
+as active flow pairs, candidate reverse misses, return-path bypass packets,
 cached invalid conntrack transitions, estimated evictions, and fragmented IPv4
 ingress drops.
 Those NodePort limits come from `network.nodeport.vip_capacity`,
 `network.nodeport.host_capacity`, and `network.nodeport.flow_capacity`.
 
-The `Load Balancer:` section reports the local overlay VIP dataplane state:
-how many per-network LB map sets are currently pinned, how many IPv4 and IPv6
-VIPs are programmed, the configured overlay flow capacity, and the live
-IPv4/IPv6 forward-flow cache occupancy. This is the quickest way to confirm
-that internal service VIP
-publication is active even when no public NodePort is involved.
+The `Network` / `Load Balancer` section reports the local overlay VIP dataplane
+state: how many per-network LB map sets are currently pinned, how many IPv4 and
+IPv6 VIPs are programmed, the configured overlay flow capacity, and the live
+IPv4/IPv6 forward-flow cache occupancy. This is the quickest way to confirm that
+internal service VIP publication is active even when no public NodePort is
+involved.
 
 ## Packet flow: NodePort curl
 
