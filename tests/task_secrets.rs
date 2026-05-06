@@ -16,8 +16,10 @@ use mantissa::scheduler::Scheduler;
 use mantissa::scheduler::{SlotCapacity, SlotSpec};
 use mantissa::secrets::crypto::SecretKeyring;
 use mantissa::secrets::gossip::SecretReplicator;
-use mantissa::secrets::master_key_protector::PassphraseMasterKeyProtector;
-use mantissa::secrets::master_key_sync::{SecretMasterKeyGrantRecipient, SecretMasterKeyPublisher};
+use mantissa::secrets::master_key::envelope::PassphraseProvider;
+use mantissa::secrets::master_key::replication::{
+    SecretMasterKeyGrantRecipient, SecretMasterKeyPublisher,
+};
 use mantissa::secrets::registry::SecretRegistry;
 use mantissa::secrets::service::{SecretsService, SecretsServiceConfig};
 use mantissa::secrets::types::{SecretMetadata, SecretValue, SecretVersion, compute_secret_id};
@@ -63,7 +65,7 @@ fn read_uuid_bytes(data: &[u8]) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-async fn temp_master_key_sync(
+async fn temp_master_key_replication(
     node_id: Uuid,
     gossip_tx: async_channel::Sender<Message>,
     noise_keys: Arc<NoiseKeys>,
@@ -72,16 +74,17 @@ async fn temp_master_key_sync(
     SecretMasterKeyStore,
     SecretMasterKeyPublisher,
 ) {
-    let dir = tempdir().expect("master key sync dir");
+    let dir = tempdir().expect("master key replication dir");
     let db = Arc::new(
         redb::Database::create(dir.path().join("secret-master-keys.redb"))
-            .expect("create master key sync db"),
+            .expect("create master key replication db"),
     );
-    let store = open_secret_master_key_store(db, node_id).expect("open master key sync store");
+    let store =
+        open_secret_master_key_store(db, node_id).expect("open master key replication store");
     store
         .rebuild_mst_from_disk()
         .await
-        .expect("rebuild master key sync store");
+        .expect("rebuild master key replication store");
     let publisher = SecretMasterKeyPublisher::new(
         store.clone(),
         gossip_tx,
@@ -364,10 +367,10 @@ async fn setup_workload_manager() -> TestHarness {
         .path()
         .join(format!("master-{}.redb", Uuid::new_v4()));
     let master_db = Arc::new(redb::Database::create(master_path).expect("create master db"));
-    let master_protector =
-        Arc::new(PassphraseMasterKeyProtector::for_test().expect("master protector"));
-    let master_store =
-        SecretMasterStore::new(master_db.clone(), master_protector).expect("open master store");
+    let master_envelope_provider =
+        Arc::new(PassphraseProvider::for_test().expect("master envelope provider"));
+    let master_store = SecretMasterStore::new(master_db.clone(), master_envelope_provider)
+        .expect("open master store");
     let master_record = master_store
         .ensure_current()
         .expect("ensure master key record");
@@ -759,8 +762,8 @@ local_test!(rotate_master_key_rewraps_secrets, {
     let secret_replicator =
         SecretReplicator::new(secret_registry.clone(), gossip_tx.clone(), secret_rx);
     let noise_keys = Arc::new(NoiseKeys::from_private_bytes([9u8; 32]));
-    let (_master_key_sync_dir, secret_master_keys_for_assert, master_key_publisher) =
-        temp_master_key_sync(node_id, gossip_tx, noise_keys.clone()).await;
+    let (_master_key_replication_dir, secret_master_keys_for_assert, master_key_publisher) =
+        temp_master_key_replication(node_id, gossip_tx, noise_keys.clone()).await;
 
     let service = SecretsService::new(SecretsServiceConfig {
         registry: secret_registry.clone(),
@@ -850,8 +853,8 @@ local_test!(publish_current_with_key_grants_includes_historical_keys, {
 
     let (gossip_tx, _gossip_rx) = async_channel::unbounded::<Message>();
     let sender_noise = Arc::new(NoiseKeys::from_private_bytes([9u8; 32]));
-    let (_master_key_sync_dir, secret_master_keys, master_key_publisher) =
-        temp_master_key_sync(node_id, gossip_tx, sender_noise.clone()).await;
+    let (_master_key_replication_dir, secret_master_keys, master_key_publisher) =
+        temp_master_key_replication(node_id, gossip_tx, sender_noise.clone()).await;
     let recipient_id = Uuid::new_v4();
     let recipient_noise = Arc::new(NoiseKeys::from_private_bytes([11u8; 32]));
     let recipient = SecretMasterKeyGrantRecipient {

@@ -7,7 +7,7 @@ use common::convergence::{
 use common::testkit::{ClusterConfig, RuntimeBackendOverrideGuard, TestNode};
 use mantissa::cluster::ClusterViewId;
 use mantissa::node::id::set_node_id;
-use mantissa::secrets::master_key_protector::PassphraseKdfParams;
+use mantissa::secrets::master_key::envelope::PassphraseKdfParams;
 use mantissa::store::secret_master_key_store::current_for_scope;
 use mantissa_protocol::secrets::secrets;
 use mantissa_protocol::topology::ClusterOperationStage;

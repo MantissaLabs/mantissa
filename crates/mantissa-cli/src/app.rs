@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use mantissa::secrets::master_key_protector::SecretPassphrase;
+use mantissa::secrets::master_key::envelope::SecretPassphrase;
 use mantissa_client::config::ClientConfig;
 use std::io::{IsTerminal, Read};
 use std::path::Path;

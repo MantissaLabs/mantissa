@@ -4,7 +4,7 @@ use crate::cluster::{
     SUPPORTED_ROOT_SCHEMA_VERSION,
 };
 use crate::secrets::crypto::SecretKeyring;
-use crate::secrets::master_key_protector::PassphraseMasterKeyProtector;
+use crate::secrets::master_key::envelope::PassphraseProvider;
 use crate::server::auth::AuthStore;
 use crate::store::agent_store::{AgentStore, open_agent_store};
 use crate::store::cluster_operation_store::ClusterOperationStore;
@@ -104,12 +104,12 @@ impl BootstrapStores {
                 "master key passphrase source is required",
             )
         })?;
-        let secret_master_protector = Arc::new(PassphraseMasterKeyProtector::with_params(
+        let secret_master_envelope_provider = Arc::new(PassphraseProvider::with_params(
             passphrase,
             options.master_key_kdf_params,
         ));
         let secret_master_store =
-            SecretMasterStore::new(ctx.db.clone(), secret_master_protector)
+            SecretMasterStore::new(ctx.db.clone(), secret_master_envelope_provider)
                 .map_err(|error| store_error("open secret master key store", error))?;
         let master_record = secret_master_store
             .ensure_current_for_node(ClusterViewId::legacy_default(), ctx.self_id)

@@ -20,9 +20,11 @@ use crate::scheduler::digest::{
     SchedulerDigestPublisher, SchedulerDigestRegistry, SchedulerDigestReplicator,
 };
 use crate::scheduler::service::SchedulerService;
-use crate::secrets::master_key_protector::{PassphraseKdfParams, SecretPassphrase};
-use crate::secrets::master_key_reconciler::SecretMasterKeyReconciler;
-use crate::secrets::master_key_sync::{SecretMasterKeyPublisher, SecretMasterKeyReplicator};
+use crate::secrets::master_key::envelope::{PassphraseKdfParams, SecretPassphrase};
+use crate::secrets::master_key::reconciler::SecretMasterKeyReconciler;
+use crate::secrets::master_key::replication::{
+    SecretMasterKeyPublisher, SecretMasterKeyReplicator,
+};
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
@@ -193,7 +195,7 @@ struct RuntimeActors {
     secret_replicator: crate::secrets::gossip::SecretReplicator,
     secret_master_key_replicator: SecretMasterKeyReplicator,
     secret_master_key_reconciler: SecretMasterKeyReconciler,
-    secret_master_key_sync_notify: Arc<Notify>,
+    secret_master_key_replication_notify: Arc<Notify>,
     volume_replicator: VolumeReplicator,
     scheduler_digest_replicator: SchedulerDigestReplicator,
     volume_controller: VolumeController,
@@ -436,11 +438,11 @@ async fn build_runtime_components(
 
     let runtime_health = config::health_runtime_config();
     let health_monitor = mantissa_health::HealthMonitor::new(ctx.self_id);
-    let secret_master_key_sync_notify = Arc::new(Notify::new());
+    let secret_master_key_replication_notify = Arc::new(Notify::new());
     let secret_master_key_publisher = SecretMasterKeyPublisher::new(
         stores.secret_master_keys.clone(),
         gossip_tx.clone(),
-        secret_master_key_sync_notify.clone(),
+        secret_master_key_replication_notify.clone(),
         ctx.self_id,
         ctx.noise_keys.clone(),
     );
@@ -455,7 +457,7 @@ async fn build_runtime_components(
         sync_stores.clone(),
         root_schema,
         Some(attachment_sync_notify.clone()),
-        Some(secret_master_key_sync_notify.clone()),
+        Some(secret_master_key_replication_notify.clone()),
     );
     let sync_gc_progress = sync_runner.gc_progress();
     let network_registry = NetworkRegistry::new(
@@ -504,7 +506,7 @@ async fn build_runtime_components(
     let secret_master_key_replicator = SecretMasterKeyReplicator::new(
         stores.secret_master_keys.clone(),
         secret_master_key_rx,
-        secret_master_key_sync_notify.clone(),
+        secret_master_key_replication_notify.clone(),
     );
     let secret_master_key_reconciler = SecretMasterKeyReconciler::new(
         ctx.self_id,
@@ -714,7 +716,7 @@ async fn build_runtime_components(
             secret_replicator,
             secret_master_key_replicator,
             secret_master_key_reconciler,
-            secret_master_key_sync_notify,
+            secret_master_key_replication_notify,
             volume_replicator,
             scheduler_digest_replicator,
             volume_controller,
@@ -1073,7 +1075,7 @@ async fn spawn_runtime_tasks(
         secret_replicator,
         secret_master_key_replicator,
         secret_master_key_reconciler,
-        secret_master_key_sync_notify,
+        secret_master_key_replication_notify,
         volume_replicator,
         scheduler_digest_replicator,
         volume_controller,
@@ -1145,7 +1147,7 @@ async fn spawn_runtime_tasks(
 
     tasks.push(tokio::task::spawn_local(async move {
         secret_master_key_reconciler
-            .run_on_notify(secret_master_key_sync_notify)
+            .run_on_notify(secret_master_key_replication_notify)
             .await;
     }));
 

@@ -11,7 +11,7 @@ use mantissa::topology_capnp::topology;
 use mantissa::workload::manager::WorkloadRuntimeConfig;
 use mantissa::{
     node,
-    secrets::master_key_protector::PassphraseKdfParams,
+    secrets::master_key::envelope::PassphraseKdfParams,
     server::headless::{HeadlessConfig, HeadlessNode, HeadlessTransport},
 };
 use mantissa_protocol::health::NodeStatus;

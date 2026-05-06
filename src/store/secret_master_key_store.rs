@@ -1,5 +1,5 @@
 use crate::cluster::ClusterViewId;
-use crate::secrets::master_key_protector::{
+use crate::secrets::master_key::envelope::{
     MASTER_KEY_SIZE, MasterKeyDescriptor, MasterKeyTransfer, read_master_key_descriptor,
     write_master_key_descriptor,
 };
@@ -500,7 +500,7 @@ mod tests {
         open_secret_master_key_store, upsert_current, upsert_descriptor, upsert_grant,
     };
     use crate::cluster::ClusterViewId;
-    use crate::secrets::master_key_protector::{MASTER_KEY_SIZE, MasterKeyDescriptor};
+    use crate::secrets::master_key::envelope::{MASTER_KEY_SIZE, MasterKeyDescriptor};
     use mantissa_store::codec::StoreValueCodec;
     use mantissa_store::uuid_key::UuidKey;
     use std::sync::Arc;

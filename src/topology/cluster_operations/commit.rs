@@ -6,7 +6,7 @@ use crate::cluster::operations::{
 use crate::cluster::participant::{ClusterParticipantReport, ClusterTransitionParticipant};
 use crate::cluster::transition::ClusterTransition;
 use crate::network::transition::SplitNetworkRuntimeParticipant;
-use crate::secrets::master_key_sync::SecretMasterKeyGrantRecipient;
+use crate::secrets::master_key::replication::SecretMasterKeyGrantRecipient;
 use crate::services::ServiceRegistry;
 use crate::store::local::MasterKeyRecord;
 use crate::topology::Topology;

@@ -856,12 +856,12 @@ async fn setup_manager_with_forwarding(
         .expect("rebuild volume node store");
     let volume_registry = VolumeRegistry::new(volume_spec_store, volume_node_store);
     let (master_db, _master_dir) = temp_db("master");
-    let master_protector = Arc::new(
-        crate::secrets::master_key_protector::PassphraseMasterKeyProtector::for_test()
-            .expect("master protector"),
+    let master_envelope_provider = Arc::new(
+        crate::secrets::master_key::envelope::PassphraseProvider::for_test()
+            .expect("master envelope provider"),
     );
-    let master_store =
-        SecretMasterStore::new(master_db.clone(), master_protector).expect("open master store");
+    let master_store = SecretMasterStore::new(master_db.clone(), master_envelope_provider)
+        .expect("open master store");
     let master_record = master_store
         .ensure_current()
         .expect("ensure master key record");

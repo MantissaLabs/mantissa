@@ -1,4 +1,4 @@
-use crate::secrets::master_key_protector::{
+use crate::secrets::master_key::envelope::{
     MASTER_KEY_SIZE, MasterKeyDescriptor, MasterKeyPlaintext,
 };
 use crate::secrets::types::SecretCiphertext;
@@ -241,7 +241,7 @@ impl SecretKeyring {
 #[cfg(test)]
 mod tests {
     use super::SecretKeyring;
-    use crate::secrets::master_key_protector::PassphraseMasterKeyProtector;
+    use crate::secrets::master_key::envelope::PassphraseProvider;
     use crate::store::local::SecretMasterStore;
     use redb::Database;
     use std::sync::Arc;
@@ -253,8 +253,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let db = Arc::new(Database::create(db_path).unwrap());
-        let protector = Arc::new(PassphraseMasterKeyProtector::for_test().unwrap());
-        let store = SecretMasterStore::new(db, protector).expect("open store");
+        let envelope_provider = Arc::new(PassphraseProvider::for_test().unwrap());
+        let store = SecretMasterStore::new(db, envelope_provider).expect("open store");
         (store, dir)
     }
 

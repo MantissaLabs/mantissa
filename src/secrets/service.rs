@@ -1,6 +1,8 @@
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::gossip::SecretReplicator;
-use crate::secrets::master_key_sync::{SecretMasterKeyGrantRecipient, SecretMasterKeyPublisher};
+use crate::secrets::master_key::replication::{
+    SecretMasterKeyGrantRecipient, SecretMasterKeyPublisher,
+};
 use crate::secrets::registry::SecretRegistry;
 use crate::secrets::types::{
     SecretCiphertext, SecretEvent, SecretMetadata, SecretValue, SecretVersion, compute_secret_id,

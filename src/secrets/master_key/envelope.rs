@@ -273,8 +273,8 @@ impl WrappedMasterKeyRecord {
 }
 
 /// Interface for local providers that wrap cluster master key material.
-pub trait MasterKeyProtector: Send + Sync {
-    /// Returns the stable provider id stored in envelopes this protector creates.
+pub trait Provider: Send + Sync {
+    /// Returns the stable provider id stored in envelopes this provider creates.
     fn provider(&self) -> &'static str;
 
     /// Wraps one plaintext cluster master key for local durable storage.
@@ -288,7 +288,7 @@ pub trait MasterKeyProtector: Send + Sync {
     fn unwrap(&self, record: &WrappedMasterKeyRecord) -> io::Result<MasterKeyPlaintext>;
 }
 
-pub type MasterKeyProtectorHandle = Arc<dyn MasterKeyProtector>;
+pub type ProviderHandle = Arc<dyn Provider>;
 
 /// Passphrase bytes provided by a local operator or protected daemon source.
 #[derive(Clone)]
@@ -344,31 +344,31 @@ impl PassphraseKdfParams {
     }
 }
 
-/// Local passphrase-backed master key protector.
-pub struct PassphraseMasterKeyProtector {
+/// Local passphrase-backed master key envelope provider.
+pub struct PassphraseProvider {
     passphrase: SecretPassphrase,
     params: PassphraseKdfParams,
 }
 
-impl PassphraseMasterKeyProtector {
-    /// Creates a production passphrase protector for locally persisted envelopes.
+impl PassphraseProvider {
+    /// Creates a production passphrase envelope provider for locally persisted envelopes.
     pub fn new(passphrase: SecretPassphrase) -> Self {
         Self::with_params(passphrase, PassphraseKdfParams::production())
     }
 
-    /// Creates a passphrase protector with explicit KDF parameters.
+    /// Creates a passphrase envelope provider with explicit KDF parameters.
     pub fn with_params(passphrase: SecretPassphrase, params: PassphraseKdfParams) -> Self {
         Self { passphrase, params }
     }
 
-    /// Creates a deterministic low-cost protector used by tests and headless harnesses.
+    /// Creates a deterministic low-cost envelope provider used by tests and headless harnesses.
     pub fn for_test() -> io::Result<Self> {
         let passphrase = SecretPassphrase::new(b"mantissa-test-master-key-passphrase".to_vec())?;
         Ok(Self::with_params(passphrase, PassphraseKdfParams::test()))
     }
 }
 
-impl MasterKeyProtector for PassphraseMasterKeyProtector {
+impl Provider for PassphraseProvider {
     /// Returns the stable passphrase provider id.
     fn provider(&self) -> &'static str {
         PASSPHRASE_PROVIDER
@@ -459,7 +459,7 @@ impl MasterKeyProtector for PassphraseMasterKeyProtector {
     }
 }
 
-impl PassphraseMasterKeyProtector {
+impl PassphraseProvider {
     /// Derives the AEAD wrapping key from the passphrase and stored provider metadata.
     fn derive_wrap_key(&self, metadata: &[u8]) -> io::Result<Zeroizing<[u8; MASTER_KEY_SIZE]>> {
         let parsed = decode_passphrase_metadata(metadata)?;
@@ -873,9 +873,9 @@ fn capnp_to_io(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ARGON2_MEMORY_COST_KIB, MasterKeyDescriptor, MasterKeyPlaintext, MasterKeyProtector,
-        MasterKeyTransfer, PASSPHRASE_SALT_SIZE, PassphraseKdfParams, PassphraseMasterKeyProtector,
-        SecretPassphrase, encode_passphrase_metadata,
+        MAX_ARGON2_MEMORY_COST_KIB, MasterKeyDescriptor, MasterKeyPlaintext, MasterKeyTransfer,
+        PASSPHRASE_SALT_SIZE, PassphraseKdfParams, PassphraseProvider, Provider, SecretPassphrase,
+        encode_passphrase_metadata,
     };
     use crate::cluster::ClusterViewId;
     use mantissa_net::noise::NoiseKeys;
@@ -898,11 +898,11 @@ mod tests {
     fn passphrase_provider_reopens_wrapped_key() {
         let passphrase =
             SecretPassphrase::new(b"correct horse battery staple".to_vec()).expect("passphrase");
-        let provider = PassphraseMasterKeyProtector::new(passphrase.clone());
+        let provider = PassphraseProvider::new(passphrase.clone());
         let key = MasterKeyPlaintext::generate().expect("key");
 
         let wrapped = provider.wrap(descriptor(1), &key).expect("wrap");
-        let reopened = PassphraseMasterKeyProtector::new(passphrase);
+        let reopened = PassphraseProvider::new(passphrase);
         let unwrapped = reopened.unwrap(&wrapped).expect("unwrap");
 
         assert_eq!(key.as_bytes(), unwrapped.as_bytes());
@@ -912,13 +912,13 @@ mod tests {
     fn passphrase_provider_rejects_wrong_passphrase() {
         let passphrase =
             SecretPassphrase::new(b"correct horse battery staple".to_vec()).expect("passphrase");
-        let provider = PassphraseMasterKeyProtector::new(passphrase);
+        let provider = PassphraseProvider::new(passphrase);
         let key = MasterKeyPlaintext::generate().expect("key");
         let wrapped = provider.wrap(descriptor(1), &key).expect("wrap");
 
         let wrong = SecretPassphrase::new(b"incorrect horse battery staple".to_vec())
             .expect("wrong passphrase");
-        let reopened = PassphraseMasterKeyProtector::new(wrong);
+        let reopened = PassphraseProvider::new(wrong);
         assert!(reopened.unwrap(&wrapped).is_err());
     }
 
@@ -980,7 +980,7 @@ mod tests {
     fn passphrase_provider_rejects_excessive_kdf_params() {
         let passphrase =
             SecretPassphrase::new(b"correct horse battery staple".to_vec()).expect("passphrase");
-        let provider = PassphraseMasterKeyProtector::new(passphrase);
+        let provider = PassphraseProvider::new(passphrase);
         let key = MasterKeyPlaintext::generate().expect("key");
         let mut wrapped = provider.wrap(descriptor(1), &key).expect("wrap");
         let salt = [1u8; PASSPHRASE_SALT_SIZE];

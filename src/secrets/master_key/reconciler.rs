@@ -1,7 +1,7 @@
 use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::registry::Registry;
 use crate::secrets::crypto::SecretKeyring;
-use crate::secrets::master_key_protector::{MasterKeyDescriptor, MasterKeyTransfer};
+use crate::secrets::master_key::envelope::{MasterKeyDescriptor, MasterKeyTransfer};
 use crate::store::local::{MasterKeyRecord, SecretMasterStore};
 use crate::store::secret_master_key_store::{
     SecretMasterKeyCurrent, SecretMasterKeyGrant, SecretMasterKeyStore, SecretMasterKeySyncRecord,
@@ -310,8 +310,8 @@ mod tests {
     use crate::cluster::{ClusterViewId, ClusterViewState};
     use crate::registry::Registry;
     use crate::secrets::crypto::SecretKeyring;
-    use crate::secrets::master_key_protector::{
-        MasterKeyDescriptor, MasterKeyPlaintext, MasterKeyTransfer, PassphraseMasterKeyProtector,
+    use crate::secrets::master_key::envelope::{
+        MasterKeyDescriptor, MasterKeyPlaintext, MasterKeyTransfer, PassphraseProvider,
     };
     use crate::store::local::{LocalSessionStore, MasterKeyRecord, SecretMasterStore};
     use crate::store::peer_store::open_peers_store;
@@ -368,9 +368,10 @@ mod tests {
         let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
         let local_node_id = Uuid::from_u128(1);
         let noise_keys = Arc::new(NoiseKeys::from_private_bytes([7u8; 32]));
-        let protector = Arc::new(PassphraseMasterKeyProtector::for_test().expect("protector"));
+        let envelope_provider =
+            Arc::new(PassphraseProvider::for_test().expect("envelope provider"));
         let master_store =
-            SecretMasterStore::new(db.clone(), protector).expect("open master store");
+            SecretMasterStore::new(db.clone(), envelope_provider).expect("open master store");
         let active = master_store
             .ensure_current_for_node(ClusterViewId::legacy_default(), local_node_id)
             .expect("ensure current");

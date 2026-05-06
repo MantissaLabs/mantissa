@@ -1,5 +1,5 @@
 use crate::gossip::Message;
-use crate::secrets::master_key_protector::MasterKeyTransfer;
+use crate::secrets::master_key::envelope::MasterKeyTransfer;
 use crate::store::local::MasterKeyRecord;
 use crate::store::secret_master_key_store::{
     SecretMasterKeyStore, SecretMasterKeySyncRecord, current_from_descriptor, upsert_record,

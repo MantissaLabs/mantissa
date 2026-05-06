@@ -1,6 +1,6 @@
 use super::runtime::BootstrapOptions;
 use crate::config;
-use crate::secrets::master_key_protector::SecretPassphrase;
+use crate::secrets::master_key::envelope::SecretPassphrase;
 
 /// Builds the runtime options used by the production daemon entrypoint.
 ///

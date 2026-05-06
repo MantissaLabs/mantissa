@@ -13,7 +13,7 @@ use crate::{
     registry::Registry,
     runtime::set::RuntimeSet,
     scheduler::Scheduler,
-    secrets::master_key_protector::{PassphraseKdfParams, SecretPassphrase},
+    secrets::master_key::envelope::{PassphraseKdfParams, SecretPassphrase},
     server::{
         RunHandles, Server,
         bootstrap::{BootedRuntime, BootstrapContext, BootstrapOptions, RuntimeTaskHandles, boot},

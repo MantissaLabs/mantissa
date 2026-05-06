@@ -10,7 +10,7 @@ use crate::registry::Registry;
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::scheduler::Scheduler;
 use crate::secrets::crypto::SecretKeyring;
-use crate::secrets::master_key_sync::SecretMasterKeyPublisher;
+use crate::secrets::master_key::replication::SecretMasterKeyPublisher;
 use crate::server::auth::AuthStore;
 use crate::services::ServiceRegistry;
 use crate::store::cluster_operation_store::ClusterOperationStore;

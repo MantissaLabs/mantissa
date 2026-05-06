@@ -1,6 +1,6 @@
 use crate::cluster::ClusterViewId;
-use crate::secrets::master_key_protector::{
-    MasterKeyDescriptor, MasterKeyPlaintext, MasterKeyProtectorHandle, WrappedMasterKeyRecord,
+use crate::secrets::master_key::envelope::{
+    MasterKeyDescriptor, MasterKeyPlaintext, ProviderHandle, WrappedMasterKeyRecord,
 };
 use crate::store::tx::{into_io, with_read_tx, with_write_tx};
 use parking_lot::{Mutex, MutexGuard};
@@ -56,7 +56,7 @@ impl MasterKeyRecord {
 #[derive(Clone)]
 pub struct SecretMasterStore {
     db: Arc<Database>,
-    protector: MasterKeyProtectorHandle,
+    envelope_provider: ProviderHandle,
     // Serializes the local cluster-key decision. A fresh node starts with a
     // temporary key so secrets can work before it joins. The first cluster
     // action must choose one outcome: adopt an anchor key, serve its own key as
@@ -67,7 +67,7 @@ pub struct SecretMasterStore {
 
 impl SecretMasterStore {
     /// Opens or creates the wrapped secret master key tables.
-    pub fn new(db: Arc<Database>, protector: MasterKeyProtectorHandle) -> io::Result<Self> {
+    pub fn new(db: Arc<Database>, envelope_provider: ProviderHandle) -> io::Result<Self> {
         with_write_tx(&db, |tx| {
             let _ = tx.open_table(T_MASTER_KEY_ENVELOPES).map_err(into_io)?;
             let _ = tx.open_table(T_MASTER_META).map_err(into_io)?;
@@ -76,7 +76,7 @@ impl SecretMasterStore {
 
         Ok(Self {
             db,
-            protector,
+            envelope_provider,
             policy_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -114,7 +114,7 @@ impl SecretMasterStore {
         let Some(wrapped) = self.load_wrapped_key(key_id)? else {
             return Ok(None);
         };
-        let key = self.protector.unwrap(&wrapped)?;
+        let key = self.envelope_provider.unwrap(&wrapped)?;
         MasterKeyRecord::new(wrapped.descriptor, key).map(Some)
     }
 
@@ -138,7 +138,7 @@ impl SecretMasterStore {
 
         let mut records = Vec::with_capacity(wrapped_records.len());
         for wrapped in wrapped_records {
-            let key = self.protector.unwrap(&wrapped)?;
+            let key = self.envelope_provider.unwrap(&wrapped)?;
             records.push(MasterKeyRecord::new(wrapped.descriptor, key)?);
         }
         records.sort_by_key(|record| record.key_id());
@@ -401,7 +401,7 @@ impl SecretMasterStore {
             ));
         }
 
-        let wrapped = self.protector.wrap(descriptor.clone(), key)?;
+        let wrapped = self.envelope_provider.wrap(descriptor.clone(), key)?;
         let encoded = wrapped.encode()?;
 
         with_write_tx(&self.db, |tx| {
@@ -471,9 +471,9 @@ fn uuid_from_bytes(bytes: &[u8]) -> io::Result<Uuid> {
 mod tests {
     use super::{MasterKeyRecord, SecretMasterStore};
     use crate::cluster::ClusterViewId;
-    use crate::secrets::master_key_protector::{
-        MasterKeyCipherSuite, MasterKeyDescriptor, MasterKeyPlaintext, MasterKeyProtector,
-        PassphraseMasterKeyProtector, WrappedMasterKeyRecord,
+    use crate::secrets::master_key::envelope::{
+        MasterKeyCipherSuite, MasterKeyDescriptor, MasterKeyPlaintext, PassphraseProvider,
+        Provider, WrappedMasterKeyRecord,
     };
     use redb::Database;
     use std::io;
@@ -482,9 +482,9 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
-    /// Builds the low-cost passphrase protector shared by local store tests.
-    fn test_protector() -> crate::secrets::master_key_protector::MasterKeyProtectorHandle {
-        Arc::new(PassphraseMasterKeyProtector::for_test().expect("protector"))
+    /// Builds the low-cost passphrase envelope provider shared by local store tests.
+    fn test_envelope_provider() -> crate::secrets::master_key::envelope::ProviderHandle {
+        Arc::new(PassphraseProvider::for_test().expect("envelope provider"))
     }
 
     /// Builds a descriptor with a unique key id for import-policy tests.
@@ -502,18 +502,18 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct CountingProtector {
+    struct CountingProvider {
         unwraps: AtomicUsize,
     }
 
-    impl CountingProtector {
-        /// Returns how many envelope unwraps this test protector performed.
+    impl CountingProvider {
+        /// Returns how many envelope unwraps this test provider performed.
         fn unwrap_count(&self) -> usize {
             self.unwraps.load(Ordering::SeqCst)
         }
     }
 
-    impl MasterKeyProtector for CountingProtector {
+    impl Provider for CountingProvider {
         /// Returns the test provider id stored in fake envelopes.
         fn provider(&self) -> &'static str {
             "counting-test"
@@ -550,8 +550,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let db = Arc::new(Database::create(db_path).unwrap());
-        let protector = test_protector();
-        let store = SecretMasterStore::new(db.clone(), protector.clone()).expect("open store");
+        let envelope_provider = test_envelope_provider();
+        let store =
+            SecretMasterStore::new(db.clone(), envelope_provider.clone()).expect("open store");
 
         let first = store
             .ensure_current_for_node(ClusterViewId::legacy_default(), Uuid::new_v4())
@@ -563,7 +564,7 @@ mod tests {
         assert_eq!(first.key_id(), again.key_id());
         assert_eq!(first.key, again.key);
 
-        let reopened = SecretMasterStore::new(db, protector).expect("reopen store");
+        let reopened = SecretMasterStore::new(db, envelope_provider).expect("reopen store");
         let current = reopened.current().expect("load master key");
         assert_eq!(current.key_id(), again.key_id());
         assert_eq!(current.key, again.key);
@@ -574,7 +575,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let db = Arc::new(Database::create(db_path).unwrap());
-        let store = SecretMasterStore::new(db, test_protector()).expect("open store");
+        let store = SecretMasterStore::new(db, test_envelope_provider()).expect("open store");
 
         let base = store.ensure_current().expect("ensure master key");
         let rotated = store
@@ -599,7 +600,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let db = Arc::new(Database::create(db_path).unwrap());
-        let store = SecretMasterStore::new(db, test_protector()).expect("open store");
+        let store = SecretMasterStore::new(db, test_envelope_provider()).expect("open store");
 
         let current = store.ensure_current().expect("ensure master key");
         let historical = MasterKeyRecord::new(
@@ -633,7 +634,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let db = Arc::new(Database::create(db_path).unwrap());
-        let store = SecretMasterStore::new(db, test_protector()).expect("open store");
+        let store = SecretMasterStore::new(db, test_envelope_provider()).expect("open store");
 
         let original = store.ensure_current().expect("ensure master key");
         let replicated_current = MasterKeyRecord::new(
@@ -667,7 +668,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let db = Arc::new(Database::create(db_path).unwrap());
-        let store = SecretMasterStore::new(db, test_protector()).expect("open store");
+        let store = SecretMasterStore::new(db, test_envelope_provider()).expect("open store");
 
         let bootstrap = store.ensure_current().expect("ensure master key");
         store
@@ -696,7 +697,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let db = Arc::new(Database::create(db_path).unwrap());
-        let store = SecretMasterStore::new(db, test_protector()).expect("open store");
+        let store = SecretMasterStore::new(db, test_envelope_provider()).expect("open store");
 
         let bootstrap = store.ensure_current().expect("ensure master key");
         store
@@ -727,8 +728,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let db = Arc::new(Database::create(db_path).unwrap());
-        let protector = Arc::new(CountingProtector::default());
-        let store = SecretMasterStore::new(db, protector.clone()).expect("open store");
+        let envelope_provider = Arc::new(CountingProvider::default());
+        let store = SecretMasterStore::new(db, envelope_provider.clone()).expect("open store");
 
         let bootstrap = store.ensure_current().expect("ensure master key");
         store
@@ -736,7 +737,7 @@ mod tests {
             .expect("commit current key for grant publication");
 
         assert_eq!(
-            protector.unwrap_count(),
+            envelope_provider.unwrap_count(),
             0,
             "grant policy commit should not unwrap the local envelope"
         );
@@ -747,8 +748,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let db = Arc::new(Database::create(db_path).unwrap());
-        let protector = Arc::new(CountingProtector::default());
-        let store = SecretMasterStore::new(db, protector.clone()).expect("open store");
+        let envelope_provider = Arc::new(CountingProvider::default());
+        let store = SecretMasterStore::new(db, envelope_provider.clone()).expect("open store");
 
         let original = store.ensure_current().expect("ensure master key");
         let replicated_current = MasterKeyRecord::new(
@@ -765,7 +766,7 @@ mod tests {
             .expect("activate replicated key");
 
         assert_eq!(
-            protector.unwrap_count(),
+            envelope_provider.unwrap_count(),
             0,
             "activating a just-imported key should not unwrap its envelope again"
         );
@@ -780,7 +781,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let db = Arc::new(Database::create(&db_path).unwrap());
-        let store = SecretMasterStore::new(db.clone(), test_protector()).expect("open store");
+        let store =
+            SecretMasterStore::new(db.clone(), test_envelope_provider()).expect("open store");
 
         let record = store.ensure_current().expect("ensure master key");
         drop(store);

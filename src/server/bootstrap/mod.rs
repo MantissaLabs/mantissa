@@ -3,7 +3,7 @@ mod runtime;
 mod stores;
 mod transport;
 
-use crate::secrets::master_key_protector::SecretPassphrase;
+use crate::secrets::master_key::envelope::SecretPassphrase;
 use crate::server;
 
 pub(crate) use context::BootstrapContext;

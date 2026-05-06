@@ -410,12 +410,12 @@ mod tests {
             original_id = load_or_create_node_id(&db).expect("node id");
             let token_store = LocalTokenStore::new(db.clone()).expect("token store");
             token_store.write("MNTISA-1-abc234").expect("write token");
-            let master_protector = Arc::new(
-                crate::secrets::master_key_protector::PassphraseMasterKeyProtector::for_test()
-                    .expect("master protector"),
+            let master_envelope_provider = Arc::new(
+                crate::secrets::master_key::envelope::PassphraseProvider::for_test()
+                    .expect("master envelope provider"),
             );
-            let master_store =
-                SecretMasterStore::new(db.clone(), master_protector.clone()).expect("master store");
+            let master_store = SecretMasterStore::new(db.clone(), master_envelope_provider.clone())
+                .expect("master store");
             let master = master_store.ensure_current().expect("master key");
             let peers = open_peers_store(db.clone(), original_id).expect("open peers");
             peers
@@ -468,12 +468,12 @@ mod tests {
             token_store.read().expect("token").as_deref(),
             Some("MNTISA-1-abc234")
         );
-        let master_protector = Arc::new(
-            crate::secrets::master_key_protector::PassphraseMasterKeyProtector::for_test()
-                .expect("master protector"),
+        let master_envelope_provider = Arc::new(
+            crate::secrets::master_key::envelope::PassphraseProvider::for_test()
+                .expect("master envelope provider"),
         );
         let master_store =
-            SecretMasterStore::new(db.clone(), master_protector).expect("master store");
+            SecretMasterStore::new(db.clone(), master_envelope_provider).expect("master store");
         assert_eq!(master_store.current().expect("master").generation(), 1);
 
         assert_eq!(count_uuid_table(&db, T_LOCAL_SESSIONS), 0);
