@@ -249,13 +249,30 @@ impl SecretMasterKeyReconciler {
             return Ok(());
         }
 
-        let Some(record) = self
-            .master_store
-            .load_key(current.key_id)
-            .context("load local current master key")?
-        else {
-            report.current_waiting_for_key = true;
-            return Ok(());
+        // The grant import pass above has already wrapped newly received
+        // plaintext and cached it in the keyring. Prefer that cache so join
+        // adoption performs one production KDF wrap, not a wrap followed by an
+        // immediate unwrap of the same local envelope. The store fallback still
+        // covers startup or reconciliation after the process lost its cache.
+        let cached_record = {
+            let keyring = self.keyring.read().await;
+            keyring
+                .cached_record(descriptor)
+                .context("read cached current master key")?
+        };
+        let record = match cached_record {
+            Some(record) => record,
+            None => {
+                let Some(record) = self
+                    .master_store
+                    .load_key(current.key_id)
+                    .context("load local current master key")?
+                else {
+                    report.current_waiting_for_key = true;
+                    return Ok(());
+                };
+                record
+            }
         };
         if &record.descriptor != descriptor {
             anyhow::bail!(

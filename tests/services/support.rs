@@ -923,6 +923,7 @@ pub(crate) async fn create_restartable_service_node(
                 runtime_backend,
             )),
             local_volume_root: Some(local_volume_root),
+            master_key_kdf_params: None,
         },
     )
     .await

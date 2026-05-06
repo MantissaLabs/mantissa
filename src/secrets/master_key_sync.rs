@@ -61,16 +61,31 @@ impl SecretMasterKeyPublisher {
         record: &MasterKeyRecord,
         recipients: &[SecretMasterKeyGrantRecipient],
     ) -> Result<()> {
-        self.publish_current_with_key_grants(record, std::slice::from_ref(record), recipients)
+        self.publish_current_key_returning_records(record, recipients)
             .await
+            .map(|_| ())
+    }
+
+    /// Publishes the current key rows and returns them for latency-sensitive join seeding.
+    pub async fn publish_current_key_returning_records(
+        &self,
+        record: &MasterKeyRecord,
+        recipients: &[SecretMasterKeyGrantRecipient],
+    ) -> Result<Vec<SecretMasterKeySyncRecord>> {
+        self.publish_current_with_key_grants_returning_records(
+            record,
+            std::slice::from_ref(record),
+            recipients,
+        )
+        .await
     }
 
     /// Publishes all known key grants for recipients and advances the current pointer.
     ///
-    /// A joining node needs both the active key and historical keys still
-    /// referenced by replicated secrets. Publishing those rows together keeps
-    /// the join path on the normal sync domain without reviving the old direct
-    /// master-key transfer RPC.
+    /// Callers that must make historical ciphertext readable for a recipient
+    /// can pass every locally known key. The join fast path intentionally uses
+    /// `publish_current_key_returning_records` instead so registerNode does
+    /// not unwrap every local envelope before it can return.
     pub async fn publish_current_with_key_grants(
         &self,
         current: &MasterKeyRecord,

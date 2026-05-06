@@ -91,6 +91,24 @@ impl SecretKeyring {
         cache.insert(record.key_id(), record.key.clone());
     }
 
+    /// Rebuilds a master key record from cached key material and replicated metadata.
+    ///
+    /// Reconciliation imports a replicated grant by wrapping it locally and
+    /// caching the plaintext in the same pass. When that grant is also the
+    /// replicated current key, adoption can use this method instead of loading
+    /// the freshly persisted envelope and paying a second passphrase KDF.
+    pub fn cached_record(
+        &self,
+        descriptor: &MasterKeyDescriptor,
+    ) -> io::Result<Option<MasterKeyRecord>> {
+        let cache = self.inner.cache.read();
+        cache
+            .get(&descriptor.key_id)
+            .cloned()
+            .map(|key| MasterKeyRecord::new(descriptor.clone(), key))
+            .transpose()
+    }
+
     /// Borrows one master key by id for immediate cryptographic use.
     fn with_master_key<R>(
         &self,

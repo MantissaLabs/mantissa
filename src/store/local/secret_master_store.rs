@@ -171,6 +171,18 @@ impl SecretMasterStore {
     pub fn activate_current(&self, record: &MasterKeyRecord) -> io::Result<()> {
         let _guard = self.policy_guard();
         self.ensure_replicated_current_allowed(record)?;
+        // Most replicated-current activations follow an import that already
+        // wrapped this key locally. Updating metadata from the descriptor avoids
+        // re-running the passphrase KDF just to prove the same envelope decrypts.
+        if let Some(existing) = self.load_wrapped_key(record.key_id())? {
+            if existing.descriptor != record.descriptor {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "conflicting secret master key envelope rejected",
+                ));
+            }
+            return self.update_metadata(record.key_id(), true, Some(false));
+        }
         self.persist_record(&record.descriptor, &record.key, true, Some(false))
     }
 
@@ -727,6 +739,39 @@ mod tests {
             protector.unwrap_count(),
             0,
             "grant policy commit should not unwrap the local envelope"
+        );
+    }
+
+    #[test]
+    fn activate_imported_current_updates_metadata_without_unwrap() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let db = Arc::new(Database::create(db_path).unwrap());
+        let protector = Arc::new(CountingProtector::default());
+        let store = SecretMasterStore::new(db, protector.clone()).expect("open store");
+
+        let original = store.ensure_current().expect("ensure master key");
+        let replicated_current = MasterKeyRecord::new(
+            descriptor(original.generation()),
+            MasterKeyPlaintext::generate().expect("replicated key"),
+        )
+        .expect("replicated record");
+
+        store
+            .import_key(&replicated_current)
+            .expect("import replicated key");
+        store
+            .activate_current(&replicated_current)
+            .expect("activate replicated key");
+
+        assert_eq!(
+            protector.unwrap_count(),
+            0,
+            "activating a just-imported key should not unwrap its envelope again"
+        );
+        assert_eq!(
+            store.current().expect("current").key_id(),
+            replicated_current.key_id()
         );
     }
 

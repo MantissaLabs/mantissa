@@ -64,6 +64,7 @@ pub struct HeadlessConfig {
     pub task_runtime: Option<WorkloadRuntimeConfig>,
     pub runtime_set: Option<RuntimeSet>,
     pub local_volume_root: Option<PathBuf>,
+    pub master_key_kdf_params: Option<PassphraseKdfParams>,
 }
 
 impl Default for HeadlessConfig {
@@ -82,6 +83,7 @@ impl Default for HeadlessConfig {
             task_runtime: None,
             runtime_set: None,
             local_volume_root: None,
+            master_key_kdf_params: None,
         }
     }
 }
@@ -182,6 +184,7 @@ impl HeadlessNode {
             task_runtime,
             runtime_set,
             local_volume_root,
+            master_key_kdf_params,
         } = cfg;
         // Local Node + client
         let mut node_obj = node::Node::new();
@@ -221,7 +224,7 @@ impl HeadlessNode {
             )?),
             // Headless nodes still exercise the real master-key envelope and transfer
             // code paths, but avoid production Argon2 cost in broad integration tests.
-            master_key_kdf_params: PassphraseKdfParams::test(),
+            master_key_kdf_params: master_key_kdf_params.unwrap_or_else(PassphraseKdfParams::test),
         };
 
         let BootedRuntime {
@@ -535,6 +538,7 @@ impl HeadlessNode {
                 task_runtime,
                 runtime_set: None,
                 local_volume_root: Some(state.tmp_dir.join("volumes")),
+                master_key_kdf_params: None,
             },
         )
         .await

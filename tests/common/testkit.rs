@@ -11,6 +11,7 @@ use mantissa::topology_capnp::topology;
 use mantissa::workload::manager::WorkloadRuntimeConfig;
 use mantissa::{
     node,
+    secrets::master_key_protector::PassphraseKdfParams,
     server::headless::{HeadlessConfig, HeadlessNode, HeadlessTransport},
 };
 use mantissa_protocol::health::NodeStatus;
@@ -146,6 +147,7 @@ impl TestNode {
             task_runtime,
             runtime_set: None,
             local_volume_root: None,
+            master_key_kdf_params: None,
         }
     }
 
@@ -622,6 +624,7 @@ pub struct ClusterConfig {
     pub gossip_channel_capacity: Option<usize>,
     pub task_reconcile_tick_ms: Option<u64>,
     pub task_repair_tick_ms: Option<u64>,
+    pub master_key_kdf_params: Option<PassphraseKdfParams>,
 }
 
 impl Default for ClusterConfig {
@@ -635,6 +638,7 @@ impl Default for ClusterConfig {
             // production defaults in the main binary.
             task_reconcile_tick_ms: Some(500),
             task_repair_tick_ms: Some(500),
+            master_key_kdf_params: None,
         }
     }
 }
@@ -672,12 +676,24 @@ async fn build_inproc_node_with_config(cfg: ClusterConfig) -> HeadlessNode {
         gossip_channel_capacity,
         cfg.task_runtime_config(),
     );
+    let headless_cfg = HeadlessConfig {
+        master_key_kdf_params: cfg.master_key_kdf_params,
+        ..headless_cfg
+    };
     HeadlessNode::new_with_config(TestNode::apply_test_runtime_backend(headless_cfg))
         .await
         .expect("headless inproc node (custom)")
 }
 
 impl TestNode {
+    /// Starts one in-process node with the provided cluster test configuration.
+    pub async fn new_inproc_with_config(cfg: ClusterConfig) -> Self {
+        let node = build_inproc_node_with_config(cfg).await;
+        Self {
+            node: Box::new(node),
+        }
+    }
+
     pub async fn new_cluster_inproc_with_config(
         n: usize,
         cfg: ClusterConfig,

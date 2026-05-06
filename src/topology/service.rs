@@ -287,7 +287,7 @@ impl Topology {
         Ok(())
     }
 
-    /// Publishes replicated master-key rows for a node accepted by this anchor.
+    /// Publishes the current master-key rows for a node accepted by this anchor.
     pub(crate) async fn publish_master_key_grants_for_joiner(
         &self,
         joiner_id: Uuid,
@@ -300,7 +300,9 @@ impl Topology {
 
         // Keep the keyring read lock until the current row and grants are durable. Otherwise a
         // rotation or replicated-current adoption could switch the local current key between
-        // "which key did this anchor grant?" and "which current key did the joiner sync?".
+        // "which key did this anchor grant?" and "which current key did the joiner adopt?".
+        // Join must only grant the cached current key here: loading all historical keys unwraps
+        // every local envelope and moves production Argon2 work back onto the registerNode path.
         let keyring = self.stores.secret_keyring.read().await;
         let current = keyring
             .current_record()
@@ -309,14 +311,9 @@ impl Topology {
             .secret_master_store
             .commit_current_for_replication(current.key_id())
             .map_err(|err| Error::failed(format!("commit join master key grant: {err}")))?;
-        let records = self
-            .stores
-            .secret_master_store
-            .load_all_keys()
-            .map_err(|err| Error::failed(format!("load local master keys: {err}")))?;
         self.stores
             .secret_master_key_publisher
-            .publish_current_with_key_grants_returning_records(&current, &records, &[recipient])
+            .publish_current_key_returning_records(&current, &[recipient])
             .await
             .map_err(|err| Error::failed(format!("publish join master-key grants: {err}")))
     }

@@ -7,10 +7,11 @@ use common::convergence::{
 use common::testkit::{ClusterConfig, RuntimeBackendOverrideGuard, TestNode};
 use mantissa::cluster::ClusterViewId;
 use mantissa::node::id::set_node_id;
+use mantissa::secrets::master_key_protector::PassphraseKdfParams;
 use mantissa::store::secret_master_key_store::current_for_scope;
 use mantissa_protocol::secrets::secrets;
 use mantissa_protocol::topology::ClusterOperationStage;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// Creates a secret through the public RPC so encryption uses the node's live keyring.
@@ -407,6 +408,37 @@ local_test!(master_key_exchange_supports_three_node_secret_decryption, {
         );
     }
 });
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "uses production Argon2 cost and prints a join latency baseline"]
+async fn production_kdf_join_latency_baseline() {
+    mantissa::logger::init_for_tests();
+    common::testkit::run_local(async {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+        let cfg = ClusterConfig {
+            sync_tick_ms: Some(30_000),
+            gossip_tick_ms: Some(30_000),
+            master_key_kdf_params: Some(PassphraseKdfParams::production()),
+            ..ClusterConfig::default()
+        };
+        let anchor = TestNode::new_inproc_with_config(cfg).await;
+        let joiner = TestNode::new_inproc_with_config(cfg).await;
+
+        let started = Instant::now();
+        joiner
+            .join(&anchor)
+            .await
+            .expect("join with production KDF");
+        let elapsed = started.elapsed();
+        eprintln!("production KDF join elapsed: {elapsed:?}");
+
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "production KDF join should not wait for background sync: {elapsed:?}"
+        );
+    })
+    .await;
+}
 
 local_test!(split_scopes_secret_master_key_current_to_target_view, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
