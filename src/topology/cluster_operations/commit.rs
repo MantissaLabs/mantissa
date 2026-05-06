@@ -10,9 +10,11 @@ use crate::secrets::master_key_sync::SecretMasterKeyGrantRecipient;
 use crate::services::ServiceRegistry;
 use crate::store::local::MasterKeyRecord;
 use crate::topology::Topology;
+use crate::topology::peers::PeerValue;
 use crate::workload::WorkloadRegistry;
 use async_trait::async_trait;
-use std::collections::HashSet;
+use mantissa_store::uuid_key::UuidKey;
+use std::collections::{BTreeMap, HashSet};
 use tracing::warn;
 
 struct PeerScopeParticipant {
@@ -216,25 +218,35 @@ impl MergeSecretMasterKeyParticipant {
     fn merge_master_key_recipients(
         &self,
     ) -> Result<Vec<SecretMasterKeyGrantRecipient>, capnp::Error> {
-        let (active_peers, _) = self
+        let (peer_regs, _) = self
             .topology
             .stores
             .peers
-            .load_all()
+            .load_all_regs()
             .map_err(|err| capnp::Error::failed(format!("load merge peers: {err}")))?;
-        let mut node_ids = active_peers
-            .into_iter()
-            .map(|(key, _)| key.to_uuid())
-            .collect::<Vec<_>>();
-        node_ids.push(self.topology.local.node.id);
-        node_ids.sort_unstable();
-        node_ids.dedup();
-
-        let mut recipients = Vec::with_capacity(node_ids.len());
-        for node_id in node_ids {
-            recipients.push(master_key_recipient_for_node(&self.topology, node_id)?);
+        let mut recipient_keys = BTreeMap::new();
+        for (key, reg) in peer_regs {
+            let Some(peer) = PeerValue::select_reg(&reg) else {
+                continue;
+            };
+            if peer.is_active() {
+                recipient_keys.insert(key.to_uuid(), peer.noise_static_pub);
+            }
         }
-        Ok(recipients)
+        recipient_keys.insert(
+            self.topology.local.node.id,
+            self.topology.deps.registry.noise_keys().public_bytes(),
+        );
+
+        Ok(recipient_keys
+            .into_iter()
+            .map(
+                |(node_id, noise_static_pub)| SecretMasterKeyGrantRecipient {
+                    node_id,
+                    noise_static_pub,
+                },
+            )
+            .collect())
     }
 
     /// Resolves the merge current row to publish, preserving replay idempotence.
@@ -306,9 +318,14 @@ fn master_key_recipient_for_node(
     }
 
     let peer = topology
-        .deps
-        .registry
-        .peer_value_unscoped(node_id)
+        .stores
+        .peers
+        .get_reg(&UuidKey::from(node_id))
+        .map_err(|err| {
+            capnp::Error::failed(format!("load peer {node_id} for master-key grant: {err}"))
+        })?
+        .as_ref()
+        .and_then(PeerValue::select_reg)
         .ok_or_else(|| {
             capnp::Error::failed(format!(
                 "peer {node_id} has no peer record for master-key grant"
