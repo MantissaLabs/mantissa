@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use common::testkit::TestNode;
 use mantissa::cluster::ClusterViewId;
+use mantissa::topology::peers::NodeReadiness;
 use mantissa::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadValue, WorkloadValueDraft,
 };
@@ -111,6 +112,30 @@ async fn seed_bootstrap_workloads(anchor: &TestNode, count: u64) {
         .upsert_many(rows)
         .await
         .expect("seed bootstrap workloads");
+}
+
+/// Rewrites one local peer row as if a crash had preserved an older readiness state.
+async fn force_peer_readiness(observer: &TestNode, target: Uuid, readiness: NodeReadiness) {
+    let mut value = observer
+        .node
+        .registry
+        .peer_value_unscoped(target)
+        .expect("peer value exists before forcing readiness");
+    value.readiness = readiness;
+
+    let key = UuidKey::from(target);
+    observer
+        .node
+        .peers
+        .purge_local(&key)
+        .await
+        .expect("purge peer row before forcing readiness");
+    observer
+        .node
+        .peers
+        .upsert(&key, value)
+        .await
+        .expect("force peer readiness");
 }
 
 /// Reads one node readiness state through the public topology list RPC.
@@ -223,6 +248,64 @@ local_test!(register_node_reports_syncing_during_bootstrap, {
     TestNode::wait_roots_equal(&anchor, &joiner, Duration::from_secs(10))
         .await
         .expect("roots equal after bootstrap sync");
+});
+
+local_test!(register_node_recovers_syncing_after_bootstrap_crash, {
+    let anchor = TestNode::new_with_tick_ms(10_000).await;
+    let joiner = TestNode::new_with_tick_ms(10_000).await;
+
+    joiner
+        .join_without_waiting_ready(&anchor)
+        .await
+        .expect("join ok");
+    assert!(
+        wait_readiness_of(
+            &anchor,
+            joiner.id(),
+            NodeReadinessState::Ready,
+            Duration::from_secs(10),
+        )
+        .await,
+        "joiner should become ready before forcing crash state"
+    );
+
+    let crash_readiness = NodeReadiness::syncing(joiner.id(), 1);
+    force_peer_readiness(&anchor, joiner.id(), crash_readiness.clone()).await;
+    force_peer_readiness(&joiner, joiner.id(), crash_readiness).await;
+
+    assert_eq!(
+        list_readiness_of(&joiner, joiner.id()).await,
+        Some(NodeReadinessState::Syncing),
+        "joiner should locally expose the recovered crash state"
+    );
+    assert_eq!(
+        list_readiness_of(&anchor, joiner.id()).await,
+        Some(NodeReadinessState::Syncing),
+        "anchor should also expose the forced crash state before repair"
+    );
+
+    joiner.node.sync_once_now();
+
+    assert!(
+        wait_readiness_of(
+            &joiner,
+            joiner.id(),
+            NodeReadinessState::Ready,
+            Duration::from_secs(10),
+        )
+        .await,
+        "successful full-domain sync should promote local readiness"
+    );
+    assert!(
+        wait_readiness_of(
+            &anchor,
+            joiner.id(),
+            NodeReadinessState::Ready,
+            Duration::from_secs(10),
+        )
+        .await,
+        "ready promotion should propagate back to the anchor"
+    );
 });
 
 local_test!(register_node_tcp, {

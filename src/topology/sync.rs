@@ -1,4 +1,5 @@
 use super::*;
+use crate::topology::peers::NodeReadinessState;
 use parking_lot::Mutex;
 
 /// Chooses the root schema version to use for one peer sync session.
@@ -441,8 +442,30 @@ impl Topology {
 
         if synced {
             crate::observability::metrics::record_sync_attempt("view", "success", "ok");
+            self.promote_local_readiness_after_full_sync().await;
         } else {
             crate::observability::metrics::record_sync_attempt("view", "failure", "sync_failed");
+        }
+    }
+
+    /// Promotes a persisted local Syncing row after one successful full-domain sync.
+    ///
+    /// This recovers the conservative state left behind if a node crashes after join persists its
+    /// Syncing peer row but before the bootstrap task can publish Ready. A later all-domain sync
+    /// proves the node can reconcile from a peer again, so it can leave the scheduling fence.
+    async fn promote_local_readiness_after_full_sync(&self) {
+        if self.current_readiness_state().state != NodeReadinessState::Syncing {
+            return;
+        }
+
+        if let Err(err) = self
+            .publish_local_readiness_state(NodeReadinessState::Ready)
+            .await
+        {
+            warn!(
+                target: "topology",
+                "failed to mark local node ready after successful full-domain sync: {err}"
+            );
         }
     }
 
@@ -491,7 +514,8 @@ impl Topology {
         };
 
         let trace = SyncTraceContext::peer(peer_id, value.address.clone(), "periodic-task-repair");
-        self.deps
+        let synced = self
+            .deps
             .sync
             .sync_selected_domains(
                 sync_cap,
@@ -501,7 +525,15 @@ impl Topology {
                 Some(trace),
             )
             .await;
-        crate::observability::metrics::record_sync_attempt("workload", "success", "ok");
+        if synced {
+            crate::observability::metrics::record_sync_attempt("workload", "success", "ok");
+        } else {
+            crate::observability::metrics::record_sync_attempt(
+                "workload",
+                "failure",
+                "sync_failed",
+            );
+        }
     }
 
     /// Runs one unscoped metadata anti-entropy exchange against a peer.
@@ -556,7 +588,8 @@ impl Topology {
 
         let trace =
             SyncTraceContext::peer(peer_id, value.address.clone(), "periodic-global-metadata");
-        self.deps
+        let synced = self
+            .deps
             .sync
             .sync_selected_domains(
                 sync_cap,
@@ -566,7 +599,15 @@ impl Topology {
                 Some(trace),
             )
             .await;
-        crate::observability::metrics::record_sync_attempt("global_metadata", "success", "ok");
+        if synced {
+            crate::observability::metrics::record_sync_attempt("global_metadata", "success", "ok");
+        } else {
+            crate::observability::metrics::record_sync_attempt(
+                "global_metadata",
+                "failure",
+                "sync_failed",
+            );
+        }
     }
 
     /// Run one cross-view metadata sync tick.
