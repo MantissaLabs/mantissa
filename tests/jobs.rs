@@ -394,15 +394,25 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
     )
     .await
     .expect("create jobs failover cluster");
+    TestNode::wait_cluster_ready_all(&cluster, 3, Duration::from_secs(10))
+        .await
+        .expect("jobs failover cluster should converge to three ready nodes");
 
     let job_id = submit_job(&cluster[0].node.jobs_client, "failover-job", 1, 2)
         .await
         .expect("submit failover job");
+    let owner_id = select_job_owner_for_test(job_id, &cluster_ids(&cluster)).expect("job owner");
+    let owner_index = cluster
+        .iter()
+        .position(|node| node.id() == owner_id)
+        .expect("owner index");
+    let owner = &cluster[owner_index];
+
     let first_workload_id =
-        wait_for_active_workload(&cluster[0].node.jobs_client, job_id, Duration::from_secs(5))
+        wait_for_active_workload(&owner.node.jobs_client, job_id, Duration::from_secs(10))
             .await
             .expect("job should launch first workload");
-    let first_attempt = cluster[0]
+    let first_attempt = owner
         .node
         .workload_manager
         .inspect_workload(first_workload_id)
@@ -416,7 +426,7 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
 
     assert!(
         wait_for_job_status(
-            &cluster[0].node.jobs_client,
+            &owner.node.jobs_client,
             job_id,
             ProtoJobStatus::Retrying,
             Duration::from_secs(10)
@@ -425,11 +435,6 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
         "job should enter retrying before owner failover"
     );
 
-    let owner_id = select_job_owner_for_test(job_id, &cluster_ids(&cluster)).expect("job owner");
-    let owner_index = cluster
-        .iter()
-        .position(|node| node.id() == owner_id)
-        .expect("owner index");
     cluster[owner_index].leave().await.expect("owner leave");
 
     for (index, node) in cluster.iter().enumerate() {

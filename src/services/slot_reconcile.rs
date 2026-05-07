@@ -32,6 +32,24 @@ struct SlotReconcileEnv<'a> {
     service_degraded: bool,
 }
 
+/// Returns the preferred slot target only while the target is still eligible.
+///
+/// Reconciliation computes placement targets from a point-in-time eligible-node snapshot, but drain
+/// metadata can arrive before a slot actually starts its replacement. Re-checking live
+/// schedulability here prevents an evacuation from aiming the fresh task back at a newly drained
+/// node.
+fn preferred_slot_node(
+    desired_node: Uuid,
+    health_snapshot: &HashMap<Uuid, HealthStatus>,
+    schedulable: bool,
+) -> Option<Uuid> {
+    if !schedulable || node_is_down(desired_node, health_snapshot) {
+        None
+    } else {
+        Some(desired_node)
+    }
+}
+
 impl ServiceController {
     /// Reconciles each replica slot owned by this node so rescheduling is distributed per-slot.
     pub(super) async fn reconcile_service(
@@ -200,11 +218,11 @@ impl ServiceController {
         let Some(desired_node) = env.slot_targets.get(key).copied() else {
             return Ok(());
         };
-        let preferred_node = if node_is_down(desired_node, env.health_snapshot) {
-            None
-        } else {
-            Some(desired_node)
-        };
+        let preferred_node = preferred_slot_node(
+            desired_node,
+            env.health_snapshot,
+            self.cluster_registry.peer_schedulable(desired_node),
+        );
         let requires_pinned_target = mounted_local_volumes_require_pinned_target(
             &self.volume_registry,
             &slot.template.volumes,
@@ -819,5 +837,37 @@ impl Drop for SlotGuard {
         tokio::task::spawn_local(async move {
             inflight.lock().await.remove(&key);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Preferred placement keeps the deterministic slot target while the node is usable.
+    #[test]
+    fn preferred_slot_node_uses_schedulable_alive_target() {
+        let node = Uuid::from_bytes([1u8; 16]);
+        let health = HashMap::new();
+
+        assert_eq!(preferred_slot_node(node, &health, true), Some(node));
+    }
+
+    /// Newly drained targets are ignored even if they came from an older placement snapshot.
+    #[test]
+    fn preferred_slot_node_rejects_unschedulable_target() {
+        let node = Uuid::from_bytes([2u8; 16]);
+        let health = HashMap::new();
+
+        assert_eq!(preferred_slot_node(node, &health, false), None);
+    }
+
+    /// Down targets remain ineligible regardless of their last scheduling bit.
+    #[test]
+    fn preferred_slot_node_rejects_down_target() {
+        let node = Uuid::from_bytes([3u8; 16]);
+        let health = HashMap::from([(node, HealthStatus::Down)]);
+
+        assert_eq!(preferred_slot_node(node, &health, true), None);
     }
 }
