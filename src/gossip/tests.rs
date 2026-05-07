@@ -116,6 +116,7 @@ fn message_for_forwarding_strips_join_client_capability() {
             scheduling: Box::new(
                 crate::topology::peers::PeerSchedulingState::schedulable_default(Uuid::new_v4()),
             ),
+            readiness: Box::new(crate::topology::peers::NodeReadiness::default()),
             labels: Box::new(crate::topology::peers::PeerLabelState::default()),
             runtime_support: Box::new(crate::runtime::types::RuntimeSupportProfile::default()),
             root_schema: crate::cluster::RootSchemaInfo::default(),

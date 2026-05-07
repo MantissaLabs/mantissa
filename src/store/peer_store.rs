@@ -139,6 +139,7 @@ mod tests {
                 enabled: true,
             }),
             scheduling: PeerSchedulingState::schedulable_default(Uuid::from_bytes([byte; 16])),
+            readiness: Default::default(),
             labels: PeerLabelState::default(),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             root_schema: crate::cluster::RootSchemaInfo::default(),

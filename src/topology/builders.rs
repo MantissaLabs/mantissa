@@ -3,7 +3,8 @@ use crate::cluster::{ClusterId, ClusterViewId, RootSchemaInfo};
 use crate::node::id::set_node_id;
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::topology::peers::{
-    PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue, write_peer,
+    NodeReadiness, PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue,
+    WireGuardPeerValue, write_peer,
 };
 use mantissa_protocol::gossip::gossip_message;
 use mantissa_protocol::server;
@@ -30,6 +31,7 @@ pub(super) struct JoinPayload {
     pub(super) identity_sig: [u8; 64],
     pub(super) wireguard: Option<WireGuardPeerValue>,
     pub(super) scheduling: PeerSchedulingState,
+    pub(super) readiness: NodeReadiness,
     pub(super) labels: PeerLabelState,
     pub(super) runtime_support: RuntimeSupportProfile,
     pub(super) root_schema: RootSchemaInfo,
@@ -153,6 +155,7 @@ pub(super) fn write_join_payload_to_node_info(
     let peer = join_payload_peer_value(payload);
     write_peer(info.reborrow().init_peer(), &peer);
     info.set_drain_state(drain_state_from_scheduling(&payload.scheduling));
+    info.set_readiness_state(payload.readiness.state.as_capnp());
 }
 
 /// Builds the peer projection carried by one join payload.
@@ -167,6 +170,7 @@ fn join_payload_peer_value(payload: &JoinPayload) -> PeerValue {
         identity_sig: payload.identity_sig.to_vec(),
         wireguard: payload.wireguard.clone(),
         scheduling: payload.scheduling.clone(),
+        readiness: payload.readiness.clone(),
         labels: payload.labels.clone(),
         runtime_support: payload.runtime_support.clone(),
         root_schema: payload.root_schema,
@@ -184,6 +188,7 @@ pub(super) fn write_listed_node_row(
     cluster_view.write_capnp(node.reborrow().init_active_cluster_view());
     write_peer(node.reborrow().init_peer(), &row.value);
     node.set_drain_state(row.drain_state);
+    node.set_readiness_state(row.value.readiness.state.as_capnp());
     node.set_health(row.health);
 }
 
@@ -299,6 +304,7 @@ fn write_join_event(
         identity_sig,
         wireguard,
         scheduling,
+        readiness,
         labels,
         runtime_support,
         root_schema,
@@ -319,6 +325,7 @@ fn write_join_event(
         identity_sig: identity_sig.clone(),
         wireguard: wireguard.clone(),
         scheduling: scheduling.as_ref().clone(),
+        readiness: readiness.as_ref().clone(),
         labels: labels.as_ref().clone(),
         runtime_support: runtime_support.as_ref().clone(),
         root_schema: *root_schema,
@@ -384,6 +391,25 @@ fn write_node_scheduling_updated_event(
         cluster_view,
     );
     write_scheduling_fields_to_peer(node.reborrow().init_peer(), scheduling);
+}
+
+/// Writes one readiness-update event into a gossip message builder.
+fn write_node_readiness_updated_event(
+    msg: gossip_message::Builder<'_>,
+    id: &Uuid,
+    readiness: &NodeReadiness,
+    cluster_view: ClusterViewId,
+) {
+    let mut node = init_topology_event_node(
+        msg,
+        topology_event::EventType::NodeReadinessUpdated,
+        id,
+        cluster_view,
+    );
+    let mut peer = node.reborrow().init_peer();
+    peer.set_readiness_state(readiness.state.as_capnp());
+    peer.set_readiness_updated_at_unix_ms(readiness.updated_at_unix_ms);
+    peer.set_readiness_actor_node_id(readiness.actor_node_id.as_bytes());
 }
 
 /// Writes one label-update event into a gossip message builder.
@@ -455,6 +481,9 @@ pub fn add_event(
         ),
         TopologyEvent::NodeSchedulingUpdated { id, scheduling } => {
             write_node_scheduling_updated_event(msg, id, scheduling, cluster_view)
+        }
+        TopologyEvent::NodeReadinessUpdated { id, readiness } => {
+            write_node_readiness_updated_event(msg, id, readiness, cluster_view)
         }
         TopologyEvent::NodeLabelsUpdated { id, labels } => {
             write_node_labels_updated_event(msg, id, labels, cluster_view)

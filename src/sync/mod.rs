@@ -32,9 +32,9 @@ pub use mantissa_store::gc::GcBarrier;
 /// Number of replicated domains exposed through view-scoped sync RPCs.
 pub const VIEW_SCOPED_DOMAIN_COUNT: usize = ALL_DOMAINS.len();
 /// Default max entries per streamed delta chunk.
-pub const DEFAULT_DELTA_CHUNK_MAX: usize = 2048;
+pub const DEFAULT_DELTA_CHUNK_MAX: usize = 8192;
 /// Default approximate payload target per streamed delta chunk.
-pub const DEFAULT_DELTA_CHUNK_TARGET_BYTES: usize = 128 * 1024;
+pub const DEFAULT_DELTA_CHUNK_TARGET_BYTES: usize = 1024 * 1024;
 
 /// Reads the max register/tombstone entries per streamed delta chunk.
 ///

@@ -92,6 +92,7 @@ impl JoinRequest {
             identity_sig: self.identity_sig.clone(),
             wireguard: self.peer.wireguard.clone(),
             scheduling: Box::new(self.peer.scheduling.clone()),
+            readiness: Box::new(self.peer.readiness.clone()),
             labels: Box::new(self.peer.labels.clone()),
             runtime_support: Box::new(self.peer.runtime_support.clone()),
             root_schema: self.peer.root_schema,

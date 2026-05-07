@@ -2,7 +2,7 @@ use crate::config::ClientConfig;
 use crate::connection;
 use anyhow::Result;
 use mantissa_protocol::topology::{
-    NodeDrainState, node_info::Reader as NodeInfo, peer::Reader as PeerInfo,
+    NodeDrainState, NodeReadinessState, node_info::Reader as NodeInfo, peer::Reader as PeerInfo,
 };
 use uuid::Uuid;
 
@@ -13,6 +13,7 @@ pub struct NodeListEntry {
     pub hostname: String,
     pub endpoint: String,
     pub health: String,
+    pub readiness: NodeReadinessState,
     pub schedulable: bool,
     pub drain_state: NodeDrainState,
     pub labels: Vec<String>,
@@ -28,6 +29,7 @@ impl NodeListEntry {
             hostname: peer.get_hostname()?.to_str()?.to_string(),
             endpoint: peer.get_address()?.to_str()?.to_string(),
             health: format!("{:?}", reader.get_health()?),
+            readiness: reader.get_readiness_state()?,
             schedulable: peer.get_schedulable(),
             drain_state: reader.get_drain_state()?,
             labels: labels_from_peer(&peer)?,

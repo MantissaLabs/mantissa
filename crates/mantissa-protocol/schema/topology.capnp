@@ -102,6 +102,14 @@ enum NodeDrainState {
   # Drain cannot make progress with the current cluster state.
 }
 
+enum NodeReadinessState {
+  ready @0;
+  # Node has completed bootstrap sync and may participate in scheduling.
+
+  syncing @1;
+  # Node is reachable but still synchronizing cluster state after join or restart.
+}
+
 struct NodeDrainStatus {
   nodeId @0 :Node.NodeId;
   # Node identifier this status row describes.
@@ -177,6 +185,7 @@ struct TopologyEvent {
       clusterNameUpdated @5;
       nodeSchedulingUpdated @6;
       nodeLabelsUpdated @7;
+      nodeReadinessUpdated @8;
   }
 }
 
@@ -223,6 +232,9 @@ struct NodeInfo {
 
   drainState @7 :NodeDrainState;
   # Derived maintenance progress state used by `Topology.list` output.
+
+  readinessState @8 :NodeReadinessState;
+  # Bootstrap/sync readiness state used by `Topology.list` output.
 }
 
 enum PeerMembershipState {
@@ -323,6 +335,15 @@ struct Peer {
 
   membershipState @28 :PeerMembershipState;
   # Durable membership state for the peer identity.
+
+  readinessState @29 :NodeReadinessState;
+  # Durable bootstrap/sync readiness state for the peer identity.
+
+  readinessUpdatedAtUnixMs @30 :UInt64;
+  # Last-writer timestamp for readiness state convergence.
+
+  readinessActorNodeId @31 :Data;
+  # Actor node id used to resolve readiness-state conflicts deterministically.
 }
 
 struct NodeList {

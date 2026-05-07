@@ -333,6 +333,7 @@ mod tests {
             identity_sig: vec![byte.saturating_add(2); 64],
             wireguard: None,
             scheduling: PeerSchedulingState::schedulable_default(node_id),
+            readiness: Default::default(),
             labels: PeerLabelState::default(),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             root_schema: crate::cluster::RootSchemaInfo::default(),

@@ -2,7 +2,9 @@ use crate::cluster::ClusterViewId;
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::store::local::LocalSessionStore;
 use crate::store::peer_store::PeersStore;
-use crate::topology::peers::{PeerLabelState, PeerSchedulingState, PeerValue, WireGuardPeerValue};
+use crate::topology::peers::{
+    NodeReadiness, PeerLabelState, PeerSchedulingState, PeerValue, WireGuardPeerValue,
+};
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
 use ::mantissa_health::HealthMonitor;
 use anyhow::{Result as AnyResult, anyhow};
@@ -485,6 +487,12 @@ impl Registry {
             .map(|value| value.scheduling)
     }
 
+    /// Returns the converged readiness metadata for one peer, if known locally.
+    pub fn peer_readiness(&self, peer_id: Uuid) -> Option<NodeReadiness> {
+        self.peer_latest_value_unscoped(peer_id)
+            .map(|value| value.readiness)
+    }
+
     /// Returns the converged node-label metadata for one peer, if known locally.
     pub fn peer_labels(&self, peer_id: Uuid) -> Option<PeerLabelState> {
         self.peer_latest_value_unscoped(peer_id)
@@ -504,7 +512,7 @@ impl Registry {
         }
 
         self.peer_latest_value_unscoped(peer_id)
-            .map(|value| value.scheduling.schedulable)
+            .map(|value| value.scheduling.schedulable && value.readiness.is_ready())
             .unwrap_or(true)
     }
 
@@ -693,6 +701,7 @@ impl Registry {
                 identity_sig: Vec::new(),
                 wireguard: None,
                 scheduling: PeerSchedulingState::schedulable_default(self.node_id),
+                readiness: NodeReadiness::ready(self.node_id, 0),
                 labels: PeerLabelState::default(),
                 runtime_support: RuntimeSupportProfile::default(),
                 root_schema: crate::cluster::RootSchemaInfo::default(),

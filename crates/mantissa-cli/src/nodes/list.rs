@@ -2,7 +2,7 @@ use crate::output;
 use anyhow::Result;
 use mantissa_client::config::ClientConfig;
 use mantissa_client::nodes::NodeListEntry;
-use mantissa_protocol::topology::NodeDrainState;
+use mantissa_protocol::topology::{NodeDrainState, NodeReadinessState};
 use std::io::Write;
 use tabwriter::TabWriter;
 
@@ -14,17 +14,18 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "ID\tHOSTNAME\tENDPOINT\tHEALTH\tSCHED\tDRAIN\tLABELS\tREASON"
+        "ID\tHOSTNAME\tENDPOINT\tHEALTH\tREADY\tSCHED\tDRAIN\tLABELS\tREASON"
     )?;
 
     for row in &rows {
         writeln!(
             &mut tw,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.id,
             row.hostname,
             row.endpoint,
             row.health,
+            readiness_label(row.readiness),
             sched_label(row),
             drain_label(row.drain_state),
             labels_label(row),
@@ -39,9 +40,21 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     Ok(())
 }
 
+/// Converts one readiness enum into the compact table label.
+fn readiness_label(state: NodeReadinessState) -> &'static str {
+    match state {
+        NodeReadinessState::Ready => "ready",
+        NodeReadinessState::Syncing => "syncing",
+    }
+}
+
 /// Converts one schedulability flag into the compact table label.
 fn sched_label(row: &NodeListEntry) -> &'static str {
-    if row.schedulable { "open" } else { "fenced" }
+    if row.schedulable && matches!(row.readiness, NodeReadinessState::Ready) {
+        "open"
+    } else {
+        "fenced"
+    }
 }
 
 /// Converts one drain-state enum into the compact table label.

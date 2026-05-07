@@ -619,6 +619,7 @@ fn message_targets_peer(message: &Message, peer_id: Uuid) -> bool {
             | TopologyEvent::Suspect { id, .. }
             | TopologyEvent::Down { id, .. }
             | TopologyEvent::NodeSchedulingUpdated { id, .. }
+            | TopologyEvent::NodeReadinessUpdated { id, .. }
             | TopologyEvent::NodeLabelsUpdated { id, .. } => *id == peer_id,
             TopologyEvent::ClusterNameUpdated { .. } => false,
         },

@@ -904,6 +904,7 @@ mod tests {
                 wireguard: None,
                 runtime_support: RuntimeSupportProfile::default(),
                 scheduling: PeerSchedulingState::schedulable_default(peer_id),
+                readiness: Default::default(),
                 labels: crate::topology::peers::PeerLabelState::default(),
                 root_schema: crate::cluster::RootSchemaInfo::default(),
                 membership: crate::topology::peers::PeerMembership::active(1),

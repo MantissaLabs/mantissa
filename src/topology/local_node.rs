@@ -10,6 +10,14 @@ impl Topology {
             .unwrap_or_else(|| PeerSchedulingState::schedulable_default(self.local.node.id))
     }
 
+    /// Returns the current converged readiness state for the local node.
+    pub(super) fn current_readiness_state(&self) -> crate::topology::peers::NodeReadiness {
+        self.deps
+            .registry
+            .peer_readiness(self.local.node.id)
+            .unwrap_or_default()
+    }
+
     /// Returns the current converged label state for the local node.
     pub(super) fn current_label_state(&self) -> crate::topology::peers::PeerLabelState {
         self.deps
@@ -169,6 +177,7 @@ impl Topology {
             identity_sig: identity_sig.to_vec(),
             wireguard,
             scheduling: self.current_scheduling_state(),
+            readiness: self.current_readiness_state(),
             labels: self.current_label_state(),
             runtime_support: self.local.runtime_support.clone(),
             root_schema: self.root_schema_info(),
@@ -281,6 +290,8 @@ impl Topology {
 
         let scheduling = self.current_scheduling_state();
         info.set_drain_state(drain_state_from_scheduling(&scheduling));
+        let readiness = self.current_readiness_state();
+        info.set_readiness_state(readiness.state.as_capnp());
         let labels = self.current_label_state();
 
         let wireguard = if config::wireguard_enabled() && mantissa_net::paths::running_as_root() {
@@ -336,6 +347,7 @@ impl Topology {
             identity_sig: identity_sig.to_vec(),
             wireguard,
             scheduling,
+            readiness,
             labels,
             runtime_support: self.local.runtime_support.clone(),
             root_schema,

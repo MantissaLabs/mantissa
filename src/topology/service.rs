@@ -22,8 +22,8 @@ use crate::store::secret_master_key_store::{
 use crate::sync::SyncTraceContext;
 use crate::topology::health::status_to_node_status;
 use crate::topology::peers::{
-    PeerLabel, PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
-    labels_from_peer,
+    NodeReadiness, NodeReadinessState, PeerLabel, PeerLabelState, PeerMembership,
+    PeerSchedulingState, PeerValue, WireGuardPeerValue, labels_from_peer,
 };
 use capnp::Error;
 use ed25519_dalek::VerifyingKey;
@@ -74,6 +74,7 @@ fn peer_value_from_join_payload(payload: &JoinPayload) -> PeerValue {
         identity_sig: payload.identity_sig.to_vec(),
         wireguard: payload.wireguard.clone(),
         scheduling: payload.scheduling.clone(),
+        readiness: payload.readiness.clone(),
         labels: payload.labels.clone(),
         runtime_support: payload.runtime_support.clone(),
         root_schema: payload.root_schema,
@@ -98,6 +99,7 @@ fn restored_local_peer_value(current: Option<&PeerValue>, mut restored: PeerValu
         restored.wireguard =
             WireGuardPeerValue::preferred(current.wireguard.as_ref(), restored.wireguard.as_ref());
         restored.scheduling = PeerSchedulingState::merge(&restored.scheduling, &current.scheduling);
+        restored.readiness = NodeReadiness::merge(&restored.readiness, &current.readiness);
         restored.labels = PeerLabelState::merge(&restored.labels, &current.labels);
         restored.root_schema =
             crate::cluster::RootSchemaInfo::merge(restored.root_schema, current.root_schema);
@@ -191,6 +193,7 @@ impl Topology {
             ),
             wireguard,
             scheduling: self.current_scheduling_state(),
+            readiness: self.current_readiness_state(),
             labels: self.current_label_state(),
             runtime_support: self.local.runtime_support.clone(),
             root_schema: self.root_schema_info(),
@@ -482,7 +485,8 @@ impl topology::Server for Topology {
         params: topology::JoinParams,
         mut _results: topology::JoinResults,
     ) -> Result<(), Error> {
-        let payload = self.build_join_payload()?;
+        let mut payload = self.build_join_payload()?;
+        payload.readiness = NodeReadiness::syncing(self.local.node.id, Topology::now_unix_ms());
 
         let self_addr = self.local.advertise.configured().to_string();
 
@@ -566,7 +570,7 @@ impl topology::Server for Topology {
             async move {
                 // Bootstrap immediately from the anchor session so the join path does not wait
                 // for the next periodic tick before the new node has a converged view.
-                topology
+                let sync_completed = topology
                     .deps
                     .sync
                     .sync_all_domains(sync_cap, cluster_view, root_schema_version, Some(trace))
@@ -576,6 +580,16 @@ impl topology::Server for Topology {
                 // if the bootstrap sync observed a stale leave tombstone from another peer.
                 if let Err(err) = topology.persist_local_join_payload(&payload).await {
                     warn!(target: "topology", "join: failed to restore local peer row after bootstrap sync: {err}");
+                }
+                if sync_completed {
+                    if let Err(err) = topology
+                        .publish_local_readiness_state(NodeReadinessState::Ready)
+                        .await
+                    {
+                        warn!(target: "topology", "join: failed to mark local node ready after bootstrap sync: {err}");
+                    }
+                } else {
+                    warn!(target: "topology", "join: bootstrap sync failed; local node remains syncing");
                 }
                 if let Err(err) = topology.publish_local_cluster_node_count().await {
                     warn!(
@@ -1368,6 +1382,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                 identity_sig: peer.identity_sig,
                 wireguard: peer.wireguard,
                 scheduling: Box::new(peer.scheduling),
+                readiness: Box::new(peer.readiness),
                 labels: Box::new(peer.labels),
                 runtime_support: Box::new(peer.runtime_support),
                 root_schema: peer.root_schema,
@@ -1434,6 +1449,23 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                 ),
             }
         }
+        EventType::NodeReadinessUpdated => {
+            let node = reader.get_node()?;
+            let id = read_node_id(node.get_id()?)?;
+            let peer = node.get_peer()?;
+            TopologyEvent::NodeReadinessUpdated {
+                id,
+                readiness: NodeReadiness::from_node_info(
+                    id,
+                    NodeReadinessState::from_capnp(peer.get_readiness_state()?),
+                    peer.get_readiness_updated_at_unix_ms(),
+                    read_optional_uuid_data(
+                        peer.get_readiness_actor_node_id()?,
+                        "readinessActorNodeId",
+                    )?,
+                ),
+            }
+        }
         EventType::NodeLabelsUpdated => {
             let node = reader.get_node()?;
             let id = read_node_id(node.get_id()?)?;
@@ -1484,6 +1516,7 @@ mod tests {
                 reason: None,
                 drain_task_stop_timeout_secs: None,
             },
+            readiness: Default::default(),
             labels: PeerLabelState::default(),
             root_schema: crate::cluster::RootSchemaInfo::default(),
             membership: PeerMembership::active(10),
@@ -1563,6 +1596,7 @@ mod tests {
                 reason: Some("maintenance".to_string()),
                 drain_task_stop_timeout_secs: Some(30),
             },
+            readiness: Default::default(),
             labels: PeerLabelState::default(),
             root_schema: crate::cluster::RootSchemaInfo::default(),
             membership: PeerMembership::active(20),

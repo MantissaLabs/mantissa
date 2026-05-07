@@ -1,4 +1,5 @@
 use super::*;
+use crate::topology::peers::{NodeReadiness, NodeReadinessState};
 
 impl Topology {
     /// Clears locally cached peer authentication material after this node leaves a cluster.
@@ -47,6 +48,62 @@ impl Topology {
                 ))
             })?;
         Ok(true)
+    }
+
+    /// Applies one readiness-state update to the peer store using deterministic convergence.
+    pub(super) async fn apply_peer_readiness_update(
+        &self,
+        node_id: Uuid,
+        readiness: NodeReadiness,
+    ) -> Result<bool, capnp::Error> {
+        let Some(mut current) = self.deps.registry.peer_value_unscoped(node_id) else {
+            return Err(capnp::Error::failed(format!(
+                "node '{}' not found",
+                node_id
+            )));
+        };
+
+        let merged = NodeReadiness::merge(&current.readiness, &readiness);
+        if current.readiness == merged {
+            return Ok(false);
+        }
+
+        current.readiness = merged;
+        self.stores
+            .peers
+            .upsert(&UuidKey::from(node_id), current)
+            .await
+            .map_err(|err| {
+                capnp::Error::failed(format!(
+                    "failed to persist readiness update for node '{}': {err}",
+                    node_id
+                ))
+            })?;
+        Ok(true)
+    }
+
+    /// Publishes this node's readiness state and relays the update through topology gossip.
+    pub(super) async fn publish_local_readiness_state(
+        &self,
+        state: NodeReadinessState,
+    ) -> Result<(), capnp::Error> {
+        let readiness = NodeReadiness {
+            state,
+            updated_at_unix_ms: Self::now_unix_ms(),
+            actor_node_id: self.local.node.id,
+        };
+        let changed = self
+            .apply_peer_readiness_update(self.local.node.id, readiness.clone())
+            .await?;
+        if changed {
+            self.sync_once_now();
+            self.gossip_topology_event(TopologyEvent::NodeReadinessUpdated {
+                id: self.local.node.id,
+                readiness,
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     /// Applies one node-label update to the peer store using deterministic convergence.
@@ -161,6 +218,11 @@ impl Topology {
             identity_sig: Vec::new(),
             wireguard: None,
             scheduling: PeerSchedulingState::schedulable_default(id),
+            readiness: NodeReadiness {
+                state: NodeReadinessState::Ready,
+                updated_at_unix_ms: 0,
+                actor_node_id: id,
+            },
             labels: crate::topology::peers::PeerLabelState::default(),
             runtime_support: RuntimeSupportProfile::default(),
             root_schema: crate::cluster::RootSchemaInfo::default(),

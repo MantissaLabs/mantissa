@@ -4,6 +4,13 @@ use std::time::Duration;
 
 use common::testkit::TestNode;
 use mantissa::cluster::ClusterViewId;
+use mantissa::workload::model::{
+    ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadValue, WorkloadValueDraft,
+};
+use mantissa_protocol::topology::NodeReadinessState;
+use mantissa_store::uuid_key::UuidKey;
+use tokio::time::sleep;
+use uuid::Uuid;
 
 async fn split_candidate_ids(node: &TestNode) -> Vec<uuid::Uuid> {
     let view_response = node
@@ -45,6 +52,110 @@ async fn split_candidate_ids(node: &TestNode) -> Vec<uuid::Uuid> {
     ids
 }
 
+/// Builds one deterministic workload row used to make bootstrap sync observable.
+fn bootstrap_workload_value(id: Uuid, node_id: Uuid, index: u64) -> WorkloadValue {
+    let payload = "x".repeat(4096);
+    WorkloadValue::new(WorkloadValueDraft {
+        id,
+        name: format!("bootstrap-sync-{index}-{payload}"),
+        image: format!("example/bootstrap-sync:{index}-{payload}"),
+        execution_platform: ExecutionPlatform::Oci,
+        isolation_mode: IsolationMode::Standard,
+        isolation_profile: None,
+        state: WorkloadPhase::Running,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: format!("2026-04-27T00:00:{:02}Z", index % 60),
+        updated_at: format!("2026-04-27T00:01:{:02}Z", index % 60),
+        command: Vec::new(),
+        tty: false,
+        node_id,
+        node_name: format!("node-{node_id}"),
+        slot_ids: vec![index],
+        networks: Vec::new(),
+        cpu_millis: 100,
+        memory_bytes: 128 * 1024 * 1024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        ports: Vec::new(),
+        owner: None,
+        lease_id: None,
+        lease_coordinator_node_id: None,
+        task_epoch: index,
+        phase_version: index,
+        launch_attempt: index,
+        last_terminal_observed_launch: None,
+    })
+}
+
+/// Inserts enough replicated state for bootstrap sync to remain visible after join returns.
+async fn seed_bootstrap_workloads(anchor: &TestNode, count: u64) {
+    let rows = (0..count)
+        .map(|index| {
+            let id = Uuid::from_u128(0x1000_0000_0000_0000_0000_0000_0000_0000 + index as u128);
+            (
+                UuidKey::from(id),
+                bootstrap_workload_value(id, anchor.id(), index),
+            )
+        })
+        .collect::<Vec<_>>();
+    anchor
+        .node
+        .workloads
+        .upsert_many(rows)
+        .await
+        .expect("seed bootstrap workloads");
+}
+
+/// Reads one node readiness state through the public topology list RPC.
+async fn list_readiness_of(node: &TestNode, target: Uuid) -> Option<NodeReadinessState> {
+    let req = node.topology().list_request();
+    let resp = req.send().promise.await.expect("list send");
+    let list = resp
+        .get()
+        .expect("list response")
+        .get_nodes()
+        .expect("nodes");
+    for row in list.get_nodes().expect("node list").iter() {
+        let id = Uuid::from_slice(
+            row.get_id()
+                .expect("node id")
+                .get_bytes()
+                .expect("node id bytes"),
+        )
+        .expect("uuid");
+        if id == target {
+            return Some(row.get_readiness_state().expect("readiness state"));
+        }
+    }
+    None
+}
+
+/// Waits for one node readiness state to appear through topology list.
+async fn wait_readiness_of(
+    node: &TestNode,
+    target: Uuid,
+    expected: NodeReadinessState,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if list_readiness_of(node, target).await == Some(expected) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
 local_test!(register_node_inproc, {
     let anchor = TestNode::new_with_tick_ms(100).await;
     let joiner = TestNode::new_with_tick_ms(100).await;
@@ -68,6 +179,44 @@ local_test!(register_node_inproc, {
     TestNode::wait_roots_equal(&anchor, &joiner, Duration::from_secs(5))
         .await
         .expect("roots equal");
+});
+
+local_test!(register_node_reports_syncing_during_bootstrap, {
+    let anchor = TestNode::new_with_tick_ms(100).await;
+    let joiner = TestNode::new_with_tick_ms(100).await;
+
+    seed_bootstrap_workloads(&anchor, 256).await;
+
+    joiner.join(&anchor).await.expect("join ok");
+
+    assert_eq!(
+        list_readiness_of(&anchor, joiner.id()).await,
+        Some(NodeReadinessState::Syncing),
+        "anchor should report the newly joined peer as syncing before bootstrap catch-up completes"
+    );
+    assert!(
+        !anchor.node.registry.peer_schedulable(joiner.id()),
+        "syncing peers must be fenced from new placements"
+    );
+
+    assert!(
+        wait_readiness_of(
+            &anchor,
+            joiner.id(),
+            NodeReadinessState::Ready,
+            Duration::from_secs(20),
+        )
+        .await,
+        "anchor should observe the joiner becoming ready after bootstrap sync"
+    );
+    assert!(
+        anchor.node.registry.peer_schedulable(joiner.id()),
+        "ready peers should become placement eligible again"
+    );
+
+    TestNode::wait_roots_equal(&anchor, &joiner, Duration::from_secs(10))
+        .await
+        .expect("roots equal after bootstrap sync");
 });
 
 local_test!(register_node_tcp, {

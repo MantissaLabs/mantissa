@@ -72,6 +72,7 @@ impl Topology {
                             ref identity_sig,
                             ref wireguard,
                             ref scheduling,
+                            ref readiness,
                             ref labels,
                             ref runtime_support,
                             root_schema,
@@ -101,6 +102,7 @@ impl Topology {
                                 identity_sig: identity_sig.clone(),
                                 wireguard: wireguard.clone(),
                                 scheduling: scheduling.as_ref().clone(),
+                                readiness: readiness.as_ref().clone(),
                                 labels: labels.as_ref().clone(),
                                 runtime_support: runtime_support.as_ref().clone(),
                                 root_schema,
@@ -189,6 +191,19 @@ impl Topology {
                                 continue;
                             }
                         }
+                        TopologyEvent::NodeReadinessUpdated { id, ref readiness } => {
+                            if let Err(err) = self
+                                .apply_peer_readiness_update(id, readiness.clone())
+                                .await
+                            {
+                                warn!(
+                                    target: "topology",
+                                    node_id = %id,
+                                    "failed to apply gossiped readiness update: {err}"
+                                );
+                                continue;
+                            }
+                        }
                         TopologyEvent::NodeLabelsUpdated { id, ref labels } => {
                             if let Err(err) =
                                 self.apply_peer_labels_update(id, labels.clone()).await
@@ -218,6 +233,7 @@ impl Topology {
                             identity_sig,
                             wireguard,
                             scheduling,
+                            readiness,
                             labels,
                             runtime_support,
                             root_schema,
@@ -241,6 +257,7 @@ impl Topology {
                                 identity_sig,
                                 wireguard,
                                 scheduling,
+                                readiness,
                                 labels,
                                 runtime_support,
                                 root_schema,

@@ -6,8 +6,8 @@ use capnp::Error as CapnpError;
 use capnp::text_list;
 use ed25519_dalek::VerifyingKey;
 use mantissa_protocol::topology::{
-    PeerMembershipState as CapnpPeerMembershipState, node_info as node_info_capnp,
-    peer as peer_capnp,
+    NodeReadinessState as CapnpNodeReadinessState, PeerMembershipState as CapnpPeerMembershipState,
+    node_info as node_info_capnp, peer as peer_capnp,
 };
 use mantissa_store::codec::StoreValueCodec;
 use mantissa_store::mvreg::MvReg;
@@ -17,6 +17,134 @@ use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
 use serde::{Deserialize, Serialize};
+
+/// Cluster-visible bootstrap readiness for one peer entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
+pub enum NodeReadinessState {
+    Ready,
+    Syncing,
+}
+
+impl Default for NodeReadinessState {
+    /// Build the default readiness state used by established or legacy peer rows.
+    fn default() -> Self {
+        Self::Ready
+    }
+}
+
+impl NodeReadinessState {
+    /// Converts this readiness state into the Cap'n Proto representation.
+    pub fn as_capnp(self) -> CapnpNodeReadinessState {
+        match self {
+            Self::Ready => CapnpNodeReadinessState::Ready,
+            Self::Syncing => CapnpNodeReadinessState::Syncing,
+        }
+    }
+
+    /// Decodes a Cap'n Proto readiness state into the internal representation.
+    pub fn from_capnp(state: CapnpNodeReadinessState) -> Self {
+        match state {
+            CapnpNodeReadinessState::Ready => Self::Ready,
+            CapnpNodeReadinessState::Syncing => Self::Syncing,
+        }
+    }
+
+    /// Returns true when this node has finished bootstrap sync.
+    pub fn is_ready(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// Returns the deterministic rank used when timestamp metadata ties exactly.
+    fn precedence_rank(self) -> u8 {
+        match self {
+            Self::Syncing => 0,
+            Self::Ready => 1,
+        }
+    }
+}
+
+/// Last-writer-wins readiness metadata attached to one peer entry.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
+pub struct NodeReadiness {
+    /// Bootstrap/sync readiness advertised for this peer.
+    pub state: NodeReadinessState,
+
+    /// Last-writer timestamp used to converge concurrent readiness updates.
+    #[serde(default)]
+    pub updated_at_unix_ms: u64,
+
+    /// Actor node id used as the deterministic tie-breaker for equal timestamps.
+    #[serde(default = "Uuid::nil")]
+    pub actor_node_id: Uuid,
+}
+
+impl Default for NodeReadiness {
+    /// Build the default ready state used by established peers.
+    fn default() -> Self {
+        Self {
+            state: NodeReadinessState::Ready,
+            updated_at_unix_ms: 0,
+            actor_node_id: Uuid::nil(),
+        }
+    }
+}
+
+impl NodeReadiness {
+    /// Builds one ready readiness state authored by the provided node.
+    pub fn ready(actor_node_id: Uuid, updated_at_unix_ms: u64) -> Self {
+        Self {
+            state: NodeReadinessState::Ready,
+            updated_at_unix_ms,
+            actor_node_id,
+        }
+    }
+
+    /// Builds one syncing readiness state authored by the provided node.
+    pub fn syncing(actor_node_id: Uuid, updated_at_unix_ms: u64) -> Self {
+        Self {
+            state: NodeReadinessState::Syncing,
+            updated_at_unix_ms,
+            actor_node_id,
+        }
+    }
+
+    /// Builds one converged readiness state from Cap'n Proto node metadata.
+    pub fn from_node_info(
+        node_id: Uuid,
+        state: NodeReadinessState,
+        updated_at_unix_ms: u64,
+        actor_node_id: Option<Uuid>,
+    ) -> Self {
+        Self {
+            state,
+            updated_at_unix_ms,
+            actor_node_id: actor_node_id.unwrap_or(node_id),
+        }
+    }
+
+    /// Returns true when the peer is ready to participate in scheduling.
+    pub fn is_ready(&self) -> bool {
+        self.state.is_ready()
+    }
+
+    /// Returns the deterministic conflict-resolution key for one readiness update.
+    fn precedence_key(&self) -> (u64, Uuid, u8) {
+        (
+            self.updated_at_unix_ms,
+            self.actor_node_id,
+            self.state.precedence_rank(),
+        )
+    }
+
+    /// Selects the converged winner between two readiness states.
+    pub fn merge(left: &Self, right: &Self) -> Self {
+        if left.precedence_key() >= right.precedence_key() {
+            left.clone()
+        } else {
+            right.clone()
+        }
+    }
+}
 
 /// Cluster-visible scheduling policy attached to one peer entry.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
@@ -374,6 +502,10 @@ pub struct PeerValue {
     #[serde(default)]
     pub scheduling: PeerSchedulingState,
 
+    /// Bootstrap/sync readiness state used to fence nodes until they have caught up.
+    #[serde(default)]
+    pub readiness: NodeReadiness,
+
     /// Operator-managed node labels used by split selectors and future placement controls.
     #[serde(default)]
     pub labels: PeerLabelState,
@@ -437,6 +569,10 @@ pub(crate) fn write_peer(mut builder: peer_capnp::Builder<'_>, value: &PeerValue
     builder.set_drain_task_stop_timeout_secs(
         value.scheduling.drain_task_stop_timeout_secs.unwrap_or(0),
     );
+
+    builder.set_readiness_state(value.readiness.state.as_capnp());
+    builder.set_readiness_updated_at_unix_ms(value.readiness.updated_at_unix_ms);
+    builder.set_readiness_actor_node_id(value.readiness.actor_node_id.as_bytes());
 
     let mut labels = builder
         .reborrow()
@@ -515,6 +651,16 @@ pub(crate) fn read_peer(reader: peer_capnp::Reader<'_>) -> Result<PeerValue, Cap
         },
     };
 
+    let readiness = NodeReadiness::from_node_info(
+        Uuid::nil(),
+        NodeReadinessState::from_capnp(reader.get_readiness_state()?),
+        reader.get_readiness_updated_at_unix_ms(),
+        Some(read_uuid_or_nil(
+            reader.get_readiness_actor_node_id()?,
+            "readinessActorNodeId",
+        )?),
+    );
+
     let labels = PeerLabelState::from_node_info(
         read_text_list(reader.get_labels()?)?,
         reader.get_labels_updated_at_unix_ms(),
@@ -571,6 +717,7 @@ pub(crate) fn read_peer(reader: peer_capnp::Reader<'_>) -> Result<PeerValue, Cap
         identity_sig: reader.get_identity_sig()?.to_vec(),
         wireguard,
         scheduling,
+        readiness,
         labels,
         runtime_support,
         root_schema,
@@ -632,6 +779,7 @@ pub struct PeerRootSnapshot {
     pub identity_sig: Vec<u8>,
     pub wireguard: Option<WireGuardPeerValue>,
     pub scheduling: PeerSchedulingState,
+    pub readiness: NodeReadiness,
     pub labels: PeerLabelState,
     pub runtime_support: RuntimeSupportProfile,
     pub membership: PeerMembership,
@@ -658,6 +806,7 @@ impl PeerRootSnapshot {
             identity_sig: value.identity_sig.clone(),
             wireguard: value.wireguard.clone(),
             scheduling: value.scheduling.clone(),
+            readiness: value.readiness.clone(),
             labels: value.labels.clone(),
             runtime_support,
             membership: value.membership,
@@ -748,6 +897,7 @@ impl PeerValue {
         let mut identity_sig: Option<Vec<u8>> = None;
         let mut wireguard: Option<WireGuardPeerValue> = None;
         let mut scheduling: Option<PeerSchedulingState> = None;
+        let mut readiness: Option<NodeReadiness> = None;
         let mut labels: Option<PeerLabelState> = None;
         let mut runtime_support: Option<RuntimeSupportProfile> = None;
         let mut root_schema: Option<RootSchemaInfo> = None;
@@ -808,6 +958,10 @@ impl PeerValue {
                 None => value.scheduling.clone(),
                 Some(current) => PeerSchedulingState::merge(current, &value.scheduling),
             });
+            readiness = Some(match readiness.as_ref() {
+                None => value.readiness.clone(),
+                Some(current) => NodeReadiness::merge(current, &value.readiness),
+            });
             labels = Some(match labels.as_ref() {
                 None => value.labels.clone(),
                 Some(current) => PeerLabelState::merge(current, &value.labels),
@@ -832,6 +986,7 @@ impl PeerValue {
             identity_sig: identity_sig.unwrap_or_default(),
             wireguard,
             scheduling: scheduling.unwrap_or_default(),
+            readiness: readiness.unwrap_or_default(),
             labels: labels.unwrap_or_default(),
             runtime_support: runtime_support.unwrap_or_default(),
             root_schema: root_schema.unwrap_or_default(),
@@ -895,8 +1050,8 @@ fn read_text_list(list: text_list::Reader<'_>) -> Result<Vec<String>, CapnpError
 #[cfg(test)]
 mod tests {
     use super::{
-        PeerLabel, PeerLabelState, PeerRootSnapshot, PeerSchedulingState, PeerValue,
-        WireGuardPeerValue,
+        NodeReadiness, NodeReadinessState, PeerLabel, PeerLabelState, PeerRootSnapshot,
+        PeerSchedulingState, PeerValue, WireGuardPeerValue,
     };
     use crate::runtime::types::RuntimeSupportProfile;
     use uuid::Uuid;
@@ -936,6 +1091,7 @@ mod tests {
                 reason: None,
                 drain_task_stop_timeout_secs: None,
             },
+            readiness: Default::default(),
             labels: PeerLabelState::default(),
             root_schema: crate::cluster::RootSchemaInfo::default(),
             membership: super::PeerMembership::active(10),
@@ -975,6 +1131,7 @@ mod tests {
             wireguard: None,
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(node_id),
+            readiness: Default::default(),
             labels: PeerLabelState::new(
                 vec![PeerLabel {
                     key: "topology.zone".to_string(),
@@ -1000,6 +1157,36 @@ mod tests {
         let selected = PeerValue::select(&[older, newer]).expect("selected peer value");
 
         assert_eq!(selected.labels.get("topology.zone"), Some("west"));
+        assert_eq!(selected.address, "127.0.0.1:7000");
+    }
+
+    /// Later readiness updates must win peer selection across concurrent values.
+    #[test]
+    fn peer_select_prefers_latest_readiness_state() {
+        let node_id = Uuid::from_bytes([8u8; 16]);
+        let mut older = PeerValue {
+            address: "127.0.0.1:7000".to_string(),
+            hostname: "node-a".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "amd64".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: None,
+            runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
+            scheduling: PeerSchedulingState::schedulable_default(node_id),
+            readiness: NodeReadiness::syncing(node_id, 10),
+            labels: PeerLabelState::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
+            membership: super::PeerMembership::active(10),
+        };
+        let mut newer = older.clone();
+        newer.readiness = NodeReadiness::ready(node_id, 20);
+        older.address = String::new();
+
+        let selected = PeerValue::select(&[older, newer]).expect("selected peer value");
+
+        assert_eq!(selected.readiness.state, NodeReadinessState::Ready);
         assert_eq!(selected.address, "127.0.0.1:7000");
     }
 
@@ -1040,6 +1227,7 @@ mod tests {
             wireguard: None,
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(node_id),
+            readiness: Default::default(),
             labels: PeerLabelState::default(),
             root_schema: crate::cluster::RootSchemaInfo::default(),
             membership: super::PeerMembership::active(42),
@@ -1070,6 +1258,7 @@ mod tests {
             }),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(Uuid::from_bytes([6u8; 16])),
+            readiness: Default::default(),
             labels: PeerLabelState::default(),
             root_schema: crate::cluster::RootSchemaInfo::new(1, 2, 10).expect("root schema"),
             membership: super::PeerMembership::active(7),
@@ -1102,6 +1291,7 @@ mod tests {
                 ["runtime.feature.demo"],
             ),
             scheduling: PeerSchedulingState::schedulable_default(Uuid::from_bytes([7u8; 16])),
+            readiness: Default::default(),
             labels: PeerLabelState::default(),
             root_schema: crate::cluster::RootSchemaInfo::default(),
             membership: super::PeerMembership::active(7),
@@ -1140,6 +1330,7 @@ mod tests {
                 reason: Some("kernel update".to_string()),
                 drain_task_stop_timeout_secs: Some(30),
             },
+            readiness: NodeReadiness::syncing(actor, 3456),
             labels: PeerLabelState::new(
                 vec![
                     PeerLabel {

@@ -5,7 +5,9 @@ use x25519_dalek::PublicKey;
 
 use crate::cluster::{ClusterId, RootSchemaInfo};
 use crate::runtime::types::RuntimeSupportProfile;
-use crate::topology::peers::{PeerLabelState, PeerSchedulingState, WireGuardPeerValue};
+use crate::topology::peers::{
+    NodeReadiness, PeerLabelState, PeerSchedulingState, WireGuardPeerValue,
+};
 
 /// Actions to apply to the memberlist.
 ///
@@ -34,6 +36,7 @@ pub enum TopologyEvent {
         identity_sig: Vec<u8>,
         wireguard: Option<WireGuardPeerValue>,
         scheduling: Box<PeerSchedulingState>,
+        readiness: Box<NodeReadiness>,
         labels: Box<PeerLabelState>,
         runtime_support: Box<RuntimeSupportProfile>,
         root_schema: RootSchemaInfo,
@@ -63,6 +66,10 @@ pub enum TopologyEvent {
     NodeSchedulingUpdated {
         id: Uuid,
         scheduling: PeerSchedulingState,
+    },
+    NodeReadinessUpdated {
+        id: Uuid,
+        readiness: NodeReadiness,
     },
     NodeLabelsUpdated {
         id: Uuid,

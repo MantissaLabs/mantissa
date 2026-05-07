@@ -95,7 +95,7 @@ impl SyncRunner {
         cluster_view: ClusterViewId,
         root_schema_version: u32,
         trace: Option<SyncTraceContext>,
-    ) {
+    ) -> bool {
         self.sync_selected_domains(
             sync_cap,
             cluster_view,
@@ -103,7 +103,7 @@ impl SyncRunner {
             &ALL_DOMAINS,
             trace,
         )
-        .await;
+        .await
     }
 
     /// Runs anti-entropy for one caller-selected domain subset against one peer view.
@@ -117,7 +117,7 @@ impl SyncRunner {
         root_schema_version: u32,
         domains: &[Domain],
         trace: Option<SyncTraceContext>,
-    ) {
+    ) -> bool {
         sync_selected_domains_with_stores(
             &self.stores,
             sync_cap,
@@ -131,7 +131,7 @@ impl SyncRunner {
                 master_key_replication_notify: self.master_key_replication_notify.clone(),
             },
         )
-        .await;
+        .await
     }
 
     /// Rebuilds the local in-memory MSTs for one selected semantic root schema.
@@ -268,9 +268,9 @@ async fn sync_selected_domains_with_stores(
     root_schema_version: u32,
     domains: &[Domain],
     context: SyncClientContext,
-) {
+) -> bool {
     if domains.is_empty() {
-        return;
+        return true;
     }
 
     let requested_domains = domains.to_vec();
@@ -478,6 +478,9 @@ async fn sync_selected_domains_with_stores(
                 "peer-scoped sync_selected_domains failure"
             );
         }
+        false
+    } else {
+        true
     }
 }
 
