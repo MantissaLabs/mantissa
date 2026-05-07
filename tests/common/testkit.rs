@@ -15,6 +15,7 @@ use mantissa::{
     server::headless::{HeadlessConfig, HeadlessNode, HeadlessTransport},
 };
 use mantissa_protocol::health::NodeStatus;
+use mantissa_protocol::topology::NodeReadinessState;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
@@ -231,11 +232,21 @@ impl TestNode {
     /// Ask this node to join the cluster whose **anchor** is `anchor`.
     ///
     /// This takes the current join token from the anchor and calls the real
-    /// `Topology.join` RPC on *this* node (the joiner).
+    /// `Topology.join` RPC on *this* node (the joiner). The RPC returns once
+    /// membership accepts the join; callers that need schedulable peers should
+    /// wait explicitly with `wait_readiness_of` or `wait_cluster_ready_all`.
     pub async fn join(&self, anchor: &TestNode) -> Result<(), capnp::Error> {
         let token = anchor.node.current_join_token().await?;
         let anchor_addr = anchor.node.client_addr();
         self.node.join_anchor_addr(&anchor_addr, &token).await
+    }
+
+    /// Joins an anchor without waiting for the readiness transition.
+    ///
+    /// Readiness-specific tests use this to observe the transient syncing state
+    /// that production exposes while bootstrap catch-up is still running.
+    pub async fn join_without_waiting_ready(&self, anchor: &TestNode) -> Result<(), capnp::Error> {
+        self.join(anchor).await
     }
 
     /// Returns this node's UUID (cluster node id).
@@ -266,6 +277,85 @@ impl TestNode {
         }
         out.sort();
         out
+    }
+
+    /// Fetch active node IDs and readiness states via one `Topology.list` call.
+    pub async fn list_readiness_states(
+        &self,
+    ) -> Result<Vec<(Uuid, NodeReadinessState)>, capnp::Error> {
+        let req = self.node.topology_client.list_request();
+        let resp = req.send().promise.await?;
+        let get_resp = resp.get()?;
+        let nodes = get_resp.get_nodes()?;
+        let list = nodes.get_nodes()?;
+
+        let mut out = Vec::with_capacity(list.len() as usize);
+        for i in 0..list.len() {
+            let ni = list.get(i);
+            let id = node::id::read_node_id(ni.get_id()?)?;
+            out.push((id, ni.get_readiness_state()?));
+        }
+        out.sort_by_key(|(id, _)| *id);
+        Ok(out)
+    }
+
+    /// Returns the readiness state for one active node as seen by this node.
+    pub async fn list_readiness_of(
+        &self,
+        target: Uuid,
+    ) -> Result<Option<NodeReadinessState>, capnp::Error> {
+        Ok(self
+            .list_readiness_states()
+            .await?
+            .into_iter()
+            .find_map(|(id, state)| (id == target).then_some(state)))
+    }
+
+    /// Waits until this node sees one target in a specific readiness state.
+    pub async fn wait_readiness_of(
+        &self,
+        target: Uuid,
+        expected: NodeReadinessState,
+        timeout_duration: Duration,
+    ) -> Result<(), capnp::Error> {
+        let deadline = Instant::now() + timeout_duration;
+        loop {
+            let current = self.list_readiness_of(target).await?;
+            if current == Some(expected) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(capnp::Error::failed(format!(
+                    "timeout waiting for readiness {expected:?} on {target}; last_seen={current:?}"
+                )));
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Wait until this node sees exactly `expected` ready members in `Topology.list`.
+    pub async fn wait_for_ready_cluster_size(&self, expected: usize, timeout_ms: u64) -> bool {
+        let patience = Duration::from_millis(timeout_ms);
+        let poll_every = Duration::from_millis(50);
+
+        let fut = async {
+            loop {
+                match self.list_readiness_states().await {
+                    Ok(rows)
+                        if rows.len() == expected
+                            && rows
+                                .iter()
+                                .all(|(_, state)| *state == NodeReadinessState::Ready) =>
+                    {
+                        break true;
+                    }
+                    Ok(_) | Err(_) => {}
+                }
+                sleep(poll_every).await;
+            }
+        };
+
+        timeout(patience, fut).await.unwrap_or_default()
     }
 
     /// Wait until this node sees `expected` members in `Topology.list`.
@@ -342,10 +432,6 @@ impl TestNode {
         let anchor = TestNode::try_new_tcp()
             .await
             .map_err(|err| capnp::Error::failed(err.to_string()))?;
-        let anchor_addr = anchor.addr(); // String, cheap clone
-        let join_token = anchor.current_join_token().await?; // fetch once
-
-        // 2) Start joiners and join using the captured data (no &anchor needed).
         let mut cluster = Vec::with_capacity(n);
         cluster.push(anchor); // move anchor now; we won't borrow it again
 
@@ -353,9 +439,7 @@ impl TestNode {
             let node = TestNode::try_new_tcp()
                 .await
                 .map_err(|err| capnp::Error::failed(err.to_string()))?;
-            node.node
-                .join_anchor_addr(&anchor_addr, &join_token)
-                .await?;
+            node.join(&cluster[0]).await?;
             cluster.push(node);
         }
 
@@ -382,9 +466,6 @@ impl TestNode {
         let anchor = TestNode::try_new_tcp_with_tick_ms(tick_ms)
             .await
             .map_err(|err| capnp::Error::failed(err.to_string()))?;
-        let anchor_addr = anchor.addr();
-        let join_token = anchor.current_join_token().await?;
-
         let mut cluster = Vec::with_capacity(n);
         cluster.push(anchor);
 
@@ -392,9 +473,7 @@ impl TestNode {
             let node = TestNode::try_new_tcp_with_tick_ms(tick_ms)
                 .await
                 .map_err(|err| capnp::Error::failed(err.to_string()))?;
-            node.node
-                .join_anchor_addr(&anchor_addr, &join_token)
-                .await?;
+            node.join(&cluster[0]).await?;
             cluster.push(node);
         }
 
@@ -491,6 +570,63 @@ impl TestNode {
                     .join(", ");
                 return Err(format!(
                     "cluster size not converged to {expected} after {timeout:?} → [{snapshot}]"
+                ));
+            }
+
+            tokio::time::sleep(poll_every).await;
+        }
+    }
+
+    /// Wait until every node sees exactly `expected` ready members.
+    pub async fn wait_cluster_ready_all(
+        cluster: &[TestNode],
+        expected: usize,
+        timeout_duration: Duration,
+    ) -> Result<(), String> {
+        let poll_every = Duration::from_millis(50);
+        let deadline = Instant::now() + timeout_duration;
+
+        loop {
+            let mut snapshots: Vec<(Uuid, Vec<(Uuid, NodeReadinessState)>)> =
+                Vec::with_capacity(cluster.len());
+            let mut all_ok = true;
+
+            for n in cluster {
+                let rows = n
+                    .list_readiness_states()
+                    .await
+                    .map_err(|err| format!("list readiness failed on {}: {err}", n.id()))?;
+                if rows.len() != expected
+                    || rows
+                        .iter()
+                        .any(|(_, state)| *state != NodeReadinessState::Ready)
+                {
+                    all_ok = false;
+                }
+                snapshots.push((n.id(), rows));
+            }
+
+            if all_ok {
+                return Ok(());
+            }
+
+            if Instant::now() >= deadline {
+                let snapshot = snapshots
+                    .into_iter()
+                    .map(|(id, rows)| {
+                        let peers = rows
+                            .into_iter()
+                            .map(|(peer_id, state)| {
+                                format!("{}:{state:?}", &peer_id.to_string()[..8])
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!("{}:[{}]", &id.to_string()[..8], peers)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "cluster readiness not converged to {expected} ready nodes after {timeout_duration:?}: [{snapshot}]"
                 ));
             }
 
@@ -704,9 +840,6 @@ impl TestNode {
         let anchor = TestNode {
             node: Box::new(anchor_node),
         };
-        let anchor_addr = anchor.addr();
-        let join_token = anchor.current_join_token().await?;
-
         let mut cluster = Vec::with_capacity(n);
         cluster.push(anchor);
 
@@ -715,10 +848,7 @@ impl TestNode {
             let test_node = TestNode {
                 node: Box::new(node),
             };
-            test_node
-                .node
-                .join_anchor_addr(&anchor_addr, &join_token)
-                .await?;
+            test_node.join(&cluster[0]).await?;
             cluster.push(test_node);
         }
 

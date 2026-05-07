@@ -290,6 +290,40 @@ impl Topology {
         Ok(())
     }
 
+    /// Detects whether local membership left after a join payload before bootstrap finished.
+    ///
+    /// Join bootstrap runs in the background. A later local leave publishes a higher left
+    /// incarnation, so the captured active join payload must not be restored after that point.
+    /// Higher active incarnations can be normal SWIM refutations and must still be marked ready.
+    /// Same-incarnation tombstones can still be stale remote state from an earlier leave and must
+    /// remain restorable.
+    fn local_join_payload_superseded(&self, payload: &JoinPayload) -> Result<bool, Error> {
+        let membership = self.peer_membership_unscoped(payload.id)?;
+        Ok(membership
+            .map(|membership| {
+                membership.incarnation > payload.incarnation && !membership.is_active()
+            })
+            .unwrap_or(false))
+    }
+
+    /// Chooses a leave incarnation that beats both SWIM and durable self membership.
+    ///
+    /// The SWIM monitor and the peer store can move independently: refutations advance the monitor,
+    /// while self-row refreshes persist active peer values. A leave tombstone must dominate both so
+    /// peers cannot keep a same-incarnation active row after a graceful leave.
+    fn next_local_leave_incarnation(&self) -> Result<u64, Error> {
+        let advanced = self.swim_advance_local_incarnation();
+        let durable_next = match self.peer_membership_unscoped(self.local.node.id)? {
+            Some(membership) => membership.incarnation.checked_add(1).ok_or_else(|| {
+                Error::failed("local membership incarnation is already at u64::MAX".into())
+            })?,
+            None => advanced,
+        };
+        let leave_incarnation = advanced.max(durable_next);
+        self.swim_record_join(self.local.node.id, leave_incarnation);
+        Ok(leave_incarnation)
+    }
+
     /// Publishes the current master-key rows for a node accepted by this anchor.
     pub(crate) async fn publish_master_key_grants_for_joiner(
         &self,
@@ -576,6 +610,24 @@ impl topology::Server for Topology {
                     .sync_all_domains(sync_cap, cluster_view, root_schema_version, Some(trace))
                     .await;
 
+                match topology.local_join_payload_superseded(&payload) {
+                    Ok(true) => {
+                        warn!(
+                            target: "topology",
+                            "join: skipping stale bootstrap restore because local membership advanced"
+                        );
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        warn!(
+                            target: "topology",
+                            "join: failed to validate bootstrap restore freshness: {err}"
+                        );
+                        return;
+                    }
+                }
+
                 // A successful rejoin must end with the local node's own peer row restored even
                 // if the bootstrap sync observed a stale leave tombstone from another peer.
                 if let Err(err) = topology.persist_local_join_payload(&payload).await {
@@ -618,7 +670,7 @@ impl topology::Server for Topology {
         }
 
         let self_id = self.local.node.id;
-        let leave_incarnation = self.swim_advance_local_incarnation();
+        let leave_incarnation = self.next_local_leave_incarnation()?;
         self.mark_peer_left(self_id, leave_incarnation)
             .await
             .map_err(|e| capnp::Error::failed(format!("leave: mark-left failed: {e}")))?;

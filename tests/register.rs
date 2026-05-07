@@ -160,7 +160,10 @@ local_test!(register_node_inproc, {
     let anchor = TestNode::new_with_tick_ms(100).await;
     let joiner = TestNode::new_with_tick_ms(100).await;
 
-    joiner.join(&anchor).await.expect("join ok");
+    joiner
+        .join_without_waiting_ready(&anchor)
+        .await
+        .expect("join ok");
 
     // Both should see 2 nodes (self + the other)
     anchor
@@ -185,9 +188,12 @@ local_test!(register_node_reports_syncing_during_bootstrap, {
     let anchor = TestNode::new_with_tick_ms(100).await;
     let joiner = TestNode::new_with_tick_ms(100).await;
 
-    seed_bootstrap_workloads(&anchor, 256).await;
+    seed_bootstrap_workloads(&anchor, 2048).await;
 
-    joiner.join(&anchor).await.expect("join ok");
+    joiner
+        .join_without_waiting_ready(&anchor)
+        .await
+        .expect("join ok");
 
     assert_eq!(
         list_readiness_of(&anchor, joiner.id()).await,

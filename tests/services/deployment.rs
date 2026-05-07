@@ -598,6 +598,10 @@ local_test!(services_deployment_replicates_across_cluster, {
     let manifest_id = Uuid::new_v4();
     ensure_demo_manifest_secrets(&cluster).await;
     let task_templates = manifest_to_task_templates(&manifest);
+    let expected_count = task_templates
+        .iter()
+        .map(|template| template.replicas as usize)
+        .sum::<usize>();
 
     let service_id = cluster[0]
         .node
@@ -616,17 +620,6 @@ local_test!(services_deployment_replicates_across_cluster, {
         "anchor should observe service running"
     );
 
-    let expected_spec = cluster[0]
-        .node
-        .service_controller
-        .registry()
-        .get(service_id)
-        .expect("lookup service spec on anchor")
-        .expect("service spec present");
-
-    let expected_task_ids: BTreeSet<Uuid> = expected_spec.replica_ids.iter().cloned().collect();
-    let expected_count = expected_task_ids.len();
-
     for node in &cluster {
         assert!(
             wait_for_service_status(
@@ -640,17 +633,38 @@ local_test!(services_deployment_replicates_across_cluster, {
         );
     }
 
+    let expected_task_ids = wait_for_service_replica_ids_converged_all(
+        &cluster,
+        service_id,
+        expected_count,
+        3,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("service task ids should converge across all nodes");
+
     for node in &cluster {
-        assert!(
-            wait_for_task_count(
-                &node.node.workload_manager,
+        if !wait_for_task_count(
+            &node.node.workload_manager,
+            expected_count,
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            let filter = TaskStateFilter::all();
+            let specs = node
+                .node
+                .workload_manager
+                .list_workloads(&filter)
+                .await
+                .expect("list tasks after task-count timeout");
+            panic!(
+                "node {} should list all tasks: expected {}, saw {}",
+                node.id(),
                 expected_count,
-                Duration::from_secs(10)
-            )
-            .await,
-            "node {} should list all tasks",
-            node.id()
-        );
+                specs.len()
+            );
+        }
 
         let filter = TaskStateFilter::all();
         let specs = node

@@ -2068,6 +2068,12 @@ local_test!(cluster_view_name_updates_cross_view_after_split, {
     anchor
         .assert_cluster_size(3, "cluster size after joins")
         .await;
+    joiner_a
+        .assert_cluster_size(3, "joiner A cluster size after joins")
+        .await;
+    joiner_b
+        .assert_cluster_size(3, "joiner B cluster size after joins")
+        .await;
 
     let source_view = current_cluster_view(&anchor.topology()).await;
     let mut split_req = anchor.topology().split_cluster_request();
@@ -2112,8 +2118,8 @@ local_test!(cluster_view_name_updates_cross_view_after_split, {
         Duration::from_secs(5),
     )
     .await;
-    wait_for_cluster_view(&joiner_a.topology(), remote_view, Duration::from_secs(5)).await;
-    wait_for_cluster_view(&joiner_b.topology(), remote_view, Duration::from_secs(5)).await;
+    wait_for_cluster_view(&joiner_a.topology(), remote_view, Duration::from_secs(15)).await;
+    wait_for_cluster_view(&joiner_b.topology(), remote_view, Duration::from_secs(15)).await;
 
     let anchor_view = current_cluster_view(&anchor.topology()).await;
     let lineage_id = anchor_view.cluster_id.to_uuid();

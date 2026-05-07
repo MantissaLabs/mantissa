@@ -332,6 +332,23 @@ impl Topology {
         )
     }
 
+    /// Returns lower local root-schema versions to retry after a stale negotiation failure.
+    ///
+    /// A restarted peer can downgrade its advertised support range before we learn the new peer
+    /// row. Retrying lower local projections lets the peer-domain sync pull that new row instead
+    /// of getting stuck using the stale higher version.
+    fn root_schema_fallback_versions(&self, attempted: u32) -> Vec<u32> {
+        let local = self.root_schema_info();
+        if attempted <= local.minimum_supported_version {
+            return Vec::new();
+        }
+
+        (local.minimum_supported_version..attempted)
+            .rev()
+            .filter(|version| local.supports(*version))
+            .collect()
+    }
+
     /// Executes one view-scoped anti-entropy exchange against a selected peer.
     ///
     /// This is the main periodic reconciliation path. It only proceeds when the registry can
@@ -381,11 +398,52 @@ impl Topology {
         };
 
         let trace = SyncTraceContext::peer(peer_id, value.address.clone(), "periodic");
-        self.deps
+        let mut synced = self
+            .deps
             .sync
-            .sync_all_domains(sync_cap, cluster_view, root_schema_version, Some(trace))
+            .sync_all_domains(
+                sync_cap.clone(),
+                cluster_view,
+                root_schema_version,
+                Some(trace),
+            )
             .await;
-        crate::observability::metrics::record_sync_attempt("view", "success", "ok");
+        if !synced {
+            for fallback_version in self.root_schema_fallback_versions(root_schema_version) {
+                warn!(
+                    target: "sync",
+                    peer = %peer_id,
+                    addr = %value.address,
+                    root_schema_version,
+                    fallback_root_schema_version = fallback_version,
+                    "retrying sync with lower root schema version"
+                );
+                let trace = SyncTraceContext::peer(
+                    peer_id,
+                    value.address.clone(),
+                    "periodic-root-schema-fallback",
+                );
+                synced = self
+                    .deps
+                    .sync
+                    .sync_all_domains(
+                        sync_cap.clone(),
+                        cluster_view,
+                        fallback_version,
+                        Some(trace),
+                    )
+                    .await;
+                if synced {
+                    break;
+                }
+            }
+        }
+
+        if synced {
+            crate::observability::metrics::record_sync_attempt("view", "success", "ok");
+        } else {
+            crate::observability::metrics::record_sync_attempt("view", "failure", "sync_failed");
+        }
     }
 
     /// Executes one targeted workload-only repair exchange against a selected peer.

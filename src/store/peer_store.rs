@@ -118,7 +118,8 @@ pub fn open_peers_store(db: Arc<redb::Database>, actor: uuid::Uuid) -> std::io::
 mod tests {
     use super::PeerRegAdapter;
     use crate::topology::peers::{
-        PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
+        NodeReadiness, NodeReadinessState, PeerLabelState, PeerMembership, PeerSchedulingState,
+        PeerValue, WireGuardPeerValue,
     };
     use mantissa_store::adapter::RegAdapter;
     use uuid::Uuid;
@@ -164,5 +165,23 @@ mod tests {
             PeerRegAdapter::snapshot_reg(&decoded),
             PeerRegAdapter::snapshot_reg(&reg)
         );
+    }
+
+    /// Rewriting stale join gossip under a later actor should not erase Ready state.
+    #[test]
+    fn peer_register_adapter_preserves_ready_when_rewriting_stale_join() {
+        let joiner_actor = Uuid::from_u128(1);
+        let observer_actor = Uuid::from_u128(2);
+        let mut ready = peer_value(8, 1);
+        ready.readiness = NodeReadiness::ready(joiner_actor, 10);
+        let mut stale_join = ready.clone();
+        stale_join.readiness = NodeReadiness::syncing(joiner_actor, 20);
+
+        let first_reg = PeerRegAdapter::upsert_reg(None, &joiner_actor, ready.clone());
+        let merged = PeerValue::merge_observed(Some(&ready), &stale_join);
+        let observed_reg = PeerRegAdapter::upsert_reg(Some(first_reg), &observer_actor, merged);
+        let selected = PeerValue::select_reg(&observed_reg).expect("selected peer value");
+
+        assert_eq!(selected.readiness.state, NodeReadinessState::Ready);
     }
 }

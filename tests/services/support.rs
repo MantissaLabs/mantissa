@@ -1521,6 +1521,66 @@ pub(crate) async fn wait_for_service_spec_all(
     .await
 }
 
+pub(crate) async fn wait_for_service_replica_ids_converged_all(
+    cluster: &[TestNode],
+    service_id: Uuid,
+    expected_count: usize,
+    stable_rounds_required: usize,
+    timeout: Duration,
+) -> Option<BTreeSet<Uuid>> {
+    let deadline = Instant::now() + timeout;
+    let mut previous = None::<BTreeSet<Uuid>>;
+    let mut stable_rounds = 0usize;
+
+    while Instant::now() < deadline {
+        let mut canonical = None::<BTreeSet<Uuid>>;
+        let mut all_match = true;
+
+        for node in cluster {
+            let spec = match node.node.service_controller.registry().get(service_id) {
+                Ok(Some(spec)) if spec.status() == ServiceStatus::Running => spec,
+                _ => {
+                    all_match = false;
+                    break;
+                }
+            };
+            let replica_ids = spec.replica_ids.iter().copied().collect::<BTreeSet<_>>();
+            if replica_ids.len() != expected_count {
+                all_match = false;
+                break;
+            }
+            match canonical.as_ref() {
+                Some(current) if current != &replica_ids => {
+                    all_match = false;
+                    break;
+                }
+                Some(_) => {}
+                None => canonical = Some(replica_ids),
+            }
+        }
+
+        if all_match {
+            let replica_ids = canonical.unwrap_or_default();
+            if previous.as_ref() == Some(&replica_ids) {
+                stable_rounds += 1;
+            } else {
+                previous = Some(replica_ids.clone());
+                stable_rounds = 1;
+            }
+            if stable_rounds >= stable_rounds_required {
+                return Some(replica_ids);
+            }
+        } else {
+            stable_rounds = 0;
+            previous = None;
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    None
+}
+
 pub(crate) async fn ensure_demo_manifest_secrets(cluster: &[TestNode]) {
     assert!(
         !cluster.is_empty(),

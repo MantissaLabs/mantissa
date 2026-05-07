@@ -138,6 +138,12 @@ impl NodeReadiness {
 
     /// Selects the converged winner between two readiness states.
     pub fn merge(left: &Self, right: &Self) -> Self {
+        match (left.state, right.state) {
+            (NodeReadinessState::Ready, NodeReadinessState::Syncing) => return left.clone(),
+            (NodeReadinessState::Syncing, NodeReadinessState::Ready) => return right.clone(),
+            _ => {}
+        }
+
         if left.precedence_key() >= right.precedence_key() {
             left.clone()
         } else {
@@ -479,6 +485,33 @@ impl PeerMembership {
     }
 }
 
+/// Returns whether a readiness value can carry into the selected membership row.
+///
+/// Readiness is monotonic across active incarnation bumps caused by SWIM refutations, but a left
+/// tombstone is a hard barrier. That keeps a true leave/rejoin fenced as syncing while preventing
+/// stale syncing rows from demoting an active node that already reached ready.
+fn readiness_survives_membership_barrier(
+    values: &[PeerValue],
+    winning: PeerMembership,
+    candidate: PeerMembership,
+) -> bool {
+    if candidate == winning {
+        return true;
+    }
+    if !winning.is_active()
+        || !candidate.is_active()
+        || candidate.incarnation >= winning.incarnation
+    {
+        return false;
+    }
+
+    !values.iter().any(|value| {
+        !value.membership.is_active()
+            && value.membership.incarnation > candidate.incarnation
+            && value.membership.incarnation <= winning.incarnation
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
 pub struct PeerValue {
     pub address: String,
@@ -767,9 +800,8 @@ fn peer_store_codec_error<E: std::fmt::Display>(error: E) -> Box<mantissa_store:
 
 /// Peer snapshot projection used by the peer-domain MST.
 ///
-/// Root-schema support metadata is intentionally excluded here so peers can
-/// advertise sync compatibility without changing the peer-domain Merkle
-/// contract.
+/// Root-schema metadata stays visible in every projection because peers use
+/// it to negotiate the projection version for the next anti-entropy exchange.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
 pub struct PeerRootSnapshot {
     pub address: String,
@@ -782,6 +814,7 @@ pub struct PeerRootSnapshot {
     pub readiness: NodeReadiness,
     pub labels: PeerLabelState,
     pub runtime_support: RuntimeSupportProfile,
+    pub root_schema: RootSchemaInfo,
     pub membership: PeerMembership,
 }
 
@@ -809,6 +842,7 @@ impl PeerRootSnapshot {
             readiness: value.readiness.clone(),
             labels: value.labels.clone(),
             runtime_support,
+            root_schema: value.root_schema,
             membership: value.membership,
         }
     }
@@ -857,6 +891,20 @@ impl PeerProvider for Topology {
 }
 
 impl PeerValue {
+    /// Merges one newly observed peer row with the currently selected peer row.
+    ///
+    /// Registering a gossip-delivered join writes under the local node's MVReg actor and can
+    /// causally dominate values already visible to this node. Fold the selected row into the
+    /// incoming row first so delayed join gossip cannot erase newer per-peer metadata such as
+    /// readiness, while `select` still keeps leave/rejoin membership barriers intact.
+    pub(crate) fn merge_observed(current: Option<&PeerValue>, incoming: &PeerValue) -> PeerValue {
+        let Some(current) = current else {
+            return incoming.clone();
+        };
+
+        Self::select(&[current.clone(), incoming.clone()]).unwrap_or_else(|| incoming.clone())
+    }
+
     /// Returns true when this peer row still represents an active member.
     pub fn is_active(&self) -> bool {
         self.membership.is_active()
@@ -903,6 +951,13 @@ impl PeerValue {
         let mut root_schema: Option<RootSchemaInfo> = None;
 
         for value in values {
+            if readiness_survives_membership_barrier(values, winning_membership, value.membership) {
+                readiness = Some(match readiness.as_ref() {
+                    None => value.readiness.clone(),
+                    Some(current) => NodeReadiness::merge(current, &value.readiness),
+                });
+            }
+
             if value.membership != winning_membership {
                 continue;
             }
@@ -957,10 +1012,6 @@ impl PeerValue {
             scheduling = Some(match scheduling.as_ref() {
                 None => value.scheduling.clone(),
                 Some(current) => PeerSchedulingState::merge(current, &value.scheduling),
-            });
-            readiness = Some(match readiness.as_ref() {
-                None => value.readiness.clone(),
-                Some(current) => NodeReadiness::merge(current, &value.readiness),
             });
             labels = Some(match labels.as_ref() {
                 None => value.labels.clone(),
@@ -1190,6 +1241,155 @@ mod tests {
         assert_eq!(selected.address, "127.0.0.1:7000");
     }
 
+    /// Stale syncing rows must not demote a peer that is ready for the same membership.
+    #[test]
+    fn peer_select_keeps_ready_over_newer_syncing_for_same_membership() {
+        let node_id = Uuid::from_bytes([10u8; 16]);
+        let ready = PeerValue {
+            address: "127.0.0.1:7000".to_string(),
+            hostname: "node-a".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "amd64".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: None,
+            runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
+            scheduling: PeerSchedulingState::schedulable_default(node_id),
+            readiness: NodeReadiness::ready(node_id, 10),
+            labels: PeerLabelState::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
+            membership: super::PeerMembership::active(10),
+        };
+        let mut stale_syncing = ready.clone();
+        stale_syncing.readiness = NodeReadiness::syncing(node_id, 20);
+
+        let selected = PeerValue::select(&[ready, stale_syncing]).expect("selected peer value");
+
+        assert_eq!(selected.readiness.state, NodeReadinessState::Ready);
+    }
+
+    /// Merging an observed join row should preserve a same-membership Ready update.
+    #[test]
+    fn peer_merge_observed_keeps_ready_over_stale_syncing_join() {
+        let node_id = Uuid::from_bytes([13u8; 16]);
+        let ready = PeerValue {
+            address: "127.0.0.1:7000".to_string(),
+            hostname: "node-a".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "amd64".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: None,
+            runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
+            scheduling: PeerSchedulingState::schedulable_default(node_id),
+            readiness: NodeReadiness::ready(node_id, 10),
+            labels: PeerLabelState::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
+            membership: super::PeerMembership::active(10),
+        };
+        let mut stale_join = ready.clone();
+        stale_join.readiness = NodeReadiness::syncing(node_id, 20);
+
+        let merged = PeerValue::merge_observed(Some(&ready), &stale_join);
+
+        assert_eq!(merged.readiness.state, NodeReadinessState::Ready);
+    }
+
+    /// A left tombstone remains a barrier when merging a new rejoin row.
+    #[test]
+    fn peer_merge_observed_keeps_rejoin_syncing_after_left_barrier() {
+        let node_id = Uuid::from_bytes([14u8; 16]);
+        let mut left = PeerValue {
+            address: "127.0.0.1:7000".to_string(),
+            hostname: "node-a".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "amd64".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: None,
+            runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
+            scheduling: PeerSchedulingState::schedulable_default(node_id),
+            readiness: NodeReadiness::ready(node_id, 10),
+            labels: PeerLabelState::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
+            membership: super::PeerMembership::active(10),
+        };
+        left.membership = super::PeerMembership::left(11);
+        let mut rejoin = left.clone();
+        rejoin.readiness = NodeReadiness::syncing(node_id, 20);
+        rejoin.membership = super::PeerMembership::active(12);
+
+        let merged = PeerValue::merge_observed(Some(&left), &rejoin);
+
+        assert_eq!(merged.membership, super::PeerMembership::active(12));
+        assert_eq!(merged.readiness.state, NodeReadinessState::Syncing);
+    }
+
+    /// Ready should survive active incarnation bumps that are not separated by a leave.
+    #[test]
+    fn peer_select_carries_ready_across_active_incarnation_bump() {
+        let node_id = Uuid::from_bytes([11u8; 16]);
+        let ready = PeerValue {
+            address: "127.0.0.1:7000".to_string(),
+            hostname: "node-a".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "amd64".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: None,
+            runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
+            scheduling: PeerSchedulingState::schedulable_default(node_id),
+            readiness: NodeReadiness::ready(node_id, 10),
+            labels: PeerLabelState::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
+            membership: super::PeerMembership::active(10),
+        };
+        let mut bumped = ready.clone();
+        bumped.readiness = NodeReadiness::syncing(node_id, 20);
+        bumped.membership = super::PeerMembership::active(11);
+
+        let selected = PeerValue::select(&[ready, bumped]).expect("selected peer value");
+
+        assert_eq!(selected.membership, super::PeerMembership::active(11));
+        assert_eq!(selected.readiness.state, NodeReadinessState::Ready);
+    }
+
+    /// A left tombstone should prevent old ready state from bypassing a new join fence.
+    #[test]
+    fn peer_select_keeps_rejoin_syncing_after_left_barrier() {
+        let node_id = Uuid::from_bytes([12u8; 16]);
+        let ready = PeerValue {
+            address: "127.0.0.1:7000".to_string(),
+            hostname: "node-a".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "amd64".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: None,
+            runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
+            scheduling: PeerSchedulingState::schedulable_default(node_id),
+            readiness: NodeReadiness::ready(node_id, 10),
+            labels: PeerLabelState::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
+            membership: super::PeerMembership::active(10),
+        };
+        let mut left = ready.clone();
+        left.membership = super::PeerMembership::left(11);
+        let mut rejoin = ready.clone();
+        rejoin.readiness = NodeReadiness::syncing(node_id, 20);
+        rejoin.membership = super::PeerMembership::active(11);
+
+        let selected = PeerValue::select(&[ready, left, rejoin]).expect("selected peer value");
+
+        assert_eq!(selected.membership, super::PeerMembership::active(11));
+        assert_eq!(selected.readiness.state, NodeReadinessState::Syncing);
+    }
+
     /// Enabled WireGuard advertisements should win over stale disabled placeholders.
     #[test]
     fn wireguard_preferred_keeps_enabled_state() {
@@ -1240,9 +1440,9 @@ mod tests {
         assert_eq!(selected.membership, active.membership);
     }
 
-    /// Root-schema support metadata must not perturb the peer-domain MST snapshot.
+    /// Root-schema support metadata must be visible in the v1 peer-domain MST snapshot.
     #[test]
-    fn peer_root_snapshot_excludes_root_schema_metadata() {
+    fn peer_root_snapshot_v1_includes_root_schema_metadata() {
         let peer = PeerValue {
             address: "127.0.0.1:7000".to_string(),
             hostname: "node-a".to_string(),
@@ -1266,10 +1466,40 @@ mod tests {
         let mut upgraded = peer.clone();
         upgraded.root_schema = crate::cluster::RootSchemaInfo::new(1, 4, 20).expect("root schema");
 
-        let before = PeerRootSnapshot::from(&peer);
-        let after = PeerRootSnapshot::from(&upgraded);
+        let before = PeerRootSnapshot::from_value_at_version(&peer, 1);
+        let after = PeerRootSnapshot::from_value_at_version(&upgraded, 1);
 
-        assert_eq!(before, after);
+        assert_ne!(before, after);
+        assert_eq!(after.root_schema.supported_version, 4);
+    }
+
+    /// Root-schema support metadata must become root-visible in v2 projections.
+    #[test]
+    fn peer_root_snapshot_v2_includes_root_schema_metadata() {
+        let peer = PeerValue {
+            address: "127.0.0.1:7000".to_string(),
+            hostname: "node-a".to_string(),
+            platform_os: std::env::consts::OS.to_string(),
+            platform_arch: std::env::consts::ARCH.to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: None,
+            runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
+            scheduling: PeerSchedulingState::schedulable_default(Uuid::from_bytes([6u8; 16])),
+            readiness: Default::default(),
+            labels: PeerLabelState::default(),
+            root_schema: crate::cluster::RootSchemaInfo::new(1, 2, 10).expect("root schema"),
+            membership: super::PeerMembership::active(7),
+        };
+        let mut upgraded = peer.clone();
+        upgraded.root_schema = crate::cluster::RootSchemaInfo::new(1, 4, 20).expect("root schema");
+
+        let before = PeerRootSnapshot::from_value_at_version(&peer, 2);
+        let after = PeerRootSnapshot::from_value_at_version(&upgraded, 2);
+
+        assert_ne!(before, after);
+        assert_eq!(after.root_schema.supported_version, 4);
     }
 
     /// Runtime support remains root-neutral in v1 and becomes root-visible at v2.

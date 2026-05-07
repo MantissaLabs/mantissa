@@ -87,6 +87,13 @@ impl Topology {
         &self,
         state: NodeReadinessState,
     ) -> Result<(), capnp::Error> {
+        let Some(membership) = self.peer_membership_unscoped(self.local.node.id)? else {
+            return Ok(());
+        };
+        if !membership.is_active() {
+            return Ok(());
+        }
+
         let readiness = NodeReadiness {
             state,
             updated_at_unix_ms: Self::now_unix_ms(),
@@ -155,10 +162,9 @@ impl Topology {
         val: &PeerValue,
         handle: Option<server::Client>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.stores
-            .peers
-            .upsert(&UuidKey::from(id), val.clone())
-            .await?;
+        let current = self.deps.registry.peer_value_unscoped(id);
+        let value = PeerValue::merge_observed(current.as_ref(), val);
+        self.stores.peers.upsert(&UuidKey::from(id), value).await?;
         match handle {
             Some(handle) => {
                 self.deps.registry.register_peer_handle(id, handle).await;
