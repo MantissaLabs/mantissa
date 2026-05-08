@@ -1,4 +1,5 @@
 use super::*;
+use crate::network::allocator::allocate_overlay_address;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
     NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver,
@@ -140,6 +141,56 @@ fn filter_cached_backends_excludes_unknown_backends_from_routing() {
         filtered.is_empty(),
         "cached unknown endpoints must remain unroutable until they become healthy"
     );
+}
+
+#[tokio::test]
+async fn service_vip_address_class_is_disjoint_from_task_allocations() {
+    let harness = setup_catalog_harness().await;
+    let service_name = "backend";
+    let backends = vec![backend([10, 88, 0, 10], [0x02, 0, 0, 0, 0, 1])];
+    let (vip, _) = compute_service_vip(
+        &harness.registry,
+        harness.network.id,
+        service_name,
+        &backends,
+    )
+    .expect("compute service vip")
+    .expect("service vip");
+    let IpAddr::V4(vip_v4) = vip else {
+        panic!("catalog harness should use an IPv4 network")
+    };
+    let subnet_base = Ipv4Addr::new(10, 88, 0, 0);
+    let vip_offset = u32::from(vip_v4)
+        .checked_sub(u32::from(subnet_base))
+        .expect("vip should be inside the test subnet");
+    assert_eq!(
+        vip_offset % 4,
+        0,
+        "service VIPs must stay in the reserved VIP address class"
+    );
+
+    for raw in 1..512u128 {
+        let assigned: IpAddr = allocate_overlay_address(&harness.network, Uuid::from_u128(raw))
+            .expect("allocate task attachment address")
+            .assigned_ip
+            .parse()
+            .expect("parse task attachment address");
+        let IpAddr::V4(assigned_v4) = assigned else {
+            panic!("catalog harness should allocate IPv4 task addresses")
+        };
+        let assigned_offset = u32::from(assigned_v4)
+            .checked_sub(u32::from(subnet_base))
+            .expect("task address should be inside the test subnet");
+        assert_eq!(
+            assigned_offset % 4,
+            2,
+            "task attachments must stay in the reserved task address class"
+        );
+        assert_ne!(
+            assigned, vip,
+            "task attachment must not reuse the service VIP"
+        );
+    }
 }
 
 #[test]

@@ -730,23 +730,23 @@ fn compute_service_vip(
     slot_seed.copy_from_slice(&digest.as_bytes()[..16]);
     let slot_seed = u128::from_le_bytes(slot_seed);
 
-    // Constrain VIPs to the even offsets of the overlay to avoid collisions with per-node resolver
-    // addresses, which always occupy the odd slots (offsets 1, 3, 5, ...).
+    // Constrain VIPs to the `0 mod 4` overlay offsets so they cannot collide with resolver
+    // addresses (`1 mod 2`) or automatically assigned task attachments (`2 mod 4`).
     let max_hosts: u128 = match (subnet.family, host_bits) {
         (OverlayIpFamily::Ipv4, 32) => u32::MAX as u128 + 1,
         (OverlayIpFamily::Ipv6, 128) => return Ok(None),
         _ => 1u128 << host_bits,
     };
-    let available_even = max_hosts.saturating_sub(16) / 2;
-    if available_even == 0 {
+    let available_vips = max_hosts.saturating_sub(16) / 4;
+    if available_vips == 0 {
         return Ok(None);
     }
 
-    let backend_ips: std::collections::HashSet<u128> = backends
+    let backend_ips: HashSet<IpAddr> = backends
         .iter()
         .filter_map(|backend| match (subnet.family, backend.ip) {
-            (OverlayIpFamily::Ipv4, IpAddr::V4(ip)) => Some(u32::from(ip) as u128),
-            (OverlayIpFamily::Ipv6, IpAddr::V6(ip)) => Some(u128::from(ip)),
+            (OverlayIpFamily::Ipv4, IpAddr::V4(_)) => Some(backend.ip),
+            (OverlayIpFamily::Ipv6, IpAddr::V6(_)) => Some(backend.ip),
             _ => None,
         })
         .collect();
@@ -754,16 +754,15 @@ fn compute_service_vip(
         return Ok(None);
     }
 
-    let mut slot = (slot_seed % available_even) * 2 + 8;
-    let probe_budget = usize::try_from(available_even.min(16)).unwrap_or(16);
+    let mut slot = (slot_seed % available_vips) * 4 + 8;
+    let probe_budget = usize::try_from(available_vips.min(16)).unwrap_or(16);
     for _ in 0..probe_budget {
         let candidate = base_ip.saturating_add(slot);
-        if !backend_ips.contains(&candidate) {
-            let vip = match subnet.family {
-                OverlayIpFamily::Ipv4 => IpAddr::V4(Ipv4Addr::from(candidate as u32)),
-                OverlayIpFamily::Ipv6 => IpAddr::V6(Ipv6Addr::from(candidate)),
-            };
-
+        let vip = match subnet.family {
+            OverlayIpFamily::Ipv4 => IpAddr::V4(Ipv4Addr::from(candidate as u32)),
+            OverlayIpFamily::Ipv6 => IpAddr::V6(Ipv6Addr::from(candidate)),
+        };
+        if !backend_ips.contains(&vip) {
             let mut mac = [0u8; 6];
             mac[0] = 0x02;
             mac[1..].copy_from_slice(&digest.as_bytes()[4..9]);
@@ -771,8 +770,8 @@ fn compute_service_vip(
             return Ok(Some((vip, mac)));
         }
 
-        // Walk forward to the next even slot if we collided with an existing backend.
-        slot = slot.wrapping_add(2) % (available_even * 2);
+        // Walk forward to the next VIP slot if a nonstandard backend already uses this address.
+        slot = slot.wrapping_add(4) % (available_vips * 4);
         if slot < 8 {
             slot = 8;
         }

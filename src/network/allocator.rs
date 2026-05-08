@@ -276,16 +276,18 @@ impl OverlayLayout {
         }
     }
 
-    /// Convert one workload slot into the even host address reserved for task attachments.
+    /// Convert one workload slot into the host address class reserved for task attachments.
     fn address_for_task_slot(self, slot: u128) -> IpAddr {
-        self.address_at(2u128 + slot.saturating_mul(2))
+        self.address_at(2u128 + slot.saturating_mul(4))
     }
 }
 
 /// Derive the allocation layout for one overlay subnet.
 ///
-/// Mantissa splits usable host addresses into alternating resolver and task slots so resolver
-/// addresses remain deterministic per node while workload addresses remain deterministic per task.
+/// Mantissa splits usable host addresses into stable resolver, task, and service VIP classes.
+/// Resolver addresses occupy odd offsets, task attachments occupy `2 mod 4` offsets, and
+/// service VIPs occupy `0 mod 4` offsets. Keeping the classes disjoint prevents a task IP from
+/// stealing traffic that should have been handled by the bridge VIP dataplane.
 fn overlay_layout(network: &NetworkSpecValue) -> Result<OverlayLayout> {
     let subnet = parse_overlay_cidr(&network.subnet_cidr)?;
     let base = match subnet.base_ip {
@@ -316,8 +318,8 @@ fn overlay_layout(network: &NetworkSpecValue) -> Result<OverlayLayout> {
         );
     }
 
-    let task_slots = host_span / 2;
-    let node_slots = host_span - task_slots;
+    let node_slots = host_span / 2;
+    let task_slots = host_span / 4;
 
     Ok(OverlayLayout {
         family: subnet.family,
