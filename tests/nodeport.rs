@@ -2277,18 +2277,68 @@ local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
         "owner public service should reach running state"
     );
 
-    assert!(
-        wait_until(
-            Duration::from_secs(60),
-            Duration::from_millis(100),
-            || async {
-                let status = node.network_controller.nodeport_manager().status().await;
-                status.state == NodePortRuntimeState::Ready && status.active_ports == 1
+    let owner_published = wait_until(
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        || async {
+            let status = node.network_controller.nodeport_manager().status().await;
+            let service = node
+                .service_controller
+                .registry()
+                .get(owner_service_id)
+                .expect("read owner NodePort service while waiting for publication")
+                .expect("owner NodePort service should still exist while waiting");
+            status.state == NodePortRuntimeState::Ready
+                && status.active_ports == 1
+                && status.resolved_node_ip == Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                && status.stats_error.is_none()
+                && service.public_endpoint_detail().is_none()
+        },
+    )
+    .await;
+    if !owner_published {
+        let status = node.network_controller.nodeport_manager().status().await;
+        let service = node
+            .service_controller
+            .registry()
+            .get(owner_service_id)
+            .expect("read owner NodePort service after publication timeout")
+            .expect("owner NodePort service should still exist after publication timeout");
+        panic!(
+            "owner service should publish one healthy NodePort before conflict validation; status={status:?}; public_detail={:?}",
+            service.public_endpoint_detail()
+        );
+    }
+
+    let owner_addr = format!("127.0.0.1:{NODEPORT_HTTP_PORT}");
+    let owner_http_ok = wait_until(
+        Duration::from_secs(60),
+        Duration::from_millis(250),
+        || async {
+            match http_get(&owner_addr).await {
+                Ok(response) => response.contains(NODEPORT_CONFLICT_RESPONSE),
+                Err(_) => false,
             }
-        )
-        .await,
-        "owner service should publish the first NodePort mapping"
-    );
+        },
+    )
+    .await;
+    if !owner_http_ok {
+        let status = node.network_controller.nodeport_manager().status().await;
+        let service = node
+            .service_controller
+            .registry()
+            .get(owner_service_id)
+            .expect("read owner NodePort service after HTTP timeout")
+            .expect("owner NodePort service should still exist after HTTP timeout");
+        let last_http_error = http_get(&owner_addr)
+            .await
+            .map(|response| format!("unexpected response: {response}"))
+            .unwrap_or_else(|err| err.to_string());
+        panic!(
+            "owner NodePort should accept traffic before conflict validation; status={status:?}; public_detail={:?}; last_http_error={last_http_error}",
+            service.public_endpoint_detail()
+        );
+    }
 
     let conflict = deploy_privileged_nodeport_service(
         &node.service_controller,
@@ -2313,7 +2363,7 @@ local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
         "rejecting a conflicting deployment should keep the original NodePort owner intact"
     );
 
-    let response = http_get(&format!("127.0.0.1:{NODEPORT_HTTP_PORT}"))
+    let response = http_get(&owner_addr)
         .await
         .expect("owner NodePort should still accept traffic after a conflict");
     assert!(
