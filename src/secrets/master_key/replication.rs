@@ -1,7 +1,7 @@
 use crate::gossip::Message;
 use crate::secrets::master_key::envelope::MasterKeyTransfer;
 use crate::store::local::MasterKeyRecord;
-use crate::store::secret_master_key_store::{
+use crate::store::replicated::secret_master_key_store::{
     SecretMasterKeyStore, SecretMasterKeySyncRecord, current_from_descriptor, upsert_record,
 };
 use anyhow::{Result, anyhow};

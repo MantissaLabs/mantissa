@@ -6,7 +6,7 @@
 //! safe up to the last local time when both sides reported the same MST root.
 
 use crate::cluster::ClusterViewId;
-use crate::store::registry::domain_key;
+use crate::store::replicated::registry::domain_key;
 use mantissa_protocol::sync::Domain;
 use mantissa_store::gc::GcBarrier;
 use parking_lot::Mutex;

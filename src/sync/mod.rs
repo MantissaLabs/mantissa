@@ -10,7 +10,7 @@
 //! inside one control-plane lineage.
 
 use crate::cluster::{ClusterViewId, ClusterViewState, RootSchemaState};
-use crate::store::registry::{
+use crate::store::replicated::registry::{
     EncodedRegister, EncodedRegisters, EncodedTombstone, EncodedTombstones,
 };
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
@@ -22,7 +22,7 @@ pub mod delta;
 pub mod gc_progress;
 pub mod ranges;
 
-pub use crate::store::registry::{
+pub use crate::store::replicated::registry::{
     REPLICATED_DOMAINS as ALL_DOMAINS, ReplicatedStoreRegistry as SyncStores,
 };
 pub use delta::{SyncRunner, SyncTraceContext};

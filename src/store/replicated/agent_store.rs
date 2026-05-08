@@ -2,7 +2,7 @@ use crate::agents::types::{
     AgentRecordValue, AgentRunSpecValue, AgentRunStatus, AgentSessionSpecValue, AgentSessionStatus,
     parse_timestamp,
 };
-use crate::store::open::open_arc_store;
+use crate::store::replicated::open::open_arc_store;
 use chrono::{DateTime, Utc};
 use mantissa_store::adapter::{CompactingStoreMvRegAdapterSorted, MvRegCompactionRanker};
 use mantissa_store::hash::XXHash128;

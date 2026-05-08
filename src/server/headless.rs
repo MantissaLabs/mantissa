@@ -19,7 +19,7 @@ use crate::{
         bootstrap::{BootedRuntime, BootstrapContext, BootstrapOptions, RuntimeTaskHandles, boot},
     },
     services::ServiceController,
-    store::scheduler_digest_store::SchedulerDigestStore,
+    store::replicated::scheduler_digest_store::SchedulerDigestStore,
     workload::manager::{WorkloadManager, WorkloadRuntimeConfig},
 };
 use mantissa_net::noise::NoiseKeys;
@@ -124,16 +124,16 @@ pub struct HeadlessNode {
     topology_runtime: crate::topology::Topology,
 
     // Stores (optional inspection in tests)
-    pub peers: crate::store::peer_store::PeersStore,
-    pub workloads: crate::store::workload_store::WorkloadStore,
-    pub jobs: crate::store::job_store::JobStore,
-    pub agents: crate::store::agent_store::AgentStore,
-    pub services: crate::store::service_store::ServiceStore,
+    pub peers: crate::store::replicated::peer_store::PeersStore,
+    pub workloads: crate::store::replicated::workload_store::WorkloadStore,
+    pub jobs: crate::store::replicated::job_store::JobStore,
+    pub agents: crate::store::replicated::agent_store::AgentStore,
+    pub services: crate::store::replicated::service_store::ServiceStore,
     pub scheduler_digests: SchedulerDigestStore,
     pub local_sessions: crate::store::local::LocalSessionStore,
     pub local_creds: crate::store::local::LocalCredentialStore,
     pub secret_master_store: crate::store::local::SecretMasterStore,
-    pub secret_master_keys: crate::store::secret_master_key_store::SecretMasterKeyStore,
+    pub secret_master_keys: crate::store::replicated::secret_master_key_store::SecretMasterKeyStore,
 
     // Keep resources alive
     _db: Arc<redb::Database>,

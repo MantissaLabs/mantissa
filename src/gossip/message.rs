@@ -4,7 +4,7 @@ use crate::network::types::NetworkEvent;
 use crate::scheduler::digest::SchedulerDigestEvent;
 use crate::secrets::types::SecretEvent;
 use crate::services::types::ServiceEvent;
-use crate::store::secret_master_key_store::SecretMasterKeySyncRecord;
+use crate::store::replicated::secret_master_key_store::SecretMasterKeySyncRecord;
 use crate::topology::TopologyEvent;
 use crate::volumes::types::VolumeEvent;
 use crate::workload::model::WorkloadEvent;

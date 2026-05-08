@@ -1,5 +1,5 @@
-use crate::store::compaction::ParsedOrRawTimestampRank;
-use crate::store::open::open_arc_store;
+use crate::store::replicated::compaction::ParsedOrRawTimestampRank;
+use crate::store::replicated::open::open_arc_store;
 use crate::volumes::types::{
     VolumeAccessMode, VolumeBindingMode, VolumeDriver, VolumeNodeState, VolumeNodeStateValue,
     VolumeReclaimPolicy, VolumeSpecValue, VolumeStatus,

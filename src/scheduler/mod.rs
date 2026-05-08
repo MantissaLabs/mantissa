@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::gpu::{GpuDeviceOverrideAction, gpu_device_override_for, read_gpu_device_overrides};
 use crate::registry::Registry;
-use crate::store::scheduler_store::SchedulerStore;
+use crate::store::replicated::scheduler_store::SchedulerStore;
 
 use self::digest::{
     ObservedSchedulerDigest, SchedulerDigestPublisher, SchedulerDigestRegistry,
@@ -2087,8 +2087,8 @@ mod tests {
     use crate::config::RuntimeSchedulerConfig;
     use crate::node::info::{Cpu, Memory};
     use crate::store::local::LocalSessionStore;
-    use crate::store::peer_store::open_peers_store;
-    use crate::store::scheduler_store::open_scheduler_store;
+    use crate::store::replicated::peer_store::open_peers_store;
+    use crate::store::replicated::scheduler_store::open_scheduler_store;
     use ::mantissa_health::HealthMonitor;
     use ed25519_dalek::SigningKey;
     use mantissa_net::noise::NoiseKeys;

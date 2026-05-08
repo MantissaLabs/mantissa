@@ -1,20 +1,7 @@
-pub mod agent_store;
+//! Durable store modules grouped by replication semantics.
+
 pub mod cluster_operation_store;
-pub mod cluster_view_store;
-mod compaction;
-pub mod gc;
-pub mod job_store;
 pub mod local;
-pub mod network_store;
-pub mod open;
 pub mod path;
-pub mod peer_store;
-pub mod registry;
-pub mod scheduler_digest_store;
-pub mod scheduler_store;
-pub mod secret_master_key_store;
-pub mod secret_store;
-pub mod service_store;
+pub mod replicated;
 mod tx;
-pub mod volume_store;
-pub mod workload_store;

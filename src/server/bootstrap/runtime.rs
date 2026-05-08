@@ -28,9 +28,9 @@ use crate::secrets::master_key::replication::{
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
-use crate::store::gc::StoreGcRunner;
 use crate::store::path::default_db_path;
-use crate::store::registry::{ReplicatedStoreHandles, replicated_store_registry};
+use crate::store::replicated::gc::StoreGcRunner;
+use crate::store::replicated::registry::{ReplicatedStoreHandles, replicated_store_registry};
 use crate::sync::{SyncGcProgress, SyncRunner, SyncService, SyncStores};
 use crate::task::service::TaskService;
 use crate::topology::{Keys, Topology, TopologyConfig, TopologyDependencies, TopologyStorage};

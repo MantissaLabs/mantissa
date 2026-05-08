@@ -647,7 +647,7 @@ fn workload_phase_exit_code(state: &WorkloadPhase) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::job_store::open_job_store;
+    use crate::store::replicated::job_store::open_job_store;
     use crate::workload::types::{WorkloadPortBinding, WorkloadPortProtocol};
     use mantissa_store::uuid_key::UuidKey;
     use std::sync::Arc;

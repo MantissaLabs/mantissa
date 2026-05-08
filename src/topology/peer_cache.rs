@@ -1,4 +1,4 @@
-use crate::store::peer_store::PeersStore;
+use crate::store::replicated::peer_store::PeersStore;
 use crate::topology::peers::PeerValue;
 use mantissa_store::codec::TombstoneRecord;
 use mantissa_store::mvreg::MvReg;

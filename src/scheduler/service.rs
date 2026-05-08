@@ -235,8 +235,8 @@ mod tests {
     use crate::scheduler::digest::read_scheduler_digest;
     use crate::scheduler::{Scheduler, SlotCapacity, SlotSpec};
     use crate::store::local::LocalSessionStore;
-    use crate::store::peer_store::open_peers_store;
-    use crate::store::scheduler_store::open_scheduler_store;
+    use crate::store::replicated::peer_store::open_peers_store;
+    use crate::store::replicated::scheduler_store::open_scheduler_store;
     use ::mantissa_health::HealthMonitor;
     use capnp_rpc::new_client as capnp_new_client;
     use ed25519_dalek::SigningKey;

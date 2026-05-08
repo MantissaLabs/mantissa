@@ -2,7 +2,7 @@ use crate::agents::types::{
     AgentRecordValue, AgentRunSpecValue, AgentRunStatus, AgentSessionSpecValue, AgentSessionStatus,
     parse_timestamp,
 };
-use crate::store::agent_store::AgentStore;
+use crate::store::replicated::agent_store::AgentStore;
 use anyhow::{Result, anyhow};
 use mantissa_store::uuid_key::UuidKey;
 use std::cmp::Ordering;

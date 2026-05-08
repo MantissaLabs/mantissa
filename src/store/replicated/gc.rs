@@ -8,7 +8,7 @@
 use crate::cluster::{ClusterViewState, RootSchemaState};
 use crate::config::RuntimeStoreGcConfig;
 use crate::registry::Registry;
-use crate::store::registry::ReplicatedStoreEntry;
+use crate::store::replicated::registry::ReplicatedStoreEntry;
 use crate::sync::{SyncGcProgress, SyncStores};
 use mantissa_protocol::sync::Domain;
 use mantissa_store::gc::{GcBarrier, StoreGcReport};

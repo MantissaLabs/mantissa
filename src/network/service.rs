@@ -779,7 +779,7 @@ mod tests {
     use crate::network::types::{
         BpfAttachPoint, compute_network_attachment_id, compute_network_peer_state_id,
     };
-    use crate::store::network_store::{
+    use crate::store::replicated::network_store::{
         open_network_attachment_store, open_network_peer_store, open_network_spec_store,
     };
     use mantissa_store::uuid_key::UuidKey;

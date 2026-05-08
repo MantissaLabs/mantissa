@@ -2,7 +2,7 @@ use crate::cluster::operations::{
     ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage,
 };
 use crate::cluster::{ClusterId, ClusterViewId};
-use crate::store::cluster_view_store::{ClusterNameRecord, ClusterNodeCountRecord};
+use crate::store::replicated::cluster_view_store::{ClusterNameRecord, ClusterNodeCountRecord};
 use crate::topology::Topology;
 use crate::topology::cluster_operations::{
     CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT, COMMIT_PRECONDITION_FAILURE_PREFIX,

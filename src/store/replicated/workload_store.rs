@@ -1,4 +1,4 @@
-use crate::store::open::open_arc_store;
+use crate::store::replicated::open::open_arc_store;
 use crate::workload::model::{WorkloadValue, parse_workload_timestamp, workload_phase_rank};
 use chrono::{DateTime, Utc};
 use mantissa_store::adapter::{CompactingStoreMvRegAdapterSorted, MvRegCompactionRanker};

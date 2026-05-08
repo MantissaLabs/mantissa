@@ -8,7 +8,7 @@ use crate::network::service::read_network_event;
 use crate::scheduler::digest::read_scheduler_digest_event;
 use crate::secrets::service::read_secret_event;
 use crate::services::service::read_service_event;
-use crate::store::secret_master_key_store::read_secret_master_key_sync_record;
+use crate::store::replicated::secret_master_key_store::read_secret_master_key_sync_record;
 use crate::topology;
 use crate::topology::TopologyEvent;
 use crate::volumes::service::read_volume_event;

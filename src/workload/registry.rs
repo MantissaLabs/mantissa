@@ -1,4 +1,4 @@
-use crate::store::workload_store::WorkloadStore;
+use crate::store::replicated::workload_store::WorkloadStore;
 use crate::workload::model::{WorkloadValue, select_best_workload_value};
 use anyhow::{Result, anyhow};
 use mantissa_store::uuid_key::UuidKey;
@@ -68,7 +68,7 @@ impl WorkloadRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::workload_store::open_workload_store;
+    use crate::store::replicated::workload_store::open_workload_store;
     use crate::workload::model::{ExecutionPlatform, IsolationMode};
     use crate::workload::model::{WorkloadPhase, WorkloadValueDraft};
     use redb::Database;

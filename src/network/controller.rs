@@ -18,7 +18,7 @@ use crate::network::types::{
 use crate::network::wireguard::{self, WireGuardUnderlayState};
 use crate::registry::Registry;
 use crate::services::registry::ServiceRegistry;
-use crate::store::workload_store::WorkloadStore;
+use crate::store::replicated::workload_store::WorkloadStore;
 use anyhow::{Context, Result, anyhow};
 use async_channel::Sender;
 #[cfg(target_os = "linux")]

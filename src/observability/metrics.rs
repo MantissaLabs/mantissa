@@ -15,7 +15,7 @@ use crate::network::nodeport::{NodePortManager, NodePortRuntimeState, NodePortSt
 use crate::registry::Registry;
 use crate::runtime::types::RuntimeError;
 use crate::scheduler::{GpuDeviceState, Scheduler, SchedulerError, SchedulerSnapshot, SlotState};
-use crate::store::registry::{REPLICATED_DOMAINS, domain_label};
+use crate::store::replicated::registry::{REPLICATED_DOMAINS, domain_label};
 use crate::sync::SyncGcProgress;
 
 /// Runtime handles used by the low-cost metrics sampler.

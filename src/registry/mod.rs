@@ -1,7 +1,7 @@
 use crate::cluster::ClusterViewId;
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::store::local::LocalSessionStore;
-use crate::store::peer_store::PeersStore;
+use crate::store::replicated::peer_store::PeersStore;
 use crate::topology::peers::{
     NodeReadiness, PeerLabelState, PeerSchedulingState, PeerValue, WireGuardPeerValue,
 };

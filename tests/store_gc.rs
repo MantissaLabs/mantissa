@@ -18,18 +18,22 @@ use mantissa::network::types::{
 };
 use mantissa::scheduler::digest::SchedulerDigestValue;
 use mantissa::secrets::types::{SecretCiphertext, SecretMetadata, SecretValue, SecretVersion};
-use mantissa::store::agent_store::AgentRegAdapter;
-use mantissa::store::job_store::JobRegAdapter;
-use mantissa::store::network_store::{
+use mantissa::store::replicated::agent_store::AgentRegAdapter;
+use mantissa::store::replicated::job_store::JobRegAdapter;
+use mantissa::store::replicated::network_store::{
     NetworkAttachmentRegAdapter, NetworkPeerRegAdapter, NetworkSpecRegAdapter,
 };
-use mantissa::store::scheduler_digest_store::{SchedulerDigestStore, open_scheduler_digest_store};
-use mantissa::store::secret_master_key_store::{
+use mantissa::store::replicated::scheduler_digest_store::{
+    SchedulerDigestStore, open_scheduler_digest_store,
+};
+use mantissa::store::replicated::secret_master_key_store::{
     SecretMasterKeyCurrent, SecretMasterKeyRegAdapter, SecretMasterKeySyncRecord,
 };
-use mantissa::store::secret_store::SecretRegAdapter;
-use mantissa::store::volume_store::{VolumeNodeRegAdapter, VolumeSpecRegAdapter};
-use mantissa::store::workload_store::{WorkloadRegAdapter, WorkloadStore, open_workload_store};
+use mantissa::store::replicated::secret_store::SecretRegAdapter;
+use mantissa::store::replicated::volume_store::{VolumeNodeRegAdapter, VolumeSpecRegAdapter};
+use mantissa::store::replicated::workload_store::{
+    WorkloadRegAdapter, WorkloadStore, open_workload_store,
+};
 use mantissa::volumes::types::{
     LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode,
     VolumeDriver, VolumeNodeState, VolumeNodeStateValue, VolumeReclaimPolicy, VolumeSpecDraft,

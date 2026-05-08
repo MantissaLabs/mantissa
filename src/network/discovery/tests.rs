@@ -8,11 +8,11 @@ use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
     ServiceSpecValue, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
 };
-use crate::store::network_store::{
+use crate::store::replicated::network_store::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
 };
-use crate::store::service_store::open_service_store;
-use crate::store::workload_store::{WorkloadStore, open_workload_store};
+use crate::store::replicated::service_store::open_service_store;
+use crate::store::replicated::workload_store::{WorkloadStore, open_workload_store};
 use crate::workload::model::{
     WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata, WorkloadValue, WorkloadValueDraft,
 };

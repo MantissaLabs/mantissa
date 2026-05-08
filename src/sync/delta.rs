@@ -6,7 +6,7 @@
 
 use super::{ALL_DOMAINS, SyncStores};
 use crate::cluster::{ClusterViewId, RootSchemaState};
-use crate::store::registry::{EncodedRegisters, EncodedTombstones};
+use crate::store::replicated::registry::{EncodedRegisters, EncodedTombstones};
 use crate::sync::gc_progress::SyncGcProgress;
 use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use capnp_rpc::new_client;

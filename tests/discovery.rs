@@ -15,11 +15,11 @@ use mantissa::services::types::{
     ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceSpecValue,
     TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
 };
-use mantissa::store::network_store::{
+use mantissa::store::replicated::network_store::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
 };
-use mantissa::store::service_store::open_service_store;
-use mantissa::store::workload_store::open_workload_store;
+use mantissa::store::replicated::service_store::open_service_store;
+use mantissa::store::replicated::workload_store::open_workload_store;
 use mantissa::task::types::{TaskServiceMetadata, TaskValue, TaskValueDraft};
 use mantissa::workload::model::{WorkloadOwner, WorkloadPhase};
 use mantissa::workload::types::ExecutionSpec;
@@ -36,7 +36,7 @@ use uuid::Uuid;
 
 struct DiscoveryHarness {
     registry: NetworkRegistry,
-    workloads: mantissa::store::workload_store::WorkloadStore,
+    workloads: mantissa::store::replicated::workload_store::WorkloadStore,
     services: ServiceRegistry,
     discovery: ServiceDiscovery,
     network: NetworkSpecValue,

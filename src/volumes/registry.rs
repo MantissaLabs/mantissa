@@ -1,4 +1,4 @@
-use crate::store::volume_store::{VolumeNodeStore, VolumeSpecStore};
+use crate::store::replicated::volume_store::{VolumeNodeStore, VolumeSpecStore};
 use crate::volumes::types::{VolumeNodeStateValue, VolumeSpecValue, compute_volume_id};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};

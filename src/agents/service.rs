@@ -917,7 +917,7 @@ fn normalize_text(reader: capnp::text::Reader<'_>) -> Option<String> {
 mod tests {
     use super::*;
     use crate::agents::types::AgentInteractionPolicy;
-    use crate::store::agent_store::open_agent_store;
+    use crate::store::replicated::agent_store::open_agent_store;
     use mantissa_store::uuid_key::UuidKey;
     use std::sync::Arc;
     use tempfile::tempdir;

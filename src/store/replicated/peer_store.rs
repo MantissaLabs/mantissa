@@ -1,4 +1,4 @@
-use crate::store::open::open_arc_store;
+use crate::store::replicated::open::open_arc_store;
 use crate::topology::peers::{PeerRootSnapshot, PeerValue};
 use mantissa_store::adapter::RegAdapter;
 use mantissa_store::codec::{MvRegStoreCodec, StoreRegisterCodec};

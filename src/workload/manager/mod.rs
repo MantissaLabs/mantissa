@@ -12,7 +12,7 @@ use crate::scheduler::{Scheduler, SlotId};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
 use crate::services::registry::ServiceRegistry;
-use crate::store::workload_store::WorkloadStore;
+use crate::store::replicated::workload_store::WorkloadStore;
 use crate::volumes::VolumeRegistry;
 use crate::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadSpec,

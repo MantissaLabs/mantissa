@@ -1,5 +1,5 @@
 use crate::cluster::{ClusterId, ClusterViewId};
-use crate::store::open::open_arc_store;
+use crate::store::replicated::open::open_arc_store;
 use crate::store::tx::{into_io, with_read_tx, with_write_tx};
 use mantissa_protocol::topology::{
     cluster_name_record, cluster_node_count_record, cluster_view_id, cluster_view_metadata_record,

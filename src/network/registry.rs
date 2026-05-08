@@ -5,7 +5,9 @@ use crate::network::types::{
     NetworkAttachmentValue, NetworkPeerState, NetworkPeerStateValue, NetworkSpecValue,
     compute_network_peer_state_id,
 };
-use crate::store::network_store::{NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore};
+use crate::store::replicated::network_store::{
+    NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore,
+};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use mantissa_store::uuid_key::UuidKey;
@@ -829,7 +831,7 @@ mod tests {
     use super::*;
     use crate::network::defaults::{CidrBlock, DefaultNetworkIpFamily, default_network_subnet};
     use crate::network::types::{NetworkDriver, NetworkSpecDraft};
-    use crate::store::network_store::{
+    use crate::store::replicated::network_store::{
         open_network_attachment_store, open_network_peer_store, open_network_spec_store,
     };
     use redb::Database;

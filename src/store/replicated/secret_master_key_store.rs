@@ -3,7 +3,7 @@ use crate::secrets::master_key::envelope::{
     MASTER_KEY_SIZE, MasterKeyDescriptor, MasterKeyTransfer, read_master_key_descriptor,
     write_master_key_descriptor,
 };
-use crate::store::open::open_arc_store;
+use crate::store::replicated::open::open_arc_store;
 use capnp::Error;
 use mantissa_protocol::secrets::{
     secret_master_key_current, secret_master_key_grant, secret_master_key_sync_record,

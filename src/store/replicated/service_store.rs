@@ -1,5 +1,5 @@
 use crate::services::types::ServiceSpecValue;
-use crate::store::open::open_arc_store;
+use crate::store::replicated::open::open_arc_store;
 use mantissa_store::adapter::StoreMvRegAdapterSorted;
 use mantissa_store::hash::XXHash128;
 use mantissa_store::mst_store::CrdtMstStore;
