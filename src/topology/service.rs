@@ -32,11 +32,15 @@ use mantissa_protocol::topology::{topology, topology_event};
 use mantissa_store::uuid_key::UuidKey;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
+use std::time::Duration;
 use tracing::{info, warn};
 use uuid::Uuid;
 use x25519_dalek::PublicKey;
 
 use super::cluster_operations::SplitOperationBuildInput;
+
+/// Maximum time a graceful leave spends waiting for one direct peer notification.
+const LEAVE_DIRECT_BROADCAST_TIMEOUT: Duration = Duration::from_millis(500);
 
 struct JoinInputs {
     anchor: String,
@@ -481,6 +485,87 @@ impl Topology {
             }
         }
     }
+
+    /// Returns active peer ids that are currently in this node's local control-plane scope.
+    async fn scoped_active_peer_ids(&self) -> Vec<Uuid> {
+        let Some(snapshot) = self.peer_snapshot().await else {
+            return Vec::new();
+        };
+        let excluded_peers = self.excluded_peers_snapshot().await;
+        let mut peer_ids = snapshot
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                (entry.peer_id != self.local.node.id && !excluded_peers.contains(&entry.peer_id))
+                    .then_some(entry.peer_id)
+            })
+            .collect::<Vec<_>>();
+        peer_ids.sort_unstable();
+        peer_ids
+    }
+
+    /// Flushes a clean leave event directly to retained peers before this node fences itself.
+    async fn broadcast_leave_event_to_scoped_peers(
+        &self,
+        event: &TopologyEvent,
+        peer_ids: &[Uuid],
+        cluster_view: ClusterViewId,
+    ) {
+        for peer_id in peer_ids {
+            let gossip_cap = match self
+                .deps
+                .registry
+                .gossip_client_for_unscoped(*peer_id)
+                .await
+            {
+                Ok(Some(cap)) => cap,
+                Ok(None) => {
+                    warn!(
+                        target: "topology",
+                        peer_id = %peer_id,
+                        "leave: no gossip capability available for direct leave broadcast"
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    warn!(
+                        target: "topology",
+                        peer_id = %peer_id,
+                        "leave: failed to resolve gossip capability for direct leave broadcast: {err}"
+                    );
+                    continue;
+                }
+            };
+
+            let mut request = gossip_cap.gossip_request();
+            let list = request.get().init_messages();
+            let mut messages = list.init_messages(1);
+            let mut message = messages.reborrow().get(0);
+            message.set_id(Uuid::new_v4().as_bytes());
+            cluster_view.write_capnp(message.reborrow().init_view());
+            add_event(&mut messages, 0, event, cluster_view);
+
+            match tokio::time::timeout(LEAVE_DIRECT_BROADCAST_TIMEOUT, request.send().promise).await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    warn!(
+                        target: "topology",
+                        peer_id = %peer_id,
+                        "leave: direct leave broadcast failed: {err}"
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        target: "topology",
+                        peer_id = %peer_id,
+                        timeout_ms = LEAVE_DIRECT_BROADCAST_TIMEOUT.as_millis() as u64,
+                        "leave: direct leave broadcast timed out"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Returns true when two current rows represent unrelated key identities for join.
@@ -670,14 +755,19 @@ impl topology::Server for Topology {
         }
 
         let self_id = self.local.node.id;
+        let cluster_view = self.active_cluster_view();
+        let leave_peer_ids = self.scoped_active_peer_ids().await;
         let leave_incarnation = self.next_local_leave_incarnation()?;
-        self.mark_peer_left(self_id, leave_incarnation)
-            .await
-            .map_err(|e| capnp::Error::failed(format!("leave: mark-left failed: {e}")))?;
         let leave_event = TopologyEvent::Leave {
             id: self_id,
             incarnation: leave_incarnation,
         };
+
+        self.broadcast_leave_event_to_scoped_peers(&leave_event, &leave_peer_ids, cluster_view)
+            .await;
+        self.mark_peer_left(self_id, leave_incarnation)
+            .await
+            .map_err(|e| capnp::Error::failed(format!("leave: mark-left failed: {e}")))?;
         self.broadcast_topology_event_now(&leave_event).await;
         self.gossip_topology_event(leave_event).await?;
 
