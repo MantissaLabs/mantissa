@@ -896,6 +896,13 @@ local_test!(nodeport_restart_restores_public_service_publication, {
         Duration::from_millis(100),
         || async {
             let status = node.network_controller.nodeport_manager().status().await;
+            let public_endpoint_ready = node
+                .service_controller
+                .registry()
+                .get(service_id)
+                .ok()
+                .flatten()
+                .is_some_and(|service| service.public_endpoint_detail().is_none());
             status.state == NodePortRuntimeState::Ready
                 && status.source_mode == NodePortSourceMode::SnatHostAccess
                 && status.identity_source == Some(NodePortIdentitySource::NodePortIp)
@@ -903,6 +910,7 @@ local_test!(nodeport_restart_restores_public_service_publication, {
                 && status.active_host_networks == 1
                 && status.resolved_node_ip == Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
                 && status.stats_error.is_none()
+                && public_endpoint_ready
         },
     )
     .await;
@@ -991,6 +999,13 @@ local_test!(nodeport_restart_restores_public_service_publication, {
                 .nodeport_manager()
                 .status()
                 .await;
+            let public_endpoint_ready = restarted
+                .service_controller
+                .registry()
+                .get(service_id)
+                .ok()
+                .flatten()
+                .is_some_and(|service| service.public_endpoint_detail().is_none());
             status.state == NodePortRuntimeState::Ready
                 && status.source_mode == NodePortSourceMode::SnatHostAccess
                 && status.identity_source == Some(NodePortIdentitySource::NodePortIp)
@@ -998,6 +1013,7 @@ local_test!(nodeport_restart_restores_public_service_publication, {
                 && status.active_host_networks == 1
                 && status.resolved_node_ip == Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
                 && status.stats_error.is_none()
+                && public_endpoint_ready
         },
     )
     .await;

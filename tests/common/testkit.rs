@@ -144,6 +144,8 @@ impl TestNode {
             global_metadata_sync_fanout: None,
             gossip_tick,
             gossip_fanout,
+            network_reconcile_tick: None,
+            network_attachment_refresh_tick: None,
             gossip_channel_capacity,
             task_runtime,
             runtime_set: None,

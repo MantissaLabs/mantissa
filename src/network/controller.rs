@@ -32,10 +32,10 @@ use tokio::time::Duration;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-/// Periodic reconciliation interval for drift detection when no events are pending.
-const RECONCILE_DRIFT_INTERVAL: Duration = Duration::from_secs(60);
-/// Frequency to check for attachment updates that require forwarding refresh.
-const ATTACHMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+/// Default periodic reconciliation interval for drift detection when no events are pending.
+const DEFAULT_RECONCILE_DRIFT_INTERVAL: Duration = Duration::from_secs(60);
+/// Default frequency to check for attachment updates that require forwarding refresh.
+const DEFAULT_ATTACHMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// Retry interval for service-discovery startup after local interface programming.
 const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 /// Number of short retries before discovery startup falls back to the normal drift sweep.
@@ -84,6 +84,8 @@ struct NetworkControllerInner {
     wireguard_retry_scheduled: AsyncMutex<bool>,
     attachments_root: AsyncMutex<Option<String>>,
     attachment_sync_notify: Option<Arc<Notify>>,
+    reconcile_drift_interval: Duration,
+    attachment_refresh_interval: Duration,
     wake: Notify,
     gossip_tx: Sender<Message>,
 }
@@ -102,6 +104,8 @@ pub struct NetworkControllerInit {
     pub gossip_tx: Sender<Message>,
     pub forwarding_events: Option<UnboundedReceiver<ForwardingEvent>>,
     pub attachment_sync_notify: Option<Arc<Notify>>,
+    pub reconcile_drift_interval: Option<Duration>,
+    pub attachment_refresh_interval: Option<Duration>,
 }
 
 #[cfg(target_os = "linux")]
@@ -134,7 +138,23 @@ impl NetworkController {
             gossip_tx,
             forwarding_events,
             attachment_sync_notify,
+            reconcile_drift_interval,
+            attachment_refresh_interval,
         } = init;
+        let reconcile_drift_interval =
+            reconcile_drift_interval.unwrap_or(DEFAULT_RECONCILE_DRIFT_INTERVAL);
+        let attachment_refresh_interval =
+            attachment_refresh_interval.unwrap_or(DEFAULT_ATTACHMENT_REFRESH_INTERVAL);
+        if reconcile_drift_interval.is_zero() {
+            return Err(anyhow!(
+                "network reconcile drift interval must be greater than zero"
+            ));
+        }
+        if attachment_refresh_interval.is_zero() {
+            return Err(anyhow!(
+                "network attachment refresh interval must be greater than zero"
+            ));
+        }
         let provisioner = platform::NetworkProvisioner::new()?;
         let attachment = PlatformAttachmentProvisioner::new().unwrap_or_else(|err| {
             warn!(target: "network", "failed to initialize attachment provisioner: {err}");
@@ -176,6 +196,8 @@ impl NetworkController {
                 wireguard_retry_scheduled: AsyncMutex::new(false),
                 attachments_root: AsyncMutex::new(None),
                 attachment_sync_notify,
+                reconcile_drift_interval,
+                attachment_refresh_interval,
                 wake: Notify::new(),
                 gossip_tx,
             }),
@@ -612,8 +634,8 @@ impl NetworkController {
             );
         }
 
-        let mut interval = tokio::time::interval(RECONCILE_DRIFT_INTERVAL);
-        let mut attachment_refresh = tokio::time::interval(ATTACHMENT_REFRESH_INTERVAL);
+        let mut interval = tokio::time::interval(self.inner.reconcile_drift_interval);
+        let mut attachment_refresh = tokio::time::interval(self.inner.attachment_refresh_interval);
         loop {
             tokio::select! {
                 _ = interval.tick() => {

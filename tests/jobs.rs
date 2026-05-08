@@ -807,6 +807,8 @@ async fn create_restartable_job_node(
             global_metadata_sync_fanout: None,
             gossip_tick: Some(Duration::from_millis(100)),
             gossip_fanout: None,
+            network_reconcile_tick: None,
+            network_attachment_refresh_tick: None,
             gossip_channel_capacity: None,
             task_runtime: None,
             runtime_set: Some(RuntimeSet::singleton(

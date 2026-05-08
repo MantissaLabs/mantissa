@@ -77,6 +77,8 @@ pub struct BootstrapOptions {
     pub global_metadata_sync_tick: Option<Duration>,
     pub global_metadata_sync_fanout: Option<usize>,
     pub gossip_tick: Option<Duration>,
+    pub network_reconcile_tick: Option<Duration>,
+    pub network_attachment_refresh_tick: Option<Duration>,
     pub advertise_override: Option<String>,
     pub master_key_passphrase: Option<SecretPassphrase>,
     /// KDF cost for passphrase-backed master-key envelopes.
@@ -101,6 +103,8 @@ impl Default for BootstrapOptions {
             global_metadata_sync_tick: None,
             global_metadata_sync_fanout: None,
             gossip_tick: None,
+            network_reconcile_tick: None,
+            network_attachment_refresh_tick: None,
             advertise_override: None,
             master_key_passphrase: None,
             master_key_kdf_params: PassphraseKdfParams::production(),
@@ -550,6 +554,8 @@ async fn build_runtime_components(
             gossip_tx: gossip_tx.clone(),
             forwarding_events: Some(forwarding_rx),
             attachment_sync_notify: Some(attachment_sync_notify),
+            reconcile_drift_interval: options.network_reconcile_tick,
+            attachment_refresh_interval: options.network_attachment_refresh_tick,
         })
         .map_err(|error| -> Box<dyn std::error::Error> {
             Box::new(std::io::Error::other(error.to_string()))

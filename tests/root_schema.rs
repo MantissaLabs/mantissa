@@ -112,6 +112,8 @@ async fn create_restartable_node_with_root_schema(
             global_metadata_sync_fanout: None,
             gossip_tick: Some(Duration::from_millis(100)),
             gossip_fanout: None,
+            network_reconcile_tick: None,
+            network_attachment_refresh_tick: None,
             gossip_channel_capacity: None,
             task_runtime: None,
             runtime_set: Some(default_test_runtime_set()),

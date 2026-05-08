@@ -283,6 +283,8 @@ pub fn privileged_headless_config() -> HeadlessConfig {
         global_metadata_sync_fanout: None,
         gossip_tick: Some(Duration::from_millis(100)),
         gossip_fanout: None,
+        network_reconcile_tick: Some(Duration::from_secs(1)),
+        network_attachment_refresh_tick: Some(Duration::from_millis(100)),
         gossip_channel_capacity: None,
         task_runtime: None,
         runtime_set: None,
