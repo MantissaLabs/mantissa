@@ -1,5 +1,6 @@
 use super::support::*;
 use crate::common;
+use mantissa::services::types::compute_service_id;
 
 local_test!(services_gossip_propagates_across_peers, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
@@ -487,6 +488,163 @@ local_test!(services_deploying_generation_resumes_after_restart, {
     );
 });
 
+local_test!(
+    services_deploying_generation_owner_failover_completes_after_owner_shutdown,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+
+        let mut cluster = TestNode::new_cluster_inproc_with_config(
+            3,
+            ClusterConfig {
+                sync_tick_ms: Some(100),
+                gossip_tick_ms: Some(100),
+                ..ClusterConfig::default()
+            },
+        )
+        .await
+        .expect("create service owner failover cluster");
+        TestNode::wait_cluster_ready_all(&cluster, 3, Duration::from_secs(10))
+            .await
+            .expect("service owner failover cluster should converge to three ready nodes");
+
+        let failed_owner_id = cluster[2].id();
+        let candidate_ids = cluster.iter().map(TestNode::id).collect::<Vec<_>>();
+        let (service_name, service_id) = service_name_for_generation_owner(
+            "owner-failover-deploy",
+            failed_owner_id,
+            &candidate_ids,
+        );
+        assert_eq!(
+            select_generation_owner_for_test(service_id, 0, &candidate_ids),
+            Some(failed_owner_id),
+            "test setup should choose the node we shut down as the initial generation owner"
+        );
+
+        for observer in &cluster[..2] {
+            observer
+                .wait_status_of(failed_owner_id, NodeStatus::Alive, Duration::from_secs(5))
+                .await
+                .expect("remaining nodes should see selected owner alive before shutdown");
+        }
+
+        let failed_owner = cluster.remove(2);
+        let failed_owner = *failed_owner.node;
+        failed_owner
+            .shutdown()
+            .await
+            .expect("shut down selected generation owner");
+
+        let service_id_from_submission = cluster[0]
+            .node
+            .service_controller
+            .submit_deployment(
+                Uuid::new_v4(),
+                "owner-failover-deploy",
+                &service_name,
+                vec![TaskTemplateSpecValue {
+                    name: "api".into(),
+                    execution: ExecutionSpec {
+                        command: vec!["serve".into()],
+                        cpu_millis: 100,
+                        memory_bytes: 64 * 1024 * 1024,
+                        ..empty_service_execution("ghcr.io/mantissa/demo:api")
+                    },
+                    depends_on: Vec::new(),
+                    replicas: 1,
+                    readiness: None,
+                    public_port: None,
+                    public_protocol: None,
+                }],
+            )
+            .await
+            .expect("submit deployment while selected generation owner is offline");
+        assert_eq!(service_id_from_submission, service_id);
+
+        let initial = cluster[0]
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("read initial failover deployment")
+            .expect("service should be present after submission");
+        assert_eq!(
+            initial.status(),
+            ServiceStatus::Deploying,
+            "deployment should start as pending because the selected owner is gone"
+        );
+        assert!(
+            initial.replica_ids.is_empty(),
+            "no live node should assign task ids while the down owner still wins rendezvous hashing"
+        );
+
+        for observer in &cluster {
+            observer
+                .wait_status_of(
+                    failed_owner_id,
+                    NodeStatus::Down,
+                    swim_down_transition_timeout(2),
+                )
+                .await
+                .expect("remaining nodes should mark selected owner down");
+        }
+
+        let live_candidate_ids = cluster.iter().map(TestNode::id).collect::<Vec<_>>();
+        let live_owner_id = select_generation_owner_for_test(service_id, 0, &live_candidate_ids)
+            .expect("live owner");
+        assert_ne!(
+            live_owner_id, failed_owner_id,
+            "generation owner should move to a live node once the previous owner is down"
+        );
+        let live_owner = cluster
+            .iter()
+            .find(|node| node.id() == live_owner_id)
+            .expect("live owner should remain in cluster");
+
+        assert!(
+            wait_for_service_status(
+                &live_owner.node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "new live generation owner should complete the deployment after failover"
+        );
+        assert!(
+            wait_for_service_replica_ids_converged_all(
+                &cluster,
+                service_id,
+                1,
+                3,
+                Duration::from_secs(30),
+            )
+            .await
+            .is_some(),
+            "remaining nodes should converge on the replica assigned by the live owner"
+        );
+        assert!(
+            wait_for_service_running_tasks_stable_all(
+                &cluster,
+                &service_name,
+                1,
+                3,
+                Duration::from_secs(30),
+            )
+            .await,
+            "remaining nodes should converge on one running service task"
+        );
+        assert!(
+            surviving_nodes_observe_no_active_service_tasks_on_node(
+                &cluster,
+                &service_name,
+                failed_owner_id,
+                Duration::from_secs(10),
+            )
+            .await,
+            "failed owner should not host active tasks after live-owner adoption"
+        );
+    }
+);
+
 local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
     let _guard =
         RuntimeBackendOverrideGuard::install(Arc::new(ExitSignalRuntimeBackend::default()));
@@ -699,3 +857,50 @@ local_test!(services_deployment_replicates_across_cluster, {
         );
     }
 });
+
+/// Finds a deterministic service name whose initial generation owner is `owner_id`.
+fn service_name_for_generation_owner(
+    prefix: &str,
+    owner_id: Uuid,
+    candidates: &[Uuid],
+) -> (String, Uuid) {
+    for nonce in 0..10_000 {
+        let service_name = format!("{prefix}-{nonce}");
+        let service_id = compute_service_id(&service_name);
+        if select_generation_owner_for_test(service_id, 0, candidates) == Some(owner_id) {
+            return (service_name, service_id);
+        }
+    }
+    panic!("unable to find service name owned by {owner_id}");
+}
+
+/// Selects the deterministic owner for one service generation using the production hash input.
+fn select_generation_owner_for_test(
+    service_id: Uuid,
+    service_epoch: u64,
+    candidates: &[Uuid],
+) -> Option<Uuid> {
+    let mut best: Option<(Uuid, u128)> = None;
+    for node_id in candidates {
+        let score = generation_owner_score_for_test(service_id, service_epoch, *node_id);
+        match best {
+            None => best = Some((*node_id, score)),
+            Some((_, best_score)) if score > best_score => best = Some((*node_id, score)),
+            _ => {}
+        }
+    }
+    best.map(|(node_id, _)| node_id)
+}
+
+/// Computes the rendezvous score used by service generation ownership selection.
+fn generation_owner_score_for_test(service_id: Uuid, service_epoch: u64, node_id: Uuid) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"generation");
+    hasher.update(service_id.as_bytes());
+    hasher.update(&service_epoch.to_le_bytes());
+    hasher.update(node_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    u128::from_le_bytes(bytes)
+}
