@@ -1,5 +1,5 @@
 use crate::jobs::types::{JobSpecValue, parse_timestamp};
-use crate::store::replicated::job_store::JobStore;
+use crate::store::replicated::jobs::JobStore;
 use anyhow::{Result, anyhow};
 use mantissa_store::uuid_key::UuidKey;
 use std::cmp::Ordering;

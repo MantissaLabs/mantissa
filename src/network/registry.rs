@@ -5,7 +5,7 @@ use crate::network::types::{
     NetworkAttachmentValue, NetworkPeerState, NetworkPeerStateValue, NetworkSpecValue,
     compute_network_peer_state_id,
 };
-use crate::store::replicated::network_store::{
+use crate::store::replicated::networks::{
     NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore,
 };
 use anyhow::{Result, anyhow};
@@ -831,7 +831,7 @@ mod tests {
     use super::*;
     use crate::network::defaults::{CidrBlock, DefaultNetworkIpFamily, default_network_subnet};
     use crate::network::types::{NetworkDriver, NetworkSpecDraft};
-    use crate::store::replicated::network_store::{
+    use crate::store::replicated::networks::{
         open_network_attachment_store, open_network_peer_store, open_network_spec_store,
     };
     use redb::Database;

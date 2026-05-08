@@ -886,7 +886,7 @@ impl volumes::Server for VolumesRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::replicated::volume_store::{open_volume_node_store, open_volume_spec_store};
+    use crate::store::replicated::volumes::{open_volume_node_store, open_volume_spec_store};
     use crate::volumes::types::VolumeStatus;
     use mantissa_store::uuid_key::UuidKey;
     use std::sync::Arc;

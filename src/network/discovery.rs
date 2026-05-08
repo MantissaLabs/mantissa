@@ -10,7 +10,7 @@ use crate::services::types::{
     ServicePortProtocol, ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceSpecValue,
     ServiceStatus,
 };
-use crate::store::replicated::workload_store::WorkloadStore;
+use crate::store::replicated::workloads::WorkloadStore;
 use crate::workload::model::WorkloadPhase;
 use crate::workload::model::{WorkloadValue, select_best_workload_value};
 use ::mantissa_health::{HealthMonitor, Status as HealthStatus};

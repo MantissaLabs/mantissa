@@ -5,19 +5,19 @@
 //! the domain-to-store mapping so those callers can iterate or look up a store
 //! without repeating large `Domain` match blocks.
 
-use crate::store::replicated::agent_store::AgentStore;
-use crate::store::replicated::cluster_view_store::ClusterViewDomainStore;
-use crate::store::replicated::job_store::JobStore;
-use crate::store::replicated::network_store::{
+use crate::store::replicated::agents::AgentStore;
+use crate::store::replicated::cluster_views::ClusterViewDomainStore;
+use crate::store::replicated::jobs::JobStore;
+use crate::store::replicated::networks::{
     NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore,
 };
-use crate::store::replicated::peer_store::PeersStore;
-use crate::store::replicated::scheduler_digest_store::SchedulerDigestStore;
-use crate::store::replicated::secret_master_key_store::SecretMasterKeyStore;
-use crate::store::replicated::secret_store::SecretStore;
-use crate::store::replicated::service_store::ServiceStore;
-use crate::store::replicated::volume_store::{VolumeNodeStore, VolumeSpecStore};
-use crate::store::replicated::workload_store::WorkloadStore;
+use crate::store::replicated::peers::PeersStore;
+use crate::store::replicated::scheduler_digests::SchedulerDigestStore;
+use crate::store::replicated::secret_key_sync::SecretMasterKeyStore;
+use crate::store::replicated::secrets::SecretStore;
+use crate::store::replicated::services::ServiceStore;
+use crate::store::replicated::volumes::{VolumeNodeStore, VolumeSpecStore};
+use crate::store::replicated::workloads::WorkloadStore;
 use mantissa_protocol::sync::Domain;
 use mantissa_store::adapter::RegAdapter;
 use mantissa_store::codec::TombstoneRecord;

@@ -3,7 +3,7 @@ use crate::cluster::ClusterViewId;
 use crate::crypto::rand;
 use crate::node::id;
 use crate::server::credential::ClusterCredential;
-use crate::store::replicated::secret_master_key_store::{
+use crate::store::replicated::secret_key_sync::{
     SecretMasterKeySyncRecord, write_secret_master_key_sync_record,
 };
 use crate::topology::TopologyEvent;

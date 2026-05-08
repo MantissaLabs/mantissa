@@ -1,5 +1,5 @@
 use crate::secrets::types::{SecretValue, compute_secret_id};
-use crate::store::replicated::secret_store::SecretStore;
+use crate::store::replicated::secrets::SecretStore;
 use anyhow::{Result, anyhow};
 use mantissa_store::uuid_key::UuidKey;
 use std::collections::HashSet;

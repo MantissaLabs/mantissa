@@ -1,13 +1,13 @@
 //! Node-local Redb stores that persist data across restarts but are not CRDT replicated.
 
-pub mod credential_store;
-pub mod id;
-pub mod secret_master_store;
-pub mod session_store;
-pub mod token_store;
+pub mod credentials;
+pub mod peer_id;
+pub mod secret_keyring;
+pub mod sessions;
+pub mod token;
 
-pub use credential_store::LocalCredentialStore;
-pub use id::{load_or_create_node_id, next_root_schema_publication_generation};
-pub use secret_master_store::{MasterKeyRecord, SecretMasterStore};
-pub use session_store::LocalSessionStore;
-pub use token_store::LocalTokenStore;
+pub use credentials::LocalCredentialStore;
+pub use peer_id::{load_or_create_node_id, next_root_schema_publication_generation};
+pub use secret_keyring::{MasterKeyRecord, SecretMasterStore};
+pub use sessions::LocalSessionStore;
+pub use token::LocalTokenStore;

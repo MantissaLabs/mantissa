@@ -1175,7 +1175,7 @@ mod tests {
         TaskTemplateNetworkRequirement, TaskTemplateRestartPolicy, TaskTemplateRestartPolicyKind,
         TaskTemplateSpecValue,
     };
-    use crate::store::replicated::service_store::open_service_store;
+    use crate::store::replicated::services::open_service_store;
     use crate::task::types::{
         TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskVolumeMount,
     };

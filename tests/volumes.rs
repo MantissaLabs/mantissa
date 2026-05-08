@@ -11,7 +11,7 @@ use mantissa::runtime::types::{
     RuntimeStateInfo,
 };
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
-use mantissa::store::replicated::volume_store::{open_volume_node_store, open_volume_spec_store};
+use mantissa::store::replicated::volumes::{open_volume_node_store, open_volume_spec_store};
 use mantissa::task::types::TaskVolumeMount;
 use mantissa::volumes::registry::VolumeRegistry;
 use mantissa::volumes::types::{

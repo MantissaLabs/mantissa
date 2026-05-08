@@ -1,18 +1,18 @@
 //! Replicated CRDT/MST-backed stores and sync-domain infrastructure.
 
-pub mod agent_store;
-pub mod cluster_view_store;
+pub mod agents;
+pub mod cluster_views;
 mod compaction;
 pub mod gc;
-pub mod job_store;
-pub mod network_store;
+pub mod jobs;
+pub mod networks;
 mod open;
-pub mod peer_store;
+pub mod peers;
 pub mod registry;
-pub mod scheduler_digest_store;
-pub mod scheduler_store;
-pub mod secret_master_key_store;
-pub mod secret_store;
-pub mod service_store;
-pub mod volume_store;
-pub mod workload_store;
+pub mod scheduler;
+pub mod scheduler_digests;
+pub mod secret_key_sync;
+pub mod secrets;
+pub mod services;
+pub mod volumes;
+pub mod workloads;

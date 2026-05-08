@@ -9,10 +9,10 @@ use super::state::*;
 use super::*;
 use crate::network::types::{NetworkDriver, NetworkSpecDraft, NetworkSpecValue};
 use crate::services::types::TaskTemplateNetworkRequirement;
-use crate::store::replicated::network_store::{
+use crate::store::replicated::networks::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
 };
-use crate::store::replicated::volume_store::{open_volume_node_store, open_volume_spec_store};
+use crate::store::replicated::volumes::{open_volume_node_store, open_volume_spec_store};
 use crate::volumes::types::{
     LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode,
     VolumeDriver, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,

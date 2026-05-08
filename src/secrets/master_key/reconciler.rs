@@ -3,7 +3,7 @@ use crate::registry::Registry;
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::master_key::envelope::{MasterKeyDescriptor, MasterKeyTransfer};
 use crate::store::local::{MasterKeyRecord, SecretMasterStore};
-use crate::store::replicated::secret_master_key_store::{
+use crate::store::replicated::secret_key_sync::{
     SecretMasterKeyCurrent, SecretMasterKeyGrant, SecretMasterKeyStore, SecretMasterKeySyncRecord,
     current_for_scope,
 };
@@ -314,8 +314,8 @@ mod tests {
         MasterKeyDescriptor, MasterKeyPlaintext, MasterKeyTransfer, PassphraseProvider,
     };
     use crate::store::local::{LocalSessionStore, MasterKeyRecord, SecretMasterStore};
-    use crate::store::replicated::peer_store::open_peers_store;
-    use crate::store::replicated::secret_master_key_store::{
+    use crate::store::replicated::peers::open_peers_store;
+    use crate::store::replicated::secret_key_sync::{
         SecretMasterKeyCurrent, SecretMasterKeyStore, open_secret_master_key_store, upsert_current,
         upsert_descriptor, upsert_grant,
     };

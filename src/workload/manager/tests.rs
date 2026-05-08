@@ -30,16 +30,16 @@ use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
 use crate::services::registry::ServiceRegistry;
 use crate::store::local::{LocalSessionStore, SecretMasterStore};
-use crate::store::replicated::network_store::{
+use crate::store::replicated::networks::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
 };
-use crate::store::replicated::peer_store::open_peers_store;
-use crate::store::replicated::scheduler_digest_store::open_scheduler_digest_store;
-use crate::store::replicated::scheduler_store::open_scheduler_store;
-use crate::store::replicated::secret_store::open_secret_store;
-use crate::store::replicated::service_store::open_service_store;
-use crate::store::replicated::volume_store::{open_volume_node_store, open_volume_spec_store};
-use crate::store::replicated::workload_store::open_workload_store;
+use crate::store::replicated::peers::open_peers_store;
+use crate::store::replicated::scheduler::open_scheduler_store;
+use crate::store::replicated::scheduler_digests::open_scheduler_digest_store;
+use crate::store::replicated::secrets::open_secret_store;
+use crate::store::replicated::services::open_service_store;
+use crate::store::replicated::volumes::{open_volume_node_store, open_volume_spec_store};
+use crate::store::replicated::workloads::open_workload_store;
 use crate::task::types::{TaskStateFilter, TaskStateKind};
 use crate::topology::peers::PeerSchedulingState;
 use crate::volumes::VolumeRegistry;

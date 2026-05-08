@@ -1,5 +1,5 @@
 use crate::store::path::open_state_database;
-use crate::store::replicated::peer_store::open_peers_store;
+use crate::store::replicated::peers::open_peers_store;
 use anyhow::{Context, Result, bail};
 use mantissa_store::uuid_key::UuidKey;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableError};

@@ -689,7 +689,7 @@ impl secrets::Server for SecretsService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::replicated::secret_store::open_secret_store;
+    use crate::store::replicated::secrets::open_secret_store;
     use mantissa_store::uuid_key::UuidKey;
     use std::sync::Arc;
     use tempfile::tempdir;

@@ -663,7 +663,7 @@ fn list_filter_from_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::replicated::workload_store::open_workload_store;
+    use crate::store::replicated::workloads::open_workload_store;
     use crate::volumes::types::LocalVolumeOwnership;
     use crate::workload::model::{
         WorkloadEnvironmentVariable, WorkloadJobMetadata, WorkloadOwner, WorkloadSecretFile,

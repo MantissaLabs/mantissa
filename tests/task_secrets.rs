@@ -25,19 +25,19 @@ use mantissa::secrets::service::{SecretsService, SecretsServiceConfig};
 use mantissa::secrets::types::{SecretMetadata, SecretValue, SecretVersion, compute_secret_id};
 use mantissa::services::registry::ServiceRegistry;
 use mantissa::store::local::{LocalSessionStore, SecretMasterStore};
-use mantissa::store::replicated::network_store::{
+use mantissa::store::replicated::networks::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
 };
-use mantissa::store::replicated::peer_store::open_peers_store;
-use mantissa::store::replicated::scheduler_store::open_scheduler_store;
-use mantissa::store::replicated::secret_master_key_store::{
+use mantissa::store::replicated::peers::open_peers_store;
+use mantissa::store::replicated::scheduler::open_scheduler_store;
+use mantissa::store::replicated::secret_key_sync::{
     SecretMasterKeyStore, SecretMasterKeySyncRecord, current_for_scope, grant_row_id,
     open_secret_master_key_store,
 };
-use mantissa::store::replicated::secret_store::open_secret_store;
-use mantissa::store::replicated::service_store::open_service_store;
-use mantissa::store::replicated::volume_store::{open_volume_node_store, open_volume_spec_store};
-use mantissa::store::replicated::workload_store::open_workload_store;
+use mantissa::store::replicated::secrets::open_secret_store;
+use mantissa::store::replicated::services::open_service_store;
+use mantissa::store::replicated::volumes::{open_volume_node_store, open_volume_spec_store};
+use mantissa::store::replicated::workloads::open_workload_store;
 use mantissa::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
 use mantissa::volumes::VolumeRegistry;
 use mantissa::volumes::types::LocalVolumeOwnership;

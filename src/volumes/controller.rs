@@ -249,7 +249,7 @@ fn capacity_exceeded_message(volume_name: &str, used_bytes: u64, capacity_bytes:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::replicated::volume_store::{open_volume_node_store, open_volume_spec_store};
+    use crate::store::replicated::volumes::{open_volume_node_store, open_volume_spec_store};
     use crate::volumes::types::{
         LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode,
         VolumeBindingMode, VolumeDriver, VolumeReclaimPolicy, VolumeSpecDraft, VolumeStatus,

@@ -1,6 +1,6 @@
 use crate::gossip::Message;
 use crate::gpu::gpu_runtime_status;
-use crate::store::replicated::scheduler_digest_store::SchedulerDigestStore;
+use crate::store::replicated::scheduler_digests::SchedulerDigestStore;
 use anyhow::{Result as AnyhowResult, anyhow};
 use async_channel::{Receiver, Sender};
 use capnp::Error;
@@ -464,7 +464,7 @@ mod tests {
         SchedulerDigestEvent, SchedulerDigestRegistry, SchedulerDigestValue,
         should_replace_scheduler_digest_event,
     };
-    use crate::store::replicated::scheduler_digest_store::open_scheduler_digest_store;
+    use crate::store::replicated::scheduler_digests::open_scheduler_digest_store;
     use mantissa_store::codec::StoreValueCodec;
     use std::sync::Arc;
     use tempfile::tempdir;

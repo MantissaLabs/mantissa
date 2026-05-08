@@ -8,7 +8,7 @@ use common::testkit::{ClusterConfig, RuntimeBackendOverrideGuard, TestNode};
 use mantissa::cluster::ClusterViewId;
 use mantissa::node::id::set_node_id;
 use mantissa::secrets::master_key::envelope::PassphraseKdfParams;
-use mantissa::store::replicated::secret_master_key_store::current_for_scope;
+use mantissa::store::replicated::secret_key_sync::current_for_scope;
 use mantissa_protocol::secrets::secrets;
 use mantissa_protocol::topology::ClusterOperationStage;
 use std::time::{Duration, Instant};

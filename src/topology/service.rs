@@ -14,8 +14,8 @@ use crate::secrets::master_key::reconciler::SecretMasterKeyReconciler;
 use crate::secrets::master_key::replication::SecretMasterKeyGrantRecipient;
 use crate::server::credential::ClusterCredential;
 use crate::store::local::{LocalCredentialStore, LocalSessionStore};
-use crate::store::replicated::peer_store::PeersStore;
-use crate::store::replicated::secret_master_key_store::{
+use crate::store::replicated::peers::PeersStore;
+use crate::store::replicated::secret_key_sync::{
     SecretMasterKeyCurrent, SecretMasterKeySyncRecord, current_for_scope, current_row_id,
     read_secret_master_key_sync_record, upsert_record,
 };
@@ -1536,7 +1536,7 @@ mod tests {
     use super::{join_current_conflicts, restored_local_peer_value};
     use crate::cluster::ClusterViewId;
     use crate::runtime::types::RuntimeSupportProfile;
-    use crate::store::replicated::secret_master_key_store::SecretMasterKeyCurrent;
+    use crate::store::replicated::secret_key_sync::SecretMasterKeyCurrent;
     use crate::topology::peers::{
         PeerLabel, PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue,
         WireGuardPeerValue,

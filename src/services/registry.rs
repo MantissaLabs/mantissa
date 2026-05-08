@@ -1,6 +1,6 @@
 use crate::services::ordering::compare_service_specs;
 use crate::services::types::{ServiceSpecValue, ServiceStatus, compute_service_id};
-use crate::store::replicated::service_store::ServiceStore;
+use crate::store::replicated::services::ServiceStore;
 use anyhow::{Result, anyhow};
 use mantissa_store::uuid_key::UuidKey;
 use std::collections::HashSet;
@@ -140,7 +140,7 @@ mod tests {
     use super::*;
     use crate::services::types::TaskTemplateSpecValue;
     use crate::services::types::{ServiceRolloutState, ServiceStatus};
-    use crate::store::replicated::service_store::open_service_store;
+    use crate::store::replicated::services::open_service_store;
     use crate::workload::types::ExecutionSpec;
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use redb::Database;

@@ -6,32 +6,32 @@ use crate::cluster::{
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::master_key::envelope::PassphraseProvider;
 use crate::server::auth::AuthStore;
-use crate::store::cluster_operation_store::ClusterOperationStore;
+use crate::store::cluster_operations::ClusterOperationStore;
 use crate::store::local::{
     LocalCredentialStore, LocalSessionStore, SecretMasterStore,
     next_root_schema_publication_generation,
 };
-use crate::store::replicated::agent_store::{AgentStore, open_agent_store};
-use crate::store::replicated::cluster_view_store::ClusterViewStore;
-use crate::store::replicated::job_store::{JobStore, open_job_store};
-use crate::store::replicated::network_store::{
+use crate::store::replicated::agents::{AgentStore, open_agent_store};
+use crate::store::replicated::cluster_views::ClusterViewStore;
+use crate::store::replicated::jobs::{JobStore, open_job_store};
+use crate::store::replicated::networks::{
     NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore, open_network_attachment_store,
     open_network_peer_store, open_network_spec_store,
 };
-use crate::store::replicated::peer_store::{PeersStore, open_peers_store};
-use crate::store::replicated::scheduler_digest_store::{
+use crate::store::replicated::peers::{PeersStore, open_peers_store};
+use crate::store::replicated::scheduler::{SchedulerStore, open_scheduler_store};
+use crate::store::replicated::scheduler_digests::{
     SchedulerDigestStore, open_scheduler_digest_store,
 };
-use crate::store::replicated::scheduler_store::{SchedulerStore, open_scheduler_store};
-use crate::store::replicated::secret_master_key_store::{
+use crate::store::replicated::secret_key_sync::{
     SecretMasterKeyStore, open_secret_master_key_store,
 };
-use crate::store::replicated::secret_store::{SecretStore, open_secret_store};
-use crate::store::replicated::service_store::{ServiceStore, open_service_store};
-use crate::store::replicated::volume_store::{
+use crate::store::replicated::secrets::{SecretStore, open_secret_store};
+use crate::store::replicated::services::{ServiceStore, open_service_store};
+use crate::store::replicated::volumes::{
     VolumeNodeStore, VolumeSpecStore, open_volume_node_store, open_volume_spec_store,
 };
-use crate::store::replicated::workload_store::{WorkloadStore, open_workload_store};
+use crate::store::replicated::workloads::{WorkloadStore, open_workload_store};
 use crate::token::TokenStore;
 use std::sync::Arc;
 use tokio::sync::RwLock;
