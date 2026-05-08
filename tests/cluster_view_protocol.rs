@@ -2984,12 +2984,20 @@ local_test!(
         )
         .await;
 
-        let rows = cluster_view_rows(&joiner_a.topology()).await;
-        assert_eq!(
-            rows.len(),
-            1,
-            "merged cluster listing should retire the split source view"
-        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let rows = loop {
+            let rows = cluster_view_rows(&joiner_a.topology()).await;
+            if rows.len() == 1 && rows[0].0 == split_destination_view && rows[0].1 == 2 && rows[0].2
+            {
+                break rows;
+            }
+
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "merged cluster view listing did not converge after peer leave; last rows={rows:?}"
+            );
+            sleep(Duration::from_millis(100)).await;
+        };
         let (merged_view, merged_count, merged_local_active) = rows[0];
         assert_eq!(
             merged_view, split_destination_view,
