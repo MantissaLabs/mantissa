@@ -56,7 +56,7 @@ cargo build
 3. Start the first node and grab its join token:
 
 ```bash
-mantissa init
+sudo mantissa init
 mantissa token show
 ```
 
@@ -71,7 +71,7 @@ stream daemon logs with `mantissa logs -f`, and stop it with
 4. Join a second node (replace `<vm1-ip>` and `<TOKEN>`):
 
 ```bash
-mantissa init
+sudo mantissa init
 mantissa join --anchor <vm1-ip>:6578 --join-token <TOKEN>
 ```
 
