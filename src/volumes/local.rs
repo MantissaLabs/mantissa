@@ -8,9 +8,23 @@ use crate::volumes::types::{
     LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeDriver, VolumeSpecValue,
 };
 
+#[cfg(unix)]
+const ROOT_VOLUME_WRAPPER_DIR_MODE: u32 = 0o710;
+#[cfg(unix)]
+const USER_VOLUME_WRAPPER_DIR_MODE: u32 = 0o700;
+
 /// Returns the managed data path for one local volume under the configured root.
 pub fn managed_volume_data_path(root: &Path, volume_id: Uuid) -> PathBuf {
-    root.join(volume_id.to_string()).join("data")
+    managed_volume_wrapper_path(root, volume_id).join("data")
+}
+
+/// Ensures the configured managed local-volume root has Mantissa's wrapper permissions.
+pub fn ensure_local_volume_root(root: &Path) -> Result<()> {
+    fs::create_dir_all(root)
+        .with_context(|| format!("failed to create local volume root {}", root.display()))?;
+    normalize_volume_wrapper_permissions(root)
+        .with_context(|| format!("failed to normalize local volume root {}", root.display()))?;
+    Ok(())
 }
 
 /// Resolves the concrete local filesystem path for one local-driver volume on its bound node.
@@ -39,6 +53,22 @@ pub fn ensure_local_volume_path(root: &Path, spec: &VolumeSpecValue) -> Result<P
             source: LocalVolumeSource::Managed,
             ownership,
         }) => {
+            ensure_local_volume_root(root)?;
+            let wrapper_path = managed_volume_wrapper_path(root, spec.id);
+            fs::create_dir_all(&wrapper_path).with_context(|| {
+                format!(
+                    "failed to create managed local volume wrapper {} for '{}'",
+                    wrapper_path.display(),
+                    spec.name
+                )
+            })?;
+            normalize_volume_wrapper_permissions(&wrapper_path).with_context(|| {
+                format!(
+                    "failed to normalize managed local volume wrapper {} for '{}'",
+                    wrapper_path.display(),
+                    spec.name
+                )
+            })?;
             fs::create_dir_all(&path).with_context(|| {
                 format!(
                     "failed to create managed local volume path {} for '{}'",
@@ -77,6 +107,50 @@ pub fn ensure_local_volume_path(root: &Path, spec: &VolumeSpecValue) -> Result<P
     }
 
     Ok(path)
+}
+
+/// Returns the non-data wrapper directory for one managed local volume.
+fn managed_volume_wrapper_path(root: &Path, volume_id: Uuid) -> PathBuf {
+    root.join(volume_id.to_string())
+}
+
+/// Applies Mantissa's ownership policy to a volume root or per-volume wrapper directory.
+#[cfg(unix)]
+fn normalize_volume_wrapper_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let desired_mode = if mantissa_net::paths::running_as_root() {
+        ROOT_VOLUME_WRAPPER_DIR_MODE
+    } else {
+        USER_VOLUME_WRAPPER_DIR_MODE
+    };
+    let metadata = fs::metadata(path).with_context(|| {
+        format!(
+            "failed to read managed local volume wrapper metadata for {}",
+            path.display()
+        )
+    })?;
+    let current_mode = metadata.permissions().mode() & 0o7777;
+    if current_mode != desired_mode {
+        fs::set_permissions(path, fs::Permissions::from_mode(desired_mode)).with_context(|| {
+            format!(
+                "failed to set managed local volume wrapper mode {:o} on {}",
+                desired_mode,
+                path.display()
+            )
+        })?;
+    }
+
+    if mantissa_net::paths::running_as_root() {
+        mantissa_net::paths::ensure_mantissa_group(path);
+    }
+    Ok(())
+}
+
+/// Leaves volume wrapper permissions unchanged on non-Unix targets.
+#[cfg(not(unix))]
+fn normalize_volume_wrapper_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Applies Mantissa's managed-volume ownership policy to one realized data directory.
@@ -201,16 +275,55 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempdir().expect("create temp volume root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777))
+            .expect("loosen volume root");
         let spec = managed_volume_spec();
         let path = ensure_local_volume_path(root.path(), &spec).expect("realize managed volume");
+        let wrapper = managed_volume_wrapper_path(root.path(), spec.id);
+        let root_metadata = fs::metadata(root.path()).expect("stat volume root");
+        let wrapper_metadata = fs::metadata(&wrapper).expect("stat volume wrapper");
         let metadata = fs::metadata(&path).expect("stat managed volume path");
+        let root_mode = root_metadata.permissions().mode() & 0o7777;
+        let wrapper_mode = wrapper_metadata.permissions().mode() & 0o7777;
         let mode = metadata.permissions().mode() & 0o7777;
         let (uid, gid) = current_process_ids();
+        let expected_wrapper_mode = if mantissa_net::paths::running_as_root() {
+            ROOT_VOLUME_WRAPPER_DIR_MODE
+        } else {
+            USER_VOLUME_WRAPPER_DIR_MODE
+        };
 
         assert_eq!(path, managed_volume_data_path(root.path(), spec.id));
+        assert_eq!(root_mode, expected_wrapper_mode);
+        assert_eq!(wrapper_mode, expected_wrapper_mode);
         assert_eq!(mode, LocalVolumeOwnership::Daemon.directory_mode());
         assert_eq!(metadata.uid(), uid);
         assert_eq!(metadata.gid(), gid);
+    }
+
+    /// Ensures the standalone volume-root helper tightens loose configured roots.
+    #[test]
+    #[cfg(unix)]
+    fn ensure_local_volume_root_tightens_configured_root_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().expect("create temp volume root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777))
+            .expect("loosen volume root");
+        let expected_mode = if mantissa_net::paths::running_as_root() {
+            ROOT_VOLUME_WRAPPER_DIR_MODE
+        } else {
+            USER_VOLUME_WRAPPER_DIR_MODE
+        };
+
+        ensure_local_volume_root(root.path()).expect("tighten configured volume root");
+
+        let mode = fs::metadata(root.path())
+            .expect("stat volume root")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, expected_mode);
     }
 
     /// Ensures explicit user ownership rewrites the managed directory to the requested uid and gid.

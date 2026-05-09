@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::ip_family::DefaultIpFamilyPolicy;
+use crate::volumes::local::ensure_local_volume_root;
 
 /// # Description:
 ///
@@ -896,8 +897,7 @@ pub fn local_volume_root() -> Result<PathBuf> {
         .map(|path| PathBuf::from(path.trim()))
         .filter(|path| !path.as_os_str().is_empty());
     let root = configured.unwrap_or(ensure_state_dir()?.join("volumes"));
-    fs::create_dir_all(&root)
-        .with_context(|| format!("failed to create local volume root {}", root.display()))?;
+    ensure_local_volume_root(&root)?;
     Ok(root)
 }
 
