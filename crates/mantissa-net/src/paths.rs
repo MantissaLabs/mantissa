@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-const SYSTEM_STATE_DIR: &str = "/var/lib/mantissa";
+pub const SYSTEM_STATE_DIR: &str = "/var/lib/mantissa";
 const USER_STATE_SUBDIR: &str = ".mantissa";
 const MANTISSA_GROUP: &str = "mantissa";
 pub const STATE_DIR_ENV: &str = "MANTISSA_STATE_DIR";

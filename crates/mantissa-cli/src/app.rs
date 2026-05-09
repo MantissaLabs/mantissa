@@ -5,7 +5,7 @@ use mantissa_client::config::ClientConfig;
 use std::io::{IsTerminal, Read};
 use std::path::Path;
 use tokio::task::LocalSet;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::cli::*;
 use mantissa::config;
@@ -47,6 +47,17 @@ fn resolve_local_volume_ownership(
     }
 }
 
+/// Returns the state directory explicitly selected by one local daemon lifecycle command.
+fn command_state_dir(cmd: &Command) -> Option<&std::path::PathBuf> {
+    match cmd {
+        Command::Init(init) => init.state_dir.as_ref(),
+        Command::Status(args) => args.state_dir.as_ref(),
+        Command::Shutdown(args) => args.state_dir.as_ref(),
+        Command::Logs(args) => args.state_dir.as_ref(),
+        _ => None,
+    }
+}
+
 /// Executes the CLI command dispatcher for pre-parsed arguments.
 ///
 /// Keeping this path in the library avoids compiling the application module graph through
@@ -56,17 +67,16 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
     let MantissaCli {
         config: config_arg,
         listen,
+        name,
+        verbosity,
         cmd,
-        ..
     } = args;
 
     let config_path = config_arg.as_deref().map(Path::new);
     let (resolved_config, source) = config::load_config_with_source(config_path)?;
     config::set_global_config_with_source(resolved_config, source);
 
-    if let Command::Init(init) = &cmd
-        && let Some(state_dir) = &init.state_dir
-    {
+    if let Some(state_dir) = command_state_dir(&cmd) {
         mantissa_net::paths::set_state_dir_override(state_dir.clone())?;
     }
 
@@ -77,6 +87,29 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
 
     match cmd {
         Command::Init(init) => {
+            if init.detach {
+                let prompted_passphrase = if init.master_key_passphrase_file.is_none()
+                    && init.master_key_passphrase_fd.is_none()
+                {
+                    Some(Zeroizing::new(read_master_key_passphrase_bytes(&init)?))
+                } else {
+                    None
+                };
+                local
+                    .run_until(crate::daemon::start_detached(
+                        crate::daemon::DetachedInitOptions {
+                            config: config_arg.as_deref(),
+                            listen: &listen,
+                            name: name.as_deref(),
+                            verbosity,
+                            init: &init,
+                            prompted_passphrase,
+                        },
+                    ))
+                    .await?;
+                return Ok(());
+            }
+
             if init.reset_identity {
                 let report =
                     mantissa::recovery::reset_identity(mantissa::recovery::ResetIdentityOptions {
@@ -86,6 +119,13 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                 print!("{report}");
             }
 
+            let state_dir =
+                mantissa_net::paths::ensure_state_dir().map_err(|error| anyhow!("{error}"))?;
+            let _metadata_guard = if init.daemon_child {
+                None
+            } else {
+                Some(crate::daemon::record_foreground_start(&state_dir, &listen)?)
+            };
             let master_key_passphrase = resolve_master_key_passphrase(&init)?;
             let advertise_addr = init.advertise.or_else(config::advertise_addr);
             local
@@ -98,6 +138,18 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                 ))
                 .await
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
+        }
+
+        Command::Status(args) => {
+            local.run_until(crate::daemon::status(&args)).await?;
+        }
+
+        Command::Shutdown(args) => {
+            local.run_until(crate::daemon::shutdown(&args)).await?;
+        }
+
+        Command::Logs(args) => {
+            local.run_until(crate::daemon::logs(&args)).await?;
         }
 
         Command::Info(_info) => {
@@ -704,6 +756,12 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
 
 /// Resolves the passphrase used to unlock or initialize the local master key envelope.
 fn resolve_master_key_passphrase(init: &InitArgs) -> Result<SecretPassphrase> {
+    SecretPassphrase::new(read_master_key_passphrase_bytes(init)?)
+        .map_err(|error| anyhow!("{error}"))
+}
+
+/// Reads passphrase bytes from the configured CLI source or interactive prompt.
+fn read_master_key_passphrase_bytes(init: &InitArgs) -> Result<Vec<u8>> {
     let bytes = if let Some(path) = &init.master_key_passphrase_file {
         read_passphrase_file(path)?
     } else if let Some(fd) = init.master_key_passphrase_fd {
@@ -712,7 +770,9 @@ fn resolve_master_key_passphrase(init: &InitArgs) -> Result<SecretPassphrase> {
         prompt_master_key_passphrase()?
     };
 
-    SecretPassphrase::new(strip_trailing_newlines(bytes)).map_err(|error| anyhow!("{error}"))
+    let bytes = strip_trailing_newlines(bytes);
+    let _validated = SecretPassphrase::new(bytes.clone()).map_err(|error| anyhow!("{error}"))?;
+    Ok(bytes)
 }
 
 /// Prompts for a passphrase when Mantissa is attached to an interactive terminal.

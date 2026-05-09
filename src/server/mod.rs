@@ -67,10 +67,19 @@ impl RunHandles {
     /// This centralizes the listener join behavior so blocking startup does not
     /// have to duplicate the same await logic as the non-blocking path.
     pub async fn join(self) {
-        if let Some(unix) = self.unix_task {
-            let _ = tokio::join!(self.tcp_task, unix);
+        let mut handles = self;
+        handles.wait().await;
+    }
+
+    /// Waits for the transport tasks without taking ownership of the handles.
+    ///
+    /// Blocking daemon startup uses this inside a signal-aware select so it can
+    /// still abort listeners when the process receives a shutdown signal.
+    pub async fn wait(&mut self) {
+        if let Some(unix) = self.unix_task.as_mut() {
+            let _ = tokio::join!(&mut self.tcp_task, unix);
         } else {
-            let _ = self.tcp_task.await;
+            let _ = (&mut self.tcp_task).await;
         }
     }
 

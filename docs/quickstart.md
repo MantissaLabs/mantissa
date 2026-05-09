@@ -23,6 +23,9 @@ mantissa init
 `mantissa init` prompts for the local master-key envelope passphrase when run
 interactively. For non-interactive starts, use
 `--master-key-passphrase-file <file>` or `--master-key-passphrase-fd <fd>`.
+To keep the daemon in the background, run `mantissa init --detach`; it still
+prompts when attached to a terminal. Use `mantissa status`, `mantissa logs -f`,
+and `mantissa shutdown` for the local process lifecycle.
 
 2) In a second terminal, fetch the join token:
 

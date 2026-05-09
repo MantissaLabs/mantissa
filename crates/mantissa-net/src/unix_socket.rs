@@ -1,4 +1,6 @@
-use crate::paths::{STATE_DIR_ENV, ensure_mantissa_group, running_as_root, state_dir_override};
+use crate::paths::{
+    STATE_DIR_ENV, SYSTEM_STATE_DIR, ensure_mantissa_group, running_as_root, state_dir_override,
+};
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 use mantissa_protocol::server::cluster_session;
@@ -14,18 +16,51 @@ use tracing::info;
 /// List potential Unix socket locations ordered by preference.
 pub fn candidate_unix_socket_paths() -> Vec<PathBuf> {
     let mut v = Vec::new();
-    v.push(PathBuf::from("/var/run/mantissa.sock")); // default
-    v.push(PathBuf::from("/run/mantissa.sock"));
-    if let Ok(dir) = env::var("XDG_RUNTIME_DIR") {
-        v.push(Path::new(&dir).join("mantissa").join("mantissa.sock"));
+    if let Some(path) = explicit_state_socket_path() {
+        push_socket_candidate(&mut v, path);
     }
-    if let Some(path) = user_state_socket_path() {
-        v.push(path);
+    push_socket_candidate(&mut v, PathBuf::from("/var/run/mantissa.sock")); // default
+    push_socket_candidate(&mut v, PathBuf::from("/run/mantissa.sock"));
+    push_socket_candidate(&mut v, system_state_socket_path());
+    if let Ok(dir) = env::var("XDG_RUNTIME_DIR") {
+        push_socket_candidate(
+            &mut v,
+            Path::new(&dir).join("mantissa").join("mantissa.sock"),
+        );
+    }
+    if explicit_state_socket_path().is_none()
+        && let Some(path) = user_state_socket_path()
+    {
+        push_socket_candidate(&mut v, path);
     }
     if !running_as_root() {
-        v.push(private_tmp_socket_path());
+        push_socket_candidate(&mut v, private_tmp_socket_path());
     }
     v
+}
+
+/// Adds one candidate path while preserving discovery order and uniqueness.
+fn push_socket_candidate(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+/// Return the socket path inside the root daemon's persistent state directory.
+pub fn system_state_socket_path() -> PathBuf {
+    Path::new(SYSTEM_STATE_DIR).join("mantissa.sock")
+}
+
+/// Return the socket path for an explicitly configured state directory.
+fn explicit_state_socket_path() -> Option<PathBuf> {
+    if let Some(dir) = state_dir_override() {
+        return Some(dir.join("mantissa.sock"));
+    }
+
+    env::var_os(STATE_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|dir| dir.join("mantissa.sock"))
 }
 
 /// Return the state-directory socket path when a state directory can be resolved.
@@ -171,6 +206,16 @@ mod tests {
                 .iter()
                 .any(|path| path == &public_tmp_socket),
             "local control socket must not fall back to a shared /tmp path"
+        );
+    }
+
+    #[test]
+    fn candidate_paths_include_system_state_socket() {
+        assert!(
+            candidate_unix_socket_paths()
+                .iter()
+                .any(|path| path == &system_state_socket_path()),
+            "clients should discover root daemons listening under the system state directory"
         );
     }
 

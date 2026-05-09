@@ -176,6 +176,18 @@ impl ClusterSessionImpl {
 }
 
 impl cluster_session::Server for ClusterSessionImpl {
+    /// Answers a lightweight session liveness probe.
+    ///
+    /// Local daemon lifecycle commands use this to distinguish an accepting
+    /// Unix socket from a fully usable cluster session capability.
+    async fn ping(
+        self: Rc<Self>,
+        _params: cluster_session::PingParams,
+        _results: cluster_session::PingResults,
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()
+    }
+
     /// Get all capabilities.
     async fn get_capabilities(
         self: Rc<Self>,

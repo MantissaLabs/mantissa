@@ -3,6 +3,10 @@
 Common commands:
 
 - `mantissa init` - bootstrap a standalone node (blocking until interrupted)
+- `mantissa init --detach` - prompt if needed, start the local daemon in the background, and wait until it is reachable
+- `mantissa status` - inspect local daemon pid, socket, health, and log paths
+- `mantissa logs [-f] [--tail <n|all>]` - read or follow detached daemon logs
+- `mantissa shutdown [--force]` - gracefully stop the local daemon process
 - `mantissa init --master-key-passphrase-file <file>` - read the local master-key envelope passphrase from an owner-protected file
 - `mantissa init --master-key-passphrase-fd <fd>` - read the local master-key envelope passphrase from an inherited file descriptor
 - `mantissa init --reset-identity --state-dir <dir>` - reset copied node identity before bootstrap

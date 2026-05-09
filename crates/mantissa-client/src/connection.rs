@@ -192,24 +192,103 @@ pub async fn get_local_session(
         return get_client_unix_path(p.clone()).await;
     }
 
-    // Auto discover local socket.
-    let mut tried: Vec<PathBuf> = Vec::new();
-    for p in candidate_unix_socket_paths() {
+    let (_path, stream) = connect_discovered_unix_stream(candidate_unix_socket_paths()).await?;
+    client_from_unix_stream(stream).await
+}
+
+/// Opens the first usable Unix socket from an auto-discovery candidate list.
+async fn connect_discovered_unix_stream(
+    paths: Vec<PathBuf>,
+) -> Result<(PathBuf, UnixStream), ClientSocketError> {
+    let mut tried = Vec::new();
+    let mut first_permission_denied = None;
+    let mut first_refused = None;
+    let mut first_not_socket = None;
+    let mut first_other = None;
+
+    for p in paths {
         tried.push(p.clone());
         if let Some(e) = classify_path_not_socket(&p) {
-            return Err(e);
+            if first_not_socket.is_none() {
+                first_not_socket = Some(e);
+            }
+            continue;
         }
         match UnixStream::connect(&p).await {
-            Ok(stream) => return client_from_unix_stream(stream).await,
+            Ok(stream) => return Ok((p, stream)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                return Err(ClientSocketError::PermissionDenied { path: p });
+                if first_permission_denied.is_none() {
+                    first_permission_denied = Some(ClientSocketError::PermissionDenied { path: p });
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-                return Err(ClientSocketError::Refused { path: p });
+                if first_refused.is_none() {
+                    first_refused = Some(ClientSocketError::Refused { path: p });
+                }
             }
-            Err(e) => return Err(ClientSocketError::Other { path: p, source: e }),
+            Err(e) => {
+                if first_other.is_none() {
+                    first_other = Some(ClientSocketError::Other { path: p, source: e });
+                }
+            }
         }
     }
+
+    if let Some(e) = first_permission_denied {
+        return Err(e);
+    }
+    if let Some(e) = first_refused {
+        return Err(e);
+    }
+    if let Some(e) = first_not_socket {
+        return Err(e);
+    }
+    if let Some(e) = first_other {
+        return Err(e);
+    }
     Err(ClientSocketError::NotFound { tried })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::net::UnixListener;
+
+    /// Creates a unique test directory below the system temp directory.
+    fn test_socket_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock before epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mantissa-client-socket-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create test socket dir");
+        dir
+    }
+
+    #[tokio::test]
+    async fn auto_discovery_skips_refused_stale_socket() {
+        let dir = test_socket_dir();
+        let stale = dir.join("stale.sock");
+        let live = dir.join("live.sock");
+        let stale_listener = UnixListener::bind(&stale).expect("bind stale socket");
+        drop(stale_listener);
+        let live_listener = UnixListener::bind(&live).expect("bind live socket");
+        let accept = tokio::spawn(async move {
+            let _accepted = live_listener.accept().await;
+        });
+
+        let (path, stream) = connect_discovered_unix_stream(vec![stale, live.clone()])
+            .await
+            .expect("connect live socket after stale refusal");
+
+        assert_eq!(path, live);
+        drop(stream);
+        accept.await.expect("accept task");
+        fs::remove_dir_all(dir).expect("remove test socket dir");
+    }
 }

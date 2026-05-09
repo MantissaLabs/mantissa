@@ -6,6 +6,7 @@ mod agents;
 mod app;
 mod cli;
 mod clusters;
+mod daemon;
 mod host_ports;
 mod jobs;
 mod networks;

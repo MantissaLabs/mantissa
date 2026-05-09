@@ -110,6 +110,15 @@ pub enum Command {
     /// Leave an existing cluster
     Leave(LeaveArgs),
 
+    /// Show local Mantissa daemon status
+    Status(DaemonStatusArgs),
+
+    /// Shut down the local Mantissa daemon
+    Shutdown(DaemonShutdownArgs),
+
+    /// Read logs from the local Mantissa daemon
+    Logs(DaemonLogsArgs),
+
     /// Nodes subcommands
     #[command(alias = "n", subcommand_required = true, arg_required_else_help = true)]
     Nodes {
@@ -213,6 +222,14 @@ pub struct InitArgs {
     #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub debug: bool,
 
+    /// Start Mantissa in the background and return after the local daemon is reachable
+    #[arg(long = "detach", action = ArgAction::SetTrue, conflicts_with = "daemon_child")]
+    pub detach: bool,
+
+    /// Internal marker used by `mantissa init --detach` for the spawned daemon process
+    #[arg(long = "daemon-child", action = ArgAction::SetTrue, hide = true)]
+    pub daemon_child: bool,
+
     /// Publish this address to peers instead of inferring it from local routing
     #[arg(long = "advertise", value_name = "HOST:PORT")]
     pub advertise: Option<String>,
@@ -224,6 +241,19 @@ pub struct InitArgs {
     /// State directory to initialize, defaults to Mantissa's root/user state directory
     #[arg(long = "state-dir", value_name = "DIR")]
     pub state_dir: Option<PathBuf>,
+
+    /// Log file used by detached daemon mode, defaults below the state directory
+    #[arg(long = "log-file", value_name = "FILE", requires = "detach")]
+    pub log_file: Option<PathBuf>,
+
+    /// Maximum time to wait for a detached daemon to become locally reachable
+    #[arg(
+        long = "detach-timeout",
+        value_name = "DURATION",
+        default_value = "10s",
+        value_parser = parse_cli_duration
+    )]
+    pub detach_timeout: Duration,
 
     /// Read the secret master key passphrase from an owner-protected file
     #[arg(
@@ -240,6 +270,52 @@ pub struct InitArgs {
         conflicts_with = "master_key_passphrase_file"
     )]
     pub master_key_passphrase_fd: Option<i32>,
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonStatusArgs {
+    /// State directory whose daemon metadata should be inspected
+    #[arg(long = "state-dir", value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonShutdownArgs {
+    /// State directory whose daemon should be stopped
+    #[arg(long = "state-dir", value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+
+    /// Kill the process if graceful shutdown does not finish before the timeout
+    #[arg(long = "force", action = ArgAction::SetTrue)]
+    pub force: bool,
+
+    /// Maximum time to wait for graceful shutdown before returning or forcing
+    #[arg(
+        long = "timeout",
+        value_name = "DURATION",
+        default_value = "10s",
+        value_parser = parse_cli_duration
+    )]
+    pub timeout: Duration,
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonLogsArgs {
+    /// State directory whose daemon log metadata should be inspected
+    #[arg(long = "state-dir", value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+
+    /// Read this daemon log file instead of the metadata/default path
+    #[arg(long = "file", value_name = "FILE")]
+    pub file: Option<PathBuf>,
+
+    /// Number of lines to show from the end of the daemon log, or `all`
+    #[arg(long = "tail", value_name = "N", default_value = "100", value_parser = parse_log_tail)]
+    pub tail: String,
+
+    /// Continue streaming appended daemon log lines
+    #[arg(short = 'f', long = "follow", action = ArgAction::SetTrue)]
+    pub follow: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1711,4 +1787,76 @@ impl From<SplitArgs> for mantissa_client::clusters::SplitCommandRequest {
 pub enum MergeServicePolicyOpt {
     Rebalance,
     Preserve,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_detach_parses_with_daemon_log_options() {
+        let cli = MantissaCli::try_parse_from([
+            "mantissa",
+            "--listen",
+            "127.0.0.1:6578",
+            "init",
+            "--detach",
+            "--log-file",
+            "/tmp/mantissa.log",
+            "--detach-timeout",
+            "250ms",
+            "--master-key-passphrase-file",
+            "/tmp/passphrase",
+        ])
+        .unwrap();
+
+        match cli.cmd {
+            Command::Init(args) => {
+                assert!(args.detach);
+                assert_eq!(args.log_file, Some(PathBuf::from("/tmp/mantissa.log")));
+                assert_eq!(args.detach_timeout, Duration::from_millis(250));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn root_lifecycle_commands_parse_state_dir_options() {
+        let status = MantissaCli::try_parse_from([
+            "mantissa",
+            "status",
+            "--state-dir",
+            "/tmp/mantissa-state",
+        ])
+        .unwrap();
+        assert!(matches!(
+            status.cmd,
+            Command::Status(DaemonStatusArgs { state_dir: Some(path) })
+                if path.as_path() == std::path::Path::new("/tmp/mantissa-state")
+        ));
+
+        let shutdown = MantissaCli::try_parse_from([
+            "mantissa",
+            "shutdown",
+            "--state-dir",
+            "/tmp/mantissa-state",
+            "--force",
+            "--timeout",
+            "1s",
+        ])
+        .unwrap();
+        assert!(matches!(
+            shutdown.cmd,
+            Command::Shutdown(DaemonShutdownArgs { force: true, timeout, .. })
+                if timeout == Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn init_log_file_requires_detach() {
+        let parsed =
+            MantissaCli::try_parse_from(["mantissa", "init", "--log-file", "/tmp/mantissa.log"]);
+
+        assert!(parsed.is_err());
+    }
 }
