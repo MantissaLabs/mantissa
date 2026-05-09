@@ -11,7 +11,7 @@ use tokio::time::sleep;
 use zeroize::Zeroizing;
 
 #[cfg(unix)]
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(not(unix))]
@@ -89,7 +89,7 @@ pub(crate) async fn start_detached(options: DetachedInitOptions<'_>) -> Result<(
     drop(passphrase_pipe);
     let pid = child.id();
     let mut metadata =
-        DaemonMetadata::new(pid, state_dir.clone(), log_path.clone(), options.listen);
+        DaemonMetadata::new(pid, state_dir.clone(), log_path.clone(), options.listen)?;
     write_metadata(&state_dir, &metadata)?;
 
     match wait_for_daemon_ready(&mut child, options.init.detach_timeout, preferred_socket).await {
@@ -127,7 +127,7 @@ pub(crate) fn record_foreground_start(
         state_dir.to_path_buf(),
         default_log_path(state_dir),
         listen,
-    );
+    )?;
     let path = write_metadata(state_dir, &metadata)?;
     Ok(ForegroundMetadataGuard { path, pid })
 }
@@ -143,7 +143,7 @@ pub(crate) async fn status(args: &DaemonStatusArgs) -> Result<()> {
     let reachable = connect_reachable_socket(preferred_socket).await;
     let pid_state = metadata
         .as_ref()
-        .map(|value| process_state(value.pid))
+        .map(metadata_process_state)
         .unwrap_or(ProcessState::Unknown);
 
     if let Some((socket_path, session)) = reachable {
@@ -197,14 +197,23 @@ pub(crate) async fn shutdown(args: &DaemonShutdownArgs) -> Result<()> {
         )
     })?;
 
-    if process_state(metadata.pid) != ProcessState::Alive {
-        remove_metadata_if_matches(&state_dir, metadata.pid);
-        println!("Mantissa daemon is already stopped");
-        return Ok(());
+    match metadata_process_state(&metadata) {
+        ProcessState::Alive => {}
+        ProcessState::Dead => {
+            remove_metadata_if_matches(&state_dir, metadata.pid);
+            println!("Mantissa daemon is already stopped");
+            return Ok(());
+        }
+        ProcessState::Unknown => {
+            return Err(anyhow!(
+                "daemon pid {} cannot be verified; refusing to signal an untrusted pid",
+                metadata.pid
+            ));
+        }
     }
 
-    send_signal(metadata.pid, ShutdownSignal::Terminate)?;
-    if wait_for_process_exit(metadata.pid, args.timeout).await {
+    send_signal(&metadata, ShutdownSignal::Terminate)?;
+    if wait_for_process_exit(&metadata, args.timeout).await {
         remove_metadata_if_matches(&state_dir, metadata.pid);
         println!("Mantissa daemon stopped");
         return Ok(());
@@ -218,8 +227,8 @@ pub(crate) async fn shutdown(args: &DaemonShutdownArgs) -> Result<()> {
         ));
     }
 
-    send_signal(metadata.pid, ShutdownSignal::Kill)?;
-    if wait_for_process_exit(metadata.pid, args.timeout).await {
+    send_signal(&metadata, ShutdownSignal::Kill)?;
+    if wait_for_process_exit(&metadata, args.timeout).await {
         remove_metadata_if_matches(&state_dir, metadata.pid);
         println!("Mantissa daemon killed");
         return Ok(());
@@ -262,7 +271,11 @@ fn lifecycle_metadata_target(
 ) -> Result<(PathBuf, Option<DaemonMetadata>)> {
     let state_dir = lifecycle_state_dir(override_dir)?;
     let metadata = read_metadata(&state_dir).ok();
-    if override_dir.is_some() || metadata.is_some() {
+    if override_dir.is_some()
+        || metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata_process_state(metadata) == ProcessState::Alive)
+    {
         return Ok((state_dir, metadata));
     }
 
@@ -471,11 +484,20 @@ fn ensure_no_recorded_daemon(state_dir: &Path) -> Result<()> {
     let Ok(metadata) = read_metadata(state_dir) else {
         return Ok(());
     };
-    if process_state(metadata.pid) == ProcessState::Alive {
-        return Err(anyhow!(
-            "Mantissa daemon is already running with pid {}",
-            metadata.pid
-        ));
+    match metadata_process_state(&metadata) {
+        ProcessState::Alive => {
+            return Err(anyhow!(
+                "Mantissa daemon is already running with pid {}",
+                metadata.pid
+            ));
+        }
+        ProcessState::Unknown => {
+            return Err(anyhow!(
+                "Mantissa daemon pid {} is recorded but cannot be verified",
+                metadata.pid
+            ));
+        }
+        ProcessState::Dead => {}
     }
     remove_metadata_if_matches(state_dir, metadata.pid);
     Ok(())
@@ -706,13 +728,13 @@ async fn follow_log(path: &Path, offset: &mut u64) -> Result<()> {
     }
 }
 
-/// Waits for a process id to disappear before the timeout elapses.
-async fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+/// Waits for the recorded daemon process to disappear before the timeout elapses.
+async fn wait_for_process_exit(metadata: &DaemonMetadata, timeout: Duration) -> bool {
     let Some(deadline) = Instant::now().checked_add(timeout) else {
         return false;
     };
     loop {
-        if process_state(pid) != ProcessState::Alive {
+        if metadata_process_state(metadata) == ProcessState::Dead {
             return true;
         }
         if Instant::now() >= deadline {
@@ -720,6 +742,33 @@ async fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
         }
         sleep(READY_POLL_INTERVAL).await;
     }
+}
+
+/// Returns whether recorded metadata still points at the original daemon process.
+fn metadata_process_state(metadata: &DaemonMetadata) -> ProcessState {
+    match process_state(metadata.pid) {
+        ProcessState::Alive => match metadata_matches_current_process(metadata) {
+            Ok(true) => ProcessState::Alive,
+            Ok(false) => ProcessState::Dead,
+            Err(_) => ProcessState::Unknown,
+        },
+        state => state,
+    }
+}
+
+/// Verifies the current pid occupant against the identity captured at daemon start.
+fn metadata_matches_current_process(metadata: &DaemonMetadata) -> Result<bool> {
+    if !process_start_time_supported() {
+        return Ok(true);
+    }
+
+    let Some(expected) = metadata.process_start_time_ticks else {
+        return Err(anyhow!(
+            "daemon metadata for pid {} does not include process identity",
+            metadata.pid
+        ));
+    };
+    Ok(process_start_time_ticks(metadata.pid)?.is_some_and(|actual| actual == expected))
 }
 
 /// Returns whether a pid appears to belong to a live process.
@@ -747,15 +796,86 @@ fn process_state(pid: u32) -> ProcessState {
     }
 }
 
-/// Sends one shutdown signal to a daemon pid.
-fn send_signal(pid: u32, signal: ShutdownSignal) -> Result<()> {
+/// Sends one shutdown signal to the recorded daemon process.
+fn send_signal(metadata: &DaemonMetadata, signal: ShutdownSignal) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        send_signal_to_pidfd(metadata, signal)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        if !metadata_matches_current_process(metadata)? {
+            return Err(anyhow!(
+                "daemon pid file is stale; pid {} no longer belongs to this Mantissa daemon",
+                metadata.pid
+            ));
+        }
+
+        send_signal_to_pid(metadata.pid, signal)
+    }
+}
+
+/// Sends one shutdown signal through a Linux pidfd for pid-reuse safety.
+#[cfg(target_os = "linux")]
+fn send_signal_to_pidfd(metadata: &DaemonMetadata, signal: ShutdownSignal) -> Result<()> {
+    let pidfd = open_pidfd(metadata.pid)?;
+    if !metadata_matches_current_process(metadata)? {
+        return Err(anyhow!(
+            "daemon pid file is stale; pid {} no longer belongs to this Mantissa daemon",
+            metadata.pid
+        ));
+    }
+
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            raw_signal(signal),
+            std::ptr::null_mut::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "failed to signal daemon pid {}: {}",
+            metadata.pid,
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+/// Opens a stable Linux pidfd for the current occupant of one process id.
+#[cfg(target_os = "linux")]
+fn open_pidfd(pid: u32) -> Result<File> {
+    let result = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if result < 0 {
+        return Err(anyhow!(
+            "failed to open pidfd for daemon pid {}: {}",
+            pid,
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { File::from_raw_fd(result as RawFd) })
+}
+
+/// Converts a shutdown signal into the platform signal number.
+#[cfg(unix)]
+fn raw_signal(signal: ShutdownSignal) -> libc::c_int {
+    match signal {
+        ShutdownSignal::Terminate => libc::SIGTERM,
+        ShutdownSignal::Kill => libc::SIGKILL,
+    }
+}
+
+/// Sends one shutdown signal to a pid after caller-side identity validation.
+#[cfg(not(target_os = "linux"))]
+fn send_signal_to_pid(pid: u32, signal: ShutdownSignal) -> Result<()> {
     #[cfg(unix)]
     {
-        let raw_signal = match signal {
-            ShutdownSignal::Terminate => libc::SIGTERM,
-            ShutdownSignal::Kill => libc::SIGKILL,
-        };
-        let result = unsafe { libc::kill(pid as libc::pid_t, raw_signal) };
+        let result = unsafe { libc::kill(pid as libc::pid_t, raw_signal(signal)) };
         if result == 0 {
             Ok(())
         } else {
@@ -772,6 +892,52 @@ fn send_signal(pid: u32, signal: ShutdownSignal) -> Result<()> {
         let _ = (pid, signal);
         Err(anyhow!("daemon shutdown is only supported on Unix hosts"))
     }
+}
+
+/// Returns whether this platform can capture a stable pid start-time identity.
+fn process_start_time_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// Reads the kernel start-time tick for one live process when supported.
+fn process_start_time_ticks(pid: u32) -> Result<Option<u64>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_process_start_time_ticks(pid)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        Ok(None)
+    }
+}
+
+/// Reads `/proc/<pid>/stat` and returns field 22, the process start time in ticks.
+#[cfg(target_os = "linux")]
+fn linux_process_start_time_ticks(pid: u32) -> Result<Option<u64>> {
+    let path = PathBuf::from("/proc").join(pid.to_string()).join("stat");
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow!(
+                "read process identity from {}: {}",
+                path.display(),
+                error
+            ));
+        }
+    };
+    let (_, fields) = raw
+        .rsplit_once(") ")
+        .ok_or_else(|| anyhow!("malformed process stat {}", path.display()))?;
+    let start_time = fields
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| anyhow!("process stat {} is missing start time", path.display()))?
+        .parse::<u64>()
+        .with_context(|| format!("parse process start time from {}", path.display()))?;
+    Ok(Some(start_time))
 }
 
 /// Converts bytes to lower-case hexadecimal for operator-facing status output.
@@ -793,12 +959,13 @@ struct DaemonMetadata {
     listen_addr: String,
     started_at_unix_secs: u64,
     socket_path: Option<PathBuf>,
+    process_start_time_ticks: Option<u64>,
 }
 
 impl DaemonMetadata {
     /// Builds daemon metadata for a newly started process.
-    fn new(pid: u32, state_dir: PathBuf, log_path: PathBuf, listen_addr: &str) -> Self {
-        Self {
+    fn new(pid: u32, state_dir: PathBuf, log_path: PathBuf, listen_addr: &str) -> Result<Self> {
+        Ok(Self {
             pid,
             state_dir,
             log_path,
@@ -808,7 +975,8 @@ impl DaemonMetadata {
                 .map(|duration| duration.as_secs())
                 .unwrap_or(0),
             socket_path: None,
-        }
+            process_start_time_ticks: process_start_time_ticks(pid)?,
+        })
     }
 
     /// Encodes metadata as simple key-value lines for shell-friendly inspection.
@@ -818,14 +986,19 @@ impl DaemonMetadata {
             .as_ref()
             .map(|path| path_to_string(path))
             .unwrap_or_default();
+        let process_start_time_ticks = self
+            .process_start_time_ticks
+            .map(|value| value.to_string())
+            .unwrap_or_default();
         format!(
-            "pid={}\nstate_dir={}\nlog_path={}\nlisten={}\nstarted_at_unix_secs={}\nsocket_path={}\n",
+            "pid={}\nstate_dir={}\nlog_path={}\nlisten={}\nstarted_at_unix_secs={}\nsocket_path={}\nprocess_start_time_ticks={}\n",
             self.pid,
             path_to_string(&self.state_dir),
             path_to_string(&self.log_path),
             self.listen_addr,
             self.started_at_unix_secs,
-            socket_path
+            socket_path,
+            process_start_time_ticks
         )
     }
 
@@ -851,6 +1024,15 @@ impl DaemonMetadata {
             .get("socket_path")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
+        let process_start_time_ticks = fields
+            .get("process_start_time_ticks")
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .context("parse daemon process start time")
+            })
+            .transpose()?;
 
         Ok(Self {
             pid,
@@ -859,6 +1041,7 @@ impl DaemonMetadata {
             listen_addr,
             started_at_unix_secs,
             socket_path,
+            process_start_time_ticks,
         })
     }
 }
@@ -1080,12 +1263,32 @@ mod tests {
             state_dir.clone(),
             state_dir.join("logs").join("mantissa.log"),
             "127.0.0.1:0",
-        );
+        )
+        .expect("build daemon metadata");
 
         let pid_path = write_metadata(&state_dir, &metadata).expect("write daemon metadata");
 
         assert_eq!(mode(&state_dir), expected_dir_mode());
         assert_eq!(mode(&pid_path), expected_file_mode());
+        fs::remove_dir_all(state_dir).expect("remove daemon test directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn metadata_process_state_rejects_reused_pid_identity() {
+        let state_dir = test_state_dir();
+        let mut metadata = DaemonMetadata::new(
+            std::process::id(),
+            state_dir.clone(),
+            state_dir.join("logs").join("mantissa.log"),
+            "127.0.0.1:0",
+        )
+        .expect("build current process metadata");
+        metadata.process_start_time_ticks = metadata
+            .process_start_time_ticks
+            .map(|start_time| start_time.saturating_add(1));
+
+        assert_eq!(metadata_process_state(&metadata), ProcessState::Dead);
         fs::remove_dir_all(state_dir).expect("remove daemon test directory");
     }
 
