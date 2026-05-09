@@ -113,7 +113,7 @@ fn prepare_socket_file(path: &Path) -> io::Result<()> {
         && !is_shared_socket_parent(parent)
     {
         fs::create_dir_all(parent)?;
-        let mode = if running_as_root() { 0o770 } else { 0o700 };
+        let mode = if running_as_root() { 0o750 } else { 0o700 };
         fs::set_permissions(parent, fs::Permissions::from_mode(mode))?;
         if running_as_root() {
             ensure_mantissa_group(parent);
@@ -250,7 +250,7 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        let expected = if running_as_root() { 0o770 } else { 0o700 };
+        let expected = if running_as_root() { 0o750 } else { 0o700 };
         assert_eq!(mode, expected);
     }
 

@@ -12,6 +12,8 @@ use zeroize::Zeroizing;
 
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(not(unix))]
 type RawFd = i32;
 
@@ -21,6 +23,14 @@ const DEFAULT_LOG_DIR: &str = "logs";
 const DEFAULT_LOG_FILE: &str = "mantissa.log";
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FOLLOW_POLL_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(unix)]
+const ROOT_DAEMON_DIR_MODE: u32 = 0o750;
+#[cfg(unix)]
+const USER_DAEMON_DIR_MODE: u32 = 0o700;
+#[cfg(unix)]
+const ROOT_DAEMON_FILE_MODE: u32 = 0o640;
+#[cfg(unix)]
+const USER_DAEMON_FILE_MODE: u32 = 0o600;
 
 /// Options needed to spawn a detached daemon child with the same CLI context.
 pub(crate) struct DetachedInitOptions<'a> {
@@ -55,7 +65,7 @@ pub(crate) async fn start_detached(options: DetachedInitOptions<'_>) -> Result<(
         .clone()
         .unwrap_or_else(|| default_log_path(&state_dir));
     let preferred_socket = preferred_detached_socket(&state_dir, options.init);
-    prepare_log_file(&log_path)?;
+    prepare_log_file(&log_path, &state_dir)?;
     ensure_no_recorded_daemon(&state_dir)?;
     ensure_no_reachable_daemon(preferred_socket.clone()).await?;
 
@@ -513,10 +523,12 @@ fn read_metadata(state_dir: &Path) -> Result<DaemonMetadata> {
 fn write_metadata(state_dir: &Path, metadata: &DaemonMetadata) -> Result<PathBuf> {
     fs::create_dir_all(state_dir)
         .with_context(|| format!("create state directory {}", state_dir.display()))?;
+    secure_daemon_dir(state_dir)?;
     let path = metadata_path(state_dir);
     let tmp = path.with_extension("pid.tmp");
     fs::write(&tmp, metadata.encode())
         .with_context(|| format!("write daemon metadata {}", tmp.display()))?;
+    secure_daemon_file(&tmp)?;
     fs::rename(&tmp, &path).with_context(|| {
         format!(
             "replace daemon metadata {} with {}",
@@ -524,6 +536,7 @@ fn write_metadata(state_dir: &Path, metadata: &DaemonMetadata) -> Result<PathBuf
             tmp.display()
         )
     })?;
+    secure_daemon_file(&path)?;
     Ok(path)
 }
 
@@ -555,11 +568,12 @@ fn default_log_path(state_dir: &Path) -> PathBuf {
     state_dir.join(DEFAULT_LOG_DIR).join(DEFAULT_LOG_FILE)
 }
 
-/// Creates the log parent directory and initial log file.
-fn prepare_log_file(path: &Path) -> Result<()> {
+/// Creates the log parent directory and initial log file with daemon permissions.
+fn prepare_log_file(path: &Path, state_dir: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create daemon log directory {}", parent.display()))?;
+        secure_managed_log_dirs(parent, state_dir)?;
     }
     let _file = open_log_append(path)?;
     Ok(())
@@ -567,11 +581,71 @@ fn prepare_log_file(path: &Path) -> Result<()> {
 
 /// Opens a daemon log file for append.
 fn open_log_append(path: &Path) -> Result<File> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .with_context(|| format!("open daemon log {}", path.display()))
+        .with_context(|| format!("open daemon log {}", path.display()))?;
+    secure_daemon_file(path)?;
+    Ok(file)
+}
+
+/// Tightens one Mantissa-managed directory for the daemon owner model.
+fn secure_daemon_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mode = if mantissa_net::paths::running_as_root() {
+            ROOT_DAEMON_DIR_MODE
+        } else {
+            USER_DAEMON_DIR_MODE
+        };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .with_context(|| format!("set daemon directory permissions on {}", path.display()))?;
+        if mantissa_net::paths::running_as_root() {
+            mantissa_net::paths::ensure_mantissa_group(path);
+        }
+    }
+    Ok(())
+}
+
+/// Tightens one Mantissa-managed file for the daemon owner model.
+fn secure_daemon_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mode = if mantissa_net::paths::running_as_root() {
+            ROOT_DAEMON_FILE_MODE
+        } else {
+            USER_DAEMON_FILE_MODE
+        };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .with_context(|| format!("set daemon file permissions on {}", path.display()))?;
+        if mantissa_net::paths::running_as_root() {
+            mantissa_net::paths::ensure_mantissa_group(path);
+        }
+    }
+    Ok(())
+}
+
+/// Tightens log directories that live below the managed state directory.
+fn secure_managed_log_dirs(parent: &Path, state_dir: &Path) -> Result<()> {
+    if !parent.starts_with(state_dir) {
+        return Ok(());
+    }
+
+    let mut dirs = Vec::new();
+    let mut current = Some(parent);
+    while let Some(dir) = current {
+        if dir == state_dir {
+            break;
+        }
+        dirs.push(dir.to_path_buf());
+        current = dir.parent();
+    }
+
+    for dir in dirs.iter().rev() {
+        secure_daemon_dir(dir)?;
+    }
+    Ok(())
 }
 
 /// Prints the selected tail of a daemon log and returns the byte offset at EOF.
@@ -930,6 +1004,90 @@ impl PassphrasePipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    /// Creates one unique daemon test directory below the system temp directory.
+    fn test_state_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock before epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mantissa-daemon-perms-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create daemon test directory");
+        dir
+    }
+
+    #[cfg(unix)]
+    /// Returns the permission bits currently set on a filesystem path.
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path)
+            .expect("read metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[cfg(unix)]
+    /// Returns the expected daemon directory mode for the current test uid.
+    fn expected_dir_mode() -> u32 {
+        if mantissa_net::paths::running_as_root() {
+            ROOT_DAEMON_DIR_MODE
+        } else {
+            USER_DAEMON_DIR_MODE
+        }
+    }
+
+    #[cfg(unix)]
+    /// Returns the expected daemon file mode for the current test uid.
+    fn expected_file_mode() -> u32 {
+        if mantissa_net::paths::running_as_root() {
+            ROOT_DAEMON_FILE_MODE
+        } else {
+            USER_DAEMON_FILE_MODE
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_log_file_tightens_managed_log_permissions() {
+        let state_dir = test_state_dir();
+        let log_dir = state_dir.join("logs");
+        let log_path = log_dir.join("mantissa.log");
+        fs::create_dir_all(&log_dir).expect("create log directory");
+        fs::set_permissions(&log_dir, fs::Permissions::from_mode(0o777))
+            .expect("loosen log directory");
+        fs::write(&log_path, "existing log\n").expect("write log file");
+        fs::set_permissions(&log_path, fs::Permissions::from_mode(0o666)).expect("loosen log file");
+
+        prepare_log_file(&log_path, &state_dir).expect("prepare log file");
+
+        assert_eq!(mode(&log_dir), expected_dir_mode());
+        assert_eq!(mode(&log_path), expected_file_mode());
+        fs::remove_dir_all(state_dir).expect("remove daemon test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_metadata_tightens_state_and_pid_permissions() {
+        let state_dir = test_state_dir();
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o777))
+            .expect("loosen state directory");
+        let metadata = DaemonMetadata::new(
+            42,
+            state_dir.clone(),
+            state_dir.join("logs").join("mantissa.log"),
+            "127.0.0.1:0",
+        );
+
+        let pid_path = write_metadata(&state_dir, &metadata).expect("write daemon metadata");
+
+        assert_eq!(mode(&state_dir), expected_dir_mode());
+        assert_eq!(mode(&pid_path), expected_file_mode());
+        fs::remove_dir_all(state_dir).expect("remove daemon test directory");
+    }
 
     #[cfg(unix)]
     #[test]
