@@ -384,7 +384,7 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
             .clone();
         backend
     }));
-    let cluster = TestNode::new_cluster_inproc_with_config(
+    let mut cluster = TestNode::new_cluster_inproc_with_config(
         3,
         ClusterConfig {
             sync_tick_ms: Some(100),
@@ -397,6 +397,11 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
     TestNode::wait_cluster_ready_all(&cluster, 3, Duration::from_secs(10))
         .await
         .expect("jobs failover cluster should converge to three ready nodes");
+    let backend_by_node = cluster
+        .iter()
+        .zip(backends.iter())
+        .map(|(node, backend)| (node.id(), backend.clone()))
+        .collect::<HashMap<_, _>>();
 
     let job_id = submit_job(&cluster[0].node.jobs_client, "failover-job", 1, 2)
         .await
@@ -418,7 +423,7 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
         .inspect_workload(first_workload_id)
         .await
         .expect("inspect first workload");
-    let first_backend = backend_for_node(&cluster, &backends, first_attempt.node_id);
+    let first_backend = backend_for_node(&backend_by_node, first_attempt.node_id);
     first_backend
         .signal_workload_exit(first_workload_id, 1)
         .await
@@ -436,21 +441,28 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
     );
 
     cluster[owner_index].leave().await.expect("owner leave");
+    let departed_owner = cluster.remove(owner_index);
+    let departed_owner_node = *departed_owner.node;
+    departed_owner_node
+        .shutdown()
+        .await
+        .expect("shut down departed job owner");
 
-    for (index, node) in cluster.iter().enumerate() {
-        if index != owner_index {
-            node.assert_cluster_size(2, "remaining nodes should converge after owner leave")
-                .await;
-        }
+    for node in &cluster {
+        node.assert_cluster_size(2, "remaining nodes should converge after owner leave")
+            .await;
     }
 
-    let observer = cluster
+    let remaining_ids = cluster_ids(&cluster);
+    let remaining_owner_id =
+        select_job_owner_for_test(job_id, &remaining_ids).expect("post-failover job owner");
+    let remaining_owner = cluster
         .iter()
-        .enumerate()
-        .find_map(|(index, node)| (index != owner_index).then_some(node))
-        .expect("remaining observer");
+        .find(|node| node.id() == remaining_owner_id)
+        .expect("post-failover owner node");
+
     let second_workload_id = wait_for_active_workload_transition(
-        &observer.node.jobs_client,
+        &remaining_owner.node.jobs_client,
         job_id,
         Some(first_workload_id),
         Duration::from_secs(12),
@@ -458,28 +470,48 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
     .await
     .expect("remaining owner should launch retry attempt after failover");
 
-    let second_attempt = observer
+    let second_attempt = remaining_owner
         .node
         .workload_manager
         .inspect_workload(second_workload_id)
         .await
         .expect("inspect second workload");
-    let second_backend = backend_for_node(&cluster, &backends, second_attempt.node_id);
+    assert_ne!(
+        second_attempt.node_id, owner_id,
+        "retry attempt should not be placed on the departed owner"
+    );
+    let second_backend = backend_for_node(&backend_by_node, second_attempt.node_id);
     second_backend
         .signal_workload_exit(second_workload_id, 0)
         .await
         .expect("emit successful retry exit after failover");
 
-    assert!(
-        wait_for_job_status(
-            &observer.node.jobs_client,
-            job_id,
-            ProtoJobStatus::Succeeded,
-            Duration::from_secs(10)
-        )
-        .await,
-        "remaining cluster should complete the job after owner failover"
-    );
+    if !wait_for_job_status(
+        &remaining_owner.node.jobs_client,
+        job_id,
+        ProtoJobStatus::Succeeded,
+        Duration::from_secs(20),
+    )
+    .await
+    {
+        panic!(
+            "post-failover owner should complete the job after the retry attempt exits: {}",
+            describe_remaining_job_state(&cluster, job_id, second_workload_id).await
+        );
+    }
+
+    for node in &cluster {
+        assert!(
+            wait_for_job_status(
+                &node.node.jobs_client,
+                job_id,
+                ProtoJobStatus::Succeeded,
+                Duration::from_secs(10)
+            )
+            .await,
+            "remaining node should observe the completed job after owner failover"
+        );
+    }
 });
 
 #[derive(Clone, Debug)]
@@ -690,6 +722,41 @@ async fn wait_for_job_status(
     .await
 }
 
+/// Builds a compact diagnostic string for one job and workload across remaining nodes.
+async fn describe_remaining_job_state(
+    nodes: &[TestNode],
+    job_id: Uuid,
+    workload_id: Uuid,
+) -> String {
+    let mut entries = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let job = match list_jobs(&node.node.jobs_client).await {
+            Ok(jobs) => jobs
+                .into_iter()
+                .find(|job| job.id == job_id)
+                .map(|job| {
+                    format!(
+                        "job={:?}/attempts={}/active={:?}",
+                        job.status, job.attempts_started, job.active_workload_id
+                    )
+                })
+                .unwrap_or_else(|| "job=<missing>".to_string()),
+            Err(err) => format!("job=<list error: {err}>"),
+        };
+        let workload = match node
+            .node
+            .workload_manager
+            .inspect_workload(workload_id)
+            .await
+        {
+            Ok(workload) => format!("workload={:?}/host={}", workload.state, workload.node_id),
+            Err(err) => format!("workload=<inspect error: {err}>"),
+        };
+        entries.push(format!("{}: {job}; {workload}", node.id()));
+    }
+    entries.join(" | ")
+}
+
 /// Decodes one required UUID from a 16-byte protocol field.
 fn read_uuid(data: capnp::data::Reader<'_>) -> Result<Uuid, capnp::Error> {
     let bytes = data.to_owned();
@@ -773,16 +840,14 @@ fn cluster_ids(cluster: &[TestNode]) -> Vec<Uuid> {
 }
 
 /// Resolves the controllable runtime backend hosting one workload by node id.
-fn backend_for_node<'a>(
-    cluster: &'a [TestNode],
-    backends: &'a [Arc<ControllableExitRuntimeBackend>],
+fn backend_for_node(
+    backends_by_node: &HashMap<Uuid, Arc<ControllableExitRuntimeBackend>>,
     node_id: Uuid,
 ) -> Arc<ControllableExitRuntimeBackend> {
-    let index = cluster
-        .iter()
-        .position(|node| node.id() == node_id)
-        .expect("backend node");
-    backends[index].clone()
+    backends_by_node
+        .get(&node_id)
+        .cloned()
+        .expect("backend node")
 }
 
 /// Creates one restartable headless node backed by the provided durable state and runtime.
@@ -838,21 +903,43 @@ struct ControllableExitRuntimeBackend {
 }
 
 impl ControllableExitRuntimeBackend {
+    /// Waits until the backend has created a runtime instance for one workload.
+    async fn wait_for_runtime_instance(&self, workload_id: Uuid, timeout: Duration) -> bool {
+        wait_until(timeout, Duration::from_millis(25), || async {
+            self.runtime_ids_by_workload
+                .lock()
+                .await
+                .contains_key(&workload_id)
+        })
+        .await
+    }
+
     /// Emits one explicit task-exit event for the selected workload id.
     async fn signal_workload_exit(
         &self,
         workload_id: Uuid,
         exit_code: i32,
     ) -> Result<(), RuntimeError> {
-        if let Some(runtime_id) = self
+        if !self
+            .wait_for_runtime_instance(workload_id, Duration::from_secs(5))
+            .await
+        {
+            return Err(RuntimeError::NotFound(format!(
+                "runtime instance for workload {workload_id}"
+            )));
+        }
+
+        let runtime_id = self
             .runtime_ids_by_workload
             .lock()
             .await
             .get(&workload_id)
             .cloned()
-        {
-            self.inner.stop_instance(&runtime_id, None).await?;
-        }
+            .ok_or_else(|| {
+                RuntimeError::NotFound(format!("runtime instance for workload {workload_id}"))
+            })?;
+        self.inner.stop_instance(&runtime_id, None).await?;
+
         let event = RuntimeEvent::TaskExited {
             task_id: workload_id,
             exit_code,
