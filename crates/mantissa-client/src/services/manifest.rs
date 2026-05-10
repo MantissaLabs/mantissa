@@ -1346,7 +1346,7 @@ mod tests {
                 .expect("manifest");
 
         assert_eq!(manifest.networks.len(), 1);
-        assert_eq!(manifest.networks[0].name, "discovery-demo-ipv6");
+        assert_eq!(manifest.networks[0].name, "demo-network");
         assert_eq!(
             manifest.networks[0].ip_family,
             Some(crate::config::NetworkIpFamily::Ipv6)

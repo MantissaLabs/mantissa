@@ -125,6 +125,7 @@ struct NetworkBackendCatalog {
     service_generation: u64,
     peer_generation: u64,
     health_fingerprint: u64,
+    /// Service-template catalog entries keyed by `<template>.<service>` in DNS-normalized form.
     services: HashMap<String, ServiceBackendCatalogEntry>,
 }
 
@@ -152,7 +153,7 @@ impl Default for NetworkBackendCatalog {
 struct ServiceBackendCatalogEntry {
     service_id: Uuid,
     template_name: String,
-    service_name: String,
+    discovery_name: String,
     candidates: Vec<BackendAddress>,
     readiness: Option<ServiceReadinessProbe>,
     expose_to_host: bool,
@@ -361,8 +362,12 @@ struct ServiceBackendResolver<'a> {
 }
 
 impl ServiceBackendResolver<'_> {
-    /// Resolve the currently routable backend attachment set for one service template name.
-    async fn resolve(&self, service_name: &str) -> Result<Vec<BackendAddress>> {
+    /// Resolve the currently routable backend attachment set for one service template.
+    async fn resolve(
+        &self,
+        service_name: &str,
+        template_name: &str,
+    ) -> Result<Vec<BackendAddress>> {
         let network_spec = self.runtime.registry.get_spec(self.runtime.network_id)?;
         let expected_family = network_spec
             .as_ref()
@@ -392,6 +397,7 @@ impl ServiceBackendResolver<'_> {
             target: "network",
             network = %self.runtime.network_id,
             service = %service_name,
+            template = %template_name,
             attachments = attachments.len(),
             "resolving service backends"
         );
@@ -485,30 +491,39 @@ impl ServiceBackendResolver<'_> {
                 }
             };
 
-            let mut template_match = false;
-            if let Some(template) = attachment.template_name.as_deref() {
-                template_match |= template.eq_ignore_ascii_case(service_name);
-            }
-            if let Some(service) = attachment.service_name.as_deref() {
-                template_match |= service.eq_ignore_ascii_case(service_name);
+            let mut saw_identity = false;
+            let mut identity_matches = true;
+            if let (Some(attached_service), Some(attached_template)) = (
+                attachment.service_name.as_deref(),
+                attachment.template_name.as_deref(),
+            ) {
+                saw_identity = true;
+                identity_matches &= attached_service.eq_ignore_ascii_case(service_name)
+                    && attached_template.eq_ignore_ascii_case(template_name);
             }
             if let Some(meta) = task.service_owner() {
-                template_match |= meta.template.eq_ignore_ascii_case(service_name);
+                saw_identity = true;
+                identity_matches &= meta.service_name.eq_ignore_ascii_case(service_name)
+                    && meta.template.eq_ignore_ascii_case(template_name);
             }
-            template_match |= task.name.eq_ignore_ascii_case(service_name);
-            if let Some((_, template)) = self.template_index.get(&attachment.task_id) {
-                template_match |= template.eq_ignore_ascii_case(service_name);
+            if let Some((indexed_service, indexed_template)) =
+                self.template_index.get(&attachment.task_id)
+            {
+                saw_identity = true;
+                identity_matches &= indexed_service.eq_ignore_ascii_case(service_name)
+                    && indexed_template.eq_ignore_ascii_case(template_name);
             }
 
-            if !template_match {
+            if !saw_identity || !identity_matches {
                 tracing::trace!(
                     target: "network",
                     network = %self.runtime.network_id,
                     attachment = %attachment.id,
                     task = %attachment.task_id,
                     template = %attachment.template_name.clone().unwrap_or_default(),
+                    expected_template = %template_name,
                     service = %service_name,
-                    "skipping attachment; template mismatch"
+                    "skipping attachment; service-template mismatch"
                 );
                 continue;
             }
@@ -594,12 +609,22 @@ impl ServiceBackendResolver<'_> {
             target: "network",
             network = %self.runtime.network_id,
             service = %service_name,
+            template = %template_name,
             backends = results.len(),
             "resolved service backends"
         );
 
         Ok(results)
     }
+}
+
+/// Build the canonical DNS catalog key for one service template.
+fn discovery_service_key(service_name: &str, template_name: &str) -> String {
+    format!(
+        "{}.{}",
+        template_name.to_ascii_lowercase(),
+        service_name.to_ascii_lowercase()
+    )
 }
 
 /// Load the most relevant task value so discovery follows the current scheduling decision.
@@ -693,11 +718,11 @@ fn build_task_template_index(specs: &[ServiceSpecValue]) -> HashMap<Uuid, (Strin
     index
 }
 
-/// Derive the deterministic service VIP from the service name, network, and IP family.
+/// Derive the deterministic service VIP from the DNS identity, network, and IP family.
 fn compute_service_vip(
     registry: &NetworkRegistry,
     network_id: Uuid,
-    service_name: &str,
+    discovery_name: &str,
     backends: &[BackendAddress],
 ) -> Result<Option<(IpAddr, [u8; 6])>> {
     let Some(spec) = registry.get_spec(network_id)? else {
@@ -723,7 +748,7 @@ fn compute_service_vip(
     let digest = {
         let mut hasher = Hasher::new();
         hasher.update(network_id.as_bytes());
-        hasher.update(service_name.as_bytes());
+        hasher.update(discovery_name.as_bytes());
         hasher.finalize()
     };
     let mut slot_seed = [0u8; 16];
@@ -804,11 +829,16 @@ impl ServiceLoadBalancer {
     /// Normal service DNS should prefer the stable service VIP whenever dataplane programming
     /// succeeds. This cursor remains as the backend-only fallback path for environments where VIP
     /// programming is unavailable and Mantissa still has to expose attachment addresses directly.
-    fn next_offset(&mut self, network_id: Uuid, service_name: &str, backend_count: usize) -> usize {
+    fn next_offset(
+        &mut self,
+        network_id: Uuid,
+        discovery_name: &str,
+        backend_count: usize,
+    ) -> usize {
         if backend_count == 0 {
             return 0;
         }
-        let key = (network_id, service_name.to_ascii_lowercase());
+        let key = (network_id, discovery_name.to_ascii_lowercase());
         let cursor = self.cursors.entry(key).or_insert(0);
         let offset = *cursor % backend_count;
         *cursor = cursor.wrapping_add(1);
@@ -871,8 +901,10 @@ async fn refresh_backend_catalog_if_needed(
                 continue;
             }
 
-            let service_name = template.name.clone();
-            let candidates = resolver.resolve(&service_name).await?;
+            let service_name = spec.service_name.clone();
+            let template_name = template.name.clone();
+            let discovery_name = discovery_service_key(&service_name, &template_name);
+            let candidates = resolver.resolve(&service_name, &template_name).await?;
             let public_port = template.public_port();
             let public_target_port = template.public_target_port();
             let public_protocols = if public_port.is_some() {
@@ -884,14 +916,14 @@ async fn refresh_backend_catalog_if_needed(
             } else {
                 Vec::new()
             };
-            let service_key = service_name.to_ascii_lowercase();
+            let service_key = discovery_name.clone();
 
             next_services.insert(
                 service_key,
                 ServiceBackendCatalogEntry {
                     service_id: spec.id,
-                    template_name: template.name.clone(),
-                    service_name,
+                    template_name,
+                    discovery_name,
                     candidates,
                     readiness: template.readiness().cloned(),
                     expose_to_host: public_port.is_some(),
@@ -1021,7 +1053,7 @@ async fn refresh_single_service(
     runtime: &DiscoveryRuntime,
     service: &ServiceBackendCatalogEntry,
 ) -> Result<ServiceRefreshResult> {
-    let service_name = service.service_name.as_str();
+    let service_name = service.discovery_name.as_str();
     let candidates = service.candidates.clone();
     let mut backends = evaluate_backend_health(
         &runtime.health,

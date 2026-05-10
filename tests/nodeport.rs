@@ -107,6 +107,7 @@ fn privileged_nodeport_task_template(
 fn privileged_nodeport_frontend_task_template(
     network_id: Uuid,
     service_name: &str,
+    network_name: &str,
     target_port: u16,
 ) -> TaskTemplateSpecValue {
     TaskTemplateSpecValue {
@@ -117,7 +118,7 @@ fn privileged_nodeport_frontend_task_template(
                 "sh".to_string(),
                 "-c".to_string(),
                 format!(
-                    "while true; do wget -T 2 -q -O - http://backend.{service_name}.svc.mantissa:{target_port} >/dev/null 2>&1; sleep 1; done"
+                    "while true; do wget -T 2 -q -O - http://backend.{service_name}.{network_name}.svc.mantissa:{target_port} >/dev/null 2>&1; sleep 1; done"
                 ),
             ],
             tty: false,
@@ -2613,6 +2614,7 @@ local_test!(
                     privileged_nodeport_frontend_task_template(
                         network_id,
                         service_name,
+                        &network.name,
                         NODEPORT_HTTP_PORT,
                     ),
                 ],

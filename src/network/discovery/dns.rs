@@ -230,16 +230,13 @@ async fn answer_query(query: &Query, runtime: &DiscoveryRuntime) -> Result<Looku
         return Ok(LookupOutcome::NoData);
     }
 
-    let Some(service_name) = extract_service_label(query.name(), &runtime.network_name) else {
+    let Some(lookup) = extract_service_lookup(query.name(), &runtime.network_name) else {
         return Ok(LookupOutcome::NxDomain);
     };
 
     let catalog_entry = {
         let guard = runtime.backend_catalog.lock().await;
-        guard
-            .services
-            .get(&service_name.to_ascii_lowercase())
-            .cloned()
+        guard.services.get(&lookup.catalog_key).cloned()
     };
     let Some(catalog_entry) = catalog_entry else {
         return Ok(LookupOutcome::NxDomain);
@@ -251,7 +248,7 @@ async fn answer_query(query: &Query, runtime: &DiscoveryRuntime) -> Result<Looku
         filter_cached_backends(
             &guard,
             runtime.network_id,
-            &service_name,
+            &catalog_entry.discovery_name,
             candidates.clone(),
         )
     } else {
@@ -260,14 +257,15 @@ async fn answer_query(query: &Query, runtime: &DiscoveryRuntime) -> Result<Looku
     tracing::trace!(
         target: "network",
         network = %runtime.network_id,
-        service = %service_name,
+        service = %lookup.service_name,
+        template = %lookup.template_name,
         candidate_backends = candidates.len(),
         healthy_backends = backends.len(),
         "post-health backends"
     );
     backends = normalize_backend_selection(
         runtime.network_id,
-        &service_name,
+        &catalog_entry.discovery_name,
         candidates,
         backends,
         catalog_entry.readiness.is_some(),
@@ -279,7 +277,7 @@ async fn answer_query(query: &Query, runtime: &DiscoveryRuntime) -> Result<Looku
         if driver.supports_service_vip() {
             let _ = sync_service_vip_for_backends(
                 runtime,
-                &service_name,
+                &catalog_entry.discovery_name,
                 &[],
                 catalog_entry.expose_to_host,
             )
@@ -291,7 +289,7 @@ async fn answer_query(query: &Query, runtime: &DiscoveryRuntime) -> Result<Looku
     if driver.supports_service_vip()
         && let Some((vip, programmed)) = sync_service_vip_for_backends(
             runtime,
-            &service_name,
+            &catalog_entry.discovery_name,
             &backends,
             catalog_entry.expose_to_host,
         )
@@ -308,7 +306,11 @@ async fn answer_query(query: &Query, runtime: &DiscoveryRuntime) -> Result<Looku
 
     let offset = {
         let mut picker = runtime.load_balancer.lock().await;
-        picker.next_offset(runtime.network_id, &service_name, backends.len())
+        picker.next_offset(
+            runtime.network_id,
+            &catalog_entry.discovery_name,
+            backends.len(),
+        )
     };
     let records = rotate_addresses(
         backends
@@ -348,8 +350,14 @@ fn address_record(name: &Name, addr: IpAddr) -> Record {
     }
 }
 
-/// Extract the service label from `<service>.<network>.svc.mantissa.` queries.
-fn extract_service_label(name: &Name, network_name: &str) -> Option<String> {
+struct ServiceLookupName {
+    service_name: String,
+    template_name: String,
+    catalog_key: String,
+}
+
+/// Extract the service/template labels from `<template>.<service>.<network>.svc.mantissa.` queries.
+fn extract_service_lookup(name: &Name, network_name: &str) -> Option<ServiceLookupName> {
     let mut labels = Vec::new();
     for raw in name.iter() {
         let lower = raw.to_ascii_lowercase();
@@ -360,7 +368,7 @@ fn extract_service_label(name: &Name, network_name: &str) -> Option<String> {
         labels.push(label);
     }
     let suffix_labels: Vec<&str> = SERVICE_ZONE_SUFFIX.split('.').collect();
-    if labels.len() != suffix_labels.len() + 2 {
+    if labels.len() != suffix_labels.len() + 3 {
         return None;
     }
     for expected in suffix_labels.iter().rev() {
@@ -372,5 +380,12 @@ fn extract_service_label(name: &Name, network_name: &str) -> Option<String> {
     if network_label != network_name.to_ascii_lowercase() {
         return None;
     }
-    labels.pop()
+    let service_name = labels.pop()?;
+    let template_name = labels.pop()?;
+    let catalog_key = discovery_service_key(&service_name, &template_name);
+    Some(ServiceLookupName {
+        service_name,
+        template_name,
+        catalog_key,
+    })
 }

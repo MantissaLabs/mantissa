@@ -458,6 +458,7 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
             let Some(vip) = compute_service_vip(
                 &network.subnet_cidr,
                 network.id,
+                &row.service_name,
                 &template.name,
                 &backend_ips,
             ) else {
@@ -518,6 +519,7 @@ fn compute_service_vip(
     subnet_cidr: &str,
     network_id: Uuid,
     service_name: &str,
+    template_name: &str,
     backend_ips: &HashSet<IpAddr>,
 ) -> Option<IpAddr> {
     let (base_ip, prefix) = parse_overlay_cidr(subnet_cidr)?;
@@ -534,7 +536,7 @@ fn compute_service_vip(
     let digest = {
         let mut hasher = Hasher::new();
         hasher.update(network_id.as_bytes());
-        hasher.update(service_name.as_bytes());
+        hasher.update(discovery_service_key(service_name, template_name).as_bytes());
         hasher.finalize()
     };
 
@@ -542,15 +544,15 @@ fn compute_service_vip(
     slot_seed.copy_from_slice(&digest.as_bytes()[..16]);
     let slot_seed = u128::from_le_bytes(slot_seed);
 
-    // Constrain VIPs to the even offsets of the overlay to avoid collisions with per-node resolver
-    // addresses, which always occupy the odd slots (offsets 1, 3, 5, ...).
+    // Constrain VIPs to the `0 mod 4` overlay offsets so they cannot collide with resolver
+    // addresses (`1 mod 2`) or automatically assigned task attachments (`2 mod 4`).
     let max_hosts = match (family, host_bits) {
         (ServiceIpFamily::Ipv4, 32) => u32::MAX as u128 + 1,
         (ServiceIpFamily::Ipv6, 128) => return None,
         _ => 1u128 << host_bits,
     };
-    let available_even = max_hosts.saturating_sub(16) / 2;
-    if available_even == 0 {
+    let available_vips = max_hosts.saturating_sub(16) / 4;
+    if available_vips == 0 {
         return None;
     }
 
@@ -566,8 +568,8 @@ fn compute_service_vip(
         return None;
     }
 
-    let mut slot = (slot_seed % available_even) * 2 + 8;
-    for _ in 0..available_even.min(16) as usize {
+    let mut slot = (slot_seed % available_vips) * 4 + 8;
+    for _ in 0..available_vips.min(16) as usize {
         let candidate = base_ip.saturating_add(slot);
         if !normalized_backend_ips.contains(&candidate) {
             return Some(match family {
@@ -576,14 +578,23 @@ fn compute_service_vip(
             });
         }
 
-        // Walk forward to the next even slot if we collided with an existing backend.
-        slot = slot.wrapping_add(2) % (available_even * 2);
+        // Walk forward to the next VIP slot if a nonstandard backend already uses this address.
+        slot = slot.wrapping_add(4) % (available_vips * 4);
         if slot < 8 {
             slot = 8;
         }
     }
 
     None
+}
+
+/// Build the canonical DNS catalog key for one service template.
+fn discovery_service_key(service_name: &str, template_name: &str) -> String {
+    format!(
+        "{}.{}",
+        template_name.to_ascii_lowercase(),
+        service_name.to_ascii_lowercase()
+    )
 }
 
 /// Supported address families for client-side public endpoint rendering.
@@ -645,12 +656,13 @@ mod tests {
         let vip = compute_service_vip(
             "10.34.16.0/20",
             Uuid::parse_str("21523dac-bdaa-6cf5-359f-57139c6464a8").expect("valid network id"),
+            "demo-service",
             "backend",
             &HashSet::new(),
         )
         .expect("vip");
 
-        assert_eq!(vip, IpAddr::V4(Ipv4Addr::new(10, 34, 24, 38)));
+        assert_eq!(vip, IpAddr::V4(Ipv4Addr::new(10, 34, 21, 0)));
     }
 
     #[test]
@@ -659,12 +671,38 @@ mod tests {
         let vip = compute_service_vip(
             "10.146.112.0/20",
             Uuid::parse_str("278974fb-d8a0-07a9-590c-9908d5b33462").expect("valid network id"),
+            "demo-service",
             "backend",
             &HashSet::new(),
         )
         .expect("vip");
 
-        assert_eq!(vip, IpAddr::V4(Ipv4Addr::new(10, 146, 120, 162)));
+        assert_eq!(vip, IpAddr::V4(Ipv4Addr::new(10, 146, 113, 52)));
+    }
+
+    #[test]
+    /// Ensures same-template services render distinct host-reachable VIPs on one network.
+    fn compute_service_vip_keeps_same_template_names_isolated_by_service() {
+        let network_id =
+            Uuid::parse_str("278974fb-d8a0-07a9-590c-9908d5b33462").expect("valid network id");
+        let payments = compute_service_vip(
+            "10.146.112.0/20",
+            network_id,
+            "payments",
+            "backend",
+            &HashSet::new(),
+        )
+        .expect("payments vip");
+        let billing = compute_service_vip(
+            "10.146.112.0/20",
+            network_id,
+            "billing",
+            "backend",
+            &HashSet::new(),
+        )
+        .expect("billing vip");
+
+        assert_ne!(payments, billing);
     }
 
     #[test]
@@ -673,6 +711,7 @@ mod tests {
         let vip = compute_service_vip(
             "fd42:1234:5678::/64",
             Uuid::parse_str("278974fb-d8a0-07a9-590c-9908d5b33462").expect("valid network id"),
+            "demo-service",
             "backend",
             &HashSet::new(),
         )
@@ -681,7 +720,7 @@ mod tests {
         assert_eq!(
             vip,
             IpAddr::V6(Ipv6Addr::new(
-                0xfd42, 0x1234, 0x5678, 0, 0x4494, 0xcfb4, 0xd0a4, 0x5582,
+                0xfd42, 0x1234, 0x5678, 0, 0xcf92, 0x7f76, 0xe40d, 0x7944,
             ))
         );
     }

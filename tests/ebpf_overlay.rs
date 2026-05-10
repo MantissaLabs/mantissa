@@ -178,6 +178,16 @@ fn overlay_family(subnet: &str) -> OverlayIpFamily {
         .family
 }
 
+/// Builds the canonical service discovery FQDN for one task template.
+fn service_fqdn(template_name: &str, service_name: &str, network_name: &str) -> String {
+    format!("{template_name}.{service_name}.{network_name}.svc.mantissa.")
+}
+
+/// Builds the canonical service discovery host name without a trailing root dot.
+fn service_host(template_name: &str, service_name: &str, network_name: &str) -> String {
+    format!("{template_name}.{service_name}.{network_name}.svc.mantissa")
+}
+
 /// Build one HTTP echo service template published on the overlay so the host-access VIP path is active.
 fn privileged_http_service_task_template(network_id: Uuid, replicas: u16) -> TaskTemplateSpecValue {
     TaskTemplateSpecValue {
@@ -854,7 +864,7 @@ local_test!(ebpf_overlay_programs_runtime_mss_for_small_mtu, {
         host_ifname,
     ] = privileged_network_interfaces(network_id);
     let resolver_ip = interface_ipv4(&host_ifname).await;
-    let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+    let fqdn = service_fqdn("backend", "ebpf-mtu-service", &network.name);
     let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
         .await
         .expect("discover VIP for the small-MTU overlay service");
@@ -1039,7 +1049,7 @@ local_test!(ebpf_overlay_host_vip_reaches_service_from_host_access, {
         host_ifname,
     ] = privileged_network_interfaces(network_id);
     let resolver_ip = interface_ipv4(&host_ifname).await;
-    let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+    let fqdn = service_fqdn("backend", "ebpf-vip-service", &network.name);
     let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
         .await
         .expect("discover VIP for host-access eBPF test");
@@ -1142,7 +1152,7 @@ local_test!(ebpf_overlay_status_reports_programmed_vip_traffic, {
         host_ifname,
     ] = privileged_network_interfaces(network_id);
     let resolver_ip = interface_ipv4(&host_ifname).await;
-    let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+    let fqdn = service_fqdn("backend", "ebpf-status-service", &network.name);
     let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
         .await
         .expect("discover VIP for overlay status test");
@@ -1253,7 +1263,7 @@ local_test!(
             host_ifname,
         ] = privileged_network_interfaces(network_id);
         let resolver_ip = interface_ipv6(&host_ifname).await;
-        let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+        let fqdn = service_fqdn("backend", "ebpf-vip-v6-service", &network.name);
         let vip = wait_for_vip_record_v6(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
             .await
             .expect("discover IPv6 VIP for host-access eBPF test");
@@ -1387,7 +1397,7 @@ local_test!(ebpf_overlay_task_dns_reaches_service_vip, {
         host_ifname,
     ] = privileged_network_interfaces(network_id);
     let resolver_ip = interface_ipv4(&host_ifname).await;
-    let fqdn = format!("backend.{}.svc.mantissa", network.name);
+    let fqdn = service_host("backend", service_name, &network.name);
     let vip = wait_for_vip_record(
         resolver_ip,
         &format!("{fqdn}."),
@@ -1558,7 +1568,7 @@ local_test!(ebpf_overlay_ipv6_task_dns_reaches_service_vip, {
         host_ifname,
     ] = privileged_network_interfaces(network_id);
     let resolver_ip = interface_ipv6(&host_ifname).await;
-    let fqdn = format!("backend.{}.svc.mantissa", network.name);
+    let fqdn = service_host("backend", service_name, &network.name);
     let vip = wait_for_vip_record_v6(
         resolver_ip,
         &format!("{fqdn}."),
@@ -1699,7 +1709,7 @@ local_test!(ebpf_overlay_vip_load_balances_across_local_replicas, {
         host_ifname,
     ] = privileged_network_interfaces(network_id);
     let resolver_ip = interface_ipv4(&host_ifname).await;
-    let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+    let fqdn = service_fqdn("backend", "ebpf-vip-lb-service", &network.name);
     let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
         .await
         .expect("discover VIP for local load-balancing test");
@@ -1793,7 +1803,7 @@ local_test!(
             host_ifname,
         ] = privileged_network_interfaces(network_id);
         let resolver_ip = interface_ipv6(&host_ifname).await;
-        let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+        let fqdn = service_fqdn("backend", "ebpf-vip-lb-v6-service", &network.name);
         let vip = wait_for_vip_record_v6(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
             .await
             .expect("discover IPv6 VIP for local load-balancing test");
@@ -1886,7 +1896,7 @@ local_test!(ebpf_overlay_return_path_preserves_vip_identity, {
         host_ifname,
     ] = privileged_network_interfaces(network_id);
     let resolver_ip = interface_ipv4(&host_ifname).await;
-    let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+    let fqdn = service_fqdn("backend", "ebpf-return-vip-service", &network.name);
     let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
         .await
         .expect("discover VIP for return-path identity test");
@@ -1975,7 +1985,7 @@ local_test!(ebpf_overlay_udp_service_reaches_host_access_vip, {
         host_ifname,
     ] = privileged_network_interfaces(network_id);
     let resolver_ip = interface_ipv4(&host_ifname).await;
-    let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+    let fqdn = service_fqdn("backend", "ebpf-udp-vip-service", &network.name);
     let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
         .await
         .expect("discover VIP for UDP host-access test");
@@ -2076,7 +2086,7 @@ local_test!(
             host_ifname,
         ] = privileged_network_interfaces(network_id);
         let resolver_ip = interface_ipv4(&host_ifname).await;
-        let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+        let fqdn = service_fqdn("backend", "ebpf-delete-service", &network.name);
         let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
             .await
             .expect("discover VIP for delete-service cleanup test");
@@ -2219,7 +2229,7 @@ local_test!(
             host_ifname,
         ] = privileged_network_interfaces(network_id);
         let resolver_ip = interface_ipv4(&host_ifname).await;
-        let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+        let fqdn = service_fqdn("backend", "ebpf-delete-service", &network.name);
         let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
             .await
             .expect("discover VIP for eBPF delete stability test");
@@ -2328,7 +2338,7 @@ local_test!(ebpf_overlay_heals_after_lb_map_removal, {
         host_ifname,
     ] = privileged_network_interfaces(network_id);
     let resolver_ip = interface_ipv4(&host_ifname).await;
-    let fqdn = format!("backend.{}.svc.mantissa.", network.name);
+    let fqdn = service_fqdn("backend", "ebpf-heal-service", &network.name);
     let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
         .await
         .expect("discover VIP before LB healing");

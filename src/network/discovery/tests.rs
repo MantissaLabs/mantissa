@@ -146,12 +146,12 @@ fn filter_cached_backends_excludes_unknown_backends_from_routing() {
 #[tokio::test]
 async fn service_vip_address_class_is_disjoint_from_task_allocations() {
     let harness = setup_catalog_harness().await;
-    let service_name = "backend";
+    let discovery_name = discovery_service_key("vip-service", "backend");
     let backends = vec![backend([10, 88, 0, 10], [0x02, 0, 0, 0, 0, 1])];
     let (vip, _) = compute_service_vip(
         &harness.registry,
         harness.network.id,
-        service_name,
+        &discovery_name,
         &backends,
     )
     .expect("compute service vip")
@@ -540,6 +540,11 @@ fn catalog_attachment(
     })
 }
 
+/// Builds the DNS-normalized catalog key used by the test backend template.
+fn catalog_key(service_name: &str) -> String {
+    discovery_service_key(service_name, "backend")
+}
+
 /// Writes one task template that maps the backend name to the provided network.
 async fn upsert_catalog_service(
     services: &ServiceRegistry,
@@ -676,7 +681,7 @@ async fn backend_catalog_refresh_invalidates_on_task_change_clock() {
         let guard = harness.runtime.backend_catalog.lock().await;
         guard
             .services
-            .get("backend")
+            .get(&catalog_key(service_name))
             .map(|entry| entry.candidates.len())
             .unwrap_or_default()
     };
@@ -701,7 +706,7 @@ async fn backend_catalog_refresh_invalidates_on_task_change_clock() {
     assert_eq!(
         guard
             .services
-            .get("backend")
+            .get(&catalog_key(service_name))
             .map(|entry| entry.candidates.len())
             .unwrap_or_default(),
         0
@@ -762,7 +767,7 @@ async fn backend_catalog_refresh_invalidates_on_peer_change_clock() {
         let guard = harness.runtime.backend_catalog.lock().await;
         guard
             .services
-            .get("backend")
+            .get(&catalog_key(service_name))
             .map(|entry| entry.candidates.len())
             .unwrap_or_default()
     };
@@ -793,7 +798,7 @@ async fn backend_catalog_refresh_invalidates_on_peer_change_clock() {
     assert_eq!(
         guard
             .services
-            .get("backend")
+            .get(&catalog_key(service_name))
             .map(|entry| entry.candidates.len())
             .unwrap_or_default(),
         1,
@@ -861,11 +866,122 @@ async fn backend_catalog_filters_remote_backends_for_bridge_network() {
     let guard = harness.runtime.backend_catalog.lock().await;
     let candidates = guard
         .services
-        .get("backend")
+        .get(&catalog_key(service_name))
         .map(|entry| entry.candidates.clone())
         .unwrap_or_default();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].ip, IpAddr::V4(Ipv4Addr::new(10, 88, 1, 10)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn backend_catalog_scopes_same_template_names_by_service() {
+    let harness = setup_catalog_harness().await;
+    let service_a = "payments";
+    let service_b = "billing";
+    let node_a = Uuid::new_v4();
+    let node_b = Uuid::new_v4();
+    let task_a = Uuid::new_v4();
+    let task_b = Uuid::new_v4();
+    let ip_a = Ipv4Addr::new(10, 88, 1, 10);
+    let ip_b = Ipv4Addr::new(10, 88, 1, 11);
+
+    upsert_catalog_service(
+        &harness.services,
+        service_a,
+        harness.network.id,
+        vec![task_a],
+    )
+    .await;
+    upsert_catalog_service(
+        &harness.services,
+        service_b,
+        harness.network.id,
+        vec![task_b],
+    )
+    .await;
+
+    for (task_id, node_id, service_name, backend_ip) in [
+        (task_a, node_a, service_a, ip_a),
+        (task_b, node_b, service_b, ip_b),
+    ] {
+        harness
+            .workloads
+            .upsert(
+                &UuidKey::from(task_id),
+                catalog_task(task_id, node_id, service_name, harness.network.id),
+            )
+            .await
+            .expect("upsert running task");
+        harness
+            .registry
+            .upsert_attachment(catalog_attachment(
+                task_id,
+                node_id,
+                harness.network.id,
+                backend_ip,
+                service_name,
+            ))
+            .await
+            .expect("upsert ready attachment");
+        harness
+            .registry
+            .upsert_peer_state(NetworkPeerStateValue::new(
+                harness.network.id,
+                node_id,
+                "backend-node",
+                NetworkPeerState::Ready,
+                None,
+            ))
+            .await
+            .expect("upsert ready peer state");
+    }
+
+    let mut health = HashMap::new();
+    health.insert(node_a, HealthStatus::Alive);
+    health.insert(node_b, HealthStatus::Alive);
+    refresh_catalog(&harness, &health).await;
+
+    let guard = harness.runtime.backend_catalog.lock().await;
+    assert!(
+        !guard.services.contains_key("backend"),
+        "the old template-only catalog key must not be populated"
+    );
+    let entry_a = guard
+        .services
+        .get(&catalog_key(service_a))
+        .expect("payments backend entry");
+    let entry_b = guard
+        .services
+        .get(&catalog_key(service_b))
+        .expect("billing backend entry");
+
+    assert_eq!(entry_a.candidates.len(), 1);
+    assert_eq!(entry_b.candidates.len(), 1);
+    assert_eq!(entry_a.candidates[0].ip, IpAddr::V4(ip_a));
+    assert_eq!(entry_b.candidates[0].ip, IpAddr::V4(ip_b));
+
+    let vip_a = compute_service_vip(
+        &harness.registry,
+        harness.network.id,
+        &entry_a.discovery_name,
+        &entry_a.candidates,
+    )
+    .expect("compute payments vip")
+    .expect("payments vip")
+    .0;
+    let vip_b = compute_service_vip(
+        &harness.registry,
+        harness.network.id,
+        &entry_b.discovery_name,
+        &entry_b.candidates,
+    )
+    .expect("compute billing vip")
+    .expect("billing vip")
+    .0;
+    assert_ne!(
+        vip_a, vip_b,
+        "same-template services must not share one VIP"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -971,11 +1087,12 @@ async fn backend_catalog_refresh_retains_unchanged_healthy_backends() {
     health.insert(withdrawing_node, HealthStatus::Alive);
     refresh_catalog(&harness, &health).await;
 
+    let discovery_name = catalog_key(service_name);
     {
         let mut guard = harness.runtime.health.lock().await;
         guard.set_entry(
             harness.network.id,
-            "backend",
+            &discovery_name,
             ready_ip,
             HealthEntry {
                 state: HealthState::Healthy,
@@ -985,7 +1102,7 @@ async fn backend_catalog_refresh_retains_unchanged_healthy_backends() {
         );
         guard.set_entry(
             harness.network.id,
-            "backend",
+            &discovery_name,
             withdrawing_ip,
             HealthEntry {
                 state: HealthState::Healthy,
@@ -1012,13 +1129,13 @@ async fn backend_catalog_refresh_retains_unchanged_healthy_backends() {
     let guard = harness.runtime.health.lock().await;
     assert!(
         guard
-            .get_entry(harness.network.id, "backend", ready_ip)
+            .get_entry(harness.network.id, &discovery_name, ready_ip)
             .is_some(),
         "unchanged healthy backend should keep its readiness cache"
     );
     assert!(
         guard
-            .get_entry(harness.network.id, "backend", withdrawing_ip)
+            .get_entry(harness.network.id, &discovery_name, withdrawing_ip)
             .is_none(),
         "withdrawn backend should lose its readiness cache"
     );
@@ -1040,7 +1157,7 @@ async fn backend_catalog_refresh_requires_service_readiness_opt_in() {
     let guard = harness.runtime.backend_catalog.lock().await;
     let entry = guard
         .services
-        .get("backend")
+        .get(&catalog_key("backend-service"))
         .expect("catalog entry for backend");
     assert!(entry.readiness.is_none());
 }
@@ -1069,7 +1186,7 @@ async fn backend_catalog_refresh_keeps_explicit_readiness_probe() {
     let guard = harness.runtime.backend_catalog.lock().await;
     let entry = guard
         .services
-        .get("backend")
+        .get(&catalog_key("backend-service"))
         .expect("catalog entry for backend");
     let readiness = entry.readiness.as_ref().expect("readiness probe");
     assert_eq!(readiness.kind, ServiceReadinessProbeKind::Http);

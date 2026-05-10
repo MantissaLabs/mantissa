@@ -337,6 +337,11 @@ fn spawn_http_ready_server(
     })
 }
 
+/// Builds the canonical service discovery FQDN for one task template.
+fn service_fqdn(template_name: &str, service_name: &str, network_name: &str) -> String {
+    format!("{template_name}.{service_name}.{network_name}.svc.mantissa.")
+}
+
 /// Sends one DNS query for the requested record type and decodes matching address answers.
 async fn query_records(
     server_ip: IpAddr,
@@ -508,7 +513,7 @@ local_test!(discovery_dns_reflects_backend_changes_unprivileged, {
         .await
         .expect("start discovery");
 
-    let fqdn = format!("backend.{}.svc.mantissa.", harness.network.name);
+    let fqdn = service_fqdn("backend", service_name, &harness.network.name);
     let (initial_code, initial_ips) =
         wait_for_answer_count(dns_port, &fqdn, 1, Duration::from_secs(5))
             .await
@@ -579,6 +584,85 @@ local_test!(discovery_dns_reflects_backend_changes_unprivileged, {
         .expect("teardown discovery");
 });
 
+local_test!(discovery_dns_scopes_same_template_names_by_service, {
+    let dns_port = 10535;
+    let service_a = "payments";
+    let service_b = "billing";
+    let harness = setup_discovery_harness(dns_port).await;
+    let network_id = harness.network.id;
+
+    let node_a = Uuid::new_v4();
+    let node_b = Uuid::new_v4();
+    let task_a = Uuid::new_v4();
+    let task_b = Uuid::new_v4();
+    let ip_a = Ipv4Addr::new(10, 42, 3, 10);
+    let ip_b = Ipv4Addr::new(10, 42, 3, 11);
+
+    upsert_service(&harness.services, service_a, network_id, vec![task_a]).await;
+    upsert_service(&harness.services, service_b, network_id, vec![task_b]).await;
+
+    for (task_id, node_id, service_name, backend_ip) in [
+        (task_a, node_a, service_a, ip_a),
+        (task_b, node_b, service_b, ip_b),
+    ] {
+        harness
+            .workloads
+            .upsert(
+                &UuidKey::from(task_id),
+                running_task(task_id, node_id, service_name, network_id),
+            )
+            .await
+            .expect("upsert task");
+        harness
+            .registry
+            .upsert_attachment(ready_attachment(
+                task_id,
+                node_id,
+                network_id,
+                backend_ip,
+                service_name,
+            ))
+            .await
+            .expect("upsert attachment");
+        harness
+            .registry
+            .upsert_peer_state(ready_peer_state(network_id, node_id))
+            .await
+            .expect("upsert ready peer state");
+    }
+
+    harness
+        .discovery
+        .ensure_network(&harness.network, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)))
+        .await
+        .expect("start discovery");
+
+    let fqdn_a = service_fqdn("backend", service_a, &harness.network.name);
+    let (_, ips_a) = wait_for_answer_count(dns_port, &fqdn_a, 1, Duration::from_secs(5))
+        .await
+        .expect("query payments dns");
+    assert_eq!(ips_a, vec![ip_a]);
+
+    let fqdn_b = service_fqdn("backend", service_b, &harness.network.name);
+    let (_, ips_b) = wait_for_answer_count(dns_port, &fqdn_b, 1, Duration::from_secs(5))
+        .await
+        .expect("query billing dns");
+    assert_eq!(ips_b, vec![ip_b]);
+
+    let ambiguous_fqdn = format!("backend.{}.svc.mantissa.", harness.network.name);
+    let (ambiguous_code, ambiguous_ips) = query_a_records(dns_port, &ambiguous_fqdn)
+        .await
+        .expect("query old ambiguous dns");
+    assert_eq!(ambiguous_code, ResponseCode::NXDomain);
+    assert!(ambiguous_ips.is_empty());
+
+    harness
+        .discovery
+        .teardown_network(network_id)
+        .await
+        .expect("teardown discovery");
+});
+
 local_test!(discovery_dns_requires_attachment_traffic_publication, {
     let dns_port = 10531;
     let service_name = "published-service";
@@ -621,7 +705,7 @@ local_test!(discovery_dns_requires_attachment_traffic_publication, {
         .await
         .expect("start discovery");
 
-    let fqdn = format!("backend.{}.svc.mantissa.", harness.network.name);
+    let fqdn = service_fqdn("backend", service_name, &harness.network.name);
     let (initial_code, initial_ips) =
         wait_for_answer_count(dns_port, &fqdn, 0, Duration::from_secs(5))
             .await
@@ -699,7 +783,7 @@ local_test!(discovery_dns_answers_aaaa_for_ipv6_networks, {
         .await
         .expect("start ipv6 discovery");
 
-    let fqdn = format!("backend.{}.svc.mantissa.", harness.network.name);
+    let fqdn = service_fqdn("backend", service_name, &harness.network.name);
     let (aaaa_code, aaaa_ips) =
         wait_for_aaaa_answer_count(dns_port, &fqdn, 1, Duration::from_secs(5))
             .await
@@ -782,7 +866,7 @@ local_test!(
             .await
             .expect("start rotating ipv6 discovery");
 
-        let fqdn = format!("backend.{}.svc.mantissa.", harness.network.name);
+        let fqdn = service_fqdn("backend", service_name, &harness.network.name);
         let (_, initial_ips) =
             wait_for_aaaa_answer_count(dns_port, &fqdn, 3, Duration::from_secs(5))
                 .await
@@ -910,7 +994,7 @@ local_test!(discovery_dns_routes_only_healthy_readiness_backends, {
         .await
         .expect("start discovery");
 
-    let fqdn = format!("backend.{}.svc.mantissa.", harness.network.name);
+    let fqdn = service_fqdn("backend", service_name, &harness.network.name);
     let (initial_code, initial_ips) = query_a_records(dns_port, &fqdn)
         .await
         .expect("query initial readiness dns");

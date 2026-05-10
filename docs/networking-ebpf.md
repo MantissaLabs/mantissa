@@ -148,10 +148,12 @@ Implemented in `src/network/discovery.rs`.
 Queries use:
 
 ```
-<service>.<network>.svc.mantissa
+<template>.<service>.<network>.svc.mantissa
 ```
 
-Example: `backend.discovery-demo.svc.mantissa`
+Example: `backend.discovery-demo.demo-network.svc.mantissa`, where the
+labels are template `backend`, service `discovery-demo`, and network
+`demo-network`.
 
 The DNS server for a network binds to the resolver IP on `mnhost-*` (UDP/53).
 
@@ -160,7 +162,7 @@ The DNS server for a network binds to the resolver IP on `mnhost-*` (UDP/53).
 For a service name lookup, Mantissa:
 
 1. Lists “ready” network attachments for the network.
-2. Filters them to tasks that match the service/template label. Bridge networks
+2. Filters them to tasks that match the owning service and task-template labels. Bridge networks
    also filter out attachments from other nodes.
 3. Optionally probes health (if configured) and refreshes backend MACs.
 4. Returns:
@@ -177,8 +179,10 @@ unavailable.
 
 `compute_service_vip` derives:
 
-- A VIP IPv4 address: stable hash over `(network_id, service_name)` mapped into the overlay subnet.
-  - VIPs use even host offsets to avoid colliding with resolver IPs, which occupy odd offsets.
+- A VIP IPv4 address: stable hash over `(network_id, "<template>.<service>")`
+  mapped into the overlay subnet.
+  - VIPs use `0 mod 4` host offsets to avoid colliding with resolver IPs
+    (`1 mod 2`) and task attachment IPs (`2 mod 4`).
   - If the candidate VIP collides with an existing backend IP, it walks forward.
 - A deterministic locally administered VIP MAC (`02:...`), also derived from the hash.
 
@@ -479,7 +483,7 @@ Prerequisites: Linux host, kernel with XDP+TC and BPF enabled, and `bpf-linker` 
    default auto-provisioned subnet:
    ```bash
    mantissa networks create \
-     --name discovery-demo \
+     --name demo-network \
      --description "VXLAN + eBPF public endpoint demo" \
      --subnet 10.42.0.0/16 \
      --bpf-program vxlan_xdp@vxlan_xdp \

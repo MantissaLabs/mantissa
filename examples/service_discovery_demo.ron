@@ -14,7 +14,7 @@
                 cpu_millis: 200,
                 memory_mb: 64,
             ),
-            networks: ["discovery-demo"],
+            networks: ["demo-network"],
             env: [],
             secret_files: [],
             readiness: Some((
@@ -40,14 +40,14 @@
             command: [
                 "sh",
                 "-c",
-                "while true; do printf '\\n---\\n' && date; curl --connect-timeout 5 --max-time 5 --no-keepalive --retry 0 -sS -w '\\n[curl] http=%{http_code} remote=%{remote_ip} dns=%{time_namelookup}s connect=%{time_connect}s start=%{time_starttransfer}s total=%{time_total}s\\n' http://backend.discovery-demo.svc.mantissa:8000; rc=$?; echo \"[curl] rc=$rc\"; sleep 2; done",
+                "while true; do printf '\\n---\\n' && date; curl --connect-timeout 5 --max-time 5 --no-keepalive --retry 0 -sS -w '\\n[curl] http=%{http_code} remote=%{remote_ip} dns=%{time_namelookup}s connect=%{time_connect}s start=%{time_starttransfer}s total=%{time_total}s\\n' http://backend.discovery-demo.demo-network.svc.mantissa:8000; rc=$?; echo \"[curl] rc=$rc\"; sleep 2; done",
             ],
             replicas: 1,
             resources: (
                 cpu_millis: 200,
                 memory_mb: 64,
             ),
-            networks: ["discovery-demo"],
+            networks: ["demo-network"],
             env: [],
             secret_files: [],
         ),

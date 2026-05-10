@@ -69,21 +69,21 @@ fn summarize_public_endpoint_issues(issues: &[String]) -> String {
 /// Returns the selected VIP and whether dataplane programming succeeded.
 pub(super) async fn sync_service_vip_for_backends(
     runtime: &DiscoveryRuntime,
-    service_name: &str,
+    discovery_name: &str,
     backends: &[BackendAddress],
     expose_to_host: bool,
 ) -> Result<Option<(IpAddr, bool)>> {
     let Some((vip, mac)) = compute_service_vip(
         &runtime.registry,
         runtime.network_id,
-        service_name,
+        discovery_name,
         backends,
     )?
     else {
         return Ok(None);
     };
     let programmed =
-        program_service_vip(runtime, service_name, vip, mac, backends, expose_to_host).await;
+        program_service_vip(runtime, discovery_name, vip, mac, backends, expose_to_host).await;
     Ok(Some((vip, programmed)))
 }
 
@@ -91,7 +91,7 @@ pub(super) async fn sync_service_vip_for_backends(
 /// the dataplane was programmed successfully. Missing maps are warned once per network.
 async fn program_service_vip(
     runtime: &DiscoveryRuntime,
-    service_name: &str,
+    discovery_name: &str,
     vip: IpAddr,
     vip_mac: [u8; 6],
     backends: &[BackendAddress],
@@ -108,7 +108,7 @@ async fn program_service_vip(
                 debug!(
                     target: "network",
                     network = %runtime.network_id,
-                    service = %service_name,
+                    service = %discovery_name,
                     vip = %vip,
                     "failed to program host neighbour for vip (continuing): {err:#}"
                 );
@@ -133,7 +133,7 @@ async fn program_service_vip(
                     debug!(
                         target: "network",
                         network = %runtime.network_id,
-                        service = %service_name,
+                        service = %discovery_name,
                         vip = %vip,
                         "failed to program host neighbour for vip after healing (continuing): {err:#}"
                     );
@@ -148,7 +148,7 @@ async fn program_service_vip(
                 warn!(
                     target: "network",
                     network = %runtime.network_id,
-                    service = %service_name,
+                    service = %discovery_name,
                     "failed to sync bpf vip for service; falling back to dns round robin: {err:#}"
                 );
             }
