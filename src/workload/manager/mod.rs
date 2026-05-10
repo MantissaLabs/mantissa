@@ -1583,6 +1583,7 @@ pub(crate) fn workload_start_error_is_retryable(err: &anyhow::Error) -> bool {
                     | SchedulingError::NoCapacityAcrossCluster
                     | SchedulingError::InsufficientCapacityForBatch
                     | SchedulingError::InsufficientCapacityOnTarget { .. }
+                    | SchedulingError::TargetNodeUnavailable { .. }
                     | SchedulingError::NetworksBlocked { .. }
                     | SchedulingError::LocalNetworksBlocked { .. }
             )

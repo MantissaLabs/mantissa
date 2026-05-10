@@ -5,6 +5,7 @@ use common::convergence::wait_until;
 use common::testkit::{ClusterConfig, RuntimeBackendOverrideGuard, TestNode};
 use mantissa::node::id::set_node_id;
 use mantissa::registry::Registry;
+use mantissa::scheduler::SlotReservationRequest;
 use mantissa::scheduler::placement::{
     PlacementConstraint, PlacementConstraintSelector, PlacementPreference, PlacementStrategy,
 };
@@ -22,6 +23,7 @@ use mantissa::workload::model::{
 use mantissa::workload::types::{
     ExecutionSpec, ResolvedExecutionSpec, WorkloadPortBinding, WorkloadPortProtocol,
 };
+use mantissa_health::Status as HealthStatus;
 use mantissa_protocol::volumes::{LocalVolumeSourceKind, volumes};
 use mantissa_store::uuid_key::UuidKey;
 use std::collections::{HashMap, HashSet};
@@ -1185,6 +1187,101 @@ local_test!(
 );
 
 local_test!(
+    workloads_placement_ignores_down_remote_digest_for_untargeted_start,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+
+        let cfg = ClusterConfig {
+            sync_tick_ms: Some(100),
+            gossip_tick_ms: Some(100),
+            gossip_fanout: Some(2),
+            ..ClusterConfig::default()
+        };
+        let cluster = TestNode::new_cluster_inproc_with_config(2, cfg)
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes")
+            .await;
+        assert!(
+            wait_for_remote_scheduler_digest(&cluster[0], cluster[1].id(), Duration::from_secs(10))
+                .await,
+            "anchor should observe remote scheduler capacity before marking it down"
+        );
+
+        reserve_all_local_scheduler_slots(&cluster[0]).await;
+        mark_peer_down_for_scheduler(&cluster[0], cluster[1].id());
+
+        let workload_name = "down-remote-untargeted";
+        let err = cluster[0]
+            .node
+            .workload_manager
+            .start_workloads_batch(vec![demo_binpack_workload_request(workload_name)])
+            .await
+            .expect_err("untargeted placement should not use a down remote digest");
+
+        assert!(
+            err.chain().any(|cause| cause
+                .to_string()
+                .contains("no available capacity across cluster")),
+            "down remote digest should be ignored instead of attempted; err={err:#}"
+        );
+        assert!(
+            list_active_workloads_by_name(&cluster[0].node.workload_manager, workload_name)
+                .await
+                .is_empty(),
+            "failed placement must not materialize a workload on the down peer"
+        );
+    }
+);
+
+local_test!(workloads_placement_rejects_targeted_down_node, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(2, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes").await;
+    assert!(
+        wait_for_remote_scheduler_digest(&cluster[0], cluster[1].id(), Duration::from_secs(10))
+            .await,
+        "anchor should observe remote scheduler capacity before marking it down"
+    );
+
+    mark_peer_down_for_scheduler(&cluster[0], cluster[1].id());
+
+    let workload_name = "down-remote-targeted";
+    let mut request = demo_binpack_workload_request(workload_name);
+    request.target_node = Some(cluster[1].id());
+
+    let err = cluster[0]
+        .node
+        .workload_manager
+        .start_workloads_batch(vec![request])
+        .await
+        .expect_err("targeted placement should reject a down peer before remote prepare");
+
+    assert!(
+        err.chain().any(|cause| {
+            let message = cause.to_string();
+            message.contains("target node") && message.contains("unavailable")
+        }),
+        "targeted down peer should surface an unavailable-target error; err={err:#}"
+    );
+    assert!(
+        list_active_workloads_by_name(&cluster[0].node.workload_manager, workload_name)
+            .await
+            .is_empty(),
+        "targeted down placement must not materialize a workload on the down peer"
+    );
+});
+
+local_test!(
     workloads_placement_service_anti_affinity_spreads_owned_batch,
     {
         let _guard = RuntimeBackendOverrideGuard::install_default();
@@ -1516,6 +1613,18 @@ async fn list_active_workloads_by_ids(
         .collect()
 }
 
+/// Lists active standalone workloads with the provided scheduler-visible workload name.
+async fn list_active_workloads_by_name(manager: &WorkloadManager, name: &str) -> Vec<WorkloadSpec> {
+    let filter = TaskStateFilter::active_only();
+    manager
+        .list_workloads(&filter)
+        .await
+        .expect("list active workloads during down-node placement checks")
+        .into_iter()
+        .filter(|task| task.name == name)
+        .collect()
+}
+
 /// Collapses one workload set into per-node counts so strategy tests can assert distribution.
 fn workload_counts_by_node(tasks: &[WorkloadSpec]) -> HashMap<Uuid, usize> {
     let mut counts = HashMap::new();
@@ -1703,6 +1812,45 @@ async fn wait_for_remote_scheduler_digest(
             .unwrap_or(false)
     })
     .await
+}
+
+/// Marks one peer down in the observer's local health view for scheduler placement checks.
+fn mark_peer_down_for_scheduler(observer: &TestNode, peer_id: Uuid) {
+    let health_monitor = observer.node.registry.health_monitor();
+    health_monitor.handle_down_event(peer_id, u64::MAX / 2);
+    assert_eq!(
+        health_monitor.status(peer_id),
+        HealthStatus::Down,
+        "test precondition should mark the peer down locally"
+    );
+}
+
+/// Reserves every local scheduler slot so only remote digest capacity remains available.
+async fn reserve_all_local_scheduler_slots(node: &TestNode) {
+    let snapshot = node
+        .node
+        .scheduler
+        .snapshot()
+        .await
+        .expect("local scheduler snapshot");
+    assert!(
+        !snapshot.slots.is_empty(),
+        "test requires at least one local scheduler slot"
+    );
+    let reservations = snapshot
+        .slots
+        .iter()
+        .map(|slot| SlotReservationRequest {
+            slot_id: slot.slot_id,
+            owner: node.id(),
+            task_id: Some(Uuid::new_v4()),
+        })
+        .collect::<Vec<_>>();
+    node.node
+        .scheduler
+        .reserve_slots(snapshot.version, reservations)
+        .await
+        .expect("reserve every local scheduler slot");
 }
 
 /// Creates one managed local volume that is bound immediately to the selected node.

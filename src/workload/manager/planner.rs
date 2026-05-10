@@ -4,6 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
+use mantissa_health::Status as HealthStatus;
 use rand::rng;
 use rand::seq::SliceRandom;
 use thiserror::Error;
@@ -45,6 +46,10 @@ pub(super) enum SchedulingError {
     InsufficientCapacityForBatch,
     #[error("scheduler reservation failed: insufficient capacity on target node {target_node}")]
     InsufficientCapacityOnTarget { target_node: Uuid },
+    #[error(
+        "scheduler reservation failed: target node {target_node} unavailable for task '{task}'"
+    )]
+    TargetNodeUnavailable { task: String, target_node: Uuid },
     #[error("scheduler reservation failed: networks {networks:?} unavailable on any candidate")]
     NetworksBlocked { networks: Vec<Uuid> },
     #[error("local node lacks required networks for task '{task}'")]
@@ -85,6 +90,14 @@ struct LocalPlacementPrereqs<'a> {
 struct HostPortReservations<'a> {
     occupied: &'a HashMap<Uuid, Vec<HostPortKey>>,
     public: &'a [HostPortKey],
+}
+
+/// Point-in-time cluster placement inputs used while building scheduler candidates.
+struct SchedulerCandidateBuildInputs<'a> {
+    readiness: &'a HashMap<Uuid, HashSet<Uuid>>,
+    health_snapshot: &'a HashMap<Uuid, HealthStatus>,
+    local_ready: &'a HashSet<Uuid>,
+    host_ports: HostPortReservations<'a>,
 }
 
 /// Normalized node-local host port key used to detect local socket conflicts.
@@ -588,7 +601,7 @@ impl WorkloadDemand {
     }
 }
 
-/// Aggregate free capacity already hydrated into concrete scheduling candidates.
+/// Aggregate free capacity already represented by concrete scheduling candidates.
 #[derive(Clone, Copy, Debug, Default)]
 struct CandidateCapacity {
     free_slot_count: u32,
@@ -614,7 +627,7 @@ struct PreferenceContext<'a> {
 }
 
 impl CandidateCapacity {
-    /// Adds one hydrated candidate's free capacity into the running aggregate.
+    /// Adds one concrete candidate's free capacity into the running aggregate.
     fn add_candidate(&mut self, candidate: &Candidate) {
         let capacity = candidate.capacity();
         self.free_slot_count = self
@@ -630,7 +643,7 @@ impl CandidateCapacity {
     }
 }
 
-/// Returns true when the hydrated candidate pool already covers the aggregate workload lower bound.
+/// Returns true when the concrete candidate pool already covers the aggregate workload lower bound.
 fn capacity_covers_workload(available: CandidateCapacity, demand: WorkloadDemand) -> bool {
     available.free_slot_count >= demand.task_count
         && available.free_cpu_millis >= demand.cpu_millis
@@ -844,6 +857,11 @@ fn node_host_ports(
     let mut ports = occupied.get(&node_id).cloned().unwrap_or_default();
     record_host_port_keys(&mut ports, public_host_ports);
     ports
+}
+
+/// Returns true when the local health snapshot marks one node unavailable for new placements.
+fn node_is_down(node_id: Uuid, health_snapshot: &HashMap<Uuid, HealthStatus>) -> bool {
+    matches!(health_snapshot.get(&node_id), Some(HealthStatus::Down))
 }
 
 /// Builds the per-node host port reservations visible from the replicated workload set.
@@ -1265,6 +1283,7 @@ impl WorkloadManager {
 
         let local_version = snapshot.version;
         let readiness_map = self.collect_network_readiness()?;
+        let health_snapshot = self.core.registry.health_monitor().snapshot();
         let workload_values = self.load_workload_value_index().await?;
         let mut preference_inventory = build_preference_inventory(workload_values.as_ref());
         let mut occupied_host_ports = build_occupied_host_ports(workload_values.as_ref());
@@ -1302,11 +1321,14 @@ impl WorkloadManager {
         let mut candidates = self.build_candidate_queue(
             available_slots,
             available_gpus,
-            &readiness_map,
-            &local_ready,
-            HostPortReservations {
-                occupied: &occupied_host_ports,
-                public: public_host_ports.as_slice(),
+            SchedulerCandidateBuildInputs {
+                readiness: &readiness_map,
+                health_snapshot: &health_snapshot,
+                local_ready: &local_ready,
+                host_ports: HostPortReservations {
+                    occupied: &occupied_host_ports,
+                    public: public_host_ports.as_slice(),
+                },
             },
             &remaining_intents,
         )?;
@@ -1319,6 +1341,7 @@ impl WorkloadManager {
             &mut candidates,
             remaining_intents,
             &mut preference_inventory,
+            &health_snapshot,
         )?;
         assignment.local.sort_by_key(|plan| plan.index);
         assignment.remote.sort_by_key(|plan| plan.index);
@@ -1567,6 +1590,7 @@ impl WorkloadManager {
         &self,
         intents: &[&StartIntent],
         readiness: &HashMap<Uuid, HashSet<Uuid>>,
+        health_snapshot: &HashMap<Uuid, HealthStatus>,
     ) -> Result<Vec<RemoteCandidateHint>, anyhow::Error> {
         let now_unix_ms = current_unix_ms();
         let prepare_feedback = self.local_state.remote_prepare_feedback.snapshot();
@@ -1587,6 +1611,9 @@ impl WorkloadManager {
                 continue;
             }
             if !self.core.registry.peer_schedulable(peer_id) {
+                continue;
+            }
+            if node_is_down(peer_id, health_snapshot) {
                 continue;
             }
 
@@ -1663,9 +1690,7 @@ impl WorkloadManager {
         &self,
         local_slots: Vec<SlotChoice>,
         local_gpus: Vec<GpuChoice>,
-        readiness: &HashMap<Uuid, HashSet<Uuid>>,
-        local_ready: &HashSet<Uuid>,
-        host_ports: HostPortReservations<'_>,
+        context: SchedulerCandidateBuildInputs<'_>,
         intents: &[&StartIntent],
     ) -> Result<VecDeque<Candidate>, anyhow::Error> {
         let mut queue = VecDeque::new();
@@ -1696,12 +1721,14 @@ impl WorkloadManager {
                 .unwrap_or_default(),
         );
         if self.core.registry.peer_schedulable(self.local_node_id)
+            && !node_is_down(self.local_node_id, context.health_snapshot)
             && let Some(local_candidate) = Candidate::new_local(
                 local_placement,
                 local_slots,
                 local_gpus,
-                local_ready.clone(),
-                host_ports
+                context.local_ready.clone(),
+                context
+                    .host_ports
                     .occupied
                     .get(&self.local_node_id)
                     .cloned()
@@ -1714,7 +1741,8 @@ impl WorkloadManager {
         }
 
         let demand = WorkloadDemand::from_intents(intents);
-        let hints = self.build_remote_candidate_hints(intents, readiness)?;
+        let hints =
+            self.build_remote_candidate_hints(intents, context.readiness, context.health_snapshot)?;
         let minimum_candidate_nodes = usize::min(demand.task_count as usize, hints.len() + 1);
         let required_target_nodes: HashSet<Uuid> = hints
             .iter()
@@ -1761,7 +1789,11 @@ impl WorkloadManager {
                 placement,
                 hint.digest.clone(),
                 hint.ready_networks.clone(),
-                node_host_ports(host_ports.occupied, hint.peer_id, host_ports.public),
+                node_host_ports(
+                    context.host_ports.occupied,
+                    hint.peer_id,
+                    context.host_ports.public,
+                ),
                 self.core
                     .registry
                     .peer_runtime_support(hint.peer_id)
@@ -1786,7 +1818,16 @@ impl WorkloadManager {
         candidates: &mut VecDeque<Candidate>,
         intent: &StartIntent,
         target_node: Uuid,
+        health_snapshot: &HashMap<Uuid, HealthStatus>,
     ) -> Result<(CandidateLocation, ResourceAllocation), anyhow::Error> {
+        if node_is_down(target_node, health_snapshot) {
+            return Err(SchedulingError::TargetNodeUnavailable {
+                task: intent.name.clone(),
+                target_node,
+            }
+            .into());
+        }
+
         let candidate_count = candidates.len();
         if candidate_count == 0 {
             return Err(SchedulingError::InsufficientCapacityForBatch.into());
@@ -1811,9 +1852,11 @@ impl WorkloadManager {
         }
 
         let Some(mut candidate) = matched else {
-            return Err(anyhow::anyhow!(
-                "scheduler reservation failed: target node {target_node} unavailable"
-            ));
+            return Err(SchedulingError::TargetNodeUnavailable {
+                task: intent.name.clone(),
+                target_node,
+            }
+            .into());
         };
 
         if !candidate.supports_runtime_requirements(intent) {
@@ -2147,10 +2190,11 @@ impl WorkloadManager {
         candidates: &mut VecDeque<Candidate>,
         intents: Vec<&StartIntent>,
         preference_inventory: &mut PlacementPreferenceInventory,
+        health_snapshot: &HashMap<Uuid, HealthStatus>,
     ) -> Result<(), anyhow::Error> {
         for intent in intents {
             let (location, allocation) = if let Some(target_node) = intent.target_node {
-                self.allocate_targeted_intent(candidates, intent, target_node)?
+                self.allocate_targeted_intent(candidates, intent, target_node, health_snapshot)?
             } else {
                 match intent.placement.strategy {
                     PlacementStrategy::Spread => {
