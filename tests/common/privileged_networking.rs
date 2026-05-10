@@ -9,6 +9,7 @@ use mantissa::network::types::{
     BpfProgramSpec, NetworkDriver, NetworkSpecDraft, NetworkSpecValue, NetworkStatus,
 };
 use mantissa::server::headless::{HeadlessConfig, HeadlessNode, HeadlessTransport};
+use mantissa::workload::manager::WorkloadRuntimeConfig;
 use mantissa_net::paths::STATE_DIR_ENV;
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::BTreeSet;
@@ -271,6 +272,15 @@ fn bpf_artifact_exists(dir: &Path, artifact: &str) -> bool {
     dir.join(stem).exists() || dir.join(format!("{stem}.o")).exists()
 }
 
+/// Return fast workload reconciliation ticks for Docker-backed privileged dataplane tests.
+fn privileged_task_runtime_config() -> WorkloadRuntimeConfig {
+    WorkloadRuntimeConfig {
+        repair_tick: Duration::from_millis(500),
+        reconcile_tick: Duration::from_millis(500),
+        runtime_event_debounce: Duration::from_millis(100),
+    }
+}
+
 /// Start one real headless node with fast control-plane ticks for privileged dataplane tests.
 pub fn privileged_headless_config() -> HeadlessConfig {
     HeadlessConfig {
@@ -286,7 +296,8 @@ pub fn privileged_headless_config() -> HeadlessConfig {
         network_reconcile_tick: Some(Duration::from_secs(1)),
         network_attachment_refresh_tick: Some(Duration::from_millis(100)),
         gossip_channel_capacity: None,
-        task_runtime: None,
+        task_runtime: Some(privileged_task_runtime_config()),
+        service_ready_stability: Some(Duration::from_secs(1)),
         runtime_set: None,
         local_volume_root: None,
         master_key_kdf_params: None,

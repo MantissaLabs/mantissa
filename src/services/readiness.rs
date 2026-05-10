@@ -13,11 +13,6 @@ const SERVICE_READY_POLL_INTERVAL_MS: u64 = 200;
 const SERVICE_READY_TIMEOUT_SECS: u64 = 60;
 /// Base delay (in milliseconds) for exponential backoff between deployment retries.
 const SERVICE_READY_BACKOFF_BASE_MS: u64 = 500;
-/// Continuous all-running window required before declaring the service as Running.
-///
-/// This must exceed the default task reconcile tick (5s) so containers that die
-/// immediately after start cannot be acknowledged as stable running replicas.
-const SERVICE_READY_STABILITY_SECS: u64 = 8;
 /// Maximum consecutive unhealthy readiness probe results before marking the service failed.
 ///
 /// A slightly wider budget gives the periodic slot reconciler enough time to restart replicas
@@ -143,13 +138,14 @@ pub(super) async fn start_readiness_wait(
             ReadinessOutcome::Success(snapshot) => {
                 let stable_since = success_since.get_or_insert_with(Instant::now);
                 let stable_elapsed = stable_since.elapsed();
-                if stable_elapsed < Duration::from_secs(SERVICE_READY_STABILITY_SECS) {
+                let stability = controller.readiness_stability();
+                if stable_elapsed < stability {
                     tracing::debug!(
                         target: "services",
-                        "service '{}' readiness running state observed for {:?}; waiting for {}s stability window",
+                        "service '{}' readiness running state observed for {:?}; waiting for {:?} stability window",
                         service_name,
                         stable_elapsed,
-                        SERVICE_READY_STABILITY_SECS
+                        stability
                     );
                     sleep(Duration::from_millis(SERVICE_READY_POLL_INTERVAL_MS)).await;
                     continue;

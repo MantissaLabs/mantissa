@@ -116,6 +116,7 @@ async fn create_restartable_node_with_root_schema(
             network_attachment_refresh_tick: None,
             gossip_channel_capacity: None,
             task_runtime: None,
+            service_ready_stability: None,
             runtime_set: Some(default_test_runtime_set()),
             local_volume_root: Some(local_volume_root),
             master_key_kdf_params: None,

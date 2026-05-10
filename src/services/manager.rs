@@ -58,6 +58,11 @@ use state::{
     should_stop_tasks,
 };
 
+/// Production all-running stability window before a service deployment is acknowledged.
+///
+/// This exceeds the production task reconcile tick so containers that die immediately after start
+/// cannot be acknowledged as stable running replicas.
+const DEFAULT_SERVICE_READY_STABILITY: Duration = Duration::from_secs(8);
 /// Interval used by the rescheduler loop to evaluate service replica health.
 const SERVICE_RESCHEDULE_TICK_SECS: u64 = 2;
 /// Minimum delay before a missing replica is rescheduled to avoid transient gossip gaps.
@@ -180,6 +185,7 @@ pub struct ServiceController {
     gossip_rx: Receiver<Message>,
     local_node_id: Uuid,
     health_monitor: Arc<HealthMonitor>,
+    readiness_stability: Duration,
     inflight_slots: Arc<AsyncMutex<HashSet<SlotKey>>>,
     inflight_generations: Arc<AsyncMutex<HashSet<ServiceGenerationExecutionKey>>>,
     inflight_traffic_publish_waiters: Arc<AsyncMutex<HashSet<Uuid>>>,
@@ -217,6 +223,7 @@ pub struct ServiceControllerConfig {
     pub gossip_rx: Receiver<Message>,
     pub local_node_id: Uuid,
     pub health_monitor: Arc<HealthMonitor>,
+    pub readiness_stability: Option<Duration>,
 }
 
 impl ServiceController {
@@ -233,6 +240,7 @@ impl ServiceController {
             gossip_rx,
             local_node_id,
             health_monitor,
+            readiness_stability,
         } = config;
         Self {
             registry,
@@ -245,6 +253,7 @@ impl ServiceController {
             gossip_rx,
             local_node_id,
             health_monitor,
+            readiness_stability: readiness_stability.unwrap_or(DEFAULT_SERVICE_READY_STABILITY),
             inflight_slots: Arc::new(AsyncMutex::new(HashSet::new())),
             inflight_generations: Arc::new(AsyncMutex::new(HashSet::new())),
             inflight_traffic_publish_waiters: Arc::new(AsyncMutex::new(HashSet::new())),
@@ -570,6 +579,11 @@ impl ServiceController {
     /// alone.
     async fn await_service_readiness(self, initial_spec: ServiceSpecValue) {
         start_readiness_wait(self, initial_spec).await;
+    }
+
+    /// Returns the all-running stability window required before acknowledging a deployment.
+    fn readiness_stability(&self) -> Duration {
+        self.readiness_stability
     }
 
     /// Runs the local stop workflow for a service that originated on this node.

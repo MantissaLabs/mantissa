@@ -148,6 +148,7 @@ impl TestNode {
             network_attachment_refresh_tick: None,
             gossip_channel_capacity,
             task_runtime,
+            service_ready_stability: None,
             runtime_set: None,
             local_volume_root: None,
             master_key_kdf_params: None,
