@@ -2615,7 +2615,9 @@ local_test!(
                         network_id,
                         service_name,
                         &network.name,
-                        NODEPORT_HTTP_PORT,
+                        // Keep this traffic off the published target port so the test exercises
+                        // non-candidate DNS/VIP packets rather than real NodePort return tuples.
+                        NODEPORT_HTTP_REMAP_PORT,
                     ),
                 ],
             )
