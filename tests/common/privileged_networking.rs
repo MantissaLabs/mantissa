@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
 use super::convergence::wait_until;
+use anyhow::{Context, Result};
 use aya::programs::tc::{TcAttachType, qdisc_detach_program};
+use futures::TryStreamExt;
 use mantissa::config::{
     Config, ConfigSource, global_config, global_config_source, set_global_config_with_source,
 };
@@ -12,9 +14,15 @@ use mantissa::server::headless::{HeadlessConfig, HeadlessNode, HeadlessTransport
 use mantissa::workload::manager::WorkloadRuntimeConfig;
 use mantissa_net::paths::STATE_DIR_ENV;
 use parking_lot::{Mutex, MutexGuard};
+use rtnetlink::RouteMessageBuilder;
+use rtnetlink::packet_route::address::{AddressAttribute, AddressMessage};
+use rtnetlink::packet_route::link::{LinkAttribute, LinkXdp, XdpAttached};
+use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourState};
+use rtnetlink::packet_route::route::{RouteAttribute, RouteHeader};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
@@ -417,6 +425,384 @@ pub fn privileged_network_interfaces(network_id: Uuid) -> [String; 4] {
 /// Return whether the kernel still exposes the provided network device name.
 pub fn link_exists(iface: &str) -> bool {
     Path::new("/sys/class/net").join(iface).exists()
+}
+
+/// Open one rtnetlink connection and spawn its driver on the current Tokio runtime.
+fn rtnetlink_handle(context: &str) -> rtnetlink::Handle {
+    let (conn, handle, _) =
+        rtnetlink::new_connection().unwrap_or_else(|err| panic!("{context}: {err}"));
+    tokio::spawn(conn);
+    handle
+}
+
+/// Resolve one kernel interface index by device name.
+async fn link_index(handle: &rtnetlink::Handle, iface: &str) -> Option<u32> {
+    handle
+        .link()
+        .get()
+        .match_name(iface.to_string())
+        .execute()
+        .try_next()
+        .await
+        .unwrap_or_else(|err| panic!("query interface {iface}: {err}"))
+        .map(|link| link.header.index)
+}
+
+/// Resolve one kernel interface name by ifindex.
+async fn link_name_by_index(handle: &rtnetlink::Handle, index: u32) -> Option<String> {
+    handle
+        .link()
+        .get()
+        .match_index(index)
+        .execute()
+        .try_next()
+        .await
+        .unwrap_or_else(|err| panic!("query interface index {index}: {err}"))
+        .map(|link| {
+            link.attributes
+                .iter()
+                .find_map(|attr| match attr {
+                    LinkAttribute::IfName(name) => Some(name.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| format!("ifindex{index}"))
+        })
+}
+
+/// Return the first main-table IPv4 default-route interface name.
+pub async fn default_ipv4_route_iface() -> Option<String> {
+    let handle = rtnetlink_handle("open rtnetlink connection for default IPv4 route lookup");
+    let mut routes = handle
+        .route()
+        .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
+        .execute();
+
+    while let Some(route) = routes
+        .try_next()
+        .await
+        .expect("list IPv4 routes for default interface lookup")
+    {
+        let mut table = u32::from(route.header.table);
+        let mut destination_present = false;
+        let mut output_ifindex = None;
+        for attr in route.attributes {
+            match attr {
+                RouteAttribute::Destination(_) => destination_present = true,
+                RouteAttribute::Oif(index) => output_ifindex = Some(index),
+                RouteAttribute::Table(route_table) => table = route_table,
+                _ => {}
+            }
+        }
+        if table != u32::from(RouteHeader::RT_TABLE_MAIN)
+            || route.header.destination_prefix_length != 0
+            || destination_present
+        {
+            continue;
+        }
+        if let Some(index) = output_ifindex {
+            return link_name_by_index(&handle, index).await;
+        }
+    }
+
+    None
+}
+
+/// Return the first IPv4 address assigned to one interface.
+pub async fn interface_ipv4(iface: &str) -> Option<Ipv4Addr> {
+    let handle = rtnetlink_handle("open rtnetlink connection for interface IPv4 lookup");
+    let index = link_index(&handle, iface).await?;
+    let mut addresses = handle
+        .address()
+        .get()
+        .set_link_index_filter(index)
+        .execute();
+
+    while let Some(msg) = addresses
+        .try_next()
+        .await
+        .unwrap_or_else(|err| panic!("enumerate IPv4 addresses for {iface}: {err}"))
+    {
+        for attr in &msg.attributes {
+            match attr {
+                AddressAttribute::Address(IpAddr::V4(addr))
+                | AddressAttribute::Local(IpAddr::V4(addr)) => return Some(*addr),
+                _ => {}
+            }
+        }
+    }
+
+    None
+}
+
+/// Return the first non-link-local IPv6 address assigned to one interface.
+pub async fn interface_ipv6(iface: &str) -> Option<Ipv6Addr> {
+    let handle = rtnetlink_handle("open rtnetlink connection for interface IPv6 lookup");
+    let index = link_index(&handle, iface).await?;
+    let mut addresses = handle
+        .address()
+        .get()
+        .set_link_index_filter(index)
+        .execute();
+
+    while let Some(msg) = addresses
+        .try_next()
+        .await
+        .unwrap_or_else(|err| panic!("enumerate IPv6 addresses for {iface}: {err}"))
+    {
+        for attr in &msg.attributes {
+            let candidate = match attr {
+                AddressAttribute::Address(IpAddr::V6(addr))
+                | AddressAttribute::Local(IpAddr::V6(addr)) => *addr,
+                _ => continue,
+            };
+            if !candidate.is_unicast_link_local() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+/// Return whether an interface already has a usable non-link-local IPv6 address.
+pub async fn iface_has_usable_ipv6(iface: &str) -> bool {
+    interface_ipv6(iface).await.is_some()
+}
+
+/// Add one IP address to the requested interface through rtnetlink.
+pub async fn add_interface_address(iface: &str, ip: IpAddr, prefix_len: u8) -> Result<()> {
+    let handle = rtnetlink_handle("open rtnetlink connection for address add");
+    let index = link_index(&handle, iface)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("interface {iface} not found"))?;
+    handle
+        .address()
+        .add(index, ip, prefix_len)
+        .execute()
+        .await
+        .with_context(|| format!("add address {ip}/{prefix_len} to {iface}"))
+}
+
+/// Delete one IP address from the requested interface through rtnetlink.
+pub async fn delete_interface_address(iface: &str, ip: IpAddr, prefix_len: u8) -> Result<()> {
+    let handle = rtnetlink_handle("open rtnetlink connection for address delete");
+    let Some(index) = link_index(&handle, iface).await else {
+        return Ok(());
+    };
+    let mut addresses = handle
+        .address()
+        .get()
+        .set_link_index_filter(index)
+        .execute();
+
+    while let Some(msg) = addresses
+        .try_next()
+        .await
+        .with_context(|| format!("enumerate addresses for {iface} delete"))?
+    {
+        if msg.header.prefix_len != prefix_len || !address_attrs_contain_ip(&msg, ip) {
+            continue;
+        }
+        handle
+            .address()
+            .del(msg)
+            .execute()
+            .await
+            .with_context(|| format!("delete address {ip}/{prefix_len} from {iface}"))?;
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+/// Return true when one address message carries the provided IP address.
+fn address_attrs_contain_ip(message: &AddressMessage, ip: IpAddr) -> bool {
+    message.attributes.iter().any(|attr| match attr {
+        AddressAttribute::Address(addr) | AddressAttribute::Local(addr) => *addr == ip,
+        _ => false,
+    })
+}
+
+/// Return whether an interface has any XDP program attached according to rtnetlink.
+pub async fn link_has_xdp(iface: &str) -> bool {
+    let handle = rtnetlink_handle("open rtnetlink connection for XDP link lookup");
+    let Some(link) = handle
+        .link()
+        .get()
+        .match_name(iface.to_string())
+        .execute()
+        .try_next()
+        .await
+        .unwrap_or_else(|err| panic!("query interface {iface} for XDP: {err}"))
+    else {
+        return false;
+    };
+    link.attributes.iter().any(|attr| match attr {
+        LinkAttribute::Xdp(entries) => entries.iter().any(link_xdp_attached),
+        _ => false,
+    })
+}
+
+/// Return whether one XDP link attribute reports an attached program.
+fn link_xdp_attached(entry: &LinkXdp) -> bool {
+    match entry {
+        LinkXdp::Attached(attached) => *attached != XdpAttached::None,
+        LinkXdp::ProgId(id)
+        | LinkXdp::DrvProgId(id)
+        | LinkXdp::SkbProgId(id)
+        | LinkXdp::HwProgId(id) => *id != 0,
+        _ => false,
+    }
+}
+
+/// Build a compact structured link summary for privileged failure diagnostics.
+pub async fn link_summary(iface: &str) -> String {
+    let handle = rtnetlink_handle("open rtnetlink connection for link summary");
+    let Some(link) = handle
+        .link()
+        .get()
+        .match_name(iface.to_string())
+        .execute()
+        .try_next()
+        .await
+        .unwrap_or_else(|err| panic!("query interface {iface} summary: {err}"))
+    else {
+        return format!("{iface}: <missing>");
+    };
+    let mtu = link.attributes.iter().find_map(|attr| match attr {
+        LinkAttribute::Mtu(mtu) => Some(*mtu),
+        _ => None,
+    });
+    let qdisc = link.attributes.iter().find_map(|attr| match attr {
+        LinkAttribute::Qdisc(qdisc) => Some(qdisc.as_str()),
+        _ => None,
+    });
+    let has_xdp = link.attributes.iter().any(|attr| match attr {
+        LinkAttribute::Xdp(entries) => entries.iter().any(link_xdp_attached),
+        _ => false,
+    });
+    format!(
+        "{iface}: index={} flags={:?} mtu={mtu:?} qdisc={qdisc:?} xdp={has_xdp}",
+        link.header.index, link.header.flags
+    )
+}
+
+/// Build a compact address summary for privileged failure diagnostics.
+pub async fn interface_addresses_summary(iface: &str) -> String {
+    let handle = rtnetlink_handle("open rtnetlink connection for address summary");
+    let Some(index) = link_index(&handle, iface).await else {
+        return format!("{iface}: <missing>");
+    };
+    let mut addresses = handle
+        .address()
+        .get()
+        .set_link_index_filter(index)
+        .execute();
+    let mut out = Vec::new();
+
+    while let Some(msg) = addresses
+        .try_next()
+        .await
+        .unwrap_or_else(|err| panic!("enumerate addresses for {iface} summary: {err}"))
+    {
+        for attr in &msg.attributes {
+            if let AddressAttribute::Address(addr) | AddressAttribute::Local(addr) = attr {
+                out.push(format!("{addr}/{}", msg.header.prefix_len));
+            }
+        }
+    }
+
+    format!("{iface}: [{}]", out.join(", "))
+}
+
+/// Return whether one interface has a permanent neighbour entry for the destination IP.
+pub async fn permanent_neighbour_exists(iface: &str, ip: IpAddr) -> bool {
+    neighbour_exists_with_state(iface, ip, Some(NeighbourState::Permanent)).await
+}
+
+/// Return whether one interface has any neighbour entry for the destination IP.
+pub async fn neighbour_exists(iface: &str, ip: IpAddr) -> bool {
+    neighbour_exists_with_state(iface, ip, None).await
+}
+
+/// Return whether one interface has a neighbour entry, optionally matching one state.
+async fn neighbour_exists_with_state(
+    iface: &str,
+    ip: IpAddr,
+    state: Option<NeighbourState>,
+) -> bool {
+    let handle = rtnetlink_handle("open rtnetlink connection for neighbour lookup");
+    let Some(index) = link_index(&handle, iface).await else {
+        return false;
+    };
+    let mut neighbours = handle.neighbours().get().execute();
+
+    while let Some(msg) = neighbours
+        .try_next()
+        .await
+        .unwrap_or_else(|err| panic!("enumerate neighbours for {iface}: {err}"))
+    {
+        if msg.header.ifindex != index {
+            continue;
+        }
+        match &state {
+            Some(expected_state) if &msg.header.state != expected_state => continue,
+            _ => {}
+        }
+        if neighbour_destination(&msg.attributes) == Some(ip) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Build a compact neighbour summary for privileged failure diagnostics.
+pub async fn neighbour_summary(iface: &str, ip: IpAddr) -> String {
+    let handle = rtnetlink_handle("open rtnetlink connection for neighbour summary");
+    let Some(index) = link_index(&handle, iface).await else {
+        return format!("{iface}: <missing>");
+    };
+    let mut neighbours = handle.neighbours().get().execute();
+    let mut out = Vec::new();
+
+    while let Some(msg) = neighbours
+        .try_next()
+        .await
+        .unwrap_or_else(|err| panic!("enumerate neighbours for {iface} summary: {err}"))
+    {
+        if msg.header.ifindex != index {
+            continue;
+        }
+        let Some(destination) = neighbour_destination(&msg.attributes) else {
+            continue;
+        };
+        if destination != ip {
+            continue;
+        }
+        let mac = msg.attributes.iter().find_map(|attr| match attr {
+            NeighbourAttribute::LinkLocalAddress(bytes) if bytes.len() == 6 => Some(format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+            )),
+            _ => None,
+        });
+        out.push(format!(
+            "dst={destination} state={:?} mac={mac:?}",
+            msg.header.state
+        ));
+    }
+
+    format!("{iface}: [{}]", out.join(", "))
+}
+
+/// Extract the destination IP from one neighbour attribute set.
+fn neighbour_destination(attributes: &[NeighbourAttribute]) -> Option<IpAddr> {
+    attributes.iter().find_map(|attr| match attr {
+        NeighbourAttribute::Destination(NeighbourAddress::Inet(addr)) => Some(IpAddr::V4(*addr)),
+        NeighbourAttribute::Destination(NeighbourAddress::Inet6(addr)) => Some(IpAddr::V6(*addr)),
+        _ => None,
+    })
 }
 
 /// Best-effort delete one kernel link so privileged tests do not leak host interfaces on failure.

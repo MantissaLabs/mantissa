@@ -8,9 +8,11 @@ use aya::Pod;
 use aya::maps::{HashMap as BpfHashMap, Map, MapData};
 use common::privileged_networking::{
     PrivilegedBpfArtifacts, PrivilegedTestGuard, command_stdout, create_privileged_network,
-    create_privileged_node, delete_privileged_network, link_exists, privileged_artifact_dir,
-    privileged_network_interfaces, privileged_test_network, privileged_test_subnet,
-    privileged_test_subnet_v6,
+    create_privileged_node, delete_privileged_network, interface_addresses_summary,
+    interface_ipv4 as rtnetlink_interface_ipv4, interface_ipv6 as rtnetlink_interface_ipv6,
+    link_exists, link_has_xdp, link_summary, neighbour_exists, neighbour_summary,
+    permanent_neighbour_exists, privileged_artifact_dir, privileged_network_interfaces,
+    privileged_test_network, privileged_test_subnet, privileged_test_subnet_v6,
 };
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
@@ -65,17 +67,21 @@ fn privileged_ebpf_artifact_dir() -> Option<PrivilegedBpfArtifacts> {
     )
 }
 
-/// Return whether the detailed `ip link` output reports an attached XDP program.
-fn has_xdp_attachment(details: &str) -> bool {
-    details.contains("prog/xdp") || details.contains("xdp id")
-}
-
 /// Assert that one tc hook carries a BPF classifier on the requested interface.
 fn assert_tc_attachment(interface: &str, hook: &str, context: &str) {
     let filters = command_stdout("tc", &["filter", "show", "dev", interface, hook]);
     assert!(
         filters.contains("bpf"),
         "{context}: expected a tc BPF program on {interface} {hook}, got: {filters}"
+    );
+}
+
+/// Assert that one interface carries an XDP program according to rtnetlink state.
+async fn assert_xdp_attachment(interface: &str, context: &str) {
+    assert!(
+        link_has_xdp(interface).await,
+        "{context}: expected an XDP program on {interface}, got: {}",
+        link_summary(interface).await
     );
 }
 
@@ -478,43 +484,17 @@ async fn capture_tcpdump_line(
 }
 
 /// Read the first IPv4 address currently assigned to one host interface.
-fn interface_ipv4(iface: &str) -> Ipv4Addr {
-    let details = command_stdout("ip", &["-4", "-o", "addr", "show", "dev", iface]);
-    details
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .find_map(|window| {
-            if window[0] != "inet" {
-                return None;
-            }
-            window[1]
-                .split('/')
-                .next()
-                .and_then(|text| text.parse::<Ipv4Addr>().ok())
-        })
-        .unwrap_or_else(|| panic!("interface {iface} should expose an IPv4 address: {details}"))
+async fn interface_ipv4(iface: &str) -> Ipv4Addr {
+    rtnetlink_interface_ipv4(iface)
+        .await
+        .unwrap_or_else(|| panic!("interface {iface} should expose an IPv4 address"))
 }
 
 /// Read the first non-link-local IPv6 address currently assigned to one host interface.
-fn interface_ipv6(iface: &str) -> Ipv6Addr {
-    let details = command_stdout("ip", &["-6", "-o", "addr", "show", "dev", iface]);
-    details
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .find_map(|window| {
-            if window[0] != "inet6" {
-                return None;
-            }
-            let candidate = window[1].split('/').next()?;
-            let ip = candidate.parse::<Ipv6Addr>().ok()?;
-            if ip.is_unicast_link_local() {
-                return None;
-            }
-            Some(ip)
-        })
-        .unwrap_or_else(|| panic!("interface {iface} should expose an IPv6 address: {details}"))
+async fn interface_ipv6(iface: &str) -> Ipv6Addr {
+    rtnetlink_interface_ipv6(iface)
+        .await
+        .unwrap_or_else(|| panic!("interface {iface} should expose an IPv6 address"))
 }
 
 /// Query the per-network DNS resolver for A records for one service label.
@@ -770,17 +750,16 @@ local_test!(ebpf_overlay_attaches_programs_and_tears_down_cleanly, {
     let [vxlan_ifname, bridge_ifname, host_peer_ifname, _host_ifname] =
         privileged_network_interfaces(network.id);
 
-    let vxlan_details = command_stdout("ip", &["-d", "link", "show", "dev", &vxlan_ifname]);
-    assert!(
-        has_xdp_attachment(&vxlan_details),
-        "vxlan interface should carry the xdp program: {vxlan_details}"
-    );
-
-    let bridge_details = command_stdout("ip", &["-d", "link", "show", "dev", &bridge_ifname]);
-    assert!(
-        has_xdp_attachment(&bridge_details),
-        "bridge interface should carry the xdp program: {bridge_details}"
-    );
+    assert_xdp_attachment(
+        &vxlan_ifname,
+        "vxlan interface should carry the xdp program",
+    )
+    .await;
+    assert_xdp_attachment(
+        &bridge_ifname,
+        "bridge interface should carry the xdp program",
+    )
+    .await;
 
     let _ = bridge_ifname;
     assert_tc_attachment(
@@ -874,7 +853,7 @@ local_test!(ebpf_overlay_programs_runtime_mss_for_small_mtu, {
         _host_peer_ifname,
         host_ifname,
     ] = privileged_network_interfaces(network_id);
-    let resolver_ip = interface_ipv4(&host_ifname);
+    let resolver_ip = interface_ipv4(&host_ifname).await;
     let fqdn = format!("backend.{}.svc.mantissa.", network.name);
     let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
         .await
@@ -981,11 +960,11 @@ local_test!(ebpf_overlay_multiple_networks_attach_and_cleanup_cleanly, {
     assert_lb_maps_present(network_b.id, overlay_family(&subnet_b));
 
     let [vxlan_ifname, _bridge_ifname, host_peer_ifname, _host_ifname] = interfaces_b.clone();
-    let vxlan_details = command_stdout("ip", &["-d", "link", "show", "dev", &vxlan_ifname]);
-    assert!(
-        has_xdp_attachment(&vxlan_details),
-        "network B should keep its xdp attachment after network A is deleted: {vxlan_details}"
-    );
+    assert_xdp_attachment(
+        &vxlan_ifname,
+        "network B should keep its xdp attachment after network A is deleted",
+    )
+    .await;
     assert_tc_attachment(
         &host_peer_ifname,
         "ingress",
@@ -1059,7 +1038,7 @@ local_test!(ebpf_overlay_host_vip_reaches_service_from_host_access, {
         _host_peer_ifname,
         host_ifname,
     ] = privileged_network_interfaces(network_id);
-    let resolver_ip = interface_ipv4(&host_ifname);
+    let resolver_ip = interface_ipv4(&host_ifname).await;
     let fqdn = format!("backend.{}.svc.mantissa.", network.name);
     let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
         .await
@@ -1081,12 +1060,9 @@ local_test!(ebpf_overlay_host_vip_reaches_service_from_host_access, {
         let (last_dns_code, last_dns_answers) = query_a_records(resolver_ip, &fqdn)
             .await
             .expect("query dns after host-access vip timeout");
-        let host_link = command_stdout("ip", &["link", "show", "dev", &host_ifname]);
-        let host_addr = command_stdout("ip", &["-4", "addr", "show", "dev", &host_ifname]);
-        let neighbour = command_stdout(
-            "ip",
-            &["neigh", "show", "to", &vip.to_string(), "dev", &host_ifname],
-        );
+        let host_link = link_summary(&host_ifname).await;
+        let host_addr = interface_addresses_summary(&host_ifname).await;
+        let neighbour = neighbour_summary(&host_ifname, IpAddr::V4(vip)).await;
         let last_http_error = http_get(&vip_addr)
             .await
             .map(|response| format!("unexpected response: {response}"))
@@ -1096,13 +1072,10 @@ local_test!(ebpf_overlay_host_vip_reaches_service_from_host_access, {
         );
     }
 
-    let neighbour = command_stdout(
-        "ip",
-        &["neigh", "show", "to", &vip.to_string(), "dev", &host_ifname],
-    );
     assert!(
-        neighbour.contains("PERMANENT"),
-        "host-access interface should keep a permanent neighbour entry for the published VIP: {neighbour}"
+        permanent_neighbour_exists(&host_ifname, IpAddr::V4(vip)).await,
+        "host-access interface should keep a permanent neighbour entry for the published VIP: {}",
+        neighbour_summary(&host_ifname, IpAddr::V4(vip)).await
     );
 
     remove_service_via_rpc(&node.services_client, service_id).await;
@@ -1168,7 +1141,7 @@ local_test!(ebpf_overlay_status_reports_programmed_vip_traffic, {
         _host_peer_ifname,
         host_ifname,
     ] = privileged_network_interfaces(network_id);
-    let resolver_ip = interface_ipv4(&host_ifname);
+    let resolver_ip = interface_ipv4(&host_ifname).await;
     let fqdn = format!("backend.{}.svc.mantissa.", network.name);
     let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
         .await
@@ -1279,7 +1252,7 @@ local_test!(
             _host_peer_ifname,
             host_ifname,
         ] = privileged_network_interfaces(network_id);
-        let resolver_ip = interface_ipv6(&host_ifname);
+        let resolver_ip = interface_ipv6(&host_ifname).await;
         let fqdn = format!("backend.{}.svc.mantissa.", network.name);
         let vip = wait_for_vip_record_v6(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
             .await
@@ -1301,20 +1274,9 @@ local_test!(
             let (last_dns_code, last_dns_answers) = query_aaaa_records(resolver_ip, &fqdn)
                 .await
                 .expect("query IPv6 dns after host-access vip timeout");
-            let host_link = command_stdout("ip", &["link", "show", "dev", &host_ifname]);
-            let host_addr = command_stdout("ip", &["-6", "addr", "show", "dev", &host_ifname]);
-            let neighbour = command_stdout(
-                "ip",
-                &[
-                    "-6",
-                    "neigh",
-                    "show",
-                    "to",
-                    &vip.to_string(),
-                    "dev",
-                    &host_ifname,
-                ],
-            );
+            let host_link = link_summary(&host_ifname).await;
+            let host_addr = interface_addresses_summary(&host_ifname).await;
+            let neighbour = neighbour_summary(&host_ifname, IpAddr::V6(vip)).await;
             let last_http_error = http_get(&vip_addr)
                 .await
                 .map(|response| format!("unexpected response: {response}"))
@@ -1324,21 +1286,10 @@ local_test!(
             );
         }
 
-        let neighbour = command_stdout(
-            "ip",
-            &[
-                "-6",
-                "neigh",
-                "show",
-                "to",
-                &vip.to_string(),
-                "dev",
-                &host_ifname,
-            ],
-        );
         assert!(
-            neighbour.contains("PERMANENT"),
-            "host-access interface should keep a permanent IPv6 neighbour entry for the published VIP: {neighbour}"
+            permanent_neighbour_exists(&host_ifname, IpAddr::V6(vip)).await,
+            "host-access interface should keep a permanent IPv6 neighbour entry for the published VIP: {}",
+            neighbour_summary(&host_ifname, IpAddr::V6(vip)).await
         );
 
         remove_service_via_rpc(&node.services_client, service_id).await;
@@ -1435,7 +1386,7 @@ local_test!(ebpf_overlay_task_dns_reaches_service_vip, {
         _host_peer_ifname,
         host_ifname,
     ] = privileged_network_interfaces(network_id);
-    let resolver_ip = interface_ipv4(&host_ifname);
+    let resolver_ip = interface_ipv4(&host_ifname).await;
     let fqdn = format!("backend.{}.svc.mantissa", network.name);
     let vip = wait_for_vip_record(
         resolver_ip,
@@ -1606,7 +1557,7 @@ local_test!(ebpf_overlay_ipv6_task_dns_reaches_service_vip, {
         _host_peer_ifname,
         host_ifname,
     ] = privileged_network_interfaces(network_id);
-    let resolver_ip = interface_ipv6(&host_ifname);
+    let resolver_ip = interface_ipv6(&host_ifname).await;
     let fqdn = format!("backend.{}.svc.mantissa", network.name);
     let vip = wait_for_vip_record_v6(
         resolver_ip,
@@ -1747,7 +1698,7 @@ local_test!(ebpf_overlay_vip_load_balances_across_local_replicas, {
         _host_peer_ifname,
         host_ifname,
     ] = privileged_network_interfaces(network_id);
-    let resolver_ip = interface_ipv4(&host_ifname);
+    let resolver_ip = interface_ipv4(&host_ifname).await;
     let fqdn = format!("backend.{}.svc.mantissa.", network.name);
     let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
         .await
@@ -1841,7 +1792,7 @@ local_test!(
             _host_peer_ifname,
             host_ifname,
         ] = privileged_network_interfaces(network_id);
-        let resolver_ip = interface_ipv6(&host_ifname);
+        let resolver_ip = interface_ipv6(&host_ifname).await;
         let fqdn = format!("backend.{}.svc.mantissa.", network.name);
         let vip = wait_for_vip_record_v6(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
             .await
@@ -1934,7 +1885,7 @@ local_test!(ebpf_overlay_return_path_preserves_vip_identity, {
         _host_peer_ifname,
         host_ifname,
     ] = privileged_network_interfaces(network_id);
-    let resolver_ip = interface_ipv4(&host_ifname);
+    let resolver_ip = interface_ipv4(&host_ifname).await;
     let fqdn = format!("backend.{}.svc.mantissa.", network.name);
     let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
         .await
@@ -2023,7 +1974,7 @@ local_test!(ebpf_overlay_udp_service_reaches_host_access_vip, {
         _host_peer_ifname,
         host_ifname,
     ] = privileged_network_interfaces(network_id);
-    let resolver_ip = interface_ipv4(&host_ifname);
+    let resolver_ip = interface_ipv4(&host_ifname).await;
     let fqdn = format!("backend.{}.svc.mantissa.", network.name);
     let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
         .await
@@ -2043,10 +1994,7 @@ local_test!(ebpf_overlay_udp_service_reaches_host_access_vip, {
         let (last_dns_code, last_dns_answers) = query_a_records(resolver_ip, &fqdn)
             .await
             .expect("query dns after udp vip timeout");
-        let neighbour = command_stdout(
-            "ip",
-            &["neigh", "show", "to", &vip.to_string(), "dev", &host_ifname],
-        );
+        let neighbour = neighbour_summary(&host_ifname, IpAddr::V4(vip)).await;
         let last_udp_error = udp_echo(&vip_addr, payload)
             .await
             .map(|response| {
@@ -2127,7 +2075,7 @@ local_test!(
             _host_peer_ifname,
             host_ifname,
         ] = privileged_network_interfaces(network_id);
-        let resolver_ip = interface_ipv4(&host_ifname);
+        let resolver_ip = interface_ipv4(&host_ifname).await;
         let fqdn = format!("backend.{}.svc.mantissa.", network.name);
         let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
             .await
@@ -2149,13 +2097,10 @@ local_test!(
             "host-access traffic should reach the service VIP before service deletion"
         );
 
-        let neighbour = command_stdout(
-            "ip",
-            &["neigh", "show", "to", &vip.to_string(), "dev", &host_ifname],
-        );
         assert!(
-            neighbour.contains("PERMANENT"),
-            "host-access interface should keep a permanent neighbour entry before service deletion: {neighbour}"
+            permanent_neighbour_exists(&host_ifname, IpAddr::V4(vip)).await,
+            "host-access interface should keep a permanent neighbour entry before service deletion: {}",
+            neighbour_summary(&host_ifname, IpAddr::V4(vip)).await
         );
 
         remove_service_via_rpc(&node.services_client, service_id).await;
@@ -2181,13 +2126,7 @@ local_test!(
             common::convergence::wait_until(
                 Duration::from_secs(30),
                 Duration::from_millis(100),
-                || async {
-                    let neighbour = command_stdout(
-                        "ip",
-                        &["neigh", "show", "to", &vip.to_string(), "dev", &host_ifname],
-                    );
-                    neighbour.trim().is_empty()
-                }
+                || async { !neighbour_exists(&host_ifname, IpAddr::V4(vip)).await }
             )
             .await,
             "service deletion should remove the permanent host vip neighbour entry"
@@ -2279,7 +2218,7 @@ local_test!(
             _host_peer_ifname,
             host_ifname,
         ] = privileged_network_interfaces(network_id);
-        let resolver_ip = interface_ipv4(&host_ifname);
+        let resolver_ip = interface_ipv4(&host_ifname).await;
         let fqdn = format!("backend.{}.svc.mantissa.", network.name);
         let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
             .await
@@ -2301,12 +2240,9 @@ local_test!(
             let (last_dns_code, last_dns_answers) = query_a_records(resolver_ip, &fqdn)
                 .await
                 .expect("query dns after delete-stability vip timeout");
-            let host_link = command_stdout("ip", &["link", "show", "dev", &host_ifname]);
-            let host_addr = command_stdout("ip", &["-4", "addr", "show", "dev", &host_ifname]);
-            let neighbour = command_stdout(
-                "ip",
-                &["neigh", "show", "to", &vip.to_string(), "dev", &host_ifname],
-            );
+            let host_link = link_summary(&host_ifname).await;
+            let host_addr = interface_addresses_summary(&host_ifname).await;
+            let neighbour = neighbour_summary(&host_ifname, IpAddr::V4(vip)).await;
             let last_http_error = http_get(&vip_addr)
                 .await
                 .map(|response| format!("unexpected response: {response}"))
@@ -2391,7 +2327,7 @@ local_test!(ebpf_overlay_heals_after_lb_map_removal, {
         _host_peer_ifname,
         host_ifname,
     ] = privileged_network_interfaces(network_id);
-    let resolver_ip = interface_ipv4(&host_ifname);
+    let resolver_ip = interface_ipv4(&host_ifname).await;
     let fqdn = format!("backend.{}.svc.mantissa.", network.name);
     let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
         .await

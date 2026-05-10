@@ -6,12 +6,12 @@ mod common;
 use anyhow::Context;
 use common::convergence::wait_until;
 use common::privileged_networking::{
-    PrivilegedBpfArtifacts, PrivilegedTestGuard, command_output, command_stdout,
-    create_privileged_network, create_privileged_node, delete_privileged_network,
+    PrivilegedBpfArtifacts, PrivilegedTestGuard, add_interface_address, command_stdout,
+    create_privileged_network, create_privileged_node, default_ipv4_route_iface,
+    delete_interface_address, delete_privileged_network, iface_has_usable_ipv6, interface_ipv4,
     privileged_artifact_dir, privileged_headless_config, privileged_network_interfaces,
     privileged_test_network, privileged_test_subnet, privileged_test_subnet_v6,
 };
-use futures::TryStreamExt;
 use mantissa::config::NodePortSourceMode;
 use mantissa::network::nodeport::{NodePortIdentitySource, NodePortRuntimeState};
 use mantissa::server::headless::{HeadlessKeys, HeadlessNode};
@@ -22,7 +22,6 @@ use mantissa::services::types::{
 };
 use mantissa::workload::types::ExecutionSpec;
 use mantissa_protocol::services::services;
-use rtnetlink::packet_route::address::AddressAttribute;
 use std::mem;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Stdio;
@@ -44,30 +43,6 @@ const NODEPORT_RESPONSE: &str = "hello from nodeport privileged test";
 const NODEPORT_CONFLICT_RESPONSE: &str = "hello from nodeport owner";
 const NODEPORT_DEGRADED_RESPONSE: &str = "hello from degraded nodeport service";
 const NODEPORT_UDP_RESPONSE: &str = "hello from nodeport privileged udp test";
-
-/// Returns the first default-route interface name for the current privileged test namespace.
-fn default_route_iface() -> Option<String> {
-    let routes = command_stdout("ip", &["-4", "route", "show", "default"]);
-    routes.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        while let Some(field) = fields.next() {
-            if field == "dev" {
-                return fields.next().map(str::to_string);
-            }
-        }
-        None
-    })
-}
-
-/// Returns whether an interface already has a usable non-link-local IPv6 address.
-fn iface_has_usable_ipv6(iface: &str) -> bool {
-    let output = command_stdout("ip", &["-6", "addr", "show", "dev", iface]);
-    output
-        .lines()
-        .filter_map(|line| line.split_whitespace().nth(1))
-        .filter(|token| token != &"fe80::/64")
-        .any(|token| token.starts_with("fd") || token.starts_with("2") || token.starts_with("3"))
-}
 
 /// Resolve optional NodePort dataplane artifact overrides for the privileged validation lane.
 fn privileged_nodeport_artifact_dir() -> Option<PrivilegedBpfArtifacts> {
@@ -403,45 +378,6 @@ async fn capture_verbose_tcpdump_line(
     Ok(String::from_utf8_lossy(&output).trim().to_string())
 }
 
-/// Read the first IPv4 address currently assigned to one host interface through rtnetlink.
-async fn interface_ipv4(iface: &str) -> Ipv4Addr {
-    let (conn, handle, _) =
-        rtnetlink::new_connection().expect("open rtnetlink connection for interface IPv4 lookup");
-    tokio::spawn(conn);
-
-    let link = handle
-        .link()
-        .get()
-        .match_name(iface.to_string())
-        .execute()
-        .try_next()
-        .await
-        .expect("query interface for IPv4 lookup")
-        .unwrap_or_else(|| panic!("interface {iface} should exist for IPv4 lookup"));
-
-    let mut addresses = handle
-        .address()
-        .get()
-        .set_link_index_filter(link.header.index)
-        .execute();
-
-    while let Some(msg) = addresses
-        .try_next()
-        .await
-        .expect("enumerate interface IPv4 addresses")
-    {
-        for attr in &msg.attributes {
-            match attr {
-                AddressAttribute::Address(IpAddr::V4(addr))
-                | AddressAttribute::Local(IpAddr::V4(addr)) => return *addr,
-                _ => {}
-            }
-        }
-    }
-
-    panic!("interface {iface} should expose an IPv4 address");
-}
-
 /// Binds one localhost UDP client socket from a small fixed port range for deterministic tests.
 async fn bind_udp_client_socket(start_port: u16) -> anyhow::Result<UdpSocket> {
     let end_port = start_port.saturating_add(32);
@@ -578,20 +514,36 @@ fn send_udp_first_fragment_v4(
 /// Keeps one temporary IPv6 address assigned to `lo` for the lifetime of a privileged test.
 struct LoopbackIpv6AddressGuard {
     ip: Ipv6Addr,
+    removed: bool,
 }
 
 impl LoopbackIpv6AddressGuard {
     /// Add one stable ULA to loopback so IPv6 NodePort tests can avoid the special `::1` path.
-    fn assign(ip: Ipv6Addr) -> Self {
-        let cidr = format!("{ip}/128");
-        command_output("ip", &["-6", "addr", "add", &cidr, "dev", "lo"]);
-        Self { ip }
+    async fn assign(ip: Ipv6Addr) -> Self {
+        add_interface_address("lo", IpAddr::V6(ip), 128)
+            .await
+            .expect("add temporary IPv6 address to loopback");
+        Self { ip, removed: false }
+    }
+
+    /// Remove the temporary loopback ULA through rtnetlink before normal test exit.
+    async fn remove(&mut self) {
+        if self.removed {
+            return;
+        }
+        delete_interface_address("lo", IpAddr::V6(self.ip), 128)
+            .await
+            .expect("remove temporary IPv6 address from loopback");
+        self.removed = true;
     }
 }
 
 impl Drop for LoopbackIpv6AddressGuard {
     /// Remove the temporary loopback ULA once the test completes.
     fn drop(&mut self) {
+        if self.removed {
+            return;
+        }
         let cidr = format!("{}/128", self.ip);
         let _ = std::process::Command::new("ip")
             .args(["-6", "addr", "del", &cidr, "dev", "lo"])
@@ -751,7 +703,9 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
         _host_peer_ifname,
         host_ifname,
     ] = privileged_network_interfaces(network_id);
-    let host_access_ip = interface_ipv4(&host_ifname).await;
+    let host_access_ip = interface_ipv4(&host_ifname)
+        .await
+        .unwrap_or_else(|| panic!("interface {host_ifname} should expose an IPv4 address"));
     let capture = capture_tcpdump_line(
         &host_ifname,
         &format!("src host {host_access_ip} and tcp dst port {NODEPORT_HTTP_PORT}"),
@@ -1240,7 +1194,9 @@ local_test!(nodeport_tcp_syn_mss_clamps_to_host_access_mtu, {
         _host_peer_ifname,
         host_ifname,
     ] = privileged_network_interfaces(network_id);
-    let host_access_ip = interface_ipv4(&host_ifname).await;
+    let host_access_ip = interface_ipv4(&host_ifname)
+        .await
+        .unwrap_or_else(|| panic!("interface {host_ifname} should expose an IPv4 address"));
     let capture = capture_verbose_tcpdump_line(
         &host_ifname,
         &format!(
@@ -1277,7 +1233,7 @@ local_test!(
             config.network.nodeport.ip = Some(loopback_ip.to_string());
             config.network.advertise_addr = Some(format!("[{loopback_ip}]:6578"));
         });
-        let _loopback_ip = LoopbackIpv6AddressGuard::assign(loopback_ip);
+        let mut loopback_ip_guard = LoopbackIpv6AddressGuard::assign(loopback_ip).await;
         let node = create_privileged_node().await;
         let subnet = privileged_test_subnet_v6();
         let network = create_privileged_network(
@@ -1402,6 +1358,7 @@ local_test!(
             );
         }
         delete_privileged_network(&node, network_id).await;
+        loopback_ip_guard.remove().await;
     }
 );
 
@@ -2708,10 +2665,10 @@ local_test!(
         let Some(artifact_dir) = privileged_nodeport_artifact_dir() else {
             return;
         };
-        let Some(external_iface) = default_route_iface() else {
+        let Some(external_iface) = default_ipv4_route_iface().await else {
             return;
         };
-        if iface_has_usable_ipv6(&external_iface) {
+        if iface_has_usable_ipv6(&external_iface).await {
             eprintln!(
                 "skipping privileged IPv6 publication degradation test; interface {external_iface} already has a usable IPv6 address"
             );
