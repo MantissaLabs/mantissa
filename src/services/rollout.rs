@@ -4,6 +4,7 @@
 //! implementation while isolating rolling-update/rollback flow for maintenance.
 
 use super::admission::workload_host_port_sets_conflict;
+use super::admission_group::{ServiceAdmissionGroupScope, compute_service_admission_group_id};
 use super::deployment::{DependencyGateContext, ServiceRedeploymentJob, order_task_ids};
 use super::placement::{
     SlotTargetContext, build_placement_preference_inventory, compute_effective_slot_targets,
@@ -88,6 +89,7 @@ struct RolloutRunContext<'a> {
     service_name: &'a str,
     service_id: Uuid,
     manifest_id: Uuid,
+    service_epoch: u64,
     settings: &'a RolloutSettings,
 }
 
@@ -98,6 +100,7 @@ struct ReplacementPhaseContext<'a> {
     template_graph: &'a RolloutTemplateGraph,
     replace: &'a [ReplicaReplacement],
     update_strategy: &'a ServiceUpdateStrategy,
+    admission_policy: &'a WorkloadAdmissionPolicy,
     start_context: String,
 }
 
@@ -109,6 +112,7 @@ impl<'a> ReplacementPhaseContext<'a> {
         template_graph: &'a RolloutTemplateGraph,
         replace: &'a [ReplicaReplacement],
         update_strategy: &'a ServiceUpdateStrategy,
+        admission_policy: &'a WorkloadAdmissionPolicy,
     ) -> Self {
         Self {
             rollout,
@@ -116,6 +120,7 @@ impl<'a> ReplacementPhaseContext<'a> {
             template_graph,
             replace,
             update_strategy,
+            admission_policy,
             start_context: format!("service '{}' rolling replacement", rollout.service_name),
         }
     }
@@ -131,6 +136,7 @@ struct RemovalPhaseContext<'a> {
 
 /// One in-flight replacement chunk built from manifest-ordered rollout indices.
 struct ReplacementChunk<'a> {
+    indices: &'a [usize],
     replacements: Vec<&'a ReplicaReplacement>,
     requests: Vec<WorkloadStartRequest>,
 }
@@ -397,6 +403,7 @@ impl ServiceController {
             service_name: &service_name,
             service_id: current_spec.id,
             manifest_id,
+            service_epoch: current_spec.service_epoch,
             settings: &settings,
         };
         let replacement_phase = ReplacementPhaseContext::new(
@@ -405,6 +412,7 @@ impl ServiceController {
             &desired_graph,
             &replace,
             &update_strategy,
+            &admission_policy,
         );
         let removal_phase = RemovalPhaseContext {
             rollout,
@@ -734,9 +742,10 @@ impl ServiceController {
     fn build_replacement_chunk<'a>(
         phase: &'a ReplacementPhaseContext<'a>,
         artifacts: &RolloutArtifacts,
-        chunk_indices: &[usize],
+        chunk_indices: &'a [usize],
     ) -> ReplacementChunk<'a> {
         ReplacementChunk {
+            indices: chunk_indices,
             replacements: chunk_indices
                 .iter()
                 .map(|index| &phase.replace[*index])
@@ -746,6 +755,24 @@ impl ServiceController {
                 .map(|index| artifacts.replacement_requests[*index].clone())
                 .collect(),
         }
+    }
+
+    /// Computes the gang admission group id for one deterministic rollout replacement chunk.
+    fn replacement_chunk_group_id(
+        phase: &ReplacementPhaseContext<'_>,
+        stage_index: usize,
+        chunk: &ReplacementChunk<'_>,
+    ) -> anyhow::Result<Uuid> {
+        compute_service_admission_group_id(
+            phase.rollout.service_id,
+            phase.rollout.manifest_id,
+            phase.rollout.service_epoch,
+            ServiceAdmissionGroupScope::RolloutChunk {
+                stage_index,
+                chunk_indices: chunk.indices,
+                replacements: phase.replace,
+            },
+        )
     }
 
     /// Stops the previous task incarnations for one replacement chunk and records rollback state.
@@ -882,6 +909,7 @@ impl ServiceController {
     async fn run_replacement_chunk(
         &self,
         phase: &ReplacementPhaseContext<'_>,
+        stage_index: usize,
         chunk: &ReplacementChunk<'_>,
         progress: &mut RolloutProgress,
         artifacts: &mut RolloutArtifacts,
@@ -919,8 +947,14 @@ impl ServiceController {
                 .await;
         }
 
+        let group_id = Self::replacement_chunk_group_id(phase, stage_index, chunk)?;
         let started_specs = match self
-            .start_tasks_with_fallback(chunk.requests.clone(), &phase.start_context)
+            .start_tasks_for_admission_policy(
+                *phase.admission_policy,
+                group_id,
+                chunk.requests.clone(),
+                &phase.start_context,
+            )
             .await
         {
             Ok(specs) => specs,
@@ -988,6 +1022,7 @@ impl ServiceController {
     async fn run_replacement_stage(
         &self,
         phase: &ReplacementPhaseContext<'_>,
+        stage_index: usize,
         stage_indices: &[usize],
         progress: &mut RolloutProgress,
         artifacts: &mut RolloutArtifacts,
@@ -1002,7 +1037,7 @@ impl ServiceController {
                 &stage_indices[replacement_cursor..end],
             );
             match self
-                .run_replacement_chunk(phase, &chunk, progress, artifacts)
+                .run_replacement_chunk(phase, stage_index, &chunk, progress, artifacts)
                 .await
             {
                 Ok(ChunkProgress::Advanced) => {
@@ -1028,11 +1063,12 @@ impl ServiceController {
             .template_graph
             .replacement_stage_indices(phase.task_templates, phase.replace);
 
-        for (stage, stage_indices) in phase
+        for (stage_index, (stage, stage_indices)) in phase
             .template_graph
             .stages
             .iter()
             .zip(replacement_stage_indices)
+            .enumerate()
         {
             if stage_indices.is_empty() {
                 continue;
@@ -1046,7 +1082,7 @@ impl ServiceController {
             }
 
             if let Some(err) = self
-                .run_replacement_stage(phase, &stage_indices, progress, artifacts)
+                .run_replacement_stage(phase, stage_index, &stage_indices, progress, artifacts)
                 .await
             {
                 return Some(err);
@@ -1744,7 +1780,9 @@ mod tests {
             }),
             desired_id: Uuid::new_v4(),
         };
+        let indices = [0usize];
         let chunk = ReplacementChunk {
+            indices: &indices,
             replacements: vec![&replacement],
             requests: Vec::new(),
         };
@@ -1771,7 +1809,9 @@ mod tests {
             }),
             desired_id: Uuid::new_v4(),
         };
+        let indices = [0usize];
         let chunk = ReplacementChunk {
+            indices: &indices,
             replacements: vec![&replacement],
             requests: Vec::new(),
         };

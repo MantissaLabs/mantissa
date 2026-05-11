@@ -3,6 +3,9 @@ use super::admission::{
     ensure_public_ports_do_not_overlap_template_host_ports, public_claim_conflicts_host_port,
     service_reserves_public_ports, validate_network_contracts, workload_port_protocol_label,
 };
+use super::admission_group::{
+    ServiceAdmissionGroupScope, compute_service_admission_group_id, service_admission_stage_number,
+};
 use super::placement::{
     SlotTargetContext, allow_untargeted_fallback, build_missing_template_requests,
     build_placement_preference_inventory, build_start_requests, compute_effective_slot_targets,
@@ -1864,7 +1867,7 @@ impl ServiceController {
     }
 
     /// Starts service workloads using the admission contract selected by the service manifest.
-    async fn start_tasks_for_admission_policy(
+    pub(super) async fn start_tasks_for_admission_policy(
         &self,
         admission_policy: WorkloadAdmissionPolicy,
         group_id: Uuid,
@@ -2098,81 +2101,6 @@ fn is_running_deployment_noop(
         && existing.task_templates == task_templates
         && existing.update_strategy == *update_strategy
         && existing.admission_policy == *admission_policy
-}
-
-/// Internal admission group scope derived from a service deployment manifest.
-enum ServiceAdmissionGroupScope<'a> {
-    ServiceGeneration,
-    DependencyStage {
-        stage_index: usize,
-        template_indices: &'a [usize],
-        task_templates: &'a [TaskTemplateSpecValue],
-    },
-}
-
-/// Computes a stable admission group id for one service generation or dependency stage.
-fn compute_service_admission_group_id(
-    service_id: Uuid,
-    manifest_id: Uuid,
-    service_epoch: u64,
-    scope: ServiceAdmissionGroupScope<'_>,
-) -> anyhow::Result<Uuid> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"mantissa-service-admission-group-v1");
-    hasher.update(service_id.as_bytes());
-    hasher.update(manifest_id.as_bytes());
-    hasher.update(&service_epoch.to_le_bytes());
-
-    match scope {
-        ServiceAdmissionGroupScope::ServiceGeneration => {
-            hasher.update(b"service-generation");
-        }
-        ServiceAdmissionGroupScope::DependencyStage {
-            stage_index,
-            template_indices,
-            task_templates,
-        } => {
-            let stage_index = u64::try_from(stage_index)
-                .map_err(|_| anyhow!("dependency stage index does not fit in u64"))?;
-            hasher.update(b"dependency-stage");
-            hasher.update(&stage_index.to_le_bytes());
-            for template_index in template_indices {
-                let template = task_templates.get(*template_index).ok_or_else(|| {
-                    anyhow!(
-                        "dependency admission group references missing template index {}",
-                        template_index
-                    )
-                })?;
-                let template_index = u64::try_from(*template_index)
-                    .map_err(|_| anyhow!("template index does not fit in u64"))?;
-                hasher.update(&template_index.to_le_bytes());
-                hash_variable_bytes(&mut hasher, template.name.as_bytes())?;
-            }
-        }
-    }
-
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest.as_bytes()[..16]);
-    Ok(Uuid::from_bytes(bytes))
-}
-
-/// Converts a zero-based dependency stage index into an operator-facing stage number.
-fn service_admission_stage_number(stage_index: usize) -> anyhow::Result<u64> {
-    let zero_based = u64::try_from(stage_index)
-        .map_err(|_| anyhow!("dependency stage index does not fit in u64"))?;
-    zero_based
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("dependency stage number overflowed u64"))
-}
-
-/// Adds length-delimited bytes to a stable hash input so variable fields cannot overlap.
-fn hash_variable_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) -> anyhow::Result<()> {
-    let len = u64::try_from(bytes.len())
-        .map_err(|_| anyhow!("admission group hash input is too large"))?;
-    hasher.update(&len.to_le_bytes());
-    hasher.update(bytes);
-    Ok(())
 }
 
 struct ServiceDeploymentJob {

@@ -41,6 +41,7 @@ use tokio::time::{interval, sleep};
 use uuid::Uuid;
 
 mod admission;
+mod admission_group;
 mod deployment;
 mod inventory;
 #[path = "ownership.rs"]

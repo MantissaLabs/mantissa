@@ -21,12 +21,52 @@ fn gang_deployment_options() -> ServiceDeploymentOptions {
     }
 }
 
+/// Builds deployment options for a gang-admitted service using a specific rollout strategy.
+fn gang_deployment_options_with_strategy(
+    update_strategy: ServiceUpdateStrategy,
+) -> ServiceDeploymentOptions {
+    ServiceDeploymentOptions {
+        update_strategy,
+        ..gang_deployment_options()
+    }
+}
+
 /// Constrains a task template to one node so tests can force local and remote admission paths.
 fn constrain_template_to_node(template: &mut TaskTemplateSpecValue, node_id: Uuid) {
     template.execution.placement.constraints = vec![
         PlacementConstraint::eq(PlacementConstraintSelector::NodeId, node_id.to_string())
             .expect("node id placement constraint should be valid"),
     ];
+}
+
+/// Reserves every currently free scheduler slot on one node and returns the reservation count.
+async fn reserve_free_scheduler_slots(node: &TestNode, owner: Uuid) -> usize {
+    let snapshot = node
+        .node
+        .scheduler
+        .snapshot()
+        .await
+        .expect("scheduler snapshot should exist");
+    let intents = snapshot
+        .slots
+        .iter()
+        .filter(|slot| matches!(slot.state, SlotState::Free))
+        .map(|slot| SlotReservationRequest {
+            slot_id: slot.slot_id,
+            owner,
+            task_id: None,
+            group_id: None,
+        })
+        .collect::<Vec<_>>();
+    let reserved = intents.len();
+    if reserved > 0 {
+        node.node
+            .scheduler
+            .reserve_resources(snapshot.version, intents, Vec::new())
+            .await
+            .expect("reserve free scheduler slots");
+    }
+    reserved
 }
 
 /// Lists every workload row owned by one service, including non-active rows.
@@ -62,6 +102,26 @@ async fn wait_for_active_service_workloads(
         );
         sleep(SERVICE_WORKLOAD_POLL_INTERVAL).await;
     }
+}
+
+/// Waits for one service to reach a specific manifest generation and status.
+async fn wait_for_service_manifest_status(
+    node: &TestNode,
+    service_id: Uuid,
+    manifest_id: Uuid,
+    expected: ServiceStatus,
+) -> bool {
+    wait_until(
+        Duration::from_secs(30),
+        Duration::from_millis(50),
+        || async {
+            match node.node.service_controller.registry().get(service_id) {
+                Ok(Some(spec)) => spec.manifest_id == manifest_id && spec.status() == expected,
+                Ok(None) | Err(_) => false,
+            }
+        },
+    )
+    .await
 }
 
 /// Returns all service workloads once the expected count has appeared.
@@ -455,6 +515,223 @@ local_test!(
                 "scheduler reservations should carry the committed gang group on each assigned node: {details}"
             );
         }
+    }
+);
+
+local_test!(services_gang_rollout_commits_parallel_replacement_chunk, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let node = TestNode::new().await;
+    let service_name = "gang-rollout-chunk";
+    let mut tasks = vec![demo_backend_task_template("api", 2)];
+
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment_with_options_outcome(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            tasks.clone(),
+            gang_deployment_options(),
+        )
+        .await
+        .expect("submit baseline gang service deployment")
+        .service_id;
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "baseline gang service should converge before rollout"
+    );
+
+    tasks[0].execution.image = "hashicorp/http-echo:1.0.1".to_string();
+    let rollout_manifest_id = Uuid::new_v4();
+    let strategy = rollout_strategy(2, ServiceRolloutOrder::StartFirst, 1, 1, true);
+    node.node
+        .service_controller
+        .submit_deployment_with_options_outcome(
+            rollout_manifest_id,
+            service_name,
+            service_name,
+            tasks,
+            gang_deployment_options_with_strategy(strategy),
+        )
+        .await
+        .expect("submit gang rollout deployment");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut max_active = 0usize;
+    let mut reached_rollout_manifest = false;
+    while Instant::now() < deadline {
+        let active = list_active_service_tasks(&node.node.workload_manager, service_name)
+            .await
+            .len();
+        max_active = max_active.max(active);
+
+        if let Ok(Some(spec)) = node.node.service_controller.registry().get(service_id) {
+            reached_rollout_manifest |= spec.manifest_id == rollout_manifest_id;
+            if spec.manifest_id == rollout_manifest_id && spec.status() == ServiceStatus::Running {
+                break;
+            }
+            if matches!(spec.status(), ServiceStatus::Failed) {
+                panic!(
+                    "gang rollout should not fail; rollout={:?} detail={:?}",
+                    spec.rollout, spec.status_detail
+                );
+            }
+        }
+
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        reached_rollout_manifest,
+        "service should enter the rollout manifest generation"
+    );
+    assert!(
+        wait_for_service_manifest_status(
+            &node,
+            service_id,
+            rollout_manifest_id,
+            ServiceStatus::Running,
+        )
+        .await,
+        "gang rollout should converge to the replacement generation"
+    );
+    assert!(
+        max_active >= 4,
+        "start-first gang rollout should keep old replicas active while the replacement chunk starts; saw max {max_active}"
+    );
+
+    let active = wait_for_active_service_workloads(&node, service_name, 2).await;
+    assert!(
+        active
+            .iter()
+            .all(|workload| workload.image == "hashicorp/http-echo:1.0.1"),
+        "final active rollout tasks should come from the replacement manifest"
+    );
+    let group_id = active
+        .first()
+        .and_then(|workload| workload.admission_group_id)
+        .expect("replacement rollout task should record a gang group");
+    assert!(
+        active.iter().all(|workload| {
+            workload.admission_group_id == Some(group_id)
+                && workload.admission_state == WorkloadAdmissionState::GroupCommitted
+        }),
+        "replacement chunk should commit every parallel task under one gang group"
+    );
+});
+
+local_test!(
+    services_gang_rollout_capacity_failure_keeps_old_generation_running,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+        let node = TestNode::new().await;
+        let service_name = "gang-rollout-capacity-fail";
+        let mut tasks = vec![demo_backend_task_template("api", 1)];
+
+        let baseline_manifest_id = Uuid::new_v4();
+        let service_id = node
+            .node
+            .service_controller
+            .submit_deployment(
+                baseline_manifest_id,
+                service_name,
+                service_name,
+                tasks.clone(),
+            )
+            .await
+            .expect("submit baseline incremental service deployment");
+
+        assert!(
+            wait_for_service_status(
+                &node.node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "baseline service should converge before capacity-blocked rollout"
+        );
+        let baseline_spec = node
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("load baseline service")
+            .expect("baseline service should be persisted");
+        let baseline_ids = baseline_spec
+            .replica_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        let blocker_owner = Uuid::new_v4();
+        let reserved = reserve_free_scheduler_slots(&node, blocker_owner).await;
+        assert!(
+            reserved > 0,
+            "capacity failure test requires at least one free slot to block"
+        );
+
+        tasks[0].execution.image = "hashicorp/http-echo:1.0.1".to_string();
+        let rollout_manifest_id = Uuid::new_v4();
+        let strategy = rollout_strategy(1, ServiceRolloutOrder::StartFirst, 1, 1, true);
+        node.node
+            .service_controller
+            .submit_deployment_with_options_outcome(
+                rollout_manifest_id,
+                service_name,
+                service_name,
+                tasks,
+                gang_deployment_options_with_strategy(strategy),
+            )
+            .await
+            .expect("submit capacity-blocked gang rollout");
+
+        assert!(
+            wait_until(
+                Duration::from_secs(30),
+                Duration::from_millis(50),
+                || async {
+                    match node.node.service_controller.registry().get(service_id) {
+                        Ok(Some(spec)) => {
+                            spec.manifest_id == baseline_manifest_id
+                                && spec.status() == ServiceStatus::Running
+                                && spec.rollout.failed_steps >= 1
+                                && spec
+                                    .rollout
+                                    .last_error
+                                    .as_deref()
+                                    .is_some_and(|detail| detail.contains("gang admission failed"))
+                        }
+                        Ok(None) | Err(_) => false,
+                    }
+                }
+            )
+            .await,
+            "capacity-blocked gang rollout should roll back to the old generation"
+        );
+
+        let active = wait_for_active_service_workloads(&node, service_name, 1).await;
+        let active_ids = active
+            .iter()
+            .map(|workload| workload.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            active_ids, baseline_ids,
+            "failed start-first gang rollout should leave the old replica running"
+        );
+        assert!(
+            list_service_workloads(&node, service_name)
+                .await
+                .iter()
+                .all(|workload| workload.image != "hashicorp/http-echo:1.0.1"),
+            "failed gang admission should not leave replacement workload rows"
+        );
     }
 );
 
