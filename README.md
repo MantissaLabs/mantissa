@@ -34,7 +34,7 @@ See the [docs/limits.md](docs/limits.md) for more details on the ongoing challen
 
 - Fully distributed scheduling with resource reservation (no primary scheduler).
 - Designed to scale to large fleets of nodes without a federation layer.
-- Batch placement and dependency-aware rollout for multi-task services.
+- Batch placement, opt-in gang admission, and dependency-aware rollout for multi-task services.
 - GPU-aware scheduling with device-level reservations (NVIDIA).
 - eBPF-accelerated overlay networking for low-latency service discovery and routing.
 - Durable state via CRDT + Merkle Search Tree (backed by Redb) for fault tolerance and convergence.

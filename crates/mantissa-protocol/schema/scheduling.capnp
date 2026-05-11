@@ -17,7 +17,7 @@ interface Scheduler {
   # Promote every prepared lease in one admission group into committed reservations.
 
   abortLeaseGroup @5 (request :AbortLeaseGroupRequest) -> ();
-  # Abort every still-prepared lease in one admission group.
+  # Abort prepared leases and unpublished committed reservations in one admission group.
 }
 
 enum SlotState {

@@ -43,13 +43,26 @@ digests, then confirmed by the target node through a resource reservation. A
 bad guess should be cheap to reject, but it is still a retry and not a
 centralized in-memory decision.
 
-The service scheduler uses incremental admission with batch-aware placement
-today. A batch is a placement and reservation attempt, not a strict
-all-or-nothing gang. Multi-task services are submitted in batches and
-dependency order is respected, but placement still converges through normal
-workload rows, leases, retries and readiness checks. During failures or
-topology changes, the system may temporarily have too few or too many visible
-replicas while it chooses the safer side of the availability trade-off.
+The default scheduler admission mode is still incremental with batch-aware
+placement. A batch is a placement and reservation attempt, not a strict
+all-or-nothing gang, and this remains the default for existing manifests.
+During failures or topology changes, the system may temporarily have too few
+or too many visible replicas while it chooses the safer side of the
+availability trade-off.
+
+Mantissa also has opt-in gang admission through the shared workload
+`admission` policy. For services, the controller derives the gang boundaries:
+one group for a simple service generation, one group per dependency stage, and
+one group per rolling-update replacement chunk. Jobs and agents use the same
+workload admission contract for their current attempt or run; today those are
+single-workload groups, not parallel array jobs or distributed agent swarms.
+
+That should not be read as Kubernetes scheduler feature parity. There is no
+queue-level fair sharing, preemption, pod-group API, gang wait queue, or
+autoscaler integration. Gang admission is a resource-admission barrier around a
+controller-derived workload group. It also deliberately rejects new
+wait-for-first-consumer volume bindings for now, because those bindings need a
+rollback-capable protocol before they can be part of an all-or-nothing commit.
 
 ## Fault-tolerance
 
