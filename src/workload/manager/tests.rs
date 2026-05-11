@@ -1,7 +1,9 @@
 #![allow(clippy::unwrap_used)]
 
 use super::planner::{SchedulingError, StartIntent};
-use super::reservation::{RemotePrepareRejection, RemotePrepareRejectionReason};
+use super::reservation::{
+    DEFAULT_PREPARED_LEASE_TTL_MS, RemotePrepareRejection, RemotePrepareRejectionReason,
+};
 use super::*;
 
 use crate::agents::types::{
@@ -25,7 +27,9 @@ use crate::runtime::types::{
     RuntimeSupportContract, RuntimeSupportProfile,
 };
 use crate::scheduler::digest::SchedulerDigestRegistry;
-use crate::scheduler::{SlotCapacity, SlotReservationRequest, SlotSpec, SlotState};
+use crate::scheduler::{
+    SlotCapacity, SlotReservationRequest, SlotSpec, SlotState, TaskLeaseIntent,
+};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
 use crate::services::registry::ServiceRegistry;
@@ -51,8 +55,8 @@ use crate::volumes::types::{
 };
 use crate::workload::model::select_best_workload_value;
 use crate::workload::model::{
-    ExecutionPlatform, WorkloadAgentRunMetadata, WorkloadOwner, WorkloadServiceMetadata,
-    WorkloadStatus, WorkloadValue, WorkloadValueDraft,
+    ExecutionPlatform, WorkloadAdmissionState, WorkloadAgentRunMetadata, WorkloadOwner,
+    WorkloadServiceMetadata, WorkloadStatus, WorkloadValue, WorkloadValueDraft,
 };
 use crate::workload::types::{
     ResolvedExecutionSpec, WorkloadLivenessProbe, WorkloadLivenessProbeKind,
@@ -1211,6 +1215,8 @@ fn test_task_spec(manager: &WorkloadManager, name: &str) -> WorkloadSpec {
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 0,
         phase_version: 0,
         launch_attempt: 0,
@@ -1347,6 +1353,8 @@ async fn running_service_task_on_draining_node_marks_failed_instead_of_restart_p
         ))),
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 0,
         phase_version: 0,
         launch_attempt: 0,
@@ -1421,6 +1429,8 @@ async fn pending_service_task_on_draining_node_does_not_launch_locally() {
         ))),
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 0,
         phase_version: 0,
         launch_attempt: 0,
@@ -1489,6 +1499,8 @@ async fn pull_image_for_task_retries_and_tracks_phase_progress() {
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 0,
         phase_version: 0,
         launch_attempt: 0,
@@ -1570,6 +1582,8 @@ async fn same_state_pulling_progress_stays_local_only() {
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 0,
         phase_version: 0,
         launch_attempt: 0,
@@ -1737,6 +1751,8 @@ async fn pull_image_for_task_skips_pull_when_image_exists_locally() {
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 0,
         phase_version: 0,
         launch_attempt: 0,
@@ -1814,6 +1830,8 @@ async fn reconcile_rejects_missing_slot_assignments() {
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 0,
         phase_version: 0,
         launch_attempt: 0,
@@ -1875,6 +1893,8 @@ async fn reconcile_pending_task_reserves_assigned_slots_before_launch() {
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 0,
         phase_version: 0,
         launch_attempt: 0,
@@ -1903,6 +1923,101 @@ async fn reconcile_pending_task_reserves_assigned_slots_before_launch() {
     }
 
     assert_eq!(mock_cm.created.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn pending_group_workload_rows_are_not_adopted() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec.clone()])
+        .await
+        .expect("init slots");
+
+    let mut spec = test_task_spec(&manager, "pending-gang");
+    spec.slot_ids = vec![slot_spec.slot_id];
+    spec.slot_id = Some(slot_spec.slot_id);
+    spec.admission_group_id = Some(Uuid::new_v4());
+    spec.admission_state = WorkloadAdmissionState::PendingGroup;
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    manager
+        .reconcile_local_task(spec)
+        .await
+        .expect("pending group reconcile should no-op");
+
+    assert!(
+        mock_cm.created.lock().await.is_empty(),
+        "pending group rows must not create runtime instances"
+    );
+    let snapshot = scheduler.snapshot().await.expect("snapshot");
+    assert!(
+        matches!(snapshot.slots[0].state, SlotState::Free),
+        "pending group reconcile should not reserve scheduler slots"
+    );
+}
+
+#[tokio::test]
+async fn committed_group_workload_rows_become_adoptable() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let group_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    let prepared = scheduler
+        .prepare_task_lease_group(
+            manager.local_node_id,
+            group_id,
+            DEFAULT_PREPARED_LEASE_TTL_MS,
+            vec![TaskLeaseIntent {
+                task_id,
+                cpu_millis: 100,
+                memory_bytes: 64 * 1_024 * 1_024,
+                gpu_count: 0,
+            }],
+        )
+        .await
+        .expect("prepare group lease");
+    scheduler
+        .commit_task_lease_group(group_id, manager.local_node_id, &prepared.leases)
+        .await
+        .expect("commit group lease");
+
+    let mut spec = test_task_spec(&manager, "committed-gang");
+    spec.id = task_id;
+    spec.slot_ids = prepared.leases[0].slot_ids.clone();
+    spec.slot_id = spec.slot_ids.first().copied();
+    spec.admission_group_id = Some(group_id);
+    spec.admission_state = WorkloadAdmissionState::GroupCommitted;
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    manager
+        .reconcile_local_task(spec.clone())
+        .await
+        .expect("committed group row should start");
+
+    assert_eq!(mock_cm.created.lock().await.len(), 1);
+    let snapshot = scheduler.snapshot().await.expect("snapshot");
+    let slot = snapshot
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == spec.slot_ids[0])
+        .expect("slot present");
+    match &slot.state {
+        SlotState::Reserved(reservation) => {
+            assert_eq!(reservation.task_id, Some(task_id));
+            assert_eq!(reservation.group_id, Some(group_id));
+        }
+        other => panic!("committed group slot should stay reserved, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -1949,6 +2064,8 @@ async fn reconcile_uses_latest_persisted_slot_assignment() {
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 0,
         phase_version: 0,
         launch_attempt: 0,
@@ -2074,6 +2191,8 @@ async fn update_task_phase_ignores_stale_regression_from_creating_to_pulling() {
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 0,
         phase_version: 1,
         launch_attempt: 1,
@@ -3387,6 +3506,8 @@ async fn reconcile_local_slot_reservations_demotes_conflicting_local_task_claims
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 0,
         phase_version: 3,
         launch_attempt: 0,
@@ -4374,6 +4495,109 @@ async fn start_tasks_batch_respects_existing_reservations() {
 }
 
 #[tokio::test]
+async fn start_workloads_gang_insufficient_capacity_admits_zero_workloads() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(100, 32 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let result = manager
+        .start_workloads_gang(
+            Uuid::new_v4(),
+            vec![WorkloadStartRequest {
+                name: "too-large".into(),
+                execution: empty_resolved_execution("img"),
+                execution_platform: ExecutionPlatform::Oci,
+                isolation_mode: crate::workload::model::IsolationMode::Standard,
+                isolation_profile: None,
+                gpu_device_ids: Vec::new(),
+                id: None,
+                slot_ids: Vec::new(),
+                owner: None,
+                target_node: None,
+            }],
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert!(
+        mock_cm.created.lock().await.is_empty(),
+        "failed gang admission must not create runtime instances"
+    );
+    assert!(
+        manager
+            .list_workloads(&TaskStateFilter::all())
+            .await
+            .expect("list workloads")
+            .is_empty(),
+        "failed gang admission must not persist runnable workload rows"
+    );
+    let snapshot = scheduler.snapshot().await.expect("snapshot");
+    assert!(
+        snapshot
+            .slots
+            .iter()
+            .all(|slot| matches!(slot.state, SlotState::Free)),
+        "failed gang admission must not retain scheduler reservations"
+    );
+}
+
+#[tokio::test]
+async fn start_workloads_gang_runtime_failure_after_commit_cleans_local_reservation() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+    mock_cm
+        .create_errors
+        .lock()
+        .await
+        .push_back(RuntimeError::OperationFailed("create failed".into()));
+
+    let result = manager
+        .start_workloads_gang(
+            Uuid::new_v4(),
+            vec![WorkloadStartRequest {
+                name: "runtime-fails".into(),
+                execution: empty_resolved_execution("img"),
+                execution_platform: ExecutionPlatform::Oci,
+                isolation_mode: crate::workload::model::IsolationMode::Standard,
+                isolation_profile: None,
+                gpu_device_ids: Vec::new(),
+                id: None,
+                slot_ids: Vec::new(),
+                owner: None,
+                target_node: None,
+            }],
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert!(
+        mock_cm.created.lock().await.is_empty(),
+        "failed runtime create should not leave a created instance"
+    );
+    let snapshot = scheduler.snapshot().await.expect("snapshot");
+    assert!(
+        snapshot
+            .slots
+            .iter()
+            .all(|slot| matches!(slot.state, SlotState::Free)),
+        "local cleanup should release the committed group reservation"
+    );
+}
+
+#[tokio::test]
 async fn task_owned_locally_detects_remote_entries() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
@@ -4489,6 +4713,8 @@ async fn stream_local_task_logs_forwards_frames_and_options() {
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 0,
         phase_version: 0,
         launch_attempt: 1,
@@ -4600,6 +4826,8 @@ async fn attach_local_task_forwards_input_output_and_options() {
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 0,
         phase_version: 0,
         launch_attempt: 1,
@@ -4734,6 +4962,8 @@ async fn attach_local_task_uses_runtime_tty_when_persisted_spec_is_stale() {
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 0,
         phase_version: 0,
         launch_attempt: 1,
@@ -4830,6 +5060,8 @@ async fn exec_local_task_forwards_input_output_and_options() {
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 0,
         phase_version: 0,
         launch_attempt: 1,
@@ -6414,6 +6646,8 @@ fn build_remote_task_spec(
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch,
         phase_version,
         launch_attempt: 0,

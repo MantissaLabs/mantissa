@@ -9,12 +9,18 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::scheduler::digest::{SchedulerDigestValue, read_scheduler_digest};
-use crate::scheduler::{GpuReservationRequest, SchedulerError, SlotId, SlotReservationRequest};
-use crate::workload::model::{WorkloadEvent, WorkloadPhase, WorkloadSpec};
+use crate::scheduler::{
+    ExactTaskLeaseIntent, GpuReservationRequest, PreparedTaskLease, PreparedTaskLeaseBatch,
+    SchedulerError, SlotId, SlotReservationRequest,
+};
+use crate::workload::model::{WorkloadAdmissionState, WorkloadEvent, WorkloadPhase, WorkloadSpec};
 use crate::workload::service::read_spec;
 
 use super::WorkloadManager;
 use super::planner::{BatchStartPlan, PreparedRemoteStartPlan, RemoteStartPlan};
+
+/// Default lifetime for prepared scheduler leases while a batch or group admission commits.
+pub(super) const DEFAULT_PREPARED_LEASE_TTL_MS: u64 = 30_000;
 
 /// Error returned by slot reservation stages, signalling whether the caller should retry.
 pub(super) enum ExecutionError {
@@ -38,6 +44,11 @@ pub(super) struct RemoteLeaseReservation {
     pub(super) task_id: Uuid,
 }
 
+/// Tracks remote group leases so they can be committed or aborted together.
+pub(super) struct RemoteGroupReservation {
+    pub(super) leases: Vec<PreparedTaskLease>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RemotePrepareRejectionReason {
     InsufficientResources,
@@ -51,8 +62,10 @@ pub(super) struct RemotePrepareRejection {
 }
 
 /// Prepared binding returned by one remote scheduler for a single task.
+#[derive(Clone)]
 struct PreparedRemoteLeaseBinding {
     lease_id: Uuid,
+    expires_at_unix_ms: u64,
     slot_ids: Vec<SlotId>,
     gpu_device_ids: Vec<String>,
 }
@@ -129,6 +142,7 @@ fn parse_prepared_remote_lease(
         task_id,
         PreparedRemoteLeaseBinding {
             lease_id,
+            expires_at_unix_ms: reader.get_expires_at_unix_ms(),
             slot_ids,
             gpu_device_ids,
         },
@@ -160,6 +174,49 @@ fn parse_prepare_response(
             parse_prepare_rejection(rejected).context("decode prepare rejection")?,
         )),
         prepare_leases_response::Rejected(Err(err)) => Err(anyhow::anyhow!(err.to_string())),
+    }
+}
+
+/// Converts decoded remote bindings into the exact lease rows required by group commit RPCs.
+fn remote_group_reservation_from_bindings(
+    bindings_by_task: &HashMap<Uuid, PreparedRemoteLeaseBinding>,
+) -> RemoteGroupReservation {
+    let mut leases = bindings_by_task
+        .iter()
+        .map(|(task_id, binding)| PreparedTaskLease {
+            lease_id: binding.lease_id,
+            task_id: *task_id,
+            expires_at_unix_ms: binding.expires_at_unix_ms,
+            slot_ids: binding.slot_ids.clone(),
+            gpu_device_ids: binding.gpu_device_ids.clone(),
+        })
+        .collect::<Vec<_>>();
+    leases.sort_by_key(|lease| lease.task_id);
+    RemoteGroupReservation { leases }
+}
+
+/// Encodes prepared lease rows into a scheduler group commit request.
+fn write_prepared_leases_for_request(
+    mut builder: capnp::struct_list::Builder<scheduling::prepared_lease::Owned>,
+    leases: &[PreparedTaskLease],
+) {
+    for (idx, lease) in leases.iter().enumerate() {
+        let mut entry = builder.reborrow().get(idx as u32);
+        entry.set_lease_id(lease.lease_id.as_bytes());
+        entry.set_task_id(lease.task_id.as_bytes());
+        entry.set_expires_at_unix_ms(lease.expires_at_unix_ms);
+
+        let mut slot_ids = entry.reborrow().init_slot_ids(lease.slot_ids.len() as u32);
+        for (slot_idx, slot_id) in lease.slot_ids.iter().enumerate() {
+            slot_ids.set(slot_idx as u32, *slot_id);
+        }
+
+        let mut gpu_ids = entry
+            .reborrow()
+            .init_gpu_device_ids(lease.gpu_device_ids.len() as u32);
+        for (gpu_idx, device_id) in lease.gpu_device_ids.iter().enumerate() {
+            gpu_ids.set(gpu_idx as u32, device_id);
+        }
     }
 }
 
@@ -348,6 +405,91 @@ impl WorkloadManager {
         );
     }
 
+    /// Prepares exact local leases for one gang admission group without making rows runnable.
+    pub(super) async fn prepare_local_lease_group(
+        &self,
+        group_id: Uuid,
+        plans: &[BatchStartPlan],
+        expected_version: u64,
+        ttl_ms: u64,
+    ) -> Result<PreparedTaskLeaseBatch, ExecutionError> {
+        if plans.is_empty() {
+            return Ok(PreparedTaskLeaseBatch { leases: Vec::new() });
+        }
+
+        let mut intents = Vec::with_capacity(plans.len());
+        for plan in plans {
+            if plan.preassigned {
+                return Err(ExecutionError::Fatal(anyhow::anyhow!(
+                    "gang admission does not support preassigned local slots for task {}",
+                    plan.name
+                )));
+            }
+
+            intents.push(ExactTaskLeaseIntent {
+                task_id: plan.id,
+                slot_ids: plan.slot_ids(),
+                gpu_device_ids: plan.gpu_device_ids.clone(),
+            });
+        }
+
+        match self
+            .core
+            .scheduler
+            .prepare_exact_task_lease_group(
+                expected_version,
+                self.local_node_id,
+                group_id,
+                ttl_ms,
+                intents,
+            )
+            .await
+        {
+            Ok(prepared) => Ok(prepared),
+            Err(err @ SchedulerError::SnapshotMismatch { .. })
+            | Err(err @ SchedulerError::SlotsUnavailable { .. })
+            | Err(err @ SchedulerError::GpuDevicesUnavailable { .. })
+            | Err(err @ SchedulerError::UnknownSlots { .. })
+            | Err(err @ SchedulerError::UnknownGpuDevices { .. }) => {
+                Err(ExecutionError::Retry(anyhow::anyhow!(err)))
+            }
+            Err(err) => Err(ExecutionError::Fatal(anyhow::anyhow!(err))),
+        }
+    }
+
+    /// Commits every local prepared lease in one admission group.
+    pub(super) async fn commit_local_lease_group(
+        &self,
+        group_id: Uuid,
+        prepared: &PreparedTaskLeaseBatch,
+    ) -> Result<(), ExecutionError> {
+        if prepared.leases.is_empty() {
+            return Ok(());
+        }
+
+        self.core
+            .scheduler
+            .commit_task_lease_group(group_id, self.local_node_id, &prepared.leases)
+            .await
+            .map(|_| ())
+            .map_err(|err| ExecutionError::Fatal(anyhow::anyhow!(err)))
+    }
+
+    /// Aborts every still-prepared local lease in one admission group.
+    pub(super) async fn abort_local_lease_group(&self, group_id: Uuid) {
+        if let Err(err) = self
+            .core
+            .scheduler
+            .abort_task_lease_group(self.local_node_id, group_id)
+            .await
+        {
+            warn!(
+                target: "task",
+                "failed to abort local lease group {group_id}: {err}"
+            );
+        }
+    }
+
     /// Prepares remote leases grouped per target node and returns the rollback map.
     pub(super) async fn prepare_remote_leases(
         &self,
@@ -370,7 +512,10 @@ impl WorkloadManager {
             grouped.entry(plan.peer_id).or_default().push(plan);
         }
 
-        for (peer_id, peer_plans) in grouped {
+        let mut peer_ids = grouped.keys().copied().collect::<Vec<_>>();
+        peer_ids.sort_unstable();
+        for peer_id in peer_ids {
+            let peer_plans = &grouped[&peer_id];
             let scheduler_client = match self.remote_scheduler_client(peer_id).await {
                 Ok(client) => client,
                 Err(err) => {
@@ -383,7 +528,7 @@ impl WorkloadManager {
             };
 
             let outcome = match self
-                .send_prepare_leases_request(&scheduler_client, &peer_plans)
+                .send_prepare_leases_request(&scheduler_client, peer_plans)
                 .await
             {
                 Ok(outcome) => outcome,
@@ -402,7 +547,7 @@ impl WorkloadManager {
                 RemotePrepareOutcome::Prepared(bindings_by_task) => {
                     let (reservation, peer_prepared_plans) = match self.build_prepared_remote_plans(
                         peer_id,
-                        &peer_plans,
+                        peer_plans,
                         bindings_by_task,
                     ) {
                         Ok(prepared) => prepared,
@@ -443,6 +588,112 @@ impl WorkloadManager {
         Ok((reservations, prepared_plans))
     }
 
+    /// Prepares remote leases for one gang admission group on every target node.
+    pub(super) async fn prepare_remote_lease_group(
+        &self,
+        group_id: Uuid,
+        plans: &[RemoteStartPlan],
+        ttl_ms: u64,
+    ) -> Result<
+        (
+            HashMap<Uuid, RemoteGroupReservation>,
+            Vec<PreparedRemoteStartPlan>,
+        ),
+        ExecutionError,
+    > {
+        let mut reservations = HashMap::new();
+        let mut prepared_plans = Vec::new();
+        if plans.is_empty() {
+            return Ok((reservations, prepared_plans));
+        }
+
+        let mut grouped: HashMap<Uuid, Vec<&RemoteStartPlan>> = HashMap::new();
+        for plan in plans {
+            grouped.entry(plan.peer_id).or_default().push(plan);
+        }
+
+        let mut peer_ids = grouped.keys().copied().collect::<Vec<_>>();
+        peer_ids.sort_unstable();
+        for peer_id in peer_ids {
+            let peer_plans = &grouped[&peer_id];
+            let scheduler_client = match self.remote_scheduler_client(peer_id).await {
+                Ok(client) => client,
+                Err(err) => {
+                    self.local_state
+                        .remote_prepare_feedback
+                        .record_retryable_failure(peer_id);
+                    self.abort_remote_lease_groups(group_id, &reservations)
+                        .await;
+                    return Err(ExecutionError::Retry(err));
+                }
+            };
+
+            let outcome = match self
+                .send_prepare_lease_group_request(&scheduler_client, group_id, ttl_ms, peer_plans)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    self.abort_remote_lease_groups(group_id, &reservations)
+                        .await;
+                    if matches!(&err, ExecutionError::Retry(_)) {
+                        self.local_state
+                            .remote_prepare_feedback
+                            .record_retryable_failure(peer_id);
+                    }
+                    return Err(err);
+                }
+            };
+
+            match outcome {
+                RemotePrepareOutcome::Prepared(bindings_by_task) => {
+                    let group_reservation =
+                        remote_group_reservation_from_bindings(&bindings_by_task);
+                    let (_, peer_prepared_plans) = match self.build_prepared_remote_plans(
+                        peer_id,
+                        peer_plans,
+                        bindings_by_task,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(err) => {
+                            self.abort_remote_lease_groups(group_id, &reservations)
+                                .await;
+                            return Err(ExecutionError::Fatal(err));
+                        }
+                    };
+
+                    reservations.insert(peer_id, group_reservation);
+                    prepared_plans.extend(peer_prepared_plans);
+                    self.local_state
+                        .remote_prepare_feedback
+                        .clear_success(peer_id);
+                }
+                RemotePrepareOutcome::Rejected(rejection) => {
+                    let rejection_message = format!(
+                        "peer {peer_id} rejected group lease prepare: {} (digest version {}, free slots {}, free cpu {}, free memory {}, free gpu {})",
+                        describe_remote_prepare_rejection(rejection.reason),
+                        rejection.digest.snapshot_version,
+                        rejection.digest.free_slot_count,
+                        rejection.digest.free_cpu_millis,
+                        rejection.digest.free_memory_bytes,
+                        rejection.digest.free_gpu_count,
+                    );
+                    self.abort_remote_lease_groups(group_id, &reservations)
+                        .await;
+                    if let Err(err) = self
+                        .apply_remote_prepare_rejection(peer_id, rejection)
+                        .await
+                    {
+                        return Err(ExecutionError::Fatal(err));
+                    }
+                    return Err(ExecutionError::Retry(anyhow::anyhow!(rejection_message)));
+                }
+            }
+        }
+
+        Ok((reservations, prepared_plans))
+    }
+
     /// Opens the remote scheduler capability for a peer before sending reservation requests.
     async fn remote_scheduler_client(
         &self,
@@ -472,7 +723,45 @@ impl WorkloadManager {
         {
             let mut inner = prepare_req.get().init_request();
             inner.set_coordinator_node_id(self.local_node_id.as_bytes());
-            inner.set_ttl_ms(30_000);
+            inner.set_ttl_ms(DEFAULT_PREPARED_LEASE_TTL_MS);
+            let mut intents_builder = inner.reborrow().init_intents(peer_plans.len() as u32);
+            for (idx, plan) in peer_plans.iter().enumerate() {
+                let mut entry = intents_builder.reborrow().get(idx as u32);
+                entry.set_task_id(plan.id.as_bytes());
+                entry.set_cpu_millis(plan.cpu_millis);
+                entry.set_memory_bytes(plan.memory_bytes);
+                entry.set_gpu_count(plan.gpu_count);
+            }
+        }
+
+        let response = prepare_req
+            .send()
+            .promise
+            .await
+            .map_err(|err| ExecutionError::Retry(anyhow::anyhow!(err.to_string())))?;
+        let result = response
+            .get()
+            .map_err(|err| ExecutionError::Fatal(anyhow::anyhow!(err.to_string())))?;
+        let response = result
+            .get_response()
+            .map_err(|err| ExecutionError::Fatal(anyhow::anyhow!(err.to_string())))?;
+        parse_prepare_response(response).map_err(ExecutionError::Fatal)
+    }
+
+    /// Sends one remote group prepare RPC and decodes the target's admission result.
+    async fn send_prepare_lease_group_request(
+        &self,
+        scheduler_client: &scheduler_rpc::Client,
+        group_id: Uuid,
+        ttl_ms: u64,
+        peer_plans: &[&RemoteStartPlan],
+    ) -> Result<RemotePrepareOutcome, ExecutionError> {
+        let mut prepare_req = scheduler_client.prepare_lease_group_request();
+        {
+            let mut inner = prepare_req.get().init_request();
+            inner.set_group_id(group_id.as_bytes());
+            inner.set_coordinator_node_id(self.local_node_id.as_bytes());
+            inner.set_ttl_ms(ttl_ms);
             let mut intents_builder = inner.reborrow().init_intents(peer_plans.len() as u32);
             for (idx, plan) in peer_plans.iter().enumerate() {
                 let mut entry = intents_builder.reborrow().get(idx as u32);
@@ -658,6 +947,80 @@ impl WorkloadManager {
         }
     }
 
+    /// Commits every prepared remote group lease on its owning target node.
+    pub(super) async fn commit_remote_lease_groups(
+        &self,
+        group_id: Uuid,
+        reservations: &HashMap<Uuid, RemoteGroupReservation>,
+    ) -> Result<(), ExecutionError> {
+        let mut peer_ids = reservations.keys().copied().collect::<Vec<_>>();
+        peer_ids.sort_unstable();
+        for peer_id in peer_ids {
+            let reservation = &reservations[&peer_id];
+            let scheduler_client = self
+                .remote_scheduler_client(peer_id)
+                .await
+                .map_err(ExecutionError::Retry)?;
+
+            let mut commit_req = scheduler_client.commit_lease_group_request();
+            {
+                let mut inner = commit_req.get().init_request();
+                inner.set_group_id(group_id.as_bytes());
+                inner.set_coordinator_node_id(self.local_node_id.as_bytes());
+                write_prepared_leases_for_request(
+                    inner
+                        .reborrow()
+                        .init_prepared(reservation.leases.len() as u32),
+                    &reservation.leases,
+                );
+            }
+
+            commit_req
+                .send()
+                .promise
+                .await
+                .map_err(|err| ExecutionError::Fatal(anyhow::anyhow!(err.to_string())))?;
+        }
+
+        Ok(())
+    }
+
+    /// Aborts every still-prepared remote group lease on its owning target node.
+    pub(super) async fn abort_remote_lease_groups(
+        &self,
+        group_id: Uuid,
+        reservations: &HashMap<Uuid, RemoteGroupReservation>,
+    ) {
+        let mut peer_ids = reservations.keys().copied().collect::<Vec<_>>();
+        peer_ids.sort_unstable();
+        for peer_id in peer_ids {
+            let scheduler_client = match self.remote_scheduler_client(peer_id).await {
+                Ok(client) => client,
+                Err(err) => {
+                    warn!(
+                        target: "task",
+                        "failed to access scheduler for peer {peer_id} while aborting lease group {group_id}: {err}"
+                    );
+                    continue;
+                }
+            };
+
+            let mut abort_req = scheduler_client.abort_lease_group_request();
+            {
+                let mut inner = abort_req.get().init_request();
+                inner.set_group_id(group_id.as_bytes());
+                inner.set_coordinator_node_id(self.local_node_id.as_bytes());
+            }
+
+            if let Err(err) = abort_req.send().promise.await {
+                warn!(
+                    target: "task",
+                    "failed to abort lease group {group_id} on peer {peer_id}: {err}"
+                );
+            }
+        }
+    }
+
     pub(super) async fn remote_session(
         &self,
         peer_id: Uuid,
@@ -751,6 +1114,17 @@ impl WorkloadManager {
         &self,
         plans: &[PreparedRemoteStartPlan],
     ) -> Result<Vec<(usize, WorkloadSpec)>, ExecutionError> {
+        self.materialize_remote_specs_with_admission(plans, None, WorkloadAdmissionState::None)
+            .await
+    }
+
+    /// Creates remote task specs with the requested admission barrier metadata.
+    pub(super) async fn materialize_remote_specs_with_admission(
+        &self,
+        plans: &[PreparedRemoteStartPlan],
+        admission_group_id: Option<Uuid>,
+        admission_state: WorkloadAdmissionState,
+    ) -> Result<Vec<(usize, WorkloadSpec)>, ExecutionError> {
         if plans.is_empty() {
             return Ok(Vec::new());
         }
@@ -809,6 +1183,8 @@ impl WorkloadManager {
                 owner: plan.owner.clone(),
                 lease_id: Some(plan.lease_id),
                 lease_coordinator_node_id: Some(plan.lease_coordinator_node_id),
+                admission_group_id,
+                admission_state,
                 task_epoch,
                 phase_version: 0,
                 launch_attempt: 0,

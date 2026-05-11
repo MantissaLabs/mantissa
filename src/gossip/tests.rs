@@ -8,7 +8,7 @@ use crate::network::types::NetworkEvent;
 use crate::topology::PeerHandle;
 use crate::topology::TopologyEvent;
 use crate::topology::peer_provider::PeerProvider;
-use crate::workload::model::{WorkloadEvent, WorkloadPhase, WorkloadSpec};
+use crate::workload::model::{WorkloadAdmissionState, WorkloadEvent, WorkloadPhase, WorkloadSpec};
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use std::collections::HashSet;
@@ -185,6 +185,8 @@ fn coalesce_pending_messages_keeps_newest_task_upsert() {
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 4,
         phase_version: 7,
         launch_attempt: 0,
@@ -225,6 +227,8 @@ fn coalesce_pending_messages_keeps_newest_task_upsert() {
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 4,
         phase_version: 6,
         launch_attempt: 0,
@@ -296,6 +300,8 @@ fn coalesce_pending_messages_prefers_task_remove() {
         owner: None,
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 2,
         phase_version: 9,
         launch_attempt: 0,
@@ -378,6 +384,8 @@ fn coalesce_pending_messages_collapses_many_task_phase_updates() {
             owner: None,
             lease_id: None,
             lease_coordinator_node_id: None,
+            admission_group_id: None,
+            admission_state: WorkloadAdmissionState::None,
             task_epoch: 2,
             phase_version,
             launch_attempt: 0,

@@ -9,6 +9,15 @@ interface Scheduler {
 
   abortLeases @2 (request :AbortLeasesRequest) -> ();
   # Abort prepared leases that are no longer needed.
+
+  prepareLeaseGroup @3 (request :PrepareLeaseGroupRequest) -> (response :PrepareLeasesResponse);
+  # Prepare short-lived leases that belong to one admission group.
+
+  commitLeaseGroup @4 (request :CommitLeaseGroupRequest) -> ();
+  # Promote every prepared lease in one admission group into committed reservations.
+
+  abortLeaseGroup @5 (request :AbortLeaseGroupRequest) -> ();
+  # Abort every still-prepared lease in one admission group.
 }
 
 enum SlotState {
@@ -325,6 +334,20 @@ struct PrepareLeasesRequest {
   # Resource requests to satisfy atomically on this target node.
 }
 
+struct PrepareLeaseGroupRequest {
+  groupId @0 :Data;
+  # 16-byte UUID of the admission group that owns these leases.
+
+  coordinatorNodeId @1 :Data;
+  # 16-byte UUID of the node coordinating this placement batch.
+
+  ttlMs @2 :UInt64;
+  # Lease lifetime in milliseconds from prepare time.
+
+  intents @3 :List(LeaseIntent);
+  # Resource requests to satisfy atomically on this target node.
+}
+
 enum PrepareLeasesRejectionReason {
   insufficientResources @0;
   # The target node cannot currently satisfy the requested batch.
@@ -365,4 +388,23 @@ struct AbortLeasesRequest {
 
   intents @1 :List(AbortLeaseIntent);
   # Prepared leases to abort. Missing or expired leases are treated as already released.
+}
+
+struct CommitLeaseGroupRequest {
+  groupId @0 :Data;
+  # 16-byte UUID of the admission group to commit.
+
+  coordinatorNodeId @1 :Data;
+  # 16-byte UUID of the node coordinating this admission group.
+
+  prepared @2 :List(PreparedLease);
+  # Exact prepared leases the target must still hold for this group.
+}
+
+struct AbortLeaseGroupRequest {
+  groupId @0 :Data;
+  # 16-byte UUID of the admission group to abort.
+
+  coordinatorNodeId @1 :Data;
+  # 16-byte UUID of the node coordinating this admission group.
 }

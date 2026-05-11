@@ -7,7 +7,8 @@ use uuid::Uuid;
 use super::digest::{SchedulerDigestValue, write_scheduler_digest};
 use super::summary::SchedulerSummary;
 use super::{
-    AbortTaskLeaseIntent, PreparedTaskLeaseBatch, Scheduler, SchedulerError, TaskLeaseIntent,
+    AbortTaskLeaseIntent, PreparedTaskLease, PreparedTaskLeaseBatch, Scheduler, SchedulerError,
+    TaskLeaseIntent,
 };
 
 pub struct SchedulerService {
@@ -111,6 +112,28 @@ impl SchedulerService {
         let mut rejected = response.reborrow().init_rejected();
         rejected.set_reason(reason);
         write_scheduler_digest(rejected.reborrow().init_current_digest(), digest);
+    }
+
+    /// Decodes one list of prepared leases supplied by a remote group commit request.
+    fn read_prepared_leases(
+        leases: scheduling::prepared_lease::Reader<'_>,
+    ) -> Result<PreparedTaskLease, capnp::Error> {
+        let lease_id = Self::parse_uuid(leases.get_lease_id()?)?;
+        let task_id = Self::parse_uuid(leases.get_task_id()?)?;
+        let slot_ids = leases.get_slot_ids()?.iter().collect::<Vec<_>>();
+        let devices = leases.get_gpu_device_ids()?;
+        let mut gpu_device_ids = Vec::with_capacity(devices.len() as usize);
+        for device in devices.iter() {
+            gpu_device_ids.push(device?.to_str()?.to_string());
+        }
+
+        Ok(PreparedTaskLease {
+            lease_id,
+            task_id,
+            expires_at_unix_ms: leases.get_expires_at_unix_ms(),
+            slot_ids,
+            gpu_device_ids,
+        })
     }
 }
 
@@ -218,6 +241,85 @@ impl scheduler::Server for SchedulerService {
 
         Ok(())
     }
+
+    async fn prepare_lease_group(
+        self: Rc<Self>,
+        params: scheduler::PrepareLeaseGroupParams,
+        mut results: scheduler::PrepareLeaseGroupResults,
+    ) -> Result<(), capnp::Error> {
+        let request = params.get()?.get_request()?;
+        let group_id = Self::parse_uuid(request.get_group_id()?)?;
+        let coordinator_node_id = Self::parse_uuid(request.get_coordinator_node_id()?)?;
+        let ttl_ms = request.get_ttl_ms();
+        let intents = request.get_intents()?;
+
+        let mut reservations = Vec::with_capacity(intents.len() as usize);
+        for intent in intents.iter() {
+            let task_id = Self::parse_uuid(intent.get_task_id()?)?;
+            reservations.push(TaskLeaseIntent {
+                task_id,
+                cpu_millis: intent.get_cpu_millis(),
+                memory_bytes: intent.get_memory_bytes(),
+                gpu_count: intent.get_gpu_count(),
+            });
+        }
+
+        let mut response = results.get().init_response();
+        match self
+            .scheduler
+            .prepare_task_lease_group(coordinator_node_id, group_id, ttl_ms, reservations)
+            .await
+        {
+            Ok(prepared) => Self::write_prepared_leases(&prepared, response.reborrow()),
+            Err(err) => match self.prepare_rejection_from_error(err) {
+                Ok((reason, digest)) => {
+                    Self::write_prepare_rejection(reason, &digest, response.reborrow());
+                }
+                Err(err) => return Err(capnp::Error::failed(err.to_string())),
+            },
+        }
+
+        Ok(())
+    }
+
+    async fn commit_lease_group(
+        self: Rc<Self>,
+        params: scheduler::CommitLeaseGroupParams,
+        _results: scheduler::CommitLeaseGroupResults,
+    ) -> Result<(), capnp::Error> {
+        let request = params.get()?.get_request()?;
+        let group_id = Self::parse_uuid(request.get_group_id()?)?;
+        let coordinator_node_id = Self::parse_uuid(request.get_coordinator_node_id()?)?;
+        let prepared_reader = request.get_prepared()?;
+        let mut prepared = Vec::with_capacity(prepared_reader.len() as usize);
+        for lease in prepared_reader.iter() {
+            prepared.push(Self::read_prepared_leases(lease)?);
+        }
+
+        self.scheduler
+            .commit_task_lease_group(group_id, coordinator_node_id, &prepared)
+            .await
+            .map_err(|err| capnp::Error::failed(err.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn abort_lease_group(
+        self: Rc<Self>,
+        params: scheduler::AbortLeaseGroupParams,
+        _results: scheduler::AbortLeaseGroupResults,
+    ) -> Result<(), capnp::Error> {
+        let request = params.get()?.get_request()?;
+        let group_id = Self::parse_uuid(request.get_group_id()?)?;
+        let coordinator_node_id = Self::parse_uuid(request.get_coordinator_node_id()?)?;
+
+        self.scheduler
+            .abort_task_lease_group(coordinator_node_id, group_id)
+            .await
+            .map_err(|err| capnp::Error::failed(err.to_string()))?;
+
+        Ok(())
+    }
 }
 
 /// Returns the current Unix timestamp in milliseconds for rejection digest timestamps.
@@ -233,7 +335,7 @@ mod tests {
     use super::SchedulerService;
     use crate::registry::Registry;
     use crate::scheduler::digest::read_scheduler_digest;
-    use crate::scheduler::{Scheduler, SlotCapacity, SlotSpec};
+    use crate::scheduler::{Scheduler, SlotCapacity, SlotSpec, SlotState};
     use crate::store::local::LocalSessionStore;
     use crate::store::replicated::peers::open_peers_store;
     use crate::store::replicated::scheduler::open_scheduler_store;
@@ -246,6 +348,8 @@ mod tests {
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
     use uuid::Uuid;
+
+    const TEST_PREPARED_LEASE_TTL_MS: u64 = 30_000;
 
     /// Builds one isolated scheduler and local RPC client for scheduler service tests.
     async fn make_scheduler_client() -> (scheduler::Client, Rc<Scheduler>, Uuid, TempDir) {
@@ -295,7 +399,7 @@ mod tests {
         {
             let mut inner = request.get().init_request();
             inner.set_coordinator_node_id(Uuid::new_v4().as_bytes());
-            inner.set_ttl_ms(30_000);
+            inner.set_ttl_ms(TEST_PREPARED_LEASE_TTL_MS);
             let mut intents = inner.reborrow().init_intents(1);
             let mut intent = intents.reborrow().get(0);
             intent.set_task_id(Uuid::new_v4().as_bytes());
@@ -347,7 +451,7 @@ mod tests {
         {
             let mut inner = request.get().init_request();
             inner.set_coordinator_node_id(Uuid::new_v4().as_bytes());
-            inner.set_ttl_ms(30_000);
+            inner.set_ttl_ms(TEST_PREPARED_LEASE_TTL_MS);
             let mut intents = inner.reborrow().init_intents(1);
             let mut intent = intents.reborrow().get(0);
             intent.set_task_id(Uuid::new_v4().as_bytes());
@@ -380,6 +484,80 @@ mod tests {
                 assert_eq!(digest.free_gpu_count, 0);
             }
             _ => panic!("prepareLeases should reject oversized batches"),
+        }
+    }
+
+    /// Group lease RPCs should prepare and commit all target-side resources with the group id.
+    #[tokio::test]
+    async fn lease_group_rpc_prepares_and_commits_group_reservations() {
+        let (client, scheduler, coordinator, _dir) = make_scheduler_client().await;
+        scheduler
+            .init_slots([SlotSpec::new(
+                1,
+                SlotCapacity::new(500, 512 * 1024 * 1024, 0),
+            )])
+            .await
+            .expect("init scheduler");
+
+        let group_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let mut prepare = client.prepare_lease_group_request();
+        {
+            let mut inner = prepare.get().init_request();
+            inner.set_group_id(group_id.as_bytes());
+            inner.set_coordinator_node_id(coordinator.as_bytes());
+            inner.set_ttl_ms(TEST_PREPARED_LEASE_TTL_MS);
+            let mut intents = inner.reborrow().init_intents(1);
+            let mut intent = intents.reborrow().get(0);
+            intent.set_task_id(task_id.as_bytes());
+            intent.set_cpu_millis(100);
+            intent.set_memory_bytes(64 * 1024 * 1024);
+            intent.set_gpu_count(0);
+        }
+
+        let prepare_response = prepare
+            .send()
+            .promise
+            .await
+            .expect("call prepareLeaseGroup");
+        let payload = prepare_response
+            .get()
+            .expect("prepareLeaseGroup response")
+            .get_response()
+            .expect("prepareLeaseGroup payload");
+        let prepared = match payload.which().expect("prepareLeaseGroup variant") {
+            scheduling::prepare_leases_response::Prepared(Ok(leases)) => leases,
+            _ => panic!("prepareLeaseGroup should prepare the request"),
+        };
+        assert_eq!(prepared.len(), 1);
+
+        let mut commit = client.commit_lease_group_request();
+        {
+            let mut inner = commit.get().init_request();
+            inner.set_group_id(group_id.as_bytes());
+            inner.set_coordinator_node_id(coordinator.as_bytes());
+            let mut prepared_builder = inner.reborrow().init_prepared(1);
+            let mut lease = prepared_builder.reborrow().get(0);
+            let prepared_lease = prepared.get(0);
+            lease.set_lease_id(prepared_lease.get_lease_id().expect("lease id"));
+            lease.set_task_id(prepared_lease.get_task_id().expect("task id"));
+            lease.set_expires_at_unix_ms(prepared_lease.get_expires_at_unix_ms());
+            let prepared_slots = prepared_lease.get_slot_ids().expect("slot ids");
+            let mut slot_ids = lease.reborrow().init_slot_ids(prepared_slots.len());
+            for (idx, slot_id) in prepared_slots.iter().enumerate() {
+                slot_ids.set(idx as u32, slot_id);
+            }
+            lease.reborrow().init_gpu_device_ids(0);
+        }
+        commit.send().promise.await.expect("call commitLeaseGroup");
+
+        let snapshot = scheduler.snapshot().await.expect("snapshot");
+        match &snapshot.slots[0].state {
+            SlotState::Reserved(reservation) => {
+                assert_eq!(reservation.task_id, Some(task_id));
+                assert_eq!(reservation.group_id, Some(group_id));
+            }
+            other => panic!("expected group reservation, got {other:?}"),
         }
     }
 }

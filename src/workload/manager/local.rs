@@ -6,7 +6,9 @@ use chrono::Utc;
 use tracing::warn;
 
 use crate::gpu::gpu_runtime_status;
-use crate::workload::model::{WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadSpec};
+use crate::workload::model::{
+    WorkloadAdmissionState, WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadSpec,
+};
 
 use super::ReconcileTaskGuard;
 use super::WorkloadManager;
@@ -26,7 +28,10 @@ impl WorkloadManager {
 
         let _launch_guards = self.claim_batch_reconcile_guards(plans).await?;
 
-        let pending_specs = match self.persist_pending_batch(plans).await {
+        let pending_specs = match self
+            .persist_pending_batch_with_admission(plans, None, WorkloadAdmissionState::None)
+            .await
+        {
             Ok(specs) => specs,
             Err(err) => {
                 self.cleanup_batch(plans).await;
@@ -45,7 +50,10 @@ impl WorkloadManager {
             return Err(err);
         }
 
-        match self.commit_batch(plans).await {
+        match self
+            .commit_batch_with_admission(plans, None, WorkloadAdmissionState::None)
+            .await
+        {
             Ok(specs) => {
                 let ordered = plans
                     .iter()
@@ -54,6 +62,64 @@ impl WorkloadManager {
                     .collect();
                 Ok(ordered)
             }
+            Err(err) => {
+                self.cleanup_batch(plans).await;
+                self.rollback_pending_specs(&pending_specs).await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Starts local instances after a gang admission group has committed its scheduler leases.
+    pub(super) async fn start_local_group_instances(
+        &self,
+        group_id: uuid::Uuid,
+        plans: &mut [BatchStartPlan],
+    ) -> Result<Vec<(usize, WorkloadSpec)>, anyhow::Error> {
+        if plans.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let _launch_guards = self.claim_batch_reconcile_guards(plans).await?;
+        let pending_specs = match self
+            .persist_pending_batch_with_admission(
+                plans,
+                Some(group_id),
+                WorkloadAdmissionState::GroupCommitted,
+            )
+            .await
+        {
+            Ok(specs) => specs,
+            Err(err) => {
+                self.cleanup_batch(plans).await;
+                return Err(err);
+            }
+        };
+
+        if let Err(err) = self.launch_batch_instances(plans).await {
+            self.cleanup_batch(plans).await;
+            if is_local_volume_access_error(&err) {
+                self.persist_pending_volume_unavailable_specs(&pending_specs, &err)
+                    .await;
+            } else {
+                self.rollback_pending_specs(&pending_specs).await;
+            }
+            return Err(err);
+        }
+
+        match self
+            .commit_batch_with_admission(
+                plans,
+                Some(group_id),
+                WorkloadAdmissionState::GroupCommitted,
+            )
+            .await
+        {
+            Ok(specs) => Ok(plans
+                .iter()
+                .zip(specs)
+                .map(|(plan, spec)| (plan.index, spec))
+                .collect()),
             Err(err) => {
                 self.cleanup_batch(plans).await;
                 self.rollback_pending_specs(&pending_specs).await;
@@ -92,9 +158,11 @@ impl WorkloadManager {
     }
 
     /// Persists pending task specs before instance launch so other nodes see in-flight placement.
-    async fn persist_pending_batch(
+    pub(super) async fn persist_pending_batch_with_admission(
         &self,
         plans: &[BatchStartPlan],
+        admission_group_id: Option<uuid::Uuid>,
+        admission_state: WorkloadAdmissionState,
     ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
         let mut specs = Vec::with_capacity(plans.len());
 
@@ -145,6 +213,8 @@ impl WorkloadManager {
                 owner: plan.owner.clone(),
                 lease_id: None,
                 lease_coordinator_node_id: None,
+                admission_group_id,
+                admission_state,
                 task_epoch,
                 phase_version: 0,
                 launch_attempt: 1,
@@ -285,9 +355,11 @@ impl WorkloadManager {
         Ok(())
     }
 
-    async fn commit_batch(
+    async fn commit_batch_with_admission(
         &self,
         plans: &[BatchStartPlan],
+        admission_group_id: Option<uuid::Uuid>,
+        admission_state: WorkloadAdmissionState,
     ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
         let mut specs = Vec::with_capacity(plans.len());
 
@@ -349,6 +421,8 @@ impl WorkloadManager {
                 owner: plan.owner.clone(),
                 lease_id: None,
                 lease_coordinator_node_id: None,
+                admission_group_id,
+                admission_state,
                 task_epoch,
                 phase_version,
                 launch_attempt,

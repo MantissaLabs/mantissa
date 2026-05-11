@@ -17,7 +17,9 @@ use crate::volumes::types::{
     LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode,
     VolumeDriver, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
 };
-use crate::workload::model::{ExecutionPlatform, WorkloadOwner, WorkloadServiceMetadata};
+use crate::workload::model::{
+    ExecutionPlatform, WorkloadAdmissionState, WorkloadOwner, WorkloadServiceMetadata,
+};
 use crate::workload::types::{ExecutionSpec, ResolvedExecutionSpec};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -392,6 +394,8 @@ fn make_task(
         ))),
         lease_id: None,
         lease_coordinator_node_id: None,
+        admission_group_id: None,
+        admission_state: WorkloadAdmissionState::None,
         task_epoch: 0,
         phase_version: 0,
         launch_attempt: 0,

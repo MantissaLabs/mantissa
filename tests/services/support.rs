@@ -1293,6 +1293,8 @@ pub(crate) fn task_spec_to_value(spec: &WorkloadSpec) -> TaskValue {
         owner: spec.owner.clone(),
         lease_id: spec.lease_id,
         lease_coordinator_node_id: spec.lease_coordinator_node_id,
+        admission_group_id: spec.admission_group_id,
+        admission_state: spec.admission_state,
         task_epoch: spec.task_epoch,
         phase_version: spec.phase_version,
         launch_attempt: spec.launch_attempt,

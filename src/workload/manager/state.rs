@@ -22,8 +22,8 @@ use crate::scheduler::{
 };
 use crate::volumes::LocalVolumeAccessError;
 use crate::workload::model::{
-    WorkloadEvent, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadValue,
-    parse_workload_timestamp as parse_task_timestamp, select_best_workload_value,
+    WorkloadAdmissionState, WorkloadEvent, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec,
+    WorkloadValue, parse_workload_timestamp as parse_task_timestamp, select_best_workload_value,
     workload_event_id,
 };
 use crate::workload::types::{
@@ -2583,6 +2583,17 @@ impl WorkloadManager {
         &self,
         spec: WorkloadSpec,
     ) -> Result<(), anyhow::Error> {
+        if matches!(spec.admission_state, WorkloadAdmissionState::PendingGroup) {
+            debug!(
+                target: "task",
+                "skipping task {} ({}) while admission group {:?} is pending",
+                spec.name,
+                spec.id,
+                spec.admission_group_id
+            );
+            return Ok(());
+        }
+
         match spec.state {
             WorkloadPhase::Pending
             | WorkloadPhase::Pulling

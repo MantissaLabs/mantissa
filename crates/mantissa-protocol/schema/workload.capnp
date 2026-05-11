@@ -164,6 +164,17 @@ struct AdmissionPolicy {
   # Generic workload admission contract selected by the owning controller.
 }
 
+enum AdmissionState {
+  none @0;
+  # Workload row is not waiting on a grouped admission barrier.
+
+  pendingGroup @1;
+  # Workload row is visible but must not be adopted by a runtime yet.
+
+  groupCommitted @2;
+  # Group resources are committed and the workload row may be adopted.
+}
+
 struct LivenessProbe {
   kind @0 :LivenessProbeKind;
   # Local liveness probe transport kind.
@@ -332,6 +343,11 @@ struct WorkloadSpec {
   ports @35 :List(PortBinding);
   # Node-local host port bindings requested by the workload.
 
+  admissionGroupId @36 :Data;
+  # 16-byte UUID of the admission group, empty for ungrouped workloads.
+
+  admissionState @37 :AdmissionState;
+  # Runtime adoption barrier state for grouped workload admission.
 }
 
 struct WorkloadStatus {

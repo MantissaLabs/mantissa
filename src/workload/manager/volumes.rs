@@ -171,6 +171,29 @@ impl WorkloadManager {
         Ok(())
     }
 
+    /// Rejects gang admission when it would create irreversible first-consumer bindings.
+    pub(super) fn ensure_gang_volume_bindings_ready(&self, intents: &[StartIntent]) -> Result<()> {
+        for intent in intents {
+            for volume_id in unique_volume_ids(&intent.volumes) {
+                let spec = self
+                    .volumes
+                    .volume_registry
+                    .get_spec(volume_id)?
+                    .ok_or_else(|| anyhow!("unknown volume {volume_id}"))?;
+                if spec.bound_node_id.is_none()
+                    && matches!(spec.binding_mode, VolumeBindingMode::WaitForFirstConsumer)
+                {
+                    return Err(anyhow!(
+                        "gang admission does not yet support new first-consumer binding for volume '{}'",
+                        spec.name
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Resolves concrete bind-mount descriptors for all local volume mounts on this node.
     pub(super) async fn resolve_runtime_volume_mounts(
         &self,

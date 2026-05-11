@@ -493,6 +493,14 @@ pub struct TaskLeaseIntent {
     pub gpu_count: u32,
 }
 
+/// Exact lease intent used when a planner has already chosen local bindings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExactTaskLeaseIntent {
+    pub task_id: Uuid,
+    pub slot_ids: Vec<SlotId>,
+    pub gpu_device_ids: Vec<String>,
+}
+
 /// Exact bindings chosen locally for one task as part of a prepared lease batch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedTaskLease {
@@ -1516,6 +1524,191 @@ impl Scheduler {
 
             self.publish_digest_from_snapshot(&new_snapshot).await;
             return Ok(new_snapshot);
+        }
+    }
+
+    /// Prepares an admission-group lease for exact local slot and GPU bindings.
+    pub async fn prepare_exact_task_lease_group(
+        &self,
+        expected_version: u64,
+        coordinator_node_id: Uuid,
+        group_id: Uuid,
+        ttl_ms: u64,
+        intents: Vec<ExactTaskLeaseIntent>,
+    ) -> Result<PreparedTaskLeaseBatch, SchedulerError> {
+        if intents.is_empty() {
+            return Ok(PreparedTaskLeaseBatch { leases: Vec::new() });
+        }
+
+        loop {
+            let current_opt = self.state.load_full();
+            let current_arc = match current_opt.as_ref() {
+                Some(state) => state.clone(),
+                None => return Err(SchedulerError::Uninitialized),
+            };
+            let current = current_arc.as_ref();
+
+            if current.snapshot.version != expected_version {
+                return Err(SchedulerError::SnapshotMismatch {
+                    expected_version,
+                    current_version: current.snapshot.version,
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+
+            let mut new_snapshot = current.snapshot.clone();
+            let now_unix_ms = current_unix_ms();
+            Self::clear_expired_leases(&mut new_snapshot, now_unix_ms);
+
+            let slot_capacity = intents.iter().map(|intent| intent.slot_ids.len()).sum();
+            let gpu_capacity = intents
+                .iter()
+                .map(|intent| intent.gpu_device_ids.len())
+                .sum();
+            let mut slot_seen = HashSet::with_capacity(slot_capacity);
+            let mut slot_duplicates = BTreeSet::new();
+            let mut slot_unknown = BTreeSet::new();
+            let mut slot_conflicts = BTreeSet::new();
+            let mut gpu_seen = HashSet::with_capacity(gpu_capacity);
+            let mut gpu_duplicates = BTreeSet::new();
+            let mut gpu_unknown = BTreeSet::new();
+            let mut gpu_conflicts = BTreeSet::new();
+
+            for intent in &intents {
+                for slot_id in &intent.slot_ids {
+                    if !slot_seen.insert(*slot_id) {
+                        slot_duplicates.insert(*slot_id);
+                        continue;
+                    }
+
+                    match current.slot_index.get(slot_id) {
+                        Some(&idx) => {
+                            if !matches!(new_snapshot.slots[idx].state, SlotState::Free) {
+                                slot_conflicts.insert(*slot_id);
+                            }
+                        }
+                        None => {
+                            slot_unknown.insert(*slot_id);
+                        }
+                    }
+                }
+
+                for device_id in &intent.gpu_device_ids {
+                    if !gpu_seen.insert(device_id.clone()) {
+                        gpu_duplicates.insert(device_id.clone());
+                        continue;
+                    }
+
+                    match current.gpu_index.get(device_id) {
+                        Some(&idx) => {
+                            if !matches!(new_snapshot.gpu_devices[idx].state, GpuDeviceState::Free)
+                            {
+                                gpu_conflicts.insert(device_id.clone());
+                            }
+                        }
+                        None => {
+                            gpu_unknown.insert(device_id.clone());
+                        }
+                    }
+                }
+            }
+
+            if !slot_duplicates.is_empty() {
+                return Err(SchedulerError::DuplicateSlots {
+                    duplicates: slot_duplicates.into_iter().collect(),
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+            if !slot_unknown.is_empty() {
+                return Err(SchedulerError::UnknownSlots {
+                    unknown: slot_unknown.into_iter().collect(),
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+            if !slot_conflicts.is_empty() {
+                return Err(SchedulerError::SlotsUnavailable {
+                    conflicts: slot_conflicts.into_iter().collect(),
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+            if !gpu_duplicates.is_empty() {
+                return Err(SchedulerError::DuplicateGpuDevices {
+                    duplicates: gpu_duplicates.into_iter().collect(),
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+            if !gpu_unknown.is_empty() {
+                return Err(SchedulerError::UnknownGpuDevices {
+                    unknown: gpu_unknown.into_iter().collect(),
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+            if !gpu_conflicts.is_empty() {
+                return Err(SchedulerError::GpuDevicesUnavailable {
+                    conflicts: gpu_conflicts.into_iter().collect(),
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+
+            let expires_at_unix_ms = now_unix_ms.saturating_add(ttl_ms);
+            let mut leases = Vec::with_capacity(intents.len());
+            for intent in &intents {
+                let lease_id = Uuid::new_v4();
+                let reservation = LeaseReservation {
+                    lease_id,
+                    coordinator_node_id,
+                    task_id: intent.task_id,
+                    expires_at_unix_ms,
+                    group_id: Some(group_id),
+                };
+
+                let mut slot_ids = intent.slot_ids.clone();
+                slot_ids.sort_unstable();
+                for slot_id in &slot_ids {
+                    let idx = current.slot_index[slot_id];
+                    new_snapshot.slots[idx].state = SlotState::Leased(reservation.clone());
+                }
+
+                let mut gpu_device_ids = intent.gpu_device_ids.clone();
+                gpu_device_ids.sort();
+                for device_id in &gpu_device_ids {
+                    let idx = current.gpu_index[device_id];
+                    new_snapshot.gpu_devices[idx].state =
+                        GpuDeviceState::Leased(reservation.clone());
+                }
+
+                leases.push(PreparedTaskLease {
+                    lease_id,
+                    task_id: intent.task_id,
+                    expires_at_unix_ms,
+                    slot_ids,
+                    gpu_device_ids,
+                });
+            }
+
+            new_snapshot.version = Self::next_snapshot_version(&new_snapshot)?;
+
+            let new_state_arc = Arc::new(SchedulerState::new(new_snapshot.clone()));
+            let prev = self
+                .state
+                .compare_and_swap(&current_opt, Some(new_state_arc.clone()));
+            if !ptr_eq_option(&prev, &current_opt) {
+                continue;
+            }
+
+            if let Err(e) = self
+                .store
+                .upsert(&self.store_key, new_snapshot.clone())
+                .await
+            {
+                let _ = self
+                    .state
+                    .compare_and_swap(&Some(new_state_arc.clone()), current_opt.clone());
+                return Err(SchedulerError::Store(e));
+            }
+
+            self.publish_digest_from_snapshot(&new_snapshot).await;
+            return Ok(PreparedTaskLeaseBatch { leases });
         }
     }
 

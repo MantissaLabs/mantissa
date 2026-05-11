@@ -127,6 +127,18 @@ pub enum WorkloadPhase {
     Unknown,
 }
 
+/// Admission barrier state for workload rows that belong to a grouped start.
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadAdmissionState {
+    #[default]
+    None,
+    PendingGroup,
+    GroupCommitted,
+}
+
 /// Canonical, filterable workload lifecycle identifiers projected from concrete phases.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum WorkloadStateKind {
@@ -418,6 +430,10 @@ pub struct WorkloadSpec {
     #[serde(default)]
     pub lease_coordinator_node_id: Option<Uuid>,
     #[serde(default)]
+    pub admission_group_id: Option<Uuid>,
+    #[serde(default)]
+    pub admission_state: WorkloadAdmissionState,
+    #[serde(default)]
     pub task_epoch: u64,
     #[serde(default)]
     pub phase_version: u64,
@@ -645,6 +661,10 @@ pub struct WorkloadValue {
     #[serde(default)]
     pub lease_coordinator_node_id: Option<Uuid>,
     #[serde(default)]
+    pub admission_group_id: Option<Uuid>,
+    #[serde(default)]
+    pub admission_state: WorkloadAdmissionState,
+    #[serde(default)]
     pub task_epoch: u64,
     #[serde(default)]
     pub phase_version: u64,
@@ -734,6 +754,8 @@ impl WorkloadValue {
             owner: draft.owner,
             lease_id: draft.lease_id,
             lease_coordinator_node_id: draft.lease_coordinator_node_id,
+            admission_group_id: None,
+            admission_state: WorkloadAdmissionState::None,
             task_epoch: draft.task_epoch,
             phase_version: draft.phase_version,
             launch_attempt: draft.launch_attempt,
@@ -1102,6 +1124,8 @@ pub(crate) fn value_to_spec(id: Uuid, value: WorkloadValue) -> WorkloadSpec {
         owner: value.owner,
         lease_id: value.lease_id,
         lease_coordinator_node_id: value.lease_coordinator_node_id,
+        admission_group_id: value.admission_group_id,
+        admission_state: value.admission_state,
         task_epoch: value.task_epoch,
         phase_version: value.phase_version,
         launch_attempt: value.launch_attempt,
@@ -1242,13 +1266,15 @@ pub(crate) fn spec_to_value(spec: &WorkloadSpec) -> WorkloadValue {
     });
 
     value.restart_policy = spec.restart_policy.clone();
+    value.admission_group_id = spec.admission_group_id;
+    value.admission_state = spec.admission_state;
     value
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec,
+        ExecutionPlatform, IsolationMode, WorkloadAdmissionState, WorkloadPhase, WorkloadSpec,
         compare_workload_spec_causality,
     };
     use chrono::Utc;
@@ -1293,6 +1319,8 @@ mod tests {
             owner: None,
             lease_id: None,
             lease_coordinator_node_id: None,
+            admission_group_id: None,
+            admission_state: WorkloadAdmissionState::None,
             task_epoch: 3,
             phase_version: 9,
             launch_attempt: 0,

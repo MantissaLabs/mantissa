@@ -15,8 +15,9 @@ use crate::services::registry::ServiceRegistry;
 use crate::store::replicated::workloads::WorkloadStore;
 use crate::volumes::VolumeRegistry;
 use crate::workload::model::{
-    ExecutionPlatform, IsolationMode, WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadSpec,
-    WorkloadStateFilter, WorkloadStatus, WorkloadValue, should_replace_workload_event,
+    ExecutionPlatform, IsolationMode, WorkloadAdmissionState, WorkloadEvent, WorkloadOwner,
+    WorkloadPhase, WorkloadSpec, WorkloadStateFilter, WorkloadStatus, WorkloadValue,
+    should_replace_workload_event,
 };
 pub(crate) use crate::workload::model::{
     merge_definition_into_value, merge_status_into_value, spec_to_status, spec_to_value,
@@ -59,7 +60,9 @@ mod tests;
 
 use self::planner::{RemoteStartPlan, SchedulingError};
 use self::remote_advisory::RemotePrepareFeedbackRegistry;
-use self::reservation::{ExecutionError, RemoteReservation, ReservedResources};
+use self::reservation::{
+    DEFAULT_PREPARED_LEASE_TTL_MS, ExecutionError, RemoteReservation, ReservedResources,
+};
 
 #[cfg(test)]
 pub(crate) use crate::workload::model::should_accept_incoming_workload_value as should_accept_incoming_workload_value_for_tests;
@@ -625,6 +628,275 @@ impl WorkloadManager {
     ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
         self.start_workloads_batch_with_scheduling_retry_limit(requests, None)
             .await
+    }
+
+    /// Starts one workload group with a strict admission barrier before any row is runnable.
+    pub async fn start_workloads_gang(
+        &self,
+        group_id: Uuid,
+        requests: Vec<WorkloadStartRequest>,
+    ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.ensure_secret_dependencies(&requests)?;
+
+        let mut intents = Self::build_start_intents(requests)?;
+        self.apply_volume_locality_to_intents(&mut intents).await?;
+        self.ensure_gang_volume_bindings_ready(&intents)?;
+
+        const MAX_ATTEMPTS: usize = 5;
+        let mut attempt = 0usize;
+        let lease_ttl_ms = DEFAULT_PREPARED_LEASE_TTL_MS;
+
+        while attempt < MAX_ATTEMPTS {
+            let assignment = self
+                .compute_assignment(&intents)
+                .await
+                .context("failed to compute gang scheduling plan")?;
+
+            self.bind_assignment_volumes(&assignment, &intents)
+                .await
+                .context("failed to validate local volumes for gang workload group")?;
+
+            attempt += 1;
+
+            let local_version = assignment.local_version;
+            let mut local_plans = assignment.local;
+            let remote_plans = assignment.remote;
+
+            if let Err(err) = self.ensure_remote_secret_availability(&remote_plans).await {
+                debug!(
+                    target: "task",
+                    "remote secrets unavailable for gang group {group_id} on attempt {attempt}: {err}"
+                );
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+
+            let prepared_local = match self
+                .prepare_local_lease_group(group_id, &local_plans, local_version, lease_ttl_ms)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(ExecutionError::Retry(err)) => {
+                    debug!(
+                        target: "task",
+                        "local gang prepare conflicted for group {group_id} on attempt {attempt}: {err}"
+                    );
+                    continue;
+                }
+                Err(ExecutionError::Fatal(err)) => return Err(err),
+            };
+
+            let (mut remote_reservations, prepared_remote_plans) = match self
+                .prepare_remote_lease_group(group_id, &remote_plans, lease_ttl_ms)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(ExecutionError::Retry(err)) => {
+                    self.abort_local_lease_group(group_id).await;
+                    debug!(
+                        target: "task",
+                        "remote gang prepare conflicted for group {group_id} on attempt {attempt}: {err}"
+                    );
+                    continue;
+                }
+                Err(ExecutionError::Fatal(err)) => {
+                    self.abort_local_lease_group(group_id).await;
+                    return Err(err);
+                }
+            };
+
+            let remote_specs = match self
+                .materialize_remote_specs_with_admission(
+                    &prepared_remote_plans,
+                    Some(group_id),
+                    WorkloadAdmissionState::PendingGroup,
+                )
+                .await
+            {
+                Ok(specs) => specs,
+                Err(ExecutionError::Retry(err)) => {
+                    self.abort_remote_lease_groups(group_id, &remote_reservations)
+                        .await;
+                    self.abort_local_lease_group(group_id).await;
+                    remote_reservations.clear();
+                    debug!(
+                        target: "task",
+                        "remote gang materialization conflicted for group {group_id} on attempt {attempt}: {err}"
+                    );
+                    continue;
+                }
+                Err(ExecutionError::Fatal(err)) => {
+                    self.abort_remote_lease_groups(group_id, &remote_reservations)
+                        .await;
+                    self.abort_local_lease_group(group_id).await;
+                    remote_reservations.clear();
+                    return Err(err);
+                }
+            };
+
+            let local_pending_specs = match self
+                .persist_pending_batch_with_admission(
+                    &local_plans,
+                    Some(group_id),
+                    WorkloadAdmissionState::PendingGroup,
+                )
+                .await
+            {
+                Ok(specs) => specs,
+                Err(err) => {
+                    self.remove_group_specs(remote_specs.iter().map(|(_, spec)| spec))
+                        .await;
+                    self.abort_remote_lease_groups(group_id, &remote_reservations)
+                        .await;
+                    self.abort_local_lease_group(group_id).await;
+                    remote_reservations.clear();
+                    return Err(err);
+                }
+            };
+
+            if let Err(err) = self
+                .commit_remote_lease_groups(group_id, &remote_reservations)
+                .await
+            {
+                self.remove_group_specs(remote_specs.iter().map(|(_, spec)| spec))
+                    .await;
+                self.remove_group_specs(local_pending_specs.iter()).await;
+                self.abort_remote_lease_groups(group_id, &remote_reservations)
+                    .await;
+                self.abort_local_lease_group(group_id).await;
+                remote_reservations.clear();
+                return match err {
+                    ExecutionError::Retry(err) | ExecutionError::Fatal(err) => Err(err),
+                };
+            }
+
+            if let Err(err) = self
+                .commit_local_lease_group(group_id, &prepared_local)
+                .await
+            {
+                self.remove_group_specs(remote_specs.iter().map(|(_, spec)| spec))
+                    .await;
+                self.remove_group_specs(local_pending_specs.iter()).await;
+                self.abort_remote_lease_groups(group_id, &remote_reservations)
+                    .await;
+                self.abort_local_lease_group(group_id).await;
+                remote_reservations.clear();
+                return match err {
+                    ExecutionError::Retry(err) | ExecutionError::Fatal(err) => Err(err),
+                };
+            }
+
+            let mut committed_remote_specs = remote_specs;
+            self.mark_group_specs_committed(&mut committed_remote_specs)
+                .await?;
+            let local_plan_indexes = local_plans
+                .iter()
+                .map(|plan| (plan.id, plan.index))
+                .collect::<HashMap<_, _>>();
+            let mut committed_local_specs: Vec<(usize, WorkloadSpec)> = local_pending_specs
+                .into_iter()
+                .map(|spec| {
+                    let index = local_plan_indexes.get(&spec.id).copied().ok_or_else(|| {
+                        anyhow!(
+                            "missing local gang plan index for pending workload {}",
+                            spec.id
+                        )
+                    })?;
+                    Ok((index, spec))
+                })
+                .collect::<Result<_, anyhow::Error>>()?;
+            self.mark_group_specs_committed(&mut committed_local_specs)
+                .await?;
+
+            match self
+                .start_local_group_instances(group_id, &mut local_plans)
+                .await
+            {
+                Ok(local_specs) => {
+                    remote_reservations.clear();
+                    let mut ordered: Vec<Option<WorkloadSpec>> = vec![None; intents.len()];
+
+                    for (idx, spec) in committed_remote_specs.into_iter().chain(local_specs) {
+                        ordered[idx] = Some(spec);
+                    }
+
+                    let specs: Vec<WorkloadSpec> = ordered
+                        .into_iter()
+                        .map(|spec| {
+                            spec.ok_or_else(|| anyhow!("missing workload spec after gang start"))
+                        })
+                        .collect::<Result<_, _>>()?;
+
+                    return Ok(specs);
+                }
+                Err(err) => {
+                    debug!(
+                        target: "task",
+                        "local gang execution failed after group {group_id} commit; rolling back remote tasks: {err}"
+                    );
+                    self.signal_remote_stop(&committed_remote_specs).await;
+                    remote_reservations.clear();
+                    return Err(err);
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "failed to gang schedule workloads after {MAX_ATTEMPTS} attempts"
+        ))
+    }
+
+    /// Removes pending group specs during a pre-commit admission rollback.
+    async fn remove_group_specs<'a, I>(&self, specs: I)
+    where
+        I: IntoIterator<Item = &'a WorkloadSpec>,
+    {
+        for spec in specs {
+            if let Err(err) = self.remove_spec(spec.id).await {
+                warn!(
+                    target: "task",
+                    "failed to remove pending group workload {} during rollback: {err}",
+                    spec.id
+                );
+            }
+        }
+    }
+
+    /// Marks pending group specs as committed and clears task-local lease metadata.
+    async fn mark_group_specs_committed(
+        &self,
+        specs: &mut [(usize, WorkloadSpec)],
+    ) -> Result<(), anyhow::Error> {
+        for (_, spec) in specs.iter_mut() {
+            spec.admission_state = WorkloadAdmissionState::GroupCommitted;
+            spec.lease_id = None;
+            spec.lease_coordinator_node_id = None;
+            spec.updated_at = Utc::now().to_rfc3339();
+        }
+
+        let committed: Vec<WorkloadSpec> = specs.iter().map(|(_, spec)| spec.clone()).collect();
+        self.persist_specs_batch(&committed)
+            .await
+            .context("failed to mark gang workload specs committed")?;
+
+        for spec in committed {
+            if let Err(err) = self
+                .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(spec.clone())))
+                .await
+            {
+                warn!(
+                    target: "task",
+                    "failed to record committed group workload gossip for {}: {err}",
+                    spec.name
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Starts one workload batch while allowing higher layers to clamp scheduling retries.

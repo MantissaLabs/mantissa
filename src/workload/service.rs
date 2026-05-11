@@ -6,10 +6,10 @@ use crate::workload::capnp_codec::{
 };
 use crate::workload::manager::WorkloadManager;
 use crate::workload::model::{
-    ExecutionPlatform, IsolationMode, WorkloadAgentRunMetadata, WorkloadEvent, WorkloadJobMetadata,
-    WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStateFilter,
-    WorkloadStateKind, WorkloadStatus, WorkloadValue, merge_status_into_value, spec_to_status,
-    spec_to_value, value_to_spec,
+    ExecutionPlatform, IsolationMode, WorkloadAdmissionState, WorkloadAgentRunMetadata,
+    WorkloadEvent, WorkloadJobMetadata, WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata,
+    WorkloadSpec, WorkloadStateFilter, WorkloadStateKind, WorkloadStatus, WorkloadValue,
+    merge_status_into_value, spec_to_status, spec_to_value, value_to_spec,
 };
 use capnp::Error;
 use mantissa_protocol::gossip::gossip_message;
@@ -250,6 +250,14 @@ pub fn write_spec(mut builder: workload_spec::Builder<'_>, spec: &WorkloadSpec) 
             .map(|bytes| bytes.as_slice())
             .unwrap_or(&[]),
     );
+    builder.set_admission_group_id(
+        spec.admission_group_id
+            .as_ref()
+            .map(Uuid::as_bytes)
+            .map(|bytes| bytes.as_slice())
+            .unwrap_or(&[]),
+    );
+    builder.set_admission_state(workload_admission_state_to_proto(spec.admission_state));
     builder.set_node_id(spec.node_id.as_bytes());
     builder.set_node_name(&spec.node_name);
 
@@ -338,6 +346,10 @@ pub fn read_spec(reader: workload_spec::Reader<'_>) -> Result<WorkloadSpec, Erro
         Ok(bytes) if bytes.len() == 16 => Some(read_id_from_data(bytes)?),
         _ => None,
     };
+    let admission_group_id = match reader.get_admission_group_id() {
+        Ok(bytes) if bytes.len() == 16 => Some(read_id_from_data(bytes)?),
+        _ => None,
+    };
 
     let mut pre_stop_command = Vec::new();
     for arg in reader.get_pre_stop_command()?.iter() {
@@ -411,6 +423,8 @@ pub fn read_spec(reader: workload_spec::Reader<'_>) -> Result<WorkloadSpec, Erro
         owner: read_owner(reader.get_owner()?)?,
         lease_id,
         lease_coordinator_node_id,
+        admission_group_id,
+        admission_state: workload_admission_state_from_proto(reader.get_admission_state()),
         task_epoch: reader.get_task_epoch(),
         phase_version: reader.get_phase_version(),
         launch_attempt: reader.get_launch_attempt(),
@@ -419,6 +433,37 @@ pub fn read_spec(reader: workload_spec::Reader<'_>) -> Result<WorkloadSpec, Erro
             value => Some(value),
         },
     })
+}
+
+/// Encodes the workload-row admission barrier state into the wire schema.
+fn workload_admission_state_to_proto(
+    state: WorkloadAdmissionState,
+) -> mantissa_protocol::workload::AdmissionState {
+    match state {
+        WorkloadAdmissionState::None => mantissa_protocol::workload::AdmissionState::None,
+        WorkloadAdmissionState::PendingGroup => {
+            mantissa_protocol::workload::AdmissionState::PendingGroup
+        }
+        WorkloadAdmissionState::GroupCommitted => {
+            mantissa_protocol::workload::AdmissionState::GroupCommitted
+        }
+    }
+}
+
+/// Decodes the workload-row admission barrier state, defaulting older rows to ungrouped.
+fn workload_admission_state_from_proto(
+    state: Result<mantissa_protocol::workload::AdmissionState, capnp::NotInSchema>,
+) -> WorkloadAdmissionState {
+    match state {
+        Ok(mantissa_protocol::workload::AdmissionState::None) => WorkloadAdmissionState::None,
+        Ok(mantissa_protocol::workload::AdmissionState::PendingGroup) => {
+            WorkloadAdmissionState::PendingGroup
+        }
+        Ok(mantissa_protocol::workload::AdmissionState::GroupCommitted) => {
+            WorkloadAdmissionState::GroupCommitted
+        }
+        Err(_) => WorkloadAdmissionState::None,
+    }
 }
 
 /// Encodes one exclusive workload owner into the workload wire payload.
