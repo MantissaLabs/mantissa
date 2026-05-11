@@ -223,6 +223,11 @@ impl WorkloadStateFilter {
         let kind = WorkloadStateKind::from_phase(state);
         self.allowed.contains(&kind)
     }
+
+    /// Returns true when this filter is the default operator-facing active workload view.
+    pub fn is_active_only(&self) -> bool {
+        self.allowed == Self::active_only().allowed
+    }
 }
 
 /// One resolved volume mount attached to a workload after manifest and CLI inputs are validated.

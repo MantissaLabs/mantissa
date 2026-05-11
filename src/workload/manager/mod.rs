@@ -1110,7 +1110,9 @@ impl WorkloadManager {
             if let Some(value) = crate::workload::model::select_best_workload_value(snap.as_slice())
             {
                 let spec = value_to_spec(id, value);
-                if filter.accepts(&spec.state) {
+                let hidden_pending_group = filter.is_active_only()
+                    && matches!(spec.admission_state, WorkloadAdmissionState::PendingGroup);
+                if filter.accepts(&spec.state) && !hidden_pending_group {
                     specs.push(spec);
                 }
             }

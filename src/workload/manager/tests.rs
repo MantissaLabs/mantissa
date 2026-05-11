@@ -1951,6 +1951,23 @@ async fn pending_group_workload_rows_are_not_adopted() {
         mock_cm.created.lock().await.is_empty(),
         "pending group rows must not create runtime instances"
     );
+    assert!(
+        manager
+            .list_workloads(&TaskStateFilter::active_only())
+            .await
+            .expect("list active workloads")
+            .is_empty(),
+        "pending group rows must not appear in the default active view"
+    );
+    assert_eq!(
+        manager
+            .list_workloads(&TaskStateFilter::all())
+            .await
+            .expect("list all workloads")
+            .len(),
+        1,
+        "pending group rows should remain visible in the full debug view"
+    );
     let snapshot = scheduler.snapshot().await.expect("snapshot");
     assert!(
         matches!(snapshot.slots[0].state, SlotState::Free),
