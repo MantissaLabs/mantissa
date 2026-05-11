@@ -16,12 +16,14 @@ use crate::services::types::{
 };
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
-    decode_env_vars, decode_network_requirements, decode_port_bindings, decode_secret_files,
-    decode_service_liveness_probe, decode_service_restart_policy, decode_volume_mounts,
-    encode_env_vars, encode_port_bindings, encode_secret_files, encode_service_liveness_probe,
-    encode_service_restart_policy, encode_volume_mounts,
+    decode_admission_policy as read_admission_policy, decode_env_vars, decode_network_requirements,
+    decode_port_bindings, decode_secret_files, decode_service_liveness_probe,
+    decode_service_restart_policy, decode_volume_mounts,
+    encode_admission_policy as write_admission_policy, encode_env_vars, encode_port_bindings,
+    encode_secret_files, encode_service_liveness_probe, encode_service_restart_policy,
+    encode_volume_mounts,
 };
-use crate::workload::types::{ExecutionSpec, WorkloadAdmissionMode, WorkloadAdmissionPolicy};
+use crate::workload::types::{ExecutionSpec, WorkloadAdmissionPolicy};
 use capnp::Error;
 use mantissa_protocol::services::{
     placement_constraint, placement_constraint_selector, service_event, service_spec,
@@ -913,34 +915,6 @@ fn proto_to_service_status(status: mantissa_protocol::services::ServiceStatus) -
         mantissa_protocol::services::ServiceStatus::Stopped => ServiceStatus::Stopped,
         mantissa_protocol::services::ServiceStatus::Failed => ServiceStatus::Failed,
     }
-}
-
-/// Encodes the workload admission policy selected by the service manifest.
-fn write_admission_policy(
-    mut builder: mantissa_protocol::workload::admission_policy::Builder<'_>,
-    policy: &WorkloadAdmissionPolicy,
-) {
-    let mode = match policy.mode {
-        WorkloadAdmissionMode::Incremental => {
-            mantissa_protocol::workload::AdmissionMode::Incremental
-        }
-        WorkloadAdmissionMode::Gang => mantissa_protocol::workload::AdmissionMode::Gang,
-    };
-    builder.set_mode(mode);
-}
-
-/// Decodes the workload admission policy, defaulting to current incremental behavior.
-fn read_admission_policy(
-    reader: mantissa_protocol::workload::admission_policy::Reader<'_>,
-) -> Result<WorkloadAdmissionPolicy, Error> {
-    let mode = match reader.get_mode() {
-        Ok(mantissa_protocol::workload::AdmissionMode::Incremental) => {
-            WorkloadAdmissionMode::Incremental
-        }
-        Ok(mantissa_protocol::workload::AdmissionMode::Gang) => WorkloadAdmissionMode::Gang,
-        Err(_) => WorkloadAdmissionMode::Incremental,
-    };
-    Ok(WorkloadAdmissionPolicy { mode })
 }
 
 /// Encodes the service update strategy so rollout behavior is replicated with the service spec.

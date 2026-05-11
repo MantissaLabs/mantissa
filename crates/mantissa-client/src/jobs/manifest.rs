@@ -2,6 +2,7 @@ use crate::runtime_contract::{
     DEFAULT_EXECUTION_PLATFORM, normalize_execution_platform, normalize_isolation_mode,
     normalize_isolation_profile,
 };
+use crate::workload_submit::WorkloadAdmissionPolicy;
 use crate::workload_submit::{
     DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec, ManifestNetworkSpec,
     RequestedNetworkSpec, resolve_requested_networks, validate_declared_networks,
@@ -32,6 +33,8 @@ pub struct JobManifest {
     pub execution: JobExecutionSpec,
     #[serde(default)]
     pub retry_policy: JobRetryPolicySpec,
+    #[serde(default)]
+    pub admission: WorkloadAdmissionPolicy,
 }
 
 /// Resource requests declared for one job execution template.
@@ -665,6 +668,7 @@ fn default_liveness_start_period_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workload_submit::WorkloadAdmissionMode;
 
     fn base_manifest() -> JobManifest {
         JobManifest {
@@ -708,6 +712,7 @@ mod tests {
                 liveness: None,
             },
             retry_policy: JobRetryPolicySpec::default(),
+            admission: WorkloadAdmissionPolicy::default(),
         }
     }
 
@@ -794,6 +799,23 @@ mod tests {
         manifest.validate().expect("valid job host port manifest");
         assert_eq!(manifest.execution.ports[0].name, "metrics");
         assert_eq!(manifest.execution.ports[0].host, 19100);
+    }
+
+    /// Accepts gang admission policy at the same top-level workload policy slot as services.
+    #[test]
+    fn manifest_accepts_gang_admission_policy() {
+        let raw = r#"(
+            name: "demo-job",
+            admission: (
+                mode: gang,
+            ),
+            execution: (
+                image: "alpine:3.20",
+            ),
+        )"#;
+        let manifest: JobManifest = ron::from_str(raw).expect("parse gang manifest");
+
+        assert_eq!(manifest.admission.mode, WorkloadAdmissionMode::Gang);
     }
 
     /// Rejects dynamic host ports until Mantissa has an allocation reporting contract.

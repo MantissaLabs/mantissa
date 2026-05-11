@@ -14,7 +14,8 @@ use mantissa::runtime::types::{
 };
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode, HeadlessTransport};
 use mantissa::task::types::TaskStateFilter;
-use mantissa::workload::model::{ExecutionPlatform, IsolationMode};
+use mantissa::workload::model::{ExecutionPlatform, IsolationMode, WorkloadAdmissionState};
+use mantissa::workload::types::WorkloadAdmissionMode;
 use mantissa_net::noise::NoiseKeys;
 use mantissa_protocol::jobs::{JobStatus as ProtoJobStatus, jobs};
 use std::collections::HashMap;
@@ -120,6 +121,40 @@ local_test!(jobs_retry_after_failed_task, {
     assert!(
         tasks.iter().any(|task| task.id == first_workload_id),
         "first failed workload should remain visible in the replicated workload store"
+    );
+});
+
+local_test!(jobs_gang_admission_records_grouped_attempt, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let node = TestNode::new().await;
+
+    let job_id = submit_job_with_admission(
+        &node.node.jobs_client,
+        "gang-job",
+        WorkloadAdmissionMode::Gang,
+    )
+    .await
+    .expect("submit gang-admitted job");
+
+    let workload_id =
+        wait_for_active_workload(&node.node.jobs_client, job_id, Duration::from_secs(5))
+            .await
+            .expect("gang job should launch one workload");
+
+    let workload = node
+        .node
+        .workload_manager
+        .inspect_workload(workload_id)
+        .await
+        .expect("inspect gang job workload");
+    assert!(
+        workload.admission_group_id.is_some(),
+        "gang job attempt should record an admission group id"
+    );
+    assert_eq!(
+        workload.admission_state,
+        WorkloadAdmissionState::GroupCommitted,
+        "gang job attempt should become runnable only after group commit"
     );
 });
 
@@ -558,6 +593,48 @@ async fn submit_job(
         None,
     )
     .await
+}
+
+/// Submits one first-class job with an explicit workload admission mode.
+async fn submit_job_with_admission(
+    client: &jobs::Client,
+    name: &str,
+    admission_mode: WorkloadAdmissionMode,
+) -> Result<Uuid, capnp::Error> {
+    let mut request = client.submit_request();
+    {
+        let mut builder = request.get().init_spec();
+        builder.set_name(name);
+        builder.set_execution_platform("oci");
+        builder.set_isolation_mode("standard");
+        builder.set_isolation_profile("");
+        let mut execution = builder.reborrow().init_execution();
+        execution.set_image("ghcr.io/mantissa/demo-job:latest");
+        execution.set_tty(false);
+        execution.set_cpu_millis(250);
+        execution.set_memory_bytes(128 * 1024 * 1024);
+        execution.set_gpu_count(0);
+        execution.reborrow().init_command(0);
+        execution.reborrow().init_env(0);
+        execution.reborrow().init_secret_files(0);
+        execution.reborrow().init_volumes(0);
+        execution.reborrow().init_networks(0);
+        let mut retry_policy = builder.reborrow().init_retry_policy();
+        retry_policy.set_max_retries(0);
+        retry_policy.set_backoff_secs(0);
+        let proto_mode = match admission_mode {
+            WorkloadAdmissionMode::Incremental => {
+                mantissa_protocol::workload::AdmissionMode::Incremental
+            }
+            WorkloadAdmissionMode::Gang => mantissa_protocol::workload::AdmissionMode::Gang,
+        };
+        builder
+            .reborrow()
+            .init_admission_policy()
+            .set_mode(proto_mode);
+    }
+    let response = request.send().promise.await?;
+    read_uuid(response.get()?.get_job_id()?)
 }
 
 /// Submits one first-class job with explicit runtime selection and returns the generated id.

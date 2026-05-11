@@ -6,11 +6,11 @@ use crate::runtime_contract::{
 };
 use crate::tasks::uuid_to_string;
 use crate::volumes;
-use crate::workload_submit::RequestedNetworkSpec;
+use crate::workload_submit::{RequestedNetworkSpec, WorkloadAdmissionPolicy};
 use crate::workload_wire::{
-    PreparedVolumeMount, prepared_volume_mount_from_resolved, write_env_vars, write_liveness_probe,
-    write_network_requirements, write_optional_volume_mount, write_secret_files,
-    write_volume_mounts,
+    PreparedVolumeMount, prepared_volume_mount_from_resolved, write_admission_policy,
+    write_env_vars, write_liveness_probe, write_network_requirements, write_optional_volume_mount,
+    write_secret_files, write_volume_mounts,
 };
 use anyhow::{Result, anyhow};
 use mantissa_protocol::agents::agent_session_spec;
@@ -71,6 +71,7 @@ pub(crate) struct PreparedAgentSessionSpec {
     pub checkpoint: PreparedAgentCheckpointPolicy,
     pub interaction: PreparedAgentInteractionPolicy,
     pub pending_input: Option<String>,
+    pub admission_policy: WorkloadAdmissionPolicy,
     pub required_networks: Vec<RequestedNetworkSpec>,
 }
 
@@ -193,6 +194,7 @@ async fn prepare_raw_submit_spec(
             idle_timeout_secs: options.idle_timeout_secs,
         },
         pending_input: normalize_optional_text(options.initial_input),
+        admission_policy: WorkloadAdmissionPolicy::default(),
         required_networks: Vec::new(),
     })
 }
@@ -235,6 +237,10 @@ pub(crate) fn write_agent_session_spec(
     builder.set_isolation_mode(&spec.isolation_mode);
     builder.set_isolation_profile(spec.isolation_profile.as_deref().unwrap_or(""));
     builder.set_pending_input(spec.pending_input.as_deref().unwrap_or(""));
+    write_admission_policy(
+        builder.reborrow().init_admission_policy(),
+        &spec.admission_policy,
+    );
 
     write_agent_execution(builder.reborrow(), &spec.execution);
     write_workspace_policy(builder.reborrow(), &spec.workspace);

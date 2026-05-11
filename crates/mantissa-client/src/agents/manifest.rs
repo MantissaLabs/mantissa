@@ -8,7 +8,8 @@ use crate::runtime_contract::{
 };
 use crate::workload_submit::{
     DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec, ManifestNetworkSpec,
-    RequestedNetworkSpec, resolve_requested_networks, validate_declared_networks,
+    RequestedNetworkSpec, WorkloadAdmissionPolicy, resolve_requested_networks,
+    validate_declared_networks,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -41,6 +42,8 @@ pub struct AgentManifest {
     pub interaction: AgentInteractionSpec,
     #[serde(default)]
     pub pending_input: Option<String>,
+    #[serde(default)]
+    pub admission: WorkloadAdmissionPolicy,
 }
 
 /// Resource requests declared for one agent run template.
@@ -697,6 +700,7 @@ fn default_agent_max_turns_per_run() -> u16 {
 mod tests {
     use super::*;
     use crate::jobs::manifest::{LocalVolumeSource, LocalVolumeSpec};
+    use crate::workload_submit::WorkloadAdmissionMode;
 
     fn base_manifest() -> AgentManifest {
         AgentManifest {
@@ -759,6 +763,7 @@ mod tests {
             checkpoint: AgentCheckpointSpec::default(),
             interaction: AgentInteractionSpec::default(),
             pending_input: Some("Summarize the repository".to_string()),
+            admission: WorkloadAdmissionPolicy::default(),
         }
     }
 
@@ -812,6 +817,23 @@ mod tests {
             requested[0].ip_family,
             Some(crate::config::NetworkIpFamily::Ipv6)
         );
+    }
+
+    /// Accepts gang admission policy at the durable agent session workload policy slot.
+    #[test]
+    fn manifest_accepts_gang_admission_policy() {
+        let raw = r#"(
+            name: "codex-demo",
+            admission: (
+                mode: gang,
+            ),
+            execution: (
+                image: "ghcr.io/demo/codex:latest",
+            ),
+        )"#;
+        let manifest: AgentManifest = ron::from_str(raw).expect("parse gang manifest");
+
+        assert_eq!(manifest.admission.mode, WorkloadAdmissionMode::Gang);
     }
 
     /// Rejects duplicate mount targets across execution and workspace policies.

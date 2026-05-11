@@ -3,12 +3,15 @@ use crate::jobs::manifest::{
 };
 use crate::volumes::LocalVolumeOwnership;
 use crate::volumes::ResolvedVolumeMount;
-use crate::workload_submit::{ManifestPortBinding, ManifestPortProtocol, RequestedNetworkSpec};
+use crate::workload_submit::{
+    ManifestPortBinding, ManifestPortProtocol, RequestedNetworkSpec, WorkloadAdmissionMode,
+    WorkloadAdmissionPolicy,
+};
 use capnp::struct_list;
 use mantissa_protocol::volumes::local_volume_ownership;
 use mantissa_protocol::workload::{
-    environment_var, liveness_probe, network_requirement, port_binding, secret_file, secret_ref,
-    volume_mount,
+    admission_policy, environment_var, liveness_probe, network_requirement, port_binding,
+    secret_file, secret_ref, volume_mount,
 };
 use uuid::Uuid;
 
@@ -19,6 +22,20 @@ pub struct PreparedVolumeMount {
     pub volume_name: String,
     pub target: String,
     pub read_only: bool,
+}
+
+/// Encodes one manifest-selected workload admission policy into the shared wire shape.
+pub fn write_admission_policy(
+    mut builder: admission_policy::Builder<'_>,
+    policy: &WorkloadAdmissionPolicy,
+) {
+    let mode = match policy.mode {
+        WorkloadAdmissionMode::Incremental => {
+            mantissa_protocol::workload::AdmissionMode::Incremental
+        }
+        WorkloadAdmissionMode::Gang => mantissa_protocol::workload::AdmissionMode::Gang,
+    };
+    builder.set_mode(mode);
 }
 
 /// Rebuilds one resolved CLI volume mount into the generic workload submit payload shape.

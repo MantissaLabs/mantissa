@@ -67,6 +67,7 @@ async fn prepare_manifest_submit_spec(
             idle_timeout_secs: manifest.interaction.idle_timeout_secs,
         },
         pending_input: manifest.pending_input.clone(),
+        admission_policy: manifest.admission,
         required_networks,
     })
 }

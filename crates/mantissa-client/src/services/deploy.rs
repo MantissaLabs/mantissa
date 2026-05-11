@@ -10,10 +10,11 @@ use crate::connection;
 use crate::volumes;
 use crate::workload_submit::{
     DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec, ResolvedDeclaredVolume,
-    WorkloadAdmissionMode, WorkloadAdmissionPolicy, compute_network_id, ensure_declared_volumes,
+    compute_network_id, ensure_declared_volumes,
 };
 use crate::workload_wire::{
-    write_local_volume_ownership, write_network_requirements, write_port_bindings,
+    write_admission_policy, write_local_volume_ownership, write_network_requirements,
+    write_port_bindings,
 };
 use anyhow::{Context, Result, anyhow};
 use capnp::{Error as CapnpError, struct_list};
@@ -78,19 +79,6 @@ fn write_update_strategy(
     rolling.set_monitor_secs(strategy.rolling.monitor_secs);
     rolling.set_max_failures(strategy.rolling.max_failures);
     rolling.set_auto_rollback(strategy.rolling.auto_rollback);
-}
-
-fn write_admission_policy(
-    mut builder: mantissa_protocol::workload::admission_policy::Builder<'_>,
-    policy: &WorkloadAdmissionPolicy,
-) {
-    let mode = match policy.mode {
-        WorkloadAdmissionMode::Incremental => {
-            mantissa_protocol::workload::AdmissionMode::Incremental
-        }
-        WorkloadAdmissionMode::Gang => mantissa_protocol::workload::AdmissionMode::Gang,
-    };
-    builder.set_mode(mode);
 }
 
 fn write_env_vars(

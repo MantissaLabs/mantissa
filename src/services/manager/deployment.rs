@@ -1886,7 +1886,7 @@ impl ServiceController {
                     "starting gang admission for {context}"
                 );
                 self.workload_manager
-                    .start_workloads_gang(group_id, requests)
+                    .start_workloads_with_admission_policy(admission_policy, group_id, requests)
                     .await
                     .with_context(|| format!("gang admission failed for {context}"))
             }

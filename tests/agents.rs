@@ -12,9 +12,9 @@ use mantissa::runtime::types::{
     RuntimeSupportContract, RuntimeSupportProfile,
 };
 use mantissa::task::types::TaskValue;
-use mantissa::workload::model::WorkloadPhase;
-use mantissa::workload::model::WorkloadSpec;
 use mantissa::workload::model::{ExecutionPlatform, IsolationMode};
+use mantissa::workload::model::{WorkloadAdmissionState, WorkloadPhase, WorkloadSpec};
+use mantissa::workload::types::WorkloadAdmissionMode;
 use mantissa_protocol::agents::{
     AgentRunStatus as ProtoAgentRunStatus, AgentSessionStatus as ProtoAgentSessionStatus, agents,
 };
@@ -92,6 +92,40 @@ local_test!(
         );
     }
 );
+
+local_test!(agents_gang_admission_records_grouped_run_workload, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let node = TestNode::new().await;
+
+    let session_id = submit_agent_session_with_options(
+        &node.node.agents_client,
+        "gang-agent",
+        AgentSessionSubmitOptions {
+            initial_input: Some("solve the task"),
+            admission_mode: Some(WorkloadAdmissionMode::Gang),
+            ..AgentSessionSubmitOptions::default()
+        },
+    )
+    .await
+    .expect("submit gang-admitted agent session");
+
+    let (_run_id, workload_id) = wait_for_active_run(&node.node.agents_client, session_id).await;
+    let workload = node
+        .node
+        .workload_manager
+        .inspect_workload(workload_id)
+        .await
+        .expect("inspect gang agent workload");
+    assert!(
+        workload.admission_group_id.is_some(),
+        "gang agent run should record an admission group id"
+    );
+    assert_eq!(
+        workload.admission_state,
+        WorkloadAdmissionState::GroupCommitted,
+        "gang agent run should become runnable only after group commit"
+    );
+});
 
 local_test!(agents_inspect_returns_session_and_run_history, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
@@ -216,6 +250,7 @@ local_test!(agents_submit_nono_run_projects_runtime_sandbox_policy, {
             workspace_directory: Some("/workspace"),
             allow_network: false,
             allow_write: true,
+            admission_mode: None,
         },
     )
     .await
@@ -404,6 +439,7 @@ struct AgentSessionSubmitOptions<'a> {
     workspace_directory: Option<&'a str>,
     allow_network: bool,
     allow_write: bool,
+    admission_mode: Option<WorkloadAdmissionMode>,
 }
 
 #[derive(Clone, Copy)]
@@ -613,6 +649,7 @@ async fn submit_agent_session(
             workspace_directory: None,
             allow_network: false,
             allow_write: false,
+            admission_mode: None,
         },
     )
     .await
@@ -642,6 +679,18 @@ async fn submit_agent_session_with_options(
         builder.reborrow().init_networks(0);
         builder.reborrow().init_events(0);
         builder.reborrow().init_pre_stop_command(0);
+        if let Some(mode) = options.admission_mode {
+            let proto_mode = match mode {
+                WorkloadAdmissionMode::Incremental => {
+                    mantissa_protocol::workload::AdmissionMode::Incremental
+                }
+                WorkloadAdmissionMode::Gang => mantissa_protocol::workload::AdmissionMode::Gang,
+            };
+            builder
+                .reborrow()
+                .init_admission_policy()
+                .set_mode(proto_mode);
+        }
 
         let mut workspace = builder.reborrow().init_workspace();
         workspace.reborrow().init_mount();

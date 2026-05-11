@@ -15,7 +15,7 @@ use crate::workload::model::{
 use crate::workload::network_prerequisites::{
     WorkloadNetworkPrerequisites, WorkloadNetworkRequirement,
 };
-use crate::workload::types::ResolvedExecutionSpec;
+use crate::workload::types::{ResolvedExecutionSpec, WorkloadAdmissionPolicy};
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
 use mantissa_health::{HealthMonitor, Status as HealthStatus};
@@ -133,6 +133,7 @@ impl AgentController {
         checkpoint: AgentCheckpointPolicy,
         interaction: crate::agents::types::AgentInteractionPolicy,
         initial_input: Option<String>,
+        admission_policy: WorkloadAdmissionPolicy,
         required_networks: Vec<WorkloadNetworkRequirement>,
     ) -> Result<AgentSubmission> {
         validate_agent_execution(&execution)?;
@@ -140,7 +141,7 @@ impl AgentController {
             .ensure_required_networks("agent session submission", &required_networks)
             .await?;
 
-        let session = AgentSessionSpecValue::new(
+        let mut session = AgentSessionSpecValue::new(
             Uuid::new_v4(),
             name,
             execution,
@@ -153,6 +154,7 @@ impl AgentController {
             interaction,
             initial_input,
         );
+        session.admission_policy = admission_policy;
         self.apply_session(session.clone()).await?;
         self.broadcast(AgentEvent::UpsertSession(Box::new(session.clone())))
             .await?;
@@ -636,6 +638,8 @@ impl AgentController {
             session.isolation_profile.clone(),
             prompt,
         );
+        let mut run = run;
+        run.admission_policy = session.admission_policy;
         let mut updated_session = session.clone();
         updated_session.mark_run_queued(run_id);
         self.apply_run(run.clone()).await?;
@@ -689,9 +693,11 @@ impl AgentController {
             return Ok(());
         }
 
+        let group_id = compute_agent_run_admission_group_id(session.id, run.id);
+
         match self
             .workload_manager
-            .start_workloads_batch(vec![request])
+            .start_workloads_with_admission_policy(run.admission_policy, group_id, vec![request])
             .await
         {
             Ok(mut started) => {
@@ -1096,4 +1102,16 @@ fn build_agent_run_name(session: &AgentSessionSpecValue, run_id: Uuid) -> String
         .take(24)
         .collect::<String>();
     format!("agent-{prefix}-{run_id}")
+}
+
+/// Computes the stable admission group id for one durable agent run workload.
+fn compute_agent_run_admission_group_id(session_id: Uuid, run_id: Uuid) -> Uuid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mantissa-agent-admission-group-v1");
+    hasher.update(session_id.as_bytes());
+    hasher.update(run_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
 }

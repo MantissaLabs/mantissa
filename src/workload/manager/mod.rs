@@ -23,8 +23,9 @@ pub(crate) use crate::workload::model::{
     merge_definition_into_value, merge_status_into_value, spec_to_status, spec_to_value,
     value_to_spec,
 };
-use crate::workload::types::ResolvedExecutionSpec;
-use crate::workload::types::WorkloadRestartPolicy;
+use crate::workload::types::{
+    ResolvedExecutionSpec, WorkloadAdmissionMode, WorkloadAdmissionPolicy, WorkloadRestartPolicy,
+};
 use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Utc};
@@ -628,6 +629,19 @@ impl WorkloadManager {
     ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
         self.start_workloads_batch_with_scheduling_retry_limit(requests, None)
             .await
+    }
+
+    /// Starts one controller-owned workload group using the requested admission contract.
+    pub async fn start_workloads_with_admission_policy(
+        &self,
+        admission_policy: WorkloadAdmissionPolicy,
+        group_id: Uuid,
+        requests: Vec<WorkloadStartRequest>,
+    ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
+        match admission_policy.mode {
+            WorkloadAdmissionMode::Incremental => self.start_workloads_batch(requests).await,
+            WorkloadAdmissionMode::Gang => self.start_workloads_gang(group_id, requests).await,
+        }
     }
 
     /// Starts one workload group with a strict admission barrier before any row is runnable.

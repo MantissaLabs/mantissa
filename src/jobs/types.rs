@@ -1,5 +1,5 @@
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
-use crate::workload::types::ResolvedExecutionSpec;
+use crate::workload::types::{ResolvedExecutionSpec, WorkloadAdmissionPolicy};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -34,6 +34,8 @@ pub struct JobSpecValue {
     pub completion_policy: JobCompletionPolicy,
     #[serde(default)]
     pub retry_policy: JobRetryPolicy,
+    #[serde(default)]
+    pub admission_policy: WorkloadAdmissionPolicy,
     #[serde(default)]
     pub active_workload_id: Option<Uuid>,
     #[serde(default)]
@@ -76,6 +78,7 @@ impl JobSpecValue {
             status_detail: None,
             completion_policy: JobCompletionPolicy::default(),
             retry_policy,
+            admission_policy: WorkloadAdmissionPolicy::default(),
             active_workload_id: None,
             last_workload_id: None,
             successful_workload_id: None,

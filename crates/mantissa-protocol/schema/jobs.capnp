@@ -92,6 +92,9 @@ struct JobSubmitSpec {
 
   requiredNetworks @6 :List(WorkloadSchema.NetworkRequirement);
   # Networks referenced by the manifest that the job controller must provision before placement.
+
+  admissionPolicy @7 :WorkloadSchema.AdmissionPolicy;
+  # Workload admission contract selected for each job attempt.
 }
 
 struct JobSnapshot {
@@ -151,6 +154,9 @@ struct JobSnapshot {
 
   isolationProfile @18 :Text;
   # Optional isolation profile requested for each workload attempt.
+
+  admissionPolicy @19 :WorkloadSchema.AdmissionPolicy;
+  # Workload admission contract selected for each job attempt.
 }
 
 struct JobAttemptSnapshot {
@@ -271,6 +277,9 @@ struct JobRecord {
 
   isolationProfile @19 :Text;
   # Optional isolation profile requested for each workload attempt.
+
+  admissionPolicy @20 :WorkloadSchema.AdmissionPolicy;
+  # Workload admission contract selected for each job attempt.
 }
 
 enum JobStatus {

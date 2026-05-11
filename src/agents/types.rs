@@ -1,5 +1,5 @@
 use crate::workload::model::{ExecutionPlatform, IsolationMode, WorkloadVolumeMount};
-use crate::workload::types::ResolvedExecutionSpec;
+use crate::workload::types::{ResolvedExecutionSpec, WorkloadAdmissionPolicy};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -165,6 +165,8 @@ pub struct AgentSessionSpecValue {
     #[serde(default)]
     pub interaction: AgentInteractionPolicy,
     #[serde(default)]
+    pub admission_policy: WorkloadAdmissionPolicy,
+    #[serde(default)]
     pub active_run_id: Option<Uuid>,
     #[serde(default)]
     pub last_run_id: Option<Uuid>,
@@ -209,6 +211,7 @@ impl AgentSessionSpecValue {
             tools,
             checkpoint,
             interaction,
+            admission_policy: WorkloadAdmissionPolicy::default(),
             active_run_id: None,
             last_run_id: None,
             pending_input: None,
@@ -477,6 +480,8 @@ pub struct AgentRunSpecValue {
     #[serde(default)]
     pub status_detail: Option<String>,
     #[serde(default)]
+    pub admission_policy: WorkloadAdmissionPolicy,
+    #[serde(default)]
     /// Underlying scheduled workload id once the run has been placed.
     pub workload_id: Option<Uuid>,
     #[serde(default)]
@@ -516,6 +521,7 @@ impl AgentRunSpecValue {
             phase_version: 0,
             status: AgentRunStatus::Pending,
             status_detail: Some("sandbox run pending".to_string()),
+            admission_policy: WorkloadAdmissionPolicy::default(),
             workload_id: None,
             prompt: normalize_optional_text(prompt),
             exit_code: None,

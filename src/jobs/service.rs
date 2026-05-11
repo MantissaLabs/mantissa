@@ -2,13 +2,14 @@ use crate::jobs::manager::{JobController, JobSubmission, JobSubmitRequest};
 use crate::jobs::types::{JobEvent, JobRetryPolicy, JobSpecValue, JobStatus};
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
-    decode_env_vars, decode_network_requirements, decode_port_bindings, decode_secret_files,
-    decode_task_liveness_probe, decode_volume_mounts, encode_env_vars, encode_port_bindings,
-    encode_secret_files, encode_task_liveness_probe, encode_volume_mounts,
+    decode_admission_policy, decode_env_vars, decode_network_requirements, decode_port_bindings,
+    decode_secret_files, decode_task_liveness_probe, decode_volume_mounts, encode_admission_policy,
+    encode_env_vars, encode_port_bindings, encode_secret_files, encode_task_liveness_probe,
+    encode_volume_mounts,
 };
 use crate::workload::model::{ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec};
 use crate::workload::network_prerequisites::WorkloadNetworkRequirement;
-use crate::workload::types::ResolvedExecutionSpec;
+use crate::workload::types::{ResolvedExecutionSpec, WorkloadAdmissionPolicy};
 use capnp::Error;
 use mantissa_protocol::gossip::gossip_message;
 use mantissa_protocol::jobs::{
@@ -34,6 +35,7 @@ struct DecodedJobSubmitSpec {
     isolation_mode: IsolationMode,
     isolation_profile: Option<String>,
     retry_policy: JobRetryPolicy,
+    admission_policy: WorkloadAdmissionPolicy,
     required_networks: Vec<WorkloadNetworkRequirement>,
 }
 
@@ -65,6 +67,7 @@ impl jobs::Server for JobsRpc {
                 isolation_mode: spec.isolation_mode,
                 isolation_profile: spec.isolation_profile,
                 retry_policy: spec.retry_policy,
+                admission_policy: spec.admission_policy,
                 required_networks: spec.required_networks,
             })
             .await
@@ -362,6 +365,10 @@ fn write_job_record(
     builder.set_execution_platform(value.execution_platform.as_str());
     builder.set_isolation_mode(value.isolation_mode.as_str());
     builder.set_isolation_profile(value.isolation_profile.as_deref().unwrap_or(""));
+    encode_admission_policy(
+        builder.reborrow().init_admission_policy(),
+        &value.admission_policy,
+    );
 
     Ok(())
 }
@@ -437,6 +444,11 @@ fn read_job_record(reader: job_record::Reader<'_>) -> Result<JobSpecValue, Error
     };
     value.terminal_exit_code =
         (reader.get_terminal_exit_code() >= 0).then(|| reader.get_terminal_exit_code());
+    value.admission_policy = if reader.has_admission_policy() {
+        decode_admission_policy(reader.get_admission_policy()?)?
+    } else {
+        WorkloadAdmissionPolicy::default()
+    };
     Ok(value)
 }
 
@@ -485,6 +497,10 @@ fn write_job_snapshot(
     builder.set_execution_platform(value.execution_platform.as_str());
     builder.set_isolation_mode(value.isolation_mode.as_str());
     builder.set_isolation_profile(value.isolation_profile.as_deref().unwrap_or(""));
+    encode_admission_policy(
+        builder.reborrow().init_admission_policy(),
+        &value.admission_policy,
+    );
     Ok(())
 }
 
@@ -537,6 +553,11 @@ fn read_job_submit_spec(
         isolation_mode: parse_isolation_mode(reader.get_isolation_mode()?.to_str()?)?,
         isolation_profile: read_optional_text(reader.get_isolation_profile()?.to_str()?),
         retry_policy: read_job_retry_policy(reader.get_retry_policy()?),
+        admission_policy: if reader.has_admission_policy() {
+            decode_admission_policy(reader.get_admission_policy()?)?
+        } else {
+            WorkloadAdmissionPolicy::default()
+        },
         required_networks: decode_network_requirements(reader.get_required_networks()?)?,
     })
 }

@@ -6,9 +6,10 @@ use crate::agents::types::{
 };
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
-    decode_env_vars, decode_network_requirements, decode_secret_files, decode_task_liveness_probe,
-    decode_task_restart_policy, decode_volume_mounts, encode_env_vars, encode_secret_files,
-    encode_task_liveness_probe, encode_task_restart_policy, encode_volume_mounts,
+    decode_admission_policy, decode_env_vars, decode_network_requirements, decode_secret_files,
+    decode_task_liveness_probe, decode_task_restart_policy, decode_volume_mounts,
+    encode_admission_policy, encode_env_vars, encode_secret_files, encode_task_liveness_probe,
+    encode_task_restart_policy, encode_volume_mounts,
 };
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
 use crate::workload::types::ResolvedExecutionSpec;
@@ -61,6 +62,7 @@ impl agents::Server for AgentsRpc {
                 session.checkpoint,
                 session.interaction,
                 session.pending_input,
+                session.admission_policy,
                 required_networks,
             )
             .await
@@ -327,6 +329,10 @@ pub fn write_agent_session_spec(
     write_tool_policy(builder.reborrow().init_tools(), &value.tools);
     write_checkpoint_policy(builder.reborrow().init_checkpoint(), &value.checkpoint)?;
     write_interaction_policy(builder.reborrow().init_interaction(), &value.interaction);
+    encode_admission_policy(
+        builder.reborrow().init_admission_policy(),
+        &value.admission_policy,
+    );
 
     let mut events = builder.reborrow().init_events(value.events.len() as u32);
     for (index, entry) in value.events.iter().enumerate() {
@@ -364,6 +370,11 @@ pub fn read_agent_session_spec(
     value.active_run_id = read_optional_uuid(reader.get_active_run_id()?);
     value.last_run_id = read_optional_uuid(reader.get_last_run_id()?);
     value.pending_input = normalize_text(reader.get_pending_input()?);
+    value.admission_policy = if reader.has_admission_policy() {
+        decode_admission_policy(reader.get_admission_policy()?)?
+    } else {
+        Default::default()
+    };
     value.events = read_agent_events(reader.get_events()?)?;
     value.event_sequence = value.events.last().map(|entry| entry.sequence).unwrap_or(0);
     Ok(value)
@@ -395,6 +406,10 @@ pub fn write_agent_run_spec(
     builder.set_exit_code(value.exit_code.unwrap_or_default());
     builder.set_started_at(value.started_at.as_deref().unwrap_or(""));
     builder.set_finished_at(value.finished_at.as_deref().unwrap_or(""));
+    encode_admission_policy(
+        builder.reborrow().init_admission_policy(),
+        &value.admission_policy,
+    );
     Ok(())
 }
 
@@ -422,6 +437,11 @@ pub fn read_agent_run_spec(reader: agent_run_spec::Reader<'_>) -> Result<AgentRu
     value.exit_code = reader.get_has_exit_code().then_some(reader.get_exit_code());
     value.started_at = normalize_text(reader.get_started_at()?);
     value.finished_at = normalize_text(reader.get_finished_at()?);
+    value.admission_policy = if reader.has_admission_policy() {
+        decode_admission_policy(reader.get_admission_policy()?)?
+    } else {
+        Default::default()
+    };
     Ok(value)
 }
 

@@ -4,15 +4,45 @@ use crate::workload::model::{
 };
 use crate::workload::network_prerequisites::{WorkloadNetworkIpFamily, WorkloadNetworkRequirement};
 use crate::workload::types::{
-    WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadPortBinding, WorkloadPortProtocol,
-    WorkloadRestartPolicy, WorkloadRestartPolicyKind,
+    WorkloadAdmissionMode, WorkloadAdmissionPolicy, WorkloadLivenessProbe,
+    WorkloadLivenessProbeKind, WorkloadPortBinding, WorkloadPortProtocol, WorkloadRestartPolicy,
+    WorkloadRestartPolicyKind,
 };
 use capnp::{Error, struct_list};
 use mantissa_protocol::volumes::local_volume_ownership;
 use mantissa_protocol::workload::{
-    environment_var, network_requirement, port_binding, secret_file, secret_ref, volume_mount,
+    admission_policy, environment_var, network_requirement, port_binding, secret_file, secret_ref,
+    volume_mount,
 };
 use uuid::Uuid;
+
+/// Encodes the workload admission policy selected by a higher-level controller.
+pub fn encode_admission_policy(
+    mut builder: admission_policy::Builder<'_>,
+    policy: &WorkloadAdmissionPolicy,
+) {
+    let mode = match policy.mode {
+        WorkloadAdmissionMode::Incremental => {
+            mantissa_protocol::workload::AdmissionMode::Incremental
+        }
+        WorkloadAdmissionMode::Gang => mantissa_protocol::workload::AdmissionMode::Gang,
+    };
+    builder.set_mode(mode);
+}
+
+/// Decodes one workload admission policy, defaulting absent modes to incremental admission.
+pub fn decode_admission_policy(
+    reader: admission_policy::Reader<'_>,
+) -> Result<WorkloadAdmissionPolicy, Error> {
+    let mode = match reader.get_mode() {
+        Ok(mantissa_protocol::workload::AdmissionMode::Incremental) => {
+            WorkloadAdmissionMode::Incremental
+        }
+        Ok(mantissa_protocol::workload::AdmissionMode::Gang) => WorkloadAdmissionMode::Gang,
+        Err(_) => WorkloadAdmissionMode::Incremental,
+    };
+    Ok(WorkloadAdmissionPolicy { mode })
+}
 
 /// Encodes one secret reference into the task schema payload.
 pub fn encode_secret_ref(

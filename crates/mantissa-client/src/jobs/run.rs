@@ -9,12 +9,13 @@ use crate::runtime_contract::{
 use crate::tasks::uuid_to_string;
 use crate::volumes;
 use crate::workload_submit::{
-    ManifestPortBinding, RequestedNetworkSpec, ResolvedDeclaredVolume, compute_network_id,
-    ensure_declared_volumes,
+    ManifestPortBinding, RequestedNetworkSpec, ResolvedDeclaredVolume, WorkloadAdmissionPolicy,
+    compute_network_id, ensure_declared_volumes,
 };
 use crate::workload_wire::{
-    PreparedVolumeMount, prepared_volume_mount_from_resolved, write_env_vars, write_liveness_probe,
-    write_network_requirements, write_port_bindings, write_secret_files, write_volume_mounts,
+    PreparedVolumeMount, prepared_volume_mount_from_resolved, write_admission_policy,
+    write_env_vars, write_liveness_probe, write_network_requirements, write_port_bindings,
+    write_secret_files, write_volume_mounts,
 };
 use anyhow::{Result, anyhow};
 use mantissa_protocol::jobs::{job_execution, job_retry_policy, job_submit_spec};
@@ -75,6 +76,7 @@ struct PreparedJobSubmitSpec {
     name: String,
     execution: PreparedJobExecution,
     retry_policy: PreparedJobRetryPolicy,
+    admission_policy: WorkloadAdmissionPolicy,
     execution_platform: String,
     isolation_mode: String,
     isolation_profile: Option<String>,
@@ -192,6 +194,7 @@ async fn prepare_raw_submit_spec(
                 .retry_backoff_secs
                 .unwrap_or(DEFAULT_RETRY_BACKOFF_SECS),
         },
+        admission_policy: WorkloadAdmissionPolicy::default(),
         execution_platform,
         isolation_mode,
         isolation_profile,
@@ -215,6 +218,7 @@ async fn prepare_manifest_submit_spec(
             max_retries: manifest.retry_policy.max_retries,
             backoff_secs: manifest.retry_policy.backoff_secs,
         },
+        admission_policy: manifest.admission,
         execution_platform: manifest.execution_platform.clone(),
         isolation_mode: manifest.isolation_mode.clone(),
         isolation_profile: manifest.isolation_profile.clone(),
@@ -278,6 +282,10 @@ fn write_job_submit_spec(
     builder.set_execution_platform(&spec.execution_platform);
     builder.set_isolation_mode(&spec.isolation_mode);
     builder.set_isolation_profile(spec.isolation_profile.as_deref().unwrap_or(""));
+    write_admission_policy(
+        builder.reborrow().init_admission_policy(),
+        &spec.admission_policy,
+    );
     write_network_requirements(
         &mut builder
             .reborrow()

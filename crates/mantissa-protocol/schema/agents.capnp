@@ -127,6 +127,9 @@ struct AgentSessionSpec {
 
   requiredNetworks @32 :List(WorkloadSchema.NetworkRequirement);
   # Networks referenced by the manifest that the agent controller must provision before placement.
+
+  admissionPolicy @33 :WorkloadSchema.AdmissionPolicy;
+  # Workload admission contract selected for runs launched from this session.
 }
 
 struct AgentRunSpec {
@@ -222,6 +225,9 @@ struct AgentRunSpec {
 
   liveness @30 :WorkloadSchema.LivenessProbe;
   # Optional local liveness probe evaluated by the hosting runtime.
+
+  admissionPolicy @31 :WorkloadSchema.AdmissionPolicy;
+  # Workload admission contract selected for this run.
 }
 
 struct AgentWorkspacePolicy {

@@ -11,6 +11,7 @@ use crate::workload::model::{
 use crate::workload::network_prerequisites::{
     WorkloadNetworkPrerequisites, WorkloadNetworkRequirement,
 };
+use crate::workload::types::WorkloadAdmissionPolicy;
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
 use chrono::Utc;
@@ -40,6 +41,7 @@ pub struct JobSubmitRequest {
     pub isolation_mode: IsolationMode,
     pub isolation_profile: Option<String>,
     pub retry_policy: JobRetryPolicy,
+    pub admission_policy: WorkloadAdmissionPolicy,
     pub required_networks: Vec<WorkloadNetworkRequirement>,
 }
 
@@ -125,7 +127,7 @@ impl JobController {
             .ensure_required_networks("job submission", &request.required_networks)
             .await?;
 
-        let spec = JobSpecValue::new(
+        let mut spec = JobSpecValue::new(
             Uuid::new_v4(),
             request.name,
             request.execution,
@@ -134,6 +136,7 @@ impl JobController {
             request.isolation_profile,
             request.retry_policy,
         );
+        spec.admission_policy = request.admission_policy;
         self.apply_upsert(spec.clone()).await?;
         self.broadcast(JobEvent::Upsert(Box::new(spec.clone())))
             .await?;
@@ -564,9 +567,12 @@ impl JobController {
             return Ok(());
         }
 
+        let group_id =
+            compute_job_attempt_admission_group_id(latest.id, workload_id, latest.attempts_started);
+
         match self
             .workload_manager
-            .start_workloads_batch(vec![request])
+            .start_workloads_with_admission_policy(latest.admission_policy, group_id, vec![request])
             .await
         {
             Ok(mut specs) => {
@@ -811,6 +817,23 @@ fn job_owner_score(job_id: Uuid, node_id: Uuid) -> u128 {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest.as_bytes()[..16]);
     u128::from_le_bytes(bytes)
+}
+
+/// Computes the stable admission group id for one reserved job workload attempt.
+fn compute_job_attempt_admission_group_id(
+    job_id: Uuid,
+    workload_id: Uuid,
+    attempts_started: u32,
+) -> Uuid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mantissa-job-admission-group-v1");
+    hasher.update(job_id.as_bytes());
+    hasher.update(workload_id.as_bytes());
+    hasher.update(&attempts_started.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
 }
 
 #[cfg(test)]
