@@ -9,27 +9,32 @@ Every node participates equally in scheduling, state replication, and cluster me
 No control-plane masters, and no federation layer required at scale.
 
 Built in Rust with Cap'n Proto RPC, CRDT replication, Merkle Search Trees over Redb, and
-an extensible eBPF data path, Mantissa targets low-latency scheduling and fault-tolerant
-operation across tens of thousands of nodes.
+an eBPF driven data path, Mantissa targets low-latency scheduling and fault-tolerant
+operation across large fleets of nodes.
+
+## Why Mantissa?
+
+Traditional workload orchestration systems often rely on a centralized control plane, which
+could be difficult to scale and maintain as the cluster grows. Mantissa explores an alternative
+approach that leverages distributed scheduling with optimistic concurrency. It is similar to the
+[Omega scheduler](https://people.csail.mit.edu/malte/pub/papers/2013-eurosys-omega.pdf) in the
+approach, but with the shared state being replicated via CRDTs.
+
+The goal is to reduce the operational overhead and complexity, as well as maintaining a highly
+available and fault-tolerant system. This could be useful to scale infrastructures and deploy
+a large amount of AI agents for example.
 
 ## Status
 
-**Experimental**. This project is here to demonstrate that strong eventual consistency is
-sufficient for workload orchestration and metadata replication. We could keep a simple UX
-and still get a very powerful cluster scheduler with advanced features. It is a spiritual
-successor to Docker Swarm Mode and aims at supporting small but also very large clusters,
-for scenarios where upgrades and maintenance are becoming a bottleneck.
+**Experimental**. Do not use in Production (yet).
 
-> [!Warning]
-> Expect contract breakages and random failures/inconsistencies as development goes on.
->
-> _Do not use in Production._
+See the [docs/limits.md](docs/limits.md) for more details on the ongoing challenges and limitations.
 
 ## Highlights
 
 - Fully distributed scheduling with resource reservation (no primary scheduler).
-- Designed to scale to tens of thousands of nodes without a federation layer.
-- Gang-style placement for multi-task services (batch scheduling) to keep replicas aligned.
+- Designed to scale to large fleets of nodes without a federation layer.
+- Batch placement and dependency-aware rollout for multi-task services.
 - GPU-aware scheduling with device-level reservations (NVIDIA).
 - eBPF-accelerated overlay networking for low-latency service discovery and routing.
 - Durable state via CRDT + Merkle Search Tree (backed by Redb) for fault tolerance and convergence.
@@ -88,9 +93,9 @@ mantissa tasks logs <id-task>
 
 6. Play around and bring nodes up/down
 
-See `docs/quickstart.md` for the full local and multi-VM workflow.
-See `docs/disaster-recovery.md` for backup and restore workflows.
+See [docs/quickstart.md](docs/quickstart.md) for the full local and multi-VM workflow.
+See [docs/disaster-recovery.md](docs/disaster-recovery.md) for backup and restore workflows.
 
 ## Contributing
 
-See `docs/contributing.md`.
+See [docs/contributing.md](docs/contributing.md).

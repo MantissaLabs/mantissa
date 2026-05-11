@@ -91,7 +91,7 @@ struct SessionTicketRecord {
 }
 
 interface ClusterSession {
-  # ClusterSession is the top level interface that gives access to a node's
+  # ClusterSession is the top level interface that gives access to a node's capabilities.
   # Access to a given service is granted only if a node has proper permission.
 
   ping @0 ();
