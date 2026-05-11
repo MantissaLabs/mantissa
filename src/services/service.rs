@@ -4,7 +4,8 @@ use crate::scheduler::placement::{
     PlacementStrategy as SchedulerPlacementStrategy,
 };
 use crate::services::manager::{
-    ServiceController, ServiceDeploymentOutcome, ServiceTaskProgressSnapshot,
+    ServiceController, ServiceDeploymentOptions, ServiceDeploymentOutcome,
+    ServiceTaskProgressSnapshot,
 };
 use crate::services::types::{
     ServiceEvent, ServicePortProtocol, ServicePreviousGeneration, ServiceReadinessProbe,
@@ -20,7 +21,7 @@ use crate::workload::capnp_codec::{
     encode_env_vars, encode_port_bindings, encode_secret_files, encode_service_liveness_probe,
     encode_service_restart_policy, encode_volume_mounts,
 };
-use crate::workload::types::ExecutionSpec;
+use crate::workload::types::{ExecutionSpec, WorkloadAdmissionMode, WorkloadAdmissionPolicy};
 use capnp::Error;
 use mantissa_protocol::services::{
     placement_constraint, placement_constraint_selector, service_event, service_spec,
@@ -73,16 +74,24 @@ impl services::Server for ServicesRPC {
         } else {
             ServiceUpdateStrategy::default()
         };
+        let admission_policy = if spec.has_admission_policy() {
+            read_admission_policy(spec.get_admission_policy()?)?
+        } else {
+            WorkloadAdmissionPolicy::default()
+        };
 
         let submission = self
             .manager
-            .submit_deployment_with_required_networks_outcome(
+            .submit_deployment_with_options_outcome(
                 manifest_id,
                 manifest_name,
                 service_name,
                 task_templates,
-                update_strategy,
-                required_networks,
+                ServiceDeploymentOptions {
+                    update_strategy,
+                    admission_policy,
+                    required_networks,
+                },
             )
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
@@ -231,6 +240,10 @@ pub(crate) fn write_service_spec(
     write_update_strategy(
         builder.reborrow().init_update_strategy(),
         &value.update_strategy,
+    );
+    write_admission_policy(
+        builder.reborrow().init_admission_policy(),
+        &value.admission_policy,
     );
     builder.set_status_detail(value.status_detail.as_deref().unwrap_or(""));
 
@@ -394,6 +407,11 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
     } else {
         ServiceUpdateStrategy::default()
     };
+    value.admission_policy = if reader.has_admission_policy() {
+        read_admission_policy(reader.get_admission_policy()?)?
+    } else {
+        WorkloadAdmissionPolicy::default()
+    };
     value.previous_generation = if reader.has_previous_generation() {
         Some(read_previous_generation(reader.get_previous_generation()?)?)
     } else {
@@ -475,6 +493,10 @@ fn write_previous_generation(
         builder.reborrow().init_update_strategy(),
         &previous.update_strategy,
     );
+    write_admission_policy(
+        builder.reborrow().init_admission_policy(),
+        &previous.admission_policy,
+    );
 
     let mut templates_builder = builder
         .reborrow()
@@ -514,6 +536,11 @@ fn read_previous_generation(
     } else {
         ServiceUpdateStrategy::default()
     };
+    let admission_policy = if reader.has_admission_policy() {
+        read_admission_policy(reader.get_admission_policy()?)?
+    } else {
+        WorkloadAdmissionPolicy::default()
+    };
 
     Ok(ServicePreviousGeneration {
         manifest_id,
@@ -521,6 +548,7 @@ fn read_previous_generation(
         task_templates,
         replica_ids,
         update_strategy,
+        admission_policy,
         service_epoch: reader.get_service_epoch(),
         status: proto_to_service_status(reader.get_status()?),
     })
@@ -887,6 +915,34 @@ fn proto_to_service_status(status: mantissa_protocol::services::ServiceStatus) -
     }
 }
 
+/// Encodes the workload admission policy selected by the service manifest.
+fn write_admission_policy(
+    mut builder: mantissa_protocol::workload::admission_policy::Builder<'_>,
+    policy: &WorkloadAdmissionPolicy,
+) {
+    let mode = match policy.mode {
+        WorkloadAdmissionMode::Incremental => {
+            mantissa_protocol::workload::AdmissionMode::Incremental
+        }
+        WorkloadAdmissionMode::Gang => mantissa_protocol::workload::AdmissionMode::Gang,
+    };
+    builder.set_mode(mode);
+}
+
+/// Decodes the workload admission policy, defaulting to current incremental behavior.
+fn read_admission_policy(
+    reader: mantissa_protocol::workload::admission_policy::Reader<'_>,
+) -> Result<WorkloadAdmissionPolicy, Error> {
+    let mode = match reader.get_mode() {
+        Ok(mantissa_protocol::workload::AdmissionMode::Incremental) => {
+            WorkloadAdmissionMode::Incremental
+        }
+        Ok(mantissa_protocol::workload::AdmissionMode::Gang) => WorkloadAdmissionMode::Gang,
+        Err(_) => WorkloadAdmissionMode::Incremental,
+    };
+    Ok(WorkloadAdmissionPolicy { mode })
+}
+
 /// Encodes the service update strategy so rollout behavior is replicated with the service spec.
 fn write_update_strategy(
     mut builder: mantissa_protocol::services::update_strategy::Builder<'_>,
@@ -1180,7 +1236,9 @@ mod tests {
         TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskVolumeMount,
     };
     use crate::workload::types::ExecutionSpec;
-    use crate::workload::types::{WorkloadPortBinding, WorkloadPortProtocol};
+    use crate::workload::types::{
+        WorkloadAdmissionMode, WorkloadAdmissionPolicy, WorkloadPortBinding, WorkloadPortProtocol,
+    };
     use capnp::message::Builder;
     use mantissa_protocol::services::{service_spec, task_template};
     use mantissa_store::codec::StoreValueCodec;
@@ -1439,6 +1497,9 @@ mod tests {
                 auto_rollback: false,
             },
         };
+        previous.admission_policy = WorkloadAdmissionPolicy {
+            mode: WorkloadAdmissionMode::Incremental,
+        };
         previous.service_epoch = 3;
         previous.phase_version = 8;
         previous.updated_at = "2026-03-23T10:00:00Z".to_string();
@@ -1463,6 +1524,9 @@ mod tests {
                 max_failures: 1,
                 auto_rollback: true,
             },
+        };
+        spec.admission_policy = WorkloadAdmissionPolicy {
+            mode: WorkloadAdmissionMode::Gang,
         };
         spec.service_epoch = 4;
         spec.phase_version = 11;

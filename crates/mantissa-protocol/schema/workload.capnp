@@ -151,6 +151,19 @@ struct WorkloadOwner {
   }
 }
 
+enum AdmissionMode {
+  incremental @0;
+  # Batch-aware placement without a strict admission barrier.
+
+  gang @1;
+  # All-or-nothing admission for a controller-derived workload group.
+}
+
+struct AdmissionPolicy {
+  mode @0 :AdmissionMode;
+  # Generic workload admission contract selected by the owning controller.
+}
+
 struct LivenessProbe {
   kind @0 :LivenessProbeKind;
   # Local liveness probe transport kind.

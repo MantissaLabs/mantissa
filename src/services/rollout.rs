@@ -12,6 +12,15 @@ use super::state::rollout_task_stopped_or_absent;
 use super::*;
 use std::future::Future;
 
+/// Borrowed target generation metadata shared by redeployment helpers.
+struct ServiceRedeploymentTarget<'a> {
+    manifest_id: Uuid,
+    manifest_name: &'a str,
+    task_templates: &'a [TaskTemplateSpecValue],
+    update_strategy: &'a ServiceUpdateStrategy,
+    admission_policy: &'a WorkloadAdmissionPolicy,
+}
+
 #[derive(Clone, Debug)]
 struct RollbackTaskRecord {
     task_id: Uuid,
@@ -348,6 +357,7 @@ impl ServiceController {
             task_templates,
             current_spec,
             update_strategy,
+            admission_policy,
         } = job;
 
         let previous_status = current_spec.status();
@@ -358,6 +368,14 @@ impl ServiceController {
         let current_graph =
             RolloutTemplateGraph::from_templates(&service_name, &current_spec.task_templates)?;
 
+        let target = ServiceRedeploymentTarget {
+            manifest_id,
+            manifest_name: &manifest_name,
+            task_templates: &task_templates,
+            update_strategy: &update_strategy,
+            admission_policy: &admission_policy,
+        };
+
         let plan = compute_change_plan(
             &current_spec.task_templates,
             &task_templates,
@@ -365,15 +383,8 @@ impl ServiceController {
         );
 
         if plan.is_noop() {
-            self.apply_noop_redeployment(
-                &current_spec,
-                manifest_id,
-                manifest_name,
-                task_templates,
-                update_strategy,
-                previous_status,
-            )
-            .await?;
+            self.apply_noop_redeployment(&current_spec, &target, previous_status)
+                .await?;
             return Ok(());
         }
 
@@ -453,32 +464,23 @@ impl ServiceController {
             return Ok(());
         }
 
-        self.finalize_successful_redeployment(
-            manifest_id,
-            &manifest_name,
-            &task_templates,
-            &current_spec,
-            update_strategy,
-            &artifacts.assignment_index,
-        )
-        .await
+        self.finalize_successful_redeployment(&target, &current_spec, &artifacts.assignment_index)
+            .await
     }
 
     /// Applies a no-op redeployment that only bumps generation metadata.
     async fn apply_noop_redeployment(
         &self,
         current_spec: &ServiceSpecValue,
-        manifest_id: Uuid,
-        manifest_name: String,
-        task_templates: Vec<TaskTemplateSpecValue>,
-        update_strategy: ServiceUpdateStrategy,
+        target: &ServiceRedeploymentTarget<'_>,
         previous_status: ServiceStatus,
     ) -> anyhow::Result<()> {
         let mut updated = current_spec.clone();
-        updated.manifest_id = manifest_id;
-        updated.manifest_name = manifest_name;
-        updated.task_templates = task_templates;
-        updated.update_strategy = update_strategy;
+        updated.manifest_id = target.manifest_id;
+        updated.manifest_name = target.manifest_name.to_string();
+        updated.task_templates = target.task_templates.to_vec();
+        updated.update_strategy = target.update_strategy.clone();
+        updated.admission_policy = *target.admission_policy;
         updated.start_new_generation();
         updated.previous_generation = None;
         updated.set_status(previous_status);
@@ -1116,31 +1118,30 @@ impl ServiceController {
     /// Publishes the new service generation and starts asynchronous readiness monitoring.
     async fn finalize_successful_redeployment(
         &self,
-        manifest_id: Uuid,
-        manifest_name: &str,
-        task_templates: &[TaskTemplateSpecValue],
+        target: &ServiceRedeploymentTarget<'_>,
         current_spec: &ServiceSpecValue,
-        update_strategy: ServiceUpdateStrategy,
         assignment_index: &BTreeMap<(String, u16), Uuid>,
     ) -> anyhow::Result<()> {
         let service_name = current_spec.service_name.as_str();
-        let ordered_task_ids = order_task_ids(service_name, task_templates, assignment_index);
+        let ordered_task_ids =
+            order_task_ids(service_name, target.task_templates, assignment_index);
         let mut next_spec = match self.registry.get(current_spec.id)? {
-            Some(spec) if spec.manifest_id == manifest_id => spec,
+            Some(spec) if spec.manifest_id == target.manifest_id => spec,
             _ => ServiceSpecValue::new(
-                manifest_id,
-                manifest_name.to_string(),
+                target.manifest_id,
+                target.manifest_name.to_string(),
                 service_name.to_string(),
-                task_templates.to_vec(),
+                target.task_templates.to_vec(),
                 Vec::new(),
             ),
         };
-        next_spec.manifest_id = manifest_id;
-        next_spec.manifest_name = manifest_name.to_string();
+        next_spec.manifest_id = target.manifest_id;
+        next_spec.manifest_name = target.manifest_name.to_string();
         next_spec.service_name = service_name.to_string();
-        next_spec.task_templates = task_templates.to_vec();
+        next_spec.task_templates = target.task_templates.to_vec();
         next_spec.replica_ids = ordered_task_ids;
-        next_spec.update_strategy = update_strategy;
+        next_spec.update_strategy = target.update_strategy.clone();
+        next_spec.admission_policy = *target.admission_policy;
         next_spec.service_epoch = current_spec.service_epoch.saturating_add(1);
         next_spec.previous_generation = None;
         next_spec.set_rollout(ServiceRolloutState::default());

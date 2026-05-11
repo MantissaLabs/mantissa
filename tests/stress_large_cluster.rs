@@ -176,6 +176,7 @@ fn read_log_tail(path: &Path, max_bytes: usize) -> String {
 fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
     ServiceManifest {
         name: name.to_string(),
+        admission: Default::default(),
         volumes: Vec::new(),
         networks: Vec::new(),
         update: ServiceUpdateStrategy::default(),

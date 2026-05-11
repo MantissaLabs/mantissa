@@ -83,6 +83,30 @@ pub struct ManifestPortBinding {
     pub protocol: ManifestPortProtocol,
 }
 
+/// Admission behavior requested by a manifest-level workload controller.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadAdmissionMode {
+    #[default]
+    Incremental,
+    Gang,
+}
+
+/// Shared manifest-side admission policy for controller-owned workload groups.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub struct WorkloadAdmissionPolicy {
+    #[serde(default)]
+    pub mode: WorkloadAdmissionMode,
+}
+
+impl Default for WorkloadAdmissionPolicy {
+    fn default() -> Self {
+        Self {
+            mode: WorkloadAdmissionMode::Incremental,
+        }
+    }
+}
+
 /// Derive the canonical network UUID from the manifest-facing network name.
 pub fn compute_network_id(name: &str) -> Uuid {
     let mut hasher = Hasher::new();

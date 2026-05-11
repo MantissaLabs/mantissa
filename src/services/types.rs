@@ -9,7 +9,7 @@ use crate::workload::manager::WorkloadStartRequest;
 use crate::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadOwner, WorkloadServiceMetadata,
 };
-use crate::workload::types::{ExecutionSpec, ResolvedExecutionSpec};
+use crate::workload::types::{ExecutionSpec, ResolvedExecutionSpec, WorkloadAdmissionPolicy};
 pub use crate::workload::types::{
     WorkloadLivenessProbe as ServiceLivenessProbe,
     WorkloadLivenessProbeKind as ServiceLivenessProbeKind,
@@ -36,6 +36,8 @@ pub struct ServiceSpecValue {
     pub updated_at: String,
     #[serde(default)]
     pub update_strategy: ServiceUpdateStrategy,
+    #[serde(default)]
+    pub admission_policy: WorkloadAdmissionPolicy,
     #[serde(default)]
     pub service_epoch: u64,
     #[serde(default)]
@@ -74,6 +76,7 @@ impl ServiceSpecValue {
             replica_ids,
             updated_at: current_timestamp(),
             update_strategy: ServiceUpdateStrategy::default(),
+            admission_policy: WorkloadAdmissionPolicy::default(),
             service_epoch: 0,
             phase_version: 0,
             rollout: ServiceRolloutState::default(),
@@ -174,6 +177,8 @@ pub struct ServicePreviousGeneration {
     #[serde(default)]
     pub update_strategy: ServiceUpdateStrategy,
     #[serde(default)]
+    pub admission_policy: WorkloadAdmissionPolicy,
+    #[serde(default)]
     pub service_epoch: u64,
     #[serde(default)]
     pub status: ServiceStatus,
@@ -188,6 +193,7 @@ impl ServicePreviousGeneration {
             task_templates: spec.task_templates.clone(),
             replica_ids: spec.replica_ids.clone(),
             update_strategy: spec.update_strategy.clone(),
+            admission_policy: spec.admission_policy,
             service_epoch: spec.service_epoch,
             status: spec.status,
         }
@@ -208,6 +214,7 @@ impl ServicePreviousGeneration {
         );
         spec.id = service_id;
         spec.update_strategy = self.update_strategy.clone();
+        spec.admission_policy = self.admission_policy;
         spec.service_epoch = self.service_epoch;
         spec.status = self.status;
         spec

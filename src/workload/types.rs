@@ -116,6 +116,36 @@ impl<N> ExecutionSpec<N> {
 /// resolved to concrete UUIDs.
 pub type ResolvedExecutionSpec = ExecutionSpec<Uuid>;
 
+/// Admission behavior requested by the controller that owns a workload group.
+///
+/// `Incremental` is the current batch-aware scheduling behavior. `Gang`
+/// reserves the name for strict all-or-nothing admission once the scheduler
+/// implements durable group barriers.
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadAdmissionMode {
+    #[default]
+    Incremental,
+    Gang,
+}
+
+/// Shared admission policy selected by higher-level workload controllers.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorkloadAdmissionPolicy {
+    #[serde(default)]
+    pub mode: WorkloadAdmissionMode,
+}
+
+impl Default for WorkloadAdmissionPolicy {
+    fn default() -> Self {
+        Self {
+            mode: WorkloadAdmissionMode::Incremental,
+        }
+    }
+}
+
 /// Default liveness probe interval in milliseconds.
 fn default_liveness_interval_ms() -> u64 {
     10_000

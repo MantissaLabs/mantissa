@@ -471,6 +471,9 @@ struct PreviousGeneration {
 
   status @6 :ServiceStatus;
   # Prior lifecycle status restored after rollback when needed.
+
+  admissionPolicy @7 :WorkloadSchema.AdmissionPolicy;
+  # Prior workload admission policy retained for rollback reconstruction.
 }
 
 struct ServiceSpec {
@@ -518,6 +521,9 @@ struct ServiceSpec {
 
   previousGeneration @14 :PreviousGeneration;
   # Prior generation snapshot retained while a new generation is still being executed.
+
+  admissionPolicy @15 :WorkloadSchema.AdmissionPolicy;
+  # Workload admission contract selected by the manifest.
 }
 
 struct ServiceEvent {
@@ -554,6 +560,9 @@ struct ServiceDeploySpec {
 
   requiredNetworks @5 :List(WorkloadSchema.NetworkRequirement);
   # Networks referenced by the manifest that the service controller must provision before placement.
+
+  admissionPolicy @6 :WorkloadSchema.AdmissionPolicy;
+  # Workload admission contract selected by the manifest.
 }
 
 enum DeployOutcome {

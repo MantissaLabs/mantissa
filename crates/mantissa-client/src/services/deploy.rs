@@ -10,7 +10,7 @@ use crate::connection;
 use crate::volumes;
 use crate::workload_submit::{
     DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec, ResolvedDeclaredVolume,
-    compute_network_id, ensure_declared_volumes,
+    WorkloadAdmissionMode, WorkloadAdmissionPolicy, compute_network_id, ensure_declared_volumes,
 };
 use crate::workload_wire::{
     write_local_volume_ownership, write_network_requirements, write_port_bindings,
@@ -78,6 +78,19 @@ fn write_update_strategy(
     rolling.set_monitor_secs(strategy.rolling.monitor_secs);
     rolling.set_max_failures(strategy.rolling.max_failures);
     rolling.set_auto_rollback(strategy.rolling.auto_rollback);
+}
+
+fn write_admission_policy(
+    mut builder: mantissa_protocol::workload::admission_policy::Builder<'_>,
+    policy: &WorkloadAdmissionPolicy,
+) {
+    let mode = match policy.mode {
+        WorkloadAdmissionMode::Incremental => {
+            mantissa_protocol::workload::AdmissionMode::Incremental
+        }
+        WorkloadAdmissionMode::Gang => mantissa_protocol::workload::AdmissionMode::Gang,
+    };
+    builder.set_mode(mode);
 }
 
 fn write_env_vars(
@@ -206,6 +219,7 @@ pub async fn deploy_manifest(
         spec.set_manifest_name(&manifest.name);
         spec.set_service_name(&manifest.name);
         write_update_strategy(spec.reborrow().init_update_strategy(), &manifest.update);
+        write_admission_policy(spec.reborrow().init_admission_policy(), &manifest.admission);
         write_network_requirements(
             &mut spec
                 .reborrow()

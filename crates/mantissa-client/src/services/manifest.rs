@@ -10,12 +10,16 @@ use crate::workload_submit::{
     ManifestNetworkSpec, RequestedNetworkSpec, resolve_requested_networks,
     validate_declared_networks, validate_manifest_ports,
 };
-pub use crate::workload_submit::{ManifestPortBinding, ManifestPortProtocol};
+pub use crate::workload_submit::{
+    ManifestPortBinding, ManifestPortProtocol, WorkloadAdmissionMode, WorkloadAdmissionPolicy,
+};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceManifest {
     pub name: String,
+    #[serde(default)]
+    pub admission: WorkloadAdmissionPolicy,
     #[serde(default)]
     pub volumes: Vec<VolumeSpec>,
     #[serde(default)]
@@ -437,6 +441,12 @@ impl ServiceManifest {
     pub fn validate(&self) -> Result<()> {
         if self.name.trim().is_empty() {
             return Err(anyhow!("service manifest must set a non-empty name"));
+        }
+
+        if matches!(self.admission.mode, WorkloadAdmissionMode::Gang) {
+            return Err(anyhow!(
+                "service manifest requests admission.mode = gang, but gang admission is not implemented yet"
+            ));
         }
 
         validate_declared_networks(&self.networks, "service manifest")?;
@@ -1135,6 +1145,10 @@ mod tests {
             load_manifest_from_path(&example_manifest("replicated_service.ron")).expect("manifest");
 
         assert!(matches!(
+            manifest.admission.mode,
+            WorkloadAdmissionMode::Incremental
+        ));
+        assert!(matches!(
             manifest.update.mode,
             ServiceUpdateStrategyMode::Rolling
         ));
@@ -1147,6 +1161,62 @@ mod tests {
         assert_eq!(manifest.update.rolling.monitor_secs, 1);
         assert_eq!(manifest.update.rolling.max_failures, 1);
         assert!(manifest.update.rolling.auto_rollback);
+    }
+
+    #[test]
+    fn service_manifest_deserializes_gang_admission_policy() {
+        let manifest: ServiceManifest = ron::from_str(
+            r#"
+            (
+                name: "gang-demo",
+                admission: (
+                    mode: gang,
+                ),
+                tasks: [
+                    (
+                        name: "api",
+                        image: "ghcr.io/demo/api:latest",
+                    ),
+                ],
+            )
+            "#,
+        )
+        .expect("parse manifest");
+
+        assert!(matches!(
+            manifest.admission.mode,
+            WorkloadAdmissionMode::Gang
+        ));
+    }
+
+    #[test]
+    fn manifest_rejects_gang_admission_until_scheduler_supports_it() {
+        let manifest: ServiceManifest = ron::from_str(
+            r#"
+            (
+                name: "gang-demo",
+                admission: (
+                    mode: gang,
+                ),
+                tasks: [
+                    (
+                        name: "api",
+                        image: "ghcr.io/demo/api:latest",
+                    ),
+                ],
+            )
+            "#,
+        )
+        .expect("parse manifest");
+
+        let error = manifest
+            .validate()
+            .expect_err("gang admission should be rejected until implemented");
+        assert!(
+            error
+                .to_string()
+                .contains("gang admission is not implemented yet")
+        );
     }
 
     #[test]
@@ -1403,6 +1473,7 @@ mod tests {
     fn manifest_rejects_empty_pre_stop_command() {
         let manifest = ServiceManifest {
             name: "demo".into(),
+            admission: WorkloadAdmissionPolicy::default(),
             volumes: Vec::new(),
             networks: Vec::new(),
             task_templates: vec![TaskTemplateSpec {
@@ -1441,6 +1512,7 @@ mod tests {
     fn manifest_rejects_zero_readiness_interval() {
         let manifest = ServiceManifest {
             name: "demo".into(),
+            admission: WorkloadAdmissionPolicy::default(),
             volumes: Vec::new(),
             networks: Vec::new(),
             task_templates: vec![TaskTemplateSpec {
@@ -1488,6 +1560,7 @@ mod tests {
     fn manifest_rejects_zero_liveness_interval() {
         let manifest = ServiceManifest {
             name: "demo".into(),
+            admission: WorkloadAdmissionPolicy::default(),
             volumes: Vec::new(),
             networks: Vec::new(),
             task_templates: vec![TaskTemplateSpec {
@@ -1537,6 +1610,7 @@ mod tests {
     fn manifest_rejects_missing_volume_reference() {
         let manifest = ServiceManifest {
             name: "demo".into(),
+            admission: WorkloadAdmissionPolicy::default(),
             volumes: Vec::new(),
             networks: Vec::new(),
             task_templates: vec![TaskTemplateSpec {
@@ -1581,6 +1655,7 @@ mod tests {
     fn manifest_rejects_invalid_typed_node_ip_constraint() {
         let manifest = ServiceManifest {
             name: "demo".into(),
+            admission: WorkloadAdmissionPolicy::default(),
             volumes: Vec::new(),
             networks: Vec::new(),
             task_templates: vec![TaskTemplateSpec {
@@ -1624,6 +1699,7 @@ mod tests {
     fn manifest_rejects_rwo_volume_with_replicas_gt_one() {
         let manifest = ServiceManifest {
             name: "demo".into(),
+            admission: WorkloadAdmissionPolicy::default(),
             volumes: vec![VolumeSpec {
                 name: "pgdata".into(),
                 driver: VolumeDriver::Local(LocalVolumeSpec {
@@ -1679,6 +1755,7 @@ mod tests {
     fn manifest_rejects_cyclic_depends_on_graph() {
         let manifest = ServiceManifest {
             name: "demo".into(),
+            admission: WorkloadAdmissionPolicy::default(),
             volumes: Vec::new(),
             networks: Vec::new(),
             task_templates: vec![

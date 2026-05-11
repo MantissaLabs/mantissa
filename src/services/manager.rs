@@ -22,8 +22,12 @@ use crate::workload::manager::{
     workload_start_error_requires_service_requeue, workload_start_retryable_detail,
 };
 use crate::workload::model::{WorkloadPhase, WorkloadSpec, WorkloadVolumeMount};
-use crate::workload::network_prerequisites::WorkloadNetworkPrerequisites;
-use crate::workload::types::{WorkloadPortBinding, WorkloadPortProtocol};
+use crate::workload::network_prerequisites::{
+    WorkloadNetworkPrerequisites, WorkloadNetworkRequirement,
+};
+use crate::workload::types::{
+    WorkloadAdmissionMode, WorkloadAdmissionPolicy, WorkloadPortBinding, WorkloadPortProtocol,
+};
 use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -95,6 +99,14 @@ pub enum ServiceDeploymentOutcome {
 pub struct ServiceDeploymentSubmission {
     pub service_id: Uuid,
     pub outcome: ServiceDeploymentOutcome,
+}
+
+/// Deployment-time service policies and prerequisites supplied by RPC or tests.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceDeploymentOptions {
+    pub update_strategy: ServiceUpdateStrategy,
+    pub admission_policy: WorkloadAdmissionPolicy,
+    pub required_networks: Vec<WorkloadNetworkRequirement>,
 }
 
 /// Aggregated task-template rollout progress returned by targeted service status calls.
