@@ -30,6 +30,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep;
 use uuid::Uuid;
 
+const OVERCOMMITTED_CPU_MILLIS: u64 = 500_000;
+const OVERCOMMITTED_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 local_test!(jobs_submit_and_reach_succeeded_after_task_exit, {
     let backend = Arc::new(ControllableExitRuntimeBackend::default());
     let _guard = RuntimeBackendOverrideGuard::install(backend.clone());
@@ -155,6 +158,59 @@ local_test!(jobs_gang_admission_records_grouped_attempt, {
         workload.admission_state,
         WorkloadAdmissionState::GroupCommitted,
         "gang job attempt should become runnable only after group commit"
+    );
+});
+
+local_test!(jobs_gang_capacity_failure_leaves_no_attempt_workloads, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let node = TestNode::new().await;
+
+    let job_id = submit_job_with_admission_resources(
+        &node.node.jobs_client,
+        "gang-job-overcommit",
+        WorkloadAdmissionMode::Gang,
+        OVERCOMMITTED_CPU_MILLIS,
+        OVERCOMMITTED_MEMORY_BYTES,
+    )
+    .await
+    .expect("submit overcommitted gang-admitted job");
+
+    assert!(
+        wait_for_job_status(
+            &node.node.jobs_client,
+            job_id,
+            ProtoJobStatus::Failed,
+            Duration::from_secs(10),
+        )
+        .await,
+        "overcommitted gang job should fail the launch attempt"
+    );
+
+    let inspected = inspect_job(&node.node.jobs_client, job_id)
+        .await
+        .expect("inspect failed gang job");
+    assert_eq!(inspected.snapshot.attempts_started, 1);
+    assert!(
+        inspected.snapshot.active_workload_id.is_none(),
+        "failed gang job should not keep an active workload id"
+    );
+    assert!(
+        inspected.attempts.is_empty(),
+        "failed gang admission should not leave job attempt workload rows"
+    );
+
+    let workloads = node
+        .node
+        .workload_manager
+        .list_workloads(&TaskStateFilter::all())
+        .await
+        .expect("list workloads after failed gang job");
+    assert!(
+        workloads
+            .iter()
+            .filter_map(|workload| workload.job_owner())
+            .all(|owner| owner.job_id != job_id),
+        "failed gang admission should not leak job-owned workload rows"
     );
 });
 
@@ -601,6 +657,17 @@ async fn submit_job_with_admission(
     name: &str,
     admission_mode: WorkloadAdmissionMode,
 ) -> Result<Uuid, capnp::Error> {
+    submit_job_with_admission_resources(client, name, admission_mode, 250, 128 * 1024 * 1024).await
+}
+
+/// Submits one first-class job with explicit admission and resource requirements.
+async fn submit_job_with_admission_resources(
+    client: &jobs::Client,
+    name: &str,
+    admission_mode: WorkloadAdmissionMode,
+    cpu_millis: u64,
+    memory_bytes: u64,
+) -> Result<Uuid, capnp::Error> {
     let mut request = client.submit_request();
     {
         let mut builder = request.get().init_spec();
@@ -611,8 +678,8 @@ async fn submit_job_with_admission(
         let mut execution = builder.reborrow().init_execution();
         execution.set_image("ghcr.io/mantissa/demo-job:latest");
         execution.set_tty(false);
-        execution.set_cpu_millis(250);
-        execution.set_memory_bytes(128 * 1024 * 1024);
+        execution.set_cpu_millis(cpu_millis);
+        execution.set_memory_bytes(memory_bytes);
         execution.set_gpu_count(0);
         execution.reborrow().init_command(0);
         execution.reborrow().init_env(0);
