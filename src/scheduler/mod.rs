@@ -2202,7 +2202,7 @@ impl Scheduler {
         }
     }
 
-    /// Aborts every prepared lease in one group for the provided coordinator.
+    /// Aborts every prepared lease or unpublished committed reservation in one group.
     pub async fn abort_task_lease_group(
         &self,
         coordinator_node_id: Uuid,
@@ -2253,6 +2253,34 @@ impl Scheduler {
                         new_snapshot.gpu_devices[idx].state = GpuDeviceState::Free;
                         changed = true;
                     }
+                }
+            }
+
+            let scheduler_owner = self.store_key.to_uuid();
+            for slot in &mut new_snapshot.slots {
+                if matches!(
+                    &slot.state,
+                    SlotState::Reserved(SlotReservation {
+                        owner,
+                        group_id: Some(reservation_group_id),
+                        ..
+                    }) if *owner == scheduler_owner && *reservation_group_id == group_id
+                ) {
+                    slot.state = SlotState::Free;
+                    changed = true;
+                }
+            }
+            for device in &mut new_snapshot.gpu_devices {
+                if matches!(
+                    &device.state,
+                    GpuDeviceState::Reserved(GpuDeviceReservation {
+                        owner,
+                        group_id: Some(reservation_group_id),
+                        ..
+                    }) if *owner == scheduler_owner && *reservation_group_id == group_id
+                ) {
+                    device.state = GpuDeviceState::Free;
+                    changed = true;
                 }
             }
 
@@ -3429,6 +3457,68 @@ mod tests {
             .unwrap();
 
         assert_eq!(snapshot.version, 2);
+        assert!(
+            snapshot
+                .slots
+                .iter()
+                .all(|slot| matches!(slot.state, SlotState::Free))
+        );
+        assert!(
+            snapshot
+                .gpu_devices
+                .iter()
+                .all(|device| matches!(device.state, GpuDeviceState::Free))
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_task_lease_group_releases_committed_group_resources() {
+        let (scheduler, _dir) = make_scheduler().await;
+        scheduler
+            .init_resources(
+                [SlotSpec::new(
+                    1,
+                    SlotCapacity::new(500, 512 * 1024 * 1024, 0),
+                )],
+                [GpuDeviceSpec::new(
+                    "gpu-a",
+                    0,
+                    Some("gpu-a".to_string()),
+                    Some("0000:01:00.0".to_string()),
+                    "GPU A",
+                    16 * 1024 * 1024 * 1024,
+                )],
+            )
+            .await
+            .unwrap();
+
+        let coordinator = Uuid::new_v4();
+        let group_id = Uuid::new_v4();
+        let prepared = scheduler
+            .prepare_task_lease_group(
+                coordinator,
+                group_id,
+                30_000,
+                vec![TaskLeaseIntent {
+                    task_id: Uuid::new_v4(),
+                    cpu_millis: 500,
+                    memory_bytes: 512 * 1024 * 1024,
+                    gpu_count: 1,
+                }],
+            )
+            .await
+            .unwrap();
+        scheduler
+            .commit_task_lease_group(group_id, coordinator, &prepared.leases)
+            .await
+            .unwrap();
+
+        let snapshot = scheduler
+            .abort_task_lease_group(coordinator, group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.version, 3);
         assert!(
             snapshot
                 .slots
