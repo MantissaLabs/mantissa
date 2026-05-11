@@ -747,6 +747,7 @@ impl WorkloadManager {
                         slot_id: *slot_id,
                         owner: self.local_node_id,
                         task_id: Some(spec.id),
+                        group_id: spec.admission_group_id,
                     }),
                     SlotState::Leased(lease) => {
                         return Err(anyhow!(
@@ -3378,10 +3379,14 @@ impl WorkloadManager {
                 };
                 match &slot.state {
                     SlotState::Free => {
+                        let group_id = local_tasks
+                            .get(&task_id)
+                            .and_then(|task| task.admission_group_id);
                         requests.push(SlotReservationRequest {
                             slot_id: slot.slot_id,
                             owner: self.local_node_id,
                             task_id: Some(task_id),
+                            group_id,
                         });
                     }
                     SlotState::Leased(lease) => {
@@ -3416,10 +3421,14 @@ impl WorkloadManager {
                 };
                 match &device.state {
                     crate::scheduler::GpuDeviceState::Free => {
+                        let group_id = local_tasks
+                            .get(&task_id)
+                            .and_then(|task| task.admission_group_id);
                         gpu_requests.push(GpuReservationRequest {
                             device_id: device.device_id.clone(),
                             owner: self.local_node_id,
                             task_id: Some(task_id),
+                            group_id,
                         });
                     }
                     crate::scheduler::GpuDeviceState::Leased(lease) => {

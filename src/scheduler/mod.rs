@@ -474,6 +474,7 @@ pub struct SlotReservationRequest {
     pub slot_id: SlotId,
     pub owner: Uuid,
     pub task_id: Option<Uuid>,
+    pub group_id: Option<Uuid>,
 }
 
 /// Reservation intent for GPU devices.
@@ -482,6 +483,7 @@ pub struct GpuReservationRequest {
     pub device_id: String,
     pub owner: Uuid,
     pub task_id: Option<Uuid>,
+    pub group_id: Option<Uuid>,
 }
 
 /// Resource-vector lease intent used when the target node chooses exact bindings locally.
@@ -1480,7 +1482,7 @@ impl Scheduler {
                 new_snapshot.slots[idx].state = SlotState::Reserved(SlotReservation {
                     owner: req.owner,
                     task_id: req.task_id,
-                    group_id: None,
+                    group_id: req.group_id,
                 });
             }
             for req in &gpu_requests {
@@ -1489,7 +1491,7 @@ impl Scheduler {
                     GpuDeviceState::Reserved(GpuDeviceReservation {
                         owner: req.owner,
                         task_id: req.task_id,
-                        group_id: None,
+                        group_id: req.group_id,
                     });
             }
 
@@ -2846,6 +2848,7 @@ mod tests {
 
         let owner = Uuid::new_v4();
         let task = Uuid::new_v4();
+        let group = Uuid::new_v4();
         let snapshot = scheduler
             .reserve_slots(
                 0,
@@ -2853,6 +2856,7 @@ mod tests {
                     slot_id: 10,
                     owner,
                     task_id: Some(task),
+                    group_id: Some(group),
                 }],
             )
             .await
@@ -2868,6 +2872,7 @@ mod tests {
             SlotState::Reserved(res) => {
                 assert_eq!(res.owner, owner);
                 assert_eq!(res.task_id, Some(task));
+                assert_eq!(res.group_id, Some(group));
             }
             _ => panic!("slot 10 not reserved"),
         }
@@ -2892,6 +2897,7 @@ mod tests {
                     slot_id: 1,
                     owner,
                     task_id: None,
+                    group_id: None,
                 }],
             )
             .await
@@ -2904,6 +2910,7 @@ mod tests {
                     slot_id: 1,
                     owner: Uuid::new_v4(),
                     task_id: None,
+                    group_id: None,
                 }],
             )
             .await
@@ -2944,6 +2951,7 @@ mod tests {
                     slot_id: 5,
                     owner,
                     task_id: None,
+                    group_id: None,
                 }],
             )
             .await
@@ -2992,6 +3000,7 @@ mod tests {
                     slot_id: 1,
                     owner: Uuid::new_v4(),
                     task_id: None,
+                    group_id: None,
                 }],
             )
             .await

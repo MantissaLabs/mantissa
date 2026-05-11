@@ -1433,6 +1433,7 @@ pub(crate) async fn reserve_all_scheduler_slots(node: &TestNode, owner: Uuid) {
             slot_id: slot.slot_id,
             owner,
             task_id: None,
+            group_id: None,
         })
         .collect();
     if intents.is_empty() {

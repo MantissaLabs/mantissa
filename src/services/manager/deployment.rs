@@ -10,6 +10,7 @@ use super::placement::{
 };
 use super::state::deploying_assignment_incomplete;
 use super::*;
+use anyhow::Context;
 
 impl ServiceController {
     /// Schedules an asynchronous deployment for the provided service manifest and returns
@@ -95,12 +96,6 @@ impl ServiceController {
             admission_policy,
             required_networks,
         } = options;
-        if matches!(admission_policy.mode, WorkloadAdmissionMode::Gang) {
-            return Err(anyhow!(
-                "service '{}' requests gang admission, but gang scheduling is not implemented yet",
-                service_name
-            ));
-        }
         build_template_dependency_stages(&task_templates).map_err(|err| {
             anyhow!(
                 "invalid task dependency graph for service '{}': {err}",
@@ -558,6 +553,7 @@ impl ServiceController {
                 task_templates: current.task_templates.clone(),
                 update_strategy: current.update_strategy.clone(),
                 admission_policy: current.admission_policy,
+                service_epoch: current.service_epoch,
                 assigned_task_ids: current.replica_ids.clone(),
             };
             return self.clone().execute_deployment(job).await;
@@ -592,6 +588,7 @@ impl ServiceController {
             task_templates,
             update_strategy,
             admission_policy,
+            service_epoch,
             assigned_task_ids: _,
         } = job;
 
@@ -622,6 +619,7 @@ impl ServiceController {
             let mut spec = spec;
             spec.update_strategy = update_strategy;
             spec.admission_policy = admission_policy;
+            spec.service_epoch = service_epoch;
             self.apply_upsert(spec.clone()).await?;
             self.broadcast(ServiceEvent::Upsert(spec)).await?;
             tracing::info!(
@@ -654,9 +652,16 @@ impl ServiceController {
         );
         let desired_task_ids: Vec<Uuid> =
             requests.iter().filter_map(|request| request.id).collect();
+        let group_id = compute_service_admission_group_id(
+            service_id,
+            manifest_id,
+            service_epoch,
+            ServiceAdmissionGroupScope::ServiceGeneration,
+        )?;
+        let launch_context = format!("service '{}' deployment", service_name);
 
         let task_specs = match self
-            .start_tasks_with_fallback(requests, &format!("service '{}' deployment", service_name))
+            .start_tasks_for_admission_policy(admission_policy, group_id, requests, &launch_context)
             .await
         {
             Ok(specs) => specs,
@@ -806,6 +811,7 @@ impl ServiceController {
         spec.replica_ids = replica_ids;
         spec.update_strategy = update_strategy;
         spec.admission_policy = admission_policy;
+        spec.service_epoch = service_epoch;
         spec.previous_generation = None;
         spec.set_rollout(ServiceRolloutState::default());
         spec.set_status(ServiceStatus::Deploying);
@@ -841,6 +847,7 @@ impl ServiceController {
             task_templates,
             update_strategy,
             admission_policy,
+            service_epoch,
             assigned_task_ids,
         } = job;
 
@@ -853,11 +860,8 @@ impl ServiceController {
             task_templates: &task_templates,
             update_strategy: &update_strategy,
             admission_policy: &admission_policy,
+            service_epoch,
         };
-        let ordered_indices: Vec<usize> = stages
-            .iter()
-            .flat_map(|stage| stage.template_indices.iter().copied())
-            .collect();
 
         tracing::info!(
             target: "services",
@@ -907,6 +911,24 @@ impl ServiceController {
             network_registry: &self.network_registry,
             volume_registry: &self.volume_registry,
         })?;
+
+        if matches!(admission_policy.mode, WorkloadAdmissionMode::Gang) {
+            return self
+                .execute_gang_dependency_ordered_deployment(
+                    &deployment,
+                    stages,
+                    &template_replica_counts,
+                    &mut assignments,
+                    &mut launched_task_ids,
+                    &slot_targets,
+                )
+                .await;
+        }
+
+        let ordered_indices: Vec<usize> = stages
+            .iter()
+            .flat_map(|stage| stage.template_indices.iter().copied())
+            .collect();
 
         for template_index in ordered_indices {
             let template = task_templates[template_index].clone();
@@ -1018,6 +1040,186 @@ impl ServiceController {
             target: "services",
             "service '{}' dependency-ordered deployment submitted; tasks launching asynchronously",
             service_name
+        );
+
+        Ok(())
+    }
+
+    /// Launches dependency stages with one strict gang admission group per ready stage.
+    async fn execute_gang_dependency_ordered_deployment(
+        self,
+        deployment: &ServiceDeploymentContext<'_>,
+        stages: Vec<TemplateDependencyStage>,
+        template_replica_counts: &HashMap<String, u16>,
+        assignments: &mut BTreeMap<(String, u16), Uuid>,
+        launched_task_ids: &mut HashMap<String, Vec<Uuid>>,
+        slot_targets: &HashMap<SlotKey, Uuid>,
+    ) -> anyhow::Result<()> {
+        let service_id = compute_service_id(deployment.service_name);
+
+        for (stage_index, stage) in stages.iter().enumerate() {
+            let stage_number = service_admission_stage_number(stage_index)?;
+            for template_index in &stage.template_indices {
+                let template =
+                    deployment
+                        .task_templates
+                        .get(*template_index)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "dependency stage {} for service '{}' references missing template index {}",
+                                stage_number,
+                                deployment.service_name,
+                                template_index
+                            )
+                        })?;
+                if !template.depends_on.is_empty()
+                    && let Err(err) = self
+                        .wait_for_template_dependencies_ready(
+                            deployment,
+                            template,
+                            template_replica_counts,
+                            launched_task_ids,
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        target: "services",
+                        "dependency gate for service '{}' failed before launching gang stage {} template '{}': {err:#}",
+                        deployment.service_name,
+                        stage_number,
+                        template.name
+                    );
+                    self.mark_deployment_failed(deployment, Some(err.to_string()))
+                        .await?;
+                    return Ok(());
+                }
+            }
+
+            let mut requests = Vec::new();
+            for template_index in &stage.template_indices {
+                let template =
+                    deployment
+                        .task_templates
+                        .get(*template_index)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "dependency stage {} for service '{}' references missing template index {}",
+                                stage_number,
+                                deployment.service_name,
+                                template_index
+                            )
+                        })?;
+                requests.extend(build_missing_template_requests(
+                    deployment.service_name,
+                    service_id,
+                    template,
+                    assignments,
+                    slot_targets,
+                ));
+            }
+
+            if requests.is_empty() {
+                continue;
+            }
+
+            if let Some(detail) = self
+                .network_prerequisites
+                .launch_readiness_detail(&requests)?
+            {
+                self.update_service_status_detail_if_current(
+                    service_id,
+                    deployment.manifest_id,
+                    Some(detail),
+                )
+                .await;
+                tracing::info!(
+                    target: "services",
+                    "deferring gang deployment for service '{}' stage {} until target network readiness converges",
+                    deployment.service_name,
+                    stage_number
+                );
+                return Ok(());
+            }
+
+            let desired_task_ids: Vec<Uuid> =
+                requests.iter().filter_map(|request| request.id).collect();
+            let group_id = compute_service_admission_group_id(
+                service_id,
+                deployment.manifest_id,
+                deployment.service_epoch,
+                ServiceAdmissionGroupScope::DependencyStage {
+                    stage_index,
+                    template_indices: &stage.template_indices,
+                    task_templates: deployment.task_templates,
+                },
+            )?;
+            let context = format!(
+                "service '{}' gang deployment for dependency stage {}",
+                deployment.service_name, stage_number
+            );
+
+            let task_specs = match self
+                .start_tasks_for_admission_policy(
+                    *deployment.admission_policy,
+                    group_id,
+                    requests,
+                    &context,
+                )
+                .await
+            {
+                Ok(specs) => specs,
+                Err(err) if launched_task_ids.is_empty() => {
+                    self.handle_initial_deployment_launch_failure(
+                        deployment,
+                        &desired_task_ids,
+                        &err,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "services",
+                        "gang stage launch for service '{}' failed on stage {}: {err:#}",
+                        deployment.service_name,
+                        stage_number
+                    );
+                    self.mark_deployment_failed(deployment, Some(err.to_string()))
+                        .await?;
+                    return Ok(());
+                }
+            };
+
+            for (template, task_id) in
+                record_task_assignments(deployment.service_name, &task_specs, assignments)
+            {
+                launched_task_ids.entry(template).or_default().push(task_id);
+            }
+
+            let ordered_task_ids = ordered_known_task_ids(deployment.task_templates, assignments);
+            let _ = self
+                .persist_deploying_task_ids(deployment, ordered_task_ids)
+                .await?;
+        }
+
+        let readiness_spec = self
+            .persist_deploying_task_ids(
+                deployment,
+                ordered_known_task_ids(deployment.task_templates, assignments),
+            )
+            .await?;
+        self.update_service_status_detail_if_current(service_id, deployment.manifest_id, None)
+            .await;
+
+        let controller = self.clone();
+        tokio::task::spawn_local(async move {
+            controller.await_service_readiness(readiness_spec).await;
+        });
+
+        tracing::info!(
+            target: "services",
+            "service '{}' dependency-ordered gang deployment submitted; tasks launching asynchronously",
+            deployment.service_name
         );
 
         Ok(())
@@ -1654,6 +1856,33 @@ impl ServiceController {
         }
     }
 
+    /// Starts service workloads using the admission contract selected by the service manifest.
+    async fn start_tasks_for_admission_policy(
+        &self,
+        admission_policy: WorkloadAdmissionPolicy,
+        group_id: Uuid,
+        requests: Vec<WorkloadStartRequest>,
+        context: &str,
+    ) -> anyhow::Result<Vec<WorkloadSpec>> {
+        match admission_policy.mode {
+            WorkloadAdmissionMode::Incremental => {
+                self.start_tasks_with_fallback(requests, context).await
+            }
+            WorkloadAdmissionMode::Gang => {
+                tracing::info!(
+                    target: "services",
+                    admission_group = %group_id,
+                    task_count = requests.len(),
+                    "starting gang admission for {context}"
+                );
+                self.workload_manager
+                    .start_workloads_gang(group_id, requests)
+                    .await
+                    .with_context(|| format!("gang admission failed for {context}"))
+            }
+        }
+    }
+
     /// Publishes task traffic after attachment rows exist so cutover only exposes ready endpoints.
     pub(super) async fn publish_task_traffic_for_cutover(
         &self,
@@ -1864,6 +2093,81 @@ fn is_running_deployment_noop(
         && existing.admission_policy == *admission_policy
 }
 
+/// Internal admission group scope derived from a service deployment manifest.
+enum ServiceAdmissionGroupScope<'a> {
+    ServiceGeneration,
+    DependencyStage {
+        stage_index: usize,
+        template_indices: &'a [usize],
+        task_templates: &'a [TaskTemplateSpecValue],
+    },
+}
+
+/// Computes a stable admission group id for one service generation or dependency stage.
+fn compute_service_admission_group_id(
+    service_id: Uuid,
+    manifest_id: Uuid,
+    service_epoch: u64,
+    scope: ServiceAdmissionGroupScope<'_>,
+) -> anyhow::Result<Uuid> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mantissa-service-admission-group-v1");
+    hasher.update(service_id.as_bytes());
+    hasher.update(manifest_id.as_bytes());
+    hasher.update(&service_epoch.to_le_bytes());
+
+    match scope {
+        ServiceAdmissionGroupScope::ServiceGeneration => {
+            hasher.update(b"service-generation");
+        }
+        ServiceAdmissionGroupScope::DependencyStage {
+            stage_index,
+            template_indices,
+            task_templates,
+        } => {
+            let stage_index = u64::try_from(stage_index)
+                .map_err(|_| anyhow!("dependency stage index does not fit in u64"))?;
+            hasher.update(b"dependency-stage");
+            hasher.update(&stage_index.to_le_bytes());
+            for template_index in template_indices {
+                let template = task_templates.get(*template_index).ok_or_else(|| {
+                    anyhow!(
+                        "dependency admission group references missing template index {}",
+                        template_index
+                    )
+                })?;
+                let template_index = u64::try_from(*template_index)
+                    .map_err(|_| anyhow!("template index does not fit in u64"))?;
+                hasher.update(&template_index.to_le_bytes());
+                hash_variable_bytes(&mut hasher, template.name.as_bytes())?;
+            }
+        }
+    }
+
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    Ok(Uuid::from_bytes(bytes))
+}
+
+/// Converts a zero-based dependency stage index into an operator-facing stage number.
+fn service_admission_stage_number(stage_index: usize) -> anyhow::Result<u64> {
+    let zero_based = u64::try_from(stage_index)
+        .map_err(|_| anyhow!("dependency stage index does not fit in u64"))?;
+    zero_based
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("dependency stage number overflowed u64"))
+}
+
+/// Adds length-delimited bytes to a stable hash input so variable fields cannot overlap.
+fn hash_variable_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) -> anyhow::Result<()> {
+    let len = u64::try_from(bytes.len())
+        .map_err(|_| anyhow!("admission group hash input is too large"))?;
+    hasher.update(&len.to_le_bytes());
+    hasher.update(bytes);
+    Ok(())
+}
+
 struct ServiceDeploymentJob {
     manifest_id: Uuid,
     manifest_name: String,
@@ -1871,6 +2175,7 @@ struct ServiceDeploymentJob {
     task_templates: Vec<TaskTemplateSpecValue>,
     update_strategy: ServiceUpdateStrategy,
     admission_policy: WorkloadAdmissionPolicy,
+    service_epoch: u64,
     assigned_task_ids: Vec<Uuid>,
 }
 
@@ -1886,6 +2191,7 @@ struct ServiceDeploymentContext<'a> {
     task_templates: &'a [TaskTemplateSpecValue],
     update_strategy: &'a ServiceUpdateStrategy,
     admission_policy: &'a WorkloadAdmissionPolicy,
+    service_epoch: u64,
 }
 
 pub(super) struct ServiceRedeploymentJob {
@@ -1952,14 +2258,13 @@ fn format_dependency_gate_stability_detail(
     )
 }
 
-/// Records launched task ids back into the `(template, replica)` assignment index used to build
-/// Records launched task ids back into the `(template, replica)` assignment index used to build
-/// ordered service task id lists during dependency-ordered deployment.
+/// Records launched task ids back into the assignment index and returns the parsed template ids.
 fn record_task_assignments(
     service_name: &str,
     task_specs: &[WorkloadSpec],
     assignments: &mut BTreeMap<(String, u16), Uuid>,
-) {
+) -> Vec<(String, Uuid)> {
+    let mut recorded = Vec::with_capacity(task_specs.len());
     for spec in task_specs {
         let Some((template, replica)) = parse_template_and_replica(service_name, &spec.name) else {
             tracing::warn!(
@@ -1970,8 +2275,10 @@ fn record_task_assignments(
             );
             continue;
         };
-        assignments.insert((template, replica), spec.id);
+        assignments.insert((template.clone(), replica), spec.id);
+        recorded.push((template, spec.id));
     }
+    recorded
 }
 
 /// Returns the currently known task ids in manifest template/replica order without warning about

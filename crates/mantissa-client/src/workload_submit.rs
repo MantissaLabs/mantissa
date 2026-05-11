@@ -87,8 +87,10 @@ pub struct ManifestPortBinding {
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkloadAdmissionMode {
+    /// Batch-aware placement without a strict all-or-nothing admission barrier.
     #[default]
     Incremental,
+    /// Strict grouped admission for controllers that launch multiple workloads together.
     Gang,
 }
 

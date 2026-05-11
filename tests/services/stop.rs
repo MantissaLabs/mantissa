@@ -106,6 +106,7 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
                 slot_id: *slot_id,
                 owner: node.id(),
                 task_id: Some(stale.id),
+                group_id: None,
             })
             .collect();
         let _ = node

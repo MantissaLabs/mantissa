@@ -3397,6 +3397,7 @@ async fn reconcile_local_slot_reservations_releases_stale_local_slots() {
                 slot_id: stale_slot,
                 owner: manager.local_node_id,
                 task_id: Some(Uuid::new_v4()),
+                group_id: None,
             }],
         )
         .await
@@ -4466,6 +4467,7 @@ async fn start_tasks_batch_respects_existing_reservations() {
                 slot_id: slot_spec.slot_id,
                 owner: manager.local_node_id,
                 task_id: Some(task_id),
+                group_id: None,
             }],
         )
         .await
@@ -7634,6 +7636,7 @@ async fn workload_start_retryable_includes_capacity_shortage_for_controllers() {
                 slot_id: 1,
                 owner: manager.local_node_id,
                 task_id: Some(Uuid::new_v4()),
+                group_id: None,
             }],
         )
         .await
@@ -7697,6 +7700,7 @@ async fn workload_start_service_requeue_excludes_capacity_shortage() {
                 slot_id: 1,
                 owner: manager.local_node_id,
                 task_id: Some(Uuid::new_v4()),
+                group_id: None,
             }],
         )
         .await

@@ -7,6 +7,8 @@ mod dependencies;
 mod deployment;
 #[path = "services/drain.rs"]
 mod drain;
+#[path = "services/gang.rs"]
+mod gang;
 #[path = "services/partition.rs"]
 mod partition;
 #[path = "services/placement.rs"]

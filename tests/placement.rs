@@ -1844,6 +1844,7 @@ async fn reserve_all_local_scheduler_slots(node: &TestNode) {
             slot_id: slot.slot_id,
             owner: node.id(),
             task_id: Some(Uuid::new_v4()),
+            group_id: None,
         })
         .collect::<Vec<_>>();
     node.node

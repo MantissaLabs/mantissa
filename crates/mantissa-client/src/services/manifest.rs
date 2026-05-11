@@ -443,12 +443,6 @@ impl ServiceManifest {
             return Err(anyhow!("service manifest must set a non-empty name"));
         }
 
-        if matches!(self.admission.mode, WorkloadAdmissionMode::Gang) {
-            return Err(anyhow!(
-                "service manifest requests admission.mode = gang, but gang admission is not implemented yet"
-            ));
-        }
-
         validate_declared_networks(&self.networks, "service manifest")?;
 
         if self.task_templates.is_empty() {
@@ -1190,7 +1184,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_rejects_gang_admission_until_scheduler_supports_it() {
+    fn manifest_accepts_gang_admission_policy() {
         let manifest: ServiceManifest = ron::from_str(
             r#"
             (
@@ -1209,14 +1203,9 @@ mod tests {
         )
         .expect("parse manifest");
 
-        let error = manifest
+        manifest
             .validate()
-            .expect_err("gang admission should be rejected until implemented");
-        assert!(
-            error
-                .to_string()
-                .contains("gang admission is not implemented yet")
-        );
+            .expect("gang admission should be accepted by the manifest layer");
     }
 
     #[test]

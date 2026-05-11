@@ -119,8 +119,8 @@ pub type ResolvedExecutionSpec = ExecutionSpec<Uuid>;
 /// Admission behavior requested by the controller that owns a workload group.
 ///
 /// `Incremental` is the current batch-aware scheduling behavior. `Gang`
-/// reserves the name for strict all-or-nothing admission once the scheduler
-/// implements durable group barriers.
+/// requests strict all-or-nothing admission for controller-derived workload
+/// groups on controllers that have wired the grouped admission path.
 #[derive(
     Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
 )]

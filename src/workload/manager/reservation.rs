@@ -301,6 +301,7 @@ impl WorkloadManager {
                     slot_id: slot.slot_id,
                     owner: self.local_node_id,
                     task_id: Some(plan.id),
+                    group_id: None,
                 });
                 newly_reserved_slots.push(slot.slot_id);
             }
@@ -310,6 +311,7 @@ impl WorkloadManager {
                     device_id: device_id.clone(),
                     owner: self.local_node_id,
                     task_id: Some(plan.id),
+                    group_id: None,
                 });
                 newly_reserved_gpus.push(device_id.clone());
             }
@@ -975,10 +977,13 @@ impl WorkloadManager {
                 );
             }
 
-            commit_req
+            let response = commit_req
                 .send()
                 .promise
                 .await
+                .map_err(|err| ExecutionError::Fatal(anyhow::anyhow!(err.to_string())))?;
+            response
+                .get()
                 .map_err(|err| ExecutionError::Fatal(anyhow::anyhow!(err.to_string())))?;
         }
 
