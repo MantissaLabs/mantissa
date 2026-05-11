@@ -69,6 +69,10 @@ use self::reservation::{
 pub(crate) use crate::workload::model::should_accept_incoming_workload_value as should_accept_incoming_workload_value_for_tests;
 /// Maximum number of concurrent image pulls executed per node.
 const IMAGE_PULL_MAX_CONCURRENCY: usize = 2;
+/// Maximum placement/reservation attempts for one workload start transaction.
+const WORKLOAD_START_MAX_ATTEMPTS: usize = 5;
+/// Backoff before retrying a start when remote secret material has not converged yet.
+const REMOTE_SECRET_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// Retention window for remove watermarks used to suppress stale upsert replay.
 const REMOVE_WATERMARK_RETENTION_SECS: i64 = 30 * 60;
 /// Maximum time one dirty workload update may wait before it is flushed into the shared gossip queue.
@@ -660,11 +664,10 @@ impl WorkloadManager {
         self.apply_volume_locality_to_intents(&mut intents).await?;
         self.ensure_gang_volume_bindings_ready(&intents)?;
 
-        const MAX_ATTEMPTS: usize = 5;
         let mut attempt = 0usize;
         let lease_ttl_ms = DEFAULT_PREPARED_LEASE_TTL_MS;
 
-        while attempt < MAX_ATTEMPTS {
+        while attempt < WORKLOAD_START_MAX_ATTEMPTS {
             let assignment = self
                 .compute_assignment(&intents)
                 .await
@@ -685,7 +688,7 @@ impl WorkloadManager {
                     target: "task",
                     "remote secrets unavailable for gang group {group_id} on attempt {attempt}: {err}"
                 );
-                sleep(Duration::from_millis(200)).await;
+                sleep(REMOTE_SECRET_RETRY_DELAY).await;
                 continue;
             }
 
@@ -860,7 +863,7 @@ impl WorkloadManager {
         }
 
         Err(anyhow::anyhow!(
-            "failed to gang schedule workloads after {MAX_ATTEMPTS} attempts"
+            "failed to gang schedule workloads after {WORKLOAD_START_MAX_ATTEMPTS} attempts"
         ))
     }
 
@@ -932,13 +935,12 @@ impl WorkloadManager {
         let mut intents = Self::build_start_intents(requests)?;
         self.apply_volume_locality_to_intents(&mut intents).await?;
 
-        const MAX_ATTEMPTS: usize = 5;
         let mut attempt = 0usize;
         let mut scheduling_retry_attempts = 0usize;
         let scheduling_retry_max_attempts = scheduling_retry_max_attempts_override
             .unwrap_or_else(|| scheduling_retry_max_attempts_for_intents(&intents));
 
-        while attempt < MAX_ATTEMPTS {
+        while attempt < WORKLOAD_START_MAX_ATTEMPTS {
             let assignment = match self.compute_assignment(&intents).await {
                 Ok(plan) => {
                     scheduling_retry_attempts = 0;
@@ -980,7 +982,7 @@ impl WorkloadManager {
                     target: "task",
                     "remote secrets unavailable on attempt {attempt}: {err}"
                 );
-                sleep(Duration::from_millis(200)).await;
+                sleep(REMOTE_SECRET_RETRY_DELAY).await;
                 continue;
             }
 
@@ -1087,7 +1089,7 @@ impl WorkloadManager {
         }
 
         Err(anyhow::anyhow!(
-            "failed to schedule workloads after {MAX_ATTEMPTS} attempts"
+            "failed to schedule workloads after {WORKLOAD_START_MAX_ATTEMPTS} attempts"
         ))
     }
 
