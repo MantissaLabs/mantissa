@@ -627,6 +627,150 @@ local_test!(services_gang_rollout_commits_parallel_replacement_chunk, {
     );
 });
 
+local_test!(services_gang_rollout_commits_remote_replacement_groups, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(
+        &cluster,
+        3,
+        "rollout cluster should stabilise to three nodes",
+    )
+    .await;
+    assert!(
+        wait_for_cached_cluster_sessions_all(&cluster, DISTRIBUTED_GANG_WAIT_TIMEOUT).await,
+        "cluster sessions should be cached before distributed gang rollout"
+    );
+
+    let service_name = "gang-remote-rollout";
+    let mut tasks = vec![demo_backend_task_template("api", 3)];
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment_with_options_outcome(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            tasks.clone(),
+            gang_deployment_options(),
+        )
+        .await
+        .expect("submit baseline distributed gang service")
+        .service_id;
+
+    assert!(
+        wait_for_service_status(
+            &cluster[0].node.service_controller,
+            service_id,
+            ServiceStatus::Running,
+        )
+        .await,
+        "baseline distributed gang service should converge"
+    );
+    assert!(
+        wait_for_service_task_count_all(&cluster, service_name, 3, DISTRIBUTED_GANG_WAIT_TIMEOUT,)
+            .await,
+        "every node should observe the baseline gang service tasks"
+    );
+
+    tasks[0].execution.image = "hashicorp/http-echo:1.0.1".to_string();
+    let rollout_manifest_id = Uuid::new_v4();
+    let strategy = rollout_strategy(2, ServiceRolloutOrder::StartFirst, 1, 1, true);
+    cluster[0]
+        .node
+        .service_controller
+        .submit_deployment_with_options_outcome(
+            rollout_manifest_id,
+            service_name,
+            service_name,
+            tasks,
+            gang_deployment_options_with_strategy(strategy),
+        )
+        .await
+        .expect("submit distributed gang rollout");
+
+    assert!(
+        wait_for_service_manifest_status(
+            &cluster[0],
+            service_id,
+            rollout_manifest_id,
+            ServiceStatus::Running,
+        )
+        .await,
+        "distributed gang rollout should converge to the replacement manifest"
+    );
+    assert!(
+        wait_for_service_task_count_all(&cluster, service_name, 3, DISTRIBUTED_GANG_WAIT_TIMEOUT,)
+            .await,
+        "every node should observe the replacement gang service tasks"
+    );
+
+    let active = wait_for_active_service_workloads(&cluster[0], service_name, 3).await;
+    assert!(
+        active
+            .iter()
+            .all(|workload| workload.image == "hashicorp/http-echo:1.0.1"),
+        "final distributed rollout tasks should come from the replacement manifest"
+    );
+    assert!(
+        active
+            .iter()
+            .all(|workload| { workload.admission_state == WorkloadAdmissionState::GroupCommitted }),
+        "distributed rollout tasks should be runnable only after group commit"
+    );
+
+    let mut replacement_groups: HashMap<Uuid, Vec<WorkloadSpec>> = HashMap::new();
+    for workload in active {
+        let group_id = workload
+            .admission_group_id
+            .expect("distributed rollout workload should record a gang group");
+        replacement_groups
+            .entry(group_id)
+            .or_default()
+            .push(workload);
+    }
+
+    assert_eq!(
+        replacement_groups.len(),
+        2,
+        "parallelism-two rollout of three replicas should create two replacement groups"
+    );
+
+    let assigned_nodes = replacement_groups
+        .values()
+        .flatten()
+        .map(|workload| workload.node_id)
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        assigned_nodes.len(),
+        cluster.len(),
+        "replacement replicas should remain distributed across all cluster nodes"
+    );
+
+    for (group_id, workloads) in replacement_groups {
+        if let Err(details) = wait_for_gang_reservations_on_assigned_nodes(
+            &cluster,
+            &workloads,
+            group_id,
+            DISTRIBUTED_GANG_WAIT_TIMEOUT,
+        )
+        .await
+        {
+            panic!(
+                "distributed rollout group {group_id} should retain committed reservations on assigned nodes: {details}"
+            );
+        }
+    }
+});
+
 local_test!(
     services_gang_rollout_capacity_failure_keeps_old_generation_running,
     {
