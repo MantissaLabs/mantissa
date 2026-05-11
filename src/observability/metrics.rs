@@ -130,6 +130,8 @@ pub fn scheduler_error_reason(error: &SchedulerError) -> &'static str {
         SchedulerError::UnknownLeases { .. } => "unknown_leases",
         SchedulerError::ExpiredLeases { .. } => "expired_leases",
         SchedulerError::LeaseMismatch { .. } => "lease_mismatch",
+        SchedulerError::UnknownLeaseGroup { .. } => "unknown_lease_group",
+        SchedulerError::LeaseGroupMismatch { .. } => "lease_group_mismatch",
         SchedulerError::SlotsNotReserved { .. } => "slots_not_reserved",
         SchedulerError::GpuDevicesNotReserved { .. } => "gpus_not_reserved",
         SchedulerError::SnapshotVersionOverflow { .. } => "snapshot_version_overflow",

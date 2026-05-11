@@ -1493,8 +1493,9 @@ impl WorkloadManager {
                         anyhow::anyhow!("unknown preassigned gpu device {device_id}")
                     })?;
 
-                    if let GpuDeviceState::Reserved(GpuDeviceReservation { owner, task_id }) =
-                        &device.state
+                    if let GpuDeviceState::Reserved(GpuDeviceReservation {
+                        owner, task_id, ..
+                    }) = &device.state
                     {
                         if *owner != self.local_node_id {
                             return Err(anyhow::anyhow!(

@@ -41,6 +41,8 @@ pub type GpuDeviceId = String;
 pub struct SlotReservation {
     pub owner: Uuid,
     pub task_id: Option<Uuid>,
+    #[serde(default)]
+    pub group_id: Option<Uuid>,
 }
 
 /// Reservation details attached to a GPU device when it is taken.
@@ -48,6 +50,8 @@ pub struct SlotReservation {
 pub struct GpuDeviceReservation {
     pub owner: Uuid,
     pub task_id: Option<Uuid>,
+    #[serde(default)]
+    pub group_id: Option<Uuid>,
 }
 
 /// Prepared lease details attached to resources before runtime commit.
@@ -57,6 +61,8 @@ pub struct LeaseReservation {
     pub coordinator_node_id: Uuid,
     pub task_id: Uuid,
     pub expires_at_unix_ms: u64,
+    #[serde(default)]
+    pub group_id: Option<Uuid>,
 }
 
 /// Current state of a slot inside the scheduler snapshot.
@@ -297,6 +303,7 @@ fn write_scheduler_store_lease(
     builder.set_coordinator_node_id(lease.coordinator_node_id.as_bytes());
     builder.set_task_id(lease.task_id.as_bytes());
     builder.set_expires_at_unix_ms(lease.expires_at_unix_ms);
+    builder.set_group_id(optional_uuid_bytes(lease.group_id.as_ref()));
 }
 
 /// Decodes one prepared scheduler lease from the store schema.
@@ -311,6 +318,7 @@ fn read_scheduler_store_lease(
         )?,
         task_id: read_uuid_data(reader.get_task_id()?, "scheduler lease task id")?,
         expires_at_unix_ms: reader.get_expires_at_unix_ms(),
+        group_id: read_optional_uuid_data(reader.get_group_id()?, "scheduler lease group id")?,
     })
 }
 
@@ -321,6 +329,7 @@ fn write_scheduler_store_slot_reservation(
 ) {
     builder.set_owner(reservation.owner.as_bytes());
     builder.set_task_id(optional_uuid_bytes(reservation.task_id.as_ref()));
+    builder.set_group_id(optional_uuid_bytes(reservation.group_id.as_ref()));
 }
 
 /// Decodes one committed slot reservation from the store schema.
@@ -333,6 +342,10 @@ fn read_scheduler_store_slot_reservation(
             reader.get_task_id()?,
             "scheduler slot reservation task id",
         )?,
+        group_id: read_optional_uuid_data(
+            reader.get_group_id()?,
+            "scheduler slot reservation group id",
+        )?,
     })
 }
 
@@ -343,6 +356,7 @@ fn write_scheduler_store_gpu_reservation(
 ) {
     builder.set_owner(reservation.owner.as_bytes());
     builder.set_task_id(optional_uuid_bytes(reservation.task_id.as_ref()));
+    builder.set_group_id(optional_uuid_bytes(reservation.group_id.as_ref()));
 }
 
 /// Decodes one committed GPU reservation from the store schema.
@@ -357,6 +371,10 @@ fn read_scheduler_store_gpu_reservation(
         task_id: read_optional_uuid_data(
             reader.get_task_id()?,
             "scheduler gpu device reservation task id",
+        )?,
+        group_id: read_optional_uuid_data(
+            reader.get_group_id()?,
+            "scheduler gpu device reservation group id",
         )?,
     })
 }
@@ -503,6 +521,7 @@ struct LeaseAllocation {
     coordinator_node_id: Uuid,
     task_id: Uuid,
     expires_at_unix_ms: u64,
+    group_id: Option<Uuid>,
     slot_ids: Vec<SlotId>,
     gpu_device_ids: Vec<String>,
 }
@@ -585,6 +604,18 @@ pub enum SchedulerError {
         snapshot: SchedulerSnapshot,
     },
 
+    #[error("unknown lease group {group_id}")]
+    UnknownLeaseGroup {
+        group_id: Uuid,
+        snapshot: SchedulerSnapshot,
+    },
+
+    #[error("lease group mismatch for group {group_id}")]
+    LeaseGroupMismatch {
+        group_id: Uuid,
+        snapshot: SchedulerSnapshot,
+    },
+
     #[error("slots not reserved: {slots:?}")]
     SlotsNotReserved {
         slots: Vec<SlotId>,
@@ -655,6 +686,7 @@ impl SchedulerState {
                     coordinator_node_id: lease.coordinator_node_id,
                     task_id: lease.task_id,
                     expires_at_unix_ms: lease.expires_at_unix_ms,
+                    group_id: lease.group_id,
                     slot_ids: Vec::new(),
                     gpu_device_ids: Vec::new(),
                 });
@@ -672,6 +704,7 @@ impl SchedulerState {
                     coordinator_node_id: lease.coordinator_node_id,
                     task_id: lease.task_id,
                     expires_at_unix_ms: lease.expires_at_unix_ms,
+                    group_id: lease.group_id,
                     slot_ids: Vec::new(),
                     gpu_device_ids: Vec::new(),
                 });
@@ -1439,6 +1472,7 @@ impl Scheduler {
                 new_snapshot.slots[idx].state = SlotState::Reserved(SlotReservation {
                     owner: req.owner,
                     task_id: req.task_id,
+                    group_id: None,
                 });
             }
             for req in &gpu_requests {
@@ -1447,6 +1481,7 @@ impl Scheduler {
                     GpuDeviceState::Reserved(GpuDeviceReservation {
                         owner: req.owner,
                         task_id: req.task_id,
+                        group_id: None,
                     });
             }
 
@@ -1488,6 +1523,30 @@ impl Scheduler {
     pub async fn prepare_task_leases(
         &self,
         coordinator_node_id: Uuid,
+        ttl_ms: u64,
+        intents: Vec<TaskLeaseIntent>,
+    ) -> Result<PreparedTaskLeaseBatch, SchedulerError> {
+        self.prepare_task_leases_with_group(coordinator_node_id, None, ttl_ms, intents)
+            .await
+    }
+
+    /// Prepares one grouped batch of resource leases for a future all-or-nothing admission commit.
+    pub async fn prepare_task_lease_group(
+        &self,
+        coordinator_node_id: Uuid,
+        group_id: Uuid,
+        ttl_ms: u64,
+        intents: Vec<TaskLeaseIntent>,
+    ) -> Result<PreparedTaskLeaseBatch, SchedulerError> {
+        self.prepare_task_leases_with_group(coordinator_node_id, Some(group_id), ttl_ms, intents)
+            .await
+    }
+
+    /// Shared prepare implementation used by both task-local and grouped lease paths.
+    async fn prepare_task_leases_with_group(
+        &self,
+        coordinator_node_id: Uuid,
+        group_id: Option<Uuid>,
         ttl_ms: u64,
         intents: Vec<TaskLeaseIntent>,
     ) -> Result<PreparedTaskLeaseBatch, SchedulerError> {
@@ -1562,6 +1621,7 @@ impl Scheduler {
                     coordinator_node_id,
                     task_id: intent.task_id,
                     expires_at_unix_ms,
+                    group_id,
                 };
 
                 let mut slot_ids = Vec::with_capacity(slot_indices.len());
@@ -1656,6 +1716,13 @@ impl Scheduler {
                 });
             }
 
+            if let Some(group_id) = allocation.group_id {
+                return Err(SchedulerError::LeaseGroupMismatch {
+                    group_id,
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+
             let mut expected_slots = expected_slot_ids.to_vec();
             expected_slots.sort_unstable();
             let mut expected_gpus = expected_gpu_device_ids.to_vec();
@@ -1678,6 +1745,7 @@ impl Scheduler {
                 new_snapshot.slots[idx].state = SlotState::Reserved(SlotReservation {
                     owner: self.store_key.to_uuid(),
                     task_id: Some(task_id),
+                    group_id: None,
                 });
             }
             for device_id in &allocation.gpu_device_ids {
@@ -1686,7 +1754,144 @@ impl Scheduler {
                     GpuDeviceState::Reserved(GpuDeviceReservation {
                         owner: self.store_key.to_uuid(),
                         task_id: Some(task_id),
+                        group_id: None,
                     });
+            }
+
+            new_snapshot.version = Self::next_snapshot_version(&new_snapshot)?;
+
+            let new_state_arc = Arc::new(SchedulerState::new(new_snapshot.clone()));
+            let prev = self
+                .state
+                .compare_and_swap(&current_opt, Some(new_state_arc.clone()));
+            if !ptr_eq_option(&prev, &current_opt) {
+                continue;
+            }
+
+            if let Err(e) = self
+                .store
+                .upsert(&self.store_key, new_snapshot.clone())
+                .await
+            {
+                let _ = self
+                    .state
+                    .compare_and_swap(&Some(new_state_arc.clone()), current_opt.clone());
+                return Err(SchedulerError::Store(e));
+            }
+
+            self.publish_digest_from_snapshot(&new_snapshot).await;
+            return Ok(new_snapshot);
+        }
+    }
+
+    /// Commits every prepared lease in a group into durable grouped reservations atomically.
+    pub async fn commit_task_lease_group(
+        &self,
+        group_id: Uuid,
+        coordinator_node_id: Uuid,
+        prepared_leases: &[PreparedTaskLease],
+    ) -> Result<SchedulerSnapshot, SchedulerError> {
+        loop {
+            let current_opt = self.state.load_full();
+            let current_arc = match current_opt.as_ref() {
+                Some(state) => state.clone(),
+                None => return Err(SchedulerError::Uninitialized),
+            };
+            let current = current_arc.as_ref();
+            let now_unix_ms = current_unix_ms();
+
+            let mut expected_by_lease = HashMap::with_capacity(prepared_leases.len());
+            for lease in prepared_leases {
+                if expected_by_lease.insert(lease.lease_id, lease).is_some() {
+                    return Err(SchedulerError::LeaseGroupMismatch {
+                        group_id,
+                        snapshot: current.snapshot.clone(),
+                    });
+                }
+            }
+
+            let actual_lease_ids = current
+                .lease_index
+                .iter()
+                .filter_map(|(lease_id, allocation)| {
+                    (allocation.group_id == Some(group_id)).then_some(*lease_id)
+                })
+                .collect::<BTreeSet<_>>();
+
+            if actual_lease_ids.is_empty() {
+                return Err(SchedulerError::UnknownLeaseGroup {
+                    group_id,
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+
+            let expected_lease_ids = expected_by_lease.keys().copied().collect::<BTreeSet<_>>();
+            if actual_lease_ids != expected_lease_ids {
+                return Err(SchedulerError::LeaseGroupMismatch {
+                    group_id,
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+
+            let mut expired = Vec::new();
+            for lease_id in &actual_lease_ids {
+                let allocation = &current.lease_index[lease_id];
+                if allocation.coordinator_node_id != coordinator_node_id {
+                    return Err(SchedulerError::LeaseGroupMismatch {
+                        group_id,
+                        snapshot: current.snapshot.clone(),
+                    });
+                }
+                if allocation.expires_at_unix_ms <= now_unix_ms {
+                    expired.push(*lease_id);
+                }
+            }
+            if !expired.is_empty() {
+                return Err(SchedulerError::ExpiredLeases {
+                    lease_ids: expired,
+                    snapshot: current.snapshot.clone(),
+                });
+            }
+
+            for lease_id in &actual_lease_ids {
+                let allocation = &current.lease_index[lease_id];
+                let expected = expected_by_lease[lease_id];
+                let mut expected_slots = expected.slot_ids.clone();
+                expected_slots.sort_unstable();
+                let mut expected_gpus = expected.gpu_device_ids.clone();
+                expected_gpus.sort();
+
+                if allocation.task_id != expected.task_id
+                    || allocation.slot_ids != expected_slots
+                    || allocation.gpu_device_ids != expected_gpus
+                {
+                    return Err(SchedulerError::LeaseMismatch {
+                        lease_id: *lease_id,
+                        snapshot: current.snapshot.clone(),
+                    });
+                }
+            }
+
+            let mut new_snapshot = current.snapshot.clone();
+            for lease_id in &actual_lease_ids {
+                let allocation = &current.lease_index[lease_id];
+                for slot_id in &allocation.slot_ids {
+                    let idx = current.slot_index[slot_id];
+                    new_snapshot.slots[idx].state = SlotState::Reserved(SlotReservation {
+                        owner: self.store_key.to_uuid(),
+                        task_id: Some(allocation.task_id),
+                        group_id: Some(group_id),
+                    });
+                }
+                for device_id in &allocation.gpu_device_ids {
+                    let idx = current.gpu_index[device_id];
+                    new_snapshot.gpu_devices[idx].state =
+                        GpuDeviceState::Reserved(GpuDeviceReservation {
+                            owner: self.store_key.to_uuid(),
+                            task_id: Some(allocation.task_id),
+                            group_id: Some(group_id),
+                        });
+                }
             }
 
             new_snapshot.version = Self::next_snapshot_version(&new_snapshot)?;
@@ -1765,6 +1970,90 @@ impl Scheduler {
                     if matches!(
                         new_snapshot.gpu_devices[idx].state,
                         GpuDeviceState::Leased(LeaseReservation { lease_id, .. }) if lease_id == intent.lease_id
+                    ) {
+                        new_snapshot.gpu_devices[idx].state = GpuDeviceState::Free;
+                        changed = true;
+                    }
+                }
+            }
+
+            if !changed {
+                return Ok(current.snapshot.clone());
+            }
+
+            new_snapshot.version = Self::next_snapshot_version(&new_snapshot)?;
+
+            let new_state_arc = Arc::new(SchedulerState::new(new_snapshot.clone()));
+            let prev = self
+                .state
+                .compare_and_swap(&current_opt, Some(new_state_arc.clone()));
+            if !ptr_eq_option(&prev, &current_opt) {
+                continue;
+            }
+
+            if let Err(e) = self
+                .store
+                .upsert(&self.store_key, new_snapshot.clone())
+                .await
+            {
+                let _ = self
+                    .state
+                    .compare_and_swap(&Some(new_state_arc.clone()), current_opt.clone());
+                return Err(SchedulerError::Store(e));
+            }
+
+            self.publish_digest_from_snapshot(&new_snapshot).await;
+            return Ok(new_snapshot);
+        }
+    }
+
+    /// Aborts every prepared lease in one group for the provided coordinator.
+    pub async fn abort_task_lease_group(
+        &self,
+        coordinator_node_id: Uuid,
+        group_id: Uuid,
+    ) -> Result<SchedulerSnapshot, SchedulerError> {
+        loop {
+            let current_opt = self.state.load_full();
+            let current_arc = match current_opt.as_ref() {
+                Some(state) => state.clone(),
+                None => return Err(SchedulerError::Uninitialized),
+            };
+            let current = current_arc.as_ref();
+            let mut new_snapshot = current.snapshot.clone();
+            let mut changed = false;
+
+            let lease_ids = current
+                .lease_index
+                .iter()
+                .filter_map(|(lease_id, allocation)| {
+                    (allocation.group_id == Some(group_id)
+                        && allocation.coordinator_node_id == coordinator_node_id)
+                        .then_some(*lease_id)
+                })
+                .collect::<Vec<_>>();
+
+            for lease_id in &lease_ids {
+                let allocation = &current.lease_index[lease_id];
+                for slot_id in &allocation.slot_ids {
+                    let idx = current.slot_index[slot_id];
+                    if matches!(
+                        new_snapshot.slots[idx].state,
+                        SlotState::Leased(LeaseReservation { lease_id: current_lease_id, .. })
+                            if current_lease_id == *lease_id
+                    ) {
+                        new_snapshot.slots[idx].state = SlotState::Free;
+                        changed = true;
+                    }
+                }
+                for device_id in &allocation.gpu_device_ids {
+                    let idx = current.gpu_index[device_id];
+                    if matches!(
+                        new_snapshot.gpu_devices[idx].state,
+                        GpuDeviceState::Leased(LeaseReservation {
+                            lease_id: current_lease_id,
+                            ..
+                        }) if current_lease_id == *lease_id
                     ) {
                         new_snapshot.gpu_devices[idx].state = GpuDeviceState::Free;
                         changed = true;
@@ -2170,6 +2459,7 @@ mod tests {
             coordinator_node_id: Uuid::new_v4(),
             task_id: Uuid::new_v4(),
             expires_at_unix_ms: 1_776_000_000_001,
+            group_id: Some(Uuid::new_v4()),
         };
         let reservation_owner = Uuid::new_v4();
         let reserved_task = Uuid::new_v4();
@@ -2193,6 +2483,7 @@ mod tests {
                     state: SlotState::Reserved(SlotReservation {
                         owner: reservation_owner,
                         task_id: Some(reserved_task),
+                        group_id: Some(Uuid::new_v4()),
                     }),
                 },
             ],
@@ -2216,6 +2507,7 @@ mod tests {
                     state: GpuDeviceState::Reserved(GpuDeviceReservation {
                         owner: reservation_owner,
                         task_id: None,
+                        group_id: Some(Uuid::new_v4()),
                     }),
                 },
                 GpuDevice {
@@ -2745,6 +3037,7 @@ mod tests {
             SlotState::Reserved(SlotReservation {
                 owner,
                 task_id: Some(owner_task_id),
+                ..
             }) if *owner == scheduler.store_key.to_uuid() && *owner_task_id == task_id
         )));
         assert!(snapshot.gpu_devices.iter().all(|device| matches!(
@@ -2752,6 +3045,7 @@ mod tests {
             GpuDeviceState::Reserved(GpuDeviceReservation {
                 owner,
                 task_id: Some(owner_task_id),
+                ..
             }) if *owner == scheduler.store_key.to_uuid() && *owner_task_id == task_id
         )));
     }
@@ -2818,6 +3112,377 @@ mod tests {
                 .iter()
                 .all(|device| matches!(device.state, GpuDeviceState::Free))
         );
+    }
+
+    #[tokio::test]
+    async fn prepare_task_lease_group_consumes_capacity() {
+        let (scheduler, _dir) = make_scheduler().await;
+        scheduler
+            .init_slots([
+                SlotSpec::new(1, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
+                SlotSpec::new(2, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
+            ])
+            .await
+            .unwrap();
+
+        let coordinator = Uuid::new_v4();
+        let group_id = Uuid::new_v4();
+        scheduler
+            .prepare_task_lease_group(
+                coordinator,
+                group_id,
+                30_000,
+                vec![
+                    TaskLeaseIntent {
+                        task_id: Uuid::new_v4(),
+                        cpu_millis: 500,
+                        memory_bytes: 512 * 1024 * 1024,
+                        gpu_count: 0,
+                    },
+                    TaskLeaseIntent {
+                        task_id: Uuid::new_v4(),
+                        cpu_millis: 500,
+                        memory_bytes: 512 * 1024 * 1024,
+                        gpu_count: 0,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let snapshot = scheduler.snapshot().await.unwrap();
+        assert_eq!(snapshot.version, 1);
+        assert!(snapshot.slots.iter().all(|slot| matches!(
+            &slot.state,
+            SlotState::Leased(LeaseReservation {
+                coordinator_node_id,
+                group_id: Some(lease_group_id),
+                ..
+            }) if *coordinator_node_id == coordinator && *lease_group_id == group_id
+        )));
+
+        let err = scheduler
+            .prepare_task_leases(
+                Uuid::new_v4(),
+                30_000,
+                vec![TaskLeaseIntent {
+                    task_id: Uuid::new_v4(),
+                    cpu_millis: 500,
+                    memory_bytes: 512 * 1024 * 1024,
+                    gpu_count: 0,
+                }],
+            )
+            .await
+            .expect_err("group leases should consume capacity");
+
+        match err {
+            SchedulerError::InsufficientResources { snapshot, .. } => {
+                assert_eq!(snapshot.version, 1);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_task_lease_group_releases_all_resources() {
+        let (scheduler, _dir) = make_scheduler().await;
+        scheduler
+            .init_resources(
+                [SlotSpec::new(
+                    1,
+                    SlotCapacity::new(500, 512 * 1024 * 1024, 0),
+                )],
+                [GpuDeviceSpec::new(
+                    "gpu-a",
+                    0,
+                    Some("gpu-a".to_string()),
+                    Some("0000:01:00.0".to_string()),
+                    "GPU A",
+                    16 * 1024 * 1024 * 1024,
+                )],
+            )
+            .await
+            .unwrap();
+
+        let coordinator = Uuid::new_v4();
+        let group_id = Uuid::new_v4();
+        scheduler
+            .prepare_task_lease_group(
+                coordinator,
+                group_id,
+                30_000,
+                vec![TaskLeaseIntent {
+                    task_id: Uuid::new_v4(),
+                    cpu_millis: 500,
+                    memory_bytes: 512 * 1024 * 1024,
+                    gpu_count: 1,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let snapshot = scheduler
+            .abort_task_lease_group(coordinator, group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.version, 2);
+        assert!(
+            snapshot
+                .slots
+                .iter()
+                .all(|slot| matches!(slot.state, SlotState::Free))
+        );
+        assert!(
+            snapshot
+                .gpu_devices
+                .iter()
+                .all(|device| matches!(device.state, GpuDeviceState::Free))
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_task_lease_group_promotes_resources_to_group_reservations() {
+        let (scheduler, _dir) = make_scheduler().await;
+        scheduler
+            .init_resources(
+                [
+                    SlotSpec::new(1, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
+                    SlotSpec::new(2, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
+                ],
+                [GpuDeviceSpec::new(
+                    "gpu-a",
+                    0,
+                    Some("gpu-a".to_string()),
+                    Some("0000:01:00.0".to_string()),
+                    "GPU A",
+                    16 * 1024 * 1024 * 1024,
+                )],
+            )
+            .await
+            .unwrap();
+
+        let coordinator = Uuid::new_v4();
+        let group_id = Uuid::new_v4();
+        let cpu_task = Uuid::new_v4();
+        let gpu_task = Uuid::new_v4();
+        let prepared = scheduler
+            .prepare_task_lease_group(
+                coordinator,
+                group_id,
+                30_000,
+                vec![
+                    TaskLeaseIntent {
+                        task_id: cpu_task,
+                        cpu_millis: 500,
+                        memory_bytes: 512 * 1024 * 1024,
+                        gpu_count: 0,
+                    },
+                    TaskLeaseIntent {
+                        task_id: gpu_task,
+                        cpu_millis: 500,
+                        memory_bytes: 512 * 1024 * 1024,
+                        gpu_count: 1,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let snapshot = scheduler
+            .commit_task_lease_group(group_id, coordinator, &prepared.leases)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.version, 2);
+        assert!(snapshot.slots.iter().all(|slot| matches!(
+            &slot.state,
+            SlotState::Reserved(SlotReservation {
+                owner,
+                task_id: Some(task_id),
+                group_id: Some(reservation_group_id),
+            }) if *owner == scheduler.store_key.to_uuid()
+                && *reservation_group_id == group_id
+                && (*task_id == cpu_task || *task_id == gpu_task)
+        )));
+        assert!(snapshot.gpu_devices.iter().all(|device| matches!(
+            &device.state,
+            GpuDeviceState::Reserved(GpuDeviceReservation {
+                owner,
+                task_id: Some(task_id),
+                group_id: Some(reservation_group_id),
+            }) if *owner == scheduler.store_key.to_uuid()
+                && *reservation_group_id == group_id
+                && *task_id == gpu_task
+        )));
+    }
+
+    #[tokio::test]
+    async fn commit_task_lease_group_rejects_partial_group() {
+        let (scheduler, _dir) = make_scheduler().await;
+        scheduler
+            .init_slots([
+                SlotSpec::new(1, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
+                SlotSpec::new(2, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
+            ])
+            .await
+            .unwrap();
+
+        let coordinator = Uuid::new_v4();
+        let group_id = Uuid::new_v4();
+        let prepared = scheduler
+            .prepare_task_lease_group(
+                coordinator,
+                group_id,
+                30_000,
+                vec![
+                    TaskLeaseIntent {
+                        task_id: Uuid::new_v4(),
+                        cpu_millis: 500,
+                        memory_bytes: 512 * 1024 * 1024,
+                        gpu_count: 0,
+                    },
+                    TaskLeaseIntent {
+                        task_id: Uuid::new_v4(),
+                        cpu_millis: 500,
+                        memory_bytes: 512 * 1024 * 1024,
+                        gpu_count: 0,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let err = scheduler
+            .commit_task_lease_group(group_id, coordinator, &prepared.leases[..1])
+            .await
+            .expect_err("partial group commit should fail");
+
+        match err {
+            SchedulerError::LeaseGroupMismatch {
+                group_id: failed_group_id,
+                snapshot,
+            } => {
+                assert_eq!(failed_group_id, group_id);
+                assert_eq!(snapshot.version, 1);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let snapshot = scheduler.snapshot().await.unwrap();
+        assert_eq!(snapshot.version, 1);
+        assert!(snapshot.slots.iter().all(|slot| matches!(
+            &slot.state,
+            SlotState::Leased(LeaseReservation {
+                group_id: Some(lease_group_id),
+                ..
+            }) if *lease_group_id == group_id
+        )));
+    }
+
+    #[tokio::test]
+    async fn reap_expired_leases_releases_prepared_group() {
+        let (scheduler, _dir) = make_scheduler().await;
+        scheduler
+            .init_slots([
+                SlotSpec::new(1, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
+                SlotSpec::new(2, SlotCapacity::new(500, 512 * 1024 * 1024, 0)),
+            ])
+            .await
+            .unwrap();
+
+        let prepared = scheduler
+            .prepare_task_lease_group(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                0,
+                vec![
+                    TaskLeaseIntent {
+                        task_id: Uuid::new_v4(),
+                        cpu_millis: 500,
+                        memory_bytes: 512 * 1024 * 1024,
+                        gpu_count: 0,
+                    },
+                    TaskLeaseIntent {
+                        task_id: Uuid::new_v4(),
+                        cpu_millis: 500,
+                        memory_bytes: 512 * 1024 * 1024,
+                        gpu_count: 0,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let expired = scheduler.reap_expired_leases().await.unwrap();
+        let expired = expired
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = prepared
+            .leases
+            .iter()
+            .map(|lease| lease.lease_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(expired, expected);
+
+        let snapshot = scheduler.snapshot().await.unwrap();
+        assert_eq!(snapshot.version, 2);
+        assert!(
+            snapshot
+                .slots
+                .iter()
+                .all(|slot| matches!(slot.state, SlotState::Free))
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_expired_leases_keeps_committed_group_reservations() {
+        let (scheduler, _dir) = make_scheduler().await;
+        scheduler
+            .init_slots([SlotSpec::new(
+                1,
+                SlotCapacity::new(500, 512 * 1024 * 1024, 0),
+            )])
+            .await
+            .unwrap();
+
+        let coordinator = Uuid::new_v4();
+        let group_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let prepared = scheduler
+            .prepare_task_lease_group(
+                coordinator,
+                group_id,
+                30_000,
+                vec![TaskLeaseIntent {
+                    task_id,
+                    cpu_millis: 500,
+                    memory_bytes: 512 * 1024 * 1024,
+                    gpu_count: 0,
+                }],
+            )
+            .await
+            .unwrap();
+        scheduler
+            .commit_task_lease_group(group_id, coordinator, &prepared.leases)
+            .await
+            .unwrap();
+
+        let expired = scheduler.reap_expired_leases().await.unwrap();
+        assert!(expired.is_empty());
+
+        let snapshot = scheduler.snapshot().await.unwrap();
+        assert_eq!(snapshot.version, 2);
+        assert!(matches!(
+            &snapshot.slots[0].state,
+            SlotState::Reserved(SlotReservation {
+                owner,
+                task_id: Some(reserved_task_id),
+                group_id: Some(reservation_group_id),
+            }) if *owner == scheduler.store_key.to_uuid()
+                && *reserved_task_id == task_id
+                && *reservation_group_id == group_id
+        ));
     }
 
     #[tokio::test]

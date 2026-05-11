@@ -181,6 +181,9 @@ struct SchedulerStoreLeaseReservation {
 
   expiresAtUnixMs @3 :UInt64;
   # Absolute wall-clock expiry used to reclaim leaked leases.
+
+  groupId @4 :Data;
+  # Optional 16-byte admission group UUID, empty for task-local leases.
 }
 
 struct SchedulerStoreSlotReservation {
@@ -189,6 +192,9 @@ struct SchedulerStoreSlotReservation {
 
   taskId @1 :Data;
   # 16-byte UUID of the task using the slot, empty when unassigned.
+
+  groupId @2 :Data;
+  # Optional 16-byte admission group UUID, empty for task-local reservations.
 }
 
 struct SchedulerStoreGpuDeviceReservation {
@@ -197,6 +203,9 @@ struct SchedulerStoreGpuDeviceReservation {
 
   taskId @1 :Data;
   # 16-byte UUID of the task using the GPU, empty when unassigned.
+
+  groupId @2 :Data;
+  # Optional 16-byte admission group UUID, empty for task-local reservations.
 }
 
 struct SchedulerStoreSlot {
