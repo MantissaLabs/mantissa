@@ -66,7 +66,7 @@ use ::mantissa_health::HealthMonitor;
 use anyhow::{Result, anyhow};
 use async_channel::bounded;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use ed25519_dalek::SigningKey;
 use mantissa_net::noise::NoiseKeys;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1972,6 +1972,76 @@ async fn pending_group_workload_rows_are_not_adopted() {
     assert!(
         matches!(snapshot.slots[0].state, SlotState::Free),
         "pending group reconcile should not reserve scheduler slots"
+    );
+}
+
+#[tokio::test]
+async fn expired_pending_group_workload_rows_are_aborted_and_removed() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let group_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    let prepared = scheduler
+        .prepare_task_lease_group(
+            manager.local_node_id,
+            group_id,
+            DEFAULT_PREPARED_LEASE_TTL_MS,
+            vec![TaskLeaseIntent {
+                task_id,
+                cpu_millis: 100,
+                memory_bytes: 64 * 1_024 * 1_024,
+                gpu_count: 0,
+            }],
+        )
+        .await
+        .expect("prepare group lease");
+
+    let expired_at = Utc::now()
+        - ChronoDuration::milliseconds(
+            i64::try_from(DEFAULT_PREPARED_LEASE_TTL_MS).expect("test ttl should fit in i64") + 1,
+        );
+    let mut spec = test_task_spec(&manager, "expired-pending-gang");
+    spec.id = task_id;
+    spec.created_at = expired_at.to_rfc3339();
+    spec.updated_at = expired_at.to_rfc3339();
+    spec.slot_ids = prepared.leases[0].slot_ids.clone();
+    spec.slot_id = spec.slot_ids.first().copied();
+    spec.admission_group_id = Some(group_id);
+    spec.admission_state = WorkloadAdmissionState::PendingGroup;
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    manager
+        .reconcile_local_task(spec)
+        .await
+        .expect("expired pending group reconcile should clean up");
+
+    assert!(
+        mock_cm.created.lock().await.is_empty(),
+        "expired pending group cleanup must not create runtime instances"
+    );
+    assert!(
+        manager
+            .list_workloads(&TaskStateFilter::all())
+            .await
+            .expect("list workloads")
+            .is_empty(),
+        "expired pending group rows should be removed"
+    );
+    let snapshot = scheduler.snapshot().await.expect("snapshot");
+    assert!(
+        snapshot
+            .slots
+            .iter()
+            .all(|slot| matches!(slot.state, SlotState::Free)),
+        "expired pending group cleanup should release prepared scheduler leases"
     );
 }
 

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use async_channel::Sender;
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use mantissa_store::uuid_key::UuidKey;
 use rand::Rng;
 use tokio::time::{Instant, sleep, timeout};
@@ -31,8 +31,8 @@ use crate::workload::types::{
 };
 
 use super::{
-    WorkloadManager, instance_remove_in_progress, launch::InstanceLaunchRequest, spec_to_status,
-    spec_to_value, value_to_spec,
+    WorkloadManager, instance_remove_in_progress, launch::InstanceLaunchRequest,
+    reservation::DEFAULT_PREPARED_LEASE_TTL_MS, spec_to_status, spec_to_value, value_to_spec,
 };
 
 /// Snapshot of instances currently known by the local runtime.
@@ -2585,6 +2585,9 @@ impl WorkloadManager {
         spec: WorkloadSpec,
     ) -> Result<(), anyhow::Error> {
         if matches!(spec.admission_state, WorkloadAdmissionState::PendingGroup) {
+            if self.cleanup_expired_pending_group(&spec).await? {
+                return Ok(());
+            }
             debug!(
                 target: "task",
                 "skipping task {} ({}) while admission group {:?} is pending",
@@ -2621,6 +2624,53 @@ impl WorkloadManager {
                 Ok(())
             }
         }
+    }
+
+    /// Removes a stale pending admission row once its prepared leases can no longer commit.
+    async fn cleanup_expired_pending_group(
+        &self,
+        spec: &WorkloadSpec,
+    ) -> Result<bool, anyhow::Error> {
+        let Some(group_id) = spec.admission_group_id else {
+            return Ok(false);
+        };
+        let Some(observed_at) = parse_task_timestamp(&spec.updated_at, &spec.created_at) else {
+            return Ok(false);
+        };
+        let Ok(ttl_ms) = i64::try_from(DEFAULT_PREPARED_LEASE_TTL_MS) else {
+            return Ok(false);
+        };
+        let Some(expires_at) = observed_at.checked_add_signed(ChronoDuration::milliseconds(ttl_ms))
+        else {
+            return Ok(false);
+        };
+        if expires_at > Utc::now() {
+            return Ok(false);
+        }
+
+        let coordinator = spec.lease_coordinator_node_id.unwrap_or(self.local_node_id);
+        if let Err(err) = self
+            .core
+            .scheduler
+            .abort_task_lease_group(coordinator, group_id)
+            .await
+        {
+            warn!(
+                target: "task",
+                "failed to abort expired pending admission group {group_id} for task {}: {err}",
+                spec.id
+            );
+        }
+        self.remove_spec(spec.id)
+            .await
+            .with_context(|| format!("failed to remove expired pending group task {}", spec.id))?;
+        debug!(
+            target: "task",
+            "removed expired pending admission group task {} ({})",
+            spec.name,
+            spec.id
+        );
+        Ok(true)
     }
 
     /// Returns one decoded task spec from the local cache when it still matches the store clock.
