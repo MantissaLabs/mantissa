@@ -11,7 +11,7 @@ use mantissa::runtime::types::{
     RuntimeExecResult, RuntimeInfo, RuntimeLogFrame, RuntimeLogsOptions, RuntimeResult,
     RuntimeSupportContract, RuntimeSupportProfile,
 };
-use mantissa::task::types::TaskValue;
+use mantissa::task::types::{TaskStateFilter, TaskValue};
 use mantissa::workload::model::{ExecutionPlatform, IsolationMode};
 use mantissa::workload::model::{WorkloadAdmissionState, WorkloadPhase, WorkloadSpec};
 use mantissa::workload::types::WorkloadAdmissionMode;
@@ -26,6 +26,9 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender};
 use uuid::Uuid;
+
+const OVERCOMMITTED_CPU_MILLIS: u64 = 500_000;
+const OVERCOMMITTED_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 local_test!(
     agents_submit_launches_sandbox_run_and_returns_to_waiting_input,
@@ -126,6 +129,62 @@ local_test!(agents_gang_admission_records_grouped_run_workload, {
         "gang agent run should become runnable only after group commit"
     );
 });
+
+local_test!(
+    agents_gang_capacity_failure_keeps_run_pending_without_workload,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+        let node = TestNode::new().await;
+
+        let session_id = submit_agent_session_with_options(
+            &node.node.agents_client,
+            "gang-agent-overcommit",
+            AgentSessionSubmitOptions {
+                initial_input: Some("solve the task"),
+                admission_mode: Some(WorkloadAdmissionMode::Gang),
+                cpu_millis: Some(OVERCOMMITTED_CPU_MILLIS),
+                memory_bytes: Some(OVERCOMMITTED_MEMORY_BYTES),
+                ..AgentSessionSubmitOptions::default()
+            },
+        )
+        .await
+        .expect("submit overcommitted gang-admitted agent session");
+
+        assert!(
+            wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+                let client = node.node.agents_client.clone();
+                async move {
+                    let runs = list_runs(&client, Some(session_id))
+                        .await
+                        .expect("list agent runs");
+                    runs.iter().any(|run| {
+                        run.status == ProtoAgentRunStatus::Pending
+                            && run.workload_id.is_none()
+                            && run.status_detail.as_deref().is_some_and(|detail| {
+                                detail.contains("waiting for sandbox placement")
+                            })
+                    })
+                }
+            })
+            .await,
+            "overcommitted gang agent run should stay pending without a workload"
+        );
+
+        let workloads = node
+            .node
+            .workload_manager
+            .list_workloads(&TaskStateFilter::all())
+            .await
+            .expect("list workloads after failed gang agent admission");
+        assert!(
+            workloads
+                .iter()
+                .filter_map(|workload| workload.agent_run_owner())
+                .all(|owner| owner.session_id != session_id),
+            "retryable gang admission should not leak agent-owned workload rows"
+        );
+    }
+);
 
 local_test!(agents_inspect_returns_session_and_run_history, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
@@ -251,6 +310,8 @@ local_test!(agents_submit_nono_run_projects_runtime_sandbox_policy, {
             allow_network: false,
             allow_write: true,
             admission_mode: None,
+            cpu_millis: None,
+            memory_bytes: None,
         },
     )
     .await
@@ -440,6 +501,8 @@ struct AgentSessionSubmitOptions<'a> {
     allow_network: bool,
     allow_write: bool,
     admission_mode: Option<WorkloadAdmissionMode>,
+    cpu_millis: Option<u64>,
+    memory_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -450,10 +513,11 @@ struct AgentSessionSnapshot {
     last_run_id: Option<Uuid>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct AgentRunSnapshot {
     id: Uuid,
     status: ProtoAgentRunStatus,
+    status_detail: Option<String>,
     workload_id: Option<Uuid>,
     exit_code: Option<i32>,
 }
@@ -650,6 +714,8 @@ async fn submit_agent_session(
             allow_network: false,
             allow_write: false,
             admission_mode: None,
+            cpu_millis: None,
+            memory_bytes: None,
         },
     )
     .await
@@ -667,8 +733,8 @@ async fn submit_agent_session_with_options(
         builder.set_name(name);
         builder.set_image("ghcr.io/mantissa/demo-agent:latest");
         builder.set_tty(false);
-        builder.set_cpu_millis(250);
-        builder.set_memory_bytes(128 * 1024 * 1024);
+        builder.set_cpu_millis(options.cpu_millis.unwrap_or(250));
+        builder.set_memory_bytes(options.memory_bytes.unwrap_or(128 * 1024 * 1024));
         builder.set_gpu_count(0);
         builder.set_isolation_profile(options.isolation_profile.unwrap_or_default());
         builder.set_pending_input(options.initial_input.unwrap_or_default());
@@ -819,6 +885,7 @@ async fn list_runs(
         snapshots.push(AgentRunSnapshot {
             id: read_uuid(reader.get_id()?)?,
             status: reader.get_status()?,
+            status_detail: read_optional_text(reader.get_status_detail()?.to_str()?),
             workload_id: read_optional_uuid(reader.get_workload_id()?),
             exit_code: reader.get_has_exit_code().then_some(reader.get_exit_code()),
         });
@@ -941,4 +1008,10 @@ fn read_optional_uuid(data: capnp::data::Reader<'_>) -> Option<Uuid> {
         bytes.copy_from_slice(bytes_owned.as_slice());
         Uuid::from_bytes(bytes)
     })
+}
+
+/// Decodes one optional text field from the public agents schema.
+fn read_optional_text(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
