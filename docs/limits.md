@@ -43,12 +43,13 @@ digests, then confirmed by the target node through a resource reservation. A
 bad guess should be cheap to reject, but it is still a retry and not a
 centralized in-memory decision.
 
-The service scheduler also should not be read as strict all-or-nothing gang
-scheduling. Multi-task services are submitted in batches and dependency order
-is respected, but placement still converges through normal workload rows,
-leases, retries and readiness checks. During failures or topology changes, the
-system may temporarily have too few or too many visible replicas while it
-chooses the safer side of the availability trade-off.
+The service scheduler uses incremental admission with batch-aware placement
+today. A batch is a placement and reservation attempt, not a strict
+all-or-nothing gang. Multi-task services are submitted in batches and
+dependency order is respected, but placement still converges through normal
+workload rows, leases, retries and readiness checks. During failures or
+topology changes, the system may temporarily have too few or too many visible
+replicas while it chooses the safer side of the availability trade-off.
 
 ## Fault-tolerance
 
