@@ -518,6 +518,97 @@ local_test!(
     }
 );
 
+local_test!(services_gang_flat_deployment_commits_over_tcp_cluster, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+
+    let cluster = match TestNode::new_cluster_tcp_with_tick(2, 100).await {
+        Ok(cluster) => cluster,
+        Err(err) => {
+            let msg = err.to_string();
+            if msg.contains("Operation not permitted") {
+                eprintln!("skipping services_gang_flat_deployment_commits_over_tcp_cluster: {msg}");
+                return;
+            }
+            panic!("failed to build tcp cluster: {msg}");
+        }
+    };
+    TestNode::assert_cluster_size_all(
+        &cluster,
+        2,
+        "tcp gang cluster should stabilise to two nodes",
+    )
+    .await;
+    assert!(
+        wait_for_cached_cluster_sessions_all(&cluster, DISTRIBUTED_GANG_WAIT_TIMEOUT).await,
+        "tcp cluster sessions should be cached before gang deployment"
+    );
+
+    let service_name = "gang-tcp-flat";
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment_with_options_outcome(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![demo_backend_task_template("api", 2)],
+            gang_deployment_options(),
+        )
+        .await
+        .expect("submit tcp gang service deployment")
+        .service_id;
+
+    assert!(
+        wait_for_service_status(
+            &cluster[0].node.service_controller,
+            service_id,
+            ServiceStatus::Running,
+        )
+        .await,
+        "tcp gang deployment should converge to running"
+    );
+    assert!(
+        wait_for_service_task_count_all(&cluster, service_name, 2, DISTRIBUTED_GANG_WAIT_TIMEOUT,)
+            .await,
+        "both tcp nodes should observe the gang service tasks"
+    );
+
+    let workloads = wait_for_active_service_workloads(&cluster[0], service_name, 2).await;
+    let group_id = workloads[0]
+        .admission_group_id
+        .expect("tcp gang workload should record an admission group");
+    assert!(
+        workloads.iter().all(|workload| {
+            workload.admission_group_id == Some(group_id)
+                && workload.admission_state == WorkloadAdmissionState::GroupCommitted
+        }),
+        "tcp gang workloads should commit under one group"
+    );
+
+    let assigned_nodes = workloads
+        .iter()
+        .map(|workload| workload.node_id)
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        assigned_nodes.len(),
+        cluster.len(),
+        "tcp gang replicas should be placed across both nodes"
+    );
+
+    if let Err(details) = wait_for_gang_reservations_on_assigned_nodes(
+        &cluster,
+        &workloads,
+        group_id,
+        DISTRIBUTED_GANG_WAIT_TIMEOUT,
+    )
+    .await
+    {
+        panic!(
+            "tcp gang scheduler reservations should carry the committed group on assigned nodes: {details}"
+        );
+    }
+});
+
 local_test!(services_gang_rollout_commits_parallel_replacement_chunk, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
