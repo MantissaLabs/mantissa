@@ -948,7 +948,7 @@ impl ServiceController {
                     service_name,
                     template.name
                 );
-                self.mark_deployment_failed(&deployment, Some(err.to_string()))
+                self.mark_deployment_failed(&deployment, Some(service_error_detail(&err)))
                     .await?;
                 return Ok(());
             }
@@ -1003,7 +1003,7 @@ impl ServiceController {
                         service_name,
                         template.name
                     );
-                    self.mark_deployment_failed(&deployment, Some(err.to_string()))
+                    self.mark_deployment_failed(&deployment, Some(service_error_detail(&err)))
                         .await?;
                     return Ok(());
                 }
@@ -1089,7 +1089,7 @@ impl ServiceController {
                         stage_number,
                         template.name
                     );
-                    self.mark_deployment_failed(deployment, Some(err.to_string()))
+                    self.mark_deployment_failed(deployment, Some(service_error_detail(&err)))
                         .await?;
                     return Ok(());
                 }
@@ -1184,7 +1184,7 @@ impl ServiceController {
                         deployment.service_name,
                         stage_number
                     );
-                    self.mark_deployment_failed(deployment, Some(err.to_string()))
+                    self.mark_deployment_failed(deployment, Some(service_error_detail(&err)))
                         .await?;
                     return Ok(());
                 }
@@ -1737,16 +1737,23 @@ impl ServiceController {
         failed_spec.update_strategy = deployment.update_strategy.clone();
         failed_spec.admission_policy = *deployment.admission_policy;
         failed_spec.previous_generation = None;
+        let detail = reason.and_then(normalize_service_status_detail);
         failed_spec.set_rollout(ServiceRolloutState {
-            last_error: reason,
+            last_error: detail.clone(),
             ..ServiceRolloutState::default()
         });
+        let task_ids_to_stop = failed_spec.replica_ids.clone();
         failed_spec.replica_ids.clear();
         failed_spec.set_status(ServiceStatus::Failed);
+        failed_spec.set_status_detail(detail);
         self.apply_upsert(failed_spec.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(failed_spec.clone()))
             .await?;
-        self.stop_tasks(&failed_spec).await;
+        if !task_ids_to_stop.is_empty() {
+            let mut stop_spec = failed_spec;
+            stop_spec.replica_ids = task_ids_to_stop;
+            self.stop_tasks(&stop_spec).await;
+        }
         Ok(())
     }
 

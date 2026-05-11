@@ -356,7 +356,12 @@ async fn poll_service_attempt(
             last_states.clear();
             last_phase_versions.clear();
             last_terminal_launches.clear();
-            if current.task_templates.is_empty() {
+            let expected_replicas: usize = current
+                .task_templates
+                .iter()
+                .map(|template| template.replicas as usize)
+                .sum();
+            if expected_replicas == 0 {
                 return ReadinessOutcome::Success(current);
             } else {
                 tracing::debug!(

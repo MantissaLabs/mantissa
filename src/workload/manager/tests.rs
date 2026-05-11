@@ -2021,6 +2021,45 @@ async fn committed_group_workload_rows_become_adoptable() {
 }
 
 #[tokio::test]
+async fn committed_group_reconcile_reacquires_free_slots_with_group_id() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec.clone()])
+        .await
+        .expect("init slots");
+
+    let group_id = Uuid::new_v4();
+    let mut spec = test_task_spec(&manager, "committed-gang-repair");
+    spec.slot_ids = vec![slot_spec.slot_id];
+    spec.slot_id = Some(slot_spec.slot_id);
+    spec.admission_group_id = Some(group_id);
+    spec.admission_state = WorkloadAdmissionState::GroupCommitted;
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    manager
+        .reconcile_local_task(spec.clone())
+        .await
+        .expect("committed group row should repair its reservation and start");
+
+    assert_eq!(mock_cm.created.lock().await.len(), 1);
+    let snapshot = scheduler.snapshot().await.expect("snapshot");
+    let slot = snapshot
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == slot_spec.slot_id)
+        .expect("slot present");
+    match &slot.state {
+        SlotState::Reserved(reservation) => {
+            assert_eq!(reservation.task_id, Some(spec.id));
+            assert_eq!(reservation.group_id, Some(group_id));
+        }
+        other => panic!("repaired group slot should be reserved, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn reconcile_uses_latest_persisted_slot_assignment() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 

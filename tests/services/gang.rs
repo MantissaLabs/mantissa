@@ -1,5 +1,6 @@
 use super::support::*;
 use crate::common;
+use mantissa::scheduler::placement::{PlacementConstraint, PlacementConstraintSelector};
 use mantissa::services::manager::ServiceDeploymentOptions;
 use mantissa::workload::model::WorkloadAdmissionState;
 use mantissa::workload::types::{WorkloadAdmissionMode, WorkloadAdmissionPolicy};
@@ -20,6 +21,14 @@ fn gang_deployment_options() -> ServiceDeploymentOptions {
     }
 }
 
+/// Constrains a task template to one node so tests can force local and remote admission paths.
+fn constrain_template_to_node(template: &mut TaskTemplateSpecValue, node_id: Uuid) {
+    template.execution.placement.constraints = vec![
+        PlacementConstraint::eq(PlacementConstraintSelector::NodeId, node_id.to_string())
+            .expect("node id placement constraint should be valid"),
+    ];
+}
+
 /// Lists every workload row owned by one service, including non-active rows.
 async fn list_service_workloads(node: &TestNode, service_name: &str) -> Vec<WorkloadSpec> {
     node.node
@@ -33,6 +42,26 @@ async fn list_service_workloads(node: &TestNode, service_name: &str) -> Vec<Work
                 .is_some_and(|owner| owner.service_name == service_name)
         })
         .collect()
+}
+
+/// Returns active service workloads on one node once the expected count has converged.
+async fn wait_for_active_service_workloads(
+    node: &TestNode,
+    service_name: &str,
+    expected_count: usize,
+) -> Vec<WorkloadSpec> {
+    let deadline = Instant::now() + SERVICE_WORKLOAD_WAIT_TIMEOUT;
+    loop {
+        let workloads = list_active_service_tasks(&node.node.workload_manager, service_name).await;
+        if workloads.len() == expected_count {
+            return workloads;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "service '{service_name}' should expose {expected_count} active workload row(s)"
+        );
+        sleep(SERVICE_WORKLOAD_POLL_INTERVAL).await;
+    }
 }
 
 /// Returns all service workloads once the expected count has appeared.
@@ -63,24 +92,59 @@ async fn wait_for_service_detail_containing(
 ) -> String {
     let deadline = Instant::now() + SERVICE_WORKLOAD_WAIT_TIMEOUT;
     loop {
-        if let Some(detail) = node
+        let observed = node
             .node
             .service_controller
             .registry()
             .get(service_id)
-            .expect("load service while waiting for detail")
-            .and_then(|spec| spec.status_detail)
-            && expected.iter().all(|part| detail.contains(part))
+            .expect("load service while waiting for detail");
+
+        if let Some(detail) = observed
+            .as_ref()
+            .and_then(|spec| spec.status_detail.as_ref())
+            && expected.iter().all(|part| detail.contains(*part))
         {
-            return detail;
+            return detail.clone();
         }
+
+        let observed_label = observed
+            .as_ref()
+            .map(|spec| format!("{:?} {:?}", spec.status(), spec.status_detail))
+            .unwrap_or_else(|| "missing service".to_string());
         assert!(
             Instant::now() < deadline,
-            "service {service_id} detail should contain {:?}",
-            expected
+            "service {service_id} detail should contain {:?}; last observed {observed_label}",
+            expected,
         );
         sleep(SERVICE_WORKLOAD_POLL_INTERVAL).await;
     }
+}
+
+/// Returns every scheduler slot reservation that still carries a gang admission group id.
+async fn group_slot_reservations(cluster: &[TestNode]) -> Vec<(Uuid, u64, Uuid)> {
+    let mut reservations = Vec::new();
+    for node in cluster {
+        let Some(snapshot) = node.node.scheduler.snapshot().await else {
+            continue;
+        };
+        for slot in &snapshot.slots {
+            if let SlotState::Reserved(reservation) = &slot.state
+                && let Some(group_id) = reservation.group_id
+            {
+                reservations.push((node.id(), slot.slot_id, group_id));
+            }
+        }
+    }
+    reservations.sort_unstable();
+    reservations
+}
+
+/// Waits until no scheduler slot in the cluster carries a gang admission group id.
+async fn wait_for_no_group_slot_reservations(cluster: &[TestNode], timeout: Duration) -> bool {
+    wait_until(timeout, SERVICE_WORKLOAD_POLL_INTERVAL, || async {
+        group_slot_reservations(cluster).await.is_empty()
+    })
+    .await
 }
 
 /// Waits until every gang task reservation has converged on its assigned node.
@@ -154,6 +218,55 @@ async fn wait_for_gang_reservations_on_assigned_nodes(
 }
 
 local_test!(
+    services_gang_zero_replica_deployment_runs_without_workloads,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+        let node = TestNode::new().await;
+        let service_name = "gang-empty";
+        let service_id = node
+            .node
+            .service_controller
+            .submit_deployment_with_options_outcome(
+                Uuid::new_v4(),
+                service_name,
+                service_name,
+                vec![demo_backend_task_template("api", 0)],
+                gang_deployment_options(),
+            )
+            .await
+            .expect("submit empty gang service deployment")
+            .service_id;
+
+        assert!(
+            wait_for_service_status(
+                &node.node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "zero-replica gang deployment should converge to running"
+        );
+
+        let spec = node
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("load empty gang service")
+            .expect("empty gang service should be persisted");
+        assert_eq!(spec.admission_policy.mode, WorkloadAdmissionMode::Gang);
+        assert!(
+            spec.replica_ids.is_empty(),
+            "zero-replica gang service should not record replicas"
+        );
+        assert!(
+            list_service_workloads(&node, service_name).await.is_empty(),
+            "zero-replica gang service should not create workload rows"
+        );
+    }
+);
+
+local_test!(
     services_gang_flat_deployment_commits_one_generation_group,
     {
         let _guard = RuntimeBackendOverrideGuard::install_default();
@@ -206,6 +319,50 @@ local_test!(
             .expect("load gang service")
             .expect("gang service should be persisted");
         assert_eq!(spec.admission_policy.mode, WorkloadAdmissionMode::Gang);
+    }
+);
+
+local_test!(
+    services_gang_unavailable_network_defers_before_group_prepare,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+        let node = TestNode::new().await;
+        let service_name = "gang-network-wait";
+        let missing_network_id = Uuid::new_v4();
+        let template = demo_networked_backend_task_template("api", 1, missing_network_id);
+
+        let service_id = node
+            .node
+            .service_controller
+            .submit_deployment_with_options_outcome(
+                Uuid::new_v4(),
+                service_name,
+                service_name,
+                vec![template],
+                gang_deployment_options(),
+            )
+            .await
+            .expect("submit network-blocked gang service deployment")
+            .service_id;
+
+        let detail = wait_for_service_detail_containing(
+            &node,
+            service_id,
+            &["waiting for network readiness"],
+        )
+        .await;
+        assert!(
+            detail.contains(&missing_network_id.to_string()[..8]),
+            "network readiness detail should identify the missing network: {detail}"
+        );
+        assert!(
+            list_service_workloads(&node, service_name).await.is_empty(),
+            "network-blocked gang deployment must not write workload rows before admission"
+        );
+        assert!(
+            wait_for_no_group_slot_reservations(&[node], Duration::from_secs(2)).await,
+            "network-blocked gang deployment must not prepare scheduler group reservations"
+        );
     }
 );
 
@@ -302,6 +459,103 @@ local_test!(
 );
 
 local_test!(
+    services_gang_blocked_pinned_target_leaves_no_partial_leases,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+
+        let cfg = ClusterConfig {
+            sync_tick_ms: Some(100),
+            gossip_tick_ms: Some(100),
+            gossip_fanout: Some(2),
+            ..ClusterConfig::default()
+        };
+        let cluster = TestNode::new_cluster_inproc_with_config(2, cfg)
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes")
+            .await;
+        assert!(
+            wait_for_cached_cluster_sessions_all(&cluster, DISTRIBUTED_GANG_WAIT_TIMEOUT).await,
+            "cluster sessions should be cached before distributed gang deployment"
+        );
+
+        let remote_slot_count = cluster[1]
+            .node
+            .scheduler
+            .snapshot()
+            .await
+            .expect("remote scheduler snapshot should exist")
+            .slots
+            .len();
+        let blocker_owner = Uuid::new_v4();
+        reserve_all_scheduler_slots(&cluster[1], blocker_owner).await;
+        assert!(
+            wait_for_reserved_slots(&cluster[1], remote_slot_count, Duration::from_secs(5)).await,
+            "remote target should have all local slots reserved by the blocker"
+        );
+
+        let service_name = "gang-blocked-target";
+        let mut local = demo_backend_task_template("local", 1);
+        constrain_template_to_node(&mut local, cluster[0].id());
+        let mut remote = demo_backend_task_template("remote", 1);
+        constrain_template_to_node(&mut remote, cluster[1].id());
+
+        let service_id = cluster[0]
+            .node
+            .service_controller
+            .submit_deployment_with_options_outcome(
+                Uuid::new_v4(),
+                service_name,
+                service_name,
+                vec![local, remote],
+                gang_deployment_options(),
+            )
+            .await
+            .expect("submit gang service with blocked remote target")
+            .service_id;
+
+        let detail = wait_for_service_detail_containing(
+            &cluster[0],
+            service_id,
+            &["gang admission failed", "unavailable"],
+        )
+        .await;
+        assert!(
+            detail.contains(service_name),
+            "blocked target detail should identify the service: {detail}"
+        );
+        assert!(
+            list_service_workloads(&cluster[0], service_name)
+                .await
+                .is_empty(),
+            "blocked pinned target must not leave local or remote workload rows"
+        );
+        assert!(
+            wait_for_no_group_slot_reservations(&cluster, DISTRIBUTED_GANG_WAIT_TIMEOUT).await,
+            "blocked pinned target must not leave prepared gang leases"
+        );
+
+        let remote_snapshot = cluster[1]
+            .node
+            .scheduler
+            .snapshot()
+            .await
+            .expect("remote scheduler snapshot should exist");
+        assert!(
+            remote_snapshot.slots.iter().all(|slot| {
+                matches!(
+                    &slot.state,
+                    SlotState::Reserved(reservation)
+                        if reservation.owner == blocker_owner
+                            && reservation.group_id.is_none()
+                )
+            }),
+            "blocked remote slots should remain owned only by the pre-existing blocker"
+        );
+    }
+);
+
+local_test!(
     services_gang_dependency_deployment_commits_one_group_per_stage,
     {
         let _guard = RuntimeBackendOverrideGuard::install_default();
@@ -363,6 +617,64 @@ local_test!(
                 workload.admission_state == WorkloadAdmissionState::GroupCommitted
             }),
             "every staged gang workload should be committed before adoption"
+        );
+    }
+);
+
+local_test!(
+    services_gang_dependency_stage_failure_leaves_no_active_partial_service,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+        let node = TestNode::new().await;
+        let service_name = "gang-staged-failure";
+        let backend = demo_backend_task_template("backend", 1);
+        let mut frontend = demo_backend_task_template("frontend", 1);
+        frontend.depends_on = vec!["backend".to_string()];
+        frontend.execution.cpu_millis = OVERCOMMITTED_CPU_MILLIS;
+        frontend.execution.memory_bytes = OVERCOMMITTED_MEMORY_BYTES;
+
+        let service_id = node
+            .node
+            .service_controller
+            .submit_deployment_with_options_outcome(
+                Uuid::new_v4(),
+                service_name,
+                service_name,
+                vec![backend, frontend],
+                gang_deployment_options(),
+            )
+            .await
+            .expect("submit staged gang deployment with blocked second stage")
+            .service_id;
+
+        let detail = wait_for_service_detail_containing(
+            &node,
+            service_id,
+            &["gang admission failed", "capacity"],
+        )
+        .await;
+        assert!(
+            detail.contains("dependency stage 2"),
+            "staged failure detail should identify the failed stage: {detail}"
+        );
+        assert!(
+            wait_for_service_status(
+                &node.node.service_controller,
+                service_id,
+                ServiceStatus::Failed
+            )
+            .await,
+            "failed second-stage gang deployment should mark the service failed"
+        );
+        assert!(
+            wait_for_active_service_workloads(&node, service_name, 0)
+                .await
+                .is_empty(),
+            "failed staged gang deployment must not leave a partial active service"
+        );
+        assert!(
+            wait_for_no_group_slot_reservations(&[node], DISTRIBUTED_GANG_WAIT_TIMEOUT).await,
+            "failed staged gang deployment must release committed stage reservations"
         );
     }
 );
