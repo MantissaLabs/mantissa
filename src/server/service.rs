@@ -202,7 +202,7 @@ impl Server {
         let issued_ticket = self
             .auth
             .sessions
-            .issue_ticket(joiner_id)
+            .get_or_issue_ticket(joiner_id)
             .map_err(|error| capnp::Error::failed(error.to_string()))?;
         let nonce = rand::try_nonce16().map_err(|error| capnp::Error::failed(error.to_string()))?;
 
@@ -395,7 +395,7 @@ impl mantissa_protocol::server::Server for Server {
         let issued_ticket = self
             .auth
             .sessions
-            .issue_ticket(cred.subject)
+            .get_or_issue_ticket(cred.subject)
             .map_err(|error| capnp::Error::failed(error.to_string()))?;
 
         let mut out = results.get();

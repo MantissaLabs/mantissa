@@ -39,3 +39,23 @@ fn auth_issue_lookup_revoke() {
     // Revoke non-existing should be fine (idempotent-ish)
     store.revoke_by_peer(peer).expect("revoke-non-existing");
 }
+
+#[test]
+fn auth_get_or_issue_reuses_active_peer_ticket() {
+    let tmp = temp_db_dir();
+    let db_path = tmp.path().join("state.redb");
+    let db = temp_db(&db_path);
+
+    let store = AuthStore::new(db.clone()).expect("open");
+    let peer = Uuid::new_v4();
+
+    let first = store.get_or_issue_ticket(peer).expect("first ticket");
+    let second = store.get_or_issue_ticket(peer).expect("second ticket");
+
+    assert_eq!(first, second);
+    assert_eq!(
+        store.lookup(&first.ticket).expect("lookup"),
+        Some(peer),
+        "reused ticket should remain valid for the peer"
+    );
+}

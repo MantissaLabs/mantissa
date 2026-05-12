@@ -318,6 +318,19 @@ impl Topology {
         self.deps.registry.attach_handle_only(id, handle).await;
     }
 
+    /// Attach a server handle and cluster session returned by a successful join.
+    pub async fn attach_handle_and_session(
+        &self,
+        id: Uuid,
+        handle: server::Client,
+        session: server::cluster_session::Client,
+    ) {
+        self.deps
+            .registry
+            .attach_handle_and_session(id, handle, session)
+            .await;
+    }
+
     /// Best-effort resume of sessions stored locally (tickets) after restart.
     /// For each stored (peer, ticket):
     ///  - look up the peer's current address from the persisted peers store,

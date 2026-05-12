@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 type PeerEntry = Arc<AsyncMutex<PeerState>>;
 type CapabilityMap = Arc<RwLock<HashMap<Uuid, PeerEntry>>>;
+type SessionGateMap = Arc<AsyncMutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>>;
 type ReconnectGateMap = Arc<AsyncMutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>>;
 type ReconnectStateMap = Arc<AsyncMutex<HashMap<Uuid, PeerReconnectState>>>;
 type InvalidationStatsMap = Arc<AsyncMutex<HashMap<(Uuid, String), u64>>>;
@@ -105,6 +106,7 @@ impl PeerState {
 #[derive(Clone)]
 pub struct Registry {
     cache: CapabilityMap,
+    session_gates: SessionGateMap,
     reconnect_gates: ReconnectGateMap,
     reconnect_state: ReconnectStateMap,
     invalidation_stats: InvalidationStatsMap,
@@ -181,6 +183,7 @@ impl Registry {
     ) -> Self {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
+            session_gates: Arc::new(AsyncMutex::new(HashMap::new())),
             reconnect_gates: Arc::new(AsyncMutex::new(HashMap::new())),
             reconnect_state: Arc::new(AsyncMutex::new(HashMap::new())),
             invalidation_stats: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -212,8 +215,25 @@ impl Registry {
         state.replace_server(handle);
     }
 
+    /// Attaches a peer server handle and an already-minted cluster session atomically.
+    ///
+    /// Join receives a usable session in the register response, so caching both handles before
+    /// background sync starts avoids redundant credential bootstrap and ticket churn.
+    pub async fn attach_handle_and_session(
+        &self,
+        id: Uuid,
+        handle: server::Client,
+        session: cluster_session::Client,
+    ) {
+        let entry = self.ensure_entry(id).await;
+        let mut state = entry.lock().await;
+        state.replace_server(handle);
+        state.replace_session(session);
+    }
+
     pub async fn remove_peer(&self, id: Uuid) {
         self.cache.write().await.remove(&id);
+        self.session_gates.lock().await.remove(&id);
         self.reconnect_gates.lock().await.remove(&id);
         self.reconnect_state.lock().await.remove(&id);
         self.invalidation_stats
@@ -228,6 +248,7 @@ impl Registry {
 
     pub async fn clear(&self) {
         self.cache.write().await.clear();
+        self.session_gates.lock().await.clear();
         self.reconnect_gates.lock().await.clear();
         self.reconnect_state.lock().await.clear();
         self.invalidation_stats.lock().await.clear();
@@ -273,6 +294,14 @@ impl Registry {
                 .write()
                 .await
                 .retain(|peer_id, _| !empty_entries.contains(peer_id));
+            self.session_gates
+                .lock()
+                .await
+                .retain(|peer_id, _| !empty_entries.contains(peer_id));
+            self.reconnect_gates
+                .lock()
+                .await
+                .retain(|peer_id, _| !empty_entries.contains(peer_id));
         }
 
         if max_entries == 0 {
@@ -309,6 +338,14 @@ impl Registry {
         if !to_remove.is_empty() {
             self.cache
                 .write()
+                .await
+                .retain(|peer_id, _| !to_remove.contains(peer_id));
+            self.session_gates
+                .lock()
+                .await
+                .retain(|peer_id, _| !to_remove.contains(peer_id));
+            self.reconnect_gates
+                .lock()
                 .await
                 .retain(|peer_id, _| !to_remove.contains(peer_id));
         }
@@ -930,9 +967,21 @@ impl Registry {
         else {
             return Ok(None);
         };
-        if !Self::session_matches_view(&session, expected_view).await? {
-            self.invalidate_peer(peer_id, &entry).await;
-            return Ok(None);
+        match Self::session_matches_view(&session, expected_view).await {
+            Ok(true) => {}
+            Ok(false) => {
+                self.invalidate_peer(peer_id, &entry).await;
+                return Ok(None);
+            }
+            Err(err) => {
+                self.invalidate_peer(peer_id, &entry).await;
+                debug!(
+                    target: "sync",
+                    peer = %peer_id,
+                    "session view probe failed, deferring sync retry: {err}"
+                );
+                return Ok(None);
+            }
         }
 
         match Self::fetch_sync_from_session(&session).await {
@@ -1070,9 +1119,21 @@ impl Registry {
         else {
             return Ok(None);
         };
-        if !Self::session_matches_view(&session, expected_view).await? {
-            self.invalidate_peer(peer_id, &entry).await;
-            return Ok(None);
+        match Self::session_matches_view(&session, expected_view).await {
+            Ok(true) => {}
+            Ok(false) => {
+                self.invalidate_peer(peer_id, &entry).await;
+                return Ok(None);
+            }
+            Err(err) => {
+                self.invalidate_peer(peer_id, &entry).await;
+                debug!(
+                    target: "health",
+                    peer = %peer_id,
+                    "session view probe failed, deferring health retry: {err}"
+                );
+                return Ok(None);
+            }
         }
 
         match Self::fetch_health_from_session(&session).await {
@@ -1140,9 +1201,21 @@ impl Registry {
         else {
             return Ok(None);
         };
-        if !Self::session_matches_view(&session, expected_view).await? {
-            self.invalidate_peer(peer_id, &entry).await;
-            return Ok(None);
+        match Self::session_matches_view(&session, expected_view).await {
+            Ok(true) => {}
+            Ok(false) => {
+                self.invalidate_peer(peer_id, &entry).await;
+                return Ok(None);
+            }
+            Err(err) => {
+                self.invalidate_peer(peer_id, &entry).await;
+                debug!(
+                    target: "gossip",
+                    peer = %peer_id,
+                    "session view probe failed, deferring gossip retry: {err}"
+                );
+                return Ok(None);
+            }
         }
 
         match Self::fetch_gossip_from_session(&session).await {
@@ -1286,6 +1359,9 @@ impl Registry {
         strategy: SessionStrategy,
         allow_excluded: bool,
     ) -> Option<cluster_session::Client> {
+        let gate = self.session_gate(peer_id).await;
+        let _guard = gate.lock().await;
+
         if let Some(session) = self.cached_session(entry).await {
             return Some(session);
         }
@@ -1320,6 +1396,17 @@ impl Registry {
     async fn invalidate_peer(&self, _peer_id: Uuid, entry: &PeerEntry) {
         let mut state = entry.lock().await;
         state.clear_session();
+    }
+
+    /// # Description:
+    ///
+    /// Returns the per-peer session acquisition gate, creating it lazily when needed.
+    async fn session_gate(&self, peer_id: Uuid) -> Arc<AsyncMutex<()>> {
+        let mut gates = self.session_gates.lock().await;
+        gates
+            .entry(peer_id)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 
     /// # Description:

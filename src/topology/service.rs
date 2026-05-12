@@ -664,7 +664,7 @@ impl topology::Server for Topology {
 
         self.swim_record_join(response.peer_id, response.peer_incarnation);
 
-        self.attach_handle_only(response.peer_id, anchor_handle)
+        self.attach_handle_and_session(response.peer_id, anchor_handle, response.session.clone())
             .await;
 
         let sync_cap = {

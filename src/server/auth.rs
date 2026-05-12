@@ -166,6 +166,88 @@ impl AuthStore {
         })
     }
 
+    /// Return the current non-expired ticket for `peer`, issuing one only when needed.
+    ///
+    /// Peer session bootstrap can be requested concurrently by sync, gossip, and join catch-up.
+    /// Reusing the current ticket keeps session creation idempotent while preserving the
+    /// one-active-ticket-per-peer authority model.
+    pub fn get_or_issue_ticket(&self, peer: Uuid) -> io::Result<IssuedSessionTicket> {
+        let now = now_secs()?;
+        let w = self.db.begin_write().map_err(ioerr)?;
+        let mut replaced_expired = false;
+        let previous_ticket = {
+            let rev = w.open_table(T_REVERSE).map_err(ioerr)?;
+            rev.get(*peer.as_bytes())
+                .map_err(ioerr)?
+                .map(|guard| guard.value().to_vec())
+        };
+
+        if let Some(ticket) = previous_ticket.as_ref() {
+            let current = {
+                let fwd = w.open_table(T_TICKETS).map_err(ioerr)?;
+                fwd.get(ticket.as_slice())
+                    .map_err(ioerr)?
+                    .map(|guard| TicketRecord::decode(guard.value()))
+                    .transpose()?
+            };
+
+            if let Some(record) = current {
+                if record.peer == peer && !record.is_expired(now) {
+                    w.commit().map_err(ioerr)?;
+                    crate::observability::metrics::record_session_ticket_event("reused");
+                    return Ok(IssuedSessionTicket {
+                        ticket: ticket.clone(),
+                        expires_at_unix_secs: record.expires_at,
+                    });
+                }
+
+                if record.peer == peer || record.is_expired(now) {
+                    let mut fwd = w.open_table(T_TICKETS).map_err(ioerr)?;
+                    let _ = fwd.remove(ticket.as_slice()).map_err(ioerr)?;
+                    if record.peer == peer && record.is_expired(now) {
+                        replaced_expired = true;
+                    }
+                }
+            }
+
+            let mut rev = w.open_table(T_REVERSE).map_err(ioerr)?;
+            let _ = rev.remove(*peer.as_bytes()).map_err(ioerr)?;
+        }
+
+        let ticket = rand::random_vec(32)?;
+        let expires_at = now
+            .checked_add(self.ticket_ttl_secs)
+            .ok_or_else(|| io::Error::other("session ticket expiry overflow"))?;
+        let record = TicketRecord {
+            peer,
+            issued_at: now,
+            expires_at,
+        };
+        let record_bytes = record.encode();
+
+        {
+            let mut fwd = w.open_table(T_TICKETS).map_err(ioerr)?;
+            fwd.insert(ticket.as_slice(), record_bytes.as_slice())
+                .map_err(ioerr)?;
+        }
+        {
+            let mut rev = w.open_table(T_REVERSE).map_err(ioerr)?;
+            rev.insert(*peer.as_bytes(), ticket.as_slice())
+                .map_err(ioerr)?;
+        }
+
+        w.commit().map_err(ioerr)?;
+
+        if replaced_expired {
+            crate::observability::metrics::record_session_ticket_event("expired");
+        }
+        crate::observability::metrics::record_session_ticket_event("issued");
+        Ok(IssuedSessionTicket {
+            ticket,
+            expires_at_unix_secs: expires_at,
+        })
+    }
+
     /// Resolve a non-expired ticket to its peer UUID.
     pub fn lookup(&self, ticket: &[u8]) -> io::Result<Option<Uuid>> {
         let Some(record) = self.load_ticket_record(ticket)? else {
@@ -338,6 +420,19 @@ mod tests {
         w.commit().map_err(ioerr).expect("commit");
     }
 
+    /// Insert only a reverse index row so stale-index repair can be tested directly.
+    fn insert_reverse_ticket(store: &AuthStore, peer: Uuid, ticket: &[u8]) {
+        let w = store.db.begin_write().map_err(ioerr).expect("begin write");
+        {
+            let mut reverse = w.open_table(T_REVERSE).map_err(ioerr).expect("reverse");
+            reverse
+                .insert(*peer.as_bytes(), ticket)
+                .map_err(ioerr)
+                .expect("insert reverse");
+        }
+        w.commit().map_err(ioerr).expect("commit");
+    }
+
     #[test]
     fn lookup_rejects_and_purges_expired_ticket() {
         let (store, _dir) = temp_store(60);
@@ -369,6 +464,86 @@ mod tests {
         assert_eq!(
             store.lookup(&second.ticket).expect("new lookup"),
             Some(peer)
+        );
+    }
+
+    #[test]
+    fn get_or_issue_ticket_reuses_current_ticket_for_peer() {
+        let (store, _dir) = temp_store(60);
+        let peer = Uuid::new_v4();
+
+        let first = store.get_or_issue_ticket(peer).expect("first ticket");
+        let second = store.get_or_issue_ticket(peer).expect("second ticket");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            store.lookup(&first.ticket).expect("lookup reused ticket"),
+            Some(peer)
+        );
+    }
+
+    #[test]
+    fn get_or_issue_ticket_replaces_expired_current_ticket_for_peer() {
+        let (store, _dir) = temp_store(60);
+        let peer = Uuid::new_v4();
+        let ticket = b"expired-ticket";
+        let now = now_secs().expect("now");
+        insert_ticket_record(
+            &store,
+            ticket,
+            TicketRecord {
+                peer,
+                issued_at: now.saturating_sub(120),
+                expires_at: now.saturating_sub(1),
+            },
+        );
+
+        let issued = store.get_or_issue_ticket(peer).expect("replacement ticket");
+
+        assert_ne!(issued.ticket, ticket);
+        assert!(
+            store
+                .load_ticket_record(ticket)
+                .expect("old load")
+                .is_none()
+        );
+        assert_eq!(
+            store.lookup(&issued.ticket).expect("new lookup"),
+            Some(peer)
+        );
+    }
+
+    #[test]
+    fn get_or_issue_ticket_repairs_stale_reverse_without_removing_other_peer_ticket() {
+        let (store, _dir) = temp_store(60);
+        let owner = Uuid::new_v4();
+        let stale_peer = Uuid::new_v4();
+        let ticket = b"owned-ticket";
+        let now = now_secs().expect("now");
+        insert_ticket_record(
+            &store,
+            ticket,
+            TicketRecord {
+                peer: owner,
+                issued_at: now,
+                expires_at: now.saturating_add(60),
+            },
+        );
+        insert_reverse_ticket(&store, stale_peer, ticket);
+
+        let issued = store
+            .get_or_issue_ticket(stale_peer)
+            .expect("replacement ticket");
+
+        assert_ne!(issued.ticket, ticket);
+        assert_eq!(
+            store.lookup(ticket).expect("owner lookup"),
+            Some(owner),
+            "repairing a stale reverse row must not delete another peer's live ticket"
+        );
+        assert_eq!(
+            store.lookup(&issued.ticket).expect("stale peer lookup"),
+            Some(stale_peer)
         );
     }
 }
