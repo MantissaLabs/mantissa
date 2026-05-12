@@ -4732,6 +4732,77 @@ async fn start_workloads_gang_runtime_failure_after_commit_cleans_local_reservat
             .all(|slot| matches!(slot.state, SlotState::Free)),
         "local cleanup should release the committed group reservation"
     );
+    assert!(
+        manager
+            .list_workloads(&TaskStateFilter::all())
+            .await
+            .expect("list workloads")
+            .is_empty(),
+        "local cleanup should remove failed group workload rows"
+    );
+}
+
+#[tokio::test]
+async fn rollback_committed_gang_group_releases_local_reservation_and_rows() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let group_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    let prepared = scheduler
+        .prepare_task_lease_group(
+            manager.local_node_id,
+            group_id,
+            DEFAULT_PREPARED_LEASE_TTL_MS,
+            vec![TaskLeaseIntent {
+                task_id,
+                cpu_millis: 100,
+                memory_bytes: 64 * 1_024 * 1_024,
+                gpu_count: 0,
+            }],
+        )
+        .await
+        .expect("prepare group lease");
+    scheduler
+        .commit_task_lease_group(group_id, manager.local_node_id, &prepared.leases)
+        .await
+        .expect("commit group lease");
+
+    let mut spec = test_task_spec(&manager, "rollback-committed-gang");
+    spec.id = task_id;
+    spec.slot_ids = prepared.leases[0].slot_ids.clone();
+    spec.slot_id = spec.slot_ids.first().copied();
+    spec.admission_group_id = Some(group_id);
+    spec.admission_state = WorkloadAdmissionState::GroupCommitted;
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    manager
+        .rollback_committed_gang_group(group_id, &HashMap::new(), &[], std::slice::from_ref(&spec))
+        .await;
+
+    let snapshot = scheduler.snapshot().await.expect("snapshot");
+    assert!(
+        snapshot
+            .slots
+            .iter()
+            .all(|slot| matches!(slot.state, SlotState::Free)),
+        "committed group rollback should release scheduler reservations"
+    );
+    assert!(
+        manager
+            .list_workloads(&TaskStateFilter::all())
+            .await
+            .expect("list workloads")
+            .is_empty(),
+        "committed group rollback should remove workload rows"
+    );
 }
 
 #[tokio::test]

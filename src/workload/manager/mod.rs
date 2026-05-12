@@ -62,7 +62,8 @@ mod tests;
 use self::planner::{RemoteStartPlan, SchedulingError};
 use self::remote_advisory::RemotePrepareFeedbackRegistry;
 use self::reservation::{
-    DEFAULT_PREPARED_LEASE_TTL_MS, ExecutionError, RemoteReservation, ReservedResources,
+    DEFAULT_PREPARED_LEASE_TTL_MS, ExecutionError, RemoteGroupReservation, RemoteReservation,
+    ReservedResources,
 };
 
 #[cfg(test)]
@@ -826,26 +827,57 @@ impl WorkloadManager {
             }
 
             let mut committed_remote_specs = remote_specs;
-            self.mark_group_specs_committed(&mut committed_remote_specs)
-                .await?;
+            if let Err(err) = self
+                .mark_group_specs_committed(&mut committed_remote_specs)
+                .await
+            {
+                self.rollback_committed_gang_group(
+                    group_id,
+                    &remote_reservations,
+                    &committed_remote_specs,
+                    &local_pending_specs,
+                )
+                .await;
+                remote_reservations.clear();
+                return Err(err);
+            }
             let local_plan_indexes = local_plans
                 .iter()
                 .map(|plan| (plan.id, plan.index))
                 .collect::<HashMap<_, _>>();
-            let mut committed_local_specs: Vec<(usize, WorkloadSpec)> = local_pending_specs
-                .into_iter()
-                .map(|spec| {
-                    let index = local_plan_indexes.get(&spec.id).copied().ok_or_else(|| {
-                        anyhow!(
-                            "missing local gang plan index for pending workload {}",
-                            spec.id
-                        )
-                    })?;
-                    Ok((index, spec))
-                })
-                .collect::<Result<_, anyhow::Error>>()?;
-            self.mark_group_specs_committed(&mut committed_local_specs)
-                .await?;
+            let mut committed_local_specs = Vec::with_capacity(local_pending_specs.len());
+            for spec in &local_pending_specs {
+                let Some(index) = local_plan_indexes.get(&spec.id).copied() else {
+                    let err = anyhow!(
+                        "missing local gang plan index for pending workload {}",
+                        spec.id
+                    );
+                    self.rollback_committed_gang_group(
+                        group_id,
+                        &remote_reservations,
+                        &committed_remote_specs,
+                        &local_pending_specs,
+                    )
+                    .await;
+                    remote_reservations.clear();
+                    return Err(err);
+                };
+                committed_local_specs.push((index, spec.clone()));
+            }
+            if let Err(err) = self
+                .mark_group_specs_committed(&mut committed_local_specs)
+                .await
+            {
+                self.rollback_committed_gang_group(
+                    group_id,
+                    &remote_reservations,
+                    &committed_remote_specs,
+                    &local_pending_specs,
+                )
+                .await;
+                remote_reservations.clear();
+                return Err(err);
+            }
 
             match self
                 .start_local_group_instances(group_id, &mut local_plans)
@@ -873,7 +905,13 @@ impl WorkloadManager {
                         target: "task",
                         "local gang execution failed after group {group_id} commit; rolling back remote tasks: {err}"
                     );
-                    self.signal_remote_stop(&committed_remote_specs).await;
+                    self.rollback_committed_gang_group(
+                        group_id,
+                        &remote_reservations,
+                        &committed_remote_specs,
+                        &local_pending_specs,
+                    )
+                    .await;
                     remote_reservations.clear();
                     return Err(err);
                 }
@@ -901,6 +939,23 @@ impl WorkloadManager {
                 );
             }
         }
+    }
+
+    /// Rolls back a group after scheduler commit when workload publication or local launch fails.
+    async fn rollback_committed_gang_group(
+        &self,
+        group_id: Uuid,
+        remote_reservations: &HashMap<Uuid, RemoteGroupReservation>,
+        remote_specs: &[(usize, WorkloadSpec)],
+        local_specs: &[WorkloadSpec],
+    ) {
+        self.signal_remote_stop(remote_specs).await;
+        self.abort_remote_lease_groups(group_id, remote_reservations)
+            .await;
+        self.abort_local_lease_group(group_id).await;
+        self.remove_group_specs(remote_specs.iter().map(|(_, spec)| spec))
+            .await;
+        self.remove_group_specs(local_specs.iter()).await;
     }
 
     /// Marks pending group specs as committed and clears task-local lease metadata.

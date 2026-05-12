@@ -1222,7 +1222,7 @@ mod tests {
             manifest.task_templates[0].image,
             "hashicorp/http-echo:1.0.0"
         );
-        assert_eq!(manifest.task_templates[0].replicas, 3);
+        assert_eq!(manifest.task_templates[0].replicas, 20);
 
         manifest
             .validate()

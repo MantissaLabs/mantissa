@@ -951,6 +951,33 @@ impl Scheduler {
         expired.into_iter().collect()
     }
 
+    /// Releases uncommitted leases for one admission group before replacing its prepare attempt.
+    fn clear_prepared_lease_group(snapshot: &mut SchedulerSnapshot, group_id: Uuid) {
+        for slot in &mut snapshot.slots {
+            if matches!(
+                &slot.state,
+                SlotState::Leased(LeaseReservation {
+                    group_id: Some(existing),
+                    ..
+                }) if *existing == group_id
+            ) {
+                slot.state = SlotState::Free;
+            }
+        }
+
+        for device in &mut snapshot.gpu_devices {
+            if matches!(
+                &device.state,
+                GpuDeviceState::Leased(LeaseReservation {
+                    group_id: Some(existing),
+                    ..
+                }) if *existing == group_id
+            ) {
+                device.state = GpuDeviceState::Free;
+            }
+        }
+    }
+
     /// Selects the free slot indices visible after expired prepared leases have been reclaimed.
     fn free_slot_indices(snapshot: &SchedulerSnapshot) -> Vec<usize> {
         snapshot
@@ -1561,6 +1588,7 @@ impl Scheduler {
             let mut new_snapshot = current.snapshot.clone();
             let now_unix_ms = current_unix_ms();
             Self::clear_expired_leases(&mut new_snapshot, now_unix_ms);
+            Self::clear_prepared_lease_group(&mut new_snapshot, group_id);
 
             let slot_capacity = intents.iter().map(|intent| intent.slot_ids.len()).sum();
             let gpu_capacity = intents
@@ -1768,6 +1796,9 @@ impl Scheduler {
             let mut new_snapshot = current.snapshot.clone();
             let now_unix_ms = current_unix_ms();
             Self::clear_expired_leases(&mut new_snapshot, now_unix_ms);
+            if let Some(group_id) = group_id {
+                Self::clear_prepared_lease_group(&mut new_snapshot, group_id);
+            }
             let expires_at_unix_ms = now_unix_ms.saturating_add(ttl_ms);
             let mut free_slot_indices = Self::free_slot_indices(&new_snapshot);
             let mut free_gpu_indices = Self::free_gpu_indices(&new_snapshot);
@@ -3411,6 +3442,181 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn prepare_task_lease_group_replaces_stale_same_group_leases() {
+        let (scheduler, _dir) = make_scheduler().await;
+        scheduler
+            .init_resources(
+                [SlotSpec::new(
+                    1,
+                    SlotCapacity::new(500, 512 * 1024 * 1024, 0),
+                )],
+                [GpuDeviceSpec::new(
+                    "gpu-a",
+                    0,
+                    Some("gpu-a".to_string()),
+                    Some("0000:01:00.0".to_string()),
+                    "GPU A",
+                    16 * 1024 * 1024 * 1024,
+                )],
+            )
+            .await
+            .unwrap();
+
+        let coordinator = Uuid::new_v4();
+        let group_id = Uuid::new_v4();
+        let first_task = Uuid::new_v4();
+        let first = scheduler
+            .prepare_task_lease_group(
+                coordinator,
+                group_id,
+                30_000,
+                vec![TaskLeaseIntent {
+                    task_id: first_task,
+                    cpu_millis: 500,
+                    memory_bytes: 512 * 1024 * 1024,
+                    gpu_count: 1,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let second_task = Uuid::new_v4();
+        let second = scheduler
+            .prepare_task_lease_group(
+                coordinator,
+                group_id,
+                30_000,
+                vec![TaskLeaseIntent {
+                    task_id: second_task,
+                    cpu_millis: 500,
+                    memory_bytes: 512 * 1024 * 1024,
+                    gpu_count: 1,
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(first.leases[0].lease_id, second.leases[0].lease_id);
+        assert_eq!(second.leases[0].task_id, second_task);
+        assert_eq!(second.leases[0].gpu_device_ids, vec!["gpu-a".to_string()]);
+
+        let err = scheduler
+            .commit_task_lease_group(group_id, coordinator, &first.leases)
+            .await
+            .expect_err("superseded group leases must not commit");
+        match err {
+            SchedulerError::LeaseGroupMismatch { snapshot, .. } => {
+                assert_eq!(snapshot.version, 2);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let snapshot = scheduler
+            .commit_task_lease_group(group_id, coordinator, &second.leases)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.version, 3);
+        assert!(matches!(
+            &snapshot.slots[0].state,
+            SlotState::Reserved(SlotReservation {
+                task_id: Some(task_id),
+                group_id: Some(reservation_group_id),
+                ..
+            }) if *task_id == second_task && *reservation_group_id == group_id
+        ));
+        assert!(matches!(
+            &snapshot.gpu_devices[0].state,
+            GpuDeviceState::Reserved(GpuDeviceReservation {
+                task_id: Some(task_id),
+                group_id: Some(reservation_group_id),
+                ..
+            }) if *task_id == second_task && *reservation_group_id == group_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepare_exact_task_lease_group_replaces_stale_same_group_leases() {
+        let (scheduler, _dir) = make_scheduler().await;
+        scheduler
+            .init_resources(
+                [SlotSpec::new(
+                    1,
+                    SlotCapacity::new(500, 512 * 1024 * 1024, 0),
+                )],
+                [GpuDeviceSpec::new(
+                    "gpu-a",
+                    0,
+                    Some("gpu-a".to_string()),
+                    Some("0000:01:00.0".to_string()),
+                    "GPU A",
+                    16 * 1024 * 1024 * 1024,
+                )],
+            )
+            .await
+            .unwrap();
+
+        let coordinator = Uuid::new_v4();
+        let group_id = Uuid::new_v4();
+        let first_task = Uuid::new_v4();
+        let first = scheduler
+            .prepare_exact_task_lease_group(
+                0,
+                coordinator,
+                group_id,
+                30_000,
+                vec![ExactTaskLeaseIntent {
+                    task_id: first_task,
+                    slot_ids: vec![1],
+                    gpu_device_ids: vec!["gpu-a".to_string()],
+                }],
+            )
+            .await
+            .unwrap();
+
+        let second_task = Uuid::new_v4();
+        let second = scheduler
+            .prepare_exact_task_lease_group(
+                1,
+                coordinator,
+                group_id,
+                30_000,
+                vec![ExactTaskLeaseIntent {
+                    task_id: second_task,
+                    slot_ids: vec![1],
+                    gpu_device_ids: vec!["gpu-a".to_string()],
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(first.leases[0].lease_id, second.leases[0].lease_id);
+        assert_eq!(second.leases[0].task_id, second_task);
+        assert_eq!(second.leases[0].gpu_device_ids, vec!["gpu-a".to_string()]);
+
+        let snapshot = scheduler
+            .commit_task_lease_group(group_id, coordinator, &second.leases)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.version, 3);
+        assert!(matches!(
+            &snapshot.slots[0].state,
+            SlotState::Reserved(SlotReservation {
+                task_id: Some(task_id),
+                group_id: Some(reservation_group_id),
+                ..
+            }) if *task_id == second_task && *reservation_group_id == group_id
+        ));
+        assert!(matches!(
+            &snapshot.gpu_devices[0].state,
+            GpuDeviceState::Reserved(GpuDeviceReservation {
+                task_id: Some(task_id),
+                group_id: Some(reservation_group_id),
+                ..
+            }) if *task_id == second_task && *reservation_group_id == group_id
+        ));
     }
 
     #[tokio::test]
