@@ -1,0 +1,28 @@
+(
+    name: "gang-demo",
+    admission: (
+        mode: gang,
+    ),
+    tasks: [
+        (
+            name: "api",
+            image: "hashicorp/http-echo:1.0.0",
+            command: [
+                "-listen",
+                ":8000",
+                "-text",
+                "hello from a gang-admitted Mantissa replica",
+            ],
+            replicas: 20,
+            resources: (
+                cpu_millis: 200,
+                memory_mb: 128,
+            ),
+            readiness: Some((
+                kind: http,
+                port: 8000,
+                path: Some("/"),
+            )),
+        ),
+    ],
+)

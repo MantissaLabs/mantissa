@@ -21,6 +21,7 @@ mantissa services run examples/replicated_service.ron
 separately.
 
 This manifest defines two task entries:
+
 - `echo` runs two replicas of a simple Alpine container emitting log lines with a 500m CPU / 128MiB request.
 - `api` runs a single nginx replica requesting 300m CPU / 256MiB of memory.
 
@@ -47,6 +48,27 @@ This manifest shows the full `update.rolling` surface:
 - `auto_rollback`
 
 See `docs/service-rollouts.md` for field semantics and defaults.
+
+## Deploy the gang admission example
+
+```sh
+mantissa services run examples/gang_service.ron
+```
+
+This manifest opts the service into workload `gang` admission and starts
+twenty replicas of the public `hashicorp/http-echo:1.0.0` image. The controller
+admits the replicas as one service-generation group: either all twenty replicas
+receive scheduler reservations and become runnable together, or the deployment
+fails without leaving partial service workload rows. If you increase the number
+of replicas beyond the resources and slots available on the cluster, the deployment
+will fail without leaving partial service workload rows.
+
+Use it as a quick smoke check after starting a local cluster:
+
+```sh
+mantissa services list
+mantissa tasks list
+```
 
 ## Submit a simple finite job
 

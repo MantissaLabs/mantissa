@@ -1209,6 +1209,27 @@ mod tests {
     }
 
     #[test]
+    fn gang_service_example_manifest_is_runnable() {
+        let manifest =
+            load_manifest_from_path(&example_manifest("gang_service.ron")).expect("manifest");
+
+        assert!(matches!(
+            manifest.admission.mode,
+            WorkloadAdmissionMode::Gang
+        ));
+        assert_eq!(manifest.task_templates.len(), 1);
+        assert_eq!(
+            manifest.task_templates[0].image,
+            "hashicorp/http-echo:1.0.0"
+        );
+        assert_eq!(manifest.task_templates[0].replicas, 3);
+
+        manifest
+            .validate()
+            .expect("gang service example should validate");
+    }
+
+    #[test]
     fn service_manifest_deserializes_tasks_field() {
         let manifest: ServiceManifest = ron::from_str(
             r#"
