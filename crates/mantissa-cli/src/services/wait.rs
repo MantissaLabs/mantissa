@@ -62,14 +62,15 @@ pub(super) async fn follow_deployment(
                     }
                 };
 
-                match classify_deployment(&row, handle) {
+                match classify_deployment(&row, handle, last_row.as_ref()) {
                     DeploymentState::Succeeded => {
                         renderer.render_final(&row)?;
                         output::emit_line(format!("service {} deployment complete", row.service_name));
                         return Ok(());
                     }
                     DeploymentState::Failed(reason) => {
-                        renderer.render_final(&row)?;
+                        let final_row = row_with_failure_detail_fallback(&row, last_row.as_ref());
+                        renderer.render_final(&final_row)?;
                         output::emit_line(format!(
                             "inspect rollout: mantissa services rollout status {}",
                             handle.service_id
@@ -94,7 +95,7 @@ pub(super) async fn follow_deployment(
                         "timed out waiting for service '{}' deployment after {}; last observed: {}",
                         row.service_name,
                         format_duration(timeout),
-                        render_last_observed(&row)
+                        render_last_observed(&row, last_row.as_ref())
                     ));
                 }
 
@@ -119,7 +120,11 @@ enum DeploymentState {
 }
 
 /// Classifies the current service row against the submitted deployment generation.
-fn classify_deployment(row: &ServiceRow, handle: &ServiceDeploymentHandle) -> DeploymentState {
+fn classify_deployment(
+    row: &ServiceRow,
+    handle: &ServiceDeploymentHandle,
+    previous: Option<&ServiceRow>,
+) -> DeploymentState {
     if row.manifest_id == handle.manifest_id && row.status == ServiceStatusRow::Running {
         return DeploymentState::Succeeded;
     }
@@ -129,31 +134,30 @@ fn classify_deployment(row: &ServiceRow, handle: &ServiceDeploymentHandle) -> De
             "submitted manifest {} was superseded by manifest {}; {}",
             handle.manifest_id,
             row.manifest_id,
-            failure_detail(row).unwrap_or("the requested generation did not reach running")
+            failure_detail_with_fallback(row, previous)
+                .as_deref()
+                .unwrap_or("the requested generation did not reach running")
         ));
     }
 
     if row.status == ServiceStatusRow::Failed {
         return DeploymentState::Failed(
-            failure_detail(row)
-                .unwrap_or("service reached failed status")
-                .to_string(),
+            failure_detail_with_fallback(row, previous)
+                .unwrap_or_else(|| "service reached failed status".to_string()),
         );
     }
 
     if row.rollout.phase == ServiceRolloutPhaseRow::Failed {
         return DeploymentState::Failed(
-            failure_detail(row)
-                .unwrap_or("service rollout reached failed phase")
-                .to_string(),
+            failure_detail_with_fallback(row, previous)
+                .unwrap_or_else(|| "service rollout reached failed phase".to_string()),
         );
     }
 
     if row.status == ServiceStatusRow::Stopped {
         return DeploymentState::Failed(
-            failure_detail(row)
-                .unwrap_or("service stopped before deployment completed")
-                .to_string(),
+            failure_detail_with_fallback(row, previous)
+                .unwrap_or_else(|| "service stopped before deployment completed".to_string()),
         );
     }
 
@@ -173,6 +177,24 @@ fn failure_detail(row: &ServiceRow) -> Option<&str> {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
         })
+}
+
+/// Returns the current failure detail, falling back to the previous progress row when terminal state is sparse.
+fn failure_detail_with_fallback(row: &ServiceRow, previous: Option<&ServiceRow>) -> Option<String> {
+    failure_detail(row)
+        .map(str::to_string)
+        .or_else(|| previous.and_then(failure_detail).map(str::to_string))
+}
+
+/// Copies the last useful detail onto a sparse terminal row so final rendering stays diagnostic.
+fn row_with_failure_detail_fallback(row: &ServiceRow, previous: Option<&ServiceRow>) -> ServiceRow {
+    if failure_detail(row).is_some() {
+        return row.clone();
+    }
+
+    let mut row = row.clone();
+    row.status_detail = previous.and_then(failure_detail).map(str::to_string);
+    row
 }
 
 /// Renders deployment progress in-place for terminals and append-only for logs.
@@ -494,13 +516,15 @@ fn truncate_detail(value: &str, max_chars: usize) -> String {
 }
 
 /// Renders the last observed state in a single timeout/error sentence.
-fn render_last_observed(row: &ServiceRow) -> String {
+fn render_last_observed(row: &ServiceRow, previous: Option<&ServiceRow>) -> String {
     format!(
         "status={} rollout={} replicas={} detail={}",
         row.status,
         rollout_label(&row.rollout),
         replica_label(row),
-        failure_detail(row).unwrap_or("-")
+        failure_detail_with_fallback(row, previous)
+            .as_deref()
+            .unwrap_or("-")
     )
 }
 
@@ -595,7 +619,7 @@ mod tests {
         );
 
         assert_eq!(
-            classify_deployment(&row, &test_handle(manifest_id)),
+            classify_deployment(&row, &test_handle(manifest_id), None),
             DeploymentState::Succeeded
         );
     }
@@ -613,8 +637,45 @@ mod tests {
         );
 
         assert_eq!(
-            classify_deployment(&row, &test_handle(manifest_id)),
+            classify_deployment(&row, &test_handle(manifest_id), None),
             DeploymentState::Failed("placement exhausted".to_string())
+        );
+    }
+
+    #[test]
+    /// Carries the last useful deploying detail into a sparse terminal failure.
+    fn classify_failed_generation_uses_previous_detail_fallback() {
+        let manifest_id = Uuid::new_v4();
+        let previous = test_row(
+            manifest_id,
+            ServiceStatusRow::Deploying,
+            ServiceRolloutPhaseRow::RollingForward,
+            Some("not enough schedulable slots for gang reservation"),
+            None,
+        );
+        let failed = test_row(
+            manifest_id,
+            ServiceStatusRow::Failed,
+            ServiceRolloutPhaseRow::Idle,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            classify_deployment(&failed, &test_handle(manifest_id), Some(&previous)),
+            DeploymentState::Failed(
+                "not enough schedulable slots for gang reservation".to_string()
+            )
+        );
+
+        let rendered = render_progress_block(
+            &row_with_failure_detail_fallback(&failed, Some(&previous)),
+            None,
+        )
+        .expect("render failed progress block");
+        assert!(
+            rendered.contains("not enough schedulable slots for gang reservation"),
+            "final progress should keep the prior diagnostic detail: {rendered}"
         );
     }
 
@@ -630,7 +691,7 @@ mod tests {
             Some("replacement timed out"),
         );
 
-        let state = classify_deployment(&row, &test_handle(submitted_manifest_id));
+        let state = classify_deployment(&row, &test_handle(submitted_manifest_id), None);
         assert!(matches!(state, DeploymentState::Failed(reason) if reason.contains("superseded")));
     }
 
