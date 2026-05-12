@@ -80,7 +80,7 @@ local_test!(task_list_includes_service_owned_workloads, {
 
     node.node
         .workloads
-        .upsert(&UuidKey::from(task_id), service_task)
+        .upsert(&UuidKey::from(task_id), service_task.into())
         .await
         .expect("seed service-owned workload");
 

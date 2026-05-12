@@ -7,7 +7,8 @@ use tracing::warn;
 
 use crate::gpu::gpu_runtime_status;
 use crate::workload::model::{
-    WorkloadAdmissionState, WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadSpec,
+    WorkloadAdmissionGroupRecord, WorkloadAdmissionState, WorkloadEvent, WorkloadOwner,
+    WorkloadPhase, WorkloadSpec,
 };
 
 use super::ReconcileTaskGuard;
@@ -75,6 +76,7 @@ impl WorkloadManager {
         &self,
         group_id: uuid::Uuid,
         plans: &mut [BatchStartPlan],
+        admission_record: &WorkloadAdmissionGroupRecord,
     ) -> Result<Vec<(usize, WorkloadSpec)>, anyhow::Error> {
         if plans.is_empty() {
             return Ok(Vec::new());
@@ -91,12 +93,22 @@ impl WorkloadManager {
         {
             Ok(specs) => specs,
             Err(err) => {
+                self.abort_admission_group_record(
+                    admission_record,
+                    "local gang workload publication failed after commit decision",
+                )
+                .await;
                 self.cleanup_batch(plans).await;
                 return Err(err);
             }
         };
 
         if let Err(err) = self.launch_batch_instances(plans).await {
+            self.abort_admission_group_record(
+                admission_record,
+                "local gang execution failed after commit decision",
+            )
+            .await;
             self.cleanup_batch(plans).await;
             if is_local_volume_access_error(&err) {
                 self.persist_pending_volume_unavailable_specs(&pending_specs, &err)
@@ -121,6 +133,11 @@ impl WorkloadManager {
                 .map(|(plan, spec)| (plan.index, spec))
                 .collect()),
             Err(err) => {
+                self.abort_admission_group_record(
+                    admission_record,
+                    "local gang workload commit failed after runtime launch",
+                )
+                .await;
                 self.cleanup_batch(plans).await;
                 self.rollback_pending_specs(&pending_specs).await;
                 Err(err)

@@ -139,6 +139,59 @@ pub enum WorkloadAdmissionState {
     GroupCommitted,
 }
 
+/// Durable phase for one all-or-nothing grouped workload admission attempt.
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadAdmissionGroupPhase {
+    #[default]
+    Preparing,
+    CommitDecided,
+    Completed,
+    AbortDecided,
+}
+
+impl WorkloadAdmissionGroupPhase {
+    /// Returns true when this decision allows member rows to be adopted locally.
+    pub fn allows_adoption(self) -> bool {
+        matches!(self, Self::CommitDecided | Self::Completed)
+    }
+
+    /// Returns true when this decision requires member rows to be torn down.
+    pub fn requires_abort(self) -> bool {
+        matches!(self, Self::AbortDecided)
+    }
+}
+
+/// Replicated control record for one strict grouped admission attempt.
+///
+/// This is stored in the workload MST domain so workload rows and their all-or-nothing
+/// admission decision share the same anti-entropy path without adding another gossip domain.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
+pub struct WorkloadAdmissionGroupRecord {
+    pub id: Uuid,
+    pub scope_id: Uuid,
+    pub coordinator_node_id: Uuid,
+    pub target_node_ids: Vec<Uuid>,
+    pub workload_ids: Vec<Uuid>,
+    pub workload_count: u64,
+    pub lease_expires_at_unix_ms: u64,
+    pub phase: WorkloadAdmissionGroupPhase,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl WorkloadAdmissionGroupRecord {
+    /// Returns true when a preparing decision is no longer safe to commit.
+    pub fn is_preparing_expired(&self, now_unix_ms: u64) -> bool {
+        matches!(self.phase, WorkloadAdmissionGroupPhase::Preparing)
+            && self.lease_expires_at_unix_ms <= now_unix_ms
+    }
+}
+
 /// Canonical, filterable workload lifecycle identifiers projected from concrete phases.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum WorkloadStateKind {
@@ -600,7 +653,47 @@ impl WorkloadStatus {
 pub enum WorkloadEvent {
     UpsertSpec(Box<WorkloadSpec>),
     UpsertStatus(Box<WorkloadStatus>),
+    UpsertAdmissionGroup(Box<WorkloadAdmissionGroupRecord>),
     Remove { id: Uuid },
+}
+
+/// Value variants retained in the workload CRDT domain.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
+pub enum WorkloadStoreValue {
+    Workload(Box<WorkloadValue>),
+    AdmissionGroup(Box<WorkloadAdmissionGroupRecord>),
+}
+
+impl WorkloadStoreValue {
+    /// Returns the contained workload value when this row stores workload state.
+    pub fn workload(&self) -> Option<&WorkloadValue> {
+        match self {
+            Self::Workload(value) => Some(value.as_ref()),
+            Self::AdmissionGroup(_) => None,
+        }
+    }
+
+    /// Returns the contained admission record when this row stores a group decision.
+    pub fn admission_group(&self) -> Option<&WorkloadAdmissionGroupRecord> {
+        match self {
+            Self::Workload(_) => None,
+            Self::AdmissionGroup(record) => Some(record.as_ref()),
+        }
+    }
+}
+
+impl From<WorkloadValue> for WorkloadStoreValue {
+    /// Wraps a workload value for storage in the shared workload CRDT domain.
+    fn from(value: WorkloadValue) -> Self {
+        Self::Workload(Box::new(value))
+    }
+}
+
+impl From<WorkloadAdmissionGroupRecord> for WorkloadStoreValue {
+    /// Wraps an admission group record for storage in the shared workload CRDT domain.
+    fn from(record: WorkloadAdmissionGroupRecord) -> Self {
+        Self::AdmissionGroup(Box::new(record))
+    }
 }
 
 /// Replicated workload state stored in the CRDT workload store.
@@ -983,6 +1076,7 @@ pub(crate) fn workload_event_id(event: &WorkloadEvent) -> Uuid {
     match event {
         WorkloadEvent::UpsertSpec(spec) => spec.id,
         WorkloadEvent::UpsertStatus(status) => status.id,
+        WorkloadEvent::UpsertAdmissionGroup(record) => record.id,
         WorkloadEvent::Remove { id } => *id,
     }
 }
@@ -1013,6 +1107,12 @@ pub(crate) fn should_replace_workload_event(
             WorkloadEvent::UpsertStatus(current_status),
             WorkloadEvent::UpsertStatus(candidate_status),
         ) => should_accept_workload_status(current_status, candidate_status),
+        (
+            WorkloadEvent::UpsertAdmissionGroup(current_record),
+            WorkloadEvent::UpsertAdmissionGroup(candidate_record),
+        ) => should_accept_admission_group_record(current_record, candidate_record),
+        (WorkloadEvent::UpsertAdmissionGroup(_), _)
+        | (_, WorkloadEvent::UpsertAdmissionGroup(_)) => false,
     }
 }
 
@@ -1046,15 +1146,103 @@ pub(crate) fn workload_phase_rank(state: &WorkloadPhase) -> u8 {
     }
 }
 
+/// Ranks admission group phases so abort decisions win conflict resolution.
+pub(crate) fn admission_group_phase_rank(phase: WorkloadAdmissionGroupPhase) -> u8 {
+    match phase {
+        WorkloadAdmissionGroupPhase::Preparing => 0,
+        WorkloadAdmissionGroupPhase::CommitDecided => 1,
+        WorkloadAdmissionGroupPhase::Completed => 2,
+        WorkloadAdmissionGroupPhase::AbortDecided => 3,
+    }
+}
+
+/// Returns true when one admission group record should replace the retained record.
+pub(crate) fn should_accept_admission_group_record(
+    current: &WorkloadAdmissionGroupRecord,
+    candidate: &WorkloadAdmissionGroupRecord,
+) -> bool {
+    match admission_group_phase_rank(candidate.phase)
+        .cmp(&admission_group_phase_rank(current.phase))
+    {
+        Ordering::Equal => {}
+        order => return order.is_gt(),
+    }
+
+    match (
+        parse_timestamp(&current.updated_at),
+        parse_timestamp(&candidate.updated_at),
+    ) {
+        (Some(current_ts), Some(candidate_ts)) => {
+            if candidate_ts > current_ts {
+                return true;
+            }
+            if candidate_ts < current_ts {
+                return false;
+            }
+        }
+        (None, Some(_)) => return true,
+        (Some(_), None) => return false,
+        (None, None) => {}
+    }
+
+    candidate.coordinator_node_id > current.coordinator_node_id
+}
+
+/// Provides a workload view over both legacy workload values and typed store values.
+pub(crate) trait WorkloadValueSource {
+    /// Returns the workload projection carried by this value when one exists.
+    fn workload_value(&self) -> Option<&WorkloadValue>;
+}
+
+impl WorkloadValueSource for WorkloadValue {
+    /// Returns this value as a workload row.
+    fn workload_value(&self) -> Option<&WorkloadValue> {
+        Some(self)
+    }
+}
+
+impl WorkloadValueSource for WorkloadStoreValue {
+    /// Returns the workload row contained by this store value.
+    fn workload_value(&self) -> Option<&WorkloadValue> {
+        self.workload()
+    }
+}
+
 /// Selects the most relevant workload value from concurrent CRDT versions.
-pub(crate) fn select_best_workload_value(values: &[WorkloadValue]) -> Option<WorkloadValue> {
+pub(crate) fn select_best_workload_value<T: WorkloadValueSource>(
+    values: &[T],
+) -> Option<WorkloadValue> {
     let mut best: Option<&WorkloadValue> = None;
     for value in values {
+        let Some(value) = value.workload_value() else {
+            continue;
+        };
         match best {
             None => best = Some(value),
             Some(current) => {
                 if should_prefer_workload_value(current, value) {
                     best = Some(value);
+                }
+            }
+        }
+    }
+    best.cloned()
+}
+
+/// Selects the winning admission group record from concurrent store values.
+pub(crate) fn select_best_admission_group_record(
+    values: &[WorkloadStoreValue],
+) -> Option<WorkloadAdmissionGroupRecord> {
+    let mut best: Option<&WorkloadAdmissionGroupRecord> = None;
+    for value in values {
+        let Some(record) = value.admission_group() else {
+            continue;
+        };
+        match best {
+            None => best = Some(record),
+            Some(current) => {
+                if should_accept_admission_group_record(current, record) {
+                    best = Some(record);
                 }
             }
         }

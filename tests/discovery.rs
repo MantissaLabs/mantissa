@@ -486,7 +486,7 @@ local_test!(discovery_dns_reflects_backend_changes_unprivileged, {
         .workloads
         .upsert(
             &UuidKey::from(task_a),
-            running_task(task_a, node_id, service_name, network_id),
+            running_task(task_a, node_id, service_name, network_id).into(),
         )
         .await
         .expect("upsert task a");
@@ -527,7 +527,7 @@ local_test!(discovery_dns_reflects_backend_changes_unprivileged, {
         .workloads
         .upsert(
             &UuidKey::from(task_b),
-            running_task(task_b, node_id, service_name, network_id),
+            running_task(task_b, node_id, service_name, network_id).into(),
         )
         .await
         .expect("upsert task b");
@@ -568,7 +568,7 @@ local_test!(discovery_dns_reflects_backend_changes_unprivileged, {
     stopped.updated_at = chrono::Utc::now().to_rfc3339();
     harness
         .workloads
-        .upsert(&UuidKey::from(task_a), stopped)
+        .upsert(&UuidKey::from(task_a), stopped.into())
         .await
         .expect("upsert stopped task a");
 
@@ -609,7 +609,7 @@ local_test!(discovery_dns_scopes_same_template_names_by_service, {
             .workloads
             .upsert(
                 &UuidKey::from(task_id),
-                running_task(task_id, node_id, service_name, network_id),
+                running_task(task_id, node_id, service_name, network_id).into(),
             )
             .await
             .expect("upsert task");
@@ -677,7 +677,7 @@ local_test!(discovery_dns_requires_attachment_traffic_publication, {
         .workloads
         .upsert(
             &UuidKey::from(task_id),
-            running_task(task_id, node_id, service_name, network_id),
+            running_task(task_id, node_id, service_name, network_id).into(),
         )
         .await
         .expect("upsert task");
@@ -755,7 +755,7 @@ local_test!(discovery_dns_answers_aaaa_for_ipv6_networks, {
         .workloads
         .upsert(
             &UuidKey::from(task_id),
-            running_task(task_id, node_id, service_name, network_id),
+            running_task(task_id, node_id, service_name, network_id).into(),
         )
         .await
         .expect("upsert ipv6 task");
@@ -842,7 +842,7 @@ local_test!(
                 .workloads
                 .upsert(
                     &UuidKey::from(task_id),
-                    running_task(task_id, node_id, service_name, network_id),
+                    running_task(task_id, node_id, service_name, network_id).into(),
                 )
                 .await
                 .expect("upsert ipv6 rotating task");
@@ -941,7 +941,7 @@ local_test!(discovery_dns_routes_only_healthy_readiness_backends, {
         .workloads
         .upsert(
             &UuidKey::from(ready_task),
-            running_task(ready_task, ready_node, service_name, network_id),
+            running_task(ready_task, ready_node, service_name, network_id).into(),
         )
         .await
         .expect("upsert ready task");
@@ -949,7 +949,7 @@ local_test!(discovery_dns_routes_only_healthy_readiness_backends, {
         .workloads
         .upsert(
             &UuidKey::from(recovering_task),
-            running_task(recovering_task, recovering_node, service_name, network_id),
+            running_task(recovering_task, recovering_node, service_name, network_id).into(),
         )
         .await
         .expect("upsert recovering task");

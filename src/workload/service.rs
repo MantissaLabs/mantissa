@@ -6,16 +6,18 @@ use crate::workload::capnp_codec::{
 };
 use crate::workload::manager::WorkloadManager;
 use crate::workload::model::{
-    ExecutionPlatform, IsolationMode, WorkloadAdmissionState, WorkloadAgentRunMetadata,
-    WorkloadEvent, WorkloadJobMetadata, WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata,
-    WorkloadSpec, WorkloadStateFilter, WorkloadStateKind, WorkloadStatus, WorkloadValue,
-    merge_status_into_value, spec_to_status, spec_to_value, value_to_spec,
+    ExecutionPlatform, IsolationMode, WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord,
+    WorkloadAdmissionState, WorkloadAgentRunMetadata, WorkloadEvent, WorkloadJobMetadata,
+    WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStateFilter,
+    WorkloadStateKind, WorkloadStatus, WorkloadStoreValue, WorkloadValue, merge_status_into_value,
+    spec_to_status, spec_to_value, value_to_spec,
 };
 use capnp::Error;
 use mantissa_protocol::gossip::gossip_message;
 use mantissa_protocol::workload::{
-    WorkloadStateFilter as ProtoWorkloadStateFilter, workload, workload_event,
-    workload_list_request, workload_spec, workload_status,
+    AdmissionGroupPhase as ProtoAdmissionGroupPhase,
+    WorkloadStateFilter as ProtoWorkloadStateFilter, admission_group_record, workload,
+    workload_event, workload_list_request, workload_spec, workload_status,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::io::Cursor;
@@ -96,6 +98,10 @@ pub fn add_event(
             workload.set_event(workload_event::EventType::Remove);
             workload.set_id(id.as_bytes());
         }
+        WorkloadEvent::UpsertAdmissionGroup(record) => {
+            workload.set_event(workload_event::EventType::UpsertAdmissionGroup);
+            write_admission_group(workload.reborrow().init_admission_group(), record.as_ref());
+        }
     }
 }
 
@@ -113,6 +119,53 @@ pub fn read_event(reader: workload_event::Reader<'_>) -> Result<WorkloadEvent, E
         workload_event::EventType::Remove => {
             let id = read_id_from_data(reader.get_id()?)?;
             Ok(WorkloadEvent::Remove { id })
+        }
+        workload_event::EventType::UpsertAdmissionGroup => {
+            let record = read_admission_group(reader.get_admission_group()?)?;
+            Ok(WorkloadEvent::UpsertAdmissionGroup(Box::new(record)))
+        }
+    }
+}
+
+impl StoreValueCodec for WorkloadStoreValue {
+    /// Encodes one workload-domain value as the stable Cap'n Proto store value.
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        let mut event = message.init_root::<workload_event::Builder<'_>>();
+
+        match self {
+            WorkloadStoreValue::Workload(value) => {
+                let spec = value_to_spec(value.id, (**value).clone());
+                if value.definition_complete {
+                    event.set_event(workload_event::EventType::UpsertSpec);
+                    write_spec(event.reborrow().init_spec(), &spec);
+                } else {
+                    let status = spec_to_status(&spec);
+                    event.set_event(workload_event::EventType::UpsertStatus);
+                    write_status(event.reborrow().init_status(), &status);
+                }
+            }
+            WorkloadStoreValue::AdmissionGroup(record) => {
+                event.set_event(workload_event::EventType::UpsertAdmissionGroup);
+                write_admission_group(event.reborrow().init_admission_group(), record.as_ref());
+            }
+        }
+
+        Ok(capnp::serialize::write_message_to_words(&message))
+    }
+
+    /// Decodes one workload-domain value from the stable Cap'n Proto store value.
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
+        let event = decode_workload_store_event(bytes)?;
+        match event {
+            WorkloadEvent::UpsertSpec(spec) => Ok(spec_to_value(spec.as_ref()).into()),
+            WorkloadEvent::UpsertStatus(status) => {
+                Ok(merge_status_into_value(None, status.as_ref()).into())
+            }
+            WorkloadEvent::UpsertAdmissionGroup(record) => Ok((*record).into()),
+            WorkloadEvent::Remove { id } => Err(Box::new(mantissa_store::error::Error::Other(
+                format!("workload store value cannot decode remove event for {id}"),
+            ))),
         }
     }
 }
@@ -144,6 +197,12 @@ impl StoreValueCodec for WorkloadValue {
             WorkloadEvent::UpsertStatus(status) => {
                 Ok(merge_status_into_value(None, status.as_ref()))
             }
+            WorkloadEvent::UpsertAdmissionGroup(record) => {
+                Err(Box::new(mantissa_store::error::Error::Other(format!(
+                    "workload value cannot decode admission group {}",
+                    record.id
+                ))))
+            }
             WorkloadEvent::Remove { id } => Err(Box::new(mantissa_store::error::Error::Other(
                 format!("workload store value cannot decode remove event for {id}"),
             ))),
@@ -167,6 +226,89 @@ fn workload_store_codec_error<E: std::fmt::Display>(error: E) -> Box<mantissa_st
     Box::new(mantissa_store::error::Error::Other(format!(
         "workload store codec error: {error}"
     )))
+}
+
+/// Encodes one admission group control record into the workload wire payload.
+pub fn write_admission_group(
+    mut builder: admission_group_record::Builder<'_>,
+    record: &WorkloadAdmissionGroupRecord,
+) {
+    builder.set_id(record.id.as_bytes());
+    builder.set_scope_id(record.scope_id.as_bytes());
+    builder.set_coordinator_node_id(record.coordinator_node_id.as_bytes());
+
+    let mut target_node_ids = builder
+        .reborrow()
+        .init_target_node_ids(record.target_node_ids.len() as u32);
+    for (index, id) in record.target_node_ids.iter().enumerate() {
+        target_node_ids.set(index as u32, id.as_bytes());
+    }
+
+    let mut workload_ids = builder
+        .reborrow()
+        .init_workload_ids(record.workload_ids.len() as u32);
+    for (index, id) in record.workload_ids.iter().enumerate() {
+        workload_ids.set(index as u32, id.as_bytes());
+    }
+
+    builder.set_workload_count(record.workload_count);
+    builder.set_lease_expires_at_unix_ms(record.lease_expires_at_unix_ms);
+    builder.set_phase(proto_admission_group_phase(record.phase));
+    builder.set_reason(record.reason.as_deref().unwrap_or(""));
+    builder.set_created_at(&record.created_at);
+    builder.set_updated_at(&record.updated_at);
+}
+
+/// Decodes one admission group control record from the workload wire payload.
+pub fn read_admission_group(
+    reader: admission_group_record::Reader<'_>,
+) -> Result<WorkloadAdmissionGroupRecord, Error> {
+    let mut target_node_ids = Vec::new();
+    for id in reader.get_target_node_ids()?.iter() {
+        target_node_ids.push(read_id_from_data(id?)?);
+    }
+
+    let mut workload_ids = Vec::new();
+    for id in reader.get_workload_ids()?.iter() {
+        workload_ids.push(read_id_from_data(id?)?);
+    }
+
+    Ok(WorkloadAdmissionGroupRecord {
+        id: read_id_from_data(reader.get_id()?)?,
+        scope_id: read_id_from_data(reader.get_scope_id()?)?,
+        coordinator_node_id: read_id_from_data(reader.get_coordinator_node_id()?)?,
+        target_node_ids,
+        workload_ids,
+        workload_count: reader.get_workload_count(),
+        lease_expires_at_unix_ms: reader.get_lease_expires_at_unix_ms(),
+        phase: read_admission_group_phase(reader.get_phase()),
+        reason: read_optional_text(reader.get_reason()?),
+        created_at: reader.get_created_at()?.to_str()?.to_string(),
+        updated_at: reader.get_updated_at()?.to_str()?.to_string(),
+    })
+}
+
+/// Converts one internal admission phase into its wire representation.
+fn proto_admission_group_phase(phase: WorkloadAdmissionGroupPhase) -> ProtoAdmissionGroupPhase {
+    match phase {
+        WorkloadAdmissionGroupPhase::Preparing => ProtoAdmissionGroupPhase::Preparing,
+        WorkloadAdmissionGroupPhase::CommitDecided => ProtoAdmissionGroupPhase::CommitDecided,
+        WorkloadAdmissionGroupPhase::Completed => ProtoAdmissionGroupPhase::Completed,
+        WorkloadAdmissionGroupPhase::AbortDecided => ProtoAdmissionGroupPhase::AbortDecided,
+    }
+}
+
+/// Converts one wire admission phase into the internal representation.
+fn read_admission_group_phase(
+    phase: Result<ProtoAdmissionGroupPhase, capnp::NotInSchema>,
+) -> WorkloadAdmissionGroupPhase {
+    match phase {
+        Ok(ProtoAdmissionGroupPhase::Preparing) => WorkloadAdmissionGroupPhase::Preparing,
+        Ok(ProtoAdmissionGroupPhase::CommitDecided) => WorkloadAdmissionGroupPhase::CommitDecided,
+        Ok(ProtoAdmissionGroupPhase::Completed) => WorkloadAdmissionGroupPhase::Completed,
+        Ok(ProtoAdmissionGroupPhase::AbortDecided) => WorkloadAdmissionGroupPhase::AbortDecided,
+        Err(_) => WorkloadAdmissionGroupPhase::Preparing,
+    }
 }
 
 /// Encodes one compact workload lifecycle status into the workload wire payload.
@@ -713,7 +855,7 @@ mod tests {
     use crate::workload::model::{
         WorkloadEnvironmentVariable, WorkloadJobMetadata, WorkloadOwner, WorkloadSecretFile,
         WorkloadSecretReference, WorkloadValueDraft, WorkloadVolumeMount, merge_status_into_value,
-        spec_to_status, value_to_spec,
+        select_best_workload_value, spec_to_status, value_to_spec,
     };
     use crate::workload::types::{
         WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadPortBinding,
@@ -828,6 +970,24 @@ mod tests {
         merge_status_into_value(None, &status)
     }
 
+    /// Builds one admission group record for store-codec round-trip tests.
+    fn sample_admission_group_record() -> WorkloadAdmissionGroupRecord {
+        let now = chrono::Utc::now().to_rfc3339();
+        WorkloadAdmissionGroupRecord {
+            id: Uuid::new_v4(),
+            scope_id: Uuid::new_v4(),
+            coordinator_node_id: Uuid::new_v4(),
+            target_node_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
+            workload_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
+            workload_count: 2,
+            lease_expires_at_unix_ms: 42_000,
+            phase: WorkloadAdmissionGroupPhase::CommitDecided,
+            reason: None,
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
     /// Workload values should round-trip through their Cap'n Proto store-value codec.
     #[test]
     fn store_value_codec_roundtrips_workload_values() {
@@ -851,6 +1011,19 @@ mod tests {
         assert!(!decoded.definition_complete);
     }
 
+    /// Admission group records should round-trip through the workload-domain store codec.
+    #[test]
+    fn admission_group_store_codec_roundtrips_capnp() {
+        let record = sample_admission_group_record();
+        let encoded = WorkloadStoreValue::from(record.clone())
+            .encode_store_value()
+            .expect("encode admission group store value");
+        let decoded = WorkloadStoreValue::decode_store_value(&encoded)
+            .expect("decode admission group store value");
+
+        assert_eq!(decoded, WorkloadStoreValue::from(record));
+    }
+
     /// Reopening the workload store should decode Cap'n Proto MVReg rows from Redb.
     #[tokio::test]
     async fn workload_store_reopens_capnp_rows() {
@@ -868,11 +1041,11 @@ mod tests {
         {
             let store = open_workload_store(db.clone(), actor).expect("open workload store");
             store
-                .upsert(&complete_key, complete.clone())
+                .upsert(&complete_key, complete.clone().into())
                 .await
                 .expect("upsert complete workload");
             store
-                .upsert(&status_only_key, status_only.clone())
+                .upsert(&status_only_key, status_only.clone().into())
                 .await
                 .expect("upsert status-only workload");
         }
@@ -892,7 +1065,13 @@ mod tests {
             .expect("lookup status-only workload")
             .expect("status-only workload present");
 
-        assert_eq!(complete_snapshot.as_slice(), &[complete]);
-        assert_eq!(status_only_snapshot.as_slice(), &[status_only]);
+        assert_eq!(
+            select_best_workload_value(complete_snapshot.as_slice()),
+            Some(complete)
+        );
+        assert_eq!(
+            select_best_workload_value(status_only_snapshot.as_slice()),
+            Some(status_only)
+        );
     }
 }

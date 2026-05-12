@@ -175,6 +175,55 @@ enum AdmissionState {
   # Group resources are committed and the workload row may be adopted.
 }
 
+enum AdmissionGroupPhase {
+  preparing @0;
+  # Group preparation is in-flight and workloads must not be adopted.
+
+  commitDecided @1;
+  # Group resources committed and all member rows may be adopted.
+
+  completed @2;
+  # Group commit publication completed successfully.
+
+  abortDecided @3;
+  # Group must be stopped, removed, and released on every target node.
+}
+
+struct AdmissionGroupRecord {
+  id @0 :Data;
+  # Admission attempt UUID as 16 bytes.
+
+  scopeId @1 :Data;
+  # Controller-derived stable scope UUID for diagnostics and retries.
+
+  coordinatorNodeId @2 :Data;
+  # Node that prepared the distributed scheduler leases.
+
+  targetNodeIds @3 :List(Data);
+  # Nodes that may hold local resources or workload rows for this attempt.
+
+  workloadIds @4 :List(Data);
+  # Workload rows covered by this all-or-nothing admission decision.
+
+  workloadCount @5 :UInt64;
+  # Expected group cardinality.
+
+  leaseExpiresAtUnixMs @6 :UInt64;
+  # Latest safe time to commit a preparing group.
+
+  phase @7 :AdmissionGroupPhase;
+  # Durable admission decision phase.
+
+  reason @8 :Text;
+  # Operator-facing reason for abort decisions.
+
+  createdAt @9 :Text;
+  # RFC3339 timestamp when this attempt was first recorded.
+
+  updatedAt @10 :Text;
+  # RFC3339 timestamp for the latest phase update.
+}
+
 struct LivenessProbe {
   kind @0 :LivenessProbeKind;
   # Local liveness probe transport kind.
@@ -420,6 +469,9 @@ struct WorkloadEvent {
   id @3 :Data;
   # Workload identifier for remove events.
 
+  admissionGroup @4 :AdmissionGroupRecord;
+  # Durable all-or-nothing admission decision for a workload group.
+
   enum EventType {
     upsertSpec @0;
     # Workload created or updated with the full workload definition.
@@ -429,6 +481,9 @@ struct WorkloadEvent {
 
     remove @2;
     # Workload removed.
+
+    upsertAdmissionGroup @3;
+    # Group admission decision created or advanced.
   }
 }
 

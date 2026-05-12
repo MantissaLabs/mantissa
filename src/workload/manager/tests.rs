@@ -55,8 +55,9 @@ use crate::volumes::types::{
 };
 use crate::workload::model::select_best_workload_value;
 use crate::workload::model::{
-    ExecutionPlatform, WorkloadAdmissionState, WorkloadAgentRunMetadata, WorkloadOwner,
-    WorkloadServiceMetadata, WorkloadStatus, WorkloadValue, WorkloadValueDraft,
+    ExecutionPlatform, WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord,
+    WorkloadAdmissionState, WorkloadAgentRunMetadata, WorkloadOwner, WorkloadServiceMetadata,
+    WorkloadStatus, WorkloadValue, WorkloadValueDraft,
 };
 use crate::workload::types::{
     ResolvedExecutionSpec, WorkloadLivenessProbe, WorkloadLivenessProbeKind,
@@ -765,6 +766,36 @@ async fn setup_manager() -> (
     NetworkRegistry,
 ) {
     setup_manager_with_forwarding(None, None).await
+}
+
+/// Persists one admission group record for tests that exercise crash recovery gates.
+async fn persist_test_admission_group(
+    manager: &WorkloadManager,
+    group_id: Uuid,
+    phase: WorkloadAdmissionGroupPhase,
+    workload_ids: Vec<Uuid>,
+    target_node_ids: Vec<Uuid>,
+    lease_expires_at_unix_ms: u64,
+) -> WorkloadAdmissionGroupRecord {
+    let now = Utc::now().to_rfc3339();
+    let record = WorkloadAdmissionGroupRecord {
+        id: group_id,
+        scope_id: Uuid::new_v4(),
+        coordinator_node_id: manager.local_node_id,
+        target_node_ids,
+        workload_count: workload_ids.len() as u64,
+        workload_ids,
+        lease_expires_at_unix_ms,
+        phase,
+        reason: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    manager
+        .persist_admission_group_record(&record)
+        .await
+        .expect("persist test admission group");
+    record
 }
 
 async fn setup_manager_with_forwarding(
@@ -2077,6 +2108,15 @@ async fn committed_group_workload_rows_become_adoptable() {
         .commit_task_lease_group(group_id, manager.local_node_id, &prepared.leases)
         .await
         .expect("commit group lease");
+    persist_test_admission_group(
+        &manager,
+        group_id,
+        WorkloadAdmissionGroupPhase::CommitDecided,
+        vec![task_id],
+        vec![manager.local_node_id],
+        super::unix_ms(Utc::now()).saturating_add(DEFAULT_PREPARED_LEASE_TTL_MS),
+    )
+    .await;
 
     let mut spec = test_task_spec(&manager, "committed-gang");
     spec.id = task_id;
@@ -2123,6 +2163,15 @@ async fn committed_group_reconcile_reacquires_free_slots_with_group_id() {
     spec.slot_id = Some(slot_spec.slot_id);
     spec.admission_group_id = Some(group_id);
     spec.admission_state = WorkloadAdmissionState::GroupCommitted;
+    persist_test_admission_group(
+        &manager,
+        group_id,
+        WorkloadAdmissionGroupPhase::CommitDecided,
+        vec![spec.id],
+        vec![manager.local_node_id],
+        super::unix_ms(Utc::now()).saturating_add(DEFAULT_PREPARED_LEASE_TTL_MS),
+    )
+    .await;
     manager.persist_spec(&spec).await.expect("persist task");
 
     manager
@@ -2144,6 +2193,264 @@ async fn committed_group_reconcile_reacquires_free_slots_with_group_id() {
         }
         other => panic!("repaired group slot should be reserved, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn group_committed_without_admission_record_is_not_adopted() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec.clone()])
+        .await
+        .expect("init slots");
+
+    let group_id = Uuid::new_v4();
+    let mut spec = test_task_spec(&manager, "missing-decision-gang");
+    spec.slot_ids = vec![slot_spec.slot_id];
+    spec.slot_id = Some(slot_spec.slot_id);
+    spec.admission_group_id = Some(group_id);
+    spec.admission_state = WorkloadAdmissionState::GroupCommitted;
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    manager
+        .reconcile_local_task(spec)
+        .await
+        .expect("missing decision should no-op");
+
+    assert!(
+        mock_cm.created.lock().await.is_empty(),
+        "grouped rows without a durable commit decision must not start"
+    );
+    let snapshot = scheduler.snapshot().await.expect("snapshot");
+    assert!(
+        snapshot
+            .slots
+            .iter()
+            .all(|slot| matches!(slot.state, SlotState::Free)),
+        "grouped rows without a durable commit decision must not reserve slots"
+    );
+}
+
+#[tokio::test]
+async fn pending_group_with_commit_decision_is_promoted_and_started() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let group_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    let prepared = scheduler
+        .prepare_task_lease_group(
+            manager.local_node_id,
+            group_id,
+            DEFAULT_PREPARED_LEASE_TTL_MS,
+            vec![TaskLeaseIntent {
+                task_id,
+                cpu_millis: 100,
+                memory_bytes: 64 * 1_024 * 1_024,
+                gpu_count: 0,
+            }],
+        )
+        .await
+        .expect("prepare group lease");
+    scheduler
+        .commit_task_lease_group(group_id, manager.local_node_id, &prepared.leases)
+        .await
+        .expect("commit group lease");
+    persist_test_admission_group(
+        &manager,
+        group_id,
+        WorkloadAdmissionGroupPhase::CommitDecided,
+        vec![task_id],
+        vec![manager.local_node_id],
+        super::unix_ms(Utc::now()).saturating_add(DEFAULT_PREPARED_LEASE_TTL_MS),
+    )
+    .await;
+
+    let mut spec = test_task_spec(&manager, "pending-commit-decision");
+    spec.id = task_id;
+    spec.slot_ids = prepared.leases[0].slot_ids.clone();
+    spec.slot_id = spec.slot_ids.first().copied();
+    spec.lease_id = Some(prepared.leases[0].lease_id);
+    spec.lease_coordinator_node_id = Some(manager.local_node_id);
+    spec.admission_group_id = Some(group_id);
+    spec.admission_state = WorkloadAdmissionState::PendingGroup;
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    manager
+        .reconcile_local_task(spec.clone())
+        .await
+        .expect("commit decision should promote and start pending group row");
+
+    assert_eq!(mock_cm.created.lock().await.len(), 1);
+    let persisted = manager
+        .load_spec(task_id)
+        .await
+        .expect("load promoted task");
+    assert_eq!(
+        persisted.admission_state,
+        WorkloadAdmissionState::GroupCommitted
+    );
+    assert_eq!(persisted.admission_group_id, Some(group_id));
+    assert!(persisted.lease_id.is_none());
+    assert!(persisted.lease_coordinator_node_id.is_none());
+}
+
+#[tokio::test]
+async fn expired_preparing_admission_group_aborts_member_and_releases_lease() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let group_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    let prepared = scheduler
+        .prepare_task_lease_group(
+            manager.local_node_id,
+            group_id,
+            DEFAULT_PREPARED_LEASE_TTL_MS,
+            vec![TaskLeaseIntent {
+                task_id,
+                cpu_millis: 100,
+                memory_bytes: 64 * 1_024 * 1_024,
+                gpu_count: 0,
+            }],
+        )
+        .await
+        .expect("prepare group lease");
+    persist_test_admission_group(
+        &manager,
+        group_id,
+        WorkloadAdmissionGroupPhase::Preparing,
+        vec![task_id],
+        vec![manager.local_node_id],
+        super::unix_ms(Utc::now()).saturating_sub(1),
+    )
+    .await;
+
+    let mut spec = test_task_spec(&manager, "expired-preparing-decision");
+    spec.id = task_id;
+    spec.slot_ids = prepared.leases[0].slot_ids.clone();
+    spec.slot_id = spec.slot_ids.first().copied();
+    spec.lease_id = Some(prepared.leases[0].lease_id);
+    spec.lease_coordinator_node_id = Some(manager.local_node_id);
+    spec.admission_group_id = Some(group_id);
+    spec.admission_state = WorkloadAdmissionState::PendingGroup;
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    manager
+        .reconcile_admission_groups()
+        .await
+        .expect("expired preparing group should abort");
+
+    assert!(
+        mock_cm.created.lock().await.is_empty(),
+        "expired preparing admission must not create runtime instances"
+    );
+    assert!(
+        manager.load_spec(task_id).await.is_err(),
+        "expired preparing admission should remove the member row"
+    );
+    let record = manager
+        .load_admission_group_record(group_id)
+        .await
+        .expect("load admission group")
+        .expect("admission group retained");
+    assert_eq!(record.phase, WorkloadAdmissionGroupPhase::AbortDecided);
+    let snapshot = scheduler.snapshot().await.expect("snapshot");
+    assert!(
+        snapshot
+            .slots
+            .iter()
+            .all(|slot| matches!(slot.state, SlotState::Free)),
+        "expired preparing admission should release scheduler leases"
+    );
+}
+
+#[tokio::test]
+async fn abort_decision_removes_committed_member_and_releases_reservation() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let group_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    let prepared = scheduler
+        .prepare_task_lease_group(
+            manager.local_node_id,
+            group_id,
+            DEFAULT_PREPARED_LEASE_TTL_MS,
+            vec![TaskLeaseIntent {
+                task_id,
+                cpu_millis: 100,
+                memory_bytes: 64 * 1_024 * 1_024,
+                gpu_count: 0,
+            }],
+        )
+        .await
+        .expect("prepare group lease");
+    scheduler
+        .commit_task_lease_group(group_id, manager.local_node_id, &prepared.leases)
+        .await
+        .expect("commit group lease");
+    persist_test_admission_group(
+        &manager,
+        group_id,
+        WorkloadAdmissionGroupPhase::AbortDecided,
+        vec![task_id],
+        vec![manager.local_node_id],
+        super::unix_ms(Utc::now()).saturating_add(DEFAULT_PREPARED_LEASE_TTL_MS),
+    )
+    .await;
+
+    let mut spec = test_task_spec(&manager, "abort-committed-decision");
+    spec.id = task_id;
+    spec.slot_ids = prepared.leases[0].slot_ids.clone();
+    spec.slot_id = spec.slot_ids.first().copied();
+    spec.admission_group_id = Some(group_id);
+    spec.admission_state = WorkloadAdmissionState::GroupCommitted;
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    manager
+        .reconcile_local_task(spec)
+        .await
+        .expect("abort decision should clean committed member");
+
+    assert!(
+        mock_cm.created.lock().await.is_empty(),
+        "abort decision must not create runtime instances"
+    );
+    assert!(
+        manager.load_spec(task_id).await.is_err(),
+        "abort decision should remove the committed member row"
+    );
+    let snapshot = scheduler.snapshot().await.expect("snapshot");
+    assert!(
+        snapshot
+            .slots
+            .iter()
+            .all(|slot| matches!(slot.state, SlotState::Free)),
+        "abort decision should release committed reservations"
+    );
 }
 
 #[tokio::test]
@@ -4720,6 +5027,16 @@ async fn start_workloads_gang_runtime_failure_after_commit_cleans_local_reservat
         .await;
 
     assert!(result.is_err());
+    let admission_records = manager
+        .load_admission_group_records()
+        .await
+        .expect("load admission records after failed gang");
+    assert!(
+        admission_records
+            .iter()
+            .any(|record| record.phase == WorkloadAdmissionGroupPhase::AbortDecided),
+        "runtime failure after commit should durably abort the admission group"
+    );
     assert!(
         mock_cm.created.lock().await.is_empty(),
         "failed runtime create should not leave a created instance"
@@ -4870,7 +5187,7 @@ async fn task_owned_locally_detects_remote_entries() {
 
     let store = manager.core.store.clone();
     store
-        .upsert(&UuidKey::from(remote_id), remote_value)
+        .upsert(&UuidKey::from(remote_id), remote_value.into())
         .await
         .expect("insert remote task value");
 
@@ -5752,7 +6069,7 @@ async fn set_task_traffic_published_reports_missing_attachments() {
     manager
         .core
         .store
-        .upsert(&UuidKey::from(task_id), value)
+        .upsert(&UuidKey::from(task_id), value.into())
         .await
         .expect("persist service task");
 
@@ -5838,7 +6155,7 @@ async fn publish_task_traffic_when_ready_waits_for_ready_late_attachment() {
     manager
         .core
         .store
-        .upsert(&UuidKey::from(task_id), value)
+        .upsert(&UuidKey::from(task_id), value.into())
         .await
         .expect("persist service task");
 
@@ -5978,7 +6295,7 @@ async fn ensure_task_service_traffic_ready_requires_local_network_readiness() {
     manager
         .core
         .store
-        .upsert(&UuidKey::from(task_id), value)
+        .upsert(&UuidKey::from(task_id), value.into())
         .await
         .expect("persist service task");
 
@@ -6548,7 +6865,7 @@ async fn next_epoch_after_conflicting_concurrent_assignment_uses_snapshot_max() 
         .await
         .expect("rebuild remote workload store");
     remote_store
-        .upsert(&UuidKey::from(task_id), spec_to_value(&remote))
+        .upsert(&UuidKey::from(task_id), spec_to_value(&remote).into())
         .await
         .expect("persist remote concurrent task");
 
@@ -6783,7 +7100,7 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
         .await
         .expect("rebuild remote workload store");
     remote_store
-        .upsert(&UuidKey::from(original.id), stale_delta)
+        .upsert(&UuidKey::from(original.id), stale_delta.into())
         .await
         .expect("write stale value to remote store");
 
@@ -7166,7 +7483,7 @@ async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
         .await
         .expect("rebuild remote workload store");
     remote_store
-        .upsert(&UuidKey::from(task_id), stale_delta)
+        .upsert(&UuidKey::from(task_id), stale_delta.into())
         .await
         .expect("write stale value to remote store");
 
@@ -7305,7 +7622,7 @@ async fn repair_runtime_attachments_purges_unowned_local_rows() {
     manager
         .core
         .store
-        .upsert(&UuidKey::from(task_id), remote_value)
+        .upsert(&UuidKey::from(task_id), remote_value.into())
         .await
         .expect("insert remote task value");
 

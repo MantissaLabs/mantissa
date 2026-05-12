@@ -88,7 +88,7 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
 
     node.node
         .workloads
-        .upsert(&UuidKey::from(stale.id), task_spec_to_value(&stale))
+        .upsert(&UuidKey::from(stale.id), task_spec_to_value(&stale).into())
         .await
         .expect("inject stale running task value");
 
@@ -143,7 +143,7 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
         .workloads
         .upsert(
             &UuidKey::from(stale_stopping.id),
-            task_spec_to_value(&stale_stopping),
+            task_spec_to_value(&stale_stopping).into(),
         )
         .await
         .expect("inject stale stopping task value");

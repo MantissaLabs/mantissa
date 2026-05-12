@@ -102,7 +102,7 @@ async fn seed_bootstrap_workloads(anchor: &TestNode, count: u64) {
             let id = Uuid::from_u128(0x1000_0000_0000_0000_0000_0000_0000_0000 + index as u128);
             (
                 UuidKey::from(id),
-                bootstrap_workload_value(id, anchor.id(), index),
+                bootstrap_workload_value(id, anchor.id(), index).into(),
             )
         })
         .collect::<Vec<_>>();

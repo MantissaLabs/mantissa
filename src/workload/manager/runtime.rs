@@ -24,8 +24,10 @@ use crate::runtime::types::{RuntimeAttachmentTarget, RuntimeEvent, RuntimeInstan
 use crate::timing::jittered_interval;
 use crate::workload::model::{
     WorkloadEvent, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStatus,
-    compare_workload_causality as compare_task_causality,
-    compare_workload_status_causality as compare_task_status_causality, select_best_workload_value,
+    WorkloadStoreValue, compare_workload_causality as compare_task_causality,
+    compare_workload_status_causality as compare_task_status_causality,
+    select_best_admission_group_record, select_best_workload_value,
+    should_accept_admission_group_record,
 };
 use crate::workload::types::WorkloadRestartPolicyKind;
 
@@ -621,6 +623,65 @@ impl WorkloadManager {
                         .lock()
                         .await
                         .remove(&persisted_spec.id);
+                }
+
+                Ok(())
+            }
+            WorkloadEvent::UpsertAdmissionGroup(record_box) => {
+                let record = *record_box;
+                let current = self
+                    .core
+                    .store
+                    .get_snapshot(&UuidKey::from(record.id))
+                    .map_err(|e| {
+                        anyhow::anyhow!("admission group lookup failed before apply: {e}")
+                    })?
+                    .and_then(|snapshot| select_best_admission_group_record(snapshot.as_slice()));
+                if let Some(current) = current.as_ref()
+                    && !should_accept_admission_group_record(current, &record)
+                {
+                    debug!(
+                        target: "task",
+                        group = %record.id,
+                        current_phase = ?current.phase,
+                        incoming_phase = ?record.phase,
+                        "ignoring stale or duplicate admission group update"
+                    );
+                    return Ok(());
+                }
+
+                self.core
+                    .store
+                    .upsert(
+                        &UuidKey::from(record.id),
+                        WorkloadStoreValue::from(record.clone()),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("admission group upsert failed: {e}"))?;
+
+                if record.phase.allows_adoption() || record.phase.requires_abort() {
+                    for task_id in record.workload_ids.iter().copied() {
+                        let Ok(spec) = self.load_spec(task_id).await else {
+                            continue;
+                        };
+                        if spec.node_id != self.local_node_id {
+                            continue;
+                        }
+                        let Some(reconcile_guard) = self.try_begin_reconcile(spec.id).await else {
+                            continue;
+                        };
+                        let manager = self.clone();
+                        tokio::task::spawn_local(async move {
+                            let _reconcile_guard = reconcile_guard;
+                            if let Err(err) = manager.reconcile_local_task(spec.clone()).await {
+                                warn!(
+                                    target: "task",
+                                    "failed to reconcile task {} after admission group update: {err}",
+                                    spec.id
+                                );
+                            }
+                        });
+                    }
                 }
 
                 Ok(())

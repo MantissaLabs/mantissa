@@ -137,12 +137,12 @@ mod tests {
 
         registry
             .store
-            .upsert(&UuidKey::from(task_a.id), task_a.clone())
+            .upsert(&UuidKey::from(task_a.id), task_a.clone().into())
             .await
             .expect("upsert task a");
         registry
             .store
-            .upsert(&UuidKey::from(task_b.id), task_b.clone())
+            .upsert(&UuidKey::from(task_b.id), task_b.clone().into())
             .await
             .expect("upsert task b");
 
@@ -165,12 +165,15 @@ mod tests {
 
         registry
             .store
-            .upsert(&UuidKey::from(evicted_task.id), evicted_task.clone())
+            .upsert(&UuidKey::from(evicted_task.id), evicted_task.clone().into())
             .await
             .expect("upsert evicted task");
         registry
             .store
-            .upsert(&UuidKey::from(retained_task.id), retained_task.clone())
+            .upsert(
+                &UuidKey::from(retained_task.id),
+                retained_task.clone().into(),
+            )
             .await
             .expect("upsert retained task");
 

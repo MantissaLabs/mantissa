@@ -639,7 +639,7 @@ async fn backend_catalog_refresh_invalidates_on_task_change_clock() {
         .workloads
         .upsert(
             &UuidKey::from(task_id),
-            catalog_task(task_id, node_id, service_name, harness.network.id),
+            catalog_task(task_id, node_id, service_name, harness.network.id).into(),
         )
         .await
         .expect("upsert running task");
@@ -692,7 +692,7 @@ async fn backend_catalog_refresh_invalidates_on_task_change_clock() {
     stopped.updated_at = chrono::Utc::now().to_rfc3339();
     harness
         .workloads
-        .upsert(&UuidKey::from(task_id), stopped)
+        .upsert(&UuidKey::from(task_id), stopped.into())
         .await
         .expect("upsert stopped task");
 
@@ -731,7 +731,7 @@ async fn backend_catalog_refresh_invalidates_on_peer_change_clock() {
         .workloads
         .upsert(
             &UuidKey::from(task_id),
-            catalog_task(task_id, node_id, service_name, harness.network.id),
+            catalog_task(task_id, node_id, service_name, harness.network.id).into(),
         )
         .await
         .expect("upsert running task");
@@ -830,7 +830,7 @@ async fn backend_catalog_filters_remote_backends_for_bridge_network() {
             .workloads
             .upsert(
                 &UuidKey::from(task_id),
-                catalog_task(task_id, node_id, service_name, harness.network.id),
+                catalog_task(task_id, node_id, service_name, harness.network.id).into(),
             )
             .await
             .expect("upsert running task");
@@ -908,7 +908,7 @@ async fn backend_catalog_scopes_same_template_names_by_service() {
             .workloads
             .upsert(
                 &UuidKey::from(task_id),
-                catalog_task(task_id, node_id, service_name, harness.network.id),
+                catalog_task(task_id, node_id, service_name, harness.network.id).into(),
             )
             .await
             .expect("upsert running task");
@@ -1014,7 +1014,7 @@ async fn backend_catalog_refresh_retains_unchanged_healthy_backends() {
         .workloads
         .upsert(
             &UuidKey::from(ready_task),
-            catalog_task(ready_task, ready_node, service_name, harness.network.id),
+            catalog_task(ready_task, ready_node, service_name, harness.network.id).into(),
         )
         .await
         .expect("upsert ready task");
@@ -1027,7 +1027,8 @@ async fn backend_catalog_refresh_retains_unchanged_healthy_backends() {
                 withdrawing_node,
                 service_name,
                 harness.network.id,
-            ),
+            )
+            .into(),
         )
         .await
         .expect("upsert withdrawing task");

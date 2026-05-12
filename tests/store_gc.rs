@@ -40,7 +40,8 @@ use mantissa::volumes::types::{
     VolumeSpecValue, VolumeStatus,
 };
 use mantissa::workload::model::{
-    ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadValue, WorkloadValueDraft,
+    ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadStoreValue, WorkloadValue,
+    WorkloadValueDraft,
 };
 use mantissa::workload::types::ResolvedExecutionSpec;
 use mantissa_store::adapter::RegAdapter;
@@ -634,13 +635,13 @@ fn scheduler_digest_batch(start: u128, count: usize) -> Vec<(UuidKey, SchedulerD
 }
 
 /// Builds one deterministic batch of workload rows keyed by UUID.
-fn workload_batch(start: u128, count: usize, node_id: Uuid) -> Vec<(UuidKey, WorkloadValue)> {
+fn workload_batch(start: u128, count: usize, node_id: Uuid) -> Vec<(UuidKey, WorkloadStoreValue)> {
     (0..count)
         .map(|index| {
             let workload_id = Uuid::from_u128(start + index as u128);
             (
                 UuidKey::from(workload_id),
-                workload_value(workload_id, node_id, index as u64 + 1),
+                workload_value(workload_id, node_id, index as u64 + 1).into(),
             )
         })
         .collect()
@@ -684,9 +685,12 @@ local_test!(store_compaction_rankers_cover_all_replicated_domains, {
     let workload_node = Uuid::from_u128(50_002);
     assert_compacts_to_one_value!(
         WorkloadRegAdapter,
-        workload_value(workload_id, workload_node, 1),
-        workload_value(workload_id, workload_node, 2),
-        |retained: WorkloadValue| {
+        WorkloadStoreValue::from(workload_value(workload_id, workload_node, 1)),
+        WorkloadStoreValue::from(workload_value(workload_id, workload_node, 2)),
+        |retained: WorkloadStoreValue| {
+            let WorkloadStoreValue::Workload(retained) = retained else {
+                panic!("retained workload compaction value must be a workload");
+            };
             assert_eq!(retained.phase_version, 2);
             assert_eq!(retained.task_epoch, 2);
         }
@@ -869,7 +873,7 @@ local_test!(store_gc_rejects_mismatched_root_schema_barrier, {
     let (_dir, _db, store) = open_reopenable_workload_store(actor);
 
     store
-        .upsert(&key, workload_value(workload_id, actor, 1))
+        .upsert(&key, workload_value(workload_id, actor, 1).into())
         .await
         .expect("upsert workload before delete");
     store.remove(&key).await.expect("remove workload");
@@ -1051,7 +1055,10 @@ local_test!(store_gc_and_compaction_survive_reopen, {
     let (_workload_dir, workload_db, workload_store) = open_reopenable_workload_store(actor_a);
 
     workload_store
-        .upsert(&workload_key, workload_value(workload_id, actor_a, 1))
+        .upsert(
+            &workload_key,
+            workload_value(workload_id, actor_a, 1).into(),
+        )
         .await
         .expect("upsert workload before delete");
     let tombstone_sequence = workload_store

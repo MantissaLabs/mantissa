@@ -1,5 +1,7 @@
 use crate::store::replicated::open::open_arc_store;
-use crate::workload::model::{WorkloadValue, parse_workload_timestamp, workload_phase_rank};
+use crate::workload::model::{
+    WorkloadStoreValue, admission_group_phase_rank, parse_workload_timestamp, workload_phase_rank,
+};
 use chrono::{DateTime, Utc};
 use mantissa_store::adapter::{CompactingStoreMvRegAdapterSorted, MvRegCompactionRanker};
 use mantissa_store::hash::XXHash128;
@@ -23,35 +25,48 @@ impl TableSet for WorkloadTables {
 /// Workload compaction ranker used by the generic MVReg adapter.
 pub struct WorkloadCompactionRank;
 
-impl MvRegCompactionRanker<WorkloadValue, Uuid> for WorkloadCompactionRank {
+impl MvRegCompactionRanker<WorkloadStoreValue, Uuid> for WorkloadCompactionRank {
     type Rank = (
+        u8,
         u64,
         u64,
         Option<DateTime<Utc>>,
         u8,
         bool,
         Uuid,
-        Reverse<WorkloadValue>,
+        Reverse<WorkloadStoreValue>,
     );
 
-    /// Ranks one workload value using the same causal order as workload selection.
-    fn rank(entry: &MvRegEntry<WorkloadValue, Uuid>) -> Self::Rank {
-        let value = entry.value();
-        (
-            value.task_epoch,
-            value.phase_version,
-            parse_workload_timestamp(&value.updated_at, &value.created_at),
-            workload_phase_rank(&value.state),
-            value.definition_complete,
-            value.node_id,
-            Reverse(value.clone()),
-        )
+    /// Ranks one workload-domain value using its domain-specific convergence order.
+    fn rank(entry: &MvRegEntry<WorkloadStoreValue, Uuid>) -> Self::Rank {
+        match entry.value() {
+            WorkloadStoreValue::Workload(value) => (
+                0,
+                value.task_epoch,
+                value.phase_version,
+                parse_workload_timestamp(&value.updated_at, &value.created_at),
+                workload_phase_rank(&value.state),
+                value.definition_complete,
+                value.node_id,
+                Reverse(entry.value().clone()),
+            ),
+            WorkloadStoreValue::AdmissionGroup(record) => (
+                1,
+                u64::from(admission_group_phase_rank(record.phase)),
+                0,
+                parse_workload_timestamp(&record.updated_at, &record.created_at),
+                admission_group_phase_rank(record.phase),
+                true,
+                record.coordinator_node_id,
+                Reverse(entry.value().clone()),
+            ),
+        }
     }
 }
 
 /// Store adapter for workload registers with domain-aware compaction enabled.
 pub type WorkloadRegAdapter =
-    CompactingStoreMvRegAdapterSorted<UuidKey, WorkloadValue, Uuid, WorkloadCompactionRank>;
+    CompactingStoreMvRegAdapterSorted<UuidKey, WorkloadStoreValue, Uuid, WorkloadCompactionRank>;
 
 pub type WorkloadStoreInner = CrdtMstStore<WorkloadRegAdapter, XXHash128, WorkloadTables>;
 

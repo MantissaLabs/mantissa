@@ -15,9 +15,10 @@ use crate::services::registry::ServiceRegistry;
 use crate::store::replicated::workloads::WorkloadStore;
 use crate::volumes::VolumeRegistry;
 use crate::workload::model::{
-    ExecutionPlatform, IsolationMode, WorkloadAdmissionState, WorkloadEvent, WorkloadOwner,
-    WorkloadPhase, WorkloadSpec, WorkloadStateFilter, WorkloadStatus, WorkloadValue,
-    should_replace_workload_event,
+    ExecutionPlatform, IsolationMode, WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord,
+    WorkloadAdmissionState, WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadSpec,
+    WorkloadStateFilter, WorkloadStatus, WorkloadStoreValue, WorkloadValue,
+    select_best_admission_group_record, should_replace_workload_event,
 };
 pub(crate) use crate::workload::model::{
     merge_definition_into_value, merge_status_into_value, spec_to_status, spec_to_value,
@@ -81,6 +82,18 @@ const WORKLOAD_GOSSIP_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// Number of fanout rounds one logical workload update should survive before it ages out.
 const WORKLOAD_GOSSIP_COVERAGE_ROUNDS: usize = 3;
 
+/// Converts a UTC timestamp into a non-negative Unix millisecond value.
+fn unix_ms(time: DateTime<Utc>) -> u64 {
+    u64::try_from(time.timestamp_millis()).unwrap_or(0)
+}
+
+/// Sorts and deduplicates UUID lists before persisting them into control records.
+fn sorted_unique_uuids(mut values: Vec<Uuid>) -> Vec<Uuid> {
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
 /// Remove tombstone metadata used to suppress stale workload upsert replay.
 #[derive(Clone)]
 struct RemoveTombstone {
@@ -133,7 +146,7 @@ impl DirtyWorkloadGossipRecord {
                     self.latest = event;
                 }
             }
-            WorkloadEvent::UpsertStatus(_) => {
+            WorkloadEvent::UpsertStatus(_) | WorkloadEvent::UpsertAdmissionGroup(_) => {
                 if matches!(self.latest, WorkloadEvent::Remove { .. })
                     || should_replace_workload_event(&self.latest, &event)
                 {
@@ -157,6 +170,9 @@ impl DirtyWorkloadGossipRecord {
                 events
             }
             WorkloadEvent::UpsertSpec(spec) => vec![WorkloadEvent::UpsertSpec(spec.clone())],
+            WorkloadEvent::UpsertAdmissionGroup(record) => {
+                vec![WorkloadEvent::UpsertAdmissionGroup(record.clone())]
+            }
         }
     }
 
@@ -652,7 +668,7 @@ impl WorkloadManager {
     /// Starts one workload group with a strict admission barrier before any row is runnable.
     pub async fn start_workloads_gang(
         &self,
-        group_id: Uuid,
+        scope_id: Uuid,
         requests: Vec<WorkloadStartRequest>,
     ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
         if requests.is_empty() {
@@ -689,7 +705,7 @@ impl WorkloadManager {
             if let Err(err) = self.ensure_remote_secret_availability(&remote_plans).await {
                 debug!(
                     target: "task",
-                    "remote secrets unavailable for gang group {group_id} on attempt {attempt}: {err}"
+                    "remote secrets unavailable for gang scope {scope_id} on attempt {attempt}: {err}"
                 );
                 last_retry_error = Some(err.context(format!(
                     "remote secrets are unavailable during gang reservation prepare ({request_summary})"
@@ -698,15 +714,40 @@ impl WorkloadManager {
                 continue;
             }
 
+            let attempt_id = Uuid::new_v4();
+            let workload_ids = intents.iter().map(|intent| intent.id).collect::<Vec<_>>();
+            let mut target_node_ids = remote_plans
+                .iter()
+                .map(|plan| plan.peer_id)
+                .collect::<Vec<_>>();
+            if !local_plans.is_empty() {
+                target_node_ids.push(self.local_node_id);
+            }
+            let admission_record = self
+                .prepare_admission_group_record(
+                    scope_id,
+                    attempt_id,
+                    workload_ids,
+                    target_node_ids,
+                    lease_ttl_ms,
+                )
+                .await?;
+
             let prepared_local = match self
-                .prepare_local_lease_group(group_id, &local_plans, local_version, lease_ttl_ms)
+                .prepare_local_lease_group(attempt_id, &local_plans, local_version, lease_ttl_ms)
                 .await
             {
                 Ok(prepared) => prepared,
                 Err(ExecutionError::Retry(err)) => {
+                    self.abort_admission_group_record(
+                        &admission_record,
+                        "local lease prepare conflicted before gang commit",
+                    )
+                    .await;
+                    self.abort_local_lease_group(attempt_id).await;
                     debug!(
                         target: "task",
-                        "local gang prepare conflicted for group {group_id} on attempt {attempt}: {err}"
+                        "local gang prepare conflicted for admission attempt {attempt_id} on attempt {attempt}: {err}"
                     );
                     last_retry_error = Some(gang_retry_error(
                         "local lease prepare",
@@ -715,19 +756,32 @@ impl WorkloadManager {
                     ));
                     continue;
                 }
-                Err(ExecutionError::Fatal(err)) => return Err(err),
+                Err(ExecutionError::Fatal(err)) => {
+                    self.abort_admission_group_record(
+                        &admission_record,
+                        "local lease prepare failed before gang commit",
+                    )
+                    .await;
+                    self.abort_local_lease_group(attempt_id).await;
+                    return Err(err);
+                }
             };
 
             let (mut remote_reservations, prepared_remote_plans) = match self
-                .prepare_remote_lease_group(group_id, &remote_plans, lease_ttl_ms)
+                .prepare_remote_lease_group(attempt_id, &remote_plans, lease_ttl_ms)
                 .await
             {
                 Ok(prepared) => prepared,
                 Err(ExecutionError::Retry(err)) => {
-                    self.abort_local_lease_group(group_id).await;
+                    self.abort_admission_group_record(
+                        &admission_record,
+                        "remote lease prepare conflicted before gang commit",
+                    )
+                    .await;
+                    self.abort_local_lease_group(attempt_id).await;
                     debug!(
                         target: "task",
-                        "remote gang prepare conflicted for group {group_id} on attempt {attempt}: {err}"
+                        "remote gang prepare conflicted for admission attempt {attempt_id} on attempt {attempt}: {err}"
                     );
                     last_retry_error = Some(gang_retry_error(
                         "remote lease prepare",
@@ -737,7 +791,12 @@ impl WorkloadManager {
                     continue;
                 }
                 Err(ExecutionError::Fatal(err)) => {
-                    self.abort_local_lease_group(group_id).await;
+                    self.abort_admission_group_record(
+                        &admission_record,
+                        "remote lease prepare failed before gang commit",
+                    )
+                    .await;
+                    self.abort_local_lease_group(attempt_id).await;
                     return Err(err);
                 }
             };
@@ -745,20 +804,25 @@ impl WorkloadManager {
             let remote_specs = match self
                 .materialize_remote_specs_with_admission(
                     &prepared_remote_plans,
-                    Some(group_id),
+                    Some(attempt_id),
                     WorkloadAdmissionState::PendingGroup,
                 )
                 .await
             {
                 Ok(specs) => specs,
                 Err(ExecutionError::Retry(err)) => {
-                    self.abort_remote_lease_groups(group_id, &remote_reservations)
+                    self.abort_admission_group_record(
+                        &admission_record,
+                        "remote workload materialization conflicted before gang commit",
+                    )
+                    .await;
+                    self.abort_remote_lease_groups(attempt_id, &remote_reservations)
                         .await;
-                    self.abort_local_lease_group(group_id).await;
+                    self.abort_local_lease_group(attempt_id).await;
                     remote_reservations.clear();
                     debug!(
                         target: "task",
-                        "remote gang materialization conflicted for group {group_id} on attempt {attempt}: {err}"
+                        "remote gang materialization conflicted for admission attempt {attempt_id} on attempt {attempt}: {err}"
                     );
                     last_retry_error = Some(err.context(format!(
                         "remote workload rows changed during gang reservation materialization ({request_summary})"
@@ -766,9 +830,14 @@ impl WorkloadManager {
                     continue;
                 }
                 Err(ExecutionError::Fatal(err)) => {
-                    self.abort_remote_lease_groups(group_id, &remote_reservations)
+                    self.abort_admission_group_record(
+                        &admission_record,
+                        "remote workload materialization failed before gang commit",
+                    )
+                    .await;
+                    self.abort_remote_lease_groups(attempt_id, &remote_reservations)
                         .await;
-                    self.abort_local_lease_group(group_id).await;
+                    self.abort_local_lease_group(attempt_id).await;
                     remote_reservations.clear();
                     return Err(err);
                 }
@@ -777,33 +846,43 @@ impl WorkloadManager {
             let local_pending_specs = match self
                 .persist_pending_batch_with_admission(
                     &local_plans,
-                    Some(group_id),
+                    Some(attempt_id),
                     WorkloadAdmissionState::PendingGroup,
                 )
                 .await
             {
                 Ok(specs) => specs,
                 Err(err) => {
+                    self.abort_admission_group_record(
+                        &admission_record,
+                        "local workload materialization failed before gang commit",
+                    )
+                    .await;
                     self.remove_group_specs(remote_specs.iter().map(|(_, spec)| spec))
                         .await;
-                    self.abort_remote_lease_groups(group_id, &remote_reservations)
+                    self.abort_remote_lease_groups(attempt_id, &remote_reservations)
                         .await;
-                    self.abort_local_lease_group(group_id).await;
+                    self.abort_local_lease_group(attempt_id).await;
                     remote_reservations.clear();
                     return Err(err);
                 }
             };
 
             if let Err(err) = self
-                .commit_remote_lease_groups(group_id, &remote_reservations)
+                .commit_remote_lease_groups(attempt_id, &remote_reservations)
                 .await
             {
+                self.abort_admission_group_record(
+                    &admission_record,
+                    "remote lease commit failed before gang commit decision",
+                )
+                .await;
                 self.remove_group_specs(remote_specs.iter().map(|(_, spec)| spec))
                     .await;
                 self.remove_group_specs(local_pending_specs.iter()).await;
-                self.abort_remote_lease_groups(group_id, &remote_reservations)
+                self.abort_remote_lease_groups(attempt_id, &remote_reservations)
                     .await;
-                self.abort_local_lease_group(group_id).await;
+                self.abort_local_lease_group(attempt_id).await;
                 remote_reservations.clear();
                 return match err {
                     ExecutionError::Retry(err) | ExecutionError::Fatal(err) => Err(err),
@@ -811,28 +890,66 @@ impl WorkloadManager {
             }
 
             if let Err(err) = self
-                .commit_local_lease_group(group_id, &prepared_local)
+                .commit_local_lease_group(attempt_id, &prepared_local)
                 .await
             {
+                self.abort_admission_group_record(
+                    &admission_record,
+                    "local lease commit failed before gang commit decision",
+                )
+                .await;
                 self.remove_group_specs(remote_specs.iter().map(|(_, spec)| spec))
                     .await;
                 self.remove_group_specs(local_pending_specs.iter()).await;
-                self.abort_remote_lease_groups(group_id, &remote_reservations)
+                self.abort_remote_lease_groups(attempt_id, &remote_reservations)
                     .await;
-                self.abort_local_lease_group(group_id).await;
+                self.abort_local_lease_group(attempt_id).await;
                 remote_reservations.clear();
                 return match err {
                     ExecutionError::Retry(err) | ExecutionError::Fatal(err) => Err(err),
                 };
             }
+
+            let committed_admission_record = match self
+                .advance_admission_group_record(
+                    &admission_record,
+                    WorkloadAdmissionGroupPhase::CommitDecided,
+                    None,
+                )
+                .await
+            {
+                Ok(record) => record,
+                Err(err) => {
+                    self.abort_admission_group_record(
+                        &admission_record,
+                        "failed to persist gang commit decision after scheduler commit",
+                    )
+                    .await;
+                    self.rollback_committed_gang_group(
+                        attempt_id,
+                        &remote_reservations,
+                        &remote_specs,
+                        &local_pending_specs,
+                    )
+                    .await;
+                    remote_reservations.clear();
+                    return Err(err
+                        .context("failed to persist gang commit decision after scheduler commit"));
+                }
+            };
 
             let mut committed_remote_specs = remote_specs;
             if let Err(err) = self
                 .mark_group_specs_committed(&mut committed_remote_specs)
                 .await
             {
+                self.abort_admission_group_record(
+                    &committed_admission_record,
+                    "failed to publish remote gang workload rows after commit decision",
+                )
+                .await;
                 self.rollback_committed_gang_group(
-                    group_id,
+                    attempt_id,
                     &remote_reservations,
                     &committed_remote_specs,
                     &local_pending_specs,
@@ -852,8 +969,13 @@ impl WorkloadManager {
                         "missing local gang plan index for pending workload {}",
                         spec.id
                     );
+                    self.abort_admission_group_record(
+                        &committed_admission_record,
+                        "failed to build local gang workload publication after commit decision",
+                    )
+                    .await;
                     self.rollback_committed_gang_group(
-                        group_id,
+                        attempt_id,
                         &remote_reservations,
                         &committed_remote_specs,
                         &local_pending_specs,
@@ -868,8 +990,13 @@ impl WorkloadManager {
                 .mark_group_specs_committed(&mut committed_local_specs)
                 .await
             {
+                self.abort_admission_group_record(
+                    &committed_admission_record,
+                    "failed to publish local gang workload rows after commit decision",
+                )
+                .await;
                 self.rollback_committed_gang_group(
-                    group_id,
+                    attempt_id,
                     &remote_reservations,
                     &committed_remote_specs,
                     &local_pending_specs,
@@ -880,7 +1007,11 @@ impl WorkloadManager {
             }
 
             match self
-                .start_local_group_instances(group_id, &mut local_plans)
+                .start_local_group_instances(
+                    attempt_id,
+                    &mut local_plans,
+                    &committed_admission_record,
+                )
                 .await
             {
                 Ok(local_specs) => {
@@ -898,15 +1029,35 @@ impl WorkloadManager {
                         })
                         .collect::<Result<_, _>>()?;
 
+                    if let Err(err) = self
+                        .advance_admission_group_record(
+                            &committed_admission_record,
+                            WorkloadAdmissionGroupPhase::Completed,
+                            None,
+                        )
+                        .await
+                    {
+                        warn!(
+                            target: "task",
+                            group = %attempt_id,
+                            "failed to mark gang admission group completed after successful start: {err}"
+                        );
+                    }
+
                     return Ok(specs);
                 }
                 Err(err) => {
                     debug!(
                         target: "task",
-                        "local gang execution failed after group {group_id} commit; rolling back remote tasks: {err}"
+                        "local gang execution failed after admission attempt {attempt_id} commit; rolling back remote tasks: {err}"
                     );
+                    self.abort_admission_group_record(
+                        &committed_admission_record,
+                        "local gang execution failed after commit decision",
+                    )
+                    .await;
                     self.rollback_committed_gang_group(
-                        group_id,
+                        attempt_id,
                         &remote_reservations,
                         &committed_remote_specs,
                         &local_pending_specs,
@@ -989,6 +1140,152 @@ impl WorkloadManager {
         }
 
         Ok(())
+    }
+
+    /// Persists one admission group decision record in the workload replication domain.
+    async fn persist_admission_group_record(
+        &self,
+        record: &WorkloadAdmissionGroupRecord,
+    ) -> Result<(), anyhow::Error> {
+        self.core
+            .store
+            .upsert(
+                &UuidKey::from(record.id),
+                WorkloadStoreValue::from(record.clone()),
+            )
+            .await
+            .map_err(|e| anyhow!("admission group upsert failed: {e}"))?;
+
+        if let Err(err) = self
+            .enqueue_gossip_best_effort(WorkloadEvent::UpsertAdmissionGroup(Box::new(
+                record.clone(),
+            )))
+            .await
+        {
+            warn!(
+                target: "task",
+                group = %record.id,
+                phase = ?record.phase,
+                "failed to enqueue admission group gossip: {err}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Loads the selected admission group decision record for one group attempt.
+    async fn load_admission_group_record(
+        &self,
+        group_id: Uuid,
+    ) -> Result<Option<WorkloadAdmissionGroupRecord>, anyhow::Error> {
+        let key = UuidKey::from(group_id);
+        let snapshot = self
+            .core
+            .store
+            .get_snapshot(&key)
+            .map_err(|e| anyhow!("admission group lookup failed: {e}"))?;
+        Ok(snapshot.and_then(|values| select_best_admission_group_record(values.as_slice())))
+    }
+
+    /// Loads every selected admission group decision record currently retained locally.
+    async fn load_admission_group_records(
+        &self,
+    ) -> Result<Vec<WorkloadAdmissionGroupRecord>, anyhow::Error> {
+        let (entries, _) = self
+            .core
+            .store
+            .load_all()
+            .map_err(|e| anyhow!("workload store load_all failed: {e}"))?;
+        let mut records = Vec::new();
+        for (_, snapshot) in entries {
+            if let Some(record) = select_best_admission_group_record(snapshot.as_slice()) {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    /// Builds and persists the preparing record for one concrete gang admission attempt.
+    async fn prepare_admission_group_record(
+        &self,
+        scope_id: Uuid,
+        attempt_id: Uuid,
+        workload_ids: Vec<Uuid>,
+        target_node_ids: Vec<Uuid>,
+        lease_ttl_ms: u64,
+    ) -> Result<WorkloadAdmissionGroupRecord, anyhow::Error> {
+        let now = Utc::now();
+        let lease_expires_at_unix_ms = unix_ms(now).saturating_add(lease_ttl_ms);
+        let record = WorkloadAdmissionGroupRecord {
+            id: attempt_id,
+            scope_id,
+            coordinator_node_id: self.local_node_id,
+            target_node_ids: sorted_unique_uuids(target_node_ids),
+            workload_count: workload_ids.len() as u64,
+            workload_ids: sorted_unique_uuids(workload_ids),
+            lease_expires_at_unix_ms,
+            phase: WorkloadAdmissionGroupPhase::Preparing,
+            reason: None,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+        };
+        self.persist_admission_group_record(&record).await?;
+        Ok(record)
+    }
+
+    /// Advances a group admission record to a durable phase without mutating its membership.
+    async fn advance_admission_group_record(
+        &self,
+        record: &WorkloadAdmissionGroupRecord,
+        phase: WorkloadAdmissionGroupPhase,
+        reason: Option<String>,
+    ) -> Result<WorkloadAdmissionGroupRecord, anyhow::Error> {
+        let mut next = record.clone();
+        next.phase = phase;
+        next.reason = reason.filter(|value| !value.trim().is_empty());
+        next.updated_at = Utc::now().to_rfc3339();
+        self.persist_admission_group_record(&next).await?;
+        Ok(next)
+    }
+
+    /// Records an abort decision for one known admission attempt.
+    async fn abort_admission_group_record(
+        &self,
+        record: &WorkloadAdmissionGroupRecord,
+        reason: impl Into<String>,
+    ) -> WorkloadAdmissionGroupRecord {
+        match self
+            .advance_admission_group_record(
+                record,
+                WorkloadAdmissionGroupPhase::AbortDecided,
+                Some(reason.into()),
+            )
+            .await
+        {
+            Ok(next) => next,
+            Err(err) => {
+                warn!(
+                    target: "task",
+                    group = %record.id,
+                    "failed to persist admission group abort decision: {err}"
+                );
+                record.clone()
+            }
+        }
+    }
+
+    /// Returns true when a spec belongs to a group that can be adopted by the local runtime.
+    async fn admission_group_allows_adoption(
+        &self,
+        spec: &WorkloadSpec,
+    ) -> Result<bool, anyhow::Error> {
+        let Some(group_id) = spec.admission_group_id else {
+            return Ok(true);
+        };
+        let Some(record) = self.load_admission_group_record(group_id).await? else {
+            return Ok(false);
+        };
+        Ok(record.phase.allows_adoption())
     }
 
     /// Starts one workload batch while allowing higher layers to clamp scheduling retries.
@@ -1949,9 +2246,9 @@ fn format_memory_bytes(bytes: u64) -> String {
     const GIB: u64 = 1_024 * 1_024 * 1_024;
     const MIB: u64 = 1_024 * 1_024;
 
-    if bytes >= GIB && bytes % GIB == 0 {
+    if bytes >= GIB && bytes.is_multiple_of(GIB) {
         format!("{} GiB memory", bytes / GIB)
-    } else if bytes >= MIB && bytes % MIB == 0 {
+    } else if bytes >= MIB && bytes.is_multiple_of(MIB) {
         format!("{} MiB memory", bytes / MIB)
     } else {
         format!("{bytes} bytes memory")

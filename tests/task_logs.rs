@@ -248,13 +248,13 @@ local_test!(task_logs_relay_over_tcp_sessions, {
     owner
         .node
         .workloads
-        .upsert(&UuidKey::from(task_id), task_value.clone())
+        .upsert(&UuidKey::from(task_id), task_value.clone().into())
         .await
         .expect("seed owner workload store");
     requester
         .node
         .workloads
-        .upsert(&UuidKey::from(task_id), task_value)
+        .upsert(&UuidKey::from(task_id), task_value.into())
         .await
         .expect("seed requester workload store");
 

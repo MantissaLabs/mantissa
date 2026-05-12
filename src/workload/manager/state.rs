@@ -22,9 +22,10 @@ use crate::scheduler::{
 };
 use crate::volumes::LocalVolumeAccessError;
 use crate::workload::model::{
-    WorkloadAdmissionState, WorkloadEvent, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec,
-    WorkloadValue, parse_workload_timestamp as parse_task_timestamp, select_best_workload_value,
-    workload_event_id,
+    WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord, WorkloadAdmissionState,
+    WorkloadEvent, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStoreValue,
+    WorkloadValue, parse_workload_timestamp as parse_task_timestamp,
+    select_best_admission_group_record, select_best_workload_value, workload_event_id,
 };
 use crate::workload::types::{
     WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadRestartPolicyKind,
@@ -811,7 +812,10 @@ impl WorkloadManager {
     ) -> Result<(), anyhow::Error> {
         self.core
             .store
-            .upsert(&UuidKey::from(task_id), value.clone())
+            .upsert(
+                &UuidKey::from(task_id),
+                WorkloadStoreValue::from(value.clone()),
+            )
             .await
             .map_err(|e| anyhow::anyhow!("task upsert failed: {e}"))
     }
@@ -852,6 +856,7 @@ impl WorkloadManager {
         let max_epoch = snapshot
             .as_slice()
             .iter()
+            .filter_map(WorkloadStoreValue::workload)
             .map(|value| value.task_epoch)
             .max()
             .unwrap_or(current.task_epoch);
@@ -862,6 +867,7 @@ impl WorkloadManager {
         if snapshot
             .as_slice()
             .iter()
+            .filter_map(WorkloadStoreValue::workload)
             .any(|value| value.node_id != node_id || value.slot_ids.as_slice() != slot_ids)
         {
             Ok(max_epoch.saturating_add(1))
@@ -881,7 +887,12 @@ impl WorkloadManager {
 
         let entries: Vec<_> = specs
             .iter()
-            .map(|spec| (UuidKey::from(spec.id), spec_to_value(spec)))
+            .map(|spec| {
+                (
+                    UuidKey::from(spec.id),
+                    WorkloadStoreValue::from(spec_to_value(spec)),
+                )
+            })
             .collect();
 
         self.core
@@ -2584,19 +2595,9 @@ impl WorkloadManager {
         &self,
         spec: WorkloadSpec,
     ) -> Result<(), anyhow::Error> {
-        if matches!(spec.admission_state, WorkloadAdmissionState::PendingGroup) {
-            if self.cleanup_expired_pending_group(&spec).await? {
-                return Ok(());
-            }
-            debug!(
-                target: "task",
-                "skipping task {} ({}) while admission group {:?} is pending",
-                spec.name,
-                spec.id,
-                spec.admission_group_id
-            );
+        let Some(spec) = self.prepare_grouped_task_for_reconcile(spec).await? else {
             return Ok(());
-        }
+        };
 
         match spec.state {
             WorkloadPhase::Pending
@@ -2624,6 +2625,137 @@ impl WorkloadManager {
                 Ok(())
             }
         }
+    }
+
+    /// Gates grouped task reconciliation on the durable all-or-nothing admission decision.
+    async fn prepare_grouped_task_for_reconcile(
+        &self,
+        mut spec: WorkloadSpec,
+    ) -> Result<Option<WorkloadSpec>, anyhow::Error> {
+        let Some(group_id) = spec.admission_group_id else {
+            return Ok(Some(spec));
+        };
+        let Some(record) = self.load_admission_group_record(group_id).await? else {
+            if matches!(spec.admission_state, WorkloadAdmissionState::PendingGroup)
+                && self.cleanup_expired_pending_group(&spec).await?
+            {
+                return Ok(None);
+            }
+            debug!(
+                target: "task",
+                "skipping task {} ({}) while admission group {group_id} has no durable decision",
+                spec.name,
+                spec.id
+            );
+            return Ok(None);
+        };
+
+        if record.phase.requires_abort() {
+            self.cleanup_aborted_group_member(&spec, &record).await?;
+            return Ok(None);
+        }
+
+        if matches!(record.phase, WorkloadAdmissionGroupPhase::Preparing) {
+            if record.is_preparing_expired(super::unix_ms(Utc::now())) {
+                let record = self
+                    .abort_admission_group_record(
+                        &record,
+                        "preparing gang admission expired before commit decision",
+                    )
+                    .await;
+                self.cleanup_aborted_group_member(&spec, &record).await?;
+                return Ok(None);
+            }
+            debug!(
+                target: "task",
+                "skipping task {} ({}) while admission group {group_id} is preparing",
+                spec.name,
+                spec.id
+            );
+            return Ok(None);
+        }
+
+        if !record.phase.allows_adoption() {
+            return Ok(None);
+        }
+
+        if matches!(spec.admission_state, WorkloadAdmissionState::PendingGroup) {
+            spec.admission_state = WorkloadAdmissionState::GroupCommitted;
+            spec.lease_id = None;
+            spec.lease_coordinator_node_id = None;
+            spec.updated_at = Utc::now().to_rfc3339();
+            self.persist_spec(&spec).await?;
+            self.enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(spec.clone())))
+                .await?;
+        }
+
+        Ok(Some(spec))
+    }
+
+    /// Applies an abort decision to one local group member and releases its scheduler state.
+    async fn cleanup_aborted_group_member(
+        &self,
+        spec: &WorkloadSpec,
+        record: &WorkloadAdmissionGroupRecord,
+    ) -> Result<(), anyhow::Error> {
+        let group_id = record.id;
+        if let Err(err) = self
+            .core
+            .scheduler
+            .abort_task_lease_group(record.coordinator_node_id, group_id)
+            .await
+        {
+            warn!(
+                target: "task",
+                "failed to abort admission group {group_id} while cleaning task {}: {err}",
+                spec.id
+            );
+        }
+
+        if matches!(
+            spec.state,
+            WorkloadPhase::Pulling
+                | WorkloadPhase::Creating
+                | WorkloadPhase::VolumeUnavailable
+                | WorkloadPhase::Running
+                | WorkloadPhase::Stopping
+        ) {
+            if let Err(err) = self.ensure_task_stopped(spec.clone()).await {
+                warn!(
+                    target: "task",
+                    task = %spec.id,
+                    group = %group_id,
+                    "failed to stop aborted admission group member: {err}"
+                );
+                return Err(err);
+            }
+        } else {
+            self.remove_spec(spec.id).await.with_context(|| {
+                format!(
+                    "failed to remove aborted admission group task {} ({})",
+                    spec.name, spec.id
+                )
+            })?;
+            if let Err(err) = self
+                .enqueue_gossip_best_effort(WorkloadEvent::Remove { id: spec.id })
+                .await
+            {
+                warn!(
+                    target: "task",
+                    task = %spec.id,
+                    "failed to gossip aborted admission group task removal: {err}"
+                );
+            }
+        }
+
+        debug!(
+            target: "task",
+            group = %group_id,
+            task = %spec.id,
+            phase = ?record.phase,
+            "cleaned local member of aborted admission group"
+        );
+        Ok(())
     }
 
     /// Removes a stale pending admission row once its prepared leases can no longer commit.
@@ -2743,7 +2875,7 @@ impl WorkloadManager {
             let id = key.to_uuid();
             if let Some(value) = select_best_workload_value(snapshot.as_slice()) {
                 workload_values.insert(id, value);
-            } else {
+            } else if select_best_admission_group_record(snapshot.as_slice()).is_none() {
                 invalid_ids.push(id);
             }
         }
@@ -2819,6 +2951,15 @@ impl WorkloadManager {
                 self.stop_unowned_instance(task_id, &instance, false, Some(&value))
                     .await;
                 continue;
+            }
+
+            if value.admission_group_id.is_some() {
+                let spec = value_to_spec(task_id, value.clone());
+                if !self.admission_group_allows_adoption(&spec).await? {
+                    self.stop_unowned_instance(task_id, &instance, false, Some(&value))
+                        .await;
+                    continue;
+                }
             }
 
             let instance_id = canonicalize_runtime_ref(&instance.runtime, &instance.info);
@@ -3038,6 +3179,13 @@ impl WorkloadManager {
             );
         }
 
+        if let Err(err) = self.reconcile_admission_groups().await {
+            warn!(
+                target: "task",
+                "failed to reconcile gang admission groups: {err}"
+            );
+        }
+
         let runtime_inventory = match self.list_runtime_inventory().await {
             Ok(inventory) => Some(inventory),
             Err(err) => {
@@ -3096,6 +3244,68 @@ impl WorkloadManager {
                 target: "task",
                 "failed to reconcile local scheduler reservations: {err}"
             );
+        }
+
+        Ok(())
+    }
+
+    /// Reconciles durable gang decisions so crashed coordinators converge to commit or abort.
+    pub(super) async fn reconcile_admission_groups(&self) -> Result<(), anyhow::Error> {
+        let records = self.load_admission_group_records().await?;
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let now_ms = super::unix_ms(Utc::now());
+        let mut actionable = Vec::new();
+        for record in records {
+            let record = if record.is_preparing_expired(now_ms) {
+                self.abort_admission_group_record(
+                    &record,
+                    "preparing gang admission expired before commit decision",
+                )
+                .await
+            } else {
+                record
+            };
+            if record.phase.requires_abort() {
+                actionable.push(record);
+            }
+        }
+
+        if actionable.is_empty() {
+            return Ok(());
+        }
+
+        let task_index = self.load_workload_value_index().await?;
+        for record in actionable {
+            if record.target_node_ids.contains(&self.local_node_id)
+                && let Err(err) = self
+                    .core
+                    .scheduler
+                    .abort_task_lease_group(record.coordinator_node_id, record.id)
+                    .await
+            {
+                warn!(
+                    target: "task",
+                    group = %record.id,
+                    "failed to abort scheduler resources while reconciling admission group: {err}"
+                );
+            }
+
+            for task_id in &record.workload_ids {
+                let Some(value) = task_index.get(task_id) else {
+                    continue;
+                };
+                if value.node_id != self.local_node_id {
+                    continue;
+                }
+                if value.admission_group_id != Some(record.id) {
+                    continue;
+                }
+                let spec = value_to_spec(*task_id, value.clone());
+                self.cleanup_aborted_group_member(&spec, &record).await?;
+            }
         }
 
         Ok(())
@@ -3220,6 +3430,12 @@ impl WorkloadManager {
                 None => return Ok(()),
             };
             let task_index = self.load_workload_value_index().await?;
+            let admission_groups: HashMap<Uuid, WorkloadAdmissionGroupPhase> = self
+                .load_admission_group_records()
+                .await?
+                .into_iter()
+                .map(|record| (record.id, record.phase))
+                .collect();
 
             let mut desired: HashMap<SlotId, Uuid> = HashMap::new();
             let mut desired_gpus: HashMap<String, Uuid> = HashMap::new();
@@ -3262,6 +3478,13 @@ impl WorkloadManager {
                     continue;
                 }
                 if !task_requires_slots(&value.state) {
+                    continue;
+                }
+                if let Some(group_id) = value.admission_group_id
+                    && !admission_groups
+                        .get(&group_id)
+                        .is_some_and(|phase| phase.allows_adoption())
+                {
                     continue;
                 }
                 if value.slot_ids.is_empty() {

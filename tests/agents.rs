@@ -64,7 +64,7 @@ local_test!(
             .workloads
             .upsert(
                 &UuidKey::from(workload_id),
-                task_spec_to_value(&exited_task),
+                task_spec_to_value(&exited_task).into(),
             )
             .await
             .expect("persist successful agent workload state");
@@ -940,7 +940,10 @@ async fn mark_workload_phase(node: &TestNode, workload_id: Uuid, phase: Workload
     task.updated_at = Utc::now().to_rfc3339();
     node.node
         .workloads
-        .upsert(&UuidKey::from(workload_id), task_spec_to_value(&task))
+        .upsert(
+            &UuidKey::from(workload_id),
+            task_spec_to_value(&task).into(),
+        )
         .await
         .expect("persist exited agent workload state");
 }

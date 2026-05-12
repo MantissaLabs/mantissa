@@ -285,13 +285,13 @@ local_test!(task_attach_relay_over_tcp_sessions, {
     owner
         .node
         .workloads
-        .upsert(&UuidKey::from(task_id), owner_value.clone())
+        .upsert(&UuidKey::from(task_id), owner_value.clone().into())
         .await
         .expect("store task on owner");
     requester
         .node
         .workloads
-        .upsert(&UuidKey::from(task_id), owner_value)
+        .upsert(&UuidKey::from(task_id), owner_value.into())
         .await
         .expect("store task on requester");
 
