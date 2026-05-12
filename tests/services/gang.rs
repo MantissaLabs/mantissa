@@ -1,13 +1,21 @@
 use super::support::*;
 use crate::common;
+use mantissa::scheduler::TaskLeaseIntent;
 use mantissa::scheduler::placement::{PlacementConstraint, PlacementConstraintSelector};
 use mantissa::services::manager::ServiceDeploymentOptions;
-use mantissa::workload::model::WorkloadAdmissionState;
+use mantissa::workload::model::{
+    ExecutionPlatform, IsolationMode, WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord,
+    WorkloadAdmissionState, WorkloadStoreValue, WorkloadValue, WorkloadValueDraft,
+};
 use mantissa::workload::types::{WorkloadAdmissionMode, WorkloadAdmissionPolicy};
 
 const SERVICE_WORKLOAD_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 const SERVICE_WORKLOAD_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DISTRIBUTED_GANG_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const CRASH_SCENARIO_NODE_COUNT: usize = 5;
+const CRASH_SCENARIO_LEASE_TTL_MS: u64 = 60_000;
+const CRASH_SCENARIO_CPU_MILLIS: u64 = 200;
+const CRASH_SCENARIO_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 const OVERCOMMITTED_CPU_MILLIS: u64 = 500_000;
 const OVERCOMMITTED_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
@@ -276,6 +284,524 @@ async fn wait_for_gang_reservations_on_assigned_nodes(
 
     Err(last_observed)
 }
+
+/// Builds a five-node in-process cluster tuned for deterministic admission crash coverage.
+async fn new_gang_crash_scenario_cluster() -> Vec<TestNode> {
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        task_reconcile_tick_ms: Some(100),
+        task_repair_tick_ms: Some(100),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(CRASH_SCENARIO_NODE_COUNT, cfg)
+        .await
+        .expect("five-node crash scenario cluster should start");
+    TestNode::assert_cluster_size_all(
+        &cluster,
+        CRASH_SCENARIO_NODE_COUNT,
+        "crash scenario cluster should stabilise to five nodes",
+    )
+    .await;
+    assert!(
+        wait_for_cached_cluster_sessions_all(&cluster, DISTRIBUTED_GANG_WAIT_TIMEOUT).await,
+        "crash scenario cluster sessions should be cached before admission record sync"
+    );
+    cluster
+}
+
+/// Returns a non-negative current Unix timestamp in milliseconds.
+fn current_unix_ms_for_test() -> u64 {
+    Utc::now().timestamp_millis().max(0) as u64
+}
+
+/// Ranks admission phases the same way the production merge rule does.
+fn admission_phase_rank_for_test(phase: WorkloadAdmissionGroupPhase) -> u8 {
+    match phase {
+        WorkloadAdmissionGroupPhase::Preparing => 0,
+        WorkloadAdmissionGroupPhase::CommitDecided => 1,
+        WorkloadAdmissionGroupPhase::Completed => 2,
+        WorkloadAdmissionGroupPhase::AbortDecided => 3,
+    }
+}
+
+/// Selects the best admission record from one workload-store MV-register snapshot.
+fn select_test_admission_record(
+    values: &[WorkloadStoreValue],
+) -> Option<WorkloadAdmissionGroupRecord> {
+    values
+        .iter()
+        .filter_map(WorkloadStoreValue::admission_group)
+        .max_by(|left, right| {
+            admission_phase_rank_for_test(left.phase)
+                .cmp(&admission_phase_rank_for_test(right.phase))
+                .then_with(|| left.updated_at.cmp(&right.updated_at))
+        })
+        .cloned()
+}
+
+/// Loads the current admission group decision observed by one node.
+fn observed_admission_record(
+    node: &TestNode,
+    group_id: Uuid,
+) -> Option<WorkloadAdmissionGroupRecord> {
+    node.node
+        .workloads
+        .get_snapshot(&UuidKey::from(group_id))
+        .expect("load admission group snapshot")
+        .and_then(|snapshot| select_test_admission_record(snapshot.as_slice()))
+}
+
+/// Nudges every node's sync loop so tests are not dependent on the next periodic tick.
+fn trigger_sync_all(nodes: &[TestNode]) {
+    for node in nodes {
+        node.node.sync_once_now();
+    }
+}
+
+/// Waits until every provided node observes the expected admission group phase.
+async fn wait_for_admission_group_phase_all(
+    nodes: &[TestNode],
+    group_id: Uuid,
+    expected: WorkloadAdmissionGroupPhase,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut last_observed = Vec::new();
+
+    while Instant::now() < deadline {
+        trigger_sync_all(nodes);
+        last_observed.clear();
+        let mut all_match = true;
+
+        for node in nodes {
+            match observed_admission_record(node, group_id) {
+                Some(record) if record.phase == expected => {
+                    last_observed.push(format!("node {}: {:?}", node.id(), record.phase));
+                }
+                Some(record) => {
+                    all_match = false;
+                    last_observed.push(format!("node {}: {:?}", node.id(), record.phase));
+                }
+                None => {
+                    all_match = false;
+                    last_observed.push(format!("node {}: missing", node.id()));
+                }
+            }
+        }
+
+        if all_match {
+            return Ok(());
+        }
+
+        sleep(SERVICE_WORKLOAD_POLL_INTERVAL).await;
+    }
+
+    Err(last_observed.join("; "))
+}
+
+/// Waits until one node observes the expected admission group phase.
+async fn wait_for_admission_group_phase(
+    node: &TestNode,
+    group_id: Uuid,
+    expected: WorkloadAdmissionGroupPhase,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, SERVICE_WORKLOAD_POLL_INTERVAL, || async {
+        node.node.sync_once_now();
+        observed_admission_record(node, group_id).is_some_and(|record| record.phase == expected)
+    })
+    .await
+}
+
+/// Persists an admission record directly, bypassing workload gossip.
+async fn upsert_admission_record_without_gossip(
+    node: &TestNode,
+    record: WorkloadAdmissionGroupRecord,
+) {
+    node.node
+        .workloads
+        .upsert(&UuidKey::from(record.id), WorkloadStoreValue::from(record))
+        .await
+        .expect("upsert admission record directly into workload store");
+}
+
+/// Persists a workload row directly, bypassing workload gossip.
+async fn upsert_workload_without_gossip(node: &TestNode, value: WorkloadValue) {
+    node.node
+        .workloads
+        .upsert(&UuidKey::from(value.id), WorkloadStoreValue::from(value))
+        .await
+        .expect("upsert workload directly into workload store");
+}
+
+/// Builds a replicated admission record for one crash-scenario group.
+fn crash_scenario_admission_record(
+    group_id: Uuid,
+    scope_id: Uuid,
+    coordinator_node_id: Uuid,
+    target_node_ids: Vec<Uuid>,
+    workload_ids: Vec<Uuid>,
+    lease_ttl_ms: u64,
+    phase: WorkloadAdmissionGroupPhase,
+) -> WorkloadAdmissionGroupRecord {
+    let now = Utc::now().to_rfc3339();
+    WorkloadAdmissionGroupRecord {
+        id: group_id,
+        scope_id,
+        coordinator_node_id,
+        target_node_ids,
+        workload_count: workload_ids.len() as u64,
+        workload_ids,
+        lease_expires_at_unix_ms: current_unix_ms_for_test().saturating_add(lease_ttl_ms),
+        phase,
+        reason: None,
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+/// Builds one pending grouped workload row as if a coordinator had prepared the member locally.
+fn crash_scenario_workload_value(
+    target_node_id: Uuid,
+    task_id: Uuid,
+    name: &str,
+    group_id: Uuid,
+    lease_id: Option<Uuid>,
+    coordinator_node_id: Option<Uuid>,
+    slot_ids: Vec<u64>,
+) -> WorkloadValue {
+    let now = Utc::now().to_rfc3339();
+    let mut value = WorkloadValue::new(WorkloadValueDraft {
+        id: task_id,
+        name: name.to_string(),
+        image: "hashicorp/http-echo:1.0.0".to_string(),
+        execution_platform: ExecutionPlatform::Oci,
+        isolation_mode: IsolationMode::Standard,
+        isolation_profile: None,
+        state: WorkloadPhase::Pending,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: now.clone(),
+        updated_at: now,
+        command: vec![
+            "-listen".to_string(),
+            ":8000".to_string(),
+            "-text".to_string(),
+            "gang crash scenario".to_string(),
+        ],
+        tty: false,
+        node_id: target_node_id,
+        node_name: format!("node-{target_node_id}"),
+        slot_ids,
+        networks: Vec::new(),
+        cpu_millis: CRASH_SCENARIO_CPU_MILLIS,
+        memory_bytes: CRASH_SCENARIO_MEMORY_BYTES,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        ports: Vec::new(),
+        owner: None,
+        lease_id,
+        lease_coordinator_node_id: coordinator_node_id,
+        task_epoch: 1,
+        phase_version: 1,
+        launch_attempt: 1,
+        last_terminal_observed_launch: None,
+    });
+    value.admission_group_id = Some(group_id);
+    value.admission_state = WorkloadAdmissionState::PendingGroup;
+    value
+}
+
+/// Prepares one scheduler group lease on a target node and optionally commits it.
+async fn prepare_crash_scenario_group_member(
+    target: &TestNode,
+    coordinator_node_id: Uuid,
+    group_id: Uuid,
+    task_id: Uuid,
+    commit: bool,
+) -> (Uuid, Vec<u64>) {
+    let prepared = target
+        .node
+        .scheduler
+        .prepare_task_lease_group(
+            coordinator_node_id,
+            group_id,
+            CRASH_SCENARIO_LEASE_TTL_MS,
+            vec![TaskLeaseIntent {
+                task_id,
+                cpu_millis: CRASH_SCENARIO_CPU_MILLIS,
+                memory_bytes: CRASH_SCENARIO_MEMORY_BYTES,
+                gpu_count: 0,
+            }],
+        )
+        .await
+        .expect("prepare crash scenario scheduler group member");
+    assert_eq!(
+        prepared.leases.len(),
+        1,
+        "single task lease prepare should return exactly one lease"
+    );
+
+    if commit {
+        target
+            .node
+            .scheduler
+            .commit_task_lease_group(group_id, coordinator_node_id, &prepared.leases)
+            .await
+            .expect("commit crash scenario scheduler group member");
+    }
+
+    let lease = prepared
+        .leases
+        .into_iter()
+        .next()
+        .expect("prepared lease should exist");
+    (lease.lease_id, lease.slot_ids)
+}
+
+/// Returns true once no scheduler slot on the node references the admission group.
+async fn scheduler_group_released(node: &TestNode, group_id: Uuid) -> bool {
+    let Some(snapshot) = node.node.scheduler.snapshot().await else {
+        return false;
+    };
+
+    snapshot.slots.iter().all(|slot| match &slot.state {
+        SlotState::Free => true,
+        SlotState::Leased(lease) => lease.group_id != Some(group_id),
+        SlotState::Reserved(reservation) => reservation.group_id != Some(group_id),
+    })
+}
+
+/// Returns true once one scheduler slot carries the expected committed group reservation.
+async fn scheduler_group_reserved_for_task(node: &TestNode, group_id: Uuid, task_id: Uuid) -> bool {
+    let Some(snapshot) = node.node.scheduler.snapshot().await else {
+        return false;
+    };
+
+    snapshot.slots.iter().any(|slot| {
+        matches!(
+            &slot.state,
+            SlotState::Reserved(reservation)
+                if reservation.group_id == Some(group_id)
+                    && reservation.task_id == Some(task_id)
+        )
+    })
+}
+
+local_test!(
+    services_gang_crash_admission_record_syncs_without_workload_gossip_on_five_nodes,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+        let cluster = new_gang_crash_scenario_cluster().await;
+
+        let group_id = Uuid::new_v4();
+        let record = crash_scenario_admission_record(
+            group_id,
+            Uuid::new_v4(),
+            cluster[0].id(),
+            cluster.iter().map(TestNode::id).collect(),
+            vec![Uuid::new_v4(), Uuid::new_v4()],
+            CRASH_SCENARIO_LEASE_TTL_MS,
+            WorkloadAdmissionGroupPhase::CommitDecided,
+        );
+
+        upsert_admission_record_without_gossip(&cluster[0], record).await;
+
+        if let Err(details) = wait_for_admission_group_phase_all(
+            &cluster,
+            group_id,
+            WorkloadAdmissionGroupPhase::CommitDecided,
+            DISTRIBUTED_GANG_WAIT_TIMEOUT,
+        )
+        .await
+        {
+            panic!(
+                "admission commit record should sync to all five nodes without workload gossip; observed {details}"
+            );
+        }
+    }
+);
+
+local_test!(
+    services_gang_crash_commit_decision_from_sync_adopts_pending_remote_member,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+        let cluster = new_gang_crash_scenario_cluster().await;
+        let coordinator = &cluster[0];
+        let target = &cluster[1];
+        let group_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+
+        let (lease_id, slot_ids) =
+            prepare_crash_scenario_group_member(target, coordinator.id(), group_id, task_id, true)
+                .await;
+        let workload = crash_scenario_workload_value(
+            target.id(),
+            task_id,
+            "gang-sync-adopt",
+            group_id,
+            Some(lease_id),
+            Some(coordinator.id()),
+            slot_ids,
+        );
+        upsert_workload_without_gossip(target, workload).await;
+
+        let record = crash_scenario_admission_record(
+            group_id,
+            Uuid::new_v4(),
+            coordinator.id(),
+            vec![target.id()],
+            vec![task_id],
+            CRASH_SCENARIO_LEASE_TTL_MS,
+            WorkloadAdmissionGroupPhase::CommitDecided,
+        );
+        upsert_admission_record_without_gossip(coordinator, record).await;
+
+        assert!(
+            wait_for_admission_group_phase(
+                target,
+                group_id,
+                WorkloadAdmissionGroupPhase::CommitDecided,
+                DISTRIBUTED_GANG_WAIT_TIMEOUT,
+            )
+            .await,
+            "target should learn the commit decision through workload sync"
+        );
+        assert!(
+            wait_until(
+                DISTRIBUTED_GANG_WAIT_TIMEOUT,
+                SERVICE_WORKLOAD_POLL_INTERVAL,
+                || async {
+                    match target.node.workload_manager.inspect_workload(task_id).await {
+                        Ok(spec) => {
+                            spec.admission_state == WorkloadAdmissionState::GroupCommitted
+                                && spec.lease_id.is_none()
+                                && matches!(
+                                    spec.state,
+                                    WorkloadPhase::Pulling
+                                        | WorkloadPhase::Creating
+                                        | WorkloadPhase::Running
+                                )
+                        }
+                        Err(_) => false,
+                    }
+                },
+            )
+            .await,
+            "target should adopt and launch the pending group member after synced commit"
+        );
+        assert!(
+            scheduler_group_reserved_for_task(target, group_id, task_id).await,
+            "target scheduler reservation should remain attached to the committed group"
+        );
+    }
+);
+
+local_test!(
+    services_gang_crash_preparing_without_commit_aborts_after_coordinator_shutdown,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+        let mut cluster = new_gang_crash_scenario_cluster().await;
+        let coordinator_id = cluster[0].id();
+        let target_id = cluster[1].id();
+        let group_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+
+        let (lease_id, slot_ids) = prepare_crash_scenario_group_member(
+            &cluster[1],
+            coordinator_id,
+            group_id,
+            task_id,
+            false,
+        )
+        .await;
+        let workload = crash_scenario_workload_value(
+            target_id,
+            task_id,
+            "gang-sync-abort",
+            group_id,
+            Some(lease_id),
+            Some(coordinator_id),
+            slot_ids,
+        );
+        upsert_workload_without_gossip(&cluster[1], workload).await;
+
+        let record = crash_scenario_admission_record(
+            group_id,
+            Uuid::new_v4(),
+            coordinator_id,
+            vec![target_id],
+            vec![task_id],
+            500,
+            WorkloadAdmissionGroupPhase::Preparing,
+        );
+        upsert_admission_record_without_gossip(&cluster[0], record).await;
+
+        assert!(
+            wait_for_admission_group_phase(
+                &cluster[1],
+                group_id,
+                WorkloadAdmissionGroupPhase::Preparing,
+                DISTRIBUTED_GANG_WAIT_TIMEOUT,
+            )
+            .await,
+            "target should learn the preparing record before the coordinator shuts down"
+        );
+
+        let coordinator = cluster.remove(0);
+        let coordinator = *coordinator.node;
+        coordinator
+            .shutdown()
+            .await
+            .expect("coordinator shutdown should simulate daemon crash");
+
+        if let Err(details) = wait_for_admission_group_phase_all(
+            &cluster,
+            group_id,
+            WorkloadAdmissionGroupPhase::AbortDecided,
+            DISTRIBUTED_GANG_WAIT_TIMEOUT,
+        )
+        .await
+        {
+            panic!(
+                "surviving nodes should converge on abort after preparing record expires; observed {details}"
+            );
+        }
+        assert!(
+            wait_until(
+                DISTRIBUTED_GANG_WAIT_TIMEOUT,
+                SERVICE_WORKLOAD_POLL_INTERVAL,
+                || async {
+                    cluster[0]
+                        .node
+                        .workload_manager
+                        .inspect_workload(task_id)
+                        .await
+                        .is_err()
+                },
+            )
+            .await,
+            "target should remove the uncommitted pending group member"
+        );
+        assert!(
+            wait_until(
+                DISTRIBUTED_GANG_WAIT_TIMEOUT,
+                SERVICE_WORKLOAD_POLL_INTERVAL,
+                || async { scheduler_group_released(&cluster[0], group_id).await },
+            )
+            .await,
+            "target should release prepared scheduler capacity for the aborted group"
+        );
+    }
+);
 
 local_test!(
     services_gang_zero_replica_deployment_runs_without_workloads,
