@@ -190,6 +190,15 @@ local_test!(jobs_gang_capacity_failure_leaves_no_attempt_workloads, {
         .await
         .expect("inspect failed gang job");
     assert_eq!(inspected.snapshot.attempts_started, 1);
+    let detail = inspected
+        .snapshot
+        .status_detail
+        .as_deref()
+        .expect("failed gang job should report a launch detail");
+    assert!(
+        detail.contains("not enough schedulable slots or resources"),
+        "failed gang job should explain the reservation failure: {detail}"
+    );
     assert!(
         inspected.snapshot.active_workload_id.is_none(),
         "failed gang job should not keep an active workload id"
@@ -609,6 +618,7 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
 struct JobSnapshot {
     id: Uuid,
     status: ProtoJobStatus,
+    status_detail: Option<String>,
     attempts_started: u32,
     active_workload_id: Option<Uuid>,
     execution_platform: String,
@@ -749,6 +759,7 @@ async fn list_jobs(client: &jobs::Client) -> Result<Vec<JobSnapshot>, capnp::Err
         snapshots.push(JobSnapshot {
             id: read_uuid(reader.get_id()?)?,
             status: reader.get_status()?,
+            status_detail: read_optional_text(reader.get_status_detail()?.to_str()?),
             attempts_started: reader.get_attempts_started(),
             active_workload_id: read_optional_uuid(reader.get_active_workload_id()?),
             execution_platform: reader.get_execution_platform()?.to_str()?.to_string(),
@@ -781,6 +792,7 @@ async fn inspect_job(client: &jobs::Client, job_id: Uuid) -> Result<JobDetail, c
         snapshot: JobSnapshot {
             id: read_uuid(snapshot.get_id()?)?,
             status: snapshot.get_status()?,
+            status_detail: read_optional_text(snapshot.get_status_detail()?.to_str()?),
             attempts_started: snapshot.get_attempts_started(),
             active_workload_id: read_optional_uuid(snapshot.get_active_workload_id()?),
             execution_platform: snapshot.get_execution_platform()?.to_str()?.to_string(),
@@ -800,6 +812,7 @@ async fn cancel_job(client: &jobs::Client, job_id: Uuid) -> Result<JobSnapshot, 
     Ok(JobSnapshot {
         id: read_uuid(reader.get_id()?)?,
         status: reader.get_status()?,
+        status_detail: read_optional_text(reader.get_status_detail()?.to_str()?),
         attempts_started: reader.get_attempts_started(),
         active_workload_id: read_optional_uuid(reader.get_active_workload_id()?),
         execution_platform: reader.get_execution_platform()?.to_str()?.to_string(),
@@ -817,6 +830,7 @@ async fn delete_job(client: &jobs::Client, job_id: Uuid) -> Result<JobSnapshot, 
     Ok(JobSnapshot {
         id: read_uuid(reader.get_id()?)?,
         status: reader.get_status()?,
+        status_detail: read_optional_text(reader.get_status_detail()?.to_str()?),
         attempts_started: reader.get_attempts_started(),
         active_workload_id: read_optional_uuid(reader.get_active_workload_id()?),
         execution_platform: reader.get_execution_platform()?.to_str()?.to_string(),

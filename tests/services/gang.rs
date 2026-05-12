@@ -1162,7 +1162,10 @@ local_test!(
         let detail = wait_for_service_detail_containing(
             &node,
             service_id,
-            &["gang admission failed", "capacity"],
+            &[
+                "gang admission failed",
+                "not enough schedulable slots or resources",
+            ],
         )
         .await;
         assert!(
@@ -1218,7 +1221,10 @@ local_test!(
         let detail = wait_for_service_detail_containing(
             &node,
             service_id,
-            &["gang admission failed", "capacity"],
+            &[
+                "gang admission failed",
+                "not enough schedulable slots or resources",
+            ],
         )
         .await;
         assert!(

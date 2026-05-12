@@ -162,6 +162,7 @@ local_test!(
                             && run.workload_id.is_none()
                             && run.status_detail.as_deref().is_some_and(|detail| {
                                 detail.contains("waiting for sandbox placement")
+                                    && detail.contains("not enough schedulable slots or resources")
                             })
                     })
                 }

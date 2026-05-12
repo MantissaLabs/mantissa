@@ -76,14 +76,6 @@ enum RemotePrepareOutcome {
     Rejected(RemotePrepareRejection),
 }
 
-/// Maps one structured rejection reason into the human-readable task-manager retry message.
-fn describe_remote_prepare_rejection(reason: RemotePrepareRejectionReason) -> &'static str {
-    match reason {
-        RemotePrepareRejectionReason::InsufficientResources => "insufficient resources",
-        RemotePrepareRejectionReason::Uninitialized => "scheduler uninitialized",
-    }
-}
-
 /// Decodes one structured prepare rejection returned by a remote scheduler RPC.
 fn parse_prepare_rejection(
     reader: scheduling::prepare_leases_rejected::Reader<'_>,
@@ -108,6 +100,27 @@ fn parse_uuid(bytes: capnp::data::Reader<'_>) -> Result<Uuid, anyhow::Error> {
     let mut raw = [0u8; 16];
     raw.copy_from_slice(bytes);
     Ok(Uuid::from_bytes(raw))
+}
+
+/// Builds the retry detail for one structured prepare rejection from a remote scheduler.
+fn remote_prepare_rejection_message(
+    peer_id: Uuid,
+    operation: &'static str,
+    rejection: &RemotePrepareRejection,
+) -> String {
+    let reason = match rejection.reason {
+        RemotePrepareRejectionReason::InsufficientResources => "not enough slots or resources",
+        RemotePrepareRejectionReason::Uninitialized => "scheduler uninitialized",
+    };
+
+    format!(
+        "peer {peer_id} rejected {operation}: {reason} (digest version {}, free slots {}, free cpu {}, free memory {}, free gpu {})",
+        rejection.digest.snapshot_version,
+        rejection.digest.free_slot_count,
+        rejection.digest.free_cpu_millis,
+        rejection.digest.free_memory_bytes,
+        rejection.digest.free_gpu_count,
+    )
 }
 
 /// Decodes one prepared lease row returned by a remote scheduler.
@@ -566,15 +579,8 @@ impl WorkloadManager {
                         .clear_success(peer_id);
                 }
                 RemotePrepareOutcome::Rejected(rejection) => {
-                    let rejection_message = format!(
-                        "peer {peer_id} rejected lease prepare: {} (digest version {}, free slots {}, free cpu {}, free memory {}, free gpu {})",
-                        describe_remote_prepare_rejection(rejection.reason),
-                        rejection.digest.snapshot_version,
-                        rejection.digest.free_slot_count,
-                        rejection.digest.free_cpu_millis,
-                        rejection.digest.free_memory_bytes,
-                        rejection.digest.free_gpu_count,
-                    );
+                    let rejection_message =
+                        remote_prepare_rejection_message(peer_id, "lease prepare", &rejection);
                     self.abort_remote_leases(&reservations).await;
                     if let Err(err) = self
                         .apply_remote_prepare_rejection(peer_id, rejection)
@@ -671,14 +677,10 @@ impl WorkloadManager {
                         .clear_success(peer_id);
                 }
                 RemotePrepareOutcome::Rejected(rejection) => {
-                    let rejection_message = format!(
-                        "peer {peer_id} rejected group lease prepare: {} (digest version {}, free slots {}, free cpu {}, free memory {}, free gpu {})",
-                        describe_remote_prepare_rejection(rejection.reason),
-                        rejection.digest.snapshot_version,
-                        rejection.digest.free_slot_count,
-                        rejection.digest.free_cpu_millis,
-                        rejection.digest.free_memory_bytes,
-                        rejection.digest.free_gpu_count,
+                    let rejection_message = remote_prepare_rejection_message(
+                        peer_id,
+                        "group lease prepare",
+                        &rejection,
                     );
                     self.abort_remote_lease_groups(group_id, &reservations)
                         .await;

@@ -4652,7 +4652,16 @@ async fn start_workloads_gang_insufficient_capacity_admits_zero_workloads() {
         )
         .await;
 
-    assert!(result.is_err());
+    let err = result.expect_err("gang admission should fail when capacity is insufficient");
+    let detail = format!("{err:#}");
+    assert!(
+        detail.contains("not enough schedulable slots or resources for gang reservation"),
+        "gang capacity error should explain the reservation failure: {detail}"
+    );
+    assert!(
+        detail.contains("1 workload"),
+        "gang capacity error should include the workload count: {detail}"
+    );
     assert!(
         mock_cm.created.lock().await.is_empty(),
         "failed gang admission must not create runtime instances"

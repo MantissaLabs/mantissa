@@ -8,7 +8,7 @@ use crate::runtime::types::{
     RuntimeAttachOptions, RuntimeCapabilities, RuntimeError, RuntimeExecOptions, RuntimeExecResult,
     RuntimeInstanceRef, RuntimeLogFrame, RuntimeLogsOptions,
 };
-use crate::scheduler::{Scheduler, SlotId};
+use crate::scheduler::{Scheduler, SchedulerError, SlotId};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
 use crate::services::registry::ServiceRegistry;
@@ -666,12 +666,14 @@ impl WorkloadManager {
 
         let mut attempt = 0usize;
         let lease_ttl_ms = DEFAULT_PREPARED_LEASE_TTL_MS;
+        let request_summary = format_gang_request_summary(&intents);
+        let mut last_retry_error: Option<anyhow::Error> = None;
 
         while attempt < WORKLOAD_START_MAX_ATTEMPTS {
-            let assignment = self
-                .compute_assignment(&intents)
-                .await
-                .context("failed to compute gang scheduling plan")?;
+            let assignment = match self.compute_assignment(&intents).await {
+                Ok(assignment) => assignment,
+                Err(err) => return Err(gang_planning_error(err, &request_summary)),
+            };
 
             self.bind_assignment_volumes(&assignment, &intents)
                 .await
@@ -688,6 +690,9 @@ impl WorkloadManager {
                     target: "task",
                     "remote secrets unavailable for gang group {group_id} on attempt {attempt}: {err}"
                 );
+                last_retry_error = Some(err.context(format!(
+                    "remote secrets are unavailable during gang reservation prepare ({request_summary})"
+                )));
                 sleep(REMOTE_SECRET_RETRY_DELAY).await;
                 continue;
             }
@@ -702,6 +707,11 @@ impl WorkloadManager {
                         target: "task",
                         "local gang prepare conflicted for group {group_id} on attempt {attempt}: {err}"
                     );
+                    last_retry_error = Some(gang_retry_error(
+                        "local lease prepare",
+                        err,
+                        &request_summary,
+                    ));
                     continue;
                 }
                 Err(ExecutionError::Fatal(err)) => return Err(err),
@@ -718,6 +728,11 @@ impl WorkloadManager {
                         target: "task",
                         "remote gang prepare conflicted for group {group_id} on attempt {attempt}: {err}"
                     );
+                    last_retry_error = Some(gang_retry_error(
+                        "remote lease prepare",
+                        err,
+                        &request_summary,
+                    ));
                     continue;
                 }
                 Err(ExecutionError::Fatal(err)) => {
@@ -744,6 +759,9 @@ impl WorkloadManager {
                         target: "task",
                         "remote gang materialization conflicted for group {group_id} on attempt {attempt}: {err}"
                     );
+                    last_retry_error = Some(err.context(format!(
+                        "remote workload rows changed during gang reservation materialization ({request_summary})"
+                    )));
                     continue;
                 }
                 Err(ExecutionError::Fatal(err)) => {
@@ -862,8 +880,10 @@ impl WorkloadManager {
             }
         }
 
-        Err(anyhow::anyhow!(
-            "failed to gang schedule workloads after {WORKLOAD_START_MAX_ATTEMPTS} attempts"
+        Err(final_gang_retry_error(
+            WORKLOAD_START_MAX_ATTEMPTS,
+            &request_summary,
+            last_retry_error,
         ))
     }
 
@@ -1842,6 +1862,209 @@ impl Drop for WorkloadManager {
                 );
             }
         }
+    }
+}
+
+/// Builds the resource summary shown in gang-admission failure details.
+fn format_gang_request_summary(intents: &[planner::StartIntent]) -> String {
+    let workload_count = intents.len();
+    let total_cpu_millis = intents.iter().fold(0u64, |total, intent| {
+        total.saturating_add(intent.cpu_millis)
+    });
+    let total_memory_bytes = intents.iter().fold(0u64, |total, intent| {
+        total.saturating_add(intent.memory_bytes)
+    });
+    let total_gpu_count = intents.iter().fold(0u64, |total, intent| {
+        total.saturating_add(intent.gpu_count as u64)
+    });
+
+    format!(
+        "{} {}, requesting {} CPU millis, {}, and {} {}",
+        workload_count,
+        pluralize_count(workload_count, "workload", "workloads"),
+        total_cpu_millis,
+        format_memory_bytes(total_memory_bytes),
+        total_gpu_count,
+        pluralize_count(total_gpu_count as usize, "GPU", "GPUs")
+    )
+}
+
+/// Formats memory quantities in a compact binary unit when the value divides cleanly.
+fn format_memory_bytes(bytes: u64) -> String {
+    const GIB: u64 = 1_024 * 1_024 * 1_024;
+    const MIB: u64 = 1_024 * 1_024;
+
+    if bytes >= GIB && bytes % GIB == 0 {
+        format!("{} GiB memory", bytes / GIB)
+    } else if bytes >= MIB && bytes % MIB == 0 {
+        format!("{} MiB memory", bytes / MIB)
+    } else {
+        format!("{bytes} bytes memory")
+    }
+}
+
+/// Returns the singular or plural word that matches one rendered count.
+fn pluralize_count(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 { singular } else { plural }
+}
+
+/// Adds an operator-facing gang reservation context around scheduler planning failures.
+fn gang_planning_error(err: anyhow::Error, request_summary: &str) -> anyhow::Error {
+    let context = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<SchedulingError>())
+        .map(|cause| gang_planning_error_context(cause, request_summary))
+        .unwrap_or_else(|| format!("failed to plan gang reservation ({request_summary})"));
+
+    err.context(context)
+}
+
+/// Maps one scheduler planning failure into the clearest gang-reservation status detail.
+fn gang_planning_error_context(cause: &SchedulingError, request_summary: &str) -> String {
+    match cause {
+        SchedulingError::SnapshotMissing => {
+            format!(
+                "scheduler snapshot unavailable while planning gang reservation ({request_summary})"
+            )
+        }
+        SchedulingError::NoCapacityAcrossCluster => {
+            format!(
+                "not enough schedulable capacity across the cluster for gang reservation ({request_summary})"
+            )
+        }
+        SchedulingError::InsufficientCapacityForBatch => {
+            format!(
+                "not enough schedulable slots or resources for gang reservation ({request_summary})"
+            )
+        }
+        SchedulingError::InsufficientCapacityOnTarget { target_node } => {
+            format!(
+                "not enough schedulable slots or resources on target node {target_node} for gang reservation ({request_summary})"
+            )
+        }
+        SchedulingError::TargetNodeUnavailable { task, target_node } => {
+            format!(
+                "target node {target_node} is unavailable while planning gang reservation for task '{task}' ({request_summary})"
+            )
+        }
+        SchedulingError::NetworksBlocked { networks } => {
+            format!(
+                "no schedulable node has the required networks for gang reservation ({request_summary}); missing {}",
+                format_scheduling_networks(networks)
+            )
+        }
+        SchedulingError::LocalNetworksBlocked { task } => {
+            format!(
+                "local network readiness is blocking gang reservation for task '{task}' ({request_summary})"
+            )
+        }
+        SchedulingError::PlacementConstraintsBlocked { task, constraints } => {
+            format!(
+                "placement constraints are blocking gang reservation for task '{task}' ({request_summary}); {constraints}"
+            )
+        }
+        SchedulingError::RuntimeRequirementsBlocked { task, .. } => {
+            format!(
+                "runtime requirements are blocking gang reservation for task '{task}' ({request_summary})"
+            )
+        }
+        SchedulingError::HostPortsBlocked { task } => {
+            format!(
+                "host ports are unavailable while planning gang reservation for task '{task}' ({request_summary})"
+            )
+        }
+    }
+}
+
+/// Adds a gang-specific context around one retryable prepare/materialization failure.
+fn gang_retry_error(
+    stage: &'static str,
+    err: anyhow::Error,
+    request_summary: &str,
+) -> anyhow::Error {
+    let context = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<SchedulerError>())
+        .map(|cause| gang_retry_error_context(stage, cause, request_summary))
+        .unwrap_or_else(|| {
+            format!("gang reservation {stage} failed retryably ({request_summary})")
+        });
+
+    err.context(context)
+}
+
+/// Maps one scheduler prepare conflict into an operator-facing gang retry detail.
+fn gang_retry_error_context(
+    stage: &'static str,
+    cause: &SchedulerError,
+    request_summary: &str,
+) -> String {
+    match cause {
+        SchedulerError::SnapshotMismatch { .. } => {
+            format!(
+                "scheduler snapshot changed during {stage} for gang reservation ({request_summary})"
+            )
+        }
+        SchedulerError::SlotsUnavailable { conflicts, .. } => {
+            format!(
+                "not enough free slots during {stage} for gang reservation ({request_summary}); {} selected {} no longer available",
+                conflicts.len(),
+                pluralize_count(conflicts.len(), "slot was", "slots were")
+            )
+        }
+        SchedulerError::GpuDevicesUnavailable { conflicts, .. } => {
+            format!(
+                "not enough free GPU devices during {stage} for gang reservation ({request_summary}); {} selected {} no longer available",
+                conflicts.len(),
+                pluralize_count(conflicts.len(), "device was", "devices were")
+            )
+        }
+        SchedulerError::UnknownSlots { unknown, .. } => {
+            format!(
+                "scheduler slots changed during {stage} for gang reservation ({request_summary}); {} selected {} no longer known",
+                unknown.len(),
+                pluralize_count(unknown.len(), "slot is", "slots are")
+            )
+        }
+        SchedulerError::UnknownGpuDevices { unknown, .. } => {
+            format!(
+                "scheduler GPU inventory changed during {stage} for gang reservation ({request_summary}); {} selected {} no longer known",
+                unknown.len(),
+                pluralize_count(unknown.len(), "device is", "devices are")
+            )
+        }
+        SchedulerError::InsufficientResources { task_ids, .. } => {
+            format!(
+                "not enough scheduler slots or resources during {stage} for gang reservation ({request_summary}); {} {} rejected by the target scheduler",
+                task_ids.len(),
+                pluralize_count(task_ids.len(), "task was", "tasks were")
+            )
+        }
+        SchedulerError::Uninitialized => {
+            format!(
+                "target scheduler is not initialized during {stage} for gang reservation ({request_summary})"
+            )
+        }
+        _ => format!("gang reservation {stage} failed retryably ({request_summary})"),
+    }
+}
+
+/// Builds the final retry-exhausted gang admission error while preserving the last cause.
+fn final_gang_retry_error(
+    max_attempts: usize,
+    request_summary: &str,
+    last_retry_error: Option<anyhow::Error>,
+) -> anyhow::Error {
+    match last_retry_error {
+        Some(err) => {
+            let last_cause = err.to_string();
+            err.context(format!(
+                "failed to complete gang slot reservation after {max_attempts} attempts ({request_summary}); last retryable cause: {last_cause}"
+            ))
+        }
+        None => anyhow!(
+            "failed to complete gang slot reservation after {max_attempts} attempts ({request_summary})"
+        ),
     }
 }
 
