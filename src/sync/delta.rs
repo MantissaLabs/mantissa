@@ -26,6 +26,18 @@ struct RemoteDomainRoot {
     prune_frontiers: TombstonePruneFrontiers,
 }
 
+/// Range-summary payload decoded from the peer before local want computation.
+struct RemoteDomainRangeSummary {
+    domain: Domain,
+    ranges: Vec<PageDigestRange>,
+}
+
+/// Per-domain page ranges this node wants the peer to stream through `DeltaSink`.
+struct DomainDeltaRequest {
+    domain: Domain,
+    want_ranges: Vec<PageDigestRange>,
+}
+
 /// Carries one peer-scoped context for anti-entropy diagnostics.
 #[derive(Clone, Debug)]
 pub struct SyncTraceContext {
@@ -274,189 +286,14 @@ async fn sync_selected_domains_with_stores(
     }
 
     let requested_domains = domains.to_vec();
-    let res: Result<(), capnp::Error> = async {
-        let mut roots_req = sync_cap.get_roots_for_view_request();
-        {
-            let mut req = roots_req.get().init_req();
-            cluster_view.write_capnp(req.reborrow().init_view());
-            req.set_root_schema_version(root_schema_version);
-        }
-        let roots_resp = roots_req.send().promise.await?;
-        let roots_reader = roots_resp.get()?.get_roots()?;
-
-        let mut remote_roots = Vec::with_capacity(roots_reader.len() as usize);
-        for idx in 0..roots_reader.len() {
-            let entry = roots_reader.get(idx);
-            let root_view =
-                ClusterViewId::from_capnp(entry.get_view()?).map_err(capnp::Error::failed)?;
-            if root_view != cluster_view {
-                return Err(capnp::Error::failed(format!(
-                    "sync roots view mismatch: expected {cluster_view}, got {root_view}"
-                )));
-            }
-            if entry.get_root_schema_version() != root_schema_version {
-                return Err(capnp::Error::failed(format!(
-                    "sync roots root schema mismatch: expected {root_schema_version}, got {}",
-                    entry.get_root_schema_version()
-                )));
-            }
-            let domain = entry
-                .get_domain()
-                .map_err(|_| capnp::Error::failed("unknown domain".into()))?;
-            let digest = read_root_digest(entry.get_root_digest()?)?;
-            let frontiers_reader = entry.get_tombstone_prune_frontiers()?;
-            let mut prune_frontiers = Vec::with_capacity(frontiers_reader.len() as usize);
-            for frontier in frontiers_reader.iter() {
-                let origin_actor = frontier.get_origin_actor()?.to_vec();
-                let sequence = frontier.get_sequence();
-                if sequence > 0 {
-                    prune_frontiers.push((origin_actor, sequence));
-                }
-            }
-            remote_roots.push(RemoteDomainRoot {
-                domain,
-                digest,
-                prune_frontiers,
-            });
-        }
-
-        let mut domains_to_sync = Vec::new();
-        // Root equality lets us skip the more expensive page-summary walk for matched domains.
-        for domain in &requested_domains {
-            let remote_root = remote_roots
-                .iter()
-                .find(|candidate| candidate.domain == *domain);
-            if let Some(remote_root) = remote_root
-                && !remote_root.prune_frontiers.is_empty()
-            {
-                stores
-                    .apply_tombstone_prune_frontiers(*domain, remote_root.prune_frontiers.clone())
-                    .await
-                    .map_err(to_capnp)?;
-            }
-
-            let local_root = stores
-                .root_digest_at_version(*domain, root_schema_version)
-                .await
-                .map_err(to_capnp)?;
-            let remote_root = remote_root.map(|root| root.digest);
-            match remote_root {
-                Some(remote_root) if remote_root == local_root => {
-                    if let Some(ctx) = context.trace.as_ref() {
-                        context.gc_progress.record_equal_root_now(
-                            ctx.peer_id,
-                            *domain,
-                            cluster_view,
-                            root_schema_version,
-                        );
-                    }
-                }
-                Some(_) | None => domains_to_sync.push(*domain),
-            }
-        }
-
-        if domains_to_sync.is_empty() {
-            return Ok(());
-        }
-
-        let mut ranges_req = sync_cap.get_ranges_for_view_request();
-        {
-            let mut req = ranges_req.get().init_req();
-            cluster_view.write_capnp(req.reborrow().init_view());
-            req.set_root_schema_version(root_schema_version);
-            let mut list = req.reborrow().init_domains(domains_to_sync.len() as u32);
-            for (idx, domain) in domains_to_sync.iter().enumerate() {
-                list.set(idx as u32, *domain);
-            }
-        }
-        let ranges_resp = ranges_req.send().promise.await?;
-        let ranges_reader = ranges_resp.get()?.get_ranges()?;
-
-        let mut domains_wants = Vec::new();
-        for idx in 0..ranges_reader.len() {
-            let summary = ranges_reader.get(idx);
-            let summary_view =
-                ClusterViewId::from_capnp(summary.get_view()?).map_err(capnp::Error::failed)?;
-            if summary_view != cluster_view {
-                return Err(capnp::Error::failed(format!(
-                    "sync ranges view mismatch: expected {cluster_view}, got {summary_view}"
-                )));
-            }
-            if summary.get_root_schema_version() != root_schema_version {
-                return Err(capnp::Error::failed(format!(
-                    "sync ranges root schema mismatch: expected {root_schema_version}, got {}",
-                    summary.get_root_schema_version()
-                )));
-            }
-            let domain = summary
-                .get_domain()
-                .map_err(|_| capnp::Error::failed("unknown domain".into()))?;
-            let remote_summary = summary.get_summary()?;
-            let remote_ranges = page_ranges_from_capnp(remote_summary)?;
-            let local_ranges = stores
-                .page_range_summary_at_version(domain, root_schema_version)
-                .await
-                .map_err(to_capnp)?;
-            // Ask the peer only for pages present in its summary but missing locally.
-            let want = compute_want_from_have(&remote_ranges, &local_ranges);
-            if !want.is_empty() {
-                domains_wants.push((domain, want));
-            }
-        }
-
-        if domains_wants.is_empty() {
-            return Ok(());
-        }
-
-        let sink_client = new_client(DeltaSinkImpl::new(
-            stores.clone(),
-            cluster_view,
-            root_schema_version,
-        ));
-
-        let mut od = sync_cap.open_delta_for_view_request();
-        {
-            let mut req = od.get().init_req();
-            cluster_view.write_capnp(req.reborrow().init_view());
-            req.set_root_schema_version(root_schema_version);
-            let mut wants_builder = req.reborrow().init_wants(domains_wants.len() as u32);
-            for (idx, (domain, want_ranges)) in domains_wants.iter().enumerate() {
-                let mut entry = wants_builder.reborrow().get(idx as u32);
-                entry.set_domain(*domain);
-                let summary_builder = entry.reborrow().init_want();
-                capnp_fill_ranges(want_ranges, summary_builder)?;
-                cluster_view.write_capnp(entry.reborrow().init_view());
-                entry.set_root_schema_version(root_schema_version);
-            }
-            req.set_sink(sink_client);
-        }
-
-        debug!(
-            target: "sync",
-            cluster_view = %cluster_view,
-            domains_requested = requested_domains.len(),
-            domains_with_delta = domains_wants.len(),
-            "opening selective delta stream"
-        );
-        od.send().promise.await?;
-        if should_notify_network_attachment_sync(&domains_wants)
-            && let Some(notify) = context.attachment_sync_notify.as_ref()
-        {
-            // Remote nodes otherwise only notice replicated attachment changes on the slow
-            // attachment-refresh poll. Wake the network controller immediately so forwarding
-            // catches up as soon as anti-entropy applies the attachment delta locally.
-            notify.notify_one();
-        }
-        if should_notify_master_key_replication(&domains_wants)
-            && let Some(notify) = context.master_key_replication_notify.as_ref()
-        {
-            // Master-key grants are correctness-critical. Anti-entropy is the
-            // repair path for missed gossip, so wake the reconciler as soon as
-            // this domain receives deltas instead of waiting for another tick.
-            notify.notify_one();
-        }
-        Ok(())
-    }
+    let res = run_selected_domain_sync(
+        stores,
+        &sync_cap,
+        cluster_view,
+        root_schema_version,
+        &requested_domains,
+        &context,
+    )
     .await;
 
     if let Err(e) = res {
@@ -484,6 +321,444 @@ async fn sync_selected_domains_with_stores(
     }
 }
 
+/// Runs the root, range-summary, and delta phases for one peer-scoped sync attempt.
+async fn run_selected_domain_sync(
+    stores: &SyncStores,
+    sync_cap: &sync::Client,
+    cluster_view: ClusterViewId,
+    root_schema_version: u32,
+    requested_domains: &[Domain],
+    context: &SyncClientContext,
+) -> Result<(), capnp::Error> {
+    // Step 1: compare remote roots against local roots and skip converged domains.
+    let remote_roots =
+        request_remote_domain_roots(sync_cap, cluster_view, root_schema_version).await?;
+    let domains_requiring_ranges = select_domains_requiring_range_sync(
+        stores,
+        requested_domains,
+        &remote_roots,
+        cluster_view,
+        root_schema_version,
+        context,
+    )
+    .await?;
+    if domains_requiring_ranges.is_empty() {
+        return Ok(());
+    }
+
+    // Step 2: fetch range summaries only for domains whose root digest differs.
+    let delta_requests = request_missing_delta_ranges(
+        stores,
+        sync_cap,
+        cluster_view,
+        root_schema_version,
+        &domains_requiring_ranges,
+    )
+    .await?;
+    if delta_requests.is_empty() {
+        return Ok(());
+    }
+
+    // Step 3: stream the missing pages into a local sink and wake dependent reconcilers.
+    open_remote_delta_stream(
+        stores,
+        sync_cap,
+        cluster_view,
+        root_schema_version,
+        requested_domains.len(),
+        &delta_requests,
+    )
+    .await?;
+    notify_delta_side_effects(&delta_requests, context);
+    Ok(())
+}
+
+/// Fetches and decodes the peer's per-domain root digests for the requested view.
+async fn request_remote_domain_roots(
+    sync_cap: &sync::Client,
+    cluster_view: ClusterViewId,
+    root_schema_version: u32,
+) -> Result<Vec<RemoteDomainRoot>, capnp::Error> {
+    let mut roots_request = sync_cap.get_roots_for_view_request();
+    encode_view_request(
+        roots_request.get().init_req(),
+        cluster_view,
+        root_schema_version,
+    );
+
+    let roots_response = roots_request.send().promise.await?;
+    decode_remote_domain_roots(
+        roots_response.get()?.get_roots()?,
+        cluster_view,
+        root_schema_version,
+    )
+}
+
+/// Encodes the shared view/root-schema selector used by root requests.
+fn encode_view_request(
+    mut request: sync::view_request::Builder<'_>,
+    cluster_view: ClusterViewId,
+    root_schema_version: u32,
+) {
+    cluster_view.write_capnp(request.reborrow().init_view());
+    request.set_root_schema_version(root_schema_version);
+}
+
+/// Decodes and validates the root response returned by `getRootsForView`.
+fn decode_remote_domain_roots(
+    roots_reader: capnp::struct_list::Reader<'_, sync::domain_root::Owned>,
+    expected_view: ClusterViewId,
+    expected_root_schema_version: u32,
+) -> Result<Vec<RemoteDomainRoot>, capnp::Error> {
+    let mut roots = Vec::with_capacity(roots_reader.len() as usize);
+    for index in 0..roots_reader.len() {
+        roots.push(decode_remote_domain_root(
+            roots_reader.get(index),
+            expected_view,
+            expected_root_schema_version,
+        )?);
+    }
+    Ok(roots)
+}
+
+/// Decodes one root entry and rejects responses scoped to a different view/schema.
+fn decode_remote_domain_root(
+    root_reader: sync::domain_root::Reader<'_>,
+    expected_view: ClusterViewId,
+    expected_root_schema_version: u32,
+) -> Result<RemoteDomainRoot, capnp::Error> {
+    let actual_view =
+        ClusterViewId::from_capnp(root_reader.get_view()?).map_err(capnp::Error::failed)?;
+    if actual_view != expected_view {
+        return Err(capnp::Error::failed(format!(
+            "sync roots view mismatch: expected {expected_view}, got {actual_view}"
+        )));
+    }
+
+    let actual_root_schema_version = root_reader.get_root_schema_version();
+    if actual_root_schema_version != expected_root_schema_version {
+        return Err(capnp::Error::failed(format!(
+            "sync roots root schema mismatch: expected {expected_root_schema_version}, got {actual_root_schema_version}"
+        )));
+    }
+
+    let domain = root_reader
+        .get_domain()
+        .map_err(|_| capnp::Error::failed("unknown domain".into()))?;
+    let digest = read_root_digest(root_reader.get_root_digest()?)?;
+    let prune_frontiers =
+        decode_tombstone_prune_frontiers(root_reader.get_tombstone_prune_frontiers()?)?;
+    Ok(RemoteDomainRoot {
+        domain,
+        digest,
+        prune_frontiers,
+    })
+}
+
+/// Decodes peer tombstone prune-frontiers, ignoring the wire default sequence.
+fn decode_tombstone_prune_frontiers(
+    frontiers_reader: capnp::struct_list::Reader<'_, sync::tombstone_prune_frontier::Owned>,
+) -> Result<TombstonePruneFrontiers, capnp::Error> {
+    let mut prune_frontiers = Vec::with_capacity(frontiers_reader.len() as usize);
+    for frontier in frontiers_reader.iter() {
+        let origin_actor = frontier.get_origin_actor()?.to_vec();
+        let sequence = frontier.get_sequence();
+        if sequence > 0 {
+            prune_frontiers.push((origin_actor, sequence));
+        }
+    }
+    Ok(prune_frontiers)
+}
+
+/// Applies root-phase side effects and returns only domains that need range summaries.
+async fn select_domains_requiring_range_sync(
+    stores: &SyncStores,
+    requested_domains: &[Domain],
+    remote_roots: &[RemoteDomainRoot],
+    cluster_view: ClusterViewId,
+    root_schema_version: u32,
+    context: &SyncClientContext,
+) -> Result<Vec<Domain>, capnp::Error> {
+    let mut domains_requiring_ranges = Vec::new();
+
+    for domain in requested_domains {
+        let remote_root = remote_roots
+            .iter()
+            .find(|candidate| candidate.domain == *domain);
+
+        if let Some(remote_root) = remote_root
+            && !remote_root.prune_frontiers.is_empty()
+        {
+            stores
+                .apply_tombstone_prune_frontiers(*domain, remote_root.prune_frontiers.clone())
+                .await
+                .map_err(to_capnp)?;
+        }
+
+        let local_root_digest = stores
+            .root_digest_at_version(*domain, root_schema_version)
+            .await
+            .map_err(to_capnp)?;
+
+        match remote_root.map(|root| root.digest) {
+            Some(remote_root_digest) if remote_root_digest == local_root_digest => {
+                record_equal_domain_root(*domain, cluster_view, root_schema_version, context);
+            }
+            Some(_) | None => domains_requiring_ranges.push(*domain),
+        }
+    }
+
+    Ok(domains_requiring_ranges)
+}
+
+/// Records one equal-root observation for GC when peer trace context is available.
+fn record_equal_domain_root(
+    domain: Domain,
+    cluster_view: ClusterViewId,
+    root_schema_version: u32,
+    context: &SyncClientContext,
+) {
+    if let Some(trace) = context.trace.as_ref() {
+        context.gc_progress.record_equal_root_now(
+            trace.peer_id,
+            domain,
+            cluster_view,
+            root_schema_version,
+        );
+    }
+}
+
+/// Fetches remote range summaries and computes the exact page ranges missing locally.
+async fn request_missing_delta_ranges(
+    stores: &SyncStores,
+    sync_cap: &sync::Client,
+    cluster_view: ClusterViewId,
+    root_schema_version: u32,
+    domains_requiring_ranges: &[Domain],
+) -> Result<Vec<DomainDeltaRequest>, capnp::Error> {
+    let mut ranges_request = sync_cap.get_ranges_for_view_request();
+    encode_view_ranges_request(
+        ranges_request.get().init_req(),
+        cluster_view,
+        root_schema_version,
+        domains_requiring_ranges,
+    );
+
+    let ranges_response = ranges_request.send().promise.await?;
+    compute_missing_delta_ranges_from_response(
+        stores,
+        ranges_response.get()?.get_ranges()?,
+        cluster_view,
+        root_schema_version,
+    )
+    .await
+}
+
+/// Encodes the view/root-schema selector plus the explicit domains to summarize.
+fn encode_view_ranges_request(
+    mut request: sync::view_ranges_request::Builder<'_>,
+    cluster_view: ClusterViewId,
+    root_schema_version: u32,
+    domains: &[Domain],
+) {
+    cluster_view.write_capnp(request.reborrow().init_view());
+    request.set_root_schema_version(root_schema_version);
+    encode_domain_list(
+        request.reborrow().init_domains(domains.len() as u32),
+        domains,
+    );
+}
+
+/// Encodes one domain enum list into an already initialized Cap'n Proto list.
+fn encode_domain_list(mut list: capnp::enum_list::Builder<'_, Domain>, domains: &[Domain]) {
+    for (index, domain) in domains.iter().enumerate() {
+        list.set(index as u32, *domain);
+    }
+}
+
+/// Decodes each range summary and computes missing pages in the original response order.
+async fn compute_missing_delta_ranges_from_response(
+    stores: &SyncStores,
+    ranges_reader: capnp::struct_list::Reader<'_, sync::domain_range_summary::Owned>,
+    expected_view: ClusterViewId,
+    expected_root_schema_version: u32,
+) -> Result<Vec<DomainDeltaRequest>, capnp::Error> {
+    let mut delta_requests = Vec::new();
+    for index in 0..ranges_reader.len() {
+        let remote_summary = decode_remote_domain_range_summary(
+            ranges_reader.get(index),
+            expected_view,
+            expected_root_schema_version,
+        )?;
+        if let Some(delta_request) =
+            compute_missing_delta_range(stores, expected_root_schema_version, remote_summary)
+                .await?
+        {
+            delta_requests.push(delta_request);
+        }
+    }
+    Ok(delta_requests)
+}
+
+/// Decodes one range summary and rejects responses scoped to a different view/schema.
+fn decode_remote_domain_range_summary(
+    summary_reader: sync::domain_range_summary::Reader<'_>,
+    expected_view: ClusterViewId,
+    expected_root_schema_version: u32,
+) -> Result<RemoteDomainRangeSummary, capnp::Error> {
+    let actual_view =
+        ClusterViewId::from_capnp(summary_reader.get_view()?).map_err(capnp::Error::failed)?;
+    if actual_view != expected_view {
+        return Err(capnp::Error::failed(format!(
+            "sync ranges view mismatch: expected {expected_view}, got {actual_view}"
+        )));
+    }
+
+    let actual_root_schema_version = summary_reader.get_root_schema_version();
+    if actual_root_schema_version != expected_root_schema_version {
+        return Err(capnp::Error::failed(format!(
+            "sync ranges root schema mismatch: expected {expected_root_schema_version}, got {actual_root_schema_version}"
+        )));
+    }
+
+    let domain = summary_reader
+        .get_domain()
+        .map_err(|_| capnp::Error::failed("unknown domain".into()))?;
+    let ranges = page_ranges_from_capnp(summary_reader.get_summary()?)?;
+    Ok(RemoteDomainRangeSummary { domain, ranges })
+}
+
+/// Computes the local want for one decoded remote range summary.
+async fn compute_missing_delta_range(
+    stores: &SyncStores,
+    root_schema_version: u32,
+    remote_summary: RemoteDomainRangeSummary,
+) -> Result<Option<DomainDeltaRequest>, capnp::Error> {
+    let local_ranges = stores
+        .page_range_summary_at_version(remote_summary.domain, root_schema_version)
+        .await
+        .map_err(to_capnp)?;
+    let want_ranges = compute_want_from_have(&remote_summary.ranges, &local_ranges);
+    if want_ranges.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(DomainDeltaRequest {
+        domain: remote_summary.domain,
+        want_ranges,
+    }))
+}
+
+/// Opens the selective delta stream and feeds remote chunks into a local sink.
+async fn open_remote_delta_stream(
+    stores: &SyncStores,
+    sync_cap: &sync::Client,
+    cluster_view: ClusterViewId,
+    root_schema_version: u32,
+    requested_domain_count: usize,
+    delta_requests: &[DomainDeltaRequest],
+) -> Result<(), capnp::Error> {
+    let sink_client = new_client(DeltaSinkImpl::new(
+        stores.clone(),
+        cluster_view,
+        root_schema_version,
+    ));
+
+    let mut open_delta_request = sync_cap.open_delta_for_view_request();
+    encode_open_delta_request(
+        open_delta_request.get().init_req(),
+        cluster_view,
+        root_schema_version,
+        delta_requests,
+        sink_client,
+    )?;
+
+    debug!(
+        target: "sync",
+        cluster_view = %cluster_view,
+        domains_requested = requested_domain_count,
+        domains_with_delta = delta_requests.len(),
+        "opening selective delta stream"
+    );
+    open_delta_request.send().promise.await?;
+    Ok(())
+}
+
+/// Encodes an open-delta request, including the caller-owned sink capability.
+fn encode_open_delta_request(
+    mut request: sync::view_open_delta_request::Builder<'_>,
+    cluster_view: ClusterViewId,
+    root_schema_version: u32,
+    delta_requests: &[DomainDeltaRequest],
+    sink_client: sync::DeltaSinkClient,
+) -> Result<(), capnp::Error> {
+    cluster_view.write_capnp(request.reborrow().init_view());
+    request.set_root_schema_version(root_schema_version);
+    encode_domain_wants(
+        request.reborrow().init_wants(delta_requests.len() as u32),
+        cluster_view,
+        root_schema_version,
+        delta_requests,
+    )?;
+    request.set_sink(sink_client);
+    Ok(())
+}
+
+/// Encodes all per-domain want entries for one open-delta request.
+fn encode_domain_wants(
+    mut wants_builder: capnp::struct_list::Builder<'_, sync::domain_want::Owned>,
+    cluster_view: ClusterViewId,
+    root_schema_version: u32,
+    delta_requests: &[DomainDeltaRequest],
+) -> Result<(), capnp::Error> {
+    for (index, delta_request) in delta_requests.iter().enumerate() {
+        encode_domain_want(
+            wants_builder.reborrow().get(index as u32),
+            cluster_view,
+            root_schema_version,
+            delta_request,
+        )?;
+    }
+    Ok(())
+}
+
+/// Encodes one domain want entry with its page-summary request ranges.
+fn encode_domain_want(
+    mut want_builder: sync::domain_want::Builder<'_>,
+    cluster_view: ClusterViewId,
+    root_schema_version: u32,
+    delta_request: &DomainDeltaRequest,
+) -> Result<(), capnp::Error> {
+    want_builder.set_domain(delta_request.domain);
+    capnp_fill_ranges(
+        &delta_request.want_ranges,
+        want_builder.reborrow().init_want(),
+    )?;
+    cluster_view.write_capnp(want_builder.reborrow().init_view());
+    want_builder.set_root_schema_version(root_schema_version);
+    Ok(())
+}
+
+/// Wakes local reconcilers for domains whose deltas have just been applied.
+fn notify_delta_side_effects(delta_requests: &[DomainDeltaRequest], context: &SyncClientContext) {
+    if should_notify_network_attachment_sync(delta_requests)
+        && let Some(notify) = context.attachment_sync_notify.as_ref()
+    {
+        // Remote nodes otherwise only notice replicated attachment changes on the slow
+        // attachment-refresh poll. Wake the network controller immediately so forwarding
+        // catches up as soon as anti-entropy applies the attachment delta locally.
+        notify.notify_one();
+    }
+    if should_notify_master_key_replication(delta_requests)
+        && let Some(notify) = context.master_key_replication_notify.as_ref()
+    {
+        // Master-key grants are correctness-critical. Anti-entropy is the
+        // repair path for missed gossip, so wake the reconciler as soon as
+        // this domain receives deltas instead of waiting for another tick.
+        notify.notify_one();
+    }
+}
+
 /// Returns true when one Cap'n Proto error corresponds to a disconnected transport path.
 fn is_disconnected_capnp(error: &capnp::Error) -> bool {
     let text = error.to_string();
@@ -494,17 +769,17 @@ fn is_disconnected_capnp(error: &capnp::Error) -> bool {
 ///
 /// Attachment deltas require a follow-up forwarding refresh on the receiving node so the local
 /// VXLAN FDB catches up before clients try to send traffic to newly replicated remote backends.
-fn should_notify_network_attachment_sync(domains_wants: &[(Domain, Vec<PageDigestRange>)]) -> bool {
-    domains_wants
+fn should_notify_network_attachment_sync(delta_requests: &[DomainDeltaRequest]) -> bool {
+    delta_requests
         .iter()
-        .any(|(domain, _)| *domain == Domain::NetworkAttachments)
+        .any(|request| request.domain == Domain::NetworkAttachments)
 }
 
 /// Returns true when a completed delta stream included secret master-key grants.
-fn should_notify_master_key_replication(domains_wants: &[(Domain, Vec<PageDigestRange>)]) -> bool {
-    domains_wants
+fn should_notify_master_key_replication(delta_requests: &[DomainDeltaRequest]) -> bool {
+    delta_requests
         .iter()
-        .any(|(domain, _)| *domain == Domain::SecretMasterKeys)
+        .any(|request| request.domain == Domain::SecretMasterKeys)
 }
 
 /// Decodes one fixed-width XXHash128 root digest from the sync wire format.
@@ -519,14 +794,25 @@ fn read_root_digest(bytes: &[u8]) -> Result<[u8; 16], capnp::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_notify_master_key_replication, should_notify_network_attachment_sync};
+    use super::{
+        DomainDeltaRequest, should_notify_master_key_replication,
+        should_notify_network_attachment_sync,
+    };
     use mantissa_protocol::sync::Domain;
     use mantissa_store::PageDigestRange;
+
+    /// Builds a test delta request for notification predicate coverage.
+    fn delta_request_for(domain: Domain) -> DomainDeltaRequest {
+        DomainDeltaRequest {
+            domain,
+            want_ranges: Vec::<PageDigestRange>::new(),
+        }
+    }
 
     /// Attachment deltas should wake the network controller on the receiving node immediately.
     #[test]
     fn attachment_domain_requests_forwarding_refresh_notification() {
-        let wants = vec![(Domain::NetworkAttachments, Vec::<PageDigestRange>::new())];
+        let wants = vec![delta_request_for(Domain::NetworkAttachments)];
 
         assert!(should_notify_network_attachment_sync(&wants));
     }
@@ -535,8 +821,8 @@ mod tests {
     #[test]
     fn non_attachment_domains_skip_forwarding_refresh_notification() {
         let wants = vec![
-            (Domain::Workloads, Vec::<PageDigestRange>::new()),
-            (Domain::Services, Vec::<PageDigestRange>::new()),
+            delta_request_for(Domain::Workloads),
+            delta_request_for(Domain::Services),
         ];
 
         assert!(!should_notify_network_attachment_sync(&wants));
@@ -545,7 +831,7 @@ mod tests {
     /// Master-key deltas should wake the grant reconciler immediately.
     #[test]
     fn master_key_domain_requests_reconciler_notification() {
-        let wants = vec![(Domain::SecretMasterKeys, Vec::<PageDigestRange>::new())];
+        let wants = vec![delta_request_for(Domain::SecretMasterKeys)];
 
         assert!(should_notify_master_key_replication(&wants));
     }
@@ -553,7 +839,7 @@ mod tests {
     /// Non-master-key deltas must not trigger unnecessary reconciler work.
     #[test]
     fn non_master_key_domains_skip_reconciler_notification() {
-        let wants = vec![(Domain::Secrets, Vec::<PageDigestRange>::new())];
+        let wants = vec![delta_request_for(Domain::Secrets)];
 
         assert!(!should_notify_master_key_replication(&wants));
     }
