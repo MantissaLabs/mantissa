@@ -205,10 +205,7 @@ impl Topology {
         let current = self.deps.registry.peer_value_unscoped(id);
         let stale_against_current = current
             .as_ref()
-            .map(|value| {
-                value.membership.incarnation > incarnation
-                    || (value.membership.incarnation == incarnation && value.membership.is_active())
-            })
+            .map(|value| value.membership.incarnation > incarnation)
             .unwrap_or(false);
         if stale_against_current {
             return Ok(());

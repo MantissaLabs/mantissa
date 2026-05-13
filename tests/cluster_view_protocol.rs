@@ -175,6 +175,34 @@ async fn cluster_view_rows(
     out
 }
 
+/// Renders one peer register's membership values for failure diagnostics.
+fn peer_membership_debug(node: &TestNode, peer_id: Uuid) -> String {
+    let reg = match node.node.peers.get_reg(&UuidKey::from(peer_id)) {
+        Ok(Some(reg)) => reg,
+        Ok(None) => return "missing".to_string(),
+        Err(err) => return format!("load_error={err}"),
+    };
+    let values = reg
+        .read_values()
+        .into_iter()
+        .map(|value| {
+            format!(
+                "{:?}@{}",
+                value.membership.state, value.membership.incarnation
+            )
+        })
+        .collect::<Vec<_>>();
+    let selected = PeerValue::select_reg(&reg)
+        .map(|value| {
+            format!(
+                "{:?}@{}",
+                value.membership.state, value.membership.incarnation
+            )
+        })
+        .unwrap_or_else(|| "none".to_string());
+    format!("selected={selected}, values=[{}]", values.join(", "))
+}
+
 fn headless_config_with_in_memory_runtime() -> HeadlessConfig {
     HeadlessConfig {
         runtime_set: Some(RuntimeSet::singleton(
@@ -2994,7 +3022,8 @@ local_test!(
 
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "merged cluster view listing did not converge after peer leave; last rows={rows:?}"
+                "merged cluster view listing did not converge after peer leave; last rows={rows:?}; left_peer_on_survivor={}",
+                peer_membership_debug(&joiner_a, joiner_b.id())
             );
             sleep(Duration::from_millis(100)).await;
         };

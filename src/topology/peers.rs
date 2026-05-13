@@ -929,8 +929,8 @@ impl PeerValue {
                 (
                     membership.incarnation,
                     match membership.state {
-                        PeerMembershipState::Left => 0u8,
-                        PeerMembershipState::Active => 1u8,
+                        PeerMembershipState::Active => 0u8,
+                        PeerMembershipState::Left => 1u8,
                     },
                 )
             })
@@ -1328,6 +1328,64 @@ mod tests {
         assert_eq!(merged.readiness.state, NodeReadinessState::Syncing);
     }
 
+    /// A stale active observation must not erase a newer left tombstone.
+    #[test]
+    fn peer_merge_observed_keeps_left_over_stale_active() {
+        let node_id = Uuid::from_bytes([17u8; 16]);
+        let mut left = PeerValue {
+            address: "127.0.0.1:7000".to_string(),
+            hostname: "node-a".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "amd64".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: None,
+            runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
+            scheduling: PeerSchedulingState::schedulable_default(node_id),
+            readiness: NodeReadiness::ready(node_id, 10),
+            labels: PeerLabelState::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
+            membership: super::PeerMembership::active(10),
+        };
+        left.membership = super::PeerMembership::left(11);
+        let mut stale_active = left.clone();
+        stale_active.membership = super::PeerMembership::active(10);
+
+        let merged = PeerValue::merge_observed(Some(&left), &stale_active);
+
+        assert_eq!(merged.membership, super::PeerMembership::left(11));
+    }
+
+    /// A stale same-incarnation active observation must not erase a left tombstone.
+    #[test]
+    fn peer_merge_observed_keeps_left_over_same_incarnation_active() {
+        let node_id = Uuid::from_bytes([18u8; 16]);
+        let mut left = PeerValue {
+            address: "127.0.0.1:7000".to_string(),
+            hostname: "node-a".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "amd64".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: None,
+            runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
+            scheduling: PeerSchedulingState::schedulable_default(node_id),
+            readiness: NodeReadiness::ready(node_id, 10),
+            labels: PeerLabelState::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
+            membership: super::PeerMembership::active(11),
+        };
+        left.membership = super::PeerMembership::left(11);
+        let mut stale_active = left.clone();
+        stale_active.membership = super::PeerMembership::active(11);
+
+        let merged = PeerValue::merge_observed(Some(&left), &stale_active);
+
+        assert_eq!(merged.membership, super::PeerMembership::left(11));
+    }
+
     /// Ready should survive active incarnation bumps that are not separated by a leave.
     #[test]
     fn peer_select_carries_ready_across_active_incarnation_bump() {
@@ -1382,11 +1440,11 @@ mod tests {
         left.membership = super::PeerMembership::left(11);
         let mut rejoin = ready.clone();
         rejoin.readiness = NodeReadiness::syncing(node_id, 20);
-        rejoin.membership = super::PeerMembership::active(11);
+        rejoin.membership = super::PeerMembership::active(12);
 
         let selected = PeerValue::select(&[ready, left, rejoin]).expect("selected peer value");
 
-        assert_eq!(selected.membership, super::PeerMembership::active(11));
+        assert_eq!(selected.membership, super::PeerMembership::active(12));
         assert_eq!(selected.readiness.state, NodeReadinessState::Syncing);
     }
 
@@ -1412,9 +1470,9 @@ mod tests {
         assert_eq!(selected.public_key, [1u8; 32]);
     }
 
-    /// A rejoin with the same membership incarnation must beat a stale left state.
+    /// A same-incarnation left tombstone must beat a stale active observation.
     #[test]
-    fn peer_select_prefers_active_rejoin_over_same_incarnation_left() {
+    fn peer_select_prefers_left_over_same_incarnation_active() {
         let node_id = Uuid::from_bytes([5u8; 16]);
         let active = PeerValue {
             address: "127.0.0.1:7000".to_string(),
@@ -1435,9 +1493,9 @@ mod tests {
         let mut left = active.clone();
         left.membership = super::PeerMembership::left(42);
 
-        let selected = PeerValue::select(&[left, active.clone()]).expect("selected peer value");
-        assert!(selected.is_active());
-        assert_eq!(selected.membership, active.membership);
+        let selected = PeerValue::select(&[left.clone(), active]).expect("selected peer value");
+        assert!(!selected.is_active());
+        assert_eq!(selected.membership, left.membership);
     }
 
     /// Root-schema support metadata must be visible in the v1 peer-domain MST snapshot.

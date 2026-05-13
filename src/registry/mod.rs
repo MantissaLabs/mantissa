@@ -1616,13 +1616,13 @@ impl Registry {
                 };
 
                 if let Ok(ni) = r.get_node_info()
-                    && let Ok(v) = PeerValue::from_node_info(peer_id, ni)
-                    && let Err(e) = self
-                        .peers
-                        .upsert(&mantissa_store::uuid_key::UuidKey::from(peer_id), v)
-                        .await
+                    && let Ok(observed) = PeerValue::from_node_info(peer_id, ni)
                 {
-                    error!(target: "sync", "upsert nodeInfo failed for {peer_id}: {e}");
+                    let current = self.peer_selected_value_unscoped(peer_id);
+                    let merged = PeerValue::merge_observed(current.as_ref(), &observed);
+                    if let Err(e) = self.peers.upsert(&UuidKey::from(peer_id), merged).await {
+                        error!(target: "sync", "upsert nodeInfo failed for {peer_id}: {e}");
+                    }
                 }
 
                 let ticket_expires_at_unix_secs = match r.get_ticket_expires_at_unix_secs() {
@@ -1734,6 +1734,15 @@ impl Registry {
         self.refresh_peer_snapshot_cache_if_needed().ok()?;
         let cache = self.peer_snapshot_cache_read();
         cache.values_by_peer.get(&peer_id).cloned()
+    }
+
+    /// Returns the selected peer value without filtering out left membership rows.
+    fn peer_selected_value_unscoped(&self, peer_id: Uuid) -> Option<PeerValue> {
+        self.peers
+            .get_reg(&UuidKey::from(peer_id))
+            .ok()
+            .flatten()
+            .and_then(|reg| PeerValue::select_reg(&reg))
     }
 
     /// Dial a peer over authenticated Noise using the current join token.

@@ -42,6 +42,41 @@ use super::cluster_operations::SplitOperationBuildInput;
 /// Maximum time a graceful leave spends waiting for one direct peer notification.
 const LEAVE_DIRECT_BROADCAST_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Maximum number of direct notification passes before a graceful leave gives up.
+const LEAVE_DIRECT_BROADCAST_ATTEMPTS: usize = 3;
+
+/// Maximum retained peers contacted directly to seed one graceful leave event.
+const LEAVE_DIRECT_BROADCAST_FANOUT: usize = 5;
+
+/// Delay between direct leave notification retry passes.
+const LEAVE_DIRECT_BROADCAST_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+struct LeaveBroadcastReport {
+    peer_count: usize,
+    selected_count: usize,
+    rpc_attempts: usize,
+    delivered: usize,
+    failed: Vec<Uuid>,
+}
+
+impl LeaveBroadcastReport {
+    /// Builds an empty report for one direct leave notification pass.
+    fn empty(peer_count: usize, selected_count: usize) -> Self {
+        Self {
+            peer_count,
+            selected_count,
+            rpc_attempts: 0,
+            delivered: 0,
+            failed: Vec::new(),
+        }
+    }
+
+    /// Returns true when this report reached at least one retained peer.
+    fn reached_survivor(&self) -> bool {
+        self.delivered > 0
+    }
+}
+
 struct JoinInputs {
     anchor: String,
     join_token: String,
@@ -128,10 +163,35 @@ struct JoinResponse {
 }
 
 impl Topology {
+    /// Chooses the active incarnation to advertise for one local join attempt.
+    ///
+    /// A rejoin is a new membership transition. If the durable self row is left at the
+    /// current SWIM incarnation, the join must advance beyond it so delayed active
+    /// observations from the prior membership cannot tie with the leave tombstone.
+    fn next_local_join_incarnation(&self) -> Result<u64, Error> {
+        let swim_incarnation = self.swim_local_incarnation();
+        let membership = self.peer_membership_unscoped(self.local.node.id)?;
+        match membership {
+            Some(membership)
+                if !membership.is_active() && membership.incarnation >= swim_incarnation =>
+            {
+                membership.incarnation.checked_add(1).ok_or_else(|| {
+                    Error::failed("local membership incarnation is already at u64::MAX".into())
+                })
+            }
+            Some(membership) if membership.incarnation > swim_incarnation => {
+                Ok(membership.incarnation)
+            }
+            _ => Ok(swim_incarnation),
+        }
+    }
+
+    /// Builds the local join payload sent to an anchor during cluster admission.
     fn build_join_payload(&self) -> Result<JoinPayload, Error> {
         let server_handle = self
             .get_server_handle()
             .ok_or_else(|| Error::failed("server handle not set".into()))?;
+        let join_incarnation = self.next_local_join_incarnation()?;
 
         let advertise_addr = self
             .compute_advertise_addr()
@@ -185,7 +245,7 @@ impl Topology {
             advertise_addr,
             platform_os: std::env::consts::OS.to_string(),
             platform_arch: std::env::consts::ARCH.to_string(),
-            incarnation: self.swim_local_incarnation(),
+            incarnation: join_incarnation,
             server_handle,
             public_key: self.local.public_key.to_bytes(),
             signing_key: self.local.signing_key.verifying_key().to_bytes(),
@@ -253,13 +313,13 @@ impl Topology {
         local_creds: &LocalCredentialStore,
         response: &JoinResponse,
     ) -> Result<(), Error> {
-        if let Err(e) = peers
-            .upsert(
-                &UuidKey::from(response.peer_id),
-                response.peer_value.clone(),
-            )
-            .await
-        {
+        let current = peers
+            .get_reg(&UuidKey::from(response.peer_id))
+            .map_err(|err| Error::failed(format!("load anchor peer row failed: {err}")))?
+            .as_ref()
+            .and_then(PeerValue::select_reg);
+        let merged = PeerValue::merge_observed(current.as_ref(), &response.peer_value);
+        if let Err(e) = peers.upsert(&UuidKey::from(response.peer_id), merged).await {
             log::warn!(target: "topology", "join: upsert of anchor NodeInfo failed: {e}");
         }
 
@@ -299,33 +359,46 @@ impl Topology {
     /// Join bootstrap runs in the background. A later local leave publishes a higher left
     /// incarnation, so the captured active join payload must not be restored after that point.
     /// Higher active incarnations can be normal SWIM refutations and must still be marked ready.
-    /// Same-incarnation tombstones can still be stale remote state from an earlier leave and must
-    /// remain restorable.
+    /// Same-incarnation tombstones supersede this payload because rejoin must advance beyond any
+    /// durable left row before advertising active membership again.
     fn local_join_payload_superseded(&self, payload: &JoinPayload) -> Result<bool, Error> {
         let membership = self.peer_membership_unscoped(payload.id)?;
         Ok(membership
             .map(|membership| {
-                membership.incarnation > payload.incarnation && !membership.is_active()
+                membership.incarnation >= payload.incarnation && !membership.is_active()
             })
             .unwrap_or(false))
     }
 
     /// Chooses a leave incarnation that beats both SWIM and durable self membership.
     ///
-    /// The SWIM monitor and the peer store can move independently: refutations advance the monitor,
-    /// while self-row refreshes persist active peer values. A leave tombstone must dominate both so
-    /// peers cannot keep a same-incarnation active row after a graceful leave.
+    /// This intentionally does not advance the local SWIM monitor yet. Until the durable left row
+    /// exists, session bootstrap can still serve NodeInfo for this node; publishing an active row
+    /// at the leave incarnation would leave stale active observations competing with the tombstone.
     fn next_local_leave_incarnation(&self) -> Result<u64, Error> {
-        let advanced = self.swim_advance_local_incarnation();
+        let swim_next = self
+            .swim_local_incarnation()
+            .checked_add(1)
+            .ok_or_else(|| Error::failed("local SWIM incarnation is already at u64::MAX".into()))?;
         let durable_next = match self.peer_membership_unscoped(self.local.node.id)? {
             Some(membership) => membership.incarnation.checked_add(1).ok_or_else(|| {
                 Error::failed("local membership incarnation is already at u64::MAX".into())
             })?,
-            None => advanced,
+            None => swim_next,
         };
-        let leave_incarnation = advanced.max(durable_next);
-        self.swim_record_join(self.local.node.id, leave_incarnation);
-        Ok(leave_incarnation)
+        Ok(swim_next.max(durable_next))
+    }
+
+    /// Advances local SWIM state after the durable leave tombstone has been written.
+    ///
+    /// Rejoin must not reuse an incarnation lower than the leave, but the advancement belongs after
+    /// `mark_peer_left` so any same-incarnation active NodeInfo races an existing leave tombstone.
+    fn record_local_leave_incarnation(&self, incarnation: u64) {
+        while self.swim_local_incarnation() < incarnation {
+            if self.swim_advance_local_incarnation() >= incarnation {
+                break;
+            }
+        }
     }
 
     /// Publishes the current master-key rows for a node accepted by this anchor.
@@ -492,80 +565,150 @@ impl Topology {
             return Vec::new();
         };
         let excluded_peers = self.excluded_peers_snapshot().await;
-        let mut peer_ids = snapshot
+        snapshot
             .entries
             .iter()
             .filter_map(|entry| {
                 (entry.peer_id != self.local.node.id && !excluded_peers.contains(&entry.peer_id))
                     .then_some(entry.peer_id)
             })
-            .collect::<Vec<_>>();
-        peer_ids.sort_unstable();
-        peer_ids
+            .collect::<Vec<_>>()
+    }
+
+    /// Sends one clean leave event to a retained peer and waits for transport acceptance.
+    async fn send_leave_event_to_peer_once(
+        &self,
+        peer_id: Uuid,
+        event: &TopologyEvent,
+        cluster_view: ClusterViewId,
+    ) -> Result<(), String> {
+        let gossip_cap = match self.deps.registry.gossip_client_for_unscoped(peer_id).await {
+            Ok(Some(cap)) => cap,
+            Ok(None) => {
+                return Err("no gossip capability available".to_string());
+            }
+            Err(err) => {
+                return Err(format!("failed to resolve gossip capability: {err}"));
+            }
+        };
+
+        let mut request = gossip_cap.gossip_request();
+        let list = request.get().init_messages();
+        let mut messages = list.init_messages(1);
+        let mut message = messages.reborrow().get(0);
+        message.set_id(Uuid::new_v4().as_bytes());
+        cluster_view.write_capnp(message.reborrow().init_view());
+        add_event(&mut messages, 0, event, cluster_view);
+
+        match tokio::time::timeout(LEAVE_DIRECT_BROADCAST_TIMEOUT, request.send().promise).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) => Err(format!("direct leave broadcast failed: {err}")),
+            Err(_) => Err(format!(
+                "direct leave broadcast timed out after {} ms",
+                LEAVE_DIRECT_BROADCAST_TIMEOUT.as_millis()
+            )),
+        }
+    }
+
+    /// Sends a direct leave event once to one bounded retained-peer set.
+    async fn broadcast_leave_event_once(
+        &self,
+        event: &TopologyEvent,
+        peer_count: usize,
+        selected_peer_ids: &[Uuid],
+        cluster_view: ClusterViewId,
+    ) -> LeaveBroadcastReport {
+        let mut report = LeaveBroadcastReport::empty(peer_count, selected_peer_ids.len());
+        for peer_id in selected_peer_ids.iter().copied() {
+            report.rpc_attempts = report.rpc_attempts.saturating_add(1);
+            match self
+                .send_leave_event_to_peer_once(peer_id, event, cluster_view)
+                .await
+            {
+                Ok(()) => {
+                    report.delivered = report.delivered.saturating_add(1);
+                }
+                Err(err) => {
+                    self.deps
+                        .registry
+                        .invalidate_peer_capabilities(peer_id)
+                        .await;
+                    warn!(
+                        target: "topology",
+                        peer_id = %peer_id,
+                        "leave: direct leave broadcast attempt failed: {err}"
+                    );
+                    report.failed.push(peer_id);
+                }
+            }
+        }
+        report
     }
 
     /// Flushes a clean leave event directly to retained peers before this node fences itself.
     async fn broadcast_leave_event_to_scoped_peers(
         &self,
         event: &TopologyEvent,
-        peer_ids: &[Uuid],
+        mut peer_ids: Vec<Uuid>,
         cluster_view: ClusterViewId,
-    ) {
-        for peer_id in peer_ids {
-            let gossip_cap = match self
-                .deps
-                .registry
-                .gossip_client_for_unscoped(*peer_id)
-                .await
-            {
-                Ok(Some(cap)) => cap,
-                Ok(None) => {
-                    warn!(
-                        target: "topology",
-                        peer_id = %peer_id,
-                        "leave: no gossip capability available for direct leave broadcast"
-                    );
-                    continue;
-                }
-                Err(err) => {
-                    warn!(
-                        target: "topology",
-                        peer_id = %peer_id,
-                        "leave: failed to resolve gossip capability for direct leave broadcast: {err}"
-                    );
-                    continue;
-                }
-            };
+    ) -> LeaveBroadcastReport {
+        let peer_count = peer_ids.len();
+        let mut attempts = 0usize;
+        let mut report = LeaveBroadcastReport::empty(peer_count, 0);
 
-            let mut request = gossip_cap.gossip_request();
-            let list = request.get().init_messages();
-            let mut messages = list.init_messages(1);
-            let mut message = messages.reborrow().get(0);
-            message.set_id(Uuid::new_v4().as_bytes());
-            cluster_view.write_capnp(message.reborrow().init_view());
-            add_event(&mut messages, 0, event, cluster_view);
+        while attempts < LEAVE_DIRECT_BROADCAST_ATTEMPTS && !peer_ids.is_empty() {
+            attempts = attempts.saturating_add(1);
+            let selected_peer_ids =
+                take_random_leave_broadcast_peers(&mut peer_ids, LEAVE_DIRECT_BROADCAST_FANOUT);
+            let mut pass_report = self
+                .broadcast_leave_event_once(event, peer_count, &selected_peer_ids, cluster_view)
+                .await;
+            report.selected_count = report
+                .selected_count
+                .saturating_add(pass_report.selected_count);
+            report.rpc_attempts = report.rpc_attempts.saturating_add(pass_report.rpc_attempts);
+            report.delivered = report.delivered.saturating_add(pass_report.delivered);
+            report.failed.append(&mut pass_report.failed);
 
-            match tokio::time::timeout(LEAVE_DIRECT_BROADCAST_TIMEOUT, request.send().promise).await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(err)) => {
-                    warn!(
-                        target: "topology",
-                        peer_id = %peer_id,
-                        "leave: direct leave broadcast failed: {err}"
-                    );
-                }
-                Err(_) => {
-                    warn!(
-                        target: "topology",
-                        peer_id = %peer_id,
-                        timeout_ms = LEAVE_DIRECT_BROADCAST_TIMEOUT.as_millis() as u64,
-                        "leave: direct leave broadcast timed out"
-                    );
-                }
+            if selected_peer_ids.is_empty() || report.reached_survivor() {
+                return report;
+            }
+            if attempts < LEAVE_DIRECT_BROADCAST_ATTEMPTS && !peer_ids.is_empty() {
+                tokio::time::sleep(LEAVE_DIRECT_BROADCAST_RETRY_DELAY).await;
             }
         }
+
+        report
     }
+}
+
+/// Returns a compact string describing one graceful leave notification report.
+fn describe_leave_broadcast_report(report: &LeaveBroadcastReport) -> String {
+    format!(
+        "peers={}, selected={}, delivered={}, failed={}, rpc_attempts={}",
+        report.peer_count,
+        report.selected_count,
+        report.delivered,
+        report.failed.len(),
+        report.rpc_attempts
+    )
+}
+
+/// Takes a random bounded survivor set from the remaining graceful-leave candidates.
+fn take_random_leave_broadcast_peers(peer_ids: &mut Vec<Uuid>, fanout: usize) -> Vec<Uuid> {
+    if fanout == 0 || peer_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let target = fanout.min(peer_ids.len());
+    let mut selected = Vec::with_capacity(target);
+    let mut rng = ::rand::rng();
+    use ::rand::Rng as _;
+    for _ in 0..target {
+        let idx = rng.random_range(0..peer_ids.len());
+        selected.push(peer_ids.swap_remove(idx));
+    }
+    selected
 }
 
 /// Returns true when two current rows represent unrelated key identities for join.
@@ -763,13 +906,32 @@ impl topology::Server for Topology {
             incarnation: leave_incarnation,
         };
 
-        self.broadcast_leave_event_to_scoped_peers(&leave_event, &leave_peer_ids, cluster_view)
+        let leave_report = self
+            .broadcast_leave_event_to_scoped_peers(&leave_event, leave_peer_ids, cluster_view)
             .await;
+        if leave_report.peer_count > 0 && !leave_report.reached_survivor() {
+            return Err(capnp::Error::failed(format!(
+                "leave: failed to notify any retained peer before local shutdown ({})",
+                describe_leave_broadcast_report(&leave_report)
+            )));
+        }
+
         self.mark_peer_left(self_id, leave_incarnation)
             .await
             .map_err(|e| capnp::Error::failed(format!("leave: mark-left failed: {e}")))?;
+        self.record_local_leave_incarnation(leave_incarnation);
         self.broadcast_topology_event_now(&leave_event).await;
         self.gossip_topology_event(leave_event).await?;
+
+        if !leave_report.failed.is_empty() {
+            warn!(
+                target: "topology",
+                delivered = leave_report.delivered,
+                failed = leave_report.failed.len(),
+                rpc_attempts = leave_report.rpc_attempts,
+                "leave: direct broadcast reached a subset of retained peers; relying on anti-entropy from delivered peers"
+            );
+        }
 
         // Stop all background peer contact before clearing local auth state so the
         // node becomes quiescent immediately after the leave broadcast completes.
@@ -1623,7 +1785,10 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
 
 #[cfg(test)]
 mod tests {
-    use super::{join_current_conflicts, restored_local_peer_value};
+    use super::{
+        LEAVE_DIRECT_BROADCAST_FANOUT, join_current_conflicts, restored_local_peer_value,
+        take_random_leave_broadcast_peers,
+    };
     use crate::cluster::ClusterViewId;
     use crate::runtime::types::RuntimeSupportProfile;
     use crate::store::replicated::secret_key_sync::SecretMasterKeyCurrent;
@@ -1631,6 +1796,7 @@ mod tests {
         PeerLabel, PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue,
         WireGuardPeerValue,
     };
+    use std::collections::HashSet;
     use uuid::Uuid;
 
     /// Build one synthetic self row matching the conservative join-time snapshot.
@@ -1674,6 +1840,50 @@ mod tests {
             created_by_operation_id: None,
             parent_key_ids,
         }
+    }
+
+    /// Direct leave notification should stay bounded and remove selected retry candidates.
+    #[test]
+    fn leave_broadcast_peer_selection_is_bounded_and_consumes_candidates() {
+        let peers = (1..=20).map(Uuid::from_u128).collect::<Vec<_>>();
+        let original = peers.iter().copied().collect::<HashSet<_>>();
+        let mut candidates = peers;
+
+        let selected =
+            take_random_leave_broadcast_peers(&mut candidates, LEAVE_DIRECT_BROADCAST_FANOUT);
+        let selected_set = selected.iter().copied().collect::<HashSet<_>>();
+
+        assert_eq!(selected.len(), LEAVE_DIRECT_BROADCAST_FANOUT);
+        assert_eq!(selected_set.len(), LEAVE_DIRECT_BROADCAST_FANOUT);
+        assert_eq!(candidates.len(), 20 - LEAVE_DIRECT_BROADCAST_FANOUT);
+        assert!(selected.iter().all(|peer_id| original.contains(peer_id)));
+        assert!(selected.iter().all(|peer_id| !candidates.contains(peer_id)));
+    }
+
+    /// Direct leave notification should contact every survivor only when the set is already small.
+    #[test]
+    fn leave_broadcast_peer_selection_caps_to_available_peers() {
+        let mut peers = (1..=3).map(Uuid::from_u128).collect::<Vec<_>>();
+
+        let selected = take_random_leave_broadcast_peers(&mut peers, LEAVE_DIRECT_BROADCAST_FANOUT);
+
+        assert_eq!(selected.len(), 3);
+        assert!(peers.is_empty());
+    }
+
+    /// Retry attempts should move to another bounded cohort before giving up.
+    #[test]
+    fn leave_broadcast_peer_selection_rotates_retry_cohorts() {
+        let mut peers = (1..=20).map(Uuid::from_u128).collect::<Vec<_>>();
+
+        let first = take_random_leave_broadcast_peers(&mut peers, LEAVE_DIRECT_BROADCAST_FANOUT);
+        let second = take_random_leave_broadcast_peers(&mut peers, LEAVE_DIRECT_BROADCAST_FANOUT);
+        let second_set = second.iter().copied().collect::<HashSet<_>>();
+
+        assert_eq!(first.len(), LEAVE_DIRECT_BROADCAST_FANOUT);
+        assert_eq!(second.len(), LEAVE_DIRECT_BROADCAST_FANOUT);
+        assert!(first.iter().all(|peer_id| !second_set.contains(peer_id)));
+        assert_eq!(peers.len(), 20 - (LEAVE_DIRECT_BROADCAST_FANOUT * 2));
     }
 
     /// Independent initial current rows should make join fail instead of picking by key id.
