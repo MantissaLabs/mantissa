@@ -55,7 +55,7 @@ impl ClusterCredential {
 
     /// Verify signature + expiry. Returns `Ok(())` if valid.
     pub fn verify(&self) -> Result<(), String> {
-        if now_secs() > self.not_after {
+        if now_secs() >= self.not_after {
             return Err("credential expired".to_string());
         }
         let msg = Self::message(&self.issuer, &self.subject, self.not_after, &self.nonce);

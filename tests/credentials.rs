@@ -24,9 +24,8 @@ fn credential_expiry_and_tamper() {
     let sk = SigningKey::from_bytes(&[9u8; 32]);
     let subject = Uuid::new_v4();
 
-    // Very short TTL so it expires quickly
-    let cred = ClusterCredential::sign(&sk, subject, 1, [2u8; 16]);
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Zero TTL expires at the issuing second, matching ticket expiry semantics.
+    let cred = ClusterCredential::sign(&sk, subject, 0, [2u8; 16]);
     assert!(cred.verify().is_err(), "should be expired");
 
     // Tamper a signed field and re-encode it; verification must reject it.
