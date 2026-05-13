@@ -4,7 +4,7 @@ use std::ops::Deref;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::scheduler::placement::PlacementPolicy;
+use crate::scheduler::placement::{PlacementPolicy, ServicePlacementPreference};
 use crate::workload::manager::WorkloadStartRequest;
 use crate::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadOwner, WorkloadServiceMetadata,
@@ -396,6 +396,9 @@ pub struct TaskTemplateSpecValue {
     pub public_port: Option<u16>,
     #[serde(default)]
     pub public_protocol: Option<ServicePortProtocol>,
+    /// Service-only soft placement preferences for this task template.
+    #[serde(default)]
+    pub placement_preferences: Vec<ServicePlacementPreference>,
 }
 
 /// Supported transport protocols for publicly exposed service ports.
@@ -446,6 +449,11 @@ impl TaskTemplateSpecValue {
         &self.execution.placement
     }
 
+    /// Returns the service-only soft scheduler preferences declared for this template.
+    pub fn placement_preferences(&self) -> &[ServicePlacementPreference] {
+        self.placement_preferences.as_slice()
+    }
+
     pub fn required_network_ids(&self) -> Vec<Uuid> {
         self.execution
             .networks
@@ -479,6 +487,7 @@ impl TaskTemplateSpecValue {
                 service_name,
                 &self.name,
             ))),
+            service_placement_preferences: self.placement_preferences.clone(),
             target_node,
         }
     }
@@ -667,6 +676,7 @@ mod tests {
                 readiness: None,
                 public_port: Some(443),
                 public_protocol: None,
+                placement_preferences: Vec::new(),
             }],
             Vec::new(),
         );

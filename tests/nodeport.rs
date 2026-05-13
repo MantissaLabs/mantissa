@@ -97,6 +97,7 @@ fn privileged_nodeport_task_template(
         }),
         public_port: Some(public_port),
         public_protocol: Some(ServicePortProtocol::Tcp),
+        placement_preferences: Vec::new(),
     }
 }
 
@@ -141,6 +142,7 @@ fn privileged_nodeport_frontend_task_template(
         readiness: None,
         public_port: None,
         public_protocol: None,
+        placement_preferences: Vec::new(),
     }
 }
 
@@ -180,6 +182,7 @@ fn privileged_nodeport_udp_task_template(
         readiness: None,
         public_port: Some(public_port),
         public_protocol: Some(ServicePortProtocol::Udp),
+        placement_preferences: Vec::new(),
     }
 }
 

@@ -8,6 +8,7 @@ use crate::runtime::types::{
     RuntimeAttachOptions, RuntimeCapabilities, RuntimeError, RuntimeExecOptions, RuntimeExecResult,
     RuntimeInstanceRef, RuntimeLogFrame, RuntimeLogsOptions,
 };
+use crate::scheduler::placement::ServicePlacementPreference;
 use crate::scheduler::{Scheduler, SchedulerError, SlotId};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
@@ -364,6 +365,8 @@ pub struct WorkloadStartRequest {
     pub slot_ids: Vec<SlotId>,
     /// Optional exclusive controller owner for this workload row.
     pub owner: Option<WorkloadOwner>,
+    /// Service-only soft placement preferences applied before the generic strategy.
+    pub service_placement_preferences: Vec<ServicePlacementPreference>,
     /// Placement hint used by the scheduler when a task must land on a specific node.
     pub target_node: Option<Uuid>,
 }
@@ -634,6 +637,7 @@ impl WorkloadManager {
             id: None,
             slot_ids: Vec::new(),
             owner: None,
+            service_placement_preferences: Vec::new(),
             target_node: None,
         };
 

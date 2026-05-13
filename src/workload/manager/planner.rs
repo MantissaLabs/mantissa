@@ -15,7 +15,7 @@ use crate::runtime::types::{RuntimeInstanceRef, RuntimeSupportProfile};
 use crate::scheduler::digest::SchedulerDigestValue;
 use crate::scheduler::placement::{
     PlacementNode, PlacementPolicy, PlacementPreferenceCounts, PlacementPreferenceInventory,
-    PlacementStrategy, compare_placement_preference_counts,
+    PlacementStrategy, ServicePlacementPreference, compare_placement_preference_counts,
 };
 use crate::scheduler::{
     GpuDeviceReservation, GpuDeviceState, SchedulerSnapshot, SlotCapacity, SlotId, SlotState,
@@ -176,6 +176,7 @@ pub(super) struct StartIntent {
     pub(super) networks: Vec<Uuid>,
     pub(super) ports: Vec<WorkloadPortBinding>,
     pub(super) placement: PlacementPolicy,
+    pub(super) service_placement_preferences: Vec<ServicePlacementPreference>,
     pub(super) owner: Option<WorkloadOwner>,
     pub(super) target_node: Option<Uuid>,
 }
@@ -1181,6 +1182,7 @@ impl WorkloadManager {
                 id,
                 slot_ids,
                 owner,
+                service_placement_preferences,
                 target_node,
             } = request;
             if !gpu_device_ids.is_empty() {
@@ -1247,6 +1249,7 @@ impl WorkloadManager {
                 networks: execution.networks,
                 ports: execution.ports,
                 placement: execution.placement,
+                service_placement_preferences,
                 owner,
                 target_node,
             });
@@ -1960,7 +1963,7 @@ impl WorkloadManager {
                 }
                 Some(current_best_index) => {
                     let preference_cmp = compare_placement_preference_counts(
-                        intent.placement.preferences.as_slice(),
+                        intent.service_placement_preferences.as_slice(),
                         preference_counts,
                         best_preference_counts,
                     );
@@ -2064,7 +2067,7 @@ impl WorkloadManager {
                 None => best = Some((idx, preference_counts, score, node_id)),
                 Some((_, best_preference_counts, best_score, best_node_id)) => {
                     let preference_cmp = compare_placement_preference_counts(
-                        intent.placement.preferences.as_slice(),
+                        intent.service_placement_preferences.as_slice(),
                         preference_counts,
                         best_preference_counts,
                     );
@@ -2278,6 +2281,7 @@ mod tests {
             ports: Vec::new(),
             placement: Default::default(),
             owner: None,
+            service_placement_preferences: Vec::new(),
             target_node: None,
         };
         let digest = SchedulerDigestValue {
@@ -2353,6 +2357,7 @@ mod tests {
             ports: Vec::new(),
             placement: Default::default(),
             owner: None,
+            service_placement_preferences: Vec::new(),
             target_node: None,
         };
         let digest = SchedulerDigestValue {
@@ -2474,6 +2479,7 @@ mod tests {
                 readiness: None,
                 public_port: Some(18080),
                 public_protocol: Some(ServicePortProtocol::TcpUdp),
+                placement_preferences: Vec::new(),
             }],
             Vec::new(),
         );

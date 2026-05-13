@@ -177,6 +177,7 @@ mod tests {
             readiness: None,
             public_port: None,
             public_protocol: None,
+            placement_preferences: Vec::new(),
         }
     }
 

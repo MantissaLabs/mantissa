@@ -17,8 +17,6 @@ pub struct PlacementPolicy {
     #[serde(default)]
     pub constraints: Vec<PlacementConstraint>,
     #[serde(default)]
-    pub preferences: Vec<PlacementPreference>,
-    #[serde(default)]
     pub strategy: PlacementStrategy,
 }
 
@@ -44,13 +42,13 @@ impl PlacementPolicy {
     }
 }
 
-/// Best-effort scheduler hints evaluated after hard constraints pass.
+/// Service-only best-effort scheduler hints evaluated after hard constraints pass.
 ///
-/// These preferences currently rely on service ownership metadata, so they are most useful for
-/// service-managed workloads whose replicas already advertise stable `(service, template)` labels.
+/// These preferences rely on service ownership metadata, so they stay separate from the generic
+/// workload policy used by jobs and agents.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
-pub enum PlacementPreference {
+pub enum ServicePlacementPreference {
     /// Prefer nodes that already run replicas from the same service.
     ServiceAffinity,
     /// Prefer nodes that currently run fewer replicas from the same service.
@@ -67,7 +65,7 @@ pub enum PlacementPreference {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum PlacementStrategy {
-    /// Prefer even task distribution across the eligible candidate set.
+    /// Prefer even workload distribution across the eligible candidate set.
     #[default]
     Spread,
     /// Prefer reusing the fullest matching node before expanding onto more peers.
@@ -454,16 +452,14 @@ pub struct PlacementPreferenceCounts {
     pub same_template_count: usize,
 }
 
-impl PlacementPreference {
+impl ServicePlacementPreference {
     /// Returns the per-node count this preference reads when comparing two candidates.
     fn relevant_count(self, counts: PlacementPreferenceCounts) -> usize {
         match self {
-            PlacementPreference::ServiceAffinity | PlacementPreference::ServiceAntiAffinity => {
-                counts.same_service_count
-            }
-            PlacementPreference::TaskAffinity | PlacementPreference::TaskAntiAffinity => {
-                counts.same_template_count
-            }
+            ServicePlacementPreference::ServiceAffinity
+            | ServicePlacementPreference::ServiceAntiAffinity => counts.same_service_count,
+            ServicePlacementPreference::TaskAffinity
+            | ServicePlacementPreference::TaskAntiAffinity => counts.same_template_count,
         }
     }
 
@@ -477,12 +473,10 @@ impl PlacementPreference {
         let right_count = self.relevant_count(right);
 
         match self {
-            PlacementPreference::ServiceAffinity | PlacementPreference::TaskAffinity => {
-                left_count.cmp(&right_count)
-            }
-            PlacementPreference::ServiceAntiAffinity | PlacementPreference::TaskAntiAffinity => {
-                right_count.cmp(&left_count)
-            }
+            ServicePlacementPreference::ServiceAffinity
+            | ServicePlacementPreference::TaskAffinity => left_count.cmp(&right_count),
+            ServicePlacementPreference::ServiceAntiAffinity
+            | ServicePlacementPreference::TaskAntiAffinity => right_count.cmp(&left_count),
         }
     }
 }
@@ -492,7 +486,7 @@ impl PlacementPreference {
 /// The first preference that distinguishes the candidates wins, which keeps operator intent
 /// explicit and easy to reason about when multiple soft hints are present.
 pub fn compare_placement_preference_counts(
-    preferences: &[PlacementPreference],
+    preferences: &[ServicePlacementPreference],
     left: PlacementPreferenceCounts,
     right: PlacementPreferenceCounts,
 ) -> Ordering {
@@ -598,8 +592,8 @@ fn normalize_platform_arch(value: &str) -> String {
 mod tests {
     use super::{
         PlacementConstraint, PlacementConstraintOperator, PlacementConstraintSelector,
-        PlacementNode, PlacementPolicy, PlacementPreference, PlacementPreferenceCounts,
-        PlacementStrategy, compare_placement_preference_counts,
+        PlacementNode, PlacementPolicy, PlacementPreferenceCounts, PlacementStrategy,
+        ServicePlacementPreference, compare_placement_preference_counts,
     };
     use crate::topology::peers::PeerLabel;
     use std::cmp::Ordering;
@@ -644,7 +638,6 @@ mod tests {
                 PlacementConstraint::eq(PlacementConstraintSelector::node_label("zone"), "west")
                     .expect("label constraint"),
             ],
-            preferences: Vec::new(),
             strategy: PlacementStrategy::Spread,
         };
 
@@ -667,7 +660,6 @@ mod tests {
                 PlacementConstraint::eq(PlacementConstraintSelector::NodeIp, "10.42.0.0/16")
                     .expect("cidr constraint"),
             ],
-            preferences: Vec::new(),
             strategy: PlacementStrategy::Spread,
         };
 
@@ -701,7 +693,6 @@ mod tests {
                 PlacementConstraint::eq(PlacementConstraintSelector::NodePlatformArch, "amd64")
                     .expect("platform arch constraint"),
             ],
-            preferences: Vec::new(),
             strategy: PlacementStrategy::Spread,
         };
 
@@ -722,8 +713,8 @@ mod tests {
 
         let ordering = compare_placement_preference_counts(
             &[
-                PlacementPreference::TaskAffinity,
-                PlacementPreference::ServiceAntiAffinity,
+                ServicePlacementPreference::TaskAffinity,
+                ServicePlacementPreference::ServiceAntiAffinity,
             ],
             left,
             right,

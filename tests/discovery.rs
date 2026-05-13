@@ -294,6 +294,7 @@ async fn upsert_service_with_readiness(
             readiness,
             public_port: None,
             public_protocol: None,
+            placement_preferences: Vec::new(),
         }],
         replica_ids,
     );

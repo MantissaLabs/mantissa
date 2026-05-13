@@ -5,10 +5,13 @@ use crate::runtime_contract::{
 use crate::workload_submit::WorkloadAdmissionPolicy;
 use crate::workload_submit::{
     DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec, ManifestNetworkSpec,
-    RequestedNetworkSpec, resolve_requested_networks, validate_declared_networks,
-    validate_manifest_ports,
+    PlacementSpec, RequestedNetworkSpec, resolve_requested_networks, validate_declared_networks,
+    validate_manifest_ports, validate_placement,
 };
-pub use crate::workload_submit::{ManifestPortBinding, ManifestPortProtocol};
+pub use crate::workload_submit::{
+    ManifestPortBinding, ManifestPortProtocol, PlacementConstraint, PlacementConstraintOperator,
+    PlacementConstraintSelector, PlacementStrategy,
+};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -250,6 +253,8 @@ pub struct JobExecutionSpec {
     pub ports: Vec<ManifestPortBinding>,
     #[serde(default)]
     pub liveness: Option<LivenessProbe>,
+    #[serde(default)]
+    pub placement: PlacementSpec,
 }
 
 impl JobManifest {
@@ -270,6 +275,10 @@ impl JobManifest {
 
         let declared_volume_names = validate_declared_volumes(&self.volumes)?;
         validate_execution(&self.execution, &declared_volume_names)?;
+        validate_placement(
+            &self.execution.placement,
+            "job manifest execution.placement",
+        )?;
         Ok(())
     }
 
@@ -710,6 +719,7 @@ mod tests {
                 networks: vec!["jobs".to_string()],
                 ports: Vec::new(),
                 liveness: None,
+                placement: PlacementSpec::default(),
             },
             retry_policy: JobRetryPolicySpec::default(),
             admission: WorkloadAdmissionPolicy::default(),
@@ -816,6 +826,39 @@ mod tests {
         let manifest: JobManifest = ron::from_str(raw).expect("parse gang manifest");
 
         assert_eq!(manifest.admission.mode, WorkloadAdmissionMode::Gang);
+    }
+
+    /// Accepts the shared workload placement policy on finite job attempts.
+    #[test]
+    fn manifest_accepts_execution_placement_policy() {
+        let raw = r#"(
+            name: "demo-job",
+            execution: (
+                image: "alpine:3.20",
+                placement: (
+                    constraints: [(
+                        selector: node_label(key: "workload.pool"),
+                        operator: eq,
+                        value: "batch",
+                    )],
+                    strategy: binpack,
+                ),
+            ),
+        )"#;
+        let manifest: JobManifest = ron::from_str(raw).expect("parse placement manifest");
+
+        manifest.validate().expect("valid job placement manifest");
+        assert_eq!(
+            manifest.execution.placement.strategy,
+            PlacementStrategy::Binpack
+        );
+        assert_eq!(
+            manifest.execution.placement.constraints[0],
+            PlacementConstraint::eq(
+                PlacementConstraintSelector::node_label("workload.pool"),
+                "batch",
+            )
+        );
     }
 
     /// Rejects dynamic host ports until Mantissa has an allocation reporting contract.

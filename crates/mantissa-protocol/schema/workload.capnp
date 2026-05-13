@@ -164,6 +164,66 @@ struct AdmissionPolicy {
   # Generic workload admission contract selected by the owning controller.
 }
 
+struct PlacementPolicy {
+  constraints @0 :List(PlacementConstraint);
+  # Hard scheduler constraints evaluated as typed selector/operator/value predicates.
+
+  strategy @1 :PlacementStrategy;
+  # Candidate ranking strategy used after hard constraints pass.
+}
+
+struct PlacementConstraint {
+  selector @0 :PlacementConstraintSelector;
+  # Typed selector evaluated against the candidate node.
+
+  operator @1 :PlacementConstraintOperator;
+  # Comparison applied between the selector value and the expected operand.
+
+  value @2 :Text;
+  # Expected operand compared against the selector value.
+}
+
+struct PlacementConstraintSelector {
+  union {
+    nodeId @0 :Void;
+    # Match the candidate node UUID.
+
+    nodeHostname @1 :Void;
+    # Match the candidate node hostname.
+
+    nodeIp @2 :Void;
+    # Match the candidate node IP address or one CIDR operand.
+
+    nodeAddress @3 :Void;
+    # Match the advertised node address exactly.
+
+    nodePlatformOs @4 :Void;
+    # Match the scheduler-visible operating-system identifier.
+
+    nodePlatformArch @5 :Void;
+    # Match the scheduler-visible architecture identifier.
+
+    nodeLabel @6 :Text;
+    # Match one node label by key.
+  }
+}
+
+enum PlacementConstraintOperator {
+  eq @0;
+  # Require the selector value to equal the expected operand.
+
+  ne @1;
+  # Require the selector value to differ from the expected operand.
+}
+
+enum PlacementStrategy {
+  spread @0;
+  # Prefer even workload distribution across matching nodes.
+
+  binpack @1;
+  # Prefer reusing the fullest matching node before expanding onto more peers.
+}
+
 enum AdmissionState {
   none @0;
   # Workload row is not waiting on a grouped admission barrier.

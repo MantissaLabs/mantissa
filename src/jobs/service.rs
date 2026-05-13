@@ -2,10 +2,10 @@ use crate::jobs::manager::{JobController, JobSubmission, JobSubmitRequest};
 use crate::jobs::types::{JobEvent, JobRetryPolicy, JobSpecValue, JobStatus};
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
-    decode_admission_policy, decode_env_vars, decode_network_requirements, decode_port_bindings,
-    decode_secret_files, decode_task_liveness_probe, decode_volume_mounts, encode_admission_policy,
-    encode_env_vars, encode_port_bindings, encode_secret_files, encode_task_liveness_probe,
-    encode_volume_mounts,
+    decode_admission_policy, decode_env_vars, decode_network_requirements, decode_placement_policy,
+    decode_port_bindings, decode_secret_files, decode_task_liveness_probe, decode_volume_mounts,
+    encode_admission_policy, encode_env_vars, encode_placement_policy, encode_port_bindings,
+    encode_secret_files, encode_task_liveness_probe, encode_volume_mounts,
 };
 use crate::workload::model::{ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec};
 use crate::workload::network_prerequisites::WorkloadNetworkRequirement;
@@ -247,6 +247,7 @@ fn write_job_execution(
     if let Some(liveness) = execution.liveness.as_ref() {
         encode_task_liveness_probe(builder.reborrow().init_liveness(), liveness);
     }
+    encode_placement_policy(builder.reborrow().init_placement(), &execution.placement);
 
     Ok(())
 }
@@ -281,6 +282,7 @@ fn read_job_execution(reader: job_execution::Reader<'_>) -> Result<ResolvedExecu
     } else {
         None
     };
+    let placement = decode_placement_policy(reader.get_placement()?)?;
 
     Ok(ResolvedExecutionSpec {
         image: reader.get_image()?.to_str()?.to_string(),
@@ -298,7 +300,7 @@ fn read_job_execution(reader: job_execution::Reader<'_>) -> Result<ResolvedExecu
         volumes,
         networks,
         ports,
-        placement: Default::default(),
+        placement,
     })
 }
 
@@ -668,6 +670,9 @@ fn workload_phase_exit_code(state: &WorkloadPhase) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler::placement::{
+        PlacementConstraint, PlacementConstraintSelector, PlacementPolicy, PlacementStrategy,
+    };
     use crate::store::replicated::jobs::open_job_store;
     use crate::workload::types::{WorkloadPortBinding, WorkloadPortProtocol};
     use mantissa_store::uuid_key::UuidKey;
@@ -698,7 +703,16 @@ mod tests {
                 host_ip: "127.0.0.1".to_string(),
                 protocol: WorkloadPortProtocol::Tcp,
             }],
-            placement: Default::default(),
+            placement: PlacementPolicy {
+                constraints: vec![
+                    PlacementConstraint::eq(
+                        PlacementConstraintSelector::node_label("job.pool"),
+                        "cpu",
+                    )
+                    .expect("job placement constraint should parse"),
+                ],
+                strategy: PlacementStrategy::Binpack,
+            },
         }
     }
 

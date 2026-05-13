@@ -101,6 +101,7 @@ fn prepared_execution_from_manifest(
             .map(|network| compute_network_id(network.trim()))
             .collect(),
         liveness: manifest.execution.liveness.clone(),
+        placement: manifest.execution.placement.clone(),
     })
 }
 

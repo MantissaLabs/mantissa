@@ -545,6 +545,7 @@ impl JobController {
                 latest.id,
                 latest.name.clone(),
             ))),
+            service_placement_preferences: Vec::new(),
             target_node: None,
         };
 

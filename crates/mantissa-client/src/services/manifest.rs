@@ -2,16 +2,16 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::net::IpAddr;
 use std::path::Path;
 use uuid::Uuid;
 
 use crate::workload_submit::{
     ManifestNetworkSpec, RequestedNetworkSpec, resolve_requested_networks,
-    validate_declared_networks, validate_manifest_ports,
+    validate_declared_networks, validate_manifest_ports, validate_placement_constraints,
 };
 pub use crate::workload_submit::{
-    ManifestPortBinding, ManifestPortProtocol, WorkloadAdmissionMode, WorkloadAdmissionPolicy,
+    ManifestPortBinding, ManifestPortProtocol, PlacementConstraint, PlacementConstraintOperator,
+    PlacementConstraintSelector, PlacementStrategy, WorkloadAdmissionMode, WorkloadAdmissionPolicy,
 };
 
 #[derive(Debug, Deserialize)]
@@ -248,85 +248,10 @@ pub enum LivenessKind {
     Tcp,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PlacementStrategy {
-    #[default]
-    Spread,
-    Binpack,
-}
-
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum PlacementConstraintSelector {
-    NodeId,
-    NodeHostname,
-    NodeIp,
-    NodeAddress,
-    NodePlatformOs,
-    NodePlatformArch,
-    NodeLabel { key: String },
-}
-
-impl PlacementConstraintSelector {
-    /// Builds one typed node-label selector for manifest authors constructing constraints in code.
-    pub fn node_label(key: impl Into<String>) -> Self {
-        Self::NodeLabel { key: key.into() }
-    }
-
-    /// Returns the stable operator-facing selector key for diagnostics and validation errors.
-    fn render_key(&self) -> String {
-        match self {
-            Self::NodeId => "node.id".to_string(),
-            Self::NodeHostname => "node.hostname".to_string(),
-            Self::NodeIp => "node.ip".to_string(),
-            Self::NodeAddress => "node.address".to_string(),
-            Self::NodePlatformOs => "node.platform.os".to_string(),
-            Self::NodePlatformArch => "node.platform.arch".to_string(),
-            Self::NodeLabel { key } => format!("node.labels.{key}"),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum PlacementConstraintOperator {
-    #[default]
-    Eq,
-    Ne,
-}
-
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash)]
-pub struct PlacementConstraint {
-    pub selector: PlacementConstraintSelector,
-    #[serde(default)]
-    pub operator: PlacementConstraintOperator,
-    pub value: String,
-}
-
-impl PlacementConstraint {
-    /// Builds one typed equality constraint for callers constructing manifests in code.
-    pub fn eq(selector: PlacementConstraintSelector, value: impl Into<String>) -> Self {
-        Self {
-            selector,
-            operator: PlacementConstraintOperator::Eq,
-            value: value.into(),
-        }
-    }
-
-    /// Builds one typed inequality constraint for callers constructing manifests in code.
-    pub fn ne(selector: PlacementConstraintSelector, value: impl Into<String>) -> Self {
-        Self {
-            selector,
-            operator: PlacementConstraintOperator::Ne,
-            value: value.into(),
-        }
-    }
-}
-
+/// Service-only placement preference that depends on service replica metadata.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
-pub enum PlacementPreference {
+pub enum ServicePlacementPreference {
     ServiceAffinity,
     ServiceAntiAffinity,
     TaskAffinity,
@@ -338,7 +263,7 @@ pub struct PlacementSpec {
     #[serde(default)]
     pub constraints: Vec<PlacementConstraint>,
     #[serde(default)]
-    pub preferences: Vec<PlacementPreference>,
+    pub preferences: Vec<ServicePlacementPreference>,
     #[serde(default)]
     pub strategy: PlacementStrategy,
 }
@@ -1015,65 +940,10 @@ fn validate_template_dependencies(task_templates: &[TaskTemplateSpec]) -> Result
 
 /// Validates one task template placement section before the manifest is submitted.
 fn validate_template_placement(template: &TaskTemplateSpec) -> Result<()> {
-    for constraint in &template.placement.constraints {
-        validate_constraint(constraint).map_err(|message| {
-            anyhow!(
-                "template '{}' defines an invalid placement constraint: {message}",
-                template.name
-            )
-        })?;
-    }
-
-    Ok(())
-}
-
-/// Performs lightweight local validation for one typed placement constraint.
-fn validate_constraint(constraint: &PlacementConstraint) -> std::result::Result<(), String> {
-    let selector_key = constraint.selector.render_key();
-    let value = constraint.value.trim();
-    if value.is_empty() {
-        return Err(format!(
-            "constraint for selector '{}' must include a non-empty value",
-            selector_key
-        ));
-    }
-
-    match &constraint.selector {
-        PlacementConstraintSelector::NodeLabel { key } if key.trim().is_empty() => {
-            return Err("node_label selector requires a non-empty key".to_string());
-        }
-        PlacementConstraintSelector::NodeIp if !is_valid_ip_or_cidr(value) => {
-            return Err(format!(
-                "selector '{}' requires an IP address or CIDR value, got '{}'",
-                selector_key, constraint.value
-            ));
-        }
-        _ => {}
-    }
-
-    Ok(())
-}
-
-/// Returns true when the provided string encodes either one IP address or one CIDR prefix.
-fn is_valid_ip_or_cidr(value: &str) -> bool {
-    if value.parse::<IpAddr>().is_ok() {
-        return true;
-    }
-
-    parse_cidr(value).is_some()
-}
-
-/// Parses one CIDR string into a network IP and prefix length.
-fn parse_cidr(value: &str) -> Option<(IpAddr, u8)> {
-    let (network_text, prefix_text) = value.split_once('/')?;
-    let network = network_text.parse::<IpAddr>().ok()?;
-    let prefix = prefix_text.parse::<u8>().ok()?;
-    let max_prefix = match network {
-        IpAddr::V4(_) => 32,
-        IpAddr::V6(_) => 128,
-    };
-
-    (prefix <= max_prefix).then_some((network, prefix))
+    validate_placement_constraints(
+        &template.placement.constraints,
+        &format!("template '{}'", template.name),
+    )
 }
 
 pub fn load_manifest_from_path(path: &Path) -> Result<ServiceManifest> {

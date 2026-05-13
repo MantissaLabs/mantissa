@@ -8,8 +8,12 @@ use crate::runtime_contract::{
 };
 use crate::workload_submit::{
     DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec, ManifestNetworkSpec,
-    RequestedNetworkSpec, WorkloadAdmissionPolicy, resolve_requested_networks,
-    validate_declared_networks,
+    PlacementSpec, RequestedNetworkSpec, WorkloadAdmissionPolicy, resolve_requested_networks,
+    validate_declared_networks, validate_placement,
+};
+pub use crate::workload_submit::{
+    PlacementConstraint, PlacementConstraintOperator, PlacementConstraintSelector,
+    PlacementStrategy,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -106,6 +110,8 @@ pub struct AgentExecutionSpec {
     pub networks: Vec<String>,
     #[serde(default)]
     pub liveness: Option<LivenessProbe>,
+    #[serde(default)]
+    pub placement: PlacementSpec,
 }
 
 /// Persistent workspace policy owned by one agent session.
@@ -183,6 +189,10 @@ impl AgentManifest {
 
         let declared_volume_names = validate_declared_volumes(&self.volumes)?;
         validate_execution(&self.execution, &declared_volume_names)?;
+        validate_placement(
+            &self.execution.placement,
+            "agent manifest execution.placement",
+        )?;
         validate_workspace(&self.workspace, &declared_volume_names)?;
         validate_checkpoint(&self.checkpoint, &declared_volume_names)?;
         validate_tools(&self.tools)?;
@@ -744,6 +754,7 @@ mod tests {
                 volumes: Vec::new(),
                 networks: Vec::new(),
                 liveness: None,
+                placement: PlacementSpec::default(),
             },
             workspace: AgentWorkspaceSpec {
                 mount: Some(VolumeMount {
@@ -834,6 +845,39 @@ mod tests {
         let manifest: AgentManifest = ron::from_str(raw).expect("parse gang manifest");
 
         assert_eq!(manifest.admission.mode, WorkloadAdmissionMode::Gang);
+    }
+
+    /// Accepts the shared workload placement policy on durable agent runs.
+    #[test]
+    fn manifest_accepts_execution_placement_policy() {
+        let raw = r#"(
+            name: "codex-demo",
+            execution: (
+                image: "ghcr.io/demo/codex:latest",
+                placement: (
+                    constraints: [(
+                        selector: node_label(key: "workload.pool"),
+                        operator: eq,
+                        value: "interactive",
+                    )],
+                    strategy: spread,
+                ),
+            ),
+        )"#;
+        let manifest: AgentManifest = ron::from_str(raw).expect("parse placement manifest");
+
+        manifest.validate().expect("valid agent placement manifest");
+        assert_eq!(
+            manifest.execution.placement.strategy,
+            PlacementStrategy::Spread
+        );
+        assert_eq!(
+            manifest.execution.placement.constraints[0],
+            PlacementConstraint::eq(
+                PlacementConstraintSelector::node_label("workload.pool"),
+                "interactive",
+            )
+        );
     }
 
     /// Rejects duplicate mount targets across execution and workspace policies.

@@ -1,9 +1,8 @@
 use super::manifest::{
-    EnvironmentVariable, LivenessKind, LivenessProbe, PlacementConstraint,
-    PlacementConstraintOperator, PlacementConstraintSelector, PlacementPreference,
-    PlacementStrategy, ReadinessKind, ReadinessProbe, RestartPolicyName, RolloutOrder,
-    SecretFileProjection, SecretReference, ServiceManifest, ServiceUpdateStrategy,
-    ServiceUpdateStrategyMode, TaskTemplateSpec, VolumeMount,
+    EnvironmentVariable, LivenessKind, LivenessProbe, ReadinessKind, ReadinessProbe,
+    RestartPolicyName, RolloutOrder, SecretFileProjection, SecretReference, ServiceManifest,
+    ServicePlacementPreference, ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskTemplateSpec,
+    VolumeMount,
 };
 use crate::config::ClientConfig;
 use crate::connection;
@@ -14,13 +13,11 @@ use crate::workload_submit::{
 };
 use crate::workload_wire::{
     write_admission_policy, write_local_volume_ownership, write_network_requirements,
-    write_port_bindings,
+    write_placement_policy_parts, write_port_bindings,
 };
 use anyhow::{Context, Result, anyhow};
 use capnp::{Error as CapnpError, struct_list};
-use mantissa_protocol::services::{
-    placement_constraint, placement_constraint_selector, task_template,
-};
+use mantissa_protocol::services::task_template;
 use mantissa_protocol::workload::{environment_var, secret_file, secret_ref, volume_mount};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -351,34 +348,27 @@ fn write_task_template(
 
     builder.set_public_port(template.public_port.unwrap_or(0));
     builder.set_tty(template.tty);
-    let mut placement_constraints = builder
-        .reborrow()
-        .init_placement_constraints(template.placement.constraints.len() as u32);
-    for (idx, constraint) in template.placement.constraints.iter().enumerate() {
-        let builder = placement_constraints.reborrow().get(idx as u32);
-        write_placement_constraint(builder, constraint);
-    }
-    let placement_strategy = match template.placement.strategy {
-        PlacementStrategy::Spread => mantissa_protocol::services::PlacementStrategy::Spread,
-        PlacementStrategy::Binpack => mantissa_protocol::services::PlacementStrategy::Binpack,
-    };
-    builder.set_placement_strategy(placement_strategy);
+    write_placement_policy_parts(
+        builder.reborrow().init_placement(),
+        &template.placement.constraints,
+        template.placement.strategy,
+    );
     let mut placement_preferences = builder
         .reborrow()
-        .init_placement_preferences(template.placement.preferences.len() as u32);
+        .init_service_placement_preferences(template.placement.preferences.len() as u32);
     for (idx, preference) in template.placement.preferences.iter().enumerate() {
         let encoded = match preference {
-            PlacementPreference::ServiceAffinity => {
-                mantissa_protocol::services::PlacementPreference::ServiceAffinity
+            ServicePlacementPreference::ServiceAffinity => {
+                mantissa_protocol::services::ServicePlacementPreference::ServiceAffinity
             }
-            PlacementPreference::ServiceAntiAffinity => {
-                mantissa_protocol::services::PlacementPreference::ServiceAntiAffinity
+            ServicePlacementPreference::ServiceAntiAffinity => {
+                mantissa_protocol::services::ServicePlacementPreference::ServiceAntiAffinity
             }
-            PlacementPreference::TaskAffinity => {
-                mantissa_protocol::services::PlacementPreference::TaskAffinity
+            ServicePlacementPreference::TaskAffinity => {
+                mantissa_protocol::services::ServicePlacementPreference::TaskAffinity
             }
-            PlacementPreference::TaskAntiAffinity => {
-                mantissa_protocol::services::PlacementPreference::TaskAntiAffinity
+            ServicePlacementPreference::TaskAntiAffinity => {
+                mantissa_protocol::services::ServicePlacementPreference::TaskAntiAffinity
             }
         };
         placement_preferences.set(idx as u32, encoded);
@@ -399,40 +389,6 @@ fn write_task_template(
     )?;
 
     Ok(())
-}
-
-/// Writes one typed placement constraint into the service deployment payload.
-fn write_placement_constraint(
-    mut builder: placement_constraint::Builder<'_>,
-    constraint: &PlacementConstraint,
-) {
-    write_placement_constraint_selector(builder.reborrow().init_selector(), &constraint.selector);
-    let operator = match constraint.operator {
-        PlacementConstraintOperator::Eq => {
-            mantissa_protocol::services::PlacementConstraintOperator::Eq
-        }
-        PlacementConstraintOperator::Ne => {
-            mantissa_protocol::services::PlacementConstraintOperator::Ne
-        }
-    };
-    builder.set_operator(operator);
-    builder.set_value(constraint.value.trim());
-}
-
-/// Writes one typed placement selector into the service deployment payload.
-fn write_placement_constraint_selector(
-    mut builder: placement_constraint_selector::Builder<'_>,
-    selector: &PlacementConstraintSelector,
-) {
-    match selector {
-        PlacementConstraintSelector::NodeId => builder.set_node_id(()),
-        PlacementConstraintSelector::NodeHostname => builder.set_node_hostname(()),
-        PlacementConstraintSelector::NodeIp => builder.set_node_ip(()),
-        PlacementConstraintSelector::NodeAddress => builder.set_node_address(()),
-        PlacementConstraintSelector::NodePlatformOs => builder.set_node_platform_os(()),
-        PlacementConstraintSelector::NodePlatformArch => builder.set_node_platform_arch(()),
-        PlacementConstraintSelector::NodeLabel { key } => builder.set_node_label(key.trim()),
-    }
 }
 
 /// Writes one readiness probe into the service deployment payload.

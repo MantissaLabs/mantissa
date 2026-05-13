@@ -84,16 +84,13 @@ struct TaskTemplate {
   tty @19 :Bool;
   # Allocate a terminal for the replica entrypoint.
 
-  placementConstraints @20 :List(PlacementConstraint);
-  # Hard scheduler constraints evaluated as typed selector/operator/value predicates.
+  placement @20 :WorkloadSchema.PlacementPolicy;
+  # Generic workload placement policy shared with jobs and agents.
 
-  placementStrategy @21 :PlacementStrategy;
-  # Candidate ranking strategy used after hard constraints pass.
+  servicePlacementPreferences @21 :List(ServicePlacementPreference);
+  # Service-only soft hints evaluated before the generic strategy breaks ties.
 
-  placementPreferences @22 :List(PlacementPreference);
-  # Soft best-effort hints evaluated before the strategy breaks ties.
-
-  ports @23 :List(WorkloadSchema.PortBinding);
+  ports @22 :List(WorkloadSchema.PortBinding);
   # Node-local host port bindings for each replica of this template.
 }
 
@@ -103,50 +100,6 @@ struct TaskTemplateNetwork {
 
   networkId @1 :Data;
   # Required overlay network UUID as a 16-byte binary identifier.
-}
-
-struct PlacementConstraint {
-  selector @0 :PlacementConstraintSelector;
-  # Typed selector evaluated against the candidate node.
-
-  operator @1 :PlacementConstraintOperator;
-  # Comparison applied between the selector value and the expected operand.
-
-  value @2 :Text;
-  # Expected operand compared against the selector value.
-}
-
-struct PlacementConstraintSelector {
-  union {
-    nodeId @0 :Void;
-    # Match the candidate node UUID.
-
-    nodeHostname @1 :Void;
-    # Match the candidate node hostname.
-
-    nodeIp @2 :Void;
-    # Match the candidate node IP address or one CIDR operand.
-
-    nodeAddress @3 :Void;
-    # Match the advertised node address exactly.
-
-    nodePlatformOs @4 :Void;
-    # Match the scheduler-visible operating-system identifier.
-
-    nodePlatformArch @5 :Void;
-    # Match the scheduler-visible architecture identifier.
-
-    nodeLabel @6 :Text;
-    # Match one node label by key.
-  }
-}
-
-enum PlacementConstraintOperator {
-  eq @0;
-  # Require the selector value to equal the expected operand.
-
-  ne @1;
-  # Require the selector value to differ from the expected operand.
 }
 
 enum ReadinessProbeKind {
@@ -225,15 +178,7 @@ enum PublicProtocol {
   # Support both TCP and UDP.
 }
 
-enum PlacementStrategy {
-  spread @0;
-  # Prefer even task distribution across matching nodes.
-
-  binpack @1;
-  # Prefer reusing the fullest matching node before expanding onto more peers.
-}
-
-enum PlacementPreference {
+enum ServicePlacementPreference {
   serviceAffinity @0;
   # Prefer nodes that already run replicas from the same service.
 

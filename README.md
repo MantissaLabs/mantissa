@@ -15,7 +15,7 @@ operation across large fleets of nodes.
 ## Why Mantissa?
 
 Traditional workload orchestration systems often rely on a centralized control plane, which
-could be difficult to scale and maintain as the cluster grows. Mantissa explores an alternative
+could become a bottleneck and hard to maintain as the cluster grows. Mantissa explores an alternative
 approach that leverages distributed scheduling with optimistic concurrency. It is similar to the
 [Omega scheduler](https://people.csail.mit.edu/malte/pub/papers/2013-eurosys-omega.pdf) in the
 approach, but with the shared state being replicated via CRDTs.

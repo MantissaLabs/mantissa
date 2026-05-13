@@ -9,13 +9,13 @@ use crate::runtime_contract::{
 use crate::tasks::uuid_to_string;
 use crate::volumes;
 use crate::workload_submit::{
-    ManifestPortBinding, RequestedNetworkSpec, ResolvedDeclaredVolume, WorkloadAdmissionPolicy,
-    compute_network_id, ensure_declared_volumes,
+    ManifestPortBinding, PlacementSpec, RequestedNetworkSpec, ResolvedDeclaredVolume,
+    WorkloadAdmissionPolicy, compute_network_id, ensure_declared_volumes,
 };
 use crate::workload_wire::{
     PreparedVolumeMount, prepared_volume_mount_from_resolved, write_admission_policy,
-    write_env_vars, write_liveness_probe, write_network_requirements, write_port_bindings,
-    write_secret_files, write_volume_mounts,
+    write_env_vars, write_liveness_probe, write_network_requirements, write_placement_policy,
+    write_port_bindings, write_secret_files, write_volume_mounts,
 };
 use anyhow::{Result, anyhow};
 use mantissa_protocol::jobs::{job_execution, job_retry_policy, job_submit_spec};
@@ -99,6 +99,7 @@ struct PreparedJobExecution {
     networks: Vec<Uuid>,
     ports: Vec<ManifestPortBinding>,
     liveness: Option<LivenessProbe>,
+    placement: PlacementSpec,
 }
 
 /// One prepared controller retry policy ready for jobs wire encoding.
@@ -187,6 +188,7 @@ async fn prepare_raw_submit_spec(
             networks: Vec::new(),
             ports: Vec::new(),
             liveness: None,
+            placement: PlacementSpec::default(),
         },
         retry_policy: PreparedJobRetryPolicy {
             max_retries: options.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
@@ -268,6 +270,7 @@ fn prepared_execution_from_manifest(
             .collect(),
         ports: execution.ports.clone(),
         liveness: execution.liveness.clone(),
+        placement: execution.placement.clone(),
     })
 }
 
@@ -348,6 +351,7 @@ fn write_job_execution(
     if let Some(liveness) = execution.liveness.as_ref() {
         write_liveness_probe(builder.reborrow().init_liveness(), liveness);
     }
+    write_placement_policy(builder.reborrow().init_placement(), &execution.placement);
 
     Ok(())
 }

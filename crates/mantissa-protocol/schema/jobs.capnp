@@ -61,6 +61,9 @@ struct JobExecution {
 
   ports @13 :List(WorkloadSchema.PortBinding);
   # Node-local host port bindings for each job attempt.
+
+  placement @14 :WorkloadSchema.PlacementPolicy;
+  # Generic workload placement policy for each job attempt.
 }
 
 struct JobRetryPolicy {

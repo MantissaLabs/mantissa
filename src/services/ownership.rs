@@ -1,6 +1,6 @@
 use crate::scheduler::placement::{
-    PlacementNode, PlacementPreference, PlacementPreferenceCounts, PlacementPreferenceInventory,
-    PlacementStrategy, compare_placement_preference_counts,
+    PlacementNode, PlacementPreferenceCounts, PlacementPreferenceInventory, PlacementStrategy,
+    ServicePlacementPreference, compare_placement_preference_counts,
 };
 use crate::services::types::{ServiceSpecValue, TaskTemplateSpecValue};
 use anyhow::anyhow;
@@ -147,7 +147,7 @@ pub(super) fn compute_slot_targets_with_placement(
         let context = SlotTargetingContext {
             service_name,
             template_name: &template.name,
-            preferences: template.placement().preferences.as_slice(),
+            preferences: template.placement_preferences(),
             total_counts: &total_counts,
             template_counts: &template_counts,
             preference_inventory: &preference_inventory,
@@ -202,7 +202,7 @@ struct SlotTargetCandidate {
 struct SlotTargetingContext<'a> {
     service_name: &'a str,
     template_name: &'a str,
-    preferences: &'a [PlacementPreference],
+    preferences: &'a [ServicePlacementPreference],
     total_counts: &'a HashMap<Uuid, usize>,
     template_counts: &'a HashMap<(Uuid, String), usize>,
     preference_inventory: &'a PlacementPreferenceInventory,
@@ -240,7 +240,7 @@ fn slot_target_candidate(
 
 /// Compares two candidate snapshots according to the declared soft placement preferences.
 fn preference_ordering(
-    preferences: &[PlacementPreference],
+    preferences: &[ServicePlacementPreference],
     left: SlotTargetCandidate,
     right: SlotTargetCandidate,
 ) -> Ordering {
@@ -257,7 +257,7 @@ fn preference_ordering(
 /// then keeps the template-local count low, and finally falls back to rendezvous rank to keep
 /// ownership deterministic.
 fn spread_prefers_candidate(
-    preferences: &[PlacementPreference],
+    preferences: &[ServicePlacementPreference],
     candidate: SlotTargetCandidate,
     best: SlotTargetCandidate,
 ) -> bool {
@@ -293,7 +293,7 @@ fn spread_prefers_candidate(
 /// preferred, it chooses the node that is already the fullest for this service, then for this
 /// template, and finally uses rendezvous rank as the deterministic tie-breaker.
 fn binpack_prefers_candidate(
-    preferences: &[PlacementPreference],
+    preferences: &[ServicePlacementPreference],
     candidate: SlotTargetCandidate,
     best: SlotTargetCandidate,
 ) -> bool {
@@ -564,7 +564,7 @@ mod tests {
     use super::{SlotKey, compute_slot_targets_with_placement};
     use crate::scheduler::placement::{
         PlacementConstraint, PlacementConstraintSelector, PlacementNode, PlacementPolicy,
-        PlacementPreference, PlacementPreferenceInventory, PlacementStrategy,
+        PlacementPreferenceInventory, PlacementStrategy, ServicePlacementPreference,
     };
     use crate::services::types::TaskTemplateSpecValue;
     use crate::topology::peers::PeerLabel;
@@ -662,10 +662,10 @@ mod tests {
                 ports: Vec::new(),
                 placement: PlacementPolicy {
                     constraints,
-                    preferences: vec![PlacementPreference::ServiceAffinity],
                     strategy: PlacementStrategy::Spread,
                 },
             },
+            placement_preferences: vec![ServicePlacementPreference::ServiceAffinity],
             depends_on: Vec::new(),
             replicas,
             readiness: None,

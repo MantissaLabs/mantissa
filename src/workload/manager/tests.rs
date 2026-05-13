@@ -1298,6 +1298,7 @@ fn standalone_volume_task_request(volume: &VolumeSpecValue, target: &str) -> Wor
         id: None,
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     }
 }
@@ -3022,6 +3023,7 @@ async fn reconcile_local_tasks_does_not_duplicate_batch_launch_in_progress() {
         id: None,
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     };
 
@@ -4857,6 +4859,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 id: None,
                 slot_ids: Vec::new(),
                 owner: None,
+                service_placement_preferences: Vec::new(),
                 target_node: None,
             },
             WorkloadStartRequest {
@@ -4869,6 +4872,7 @@ async fn start_tasks_batch_reserves_every_slot() {
                 id: None,
                 slot_ids: Vec::new(),
                 owner: None,
+                service_placement_preferences: Vec::new(),
                 target_node: None,
             },
         ])
@@ -4917,6 +4921,7 @@ async fn start_tasks_batch_respects_existing_reservations() {
             id: Some(task_id),
             slot_ids: vec![slot_spec.slot_id],
             owner: None,
+            service_placement_preferences: Vec::new(),
             target_node: None,
         }])
         .await
@@ -4954,6 +4959,7 @@ async fn start_workloads_gang_insufficient_capacity_admits_zero_workloads() {
                 id: None,
                 slot_ids: Vec::new(),
                 owner: None,
+                service_placement_preferences: Vec::new(),
                 target_node: None,
             }],
         )
@@ -5021,6 +5027,7 @@ async fn start_workloads_gang_runtime_failure_after_commit_cleans_local_reservat
                 id: None,
                 slot_ids: Vec::new(),
                 owner: None,
+                service_placement_preferences: Vec::new(),
                 target_node: None,
             }],
         )
@@ -5718,6 +5725,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 id: None,
                 slot_ids: Vec::new(),
                 owner: None,
+                service_placement_preferences: Vec::new(),
                 target_node: None,
             },
             WorkloadStartRequest {
@@ -5730,6 +5738,7 @@ async fn start_tasks_batch_is_atomic_on_capacity_failure() {
                 id: None,
                 slot_ids: Vec::new(),
                 owner: None,
+                service_placement_preferences: Vec::new(),
                 target_node: None,
             },
         ])
@@ -5805,6 +5814,7 @@ async fn runtime_attachments_created_and_removed_on_stop() {
         id: None,
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     };
 
@@ -5913,6 +5923,7 @@ async fn runtime_attachments_avoid_overlay_ip_collisions() {
             id: Some(id),
             slot_ids: Vec::new(),
             owner: None,
+            service_placement_preferences: Vec::new(),
             target_node: None,
         })
         .collect::<Vec<_>>();
@@ -5992,6 +6003,7 @@ async fn service_runtime_attachments_start_unpublished_until_controller_publishe
         owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
             "svc", "backend",
         ))),
+        service_placement_preferences: Vec::new(),
         target_node: None,
     };
 
@@ -6531,6 +6543,7 @@ async fn stop_withdraws_attachment_traffic_before_runtime_stop() {
         id: None,
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     };
 
@@ -6638,6 +6651,7 @@ async fn request_task_stop_cleans_up_after_teardown_failure() {
         id: None,
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     };
 
@@ -7715,6 +7729,7 @@ async fn attachment_ready_triggers_forwarding_event() {
         id: None,
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     };
 
@@ -7813,6 +7828,7 @@ async fn runtime_attachments_reconcile_removes_stale_entries() {
         id: None,
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     };
 
@@ -7905,6 +7921,7 @@ async fn runtime_attachments_retry_transient_provision_errors() {
         id: None,
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     };
 
@@ -8001,6 +8018,7 @@ async fn runtime_attachments_real_provisioning_runs_when_enabled() {
         id: None,
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     };
 
@@ -8066,6 +8084,7 @@ fn scheduling_retry_budget_stays_wide_for_untargeted_starts() {
         ports: Vec::new(),
         placement: Default::default(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     }];
 
@@ -8101,6 +8120,7 @@ fn scheduling_retry_budget_is_shorter_for_targeted_starts() {
         ports: Vec::new(),
         placement: Default::default(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: Some(Uuid::new_v4()),
     }];
 
@@ -8127,6 +8147,7 @@ async fn scheduling_retry_limit_override_fast_fails_retryable_errors() {
             "demo-service",
             "api",
         ))),
+        service_placement_preferences: Vec::new(),
         target_node: None,
     };
 
@@ -8178,6 +8199,7 @@ async fn workload_start_retryable_includes_capacity_shortage_for_controllers() {
         id: Some(Uuid::new_v4()),
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     };
 
@@ -8242,6 +8264,7 @@ async fn workload_start_service_requeue_excludes_capacity_shortage() {
         id: Some(Uuid::new_v4()),
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     };
 
@@ -8284,6 +8307,7 @@ async fn start_tasks_batch_rejects_unsupported_local_execution_platform() {
         id: Some(Uuid::new_v4()),
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     };
 
@@ -8624,6 +8648,7 @@ async fn multi_volume_bound_node_conflict_rejected() {
             id: None,
             slot_ids: Vec::new(),
             owner: None,
+            service_placement_preferences: Vec::new(),
             target_node: None,
         }])
         .await

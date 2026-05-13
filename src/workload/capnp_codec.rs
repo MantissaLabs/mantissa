@@ -1,3 +1,7 @@
+use crate::scheduler::placement::{
+    PlacementConstraint, PlacementConstraintOperator, PlacementConstraintSelector, PlacementPolicy,
+    PlacementStrategy,
+};
 use crate::volumes::types::LocalVolumeOwnership;
 use crate::workload::model::{
     WorkloadEnvironmentVariable, WorkloadSecretFile, WorkloadSecretReference, WorkloadVolumeMount,
@@ -11,7 +15,8 @@ use crate::workload::types::{
 use capnp::{Error, struct_list};
 use mantissa_protocol::volumes::local_volume_ownership;
 use mantissa_protocol::workload::{
-    admission_policy, environment_var, network_requirement, port_binding, secret_file, secret_ref,
+    admission_policy, environment_var, network_requirement, placement_constraint,
+    placement_constraint_selector, placement_policy, port_binding, secret_file, secret_ref,
     volume_mount,
 };
 use uuid::Uuid;
@@ -42,6 +47,162 @@ pub fn decode_admission_policy(
         Err(_) => WorkloadAdmissionMode::Incremental,
     };
     Ok(WorkloadAdmissionPolicy { mode })
+}
+
+/// Encodes one generic workload placement policy into the shared wire shape.
+pub fn encode_placement_policy(
+    mut builder: placement_policy::Builder<'_>,
+    policy: &PlacementPolicy,
+) {
+    let mut constraints = builder
+        .reborrow()
+        .init_constraints(policy.constraints.len() as u32);
+    for (idx, constraint) in policy.constraints.iter().enumerate() {
+        encode_placement_constraint(constraints.reborrow().get(idx as u32), constraint);
+    }
+    builder.set_strategy(placement_strategy_to_proto(policy.strategy));
+}
+
+/// Decodes one generic workload placement policy from the shared wire shape.
+pub fn decode_placement_policy(
+    reader: placement_policy::Reader<'_>,
+) -> Result<PlacementPolicy, Error> {
+    let constraints = match reader.get_constraints() {
+        Ok(entries) => {
+            let mut constraints = Vec::with_capacity(entries.len() as usize);
+            for entry in entries.iter() {
+                constraints.push(decode_placement_constraint(entry)?);
+            }
+            constraints
+        }
+        Err(_) => Vec::new(),
+    };
+    let strategy = match reader.get_strategy() {
+        Ok(strategy) => placement_strategy_from_proto(strategy),
+        Err(_) => PlacementStrategy::Spread,
+    };
+
+    Ok(PlacementPolicy {
+        constraints,
+        strategy,
+    })
+}
+
+/// Encodes one hard placement constraint into the shared workload wire shape.
+fn encode_placement_constraint(
+    mut builder: placement_constraint::Builder<'_>,
+    constraint: &PlacementConstraint,
+) {
+    encode_placement_constraint_selector(builder.reborrow().init_selector(), constraint.selector());
+    builder.set_operator(placement_constraint_operator_to_proto(
+        constraint.operator(),
+    ));
+    builder.set_value(constraint.value());
+}
+
+/// Decodes one hard placement constraint from the shared workload wire shape.
+fn decode_placement_constraint(
+    reader: placement_constraint::Reader<'_>,
+) -> Result<PlacementConstraint, Error> {
+    let selector = decode_placement_constraint_selector(reader.get_selector()?)?;
+    let operator = match reader.get_operator() {
+        Ok(operator) => placement_constraint_operator_from_proto(operator),
+        Err(_) => PlacementConstraintOperator::Eq,
+    };
+    let value = reader.get_value()?.to_str()?.to_string();
+
+    PlacementConstraint::new(selector, operator, value)
+        .map_err(|err| Error::failed(err.to_string()))
+}
+
+/// Encodes one internal placement selector into the shared workload wire union.
+fn encode_placement_constraint_selector(
+    mut builder: placement_constraint_selector::Builder<'_>,
+    selector: &PlacementConstraintSelector,
+) {
+    match selector {
+        PlacementConstraintSelector::NodeId => builder.set_node_id(()),
+        PlacementConstraintSelector::NodeHostname => builder.set_node_hostname(()),
+        PlacementConstraintSelector::NodeIp => builder.set_node_ip(()),
+        PlacementConstraintSelector::NodeAddress => builder.set_node_address(()),
+        PlacementConstraintSelector::NodePlatformOs => builder.set_node_platform_os(()),
+        PlacementConstraintSelector::NodePlatformArch => builder.set_node_platform_arch(()),
+        PlacementConstraintSelector::NodeLabel { key } => builder.set_node_label(key),
+    }
+}
+
+/// Decodes one typed placement selector from the shared workload wire union.
+fn decode_placement_constraint_selector(
+    reader: placement_constraint_selector::Reader<'_>,
+) -> Result<PlacementConstraintSelector, Error> {
+    match reader.which()? {
+        placement_constraint_selector::Which::NodeId(()) => Ok(PlacementConstraintSelector::NodeId),
+        placement_constraint_selector::Which::NodeHostname(()) => {
+            Ok(PlacementConstraintSelector::NodeHostname)
+        }
+        placement_constraint_selector::Which::NodeIp(()) => Ok(PlacementConstraintSelector::NodeIp),
+        placement_constraint_selector::Which::NodeAddress(()) => {
+            Ok(PlacementConstraintSelector::NodeAddress)
+        }
+        placement_constraint_selector::Which::NodePlatformOs(()) => {
+            Ok(PlacementConstraintSelector::NodePlatformOs)
+        }
+        placement_constraint_selector::Which::NodePlatformArch(()) => {
+            Ok(PlacementConstraintSelector::NodePlatformArch)
+        }
+        placement_constraint_selector::Which::NodeLabel(Ok(key)) => Ok(
+            PlacementConstraintSelector::node_label(key.to_str()?.to_string()),
+        ),
+        placement_constraint_selector::Which::NodeLabel(Err(err)) => Err(err),
+    }
+}
+
+/// Decodes the placement comparison operator stored in the shared wire payload.
+fn placement_constraint_operator_from_proto(
+    operator: mantissa_protocol::workload::PlacementConstraintOperator,
+) -> PlacementConstraintOperator {
+    match operator {
+        mantissa_protocol::workload::PlacementConstraintOperator::Eq => {
+            PlacementConstraintOperator::Eq
+        }
+        mantissa_protocol::workload::PlacementConstraintOperator::Ne => {
+            PlacementConstraintOperator::Ne
+        }
+    }
+}
+
+/// Encodes the internal placement comparison operator into the shared wire enum.
+fn placement_constraint_operator_to_proto(
+    operator: PlacementConstraintOperator,
+) -> mantissa_protocol::workload::PlacementConstraintOperator {
+    match operator {
+        PlacementConstraintOperator::Eq => {
+            mantissa_protocol::workload::PlacementConstraintOperator::Eq
+        }
+        PlacementConstraintOperator::Ne => {
+            mantissa_protocol::workload::PlacementConstraintOperator::Ne
+        }
+    }
+}
+
+/// Decodes the placement strategy stored in the shared wire payload.
+fn placement_strategy_from_proto(
+    strategy: mantissa_protocol::workload::PlacementStrategy,
+) -> PlacementStrategy {
+    match strategy {
+        mantissa_protocol::workload::PlacementStrategy::Spread => PlacementStrategy::Spread,
+        mantissa_protocol::workload::PlacementStrategy::Binpack => PlacementStrategy::Binpack,
+    }
+}
+
+/// Encodes the internal placement strategy into the shared wire enum.
+fn placement_strategy_to_proto(
+    strategy: PlacementStrategy,
+) -> mantissa_protocol::workload::PlacementStrategy {
+    match strategy {
+        PlacementStrategy::Spread => mantissa_protocol::workload::PlacementStrategy::Spread,
+        PlacementStrategy::Binpack => mantissa_protocol::workload::PlacementStrategy::Binpack,
+    }
 }
 
 /// Encodes one secret reference into the task schema payload.

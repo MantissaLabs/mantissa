@@ -1,8 +1,4 @@
-use crate::scheduler::placement::{
-    PlacementConstraint, PlacementConstraintOperator, PlacementConstraintSelector, PlacementPolicy,
-    PlacementPreference as SchedulerPlacementPreference,
-    PlacementStrategy as SchedulerPlacementStrategy,
-};
+use crate::scheduler::placement::ServicePlacementPreference as SchedulerPlacementPreference;
 use crate::services::manager::{
     ServiceController, ServiceDeploymentOptions, ServiceDeploymentOutcome,
     ServiceTaskProgressSnapshot,
@@ -17,17 +13,16 @@ use crate::services::types::{
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
     decode_admission_policy as read_admission_policy, decode_env_vars, decode_network_requirements,
-    decode_port_bindings, decode_secret_files, decode_service_liveness_probe,
-    decode_service_restart_policy, decode_volume_mounts,
-    encode_admission_policy as write_admission_policy, encode_env_vars, encode_port_bindings,
-    encode_secret_files, encode_service_liveness_probe, encode_service_restart_policy,
-    encode_volume_mounts,
+    decode_placement_policy as read_placement_policy, decode_port_bindings, decode_secret_files,
+    decode_service_liveness_probe, decode_service_restart_policy, decode_volume_mounts,
+    encode_admission_policy as write_admission_policy, encode_env_vars,
+    encode_placement_policy as write_placement_policy, encode_port_bindings, encode_secret_files,
+    encode_service_liveness_probe, encode_service_restart_policy, encode_volume_mounts,
 };
 use crate::workload::types::{ExecutionSpec, WorkloadAdmissionPolicy};
 use capnp::Error;
 use mantissa_protocol::services::{
-    placement_constraint, placement_constraint_selector, service_event, service_spec,
-    service_task_progress, services, task_template,
+    service_event, service_spec, service_task_progress, services, task_template,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::collections::HashSet;
@@ -576,146 +571,21 @@ fn read_readiness_probe(
     })
 }
 
-/// Decodes the placement strategy stored in the wire payload, defaulting conservatively.
-fn placement_strategy_from_proto(
-    strategy: mantissa_protocol::services::PlacementStrategy,
-) -> SchedulerPlacementStrategy {
-    match strategy {
-        mantissa_protocol::services::PlacementStrategy::Spread => {
-            SchedulerPlacementStrategy::Spread
-        }
-        mantissa_protocol::services::PlacementStrategy::Binpack => {
-            SchedulerPlacementStrategy::Binpack
-        }
-    }
-}
-
-/// Encodes the internal placement strategy into the replicated wire enum.
-fn placement_strategy_to_proto(
-    strategy: SchedulerPlacementStrategy,
-) -> mantissa_protocol::services::PlacementStrategy {
-    match strategy {
-        SchedulerPlacementStrategy::Spread => {
-            mantissa_protocol::services::PlacementStrategy::Spread
-        }
-        SchedulerPlacementStrategy::Binpack => {
-            mantissa_protocol::services::PlacementStrategy::Binpack
-        }
-    }
-}
-
-/// Decodes the placement comparison operator stored in the wire payload.
-fn placement_constraint_operator_from_proto(
-    operator: mantissa_protocol::services::PlacementConstraintOperator,
-) -> PlacementConstraintOperator {
-    match operator {
-        mantissa_protocol::services::PlacementConstraintOperator::Eq => {
-            PlacementConstraintOperator::Eq
-        }
-        mantissa_protocol::services::PlacementConstraintOperator::Ne => {
-            PlacementConstraintOperator::Ne
-        }
-    }
-}
-
-/// Encodes the internal placement comparison operator into the replicated wire enum.
-fn placement_constraint_operator_to_proto(
-    operator: PlacementConstraintOperator,
-) -> mantissa_protocol::services::PlacementConstraintOperator {
-    match operator {
-        PlacementConstraintOperator::Eq => {
-            mantissa_protocol::services::PlacementConstraintOperator::Eq
-        }
-        PlacementConstraintOperator::Ne => {
-            mantissa_protocol::services::PlacementConstraintOperator::Ne
-        }
-    }
-}
-
-/// Decodes one typed placement selector stored in the wire payload.
-fn placement_constraint_selector_from_proto(
-    reader: placement_constraint_selector::Reader<'_>,
-) -> Result<PlacementConstraintSelector, Error> {
-    match reader.which()? {
-        placement_constraint_selector::Which::NodeId(()) => Ok(PlacementConstraintSelector::NodeId),
-        placement_constraint_selector::Which::NodeHostname(()) => {
-            Ok(PlacementConstraintSelector::NodeHostname)
-        }
-        placement_constraint_selector::Which::NodeIp(()) => Ok(PlacementConstraintSelector::NodeIp),
-        placement_constraint_selector::Which::NodeAddress(()) => {
-            Ok(PlacementConstraintSelector::NodeAddress)
-        }
-        placement_constraint_selector::Which::NodePlatformOs(()) => {
-            Ok(PlacementConstraintSelector::NodePlatformOs)
-        }
-        placement_constraint_selector::Which::NodePlatformArch(()) => {
-            Ok(PlacementConstraintSelector::NodePlatformArch)
-        }
-        placement_constraint_selector::Which::NodeLabel(Ok(key)) => Ok(
-            PlacementConstraintSelector::node_label(key.to_str()?.to_string()),
-        ),
-        placement_constraint_selector::Which::NodeLabel(Err(err)) => Err(err),
-    }
-}
-
-/// Encodes one internal placement selector into the replicated wire union.
-fn write_placement_constraint_selector(
-    mut builder: placement_constraint_selector::Builder<'_>,
-    selector: &PlacementConstraintSelector,
-) {
-    match selector {
-        PlacementConstraintSelector::NodeId => builder.set_node_id(()),
-        PlacementConstraintSelector::NodeHostname => builder.set_node_hostname(()),
-        PlacementConstraintSelector::NodeIp => builder.set_node_ip(()),
-        PlacementConstraintSelector::NodeAddress => builder.set_node_address(()),
-        PlacementConstraintSelector::NodePlatformOs => builder.set_node_platform_os(()),
-        PlacementConstraintSelector::NodePlatformArch => builder.set_node_platform_arch(()),
-        PlacementConstraintSelector::NodeLabel { key } => builder.set_node_label(key),
-    }
-}
-
-/// Decodes one hard placement constraint stored in the wire payload.
-fn read_placement_constraint(
-    reader: placement_constraint::Reader<'_>,
-) -> Result<PlacementConstraint, Error> {
-    let selector = placement_constraint_selector_from_proto(reader.get_selector()?)?;
-    let operator = match reader.get_operator() {
-        Ok(operator) => placement_constraint_operator_from_proto(operator),
-        Err(_) => PlacementConstraintOperator::Eq,
-    };
-    let value = reader.get_value()?.to_str()?.to_string();
-
-    PlacementConstraint::new(selector, operator, value)
-        .map_err(|err| Error::failed(err.to_string()))
-}
-
-/// Encodes one hard placement constraint into the replicated wire payload.
-fn write_placement_constraint(
-    mut builder: placement_constraint::Builder<'_>,
-    constraint: &PlacementConstraint,
-) {
-    write_placement_constraint_selector(builder.reborrow().init_selector(), constraint.selector());
-    builder.set_operator(placement_constraint_operator_to_proto(
-        constraint.operator(),
-    ));
-    builder.set_value(constraint.value());
-}
-
 /// Decodes one soft placement preference stored in the wire payload.
 fn placement_preference_from_proto(
-    preference: mantissa_protocol::services::PlacementPreference,
+    preference: mantissa_protocol::services::ServicePlacementPreference,
 ) -> SchedulerPlacementPreference {
     match preference {
-        mantissa_protocol::services::PlacementPreference::ServiceAffinity => {
+        mantissa_protocol::services::ServicePlacementPreference::ServiceAffinity => {
             SchedulerPlacementPreference::ServiceAffinity
         }
-        mantissa_protocol::services::PlacementPreference::ServiceAntiAffinity => {
+        mantissa_protocol::services::ServicePlacementPreference::ServiceAntiAffinity => {
             SchedulerPlacementPreference::ServiceAntiAffinity
         }
-        mantissa_protocol::services::PlacementPreference::TaskAffinity => {
+        mantissa_protocol::services::ServicePlacementPreference::TaskAffinity => {
             SchedulerPlacementPreference::TaskAffinity
         }
-        mantissa_protocol::services::PlacementPreference::TaskAntiAffinity => {
+        mantissa_protocol::services::ServicePlacementPreference::TaskAntiAffinity => {
             SchedulerPlacementPreference::TaskAntiAffinity
         }
     }
@@ -724,19 +594,19 @@ fn placement_preference_from_proto(
 /// Encodes one internal soft placement preference into the replicated wire enum.
 fn placement_preference_to_proto(
     preference: SchedulerPlacementPreference,
-) -> mantissa_protocol::services::PlacementPreference {
+) -> mantissa_protocol::services::ServicePlacementPreference {
     match preference {
         SchedulerPlacementPreference::ServiceAffinity => {
-            mantissa_protocol::services::PlacementPreference::ServiceAffinity
+            mantissa_protocol::services::ServicePlacementPreference::ServiceAffinity
         }
         SchedulerPlacementPreference::ServiceAntiAffinity => {
-            mantissa_protocol::services::PlacementPreference::ServiceAntiAffinity
+            mantissa_protocol::services::ServicePlacementPreference::ServiceAntiAffinity
         }
         SchedulerPlacementPreference::TaskAffinity => {
-            mantissa_protocol::services::PlacementPreference::TaskAffinity
+            mantissa_protocol::services::ServicePlacementPreference::TaskAffinity
         }
         SchedulerPlacementPreference::TaskAntiAffinity => {
-            mantissa_protocol::services::PlacementPreference::TaskAntiAffinity
+            mantissa_protocol::services::ServicePlacementPreference::TaskAntiAffinity
         }
     }
 }
@@ -840,16 +710,9 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
     } else {
         None
     };
-    let mut placement_constraints = Vec::new();
-    for entry in reader.get_placement_constraints()?.iter() {
-        placement_constraints.push(read_placement_constraint(entry)?);
-    }
-    let placement_strategy = match reader.get_placement_strategy() {
-        Ok(strategy) => placement_strategy_from_proto(strategy),
-        Err(_) => SchedulerPlacementStrategy::Spread,
-    };
+    let placement = read_placement_policy(reader.get_placement()?)?;
     let mut placement_preferences = Vec::new();
-    if let Ok(preferences) = reader.get_placement_preferences() {
+    if let Ok(preferences) = reader.get_service_placement_preferences() {
         for entry in preferences.iter() {
             placement_preferences.push(placement_preference_from_proto(entry?));
         }
@@ -877,12 +740,9 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
             volumes,
             networks,
             ports,
-            placement: PlacementPolicy {
-                constraints: placement_constraints,
-                preferences: placement_preferences,
-                strategy: placement_strategy,
-            },
+            placement,
         },
+        placement_preferences,
         depends_on,
         replicas: reader.get_replicas(),
         readiness,
@@ -1131,18 +991,11 @@ fn write_task_template(
     };
     builder.set_public_protocol(proto);
     builder.set_tty(template.tty);
-    let mut placement_constraints = builder
-        .reborrow()
-        .init_placement_constraints(template.placement().constraints.len() as u32);
-    for (idx, constraint) in template.placement().constraints.iter().enumerate() {
-        let builder = placement_constraints.reborrow().get(idx as u32);
-        write_placement_constraint(builder, constraint);
-    }
-    builder.set_placement_strategy(placement_strategy_to_proto(template.placement().strategy));
+    write_placement_policy(builder.reborrow().init_placement(), template.placement());
     let mut placement_preferences = builder
         .reborrow()
-        .init_placement_preferences(template.placement().preferences.len() as u32);
-    for (idx, preference) in template.placement().preferences.iter().enumerate() {
+        .init_service_placement_preferences(template.placement_preferences().len() as u32);
+    for (idx, preference) in template.placement_preferences().iter().enumerate() {
         placement_preferences.set(idx as u32, placement_preference_to_proto(*preference));
     }
 
@@ -1192,8 +1045,8 @@ fn read_uuid(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
 mod tests {
     use super::{read_service_spec, read_task_template, write_service_spec, write_task_template};
     use crate::scheduler::placement::{
-        PlacementConstraint, PlacementConstraintSelector, PlacementPolicy, PlacementPreference,
-        PlacementStrategy,
+        PlacementConstraint, PlacementConstraintSelector, PlacementPolicy, PlacementStrategy,
+        ServicePlacementPreference,
     };
     use crate::services::registry::ServiceRegistry;
     use crate::services::types::{
@@ -1255,6 +1108,7 @@ mod tests {
                 readiness: None,
                 public_port: Some(8080),
                 public_protocol: Some(ServicePortProtocol::Tcp),
+                placement_preferences: Vec::new(),
             }],
             vec![Uuid::new_v4(), Uuid::new_v4()],
         );
@@ -1296,10 +1150,10 @@ mod tests {
                         )
                         .expect("constraint should parse"),
                     ],
-                    preferences: vec![PlacementPreference::ServiceAffinity],
                     strategy: PlacementStrategy::Spread,
                 },
             },
+            placement_preferences: vec![ServicePlacementPreference::ServiceAffinity],
             depends_on: Vec::new(),
             replicas: 1,
             readiness: None,
@@ -1423,6 +1277,7 @@ mod tests {
             }),
             public_port: Some(443),
             public_protocol: Some(ServicePortProtocol::TcpUdp),
+            placement_preferences: Vec::new(),
         };
 
         let mut previous = ServiceSpecValue::new(
@@ -1457,6 +1312,7 @@ mod tests {
                 readiness: None,
                 public_port: None,
                 public_protocol: None,
+                placement_preferences: Vec::new(),
             }],
             vec![Uuid::new_v4()],
         );

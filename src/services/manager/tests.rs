@@ -61,6 +61,7 @@ fn make_public_template(
         readiness: None,
         public_port,
         public_protocol,
+        placement_preferences: Vec::new(),
     }
 }
 
@@ -328,6 +329,7 @@ fn make_volume_request(
         id: Some(Uuid::new_v4()),
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node,
     }
 }
@@ -344,6 +346,7 @@ fn make_request(target_node: Option<Uuid>) -> WorkloadStartRequest {
         id: Some(Uuid::new_v4()),
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node,
     }
 }
@@ -419,6 +422,7 @@ fn replica_request_preserves_termination_grace_period() {
         readiness: None,
         public_port: None,
         public_protocol: None,
+        placement_preferences: Vec::new(),
     };
 
     let request = template.replica_start_request("demo-service", 1, desired_id, None);
@@ -447,6 +451,7 @@ fn replica_slots_follow_template_order() {
                 readiness: None,
                 public_port: None,
                 public_protocol: None,
+                placement_preferences: Vec::new(),
             },
             TaskTemplateSpecValue {
                 name: "web".into(),
@@ -456,6 +461,7 @@ fn replica_slots_follow_template_order() {
                 readiness: None,
                 public_port: None,
                 public_protocol: None,
+                placement_preferences: Vec::new(),
             },
         ],
         replica_ids.clone(),
@@ -538,6 +544,7 @@ fn slot_targets_are_deterministic() {
             readiness: None,
             public_port: None,
             public_protocol: None,
+            placement_preferences: Vec::new(),
         },
         TaskTemplateSpecValue {
             name: "curl".into(),
@@ -547,6 +554,7 @@ fn slot_targets_are_deterministic() {
             readiness: None,
             public_port: None,
             public_protocol: None,
+            placement_preferences: Vec::new(),
         },
     ];
 
@@ -574,6 +582,7 @@ fn slot_targets_balance_total_replicas() {
             readiness: None,
             public_port: None,
             public_protocol: None,
+            placement_preferences: Vec::new(),
         },
         TaskTemplateSpecValue {
             name: "curl".into(),
@@ -583,6 +592,7 @@ fn slot_targets_balance_total_replicas() {
             readiness: None,
             public_port: None,
             public_protocol: None,
+            placement_preferences: Vec::new(),
         },
     ];
 
@@ -627,6 +637,7 @@ async fn bridge_dependencies_colocate_replica_targets() {
             readiness: None,
             public_port: None,
             public_protocol: None,
+            placement_preferences: Vec::new(),
         },
         TaskTemplateSpecValue {
             name: "worker".into(),
@@ -636,6 +647,7 @@ async fn bridge_dependencies_colocate_replica_targets() {
             readiness: None,
             public_port: None,
             public_protocol: None,
+            placement_preferences: Vec::new(),
         },
     ];
 
@@ -698,6 +710,7 @@ async fn bridge_dependency_rejects_conflicting_local_volume_target() {
             readiness: None,
             public_port: None,
             public_protocol: None,
+            placement_preferences: Vec::new(),
         },
         TaskTemplateSpecValue {
             name: "worker".into(),
@@ -707,6 +720,7 @@ async fn bridge_dependency_rejects_conflicting_local_volume_target() {
             readiness: None,
             public_port: None,
             public_protocol: None,
+            placement_preferences: Vec::new(),
         },
     ];
 
@@ -783,6 +797,7 @@ fn should_stop_again_when_progressing_stopping_to_stopped() {
         readiness: None,
         public_port: None,
         public_protocol: None,
+        placement_preferences: Vec::new(),
     }];
 
     let mut current = ServiceSpecValue::new(
@@ -821,6 +836,7 @@ fn build_service_spec_with_status(
         readiness: None,
         public_port: None,
         public_protocol: None,
+        placement_preferences: Vec::new(),
     }];
 
     let mut spec = ServiceSpecValue::new(
@@ -1219,6 +1235,7 @@ fn deploying_assignment_incomplete_detected() {
         readiness: None,
         public_port: None,
         public_protocol: None,
+        placement_preferences: Vec::new(),
     }];
 
     let mut deploying = ServiceSpecValue::new(
@@ -1259,6 +1276,7 @@ fn deploying_generation_requires_execution_for_redeploy_context() {
         readiness: None,
         public_port: None,
         public_protocol: None,
+        placement_preferences: Vec::new(),
     }];
 
     let previous = ServiceSpecValue::new(

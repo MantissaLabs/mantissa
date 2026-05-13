@@ -7,7 +7,7 @@ use mantissa::node::id::set_node_id;
 use mantissa::registry::Registry;
 use mantissa::scheduler::SlotReservationRequest;
 use mantissa::scheduler::placement::{
-    PlacementConstraint, PlacementConstraintSelector, PlacementPreference, PlacementStrategy,
+    PlacementConstraint, PlacementConstraintSelector, PlacementStrategy, ServicePlacementPreference,
 };
 use mantissa::services::ServiceController;
 use mantissa::services::types::{
@@ -756,7 +756,7 @@ local_test!(services_placement_service_affinity_overrides_spread, {
     let service_name = "placement-preference-service-affinity";
     let mut template = demo_backend_task_template("backend", 2);
     template.execution.placement.strategy = PlacementStrategy::Spread;
-    template.execution.placement.preferences = vec![PlacementPreference::ServiceAffinity];
+    template.placement_preferences = vec![ServicePlacementPreference::ServiceAffinity];
 
     let service_id = cluster[0]
         .node
@@ -821,7 +821,7 @@ local_test!(
         let service_name = "placement-preference-service-anti-affinity";
         let mut template = demo_backend_task_template("backend", 2);
         template.execution.placement.strategy = PlacementStrategy::Binpack;
-        template.execution.placement.preferences = vec![PlacementPreference::ServiceAntiAffinity];
+        template.placement_preferences = vec![ServicePlacementPreference::ServiceAntiAffinity];
 
         let service_id = cluster[0]
             .node
@@ -885,7 +885,7 @@ local_test!(services_placement_task_affinity_packs_matching_template, {
     let service_name = "placement-preference-task-affinity";
     let mut api = demo_backend_task_template("api", 2);
     api.execution.placement.strategy = PlacementStrategy::Spread;
-    api.execution.placement.preferences = vec![PlacementPreference::TaskAffinity];
+    api.placement_preferences = vec![ServicePlacementPreference::TaskAffinity];
     let worker = demo_backend_task_template("worker", 2);
 
     let service_id = cluster[0]
@@ -971,7 +971,7 @@ local_test!(
         let service_name = "placement-preference-task-anti-affinity";
         let mut api = demo_backend_task_template("api", 2);
         api.execution.placement.strategy = PlacementStrategy::Binpack;
-        api.execution.placement.preferences = vec![PlacementPreference::TaskAntiAffinity];
+        api.placement_preferences = vec![ServicePlacementPreference::TaskAntiAffinity];
         let worker = demo_backend_task_template("worker", 1);
 
         let service_id = cluster[0]
@@ -1307,14 +1307,14 @@ local_test!(
                     "owned-batch-service",
                     "backend",
                     PlacementStrategy::Binpack,
-                    vec![PlacementPreference::ServiceAntiAffinity],
+                    vec![ServicePlacementPreference::ServiceAntiAffinity],
                 ),
                 demo_owned_preference_workload_request(
                     "owned-batch-b",
                     "owned-batch-service",
                     "backend",
                     PlacementStrategy::Binpack,
-                    vec![PlacementPreference::ServiceAntiAffinity],
+                    vec![ServicePlacementPreference::ServiceAntiAffinity],
                 ),
             ])
             .await
@@ -1497,6 +1497,7 @@ fn demo_backend_task_template(name: &str, replicas: u16) -> TaskTemplateSpecValu
         readiness: None,
         public_port: None,
         public_protocol: None,
+        placement_preferences: Vec::new(),
     }
 }
 
@@ -1536,6 +1537,7 @@ fn demo_binpack_workload_request(name: &str) -> WorkloadStartRequest {
         id: None,
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     }
 }
@@ -1546,7 +1548,7 @@ fn demo_owned_preference_workload_request(
     service_name: &str,
     template_name: &str,
     strategy: PlacementStrategy,
-    preferences: Vec<PlacementPreference>,
+    preferences: Vec<ServicePlacementPreference>,
 ) -> WorkloadStartRequest {
     let mut execution = ResolvedExecutionSpec {
         command: vec![
@@ -1560,7 +1562,6 @@ fn demo_owned_preference_workload_request(
         ..empty_workload_execution("hashicorp/http-echo:1.0.0")
     };
     execution.placement.strategy = strategy;
-    execution.placement.preferences = preferences;
 
     WorkloadStartRequest {
         name: name.to_string(),
@@ -1575,6 +1576,7 @@ fn demo_owned_preference_workload_request(
             service_name,
             template_name,
         ))),
+        service_placement_preferences: preferences,
         target_node: None,
     }
 }

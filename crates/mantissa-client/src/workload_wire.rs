@@ -4,14 +4,16 @@ use crate::jobs::manifest::{
 use crate::volumes::LocalVolumeOwnership;
 use crate::volumes::ResolvedVolumeMount;
 use crate::workload_submit::{
-    ManifestPortBinding, ManifestPortProtocol, RequestedNetworkSpec, WorkloadAdmissionMode,
-    WorkloadAdmissionPolicy,
+    ManifestPortBinding, ManifestPortProtocol, PlacementConstraint, PlacementConstraintOperator,
+    PlacementConstraintSelector, PlacementSpec, PlacementStrategy, RequestedNetworkSpec,
+    WorkloadAdmissionMode, WorkloadAdmissionPolicy,
 };
 use capnp::struct_list;
 use mantissa_protocol::volumes::local_volume_ownership;
 use mantissa_protocol::workload::{
-    admission_policy, environment_var, liveness_probe, network_requirement, port_binding,
-    secret_file, secret_ref, volume_mount,
+    admission_policy, environment_var, liveness_probe, network_requirement, placement_constraint,
+    placement_constraint_selector, placement_policy, port_binding, secret_file, secret_ref,
+    volume_mount,
 };
 use uuid::Uuid;
 
@@ -36,6 +38,64 @@ pub fn write_admission_policy(
         WorkloadAdmissionMode::Gang => mantissa_protocol::workload::AdmissionMode::Gang,
     };
     builder.set_mode(mode);
+}
+
+/// Encodes one generic workload placement policy into the shared wire shape.
+pub fn write_placement_policy(builder: placement_policy::Builder<'_>, policy: &PlacementSpec) {
+    write_placement_policy_parts(builder, &policy.constraints, policy.strategy);
+}
+
+/// Encodes generic placement parts for callers with controller-specific placement wrappers.
+pub fn write_placement_policy_parts(
+    mut builder: placement_policy::Builder<'_>,
+    constraints: &[PlacementConstraint],
+    strategy: PlacementStrategy,
+) {
+    let mut constraints_builder = builder
+        .reborrow()
+        .init_constraints(constraints.len() as u32);
+    for (idx, constraint) in constraints.iter().enumerate() {
+        write_placement_constraint(constraints_builder.reborrow().get(idx as u32), constraint);
+    }
+    let strategy = match strategy {
+        PlacementStrategy::Spread => mantissa_protocol::workload::PlacementStrategy::Spread,
+        PlacementStrategy::Binpack => mantissa_protocol::workload::PlacementStrategy::Binpack,
+    };
+    builder.set_strategy(strategy);
+}
+
+/// Writes one typed placement constraint into the generic workload payload.
+fn write_placement_constraint(
+    mut builder: placement_constraint::Builder<'_>,
+    constraint: &PlacementConstraint,
+) {
+    write_placement_constraint_selector(builder.reborrow().init_selector(), &constraint.selector);
+    let operator = match constraint.operator {
+        PlacementConstraintOperator::Eq => {
+            mantissa_protocol::workload::PlacementConstraintOperator::Eq
+        }
+        PlacementConstraintOperator::Ne => {
+            mantissa_protocol::workload::PlacementConstraintOperator::Ne
+        }
+    };
+    builder.set_operator(operator);
+    builder.set_value(constraint.value.trim());
+}
+
+/// Writes one typed placement selector into the generic workload payload.
+fn write_placement_constraint_selector(
+    mut builder: placement_constraint_selector::Builder<'_>,
+    selector: &PlacementConstraintSelector,
+) {
+    match selector {
+        PlacementConstraintSelector::NodeId => builder.set_node_id(()),
+        PlacementConstraintSelector::NodeHostname => builder.set_node_hostname(()),
+        PlacementConstraintSelector::NodeIp => builder.set_node_ip(()),
+        PlacementConstraintSelector::NodeAddress => builder.set_node_address(()),
+        PlacementConstraintSelector::NodePlatformOs => builder.set_node_platform_os(()),
+        PlacementConstraintSelector::NodePlatformArch => builder.set_node_platform_arch(()),
+        PlacementConstraintSelector::NodeLabel { key } => builder.set_node_label(key.trim()),
+    }
 }
 
 /// Rebuilds one resolved CLI volume mount into the generic workload submit payload shape.

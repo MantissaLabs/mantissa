@@ -418,6 +418,7 @@ fn standalone_volume_task_request(
         id: None,
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     }
 }
@@ -912,6 +913,7 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
             id: None,
             slot_ids: Vec::new(),
             owner: None,
+            service_placement_preferences: Vec::new(),
             target_node: None,
         }])
         .await

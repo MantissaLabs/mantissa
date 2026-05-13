@@ -6,11 +6,11 @@ use crate::runtime_contract::{
 };
 use crate::tasks::uuid_to_string;
 use crate::volumes;
-use crate::workload_submit::{RequestedNetworkSpec, WorkloadAdmissionPolicy};
+use crate::workload_submit::{PlacementSpec, RequestedNetworkSpec, WorkloadAdmissionPolicy};
 use crate::workload_wire::{
     PreparedVolumeMount, prepared_volume_mount_from_resolved, write_admission_policy,
     write_env_vars, write_liveness_probe, write_network_requirements, write_optional_volume_mount,
-    write_secret_files, write_volume_mounts,
+    write_placement_policy, write_secret_files, write_volume_mounts,
 };
 use anyhow::{Result, anyhow};
 use mantissa_protocol::agents::agent_session_spec;
@@ -90,6 +90,7 @@ pub(crate) struct PreparedAgentExecution {
     pub volumes: Vec<PreparedVolumeMount>,
     pub networks: Vec<Uuid>,
     pub liveness: Option<LivenessProbe>,
+    pub placement: PlacementSpec,
 }
 
 /// One prepared workspace policy ready for agents wire encoding.
@@ -168,6 +169,7 @@ async fn prepare_raw_submit_spec(
                 .collect(),
             networks: Vec::new(),
             liveness: None,
+            placement: PlacementSpec::default(),
         },
         execution_platform: normalize_execution_platform(options.execution_platform)?,
         isolation_mode: normalize_isolation_mode(options.isolation_mode)?,
@@ -310,6 +312,7 @@ fn write_agent_execution(
     if let Some(liveness) = execution.liveness.as_ref() {
         write_liveness_probe(builder.reborrow().init_liveness(), liveness);
     }
+    write_placement_policy(builder.reborrow().init_placement(), &execution.placement);
 }
 
 /// Encodes one prepared workspace policy into the agents wire builder.

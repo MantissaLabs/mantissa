@@ -130,6 +130,9 @@ struct AgentSessionSpec {
 
   admissionPolicy @33 :WorkloadSchema.AdmissionPolicy;
   # Workload admission contract selected for runs launched from this session.
+
+  placement @34 :WorkloadSchema.PlacementPolicy;
+  # Generic workload placement policy for runs launched from this session.
 }
 
 struct AgentRunSpec {
@@ -228,6 +231,9 @@ struct AgentRunSpec {
 
   admissionPolicy @31 :WorkloadSchema.AdmissionPolicy;
   # Workload admission contract selected for this run.
+
+  placement @32 :WorkloadSchema.PlacementPolicy;
+  # Generic workload placement policy for this run.
 }
 
 struct AgentWorkspacePolicy {

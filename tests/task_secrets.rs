@@ -535,6 +535,7 @@ local_test!(workload_manager_stages_secret_env_and_files, {
         id: None,
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     };
 
@@ -692,6 +693,7 @@ local_test!(workload_manager_rejects_missing_secret_reference, {
         id: None,
         slot_ids: Vec::new(),
         owner: None,
+        service_placement_preferences: Vec::new(),
         target_node: None,
     };
 

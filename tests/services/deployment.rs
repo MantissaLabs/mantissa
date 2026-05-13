@@ -75,6 +75,7 @@ local_test!(services_gossip_propagates_across_peers, {
                 readiness: None,
                 public_port: None,
                 public_protocol: None,
+                placement_preferences: Vec::new(),
             }],
         )
         .await
@@ -171,6 +172,7 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
         readiness: None,
         public_port: None,
         public_protocol: None,
+        placement_preferences: Vec::new(),
     }];
 
     let service_id = node
@@ -259,6 +261,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
                 readiness: None,
                 public_port: None,
                 public_protocol: None,
+                placement_preferences: Vec::new(),
             }],
         )
         .await
@@ -319,6 +322,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
                 readiness: None,
                 public_port: None,
                 public_protocol: None,
+                placement_preferences: Vec::new(),
             }],
         )
         .await
@@ -391,6 +395,7 @@ local_test!(services_deploying_generation_resumes_after_restart, {
                     readiness: None,
                     public_port: None,
                     public_protocol: None,
+                    placement_preferences: Vec::new(),
                 },
                 TaskTemplateSpecValue {
                     name: "frontend".into(),
@@ -405,6 +410,7 @@ local_test!(services_deploying_generation_resumes_after_restart, {
                     readiness: None,
                     public_port: None,
                     public_protocol: None,
+                    placement_preferences: Vec::new(),
                 },
             ],
         )
@@ -554,6 +560,7 @@ local_test!(
                     readiness: None,
                     public_port: None,
                     public_protocol: None,
+                    placement_preferences: Vec::new(),
                 }],
             )
             .await
@@ -674,6 +681,7 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
                 readiness: None,
                 public_port: None,
                 public_protocol: None,
+                placement_preferences: Vec::new(),
             }],
         )
         .await

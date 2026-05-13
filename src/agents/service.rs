@@ -6,10 +6,11 @@ use crate::agents::types::{
 };
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
-    decode_admission_policy, decode_env_vars, decode_network_requirements, decode_secret_files,
-    decode_task_liveness_probe, decode_task_restart_policy, decode_volume_mounts,
-    encode_admission_policy, encode_env_vars, encode_secret_files, encode_task_liveness_probe,
-    encode_task_restart_policy, encode_volume_mounts,
+    decode_admission_policy, decode_env_vars, decode_network_requirements, decode_placement_policy,
+    decode_secret_files, decode_task_liveness_probe, decode_task_restart_policy,
+    decode_volume_mounts, encode_admission_policy, encode_env_vars, encode_placement_policy,
+    encode_secret_files, encode_task_liveness_probe, encode_task_restart_policy,
+    encode_volume_mounts,
 };
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
 use crate::workload::types::ResolvedExecutionSpec;
@@ -499,6 +500,7 @@ fn write_session_execution(
     if let Some(liveness) = execution.liveness.as_ref() {
         encode_task_liveness_probe(builder.reborrow().init_liveness(), liveness);
     }
+    encode_placement_policy(builder.reborrow().init_placement(), &execution.placement);
 }
 
 fn read_session_execution(
@@ -531,7 +533,7 @@ fn read_session_execution(
         volumes: decode_volume_mounts(reader.get_volumes()?)?,
         networks: read_uuid_list(reader.get_networks()?)?,
         ports: Vec::new(),
-        placement: Default::default(),
+        placement: decode_placement_policy(reader.get_placement()?)?,
     })
 }
 
@@ -589,6 +591,7 @@ fn write_run_execution(
     if let Some(liveness) = execution.liveness.as_ref() {
         encode_task_liveness_probe(builder.reborrow().init_liveness(), liveness);
     }
+    encode_placement_policy(builder.reborrow().init_placement(), &execution.placement);
 }
 
 fn read_run_execution(reader: agent_run_spec::Reader<'_>) -> Result<ResolvedExecutionSpec, Error> {
@@ -619,7 +622,7 @@ fn read_run_execution(reader: agent_run_spec::Reader<'_>) -> Result<ResolvedExec
         volumes: decode_volume_mounts(reader.get_volumes()?)?,
         networks: read_uuid_list(reader.get_networks()?)?,
         ports: Vec::new(),
-        placement: Default::default(),
+        placement: decode_placement_policy(reader.get_placement()?)?,
     })
 }
 
@@ -937,6 +940,9 @@ fn normalize_text(reader: capnp::text::Reader<'_>) -> Option<String> {
 mod tests {
     use super::*;
     use crate::agents::types::AgentInteractionPolicy;
+    use crate::scheduler::placement::{
+        PlacementConstraint, PlacementConstraintSelector, PlacementPolicy, PlacementStrategy,
+    };
     use crate::store::replicated::agents::open_agent_store;
     use mantissa_store::uuid_key::UuidKey;
     use std::sync::Arc;
@@ -960,7 +966,16 @@ mod tests {
             volumes: Vec::new(),
             networks: Vec::new(),
             ports: Vec::new(),
-            placement: Default::default(),
+            placement: PlacementPolicy {
+                constraints: vec![
+                    PlacementConstraint::eq(
+                        PlacementConstraintSelector::node_label("agent.pool"),
+                        "interactive",
+                    )
+                    .expect("agent placement constraint should parse"),
+                ],
+                strategy: PlacementStrategy::Spread,
+            },
         }
     }
 
