@@ -1,6 +1,6 @@
 @0xb843c4292f4d88d6;
 
-using WorkloadSchema = import "workload.capnp";
+using Workload = import "workload.capnp";
 
 interface Jobs {
   submit @0 (spec :JobSubmitSpec) -> (jobId :Data);
@@ -38,13 +38,13 @@ struct JobExecution {
   gpuCount @5 :UInt32;
   # Requested GPU count.
 
-  env @6 :List(WorkloadSchema.EnvironmentVar);
+  env @6 :List(Workload.EnvironmentVar);
   # Environment variables shared with the execution template.
 
-  secretFiles @7 :List(WorkloadSchema.SecretFile);
+  secretFiles @7 :List(Workload.SecretFile);
   # Secret-backed file projections.
 
-  volumes @8 :List(WorkloadSchema.VolumeMount);
+  volumes @8 :List(Workload.VolumeMount);
   # Named volumes mounted into the job workload.
 
   networks @9 :List(Data);
@@ -56,13 +56,13 @@ struct JobExecution {
   preStopCommand @11 :List(Text);
   # Optional command executed inside the runtime instance before termination begins.
 
-  liveness @12 :WorkloadSchema.LivenessProbe;
+  liveness @12 :Workload.LivenessProbe;
   # Optional local liveness probe executed by the hosting runtime.
 
-  ports @13 :List(WorkloadSchema.PortBinding);
+  ports @13 :List(Workload.PortBinding);
   # Node-local host port bindings for each job attempt.
 
-  placement @14 :WorkloadSchema.PlacementPolicy;
+  placement @14 :Workload.PlacementPolicy;
   # Generic workload placement policy for each job attempt.
 }
 
@@ -93,10 +93,10 @@ struct JobSubmitSpec {
   isolationProfile @5 :Text;
   # Optional isolation profile requested for each workload attempt.
 
-  requiredNetworks @6 :List(WorkloadSchema.NetworkRequirement);
+  requiredNetworks @6 :List(Workload.NetworkRequirement);
   # Networks referenced by the manifest that the job controller must provision before placement.
 
-  admissionPolicy @7 :WorkloadSchema.AdmissionPolicy;
+  admissionPolicy @7 :Workload.AdmissionPolicy;
   # Workload admission contract selected for each job attempt.
 }
 
@@ -158,7 +158,7 @@ struct JobSnapshot {
   isolationProfile @18 :Text;
   # Optional isolation profile requested for each workload attempt.
 
-  admissionPolicy @19 :WorkloadSchema.AdmissionPolicy;
+  admissionPolicy @19 :Workload.AdmissionPolicy;
   # Workload admission contract selected for each job attempt.
 }
 
@@ -281,7 +281,7 @@ struct JobRecord {
   isolationProfile @19 :Text;
   # Optional isolation profile requested for each workload attempt.
 
-  admissionPolicy @20 :WorkloadSchema.AdmissionPolicy;
+  admissionPolicy @20 :Workload.AdmissionPolicy;
   # Workload admission contract selected for each job attempt.
 }
 

@@ -1,6 +1,6 @@
 @0xb69f5cf433c9f6d5;
 
-using WorkloadSchema = import "workload.capnp";
+using Workload = import "workload.capnp";
 
 interface Agents {
   submit @0 (session :AgentSessionSpec) -> (sessionId :Data);
@@ -53,16 +53,16 @@ struct AgentSessionSpec {
   gpuCount @7 :UInt32;
   # Requested GPU count.
 
-  restartPolicy @8 :WorkloadSchema.RestartPolicy;
+  restartPolicy @8 :Workload.RestartPolicy;
   # Shared execution restart policy. Current controller rejects non-empty values.
 
-  env @9 :List(WorkloadSchema.EnvironmentVar);
+  env @9 :List(Workload.EnvironmentVar);
   # Environment variables shared with run execution.
 
-  secretFiles @10 :List(WorkloadSchema.SecretFile);
+  secretFiles @10 :List(Workload.SecretFile);
   # Secret-backed file projections.
 
-  volumes @11 :List(WorkloadSchema.VolumeMount);
+  volumes @11 :List(Workload.VolumeMount);
   # Named volumes mounted into runs launched from this session.
 
   networks @12 :List(Data);
@@ -122,16 +122,16 @@ struct AgentSessionSpec {
   preStopCommand @30 :List(Text);
   # Optional command executed inside the run before termination begins.
 
-  liveness @31 :WorkloadSchema.LivenessProbe;
+  liveness @31 :Workload.LivenessProbe;
   # Optional local liveness probe evaluated by the hosting runtime.
 
-  requiredNetworks @32 :List(WorkloadSchema.NetworkRequirement);
+  requiredNetworks @32 :List(Workload.NetworkRequirement);
   # Networks referenced by the manifest that the agent controller must provision before placement.
 
-  admissionPolicy @33 :WorkloadSchema.AdmissionPolicy;
+  admissionPolicy @33 :Workload.AdmissionPolicy;
   # Workload admission contract selected for runs launched from this session.
 
-  placement @34 :WorkloadSchema.PlacementPolicy;
+  placement @34 :Workload.PlacementPolicy;
   # Generic workload placement policy for runs launched from this session.
 }
 
@@ -163,16 +163,16 @@ struct AgentRunSpec {
   gpuCount @8 :UInt32;
   # Requested GPU count.
 
-  restartPolicy @9 :WorkloadSchema.RestartPolicy;
+  restartPolicy @9 :Workload.RestartPolicy;
   # Shared execution restart policy. Current controller rejects non-empty values.
 
-  env @10 :List(WorkloadSchema.EnvironmentVar);
+  env @10 :List(Workload.EnvironmentVar);
   # Environment variables shared with run execution.
 
-  secretFiles @11 :List(WorkloadSchema.SecretFile);
+  secretFiles @11 :List(Workload.SecretFile);
   # Secret-backed file projections.
 
-  volumes @12 :List(WorkloadSchema.VolumeMount);
+  volumes @12 :List(Workload.VolumeMount);
   # Named volumes mounted into this run.
 
   networks @13 :List(Data);
@@ -226,18 +226,18 @@ struct AgentRunSpec {
   preStopCommand @29 :List(Text);
   # Optional command executed inside the run before termination begins.
 
-  liveness @30 :WorkloadSchema.LivenessProbe;
+  liveness @30 :Workload.LivenessProbe;
   # Optional local liveness probe evaluated by the hosting runtime.
 
-  admissionPolicy @31 :WorkloadSchema.AdmissionPolicy;
+  admissionPolicy @31 :Workload.AdmissionPolicy;
   # Workload admission contract selected for this run.
 
-  placement @32 :WorkloadSchema.PlacementPolicy;
+  placement @32 :Workload.PlacementPolicy;
   # Generic workload placement policy for this run.
 }
 
 struct AgentWorkspacePolicy {
-  mount @0 :WorkloadSchema.VolumeMount;
+  mount @0 :Workload.VolumeMount;
   # Optional workspace mount. Empty volumeId means "unset".
 
   workingDirectory @1 :Text;
@@ -268,7 +268,7 @@ struct AgentCheckpointPolicy {
   intervalSecs @1 :UInt32;
   # Checkpoint interval in seconds, 0 means unset.
 
-  mount @2 :WorkloadSchema.VolumeMount;
+  mount @2 :Workload.VolumeMount;
   # Optional checkpoint mount. Empty volumeId means "unset".
 }
 

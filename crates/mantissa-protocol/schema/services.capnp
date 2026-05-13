@@ -1,6 +1,6 @@
 @0xf934ee53cdab0910;
 
-using WorkloadSchema = import "workload.capnp";
+using Workload = import "workload.capnp";
 
 interface Services {
   list @0 () -> (services :List(ServiceSpec));
@@ -48,10 +48,10 @@ struct TaskTemplate {
   restartPolicy @6 :RestartPolicy;
   # Desired runtime restart behaviour (optional)
 
-  env @7 :List(WorkloadSchema.EnvironmentVar);
+  env @7 :List(Workload.EnvironmentVar);
   # Environment variables (literal or secret-backed)
 
-  secretFiles @8 :List(WorkloadSchema.SecretFile);
+  secretFiles @8 :List(Workload.SecretFile);
   # Secret-backed file projections
 
   networks @9 :List(TaskTemplateNetwork);
@@ -78,19 +78,19 @@ struct TaskTemplate {
   preStopCommand @16 :List(Text);
   # Optional command executed inside the runtime instance before termination begins.
 
-  volumes @17 :List(WorkloadSchema.VolumeMount);
+  volumes @17 :List(Workload.VolumeMount);
   # Named volumes mounted into each replica of this template.
 
   tty @19 :Bool;
   # Allocate a terminal for the replica entrypoint.
 
-  placement @20 :WorkloadSchema.PlacementPolicy;
+  placement @20 :Workload.PlacementPolicy;
   # Generic workload placement policy shared with jobs and agents.
 
   servicePlacementPreferences @21 :List(ServicePlacementPreference);
   # Service-only soft hints evaluated before the generic strategy breaks ties.
 
-  ports @22 :List(WorkloadSchema.PortBinding);
+  ports @22 :List(Workload.PortBinding);
   # Node-local host port bindings for each replica of this template.
 }
 
@@ -417,7 +417,7 @@ struct PreviousGeneration {
   status @6 :ServiceStatus;
   # Prior lifecycle status restored after rollback when needed.
 
-  admissionPolicy @7 :WorkloadSchema.AdmissionPolicy;
+  admissionPolicy @7 :Workload.AdmissionPolicy;
   # Prior workload admission policy retained for rollback reconstruction.
 }
 
@@ -467,7 +467,7 @@ struct ServiceSpec {
   previousGeneration @14 :PreviousGeneration;
   # Prior generation snapshot retained while a new generation is still being executed.
 
-  admissionPolicy @15 :WorkloadSchema.AdmissionPolicy;
+  admissionPolicy @15 :Workload.AdmissionPolicy;
   # Workload admission contract selected by the manifest.
 }
 
@@ -503,10 +503,10 @@ struct ServiceDeploySpec {
   updateStrategy @4 :UpdateStrategy;
   # Desired rollout strategy for this deployment generation.
 
-  requiredNetworks @5 :List(WorkloadSchema.NetworkRequirement);
+  requiredNetworks @5 :List(Workload.NetworkRequirement);
   # Networks referenced by the manifest that the service controller must provision before placement.
 
-  admissionPolicy @6 :WorkloadSchema.AdmissionPolicy;
+  admissionPolicy @6 :Workload.AdmissionPolicy;
   # Workload admission contract selected by the manifest.
 }
 

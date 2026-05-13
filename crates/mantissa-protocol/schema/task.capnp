@@ -1,6 +1,6 @@
 @0xc040d5aebc3fbc7e;
 
-using WorkloadSchema = import "workload.capnp";
+using Workload = import "workload.capnp";
 
 interface Task {
   start @0 (request :TaskStartRequest) -> (spec :TaskSpec);
@@ -207,13 +207,13 @@ struct TaskSpec {
   memoryBytes @10 :UInt64;
   # Allocated memory in bytes.
 
-  restartPolicy @11 :WorkloadSchema.RestartPolicy;
+  restartPolicy @11 :Workload.RestartPolicy;
   # Restart behavior for the task.
 
-  env @12 :List(WorkloadSchema.EnvironmentVar);
+  env @12 :List(Workload.EnvironmentVar);
   # Environment variables injected into the task.
 
-  secretFiles @13 :List(WorkloadSchema.SecretFile);
+  secretFiles @13 :List(Workload.SecretFile);
   # Secret-backed files mounted into the task.
 
   networks @14 :List(Data);
@@ -252,10 +252,10 @@ struct TaskSpec {
   preStopCommand @25 :List(Text);
   # Optional command executed inside the runtime instance before termination begins.
 
-  volumes @26 :List(WorkloadSchema.VolumeMount);
+  volumes @26 :List(Workload.VolumeMount);
   # Named volumes mounted into the task runtime.
 
-  liveness @27 :WorkloadSchema.LivenessProbe;
+  liveness @27 :Workload.LivenessProbe;
   # Optional local liveness probe executed by the hosting runtime.
 
   tty @28 :Bool;
@@ -276,7 +276,7 @@ struct TaskSpec {
   isolationProfile @33 :Text;
   # Optional named isolation profile used when the task requests sandboxed execution.
 
-  ports @34 :List(WorkloadSchema.PortBinding);
+  ports @34 :List(Workload.PortBinding);
   # Node-local host port bindings requested by the task.
 }
 
@@ -304,13 +304,13 @@ struct TaskStartRequest {
   taskId @6 :Data;
   # Desired task UUID (16 bytes) for the resulting standalone task.
 
-  restartPolicy @7 :WorkloadSchema.RestartPolicy;
+  restartPolicy @7 :Workload.RestartPolicy;
   # Restart behavior for the task.
 
-  env @8 :List(WorkloadSchema.EnvironmentVar);
+  env @8 :List(Workload.EnvironmentVar);
   # Environment variables injected into the task.
 
-  secretFiles @9 :List(WorkloadSchema.SecretFile);
+  secretFiles @9 :List(Workload.SecretFile);
   # Secret-backed files mounted into the task.
 
   networks @10 :List(Data);
@@ -328,10 +328,10 @@ struct TaskStartRequest {
   preStopCommand @14 :List(Text);
   # Optional command executed inside the runtime instance before termination begins.
 
-  volumes @15 :List(WorkloadSchema.VolumeMount);
+  volumes @15 :List(Workload.VolumeMount);
   # Named volumes mounted into the task runtime.
 
-  liveness @16 :WorkloadSchema.LivenessProbe;
+  liveness @16 :Workload.LivenessProbe;
   # Optional local liveness probe executed by the hosting runtime.
 
   executionPlatform @17 :Text;
