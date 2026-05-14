@@ -1,12 +1,13 @@
 //! Client side of Mantissa's anti-entropy protocol.
 //!
-//! This module drives the roots -> ranges -> delta handshake against a remote `Sync`
-//! capability and exposes `DeltaSinkImpl`, the local sink used by the remote peer to
-//! stream missing CRDT fragments back into the local stores.
+//! This module is the caller side of sync. It asks a remote peer for roots, asks for range
+//! summaries when roots differ, and then opens a local sink so the remote peer can stream back the
+//! CRDT rows this node is missing.
 
 use super::encoding::{self, DomainDeltaRequest, RemoteDomainRangeSummary, RemoteDomainRoot};
 use super::{ALL_DOMAINS, SyncStores};
 use crate::cluster::{ClusterViewId, RootSchemaState};
+use crate::store::replicated::registry::{EncodedRegisters, EncodedTombstones};
 use crate::sync::gc_progress::SyncGcProgress;
 use capnp_rpc::new_client;
 use mantissa_protocol::sync::{self, Domain, delta_sink};
@@ -15,6 +16,27 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tracing::{debug, warn};
+
+/// View and root schema used for one client-side sync attempt.
+///
+/// The client sends this scope on every request and expects the remote peer to echo it back in
+/// every response and streamed chunk. That protects the local stores from applying data from a
+/// different cluster view or MST schema.
+#[derive(Clone, Copy, Debug)]
+struct SyncAttemptScope {
+    cluster_view: ClusterViewId,
+    root_schema_version: u32,
+}
+
+impl SyncAttemptScope {
+    /// Builds the request scope shared by all three sync phases.
+    fn new(cluster_view: ClusterViewId, root_schema_version: u32) -> Self {
+        Self {
+            cluster_view,
+            root_schema_version,
+        }
+    }
+}
 
 /// Carries one peer-scoped context for anti-entropy diagnostics.
 #[derive(Clone, Debug)]
@@ -35,7 +57,7 @@ impl SyncTraceContext {
     }
 }
 
-/// Extra client-side state shared across one selected-domain sync pass.
+/// Local side effects and diagnostics shared across one selected-domain sync pass.
 struct SyncClientContext {
     trace: Option<SyncTraceContext>,
     gc_progress: SyncGcProgress,
@@ -43,11 +65,11 @@ struct SyncClientContext {
     master_key_replication_notify: Option<Arc<Notify>>,
 }
 
-#[derive(Clone)]
 /// Client-side anti-entropy runner that owns the local replicated domain stores.
 ///
-/// Topology depends on this runner rather than rebuilding ad hoc sync store bundles
-/// every time it opens a delta exchange against a remote peer.
+/// Topology owns peer selection and transport. This runner owns the store-facing sync work for one
+/// selected peer once topology hands it a remote `Sync` capability.
+#[derive(Clone)]
 pub struct SyncRunner {
     stores: SyncStores,
     root_schema: RootSchemaState,
@@ -146,8 +168,7 @@ impl SyncRunner {
 /// them directly into the appropriate replicated store.
 pub struct DeltaSinkImpl {
     stores: SyncStores,
-    expected_view: ClusterViewId,
-    expected_root_schema_version: u32,
+    expected_scope: SyncAttemptScope,
 }
 
 impl DeltaSinkImpl {
@@ -159,13 +180,32 @@ impl DeltaSinkImpl {
     ) -> Self {
         Self {
             stores,
-            expected_view,
-            expected_root_schema_version,
+            expected_scope: SyncAttemptScope::new(expected_view, expected_root_schema_version),
         }
+    }
+
+    /// Applies one decoded delta chunk to the store selected by the chunk domain.
+    async fn apply_decoded_chunk(
+        &self,
+        domain: Domain,
+        registers: EncodedRegisters,
+        tombstones: EncodedTombstones,
+    ) -> Result<(), capnp::Error> {
+        self.stores
+            .require(domain)
+            .map_err(to_capnp)?
+            .store
+            .apply_delta_encoded(registers, tombstones)
+            .await
+            .map_err(to_capnp)
     }
 }
 
 impl delta_sink::Server for DeltaSinkImpl {
+    /// Accepts one streamed delta chunk from the remote peer.
+    ///
+    /// The header is checked before decoding and applying rows, so a peer cannot mix chunks from
+    /// another view or root schema into this local sync attempt.
     async fn push_chunk(
         self: Rc<Self>,
         params: delta_sink::PushChunkParams,
@@ -173,30 +213,24 @@ impl delta_sink::Server for DeltaSinkImpl {
         let chunk = params.get()?.get_chunk()?;
         let chunk_header = encoding::decode_delta_chunk_header(
             &chunk,
-            self.expected_view,
-            self.expected_root_schema_version,
+            self.expected_scope.cluster_view,
+            self.expected_scope.root_schema_version,
         )?;
         debug!(
             target: "delta",
             cluster_view = %chunk_header.cluster_view,
             domain = ?chunk_header.domain,
-            root_schema_version = self.expected_root_schema_version,
+            root_schema_version = self.expected_scope.root_schema_version,
             "received delta chunk"
         );
 
         let registers = encoding::collect_registers(&chunk)?;
         let tombstones = encoding::collect_tombstones(&chunk)?;
-        self.stores
-            .require(chunk_header.domain)
-            .map_err(to_capnp)?
-            .store
-            .apply_delta_encoded(registers, tombstones)
+        self.apply_decoded_chunk(chunk_header.domain, registers, tombstones)
             .await
-            .map_err(to_capnp)?;
-
-        Ok(())
     }
 
+    /// Marks the end of one remote delta stream.
     async fn end(
         self: Rc<Self>,
         _params: delta_sink::EndParams,
@@ -214,8 +248,8 @@ fn to_capnp<E: std::fmt::Display>(e: E) -> capnp::Error {
 
 /// Runs anti-entropy for one caller-selected domain subset against one peer view.
 ///
-/// The runner keeps ownership of the local store handles; this helper only borrows them so
-/// topology does not have to rebuild one store bundle for every sync attempt.
+/// The public runner owns the local store handles. This helper borrows them so tests and topology
+/// can drive the same sync path without rebuilding a registry for every peer attempt.
 async fn sync_selected_domains_with_stores(
     stores: &SyncStores,
     sync_cap: sync::Client,
@@ -240,27 +274,42 @@ async fn sync_selected_domains_with_stores(
     .await;
 
     if let Err(e) = res {
-        warn!(
-            target: "sync",
-            cluster_view = %cluster_view,
-            domains_requested = requested_domains.len(),
-            "sync_selected_domains error: {e}"
+        log_sync_failure(
+            &e,
+            cluster_view,
+            requested_domains.len(),
+            context.trace.as_ref(),
         );
-        if let Some(ctx) = context.trace.as_ref() {
-            warn!(
-                target: "diag.sync.peer",
-                cluster_view = %cluster_view,
-                peer = %ctx.peer_id,
-                addr = %ctx.peer_addr,
-                reason = %ctx.reason,
-                disconnected = is_disconnected_capnp(&e),
-                error = %e,
-                "peer-scoped sync_selected_domains failure"
-            );
-        }
         false
     } else {
         true
+    }
+}
+
+/// Logs the generic sync failure and, when available, the peer-scoped diagnostic record.
+fn log_sync_failure(
+    error: &capnp::Error,
+    cluster_view: ClusterViewId,
+    requested_domain_count: usize,
+    trace: Option<&SyncTraceContext>,
+) {
+    warn!(
+        target: "sync",
+        cluster_view = %cluster_view,
+        domains_requested = requested_domain_count,
+        "sync_selected_domains error: {error}"
+    );
+    if let Some(ctx) = trace {
+        warn!(
+            target: "diag.sync.peer",
+            cluster_view = %cluster_view,
+            peer = %ctx.peer_id,
+            addr = %ctx.peer_addr,
+            reason = %ctx.reason,
+            disconnected = is_disconnected_capnp(error),
+            error = %error,
+            "peer-scoped sync_selected_domains failure"
+        );
     }
 }
 
@@ -273,41 +322,37 @@ async fn run_selected_domain_sync(
     requested_domains: &[Domain],
     context: &SyncClientContext,
 ) -> Result<(), capnp::Error> {
-    // Step 1: compare remote roots against local roots and skip converged domains.
-    let remote_roots =
-        request_remote_domain_roots(sync_cap, cluster_view, root_schema_version).await?;
-    let domains_requiring_ranges = select_domains_requiring_range_sync(
-        stores,
-        requested_domains,
-        &remote_roots,
-        cluster_view,
-        root_schema_version,
-        context,
-    )
-    .await?;
-    if domains_requiring_ranges.is_empty() {
+    let scope = SyncAttemptScope::new(cluster_view, root_schema_version);
+
+    // Phase 1: compare roots. Matching roots are already converged for this peer and schema.
+    // Mismatches move to the range phase.
+    let remote_roots = request_remote_domain_roots(sync_cap, scope).await?;
+    let domains_with_different_roots =
+        find_domains_with_different_roots(stores, requested_domains, &remote_roots, scope, context)
+            .await?;
+    if domains_with_different_roots.is_empty() {
         return Ok(());
     }
 
-    // Step 2: fetch range summaries only for domains whose root digest differs.
-    let delta_requests = request_missing_delta_ranges(
+    // Phase 2: ask only for range summaries where roots differed. The response lets this node
+    // compute the exact pages it is missing.
+    let delta_requests = request_ranges_and_compute_delta_wants(
         stores,
         sync_cap,
-        cluster_view,
-        root_schema_version,
-        &domains_requiring_ranges,
+        scope,
+        &domains_with_different_roots,
     )
     .await?;
     if delta_requests.is_empty() {
         return Ok(());
     }
 
-    // Step 3: stream the missing pages into a local sink and wake dependent reconcilers.
+    // Phase 3: open a local sink, let the remote peer stream missing rows into it, then wake
+    // reconcilers that depend on newly applied domains.
     open_remote_delta_stream(
         stores,
         sync_cap,
-        cluster_view,
-        root_schema_version,
+        scope,
         requested_domains.len(),
         &delta_requests,
     )
@@ -319,31 +364,32 @@ async fn run_selected_domain_sync(
 /// Fetches and decodes the peer's per-domain root digests for the requested view.
 async fn request_remote_domain_roots(
     sync_cap: &sync::Client,
-    cluster_view: ClusterViewId,
-    root_schema_version: u32,
+    scope: SyncAttemptScope,
 ) -> Result<Vec<RemoteDomainRoot>, capnp::Error> {
     let mut roots_request = sync_cap.get_roots_for_view_request();
     encoding::encode_view_request(
         roots_request.get().init_req(),
-        cluster_view,
-        root_schema_version,
+        scope.cluster_view,
+        scope.root_schema_version,
     );
 
     let roots_response = roots_request.send().promise.await?;
     encoding::decode_remote_domain_roots(
         roots_response.get()?.get_roots()?,
-        cluster_view,
-        root_schema_version,
+        scope.cluster_view,
+        scope.root_schema_version,
     )
 }
 
-/// Applies root-phase side effects and returns only domains that need range summaries.
-async fn select_domains_requiring_range_sync(
+/// Compares remote roots with local roots and returns domains that still need range summaries.
+///
+/// This is the only root-phase step with local side effects. Remote tombstone prune frontiers are
+/// applied before comparing roots, and equal roots are recorded for distributed store GC.
+async fn find_domains_with_different_roots(
     stores: &SyncStores,
     requested_domains: &[Domain],
     remote_roots: &[RemoteDomainRoot],
-    cluster_view: ClusterViewId,
-    root_schema_version: u32,
+    scope: SyncAttemptScope,
     context: &SyncClientContext,
 ) -> Result<Vec<Domain>, capnp::Error> {
     let mut domains_requiring_ranges = Vec::new();
@@ -353,6 +399,8 @@ async fn select_domains_requiring_range_sync(
             .iter()
             .find(|candidate| candidate.domain == *domain);
 
+        // Prune-frontier propagation is attached to roots because equal roots are the moment when
+        // peers can safely learn each other's tombstone GC progress.
         if let Some(remote_root) = remote_root
             && !remote_root.prune_frontiers.is_empty()
         {
@@ -363,13 +411,13 @@ async fn select_domains_requiring_range_sync(
         }
 
         let local_root_digest = stores
-            .root_digest_at_version(*domain, root_schema_version)
+            .root_digest_at_version(*domain, scope.root_schema_version)
             .await
             .map_err(to_capnp)?;
 
         match remote_root.map(|root| root.digest) {
             Some(remote_root_digest) if remote_root_digest == local_root_digest => {
-                record_equal_domain_root(*domain, cluster_view, root_schema_version, context);
+                record_equal_domain_root(*domain, scope, context);
             }
             Some(_) | None => domains_requiring_ranges.push(*domain),
         }
@@ -379,65 +427,55 @@ async fn select_domains_requiring_range_sync(
 }
 
 /// Records one equal-root observation for GC when peer trace context is available.
-fn record_equal_domain_root(
-    domain: Domain,
-    cluster_view: ClusterViewId,
-    root_schema_version: u32,
-    context: &SyncClientContext,
-) {
+fn record_equal_domain_root(domain: Domain, scope: SyncAttemptScope, context: &SyncClientContext) {
     if let Some(trace) = context.trace.as_ref() {
         context.gc_progress.record_equal_root_now(
             trace.peer_id,
             domain,
-            cluster_view,
-            root_schema_version,
+            scope.cluster_view,
+            scope.root_schema_version,
         );
     }
 }
 
-/// Fetches remote range summaries and computes the exact page ranges missing locally.
-async fn request_missing_delta_ranges(
+/// Fetches remote range summaries and computes the exact local wants.
+///
+/// The result is the list of per-domain page ranges this node wants the remote peer to stream back
+/// through `DeltaSinkImpl`.
+async fn request_ranges_and_compute_delta_wants(
     stores: &SyncStores,
     sync_cap: &sync::Client,
-    cluster_view: ClusterViewId,
-    root_schema_version: u32,
+    scope: SyncAttemptScope,
     domains_requiring_ranges: &[Domain],
 ) -> Result<Vec<DomainDeltaRequest>, capnp::Error> {
     let mut ranges_request = sync_cap.get_ranges_for_view_request();
     encoding::encode_view_ranges_request(
         ranges_request.get().init_req(),
-        cluster_view,
-        root_schema_version,
+        scope.cluster_view,
+        scope.root_schema_version,
         domains_requiring_ranges,
     );
 
     let ranges_response = ranges_request.send().promise.await?;
-    compute_missing_delta_ranges_from_response(
-        stores,
-        ranges_response.get()?.get_ranges()?,
-        cluster_view,
-        root_schema_version,
-    )
-    .await
+    compute_delta_wants_from_range_response(stores, ranges_response.get()?.get_ranges()?, scope)
+        .await
 }
 
 /// Decodes each range summary and computes missing pages in the original response order.
-async fn compute_missing_delta_ranges_from_response(
+async fn compute_delta_wants_from_range_response(
     stores: &SyncStores,
     ranges_reader: capnp::struct_list::Reader<'_, sync::domain_range_summary::Owned>,
-    expected_view: ClusterViewId,
-    expected_root_schema_version: u32,
+    scope: SyncAttemptScope,
 ) -> Result<Vec<DomainDeltaRequest>, capnp::Error> {
     let mut delta_requests = Vec::new();
     for index in 0..ranges_reader.len() {
         let remote_summary = encoding::decode_remote_domain_range_summary(
             ranges_reader.get(index),
-            expected_view,
-            expected_root_schema_version,
+            scope.cluster_view,
+            scope.root_schema_version,
         )?;
         if let Some(delta_request) =
-            compute_missing_delta_range(stores, expected_root_schema_version, remote_summary)
-                .await?
+            compute_delta_want_for_remote_summary(stores, scope, remote_summary).await?
         {
             delta_requests.push(delta_request);
         }
@@ -445,14 +483,14 @@ async fn compute_missing_delta_ranges_from_response(
     Ok(delta_requests)
 }
 
-/// Computes the local want for one decoded remote range summary.
-async fn compute_missing_delta_range(
+/// Computes the missing local pages for one decoded remote range summary.
+async fn compute_delta_want_for_remote_summary(
     stores: &SyncStores,
-    root_schema_version: u32,
+    scope: SyncAttemptScope,
     remote_summary: RemoteDomainRangeSummary,
 ) -> Result<Option<DomainDeltaRequest>, capnp::Error> {
     let local_ranges = stores
-        .page_range_summary_at_version(remote_summary.domain, root_schema_version)
+        .page_range_summary_at_version(remote_summary.domain, scope.root_schema_version)
         .await
         .map_err(to_capnp)?;
     let want_ranges = compute_want_from_have(&remote_summary.ranges, &local_ranges);
@@ -470,29 +508,28 @@ async fn compute_missing_delta_range(
 async fn open_remote_delta_stream(
     stores: &SyncStores,
     sync_cap: &sync::Client,
-    cluster_view: ClusterViewId,
-    root_schema_version: u32,
+    scope: SyncAttemptScope,
     requested_domain_count: usize,
     delta_requests: &[DomainDeltaRequest],
 ) -> Result<(), capnp::Error> {
     let sink_client = new_client(DeltaSinkImpl::new(
         stores.clone(),
-        cluster_view,
-        root_schema_version,
+        scope.cluster_view,
+        scope.root_schema_version,
     ));
 
     let mut open_delta_request = sync_cap.open_delta_for_view_request();
     encoding::encode_open_delta_request(
         open_delta_request.get().init_req(),
-        cluster_view,
-        root_schema_version,
+        scope.cluster_view,
+        scope.root_schema_version,
         delta_requests,
         sink_client,
     )?;
 
     debug!(
         target: "sync",
-        cluster_view = %cluster_view,
+        cluster_view = %scope.cluster_view,
         domains_requested = requested_domain_count,
         domains_with_delta = delta_requests.len(),
         "opening selective delta stream"
