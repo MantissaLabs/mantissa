@@ -628,6 +628,9 @@ impl JobController {
         if current.is_terminal() {
             return Ok(());
         }
+        if !job_tracks_workload_attempt(&current, task.id) {
+            return Ok(());
+        }
 
         match task.state {
             WorkloadPhase::Exited(0) => {
@@ -772,6 +775,15 @@ fn workload_phase_is_terminal(phase: &WorkloadPhase) -> bool {
     )
 }
 
+/// Returns true when an observed workload is still the active attempt for a job.
+///
+/// Job reconciliation can race with owner changes. A worker may inspect an old attempt, then reload
+/// the job after another owner has already reserved the next attempt. In that case the old terminal
+/// state must not be projected onto the newer attempt count.
+fn job_tracks_workload_attempt(job: &JobSpecValue, workload_id: Uuid) -> bool {
+    job.active_workload_id == Some(workload_id)
+}
+
 /// Builds the deterministic set of nodes eligible to own one job reconciliation loop.
 fn build_eligible_nodes<I>(
     local_node_id: Uuid,
@@ -914,5 +926,21 @@ mod tests {
         let owner = select_job_owner(job_id, &candidates).expect("owner");
         let owner_reversed = select_job_owner(job_id, &reversed).expect("owner");
         assert_eq!(owner, owner_reversed);
+    }
+
+    /// Stale terminal observations from an older attempt must not affect a newer retry.
+    #[test]
+    fn job_attempt_tracking_rejects_stale_attempt_after_retry_reservation() {
+        let first_workload_id = Uuid::new_v4();
+        let retry_workload_id = Uuid::new_v4();
+
+        let mut job = test_job();
+        job.retry_policy.max_retries = 1;
+        job.reserve_attempt(first_workload_id);
+        job.mark_retrying(Some("first attempt failed".to_string()), Utc::now());
+        job.reserve_attempt(retry_workload_id);
+
+        assert!(!job_tracks_workload_attempt(&job, first_workload_id));
+        assert!(job_tracks_workload_attempt(&job, retry_workload_id));
     }
 }

@@ -595,8 +595,9 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
     .await
     {
         panic!(
-            "post-failover owner should complete the job after the retry attempt exits: {}",
-            describe_remaining_job_state(&cluster, job_id, second_workload_id).await
+            "post-failover owner should complete the job after the retry attempt exits: {}; backend exits: {}",
+            describe_remaining_job_state(&cluster, job_id, second_workload_id).await,
+            describe_backend_exit_events(&backend_by_node).await
         );
     }
 
@@ -888,17 +889,28 @@ async fn describe_remaining_job_state(
 ) -> String {
     let mut entries = Vec::with_capacity(nodes.len());
     for node in nodes {
-        let job = match list_jobs(&node.node.jobs_client).await {
-            Ok(jobs) => jobs
-                .into_iter()
-                .find(|job| job.id == job_id)
-                .map(|job| {
-                    format!(
-                        "job={:?}/attempts={}/active={:?}",
-                        job.status, job.attempts_started, job.active_workload_id
-                    )
-                })
-                .unwrap_or_else(|| "job=<missing>".to_string()),
+        let job = match inspect_job(&node.node.jobs_client, job_id).await {
+            Ok(detail) => {
+                let attempts = detail
+                    .attempts
+                    .iter()
+                    .map(|attempt| {
+                        format!(
+                            "{}:active={}:last={}",
+                            attempt.workload_id, attempt.is_active, attempt.is_last
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "job={:?}/attempts={}/active={:?}/detail={:?}/attempt_rows=[{}]",
+                    detail.snapshot.status,
+                    detail.snapshot.attempts_started,
+                    detail.snapshot.active_workload_id,
+                    detail.snapshot.status_detail,
+                    attempts
+                )
+            }
             Err(err) => format!("job=<list error: {err}>"),
         };
         let workload = match node
@@ -907,7 +919,10 @@ async fn describe_remaining_job_state(
             .inspect_workload(workload_id)
             .await
         {
-            Ok(workload) => format!("workload={:?}/host={}", workload.state, workload.node_id),
+            Ok(workload) => format!(
+                "workload={:?}/host={}/reason={:?}",
+                workload.state, workload.node_id, workload.phase_reason
+            ),
             Err(err) => format!("workload=<inspect error: {err}>"),
         };
         entries.push(format!("{}: {job}; {workload}", node.id()));
@@ -1008,6 +1023,26 @@ fn backend_for_node(
         .expect("backend node")
 }
 
+/// Builds a compact diagnostic string describing synthetic runtime exits emitted by test backends.
+async fn describe_backend_exit_events(
+    backends_by_node: &HashMap<Uuid, Arc<ControllableExitRuntimeBackend>>,
+) -> String {
+    let mut rows = Vec::with_capacity(backends_by_node.len());
+    for (node_id, backend) in backends_by_node {
+        let events = backend
+            .emitted_exits
+            .lock()
+            .await
+            .iter()
+            .map(|(workload_id, exit_code)| format!("{workload_id}:{exit_code}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        rows.push(format!("{node_id}=[{events}]"));
+    }
+    rows.sort();
+    rows.join(" | ")
+}
+
 /// Creates one restartable headless node backed by the provided durable state and runtime.
 async fn create_restartable_job_node(
     db: Arc<redb::Database>,
@@ -1056,8 +1091,10 @@ async fn create_restartable_job_node(
 struct ControllableExitRuntimeBackend {
     inner: InMemoryRuntimeBackend,
     runtime_ids_by_workload: AsyncMutex<HashMap<Uuid, String>>,
+    exit_codes_by_workload: AsyncMutex<HashMap<Uuid, i32>>,
     runtime_events_tx: AsyncMutex<Option<tokio::sync::mpsc::UnboundedSender<RuntimeEvent>>>,
     pending_runtime_events: AsyncMutex<Vec<RuntimeEvent>>,
+    emitted_exits: AsyncMutex<Vec<(Uuid, i32)>>,
 }
 
 impl ControllableExitRuntimeBackend {
@@ -1073,6 +1110,9 @@ impl ControllableExitRuntimeBackend {
     }
 
     /// Emits one explicit task-exit event for the selected workload id.
+    ///
+    /// The exit code is recorded before the in-memory instance is stopped so normal reconciliation
+    /// cannot inspect a stopped runtime with no exit code and convert it into a generic failure.
     async fn signal_workload_exit(
         &self,
         workload_id: Uuid,
@@ -1096,12 +1136,20 @@ impl ControllableExitRuntimeBackend {
             .ok_or_else(|| {
                 RuntimeError::NotFound(format!("runtime instance for workload {workload_id}"))
             })?;
+        self.exit_codes_by_workload
+            .lock()
+            .await
+            .insert(workload_id, exit_code);
         self.inner.stop_instance(&runtime_id, None).await?;
 
         let event = RuntimeEvent::TaskExited {
             task_id: workload_id,
             exit_code,
         };
+        self.emitted_exits
+            .lock()
+            .await
+            .push((workload_id, exit_code));
         let sender = self.runtime_events_tx.lock().await.clone();
         if let Some(sender) = sender {
             let _ = sender.send(event);
@@ -1110,6 +1158,24 @@ impl ControllableExitRuntimeBackend {
         }
         Ok(())
     }
+}
+
+/// Adds controlled exit codes to in-memory runtime snapshots seen by reconciliation.
+///
+/// The shared in-memory backend only knows whether an instance is running. This wrapper carries the
+/// exit code supplied by the test so fallback runtime inspection agrees with the lifecycle event.
+fn apply_controlled_exit_code(info: &mut RuntimeInfo, exit_codes_by_workload: &HashMap<Uuid, i32>) {
+    let Some(workload_id) = info
+        .labels
+        .get("mantissa.workload_id")
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+    else {
+        return;
+    };
+    let Some(exit_code) = exit_codes_by_workload.get(&workload_id).copied() else {
+        return;
+    };
+    info.state.exit_code = Some(exit_code);
 }
 
 #[async_trait]
@@ -1156,12 +1222,20 @@ impl RuntimeBackend for ControllableExitRuntimeBackend {
         force: bool,
         remove_volumes: bool,
     ) -> Result<(), RuntimeError> {
-        if let Some(workload_id) = self.runtime_ids_by_workload.lock().await.iter().find_map(
-            |(workload_id, current_runtime_id)| {
-                (current_runtime_id == runtime_id).then_some(*workload_id)
-            },
-        ) {
+        let workload_id = {
+            let runtime_ids = self.runtime_ids_by_workload.lock().await;
+            runtime_ids
+                .iter()
+                .find_map(|(workload_id, current_runtime_id)| {
+                    (current_runtime_id == runtime_id).then_some(*workload_id)
+                })
+        };
+        if let Some(workload_id) = workload_id {
             self.runtime_ids_by_workload
+                .lock()
+                .await
+                .remove(&workload_id);
+            self.exit_codes_by_workload
                 .lock()
                 .await
                 .remove(&workload_id);
@@ -1175,11 +1249,19 @@ impl RuntimeBackend for ControllableExitRuntimeBackend {
         &self,
         filters: Option<HashMap<String, Vec<String>>>,
     ) -> Result<Vec<RuntimeInfo>, RuntimeError> {
-        self.inner.list_instances(filters).await
+        let mut instances = self.inner.list_instances(filters).await?;
+        let exit_codes = self.exit_codes_by_workload.lock().await.clone();
+        for instance in &mut instances {
+            apply_controlled_exit_code(instance, &exit_codes);
+        }
+        Ok(instances)
     }
 
     async fn inspect_instance(&self, runtime_id: &str) -> Result<RuntimeInfo, RuntimeError> {
-        self.inner.inspect_instance(runtime_id).await
+        let mut info = self.inner.inspect_instance(runtime_id).await?;
+        let exit_codes = self.exit_codes_by_workload.lock().await;
+        apply_controlled_exit_code(&mut info, &exit_codes);
+        Ok(info)
     }
 
     async fn pull_image(&self, image: &str) -> Result<(), RuntimeError> {
