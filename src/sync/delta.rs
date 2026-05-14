@@ -4,39 +4,17 @@
 //! capability and exposes `DeltaSinkImpl`, the local sink used by the remote peer to
 //! stream missing CRDT fragments back into the local stores.
 
+use super::encoding::{self, DomainDeltaRequest, RemoteDomainRangeSummary, RemoteDomainRoot};
 use super::{ALL_DOMAINS, SyncStores};
 use crate::cluster::{ClusterViewId, RootSchemaState};
-use crate::store::replicated::registry::{EncodedRegisters, EncodedTombstones};
 use crate::sync::gc_progress::SyncGcProgress;
-use crate::sync::ranges::{capnp_fill_ranges, page_ranges_from_capnp};
 use capnp_rpc::new_client;
-use mantissa_protocol::sync::{self, Domain, delta_chunk, delta_sink};
-use mantissa_store::PageDigestRange;
+use mantissa_protocol::sync::{self, Domain, delta_sink};
 use mantissa_store::compute_want_from_have;
-use mantissa_store::mst_store::TombstonePruneFrontiers;
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tracing::{debug, warn};
-
-/// Root-phase payload for one remote domain, including GC prune-frontier metadata.
-struct RemoteDomainRoot {
-    domain: Domain,
-    digest: [u8; 16],
-    prune_frontiers: TombstonePruneFrontiers,
-}
-
-/// Range-summary payload decoded from the peer before local want computation.
-struct RemoteDomainRangeSummary {
-    domain: Domain,
-    ranges: Vec<PageDigestRange>,
-}
-
-/// Per-domain page ranges this node wants the peer to stream through `DeltaSink`.
-struct DomainDeltaRequest {
-    domain: Domain,
-    want_ranges: Vec<PageDigestRange>,
-}
 
 /// Carries one peer-scoped context for anti-entropy diagnostics.
 #[derive(Clone, Debug)]
@@ -193,36 +171,23 @@ impl delta_sink::Server for DeltaSinkImpl {
         params: delta_sink::PushChunkParams,
     ) -> Result<(), capnp::Error> {
         let chunk = params.get()?.get_chunk()?;
-        let domain = chunk
-            .get_domain()
-            .map_err(|_| capnp::Error::failed("unknown sync domain".into()))?;
-        let chunk_view =
-            ClusterViewId::from_capnp(chunk.get_view()?).map_err(capnp::Error::failed)?;
-        if chunk_view != self.expected_view {
-            return Err(capnp::Error::failed(format!(
-                "delta chunk view mismatch: expected {}, got {}",
-                self.expected_view, chunk_view
-            )));
-        }
-        if chunk.get_root_schema_version() != self.expected_root_schema_version {
-            return Err(capnp::Error::failed(format!(
-                "delta chunk root schema mismatch: expected {}, got {}",
-                self.expected_root_schema_version,
-                chunk.get_root_schema_version()
-            )));
-        }
+        let chunk_header = encoding::decode_delta_chunk_header(
+            &chunk,
+            self.expected_view,
+            self.expected_root_schema_version,
+        )?;
         debug!(
             target: "delta",
-            cluster_view = %chunk_view,
-            ?domain,
+            cluster_view = %chunk_header.cluster_view,
+            domain = ?chunk_header.domain,
             root_schema_version = self.expected_root_schema_version,
             "received delta chunk"
         );
 
-        let registers = collect_registers(&chunk)?;
-        let tombstones = collect_tombstones(&chunk)?;
+        let registers = encoding::collect_registers(&chunk)?;
+        let tombstones = encoding::collect_tombstones(&chunk)?;
         self.stores
-            .require(domain)
+            .require(chunk_header.domain)
             .map_err(to_capnp)?
             .store
             .apply_delta_encoded(registers, tombstones)
@@ -240,28 +205,6 @@ impl delta_sink::Server for DeltaSinkImpl {
         debug!(target: "delta", "delta stream end");
         Ok(())
     }
-}
-
-/// Extracts opaque tombstone rows from a wire chunk.
-fn collect_tombstones(chunk: &delta_chunk::Reader<'_>) -> Result<EncodedTombstones, capnp::Error> {
-    let mut tombs = Vec::new();
-    for entry in chunk.get_tombs()?.iter() {
-        tombs.push((
-            entry.get_key()?.to_vec(),
-            entry.get_ts(),
-            entry.get_origin_actor()?.to_vec(),
-        ));
-    }
-    Ok(tombs)
-}
-
-/// Extracts opaque register payloads from one wire chunk.
-fn collect_registers(chunk: &delta_chunk::Reader<'_>) -> Result<EncodedRegisters, capnp::Error> {
-    let mut regs = Vec::new();
-    for entry in chunk.get_regs()?.iter() {
-        regs.push((entry.get_key()?.to_vec(), entry.get_reg()?.to_vec()));
-    }
-    Ok(regs)
 }
 
 /// Normalizes storage/runtime errors into Cap'n Proto failures for RPC propagation.
@@ -380,94 +323,18 @@ async fn request_remote_domain_roots(
     root_schema_version: u32,
 ) -> Result<Vec<RemoteDomainRoot>, capnp::Error> {
     let mut roots_request = sync_cap.get_roots_for_view_request();
-    encode_view_request(
+    encoding::encode_view_request(
         roots_request.get().init_req(),
         cluster_view,
         root_schema_version,
     );
 
     let roots_response = roots_request.send().promise.await?;
-    decode_remote_domain_roots(
+    encoding::decode_remote_domain_roots(
         roots_response.get()?.get_roots()?,
         cluster_view,
         root_schema_version,
     )
-}
-
-/// Encodes the shared view/root-schema selector used by root requests.
-fn encode_view_request(
-    mut request: sync::view_request::Builder<'_>,
-    cluster_view: ClusterViewId,
-    root_schema_version: u32,
-) {
-    cluster_view.write_capnp(request.reborrow().init_view());
-    request.set_root_schema_version(root_schema_version);
-}
-
-/// Decodes and validates the root response returned by `getRootsForView`.
-fn decode_remote_domain_roots(
-    roots_reader: capnp::struct_list::Reader<'_, sync::domain_root::Owned>,
-    expected_view: ClusterViewId,
-    expected_root_schema_version: u32,
-) -> Result<Vec<RemoteDomainRoot>, capnp::Error> {
-    let mut roots = Vec::with_capacity(roots_reader.len() as usize);
-    for index in 0..roots_reader.len() {
-        roots.push(decode_remote_domain_root(
-            roots_reader.get(index),
-            expected_view,
-            expected_root_schema_version,
-        )?);
-    }
-    Ok(roots)
-}
-
-/// Decodes one root entry and rejects responses scoped to a different view/schema.
-fn decode_remote_domain_root(
-    root_reader: sync::domain_root::Reader<'_>,
-    expected_view: ClusterViewId,
-    expected_root_schema_version: u32,
-) -> Result<RemoteDomainRoot, capnp::Error> {
-    let actual_view =
-        ClusterViewId::from_capnp(root_reader.get_view()?).map_err(capnp::Error::failed)?;
-    if actual_view != expected_view {
-        return Err(capnp::Error::failed(format!(
-            "sync roots view mismatch: expected {expected_view}, got {actual_view}"
-        )));
-    }
-
-    let actual_root_schema_version = root_reader.get_root_schema_version();
-    if actual_root_schema_version != expected_root_schema_version {
-        return Err(capnp::Error::failed(format!(
-            "sync roots root schema mismatch: expected {expected_root_schema_version}, got {actual_root_schema_version}"
-        )));
-    }
-
-    let domain = root_reader
-        .get_domain()
-        .map_err(|_| capnp::Error::failed("unknown domain".into()))?;
-    let digest = read_root_digest(root_reader.get_root_digest()?)?;
-    let prune_frontiers =
-        decode_tombstone_prune_frontiers(root_reader.get_tombstone_prune_frontiers()?)?;
-    Ok(RemoteDomainRoot {
-        domain,
-        digest,
-        prune_frontiers,
-    })
-}
-
-/// Decodes peer tombstone prune-frontiers, ignoring the wire default sequence.
-fn decode_tombstone_prune_frontiers(
-    frontiers_reader: capnp::struct_list::Reader<'_, sync::tombstone_prune_frontier::Owned>,
-) -> Result<TombstonePruneFrontiers, capnp::Error> {
-    let mut prune_frontiers = Vec::with_capacity(frontiers_reader.len() as usize);
-    for frontier in frontiers_reader.iter() {
-        let origin_actor = frontier.get_origin_actor()?.to_vec();
-        let sequence = frontier.get_sequence();
-        if sequence > 0 {
-            prune_frontiers.push((origin_actor, sequence));
-        }
-    }
-    Ok(prune_frontiers)
 }
 
 /// Applies root-phase side effects and returns only domains that need range summaries.
@@ -537,7 +404,7 @@ async fn request_missing_delta_ranges(
     domains_requiring_ranges: &[Domain],
 ) -> Result<Vec<DomainDeltaRequest>, capnp::Error> {
     let mut ranges_request = sync_cap.get_ranges_for_view_request();
-    encode_view_ranges_request(
+    encoding::encode_view_ranges_request(
         ranges_request.get().init_req(),
         cluster_view,
         root_schema_version,
@@ -554,28 +421,6 @@ async fn request_missing_delta_ranges(
     .await
 }
 
-/// Encodes the view/root-schema selector plus the explicit domains to summarize.
-fn encode_view_ranges_request(
-    mut request: sync::view_ranges_request::Builder<'_>,
-    cluster_view: ClusterViewId,
-    root_schema_version: u32,
-    domains: &[Domain],
-) {
-    cluster_view.write_capnp(request.reborrow().init_view());
-    request.set_root_schema_version(root_schema_version);
-    encode_domain_list(
-        request.reborrow().init_domains(domains.len() as u32),
-        domains,
-    );
-}
-
-/// Encodes one domain enum list into an already initialized Cap'n Proto list.
-fn encode_domain_list(mut list: capnp::enum_list::Builder<'_, Domain>, domains: &[Domain]) {
-    for (index, domain) in domains.iter().enumerate() {
-        list.set(index as u32, *domain);
-    }
-}
-
 /// Decodes each range summary and computes missing pages in the original response order.
 async fn compute_missing_delta_ranges_from_response(
     stores: &SyncStores,
@@ -585,7 +430,7 @@ async fn compute_missing_delta_ranges_from_response(
 ) -> Result<Vec<DomainDeltaRequest>, capnp::Error> {
     let mut delta_requests = Vec::new();
     for index in 0..ranges_reader.len() {
-        let remote_summary = decode_remote_domain_range_summary(
+        let remote_summary = encoding::decode_remote_domain_range_summary(
             ranges_reader.get(index),
             expected_view,
             expected_root_schema_version,
@@ -598,34 +443,6 @@ async fn compute_missing_delta_ranges_from_response(
         }
     }
     Ok(delta_requests)
-}
-
-/// Decodes one range summary and rejects responses scoped to a different view/schema.
-fn decode_remote_domain_range_summary(
-    summary_reader: sync::domain_range_summary::Reader<'_>,
-    expected_view: ClusterViewId,
-    expected_root_schema_version: u32,
-) -> Result<RemoteDomainRangeSummary, capnp::Error> {
-    let actual_view =
-        ClusterViewId::from_capnp(summary_reader.get_view()?).map_err(capnp::Error::failed)?;
-    if actual_view != expected_view {
-        return Err(capnp::Error::failed(format!(
-            "sync ranges view mismatch: expected {expected_view}, got {actual_view}"
-        )));
-    }
-
-    let actual_root_schema_version = summary_reader.get_root_schema_version();
-    if actual_root_schema_version != expected_root_schema_version {
-        return Err(capnp::Error::failed(format!(
-            "sync ranges root schema mismatch: expected {expected_root_schema_version}, got {actual_root_schema_version}"
-        )));
-    }
-
-    let domain = summary_reader
-        .get_domain()
-        .map_err(|_| capnp::Error::failed("unknown domain".into()))?;
-    let ranges = page_ranges_from_capnp(summary_reader.get_summary()?)?;
-    Ok(RemoteDomainRangeSummary { domain, ranges })
 }
 
 /// Computes the local want for one decoded remote range summary.
@@ -665,7 +482,7 @@ async fn open_remote_delta_stream(
     ));
 
     let mut open_delta_request = sync_cap.open_delta_for_view_request();
-    encode_open_delta_request(
+    encoding::encode_open_delta_request(
         open_delta_request.get().init_req(),
         cluster_view,
         root_schema_version,
@@ -681,61 +498,6 @@ async fn open_remote_delta_stream(
         "opening selective delta stream"
     );
     open_delta_request.send().promise.await?;
-    Ok(())
-}
-
-/// Encodes an open-delta request, including the caller-owned sink capability.
-fn encode_open_delta_request(
-    mut request: sync::view_open_delta_request::Builder<'_>,
-    cluster_view: ClusterViewId,
-    root_schema_version: u32,
-    delta_requests: &[DomainDeltaRequest],
-    sink_client: sync::DeltaSinkClient,
-) -> Result<(), capnp::Error> {
-    cluster_view.write_capnp(request.reborrow().init_view());
-    request.set_root_schema_version(root_schema_version);
-    encode_domain_wants(
-        request.reborrow().init_wants(delta_requests.len() as u32),
-        cluster_view,
-        root_schema_version,
-        delta_requests,
-    )?;
-    request.set_sink(sink_client);
-    Ok(())
-}
-
-/// Encodes all per-domain want entries for one open-delta request.
-fn encode_domain_wants(
-    mut wants_builder: capnp::struct_list::Builder<'_, sync::domain_want::Owned>,
-    cluster_view: ClusterViewId,
-    root_schema_version: u32,
-    delta_requests: &[DomainDeltaRequest],
-) -> Result<(), capnp::Error> {
-    for (index, delta_request) in delta_requests.iter().enumerate() {
-        encode_domain_want(
-            wants_builder.reborrow().get(index as u32),
-            cluster_view,
-            root_schema_version,
-            delta_request,
-        )?;
-    }
-    Ok(())
-}
-
-/// Encodes one domain want entry with its page-summary request ranges.
-fn encode_domain_want(
-    mut want_builder: sync::domain_want::Builder<'_>,
-    cluster_view: ClusterViewId,
-    root_schema_version: u32,
-    delta_request: &DomainDeltaRequest,
-) -> Result<(), capnp::Error> {
-    want_builder.set_domain(delta_request.domain);
-    capnp_fill_ranges(
-        &delta_request.want_ranges,
-        want_builder.reborrow().init_want(),
-    )?;
-    cluster_view.write_capnp(want_builder.reborrow().init_view());
-    want_builder.set_root_schema_version(root_schema_version);
     Ok(())
 }
 
@@ -780,16 +542,6 @@ fn should_notify_master_key_replication(delta_requests: &[DomainDeltaRequest]) -
     delta_requests
         .iter()
         .any(|request| request.domain == Domain::SecretMasterKeys)
-}
-
-/// Decodes one fixed-width XXHash128 root digest from the sync wire format.
-fn read_root_digest(bytes: &[u8]) -> Result<[u8; 16], capnp::Error> {
-    bytes.try_into().map_err(|_| {
-        capnp::Error::failed(format!(
-            "invalid sync root digest length: expected 16, got {}",
-            bytes.len()
-        ))
-    })
 }
 
 #[cfg(test)]
