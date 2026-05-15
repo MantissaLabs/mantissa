@@ -11,10 +11,11 @@ use mantissa_net::{
 use mantissa_protocol::server::{cluster_session, server};
 use std::{
     fs, io,
+    net::SocketAddr,
     os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
 };
-use tokio::net::UnixStream;
+use tokio::net::{TcpStream, UnixStream};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 /// Resolve an in-process client handle when using the inproc transport.
@@ -30,12 +31,24 @@ fn inproc_client(addr: &str) -> Result<Option<server::Client>, capnp::Error> {
     Ok(None)
 }
 
-fn to_socket_addr(addr: &str) -> Result<std::net::SocketAddr, capnp::Error> {
-    use std::net::ToSocketAddrs;
-    addr.to_socket_addrs()
+/// Resolve one TCP endpoint without blocking the async runtime thread on DNS.
+async fn resolve_socket_addr(addr: &str) -> Result<SocketAddr, capnp::Error> {
+    tokio::net::lookup_host(addr)
+        .await
         .map_err(|e| capnp::Error::failed(format!("bad addr: {e}")))?
         .next()
         .ok_or_else(|| capnp::Error::failed("no addr".into()))
+}
+
+/// Connect one TCP stream and enable low-latency writes before the Noise handshake starts.
+async fn connect_tcp_low_latency(addr: &str) -> Result<TcpStream, capnp::Error> {
+    let sock = resolve_socket_addr(addr).await?;
+    let tcp = TcpStream::connect(sock)
+        .await
+        .map_err(|e| capnp::Error::failed(format!("tcp connect: {e}")))?;
+    tcp.set_nodelay(true)
+        .map_err(|e| capnp::Error::failed(format!("tcp nodelay: {e}")))?;
+    Ok(tcp)
 }
 
 async fn rpc_client_from_stream(noise_stream: NoiseStream) -> Result<server::Client, capnp::Error> {
@@ -77,11 +90,7 @@ pub async fn get_client_secure_join_with_keys(
         return Ok(c);
     }
 
-    let sock = to_socket_addr(addr)?;
-    let tcp = tokio::net::TcpStream::connect(sock)
-        .await
-        .map_err(|e| capnp::Error::failed(format!("tcp connect: {e}")))?;
-    tcp.set_nodelay(true).ok();
+    let tcp = connect_tcp_low_latency(addr).await?;
 
     let psk = mantissa_net::noise::derive_psk_from_token(join_token)
         .map_err(|e| capnp::Error::failed(format!("psk derivation: {e}")))?;
@@ -118,11 +127,7 @@ pub async fn get_client_secure_peer_with_keys(
         return Ok(c);
     }
 
-    let sock = to_socket_addr(addr)?;
-    let tcp = tokio::net::TcpStream::connect(sock)
-        .await
-        .map_err(|e| capnp::Error::failed(format!("tcp connect: {e}")))?;
-    tcp.set_nodelay(true).ok();
+    let tcp = connect_tcp_low_latency(addr).await?;
 
     let noise_stream = client_handshake_peer(tcp, keys, peer_static)
         .await
@@ -254,7 +259,7 @@ async fn connect_discovered_unix_stream(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::net::UnixListener;
+    use tokio::net::{TcpListener, UnixListener};
 
     /// Creates a unique test directory below the system temp directory.
     fn test_socket_dir() -> PathBuf {
@@ -290,5 +295,24 @@ mod tests {
         drop(stream);
         accept.await.expect("accept task");
         fs::remove_dir_all(dir).expect("remove test socket dir");
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_uses_nodelay() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tcp listener");
+        let addr = listener.local_addr().expect("listener address").to_string();
+        let accept = tokio::spawn(async move {
+            let _accepted = listener.accept().await;
+        });
+
+        let stream = connect_tcp_low_latency(&addr)
+            .await
+            .expect("connect tcp low latency");
+
+        assert!(stream.nodelay().expect("read nodelay"));
+        drop(stream);
+        accept.await.expect("accept task");
     }
 }

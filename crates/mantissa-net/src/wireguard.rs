@@ -65,7 +65,7 @@ pub fn load_wireguard_underlay_preference() -> io::Result<bool> {
         return Ok(false);
     }
 
-    let contents = fs::read_to_string(&path).unwrap_or_default();
+    let contents = fs::read_to_string(&path)?;
     let value = match contents.trim() {
         "" => true,
         "0" | "false" | "no" => false,
@@ -348,5 +348,18 @@ mod tests {
             fs::read_to_string(&port_path).expect("read repaired wireguard port"),
             "6578\n"
         );
+    }
+
+    #[test]
+    fn invalid_underlay_preference_marker_returns_error() {
+        let dir = TempDir::new().expect("create temp wireguard state dir");
+        let _guard = EnvOverrideGuard::state_dir(dir.path());
+        let preference_path = resolve_wireguard_underlay_preference_path()
+            .expect("resolve wireguard underlay preference path");
+        fs::write(&preference_path, [0xff, 0xfe]).expect("seed invalid preference file");
+
+        let err = load_wireguard_underlay_preference().expect_err("invalid utf8 should surface");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
