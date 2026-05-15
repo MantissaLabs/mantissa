@@ -78,6 +78,47 @@ fn local_sessions_get_and_list_skip_expired_records() {
     );
 }
 
+#[test]
+fn local_sessions_list_purges_invalid_records() {
+    let tmp = temp_db_dir();
+    let db_path = tmp.path().join("state.redb");
+    let db = temp_db(&db_path);
+    let keys = fixed_noise_keys(42);
+    let store = LocalSessionStore::open(db.clone(), &keys).expect("open");
+    let peer = Uuid::new_v4();
+
+    store.put(peer, b"resume-ticket").expect("put");
+
+    let other_keys = fixed_noise_keys(7);
+    let reopened = LocalSessionStore::open(db.clone(), &other_keys).expect("reopen");
+    let err = reopened
+        .get(peer)
+        .expect_err("record is bound to original key");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+    let listed = reopened.list().expect("list skips invalid record");
+    assert!(listed.is_empty());
+    assert!(store.get(peer).expect("invalid record purged").is_none());
+}
+
+#[test]
+fn local_sessions_clear_removes_invalid_records() {
+    let tmp = temp_db_dir();
+    let db_path = tmp.path().join("state.redb");
+    let db = temp_db(&db_path);
+    let keys = fixed_noise_keys(42);
+    let store = LocalSessionStore::open(db.clone(), &keys).expect("open");
+    let peer = Uuid::new_v4();
+
+    store.put(peer, b"resume-ticket").expect("put");
+
+    let other_keys = fixed_noise_keys(7);
+    let reopened = LocalSessionStore::open(db.clone(), &other_keys).expect("reopen");
+    reopened.clear().expect("clear does not decrypt records");
+
+    assert!(store.get(peer).expect("record cleared").is_none());
+}
+
 fn now() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

@@ -100,13 +100,14 @@ impl TicketRecord {
 
 /// Derive a per-node KEK from the Noise static private key.
 /// Rotating the Noise key invalidates old blobs (acceptable).
-fn derive_local_key(noise_priv: &[u8; 32]) -> [u8; 32] {
+fn derive_local_key(noise_priv: &[u8; 32]) -> io::Result<[u8; 32]> {
     const INFO: &[u8] = b"mantissa/local-session-store/v1";
     const SALT: &[u8] = b"mantissa.salt.local.session";
     let hk = Hkdf::<Sha256>::new(Some(SALT), noise_priv);
     let mut out = [0u8; 32];
-    hk.expand(INFO, &mut out).expect("hkdf expand");
-    out
+    hk.expand(INFO, &mut out)
+        .map_err(|_| io::Error::other("hkdf local session key expansion failed"))?;
+    Ok(out)
 }
 
 fn seal(kek: &[u8; 32], plaintext: &[u8]) -> io::Result<Vec<u8>> {
@@ -166,7 +167,7 @@ impl LocalSessionStore {
             ));
         }
 
-        let kek = derive_local_key(&noise_keys.to_private_bytes());
+        let kek = derive_local_key(&noise_keys.to_private_bytes())?;
         with_write_tx(&db, |tx| {
             let _ = tx.open_table(T_SESS).map_err(into_io)?;
             Ok(())
@@ -199,11 +200,7 @@ impl LocalSessionStore {
 
     /// Remove every stored ticket so the node no longer attempts to resume any peer sessions.
     pub fn clear(&self) -> io::Result<()> {
-        let peers = self
-            .list_records()?
-            .into_iter()
-            .map(|(peer, _)| peer)
-            .collect::<Vec<_>>();
+        let peers = self.list_record_peers()?;
 
         if peers.is_empty() {
             return Ok(());
@@ -312,24 +309,55 @@ impl LocalSessionStore {
         })
     }
 
+    /// List record peer keys without decrypting their ticket blobs.
+    fn list_record_peers(&self) -> io::Result<Vec<Uuid>> {
+        with_read_tx(&self.db, |tx| {
+            let table = tx.open_table(T_SESS).map_err(into_io)?;
+            let mut peers = Vec::new();
+            for entry in table.iter().map_err(into_io)? {
+                let (key, _) = entry.map_err(into_io)?;
+                peers.push(Uuid::from_bytes(key.value()));
+            }
+            Ok(peers)
+        })
+    }
+
     /// List valid records, optionally purging expired cached values.
     pub fn list_valid_records(&self, auto_purge: bool) -> io::Result<Vec<(Uuid, TicketRecord)>> {
         let now = now_secs();
-        let mut expired = Vec::new();
+        let mut purge = Vec::new();
         let mut valid = Vec::new();
 
-        for (peer, record) in self.list_records()? {
-            if self.record_is_expired(&record, now) {
-                expired.push(peer);
-            } else {
-                valid.push((peer, record));
-            }
-        }
+        with_read_tx(&self.db, |tx| {
+            let table = tx.open_table(T_SESS).map_err(into_io)?;
+            for entry in table.iter().map_err(into_io)? {
+                let (key, value) = entry.map_err(into_io)?;
+                let peer = Uuid::from_bytes(key.value());
+                let blob = value.value();
+                let record =
+                    match open(&self.kek, blob).and_then(|pt| TicketRecord::decode_capnp(&pt)) {
+                        Ok(record) => record,
+                        Err(err) if auto_purge && err.kind() == io::ErrorKind::InvalidData => {
+                            tracing::warn!("purging invalid local session ticket for peer {peer}");
+                            purge.push(peer);
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    };
 
-        if auto_purge && !expired.is_empty() {
+                if self.record_is_expired(&record, now) {
+                    purge.push(peer);
+                } else {
+                    valid.push((peer, record));
+                }
+            }
+            Ok(())
+        })?;
+
+        if auto_purge && !purge.is_empty() {
             with_write_tx(&self.db, |tx| {
                 let mut table = tx.open_table(T_SESS).map_err(into_io)?;
-                for peer in &expired {
+                for peer in &purge {
                     let _ = table.remove(*peer.as_bytes()).map_err(into_io)?;
                 }
                 Ok(())

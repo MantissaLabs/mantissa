@@ -2168,17 +2168,16 @@ pub fn compute_want_from_have(
     remote: &[PageDigestRange],
     local: &[PageDigestRange],
 ) -> Vec<PageDigestRange> {
-    // Map (start,end) → hash
-    let mut idx: HashMap<(Vec<u8>, Vec<u8>), Vec<u8>> = HashMap::with_capacity(local.len());
+    let mut idx: HashMap<(&[u8], &[u8]), &[u8]> = HashMap::with_capacity(local.len());
     for r in local {
-        idx.insert((r.start.clone(), r.end.clone()), r.hash.clone());
+        idx.insert((r.start.as_slice(), r.end.as_slice()), r.hash.as_slice());
     }
 
     let mut out = Vec::with_capacity(remote.len().min(1024));
     for r in remote {
-        match idx.get(&(r.start.clone(), r.end.clone())) {
+        match idx.get(&(r.start.as_slice(), r.end.as_slice())) {
             None => out.push(r.clone()),
-            Some(h) if h.as_slice() != r.hash.as_slice() => out.push(r.clone()),
+            Some(h) if *h != r.hash.as_slice() => out.push(r.clone()),
             _ => {}
         }
     }
