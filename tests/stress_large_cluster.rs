@@ -511,6 +511,7 @@ impl ProcessNode {
             .env("HOME", &home_dir)
             .env("XDG_RUNTIME_DIR", &runtime_dir)
             .env("MANTISSA_TEST_INMEMORY_CONTAINER_MANAGER", "1")
+            .env("MANTISSA_TEST_MASTER_KEY_KDF", "fast")
             .env("MANTISSA_WIREGUARD_DISABLE", "1")
             .env("MANTISSA_BPF_NO_ATTACH", "1")
             .env("RUST_LOG", node_rust_log)
