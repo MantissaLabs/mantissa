@@ -17,6 +17,7 @@ use mantissa_protocol::sync::Domain;
 use mantissa_protocol::workload::WorkloadStateFilter as ProtoWorkloadStateFilter;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -115,23 +116,61 @@ fn stress_target_tasks() -> usize {
     env_usize("MANTISSA_STRESS_TARGET_TASKS").unwrap_or(DEFAULT_TARGET_TASKS)
 }
 
+/// Returns the target directory Cargo uses for local build artifacts.
+fn cargo_target_dir() -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") else {
+        return root.join("target");
+    };
+
+    let path = PathBuf::from(target_dir);
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
+/// Returns the debug daemon binary path produced by the CLI package build.
+fn target_mantissa_bin_path() -> PathBuf {
+    cargo_target_dir()
+        .join("debug")
+        .join(format!("mantissa{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// Builds the daemon binary used by stress subprocesses from the current checkout.
+fn build_mantissa_bin() -> Result<PathBuf> {
+    let path = target_mantissa_bin_path();
+    let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+        .args(["build", "-p", "mantissa-cli", "--bin", "mantissa"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .context("build mantissa daemon binary for stress test")?;
+
+    if !status.success() {
+        bail!("cargo build -p mantissa-cli --bin mantissa failed with status {status}");
+    }
+    if !path.exists() {
+        bail!(
+            "mantissa daemon binary was not produced at {} after cargo build",
+            path.display()
+        );
+    }
+
+    Ok(path)
+}
+
 /// Resolves the Mantissa binary path used to spawn subprocess-backed stress nodes.
 fn mantissa_bin_path() -> Result<PathBuf> {
+    if let Some(path) = option_env!("CARGO_BIN_EXE_mantissa") {
+        return Ok(PathBuf::from(path));
+    }
+
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_mantissa") {
         return Ok(PathBuf::from(path));
     }
 
-    let fallback = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("debug")
-        .join("mantissa");
-    if fallback.exists() {
-        return Ok(fallback);
-    }
-
-    bail!(
-        "mantissa binary path not found; set CARGO_BIN_EXE_mantissa or build target/debug/mantissa"
-    )
+    build_mantissa_bin()
 }
 
 /// Picks one ephemeral localhost TCP port for a daemon listen address.
@@ -155,6 +194,35 @@ fn write_stress_config(root: &Path) -> Result<PathBuf> {
   ),
 )"#;
     fs::write(&path, config).with_context(|| format!("write config {}", path.display()))?;
+    Ok(path)
+}
+
+/// Writes the non-interactive master-key passphrase used by stress daemon subprocesses.
+fn write_stress_passphrase(root: &Path) -> Result<PathBuf> {
+    let path = root.join("stress-master-key-passphrase");
+    let bytes = b"mantissa stress master key passphrase";
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("create passphrase file {}", path.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("write passphrase file {}", path.display()))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::write(&path, bytes)
+            .with_context(|| format!("write passphrase file {}", path.display()))?;
+    }
+
     Ok(path)
 }
 
@@ -398,7 +466,13 @@ impl ProcessNode {
     }
 
     /// Spawns a daemon process with isolated HOME/XDG directories and waits for RPC readiness.
-    async fn spawn(bin: &Path, config_path: &Path, root: &Path, idx: usize) -> Result<Self> {
+    async fn spawn(
+        bin: &Path,
+        config_path: &Path,
+        passphrase_path: &Path,
+        root: &Path,
+        idx: usize,
+    ) -> Result<Self> {
         let node_name = format!("stress-node-{idx:03}");
         let node_root = root.join(format!("node-{idx:03}"));
         let home_dir = node_root.join("home");
@@ -432,6 +506,8 @@ impl ProcessNode {
             .arg("--name")
             .arg(&node_name)
             .arg("init")
+            .arg("--master-key-passphrase-file")
+            .arg(passphrase_path)
             .env("HOME", &home_dir)
             .env("XDG_RUNTIME_DIR", &runtime_dir)
             .env("MANTISSA_TEST_INMEMORY_CONTAINER_MANAGER", "1")
@@ -913,6 +989,7 @@ impl Drop for ProcessNode {
 struct ProcessCluster {
     _temp_dir: tempfile::TempDir,
     _config_path: PathBuf,
+    _passphrase_path: PathBuf,
     nodes: Vec<ProcessNode>,
 }
 
@@ -924,11 +1001,12 @@ impl ProcessCluster {
         let temp_dir = tempfile::tempdir().context("create stress tempdir")?;
         let temp_root = temp_dir.path().to_path_buf();
         let config_path = write_stress_config(temp_dir.path())?;
+        let passphrase_path = write_stress_passphrase(temp_dir.path())?;
         let bin = mantissa_bin_path()?;
 
         let result = async {
             let mut nodes = Vec::with_capacity(n);
-            let anchor = ProcessNode::spawn(&bin, &config_path, &temp_root, 0)
+            let anchor = ProcessNode::spawn(&bin, &config_path, &passphrase_path, &temp_root, 0)
                 .await
                 .context("spawn anchor node")?;
             let anchor_addr = anchor.listen_addr.clone();
@@ -936,9 +1014,10 @@ impl ProcessCluster {
             nodes.push(anchor);
 
             for idx in 1..n {
-                let node = ProcessNode::spawn(&bin, &config_path, &temp_root, idx)
-                    .await
-                    .with_context(|| format!("spawn node index {idx}"))?;
+                let node =
+                    ProcessNode::spawn(&bin, &config_path, &passphrase_path, &temp_root, idx)
+                        .await
+                        .with_context(|| format!("spawn node index {idx}"))?;
 
                 let deadline = Instant::now() + Duration::from_secs(30);
                 let mut last_err: Option<anyhow::Error> = None;
@@ -987,6 +1066,7 @@ impl ProcessCluster {
         Ok(Self {
             _temp_dir: temp_dir,
             _config_path: config_path,
+            _passphrase_path: passphrase_path,
             nodes,
         })
     }
