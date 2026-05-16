@@ -94,6 +94,21 @@ fn to_capnp<E: std::fmt::Display>(error: E) -> Error {
     Error::failed(error.to_string())
 }
 
+/// Reject network deletion while runtime attachments still reference the network.
+fn ensure_network_has_no_attachments(
+    registry: &NetworkRegistry,
+    network_id: Uuid,
+) -> Result<(), Error> {
+    let attachment_count = registry.attachment_count(network_id).map_err(to_capnp)?;
+    if attachment_count > 0 {
+        return Err(Error::failed(format!(
+            "network {network_id} is still in use by {attachment_count} attachment(s)"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Decode one UUID from its 16-byte wire representation.
 fn read_uuid(bytes: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
     let data = bytes.to_owned();
@@ -651,8 +666,14 @@ impl networks::Server for NetworksRpc {
             .ensure_no_active_cluster_operation("delete networks")?;
 
         let ids_reader = params.get()?.get_ids()?;
+        let mut ids = Vec::with_capacity(ids_reader.len() as usize);
         for entry in ids_reader.iter() {
             let uuid = read_uuid(entry?)?;
+            ensure_network_has_no_attachments(&self.registry, uuid)?;
+            ids.push(uuid);
+        }
+
+        for uuid in ids {
             if let Some(mut spec) = self.registry.get_spec(uuid).map_err(to_capnp)? {
                 spec.mark_deleted();
                 let spec_clone = spec.clone();
@@ -663,16 +684,6 @@ impl networks::Server for NetworksRpc {
                     .map_err(|e| Error::failed(e.to_string()))?;
                 self.controller.schedule_spec_change(uuid).await;
             }
-
-            self.registry
-                .remove_peer_states_for_network(uuid)
-                .await
-                .map_err(to_capnp)?;
-
-            self.registry
-                .remove_attachments_for_network(uuid)
-                .await
-                .map_err(to_capnp)?;
         }
         Ok(())
     }
@@ -921,6 +932,48 @@ mod tests {
         value.created_at = "2026-03-25T12:02:00Z".to_string();
         value.updated_at = "2026-03-25T12:03:00Z".to_string();
         value
+    }
+
+    /// Builds one temporary network registry for delete-guard unit tests.
+    fn temp_network_registry() -> NetworkRegistry {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("network-service-registry.redb");
+        let db = Arc::new(redb::Database::create(path).expect("create db"));
+        let actor = Uuid::new_v4();
+        NetworkRegistry::new(
+            open_network_spec_store(db.clone(), actor).expect("open network spec store"),
+            open_network_peer_store(db.clone(), actor).expect("open network peer store"),
+            open_network_attachment_store(db, actor).expect("open network attachment store"),
+        )
+    }
+
+    /// Deleting an attached network must fail before mutating the network spec.
+    #[tokio::test]
+    async fn delete_guard_rejects_attached_network() {
+        let registry = temp_network_registry();
+        let network_id = Uuid::new_v4();
+        registry
+            .upsert_attachment(sample_network_attachment(network_id))
+            .await
+            .expect("upsert network attachment");
+
+        let err = ensure_network_has_no_attachments(&registry, network_id)
+            .expect_err("attached network should be rejected");
+
+        assert!(
+            err.to_string().contains("still in use by 1 attachment(s)"),
+            "unexpected delete guard error: {err}"
+        );
+    }
+
+    /// Detached networks should pass the delete preflight without requiring a spec row.
+    #[test]
+    fn delete_guard_allows_detached_network() {
+        let registry = temp_network_registry();
+        let network_id = Uuid::new_v4();
+
+        ensure_network_has_no_attachments(&registry, network_id)
+            .expect("detached network should pass delete guard");
     }
 
     /// Network values should round-trip through their Cap'n Proto store-value codecs.

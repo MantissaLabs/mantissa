@@ -629,6 +629,17 @@ impl NetworkRegistry {
         })
     }
 
+    /// Return the number of attachment rows associated with one network without cloning them.
+    pub fn attachment_count(&self, network_id: Uuid) -> Result<usize> {
+        self.refresh_attachment_cache_if_needed()?;
+        let cache = self.cache_read();
+        Ok(cache
+            .attachment_counts
+            .get(&network_id)
+            .copied()
+            .unwrap_or(0))
+    }
+
     /// List attachments bound to a specific task identifier.
     pub fn list_attachments_for_task(&self, task_id: Uuid) -> Result<Vec<NetworkAttachmentValue>> {
         self.refresh_attachment_cache_if_needed()?;
@@ -865,6 +876,26 @@ mod tests {
         })
     }
 
+    /// Builds one attachment row for registry projection tests.
+    fn test_attachment(network_id: Uuid, task_id: Uuid, node_id: Uuid) -> NetworkAttachmentValue {
+        NetworkAttachmentValue::new(crate::network::types::NetworkAttachmentDraft {
+            id: crate::network::types::compute_network_attachment_id(task_id, network_id),
+            task_id,
+            node_id,
+            instance_id: format!("instance-{task_id}"),
+            network_id,
+            task_updated_at: None,
+            requested_ip: None,
+            assigned_ip: None,
+            mac: None,
+            state: crate::network::types::NetworkAttachmentState::Ready,
+            error: None,
+            traffic_published: false,
+            service_name: None,
+            template_name: None,
+        })
+    }
+
     /// Derive a broad IPv4 supernet that covers the generated default subnet.
     fn ipv4_supernet(cidr: &str) -> String {
         let mut octets = cidr.split('.');
@@ -1039,6 +1070,64 @@ mod tests {
             .expect("select default subnet");
 
         assert_eq!(initial, resolved);
+    }
+
+    /// Attachment counts should use the cached per-network projection without cloning rows.
+    #[tokio::test]
+    async fn attachment_count_tracks_network_projection() {
+        let registry = temp_registry();
+        let network_a = Uuid::new_v4();
+        let network_b = Uuid::new_v4();
+        let node_id = Uuid::new_v4();
+        let task_a1 = Uuid::new_v4();
+        let task_a2 = Uuid::new_v4();
+        let task_b = Uuid::new_v4();
+        let attachment_a1 = test_attachment(network_a, task_a1, node_id);
+
+        assert_eq!(
+            registry
+                .attachment_count(network_a)
+                .expect("count empty network"),
+            0
+        );
+
+        registry
+            .upsert_attachment(attachment_a1.clone())
+            .await
+            .expect("upsert first network attachment");
+        registry
+            .upsert_attachment(test_attachment(network_a, task_a2, node_id))
+            .await
+            .expect("upsert second network attachment");
+        registry
+            .upsert_attachment(test_attachment(network_b, task_b, node_id))
+            .await
+            .expect("upsert other network attachment");
+
+        assert_eq!(
+            registry
+                .attachment_count(network_a)
+                .expect("count first network"),
+            2
+        );
+        assert_eq!(
+            registry
+                .attachment_count(network_b)
+                .expect("count second network"),
+            1
+        );
+
+        registry
+            .remove_attachment(attachment_a1.id)
+            .await
+            .expect("remove first network attachment");
+
+        assert_eq!(
+            registry
+                .attachment_count(network_a)
+                .expect("count after remove"),
+            1
+        );
     }
 
     /// Ensure the selector returns the entry with the most recent timestamp so readiness counts do

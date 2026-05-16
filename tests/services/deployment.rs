@@ -206,6 +206,85 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
     );
 });
 
+local_test!(services_network_delete_rejects_attached_network, {
+    let _config_guard = ConfigOverrideGuard::control_plane_network_only();
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+
+    let cluster = TestNode::new_cluster_inproc_with_config(1, ClusterConfig::default())
+        .await
+        .expect("cluster should start");
+    let node = &cluster[0];
+    let network_id = create_logical_test_network(&cluster, "delete-attached-network").await;
+
+    let service_name = "delete-attached-network-service";
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![demo_networked_backend_task_template(
+                "backend", 1, network_id,
+            )],
+        )
+        .await
+        .expect("submit networked deployment");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "networked deployment should converge to running"
+    );
+    assert!(
+        wait_for_network_attachment_count(node, network_id, 1).await,
+        "network should expose one attachment before delete is attempted"
+    );
+
+    let attached_delete_error = delete_network_via_rpc(&node.node.networks_client, network_id)
+        .await
+        .expect_err("attached network delete should be rejected");
+    assert!(
+        attached_delete_error
+            .to_string()
+            .contains("still in use by"),
+        "delete rejection should explain that the network is still attached: {attached_delete_error}"
+    );
+
+    let spec = node
+        .node
+        .network_registry
+        .get_spec(network_id)
+        .expect("load network after rejected delete")
+        .expect("network should still exist after rejected delete");
+    assert!(
+        !spec.is_deleted(),
+        "failed delete must not tombstone an attached network"
+    );
+
+    remove_service_via_rpc(&node.node.services_client, service_id).await;
+    assert!(
+        wait_for_service_state(&node.node.service_controller, service_id, false).await,
+        "service should be removed before retrying network deletion"
+    );
+    assert!(
+        wait_for_network_attachment_count(node, network_id, 0).await,
+        "network attachments should be removed after the service stops"
+    );
+
+    delete_network_via_rpc(&node.node.networks_client, network_id)
+        .await
+        .expect("detached network delete should succeed");
+    assert!(
+        wait_for_network_deleted(node, network_id).await,
+        "detached network should be tombstoned after delete"
+    );
+});
+
 local_test!(services_deployment_exhausts_retries_and_fails, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
@@ -911,4 +990,52 @@ fn generation_owner_score_for_test(service_id: Uuid, service_epoch: u64, node_id
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest.as_bytes()[..16]);
     u128::from_le_bytes(bytes)
+}
+
+/// Delete one logical network through the same RPC surface used by clients.
+async fn delete_network_via_rpc(
+    client: &mantissa_protocol::network::networks::Client,
+    network_id: Uuid,
+) -> Result<(), CapnpError> {
+    let mut request = client.delete_request();
+    {
+        let mut ids = request.get().init_ids(1);
+        ids.set(0, network_id.as_bytes());
+    }
+    request.send().promise.await.map(|_| ())
+}
+
+/// Wait until the network attachment index reaches the expected local count.
+async fn wait_for_network_attachment_count(
+    node: &TestNode,
+    network_id: Uuid,
+    expected: usize,
+) -> bool {
+    wait_until(
+        Duration::from_secs(20),
+        Duration::from_millis(50),
+        || async {
+            node.node
+                .network_registry
+                .attachment_count(network_id)
+                .expect("count network attachments")
+                == expected
+        },
+    )
+    .await
+}
+
+/// Wait until the local network spec has been tombstoned by the delete RPC.
+async fn wait_for_network_deleted(node: &TestNode, network_id: Uuid) -> bool {
+    wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || async {
+            matches!(
+                node.node.network_registry.get_spec(network_id),
+                Ok(Some(spec)) if spec.is_deleted()
+            )
+        },
+    )
+    .await
 }
