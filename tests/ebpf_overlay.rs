@@ -26,7 +26,6 @@ use mantissa::services::types::{
 };
 use mantissa::workload::model::WorkloadStateFilter;
 use mantissa::workload::types::ExecutionSpec;
-use mantissa_protocol::services::services;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -351,6 +350,47 @@ async fn wait_for_service_status(
     .await
 }
 
+/// Return concise summaries for local workload rows that still belong to one service.
+async fn service_workload_summaries(node: &HeadlessNode, service_name: &str) -> Vec<String> {
+    let tasks = node
+        .workload_manager
+        .list_workloads(&WorkloadStateFilter::all())
+        .await
+        .expect("list workloads while waiting for service cleanup");
+
+    tasks
+        .into_iter()
+        .filter(|task| {
+            task.node_id == node.id
+                && task
+                    .service_owner()
+                    .map(|owner| owner.service_name == service_name)
+                    .unwrap_or(false)
+        })
+        .map(|task| {
+            let template = task
+                .service_owner()
+                .map(|owner| owner.template.as_str())
+                .unwrap_or("unknown");
+            format!("{}:{template}:{:?}", task.id, task.state)
+        })
+        .collect()
+}
+
+/// Wait until local service workload rows have completed their stop cleanup.
+async fn wait_for_service_workloads_removed(
+    node: &HeadlessNode,
+    service_name: &str,
+    timeout: Duration,
+) -> bool {
+    common::convergence::wait_until(timeout, Duration::from_millis(100), || async {
+        service_workload_summaries(node, service_name)
+            .await
+            .is_empty()
+    })
+    .await
+}
+
 /// Return the local running task id for one service template in the privileged single-node harness.
 async fn wait_for_local_service_task(
     node: &HeadlessNode,
@@ -398,8 +438,16 @@ fn exec_task_container(task_id: Uuid, command: &str) -> Output {
 }
 
 /// Remove one service through the real RPC surface so cleanup follows production controller paths.
-async fn remove_service_via_rpc(client: &services::Client, service_id: Uuid) {
-    let mut delete = client.delete_request();
+async fn remove_service_via_rpc(node: &HeadlessNode, service_id: Uuid) {
+    let service_name = node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("load service before privileged cleanup")
+        .unwrap_or_else(|| panic!("service {service_id} should exist before cleanup"))
+        .service_name;
+
+    let mut delete = node.services_client.delete_request();
     {
         let mut ids = delete.get().init_ids(1);
         ids.set(0, service_id.as_bytes());
@@ -409,6 +457,22 @@ async fn remove_service_via_rpc(client: &services::Client, service_id: Uuid) {
         .promise
         .await
         .expect("service delete should succeed");
+
+    assert!(
+        wait_for_service_status(
+            &node.service_controller,
+            service_id,
+            ServiceStatus::Stopped,
+            Duration::from_secs(180),
+        )
+        .await,
+        "service {service_name} ({service_id}) should reach stopped before network teardown"
+    );
+    assert!(
+        wait_for_service_workloads_removed(node, &service_name, Duration::from_secs(180)).await,
+        "service {service_name} ({service_id}) should remove local workloads before network teardown; remaining={:?}",
+        service_workload_summaries(node, &service_name).await
+    );
 }
 
 /// Perform one HTTP GET against the supplied address and return the raw response bytes as UTF-8.
@@ -889,7 +953,7 @@ local_test!(ebpf_overlay_programs_runtime_mss_for_small_mtu, {
         "small-MTU overlay service should still answer host-access VIP traffic"
     );
 
-    remove_service_via_rpc(&node.services_client, service_id).await;
+    remove_service_via_rpc(&node, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
 
@@ -1092,7 +1156,7 @@ local_test!(ebpf_overlay_host_vip_reaches_service_from_host_access, {
         neighbour_summary(&host_ifname, IpAddr::V4(vip)).await
     );
 
-    remove_service_via_rpc(&node.services_client, service_id).await;
+    remove_service_via_rpc(&node, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
 
@@ -1200,7 +1264,7 @@ local_test!(ebpf_overlay_status_reports_programmed_vip_traffic, {
         "overlay load-balancer status should not report read failures during the privileged test: {status:?}"
     );
 
-    remove_service_via_rpc(&node.services_client, service_id).await;
+    remove_service_via_rpc(&node, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
 
@@ -1306,7 +1370,7 @@ local_test!(
             neighbour_summary(&host_ifname, IpAddr::V6(vip)).await
         );
 
-        remove_service_via_rpc(&node.services_client, service_id).await;
+        remove_service_via_rpc(&node, service_id).await;
         delete_privileged_network(&node, network_id).await;
     }
 );
@@ -1478,7 +1542,7 @@ local_test!(ebpf_overlay_task_dns_reaches_service_vip, {
         );
     }
 
-    remove_service_via_rpc(&node.services_client, service_id).await;
+    remove_service_via_rpc(&node, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
 
@@ -1649,7 +1713,7 @@ local_test!(ebpf_overlay_ipv6_task_dns_reaches_service_vip, {
         );
     }
 
-    remove_service_via_rpc(&node.services_client, service_id).await;
+    remove_service_via_rpc(&node, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
 
@@ -1740,7 +1804,7 @@ local_test!(ebpf_overlay_vip_load_balances_across_local_replicas, {
         "host-access VIP should spread requests across at least two local replicas; vip={vip}; backend_ips={backend_ips:?}; observed_responses={responses:?}; last_observation={last_response:?}"
     );
 
-    remove_service_via_rpc(&node.services_client, service_id).await;
+    remove_service_via_rpc(&node, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
 
@@ -1834,7 +1898,7 @@ local_test!(
             "host-access IPv6 VIP should spread requests across at least two local replicas; vip={vip}; backend_ips={backend_ips:?}; observed_responses={responses:?}; last_observation={last_response:?}"
         );
 
-        remove_service_via_rpc(&node.services_client, service_id).await;
+        remove_service_via_rpc(&node, service_id).await;
         delete_privileged_network(&node, network_id).await;
     }
 );
@@ -1925,7 +1989,7 @@ local_test!(ebpf_overlay_return_path_preserves_vip_identity, {
         "host-access response packet should not expose the backend source identity on the return path: {capture}"
     );
 
-    remove_service_via_rpc(&node.services_client, service_id).await;
+    remove_service_via_rpc(&node, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
 
@@ -2023,7 +2087,7 @@ local_test!(ebpf_overlay_udp_service_reaches_host_access_vip, {
         );
     }
 
-    remove_service_via_rpc(&node.services_client, service_id).await;
+    remove_service_via_rpc(&node, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
 
@@ -2117,7 +2181,7 @@ local_test!(
             neighbour_summary(&host_ifname, IpAddr::V4(vip)).await
         );
 
-        remove_service_via_rpc(&node.services_client, service_id).await;
+        remove_service_via_rpc(&node, service_id).await;
 
         assert!(
             common::convergence::wait_until(
@@ -2266,7 +2330,7 @@ local_test!(
             );
         }
 
-        remove_service_via_rpc(&node.services_client, service_id).await;
+        remove_service_via_rpc(&node, service_id).await;
         delete_privileged_network(&node, network_id).await;
 
         assert!(
@@ -2380,7 +2444,7 @@ local_test!(ebpf_overlay_heals_after_lb_map_removal, {
     }
     assert_lb_maps_present(network_id, OverlayIpFamily::Ipv4);
 
-    remove_service_via_rpc(&node.services_client, service_id).await;
+    remove_service_via_rpc(&node, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
 
