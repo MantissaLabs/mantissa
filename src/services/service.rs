@@ -612,14 +612,16 @@ fn placement_preference_to_proto(
 }
 
 fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateSpecValue, Error> {
-    let mut command = Vec::new();
-    for arg in reader.get_command()?.iter() {
+    let command_reader = reader.get_command()?;
+    let mut command = Vec::with_capacity(command_reader.len() as usize);
+    for arg in command_reader.iter() {
         command.push(arg?.to_str()?.to_string());
     }
 
-    let mut depends_on = Vec::new();
-    let mut seen_dependencies = HashSet::new();
-    for entry in reader.get_depends_on()?.iter() {
+    let depends_on_reader = reader.get_depends_on()?;
+    let mut depends_on = Vec::with_capacity(depends_on_reader.len() as usize);
+    let mut seen_dependencies = HashSet::with_capacity(depends_on_reader.len() as usize);
+    for entry in depends_on_reader.iter() {
         let raw = entry?.to_str()?.trim().to_string();
         if raw.is_empty() {
             return Err(Error::failed(
@@ -646,9 +648,10 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
     let secret_files = decode_secret_files(reader.get_secret_files()?)?;
     let volumes = decode_volume_mounts(reader.get_volumes()?)?;
 
-    let mut networks = Vec::new();
-    let mut seen_networks = HashSet::new();
-    for entry in reader.get_networks()?.iter() {
+    let networks_reader = reader.get_networks()?;
+    let mut networks = Vec::with_capacity(networks_reader.len() as usize);
+    let mut seen_networks = HashSet::with_capacity(networks_reader.len() as usize);
+    for entry in networks_reader.iter() {
         let raw = entry.get_name()?.to_str()?.trim().to_string();
         if raw.is_empty() {
             return Err(Error::failed("network names must be non-empty".to_string()));
@@ -675,8 +678,9 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
         None
     };
 
-    let mut pre_stop_cmds = Vec::new();
-    for arg in reader.get_pre_stop_command()?.iter() {
+    let pre_stop_reader = reader.get_pre_stop_command()?;
+    let mut pre_stop_cmds = Vec::with_capacity(pre_stop_reader.len() as usize);
+    for arg in pre_stop_reader.iter() {
         let text = arg?.to_str()?.to_string();
         if !text.is_empty() {
             pre_stop_cmds.push(text);
@@ -695,13 +699,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
         Some(raw_public)
     };
     let public_protocol = if public_port.is_some() {
-        let proto = match reader.get_public_protocol() {
-            Ok(proto) => proto,
-            Err(_) => {
-                warn!("service public protocol missing or invalid; defaulting to tcp");
-                mantissa_protocol::services::PublicProtocol::Tcp
-            }
-        };
+        let proto = reader.get_public_protocol()?;
         Some(match proto {
             mantissa_protocol::services::PublicProtocol::Tcp => ServicePortProtocol::Tcp,
             mantissa_protocol::services::PublicProtocol::Udp => ServicePortProtocol::Udp,
@@ -711,11 +709,10 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
         None
     };
     let placement = read_placement_policy(reader.get_placement()?)?;
-    let mut placement_preferences = Vec::new();
-    if let Ok(preferences) = reader.get_service_placement_preferences() {
-        for entry in preferences.iter() {
-            placement_preferences.push(placement_preference_from_proto(entry?));
-        }
+    let placement_preferences_reader = reader.get_service_placement_preferences()?;
+    let mut placement_preferences = Vec::with_capacity(placement_preferences_reader.len() as usize);
+    for entry in placement_preferences_reader.iter() {
+        placement_preferences.push(placement_preference_from_proto(entry?));
     }
     let ports = decode_port_bindings(reader.get_ports()?)?;
 
@@ -1180,6 +1177,11 @@ mod tests {
             decoded.placement(),
             template.placement(),
             "task-template placement policy should round-trip through the wire payload"
+        );
+        assert_eq!(
+            decoded.placement_preferences(),
+            template.placement_preferences(),
+            "task-template placement preferences should round-trip through the wire payload"
         );
     }
 
