@@ -7,9 +7,9 @@ use super::placement::{
     is_local_volume_unavailable_error, mounted_local_volumes_require_pinned_target,
 };
 use super::state::{
-    deploying_assignment_incomplete, expected_task_id_count, node_is_down,
-    should_restart_missing_slot_immediately, task_age_allows_cleanup, task_age_allows_rebalance,
-    task_state_healthy, task_state_rebalanceable,
+    deploying_assignment_incomplete, deploying_missing_slot_is_unknown, expected_task_id_count,
+    node_is_down, should_restart_missing_slot_immediately, task_age_allows_cleanup,
+    task_age_allows_rebalance, task_state_healthy, task_state_rebalanceable,
 };
 use super::{
     SERVICE_ENABLE_PROACTIVE_REBALANCE, SERVICE_REBALANCE_COOLDOWN_SECS,
@@ -263,6 +263,18 @@ impl ServiceController {
                     task = %task_id,
                     "slot task is assigned to a draining node; forcing evacuation"
                 );
+            }
+            if deploying_missing_slot_is_unknown(spec.status(), task) {
+                tracing::debug!(
+                    target: "services",
+                    service = %spec.service_name,
+                    template = %slot.template.name,
+                    replica = slot.replica,
+                    task = %task_id,
+                    "slot task row is not locally visible during deployment; waiting for direct delivery or sync repair"
+                );
+                self.clear_slot_missing(key).await;
+                return Ok(());
             }
             let restart_immediately = task_on_draining_node
                 || should_restart_missing_slot_immediately(spec.status(), task);

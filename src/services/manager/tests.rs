@@ -1192,6 +1192,31 @@ fn deployment_keeps_missing_slot_grace_for_non_terminal_states() {
     ));
 }
 
+/// Ensures absent deployment rows stay unknown while assignment propagation can still be lagging.
+#[test]
+fn deploying_treats_absent_slot_rows_as_unknown() {
+    let pending = make_task(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "demo",
+        "api",
+        WorkloadPhase::Pending,
+    );
+
+    assert!(deploying_missing_slot_is_unknown(
+        ServiceStatus::Deploying,
+        None
+    ));
+    assert!(!deploying_missing_slot_is_unknown(
+        ServiceStatus::Deploying,
+        Some(&pending)
+    ));
+    assert!(!deploying_missing_slot_is_unknown(
+        ServiceStatus::Running,
+        None
+    ));
+}
+
 /// Ensures rollout stop gating treats absent and terminal task states as reusable.
 #[test]
 fn rollout_stop_gate_accepts_absent_and_terminal_states() {
