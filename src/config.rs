@@ -534,6 +534,8 @@ pub struct ReplicationConfig {
     pub global_metadata_sync_fanout: usize,
     #[serde(default = "default_replication_workload_repair_fanout")]
     pub workload_repair_fanout: usize,
+    #[serde(default = "default_replication_remote_admission_parallelism")]
+    pub remote_admission_parallelism: usize,
 }
 
 impl Default for ReplicationConfig {
@@ -550,6 +552,7 @@ impl Default for ReplicationConfig {
             global_metadata_sync_tick_ms: default_replication_global_metadata_sync_tick_ms(),
             global_metadata_sync_fanout: default_replication_global_metadata_sync_fanout(),
             workload_repair_fanout: default_replication_workload_repair_fanout(),
+            remote_admission_parallelism: default_replication_remote_admission_parallelism(),
         }
     }
 }
@@ -568,6 +571,7 @@ pub struct RuntimeReplicationConfig {
     pub global_metadata_sync_tick: Duration,
     pub global_metadata_sync_fanout: usize,
     pub workload_repair_fanout: usize,
+    pub remote_admission_parallelism: usize,
 }
 
 impl ReplicationConfig {
@@ -585,6 +589,7 @@ impl ReplicationConfig {
             global_metadata_sync_tick: Duration::from_millis(self.global_metadata_sync_tick_ms),
             global_metadata_sync_fanout: self.global_metadata_sync_fanout,
             workload_repair_fanout: self.workload_repair_fanout,
+            remote_admission_parallelism: self.remote_admission_parallelism,
         }
     }
 }
@@ -1199,6 +1204,13 @@ fn default_replication_workload_repair_fanout() -> usize {
 
 /// # Description:
 ///
+/// Returns the default owner-side concurrency for remote scheduler admission.
+fn default_replication_remote_admission_parallelism() -> usize {
+    8
+}
+
+/// # Description:
+///
 /// Ensure the global configuration has been loaded at least once.
 fn ensure_config_loaded() {
     if GLOBAL_LOADED.load(Ordering::Acquire) {
@@ -1457,6 +1469,10 @@ impl Config {
             "MANTISSA_WORKLOAD_REPAIR_FANOUT",
             &mut self.replication.workload_repair_fanout,
         );
+        applied |= apply_positive_usize_env_override(
+            "MANTISSA_REMOTE_ADMISSION_PARALLELISM",
+            &mut self.replication.remote_admission_parallelism,
+        );
 
         applied
     }
@@ -1648,6 +1664,10 @@ impl Config {
 
         if self.replication.global_metadata_sync_tick_ms == 0 {
             anyhow::bail!("replication.global_metadata_sync_tick_ms must be greater than zero");
+        }
+
+        if self.replication.remote_admission_parallelism == 0 {
+            anyhow::bail!("replication.remote_admission_parallelism must be greater than zero");
         }
 
         Ok(())
@@ -2228,6 +2248,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_remote_admission_parallelism() {
+        let mut config = Config::default();
+        config.replication.remote_admission_parallelism = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn env_overrides_apply_and_validate() {
         let _env = EnvOverrideSet::set(&[
             ("MANTISSA_WIREGUARD_DISABLE", "1"),
@@ -2259,6 +2286,7 @@ mod tests {
             ("MANTISSA_GLOBAL_METADATA_SYNC_TICK_MS", "400"),
             ("MANTISSA_GLOBAL_METADATA_SYNC_FANOUT", "11"),
             ("MANTISSA_WORKLOAD_REPAIR_FANOUT", "3"),
+            ("MANTISSA_REMOTE_ADMISSION_PARALLELISM", "12"),
         ]);
 
         let mut config = Config::default();
@@ -2315,6 +2343,7 @@ mod tests {
         assert_eq!(config.replication.global_metadata_sync_tick_ms, 400);
         assert_eq!(config.replication.global_metadata_sync_fanout, 11);
         assert_eq!(config.replication.workload_repair_fanout, 3);
+        assert_eq!(config.replication.remote_admission_parallelism, 12);
     }
 
     #[test]

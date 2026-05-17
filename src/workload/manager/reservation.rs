@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::time::Instant;
 
 use anyhow::Context;
 use chrono::Utc;
+use futures::stream::{FuturesUnordered, StreamExt};
 use mantissa_protocol::scheduling::{self, prepare_leases_response, scheduler as scheduler_rpc};
 use mantissa_protocol::server::cluster_session;
 use mantissa_protocol::workload::workload as workload_rpc;
@@ -77,6 +79,16 @@ enum RemotePrepareOutcome {
     Rejected(RemotePrepareRejection),
 }
 
+/// Deferred remote prepare failure kept while draining already-started peers.
+enum RemotePrepareFailure {
+    Execution(ExecutionError),
+    Rejection {
+        peer_id: Uuid,
+        operation: &'static str,
+        rejection: RemotePrepareRejection,
+    },
+}
+
 /// Decodes one structured prepare rejection returned by a remote scheduler RPC.
 fn parse_prepare_rejection(
     reader: scheduling::prepare_leases_rejected::Reader<'_>,
@@ -122,6 +134,25 @@ fn remote_prepare_rejection_message(
         rejection.digest.free_memory_bytes,
         rejection.digest.free_gpu_count,
     )
+}
+
+/// Resolves configured remote admission concurrency, clamped to a non-zero value.
+fn remote_admission_parallelism() -> usize {
+    crate::config::replication_runtime_config()
+        .remote_admission_parallelism
+        .max(1)
+}
+
+/// Returns the bounded metrics label for one remote prepare peer result.
+fn remote_prepare_result_label(
+    result: &Result<RemotePrepareOutcome, ExecutionError>,
+) -> &'static str {
+    match result {
+        Ok(RemotePrepareOutcome::Prepared(_)) => "prepared",
+        Ok(RemotePrepareOutcome::Rejected(_)) => "rejected",
+        Err(ExecutionError::Retry(_)) => "retry",
+        Err(ExecutionError::Fatal(_)) => "fatal",
+    }
 }
 
 /// Decodes one prepared lease row returned by a remote scheduler.
@@ -533,43 +564,38 @@ impl WorkloadManager {
             plans.len(),
         );
 
+        let parallelism = remote_admission_parallelism();
+        let batch_started = Instant::now();
+        let mut first_failure = None;
         let mut peer_ids = grouped.keys().copied().collect::<Vec<_>>();
         peer_ids.sort_unstable();
-        for peer_id in peer_ids {
-            let peer_plans = &grouped[&peer_id];
-            let scheduler_client = match self.remote_scheduler_client(peer_id).await {
-                Ok(client) => client,
-                Err(err) => {
-                    self.local_state
-                        .remote_prepare_feedback
-                        .record_retryable_failure(peer_id);
-                    self.abort_remote_leases(&reservations).await;
-                    return Err(ExecutionError::Retry(err));
-                }
-            };
+        let mut pending_peers = peer_ids.into_iter();
+        let mut inflight = FuturesUnordered::new();
 
-            crate::observability::metrics::record_remote_prepare_peer(
-                "incremental",
-                peer_plans.len(),
-            );
-            let outcome = match self
-                .send_prepare_leases_request(&scheduler_client, peer_plans)
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    self.abort_remote_leases(&reservations).await;
-                    if matches!(&err, ExecutionError::Retry(_)) {
-                        self.local_state
-                            .remote_prepare_feedback
-                            .record_retryable_failure(peer_id);
-                    }
-                    return Err(err);
-                }
+        loop {
+            while first_failure.is_none() && inflight.len() < parallelism {
+                let Some(peer_id) = pending_peers.next() else {
+                    break;
+                };
+                let peer_plans = &grouped[&peer_id];
+                crate::observability::metrics::record_remote_prepare_peer(
+                    "incremental",
+                    peer_plans.len(),
+                );
+                inflight.push(self.prepare_incremental_remote_peer(
+                    peer_id,
+                    peer_plans,
+                    batch_started,
+                ));
+            }
+
+            let Some((peer_id, outcome)) = inflight.next().await else {
+                break;
             };
 
             match outcome {
-                RemotePrepareOutcome::Prepared(bindings_by_task) => {
+                Ok(RemotePrepareOutcome::Prepared(bindings_by_task)) => {
+                    let peer_plans = &grouped[&peer_id];
                     let (reservation, peer_prepared_plans) = match self.build_prepared_remote_plans(
                         peer_id,
                         peer_plans,
@@ -577,8 +603,12 @@ impl WorkloadManager {
                     ) {
                         Ok(prepared) => prepared,
                         Err(err) => {
-                            self.abort_remote_leases(&reservations).await;
-                            return Err(ExecutionError::Fatal(err));
+                            if first_failure.is_none() {
+                                first_failure = Some(RemotePrepareFailure::Execution(
+                                    ExecutionError::Fatal(err),
+                                ));
+                            }
+                            continue;
                         }
                     };
 
@@ -588,19 +618,31 @@ impl WorkloadManager {
                         .remote_prepare_feedback
                         .clear_success(peer_id);
                 }
-                RemotePrepareOutcome::Rejected(rejection) => {
-                    let rejection_message =
-                        remote_prepare_rejection_message(peer_id, "lease prepare", &rejection);
-                    self.abort_remote_leases(&reservations).await;
-                    if let Err(err) = self
-                        .apply_remote_prepare_rejection(peer_id, rejection)
-                        .await
-                    {
-                        return Err(ExecutionError::Fatal(err));
+                Ok(RemotePrepareOutcome::Rejected(rejection)) => {
+                    if first_failure.is_none() {
+                        first_failure = Some(RemotePrepareFailure::Rejection {
+                            peer_id,
+                            operation: "lease prepare",
+                            rejection,
+                        });
                     }
-                    return Err(ExecutionError::Retry(anyhow::anyhow!(rejection_message)));
                 }
-            };
+                Err(err) => {
+                    if matches!(&err, ExecutionError::Retry(_)) {
+                        self.local_state
+                            .remote_prepare_feedback
+                            .record_retryable_failure(peer_id);
+                    }
+                    if first_failure.is_none() {
+                        first_failure = Some(RemotePrepareFailure::Execution(err));
+                    }
+                }
+            }
+        }
+
+        if let Some(failure) = first_failure {
+            self.abort_remote_leases(&reservations).await;
+            self.finish_remote_prepare_failure(failure).await?;
         }
 
         Ok((reservations, prepared_plans))
@@ -635,42 +677,37 @@ impl WorkloadManager {
             plans.len(),
         );
 
+        let parallelism = remote_admission_parallelism();
+        let batch_started = Instant::now();
+        let mut first_failure = None;
         let mut peer_ids = grouped.keys().copied().collect::<Vec<_>>();
         peer_ids.sort_unstable();
-        for peer_id in peer_ids {
-            let peer_plans = &grouped[&peer_id];
-            let scheduler_client = match self.remote_scheduler_client(peer_id).await {
-                Ok(client) => client,
-                Err(err) => {
-                    self.local_state
-                        .remote_prepare_feedback
-                        .record_retryable_failure(peer_id);
-                    self.abort_remote_lease_groups(group_id, &reservations)
-                        .await;
-                    return Err(ExecutionError::Retry(err));
-                }
-            };
+        let mut pending_peers = peer_ids.into_iter();
+        let mut inflight = FuturesUnordered::new();
 
-            crate::observability::metrics::record_remote_prepare_peer("gang", peer_plans.len());
-            let outcome = match self
-                .send_prepare_lease_group_request(&scheduler_client, group_id, ttl_ms, peer_plans)
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    self.abort_remote_lease_groups(group_id, &reservations)
-                        .await;
-                    if matches!(&err, ExecutionError::Retry(_)) {
-                        self.local_state
-                            .remote_prepare_feedback
-                            .record_retryable_failure(peer_id);
-                    }
-                    return Err(err);
-                }
+        loop {
+            while first_failure.is_none() && inflight.len() < parallelism {
+                let Some(peer_id) = pending_peers.next() else {
+                    break;
+                };
+                let peer_plans = &grouped[&peer_id];
+                crate::observability::metrics::record_remote_prepare_peer("gang", peer_plans.len());
+                inflight.push(self.prepare_group_remote_peer(
+                    peer_id,
+                    group_id,
+                    ttl_ms,
+                    peer_plans,
+                    batch_started,
+                ));
+            }
+
+            let Some((peer_id, outcome)) = inflight.next().await else {
+                break;
             };
 
             match outcome {
-                RemotePrepareOutcome::Prepared(bindings_by_task) => {
+                Ok(RemotePrepareOutcome::Prepared(bindings_by_task)) => {
+                    let peer_plans = &grouped[&peer_id];
                     let group_reservation =
                         remote_group_reservation_from_bindings(&bindings_by_task);
                     let (_, peer_prepared_plans) = match self.build_prepared_remote_plans(
@@ -680,9 +717,12 @@ impl WorkloadManager {
                     ) {
                         Ok(prepared) => prepared,
                         Err(err) => {
-                            self.abort_remote_lease_groups(group_id, &reservations)
-                                .await;
-                            return Err(ExecutionError::Fatal(err));
+                            if first_failure.is_none() {
+                                first_failure = Some(RemotePrepareFailure::Execution(
+                                    ExecutionError::Fatal(err),
+                                ));
+                            }
+                            continue;
                         }
                     };
 
@@ -692,26 +732,121 @@ impl WorkloadManager {
                         .remote_prepare_feedback
                         .clear_success(peer_id);
                 }
-                RemotePrepareOutcome::Rejected(rejection) => {
-                    let rejection_message = remote_prepare_rejection_message(
-                        peer_id,
-                        "group lease prepare",
-                        &rejection,
-                    );
-                    self.abort_remote_lease_groups(group_id, &reservations)
-                        .await;
-                    if let Err(err) = self
-                        .apply_remote_prepare_rejection(peer_id, rejection)
-                        .await
-                    {
-                        return Err(ExecutionError::Fatal(err));
+                Ok(RemotePrepareOutcome::Rejected(rejection)) => {
+                    if first_failure.is_none() {
+                        first_failure = Some(RemotePrepareFailure::Rejection {
+                            peer_id,
+                            operation: "group lease prepare",
+                            rejection,
+                        });
                     }
-                    return Err(ExecutionError::Retry(anyhow::anyhow!(rejection_message)));
+                }
+                Err(err) => {
+                    if matches!(&err, ExecutionError::Retry(_)) {
+                        self.local_state
+                            .remote_prepare_feedback
+                            .record_retryable_failure(peer_id);
+                    }
+                    if first_failure.is_none() {
+                        first_failure = Some(RemotePrepareFailure::Execution(err));
+                    }
                 }
             }
         }
 
+        if let Some(failure) = first_failure {
+            self.abort_remote_lease_groups(group_id, &reservations)
+                .await;
+            self.finish_remote_prepare_failure(failure).await?;
+        }
+
         Ok((reservations, prepared_plans))
+    }
+
+    /// Prepares one target peer through the normal remote-admission RPC path.
+    async fn prepare_incremental_remote_peer(
+        &self,
+        peer_id: Uuid,
+        peer_plans: &[&RemoteStartPlan],
+        batch_started: Instant,
+    ) -> (Uuid, Result<RemotePrepareOutcome, ExecutionError>) {
+        crate::observability::metrics::record_remote_prepare_queue_delay(
+            "incremental",
+            batch_started.elapsed(),
+        );
+        let started = Instant::now();
+        let result = match self.remote_scheduler_client(peer_id).await {
+            Ok(scheduler_client) => {
+                self.send_prepare_leases_request(&scheduler_client, peer_plans)
+                    .await
+            }
+            Err(err) => Err(ExecutionError::Retry(err)),
+        };
+        crate::observability::metrics::record_remote_prepare_latency(
+            "incremental",
+            remote_prepare_result_label(&result),
+            started.elapsed(),
+        );
+        (peer_id, result)
+    }
+
+    /// Prepares one target peer through the gang-admission group RPC path.
+    async fn prepare_group_remote_peer(
+        &self,
+        peer_id: Uuid,
+        group_id: Uuid,
+        ttl_ms: u64,
+        peer_plans: &[&RemoteStartPlan],
+        batch_started: Instant,
+    ) -> (Uuid, Result<RemotePrepareOutcome, ExecutionError>) {
+        crate::observability::metrics::record_remote_prepare_queue_delay(
+            "gang",
+            batch_started.elapsed(),
+        );
+        let started = Instant::now();
+        let result = match self.remote_scheduler_client(peer_id).await {
+            Ok(scheduler_client) => {
+                self.send_prepare_lease_group_request(
+                    &scheduler_client,
+                    group_id,
+                    ttl_ms,
+                    peer_plans,
+                )
+                .await
+            }
+            Err(err) => Err(ExecutionError::Retry(err)),
+        };
+        crate::observability::metrics::record_remote_prepare_latency(
+            "gang",
+            remote_prepare_result_label(&result),
+            started.elapsed(),
+        );
+        (peer_id, result)
+    }
+
+    /// Applies the first remote prepare failure after already-started peers have drained.
+    async fn finish_remote_prepare_failure(
+        &self,
+        failure: RemotePrepareFailure,
+    ) -> Result<(), ExecutionError> {
+        match failure {
+            RemotePrepareFailure::Execution(err) => Err(err),
+            RemotePrepareFailure::Rejection {
+                peer_id,
+                operation,
+                rejection,
+            } => {
+                let rejection_message =
+                    remote_prepare_rejection_message(peer_id, operation, &rejection);
+                if let Err(err) = self
+                    .apply_remote_prepare_rejection(peer_id, rejection)
+                    .await
+                {
+                    return Err(ExecutionError::Fatal(err));
+                }
+                Err(ExecutionError::Retry(anyhow::anyhow!(rejection_message)))
+            }
+        }
     }
 
     /// Opens the remote scheduler capability for a peer before sending reservation requests.
@@ -897,6 +1032,16 @@ impl WorkloadManager {
         &self,
         reservations: &HashMap<Uuid, RemoteReservation>,
     ) {
+        let lease_count: usize = reservations
+            .values()
+            .map(|reservation| reservation.leases.len())
+            .sum();
+        crate::observability::metrics::record_remote_prepare_abort(
+            "incremental",
+            reservations.len(),
+            lease_count,
+        );
+
         for (peer_id, reservation) in reservations {
             let session = match self.remote_session(*peer_id).await {
                 Ok(session) => session,
@@ -1014,6 +1159,16 @@ impl WorkloadManager {
         group_id: Uuid,
         reservations: &HashMap<Uuid, RemoteGroupReservation>,
     ) {
+        let lease_count: usize = reservations
+            .values()
+            .map(|reservation| reservation.leases.len())
+            .sum();
+        crate::observability::metrics::record_remote_prepare_abort(
+            "gang",
+            reservations.len(),
+            lease_count,
+        );
+
         let mut peer_ids = reservations.keys().copied().collect::<Vec<_>>();
         peer_ids.sort_unstable();
         for peer_id in peer_ids {

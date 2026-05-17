@@ -144,6 +144,37 @@ pub fn record_remote_prepare_peer(mode: &'static str, plans: usize) {
     counter!("mantissa_remote_prepare_peer_plans_total", "mode" => mode).increment(plans as u64);
 }
 
+/// Records how long one remote prepare peer waited before entering the bounded RPC window.
+pub fn record_remote_prepare_queue_delay(mode: &'static str, delay: Duration) {
+    gauge!("mantissa_remote_prepare_last_queue_delay_seconds", "mode" => mode)
+        .set(delay.as_secs_f64());
+}
+
+/// Records the observed duration and outcome of one per-peer remote prepare RPC.
+pub fn record_remote_prepare_latency(mode: &'static str, result: &'static str, latency: Duration) {
+    counter!(
+        "mantissa_remote_prepare_peer_results_total",
+        "mode" => mode,
+        "result" => result
+    )
+    .increment(1);
+    gauge!(
+        "mantissa_remote_prepare_last_latency_seconds",
+        "mode" => mode,
+        "result" => result
+    )
+    .set(latency.as_secs_f64());
+}
+
+/// Records prepared remote leases aborted after an admission attempt fails.
+pub fn record_remote_prepare_abort(mode: &'static str, peers: usize, leases: usize) {
+    if peers == 0 && leases == 0 {
+        return;
+    }
+    counter!("mantissa_remote_prepare_abort_peers_total", "mode" => mode).increment(peers as u64);
+    counter!("mantissa_remote_prepare_abort_leases_total", "mode" => mode).increment(leases as u64);
+}
+
 /// Records one scheduler assignment before local and remote reservations start.
 pub fn record_workload_assignment_plan(
     mode: &'static str,
@@ -585,6 +616,31 @@ fn describe_metrics() {
         "mantissa_remote_prepare_peer_plans_total",
         Unit::Count,
         "Workload plans sent through per-peer remote scheduler prepare RPCs."
+    );
+    describe_gauge!(
+        "mantissa_remote_prepare_last_queue_delay_seconds",
+        Unit::Seconds,
+        "Delay before a remote scheduler prepare RPC entered the bounded admission window."
+    );
+    describe_counter!(
+        "mantissa_remote_prepare_peer_results_total",
+        Unit::Count,
+        "Per-peer remote scheduler prepare RPC outcomes."
+    );
+    describe_gauge!(
+        "mantissa_remote_prepare_last_latency_seconds",
+        Unit::Seconds,
+        "Duration of the most recent per-peer remote scheduler prepare RPC."
+    );
+    describe_counter!(
+        "mantissa_remote_prepare_abort_peers_total",
+        Unit::Count,
+        "Remote prepare peers aborted after failed admission attempts."
+    );
+    describe_counter!(
+        "mantissa_remote_prepare_abort_leases_total",
+        Unit::Count,
+        "Prepared remote leases aborted after failed admission attempts."
     );
     describe_counter!(
         "mantissa_workload_assignment_plans_total",
