@@ -89,14 +89,19 @@ pub(super) fn should_restart_missing_slot_immediately(
 /// Returns true when an absent task row may still be ordinary deployment propagation lag.
 ///
 /// During deployment, the service owner can assign all replica IDs before every slot owner has
-/// received the target workload rows through direct delivery or MST repair. Treating an absent row
-/// as a confirmed loss at that point can create duplicate replacements. Concrete terminal rows and
-/// down-node evidence are handled separately. This guard only covers the absence of local evidence.
+/// received the target workload rows through direct assignment delivery or workload MST sync.
+/// Treating an absent row as confirmed loss at that point can create duplicate replacements.
+/// Concrete terminal rows and down-node evidence are handled separately, because those are real
+/// evidence that the assigned slot cannot keep making progress on its current target.
 pub(super) fn deploying_missing_slot_is_unknown(
     status: ServiceStatus,
     task: Option<&WorkloadSpec>,
+    target_node_id: Uuid,
+    health_snapshot: &HashMap<Uuid, HealthStatus>,
 ) -> bool {
-    status == ServiceStatus::Deploying && task.is_none()
+    status == ServiceStatus::Deploying
+        && task.is_none()
+        && !node_is_down(target_node_id, health_snapshot)
 }
 
 /// Returns true when a task state is terminal enough to justify an immediate deployment restart.

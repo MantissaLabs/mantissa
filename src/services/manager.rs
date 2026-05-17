@@ -73,6 +73,14 @@ const DEFAULT_SERVICE_READY_STABILITY: Duration = Duration::from_secs(8);
 const SERVICE_RESCHEDULE_TICK_SECS: u64 = 2;
 /// Minimum delay before a missing replica is rescheduled to avoid transient gossip gaps.
 const SERVICE_SLOT_MISSING_GRACE_SECS: u64 = 6;
+/// Minimum delay before an absent deploying replica row is treated as a real missing slot.
+///
+/// Large deployments intentionally suppress routine workload gossip and rely on
+/// direct assignment plus workload MST sync for visibility. A slot owner may
+/// therefore observe the service assignment before it observes the target row.
+/// This longer deployment-only window prevents that lag from creating duplicate
+/// replacements. Terminal rows and down target nodes bypass this window.
+const SERVICE_DEPLOYING_SLOT_VISIBILITY_GRACE_SECS: u64 = 120;
 /// Minimum age (in seconds) before a running task is eligible for rebalancing.
 const SERVICE_REBALANCE_MIN_AGE_SECS: i64 = 20;
 /// Cooldown window between rebalance attempts for the same slot.

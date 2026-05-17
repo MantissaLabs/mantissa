@@ -9,8 +9,8 @@ use super::state::{
     task_age_allows_rebalance, task_state_healthy, task_state_rebalanceable,
 };
 use super::{
-    SERVICE_ENABLE_PROACTIVE_REBALANCE, SERVICE_REBALANCE_COOLDOWN_SECS,
-    SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController,
+    SERVICE_DEPLOYING_SLOT_VISIBILITY_GRACE_SECS, SERVICE_ENABLE_PROACTIVE_REBALANCE,
+    SERVICE_REBALANCE_COOLDOWN_SECS, SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController,
 };
 use crate::services::ownership::{
     ReplicaSlot, SlotKey, build_replica_slots, select_slot_owner, select_task_owner,
@@ -264,19 +264,63 @@ impl ServiceController {
                     "slot task is assigned to a draining node; forcing evacuation"
                 );
             }
-            if deploying_missing_slot_is_unknown(spec.status(), task) {
+            let deployment_visibility_elapsed = if deploying_missing_slot_is_unknown(
+                spec.status(),
+                task,
+                desired_node,
+                env.health_snapshot,
+            ) {
+                if !self
+                    .slot_missing_elapsed_after(
+                        key,
+                        Duration::from_secs(SERVICE_DEPLOYING_SLOT_VISIBILITY_GRACE_SECS),
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        target: "services",
+                        service = %spec.service_name,
+                        template = %slot.template.name,
+                        replica = slot.replica,
+                        task = %task_id,
+                        target = %desired_node,
+                        visibility_grace_secs = SERVICE_DEPLOYING_SLOT_VISIBILITY_GRACE_SECS,
+                        "slot task row is not locally visible during deployment; waiting for direct assignment delivery or workload MST sync"
+                    );
+                    return Ok(());
+                }
+
                 tracing::debug!(
                     target: "services",
                     service = %spec.service_name,
                     template = %slot.template.name,
                     replica = slot.replica,
                     task = %task_id,
-                    "slot task row is not locally visible during deployment; waiting for direct delivery or sync repair"
+                    target = %desired_node,
+                    visibility_grace_secs = SERVICE_DEPLOYING_SLOT_VISIBILITY_GRACE_SECS,
+                    "deployment visibility grace elapsed for absent slot task; allowing replacement"
                 );
-                self.clear_slot_missing(key).await;
-                return Ok(());
+                true
+            } else {
+                false
+            };
+            let deploying_absent_target_down = spec.status() == ServiceStatus::Deploying
+                && task.is_none()
+                && node_is_down(desired_node, env.health_snapshot);
+            if deploying_absent_target_down {
+                tracing::debug!(
+                    target: "services",
+                    service = %spec.service_name,
+                    template = %slot.template.name,
+                    replica = slot.replica,
+                    task = %task_id,
+                    target = %desired_node,
+                    "deployment slot task is absent and its assigned target is down; allowing replacement without visibility grace"
+                );
             }
             let restart_immediately = task_on_draining_node
+                || deploying_absent_target_down
+                || deployment_visibility_elapsed
                 || should_restart_missing_slot_immediately(spec.status(), task);
             if restart_immediately || self.slot_missing_elapsed(key).await {
                 self.start_slot_task(
@@ -798,14 +842,23 @@ impl ServiceController {
         })
     }
 
-    /// Records that a slot appears missing and returns true once the grace period elapses.
+    /// Records that a slot appears missing and returns true once the normal grace period elapses.
     async fn slot_missing_elapsed(&self, key: &SlotKey) -> bool {
+        self.slot_missing_elapsed_after(key, Duration::from_secs(SERVICE_SLOT_MISSING_GRACE_SECS))
+            .await
+    }
+
+    /// Records that a slot appears missing and returns true once the requested grace elapses.
+    ///
+    /// Slot reconciliation has two different absence windows. Steady-state
+    /// repair uses the short grace period, while an absent row during deployment
+    /// waits longer because direct assignment and workload MST sync can lag the
+    /// service spec assignment on large rollouts.
+    async fn slot_missing_elapsed_after(&self, key: &SlotKey, grace: Duration) -> bool {
         let now = Instant::now();
         let mut guard = self.slot_missing_since.lock().await;
         match guard.get(key) {
-            Some(started) => {
-                now.duration_since(*started) >= Duration::from_secs(SERVICE_SLOT_MISSING_GRACE_SECS)
-            }
+            Some(started) => now.duration_since(*started) >= grace,
             None => {
                 guard.insert(key.clone(), now);
                 false

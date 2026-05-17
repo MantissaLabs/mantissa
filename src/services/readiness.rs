@@ -1,6 +1,8 @@
 use super::ServiceController;
 use crate::services::types::{ServiceEvent, ServiceRolloutState, ServiceSpecValue, ServiceStatus};
-use crate::workload::model::{ServiceGenerationProgressRecord, WorkloadPhase};
+use crate::workload::model::{
+    ServiceGenerationProgressCounts, ServiceGenerationProgressRecord, WorkloadPhase,
+};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -481,7 +483,14 @@ async fn poll_service_attempt(
     }
 }
 
-/// Returns synthetic all-running readiness states when compact progress is complete.
+/// Returns synthetic readiness states from compact service generation progress.
+///
+/// Large service deployments suppress routine full-row workload gossip, so the
+/// generation owner may receive compact per-node progress before it can inspect
+/// every replica row directly. This projection lets readiness track partial
+/// running progress and in-flight work from those compact records. It uses the
+/// service replica ids only as stable labels for the existing readiness
+/// accounting; the lifecycle counts come from the aggregate progress rows.
 fn readiness_states_from_progress(
     current: &ServiceSpecValue,
     progress: &[ServiceGenerationProgressRecord],
@@ -491,27 +500,73 @@ fn readiness_states_from_progress(
     }
 
     let expected = current.replica_ids.len() as u64;
-    let mut observed = 0u64;
-    let mut running = 0u64;
+    let mut counts = ServiceGenerationProgressCounts::default();
     for record in progress {
         if record.service_id != current.id || record.service_epoch != current.service_epoch {
             continue;
         }
-        observed = observed.saturating_add(record.observed_total());
-        running = running.saturating_add(record.counts.running);
+        counts.observed = counts.observed.saturating_add(record.counts.observed);
+        counts.running = counts.running.saturating_add(record.counts.running);
+        counts.starting = counts.starting.saturating_add(record.counts.starting);
+        counts.blocked = counts.blocked.saturating_add(record.counts.blocked);
+        counts.stopping = counts.stopping.saturating_add(record.counts.stopping);
+        counts.terminal = counts.terminal.saturating_add(record.counts.terminal);
     }
 
-    if expected == 0 || observed != expected || running != expected {
+    if expected == 0 || counts.observed == 0 {
         return None;
     }
 
-    Some(
-        current
-            .replica_ids
-            .iter()
-            .map(|task_id| (*task_id, Some(WorkloadPhase::Running)))
-            .collect(),
-    )
+    let expected = expected as usize;
+    let mut phases = Vec::with_capacity(expected);
+    push_compact_progress_phases(
+        &mut phases,
+        counts.running,
+        WorkloadPhase::Running,
+        expected,
+    );
+    push_compact_progress_phases(
+        &mut phases,
+        counts.starting,
+        WorkloadPhase::Creating,
+        expected,
+    );
+    push_compact_progress_phases(
+        &mut phases,
+        counts.blocked,
+        WorkloadPhase::VolumeUnavailable,
+        expected,
+    );
+    push_compact_progress_phases(
+        &mut phases,
+        counts.stopping,
+        WorkloadPhase::Stopping,
+        expected,
+    );
+    push_compact_progress_phases(
+        &mut phases,
+        counts.terminal,
+        WorkloadPhase::Failed,
+        expected,
+    );
+
+    let mut states = Vec::with_capacity(expected);
+    for (idx, task_id) in current.replica_ids.iter().take(expected).enumerate() {
+        states.push((*task_id, phases.get(idx).cloned()));
+    }
+    Some(states)
+}
+
+/// Appends synthetic lifecycle phases from compact progress while respecting desired count.
+fn push_compact_progress_phases(
+    phases: &mut Vec<WorkloadPhase>,
+    count: u64,
+    phase: WorkloadPhase,
+    expected: usize,
+) {
+    let remaining = expected.saturating_sub(phases.len());
+    let take = remaining.min(count as usize);
+    phases.extend(std::iter::repeat_n(phase, take));
 }
 
 /// Records terminal task transitions and returns the task that exceeded deployment failure budget.
@@ -700,6 +755,129 @@ fn format_task_state_summary(states: &[(Uuid, Option<WorkloadPhase>)]) -> String
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Builds a service snapshot with the requested number of assigned replica ids.
+    fn service_with_replica_ids(count: usize) -> ServiceSpecValue {
+        let mut spec = ServiceSpecValue::new(
+            Uuid::new_v4(),
+            "manifest",
+            "readiness-progress-test",
+            Vec::new(),
+            (0..count).map(|_| Uuid::new_v4()).collect(),
+        );
+        spec.service_epoch = 7;
+        spec.set_status(ServiceStatus::Deploying);
+        spec
+    }
+
+    /// Builds one compact progress row for the readiness unit tests.
+    fn progress_record(
+        spec: &ServiceSpecValue,
+        node_id: Uuid,
+        counts: ServiceGenerationProgressCounts,
+    ) -> ServiceGenerationProgressRecord {
+        let mut record = ServiceGenerationProgressRecord::new(
+            spec.id,
+            spec.service_name.clone(),
+            spec.service_epoch,
+            node_id,
+            format!("node-{node_id}"),
+            "2026-01-01T00:00:00Z",
+        );
+        record.counts = counts;
+        record
+    }
+
+    /// Ensures partial compact progress is enough to keep readiness in-flight.
+    #[test]
+    fn partial_progress_projects_inflight_readiness_states() {
+        let spec = service_with_replica_ids(4);
+        let progress = progress_record(
+            &spec,
+            Uuid::new_v4(),
+            ServiceGenerationProgressCounts {
+                observed: 3,
+                running: 2,
+                starting: 1,
+                ..ServiceGenerationProgressCounts::default()
+            },
+        );
+
+        let states = readiness_states_from_progress(&spec, &[progress])
+            .expect("partial progress should produce readiness states");
+        assert_eq!(states.len(), 4);
+        assert_eq!(
+            states
+                .iter()
+                .filter(|(_, state)| matches!(state, Some(WorkloadPhase::Running)))
+                .count(),
+            2
+        );
+        assert_eq!(
+            states
+                .iter()
+                .filter(|(_, state)| matches!(state, Some(WorkloadPhase::Creating)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            states.iter().filter(|(_, state)| state.is_none()).count(),
+            1
+        );
+        assert!(matches!(
+            classify_readiness_states(&states),
+            ReadinessClass::Inflight
+        ));
+    }
+
+    /// Ensures complete compact running progress still acknowledges readiness.
+    #[test]
+    fn complete_progress_projects_all_running_readiness_states() {
+        let spec = service_with_replica_ids(3);
+        let progress = progress_record(
+            &spec,
+            Uuid::new_v4(),
+            ServiceGenerationProgressCounts {
+                observed: 3,
+                running: 3,
+                ..ServiceGenerationProgressCounts::default()
+            },
+        );
+
+        let states = readiness_states_from_progress(&spec, &[progress])
+            .expect("complete progress should produce readiness states");
+        assert_eq!(states.len(), 3);
+        assert!(
+            states
+                .iter()
+                .all(|(_, state)| matches!(state, Some(WorkloadPhase::Running)))
+        );
+        assert!(matches!(
+            classify_readiness_states(&states),
+            ReadinessClass::AllRunning
+        ));
+    }
+
+    /// Ensures progress from another generation is ignored instead of polluting readiness.
+    #[test]
+    fn progress_from_other_generation_is_ignored() {
+        let spec = service_with_replica_ids(2);
+        let mut stale = progress_record(
+            &spec,
+            Uuid::new_v4(),
+            ServiceGenerationProgressCounts {
+                observed: 2,
+                running: 2,
+                ..ServiceGenerationProgressCounts::default()
+            },
+        );
+        stale.service_epoch = stale.service_epoch.saturating_add(1);
+
+        assert!(
+            readiness_states_from_progress(&spec, &[stale]).is_none(),
+            "stale progress must not affect the active generation"
+        );
+    }
 
     /// Ensures the progress deadline extends only when running replicas increase.
     #[test]

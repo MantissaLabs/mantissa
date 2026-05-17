@@ -1258,25 +1258,43 @@ fn deployment_keeps_missing_slot_grace_for_non_terminal_states() {
 /// Ensures absent deployment rows stay unknown while assignment propagation can still be lagging.
 #[test]
 fn deploying_treats_absent_slot_rows_as_unknown() {
+    let target_node = Uuid::new_v4();
     let pending = make_task(
         Uuid::new_v4(),
-        Uuid::new_v4(),
+        target_node,
         "demo",
         "api",
         WorkloadPhase::Pending,
     );
+    let healthy_targets = HashMap::from([(target_node, HealthStatus::Alive)]);
+    let down_targets = HashMap::from([(target_node, HealthStatus::Down)]);
 
     assert!(deploying_missing_slot_is_unknown(
         ServiceStatus::Deploying,
-        None
+        None,
+        target_node,
+        &healthy_targets
     ));
+    assert!(
+        !deploying_missing_slot_is_unknown(
+            ServiceStatus::Deploying,
+            None,
+            target_node,
+            &down_targets
+        ),
+        "a down target is evidence that the slot cannot keep progressing there"
+    );
     assert!(!deploying_missing_slot_is_unknown(
         ServiceStatus::Deploying,
-        Some(&pending)
+        Some(&pending),
+        target_node,
+        &healthy_targets
     ));
     assert!(!deploying_missing_slot_is_unknown(
         ServiceStatus::Running,
-        None
+        None,
+        target_node,
+        &healthy_targets
     ));
 }
 
