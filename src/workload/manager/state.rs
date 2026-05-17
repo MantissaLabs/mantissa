@@ -23,8 +23,8 @@ use crate::scheduler::{
 use crate::volumes::LocalVolumeAccessError;
 use crate::workload::model::{
     WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord, WorkloadAdmissionState,
-    WorkloadEvent, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStoreValue,
-    WorkloadValue, parse_workload_timestamp as parse_task_timestamp,
+    WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec,
+    WorkloadStoreValue, WorkloadValue, parse_workload_timestamp as parse_task_timestamp,
     select_best_admission_group_record, select_best_workload_value, workload_event_id,
 };
 use crate::workload::types::{
@@ -52,6 +52,71 @@ const IMAGE_PULL_RETRY_BASE_MS: u64 = 250;
 const IMAGE_PULL_RETRY_MAX_MS: u64 = 5_000;
 /// Random jitter added to each pull retry delay.
 const IMAGE_PULL_RETRY_JITTER_MS: u64 = 250;
+
+/// Bounded labels used when recording outbound workload gossip generation.
+struct WorkloadGossipMetricLabels {
+    event: &'static str,
+    representation: &'static str,
+    owner: &'static str,
+    phase: &'static str,
+}
+
+/// Classifies one workload event without using high-cardinality identifiers as labels.
+fn workload_gossip_metric_labels(event: &WorkloadEvent) -> WorkloadGossipMetricLabels {
+    match event {
+        WorkloadEvent::UpsertSpec(spec) => WorkloadGossipMetricLabels {
+            event: "upsert_spec",
+            representation: "full_spec",
+            owner: workload_owner_label(spec.owner.as_ref()),
+            phase: workload_phase_label(&spec.state),
+        },
+        WorkloadEvent::UpsertStatus(status) => WorkloadGossipMetricLabels {
+            event: "upsert_status",
+            representation: "status",
+            owner: workload_owner_label(status.owner.as_ref()),
+            phase: workload_phase_label(&status.state),
+        },
+        WorkloadEvent::Remove { .. } => WorkloadGossipMetricLabels {
+            event: "remove",
+            representation: "remove",
+            owner: "unknown",
+            phase: "n/a",
+        },
+        WorkloadEvent::UpsertAdmissionGroup(_) => WorkloadGossipMetricLabels {
+            event: "upsert_admission_group",
+            representation: "admission_group",
+            owner: "admission_group",
+            phase: "n/a",
+        },
+    }
+}
+
+/// Converts a workload owner into a bounded metrics label.
+fn workload_owner_label(owner: Option<&WorkloadOwner>) -> &'static str {
+    match owner {
+        Some(WorkloadOwner::ServiceReplica(_)) => "service",
+        Some(WorkloadOwner::JobAttempt(_)) => "job",
+        Some(WorkloadOwner::AgentRun(_)) => "agent",
+        None => "none",
+    }
+}
+
+/// Converts a workload lifecycle phase into a bounded metrics label.
+fn workload_phase_label(phase: &WorkloadPhase) -> &'static str {
+    match phase {
+        WorkloadPhase::Pending => "pending",
+        WorkloadPhase::Pulling => "pulling",
+        WorkloadPhase::Creating => "creating",
+        WorkloadPhase::VolumeUnavailable => "volume_unavailable",
+        WorkloadPhase::Running => "running",
+        WorkloadPhase::Paused => "paused",
+        WorkloadPhase::Stopping => "stopping",
+        WorkloadPhase::Stopped => "stopped",
+        WorkloadPhase::Failed => "failed",
+        WorkloadPhase::Exited(_) => "exited",
+        WorkloadPhase::Unknown => "unknown",
+    }
+}
 
 impl WorkloadManager {
     /// Validates a task marked as running and synchronizes local runtime cache state.
@@ -1144,6 +1209,14 @@ impl WorkloadManager {
 
     /// Records the latest outbound gossip event for one task id inside the local dirty buffer.
     async fn buffer_gossip_event(&self, event: WorkloadEvent) {
+        let labels = workload_gossip_metric_labels(&event);
+        crate::observability::metrics::record_workload_gossip_event(
+            labels.event,
+            labels.representation,
+            labels.owner,
+            labels.phase,
+        );
+
         let task_id = workload_event_id(&event);
         let mut dirty = self.local_state.dirty_gossip_workloads.lock().await;
         match dirty.get_mut(&task_id) {
@@ -1169,6 +1242,9 @@ impl WorkloadManager {
             return Ok(false);
         }
 
+        let pending_count = pending.len();
+        let mut emitted_count = 0usize;
+        let mut retained_count = 0usize;
         let mut retained = HashMap::new();
         for (task_id, mut record) in pending {
             for event in record.events() {
@@ -1180,11 +1256,19 @@ impl WorkloadManager {
                     .send(message)
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to flush workload gossip: {e}"))?;
+                emitted_count += 1;
             }
             if record.retain_after_flush() {
+                retained_count += 1;
                 retained.insert(task_id, record);
             }
         }
+
+        crate::observability::metrics::record_workload_gossip_flush(
+            pending_count,
+            emitted_count,
+            retained_count,
+        );
 
         let mut dirty = self.local_state.dirty_gossip_workloads.lock().await;
         for (task_id, record) in retained {

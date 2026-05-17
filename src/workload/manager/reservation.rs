@@ -526,6 +526,11 @@ impl WorkloadManager {
         for plan in plans {
             grouped.entry(plan.peer_id).or_default().push(plan);
         }
+        crate::observability::metrics::record_remote_prepare_batch(
+            "incremental",
+            grouped.len(),
+            plans.len(),
+        );
 
         let mut peer_ids = grouped.keys().copied().collect::<Vec<_>>();
         peer_ids.sort_unstable();
@@ -542,6 +547,10 @@ impl WorkloadManager {
                 }
             };
 
+            crate::observability::metrics::record_remote_prepare_peer(
+                "incremental",
+                peer_plans.len(),
+            );
             let outcome = match self
                 .send_prepare_leases_request(&scheduler_client, peer_plans)
                 .await
@@ -619,6 +628,11 @@ impl WorkloadManager {
         for plan in plans {
             grouped.entry(plan.peer_id).or_default().push(plan);
         }
+        crate::observability::metrics::record_remote_prepare_batch(
+            "gang",
+            grouped.len(),
+            plans.len(),
+        );
 
         let mut peer_ids = grouped.keys().copied().collect::<Vec<_>>();
         peer_ids.sort_unstable();
@@ -636,6 +650,7 @@ impl WorkloadManager {
                 }
             };
 
+            crate::observability::metrics::record_remote_prepare_peer("gang", peer_plans.len());
             let outcome = match self
                 .send_prepare_lease_group_request(&scheduler_client, group_id, ttl_ms, peer_plans)
                 .await

@@ -701,6 +701,18 @@ impl WorkloadManager {
                 .context("failed to validate local volumes for gang workload group")?;
 
             attempt += 1;
+            let remote_peer_count = assignment
+                .remote
+                .iter()
+                .map(|plan| plan.peer_id)
+                .collect::<HashSet<_>>()
+                .len();
+            crate::observability::metrics::record_workload_assignment_plan(
+                "gang",
+                assignment.local.len(),
+                assignment.remote.len(),
+                remote_peer_count,
+            );
 
             let local_version = assignment.local_version;
             let mut local_plans = assignment.local;
@@ -1345,6 +1357,18 @@ impl WorkloadManager {
                 .context("failed to bind local volumes for task batch")?;
 
             attempt += 1;
+            let remote_peer_count = assignment
+                .remote
+                .iter()
+                .map(|plan| plan.peer_id)
+                .collect::<HashSet<_>>()
+                .len();
+            crate::observability::metrics::record_workload_assignment_plan(
+                "incremental",
+                assignment.local.len(),
+                assignment.remote.len(),
+                remote_peer_count,
+            );
 
             let local_version = assignment.local_version;
             let mut local_plans = assignment.local;

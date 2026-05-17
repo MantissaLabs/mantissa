@@ -79,6 +79,69 @@ pub fn set_gossip_backlog(pending: usize, oldest_age: Duration) {
     gauge!("mantissa_gossip_outbound_oldest_age_seconds").set(oldest_age.as_secs_f64());
 }
 
+/// Records one workload event buffered for outbound gossip.
+pub fn record_workload_gossip_event(
+    event: &'static str,
+    representation: &'static str,
+    owner: &'static str,
+    phase: &'static str,
+) {
+    counter!(
+        "mantissa_workload_gossip_events_total",
+        "event" => event,
+        "representation" => representation,
+        "owner" => owner,
+        "phase" => phase
+    )
+    .increment(1);
+}
+
+/// Records one dirty workload gossip flush and the retained coverage work.
+pub fn record_workload_gossip_flush(records: usize, emitted: usize, retained: usize) {
+    counter!("mantissa_workload_gossip_flush_records_total").increment(records as u64);
+    counter!("mantissa_workload_gossip_emitted_messages_total").increment(emitted as u64);
+    counter!("mantissa_workload_gossip_retained_records_total").increment(retained as u64);
+    gauge!("mantissa_workload_gossip_last_flush_records").set(records as f64);
+    gauge!("mantissa_workload_gossip_last_flush_emitted_messages").set(emitted as f64);
+    gauge!("mantissa_workload_gossip_last_flush_retained_records").set(retained as f64);
+}
+
+/// Records the fanout size of one remote scheduler prepare batch.
+pub fn record_remote_prepare_batch(mode: &'static str, peers: usize, plans: usize) {
+    counter!("mantissa_remote_prepare_batches_total", "mode" => mode).increment(1);
+    counter!("mantissa_remote_prepare_target_peers_total", "mode" => mode).increment(peers as u64);
+    counter!("mantissa_remote_prepare_plans_total", "mode" => mode).increment(plans as u64);
+    gauge!("mantissa_remote_prepare_last_target_peers", "mode" => mode).set(peers as f64);
+    gauge!("mantissa_remote_prepare_last_plans", "mode" => mode).set(plans as f64);
+}
+
+/// Records one per-target remote scheduler prepare RPC payload size.
+pub fn record_remote_prepare_peer(mode: &'static str, plans: usize) {
+    counter!("mantissa_remote_prepare_peer_rpcs_total", "mode" => mode).increment(1);
+    counter!("mantissa_remote_prepare_peer_plans_total", "mode" => mode).increment(plans as u64);
+}
+
+/// Records one scheduler assignment before local and remote reservations start.
+pub fn record_workload_assignment_plan(
+    mode: &'static str,
+    local_plans: usize,
+    remote_plans: usize,
+    remote_peers: usize,
+) {
+    counter!("mantissa_workload_assignment_plans_total", "mode" => mode).increment(1);
+    counter!("mantissa_workload_assignment_local_plans_total", "mode" => mode)
+        .increment(local_plans as u64);
+    counter!("mantissa_workload_assignment_remote_plans_total", "mode" => mode)
+        .increment(remote_plans as u64);
+    counter!("mantissa_workload_assignment_remote_peers_total", "mode" => mode)
+        .increment(remote_peers as u64);
+    gauge!("mantissa_workload_assignment_last_local_plans", "mode" => mode).set(local_plans as f64);
+    gauge!("mantissa_workload_assignment_last_remote_plans", "mode" => mode)
+        .set(remote_plans as f64);
+    gauge!("mantissa_workload_assignment_last_remote_peers", "mode" => mode)
+        .set(remote_peers as f64);
+}
+
 /// Records one sync attempt outcome.
 pub fn record_sync_attempt(scope: &'static str, result: &'static str, reason: &'static str) {
     counter!(
@@ -424,6 +487,111 @@ fn describe_metrics() {
         "mantissa_gossip_outbound_oldest_age_seconds",
         Unit::Seconds,
         "Age of the oldest outbound gossip message at the latest gossip tick."
+    );
+    describe_counter!(
+        "mantissa_workload_gossip_events_total",
+        Unit::Count,
+        "Workload events buffered for outbound gossip by event kind and phase."
+    );
+    describe_counter!(
+        "mantissa_workload_gossip_flush_records_total",
+        Unit::Count,
+        "Dirty workload records drained by gossip flushes."
+    );
+    describe_counter!(
+        "mantissa_workload_gossip_emitted_messages_total",
+        Unit::Count,
+        "Concrete workload gossip messages emitted by dirty flushes."
+    );
+    describe_counter!(
+        "mantissa_workload_gossip_retained_records_total",
+        Unit::Count,
+        "Dirty workload records retained for extra coverage rounds after flush."
+    );
+    describe_gauge!(
+        "mantissa_workload_gossip_last_flush_records",
+        Unit::Count,
+        "Dirty workload records drained by the most recent gossip flush."
+    );
+    describe_gauge!(
+        "mantissa_workload_gossip_last_flush_emitted_messages",
+        Unit::Count,
+        "Concrete workload gossip messages emitted by the most recent flush."
+    );
+    describe_gauge!(
+        "mantissa_workload_gossip_last_flush_retained_records",
+        Unit::Count,
+        "Dirty workload records retained after the most recent flush."
+    );
+    describe_counter!(
+        "mantissa_remote_prepare_batches_total",
+        Unit::Count,
+        "Remote scheduler prepare batches started by workload scheduling."
+    );
+    describe_counter!(
+        "mantissa_remote_prepare_target_peers_total",
+        Unit::Count,
+        "Remote scheduler prepare target peers selected by workload scheduling."
+    );
+    describe_counter!(
+        "mantissa_remote_prepare_plans_total",
+        Unit::Count,
+        "Remote workload plans included in remote scheduler prepare batches."
+    );
+    describe_gauge!(
+        "mantissa_remote_prepare_last_target_peers",
+        Unit::Count,
+        "Remote scheduler target peers in the most recent prepare batch."
+    );
+    describe_gauge!(
+        "mantissa_remote_prepare_last_plans",
+        Unit::Count,
+        "Remote workload plans in the most recent prepare batch."
+    );
+    describe_counter!(
+        "mantissa_remote_prepare_peer_rpcs_total",
+        Unit::Count,
+        "Per-peer remote scheduler prepare RPCs attempted."
+    );
+    describe_counter!(
+        "mantissa_remote_prepare_peer_plans_total",
+        Unit::Count,
+        "Workload plans sent through per-peer remote scheduler prepare RPCs."
+    );
+    describe_counter!(
+        "mantissa_workload_assignment_plans_total",
+        Unit::Count,
+        "Workload scheduler assignments produced before reservation."
+    );
+    describe_counter!(
+        "mantissa_workload_assignment_local_plans_total",
+        Unit::Count,
+        "Local workload plans produced by scheduler assignments."
+    );
+    describe_counter!(
+        "mantissa_workload_assignment_remote_plans_total",
+        Unit::Count,
+        "Remote workload plans produced by scheduler assignments."
+    );
+    describe_counter!(
+        "mantissa_workload_assignment_remote_peers_total",
+        Unit::Count,
+        "Remote target peers produced by scheduler assignments."
+    );
+    describe_gauge!(
+        "mantissa_workload_assignment_last_local_plans",
+        Unit::Count,
+        "Local workload plans in the most recent scheduler assignment."
+    );
+    describe_gauge!(
+        "mantissa_workload_assignment_last_remote_plans",
+        Unit::Count,
+        "Remote workload plans in the most recent scheduler assignment."
+    );
+    describe_gauge!(
+        "mantissa_workload_assignment_last_remote_peers",
+        Unit::Count,
+        "Remote target peers in the most recent scheduler assignment."
     );
     describe_counter!(
         "mantissa_sync_attempts_total",

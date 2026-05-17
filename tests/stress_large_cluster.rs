@@ -1181,6 +1181,10 @@ async fn wait_for_service_task_count(
                 .as_ref()
                 .map(|spec| spec.replica_ids)
                 .unwrap_or(0);
+            let desired_deficit = expected.saturating_sub(count);
+            let desired_excess = count.saturating_sub(expected);
+            let extra_filtered_rows = count.saturating_sub(tracked_replica_ids);
+            let extra_service_rows = all_service_tasks.len().saturating_sub(tracked_replica_ids);
 
             let scheduler = node
                 .scheduler_summary()
@@ -1195,7 +1199,7 @@ async fn wait_for_service_task_count(
                 .unwrap_or_else(|| "local_slots=<unavailable>".to_string());
 
             eprintln!(
-                "stress: task progress {count}/{expected} (best={best}, all_service_tasks={}, replica_ids={}, service_status={service_status:?}, states={by_state:?}, running_by_node={running_by_node:?}, pending_by_node={pending_by_node:?}, {scheduler})",
+                "stress: task progress {count}/{expected} filter={filter:?} (best={best}, desired_deficit={desired_deficit}, desired_excess={desired_excess}, extra_filtered_rows={extra_filtered_rows}, all_service_tasks={}, replica_ids={}, extra_service_rows={extra_service_rows}, service_status={service_status:?}, states={by_state:?}, running_by_node={running_by_node:?}, pending_by_node={pending_by_node:?}, {scheduler})",
                 all_service_tasks.len(),
                 tracked_replica_ids,
             );
