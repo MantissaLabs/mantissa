@@ -1,6 +1,7 @@
 use super::admission::*;
 use super::ownership::{
-    build_replica_slots, compute_slot_targets, select_slot_owner, select_task_owner,
+    build_replica_slots, build_service_deployment_shards, compute_slot_targets,
+    select_generation_owner, select_slot_owner, select_task_owner,
 };
 use super::placement::*;
 use super::readiness::{ReadinessClass, classify_readiness_states};
@@ -21,7 +22,7 @@ use crate::workload::model::{
     ExecutionPlatform, WorkloadAdmissionState, WorkloadOwner, WorkloadServiceMetadata,
 };
 use crate::workload::types::{ExecutionSpec, ResolvedExecutionSpec};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -522,6 +523,68 @@ fn generation_owner_is_deterministic() {
     let owner = select_generation_owner(service_id, 7, &candidates).expect("owner");
     let owner_reversed = select_generation_owner(service_id, 7, &reversed).expect("owner");
     assert_eq!(owner, owner_reversed);
+}
+
+/// Ensures deployment shard planning is deterministic across input orderings.
+#[test]
+fn service_deployment_shards_are_deterministic() {
+    let service_id = Uuid::from_u128(42);
+    let targets = (1u128..=10).map(Uuid::from_u128).collect::<Vec<_>>();
+    let mut reversed_targets = targets.clone();
+    reversed_targets.reverse();
+    let mut eligible = targets.clone();
+    eligible.push(Uuid::from_u128(100));
+    let mut reversed_eligible = eligible.clone();
+    reversed_eligible.reverse();
+
+    let shards = build_service_deployment_shards(service_id, 9, &eligible, &targets, 3);
+    let reversed =
+        build_service_deployment_shards(service_id, 9, &reversed_eligible, &reversed_targets, 3);
+
+    assert_eq!(shards, reversed);
+}
+
+/// Ensures deployment shards partition every target node exactly once.
+#[test]
+fn service_deployment_shards_partition_targets_once() {
+    let service_id = Uuid::from_u128(43);
+    let targets = (1u128..=10).map(Uuid::from_u128).collect::<Vec<_>>();
+    let shards = build_service_deployment_shards(service_id, 2, &targets, &targets, 4);
+
+    assert_eq!(shards.len(), 3);
+    assert!(shards.iter().all(|shard| shard.target_node_ids.len() <= 4));
+
+    let mut seen = HashSet::new();
+    for shard in &shards {
+        for target in &shard.target_node_ids {
+            assert!(seen.insert(*target), "target {target} assigned twice");
+        }
+    }
+
+    let expected = targets.into_iter().collect::<HashSet<_>>();
+    assert_eq!(seen, expected);
+}
+
+/// Ensures shard coordinator selection prefers an eligible target inside the shard.
+#[test]
+fn service_deployment_shards_prefer_in_shard_coordinators() {
+    let service_id = Uuid::from_u128(44);
+    let targets = (1u128..=6).map(Uuid::from_u128).collect::<Vec<_>>();
+    let outside = Uuid::from_u128(99);
+    let mut eligible = targets.clone();
+    eligible.push(outside);
+
+    let shards = build_service_deployment_shards(service_id, 3, &eligible, &targets, 2);
+
+    assert!(!shards.is_empty());
+    for shard in shards {
+        assert!(
+            shard.target_node_ids.contains(&shard.coordinator_node_id),
+            "coordinator {} should be one of {:?}",
+            shard.coordinator_node_id,
+            shard.target_node_ids
+        );
+    }
 }
 
 /// Ensures slot targets are deterministic regardless of candidate ordering.

@@ -35,6 +35,14 @@ pub(super) struct ReplicaSlot {
     pub(super) replica_id: Option<Uuid>,
 }
 
+/// Deterministic target-node shard assigned to one replaceable coordinator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ServiceDeploymentShard {
+    pub(super) shard_index: usize,
+    pub(super) coordinator_node_id: Uuid,
+    pub(super) target_node_ids: Vec<Uuid>,
+}
+
 /// Expands the service spec into an ordered list of desired replica slots.
 pub(super) fn build_replica_slots(spec: &ServiceSpecValue) -> Vec<ReplicaSlot> {
     let mut slots = Vec::new();
@@ -520,6 +528,94 @@ pub(super) fn select_generation_owner(
     best.map(|(node_id, _)| node_id)
 }
 
+/// Builds deterministic target-node shards for one service deployment generation.
+///
+/// The generation owner uses this as the only supported sharding shape for
+/// large deployments: target nodes are partitioned once, and each partition is
+/// assigned to a replaceable coordinator selected by rendezvous hashing. The
+/// function is intentionally pure so every owner or backup can recompute the
+/// same shard plan from the service generation and active eligible view.
+pub(super) fn build_service_deployment_shards(
+    service_id: Uuid,
+    service_epoch: u64,
+    eligible_nodes: &[Uuid],
+    target_node_ids: &[Uuid],
+    max_targets_per_shard: usize,
+) -> Vec<ServiceDeploymentShard> {
+    if max_targets_per_shard == 0 || eligible_nodes.is_empty() || target_node_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut eligible = eligible_nodes.to_vec();
+    eligible.sort_unstable();
+    eligible.dedup();
+    if eligible.is_empty() {
+        return Vec::new();
+    }
+
+    let mut targets = target_node_ids.to_vec();
+    targets.sort_unstable();
+    targets.dedup();
+
+    targets
+        .chunks(max_targets_per_shard)
+        .enumerate()
+        .filter_map(|(shard_index, target_chunk)| {
+            let coordinator_node_id = select_shard_coordinator(
+                service_id,
+                service_epoch,
+                shard_index,
+                target_chunk,
+                &eligible,
+            )?;
+            Some(ServiceDeploymentShard {
+                shard_index,
+                coordinator_node_id,
+                target_node_ids: target_chunk.to_vec(),
+            })
+        })
+        .collect()
+}
+
+/// Selects the deterministic coordinator for one deployment shard.
+///
+/// A coordinator inside the shard target set is preferred so the shard can
+/// often handle one of its own target batches locally. If every shard target is
+/// unavailable in the current eligible view, the function falls back to the
+/// broader eligible set so the generation can still be delegated.
+fn select_shard_coordinator(
+    service_id: Uuid,
+    service_epoch: u64,
+    shard_index: usize,
+    target_node_ids: &[Uuid],
+    eligible_nodes: &[Uuid],
+) -> Option<Uuid> {
+    let eligible: HashSet<Uuid> = eligible_nodes.iter().copied().collect();
+    let mut candidates = target_node_ids
+        .iter()
+        .copied()
+        .filter(|node_id| eligible.contains(node_id))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        candidates.extend_from_slice(eligible_nodes);
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    let mut best: Option<(Uuid, u128)> = None;
+    for node_id in candidates {
+        let score = shard_coordinator_score(service_id, service_epoch, shard_index, node_id);
+        match best {
+            None => best = Some((node_id, score)),
+            Some((_, best_score)) if score > best_score => {
+                best = Some((node_id, score));
+            }
+            _ => {}
+        }
+    }
+    best.map(|(node_id, _)| node_id)
+}
+
 /// Computes the rendezvous score for slot ownership selection.
 fn slot_owner_score(service_id: Uuid, template: &str, replica: u16, node_id: Uuid) -> u128 {
     let mut hasher = blake3::Hasher::new();
@@ -552,6 +648,25 @@ fn generation_owner_score(service_id: Uuid, service_epoch: u64, node_id: Uuid) -
     hasher.update(b"generation");
     hasher.update(service_id.as_bytes());
     hasher.update(&service_epoch.to_le_bytes());
+    hasher.update(node_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    u128::from_le_bytes(bytes)
+}
+
+/// Computes the rendezvous score used to choose one deployment shard coordinator.
+fn shard_coordinator_score(
+    service_id: Uuid,
+    service_epoch: u64,
+    shard_index: usize,
+    node_id: Uuid,
+) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"deployment-shard");
+    hasher.update(service_id.as_bytes());
+    hasher.update(&service_epoch.to_le_bytes());
+    hasher.update(&shard_index.to_le_bytes());
     hasher.update(node_id.as_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0u8; 16];

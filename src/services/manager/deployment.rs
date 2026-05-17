@@ -13,6 +13,7 @@ use super::placement::{
 };
 use super::state::deploying_assignment_incomplete;
 use super::*;
+use crate::workload::model::WorkloadOwner;
 use anyhow::Context;
 
 impl ServiceController {
@@ -1878,6 +1879,7 @@ impl ServiceController {
         requests: Vec<WorkloadStartRequest>,
         context: &str,
     ) -> anyhow::Result<Vec<WorkloadSpec>> {
+        self.observe_deployment_shard_plan(admission_policy, &requests);
         match admission_policy.mode {
             WorkloadAdmissionMode::Incremental => {
                 self.start_tasks_with_fallback(requests, context).await
@@ -1895,6 +1897,75 @@ impl ServiceController {
                     .with_context(|| format!("gang admission failed for {context}"))
             }
         }
+    }
+
+    /// Computes the deterministic shard shape for large targeted service launches.
+    ///
+    /// This method only observes the shard plan. Runtime delegation must use the same pure planner,
+    /// but it still needs explicit idempotency and rollback handling before it can replace the
+    /// direct owner-to-target path safely.
+    fn observe_deployment_shard_plan(
+        &self,
+        admission_policy: WorkloadAdmissionPolicy,
+        requests: &[WorkloadStartRequest],
+    ) {
+        if !matches!(admission_policy.mode, WorkloadAdmissionMode::Incremental) {
+            return;
+        }
+
+        let mut target_nodes = requests
+            .iter()
+            .filter_map(|request| request.target_node)
+            .collect::<Vec<_>>();
+        if target_nodes.len() != requests.len() {
+            return;
+        }
+        target_nodes.sort_unstable();
+        target_nodes.dedup();
+
+        let runtime = crate::config::replication_runtime_config();
+        if target_nodes.len() <= runtime.service_shard_target_threshold {
+            return;
+        }
+
+        let Some((service_id, service_epoch)) = service_generation_from_requests(requests) else {
+            return;
+        };
+        let eligible_nodes = self.collect_eligible_nodes();
+        let shards = build_service_deployment_shards(
+            service_id,
+            service_epoch,
+            &eligible_nodes,
+            &target_nodes,
+            runtime.service_shard_target_size,
+        );
+        if shards.is_empty() {
+            return;
+        }
+
+        let max_targets = shards
+            .iter()
+            .map(|shard| shard.target_node_ids.len())
+            .max()
+            .unwrap_or(0);
+        let coordinator_count = shards
+            .iter()
+            .map(|shard| shard.coordinator_node_id)
+            .collect::<HashSet<_>>()
+            .len();
+        let last_shard_index = shards.last().map(|shard| shard.shard_index).unwrap_or(0);
+
+        tracing::debug!(
+            target: "services",
+            service_id = %service_id,
+            service_epoch,
+            target_peer_count = target_nodes.len(),
+            shard_count = shards.len(),
+            coordinator_count,
+            max_targets_per_shard = max_targets,
+            last_shard_index,
+            "computed deterministic service deployment shard plan"
+        );
     }
 
     /// Publishes task traffic after attachment rows exist so cutover only exposes ready endpoints.
@@ -2195,6 +2266,19 @@ fn format_dependency_gate_stability_detail(
     format!(
         "service '{service_name}' monitoring dependency readiness before launching template '{template_name}' ({dependency_summary})"
     )
+}
+
+/// Extracts the service generation identity shared by one service-owned start batch.
+fn service_generation_from_requests(requests: &[WorkloadStartRequest]) -> Option<(Uuid, u64)> {
+    requests
+        .iter()
+        .find_map(|request| match request.owner.as_ref() {
+            Some(WorkloadOwner::ServiceReplica(metadata)) => Some((
+                compute_service_id(&metadata.service_name),
+                metadata.service_epoch,
+            )),
+            _ => None,
+        })
 }
 
 /// Records launched task ids back into the assignment index and returns the parsed template ids.

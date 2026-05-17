@@ -55,7 +55,10 @@ mod rollout;
 mod slot_reconcile;
 mod state;
 use inventory::TaskInventory;
-use ownership::{SlotKey, compute_slot_targets_with_placement, select_generation_owner};
+use ownership::{
+    SlotKey, build_service_deployment_shards, compute_slot_targets_with_placement,
+    select_generation_owner,
+};
 use placement::build_eligible_nodes;
 use readiness::start_readiness_wait;
 use state::{
