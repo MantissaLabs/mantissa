@@ -98,6 +98,27 @@ pub fn record_workload_gossip_event(
     .increment(1);
 }
 
+/// Records one workload event intentionally withheld from outbound gossip.
+pub fn record_workload_gossip_suppressed(
+    event: &'static str,
+    representation: &'static str,
+    owner: &'static str,
+    phase: &'static str,
+    propagation: &'static str,
+    reason: &'static str,
+) {
+    counter!(
+        "mantissa_workload_gossip_suppressed_total",
+        "event" => event,
+        "representation" => representation,
+        "owner" => owner,
+        "phase" => phase,
+        "propagation" => propagation,
+        "reason" => reason
+    )
+    .increment(1);
+}
+
 /// Records one dirty workload gossip flush and the retained coverage work.
 pub fn record_workload_gossip_flush(records: usize, emitted: usize, retained: usize) {
     counter!("mantissa_workload_gossip_flush_records_total").increment(records as u64);
@@ -494,6 +515,11 @@ fn describe_metrics() {
         "mantissa_workload_gossip_events_total",
         Unit::Count,
         "Workload events buffered for outbound gossip by event, phase, and propagation class."
+    );
+    describe_counter!(
+        "mantissa_workload_gossip_suppressed_total",
+        Unit::Count,
+        "Workload events intentionally withheld from outbound gossip."
     );
     describe_counter!(
         "mantissa_workload_gossip_flush_records_total",

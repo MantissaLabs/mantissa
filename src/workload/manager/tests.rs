@@ -7432,6 +7432,157 @@ async fn dirty_gossip_flush_keeps_definition_and_latest_status() {
 }
 
 #[tokio::test]
+async fn service_creating_and_running_updates_do_not_enter_workload_gossip() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let service_owner = Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
+        "svc", "api",
+    )));
+
+    let mut creating = build_remote_task_spec(
+        Uuid::new_v4(),
+        manager.local_node_id,
+        WorkloadPhase::Creating,
+        1,
+        1,
+        Utc::now().to_rfc3339(),
+    );
+    creating.owner = service_owner.clone();
+    manager
+        .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(creating)))
+        .await
+        .expect("record creating update");
+    assert!(
+        !manager
+            .flush_dirty_gossip_events()
+            .await
+            .expect("flush after creating update"),
+        "suppressed service creating update should not leave dirty gossip work"
+    );
+    assert_no_outbound_workload_gossip(&manager).await;
+
+    let mut running = build_remote_task_spec(
+        Uuid::new_v4(),
+        manager.local_node_id,
+        WorkloadPhase::Running,
+        1,
+        2,
+        Utc::now().to_rfc3339(),
+    );
+    running.owner = service_owner;
+    manager
+        .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(running)))
+        .await
+        .expect("record running update");
+    assert!(
+        !manager
+            .flush_dirty_gossip_events()
+            .await
+            .expect("flush after running update"),
+        "suppressed service running update should not leave dirty gossip work"
+    );
+    assert_no_outbound_workload_gossip(&manager).await;
+}
+
+#[tokio::test]
+async fn standalone_running_update_still_enters_workload_gossip() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let running = build_remote_task_spec(
+        Uuid::new_v4(),
+        manager.local_node_id,
+        WorkloadPhase::Running,
+        1,
+        2,
+        Utc::now().to_rfc3339(),
+    );
+
+    manager
+        .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(running.clone())))
+        .await
+        .expect("record standalone running update");
+    assert!(
+        manager
+            .flush_dirty_gossip_events()
+            .await
+            .expect("flush standalone running update"),
+        "standalone running update should retain normal gossip coverage"
+    );
+
+    let outbound = manager
+        .core
+        .rx
+        .recv()
+        .await
+        .expect("receive standalone running gossip");
+    match outbound {
+        Message::Workload {
+            event: WorkloadEvent::UpsertSpec(spec),
+            ..
+        } => {
+            assert_eq!(spec.id, running.id);
+            assert_eq!(spec.state, WorkloadPhase::Running);
+            assert!(spec.owner.is_none());
+        }
+        _ => panic!("unexpected outbound message for standalone running update"),
+    }
+}
+
+#[tokio::test]
+async fn service_failure_update_still_enters_workload_gossip() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let mut failed = build_remote_task_spec(
+        Uuid::new_v4(),
+        manager.local_node_id,
+        WorkloadPhase::Failed,
+        1,
+        2,
+        Utc::now().to_rfc3339(),
+    );
+    failed.owner = Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
+        "svc", "api",
+    )));
+
+    manager
+        .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(failed.clone())))
+        .await
+        .expect("record service failure update");
+    assert!(
+        manager
+            .flush_dirty_gossip_events()
+            .await
+            .expect("flush service failure update"),
+        "service failure update should retain normal repair coverage"
+    );
+
+    let outbound = manager
+        .core
+        .rx
+        .recv()
+        .await
+        .expect("receive service failure gossip");
+    match outbound {
+        Message::Workload {
+            event: WorkloadEvent::UpsertSpec(spec),
+            ..
+        } => {
+            assert_eq!(spec.id, failed.id);
+            assert_eq!(spec.state, WorkloadPhase::Failed);
+            assert!(spec.service_owner().is_some());
+        }
+        _ => panic!("unexpected outbound message for service failure update"),
+    }
+}
+
+/// Asserts that no workload gossip message was emitted by the last operation.
+async fn assert_no_outbound_workload_gossip(manager: &WorkloadManager) {
+    let next =
+        tokio::time::timeout(std::time::Duration::from_millis(20), manager.core.rx.recv()).await;
+    assert!(
+        next.is_err(),
+        "suppressed workload update should not enqueue outbound gossip"
+    );
+}
+
+#[tokio::test]
 async fn stale_delta_write_does_not_override_newer_gossip_upsert() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
 

@@ -562,6 +562,13 @@ Exit criteria:
 
 ### Phase 3: Stop Global Gossip For Routine Task Status
 
+Status:
+
+Complete locally. Service-owned `Creating` and `Running` workload updates are
+now withheld from the shared workload gossip buffer, while standalone tasks,
+non-service workloads, failures, stop/remove, and assignment rows keep their
+existing behavior.
+
 Goal:
 
 Remove the largest source of useless updates without changing assignment or

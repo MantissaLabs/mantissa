@@ -118,6 +118,28 @@ fn workload_phase_label(phase: &WorkloadPhase) -> &'static str {
     }
 }
 
+/// Returns true when routine service progress should wait for owner progress aggregation.
+fn should_suppress_routine_service_gossip(event: &WorkloadEvent) -> bool {
+    match event {
+        WorkloadEvent::UpsertSpec(spec) => {
+            is_routine_service_lifecycle_state(&spec.state, spec.owner.as_ref())
+        }
+        WorkloadEvent::UpsertStatus(status) => {
+            is_routine_service_lifecycle_state(&status.state, status.owner.as_ref())
+        }
+        WorkloadEvent::Remove { .. } | WorkloadEvent::UpsertAdmissionGroup(_) => false,
+    }
+}
+
+/// Returns true for high-volume service states that should no longer fan out globally.
+fn is_routine_service_lifecycle_state(
+    state: &WorkloadPhase,
+    owner: Option<&WorkloadOwner>,
+) -> bool {
+    matches!(owner, Some(WorkloadOwner::ServiceReplica(_)))
+        && matches!(state, WorkloadPhase::Creating | WorkloadPhase::Running)
+}
+
 impl WorkloadManager {
     /// Validates a task marked as running and synchronizes local runtime cache state.
     ///
@@ -1211,6 +1233,17 @@ impl WorkloadManager {
     async fn buffer_gossip_event(&self, event: WorkloadEvent) {
         let labels = workload_gossip_metric_labels(&event);
         let propagation = event.propagation_class();
+        if should_suppress_routine_service_gossip(&event) {
+            crate::observability::metrics::record_workload_gossip_suppressed(
+                labels.event,
+                labels.representation,
+                labels.owner,
+                labels.phase,
+                propagation.as_str(),
+                "routine_service_lifecycle",
+            );
+            return;
+        }
         crate::observability::metrics::record_workload_gossip_event(
             labels.event,
             labels.representation,
@@ -4011,11 +4044,10 @@ fn is_stale_phase_regression(current: &WorkloadPhase, requested: &WorkloadPhase)
     }
 }
 
-/// Returns whether one task phase update should become a new cluster-visible gossip event.
+/// Returns whether one lifecycle update is eligible for workload gossip.
 ///
-/// The first transition into `Pulling` / `Creating` must still propagate so remote readiness sees
-/// that launch work has started. Later same-state progress updates remain local-only because the
-/// dirty gossip buffer already keeps the latest transition alive across several fanout rounds.
+/// This only suppresses repeated local progress updates. Routine service-owned lifecycle updates
+/// are filtered in the dirty gossip buffer so all workload gossip callers share one policy gate.
 fn should_gossip_task_phase_update(state_changed: bool, state: &WorkloadPhase) -> bool {
     if state_changed {
         return true;
