@@ -634,9 +634,6 @@ fn validate_liveness(liveness: Option<&LivenessProbe>) -> Result<()> {
         LivenessKind::Exec if liveness.path.is_some() => Err(anyhow!(
             "agent manifest cannot set execution.liveness.path when liveness.kind is exec"
         )),
-        LivenessKind::Http if liveness.path.is_none() => Err(anyhow!(
-            "agent manifest must set execution.liveness.path when liveness.kind is http"
-        )),
         LivenessKind::Tcp if liveness.path.is_some() => Err(anyhow!(
             "agent manifest cannot set execution.liveness.path when liveness.kind is tcp"
         )),
@@ -808,6 +805,26 @@ mod tests {
                 .contains("workspace.working_directory must be an absolute path"),
             "unexpected error: {error:#}"
         );
+    }
+
+    /// Allows HTTP liveness probes to rely on the shared workload default path.
+    #[test]
+    fn manifest_accepts_http_liveness_without_path() {
+        let mut manifest = base_manifest();
+        manifest.execution.liveness = Some(LivenessProbe {
+            kind: LivenessKind::Http,
+            command: Vec::new(),
+            port: 8080,
+            path: None,
+            interval_ms: 10_000,
+            timeout_ms: 3_000,
+            failure_threshold: 3,
+            start_period_ms: 30_000,
+        });
+
+        manifest
+            .validate()
+            .expect("HTTP liveness should default to the workload root path");
     }
 
     /// Resolves declared network family overrides onto execution network references.
