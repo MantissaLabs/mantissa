@@ -536,6 +536,8 @@ pub struct ReplicationConfig {
     pub workload_repair_fanout: usize,
     #[serde(default = "default_replication_remote_admission_parallelism")]
     pub remote_admission_parallelism: usize,
+    #[serde(default = "default_replication_remote_assignment_parallelism")]
+    pub remote_assignment_parallelism: usize,
 }
 
 impl Default for ReplicationConfig {
@@ -553,6 +555,7 @@ impl Default for ReplicationConfig {
             global_metadata_sync_fanout: default_replication_global_metadata_sync_fanout(),
             workload_repair_fanout: default_replication_workload_repair_fanout(),
             remote_admission_parallelism: default_replication_remote_admission_parallelism(),
+            remote_assignment_parallelism: default_replication_remote_assignment_parallelism(),
         }
     }
 }
@@ -572,6 +575,7 @@ pub struct RuntimeReplicationConfig {
     pub global_metadata_sync_fanout: usize,
     pub workload_repair_fanout: usize,
     pub remote_admission_parallelism: usize,
+    pub remote_assignment_parallelism: usize,
 }
 
 impl ReplicationConfig {
@@ -590,6 +594,7 @@ impl ReplicationConfig {
             global_metadata_sync_fanout: self.global_metadata_sync_fanout,
             workload_repair_fanout: self.workload_repair_fanout,
             remote_admission_parallelism: self.remote_admission_parallelism,
+            remote_assignment_parallelism: self.remote_assignment_parallelism,
         }
     }
 }
@@ -1211,6 +1216,13 @@ fn default_replication_remote_admission_parallelism() -> usize {
 
 /// # Description:
 ///
+/// Returns the default owner-side concurrency for remote assignment delivery.
+fn default_replication_remote_assignment_parallelism() -> usize {
+    16
+}
+
+/// # Description:
+///
 /// Ensure the global configuration has been loaded at least once.
 fn ensure_config_loaded() {
     if GLOBAL_LOADED.load(Ordering::Acquire) {
@@ -1473,6 +1485,10 @@ impl Config {
             "MANTISSA_REMOTE_ADMISSION_PARALLELISM",
             &mut self.replication.remote_admission_parallelism,
         );
+        applied |= apply_positive_usize_env_override(
+            "MANTISSA_REMOTE_ASSIGNMENT_PARALLELISM",
+            &mut self.replication.remote_assignment_parallelism,
+        );
 
         applied
     }
@@ -1668,6 +1684,10 @@ impl Config {
 
         if self.replication.remote_admission_parallelism == 0 {
             anyhow::bail!("replication.remote_admission_parallelism must be greater than zero");
+        }
+
+        if self.replication.remote_assignment_parallelism == 0 {
+            anyhow::bail!("replication.remote_assignment_parallelism must be greater than zero");
         }
 
         Ok(())
@@ -2255,6 +2275,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_remote_assignment_parallelism() {
+        let mut config = Config::default();
+        config.replication.remote_assignment_parallelism = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn env_overrides_apply_and_validate() {
         let _env = EnvOverrideSet::set(&[
             ("MANTISSA_WIREGUARD_DISABLE", "1"),
@@ -2287,6 +2314,7 @@ mod tests {
             ("MANTISSA_GLOBAL_METADATA_SYNC_FANOUT", "11"),
             ("MANTISSA_WORKLOAD_REPAIR_FANOUT", "3"),
             ("MANTISSA_REMOTE_ADMISSION_PARALLELISM", "12"),
+            ("MANTISSA_REMOTE_ASSIGNMENT_PARALLELISM", "24"),
         ]);
 
         let mut config = Config::default();
@@ -2344,6 +2372,7 @@ mod tests {
         assert_eq!(config.replication.global_metadata_sync_fanout, 11);
         assert_eq!(config.replication.workload_repair_fanout, 3);
         assert_eq!(config.replication.remote_admission_parallelism, 12);
+        assert_eq!(config.replication.remote_assignment_parallelism, 24);
     }
 
     #[test]

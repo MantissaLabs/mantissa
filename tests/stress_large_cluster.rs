@@ -66,7 +66,7 @@ fn forward_stress_env_override(command: &mut Command, stress_name: &str, daemon_
 /// The stress test keeps its own env namespace so local experiments can tune one
 /// run without affecting unrelated Mantissa commands in the same shell.
 fn apply_stress_replication_env_overrides(command: &mut Command) {
-    const ENV_MAPPINGS: [(&str, &str); 9] = [
+    const ENV_MAPPINGS: [(&str, &str); 10] = [
         (
             "MANTISSA_STRESS_GOSSIP_CHANNEL_CAPACITY",
             "MANTISSA_GOSSIP_CHANNEL_CAPACITY",
@@ -90,6 +90,10 @@ fn apply_stress_replication_env_overrides(command: &mut Command) {
         (
             "MANTISSA_STRESS_REMOTE_ADMISSION_PARALLELISM",
             "MANTISSA_REMOTE_ADMISSION_PARALLELISM",
+        ),
+        (
+            "MANTISSA_STRESS_REMOTE_ASSIGNMENT_PARALLELISM",
+            "MANTISSA_REMOTE_ASSIGNMENT_PARALLELISM",
         ),
     ];
 

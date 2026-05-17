@@ -175,6 +175,33 @@ pub fn record_remote_prepare_abort(mode: &'static str, peers: usize, leases: usi
     counter!("mantissa_remote_prepare_abort_leases_total", "mode" => mode).increment(leases as u64);
 }
 
+/// Records the fanout size of one remote workload assignment delivery batch.
+pub fn record_remote_assignment_batch(peers: usize, assignments: usize) {
+    counter!("mantissa_remote_assignment_batches_total").increment(1);
+    counter!("mantissa_remote_assignment_target_peers_total").increment(peers as u64);
+    counter!("mantissa_remote_assignment_specs_total").increment(assignments as u64);
+    gauge!("mantissa_remote_assignment_last_target_peers").set(peers as f64);
+    gauge!("mantissa_remote_assignment_last_specs").set(assignments as f64);
+}
+
+/// Records one per-target workload assignment delivery RPC payload size.
+pub fn record_remote_assignment_peer(assignments: usize) {
+    counter!("mantissa_remote_assignment_peer_rpcs_total").increment(1);
+    counter!("mantissa_remote_assignment_peer_specs_total").increment(assignments as u64);
+}
+
+/// Records how long one assignment target waited before entering the bounded RPC window.
+pub fn record_remote_assignment_queue_delay(delay: Duration) {
+    gauge!("mantissa_remote_assignment_last_queue_delay_seconds").set(delay.as_secs_f64());
+}
+
+/// Records the observed duration and outcome of one per-target assignment RPC.
+pub fn record_remote_assignment_latency(result: &'static str, latency: Duration) {
+    counter!("mantissa_remote_assignment_peer_results_total", "result" => result).increment(1);
+    gauge!("mantissa_remote_assignment_last_latency_seconds", "result" => result)
+        .set(latency.as_secs_f64());
+}
+
 /// Records one scheduler assignment before local and remote reservations start.
 pub fn record_workload_assignment_plan(
     mode: &'static str,
@@ -641,6 +668,56 @@ fn describe_metrics() {
         "mantissa_remote_prepare_abort_leases_total",
         Unit::Count,
         "Prepared remote leases aborted after failed admission attempts."
+    );
+    describe_counter!(
+        "mantissa_remote_assignment_batches_total",
+        Unit::Count,
+        "Remote workload assignment delivery batches started by workload scheduling."
+    );
+    describe_counter!(
+        "mantissa_remote_assignment_target_peers_total",
+        Unit::Count,
+        "Remote workload assignment target peers selected by workload scheduling."
+    );
+    describe_counter!(
+        "mantissa_remote_assignment_specs_total",
+        Unit::Count,
+        "Workload assignment specs included in remote assignment delivery batches."
+    );
+    describe_gauge!(
+        "mantissa_remote_assignment_last_target_peers",
+        Unit::Count,
+        "Remote workload assignment target peers in the most recent delivery batch."
+    );
+    describe_gauge!(
+        "mantissa_remote_assignment_last_specs",
+        Unit::Count,
+        "Remote workload assignment specs in the most recent delivery batch."
+    );
+    describe_counter!(
+        "mantissa_remote_assignment_peer_rpcs_total",
+        Unit::Count,
+        "Per-peer remote workload assignment delivery RPCs attempted."
+    );
+    describe_counter!(
+        "mantissa_remote_assignment_peer_specs_total",
+        Unit::Count,
+        "Workload specs sent through per-peer remote assignment delivery RPCs."
+    );
+    describe_gauge!(
+        "mantissa_remote_assignment_last_queue_delay_seconds",
+        Unit::Seconds,
+        "Delay before a remote assignment RPC entered the bounded delivery window."
+    );
+    describe_counter!(
+        "mantissa_remote_assignment_peer_results_total",
+        Unit::Count,
+        "Per-peer remote workload assignment delivery RPC outcomes."
+    );
+    describe_gauge!(
+        "mantissa_remote_assignment_last_latency_seconds",
+        Unit::Seconds,
+        "Duration of the most recent per-peer remote assignment delivery RPC."
     );
     describe_counter!(
         "mantissa_workload_assignment_plans_total",

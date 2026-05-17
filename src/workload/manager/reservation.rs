@@ -143,6 +143,13 @@ fn remote_admission_parallelism() -> usize {
         .max(1)
 }
 
+/// Resolves configured remote assignment delivery concurrency, clamped to a non-zero value.
+fn remote_assignment_parallelism() -> usize {
+    crate::config::replication_runtime_config()
+        .remote_assignment_parallelism
+        .max(1)
+}
+
 /// Returns the bounded metrics label for one remote prepare peer result.
 fn remote_prepare_result_label(
     result: &Result<RemotePrepareOutcome, ExecutionError>,
@@ -152,6 +159,15 @@ fn remote_prepare_result_label(
         Ok(RemotePrepareOutcome::Rejected(_)) => "rejected",
         Err(ExecutionError::Retry(_)) => "retry",
         Err(ExecutionError::Fatal(_)) => "fatal",
+    }
+}
+
+/// Returns the bounded metrics label for one remote assignment delivery result.
+fn remote_assignment_result_label(result: &Result<(), anyhow::Error>) -> &'static str {
+    if result.is_ok() {
+        "delivered"
+    } else {
+        "failed"
     }
 }
 
@@ -1405,19 +1421,60 @@ impl WorkloadManager {
             grouped.entry(spec.node_id).or_default().push(spec.clone());
         }
 
+        let assignment_count: usize = grouped.values().map(Vec::len).sum();
+        crate::observability::metrics::record_remote_assignment_batch(
+            grouped.len(),
+            assignment_count,
+        );
+
+        let parallelism = remote_assignment_parallelism();
+        let batch_started = Instant::now();
         let mut peer_ids = grouped.keys().copied().collect::<Vec<_>>();
         peer_ids.sort_unstable();
-        for peer_id in peer_ids {
-            let specs = &grouped[&peer_id];
-            if let Err(err) = self.deliver_remote_assignment_batch(peer_id, specs).await {
+        let mut pending_peers = peer_ids.into_iter();
+        let mut inflight = FuturesUnordered::new();
+
+        loop {
+            while inflight.len() < parallelism {
+                let Some(peer_id) = pending_peers.next() else {
+                    break;
+                };
+                let specs = &grouped[&peer_id];
+                crate::observability::metrics::record_remote_assignment_peer(specs.len());
+                inflight.push(self.deliver_remote_assignment_peer(peer_id, specs, batch_started));
+            }
+
+            let Some((peer_id, assignments, result)) = inflight.next().await else {
+                break;
+            };
+            if let Err(err) = result {
                 warn!(
                     target: "task",
                     peer = %peer_id,
-                    assignments = specs.len(),
+                    assignments,
                     "failed direct assignment delivery; workload sync will repair if the target misses these rows: {err:#}"
                 );
             }
         }
+    }
+
+    /// Sends one target-node assignment batch while recording bounded-window timing.
+    async fn deliver_remote_assignment_peer(
+        &self,
+        peer_id: Uuid,
+        specs: &[WorkloadSpec],
+        batch_started: Instant,
+    ) -> (Uuid, usize, Result<(), anyhow::Error>) {
+        crate::observability::metrics::record_remote_assignment_queue_delay(
+            batch_started.elapsed(),
+        );
+        let started = Instant::now();
+        let result = self.deliver_remote_assignment_batch(peer_id, specs).await;
+        crate::observability::metrics::record_remote_assignment_latency(
+            remote_assignment_result_label(&result),
+            started.elapsed(),
+        );
+        (peer_id, specs.len(), result)
     }
 
     /// Sends one target-node assignment batch through the workload RPC hot path.
