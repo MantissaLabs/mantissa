@@ -1210,11 +1210,13 @@ impl WorkloadManager {
     /// Records the latest outbound gossip event for one task id inside the local dirty buffer.
     async fn buffer_gossip_event(&self, event: WorkloadEvent) {
         let labels = workload_gossip_metric_labels(&event);
+        let propagation = event.propagation_class();
         crate::observability::metrics::record_workload_gossip_event(
             labels.event,
             labels.representation,
             labels.owner,
             labels.phase,
+            propagation.as_str(),
         );
 
         let task_id = workload_event_id(&event);

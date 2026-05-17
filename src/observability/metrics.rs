@@ -85,13 +85,15 @@ pub fn record_workload_gossip_event(
     representation: &'static str,
     owner: &'static str,
     phase: &'static str,
+    propagation: &'static str,
 ) {
     counter!(
         "mantissa_workload_gossip_events_total",
         "event" => event,
         "representation" => representation,
         "owner" => owner,
-        "phase" => phase
+        "phase" => phase,
+        "propagation" => propagation
     )
     .increment(1);
 }
@@ -491,7 +493,7 @@ fn describe_metrics() {
     describe_counter!(
         "mantissa_workload_gossip_events_total",
         Unit::Count,
-        "Workload events buffered for outbound gossip by event kind and phase."
+        "Workload events buffered for outbound gossip by event, phase, and propagation class."
     );
     describe_counter!(
         "mantissa_workload_gossip_flush_records_total",

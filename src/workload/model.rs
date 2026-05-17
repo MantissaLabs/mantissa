@@ -657,6 +657,76 @@ pub enum WorkloadEvent {
     Remove { id: Uuid },
 }
 
+impl WorkloadEvent {
+    /// Returns the intended propagation class for this workload event.
+    pub(crate) fn propagation_class(&self) -> WorkloadPropagationClass {
+        match self {
+            WorkloadEvent::UpsertSpec(spec) => {
+                workload_upsert_propagation_class(&spec.state, spec.owner.as_ref(), true)
+            }
+            WorkloadEvent::UpsertStatus(status) => {
+                workload_upsert_propagation_class(&status.state, status.owner.as_ref(), false)
+            }
+            WorkloadEvent::UpsertAdmissionGroup(_) => WorkloadPropagationClass::TargetedRequired,
+            WorkloadEvent::Remove { .. } => WorkloadPropagationClass::GlobalCritical,
+        }
+    }
+}
+
+/// Intended routing class for one workload event before concrete transport is selected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkloadPropagationClass {
+    TargetedRequired,
+    OwnerQuorumRepair,
+    CompactOwnerQuorum,
+    LocalOnly,
+    GlobalCritical,
+}
+
+impl WorkloadPropagationClass {
+    /// Returns a stable metrics and diagnostic label for this propagation class.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::TargetedRequired => "targeted_required",
+            Self::OwnerQuorumRepair => "owner_quorum_repair",
+            Self::CompactOwnerQuorum => "compact_owner_quorum",
+            Self::LocalOnly => "local_only",
+            Self::GlobalCritical => "global_critical",
+        }
+    }
+}
+
+/// Classifies one workload upsert without changing the current gossip route.
+fn workload_upsert_propagation_class(
+    phase: &WorkloadPhase,
+    owner: Option<&WorkloadOwner>,
+    carries_definition: bool,
+) -> WorkloadPropagationClass {
+    match phase {
+        WorkloadPhase::Pending if carries_definition => WorkloadPropagationClass::TargetedRequired,
+        WorkloadPhase::Pending | WorkloadPhase::Pulling => compact_status_propagation(owner),
+        WorkloadPhase::Creating
+        | WorkloadPhase::Running
+        | WorkloadPhase::Paused
+        | WorkloadPhase::VolumeUnavailable
+        | WorkloadPhase::Failed
+        | WorkloadPhase::Exited(_)
+        | WorkloadPhase::Unknown => WorkloadPropagationClass::OwnerQuorumRepair,
+        WorkloadPhase::Stopping | WorkloadPhase::Stopped => {
+            WorkloadPropagationClass::GlobalCritical
+        }
+    }
+}
+
+/// Selects compact owner propagation when a controller owns the row.
+fn compact_status_propagation(owner: Option<&WorkloadOwner>) -> WorkloadPropagationClass {
+    if owner.is_some() {
+        WorkloadPropagationClass::CompactOwnerQuorum
+    } else {
+        WorkloadPropagationClass::LocalOnly
+    }
+}
+
 /// Value variants retained in the workload CRDT domain.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
 pub enum WorkloadStoreValue {
@@ -1467,8 +1537,10 @@ pub(crate) fn spec_to_value(spec: &WorkloadSpec) -> WorkloadValue {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutionPlatform, IsolationMode, WorkloadAdmissionState, WorkloadPhase, WorkloadSpec,
-        compare_workload_spec_causality,
+        ExecutionPlatform, IsolationMode, WorkloadAdmissionGroupPhase,
+        WorkloadAdmissionGroupRecord, WorkloadAdmissionState, WorkloadEvent, WorkloadOwner,
+        WorkloadPhase, WorkloadPropagationClass, WorkloadServiceMetadata, WorkloadSpec,
+        WorkloadStatus, compare_workload_spec_causality,
     };
     use chrono::Utc;
     use std::cmp::Ordering;
@@ -1529,5 +1601,153 @@ mod tests {
             compare_workload_spec_causality(&current, &candidate),
             Ordering::Greater
         );
+    }
+
+    /// Workload propagation policy should identify creation records that need target delivery.
+    #[test]
+    fn workload_propagation_classifies_assignment_records() {
+        let spec = test_workload_spec(
+            WorkloadPhase::Pending,
+            Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
+                "svc", "main",
+            ))),
+        );
+        assert_eq!(
+            WorkloadEvent::UpsertSpec(Box::new(spec)).propagation_class(),
+            WorkloadPropagationClass::TargetedRequired
+        );
+
+        let now = Utc::now().to_rfc3339();
+        let record = WorkloadAdmissionGroupRecord {
+            id: Uuid::new_v4(),
+            scope_id: Uuid::new_v4(),
+            coordinator_node_id: Uuid::new_v4(),
+            target_node_ids: vec![Uuid::new_v4()],
+            workload_ids: vec![Uuid::new_v4()],
+            workload_count: 1,
+            lease_expires_at_unix_ms: 1,
+            phase: WorkloadAdmissionGroupPhase::Preparing,
+            reason: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        assert_eq!(
+            WorkloadEvent::UpsertAdmissionGroup(Box::new(record)).propagation_class(),
+            WorkloadPropagationClass::TargetedRequired
+        );
+    }
+
+    /// Workload propagation policy should route routine lifecycle status to the owner side.
+    #[test]
+    fn workload_propagation_classifies_status_records() {
+        let running = test_workload_status(
+            WorkloadPhase::Running,
+            Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
+                "svc", "main",
+            ))),
+        );
+        assert_eq!(
+            WorkloadEvent::UpsertStatus(Box::new(running)).propagation_class(),
+            WorkloadPropagationClass::OwnerQuorumRepair
+        );
+
+        let pulling = test_workload_status(
+            WorkloadPhase::Pulling,
+            Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
+                "svc", "main",
+            ))),
+        );
+        assert_eq!(
+            WorkloadEvent::UpsertStatus(Box::new(pulling)).propagation_class(),
+            WorkloadPropagationClass::CompactOwnerQuorum
+        );
+
+        let standalone_progress = test_workload_status(WorkloadPhase::Pulling, None);
+        assert_eq!(
+            WorkloadEvent::UpsertStatus(Box::new(standalone_progress)).propagation_class(),
+            WorkloadPropagationClass::LocalOnly
+        );
+    }
+
+    /// Workload propagation policy should keep stop/remove and failures distinct.
+    #[test]
+    fn workload_propagation_classifies_terminal_records() {
+        let failed = test_workload_spec(
+            WorkloadPhase::Failed,
+            Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
+                "svc", "main",
+            ))),
+        );
+        assert_eq!(
+            WorkloadEvent::UpsertSpec(Box::new(failed)).propagation_class(),
+            WorkloadPropagationClass::OwnerQuorumRepair
+        );
+
+        let stopping = test_workload_spec(
+            WorkloadPhase::Stopping,
+            Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
+                "svc", "main",
+            ))),
+        );
+        assert_eq!(
+            WorkloadEvent::UpsertSpec(Box::new(stopping)).propagation_class(),
+            WorkloadPropagationClass::GlobalCritical
+        );
+
+        assert_eq!(
+            WorkloadEvent::Remove { id: Uuid::new_v4() }.propagation_class(),
+            WorkloadPropagationClass::GlobalCritical
+        );
+    }
+
+    /// Builds one compact status record for propagation policy tests.
+    fn test_workload_status(state: WorkloadPhase, owner: Option<WorkloadOwner>) -> WorkloadStatus {
+        WorkloadStatus::from_spec(&test_workload_spec(state, owner))
+    }
+
+    /// Builds one workload specification for propagation policy tests.
+    fn test_workload_spec(state: WorkloadPhase, owner: Option<WorkloadOwner>) -> WorkloadSpec {
+        let now = Utc::now().to_rfc3339();
+        WorkloadSpec {
+            id: Uuid::new_v4(),
+            name: "task".to_string(),
+            image: "img".to_string(),
+            execution_platform: ExecutionPlatform::Oci,
+            isolation_mode: IsolationMode::Standard,
+            isolation_profile: None,
+            state,
+            phase_reason: None,
+            phase_progress: None,
+            created_at: now.clone(),
+            updated_at: now,
+            command: Vec::new(),
+            tty: false,
+            node_id: Uuid::new_v4(),
+            node_name: "node-a".to_string(),
+            slot_ids: vec![1],
+            slot_id: Some(1),
+            cpu_millis: 100,
+            memory_bytes: 64 * 1_024 * 1_024,
+            gpu_count: 0,
+            gpu_device_ids: Vec::new(),
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: Vec::new(),
+            ports: Vec::new(),
+            owner,
+            lease_id: None,
+            lease_coordinator_node_id: None,
+            admission_group_id: None,
+            admission_state: WorkloadAdmissionState::None,
+            task_epoch: 0,
+            phase_version: 0,
+            launch_attempt: 0,
+            last_terminal_observed_launch: None,
+        }
     }
 }

@@ -1,5 +1,6 @@
 use super::Message;
 use crate::topology::TopologyEvent;
+use crate::workload::model::WorkloadPropagationClass;
 use mantissa_protocol::gossip;
 use mantissa_protocol::gossip::gossip_message::Which::Topology;
 
@@ -36,8 +37,17 @@ pub(super) fn gossip_plane_for_message(message: &Message) -> GossipPlane {
             event: TopologyEvent::ClusterNameUpdated { .. },
             ..
         } => GossipPlane::GlobalMetadata,
+        Message::Workload { event, .. } => workload_gossip_plane(event.propagation_class()),
         _ => GossipPlane::ViewScoped,
     }
+}
+
+/// Maps intended workload propagation classes onto today's transport plane.
+fn workload_gossip_plane(_class: WorkloadPropagationClass) -> GossipPlane {
+    // This implementation step only classifies propagation intent. All workload
+    // updates still use the existing active-view gossip path until targeted
+    // routes are introduced.
+    GossipPlane::ViewScoped
 }
 
 /// Selects the gossip plane for one inbound wire message.
