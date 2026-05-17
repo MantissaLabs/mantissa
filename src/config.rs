@@ -1942,8 +1942,64 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use parking_lot::{Mutex, MutexGuard};
+    use std::sync::OnceLock;
+
+    /// Returns the process-wide unit-test lock for environment and global-config mutations.
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::MutexGuard;
+    use std::ffi::OsString;
+
+    /// Scoped process environment overrides guarded by the unit-test serialization lock.
+    struct EnvOverrideSet {
+        previous: Vec<(&'static str, Option<OsString>)>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl EnvOverrideSet {
+        /// Applies temporary environment overrides while excluding concurrent env mutation tests.
+        fn set(overrides: &[(&'static str, &'static str)]) -> Self {
+            let lock = crate::config::test_support::env_lock();
+            let previous = overrides
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+
+            for (key, value) in overrides {
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+            }
+
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvOverrideSet {
+        /// Restores every environment variable that was changed by this scoped override.
+        fn drop(&mut self) {
+            for (key, previous) in self.previous.iter().rev() {
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn defaults_validate() {
@@ -2173,37 +2229,37 @@ mod tests {
 
     #[test]
     fn env_overrides_apply_and_validate() {
-        unsafe {
-            std::env::set_var("MANTISSA_WIREGUARD_DISABLE", "1");
-            std::env::set_var("MANTISSA_WIREGUARD_PORT", "51820");
-            std::env::set_var("MANTISSA_BPF_NO_ATTACH", "1");
-            std::env::set_var("MANTISSA_BPF_OVERLAY_FLOW_CAPACITY", "4096");
-            std::env::set_var("MANTISSA_NODEPORT_IFACE", "eth0");
-            std::env::set_var("MANTISSA_NODEPORT_SOURCE_MODE", "snat_host_access");
-            std::env::set_var("MANTISSA_NODEPORT_VIP_CAPACITY", "2048");
-            std::env::set_var("MANTISSA_NODEPORT_HOST_CAPACITY", "512");
-            std::env::set_var("MANTISSA_NODEPORT_FLOW_CAPACITY", "8192");
-            std::env::set_var("MANTISSA_ADVERTISE_ADDR", "node-1.example.com:6578");
-            std::env::set_var("MANTISSA_DEFAULT_IP_FAMILY", "ipv6");
-            std::env::set_var("MANTISSA_RUNTIME_OCI_HOST", "unix:///var/run/docker.sock");
-            std::env::set_var("MANTISSA_GPU_DEVICE_OVERRIDES", "uuid:GPU-abc=id:GPU-abc");
-            std::env::set_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY", "1");
-            std::env::set_var("MANTISSA_SESSION_TICKET_TTL_SECS", "7200");
-            std::env::set_var("MANTISSA_METRICS_ENABLE", "1");
-            std::env::set_var("MANTISSA_METRICS_LISTEN_ADDR", "127.0.0.1:19600");
-            std::env::set_var("MANTISSA_METRICS_SAMPLE_INTERVAL_MS", "15000");
-            std::env::set_var("MANTISSA_METRICS_STATE_DB_SAMPLE_INTERVAL_MS", "75000");
-            std::env::set_var("MANTISSA_SCHEDULER_RESERVED_CPU_MILLIS", "750");
-            std::env::set_var("MANTISSA_SCHEDULER_RESERVED_MEMORY_BYTES", "134217728");
-            std::env::set_var("MANTISSA_GOSSIP_CHANNEL_CAPACITY", "256");
-            std::env::set_var("MANTISSA_GOSSIP_FANOUT", "7");
-            std::env::set_var("MANTISSA_GOSSIP_TICK_MS", "200");
-            std::env::set_var("MANTISSA_SYNC_TICK_MS", "300");
-            std::env::set_var("MANTISSA_SYNC_FANOUT", "9");
-            std::env::set_var("MANTISSA_GLOBAL_METADATA_SYNC_TICK_MS", "400");
-            std::env::set_var("MANTISSA_GLOBAL_METADATA_SYNC_FANOUT", "11");
-            std::env::set_var("MANTISSA_WORKLOAD_REPAIR_FANOUT", "3");
-        }
+        let _env = EnvOverrideSet::set(&[
+            ("MANTISSA_WIREGUARD_DISABLE", "1"),
+            ("MANTISSA_WIREGUARD_PORT", "51820"),
+            ("MANTISSA_BPF_NO_ATTACH", "1"),
+            ("MANTISSA_BPF_OVERLAY_FLOW_CAPACITY", "4096"),
+            ("MANTISSA_NODEPORT_IFACE", "eth0"),
+            ("MANTISSA_NODEPORT_SOURCE_MODE", "snat_host_access"),
+            ("MANTISSA_NODEPORT_VIP_CAPACITY", "2048"),
+            ("MANTISSA_NODEPORT_HOST_CAPACITY", "512"),
+            ("MANTISSA_NODEPORT_FLOW_CAPACITY", "8192"),
+            ("MANTISSA_ADVERTISE_ADDR", "node-1.example.com:6578"),
+            ("MANTISSA_DEFAULT_IP_FAMILY", "ipv6"),
+            ("MANTISSA_RUNTIME_OCI_HOST", "unix:///var/run/docker.sock"),
+            ("MANTISSA_GPU_DEVICE_OVERRIDES", "uuid:GPU-abc=id:GPU-abc"),
+            ("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY", "1"),
+            ("MANTISSA_SESSION_TICKET_TTL_SECS", "7200"),
+            ("MANTISSA_METRICS_ENABLE", "1"),
+            ("MANTISSA_METRICS_LISTEN_ADDR", "127.0.0.1:19600"),
+            ("MANTISSA_METRICS_SAMPLE_INTERVAL_MS", "15000"),
+            ("MANTISSA_METRICS_STATE_DB_SAMPLE_INTERVAL_MS", "75000"),
+            ("MANTISSA_SCHEDULER_RESERVED_CPU_MILLIS", "750"),
+            ("MANTISSA_SCHEDULER_RESERVED_MEMORY_BYTES", "134217728"),
+            ("MANTISSA_GOSSIP_CHANNEL_CAPACITY", "256"),
+            ("MANTISSA_GOSSIP_FANOUT", "7"),
+            ("MANTISSA_GOSSIP_TICK_MS", "200"),
+            ("MANTISSA_SYNC_TICK_MS", "300"),
+            ("MANTISSA_SYNC_FANOUT", "9"),
+            ("MANTISSA_GLOBAL_METADATA_SYNC_TICK_MS", "400"),
+            ("MANTISSA_GLOBAL_METADATA_SYNC_FANOUT", "11"),
+            ("MANTISSA_WORKLOAD_REPAIR_FANOUT", "3"),
+        ]);
 
         let mut config = Config::default();
         let applied = config.apply_env_overrides();
@@ -2259,38 +2315,6 @@ mod tests {
         assert_eq!(config.replication.global_metadata_sync_tick_ms, 400);
         assert_eq!(config.replication.global_metadata_sync_fanout, 11);
         assert_eq!(config.replication.workload_repair_fanout, 3);
-
-        unsafe {
-            std::env::remove_var("MANTISSA_WIREGUARD_DISABLE");
-            std::env::remove_var("MANTISSA_WIREGUARD_PORT");
-            std::env::remove_var("MANTISSA_BPF_NO_ATTACH");
-            std::env::remove_var("MANTISSA_BPF_OVERLAY_FLOW_CAPACITY");
-            std::env::remove_var("MANTISSA_NODEPORT_IFACE");
-            std::env::remove_var("MANTISSA_NODEPORT_SOURCE_MODE");
-            std::env::remove_var("MANTISSA_NODEPORT_VIP_CAPACITY");
-            std::env::remove_var("MANTISSA_NODEPORT_HOST_CAPACITY");
-            std::env::remove_var("MANTISSA_NODEPORT_FLOW_CAPACITY");
-            std::env::remove_var("MANTISSA_ADVERTISE_ADDR");
-            std::env::remove_var("MANTISSA_DEFAULT_IP_FAMILY");
-            std::env::remove_var("MANTISSA_RUNTIME_OCI_HOST");
-            std::env::remove_var("MANTISSA_GPU_DEVICE_OVERRIDES");
-            std::env::remove_var("MANTISSA_LOCAL_VOLUME_ENFORCE_CAPACITY");
-            std::env::remove_var("MANTISSA_SESSION_TICKET_TTL_SECS");
-            std::env::remove_var("MANTISSA_METRICS_ENABLE");
-            std::env::remove_var("MANTISSA_METRICS_LISTEN_ADDR");
-            std::env::remove_var("MANTISSA_METRICS_SAMPLE_INTERVAL_MS");
-            std::env::remove_var("MANTISSA_METRICS_STATE_DB_SAMPLE_INTERVAL_MS");
-            std::env::remove_var("MANTISSA_SCHEDULER_RESERVED_CPU_MILLIS");
-            std::env::remove_var("MANTISSA_SCHEDULER_RESERVED_MEMORY_BYTES");
-            std::env::remove_var("MANTISSA_GOSSIP_CHANNEL_CAPACITY");
-            std::env::remove_var("MANTISSA_GOSSIP_FANOUT");
-            std::env::remove_var("MANTISSA_GOSSIP_TICK_MS");
-            std::env::remove_var("MANTISSA_SYNC_TICK_MS");
-            std::env::remove_var("MANTISSA_SYNC_FANOUT");
-            std::env::remove_var("MANTISSA_GLOBAL_METADATA_SYNC_TICK_MS");
-            std::env::remove_var("MANTISSA_GLOBAL_METADATA_SYNC_FANOUT");
-            std::env::remove_var("MANTISSA_WORKLOAD_REPAIR_FANOUT");
-        }
     }
 
     #[test]

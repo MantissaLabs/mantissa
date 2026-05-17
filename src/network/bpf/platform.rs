@@ -1861,11 +1861,10 @@ mod linux {
         };
         use crate::network::bpf::NetworkBpfManager;
         use crate::network::types::{NetworkDriver, NetworkSpecDraft, NetworkSpecValue};
-        use parking_lot::{Mutex, MutexGuard};
+        use parking_lot::MutexGuard;
         use std::ffi::OsString;
         use std::fs;
         use std::path::PathBuf;
-        use std::sync::OnceLock;
         use tempfile::TempDir;
         use uuid::Uuid;
 
@@ -1907,16 +1906,10 @@ mod linux {
             _lock: MutexGuard<'static, ()>,
         }
 
-        /// Return the global mutex used to serialize config and env overrides in BPF unit tests.
-        fn config_override_lock() -> &'static Mutex<()> {
-            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            LOCK.get_or_init(|| Mutex::new(()))
-        }
-
         impl ConfigOverrideGuard {
             /// Replace the global config for one test and restore it afterward.
             fn with_mutator(mutator: impl FnOnce(&mut Config)) -> Self {
-                let lock = config_override_lock().lock();
+                let lock = crate::config::test_support::env_lock();
                 let previous = global_config();
                 let source = global_config_source();
 
@@ -1970,7 +1963,7 @@ mod linux {
 
         #[test]
         fn resolves_artifact_from_env_directory() -> Result<()> {
-            let _lock = config_override_lock().lock();
+            let _lock = crate::config::test_support::env_lock();
             let dir = TempDir::new().context("create temp dir")?;
             let artifact_path = dir.path().join("resolver-env-example.bpf.o");
             fs::write(&artifact_path, b"test").context("write artifact stub")?;

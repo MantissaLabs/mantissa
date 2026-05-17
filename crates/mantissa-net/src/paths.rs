@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 #[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, chown};
 
 pub const SYSTEM_STATE_DIR: &str = "/var/lib/mantissa";
 const USER_STATE_SUBDIR: &str = ".mantissa";
@@ -151,17 +149,5 @@ fn lookup_group_gid(name: &str) -> Option<libc::gid_t> {
 /// Change the group of a path to the provided gid, leaving ownership intact.
 #[cfg(unix)]
 fn chown_group(path: &Path, gid: libc::gid_t) -> io::Result<()> {
-    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid path for chown: {}", path.display()),
-        )
-    })?;
-
-    let res = unsafe { libc::chown(c_path.as_ptr(), libc::uid_t::MAX, gid) };
-    if res == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    chown(path, None, Some(gid))
 }

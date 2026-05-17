@@ -214,22 +214,12 @@ fn current_process_ids() -> (u32, u32) {
 /// Changes the uid and gid of one managed local volume directory in place.
 #[cfg(unix)]
 fn chown_path(path: &Path, uid: u32, gid: u32) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| anyhow!("invalid path for chown: {}", path.display()))?;
-    let result = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error()).with_context(|| {
-            format!(
-                "failed to chown managed local volume path {}",
-                path.display()
-            )
-        })
-    }
+    std::os::unix::fs::chown(path, Some(uid), Some(gid)).with_context(|| {
+        format!(
+            "failed to chown managed local volume path {}",
+            path.display()
+        )
+    })
 }
 
 #[cfg(test)]
