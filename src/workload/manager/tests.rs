@@ -1255,6 +1255,125 @@ fn test_task_spec(manager: &WorkloadManager, name: &str) -> WorkloadSpec {
     }
 }
 
+#[tokio::test]
+async fn apply_target_assignment_batch_persists_target_rows_without_gossip() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (manager, _scheduler, _runtime, _network_registry) = setup_manager().await;
+            let coordinator_node_id = Uuid::new_v4();
+            let mut spec = test_task_spec(&manager, "direct-assignment");
+            spec.slot_ids = vec![1];
+            spec.slot_id = Some(1);
+            spec.lease_id = Some(Uuid::new_v4());
+            spec.lease_coordinator_node_id = Some(coordinator_node_id);
+            spec.admission_group_id = Some(Uuid::new_v4());
+            spec.admission_state = WorkloadAdmissionState::PendingGroup;
+
+            let applied = manager
+                .apply_target_assignment_batch(
+                    coordinator_node_id,
+                    manager.local_node_id,
+                    vec![spec.clone()],
+                )
+                .await
+                .expect("apply assignment batch");
+
+            assert_eq!(applied, 1);
+            let persisted = manager.load_spec(spec.id).await.expect("load applied spec");
+            assert_eq!(persisted.id, spec.id);
+            assert_eq!(persisted.node_id, manager.local_node_id);
+            assert_eq!(persisted.lease_id, spec.lease_id);
+            assert_eq!(
+                persisted.admission_state,
+                WorkloadAdmissionState::PendingGroup
+            );
+            assert!(
+                manager.core.rx.try_recv().is_err(),
+                "direct assignment apply should not enqueue workload gossip"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn apply_target_assignment_batch_rejects_foreign_target_rows() {
+    let (manager, _scheduler, _runtime, _network_registry) = setup_manager().await;
+    let coordinator_node_id = Uuid::new_v4();
+    let mut spec = test_task_spec(&manager, "foreign-assignment");
+    spec.node_id = Uuid::new_v4();
+
+    let err = manager
+        .apply_target_assignment_batch(coordinator_node_id, manager.local_node_id, vec![spec])
+        .await
+        .expect_err("foreign assignment should be rejected");
+
+    assert!(
+        err.to_string().contains("but local node is"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn materialize_remote_specs_persists_for_sync_repair_without_gossip() {
+    let (manager, _scheduler, _runtime, _network_registry) = setup_manager().await;
+    let peer_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    let plan = super::planner::PreparedRemoteStartPlan {
+        index: 0,
+        id: task_id,
+        lease_id: Uuid::new_v4(),
+        lease_coordinator_node_id: manager.local_node_id,
+        name: "remote-direct".to_string(),
+        image: "img".to_string(),
+        execution_platform: ExecutionPlatform::Oci,
+        isolation_mode: crate::workload::model::IsolationMode::Standard,
+        isolation_profile: None,
+        command: Vec::new(),
+        tty: false,
+        cpu_millis: 100,
+        memory_bytes: 64 * 1024 * 1024,
+        gpu_count: 0,
+        slot_ids: vec![1],
+        gpu_device_ids: Vec::new(),
+        peer_id,
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        networks: Vec::new(),
+        ports: Vec::new(),
+        owner: None,
+    };
+
+    let specs = match manager.materialize_remote_specs(&[plan]).await {
+        Ok(specs) => specs,
+        Err(ExecutionError::Retry(err)) | Err(ExecutionError::Fatal(err)) => {
+            panic!("materialize remote spec: {err:#}")
+        }
+    };
+
+    assert_eq!(specs.len(), 1);
+    let materialized = &specs[0].1;
+    assert_eq!(materialized.id, task_id);
+    assert_eq!(materialized.node_id, peer_id);
+    assert_eq!(
+        materialized.lease_coordinator_node_id,
+        Some(manager.local_node_id)
+    );
+    let persisted = manager
+        .load_spec(task_id)
+        .await
+        .expect("load owner-side remote assignment");
+    assert_eq!(persisted.node_id, peer_id);
+    assert!(
+        manager.core.rx.try_recv().is_err(),
+        "remote assignment materialization should not enqueue Pending gossip"
+    );
+}
+
 /// Builds one default resolved execution spec so workload-start tests only
 /// override relevant fields.
 fn empty_resolved_execution(image: &str) -> ResolvedExecutionSpec {

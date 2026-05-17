@@ -9,6 +9,10 @@ interface Workload {
 
   list @1 (request :WorkloadListRequest) -> (workloads :List(WorkloadSpec));
   # List workload rows matching the provided lifecycle filters.
+
+  applyAssignments @2 (request :WorkloadAssignmentBatchRequest)
+      -> (response :WorkloadAssignmentBatchResponse);
+  # Apply one owner-built assignment batch to the target node.
 }
 
 struct SecretRef {
@@ -616,6 +620,22 @@ struct WorkloadStopRequest {
 struct WorkloadListRequest {
   states @0 :List(WorkloadStateFilter);
   # Lifecycle-state filters to apply to the workload listing.
+}
+
+struct WorkloadAssignmentBatchRequest {
+  coordinatorNodeId @0 :Data;
+  # Node UUID that prepared or owns this assignment delivery.
+
+  targetNodeId @1 :Data;
+  # Node UUID expected to apply every assignment in this batch.
+
+  specs @2 :List(WorkloadSpec);
+  # Full workload assignment rows to persist on the target node.
+}
+
+struct WorkloadAssignmentBatchResponse {
+  applied @0 :UInt64;
+  # Number of assignment rows accepted by the target node.
 }
 
 enum WorkloadStateFilter {

@@ -18,8 +18,8 @@ use mantissa_protocol::gossip::gossip_message;
 use mantissa_protocol::workload::{
     AdmissionGroupPhase as ProtoAdmissionGroupPhase,
     WorkloadStateFilter as ProtoWorkloadStateFilter, admission_group_record,
-    service_generation_progress_record, workload, workload_event, workload_list_request,
-    workload_spec, workload_status,
+    service_generation_progress_record, workload, workload_assignment_batch_request,
+    workload_event, workload_list_request, workload_spec, workload_status,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::io::Cursor;
@@ -74,6 +74,24 @@ impl workload::Server for WorkloadService {
         for (index, spec) in workloads.iter().enumerate() {
             write_spec(list.reborrow().get(index as u32), spec);
         }
+        Ok(())
+    }
+
+    /// Applies one owner-built assignment batch to this target node.
+    async fn apply_assignments(
+        self: Rc<Self>,
+        params: workload::ApplyAssignmentsParams,
+        mut results: workload::ApplyAssignmentsResults,
+    ) -> Result<(), Error> {
+        let request = params.get()?.get_request()?;
+        let (coordinator_node_id, target_node_id, specs) = read_assignment_batch_request(&request)?;
+        let applied = self
+            .manager
+            .apply_target_assignment_batch(coordinator_node_id, target_node_id, specs)
+            .await
+            .map_err(|err| Error::failed(err.to_string()))?;
+
+        results.get().init_response().set_applied(applied as u64);
         Ok(())
     }
 }
@@ -936,6 +954,21 @@ fn list_filter_from_request(
     }
 
     Ok(WorkloadStateFilter::new(allowed))
+}
+
+/// Decodes one target assignment batch request from the workload RPC payload.
+fn read_assignment_batch_request(
+    request: &workload_assignment_batch_request::Reader<'_>,
+) -> Result<(Uuid, Uuid, Vec<WorkloadSpec>), Error> {
+    let coordinator_node_id = read_id_from_data(request.get_coordinator_node_id()?)?;
+    let target_node_id = read_id_from_data(request.get_target_node_id()?)?;
+    let spec_reader = request.get_specs()?;
+    let mut specs = Vec::with_capacity(spec_reader.len() as usize);
+    for reader in spec_reader.iter() {
+        specs.push(read_spec(reader)?);
+    }
+
+    Ok((coordinator_node_id, target_node_id, specs))
 }
 
 #[cfg(test)]

@@ -1546,6 +1546,55 @@ impl WorkloadManager {
         Ok(specs)
     }
 
+    /// Applies a batch of assignment rows delivered directly by the coordinating owner.
+    ///
+    /// Direct assignment delivery is the hot path for remote placements. The owner still keeps a
+    /// local copy for MST repair, but the target node can persist and reconcile the rows without
+    /// waiting for global workload gossip.
+    pub(crate) async fn apply_target_assignment_batch(
+        &self,
+        coordinator_node_id: Uuid,
+        target_node_id: Uuid,
+        specs: Vec<WorkloadSpec>,
+    ) -> Result<usize, anyhow::Error> {
+        if target_node_id != self.local_node_id {
+            return Err(anyhow!(
+                "assignment batch targets node {target_node_id}, but local node is {}",
+                self.local_node_id
+            ));
+        }
+
+        for spec in &specs {
+            if spec.node_id != self.local_node_id {
+                return Err(anyhow!(
+                    "assignment {} targets node {}, but local node is {}",
+                    spec.id,
+                    spec.node_id,
+                    self.local_node_id
+                ));
+            }
+
+            if let Some(lease_coordinator) = spec.lease_coordinator_node_id
+                && lease_coordinator != coordinator_node_id
+            {
+                return Err(anyhow!(
+                    "assignment {} carries lease coordinator {}, but batch coordinator is {}",
+                    spec.id,
+                    lease_coordinator,
+                    coordinator_node_id
+                ));
+            }
+        }
+
+        let applied = specs.len();
+        for spec in specs {
+            self.handle_event(WorkloadEvent::UpsertSpec(Box::new(spec)))
+                .await?;
+        }
+
+        Ok(applied)
+    }
+
     /// Resolves one operator-provided workload identifier as a full UUID or unique visible prefix.
     pub async fn resolve_workload_id(&self, selector: &str) -> Result<Uuid, anyhow::Error> {
         let trimmed = selector.trim();

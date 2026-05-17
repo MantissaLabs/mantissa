@@ -5,6 +5,7 @@ use anyhow::Context;
 use chrono::Utc;
 use mantissa_protocol::scheduling::{self, prepare_leases_response, scheduler as scheduler_rpc};
 use mantissa_protocol::server::cluster_session;
+use mantissa_protocol::workload::workload as workload_rpc;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -13,8 +14,8 @@ use crate::scheduler::{
     ExactTaskLeaseIntent, GpuReservationRequest, PreparedTaskLease, PreparedTaskLeaseBatch,
     SchedulerError, SlotId, SlotReservationRequest,
 };
-use crate::workload::model::{WorkloadAdmissionState, WorkloadEvent, WorkloadPhase, WorkloadSpec};
-use crate::workload::service::read_spec;
+use crate::workload::model::{WorkloadAdmissionState, WorkloadPhase, WorkloadSpec};
+use crate::workload::service::{read_spec, write_spec};
 
 use super::WorkloadManager;
 use super::planner::{BatchStartPlan, PreparedRemoteStartPlan, RemoteStartPlan};
@@ -1054,6 +1055,29 @@ impl WorkloadManager {
             .ok_or_else(|| anyhow::anyhow!("no active session for peer {peer_id}"))
     }
 
+    /// Opens the remote workload capability for target-side assignment and stop control.
+    async fn remote_workload_client(
+        &self,
+        peer_id: Uuid,
+    ) -> Result<workload_rpc::Client, anyhow::Error> {
+        let session = self
+            .remote_session(peer_id)
+            .await
+            .context(format!("no active session for peer {peer_id}"))?;
+        session
+            .get_workload_request()
+            .send()
+            .promise
+            .await
+            .context(format!(
+                "failed to open workload service with peer {peer_id}"
+            ))?
+            .get()
+            .context(format!("invalid workload response from peer {peer_id}"))?
+            .get_workload()
+            .context(format!("missing workload service for peer {peer_id}"))
+    }
+
     /// Requests a remote peer to stop a task so the owner updates state and broadcasts it.
     pub(super) async fn stop_remote_workload(
         &self,
@@ -1067,22 +1091,7 @@ impl WorkloadManager {
         }
 
         let peer_id = spec.node_id;
-        let session = self
-            .remote_session(peer_id)
-            .await
-            .context(format!("no active session for peer {peer_id}"))?;
-        let task_client = session
-            .get_workload_request()
-            .send()
-            .promise
-            .await
-            .context(format!(
-                "failed to open workload service with peer {peer_id}"
-            ))?
-            .get()
-            .context(format!("invalid workload response from peer {peer_id}"))?
-            .get_workload()
-            .context(format!("missing workload service for peer {peer_id}"))?;
+        let task_client = self.remote_workload_client(peer_id).await?;
 
         let mut stop_req = task_client.stop_request();
         {
@@ -1222,19 +1231,80 @@ impl WorkloadManager {
             ));
         }
 
-        for (_, spec) in &results {
-            if let Err(err) = self
-                .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(spec.clone())))
-                .await
-            {
+        self.deliver_remote_assignment_batches(&results).await;
+
+        Ok(results)
+    }
+
+    /// Best-effort delivers owner-built assignment rows to their target nodes in per-node batches.
+    ///
+    /// The owner has already persisted the rows locally before this runs, so failed direct delivery
+    /// leaves MST workload sync as the repair path instead of reintroducing global assignment
+    /// gossip.
+    async fn deliver_remote_assignment_batches(&self, results: &[(usize, WorkloadSpec)]) {
+        let mut grouped: HashMap<Uuid, Vec<WorkloadSpec>> = HashMap::new();
+        for (_, spec) in results {
+            if spec.node_id == self.local_node_id {
+                continue;
+            }
+            grouped.entry(spec.node_id).or_default().push(spec.clone());
+        }
+
+        let mut peer_ids = grouped.keys().copied().collect::<Vec<_>>();
+        peer_ids.sort_unstable();
+        for peer_id in peer_ids {
+            let specs = &grouped[&peer_id];
+            if let Err(err) = self.deliver_remote_assignment_batch(peer_id, specs).await {
                 warn!(
                     target: "task",
-                    "failed to record workload gossip for {}: {err}",
-                    spec.name
+                    peer = %peer_id,
+                    assignments = specs.len(),
+                    "failed direct assignment delivery; workload sync will repair if the target misses these rows: {err:#}"
                 );
             }
         }
+    }
 
-        Ok(results)
+    /// Sends one target-node assignment batch through the workload RPC hot path.
+    async fn deliver_remote_assignment_batch(
+        &self,
+        peer_id: Uuid,
+        specs: &[WorkloadSpec],
+    ) -> Result<(), anyhow::Error> {
+        if specs.is_empty() {
+            return Ok(());
+        }
+
+        let workload_client = self.remote_workload_client(peer_id).await?;
+        let mut apply_req = workload_client.apply_assignments_request();
+        {
+            let mut request = apply_req.get().init_request();
+            request.set_coordinator_node_id(self.local_node_id.as_bytes());
+            request.set_target_node_id(peer_id.as_bytes());
+            let mut spec_list = request.reborrow().init_specs(specs.len() as u32);
+            for (idx, spec) in specs.iter().enumerate() {
+                write_spec(spec_list.reborrow().get(idx as u32), spec);
+            }
+        }
+
+        let response = apply_req
+            .send()
+            .promise
+            .await
+            .with_context(|| format!("assignment delivery RPC failed for peer {peer_id}"))?;
+        let applied = response
+            .get()
+            .with_context(|| format!("invalid assignment delivery response from peer {peer_id}"))?
+            .get_response()
+            .with_context(|| format!("missing assignment delivery response from peer {peer_id}"))?
+            .get_applied();
+        if applied != specs.len() as u64 {
+            return Err(anyhow::anyhow!(
+                "peer {peer_id} accepted {applied} assignment(s), expected {}",
+                specs.len()
+            ));
+        }
+
+        Ok(())
     }
 }
