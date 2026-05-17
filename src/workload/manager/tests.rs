@@ -7432,14 +7432,15 @@ async fn dirty_gossip_flush_keeps_definition_and_latest_status() {
 }
 
 #[tokio::test]
-async fn service_creating_and_running_updates_do_not_enter_workload_gossip() {
+async fn service_creating_and_running_updates_emit_compact_progress_only() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
     let service_owner = Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
         "svc", "api",
     )));
 
+    let service_task_id = Uuid::new_v4();
     let mut creating = build_remote_task_spec(
-        Uuid::new_v4(),
+        service_task_id,
         manager.local_node_id,
         WorkloadPhase::Creating,
         1,
@@ -7452,16 +7453,33 @@ async fn service_creating_and_running_updates_do_not_enter_workload_gossip() {
         .await
         .expect("record creating update");
     assert!(
-        !manager
+        manager
             .flush_dirty_gossip_events()
             .await
             .expect("flush after creating update"),
-        "suppressed service creating update should not leave dirty gossip work"
+        "service creating update should emit compact progress"
     );
-    assert_no_outbound_workload_gossip(&manager).await;
+    let outbound = manager
+        .core
+        .rx
+        .recv()
+        .await
+        .expect("receive service progress after creating update");
+    match outbound {
+        Message::Workload {
+            event: WorkloadEvent::UpsertServiceProgress(progress),
+            ..
+        } => {
+            assert_eq!(progress.service_name, "svc");
+            assert_eq!(progress.counts.starting, 1);
+            assert_eq!(progress.counts.running, 0);
+            assert_eq!(progress.observed_total(), 1);
+        }
+        _ => panic!("service creating update should only emit progress"),
+    }
 
     let mut running = build_remote_task_spec(
-        Uuid::new_v4(),
+        service_task_id,
         manager.local_node_id,
         WorkloadPhase::Running,
         1,
@@ -7474,13 +7492,30 @@ async fn service_creating_and_running_updates_do_not_enter_workload_gossip() {
         .await
         .expect("record running update");
     assert!(
-        !manager
+        manager
             .flush_dirty_gossip_events()
             .await
             .expect("flush after running update"),
-        "suppressed service running update should not leave dirty gossip work"
+        "service running update should emit compact progress"
     );
-    assert_no_outbound_workload_gossip(&manager).await;
+    let outbound = manager
+        .core
+        .rx
+        .recv()
+        .await
+        .expect("receive service progress after running update");
+    match outbound {
+        Message::Workload {
+            event: WorkloadEvent::UpsertServiceProgress(progress),
+            ..
+        } => {
+            assert_eq!(progress.service_name, "svc");
+            assert_eq!(progress.counts.starting, 0);
+            assert_eq!(progress.counts.running, 1);
+            assert_eq!(progress.observed_total(), 1);
+        }
+        _ => panic!("service running update should only emit progress"),
+    }
 }
 
 #[tokio::test]
@@ -7553,32 +7588,40 @@ async fn service_failure_update_still_enters_workload_gossip() {
         "service failure update should retain normal repair coverage"
     );
 
-    let outbound = manager
-        .core
-        .rx
-        .recv()
-        .await
-        .expect("receive service failure gossip");
-    match outbound {
-        Message::Workload {
-            event: WorkloadEvent::UpsertSpec(spec),
-            ..
-        } => {
-            assert_eq!(spec.id, failed.id);
-            assert_eq!(spec.state, WorkloadPhase::Failed);
-            assert!(spec.service_owner().is_some());
+    let mut saw_spec = false;
+    let mut saw_progress = false;
+    for _ in 0..2 {
+        let outbound = manager
+            .core
+            .rx
+            .recv()
+            .await
+            .expect("receive service failure gossip");
+        match outbound {
+            Message::Workload {
+                event: WorkloadEvent::UpsertSpec(spec),
+                ..
+            } => {
+                assert_eq!(spec.id, failed.id);
+                assert_eq!(spec.state, WorkloadPhase::Failed);
+                assert!(spec.service_owner().is_some());
+                saw_spec = true;
+            }
+            Message::Workload {
+                event: WorkloadEvent::UpsertServiceProgress(progress),
+                ..
+            } => {
+                assert_eq!(progress.service_name, "svc");
+                assert_eq!(progress.counts.terminal, 1);
+                saw_progress = true;
+            }
+            _ => panic!("unexpected outbound message for service failure update"),
         }
-        _ => panic!("unexpected outbound message for service failure update"),
     }
-}
-
-/// Asserts that no workload gossip message was emitted by the last operation.
-async fn assert_no_outbound_workload_gossip(manager: &WorkloadManager) {
-    let next =
-        tokio::time::timeout(std::time::Duration::from_millis(20), manager.core.rx.recv()).await;
+    assert!(saw_spec, "service failure should keep full repair gossip");
     assert!(
-        next.is_err(),
-        "suppressed workload update should not enqueue outbound gossip"
+        saw_progress,
+        "service failure should refresh compact progress"
     );
 }
 

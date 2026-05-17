@@ -16,10 +16,11 @@ use crate::services::registry::ServiceRegistry;
 use crate::store::replicated::workloads::WorkloadStore;
 use crate::volumes::VolumeRegistry;
 use crate::workload::model::{
-    ExecutionPlatform, IsolationMode, WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord,
-    WorkloadAdmissionState, WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadSpec,
-    WorkloadStateFilter, WorkloadStatus, WorkloadStoreValue, WorkloadValue,
-    select_best_admission_group_record, should_replace_workload_event,
+    ExecutionPlatform, IsolationMode, ServiceGenerationProgressRecord, WorkloadAdmissionGroupPhase,
+    WorkloadAdmissionGroupRecord, WorkloadAdmissionState, WorkloadEvent, WorkloadOwner,
+    WorkloadPhase, WorkloadSpec, WorkloadStateFilter, WorkloadStatus, WorkloadStoreValue,
+    WorkloadValue, compute_service_generation_progress_id, select_best_admission_group_record,
+    select_best_service_generation_progress_record, should_replace_workload_event,
 };
 pub(crate) use crate::workload::model::{
     merge_definition_into_value, merge_status_into_value, spec_to_status, spec_to_value,
@@ -147,7 +148,9 @@ impl DirtyWorkloadGossipRecord {
                     self.latest = event;
                 }
             }
-            WorkloadEvent::UpsertStatus(_) | WorkloadEvent::UpsertAdmissionGroup(_) => {
+            WorkloadEvent::UpsertStatus(_)
+            | WorkloadEvent::UpsertAdmissionGroup(_)
+            | WorkloadEvent::UpsertServiceProgress(_) => {
                 if matches!(self.latest, WorkloadEvent::Remove { .. })
                     || should_replace_workload_event(&self.latest, &event)
                 {
@@ -173,6 +176,9 @@ impl DirtyWorkloadGossipRecord {
             WorkloadEvent::UpsertSpec(spec) => vec![WorkloadEvent::UpsertSpec(spec.clone())],
             WorkloadEvent::UpsertAdmissionGroup(record) => {
                 vec![WorkloadEvent::UpsertAdmissionGroup(record.clone())]
+            }
+            WorkloadEvent::UpsertServiceProgress(record) => {
+                vec![WorkloadEvent::UpsertServiceProgress(record.clone())]
             }
         }
     }
@@ -208,6 +214,23 @@ struct CachedWorkloadValueIndex {
     change_clock: u64,
     // Latest decoded workload values keyed by workload identifier.
     workload_values: Arc<HashMap<Uuid, WorkloadValue>>,
+}
+
+/// Last service-progress contribution recorded for one local workload event stream.
+struct ServiceProgressTaskEntry {
+    // Progress aggregate row currently holding this task's contribution.
+    progress_id: Uuid,
+    // Last lifecycle phase counted for this task.
+    state: WorkloadPhase,
+}
+
+/// In-memory service progress aggregates for high-volume local lifecycle updates.
+#[derive(Default)]
+struct ServiceProgressTracker {
+    // Last contribution by task id, used to move a task between lifecycle counters.
+    tasks: HashMap<Uuid, ServiceProgressTaskEntry>,
+    // Current compact progress rows keyed by stable progress id.
+    records: HashMap<Uuid, ServiceGenerationProgressRecord>,
 }
 
 /// Runtime loop cadence configuration for the workload manager reconciliation workers.
@@ -263,6 +286,8 @@ struct WorkloadManagerLocalState {
     workload_spec_cache: Arc<Mutex<HashMap<Uuid, CachedWorkloadSpecEntry>>>,
     // Full workload-store snapshot reused across periodic scans until the store changes.
     workload_value_index: Arc<Mutex<Option<CachedWorkloadValueIndex>>>,
+    // Compact service-progress aggregates updated from local lifecycle transitions.
+    service_progress: Arc<AsyncMutex<ServiceProgressTracker>>,
     // Per-workload liveness probe bookkeeping used by reconciliation.
     liveness_probes: Arc<AsyncMutex<HashMap<Uuid, LivenessProbeEntry>>>,
     // Short critical section that reserves overlay attachment addresses before provisioning.
@@ -460,6 +485,7 @@ impl WorkloadManager {
                 local_instances: Arc::new(AsyncMutex::new(HashMap::new())),
                 workload_spec_cache: Arc::new(Mutex::new(HashMap::new())),
                 workload_value_index: Arc::new(Mutex::new(None)),
+                service_progress: Arc::new(AsyncMutex::new(ServiceProgressTracker::default())),
                 liveness_probes: Arc::new(AsyncMutex::new(HashMap::new())),
                 attachment_assignment_lock: Arc::new(AsyncMutex::new(())),
                 inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
@@ -1569,6 +1595,48 @@ impl WorkloadManager {
             states.push((*id, state));
         }
         Ok(states)
+    }
+
+    /// Returns compact node progress records for one service generation.
+    ///
+    /// Progress records are keyed by service generation and node id, so callers can probe one
+    /// compact row per known node instead of scanning every workload replica row.
+    pub async fn service_generation_progress(
+        &self,
+        service_id: Uuid,
+        service_epoch: u64,
+    ) -> Result<Vec<ServiceGenerationProgressRecord>, anyhow::Error> {
+        let mut node_ids = self
+            .core
+            .registry
+            .known_peers()
+            .map_err(|e| anyhow!("known peer snapshot failed: {e}"))?;
+        node_ids.push(self.local_node_id);
+        node_ids.sort_unstable();
+        node_ids.dedup();
+
+        let mut records = Vec::new();
+        for node_id in node_ids {
+            let progress_id =
+                compute_service_generation_progress_id(service_id, service_epoch, node_id);
+            let Some(snapshot) = self
+                .core
+                .store
+                .get_snapshot(&UuidKey::from(progress_id))
+                .map_err(|e| anyhow!("service progress lookup failed: {e}"))?
+            else {
+                continue;
+            };
+            let Some(record) = select_best_service_generation_progress_record(snapshot.as_slice())
+            else {
+                continue;
+            };
+            if record.service_id == service_id && record.service_epoch == service_epoch {
+                records.push(record);
+            }
+        }
+
+        Ok(records)
     }
 
     /// Fetches the latest replicated workload spec for the provided identifier so higher level

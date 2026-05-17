@@ -84,6 +84,7 @@ impl ServiceController {
         let slot_targets = compute_effective_slot_targets(&SlotTargetContext {
             service_name: &spec.service_name,
             service_id: spec.id,
+            service_epoch: spec.service_epoch,
             task_templates: &spec.task_templates,
             eligible_nodes,
             placement_nodes: &placement_nodes,
@@ -358,6 +359,7 @@ impl ServiceController {
         if let Some(preferred_node) = preferred_node {
             let request = slot.template.replica_start_request(
                 &spec.service_name,
+                spec.service_epoch,
                 slot.replica,
                 replacement_task_id,
                 Some(preferred_node),
@@ -448,6 +450,7 @@ impl ServiceController {
 
         let fallback = slot.template.replica_start_request(
             &spec.service_name,
+            spec.service_epoch,
             slot.replica,
             replacement_task_id,
             None,
@@ -573,6 +576,7 @@ impl ServiceController {
         let replacement_task_id = Uuid::new_v4();
         let request = slot.template.replica_start_request(
             &spec.service_name,
+            spec.service_epoch,
             slot.replica,
             replacement_task_id,
             Some(preferred_node),

@@ -75,6 +75,7 @@ struct RolloutArtifacts {
 struct ReplacementRequestContext<'a> {
     service_name: &'a str,
     service_id: Uuid,
+    service_epoch: u64,
     task_templates: &'a [TaskTemplateSpecValue],
     eligible_nodes: &'a [Uuid],
     placement_nodes: &'a [PlacementNode],
@@ -324,6 +325,7 @@ fn build_replacement_requests(
     let slot_targets = compute_effective_slot_targets(&SlotTargetContext {
         service_name: context.service_name,
         service_id: context.service_id,
+        service_epoch: context.service_epoch,
         task_templates: context.task_templates,
         eligible_nodes: context.eligible_nodes,
         placement_nodes: context.placement_nodes,
@@ -342,6 +344,7 @@ fn build_replacement_requests(
             let target_node = slot_targets.get(&key).copied();
             replacement.template.replica_start_request(
                 context.service_name,
+                context.service_epoch,
                 replacement.replica,
                 replacement.desired_id,
                 target_node,
@@ -554,6 +557,7 @@ impl ServiceController {
             ReplacementRequestContext {
                 service_name,
                 service_id: current_spec.id,
+                service_epoch: current_spec.service_epoch,
                 task_templates,
                 eligible_nodes: &eligible_nodes,
                 placement_nodes: &placement_nodes,
@@ -1358,6 +1362,7 @@ impl ServiceController {
         let slot_targets = compute_effective_slot_targets(&SlotTargetContext {
             service_name,
             service_id: current_spec.id,
+            service_epoch: current_spec.service_epoch,
             task_templates: &current_spec.task_templates,
             eligible_nodes: &eligible_nodes,
             placement_nodes: &placement_nodes,
@@ -1382,6 +1387,7 @@ impl ServiceController {
             let target_node = slot_targets.get(&key).copied();
             let request = template.replica_start_request(
                 service_name,
+                current_spec.service_epoch,
                 step.replica,
                 step.task_id,
                 target_node,

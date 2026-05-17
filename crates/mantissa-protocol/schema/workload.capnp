@@ -114,6 +114,9 @@ struct ServiceMetadata {
 
   templateName @1 :Text;
   # Task template name within the owning service.
+
+  serviceEpoch @2 :UInt64;
+  # Service generation that produced this workload replica.
 }
 
 struct JobMetadata {
@@ -516,6 +519,58 @@ struct WorkloadStatus {
 
 }
 
+struct ServiceGenerationProgressRecord {
+  id @0 :Data;
+  # Stable progress-record UUID as 16 bytes.
+
+  serviceId @1 :Data;
+  # Stable service UUID as 16 bytes.
+
+  serviceName @2 :Text;
+  # Human-readable service name.
+
+  serviceEpoch @3 :UInt64;
+  # Service generation represented by this aggregate.
+
+  nodeId @4 :Data;
+  # Node UUID that owns the counted replicas.
+
+  nodeName @5 :Text;
+  # Human-readable node name for diagnostics.
+
+  counts @6 :ServiceGenerationProgressCounts;
+  # Service-level progress summary for the represented node and generation.
+
+  detail @7 :Text;
+  # Optional sparse diagnostic detail for terminal or blocked states.
+
+  createdAt @8 :Text;
+  # RFC3339 timestamp for this aggregate's first local publication.
+
+  updatedAt @9 :Text;
+  # RFC3339 timestamp for this aggregate's latest local publication.
+}
+
+struct ServiceGenerationProgressCounts {
+  observed @0 :UInt64;
+  # Total replicas represented by this node-local aggregate.
+
+  running @1 :UInt64;
+  # Replicas that reached Running.
+
+  starting @2 :UInt64;
+  # Replicas still in early launch phases such as Pending, Pulling, or Creating.
+
+  blocked @3 :UInt64;
+  # Replicas blocked before readiness, for example by unavailable local volumes.
+
+  stopping @4 :UInt64;
+  # Replicas currently stopping.
+
+  terminal @5 :UInt64;
+  # Replicas that reached a terminal or unrecoverable state.
+}
+
 struct WorkloadEvent {
   event @0 :EventType;
   # Type of workload event.
@@ -532,6 +587,9 @@ struct WorkloadEvent {
   admissionGroup @4 :AdmissionGroupRecord;
   # Durable all-or-nothing admission decision for a workload group.
 
+  serviceProgress @5 :ServiceGenerationProgressRecord;
+  # Compact per-node progress aggregate for one service generation.
+
   enum EventType {
     upsertSpec @0;
     # Workload created or updated with the full workload definition.
@@ -544,6 +602,9 @@ struct WorkloadEvent {
 
     upsertAdmissionGroup @3;
     # Group admission decision created or advanced.
+
+    upsertServiceProgress @4;
+    # Service generation progress aggregate created or advanced.
   }
 }
 

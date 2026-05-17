@@ -26,8 +26,9 @@ use crate::workload::model::{
     WorkloadEvent, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStatus,
     WorkloadStoreValue, compare_workload_causality as compare_task_causality,
     compare_workload_status_causality as compare_task_status_causality,
-    select_best_admission_group_record, select_best_workload_value,
-    should_accept_admission_group_record,
+    select_best_admission_group_record, select_best_service_generation_progress_record,
+    select_best_workload_value, should_accept_admission_group_record,
+    should_accept_service_generation_progress_record,
 };
 use crate::workload::types::WorkloadRestartPolicyKind;
 
@@ -683,6 +684,43 @@ impl WorkloadManager {
                         });
                     }
                 }
+
+                Ok(())
+            }
+            WorkloadEvent::UpsertServiceProgress(record_box) => {
+                let record = *record_box;
+                let current = self
+                    .core
+                    .store
+                    .get_snapshot(&UuidKey::from(record.id))
+                    .map_err(|e| {
+                        anyhow::anyhow!("service progress lookup failed before apply: {e}")
+                    })?
+                    .and_then(|snapshot| {
+                        select_best_service_generation_progress_record(snapshot.as_slice())
+                    });
+                if let Some(current) = current.as_ref()
+                    && !should_accept_service_generation_progress_record(current, &record)
+                {
+                    debug!(
+                        target: "task",
+                        progress = %record.id,
+                        service = %record.service_name,
+                        epoch = record.service_epoch,
+                        node = %record.node_id,
+                        "ignoring stale or duplicate service progress update"
+                    );
+                    return Ok(());
+                }
+
+                self.core
+                    .store
+                    .upsert(
+                        &UuidKey::from(record.id),
+                        WorkloadStoreValue::from(record.clone()),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("service progress upsert failed: {e}"))?;
 
                 Ok(())
             }

@@ -603,6 +603,7 @@ impl ServiceController {
         let requests = build_start_requests(SlotTargetContext {
             service_name: &service_name,
             service_id,
+            service_epoch,
             task_templates: &task_templates,
             eligible_nodes: &eligible_nodes,
             placement_nodes: &placement_nodes,
@@ -907,6 +908,7 @@ impl ServiceController {
         let slot_targets = compute_effective_slot_targets(&SlotTargetContext {
             service_name: &service_name,
             service_id,
+            service_epoch,
             task_templates: &task_templates,
             eligible_nodes: &eligible_nodes,
             placement_nodes: &placement_nodes,
@@ -959,6 +961,7 @@ impl ServiceController {
             let requests = build_missing_template_requests(
                 &service_name,
                 service_id,
+                service_epoch,
                 &template,
                 &assignments,
                 &slot_targets,
@@ -1115,6 +1118,7 @@ impl ServiceController {
                 requests.extend(build_missing_template_requests(
                     deployment.service_name,
                     service_id,
+                    deployment.service_epoch,
                     template,
                     assignments,
                     slot_targets,

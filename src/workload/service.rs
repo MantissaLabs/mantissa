@@ -6,7 +6,8 @@ use crate::workload::capnp_codec::{
 };
 use crate::workload::manager::WorkloadManager;
 use crate::workload::model::{
-    ExecutionPlatform, IsolationMode, WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord,
+    ExecutionPlatform, IsolationMode, ServiceGenerationProgressCounts,
+    ServiceGenerationProgressRecord, WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord,
     WorkloadAdmissionState, WorkloadAgentRunMetadata, WorkloadEvent, WorkloadJobMetadata,
     WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStateFilter,
     WorkloadStateKind, WorkloadStatus, WorkloadStoreValue, WorkloadValue, merge_status_into_value,
@@ -16,8 +17,9 @@ use capnp::Error;
 use mantissa_protocol::gossip::gossip_message;
 use mantissa_protocol::workload::{
     AdmissionGroupPhase as ProtoAdmissionGroupPhase,
-    WorkloadStateFilter as ProtoWorkloadStateFilter, admission_group_record, workload,
-    workload_event, workload_list_request, workload_spec, workload_status,
+    WorkloadStateFilter as ProtoWorkloadStateFilter, admission_group_record,
+    service_generation_progress_record, workload, workload_event, workload_list_request,
+    workload_spec, workload_status,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::io::Cursor;
@@ -102,6 +104,13 @@ pub fn add_event(
             workload.set_event(workload_event::EventType::UpsertAdmissionGroup);
             write_admission_group(workload.reborrow().init_admission_group(), record.as_ref());
         }
+        WorkloadEvent::UpsertServiceProgress(record) => {
+            workload.set_event(workload_event::EventType::UpsertServiceProgress);
+            write_service_generation_progress(
+                workload.reborrow().init_service_progress(),
+                record.as_ref(),
+            );
+        }
     }
 }
 
@@ -123,6 +132,10 @@ pub fn read_event(reader: workload_event::Reader<'_>) -> Result<WorkloadEvent, E
         workload_event::EventType::UpsertAdmissionGroup => {
             let record = read_admission_group(reader.get_admission_group()?)?;
             Ok(WorkloadEvent::UpsertAdmissionGroup(Box::new(record)))
+        }
+        workload_event::EventType::UpsertServiceProgress => {
+            let record = read_service_generation_progress(reader.get_service_progress()?)?;
+            Ok(WorkloadEvent::UpsertServiceProgress(Box::new(record)))
         }
     }
 }
@@ -149,6 +162,13 @@ impl StoreValueCodec for WorkloadStoreValue {
                 event.set_event(workload_event::EventType::UpsertAdmissionGroup);
                 write_admission_group(event.reborrow().init_admission_group(), record.as_ref());
             }
+            WorkloadStoreValue::ServiceProgress(record) => {
+                event.set_event(workload_event::EventType::UpsertServiceProgress);
+                write_service_generation_progress(
+                    event.reborrow().init_service_progress(),
+                    record.as_ref(),
+                );
+            }
         }
 
         Ok(capnp::serialize::write_message_to_words(&message))
@@ -163,6 +183,7 @@ impl StoreValueCodec for WorkloadStoreValue {
                 Ok(merge_status_into_value(None, status.as_ref()).into())
             }
             WorkloadEvent::UpsertAdmissionGroup(record) => Ok((*record).into()),
+            WorkloadEvent::UpsertServiceProgress(record) => Ok((*record).into()),
             WorkloadEvent::Remove { id } => Err(Box::new(mantissa_store::error::Error::Other(
                 format!("workload store value cannot decode remove event for {id}"),
             ))),
@@ -200,6 +221,12 @@ impl StoreValueCodec for WorkloadValue {
             WorkloadEvent::UpsertAdmissionGroup(record) => {
                 Err(Box::new(mantissa_store::error::Error::Other(format!(
                     "workload value cannot decode admission group {}",
+                    record.id
+                ))))
+            }
+            WorkloadEvent::UpsertServiceProgress(record) => {
+                Err(Box::new(mantissa_store::error::Error::Other(format!(
+                    "workload value cannot decode service progress {}",
                     record.id
                 ))))
             }
@@ -285,6 +312,68 @@ pub fn read_admission_group(
         reason: read_optional_text(reader.get_reason()?),
         created_at: reader.get_created_at()?.to_str()?.to_string(),
         updated_at: reader.get_updated_at()?.to_str()?.to_string(),
+    })
+}
+
+/// Encodes one service generation progress aggregate into the workload wire payload.
+pub fn write_service_generation_progress(
+    mut builder: service_generation_progress_record::Builder<'_>,
+    record: &ServiceGenerationProgressRecord,
+) {
+    builder.set_id(record.id.as_bytes());
+    builder.set_service_id(record.service_id.as_bytes());
+    builder.set_service_name(&record.service_name);
+    builder.set_service_epoch(record.service_epoch);
+    builder.set_node_id(record.node_id.as_bytes());
+    builder.set_node_name(&record.node_name);
+    write_service_generation_progress_counts(builder.reborrow().init_counts(), &record.counts);
+    builder.set_detail(record.detail.as_deref().unwrap_or(""));
+    builder.set_created_at(&record.created_at);
+    builder.set_updated_at(&record.updated_at);
+}
+
+/// Encodes service progress counts into the workload wire payload.
+fn write_service_generation_progress_counts(
+    mut builder: mantissa_protocol::workload::service_generation_progress_counts::Builder<'_>,
+    counts: &ServiceGenerationProgressCounts,
+) {
+    builder.set_observed(counts.observed);
+    builder.set_running(counts.running);
+    builder.set_starting(counts.starting);
+    builder.set_blocked(counts.blocked);
+    builder.set_stopping(counts.stopping);
+    builder.set_terminal(counts.terminal);
+}
+
+/// Decodes one service generation progress aggregate from the workload wire payload.
+pub fn read_service_generation_progress(
+    reader: service_generation_progress_record::Reader<'_>,
+) -> Result<ServiceGenerationProgressRecord, Error> {
+    Ok(ServiceGenerationProgressRecord {
+        id: read_id_from_data(reader.get_id()?)?,
+        service_id: read_id_from_data(reader.get_service_id()?)?,
+        service_name: reader.get_service_name()?.to_str()?.to_string(),
+        service_epoch: reader.get_service_epoch(),
+        node_id: read_id_from_data(reader.get_node_id()?)?,
+        node_name: reader.get_node_name()?.to_str()?.to_string(),
+        counts: read_service_generation_progress_counts(reader.get_counts()?)?,
+        detail: read_optional_text(reader.get_detail()?),
+        created_at: reader.get_created_at()?.to_str()?.to_string(),
+        updated_at: reader.get_updated_at()?.to_str()?.to_string(),
+    })
+}
+
+/// Decodes service progress counts from the workload wire payload.
+fn read_service_generation_progress_counts(
+    reader: mantissa_protocol::workload::service_generation_progress_counts::Reader<'_>,
+) -> Result<ServiceGenerationProgressCounts, Error> {
+    Ok(ServiceGenerationProgressCounts {
+        observed: reader.get_observed(),
+        running: reader.get_running(),
+        starting: reader.get_starting(),
+        blocked: reader.get_blocked(),
+        stopping: reader.get_stopping(),
+        terminal: reader.get_terminal(),
     })
 }
 
@@ -660,6 +749,7 @@ fn write_service_metadata(
 ) {
     builder.set_service_name(&metadata.service_name);
     builder.set_template_name(&metadata.template);
+    builder.set_service_epoch(metadata.service_epoch);
 }
 
 /// Decodes service ownership metadata from a workload wire payload.
@@ -674,7 +764,8 @@ fn read_service_metadata(
         ));
     }
 
-    Ok(WorkloadServiceMetadata::new(service_name, template))
+    Ok(WorkloadServiceMetadata::new(service_name, template)
+        .with_service_epoch(reader.get_service_epoch()))
 }
 
 /// Encodes job ownership metadata into a workload wire payload.
@@ -988,6 +1079,20 @@ mod tests {
         }
     }
 
+    /// Builds one service progress record for store-codec round-trip tests.
+    fn sample_service_progress_record() -> ServiceGenerationProgressRecord {
+        let now = chrono::Utc::now().to_rfc3339();
+        let service_id = Uuid::new_v4();
+        let node_id = Uuid::new_v4();
+        let mut record =
+            ServiceGenerationProgressRecord::new(service_id, "api", 7, node_id, "node-a", now);
+        record.counts.observed = 7;
+        record.counts.starting = 2;
+        record.counts.running = 5;
+        record.detail = Some("warming".to_string());
+        record
+    }
+
     /// Workload values should round-trip through their Cap'n Proto store-value codec.
     #[test]
     fn store_value_codec_roundtrips_workload_values() {
@@ -1020,6 +1125,19 @@ mod tests {
             .expect("encode admission group store value");
         let decoded = WorkloadStoreValue::decode_store_value(&encoded)
             .expect("decode admission group store value");
+
+        assert_eq!(decoded, WorkloadStoreValue::from(record));
+    }
+
+    /// Service progress records should round-trip through the workload-domain store codec.
+    #[test]
+    fn service_progress_store_codec_roundtrips_capnp() {
+        let record = sample_service_progress_record();
+        let encoded = WorkloadStoreValue::from(record.clone())
+            .encode_store_value()
+            .expect("encode service progress store value");
+        let decoded = WorkloadStoreValue::decode_store_value(&encoded)
+            .expect("decode service progress store value");
 
         assert_eq!(decoded, WorkloadStoreValue::from(record));
     }

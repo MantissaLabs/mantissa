@@ -1,6 +1,6 @@
 use super::ServiceController;
 use crate::services::types::{ServiceEvent, ServiceRolloutState, ServiceSpecValue, ServiceStatus};
-use crate::workload::model::WorkloadPhase;
+use crate::workload::model::{ServiceGenerationProgressRecord, WorkloadPhase};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -373,6 +373,31 @@ async fn poll_service_attempt(
             }
         }
 
+        match controller
+            .workload_manager
+            .service_generation_progress(current.id, current.service_epoch)
+            .await
+        {
+            Ok(progress) => {
+                if let Some(progress_states) =
+                    readiness_states_from_progress(&current, progress.as_slice())
+                {
+                    last_states.clear();
+                    last_states.extend(progress_states);
+                    last_phase_versions.clear();
+                    last_terminal_launches.clear();
+                    return ReadinessOutcome::Success(current);
+                }
+            }
+            Err(err) => {
+                tracing::debug!(
+                    target: "services",
+                    "failed to load compact progress for service '{}': {err:#}",
+                    current.service_name
+                );
+            }
+        }
+
         last_states.clear();
         last_phase_versions.clear();
         last_terminal_launches.clear();
@@ -454,6 +479,39 @@ async fn poll_service_attempt(
 
         sleep(Duration::from_millis(SERVICE_READY_POLL_INTERVAL_MS)).await;
     }
+}
+
+/// Returns synthetic all-running readiness states when compact progress is complete.
+fn readiness_states_from_progress(
+    current: &ServiceSpecValue,
+    progress: &[ServiceGenerationProgressRecord],
+) -> Option<Vec<(Uuid, Option<WorkloadPhase>)>> {
+    if progress.is_empty() {
+        return None;
+    }
+
+    let expected = current.replica_ids.len() as u64;
+    let mut observed = 0u64;
+    let mut running = 0u64;
+    for record in progress {
+        if record.service_id != current.id || record.service_epoch != current.service_epoch {
+            continue;
+        }
+        observed = observed.saturating_add(record.observed_total());
+        running = running.saturating_add(record.counts.running);
+    }
+
+    if expected == 0 || observed != expected || running != expected {
+        return None;
+    }
+
+    Some(
+        current
+            .replica_ids
+            .iter()
+            .map(|task_id| (*task_id, Some(WorkloadPhase::Running)))
+            .collect(),
+    )
 }
 
 /// Records terminal task transitions and returns the task that exceeded deployment failure budget.

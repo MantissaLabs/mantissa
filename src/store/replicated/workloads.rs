@@ -60,6 +60,16 @@ impl MvRegCompactionRanker<WorkloadStoreValue, Uuid> for WorkloadCompactionRank 
                 record.coordinator_node_id,
                 Reverse(entry.value().clone()),
             ),
+            WorkloadStoreValue::ServiceProgress(record) => (
+                2,
+                record.service_epoch,
+                record.observed_total(),
+                parse_workload_timestamp(&record.updated_at, &record.created_at),
+                0,
+                true,
+                record.node_id,
+                Reverse(entry.value().clone()),
+            ),
         }
     }
 }

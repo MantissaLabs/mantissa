@@ -470,6 +470,7 @@ impl TaskTemplateSpecValue {
     pub fn replica_start_request(
         &self,
         service_name: &str,
+        service_epoch: u64,
         replica: u16,
         desired_id: Uuid,
         target_node: Option<Uuid>,
@@ -483,10 +484,10 @@ impl TaskTemplateSpecValue {
             gpu_device_ids: Vec::new(),
             id: Some(desired_id),
             slot_ids: Vec::new(),
-            owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
-                service_name,
-                &self.name,
-            ))),
+            owner: Some(WorkloadOwner::ServiceReplica(
+                WorkloadServiceMetadata::new(service_name, &self.name)
+                    .with_service_epoch(service_epoch),
+            )),
             service_placement_preferences: self.placement_preferences.clone(),
             target_node,
         }

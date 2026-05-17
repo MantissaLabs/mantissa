@@ -192,6 +192,118 @@ impl WorkloadAdmissionGroupRecord {
     }
 }
 
+/// Per-node progress aggregate for one service generation.
+///
+/// Service replicas can emit many routine lifecycle updates during a large rollout. This compact
+/// record lets service owners observe convergence by node and generation without requiring every
+/// `Creating` or `Running` row to fan out as an individual workload gossip update.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
+pub struct ServiceGenerationProgressRecord {
+    pub id: Uuid,
+    pub service_id: Uuid,
+    pub service_name: String,
+    pub service_epoch: u64,
+    pub node_id: Uuid,
+    pub node_name: String,
+    pub counts: ServiceGenerationProgressCounts,
+    #[serde(default)]
+    pub detail: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Service-level progress summary for one node's contribution to a service generation.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash,
+)]
+pub struct ServiceGenerationProgressCounts {
+    pub observed: u64,
+    pub running: u64,
+    pub starting: u64,
+    pub blocked: u64,
+    pub stopping: u64,
+    pub terminal: u64,
+}
+
+impl ServiceGenerationProgressCounts {
+    /// Adds one workload lifecycle phase to the service-level progress summary.
+    pub fn add_phase(&mut self, phase: &WorkloadPhase) {
+        self.observed = self.observed.saturating_add(1);
+        match phase {
+            WorkloadPhase::Pending | WorkloadPhase::Pulling | WorkloadPhase::Creating => {
+                self.starting = self.starting.saturating_add(1);
+            }
+            WorkloadPhase::VolumeUnavailable | WorkloadPhase::Paused => {
+                self.blocked = self.blocked.saturating_add(1);
+            }
+            WorkloadPhase::Running => self.running = self.running.saturating_add(1),
+            WorkloadPhase::Stopping => self.stopping = self.stopping.saturating_add(1),
+            WorkloadPhase::Stopped
+            | WorkloadPhase::Failed
+            | WorkloadPhase::Exited(_)
+            | WorkloadPhase::Unknown => self.terminal = self.terminal.saturating_add(1),
+        }
+    }
+}
+
+impl ServiceGenerationProgressRecord {
+    /// Builds an empty node-local progress aggregate for one service generation.
+    pub fn new(
+        service_id: Uuid,
+        service_name: impl Into<String>,
+        service_epoch: u64,
+        node_id: Uuid,
+        node_name: impl Into<String>,
+        timestamp: impl Into<String>,
+    ) -> Self {
+        let timestamp = timestamp.into();
+        Self {
+            id: compute_service_generation_progress_id(service_id, service_epoch, node_id),
+            service_id,
+            service_name: service_name.into(),
+            service_epoch,
+            node_id,
+            node_name: node_name.into(),
+            counts: ServiceGenerationProgressCounts::default(),
+            detail: None,
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+        }
+    }
+
+    /// Adds one workload lifecycle phase to this aggregate.
+    pub fn add_phase(&mut self, phase: &WorkloadPhase) {
+        self.counts.add_phase(phase);
+    }
+
+    /// Returns the number of service-owned tasks represented by this aggregate.
+    pub fn observed_total(&self) -> u64 {
+        self.counts.observed
+    }
+
+    /// Returns the number of terminal task states represented by this aggregate.
+    pub fn terminal_total(&self) -> u64 {
+        self.counts.terminal
+    }
+}
+
+/// Computes the stable workload-domain key for one service progress aggregate.
+pub fn compute_service_generation_progress_id(
+    service_id: Uuid,
+    service_epoch: u64,
+    node_id: Uuid,
+) -> Uuid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mantissa-service-generation-progress-v1");
+    hasher.update(service_id.as_bytes());
+    hasher.update(&service_epoch.to_le_bytes());
+    hasher.update(node_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
+}
+
 /// Canonical, filterable workload lifecycle identifiers projected from concrete phases.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum WorkloadStateKind {
@@ -297,6 +409,8 @@ pub struct WorkloadVolumeMount {
 pub struct WorkloadServiceMetadata {
     pub service_name: String,
     pub template: String,
+    #[serde(default)]
+    pub service_epoch: u64,
 }
 
 impl WorkloadServiceMetadata {
@@ -305,7 +419,14 @@ impl WorkloadServiceMetadata {
         Self {
             service_name: service_name.into(),
             template: template.into(),
+            service_epoch: 0,
         }
+    }
+
+    /// Returns this ownership marker with the service generation set.
+    pub fn with_service_epoch(mut self, service_epoch: u64) -> Self {
+        self.service_epoch = service_epoch;
+        self
     }
 }
 
@@ -654,6 +775,7 @@ pub enum WorkloadEvent {
     UpsertSpec(Box<WorkloadSpec>),
     UpsertStatus(Box<WorkloadStatus>),
     UpsertAdmissionGroup(Box<WorkloadAdmissionGroupRecord>),
+    UpsertServiceProgress(Box<ServiceGenerationProgressRecord>),
     Remove { id: Uuid },
 }
 
@@ -668,6 +790,7 @@ impl WorkloadEvent {
                 workload_upsert_propagation_class(&status.state, status.owner.as_ref(), false)
             }
             WorkloadEvent::UpsertAdmissionGroup(_) => WorkloadPropagationClass::TargetedRequired,
+            WorkloadEvent::UpsertServiceProgress(_) => WorkloadPropagationClass::CompactOwnerQuorum,
             WorkloadEvent::Remove { .. } => WorkloadPropagationClass::GlobalCritical,
         }
     }
@@ -732,6 +855,7 @@ fn compact_status_propagation(owner: Option<&WorkloadOwner>) -> WorkloadPropagat
 pub enum WorkloadStoreValue {
     Workload(Box<WorkloadValue>),
     AdmissionGroup(Box<WorkloadAdmissionGroupRecord>),
+    ServiceProgress(Box<ServiceGenerationProgressRecord>),
 }
 
 impl WorkloadStoreValue {
@@ -739,15 +863,23 @@ impl WorkloadStoreValue {
     pub fn workload(&self) -> Option<&WorkloadValue> {
         match self {
             Self::Workload(value) => Some(value.as_ref()),
-            Self::AdmissionGroup(_) => None,
+            Self::AdmissionGroup(_) | Self::ServiceProgress(_) => None,
         }
     }
 
     /// Returns the contained admission record when this row stores a group decision.
     pub fn admission_group(&self) -> Option<&WorkloadAdmissionGroupRecord> {
         match self {
-            Self::Workload(_) => None,
+            Self::Workload(_) | Self::ServiceProgress(_) => None,
             Self::AdmissionGroup(record) => Some(record.as_ref()),
+        }
+    }
+
+    /// Returns the contained progress record when this row stores service-generation progress.
+    pub fn service_progress(&self) -> Option<&ServiceGenerationProgressRecord> {
+        match self {
+            Self::ServiceProgress(record) => Some(record.as_ref()),
+            Self::Workload(_) | Self::AdmissionGroup(_) => None,
         }
     }
 }
@@ -763,6 +895,13 @@ impl From<WorkloadAdmissionGroupRecord> for WorkloadStoreValue {
     /// Wraps an admission group record for storage in the shared workload CRDT domain.
     fn from(record: WorkloadAdmissionGroupRecord) -> Self {
         Self::AdmissionGroup(Box::new(record))
+    }
+}
+
+impl From<ServiceGenerationProgressRecord> for WorkloadStoreValue {
+    /// Wraps a service progress record for storage in the shared workload CRDT domain.
+    fn from(record: ServiceGenerationProgressRecord) -> Self {
+        Self::ServiceProgress(Box::new(record))
     }
 }
 
@@ -1147,6 +1286,7 @@ pub(crate) fn workload_event_id(event: &WorkloadEvent) -> Uuid {
         WorkloadEvent::UpsertSpec(spec) => spec.id,
         WorkloadEvent::UpsertStatus(status) => status.id,
         WorkloadEvent::UpsertAdmissionGroup(record) => record.id,
+        WorkloadEvent::UpsertServiceProgress(record) => record.id,
         WorkloadEvent::Remove { id } => *id,
     }
 }
@@ -1181,8 +1321,14 @@ pub(crate) fn should_replace_workload_event(
             WorkloadEvent::UpsertAdmissionGroup(current_record),
             WorkloadEvent::UpsertAdmissionGroup(candidate_record),
         ) => should_accept_admission_group_record(current_record, candidate_record),
+        (
+            WorkloadEvent::UpsertServiceProgress(current_record),
+            WorkloadEvent::UpsertServiceProgress(candidate_record),
+        ) => should_accept_service_generation_progress_record(current_record, candidate_record),
         (WorkloadEvent::UpsertAdmissionGroup(_), _)
-        | (_, WorkloadEvent::UpsertAdmissionGroup(_)) => false,
+        | (_, WorkloadEvent::UpsertAdmissionGroup(_))
+        | (WorkloadEvent::UpsertServiceProgress(_), _)
+        | (_, WorkloadEvent::UpsertServiceProgress(_)) => false,
     }
 }
 
@@ -1258,6 +1404,41 @@ pub(crate) fn should_accept_admission_group_record(
     candidate.coordinator_node_id > current.coordinator_node_id
 }
 
+/// Returns true when one service progress record should replace the retained record.
+pub(crate) fn should_accept_service_generation_progress_record(
+    current: &ServiceGenerationProgressRecord,
+    candidate: &ServiceGenerationProgressRecord,
+) -> bool {
+    match (
+        parse_timestamp(&current.updated_at),
+        parse_timestamp(&candidate.updated_at),
+    ) {
+        (Some(current_ts), Some(candidate_ts)) => {
+            if candidate_ts > current_ts {
+                return true;
+            }
+            if candidate_ts < current_ts {
+                return false;
+            }
+        }
+        (None, Some(_)) => return true,
+        (Some(_), None) => return false,
+        (None, None) => {}
+    }
+
+    match candidate.observed_total().cmp(&current.observed_total()) {
+        Ordering::Equal => {}
+        order => return order.is_gt(),
+    }
+
+    match candidate.counts.running.cmp(&current.counts.running) {
+        Ordering::Equal => {}
+        order => return order.is_gt(),
+    }
+
+    candidate > current
+}
+
 /// Provides a workload view over both legacy workload values and typed store values.
 pub(crate) trait WorkloadValueSource {
     /// Returns the workload projection carried by this value when one exists.
@@ -1312,6 +1493,27 @@ pub(crate) fn select_best_admission_group_record(
             None => best = Some(record),
             Some(current) => {
                 if should_accept_admission_group_record(current, record) {
+                    best = Some(record);
+                }
+            }
+        }
+    }
+    best.cloned()
+}
+
+/// Selects the winning service progress record from concurrent store values.
+pub(crate) fn select_best_service_generation_progress_record(
+    values: &[WorkloadStoreValue],
+) -> Option<ServiceGenerationProgressRecord> {
+    let mut best: Option<&ServiceGenerationProgressRecord> = None;
+    for value in values {
+        let Some(record) = value.service_progress() else {
+            continue;
+        };
+        match best {
+            None => best = Some(record),
+            Some(current) => {
+                if should_accept_service_generation_progress_record(current, record) {
                     best = Some(record);
                 }
             }
@@ -1537,10 +1739,11 @@ pub(crate) fn spec_to_value(spec: &WorkloadSpec) -> WorkloadValue {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutionPlatform, IsolationMode, WorkloadAdmissionGroupPhase,
-        WorkloadAdmissionGroupRecord, WorkloadAdmissionState, WorkloadEvent, WorkloadOwner,
-        WorkloadPhase, WorkloadPropagationClass, WorkloadServiceMetadata, WorkloadSpec,
-        WorkloadStatus, compare_workload_spec_causality,
+        ExecutionPlatform, IsolationMode, ServiceGenerationProgressRecord,
+        WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord, WorkloadAdmissionState,
+        WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadPropagationClass,
+        WorkloadServiceMetadata, WorkloadSpec, WorkloadStatus, compare_workload_spec_causality,
+        compute_service_generation_progress_id,
     };
     use chrono::Utc;
     use std::cmp::Ordering;
@@ -1635,6 +1838,34 @@ mod tests {
             WorkloadEvent::UpsertAdmissionGroup(Box::new(record)).propagation_class(),
             WorkloadPropagationClass::TargetedRequired
         );
+
+        let progress = ServiceGenerationProgressRecord::new(
+            Uuid::new_v4(),
+            "svc",
+            2,
+            Uuid::new_v4(),
+            "node-a",
+            Utc::now().to_rfc3339(),
+        );
+        assert_eq!(
+            WorkloadEvent::UpsertServiceProgress(Box::new(progress)).propagation_class(),
+            WorkloadPropagationClass::CompactOwnerQuorum
+        );
+    }
+
+    /// Service progress identifiers should be stable per service generation and node.
+    #[test]
+    fn service_progress_id_is_generation_and_node_scoped() {
+        let service_id = Uuid::new_v4();
+        let node_id = Uuid::new_v4();
+        let first = compute_service_generation_progress_id(service_id, 3, node_id);
+        let second = compute_service_generation_progress_id(service_id, 3, node_id);
+        let next_epoch = compute_service_generation_progress_id(service_id, 4, node_id);
+        let next_node = compute_service_generation_progress_id(service_id, 3, Uuid::new_v4());
+
+        assert_eq!(first, second);
+        assert_ne!(first, next_epoch);
+        assert_ne!(first, next_node);
     }
 
     /// Workload propagation policy should route routine lifecycle status to the owner side.

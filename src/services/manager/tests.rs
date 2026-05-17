@@ -425,7 +425,7 @@ fn replica_request_preserves_termination_grace_period() {
         placement_preferences: Vec::new(),
     };
 
-    let request = template.replica_start_request("demo-service", 1, desired_id, None);
+    let request = template.replica_start_request("demo-service", 0, 1, desired_id, None);
 
     assert_eq!(request.termination_grace_period_secs, Some(42));
     assert_eq!(
@@ -654,6 +654,7 @@ async fn bridge_dependencies_colocate_replica_targets() {
     let targets = compute_effective_slot_targets(&SlotTargetContext {
         service_name: "demo-service",
         service_id,
+        service_epoch: 0,
         task_templates: &task_templates,
         eligible_nodes: &candidates,
         placement_nodes: &[],
@@ -728,6 +729,7 @@ async fn bridge_dependency_rejects_conflicting_local_volume_target() {
     let err = compute_effective_slot_targets(&SlotTargetContext {
         service_name: "demo-service",
         service_id: Uuid::new_v4(),
+        service_epoch: 0,
         task_templates: &task_templates,
         eligible_nodes: &eligible_nodes,
         placement_nodes: &[],

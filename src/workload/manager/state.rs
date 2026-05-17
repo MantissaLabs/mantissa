@@ -20,12 +20,14 @@ use crate::scheduler::{
     GpuReservationRequest, LeaseReservation, SchedulerError, SlotId, SlotReservationRequest,
     SlotState,
 };
+use crate::services::types::compute_service_id;
 use crate::volumes::LocalVolumeAccessError;
 use crate::workload::model::{
-    WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord, WorkloadAdmissionState,
-    WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec,
-    WorkloadStoreValue, WorkloadValue, parse_workload_timestamp as parse_task_timestamp,
-    select_best_admission_group_record, select_best_workload_value, workload_event_id,
+    ServiceGenerationProgressRecord, WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord,
+    WorkloadAdmissionState, WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata,
+    WorkloadSpec, WorkloadStoreValue, WorkloadValue, compute_service_generation_progress_id,
+    parse_workload_timestamp as parse_task_timestamp, select_best_admission_group_record,
+    select_best_workload_value, workload_event_id,
 };
 use crate::workload::types::{
     WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadRestartPolicyKind,
@@ -88,6 +90,12 @@ fn workload_gossip_metric_labels(event: &WorkloadEvent) -> WorkloadGossipMetricL
             owner: "admission_group",
             phase: "n/a",
         },
+        WorkloadEvent::UpsertServiceProgress(_) => WorkloadGossipMetricLabels {
+            event: "upsert_service_progress",
+            representation: "service_progress",
+            owner: "service",
+            phase: "aggregate",
+        },
     }
 }
 
@@ -127,7 +135,9 @@ fn should_suppress_routine_service_gossip(event: &WorkloadEvent) -> bool {
         WorkloadEvent::UpsertStatus(status) => {
             is_routine_service_lifecycle_state(&status.state, status.owner.as_ref())
         }
-        WorkloadEvent::Remove { .. } | WorkloadEvent::UpsertAdmissionGroup(_) => false,
+        WorkloadEvent::Remove { .. }
+        | WorkloadEvent::UpsertAdmissionGroup(_)
+        | WorkloadEvent::UpsertServiceProgress(_) => false,
     }
 }
 
@@ -138,6 +148,57 @@ fn is_routine_service_lifecycle_state(
 ) -> bool {
     matches!(owner, Some(WorkloadOwner::ServiceReplica(_)))
         && matches!(state, WorkloadPhase::Creating | WorkloadPhase::Running)
+}
+
+/// Borrowed fields needed to derive one compact service progress update.
+struct ServiceProgressEventRef<'a> {
+    task_id: Uuid,
+    node_id: Uuid,
+    node_name: &'a str,
+    owner: &'a WorkloadServiceMetadata,
+    state: &'a WorkloadPhase,
+    reason: Option<&'a String>,
+}
+
+/// Returns the service-owned lifecycle payload carried by one workload event, if present.
+fn service_progress_event_ref(event: &WorkloadEvent) -> Option<ServiceProgressEventRef<'_>> {
+    match event {
+        WorkloadEvent::UpsertSpec(spec) => Some(ServiceProgressEventRef {
+            task_id: spec.id,
+            node_id: spec.node_id,
+            node_name: &spec.node_name,
+            owner: spec.service_owner()?,
+            state: &spec.state,
+            reason: spec.phase_reason.as_ref(),
+        }),
+        WorkloadEvent::UpsertStatus(status) => Some(ServiceProgressEventRef {
+            task_id: status.id,
+            node_id: status.node_id,
+            node_name: &status.node_name,
+            owner: status.service_owner()?,
+            state: &status.state,
+            reason: status.phase_reason.as_ref(),
+        }),
+        WorkloadEvent::Remove { .. }
+        | WorkloadEvent::UpsertAdmissionGroup(_)
+        | WorkloadEvent::UpsertServiceProgress(_) => None,
+    }
+}
+
+/// Returns true when one lifecycle phase should refresh service-level progress.
+fn should_publish_service_progress_for_phase(phase: &WorkloadPhase) -> bool {
+    matches!(
+        phase,
+        WorkloadPhase::Creating
+            | WorkloadPhase::VolumeUnavailable
+            | WorkloadPhase::Running
+            | WorkloadPhase::Paused
+            | WorkloadPhase::Stopping
+            | WorkloadPhase::Stopped
+            | WorkloadPhase::Failed
+            | WorkloadPhase::Exited(_)
+            | WorkloadPhase::Unknown
+    )
 }
 
 impl WorkloadManager {
@@ -1229,21 +1290,140 @@ impl WorkloadManager {
         self.core.tx.clone()
     }
 
-    /// Records the latest outbound gossip event for one task id inside the local dirty buffer.
-    async fn buffer_gossip_event(&self, event: WorkloadEvent) {
+    /// Publishes the compact service progress record implied by one service-owned lifecycle event.
+    async fn publish_service_progress_for_event(
+        &self,
+        event: &WorkloadEvent,
+    ) -> Result<(), anyhow::Error> {
+        let Some(progress_event) = service_progress_event_ref(event) else {
+            return Ok(());
+        };
+        if !should_publish_service_progress_for_phase(progress_event.state) {
+            return Ok(());
+        }
+
+        let service_id = compute_service_id(&progress_event.owner.service_name);
+        let timestamp = Utc::now().to_rfc3339();
+        let progress = self
+            .update_service_progress_tracker(progress_event, service_id, timestamp)
+            .await;
+
+        self.core
+            .store
+            .upsert(
+                &UuidKey::from(progress.id),
+                WorkloadStoreValue::from(progress.clone()),
+            )
+            .await
+            .map_err(|e| anyhow!("service progress upsert failed: {e}"))?;
+
+        self.buffer_gossip_event_unsuppressed(WorkloadEvent::UpsertServiceProgress(Box::new(
+            progress,
+        )))
+        .await;
+
+        Ok(())
+    }
+
+    /// Updates local service progress counts and returns the compact row to replicate.
+    async fn update_service_progress_tracker(
+        &self,
+        progress_event: ServiceProgressEventRef<'_>,
+        service_id: Uuid,
+        timestamp: String,
+    ) -> ServiceGenerationProgressRecord {
+        let progress_id = compute_service_generation_progress_id(
+            service_id,
+            progress_event.owner.service_epoch,
+            progress_event.node_id,
+        );
+        let mut tracker = self.local_state.service_progress.lock().await;
+        if let Some(previous) = tracker.tasks.remove(&progress_event.task_id)
+            && let Some(record) = tracker.records.get_mut(&previous.progress_id)
+        {
+            Self::adjust_service_progress_count(record, &previous.state, false);
+            Self::clear_service_progress_detail_if_healthy(record);
+        }
+
+        let updated = {
+            let record = tracker.records.entry(progress_id).or_insert_with(|| {
+                ServiceGenerationProgressRecord::new(
+                    service_id,
+                    progress_event.owner.service_name.clone(),
+                    progress_event.owner.service_epoch,
+                    progress_event.node_id,
+                    progress_event.node_name.to_string(),
+                    timestamp.clone(),
+                )
+            });
+
+            Self::adjust_service_progress_count(record, progress_event.state, true);
+            record.updated_at = timestamp;
+            record.node_name = progress_event.node_name.to_string();
+            if let Some(detail) =
+                Self::service_progress_detail_for_state(progress_event.state, progress_event.reason)
+            {
+                record.detail = Some(detail);
+            } else {
+                Self::clear_service_progress_detail_if_healthy(record);
+            }
+
+            record.clone()
+        };
+
+        tracker.tasks.insert(
+            progress_event.task_id,
+            super::ServiceProgressTaskEntry {
+                progress_id,
+                state: progress_event.state.clone(),
+            },
+        );
+
+        updated
+    }
+
+    /// Adjusts one lifecycle counter in a compact service progress aggregate.
+    fn adjust_service_progress_count(
+        record: &mut ServiceGenerationProgressRecord,
+        state: &WorkloadPhase,
+        increment: bool,
+    ) {
+        Self::adjust_service_progress_counter(&mut record.counts.observed, increment);
+        let counter = match state {
+            WorkloadPhase::Pending | WorkloadPhase::Pulling | WorkloadPhase::Creating => {
+                &mut record.counts.starting
+            }
+            WorkloadPhase::VolumeUnavailable | WorkloadPhase::Paused => &mut record.counts.blocked,
+            WorkloadPhase::Running => &mut record.counts.running,
+            WorkloadPhase::Stopping => &mut record.counts.stopping,
+            WorkloadPhase::Stopped
+            | WorkloadPhase::Failed
+            | WorkloadPhase::Exited(_)
+            | WorkloadPhase::Unknown => &mut record.counts.terminal,
+        };
+        Self::adjust_service_progress_counter(counter, increment);
+    }
+
+    /// Adjusts one service progress count in the requested direction.
+    fn adjust_service_progress_counter(counter: &mut u64, increment: bool) {
+        if increment {
+            *counter = counter.saturating_add(1);
+        } else {
+            *counter = counter.saturating_sub(1);
+        }
+    }
+
+    /// Clears stale diagnostic detail once the aggregate has no blocked or terminal states.
+    fn clear_service_progress_detail_if_healthy(record: &mut ServiceGenerationProgressRecord) {
+        if record.counts.blocked == 0 && record.terminal_total() == 0 {
+            record.detail = None;
+        }
+    }
+
+    /// Records an outbound workload gossip event after caller-side suppression decisions.
+    async fn buffer_gossip_event_unsuppressed(&self, event: WorkloadEvent) {
         let labels = workload_gossip_metric_labels(&event);
         let propagation = event.propagation_class();
-        if should_suppress_routine_service_gossip(&event) {
-            crate::observability::metrics::record_workload_gossip_suppressed(
-                labels.event,
-                labels.representation,
-                labels.owner,
-                labels.phase,
-                propagation.as_str(),
-                "routine_service_lifecycle",
-            );
-            return;
-        }
         crate::observability::metrics::record_workload_gossip_event(
             labels.event,
             labels.representation,
@@ -1262,6 +1442,62 @@ impl WorkloadManager {
         }
         drop(dirty);
         self.local_state.dirty_gossip_notify.notify_one();
+    }
+
+    /// Records the latest outbound gossip event for one task id inside the local dirty buffer.
+    async fn buffer_gossip_event(&self, event: WorkloadEvent) {
+        let labels = workload_gossip_metric_labels(&event);
+        let propagation = event.propagation_class();
+        if should_suppress_routine_service_gossip(&event) {
+            crate::observability::metrics::record_workload_gossip_suppressed(
+                labels.event,
+                labels.representation,
+                labels.owner,
+                labels.phase,
+                propagation.as_str(),
+                "routine_service_lifecycle",
+            );
+            if let Err(err) = self.publish_service_progress_for_event(&event).await {
+                warn!(
+                    target: "task",
+                    "failed to publish compact service progress for suppressed workload update: {err:#}"
+                );
+            }
+            return;
+        }
+
+        if let Some(progress_event) = service_progress_event_ref(&event)
+            && should_publish_service_progress_for_phase(progress_event.state)
+            && let Err(err) = self.publish_service_progress_for_event(&event).await
+        {
+            warn!(
+                target: "task",
+                "failed to publish compact service progress for workload update: {err:#}"
+            );
+        }
+
+        self.buffer_gossip_event_unsuppressed(event).await;
+    }
+
+    /// Returns sparse detail for blocked or terminal state aggregates.
+    fn service_progress_detail_for_state(
+        state: &WorkloadPhase,
+        reason: Option<&String>,
+    ) -> Option<String> {
+        if matches!(
+            state,
+            WorkloadPhase::VolumeUnavailable
+                | WorkloadPhase::Stopped
+                | WorkloadPhase::Failed
+                | WorkloadPhase::Exited(_)
+                | WorkloadPhase::Unknown
+        ) && let Some(reason) = reason
+            && !reason.is_empty()
+        {
+            return Some(reason.clone());
+        }
+
+        None
     }
 
     /// Drains the current dirty gossip buffer into the shared outbound gossip queue.
@@ -2994,7 +3230,12 @@ impl WorkloadManager {
             let id = key.to_uuid();
             if let Some(value) = select_best_workload_value(snapshot.as_slice()) {
                 workload_values.insert(id, value);
-            } else if select_best_admission_group_record(snapshot.as_slice()).is_none() {
+            } else if select_best_admission_group_record(snapshot.as_slice()).is_none()
+                && crate::workload::model::select_best_service_generation_progress_record(
+                    snapshot.as_slice(),
+                )
+                .is_none()
+            {
                 invalid_ids.push(id);
             }
         }

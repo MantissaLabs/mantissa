@@ -5,6 +5,7 @@ use crate::network::types::NetworkDriver;
 pub(super) struct SlotTargetContext<'a> {
     pub(super) service_name: &'a str,
     pub(super) service_id: Uuid,
+    pub(super) service_epoch: u64,
     pub(super) task_templates: &'a [TaskTemplateSpecValue],
     pub(super) eligible_nodes: &'a [Uuid],
     pub(super) placement_nodes: &'a [PlacementNode],
@@ -27,6 +28,7 @@ pub(super) fn build_start_requests(
             let target_node = slot_targets.get(&key).copied();
             requests.push(template.replica_start_request(
                 context.service_name,
+                context.service_epoch,
                 replica_number,
                 desired_id,
                 target_node,
@@ -40,6 +42,7 @@ pub(super) fn build_start_requests(
 pub(super) fn build_missing_template_requests(
     service_name: &str,
     service_id: Uuid,
+    service_epoch: u64,
     template: &TaskTemplateSpecValue,
     assignments: &BTreeMap<(String, u16), Uuid>,
     slot_targets: &HashMap<SlotKey, Uuid>,
@@ -55,6 +58,7 @@ pub(super) fn build_missing_template_requests(
         let target_node = slot_targets.get(&key).copied();
         requests.push(template.replica_start_request(
             service_name,
+            service_epoch,
             replica,
             desired_id,
             target_node,
