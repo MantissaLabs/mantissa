@@ -348,7 +348,21 @@ impl Topology {
         already_selected: &HashSet<Uuid>,
     ) -> Vec<&'a PeerCacheEntry> {
         let repair_fanout = *self.runtime.workload_repair_fanout.lock();
-        let hinted_peer_ids = self.runtime.workload_repair_hints.lock().drain();
+        let hinted_peer_ids = if repair_fanout == 0 {
+            self.runtime.workload_repair_hints.lock().drain();
+            Vec::new()
+        } else {
+            let available_peer_ids = entries
+                .iter()
+                .map(|entry| entry.peer_id)
+                .collect::<HashSet<_>>();
+            self.runtime.workload_repair_hints.lock().take_for_tick(
+                self.local.node.id,
+                repair_fanout,
+                already_selected,
+                &available_peer_ids,
+            )
+        };
         select_workload_repair_peers_for_node(
             self.local.node.id,
             entries,

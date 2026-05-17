@@ -252,6 +252,44 @@ impl WorkloadRepairHintState {
         }
     }
 
+    /// Selects the next repair-hinted peers that one bounded sync tick can actually try.
+    ///
+    /// The workload repair loop may have a fanout smaller than the number of deployment peers that
+    /// recently exchanged assignment rows or compact progress. This method consumes only selected
+    /// hints and leaves overflow in the queue for later ticks, so a large deployment does not lose
+    /// repair priority just because the first tick's budget was small. Hints for the local node,
+    /// peers already handled by full-domain sync, and peers missing from the current snapshot are
+    /// dropped because they no longer need or cannot receive this workload-only repair attempt.
+    pub(super) fn take_for_tick(
+        &mut self,
+        local_id: Uuid,
+        capacity: usize,
+        already_selected: &HashSet<Uuid>,
+        available_peer_ids: &HashSet<Uuid>,
+    ) -> Vec<Uuid> {
+        if capacity == 0 {
+            return Vec::new();
+        }
+
+        let mut selected = Vec::with_capacity(capacity);
+        while selected.len() < capacity {
+            let Some(peer_id) = self.order.pop_front() else {
+                break;
+            };
+            self.members.remove(&peer_id);
+
+            if peer_id == local_id
+                || already_selected.contains(&peer_id)
+                || !available_peer_ids.contains(&peer_id)
+            {
+                continue;
+            }
+
+            selected.push(peer_id);
+        }
+        selected
+    }
+
     /// Consumes the current priority list in insertion order for one sync tick.
     ///
     /// The selector later drops peers that are no longer in the current peer
@@ -261,6 +299,52 @@ impl WorkloadRepairHintState {
     pub(super) fn drain(&mut self) -> Vec<Uuid> {
         self.members.clear();
         self.order.drain(..).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkloadRepairHintState;
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    /// Ensures bounded repair ticks keep queued deployment peers for later workload sync ticks.
+    #[test]
+    fn workload_repair_hints_preserve_overflow_across_ticks() {
+        let local_id = Uuid::from_u128(1);
+        let peer_a = Uuid::from_u128(2);
+        let peer_b = Uuid::from_u128(3);
+        let peer_c = Uuid::from_u128(4);
+        let available = HashSet::from([peer_a, peer_b, peer_c]);
+        let mut hints = WorkloadRepairHintState::default();
+        hints.enqueue_many([peer_a, peer_b, peer_c], 8);
+
+        let first_tick = hints.take_for_tick(local_id, 2, &HashSet::new(), &available);
+        assert_eq!(first_tick, vec![peer_a, peer_b]);
+
+        let second_tick = hints.take_for_tick(local_id, 2, &HashSet::new(), &available);
+        assert_eq!(second_tick, vec![peer_c]);
+    }
+
+    /// Ensures stale or already-synced hints do not spend workload repair budget.
+    #[test]
+    fn workload_repair_hints_drop_unusable_peers() {
+        let local_id = Uuid::from_u128(10);
+        let already_synced = Uuid::from_u128(11);
+        let unavailable = Uuid::from_u128(12);
+        let usable = Uuid::from_u128(13);
+        let available = HashSet::from([already_synced, usable]);
+        let already_selected = HashSet::from([already_synced]);
+        let mut hints = WorkloadRepairHintState::default();
+        hints.enqueue_many([local_id, already_synced, unavailable, usable], 8);
+
+        let selected = hints.take_for_tick(local_id, 2, &already_selected, &available);
+        assert_eq!(selected, vec![usable]);
+        assert!(
+            hints
+                .take_for_tick(local_id, 2, &already_selected, &available)
+                .is_empty()
+        );
     }
 }
 
