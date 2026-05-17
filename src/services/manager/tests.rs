@@ -1,14 +1,14 @@
 use super::admission::*;
-use super::ownership::{
-    build_replica_slots, build_service_deployment_shards, compute_slot_targets,
-    select_generation_owner, select_slot_owner, select_task_owner,
-};
 use super::placement::*;
 use super::readiness::{ReadinessClass, classify_readiness_states};
 use super::rollout::wait_rollout_task_running_with_state_fetcher;
 use super::state::*;
 use super::*;
 use crate::network::types::{NetworkDriver, NetworkSpecDraft, NetworkSpecValue};
+use crate::services::ownership::{
+    build_replica_slots, build_service_deployment_shards, compute_slot_targets,
+    select_generation_owner, select_slot_owner, select_task_owner,
+};
 use crate::services::types::TaskTemplateNetworkRequirement;
 use crate::store::replicated::networks::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,

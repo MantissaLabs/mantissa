@@ -50,7 +50,7 @@ use x25519_dalek::PublicKey;
 use self::builders::drain_state_from_scheduling;
 use self::local_state::LocalNodeState;
 use self::peer_cache::{PeerCacheEntry, PeerSnapshot, PeerSnapshotCache};
-use self::runtime::{GossipWarmSetState, TopologyRuntime};
+use self::runtime::{GossipWarmSetState, TopologyRuntime, WorkloadRepairHintState};
 
 mod builders;
 mod cluster_operations;
@@ -99,6 +99,8 @@ const DEFAULT_GLOBAL_METADATA_SYNC_FANOUT: usize = 8;
 const DEFAULT_GLOBAL_METADATA_SYNC_PARALLELISM: usize = 1;
 /// Number of peers targeted by the low-rate workload-only repair path on each sync tick.
 const DEFAULT_WORKLOAD_REPAIR_FANOUT: usize = 1;
+/// Maximum queued peers that can be prioritized by deployment-aware workload repair.
+const DEFAULT_WORKLOAD_REPAIR_HINT_MAX: usize = 256;
 /// Cross-view domains synchronized by the global metadata anti-entropy loop.
 const GLOBAL_METADATA_SYNC_DOMAINS: [Domain; 1] = [Domain::ClusterViews];
 /// Selected domains synchronized by the targeted workload-only repair path.
@@ -220,6 +222,7 @@ impl Topology {
                 health_probe: runtime::ProbeLoopState::new(probe_interval),
                 workload_repair_fanout: Arc::new(Mutex::new(DEFAULT_WORKLOAD_REPAIR_FANOUT)),
                 workload_repair_cursor: Arc::new(Mutex::new(0)),
+                workload_repair_hints: Arc::new(Mutex::new(WorkloadRepairHintState::default())),
                 metadata_sync: runtime::SyncLoopState::new(
                     DEFAULT_GLOBAL_METADATA_SYNC_INTERVAL,
                     DEFAULT_GLOBAL_METADATA_SYNC_FANOUT,

@@ -954,6 +954,7 @@ async fn setup_manager_with_forwarding(
         runtime_config: None,
         local_volume_root,
         enforce_local_volume_capacity: false,
+        topology: None,
     });
 
     (manager, scheduler, mock_cm, network_registry)

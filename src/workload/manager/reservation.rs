@@ -1452,8 +1452,13 @@ impl WorkloadManager {
                     target: "task",
                     peer = %peer_id,
                     assignments,
-                    "failed direct assignment delivery; workload sync will repair if the target misses these rows: {err:#}"
+                    "failed direct assignment delivery; workload MST sync will reconcile these persisted assignment rows if the target misses them: {err:#}"
                 );
+                // The owner already persisted these assignment rows locally.
+                // Prioritize workload sync with the target so the target can
+                // pull the missing rows through MST anti-entropy instead of
+                // waiting for unrelated peer rotation.
+                self.hint_workload_repair_peer(peer_id);
             }
         }
     }

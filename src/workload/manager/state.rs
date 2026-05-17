@@ -1303,6 +1303,7 @@ impl WorkloadManager {
         }
 
         let service_id = compute_service_id(&progress_event.owner.service_name);
+        let service_epoch = progress_event.owner.service_epoch;
         let timestamp = Utc::now().to_rfc3339();
         let progress = self
             .update_service_progress_tracker(progress_event, service_id, timestamp)
@@ -1316,6 +1317,11 @@ impl WorkloadManager {
             )
             .await
             .map_err(|e| anyhow!("service progress upsert failed: {e}"))?;
+
+        // This target just wrote compact service progress. Prioritize workload
+        // sync with the deterministic generation owner so readiness decisions
+        // can observe the aggregate without global workload-row gossip.
+        self.hint_service_generation_owner_repair(service_id, service_epoch);
 
         self.buffer_gossip_event_unsuppressed(WorkloadEvent::UpsertServiceProgress(Box::new(
             progress,

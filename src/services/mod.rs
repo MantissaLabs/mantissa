@@ -1,6 +1,7 @@
 mod dependencies;
 pub mod manager;
 mod ordering;
+pub(crate) mod ownership;
 mod reconcile;
 pub mod registry;
 pub mod service;

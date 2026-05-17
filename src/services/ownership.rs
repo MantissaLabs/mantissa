@@ -509,7 +509,7 @@ pub(super) fn select_task_owner(task_id: Uuid, candidates: &[Uuid]) -> Option<Uu
 }
 
 /// Selects the deterministic owner for one service generation so only one node executes rollout.
-pub(super) fn select_generation_owner(
+pub(crate) fn select_generation_owner(
     service_id: Uuid,
     service_epoch: u64,
     candidates: &[Uuid],

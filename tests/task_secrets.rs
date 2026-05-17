@@ -419,6 +419,7 @@ async fn setup_workload_manager() -> TestHarness {
         runtime_config: None,
         local_volume_root: local_volume_root.path().to_path_buf(),
         enforce_local_volume_capacity: false,
+        topology: None,
     });
 
     TestHarness {

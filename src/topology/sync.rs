@@ -24,9 +24,49 @@ impl Topology {
         self.runtime.sync.set_fanout(fanout);
     }
 
-    /// Set the number of peers targeted by the deterministic workload-repair pass (`0` means all peers).
+    /// Set the number of peers targeted by the deterministic workload-domain sync pass.
+    ///
+    /// This pass syncs only workload rows and compact service progress records.
+    /// It is the low-rate repair path for peers that missed direct assignment
+    /// delivery or progress propagation. `0` means sync workloads with every
+    /// in-view peer.
     pub fn set_workload_repair_fanout(&self, fanout: usize) {
         *self.runtime.workload_repair_fanout.lock() = fanout;
+    }
+
+    /// Asks the existing workload-domain sync loop to contact one peer soon.
+    ///
+    /// This is intentionally only a local scheduling preference. It does not
+    /// open a connection immediately and it does not introduce another RPC path.
+    /// Callers use it when a deployment event makes a specific peer more useful
+    /// than a random peer for the next workload MST sync, such as:
+    /// - an assignment owner whose direct delivery to a target failed;
+    /// - a target that just accepted assignment rows from a coordinator;
+    /// - a target that wrote compact service progress for the generation owner.
+    pub fn hint_workload_repair_peer(&self, peer_id: Uuid) {
+        if peer_id == self.local.node.id {
+            return;
+        }
+        self.runtime
+            .workload_repair_hints
+            .lock()
+            .enqueue(peer_id, DEFAULT_WORKLOAD_REPAIR_HINT_MAX);
+    }
+
+    /// Asks the workload-domain sync loop to prioritize several peers soon.
+    ///
+    /// Each peer is deduplicated and bounded by the same queue as
+    /// `hint_workload_repair_peer`, so large deployments can mark many affected
+    /// targets without turning the next sync tick into an all-peer flood.
+    pub fn hint_workload_repair_peers<I>(&self, peer_ids: I)
+    where
+        I: IntoIterator<Item = Uuid>,
+    {
+        let local_id = self.local.node.id;
+        self.runtime.workload_repair_hints.lock().enqueue_many(
+            peer_ids.into_iter().filter(|peer_id| *peer_id != local_id),
+            DEFAULT_WORKLOAD_REPAIR_HINT_MAX,
+        );
     }
 
     /// Set the metadata sync interval used by the cross-view cluster metadata loop.
@@ -295,25 +335,28 @@ impl Topology {
         select_sync_peers_for_node(self.local.node.id, entries, sync_fanout)
     }
 
-    /// Select peers to target during one low-rate workload-only repair tick.
+    /// Select peers for one low-rate workload-domain MST sync tick.
     ///
-    /// This keeps task repair deterministic and bounded while avoiding peers already chosen for
-    /// the full all-domain sync pass during the same tick.
+    /// Peers from recent deployment exchanges are tried first because they are
+    /// the most likely to be missing assignment rows or compact service progress.
+    /// The remaining budget falls back to deterministic round-robin coverage.
+    /// Peers already selected by the full all-domain sync pass are skipped so
+    /// the same tick does not spend both sync budgets on one peer.
     fn select_workload_repair_peers<'a>(
         &self,
         entries: &'a [PeerCacheEntry],
         already_selected: &HashSet<Uuid>,
     ) -> Vec<&'a PeerCacheEntry> {
         let repair_fanout = *self.runtime.workload_repair_fanout.lock();
-        select_sync_peers_round_robin_for_node(
+        let hinted_peer_ids = self.runtime.workload_repair_hints.lock().drain();
+        select_workload_repair_peers_for_node(
             self.local.node.id,
             entries,
             repair_fanout,
             &self.runtime.workload_repair_cursor,
+            already_selected,
+            &hinted_peer_ids,
         )
-        .into_iter()
-        .filter(|entry| !already_selected.contains(&entry.peer_id))
-        .collect()
     }
 
     /// Select peers to target during one cross-view metadata anti-entropy tick.
@@ -880,6 +923,65 @@ fn select_sync_peers_round_robin_for_node<'a>(
     selected
 }
 
+/// Selects peers for workload-only MST sync using deployment endpoints first.
+///
+/// `hinted_peer_ids` are peers that recently exchanged deployment state with
+/// the local node. Trying them first helps the owner and target converge after
+/// direct assignment delivery fails, direct assignment succeeds, or compact
+/// service progress is written. The function still preserves the round-robin
+/// sweep, so peers that were not part of a recent deployment exchange continue
+/// to receive workload-domain anti-entropy over time.
+fn select_workload_repair_peers_for_node<'a>(
+    local_id: Uuid,
+    entries: &'a [PeerCacheEntry],
+    repair_fanout: usize,
+    cursor: &Arc<Mutex<usize>>,
+    already_selected: &HashSet<Uuid>,
+    hinted_peer_ids: &[Uuid],
+) -> Vec<&'a PeerCacheEntry> {
+    if repair_fanout == 0 {
+        return select_sync_peers_round_robin_for_node(local_id, entries, repair_fanout, cursor)
+            .into_iter()
+            .filter(|entry| !already_selected.contains(&entry.peer_id))
+            .collect();
+    }
+
+    let mut selected = Vec::with_capacity(repair_fanout);
+    let mut selected_ids = HashSet::with_capacity(repair_fanout.saturating_mul(2));
+    for hinted_peer_id in hinted_peer_ids {
+        if selected.len() >= repair_fanout {
+            break;
+        }
+        if *hinted_peer_id == local_id || already_selected.contains(hinted_peer_id) {
+            continue;
+        }
+        let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.peer_id == *hinted_peer_id)
+        else {
+            continue;
+        };
+        if selected_ids.insert(entry.peer_id) {
+            selected.push(entry);
+        }
+    }
+
+    if selected.len() >= repair_fanout {
+        return selected;
+    }
+
+    for entry in select_sync_peers_round_robin_for_node(local_id, entries, repair_fanout, cursor) {
+        if selected.len() >= repair_fanout {
+            break;
+        }
+        if already_selected.contains(&entry.peer_id) || !selected_ids.insert(entry.peer_id) {
+            continue;
+        }
+        selected.push(entry);
+    }
+    selected
+}
+
 /// Computes the bounded warm-set size used by view-scoped gossip.
 fn gossip_warm_target(population_len: usize, fanout_hint: usize) -> usize {
     if population_len == 0 {
@@ -980,6 +1082,7 @@ mod tests {
         PeerCacheEntry, PeerHandle, PeerSchedulingState, PeerValue, gossip_warm_target,
         negotiated_sync_root_schema_version, rebuild_gossip_warm_set, refill_gossip_warm_set,
         rotate_gossip_warm_set, select_sync_peers_round_robin_for_node,
+        select_workload_repair_peers_for_node,
     };
     use crate::cluster::RootSchemaInfo;
     use crate::runtime::types::RuntimeSupportProfile;
@@ -1117,6 +1220,90 @@ mod tests {
         }
 
         assert_eq!(seen.len(), 5, "round-robin fanout should cover every peer");
+    }
+
+    /// Workload repair should spend its bounded budget on hinted peers before round-robin fill.
+    #[test]
+    fn select_workload_repair_peers_prioritizes_hints() {
+        let local_id = Uuid::from_u128(1);
+        let peer_a = Uuid::from_u128(2);
+        let peer_b = Uuid::from_u128(3);
+        let peer_c = Uuid::from_u128(4);
+        let entries = vec![
+            make_entry(local_id, 0),
+            make_entry(peer_a, 1),
+            make_entry(peer_b, 2),
+            make_entry(peer_c, 3),
+        ];
+        let cursor = Arc::new(Mutex::new(0usize));
+        let selected = select_workload_repair_peers_for_node(
+            local_id,
+            &entries,
+            2,
+            &cursor,
+            &HashSet::new(),
+            &[peer_c, peer_b],
+        );
+
+        let selected_ids: Vec<Uuid> = selected.iter().map(|entry| entry.peer_id).collect();
+        assert_eq!(selected_ids, vec![peer_c, peer_b]);
+    }
+
+    /// Workload repair hints should not duplicate peers selected by the full sync pass.
+    #[test]
+    fn select_workload_repair_peers_skips_already_selected_hints() {
+        let local_id = Uuid::from_u128(10);
+        let peer_a = Uuid::from_u128(11);
+        let peer_b = Uuid::from_u128(12);
+        let peer_c = Uuid::from_u128(13);
+        let entries = vec![
+            make_entry(local_id, 0),
+            make_entry(peer_a, 1),
+            make_entry(peer_b, 2),
+            make_entry(peer_c, 3),
+        ];
+        let cursor = Arc::new(Mutex::new(0usize));
+        let selected = select_workload_repair_peers_for_node(
+            local_id,
+            &entries,
+            2,
+            &cursor,
+            &HashSet::from([peer_c]),
+            &[peer_c, peer_b],
+        );
+
+        let selected_ids: HashSet<Uuid> = selected.iter().map(|entry| entry.peer_id).collect();
+        assert_eq!(selected.len(), 2);
+        assert!(selected_ids.contains(&peer_b));
+        assert!(!selected_ids.contains(&peer_c));
+        assert!(!selected_ids.contains(&local_id));
+    }
+
+    /// Workload repair fanout zero should keep diagnostic all-peer behavior.
+    #[test]
+    fn select_workload_repair_peers_fanout_zero_returns_all_non_selected_peers() {
+        let local_id = Uuid::from_u128(20);
+        let peer_a = Uuid::from_u128(21);
+        let peer_b = Uuid::from_u128(22);
+        let peer_c = Uuid::from_u128(23);
+        let entries = vec![
+            make_entry(local_id, 0),
+            make_entry(peer_a, 1),
+            make_entry(peer_b, 2),
+            make_entry(peer_c, 3),
+        ];
+        let cursor = Arc::new(Mutex::new(0usize));
+        let selected = select_workload_repair_peers_for_node(
+            local_id,
+            &entries,
+            0,
+            &cursor,
+            &HashSet::from([peer_a]),
+            &[peer_a],
+        );
+
+        let selected_ids: HashSet<Uuid> = selected.iter().map(|entry| entry.peer_id).collect();
+        assert_eq!(selected_ids, HashSet::from([peer_b, peer_c]));
     }
 
     /// Warm-set sizing should stay bounded while always covering at least the hot-path fanout.

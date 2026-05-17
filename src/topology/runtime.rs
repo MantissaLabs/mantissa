@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -207,6 +207,63 @@ pub(super) struct GossipWarmSetState {
     pub(super) refresh_cursor: usize,
 }
 
+#[derive(Default)]
+pub(super) struct WorkloadRepairHintState {
+    /// Peers to contact first during the next workload-domain MST sync pass.
+    ///
+    /// A peer enters this list when the local node already knows that peer is
+    /// part of an active deployment exchange with us: for example an assignment
+    /// target, an assignment coordinator, or a service generation owner waiting
+    /// for compact progress. This state does not send any RPC or gossip message
+    /// on its own; it only changes the order used by the existing low-rate
+    /// workload sync loop.
+    order: VecDeque<Uuid>,
+    /// Fast membership check paired with `order` so repeated events for one peer
+    /// do not grow the priority list.
+    members: HashSet<Uuid>,
+}
+
+impl WorkloadRepairHintState {
+    /// Adds one peer to the workload-sync priority list while enforcing a hard capacity.
+    ///
+    /// When the list is full, the oldest peer is dropped. This keeps deployment
+    /// bursts bounded: a large service may touch many targets, but the sync loop
+    /// still spends only its configured workload repair fanout on each tick.
+    pub(super) fn enqueue(&mut self, peer_id: Uuid, capacity: usize) {
+        if capacity == 0 || !self.members.insert(peer_id) {
+            return;
+        }
+
+        self.order.push_back(peer_id);
+        while self.order.len() > capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                self.members.remove(&evicted);
+            }
+        }
+    }
+
+    /// Adds many peers through the same bounded deduplicating path as `enqueue`.
+    pub(super) fn enqueue_many<I>(&mut self, peer_ids: I, capacity: usize)
+    where
+        I: IntoIterator<Item = Uuid>,
+    {
+        for peer_id in peer_ids {
+            self.enqueue(peer_id, capacity);
+        }
+    }
+
+    /// Consumes the current priority list in insertion order for one sync tick.
+    ///
+    /// The selector later drops peers that are no longer in the current peer
+    /// snapshot. Consuming the list here prevents stale deployment events from
+    /// permanently biasing workload sync toward peers that left or were already
+    /// covered by the full-domain sync pass.
+    pub(super) fn drain(&mut self) -> Vec<Uuid> {
+        self.members.clear();
+        self.order.drain(..).collect()
+    }
+}
+
 /// Groups mutable runtime state used by background topology loops.
 #[derive(Clone)]
 pub(super) struct TopologyRuntime {
@@ -233,6 +290,13 @@ pub(super) struct TopologyRuntime {
 
     /// Rotating cursor used by workload-only repair to deterministically cover all in-view peers.
     pub(super) workload_repair_cursor: Arc<Mutex<usize>>,
+
+    /// Temporary priority list for peers involved in recent workload deployment exchanges.
+    ///
+    /// The regular workload-only sync pass drains this list before falling back
+    /// to round-robin coverage, so assignment/progress endpoints converge sooner
+    /// without changing the background anti-entropy model.
+    pub(super) workload_repair_hints: Arc<Mutex<WorkloadRepairHintState>>,
 
     /// Runtime state for cross-view cluster metadata anti-entropy management.
     pub(super) metadata_sync: SyncLoopState,

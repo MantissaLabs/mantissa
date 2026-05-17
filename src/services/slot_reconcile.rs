@@ -1,7 +1,4 @@
 use super::inventory::{ServiceReplicaSnapshot, TaskInventory};
-use super::ownership::{
-    ReplicaSlot, SlotKey, build_replica_slots, select_slot_owner, select_task_owner,
-};
 use super::placement::{
     SlotTargetContext, build_placement_preference_inventory, compute_effective_slot_targets,
     is_local_volume_unavailable_error, mounted_local_volumes_require_pinned_target,
@@ -14,6 +11,9 @@ use super::state::{
 use super::{
     SERVICE_ENABLE_PROACTIVE_REBALANCE, SERVICE_REBALANCE_COOLDOWN_SECS,
     SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController,
+};
+use crate::services::ownership::{
+    ReplicaSlot, SlotKey, build_replica_slots, select_slot_owner, select_task_owner,
 };
 use crate::services::types::{ServiceSpecValue, ServiceStatus};
 use crate::workload::model::{WorkloadPhase, WorkloadSpec};
