@@ -23,7 +23,12 @@ pub(super) fn build_start_requests(
     for template in context.task_templates {
         for replica_idx in 0..template.replicas {
             let replica_number = replica_idx + 1;
-            let desired_id = Uuid::new_v4();
+            let desired_id = crate::services::types::derive_service_replica_id(
+                context.service_id,
+                context.service_epoch,
+                &template.name,
+                replica_number,
+            );
             let key = SlotKey::new(context.service_id, &template.name, replica_number);
             let target_node = slot_targets.get(&key).copied();
             requests.push(template.replica_start_request(
@@ -53,7 +58,12 @@ pub(super) fn build_missing_template_requests(
             continue;
         }
 
-        let desired_id = Uuid::new_v4();
+        let desired_id = crate::services::types::derive_service_replica_id(
+            service_id,
+            service_epoch,
+            &template.name,
+            replica,
+        );
         let key = SlotKey::new(service_id, &template.name, replica);
         let target_node = slot_targets.get(&key).copied();
         requests.push(template.replica_start_request(

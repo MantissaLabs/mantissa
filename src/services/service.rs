@@ -5,10 +5,11 @@ use crate::services::manager::{
 };
 use crate::services::types::{
     ServiceEvent, ServicePortProtocol, ServicePreviousGeneration, ServiceReadinessProbe,
-    ServiceReadinessProbeKind, ServiceRescheduleLock, ServiceRescheduleReason,
-    ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState,
-    ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
-    TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
+    ServiceReadinessProbeKind, ServiceReplicaAssignmentSegment, ServiceRescheduleLock,
+    ServiceRescheduleReason, ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase,
+    ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy,
+    ServiceUpdateStrategyMode, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
+    derive_service_replica_id,
 };
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
@@ -20,9 +21,10 @@ use crate::workload::capnp_codec::{
     encode_service_liveness_probe, encode_service_restart_policy, encode_volume_mounts,
 };
 use crate::workload::types::{ExecutionSpec, WorkloadAdmissionPolicy};
-use capnp::Error;
+use capnp::{Error, struct_list};
 use mantissa_protocol::services::{
-    service_event, service_spec, service_task_progress, services, task_template,
+    replica_assignment_segment, service_event, service_spec, service_task_progress, services,
+    task_template,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::collections::HashSet;
@@ -225,6 +227,30 @@ pub(crate) fn write_service_spec(
     builder: &mut service_spec::Builder<'_>,
     value: &ServiceSpecValue,
 ) -> Result<(), Error> {
+    write_service_spec_with_replica_id_mode(builder, value, ReplicaIdEncoding::Expanded)
+}
+
+/// Encodes one service spec using compact replica ids when they are derivable.
+fn write_compact_service_spec(
+    builder: &mut service_spec::Builder<'_>,
+    value: &ServiceSpecValue,
+) -> Result<(), Error> {
+    write_service_spec_with_replica_id_mode(builder, value, ReplicaIdEncoding::CompactWhenDerived)
+}
+
+/// Selects whether service replica ids are encoded explicitly or as compact deterministic ranges.
+#[derive(Clone, Copy)]
+enum ReplicaIdEncoding {
+    Expanded,
+    CompactWhenDerived,
+}
+
+/// Encodes one service spec into the requested replica-id wire representation.
+fn write_service_spec_with_replica_id_mode(
+    builder: &mut service_spec::Builder<'_>,
+    value: &ServiceSpecValue,
+    replica_id_encoding: ReplicaIdEncoding,
+) -> Result<(), Error> {
     builder.set_id(value.id.as_bytes());
     builder.set_manifest_id(value.manifest_id.as_bytes());
     builder.set_manifest_name(&value.manifest_name);
@@ -251,12 +277,7 @@ pub(crate) fn write_service_spec(
         write_task_template(templates_builder.reborrow().get(idx as u32), template)?;
     }
 
-    let mut replica_ids_builder = builder
-        .reborrow()
-        .init_replica_ids(value.replica_ids.len() as u32);
-    for (idx, wid) in value.replica_ids.iter().enumerate() {
-        replica_ids_builder.set(idx as u32, wid.as_bytes());
-    }
+    write_replica_ids(builder, value, replica_id_encoding);
 
     if let Some(lock) = value.reschedule_lock.as_ref() {
         let lock_builder = builder.reborrow().init_reschedule_lock();
@@ -265,7 +286,7 @@ pub(crate) fn write_service_spec(
 
     if let Some(previous) = value.previous_generation.as_ref() {
         let previous_builder = builder.reborrow().init_previous_generation();
-        write_previous_generation(previous_builder, previous)?;
+        write_previous_generation(previous_builder, previous, value.id, replica_id_encoding)?;
     }
 
     Ok(())
@@ -299,7 +320,7 @@ impl StoreValueCodec for ServiceSpecValue {
         let mut message = capnp::message::Builder::new_default();
         {
             let mut builder = message.init_root::<service_spec::Builder<'_>>();
-            write_service_spec(&mut builder, self).map_err(service_store_codec_error)?;
+            write_compact_service_spec(&mut builder, self).map_err(service_store_codec_error)?;
         }
         Ok(capnp::serialize::write_message_to_words(&message))
     }
@@ -332,12 +353,12 @@ pub(crate) fn write_service_event(
         ServiceEvent::Upsert(spec) => {
             builder.set_event(service_event::EventType::Upsert);
             let mut spec_builder = builder.reborrow().init_spec();
-            write_service_spec(&mut spec_builder, spec)?;
+            write_compact_service_spec(&mut spec_builder, spec)?;
         }
         ServiceEvent::Remove(spec) => {
             builder.set_event(service_event::EventType::Remove);
             let mut spec_builder = builder.reborrow().init_spec();
-            write_service_spec(&mut spec_builder, spec)?;
+            write_compact_service_spec(&mut spec_builder, spec)?;
         }
     }
     Ok(())
@@ -369,10 +390,15 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
         task_templates.push(read_task_template(tmpl)?);
     }
 
-    let mut replica_ids = Vec::new();
-    for wid in reader.get_replica_ids()?.iter() {
-        replica_ids.push(read_uuid(wid?)?);
-    }
+    let service_epoch = reader.get_service_epoch();
+    let explicit_replica_ids = read_expanded_replica_ids(reader.get_replica_ids()?)?;
+    let replica_ids = read_service_replica_ids(
+        id,
+        service_epoch,
+        &task_templates,
+        explicit_replica_ids,
+        reader.get_replica_assignment_segments()?,
+    )?;
 
     let mut value = ServiceSpecValue::new(
         manifest_id,
@@ -383,7 +409,7 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
     );
     value.id = id;
     value.updated_at = reader.get_updated_at()?.to_str()?.to_string();
-    value.service_epoch = reader.get_service_epoch();
+    value.service_epoch = service_epoch;
     value.phase_version = reader.get_phase_version();
     value.rollout = if reader.has_rollout() {
         read_rollout_state(reader.get_rollout()?)?
@@ -410,7 +436,10 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
         WorkloadAdmissionPolicy::default()
     };
     value.previous_generation = if reader.has_previous_generation() {
-        Some(read_previous_generation(reader.get_previous_generation()?)?)
+        Some(read_previous_generation(
+            reader.get_previous_generation()?,
+            id,
+        )?)
     } else {
         None
     };
@@ -420,6 +449,221 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
         None
     };
     Ok(value)
+}
+
+/// Encodes replica ids explicitly or as compact deterministic assignment ranges.
+fn write_replica_ids(
+    builder: &mut service_spec::Builder<'_>,
+    value: &ServiceSpecValue,
+    replica_id_encoding: ReplicaIdEncoding,
+) {
+    if matches!(replica_id_encoding, ReplicaIdEncoding::CompactWhenDerived)
+        && let Some(segments) = compact_replica_assignment_segments(
+            value.id,
+            value.service_epoch,
+            &value.task_templates,
+            &value.replica_ids,
+        )
+        && !segments.is_empty()
+    {
+        builder.reborrow().init_replica_ids(0);
+        let segments_builder = builder
+            .reborrow()
+            .init_replica_assignment_segments(segments.len() as u32);
+        write_replica_assignment_segments(segments_builder, &segments);
+        return;
+    }
+
+    let mut replica_ids_builder = builder
+        .reborrow()
+        .init_replica_ids(value.replica_ids.len() as u32);
+    for (idx, replica_id) in value.replica_ids.iter().enumerate() {
+        replica_ids_builder.set(idx as u32, replica_id.as_bytes());
+    }
+    builder.reborrow().init_replica_assignment_segments(0);
+}
+
+/// Encodes prior-generation replica ids explicitly or as compact deterministic ranges.
+fn write_previous_replica_ids(
+    builder: &mut mantissa_protocol::services::previous_generation::Builder<'_>,
+    previous: &ServicePreviousGeneration,
+    service_id: Uuid,
+    replica_id_encoding: ReplicaIdEncoding,
+) {
+    if matches!(replica_id_encoding, ReplicaIdEncoding::CompactWhenDerived)
+        && let Some(segments) = compact_replica_assignment_segments(
+            service_id,
+            previous.service_epoch,
+            &previous.task_templates,
+            &previous.replica_ids,
+        )
+        && !segments.is_empty()
+    {
+        builder.reborrow().init_replica_ids(0);
+        let segments_builder = builder
+            .reborrow()
+            .init_replica_assignment_segments(segments.len() as u32);
+        write_replica_assignment_segments(segments_builder, &segments);
+        return;
+    }
+
+    let mut replica_ids_builder = builder
+        .reborrow()
+        .init_replica_ids(previous.replica_ids.len() as u32);
+    for (idx, replica_id) in previous.replica_ids.iter().enumerate() {
+        replica_ids_builder.set(idx as u32, replica_id.as_bytes());
+    }
+    builder.reborrow().init_replica_assignment_segments(0);
+}
+
+/// Finds a compact prefix representation for deterministic service replica ids.
+fn compact_replica_assignment_segments(
+    service_id: Uuid,
+    service_epoch: u64,
+    task_templates: &[TaskTemplateSpecValue],
+    replica_ids: &[Uuid],
+) -> Option<Vec<ServiceReplicaAssignmentSegment>> {
+    if replica_ids.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut cursor = 0usize;
+    let mut segments = Vec::new();
+    for template in task_templates {
+        let mut first_replica = None;
+        let mut replica_count = 0u16;
+        for replica in 1..=template.replicas {
+            let Some(actual_id) = replica_ids.get(cursor) else {
+                break;
+            };
+            let expected_id =
+                derive_service_replica_id(service_id, service_epoch, &template.name, replica);
+            if *actual_id != expected_id {
+                return None;
+            }
+
+            if first_replica.is_none() {
+                first_replica = Some(replica);
+            }
+            replica_count = replica_count.checked_add(1)?;
+            cursor += 1;
+        }
+
+        if let Some(first_replica) = first_replica {
+            segments.push(ServiceReplicaAssignmentSegment::new(
+                template.name.clone(),
+                first_replica,
+                replica_count,
+            )?);
+        }
+
+        if cursor == replica_ids.len() {
+            break;
+        }
+    }
+
+    (cursor == replica_ids.len()).then_some(segments)
+}
+
+/// Writes compact replica assignment ranges into the Cap'n Proto payload.
+fn write_replica_assignment_segments(
+    mut builder: struct_list::Builder<'_, replica_assignment_segment::Owned>,
+    segments: &[ServiceReplicaAssignmentSegment],
+) {
+    for (idx, segment) in segments.iter().enumerate() {
+        let mut segment_builder = builder.reborrow().get(idx as u32);
+        segment_builder.set_template_name(&segment.template_name);
+        segment_builder.set_first_replica(segment.first_replica);
+        segment_builder.set_replica_count(segment.replica_count);
+    }
+}
+
+/// Reads explicit 16-byte replica ids from the wire payload.
+fn read_expanded_replica_ids(reader: capnp::data_list::Reader<'_>) -> Result<Vec<Uuid>, Error> {
+    let mut replica_ids = Vec::with_capacity(reader.len() as usize);
+    for replica_id in reader.iter() {
+        replica_ids.push(read_uuid(replica_id?)?);
+    }
+    Ok(replica_ids)
+}
+
+/// Resolves either explicit or compact replica ids into the in-memory service representation.
+fn read_service_replica_ids(
+    service_id: Uuid,
+    service_epoch: u64,
+    task_templates: &[TaskTemplateSpecValue],
+    explicit_replica_ids: Vec<Uuid>,
+    segment_reader: struct_list::Reader<'_, replica_assignment_segment::Owned>,
+) -> Result<Vec<Uuid>, Error> {
+    let segments = read_replica_assignment_segments(segment_reader)?;
+    if segments.is_empty() {
+        return Ok(explicit_replica_ids);
+    }
+    if !explicit_replica_ids.is_empty() {
+        return Err(Error::failed(
+            "service spec cannot mix explicit replica ids and compact assignments".to_string(),
+        ));
+    }
+
+    expand_replica_assignment_segments(service_id, service_epoch, task_templates, &segments)
+}
+
+/// Reads compact assignment ranges from the service wire payload.
+fn read_replica_assignment_segments(
+    reader: struct_list::Reader<'_, replica_assignment_segment::Owned>,
+) -> Result<Vec<ServiceReplicaAssignmentSegment>, Error> {
+    let mut segments = Vec::with_capacity(reader.len() as usize);
+    for segment in reader.iter() {
+        let template_name = segment.get_template_name()?.to_str()?.to_string();
+        let first_replica = segment.get_first_replica();
+        let replica_count = segment.get_replica_count();
+        let segment =
+            ServiceReplicaAssignmentSegment::new(template_name, first_replica, replica_count)
+                .ok_or_else(|| Error::failed("invalid replica assignment segment".to_string()))?;
+        segments.push(segment);
+    }
+    Ok(segments)
+}
+
+/// Expands compact assignment ranges after validating them against the service manifest.
+fn expand_replica_assignment_segments(
+    service_id: Uuid,
+    service_epoch: u64,
+    task_templates: &[TaskTemplateSpecValue],
+    segments: &[ServiceReplicaAssignmentSegment],
+) -> Result<Vec<Uuid>, Error> {
+    let mut seen_slots = HashSet::new();
+    let mut replica_ids = Vec::new();
+    for segment in segments {
+        let Some(template) = task_templates
+            .iter()
+            .find(|template| template.name == segment.template_name)
+        else {
+            return Err(Error::failed(format!(
+                "replica assignment segment references unknown template '{}'",
+                segment.template_name
+            )));
+        };
+
+        let last_replica = segment.first_replica + segment.replica_count - 1;
+        if last_replica > template.replicas {
+            return Err(Error::failed(format!(
+                "replica assignment segment for template '{}' exceeds desired replicas",
+                segment.template_name
+            )));
+        }
+
+        for replica in segment.first_replica..=last_replica {
+            if !seen_slots.insert((segment.template_name.clone(), replica)) {
+                return Err(Error::failed(format!(
+                    "duplicate replica assignment for template '{}' replica {}",
+                    segment.template_name, replica
+                )));
+            }
+        }
+        replica_ids.extend(segment.replica_ids(service_id, service_epoch));
+    }
+    Ok(replica_ids)
 }
 
 /// Encodes rollout diagnostics and progress counters into the service wire payload.
@@ -481,6 +725,8 @@ fn read_rollout_state(
 fn write_previous_generation(
     mut builder: mantissa_protocol::services::previous_generation::Builder<'_>,
     previous: &ServicePreviousGeneration,
+    service_id: Uuid,
+    replica_id_encoding: ReplicaIdEncoding,
 ) -> Result<(), Error> {
     builder.set_manifest_id(previous.manifest_id.as_bytes());
     builder.set_manifest_name(&previous.manifest_name);
@@ -502,12 +748,7 @@ fn write_previous_generation(
         write_task_template(templates_builder.reborrow().get(idx as u32), template)?;
     }
 
-    let mut replica_ids_builder = builder
-        .reborrow()
-        .init_replica_ids(previous.replica_ids.len() as u32);
-    for (idx, replica_id) in previous.replica_ids.iter().enumerate() {
-        replica_ids_builder.set(idx as u32, replica_id.as_bytes());
-    }
+    write_previous_replica_ids(&mut builder, previous, service_id, replica_id_encoding);
 
     Ok(())
 }
@@ -515,6 +756,7 @@ fn write_previous_generation(
 /// Decodes the prior generation snapshot used by deterministic rollout owner adoption.
 fn read_previous_generation(
     reader: mantissa_protocol::services::previous_generation::Reader<'_>,
+    service_id: Uuid,
 ) -> Result<ServicePreviousGeneration, Error> {
     let manifest_id = read_uuid(reader.get_manifest_id()?)?;
     let manifest_name = reader.get_manifest_name()?.to_str()?.to_string();
@@ -523,10 +765,15 @@ fn read_previous_generation(
         task_templates.push(read_task_template(tmpl)?);
     }
 
-    let mut replica_ids = Vec::new();
-    for replica_id in reader.get_replica_ids()?.iter() {
-        replica_ids.push(read_uuid(replica_id?)?);
-    }
+    let service_epoch = reader.get_service_epoch();
+    let explicit_replica_ids = read_expanded_replica_ids(reader.get_replica_ids()?)?;
+    let replica_ids = read_service_replica_ids(
+        service_id,
+        service_epoch,
+        &task_templates,
+        explicit_replica_ids,
+        reader.get_replica_assignment_segments()?,
+    )?;
 
     let update_strategy = if reader.has_update_strategy() {
         read_update_strategy(reader.get_update_strategy()?)?
@@ -546,7 +793,7 @@ fn read_previous_generation(
         replica_ids,
         update_strategy,
         admission_policy,
-        service_epoch: reader.get_service_epoch(),
+        service_epoch,
         status: proto_to_service_status(reader.get_status()?),
     })
 }
@@ -1053,7 +1300,7 @@ mod tests {
         ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue,
         ServiceStatus, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
         TaskTemplateNetworkRequirement, TaskTemplateRestartPolicy, TaskTemplateRestartPolicyKind,
-        TaskTemplateSpecValue,
+        TaskTemplateSpecValue, derive_service_replica_id,
     };
     use crate::store::replicated::services::open_service_store;
     use crate::task::types::{
@@ -1411,6 +1658,121 @@ mod tests {
             ServiceSpecValue::decode_store_value(&encoded).expect("decode service spec value");
 
         assert_eq!(decoded, spec);
+    }
+
+    /// Store and gossip encoding should compact deterministic service replica ids.
+    #[test]
+    fn store_value_codec_compacts_derived_service_replica_ids() {
+        let mut spec = sample_service_spec();
+        spec.service_epoch = 9;
+        spec.replica_ids = (1..=2)
+            .map(|replica| derive_service_replica_id(spec.id, spec.service_epoch, "web", replica))
+            .collect();
+
+        let mut previous = sample_service_spec();
+        previous.service_epoch = 8;
+        previous.replica_ids = (1..=2)
+            .map(|replica| {
+                derive_service_replica_id(spec.id, previous.service_epoch, "web", replica)
+            })
+            .collect();
+        spec.previous_generation = Some(ServicePreviousGeneration::from_service(&previous));
+
+        let encoded = spec
+            .encode_store_value()
+            .expect("encode compact service spec value");
+        let mut cursor = std::io::Cursor::new(&encoded);
+        let reader =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .expect("read compact service spec message");
+        let spec_reader = reader
+            .get_root::<service_spec::Reader<'_>>()
+            .expect("read compact service spec root");
+
+        assert_eq!(
+            spec_reader
+                .get_replica_ids()
+                .expect("read explicit replica ids")
+                .len(),
+            0,
+            "compact store encoding should omit explicit current replica ids"
+        );
+        let segments = spec_reader
+            .get_replica_assignment_segments()
+            .expect("read current compact replica segments");
+        assert_eq!(segments.len(), 1);
+        let segment = segments.get(0);
+        assert_eq!(
+            segment
+                .get_template_name()
+                .expect("read segment template")
+                .to_str()
+                .expect("segment template is UTF-8"),
+            "web"
+        );
+        assert_eq!(segment.get_first_replica(), 1);
+        assert_eq!(segment.get_replica_count(), 2);
+
+        let previous_reader = spec_reader
+            .get_previous_generation()
+            .expect("read previous generation");
+        assert_eq!(
+            previous_reader
+                .get_replica_ids()
+                .expect("read explicit previous replica ids")
+                .len(),
+            0,
+            "compact store encoding should omit explicit previous replica ids"
+        );
+        assert_eq!(
+            previous_reader
+                .get_replica_assignment_segments()
+                .expect("read previous compact replica segments")
+                .len(),
+            1
+        );
+
+        let decoded =
+            ServiceSpecValue::decode_store_value(&encoded).expect("decode compact service spec");
+        assert_eq!(
+            decoded, spec,
+            "compact replica assignment segments should decode to explicit replica ids"
+        );
+    }
+
+    /// Operator-facing service RPC encoding should keep explicit replica ids for clients.
+    #[test]
+    fn service_spec_writer_keeps_derived_replica_ids_expanded() {
+        let mut spec = sample_service_spec();
+        spec.service_epoch = 9;
+        spec.replica_ids = (1..=2)
+            .map(|replica| derive_service_replica_id(spec.id, spec.service_epoch, "web", replica))
+            .collect();
+
+        let mut message = Builder::new_default();
+        {
+            let mut builder = message.init_root::<service_spec::Builder<'_>>();
+            write_service_spec(&mut builder, &spec).expect("encode expanded service spec");
+        }
+        let reader = message
+            .get_root::<service_spec::Builder<'_>>()
+            .expect("read expanded service spec builder")
+            .into_reader();
+
+        assert_eq!(
+            reader
+                .get_replica_ids()
+                .expect("read expanded replica ids")
+                .len(),
+            2
+        );
+        assert_eq!(
+            reader
+                .get_replica_assignment_segments()
+                .expect("read compact replica segments")
+                .len(),
+            0
+        );
     }
 
     /// Reopening the service store should decode Cap'n Proto MVReg rows from Redb.

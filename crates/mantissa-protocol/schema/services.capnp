@@ -419,6 +419,20 @@ struct PreviousGeneration {
 
   admissionPolicy @7 :Workload.AdmissionPolicy;
   # Prior workload admission policy retained for rollback reconstruction.
+
+  replicaAssignmentSegments @8 :List(ReplicaAssignmentSegment);
+  # Compact prior replica id ranges derived from service id, epoch, template, and replica number.
+}
+
+struct ReplicaAssignmentSegment {
+  templateName @0 :Text;
+  # Task template name covered by this compact assignment range.
+
+  firstReplica @1 :UInt16;
+  # First one-based replica number in the range.
+
+  replicaCount @2 :UInt16;
+  # Number of consecutive replicas in the range.
 }
 
 struct ServiceSpec {
@@ -469,6 +483,9 @@ struct ServiceSpec {
 
   admissionPolicy @15 :Workload.AdmissionPolicy;
   # Workload admission contract selected by the manifest.
+
+  replicaAssignmentSegments @16 :List(ReplicaAssignmentSegment);
+  # Compact replica id ranges derived from service id, epoch, template, and replica number.
 }
 
 struct ServiceEvent {

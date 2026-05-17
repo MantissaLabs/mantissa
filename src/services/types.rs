@@ -54,6 +54,48 @@ pub struct ServiceSpecValue {
     pub reschedule_lock: Option<ServiceRescheduleLock>,
 }
 
+/// Compact range of service replica identifiers derived from stable generation metadata.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ServiceReplicaAssignmentSegment {
+    pub template_name: String,
+    pub first_replica: u16,
+    pub replica_count: u16,
+}
+
+impl ServiceReplicaAssignmentSegment {
+    /// Builds one compact segment after validating its one-based replica range.
+    pub fn new(
+        template_name: impl Into<String>,
+        first_replica: u16,
+        replica_count: u16,
+    ) -> Option<Self> {
+        let template_name = template_name.into();
+        if template_name.trim().is_empty() || first_replica == 0 || replica_count == 0 {
+            return None;
+        }
+        first_replica.checked_add(replica_count - 1)?;
+        Some(Self {
+            template_name,
+            first_replica,
+            replica_count,
+        })
+    }
+
+    /// Expands the compact range into deterministic workload ids for one service generation.
+    pub fn replica_ids(&self, service_id: Uuid, service_epoch: u64) -> Vec<Uuid> {
+        (0..self.replica_count)
+            .map(|offset| {
+                derive_service_replica_id(
+                    service_id,
+                    service_epoch,
+                    &self.template_name,
+                    self.first_replica + offset,
+                )
+            })
+            .collect()
+    }
+}
+
 impl ServiceSpecValue {
     /// Builds one replicated service spec value with default lifecycle metadata.
     pub fn new(
@@ -165,6 +207,25 @@ impl ServiceSpecValue {
         self.rollout = rollout;
         self.touch();
     }
+}
+
+/// Derives the stable workload id for one service generation replica slot.
+pub fn derive_service_replica_id(
+    service_id: Uuid,
+    service_epoch: u64,
+    template_name: &str,
+    replica: u16,
+) -> Uuid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"service-replica-id");
+    hasher.update(service_id.as_bytes());
+    hasher.update(&service_epoch.to_le_bytes());
+    hasher.update(template_name.as_bytes());
+    hasher.update(&replica.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
 }
 
 /// Snapshot of the prior service generation kept long enough for deterministic owner adoption.
@@ -629,8 +690,8 @@ pub fn compute_service_id(service_name: &str) -> Uuid {
 #[cfg(test)]
 mod tests {
     use super::{
-        SERVICE_PUBLIC_ENDPOINT_DETAIL_PREFIX, ServiceSpecValue, TaskTemplateSpecValue,
-        compute_service_id,
+        SERVICE_PUBLIC_ENDPOINT_DETAIL_PREFIX, ServiceReplicaAssignmentSegment, ServiceSpecValue,
+        TaskTemplateSpecValue, compute_service_id, derive_service_replica_id,
     };
     use crate::workload::types::ExecutionSpec;
     use uuid::Uuid;
@@ -643,6 +704,33 @@ mod tests {
 
         let other = compute_service_id("beta-web");
         assert_ne!(first, other);
+    }
+
+    /// Service replica ids should be stable within one slot and isolated across slots.
+    #[test]
+    fn service_replica_id_derivation_is_stable_and_scoped() {
+        let service_id =
+            Uuid::parse_str("11111111-2222-3333-4444-555555555555").expect("valid service id");
+        let first = derive_service_replica_id(service_id, 7, "web", 1);
+        let second = derive_service_replica_id(service_id, 7, "web", 1);
+        assert_eq!(first, second);
+
+        assert_ne!(first, derive_service_replica_id(service_id, 8, "web", 1));
+        assert_ne!(first, derive_service_replica_id(service_id, 7, "api", 1));
+        assert_ne!(first, derive_service_replica_id(service_id, 7, "web", 2));
+
+        let segment =
+            ServiceReplicaAssignmentSegment::new("web", 1, 2).expect("valid replica segment");
+        assert_eq!(
+            segment.replica_ids(service_id, 7),
+            vec![
+                derive_service_replica_id(service_id, 7, "web", 1),
+                derive_service_replica_id(service_id, 7, "web", 2),
+            ]
+        );
+        assert!(ServiceReplicaAssignmentSegment::new("web", 0, 1).is_none());
+        assert!(ServiceReplicaAssignmentSegment::new("web", 1, 0).is_none());
+        assert!(ServiceReplicaAssignmentSegment::new("", 1, 1).is_none());
     }
 
     /// Public-endpoint detail helpers should round-trip the prefixed lifecycle text cleanly.
