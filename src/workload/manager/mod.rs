@@ -540,7 +540,7 @@ impl WorkloadManager {
     /// assignment owner-to-target state and target-to-owner progress state. If
     /// the manager was constructed without topology, tests and standalone paths
     /// simply keep the normal background sync behavior.
-    pub(super) fn hint_workload_repair_peer(&self, peer_id: Uuid) {
+    pub(crate) fn prioritize_workload_sync_with_peer(&self, peer_id: Uuid) {
         let Some(topology) = self.core.topology.as_ref() else {
             return;
         };
@@ -564,9 +564,9 @@ impl WorkloadManager {
         service_id: Uuid,
         service_epoch: u64,
     ) {
-        let Some(topology) = self.core.topology.as_ref() else {
+        if self.core.topology.is_none() {
             return;
-        };
+        }
 
         let hint_key = (service_id, service_epoch);
         let now = Instant::now();
@@ -601,7 +601,7 @@ impl WorkloadManager {
             return;
         };
         if owner_id != self.local_node_id {
-            topology.hint_workload_repair_peer(owner_id);
+            self.prioritize_workload_sync_with_peer(owner_id);
         }
     }
 
@@ -1687,7 +1687,7 @@ impl WorkloadManager {
         // The target now has the assignment rows locally. Prioritize workload
         // sync with the coordinator so both endpoints converge without waiting
         // for the round-robin workload repair sweep to pick this edge later.
-        self.hint_workload_repair_peer(coordinator_node_id);
+        self.prioritize_workload_sync_with_peer(coordinator_node_id);
 
         Ok(applied)
     }

@@ -187,6 +187,13 @@ impl ServiceController {
                 continue;
             };
             if owner != self.local_node_id {
+                // This node can see an extra service-owned row, but the deterministic cleanup
+                // owner may not have learned that row yet because routine workload gossip is
+                // suppressed for large deployments. Prioritize workload MST sync with that owner
+                // so the next cleanup pass can observe and stop the same extra task without a
+                // global gossip fallback.
+                self.workload_manager
+                    .prioritize_workload_sync_with_peer(owner);
                 continue;
             }
 

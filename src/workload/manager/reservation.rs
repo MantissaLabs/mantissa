@@ -1458,7 +1458,7 @@ impl WorkloadManager {
                 // Prioritize workload sync with the target so the target can
                 // pull the missing rows through MST anti-entropy instead of
                 // waiting for unrelated peer rotation.
-                self.hint_workload_repair_peer(peer_id);
+                self.prioritize_workload_sync_with_peer(peer_id);
             }
         }
     }
