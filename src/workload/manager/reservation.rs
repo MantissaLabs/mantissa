@@ -17,10 +17,10 @@ use crate::scheduler::{
     SchedulerError, SlotId, SlotReservationRequest,
 };
 use crate::workload::model::{WorkloadAdmissionState, WorkloadPhase, WorkloadSpec};
-use crate::workload::service::{read_spec, write_spec};
+use crate::workload::service::{read_spec, write_service_shard_assignment_request, write_spec};
 
-use super::WorkloadManager;
 use super::planner::{BatchStartPlan, PreparedRemoteStartPlan, RemoteStartPlan};
+use super::{ServiceShardAssignmentRequest, WorkloadManager};
 
 /// Default lifetime for prepared scheduler leases while a batch or group admission commits.
 pub(super) const DEFAULT_PREPARED_LEASE_TTL_MS: u64 = 30_000;
@@ -1247,6 +1247,74 @@ impl WorkloadManager {
             .context(format!("invalid workload response from peer {peer_id}"))?
             .get_workload()
             .context(format!("missing workload service for peer {peer_id}"))
+    }
+
+    /// Sends one deterministic service shard to the remote coordinator chosen by the owner.
+    ///
+    /// The coordinator runs the normal pinned workload start path for its shard
+    /// and returns rows in request order. This RPC is intentionally
+    /// service-shard-specific so it replaces owner-to-many target fanout without
+    /// becoming a generic overlay or message-bus surface.
+    pub(crate) async fn coordinate_remote_service_shard_assignments(
+        &self,
+        peer_id: Uuid,
+        request: ServiceShardAssignmentRequest,
+    ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
+        if request.coordinator_node_id != peer_id {
+            return Err(anyhow::anyhow!(
+                "service shard {} targets coordinator {}, but RPC peer is {peer_id}",
+                request.shard_index,
+                request.coordinator_node_id
+            ));
+        }
+
+        let workload_client = self.remote_workload_client(peer_id).await?;
+        let mut coordinate_req = workload_client.coordinate_service_shard_request();
+        {
+            let request_builder = coordinate_req.get().init_request();
+            write_service_shard_assignment_request(request_builder, &request);
+        }
+
+        let response = coordinate_req.send().promise.await.with_context(|| {
+            format!(
+                "service shard {} coordination RPC failed for peer {peer_id}",
+                request.shard_index
+            )
+        })?;
+        let specs_reader = response
+            .get()
+            .with_context(|| {
+                format!(
+                    "invalid service shard {} response from peer {peer_id}",
+                    request.shard_index
+                )
+            })?
+            .get_response()
+            .with_context(|| {
+                format!(
+                    "missing service shard {} response from peer {peer_id}",
+                    request.shard_index
+                )
+            })?
+            .get_specs()
+            .with_context(|| {
+                format!(
+                    "missing service shard {} specs from peer {peer_id}",
+                    request.shard_index
+                )
+            })?;
+
+        let mut specs = Vec::with_capacity(specs_reader.len() as usize);
+        for reader in specs_reader.iter() {
+            specs.push(read_spec(reader).map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to decode service shard {} response from peer {peer_id}: {err}",
+                    request.shard_index
+                )
+            })?);
+        }
+
+        Ok(specs)
     }
 
     /// Requests a remote peer to stop a task so the owner updates state and broadcasts it.

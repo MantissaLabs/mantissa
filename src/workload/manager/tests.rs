@@ -1315,6 +1315,93 @@ async fn apply_target_assignment_batch_rejects_foreign_target_rows() {
 }
 
 #[tokio::test]
+async fn coordinate_service_shard_assignments_starts_and_reuses_rows() {
+    let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let service_name = "svc";
+    let service_epoch = 3;
+    let task_id = Uuid::new_v4();
+    let launch_request = WorkloadStartRequest {
+        name: "svc-api-1".to_string(),
+        execution: empty_resolved_execution("img"),
+        execution_platform: ExecutionPlatform::Oci,
+        isolation_mode: crate::workload::model::IsolationMode::Standard,
+        isolation_profile: None,
+        gpu_device_ids: Vec::new(),
+        id: Some(task_id),
+        slot_ids: Vec::new(),
+        owner: Some(WorkloadOwner::ServiceReplica(
+            WorkloadServiceMetadata::new(service_name, "api").with_service_epoch(service_epoch),
+        )),
+        service_placement_preferences: Vec::new(),
+        target_node: Some(manager.local_node_id),
+    };
+    let shard_request = ServiceShardAssignmentRequest {
+        owner_node_id: Uuid::new_v4(),
+        coordinator_node_id: manager.local_node_id,
+        service_id: crate::services::types::compute_service_id(service_name),
+        service_epoch,
+        shard_index: 0,
+        requests: vec![launch_request],
+    };
+
+    let first = manager
+        .coordinate_service_shard_assignments(shard_request.clone())
+        .await
+        .expect("coordinate shard first time");
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].id, task_id);
+    assert_eq!(first[0].node_id, manager.local_node_id);
+    assert_eq!(first[0].state, WorkloadPhase::Running);
+    assert_eq!(
+        mock_cm.created.lock().await.len(),
+        1,
+        "first shard coordination should create one runtime instance"
+    );
+
+    let second = manager
+        .coordinate_service_shard_assignments(shard_request)
+        .await
+        .expect("coordinate shard retry");
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].id, task_id);
+    assert_eq!(
+        mock_cm.created.lock().await.len(),
+        1,
+        "retry should return the existing row instead of starting another instance"
+    );
+}
+
+#[tokio::test]
+async fn coordinate_service_shard_assignments_rejects_wrong_coordinator() {
+    let (manager, _scheduler, _runtime, _network_registry) = setup_manager().await;
+    let service_name = "svc";
+    let err = manager
+        .coordinate_service_shard_assignments(ServiceShardAssignmentRequest {
+            owner_node_id: Uuid::new_v4(),
+            coordinator_node_id: Uuid::new_v4(),
+            service_id: crate::services::types::compute_service_id(service_name),
+            service_epoch: 1,
+            shard_index: 2,
+            requests: Vec::new(),
+        })
+        .await
+        .expect_err("wrong coordinator should be rejected");
+
+    assert!(
+        err.to_string().contains("targets coordinator"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[tokio::test]
 async fn materialize_remote_specs_persists_for_sync_repair_without_gossip() {
     let (manager, _scheduler, _runtime, _network_registry) = setup_manager().await;
     let peer_id = Uuid::new_v4();

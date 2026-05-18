@@ -14,6 +14,7 @@ use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
 use crate::services::ownership::select_generation_owner;
 use crate::services::registry::ServiceRegistry;
+use crate::services::types::compute_service_id;
 use crate::store::replicated::workloads::WorkloadStore;
 use crate::topology::Topology;
 use crate::volumes::VolumeRegistry;
@@ -103,6 +104,138 @@ fn sorted_unique_uuids(mut values: Vec<Uuid>) -> Vec<Uuid> {
     values.sort_unstable();
     values.dedup();
     values
+}
+
+/// Validates that one delegated shard start request is pinned to one service generation.
+fn validate_service_shard_start_request(
+    service_id: Uuid,
+    service_epoch: u64,
+    shard_index: usize,
+    request: &WorkloadStartRequest,
+) -> Result<(), anyhow::Error> {
+    if request.id.is_none() {
+        return Err(anyhow!(
+            "service shard {shard_index} for service {service_id} contains a request without a deterministic task id"
+        ));
+    }
+    if request.target_node.is_none() {
+        return Err(anyhow!(
+            "service shard {shard_index} for service {service_id} contains an unpinned request"
+        ));
+    }
+
+    let Some(WorkloadOwner::ServiceReplica(metadata)) = request.owner.as_ref() else {
+        return Err(anyhow!(
+            "service shard {shard_index} for service {service_id} contains a non-service workload request"
+        ));
+    };
+    if metadata.service_epoch != service_epoch {
+        return Err(anyhow!(
+            "service shard {shard_index} expected service epoch {service_epoch}, got {} for task {}",
+            metadata.service_epoch,
+            request.name
+        ));
+    }
+
+    let actual_service_id = compute_service_id(&metadata.service_name);
+    if actual_service_id != service_id {
+        return Err(anyhow!(
+            "service shard {shard_index} expected service {service_id}, got {actual_service_id} from task {}",
+            request.name
+        ));
+    }
+
+    Ok(())
+}
+
+/// Validates that an existing or newly-started row matches the delegated shard request.
+fn validate_existing_service_shard_assignment(
+    service_id: Uuid,
+    service_epoch: u64,
+    shard_index: usize,
+    request: &WorkloadStartRequest,
+    spec: &WorkloadSpec,
+) -> Result<(), anyhow::Error> {
+    validate_service_shard_start_request(service_id, service_epoch, shard_index, request)?;
+    let task_id = request
+        .id
+        .ok_or_else(|| anyhow!("service shard {shard_index} request is missing task id"))?;
+    let target_node = request
+        .target_node
+        .ok_or_else(|| anyhow!("service shard {shard_index} request is missing target node"))?;
+
+    if spec.id != task_id {
+        return Err(anyhow!(
+            "service shard {shard_index} expected task id {task_id}, got {}",
+            spec.id
+        ));
+    }
+    if spec.node_id != target_node {
+        return Err(anyhow!(
+            "service shard {shard_index} task {task_id} targets node {target_node}, but row is on {}",
+            spec.node_id
+        ));
+    }
+    if spec.owner != request.owner {
+        return Err(anyhow!(
+            "service shard {shard_index} task {task_id} has incompatible controller owner"
+        ));
+    }
+
+    validate_existing_service_shard_execution(shard_index, request, spec)
+}
+
+/// Compares stable execution fields so a deterministic id cannot hide a changed request.
+fn validate_existing_service_shard_execution(
+    shard_index: usize,
+    request: &WorkloadStartRequest,
+    spec: &WorkloadSpec,
+) -> Result<(), anyhow::Error> {
+    let execution = &request.execution;
+    let task_id = spec.id;
+    let requested_gpu_count = if execution.gpu_count == 0 {
+        request.gpu_device_ids.len() as u32
+    } else {
+        execution.gpu_count
+    };
+    let mismatched = spec.name != request.name
+        || spec.image != execution.image
+        || spec.command != execution.command
+        || spec.tty != execution.tty
+        || spec.cpu_millis != execution.cpu_millis
+        || spec.memory_bytes != execution.memory_bytes
+        || spec.gpu_count != requested_gpu_count
+        || spec.execution_platform != request.execution_platform
+        || spec.isolation_mode != request.isolation_mode
+        || spec.isolation_profile != request.isolation_profile
+        || spec.restart_policy != execution.restart_policy
+        || spec.termination_grace_period_secs != execution.termination_grace_period_secs
+        || spec.pre_stop_command != execution.pre_stop_command
+        || spec.liveness != execution.liveness
+        || spec.env != execution.env
+        || spec.secret_files != execution.secret_files
+        || spec.volumes != execution.volumes
+        || spec.networks != execution.networks
+        || spec.ports != execution.ports;
+
+    if mismatched {
+        return Err(anyhow!(
+            "service shard {shard_index} task {task_id} already exists with different execution data"
+        ));
+    }
+
+    if !request.gpu_device_ids.is_empty() && spec.gpu_device_ids != request.gpu_device_ids {
+        return Err(anyhow!(
+            "service shard {shard_index} task {task_id} already exists with different GPU device bindings"
+        ));
+    }
+    if !request.slot_ids.is_empty() && spec.slot_ids != request.slot_ids {
+        return Err(anyhow!(
+            "service shard {shard_index} task {task_id} already exists with different slot bindings"
+        ));
+    }
+
+    Ok(())
 }
 
 /// Remove tombstone metadata used to suppress stale workload upsert replay.
@@ -410,6 +543,28 @@ pub struct WorkloadStartRequest {
     pub service_placement_preferences: Vec<ServicePlacementPreference>,
     /// Placement hint used by the scheduler when a task must land on a specific node.
     pub target_node: Option<Uuid>,
+}
+
+/// Service-owned start batch delegated to one deterministic deployment shard coordinator.
+///
+/// The service owner uses this shape to move a bounded subset of pinned replica
+/// starts to a replaceable coordinator. The coordinator must treat the request
+/// idempotently because the owner may retry after an RPC timeout or a later
+/// owner may reconstruct the same shard from replicated service state.
+#[derive(Clone)]
+pub(crate) struct ServiceShardAssignmentRequest {
+    /// Node currently acting as the deterministic service generation owner.
+    pub(crate) owner_node_id: Uuid,
+    /// Node expected to coordinate this shard.
+    pub(crate) coordinator_node_id: Uuid,
+    /// Stable service identifier derived from the service name.
+    pub(crate) service_id: Uuid,
+    /// Service generation represented by every request in this shard.
+    pub(crate) service_epoch: u64,
+    /// Deterministic shard index inside the service generation.
+    pub(crate) shard_index: usize,
+    /// Pinned service-owned workload starts assigned to this shard.
+    pub(crate) requests: Vec<WorkloadStartRequest>,
 }
 
 impl Deref for WorkloadStartRequest {
@@ -785,6 +940,109 @@ impl WorkloadManager {
             WorkloadAdmissionMode::Incremental => self.start_workloads_batch(requests).await,
             WorkloadAdmissionMode::Gang => self.start_workloads_gang(group_id, requests).await,
         }
+    }
+
+    /// Coordinates one deterministic service deployment shard on this node.
+    ///
+    /// A shard coordinator runs the same pinned workload start path that the
+    /// generation owner would run directly, but it first checks for matching
+    /// durable rows by deterministic workload id. That makes owner retry and
+    /// coordinator reassignment safe: already-created rows are returned in
+    /// request order instead of being scheduled a second time.
+    pub(crate) async fn coordinate_service_shard_assignments(
+        &self,
+        request: ServiceShardAssignmentRequest,
+    ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
+        let ServiceShardAssignmentRequest {
+            owner_node_id,
+            coordinator_node_id,
+            service_id,
+            service_epoch,
+            shard_index,
+            requests,
+        } = request;
+
+        if coordinator_node_id != self.local_node_id {
+            return Err(anyhow!(
+                "service shard {shard_index} for service {service_id} targets coordinator {coordinator_node_id}, but local node is {}",
+                self.local_node_id
+            ));
+        }
+
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut ordered: Vec<Option<WorkloadSpec>> = vec![None; requests.len()];
+        let mut missing = Vec::new();
+
+        for (index, launch_request) in requests.into_iter().enumerate() {
+            validate_service_shard_start_request(
+                service_id,
+                service_epoch,
+                shard_index,
+                &launch_request,
+            )?;
+            let task_id = launch_request
+                .id
+                .ok_or_else(|| anyhow!("service shard {shard_index} request is missing task id"))?;
+
+            match self.load_spec(task_id).await {
+                Ok(existing) => {
+                    validate_existing_service_shard_assignment(
+                        service_id,
+                        service_epoch,
+                        shard_index,
+                        &launch_request,
+                        &existing,
+                    )?;
+                    ordered[index] = Some(existing);
+                }
+                Err(_) => missing.push((index, launch_request)),
+            }
+        }
+
+        if !missing.is_empty() {
+            let missing_requests = missing
+                .iter()
+                .map(|(_, request)| request.clone())
+                .collect::<Vec<_>>();
+            let started = self.start_workloads_batch(missing_requests).await?;
+            if started.len() != missing.len() {
+                return Err(anyhow!(
+                    "service shard {shard_index} for service {service_id} returned {} started rows for {} missing requests",
+                    started.len(),
+                    missing.len()
+                ));
+            }
+
+            for ((index, launch_request), spec) in missing.into_iter().zip(started) {
+                validate_existing_service_shard_assignment(
+                    service_id,
+                    service_epoch,
+                    shard_index,
+                    &launch_request,
+                    &spec,
+                )?;
+                ordered[index] = Some(spec);
+            }
+        }
+
+        if owner_node_id != self.local_node_id {
+            self.prioritize_workload_sync_with_peer(owner_node_id);
+        }
+
+        ordered
+            .into_iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                spec.ok_or_else(|| {
+                    anyhow!(
+                        "service shard {shard_index} for service {service_id} did not produce row {index}"
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Starts one workload group with a strict admission barrier before any row is runnable.

@@ -1,10 +1,12 @@
 use crate::workload::capnp_codec::{
-    decode_env_vars, decode_port_bindings, decode_secret_files, decode_task_liveness_probe,
-    decode_task_restart_policy, decode_volume_mounts, encode_env_vars, encode_port_bindings,
-    encode_secret_files, encode_task_liveness_probe, encode_task_restart_policy,
-    encode_volume_mounts,
+    decode_env_vars, decode_placement_policy, decode_port_bindings, decode_secret_files,
+    decode_task_liveness_probe, decode_task_restart_policy, decode_volume_mounts, encode_env_vars,
+    encode_placement_policy, encode_port_bindings, encode_secret_files, encode_task_liveness_probe,
+    encode_task_restart_policy, encode_volume_mounts,
 };
-use crate::workload::manager::WorkloadManager;
+use crate::workload::manager::{
+    ServiceShardAssignmentRequest, WorkloadManager, WorkloadStartRequest,
+};
 use crate::workload::model::{
     ExecutionPlatform, IsolationMode, ServiceGenerationProgressCounts,
     ServiceGenerationProgressRecord, WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord,
@@ -13,13 +15,15 @@ use crate::workload::model::{
     WorkloadStateKind, WorkloadStatus, WorkloadStoreValue, WorkloadValue, merge_status_into_value,
     spec_to_status, spec_to_value, value_to_spec,
 };
+use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
 use mantissa_protocol::gossip::gossip_message;
 use mantissa_protocol::workload::{
     AdmissionGroupPhase as ProtoAdmissionGroupPhase,
     WorkloadStateFilter as ProtoWorkloadStateFilter, admission_group_record,
-    service_generation_progress_record, workload, workload_assignment_batch_request,
-    workload_event, workload_list_request, workload_spec, workload_status,
+    service_generation_progress_record, service_shard_assignment_request, workload,
+    workload_assignment_batch_request, workload_event, workload_list_request, workload_spec,
+    workload_start_request, workload_status,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::io::Cursor;
@@ -92,6 +96,28 @@ impl workload::Server for WorkloadService {
             .map_err(|err| Error::failed(err.to_string()))?;
 
         results.get().init_response().set_applied(applied as u64);
+        Ok(())
+    }
+
+    /// Coordinates one deterministic service shard and returns created or reused workload rows.
+    async fn coordinate_service_shard(
+        self: Rc<Self>,
+        params: workload::CoordinateServiceShardParams,
+        mut results: workload::CoordinateServiceShardResults,
+    ) -> Result<(), Error> {
+        let request = params.get()?.get_request()?;
+        let request = read_service_shard_assignment_request(&request)?;
+        let specs = self
+            .manager
+            .coordinate_service_shard_assignments(request)
+            .await
+            .map_err(|err| Error::failed(err.to_string()))?;
+
+        let mut response = results.get().init_response();
+        let mut spec_list = response.reborrow().init_specs(specs.len() as u32);
+        for (index, spec) in specs.iter().enumerate() {
+            write_spec(spec_list.reborrow().get(index as u32), spec);
+        }
         Ok(())
     }
 }
@@ -684,6 +710,223 @@ pub fn read_spec(reader: workload_spec::Reader<'_>) -> Result<WorkloadSpec, Erro
     })
 }
 
+/// Encodes one internal workload start request for the service-shard coordinator RPC.
+///
+/// This is intentionally narrower than a generic public task API: it carries
+/// enough execution and placement data for a deterministic shard coordinator
+/// to run the existing workload start path for pinned service replicas.
+pub(crate) fn write_start_request(
+    mut builder: workload_start_request::Builder<'_>,
+    request: &WorkloadStartRequest,
+) {
+    if let Some(id) = request.id {
+        builder.set_id(id.as_bytes());
+    } else {
+        builder.set_id(&[]);
+    }
+    builder.set_name(&request.name);
+    builder.set_image(&request.execution.image);
+    builder.set_tty(request.execution.tty);
+    builder.set_cpu_millis(request.execution.cpu_millis);
+    builder.set_memory_bytes(request.execution.memory_bytes);
+    builder.set_gpu_count(request.execution.gpu_count);
+    builder.set_execution_platform(request.execution_platform.as_str());
+    builder.set_isolation_mode(request.isolation_mode.as_str());
+    builder.set_isolation_profile(request.isolation_profile.as_deref().unwrap_or(""));
+    if let Some(target_node) = request.target_node {
+        builder.set_target_node_id(target_node.as_bytes());
+    } else {
+        builder.set_target_node_id(&[]);
+    }
+    builder.set_termination_grace_period_secs(
+        request.execution.termination_grace_period_secs.unwrap_or(0),
+    );
+
+    let mut command = builder
+        .reborrow()
+        .init_command(request.execution.command.len() as u32);
+    for (index, arg) in request.execution.command.iter().enumerate() {
+        command.set(index as u32, arg);
+    }
+
+    let mut gpu_device_ids = builder
+        .reborrow()
+        .init_gpu_device_ids(request.gpu_device_ids.len() as u32);
+    for (index, device_id) in request.gpu_device_ids.iter().enumerate() {
+        gpu_device_ids.set(index as u32, device_id);
+    }
+
+    let mut slot_ids = builder
+        .reborrow()
+        .init_slot_ids(request.slot_ids.len() as u32);
+    for (index, slot_id) in request.slot_ids.iter().enumerate() {
+        slot_ids.set(index as u32, *slot_id);
+    }
+
+    if let Some(policy) = request.execution.restart_policy.as_ref() {
+        encode_task_restart_policy(builder.reborrow().init_restart_policy(), policy);
+    }
+
+    let mut env = builder
+        .reborrow()
+        .init_env(request.execution.env.len() as u32);
+    encode_env_vars(&mut env, &request.execution.env);
+
+    let mut secret_files = builder
+        .reborrow()
+        .init_secret_files(request.execution.secret_files.len() as u32);
+    encode_secret_files(&mut secret_files, &request.execution.secret_files);
+
+    let mut networks = builder
+        .reborrow()
+        .init_networks(request.execution.networks.len() as u32);
+    for (index, network_id) in request.execution.networks.iter().enumerate() {
+        networks.set(index as u32, network_id.as_bytes());
+    }
+
+    let mut volumes = builder
+        .reborrow()
+        .init_volumes(request.execution.volumes.len() as u32);
+    encode_volume_mounts(&mut volumes, &request.execution.volumes);
+
+    let mut ports = builder
+        .reborrow()
+        .init_ports(request.execution.ports.len() as u32);
+    encode_port_bindings(&mut ports, &request.execution.ports);
+
+    if let Some(liveness) = request.execution.liveness.as_ref() {
+        encode_task_liveness_probe(builder.reborrow().init_liveness(), liveness);
+    }
+
+    let pre_stop = request.execution.pre_stop_command.as_deref().unwrap_or(&[]);
+    let mut pre_stop_command = builder
+        .reborrow()
+        .init_pre_stop_command(pre_stop.len() as u32);
+    for (index, arg) in pre_stop.iter().enumerate() {
+        pre_stop_command.set(index as u32, arg);
+    }
+
+    encode_placement_policy(
+        builder.reborrow().init_placement(),
+        &request.execution.placement,
+    );
+    write_owner(builder.reborrow().init_owner(), request.owner.as_ref());
+}
+
+/// Decodes one workload start request from a service-shard coordinator payload.
+fn read_start_request(
+    reader: workload_start_request::Reader<'_>,
+) -> Result<WorkloadStartRequest, Error> {
+    let mut command = Vec::new();
+    for arg in reader.get_command()?.iter() {
+        command.push(arg?.to_str()?.to_string());
+    }
+
+    let mut gpu_device_ids = Vec::new();
+    for entry in reader.get_gpu_device_ids()?.iter() {
+        gpu_device_ids.push(entry?.to_str()?.to_string());
+    }
+
+    let mut slot_ids = Vec::new();
+    for slot_id in reader.get_slot_ids()?.iter() {
+        slot_ids.push(slot_id);
+    }
+
+    let mut networks = Vec::new();
+    for entry in reader.get_networks()?.iter() {
+        networks.push(read_id_from_data(entry?)?);
+    }
+
+    let mut pre_stop_command = Vec::new();
+    for arg in reader.get_pre_stop_command()?.iter() {
+        let arg = arg?.to_str()?.to_string();
+        if !arg.is_empty() {
+            pre_stop_command.push(arg);
+        }
+    }
+
+    Ok(WorkloadStartRequest {
+        name: reader.get_name()?.to_str()?.to_string(),
+        execution: ResolvedExecutionSpec {
+            image: reader.get_image()?.to_str()?.to_string(),
+            command,
+            tty: reader.get_tty(),
+            cpu_millis: reader.get_cpu_millis(),
+            memory_bytes: reader.get_memory_bytes(),
+            gpu_count: reader.get_gpu_count(),
+            restart_policy: if reader.has_restart_policy() {
+                Some(decode_task_restart_policy(reader.get_restart_policy()?)?)
+            } else {
+                None
+            },
+            termination_grace_period_secs: match reader.get_termination_grace_period_secs() {
+                0 => None,
+                value => Some(value),
+            },
+            pre_stop_command: (!pre_stop_command.is_empty()).then_some(pre_stop_command),
+            liveness: if reader.has_liveness() {
+                Some(decode_task_liveness_probe(reader.get_liveness()?)?)
+            } else {
+                None
+            },
+            env: decode_env_vars(reader.get_env()?)?,
+            secret_files: decode_secret_files(reader.get_secret_files()?)?,
+            volumes: decode_volume_mounts(reader.get_volumes()?)?,
+            networks,
+            ports: decode_port_bindings(reader.get_ports()?)?,
+            placement: decode_placement_policy(reader.get_placement()?)?,
+        },
+        execution_platform: read_execution_platform(reader.get_execution_platform()?.to_str()?),
+        isolation_mode: read_isolation_mode(reader.get_isolation_mode()?.to_str()?),
+        isolation_profile: read_optional_text(reader.get_isolation_profile()?),
+        gpu_device_ids,
+        id: read_optional_id_from_data(reader.get_id()?)?,
+        slot_ids,
+        owner: read_owner(reader.get_owner()?)?,
+        service_placement_preferences: Vec::new(),
+        target_node: read_optional_id_from_data(reader.get_target_node_id()?)?,
+    })
+}
+
+/// Encodes one service-shard assignment request for a remote coordinator.
+pub(crate) fn write_service_shard_assignment_request(
+    mut builder: service_shard_assignment_request::Builder<'_>,
+    request: &ServiceShardAssignmentRequest,
+) {
+    builder.set_owner_node_id(request.owner_node_id.as_bytes());
+    builder.set_coordinator_node_id(request.coordinator_node_id.as_bytes());
+    builder.set_service_id(request.service_id.as_bytes());
+    builder.set_service_epoch(request.service_epoch);
+    builder.set_shard_index(request.shard_index as u64);
+
+    let mut requests = builder
+        .reborrow()
+        .init_requests(request.requests.len() as u32);
+    for (index, start_request) in request.requests.iter().enumerate() {
+        write_start_request(requests.reborrow().get(index as u32), start_request);
+    }
+}
+
+/// Decodes one service-shard assignment request from the workload RPC payload.
+fn read_service_shard_assignment_request(
+    request: &service_shard_assignment_request::Reader<'_>,
+) -> Result<ServiceShardAssignmentRequest, Error> {
+    let requests_reader = request.get_requests()?;
+    let mut requests = Vec::with_capacity(requests_reader.len() as usize);
+    for reader in requests_reader.iter() {
+        requests.push(read_start_request(reader)?);
+    }
+
+    Ok(ServiceShardAssignmentRequest {
+        owner_node_id: read_id_from_data(request.get_owner_node_id()?)?,
+        coordinator_node_id: read_id_from_data(request.get_coordinator_node_id()?)?,
+        service_id: read_id_from_data(request.get_service_id()?)?,
+        service_epoch: request.get_service_epoch(),
+        shard_index: request.get_shard_index() as usize,
+        requests,
+    })
+}
+
 /// Encodes the workload-row admission barrier state into the wire schema.
 fn workload_admission_state_to_proto(
     state: WorkloadAdmissionState,
@@ -926,6 +1169,14 @@ fn read_id_from_data(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
         .try_into()
         .map_err(|_| Error::failed("invalid workload id length".to_string()))?;
     Ok(Uuid::from_bytes(slice))
+}
+
+/// Decodes an optional UUID where an empty data field represents absence.
+fn read_optional_id_from_data(data: capnp::data::Reader<'_>) -> Result<Option<Uuid>, Error> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+    read_id_from_data(data).map(Some)
 }
 
 /// Decodes workload lifecycle filters from the workload list request.

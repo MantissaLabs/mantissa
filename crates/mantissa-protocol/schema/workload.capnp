@@ -13,6 +13,10 @@ interface Workload {
   applyAssignments @2 (request :WorkloadAssignmentBatchRequest)
       -> (response :WorkloadAssignmentBatchResponse);
   # Apply one owner-built assignment batch to the target node.
+
+  coordinateServiceShard @3 (request :ServiceShardAssignmentRequest)
+      -> (response :ServiceShardAssignmentResponse);
+  # Coordinate one deterministic service deployment shard on behalf of its owner.
 }
 
 struct SecretRef {
@@ -521,6 +525,108 @@ struct WorkloadStatus {
   isolationProfile @17 :Text;
   # Optional named isolation profile used when the workload requests sandboxed execution.
 
+}
+
+struct WorkloadStartRequest {
+  id @0 :Data;
+  # Optional caller-selected workload UUID as 16 bytes, empty = coordinator rejects for shards.
+
+  name @1 :Text;
+  # Human-readable workload name.
+
+  image @2 :Text;
+  # Execution image/binary identifier from the shared execution spec.
+
+  command @3 :List(Text);
+  # Command/argv for the workload entrypoint.
+
+  tty @4 :Bool;
+  # Whether the workload runtime should allocate a terminal.
+
+  cpuMillis @5 :UInt64;
+  # Requested CPU in milli-cores.
+
+  memoryBytes @6 :UInt64;
+  # Requested memory in bytes.
+
+  gpuCount @7 :UInt32;
+  # Requested GPU count.
+
+  gpuDeviceIds @8 :List(Text);
+  # Optional concrete GPU device identifiers.
+
+  executionPlatform @9 :Text;
+  # Execution platform requested by the caller.
+
+  isolationMode @10 :Text;
+  # Isolation contract requested by the caller.
+
+  isolationProfile @11 :Text;
+  # Optional named isolation profile.
+
+  slotIds @12 :List(UInt64);
+  # Optional preassigned scheduler slots.
+
+  owner @13 :WorkloadOwner;
+  # Controller owner for the resulting workload row.
+
+  targetNodeId @14 :Data;
+  # Required target node UUID as 16 bytes for service shard coordination.
+
+  restartPolicy @15 :RestartPolicy;
+  # Restart behavior for the workload.
+
+  env @16 :List(EnvironmentVar);
+  # Environment variables injected into the workload.
+
+  secretFiles @17 :List(SecretFile);
+  # Secret-backed files mounted into the workload.
+
+  networks @18 :List(Data);
+  # Required network UUIDs (16 bytes each).
+
+  volumes @19 :List(VolumeMount);
+  # Named volumes mounted into the workload runtime.
+
+  ports @20 :List(PortBinding);
+  # Node-local host port bindings requested by the workload.
+
+  liveness @21 :LivenessProbe;
+  # Optional local liveness probe executed by the hosting runtime.
+
+  terminationGracePeriodSecs @22 :UInt32;
+  # Optional graceful shutdown timeout in seconds, 0 uses the runtime default.
+
+  preStopCommand @23 :List(Text);
+  # Optional command executed inside the runtime instance before termination begins.
+
+  placement @24 :PlacementPolicy;
+  # Hard placement policy retained so pinned targets still validate constraints.
+}
+
+struct ServiceShardAssignmentRequest {
+  ownerNodeId @0 :Data;
+  # Generation owner UUID as 16 bytes.
+
+  coordinatorNodeId @1 :Data;
+  # Expected shard coordinator UUID as 16 bytes.
+
+  serviceId @2 :Data;
+  # Stable service UUID as 16 bytes.
+
+  serviceEpoch @3 :UInt64;
+  # Service generation being coordinated.
+
+  shardIndex @4 :UInt64;
+  # Deterministic shard index within this service generation.
+
+  requests @5 :List(WorkloadStartRequest);
+  # Pinned service-owned workload starts assigned to this coordinator.
+}
+
+struct ServiceShardAssignmentResponse {
+  specs @0 :List(WorkloadSpec);
+  # Workload rows created or reused by the shard coordinator, in request order.
 }
 
 struct ServiceGenerationProgressRecord {

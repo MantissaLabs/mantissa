@@ -13,6 +13,8 @@ use super::placement::{
 };
 use super::state::deploying_assignment_incomplete;
 use super::*;
+use crate::services::ownership::ServiceDeploymentShard;
+use crate::workload::manager::ServiceShardAssignmentRequest;
 use crate::workload::model::WorkloadOwner;
 use anyhow::Context;
 
@@ -1879,11 +1881,20 @@ impl ServiceController {
         requests: Vec<WorkloadStartRequest>,
         context: &str,
     ) -> anyhow::Result<Vec<WorkloadSpec>> {
-        self.observe_deployment_shard_plan(admission_policy, &requests);
         match admission_policy.mode {
-            WorkloadAdmissionMode::Incremental => {
-                self.start_tasks_with_fallback(requests, context).await
-            }
+            WorkloadAdmissionMode::Incremental => match self.deployment_shard_plan(&requests) {
+                Some((service_id, service_epoch, shards)) => {
+                    self.start_tasks_with_deployment_shards(
+                        service_id,
+                        service_epoch,
+                        shards,
+                        requests,
+                        context,
+                    )
+                    .await
+                }
+                None => self.start_tasks_with_fallback(requests, context).await,
+            },
             WorkloadAdmissionMode::Gang => {
                 tracing::info!(
                     target: "services",
@@ -1900,37 +1911,29 @@ impl ServiceController {
     }
 
     /// Computes the deterministic shard shape for large targeted service launches.
-    ///
-    /// This method only observes the shard plan. Runtime delegation must use the same pure planner,
-    /// but it still needs explicit idempotency and rollback handling before it can replace the
-    /// direct owner-to-target path safely.
-    fn observe_deployment_shard_plan(
+    fn deployment_shard_plan(
         &self,
-        admission_policy: WorkloadAdmissionPolicy,
         requests: &[WorkloadStartRequest],
-    ) {
-        if !matches!(admission_policy.mode, WorkloadAdmissionMode::Incremental) {
-            return;
-        }
-
+    ) -> Option<(Uuid, u64, Vec<ServiceDeploymentShard>)> {
         let mut target_nodes = requests
             .iter()
             .filter_map(|request| request.target_node)
             .collect::<Vec<_>>();
         if target_nodes.len() != requests.len() {
-            return;
+            return None;
+        }
+        if requests.iter().any(|request| request.id.is_none()) {
+            return None;
         }
         target_nodes.sort_unstable();
         target_nodes.dedup();
 
         let runtime = crate::config::replication_runtime_config();
         if target_nodes.len() <= runtime.service_shard_target_threshold {
-            return;
+            return None;
         }
 
-        let Some((service_id, service_epoch)) = service_generation_from_requests(requests) else {
-            return;
-        };
+        let (service_id, service_epoch) = service_generation_from_requests(requests)?;
         let eligible_nodes = self.collect_eligible_nodes();
         let shards = build_service_deployment_shards(
             service_id,
@@ -1940,7 +1943,7 @@ impl ServiceController {
             runtime.service_shard_target_size,
         );
         if shards.is_empty() {
-            return;
+            return None;
         }
 
         let max_targets = shards
@@ -1966,6 +1969,120 @@ impl ServiceController {
             last_shard_index,
             "computed deterministic service deployment shard plan"
         );
+
+        Some((service_id, service_epoch, shards))
+    }
+
+    /// Starts a large pinned deployment through deterministic shard coordinators.
+    ///
+    /// The generation owner sends one service-specific shard request to each
+    /// coordinator instead of opening scheduler and assignment sessions to
+    /// every target node itself. Coordinators still use the normal workload
+    /// manager path, so reservation, target assignment delivery, and sync repair
+    /// remain the same mechanisms used by direct owner launches.
+    async fn start_tasks_with_deployment_shards(
+        &self,
+        service_id: Uuid,
+        service_epoch: u64,
+        shards: Vec<ServiceDeploymentShard>,
+        requests: Vec<WorkloadStartRequest>,
+        context: &str,
+    ) -> anyhow::Result<Vec<WorkloadSpec>> {
+        let request_count = requests.len();
+        let mut target_to_shard = HashMap::new();
+        for shard in &shards {
+            for target_node_id in &shard.target_node_ids {
+                target_to_shard.insert(*target_node_id, shard.clone());
+            }
+        }
+
+        let mut grouped: HashMap<
+            usize,
+            (ServiceDeploymentShard, Vec<(usize, WorkloadStartRequest)>),
+        > = HashMap::new();
+        for (index, request) in requests.into_iter().enumerate() {
+            let target_node = request.target_node.ok_or_else(|| {
+                anyhow!("service shard launch for {context} received an unpinned workload request")
+            })?;
+            let shard = target_to_shard.get(&target_node).ok_or_else(|| {
+                anyhow!(
+                    "service shard launch for {context} has no shard for target node {target_node}"
+                )
+            })?;
+            grouped
+                .entry(shard.shard_index)
+                .or_insert_with(|| (shard.clone(), Vec::new()))
+                .1
+                .push((index, request));
+        }
+
+        tracing::info!(
+            target: "services",
+            service_id = %service_id,
+            service_epoch,
+            shard_count = grouped.len(),
+            task_count = request_count,
+            "delegating service deployment through deterministic shard coordinators for {context}"
+        );
+
+        let mut ordered: Vec<Option<WorkloadSpec>> = vec![None; request_count];
+        let mut shard_indices = grouped.keys().copied().collect::<Vec<_>>();
+        shard_indices.sort_unstable();
+
+        for shard_index in shard_indices {
+            let (shard, indexed_requests) = grouped
+                .remove(&shard_index)
+                .ok_or_else(|| anyhow!("missing grouped service shard {shard_index}"))?;
+            let shard_requests = indexed_requests
+                .iter()
+                .map(|(_, request)| request.clone())
+                .collect::<Vec<_>>();
+            let request = ServiceShardAssignmentRequest {
+                owner_node_id: self.local_node_id,
+                coordinator_node_id: shard.coordinator_node_id,
+                service_id,
+                service_epoch,
+                shard_index: shard.shard_index,
+                requests: shard_requests,
+            };
+
+            let specs = if shard.coordinator_node_id == self.local_node_id {
+                self.workload_manager
+                    .coordinate_service_shard_assignments(request)
+                    .await
+            } else {
+                self.workload_manager
+                    .coordinate_remote_service_shard_assignments(shard.coordinator_node_id, request)
+                    .await
+            }
+            .with_context(|| {
+                format!(
+                    "service shard {} coordination failed for {context}",
+                    shard.shard_index
+                )
+            })?;
+
+            if specs.len() != indexed_requests.len() {
+                return Err(anyhow!(
+                    "service shard {} for {context} returned {} specs for {} requests",
+                    shard.shard_index,
+                    specs.len(),
+                    indexed_requests.len()
+                ));
+            }
+
+            for ((original_index, _), spec) in indexed_requests.into_iter().zip(specs) {
+                ordered[original_index] = Some(spec);
+            }
+        }
+
+        ordered
+            .into_iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                spec.ok_or_else(|| anyhow!("service shard launch for {context} missed row {index}"))
+            })
+            .collect()
     }
 
     /// Publishes task traffic after attachment rows exist so cutover only exposes ready endpoints.
@@ -2270,15 +2387,22 @@ fn format_dependency_gate_stability_detail(
 
 /// Extracts the service generation identity shared by one service-owned start batch.
 fn service_generation_from_requests(requests: &[WorkloadStartRequest]) -> Option<(Uuid, u64)> {
-    requests
-        .iter()
-        .find_map(|request| match request.owner.as_ref() {
-            Some(WorkloadOwner::ServiceReplica(metadata)) => Some((
-                compute_service_id(&metadata.service_name),
-                metadata.service_epoch,
-            )),
-            _ => None,
-        })
+    let mut generation = None;
+    for request in requests {
+        let Some(WorkloadOwner::ServiceReplica(metadata)) = request.owner.as_ref() else {
+            return None;
+        };
+        let current = (
+            compute_service_id(&metadata.service_name),
+            metadata.service_epoch,
+        );
+        match generation {
+            None => generation = Some(current),
+            Some(expected) if expected == current => {}
+            Some(_) => return None,
+        }
+    }
+    generation
 }
 
 /// Records launched task ids back into the assignment index and returns the parsed template ids.
