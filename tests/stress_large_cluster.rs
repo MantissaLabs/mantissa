@@ -268,21 +268,31 @@ fn count_log_marker(path: &Path, marker: &str) -> usize {
     contents.matches(marker).count()
 }
 
-/// Counts service-deployment shard planning and delegation markers across daemon logs.
-fn deployment_shard_log_hits(nodes: &[ProcessNode]) -> (usize, usize) {
+/// Counts marker occurrences across both daemon log streams for one stress node.
+fn count_node_log_marker(node: &ProcessNode, marker: &str) -> usize {
+    count_log_marker(&node.stdout_log, marker) + count_log_marker(&node.stderr_log, marker)
+}
+
+/// Counts service-deployment shard planning, delegation, and direct fallback markers.
+fn deployment_shard_log_hits(nodes: &[ProcessNode]) -> (usize, usize, usize) {
     const PLAN_MARKER: &str = "computed deterministic service deployment shard plan";
     const DELEGATE_MARKER: &str =
         "delegating service deployment through deterministic shard coordinators";
+    const DIRECT_MARKER: &str = "using direct service deployment launch";
 
     let planned = nodes
         .iter()
-        .map(|node| count_log_marker(&node.stderr_log, PLAN_MARKER))
+        .map(|node| count_node_log_marker(node, PLAN_MARKER))
         .sum();
     let delegated = nodes
         .iter()
-        .map(|node| count_log_marker(&node.stderr_log, DELEGATE_MARKER))
+        .map(|node| count_node_log_marker(node, DELEGATE_MARKER))
         .sum();
-    (planned, delegated)
+    let direct = nodes
+        .iter()
+        .map(|node| count_node_log_marker(node, DIRECT_MARKER))
+        .sum();
+    (planned, delegated, direct)
 }
 
 /// Builds one minimal service manifest used by the stress deployment.
@@ -446,6 +456,7 @@ struct ProcessNode {
     node_id: Uuid,
     listen_addr: String,
     socket_path: PathBuf,
+    stdout_log: PathBuf,
     stderr_log: PathBuf,
     session: mantissa_protocol::server::cluster_session::Client,
     child: Option<Child>,
@@ -591,6 +602,7 @@ impl ProcessNode {
             node_id,
             listen_addr,
             socket_path,
+            stdout_log,
             stderr_log,
             session,
             child: Some(child),
@@ -1669,7 +1681,7 @@ fn stress_converges_large_service() {
             "anchor should converge to target active service tasks"
         );
         eprintln!("stress: active task target reached ({target_tasks})");
-        let (shard_plan_log_hits, shard_delegate_log_hits) =
+        let (shard_plan_log_hits, shard_delegate_log_hits, direct_launch_log_hits) =
             deployment_shard_log_hits(&cluster.nodes);
         let shard_threshold =
             env_usize("MANTISSA_STRESS_SERVICE_SHARD_TARGET_THRESHOLD").unwrap_or(256);
@@ -1678,7 +1690,7 @@ fn stress_converges_large_service() {
         let shard_parallelism =
             env_usize("MANTISSA_STRESS_SERVICE_SHARD_PARALLELISM").unwrap_or(16);
         eprintln!(
-            "stress: service shard path logs planned={shard_plan_log_hits} delegated={shard_delegate_log_hits} threshold={shard_threshold} target_size={shard_target_size} parallelism={shard_parallelism}"
+            "stress: service shard path logs planned={shard_plan_log_hits} delegated={shard_delegate_log_hits} direct={direct_launch_log_hits} threshold={shard_threshold} target_size={shard_target_size} parallelism={shard_parallelism}"
         );
 
         let mut visibility = Vec::with_capacity(cluster.nodes.len());

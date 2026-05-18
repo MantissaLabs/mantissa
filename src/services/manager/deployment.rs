@@ -1976,25 +1976,52 @@ impl ServiceController {
         &self,
         requests: &[WorkloadStartRequest],
     ) -> Option<(Uuid, u64, Vec<ServiceDeploymentShard>)> {
+        let request_count = requests.len();
         let mut target_nodes = requests
             .iter()
             .filter_map(|request| request.target_node)
             .collect::<Vec<_>>();
         if target_nodes.len() != requests.len() {
+            tracing::info!(
+                target: "services",
+                request_count,
+                pinned_request_count = target_nodes.len(),
+                "using direct service deployment launch because not every request has a pinned target"
+            );
             return None;
         }
         if requests.iter().any(|request| request.id.is_none()) {
+            tracing::info!(
+                target: "services",
+                request_count,
+                "using direct service deployment launch because at least one request is missing a deterministic task id"
+            );
             return None;
         }
         target_nodes.sort_unstable();
         target_nodes.dedup();
 
         let runtime = crate::config::replication_runtime_config();
-        if target_nodes.len() <= runtime.service_shard_target_threshold {
+        if target_nodes.len() < runtime.service_shard_target_threshold {
+            tracing::info!(
+                target: "services",
+                request_count,
+                target_peer_count = target_nodes.len(),
+                target_threshold = runtime.service_shard_target_threshold,
+                "using direct service deployment launch because target peer count is below the sharding threshold"
+            );
             return None;
         }
 
-        let (service_id, service_epoch) = service_generation_from_requests(requests)?;
+        let Some((service_id, service_epoch)) = service_generation_from_requests(requests) else {
+            tracing::info!(
+                target: "services",
+                request_count,
+                target_peer_count = target_nodes.len(),
+                "using direct service deployment launch because requests do not describe one service generation"
+            );
+            return None;
+        };
         let eligible_nodes = self.collect_eligible_nodes();
         let shards = build_service_deployment_shards(
             service_id,
@@ -2004,6 +2031,16 @@ impl ServiceController {
             runtime.service_shard_target_size,
         );
         if shards.is_empty() {
+            tracing::info!(
+                target: "services",
+                service_id = %service_id,
+                service_epoch,
+                request_count,
+                target_peer_count = target_nodes.len(),
+                eligible_peer_count = eligible_nodes.len(),
+                target_size = runtime.service_shard_target_size,
+                "using direct service deployment launch because no deployment shards could be built"
+            );
             return None;
         }
 
