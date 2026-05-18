@@ -583,7 +583,7 @@ pub(super) fn build_service_deployment_shards(
 /// often handle one of its own target batches locally. If every shard target is
 /// unavailable in the current eligible view, the function falls back to the
 /// broader eligible set so the generation can still be delegated.
-fn select_shard_coordinator(
+pub(super) fn select_shard_coordinator(
     service_id: Uuid,
     service_epoch: u64,
     shard_index: usize,

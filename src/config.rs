@@ -542,6 +542,8 @@ pub struct ReplicationConfig {
     pub service_shard_target_threshold: usize,
     #[serde(default = "default_replication_service_shard_target_size")]
     pub service_shard_target_size: usize,
+    #[serde(default = "default_replication_service_shard_task_target_size")]
+    pub service_shard_task_target_size: usize,
     #[serde(default = "default_replication_service_shard_parallelism")]
     pub service_shard_parallelism: usize,
 }
@@ -564,6 +566,7 @@ impl Default for ReplicationConfig {
             remote_assignment_parallelism: default_replication_remote_assignment_parallelism(),
             service_shard_target_threshold: default_replication_service_shard_target_threshold(),
             service_shard_target_size: default_replication_service_shard_target_size(),
+            service_shard_task_target_size: default_replication_service_shard_task_target_size(),
             service_shard_parallelism: default_replication_service_shard_parallelism(),
         }
     }
@@ -587,6 +590,7 @@ pub struct RuntimeReplicationConfig {
     pub remote_assignment_parallelism: usize,
     pub service_shard_target_threshold: usize,
     pub service_shard_target_size: usize,
+    pub service_shard_task_target_size: usize,
     pub service_shard_parallelism: usize,
 }
 
@@ -609,6 +613,7 @@ impl ReplicationConfig {
             remote_assignment_parallelism: self.remote_assignment_parallelism,
             service_shard_target_threshold: self.service_shard_target_threshold,
             service_shard_target_size: self.service_shard_target_size,
+            service_shard_task_target_size: self.service_shard_task_target_size,
             service_shard_parallelism: self.service_shard_parallelism,
         }
     }
@@ -1252,6 +1257,13 @@ fn default_replication_service_shard_target_size() -> usize {
 
 /// # Description:
 ///
+/// Returns the default maximum number of replica starts carried by one deployment shard RPC.
+fn default_replication_service_shard_task_target_size() -> usize {
+    128
+}
+
+/// # Description:
+///
 /// Returns the default maximum number of service shard coordinators contacted in parallel.
 fn default_replication_service_shard_parallelism() -> usize {
     16
@@ -1534,6 +1546,10 @@ impl Config {
             &mut self.replication.service_shard_target_size,
         );
         applied |= apply_positive_usize_env_override(
+            "MANTISSA_SERVICE_SHARD_TASK_TARGET_SIZE",
+            &mut self.replication.service_shard_task_target_size,
+        );
+        applied |= apply_positive_usize_env_override(
             "MANTISSA_SERVICE_SHARD_PARALLELISM",
             &mut self.replication.service_shard_parallelism,
         );
@@ -1744,6 +1760,10 @@ impl Config {
 
         if self.replication.service_shard_target_size == 0 {
             anyhow::bail!("replication.service_shard_target_size must be greater than zero");
+        }
+
+        if self.replication.service_shard_task_target_size == 0 {
+            anyhow::bail!("replication.service_shard_task_target_size must be greater than zero");
         }
 
         if self.replication.service_shard_parallelism == 0 {
@@ -2356,6 +2376,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_service_shard_task_target_size() {
+        let mut config = Config::default();
+        config.replication.service_shard_task_target_size = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn rejects_invalid_service_shard_parallelism() {
         let mut config = Config::default();
         config.replication.service_shard_parallelism = 0;
@@ -2398,6 +2425,7 @@ mod tests {
             ("MANTISSA_REMOTE_ASSIGNMENT_PARALLELISM", "24"),
             ("MANTISSA_SERVICE_SHARD_TARGET_THRESHOLD", "64"),
             ("MANTISSA_SERVICE_SHARD_TARGET_SIZE", "16"),
+            ("MANTISSA_SERVICE_SHARD_TASK_TARGET_SIZE", "32"),
             ("MANTISSA_SERVICE_SHARD_PARALLELISM", "8"),
         ]);
 
@@ -2459,6 +2487,7 @@ mod tests {
         assert_eq!(config.replication.remote_assignment_parallelism, 24);
         assert_eq!(config.replication.service_shard_target_threshold, 64);
         assert_eq!(config.replication.service_shard_target_size, 16);
+        assert_eq!(config.replication.service_shard_task_target_size, 32);
         assert_eq!(config.replication.service_shard_parallelism, 8);
     }
 

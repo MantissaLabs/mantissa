@@ -66,7 +66,7 @@ fn forward_stress_env_override(command: &mut Command, stress_name: &str, daemon_
 /// The stress test keeps its own env namespace so local experiments can tune one
 /// run without affecting unrelated Mantissa commands in the same shell.
 fn apply_stress_replication_env_overrides(command: &mut Command) {
-    const ENV_MAPPINGS: [(&str, &str); 13] = [
+    const ENV_MAPPINGS: [(&str, &str); 14] = [
         (
             "MANTISSA_STRESS_GOSSIP_CHANNEL_CAPACITY",
             "MANTISSA_GOSSIP_CHANNEL_CAPACITY",
@@ -102,6 +102,10 @@ fn apply_stress_replication_env_overrides(command: &mut Command) {
         (
             "MANTISSA_STRESS_SERVICE_SHARD_TARGET_SIZE",
             "MANTISSA_SERVICE_SHARD_TARGET_SIZE",
+        ),
+        (
+            "MANTISSA_STRESS_SERVICE_SHARD_TASK_TARGET_SIZE",
+            "MANTISSA_SERVICE_SHARD_TASK_TARGET_SIZE",
         ),
         (
             "MANTISSA_STRESS_SERVICE_SHARD_PARALLELISM",
@@ -288,6 +292,8 @@ struct DeploymentShardLogSummary {
     shard_count: usize,
     coordinator_count: usize,
     max_targets_per_shard: usize,
+    max_tasks_per_shard: usize,
+    task_target_size: usize,
 }
 
 /// Parses one `field=value` integer emitted by compact tracing log lines.
@@ -347,6 +353,12 @@ fn deployment_shard_log_summary(nodes: &[ProcessNode]) -> DeploymentShardLogSumm
                     line,
                     "max_targets_per_shard",
                 );
+                retain_max_log_field(
+                    &mut summary.max_tasks_per_shard,
+                    line,
+                    "max_tasks_per_shard",
+                );
+                retain_max_log_field(&mut summary.task_target_size, line, "task_target_size");
             }
         }
     }
@@ -1745,10 +1757,12 @@ fn stress_converges_large_service() {
             env_usize("MANTISSA_STRESS_SERVICE_SHARD_TARGET_THRESHOLD").unwrap_or(256);
         let shard_target_size =
             env_usize("MANTISSA_STRESS_SERVICE_SHARD_TARGET_SIZE").unwrap_or(128);
+        let shard_task_target_size =
+            env_usize("MANTISSA_STRESS_SERVICE_SHARD_TASK_TARGET_SIZE").unwrap_or(128);
         let shard_parallelism =
             env_usize("MANTISSA_STRESS_SERVICE_SHARD_PARALLELISM").unwrap_or(16);
         eprintln!(
-            "stress: service shard path logs planned={} delegated={} direct={} target_peers={} shard_count={} coordinator_count={} max_targets_per_shard={} threshold={shard_threshold} target_size={shard_target_size} parallelism={shard_parallelism}",
+            "stress: service shard path logs planned={} delegated={} direct={} target_peers={} shard_count={} coordinator_count={} max_targets_per_shard={} max_tasks_per_shard={} threshold={shard_threshold} target_size={shard_target_size} task_target_size={} parallelism={shard_parallelism}",
             shard_logs.planned,
             shard_logs.delegated,
             shard_logs.direct,
@@ -1756,6 +1770,8 @@ fn stress_converges_large_service() {
             shard_logs.shard_count,
             shard_logs.coordinator_count,
             shard_logs.max_targets_per_shard,
+            shard_logs.max_tasks_per_shard,
+            shard_logs.task_target_size.max(shard_task_target_size),
         );
 
         let mut visibility = Vec::with_capacity(cluster.nodes.len());

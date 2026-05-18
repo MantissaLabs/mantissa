@@ -13,7 +13,7 @@ use super::placement::{
 };
 use super::state::deploying_assignment_incomplete;
 use super::*;
-use crate::services::ownership::ServiceDeploymentShard;
+use crate::services::ownership::{ServiceDeploymentShard, select_shard_coordinator};
 use crate::workload::manager::ServiceShardAssignmentRequest;
 use crate::workload::model::WorkloadOwner;
 use anyhow::Context;
@@ -36,6 +36,23 @@ struct ServiceShardCoordinationError {
     shard_index: usize,
     coordinator_node_id: Uuid,
     reason: String,
+}
+
+/// Deterministic target-peer shard plan for one service generation launch.
+#[derive(Clone, Debug)]
+struct DeploymentShardPlan {
+    service_id: Uuid,
+    service_epoch: u64,
+    eligible_nodes: Vec<Uuid>,
+    target_peer_count: usize,
+    target_shards: Vec<ServiceDeploymentShard>,
+}
+
+/// Concrete work unit sent to one deployment shard coordinator.
+#[derive(Clone)]
+struct DeploymentShardWork {
+    shard: ServiceDeploymentShard,
+    indexed_requests: Vec<(usize, WorkloadStartRequest)>,
 }
 
 /// Returns true when deployment should stay in `Deploying` and retry later.
@@ -68,6 +85,196 @@ fn service_launch_target_peer_count(requests: &[WorkloadStartRequest]) -> usize 
         .filter_map(|request| request.target_node)
         .collect::<HashSet<_>>()
         .len()
+}
+
+/// Splits target-peer shards into task-bounded coordinator work units.
+///
+/// Target-peer sharding caps how many nodes one coordinator contacts, but it
+/// does not cap how many replicas that coordinator starts. This second split
+/// keeps each coordinator request bounded by replica count while preserving the
+/// same target-peer partition as the outer shard plan.
+fn build_deployment_shard_work(
+    service_id: Uuid,
+    service_epoch: u64,
+    eligible_nodes: &[Uuid],
+    target_shards: &[ServiceDeploymentShard],
+    requests: Vec<WorkloadStartRequest>,
+    max_tasks_per_shard: usize,
+    context: &str,
+) -> anyhow::Result<Vec<DeploymentShardWork>> {
+    let max_tasks_per_shard = max_tasks_per_shard.max(1);
+    let mut target_to_shard = HashMap::new();
+    for shard in target_shards {
+        for target_node_id in &shard.target_node_ids {
+            if target_to_shard
+                .insert(*target_node_id, shard.clone())
+                .is_some()
+            {
+                return Err(anyhow!(
+                    "service shard launch for {context} assigned target node {target_node_id} to multiple target shards"
+                ));
+            }
+        }
+    }
+
+    let mut grouped: HashMap<usize, (ServiceDeploymentShard, Vec<(usize, WorkloadStartRequest)>)> =
+        HashMap::new();
+    for (index, request) in requests.into_iter().enumerate() {
+        let target_node = request.target_node.ok_or_else(|| {
+            anyhow!("service shard launch for {context} received an unpinned workload request")
+        })?;
+        let shard = target_to_shard.get(&target_node).ok_or_else(|| {
+            anyhow!("service shard launch for {context} has no shard for target node {target_node}")
+        })?;
+        grouped
+            .entry(shard.shard_index)
+            .or_insert_with(|| (shard.clone(), Vec::new()))
+            .1
+            .push((index, request));
+    }
+
+    let mut target_groups = grouped.into_values().collect::<Vec<_>>();
+    target_groups.sort_by_key(|(shard, _)| shard.shard_index);
+
+    let mut work = Vec::new();
+    for (_, indexed_requests) in target_groups {
+        for chunk in indexed_requests.chunks(max_tasks_per_shard) {
+            let shard_index = work.len();
+            let mut target_node_ids = chunk
+                .iter()
+                .filter_map(|(_, request)| request.target_node)
+                .collect::<Vec<_>>();
+            target_node_ids.sort_unstable();
+            target_node_ids.dedup();
+
+            let coordinator_node_id = select_shard_coordinator(
+                service_id,
+                service_epoch,
+                shard_index,
+                &target_node_ids,
+                eligible_nodes,
+            )
+            .ok_or_else(|| {
+                anyhow!(
+                    "service shard launch for {context} could not select coordinator for shard {shard_index}"
+                )
+            })?;
+
+            work.push(DeploymentShardWork {
+                shard: ServiceDeploymentShard {
+                    shard_index,
+                    coordinator_node_id,
+                    target_node_ids,
+                },
+                indexed_requests: chunk.to_vec(),
+            });
+        }
+    }
+
+    Ok(work)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workload::model::{ExecutionPlatform, IsolationMode, WorkloadServiceMetadata};
+    use crate::workload::types::ResolvedExecutionSpec;
+
+    /// Builds one minimal pinned service-replica request for shard splitting tests.
+    fn pinned_service_request(
+        service_name: &str,
+        service_epoch: u64,
+        replica_index: usize,
+        target_node: Uuid,
+    ) -> WorkloadStartRequest {
+        WorkloadStartRequest {
+            name: format!("replica-{replica_index}"),
+            execution: ResolvedExecutionSpec {
+                image: "busybox:latest".to_string(),
+                command: Vec::new(),
+                tty: false,
+                cpu_millis: 100,
+                memory_bytes: 32 * 1_024 * 1_024,
+                gpu_count: 0,
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                liveness: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: Vec::new(),
+                ports: Vec::new(),
+                placement: Default::default(),
+            },
+            execution_platform: ExecutionPlatform::Oci,
+            isolation_mode: IsolationMode::Standard,
+            isolation_profile: None,
+            gpu_device_ids: Vec::new(),
+            id: Some(Uuid::from_u128(10_000 + replica_index as u128)),
+            slot_ids: Vec::new(),
+            owner: Some(WorkloadOwner::ServiceReplica(
+                WorkloadServiceMetadata::new(service_name, "web").with_service_epoch(service_epoch),
+            )),
+            service_placement_preferences: Vec::new(),
+            target_node: Some(target_node),
+        }
+    }
+
+    /// Ensures shard work is bounded by replica count, not only target-node count.
+    #[test]
+    fn deployment_shard_work_splits_by_task_count() {
+        let service_name = "large-service";
+        let service_id = compute_service_id(service_name);
+        let service_epoch = 3;
+        let eligible_nodes = (1u128..=4).map(Uuid::from_u128).collect::<Vec<_>>();
+        let target_shards = build_service_deployment_shards(
+            service_id,
+            service_epoch,
+            &eligible_nodes,
+            &eligible_nodes,
+            4,
+        );
+        let requests = (0..10)
+            .map(|index| {
+                pinned_service_request(
+                    service_name,
+                    service_epoch,
+                    index,
+                    eligible_nodes[index % eligible_nodes.len()],
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let work = build_deployment_shard_work(
+            service_id,
+            service_epoch,
+            &eligible_nodes,
+            &target_shards,
+            requests,
+            3,
+            "test deployment",
+        )
+        .expect("deployment shard work");
+
+        assert_eq!(work.len(), 4);
+        assert!(work.iter().all(|work| work.indexed_requests.len() <= 3));
+        assert!(work.iter().all(|work| {
+            eligible_nodes.contains(&work.shard.coordinator_node_id)
+                && !work.shard.target_node_ids.is_empty()
+        }));
+
+        let mut original_indices = work
+            .iter()
+            .flat_map(|work| {
+                work.indexed_requests
+                    .iter()
+                    .map(|(original_index, _)| *original_index)
+            })
+            .collect::<Vec<_>>();
+        original_indices.sort_unstable();
+        assert_eq!(original_indices, (0..10).collect::<Vec<_>>());
+    }
 }
 
 impl ServiceController {
@@ -1935,15 +2142,9 @@ impl ServiceController {
     ) -> anyhow::Result<Vec<WorkloadSpec>> {
         match admission_policy.mode {
             WorkloadAdmissionMode::Incremental => match self.deployment_shard_plan(&requests) {
-                Some((service_id, service_epoch, shards)) => {
-                    self.start_tasks_with_deployment_shards(
-                        service_id,
-                        service_epoch,
-                        shards,
-                        requests,
-                        context,
-                    )
-                    .await
+                Some(plan) => {
+                    self.start_tasks_with_deployment_shards(plan, requests, context)
+                        .await
                 }
                 None => {
                     crate::observability::metrics::record_service_deployment_launch_shape(
@@ -1975,7 +2176,7 @@ impl ServiceController {
     fn deployment_shard_plan(
         &self,
         requests: &[WorkloadStartRequest],
-    ) -> Option<(Uuid, u64, Vec<ServiceDeploymentShard>)> {
+    ) -> Option<DeploymentShardPlan> {
         let request_count = requests.len();
         let mut target_nodes = requests
             .iter()
@@ -2022,7 +2223,9 @@ impl ServiceController {
             );
             return None;
         };
-        let eligible_nodes = self.collect_eligible_nodes();
+        let mut eligible_nodes = self.collect_eligible_nodes();
+        eligible_nodes.sort_unstable();
+        eligible_nodes.dedup();
         let shards = build_service_deployment_shards(
             service_id,
             service_epoch,
@@ -2044,31 +2247,13 @@ impl ServiceController {
             return None;
         }
 
-        let max_targets = shards
-            .iter()
-            .map(|shard| shard.target_node_ids.len())
-            .max()
-            .unwrap_or(0);
-        let coordinator_count = shards
-            .iter()
-            .map(|shard| shard.coordinator_node_id)
-            .collect::<HashSet<_>>()
-            .len();
-        let last_shard_index = shards.last().map(|shard| shard.shard_index).unwrap_or(0);
-
-        tracing::info!(
-            target: "services",
-            service_id = %service_id,
+        Some(DeploymentShardPlan {
+            service_id,
             service_epoch,
-            target_peer_count = target_nodes.len(),
-            shard_count = shards.len(),
-            coordinator_count,
-            max_targets_per_shard = max_targets,
-            last_shard_index,
-            "computed deterministic service deployment shard plan"
-        );
-
-        Some((service_id, service_epoch, shards))
+            eligible_nodes,
+            target_peer_count: target_nodes.len(),
+            target_shards: shards,
+        })
     }
 
     /// Starts a large pinned deployment through deterministic shard coordinators.
@@ -2080,64 +2265,90 @@ impl ServiceController {
     /// remain the same mechanisms used by direct owner launches.
     async fn start_tasks_with_deployment_shards(
         &self,
-        service_id: Uuid,
-        service_epoch: u64,
-        shards: Vec<ServiceDeploymentShard>,
+        plan: DeploymentShardPlan,
         requests: Vec<WorkloadStartRequest>,
         context: &str,
     ) -> anyhow::Result<Vec<WorkloadSpec>> {
+        let DeploymentShardPlan {
+            service_id,
+            service_epoch,
+            eligible_nodes,
+            target_peer_count,
+            target_shards,
+        } = plan;
         let request_count = requests.len();
-        let mut target_to_shard = HashMap::new();
-        for shard in &shards {
-            for target_node_id in &shard.target_node_ids {
-                target_to_shard.insert(*target_node_id, shard.clone());
-            }
-        }
-
-        let mut grouped: HashMap<
-            usize,
-            (ServiceDeploymentShard, Vec<(usize, WorkloadStartRequest)>),
-        > = HashMap::new();
-        for (index, request) in requests.into_iter().enumerate() {
-            let target_node = request.target_node.ok_or_else(|| {
-                anyhow!("service shard launch for {context} received an unpinned workload request")
-            })?;
-            let shard = target_to_shard.get(&target_node).ok_or_else(|| {
-                anyhow!(
-                    "service shard launch for {context} has no shard for target node {target_node}"
-                )
-            })?;
-            grouped
-                .entry(shard.shard_index)
-                .or_insert_with(|| (shard.clone(), Vec::new()))
-                .1
-                .push((index, request));
-        }
+        let target_shard_count = target_shards.len();
+        let max_target_peers_per_shard = target_shards
+            .iter()
+            .map(|shard| shard.target_node_ids.len())
+            .max()
+            .unwrap_or(0);
+        let task_target_size =
+            crate::config::replication_runtime_config().service_shard_task_target_size;
+        let work_shards = build_deployment_shard_work(
+            service_id,
+            service_epoch,
+            &eligible_nodes,
+            &target_shards,
+            requests,
+            task_target_size,
+            context,
+        )?;
+        let coordinator_count = work_shards
+            .iter()
+            .map(|work| work.shard.coordinator_node_id)
+            .collect::<HashSet<_>>()
+            .len();
+        let max_tasks_per_shard = work_shards
+            .iter()
+            .map(|work| work.indexed_requests.len())
+            .max()
+            .unwrap_or(0);
+        let max_targets_per_shard = work_shards
+            .iter()
+            .map(|work| work.shard.target_node_ids.len())
+            .max()
+            .unwrap_or(0);
+        let last_shard_index = work_shards
+            .last()
+            .map(|work| work.shard.shard_index)
+            .unwrap_or(0);
 
         tracing::info!(
             target: "services",
             service_id = %service_id,
             service_epoch,
-            shard_count = grouped.len(),
+            target_peer_count,
+            target_shard_count,
+            shard_count = work_shards.len(),
+            coordinator_count,
+            max_target_peers_per_shard,
+            max_targets_per_shard,
+            max_tasks_per_shard,
+            task_target_size,
+            last_shard_index,
+            "computed deterministic service deployment shard plan"
+        );
+
+        tracing::info!(
+            target: "services",
+            service_id = %service_id,
+            service_epoch,
+            shard_count = work_shards.len(),
             task_count = request_count,
             "delegating service deployment through deterministic shard coordinators for {context}"
         );
-        let coordinator_count = grouped
-            .values()
-            .map(|(shard, _)| shard.coordinator_node_id)
-            .collect::<HashSet<_>>()
-            .len();
         crate::observability::metrics::record_service_deployment_launch_shape(
             "sharded",
-            target_to_shard.len(),
-            grouped.len(),
+            target_peer_count,
+            work_shards.len(),
             coordinator_count,
             request_count,
         );
 
         let mut ordered: Vec<Option<WorkloadSpec>> = vec![None; request_count];
-        let mut shard_groups = grouped.into_values().collect::<Vec<_>>();
-        shard_groups.sort_by_key(|(shard, _)| shard.shard_index);
+        let mut shard_groups = work_shards;
+        shard_groups.sort_by_key(|work| work.shard.shard_index);
 
         let parallelism = service_shard_parallelism();
         let mut pending_shards = shard_groups.into_iter();
@@ -2145,14 +2356,14 @@ impl ServiceController {
 
         loop {
             while inflight.len() < parallelism {
-                let Some((shard, indexed_requests)) = pending_shards.next() else {
+                let Some(work) = pending_shards.next() else {
                     break;
                 };
                 inflight.push(self.coordinate_deployment_shard(
                     service_id,
                     service_epoch,
-                    shard,
-                    indexed_requests,
+                    work.shard,
+                    work.indexed_requests,
                     context,
                 ));
             }
