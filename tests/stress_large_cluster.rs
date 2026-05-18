@@ -273,26 +273,85 @@ fn count_node_log_marker(node: &ProcessNode, marker: &str) -> usize {
     count_log_marker(&node.stdout_log, marker) + count_log_marker(&node.stderr_log, marker)
 }
 
-/// Counts service-deployment shard planning, delegation, and direct fallback markers.
-fn deployment_shard_log_hits(nodes: &[ProcessNode]) -> (usize, usize, usize) {
-    const PLAN_MARKER: &str = "computed deterministic service deployment shard plan";
-    const DELEGATE_MARKER: &str =
-        "delegating service deployment through deterministic shard coordinators";
-    const DIRECT_MARKER: &str = "using direct service deployment launch";
+const SERVICE_SHARD_PLAN_MARKER: &str = "computed deterministic service deployment shard plan";
+const SERVICE_SHARD_DELEGATE_MARKER: &str =
+    "delegating service deployment through deterministic shard coordinators";
+const SERVICE_SHARD_DIRECT_MARKER: &str = "using direct service deployment launch";
 
+/// Numeric fields extracted from service-deployment shard planning logs.
+#[derive(Clone, Copy, Debug, Default)]
+struct DeploymentShardLogSummary {
+    planned: usize,
+    delegated: usize,
+    direct: usize,
+    target_peer_count: usize,
+    shard_count: usize,
+    coordinator_count: usize,
+    max_targets_per_shard: usize,
+}
+
+/// Parses one `field=value` integer emitted by compact tracing log lines.
+fn parse_log_usize_field(line: &str, field: &str) -> Option<usize> {
+    let needle = format!("{field}=");
+    let start = line.find(&needle)? + needle.len();
+    let digits = line[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Updates the retained maximum for a numeric field found in one log line.
+fn retain_max_log_field(current: &mut usize, line: &str, field: &str) {
+    if let Some(value) = parse_log_usize_field(line, field) {
+        *current = (*current).max(value);
+    }
+}
+
+/// Counts service-deployment shard markers and extracts the largest observed plan shape.
+fn deployment_shard_log_summary(nodes: &[ProcessNode]) -> DeploymentShardLogSummary {
+    let mut summary = DeploymentShardLogSummary::default();
     let planned = nodes
         .iter()
-        .map(|node| count_node_log_marker(node, PLAN_MARKER))
+        .map(|node| count_node_log_marker(node, SERVICE_SHARD_PLAN_MARKER))
         .sum();
     let delegated = nodes
         .iter()
-        .map(|node| count_node_log_marker(node, DELEGATE_MARKER))
+        .map(|node| count_node_log_marker(node, SERVICE_SHARD_DELEGATE_MARKER))
         .sum();
     let direct = nodes
         .iter()
-        .map(|node| count_node_log_marker(node, DIRECT_MARKER))
+        .map(|node| count_node_log_marker(node, SERVICE_SHARD_DIRECT_MARKER))
         .sum();
-    (planned, delegated, direct)
+    summary.planned = planned;
+    summary.delegated = delegated;
+    summary.direct = direct;
+
+    for node in nodes {
+        for path in [&node.stdout_log, &node.stderr_log] {
+            let Ok(contents) = fs::read_to_string(path) else {
+                continue;
+            };
+            for line in contents
+                .lines()
+                .filter(|line| line.contains(SERVICE_SHARD_PLAN_MARKER))
+            {
+                retain_max_log_field(&mut summary.target_peer_count, line, "target_peer_count");
+                retain_max_log_field(&mut summary.shard_count, line, "shard_count");
+                retain_max_log_field(&mut summary.coordinator_count, line, "coordinator_count");
+                retain_max_log_field(
+                    &mut summary.max_targets_per_shard,
+                    line,
+                    "max_targets_per_shard",
+                );
+            }
+        }
+    }
+
+    summary
 }
 
 /// Builds one minimal service manifest used by the stress deployment.
@@ -1681,8 +1740,7 @@ fn stress_converges_large_service() {
             "anchor should converge to target active service tasks"
         );
         eprintln!("stress: active task target reached ({target_tasks})");
-        let (shard_plan_log_hits, shard_delegate_log_hits, direct_launch_log_hits) =
-            deployment_shard_log_hits(&cluster.nodes);
+        let shard_logs = deployment_shard_log_summary(&cluster.nodes);
         let shard_threshold =
             env_usize("MANTISSA_STRESS_SERVICE_SHARD_TARGET_THRESHOLD").unwrap_or(256);
         let shard_target_size =
@@ -1690,7 +1748,14 @@ fn stress_converges_large_service() {
         let shard_parallelism =
             env_usize("MANTISSA_STRESS_SERVICE_SHARD_PARALLELISM").unwrap_or(16);
         eprintln!(
-            "stress: service shard path logs planned={shard_plan_log_hits} delegated={shard_delegate_log_hits} direct={direct_launch_log_hits} threshold={shard_threshold} target_size={shard_target_size} parallelism={shard_parallelism}"
+            "stress: service shard path logs planned={} delegated={} direct={} target_peers={} shard_count={} coordinator_count={} max_targets_per_shard={} threshold={shard_threshold} target_size={shard_target_size} parallelism={shard_parallelism}",
+            shard_logs.planned,
+            shard_logs.delegated,
+            shard_logs.direct,
+            shard_logs.target_peer_count,
+            shard_logs.shard_count,
+            shard_logs.coordinator_count,
+            shard_logs.max_targets_per_shard,
         );
 
         let mut visibility = Vec::with_capacity(cluster.nodes.len());
