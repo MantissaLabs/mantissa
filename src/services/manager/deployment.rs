@@ -17,6 +17,58 @@ use crate::services::ownership::ServiceDeploymentShard;
 use crate::workload::manager::ServiceShardAssignmentRequest;
 use crate::workload::model::WorkloadOwner;
 use anyhow::Context;
+use futures::stream::{FuturesUnordered, StreamExt};
+use thiserror::Error;
+
+/// Retryable failure while a generation owner delegates work to a shard coordinator.
+///
+/// The coordinator path uses ordinary workload start semantics after the
+/// delegation arrives. A remote-session or coordinator availability failure is
+/// different from a local scheduler rejection: the owner has not proven that the
+/// shard cannot be launched, only that this attempt did not reach the selected
+/// coordinator. Keeping this as a typed error lets deployment stay in
+/// `Deploying` and retry the deterministic shard later.
+#[derive(Debug, Error)]
+#[error(
+    "service shard {shard_index} coordination with {coordinator_node_id} did not complete: {reason}"
+)]
+struct ServiceShardCoordinationError {
+    shard_index: usize,
+    coordinator_node_id: Uuid,
+    reason: String,
+}
+
+/// Returns true when deployment should stay in `Deploying` and retry later.
+///
+/// Direct workload starts already classify missing scheduler prerequisites as
+/// retryable. Sharded launches add one more retryable class: a failed handoff to
+/// the selected shard coordinator. The owner should not mark the service failed
+/// for that case because a later loop can reuse the same deterministic shard
+/// plan and the coordinator path is idempotent by workload id.
+fn deployment_launch_error_requires_service_requeue(err: &anyhow::Error) -> bool {
+    workload_start_error_requires_service_requeue(err)
+        || err.chain().any(|cause| {
+            cause
+                .downcast_ref::<ServiceShardCoordinationError>()
+                .is_some()
+        })
+}
+
+/// Returns the configured owner-to-shard coordinator RPC parallelism.
+fn service_shard_parallelism() -> usize {
+    crate::config::replication_runtime_config()
+        .service_shard_parallelism
+        .max(1)
+}
+
+/// Counts unique target nodes in a pinned service launch request batch.
+fn service_launch_target_peer_count(requests: &[WorkloadStartRequest]) -> usize {
+    requests
+        .iter()
+        .filter_map(|request| request.target_node)
+        .collect::<HashSet<_>>()
+        .len()
+}
 
 impl ServiceController {
     /// Schedules an asynchronous deployment for the provided service manifest and returns
@@ -679,7 +731,7 @@ impl ServiceController {
                     service_name
                 );
 
-                if workload_start_error_requires_service_requeue(&err) {
+                if deployment_launch_error_requires_service_requeue(&err) {
                     self.persist_retryable_deployment_launch_error(service_id, &service_name, &err)
                         .await;
                     tracing::info!(
@@ -1596,7 +1648,7 @@ impl ServiceController {
             deployment.service_name
         );
 
-        if workload_start_error_requires_service_requeue(err) {
+        if deployment_launch_error_requires_service_requeue(err) {
             self.persist_retryable_deployment_launch_error(
                 compute_service_id(deployment.service_name),
                 deployment.service_name,
@@ -1839,7 +1891,7 @@ impl ServiceController {
                 );
                 Err(err)
             }
-            Err(err) if has_targets && workload_start_error_requires_service_requeue(&err) => {
+            Err(err) if has_targets && deployment_launch_error_requires_service_requeue(&err) => {
                 tracing::warn!(
                     target: "services",
                     "pinned placement failed for {context}; preserving targets while scheduling prerequisites converge: {err:#}"
@@ -1893,7 +1945,16 @@ impl ServiceController {
                     )
                     .await
                 }
-                None => self.start_tasks_with_fallback(requests, context).await,
+                None => {
+                    crate::observability::metrics::record_service_deployment_launch_shape(
+                        "direct",
+                        service_launch_target_peer_count(&requests),
+                        0,
+                        0,
+                        requests.len(),
+                    );
+                    self.start_tasks_with_fallback(requests, context).await
+                }
             },
             WorkloadAdmissionMode::Gang => {
                 tracing::info!(
@@ -1958,7 +2019,7 @@ impl ServiceController {
             .len();
         let last_shard_index = shards.last().map(|shard| shard.shard_index).unwrap_or(0);
 
-        tracing::debug!(
+        tracing::info!(
             target: "services",
             service_id = %service_id,
             service_epoch,
@@ -2024,54 +2085,55 @@ impl ServiceController {
             task_count = request_count,
             "delegating service deployment through deterministic shard coordinators for {context}"
         );
+        let coordinator_count = grouped
+            .values()
+            .map(|(shard, _)| shard.coordinator_node_id)
+            .collect::<HashSet<_>>()
+            .len();
+        crate::observability::metrics::record_service_deployment_launch_shape(
+            "sharded",
+            target_to_shard.len(),
+            grouped.len(),
+            coordinator_count,
+            request_count,
+        );
 
         let mut ordered: Vec<Option<WorkloadSpec>> = vec![None; request_count];
-        let mut shard_indices = grouped.keys().copied().collect::<Vec<_>>();
-        shard_indices.sort_unstable();
+        let mut shard_groups = grouped.into_values().collect::<Vec<_>>();
+        shard_groups.sort_by_key(|(shard, _)| shard.shard_index);
 
-        for shard_index in shard_indices {
-            let (shard, indexed_requests) = grouped
-                .remove(&shard_index)
-                .ok_or_else(|| anyhow!("missing grouped service shard {shard_index}"))?;
-            let shard_requests = indexed_requests
-                .iter()
-                .map(|(_, request)| request.clone())
-                .collect::<Vec<_>>();
-            let request = ServiceShardAssignmentRequest {
-                owner_node_id: self.local_node_id,
-                coordinator_node_id: shard.coordinator_node_id,
-                service_id,
-                service_epoch,
-                shard_index: shard.shard_index,
-                requests: shard_requests,
-            };
+        let parallelism = service_shard_parallelism();
+        let mut pending_shards = shard_groups.into_iter();
+        let mut inflight = FuturesUnordered::new();
 
-            let specs = if shard.coordinator_node_id == self.local_node_id {
-                self.workload_manager
-                    .coordinate_service_shard_assignments(request)
-                    .await
-            } else {
-                self.workload_manager
-                    .coordinate_remote_service_shard_assignments(shard.coordinator_node_id, request)
-                    .await
-            }
-            .with_context(|| {
-                format!(
-                    "service shard {} coordination failed for {context}",
-                    shard.shard_index
-                )
-            })?;
-
-            if specs.len() != indexed_requests.len() {
-                return Err(anyhow!(
-                    "service shard {} for {context} returned {} specs for {} requests",
-                    shard.shard_index,
-                    specs.len(),
-                    indexed_requests.len()
+        loop {
+            while inflight.len() < parallelism {
+                let Some((shard, indexed_requests)) = pending_shards.next() else {
+                    break;
+                };
+                inflight.push(self.coordinate_deployment_shard(
+                    service_id,
+                    service_epoch,
+                    shard,
+                    indexed_requests,
+                    context,
                 ));
             }
 
-            for ((original_index, _), spec) in indexed_requests.into_iter().zip(specs) {
+            let Some((shard_index, original_indices, specs)) = inflight.next().await else {
+                break;
+            };
+            let specs = specs?;
+            if specs.len() != original_indices.len() {
+                return Err(anyhow!(
+                    "service shard {} for {context} returned {} specs for {} requests",
+                    shard_index,
+                    specs.len(),
+                    original_indices.len()
+                ));
+            }
+
+            for (original_index, spec) in original_indices.into_iter().zip(specs) {
                 ordered[original_index] = Some(spec);
             }
         }
@@ -2083,6 +2145,64 @@ impl ServiceController {
                 spec.ok_or_else(|| anyhow!("service shard launch for {context} missed row {index}"))
             })
             .collect()
+    }
+
+    /// Coordinates one deployment shard locally or through the selected remote coordinator.
+    ///
+    /// Local coordinator errors keep their original type so real scheduling
+    /// failures still consume the normal failure budget. Remote coordinator
+    /// errors are wrapped as retryable handoff failures because the owner cannot
+    /// distinguish a temporarily unavailable coordinator from a durable launch
+    /// rejection until the request is actually processed by that coordinator.
+    async fn coordinate_deployment_shard(
+        &self,
+        service_id: Uuid,
+        service_epoch: u64,
+        shard: ServiceDeploymentShard,
+        indexed_requests: Vec<(usize, WorkloadStartRequest)>,
+        context: &str,
+    ) -> (usize, Vec<usize>, anyhow::Result<Vec<WorkloadSpec>>) {
+        let original_indices = indexed_requests
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+        let shard_requests = indexed_requests
+            .into_iter()
+            .map(|(_, request)| request)
+            .collect::<Vec<_>>();
+        let request = ServiceShardAssignmentRequest {
+            owner_node_id: self.local_node_id,
+            coordinator_node_id: shard.coordinator_node_id,
+            service_id,
+            service_epoch,
+            shard_index: shard.shard_index,
+            requests: shard_requests,
+        };
+
+        let result = if shard.coordinator_node_id == self.local_node_id {
+            self.workload_manager
+                .coordinate_service_shard_assignments(request)
+                .await
+        } else {
+            self.workload_manager
+                .coordinate_remote_service_shard_assignments(shard.coordinator_node_id, request)
+                .await
+                .map_err(|err| {
+                    anyhow::Error::new(ServiceShardCoordinationError {
+                        shard_index: shard.shard_index,
+                        coordinator_node_id: shard.coordinator_node_id,
+                        reason: err.to_string(),
+                    })
+                })
+        }
+        .with_context(|| {
+            format!(
+                "service shard {} coordination failed for {context}",
+                shard.shard_index
+            )
+        });
+
+        (shard.shard_index, original_indices, result)
     }
 
     /// Publishes task traffic after attachment rows exist so cutover only exposes ready endpoints.

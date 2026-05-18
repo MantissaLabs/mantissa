@@ -542,6 +542,8 @@ pub struct ReplicationConfig {
     pub service_shard_target_threshold: usize,
     #[serde(default = "default_replication_service_shard_target_size")]
     pub service_shard_target_size: usize,
+    #[serde(default = "default_replication_service_shard_parallelism")]
+    pub service_shard_parallelism: usize,
 }
 
 impl Default for ReplicationConfig {
@@ -562,6 +564,7 @@ impl Default for ReplicationConfig {
             remote_assignment_parallelism: default_replication_remote_assignment_parallelism(),
             service_shard_target_threshold: default_replication_service_shard_target_threshold(),
             service_shard_target_size: default_replication_service_shard_target_size(),
+            service_shard_parallelism: default_replication_service_shard_parallelism(),
         }
     }
 }
@@ -584,6 +587,7 @@ pub struct RuntimeReplicationConfig {
     pub remote_assignment_parallelism: usize,
     pub service_shard_target_threshold: usize,
     pub service_shard_target_size: usize,
+    pub service_shard_parallelism: usize,
 }
 
 impl ReplicationConfig {
@@ -605,6 +609,7 @@ impl ReplicationConfig {
             remote_assignment_parallelism: self.remote_assignment_parallelism,
             service_shard_target_threshold: self.service_shard_target_threshold,
             service_shard_target_size: self.service_shard_target_size,
+            service_shard_parallelism: self.service_shard_parallelism,
         }
     }
 }
@@ -1247,6 +1252,13 @@ fn default_replication_service_shard_target_size() -> usize {
 
 /// # Description:
 ///
+/// Returns the default maximum number of service shard coordinators contacted in parallel.
+fn default_replication_service_shard_parallelism() -> usize {
+    16
+}
+
+/// # Description:
+///
 /// Ensure the global configuration has been loaded at least once.
 fn ensure_config_loaded() {
     if GLOBAL_LOADED.load(Ordering::Acquire) {
@@ -1521,6 +1533,10 @@ impl Config {
             "MANTISSA_SERVICE_SHARD_TARGET_SIZE",
             &mut self.replication.service_shard_target_size,
         );
+        applied |= apply_positive_usize_env_override(
+            "MANTISSA_SERVICE_SHARD_PARALLELISM",
+            &mut self.replication.service_shard_parallelism,
+        );
 
         applied
     }
@@ -1728,6 +1744,10 @@ impl Config {
 
         if self.replication.service_shard_target_size == 0 {
             anyhow::bail!("replication.service_shard_target_size must be greater than zero");
+        }
+
+        if self.replication.service_shard_parallelism == 0 {
+            anyhow::bail!("replication.service_shard_parallelism must be greater than zero");
         }
 
         Ok(())
@@ -2336,6 +2356,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_service_shard_parallelism() {
+        let mut config = Config::default();
+        config.replication.service_shard_parallelism = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn env_overrides_apply_and_validate() {
         let _env = EnvOverrideSet::set(&[
             ("MANTISSA_WIREGUARD_DISABLE", "1"),
@@ -2371,6 +2398,7 @@ mod tests {
             ("MANTISSA_REMOTE_ASSIGNMENT_PARALLELISM", "24"),
             ("MANTISSA_SERVICE_SHARD_TARGET_THRESHOLD", "64"),
             ("MANTISSA_SERVICE_SHARD_TARGET_SIZE", "16"),
+            ("MANTISSA_SERVICE_SHARD_PARALLELISM", "8"),
         ]);
 
         let mut config = Config::default();
@@ -2431,6 +2459,7 @@ mod tests {
         assert_eq!(config.replication.remote_assignment_parallelism, 24);
         assert_eq!(config.replication.service_shard_target_threshold, 64);
         assert_eq!(config.replication.service_shard_target_size, 16);
+        assert_eq!(config.replication.service_shard_parallelism, 8);
     }
 
     #[test]

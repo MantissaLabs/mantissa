@@ -66,7 +66,7 @@ fn forward_stress_env_override(command: &mut Command, stress_name: &str, daemon_
 /// The stress test keeps its own env namespace so local experiments can tune one
 /// run without affecting unrelated Mantissa commands in the same shell.
 fn apply_stress_replication_env_overrides(command: &mut Command) {
-    const ENV_MAPPINGS: [(&str, &str); 12] = [
+    const ENV_MAPPINGS: [(&str, &str); 13] = [
         (
             "MANTISSA_STRESS_GOSSIP_CHANNEL_CAPACITY",
             "MANTISSA_GOSSIP_CHANNEL_CAPACITY",
@@ -102,6 +102,10 @@ fn apply_stress_replication_env_overrides(command: &mut Command) {
         (
             "MANTISSA_STRESS_SERVICE_SHARD_TARGET_SIZE",
             "MANTISSA_SERVICE_SHARD_TARGET_SIZE",
+        ),
+        (
+            "MANTISSA_STRESS_SERVICE_SHARD_PARALLELISM",
+            "MANTISSA_SERVICE_SHARD_PARALLELISM",
         ),
     ];
 
@@ -254,6 +258,31 @@ fn read_log_tail(path: &Path, max_bytes: usize) -> String {
     };
     let start = bytes.len().saturating_sub(max_bytes);
     String::from_utf8_lossy(&bytes[start..]).trim().to_string()
+}
+
+/// Counts exact marker occurrences in one daemon log while the stress tempdir is still alive.
+fn count_log_marker(path: &Path, marker: &str) -> usize {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return 0;
+    };
+    contents.matches(marker).count()
+}
+
+/// Counts service-deployment shard planning and delegation markers across daemon logs.
+fn deployment_shard_log_hits(nodes: &[ProcessNode]) -> (usize, usize) {
+    const PLAN_MARKER: &str = "computed deterministic service deployment shard plan";
+    const DELEGATE_MARKER: &str =
+        "delegating service deployment through deterministic shard coordinators";
+
+    let planned = nodes
+        .iter()
+        .map(|node| count_log_marker(&node.stderr_log, PLAN_MARKER))
+        .sum();
+    let delegated = nodes
+        .iter()
+        .map(|node| count_log_marker(&node.stderr_log, DELEGATE_MARKER))
+        .sum();
+    (planned, delegated)
 }
 
 /// Builds one minimal service manifest used by the stress deployment.
@@ -417,7 +446,7 @@ struct ProcessNode {
     node_id: Uuid,
     listen_addr: String,
     socket_path: PathBuf,
-    _stderr_log: PathBuf,
+    stderr_log: PathBuf,
     session: mantissa_protocol::server::cluster_session::Client,
     child: Option<Child>,
 }
@@ -510,8 +539,8 @@ impl ProcessNode {
         let listen_addr = format!("127.0.0.1:{}", pick_free_port()?);
         let socket_path = stress_socket_path(&runtime_dir);
 
-        let node_rust_log =
-            std::env::var("MANTISSA_STRESS_NODE_RUST_LOG").unwrap_or_else(|_| "warn".to_string());
+        let node_rust_log = std::env::var("MANTISSA_STRESS_NODE_RUST_LOG")
+            .unwrap_or_else(|_| "warn,services=info".to_string());
 
         let mut command = Command::new(bin);
         command
@@ -562,7 +591,7 @@ impl ProcessNode {
             node_id,
             listen_addr,
             socket_path,
-            _stderr_log: stderr_log,
+            stderr_log,
             session,
             child: Some(child),
         })
@@ -1640,6 +1669,17 @@ fn stress_converges_large_service() {
             "anchor should converge to target active service tasks"
         );
         eprintln!("stress: active task target reached ({target_tasks})");
+        let (shard_plan_log_hits, shard_delegate_log_hits) =
+            deployment_shard_log_hits(&cluster.nodes);
+        let shard_threshold =
+            env_usize("MANTISSA_STRESS_SERVICE_SHARD_TARGET_THRESHOLD").unwrap_or(256);
+        let shard_target_size =
+            env_usize("MANTISSA_STRESS_SERVICE_SHARD_TARGET_SIZE").unwrap_or(128);
+        let shard_parallelism =
+            env_usize("MANTISSA_STRESS_SERVICE_SHARD_PARALLELISM").unwrap_or(16);
+        eprintln!(
+            "stress: service shard path logs planned={shard_plan_log_hits} delegated={shard_delegate_log_hits} threshold={shard_threshold} target_size={shard_target_size} parallelism={shard_parallelism}"
+        );
 
         let mut visibility = Vec::with_capacity(cluster.nodes.len());
         for node in &cluster.nodes {

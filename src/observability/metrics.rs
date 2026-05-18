@@ -223,6 +223,29 @@ pub fn record_workload_assignment_plan(
         .set(remote_peers as f64);
 }
 
+/// Records which service deployment launch shape was selected by the generation owner.
+pub fn record_service_deployment_launch_shape(
+    mode: &'static str,
+    target_peers: usize,
+    shards: usize,
+    coordinators: usize,
+    tasks: usize,
+) {
+    counter!("mantissa_service_deployment_launches_total", "mode" => mode).increment(1);
+    counter!("mantissa_service_deployment_target_peers_total", "mode" => mode)
+        .increment(target_peers as u64);
+    counter!("mantissa_service_deployment_shards_total", "mode" => mode).increment(shards as u64);
+    counter!("mantissa_service_deployment_coordinators_total", "mode" => mode)
+        .increment(coordinators as u64);
+    counter!("mantissa_service_deployment_tasks_total", "mode" => mode).increment(tasks as u64);
+    gauge!("mantissa_service_deployment_last_target_peers", "mode" => mode)
+        .set(target_peers as f64);
+    gauge!("mantissa_service_deployment_last_shards", "mode" => mode).set(shards as f64);
+    gauge!("mantissa_service_deployment_last_coordinators", "mode" => mode)
+        .set(coordinators as f64);
+    gauge!("mantissa_service_deployment_last_tasks", "mode" => mode).set(tasks as f64);
+}
+
 /// Records one sync attempt outcome.
 pub fn record_sync_attempt(scope: &'static str, result: &'static str, reason: &'static str) {
     counter!(
@@ -753,6 +776,51 @@ fn describe_metrics() {
         "mantissa_workload_assignment_last_remote_peers",
         Unit::Count,
         "Remote target peers in the most recent scheduler assignment."
+    );
+    describe_counter!(
+        "mantissa_service_deployment_launches_total",
+        Unit::Count,
+        "Service deployment launch attempts by direct or sharded owner path."
+    );
+    describe_counter!(
+        "mantissa_service_deployment_target_peers_total",
+        Unit::Count,
+        "Service deployment target peers selected by direct or sharded launch path."
+    );
+    describe_counter!(
+        "mantissa_service_deployment_shards_total",
+        Unit::Count,
+        "Service deployment shards selected by launch path."
+    );
+    describe_counter!(
+        "mantissa_service_deployment_coordinators_total",
+        Unit::Count,
+        "Service deployment shard coordinators selected by launch path."
+    );
+    describe_counter!(
+        "mantissa_service_deployment_tasks_total",
+        Unit::Count,
+        "Service deployment task starts submitted by launch path."
+    );
+    describe_gauge!(
+        "mantissa_service_deployment_last_target_peers",
+        Unit::Count,
+        "Target peers in the most recent service deployment launch."
+    );
+    describe_gauge!(
+        "mantissa_service_deployment_last_shards",
+        Unit::Count,
+        "Shards in the most recent service deployment launch."
+    );
+    describe_gauge!(
+        "mantissa_service_deployment_last_coordinators",
+        Unit::Count,
+        "Shard coordinators in the most recent service deployment launch."
+    );
+    describe_gauge!(
+        "mantissa_service_deployment_last_tasks",
+        Unit::Count,
+        "Task starts in the most recent service deployment launch."
     );
     describe_counter!(
         "mantissa_sync_attempts_total",
