@@ -112,6 +112,57 @@ impl ConfigOverrideGuard {
             _lock: lock,
         }
     }
+
+    /// Overrides service deployment sharding thresholds for one integration test.
+    ///
+    /// Production defaults intentionally keep sharding off for small clusters.
+    /// Integration tests need to force the coordinator path on small in-process
+    /// clusters so they can validate the same code that large deployments use.
+    /// The guard serializes global config mutation and restores the previous
+    /// config when dropped.
+    pub(crate) fn service_sharding(
+        target_threshold: usize,
+        target_size: usize,
+        task_target_size: usize,
+        parallelism: usize,
+    ) -> Self {
+        assert!(
+            target_threshold > 0,
+            "service shard target threshold must be greater than zero"
+        );
+        assert!(
+            target_size > 0,
+            "service shard target size must be greater than zero"
+        );
+        assert!(
+            task_target_size > 0,
+            "service shard task target size must be greater than zero"
+        );
+        assert!(
+            parallelism > 0,
+            "service shard parallelism must be greater than zero"
+        );
+
+        let lock = config_override_lock().lock();
+        let previous = global_config();
+        let source = global_config_source();
+
+        let mut config = previous.clone();
+        config.replication.service_shard_target_threshold = target_threshold;
+        config.replication.service_shard_target_size = target_size;
+        config.replication.service_shard_task_target_size = task_target_size;
+        config.replication.service_shard_parallelism = parallelism;
+
+        let mut override_source = source.clone();
+        override_source.env_overrides = true;
+        set_global_config_with_source(config, override_source);
+
+        Self {
+            previous,
+            source,
+            _lock: lock,
+        }
+    }
 }
 
 impl Drop for ConfigOverrideGuard {

@@ -15,6 +15,8 @@ mod partition;
 mod placement;
 #[path = "services/redeploy.rs"]
 mod redeploy;
+#[path = "services/sharding.rs"]
+mod sharding;
 #[path = "services/stop.rs"]
 mod stop;
 #[path = "services/support.rs"]
