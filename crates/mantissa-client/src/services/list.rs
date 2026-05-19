@@ -3,14 +3,15 @@ use crate::connection;
 use crate::host_ports::{HostPortView, decode_host_ports};
 use crate::networks;
 use crate::networks::{NetworkAttachment, NetworkAttachmentState, NetworkSummary};
-use crate::tasks::{uuid_from_data, uuid_to_string};
+use crate::tasks::uuid_from_data;
 use anyhow::Result;
 use blake3::Hasher;
 use capnp::Error as CapnpError;
+use capnp::struct_list;
 use mantissa_protocol::services::{
     LivenessProbeKind as ProtoLivenessProbeKind, ReadinessProbeKind as ProtoReadinessProbeKind,
-    RolloutPhase as ProtoRolloutPhase, ServiceStatus as ProtoServiceStatus, service_spec,
-    service_task_progress, task_template,
+    RolloutPhase as ProtoRolloutPhase, ServiceStatus as ProtoServiceStatus,
+    replica_assignment_segment, service_spec, service_task_progress, task_template,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -92,7 +93,8 @@ pub struct ServiceRow {
 impl ServiceRow {
     /// Builds a printable service row from one protocol reader payload.
     pub fn from_reader(spec: service_spec::Reader<'_>) -> Result<Self, CapnpError> {
-        let id = uuid_to_string(spec.get_id()?)?;
+        let service_id = uuid_from_data(spec.get_id()?)?;
+        let id = service_id.to_string();
         let manifest_id = uuid_from_data(spec.get_manifest_id()?)?;
         let service_name = spec.get_service_name()?.to_str()?.to_string();
 
@@ -101,18 +103,8 @@ impl ServiceRow {
             task_templates.push(TaskTemplateRow::from_reader(tmpl)?);
         }
 
-        let mut replica_ids = Vec::new();
-        for wid in spec.get_replica_ids()?.iter() {
-            let data = wid?.to_owned();
-            if data.len() != 16 {
-                return Err(CapnpError::failed(
-                    "invalid service replica uuid length".to_string(),
-                ));
-            }
-            let mut bytes = [0u8; 16];
-            bytes.copy_from_slice(&data);
-            replica_ids.push(Uuid::from_bytes(bytes));
-        }
+        let replica_ids =
+            read_service_replica_ids(service_id, spec.get_service_epoch(), &task_templates, spec)?;
 
         let rollout = ServiceRolloutRow::from_reader(spec.get_rollout()?)?;
         let status_detail = spec.get_status_detail()?.to_str()?.trim().to_string();
@@ -135,6 +127,123 @@ impl ServiceRow {
             task_progress: Vec::new(),
         })
     }
+}
+
+/// Reads service replica ids from either explicit UUIDs or compact deterministic ranges.
+fn read_service_replica_ids(
+    service_id: Uuid,
+    service_epoch: u64,
+    task_templates: &[TaskTemplateRow],
+    spec: service_spec::Reader<'_>,
+) -> Result<Vec<Uuid>, CapnpError> {
+    let explicit = read_explicit_service_replica_ids(spec.get_replica_ids()?)?;
+    let compact = spec.get_replica_assignment_segments()?;
+    if compact.is_empty() {
+        return Ok(explicit);
+    }
+    if !explicit.is_empty() {
+        return Err(CapnpError::failed(
+            "service spec cannot mix explicit replica ids and compact assignments".to_string(),
+        ));
+    }
+
+    expand_replica_assignment_segments(service_id, service_epoch, task_templates, compact)
+}
+
+/// Reads explicit service replica UUIDs from protocol payloads that choose the expanded form.
+fn read_explicit_service_replica_ids(
+    reader: capnp::data_list::Reader<'_>,
+) -> Result<Vec<Uuid>, CapnpError> {
+    let mut replica_ids = Vec::with_capacity(reader.len() as usize);
+    for wid in reader.iter() {
+        let data = wid?.to_owned();
+        if data.len() != 16 {
+            return Err(CapnpError::failed(
+                "invalid service replica uuid length".to_string(),
+            ));
+        }
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&data);
+        replica_ids.push(Uuid::from_bytes(bytes));
+    }
+    Ok(replica_ids)
+}
+
+/// Expands compact service replica ranges using the same deterministic task-id formula as the daemon.
+fn expand_replica_assignment_segments(
+    service_id: Uuid,
+    service_epoch: u64,
+    task_templates: &[TaskTemplateRow],
+    segments: struct_list::Reader<'_, replica_assignment_segment::Owned>,
+) -> Result<Vec<Uuid>, CapnpError> {
+    let template_replicas: HashMap<&str, u16> = task_templates
+        .iter()
+        .map(|template| (template.name.as_str(), template.replicas))
+        .collect();
+    let mut seen_slots = HashSet::new();
+    let mut replica_ids = Vec::new();
+
+    for segment in segments.iter() {
+        let template_name = segment.get_template_name()?.to_str()?;
+        let Some(template_replicas) = template_replicas.get(template_name).copied() else {
+            return Err(CapnpError::failed(format!(
+                "replica assignment segment references unknown template '{template_name}'"
+            )));
+        };
+
+        let first_replica = segment.get_first_replica();
+        let replica_count = segment.get_replica_count();
+        if first_replica == 0 || replica_count == 0 {
+            return Err(CapnpError::failed(
+                "replica assignment segment has an empty replica range".to_string(),
+            ));
+        }
+        let Some(last_replica) = first_replica.checked_add(replica_count - 1) else {
+            return Err(CapnpError::failed(
+                "replica assignment segment overflows replica range".to_string(),
+            ));
+        };
+        if last_replica > template_replicas {
+            return Err(CapnpError::failed(format!(
+                "replica assignment segment for template '{template_name}' exceeds desired replicas"
+            )));
+        }
+
+        for replica in first_replica..=last_replica {
+            if !seen_slots.insert((template_name.to_string(), replica)) {
+                return Err(CapnpError::failed(format!(
+                    "duplicate replica assignment for template '{template_name}' replica {replica}"
+                )));
+            }
+            replica_ids.push(derive_service_replica_id(
+                service_id,
+                service_epoch,
+                template_name,
+                replica,
+            ));
+        }
+    }
+
+    Ok(replica_ids)
+}
+
+/// Derives the stable workload id for one service generation replica slot.
+fn derive_service_replica_id(
+    service_id: Uuid,
+    service_epoch: u64,
+    template_name: &str,
+    replica: u16,
+) -> Uuid {
+    let mut hasher = Hasher::new();
+    hasher.update(b"service-replica-id");
+    hasher.update(service_id.as_bytes());
+    hasher.update(&service_epoch.to_le_bytes());
+    hasher.update(template_name.as_bytes());
+    hasher.update(&replica.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -648,6 +757,57 @@ mod tests {
             liveness_port,
             ports: Vec::new(),
         }
+    }
+
+    #[test]
+    /// Decodes compact service-list replica assignments into the same deterministic task ids.
+    fn service_row_reads_compact_replica_assignments() {
+        let service_id =
+            Uuid::parse_str("4e83fe38-d78a-4e42-8e31-27234ee34a5c").expect("valid service id");
+        let service_epoch = 11;
+
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut builder = message.init_root::<service_spec::Builder<'_>>();
+            builder.set_id(service_id.as_bytes());
+            builder.set_manifest_id(Uuid::new_v4().as_bytes());
+            builder.set_manifest_name("manifest");
+            builder.set_service_name("svc");
+            builder.set_updated_at("2026-01-01T00:00:00Z");
+            builder.set_status(ProtoServiceStatus::Running);
+            builder.set_service_epoch(service_epoch);
+            builder.reborrow().init_rollout();
+
+            let mut templates = builder.reborrow().init_task_templates(1);
+            let mut template = templates.reborrow().get(0);
+            template.set_name("backend");
+            template.set_image("ghcr.io/demo/backend:latest");
+            template.set_replicas(2);
+            template.reborrow().init_command(0);
+            template.reborrow().init_networks(0);
+            template.reborrow().init_ports(0);
+
+            builder.reborrow().init_replica_ids(0);
+            let mut segments = builder.reborrow().init_replica_assignment_segments(1);
+            let mut segment = segments.reborrow().get(0);
+            segment.set_template_name("backend");
+            segment.set_first_replica(1);
+            segment.set_replica_count(2);
+        }
+
+        let reader = message
+            .get_root::<service_spec::Builder<'_>>()
+            .expect("read compact service spec builder")
+            .into_reader();
+        let row = ServiceRow::from_reader(reader).expect("decode compact service row");
+
+        assert_eq!(
+            row.replica_ids,
+            vec![
+                derive_service_replica_id(service_id, service_epoch, "backend", 1),
+                derive_service_replica_id(service_id, service_epoch, "backend", 2),
+            ]
+        );
     }
 
     #[test]

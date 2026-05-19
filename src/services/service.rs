@@ -128,7 +128,7 @@ impl services::Server for ServicesRPC {
         let mut list = results.get().init_services(services.len() as u32);
         for (idx, service) in services.iter().enumerate() {
             let mut builder = list.reborrow().get(idx as u32);
-            write_service_spec(&mut builder, service)?;
+            write_compact_service_spec(&mut builder, service)?;
         }
 
         Ok(())
@@ -1287,7 +1287,10 @@ fn read_uuid(data: capnp::data::Reader<'_>) -> Result<Uuid, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_service_spec, read_task_template, write_service_spec, write_task_template};
+    use super::{
+        read_service_spec, read_task_template, write_compact_service_spec, write_service_spec,
+        write_task_template,
+    };
     use crate::scheduler::placement::{
         PlacementConstraint, PlacementConstraintSelector, PlacementPolicy, PlacementStrategy,
         ServicePlacementPreference,
@@ -1772,6 +1775,41 @@ mod tests {
                 .expect("read compact replica segments")
                 .len(),
             0
+        );
+    }
+
+    /// Service list encoding should avoid sending every deterministic replica id.
+    #[test]
+    fn compact_service_spec_writer_compacts_derived_replica_ids() {
+        let mut spec = sample_service_spec();
+        spec.service_epoch = 9;
+        spec.replica_ids = (1..=2)
+            .map(|replica| derive_service_replica_id(spec.id, spec.service_epoch, "web", replica))
+            .collect();
+
+        let mut message = Builder::new_default();
+        {
+            let mut builder = message.init_root::<service_spec::Builder<'_>>();
+            write_compact_service_spec(&mut builder, &spec).expect("encode compact service spec");
+        }
+        let reader = message
+            .get_root::<service_spec::Builder<'_>>()
+            .expect("read compact service spec builder")
+            .into_reader();
+
+        assert_eq!(
+            reader
+                .get_replica_ids()
+                .expect("read explicit replica ids")
+                .len(),
+            0
+        );
+        assert_eq!(
+            reader
+                .get_replica_assignment_segments()
+                .expect("read compact replica segments")
+                .len(),
+            1
         );
     }
 

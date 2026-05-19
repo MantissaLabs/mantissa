@@ -12,7 +12,7 @@ use mantissa_client::services::manifest::{
 };
 use mantissa_client::services::{ServiceDeploymentHandle, deploy_manifest};
 use mantissa_protocol::health::NodeStatus;
-use mantissa_protocol::services::ServiceStatus as ProtoServiceStatus;
+use mantissa_protocol::services::{ServiceStatus as ProtoServiceStatus, service_spec};
 use mantissa_protocol::sync::Domain;
 use mantissa_protocol::workload::WorkloadStateFilter as ProtoWorkloadStateFilter;
 use std::collections::BTreeMap;
@@ -973,10 +973,7 @@ impl ProcessNode {
                 continue;
             }
             let id = Uuid::from_slice(&data).context("decode service id")?;
-            let replica_ids = spec
-                .get_replica_ids()
-                .context("read service replica ids")?
-                .len() as usize;
+            let replica_ids = service_replica_count(spec).context("count service replicas")?;
 
             out.push(ServiceSnapshot {
                 id,
@@ -1104,6 +1101,7 @@ impl ProcessNode {
 }
 
 impl Drop for ProcessNode {
+    /// Terminates the daemon subprocess if the test did not already do so.
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut()
             && let Ok(None) = child.try_wait()
@@ -1112,6 +1110,23 @@ impl Drop for ProcessNode {
             let _ = child.wait();
         }
     }
+}
+
+/// Counts service replicas from either expanded UUIDs or compact assignment segments.
+fn service_replica_count(spec: service_spec::Reader<'_>) -> Result<usize> {
+    let explicit = spec.get_replica_ids().context("read service replica ids")?;
+    if !explicit.is_empty() {
+        return Ok(explicit.len() as usize);
+    }
+
+    let compact = spec
+        .get_replica_assignment_segments()
+        .context("read compact service replica assignments")?;
+    let mut total = 0usize;
+    for segment in compact.iter() {
+        total = total.saturating_add(segment.get_replica_count() as usize);
+    }
+    Ok(total)
 }
 
 /// Owns a full subprocess-backed stress cluster and ensures all daemons are torn down on drop.
