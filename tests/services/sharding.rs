@@ -1,5 +1,6 @@
 use super::support::*;
 use crate::common;
+use mantissa::scheduler::placement::{PlacementConstraint, PlacementConstraintSelector};
 
 /// Builds the faster replication loop settings used by sharding convergence tests.
 fn sharded_cluster_config() -> ClusterConfig {
@@ -23,6 +24,27 @@ async fn wait_for_service_status_all(
         for node in cluster {
             match node.node.service_controller.registry().get(service_id) {
                 Ok(Some(spec)) if spec.status() == expected => {}
+                _ => return false,
+            }
+        }
+        true
+    })
+    .await
+}
+
+/// Waits until every node observes a specific manifest generation as running.
+async fn wait_for_service_manifest_running_all(
+    cluster: &[TestNode],
+    service_id: Uuid,
+    manifest_id: Uuid,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(100), || async {
+        for node in cluster {
+            match node.node.service_controller.registry().get(service_id) {
+                Ok(Some(spec))
+                    if spec.manifest_id == manifest_id
+                        && spec.status() == ServiceStatus::Running => {}
                 _ => return false,
             }
         }
@@ -56,6 +78,50 @@ async fn active_target_node_count(node: &TestNode, service_name: &str) -> usize 
         .map(|task| task.node_id)
         .collect::<HashSet<_>>()
         .len()
+}
+
+/// Waits until at least one scheduler slot is reserved on any node in the cluster.
+async fn wait_for_any_reserved_slot(cluster: &[TestNode], timeout: Duration) -> bool {
+    wait_until(timeout, Duration::from_millis(100), || async {
+        for node in cluster {
+            let Some(snapshot) = node.node.scheduler.snapshot().await else {
+                continue;
+            };
+            if snapshot
+                .slots
+                .iter()
+                .any(|slot| matches!(slot.state, SlotState::Reserved(_)))
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+}
+
+/// Waits until every node sees exactly the expected running task ids for one service.
+async fn wait_for_service_active_task_ids_all(
+    cluster: &[TestNode],
+    service_name: &str,
+    expected_ids: &BTreeSet<Uuid>,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(100), || async {
+        for node in cluster {
+            let tasks = list_active_service_tasks(&node.node.workload_manager, service_name).await;
+            let task_ids = tasks.iter().map(|task| task.id).collect::<BTreeSet<_>>();
+            if &task_ids != expected_ids
+                || tasks
+                    .iter()
+                    .any(|task| !matches!(task.state, WorkloadPhase::Running))
+            {
+                return false;
+            }
+        }
+        true
+    })
+    .await
 }
 
 /// Verifies that a dependency-ordered service has converged with both template counts visible.
@@ -206,6 +272,252 @@ local_test!(services_sharded_deployment_converges_and_stops, {
         );
     }
 });
+
+local_test!(
+    services_sharded_stop_during_deployment_drains_inflight_work,
+    {
+        let _config_guard = ConfigOverrideGuard::service_sharding(1, 1, 2, 2);
+        let _runtime_guard = RuntimeBackendOverrideGuard::install_factory(Arc::new(|| {
+            Arc::new(SlowCreateRuntimeBackend::default())
+        }));
+
+        let cluster = TestNode::new_cluster_inproc_with_config(4, sharded_cluster_config())
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 4, "cluster should stabilise to four nodes")
+            .await;
+
+        let service_name = "sharded-stop-during-deploy";
+        let service_id = cluster[0]
+            .node
+            .service_controller
+            .submit_deployment(
+                Uuid::new_v4(),
+                service_name,
+                service_name,
+                vec![demo_backend_task_template("backend", 12)],
+            )
+            .await
+            .expect("submit slow sharded deployment");
+
+        assert!(
+            wait_for_any_reserved_slot(&cluster, Duration::from_secs(10)).await,
+            "slow sharded deployment should reserve work before the stop is submitted"
+        );
+
+        cluster[0]
+            .node
+            .service_controller
+            .submit_stop(service_id)
+            .await
+            .expect("submit stop while sharded deployment is still in flight");
+
+        assert!(
+            wait_for_service_status_all(
+                &cluster,
+                service_id,
+                ServiceStatus::Stopped,
+                Duration::from_secs(45)
+            )
+            .await,
+            "in-flight sharded deployment should converge to stopped after cancellation"
+        );
+        assert!(
+            wait_for_service_task_count_all(&cluster, service_name, 0, Duration::from_secs(30))
+                .await,
+            "stop during sharded deployment should drain all active service tasks"
+        );
+        for node in &cluster {
+            assert!(
+                wait_for_reserved_slots(node, 0, Duration::from_secs(30)).await,
+                "node {} should release reservations after in-flight sharded stop",
+                node.id()
+            );
+        }
+    }
+);
+
+local_test!(
+    services_sharded_redeploy_replaces_generation_without_stale_tasks,
+    {
+        let _config_guard = ConfigOverrideGuard::service_sharding(1, 1, 2, 4);
+        let _runtime_guard = RuntimeBackendOverrideGuard::install_default();
+
+        let cluster = TestNode::new_cluster_inproc_with_config(4, sharded_cluster_config())
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 4, "cluster should stabilise to four nodes")
+            .await;
+
+        let service_name = "sharded-redeploy-generation";
+        let initial_manifest_id = Uuid::new_v4();
+        let initial_template = demo_backend_task_template("backend", 8);
+        let service_id = cluster[0]
+            .node
+            .service_controller
+            .submit_deployment(
+                initial_manifest_id,
+                service_name,
+                service_name,
+                vec![initial_template.clone()],
+            )
+            .await
+            .expect("submit initial sharded deployment");
+
+        assert!(
+            wait_for_service_manifest_running_all(
+                &cluster,
+                service_id,
+                initial_manifest_id,
+                Duration::from_secs(30)
+            )
+            .await,
+            "initial sharded deployment should reach running everywhere"
+        );
+        assert!(
+            wait_for_sharded_service_running_all(&cluster, service_name, 8).await,
+            "initial sharded deployment should converge before redeploy"
+        );
+
+        let initial_spec = cluster[0]
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("load initial service spec")
+            .expect("initial service spec should be present");
+        let initial_epoch = initial_spec.service_epoch;
+        let initial_ids = initial_spec
+            .assigned_replica_ids()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        let mut replacement_template = initial_template;
+        replacement_template.execution.command = vec![
+            "-listen".to_string(),
+            ":8001".to_string(),
+            "-text".to_string(),
+            "hello from replacement backend replica".to_string(),
+        ];
+
+        let replacement_manifest_id = Uuid::new_v4();
+        let redeploy_id = cluster[0]
+            .node
+            .service_controller
+            .submit_deployment_with_strategy(
+                replacement_manifest_id,
+                service_name,
+                service_name,
+                vec![replacement_template],
+                rollout_strategy(8, ServiceRolloutOrder::StartFirst, 1, 1, true),
+            )
+            .await
+            .expect("submit sharded replacement deployment");
+        assert_eq!(
+            redeploy_id, service_id,
+            "redeploy should preserve the stable service id"
+        );
+
+        assert!(
+            wait_for_service_manifest_running_all(
+                &cluster,
+                service_id,
+                replacement_manifest_id,
+                Duration::from_secs(60)
+            )
+            .await,
+            "replacement sharded generation should reach running everywhere"
+        );
+
+        let replacement_spec = cluster[0]
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("load replacement service spec")
+            .expect("replacement service spec should be present");
+        assert!(
+            replacement_spec.service_epoch > initial_epoch,
+            "replacement deployment should advance the service generation"
+        );
+        let replacement_ids = replacement_spec
+            .assigned_replica_ids()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            replacement_ids.len(),
+            8,
+            "replacement service spec should track exactly eight replicas"
+        );
+        assert!(
+            initial_ids.is_disjoint(&replacement_ids),
+            "replacement generation should not reuse stale replica ids"
+        );
+        assert!(
+            wait_for_service_active_task_ids_all(
+                &cluster,
+                service_name,
+                &replacement_ids,
+                Duration::from_secs(60)
+            )
+            .await,
+            "every node should converge on only the replacement task ids"
+        );
+    }
+);
+
+local_test!(
+    services_sharding_enabled_unsatisfiable_placement_leaves_no_tasks,
+    {
+        let _config_guard = ConfigOverrideGuard::service_sharding(1, 1, 2, 2);
+        let _runtime_guard = RuntimeBackendOverrideGuard::install_default();
+
+        let cluster = TestNode::new_cluster_inproc_with_config(3, sharded_cluster_config())
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes")
+            .await;
+
+        let service_name = "sharded-placement-excluded";
+        let mut template = demo_backend_task_template("backend", 4);
+        template.execution.placement.constraints = vec![
+            PlacementConstraint::eq(
+                PlacementConstraintSelector::NodePlatformOs,
+                "definitely-not-a-real-os",
+            )
+            .expect("platform os placement constraint should be valid"),
+        ];
+
+        let service_id = cluster[0]
+            .node
+            .service_controller
+            .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
+            .await
+            .expect("submit sharding-enabled unsatisfiable placement deployment");
+
+        assert!(
+            wait_for_service_status_detail_any(
+                &cluster[0].node.service_controller,
+                service_id,
+                &["exclude every eligible node"]
+            )
+            .await,
+            "sharding-enabled deployment should surface the hard placement rejection"
+        );
+        assert!(
+            wait_for_service_task_count_all(&cluster, service_name, 0, Duration::from_secs(10))
+                .await,
+            "unsatisfiable placement should leave no active service tasks"
+        );
+        for node in &cluster {
+            assert!(
+                wait_for_reserved_slots(node, 0, Duration::from_secs(10)).await,
+                "node {} should not keep reservations after placement failure",
+                node.id()
+            );
+        }
+    }
+);
 
 local_test!(services_sharded_task_splitting_converges, {
     let _config_guard = ConfigOverrideGuard::service_sharding(1, 8, 1, 2);
