@@ -1709,9 +1709,16 @@ mod tests {
 
         let decoded =
             ServiceSpecValue::decode_store_value(&encoded).expect("decode compact service spec");
+        let mut expected = spec.clone();
+        expected.set_replica_ids_compact_when_derived(spec.replica_ids.clone());
+        let mut expected_previous = previous;
+        let expected_previous_ids = expected_previous.replica_ids.clone();
+        expected_previous.set_replica_ids_compact_when_derived(expected_previous_ids);
+        expected.previous_generation =
+            Some(ServicePreviousGeneration::from_service(&expected_previous));
         assert_eq!(
-            decoded, spec,
-            "compact replica assignment segments should decode to explicit replica ids"
+            decoded, expected,
+            "compact replica assignment segments should stay compact after decode"
         );
     }
 

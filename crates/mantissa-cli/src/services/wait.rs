@@ -566,6 +566,7 @@ mod tests {
     ) -> ServiceRow {
         ServiceRow {
             id: Uuid::new_v4().to_string(),
+            service_id: Uuid::new_v4(),
             manifest_id,
             service_name: "svc".to_string(),
             task_templates: vec![TaskTemplateRow {
@@ -581,6 +582,9 @@ mod tests {
             }],
             updated_at: "2026-05-03T00:00:00Z".to_string(),
             replica_ids: vec![Uuid::new_v4()],
+            replica_assignments: Vec::new(),
+            replica_count: 1,
+            service_epoch: 0,
             status,
             status_detail: detail.map(str::to_string),
             rollout: ServiceRolloutRow {
