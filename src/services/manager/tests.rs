@@ -7,7 +7,7 @@ use super::*;
 use crate::network::types::{NetworkDriver, NetworkSpecDraft, NetworkSpecValue};
 use crate::services::ownership::{
     build_replica_slots, build_service_deployment_shards, compute_slot_targets,
-    select_generation_owner, select_slot_owner, select_task_owner,
+    select_generation_owner, select_generation_repair_peers, select_slot_owner, select_task_owner,
 };
 use crate::services::types::TaskTemplateNetworkRequirement;
 use crate::store::replicated::networks::{
@@ -523,6 +523,32 @@ fn generation_owner_is_deterministic() {
     let owner = select_generation_owner(service_id, 7, &candidates).expect("owner");
     let owner_reversed = select_generation_owner(service_id, 7, &reversed).expect("owner");
     assert_eq!(owner, owner_reversed);
+}
+
+/// Ensures progress repair peers include the owner first and remain stable across input orderings.
+#[test]
+fn generation_repair_peers_are_deterministic() {
+    let service_id = Uuid::new_v4();
+    let node_a = Uuid::from_bytes([1u8; 16]);
+    let node_b = Uuid::from_bytes([2u8; 16]);
+    let node_c = Uuid::from_bytes([3u8; 16]);
+    let node_d = Uuid::from_bytes([4u8; 16]);
+    let candidates = vec![node_a, node_b, node_c, node_d];
+    let mut reversed = candidates.clone();
+    reversed.reverse();
+
+    let owner = select_generation_owner(service_id, 11, &candidates).expect("owner");
+    let repair_peers = select_generation_repair_peers(service_id, 11, &candidates, 2);
+    let reversed_repair_peers = select_generation_repair_peers(service_id, 11, &reversed, 2);
+
+    assert_eq!(repair_peers, reversed_repair_peers);
+    assert_eq!(repair_peers.first().copied(), Some(owner));
+    assert_eq!(repair_peers.len(), 3);
+    assert_eq!(
+        repair_peers.iter().copied().collect::<HashSet<_>>().len(),
+        repair_peers.len(),
+        "repair peer set should not contain duplicates"
+    );
 }
 
 /// Ensures deployment shard planning is deterministic across input orderings.

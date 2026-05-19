@@ -12,7 +12,7 @@ use crate::scheduler::placement::ServicePlacementPreference;
 use crate::scheduler::{Scheduler, SchedulerError, SlotId};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
-use crate::services::ownership::select_generation_owner;
+use crate::services::ownership::select_generation_repair_peers;
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::compute_service_id;
 use crate::store::replicated::workloads::WorkloadStore;
@@ -89,10 +89,16 @@ const WORKLOAD_GOSSIP_COVERAGE_ROUNDS: usize = 3;
 /// Minimum spacing between owner-sync priority requests for one service generation.
 ///
 /// Targets may publish several compact progress rows while a task moves through
-/// pending, creating, and running. We only need to prioritize the generation
-/// owner periodically so it can pull the latest compact row through workload MST
+/// pending, creating, and running. We only need to prioritize generation owners
+/// periodically so they can pull the latest compact row through workload MST
 /// sync.
 const SERVICE_PROGRESS_REPAIR_HINT_INTERVAL: Duration = Duration::from_secs(1);
+/// Number of standby service-generation owners that receive compact progress sync priority.
+///
+/// The current owner is enough for steady-state readiness, but a small backup set keeps the next
+/// deterministic owners closer to the target nodes' progress rows without broadcasting every task
+/// lifecycle update cluster-wide.
+const SERVICE_GENERATION_PROGRESS_REPAIR_BACKUPS: usize = 2;
 
 /// Converts a UTC timestamp into a non-negative Unix millisecond value.
 fn unix_ms(time: DateTime<Utc>) -> u64 {
@@ -702,14 +708,14 @@ impl WorkloadManager {
         topology.hint_workload_repair_peer(peer_id);
     }
 
-    /// Prioritizes workload sync with the owner that reads compact service progress.
+    /// Prioritizes workload sync with owners that may read compact service progress.
     ///
     /// Targets publish one compact progress row per service generation instead
-    /// of gossiping every routine lifecycle transition. The generation owner is
-    /// the node that needs those rows to decide whether deployment has reached
-    /// readiness. This method recomputes that owner from the same deterministic
-    /// ownership function used by deployment, then asks workload sync to contact
-    /// the owner soon.
+    /// of gossiping every routine lifecycle transition. The current generation
+    /// owner needs those rows for readiness, and the next deterministic owners
+    /// need them if ownership changes after a failure. This method recomputes
+    /// that repair set from the same rendezvous ordering used by deployment,
+    /// then asks workload sync to contact those peers soon.
     ///
     /// The request is throttled per `(service_id, service_epoch)` because one
     /// target can publish many progress updates while containers move through
@@ -752,11 +758,15 @@ impl WorkloadManager {
         candidates.sort_unstable();
         candidates.dedup();
 
-        let Some(owner_id) = select_generation_owner(service_id, service_epoch, &candidates) else {
-            return;
-        };
-        if owner_id != self.local_node_id {
-            self.prioritize_workload_sync_with_peer(owner_id);
+        for peer_id in select_generation_repair_peers(
+            service_id,
+            service_epoch,
+            &candidates,
+            SERVICE_GENERATION_PROGRESS_REPAIR_BACKUPS,
+        ) {
+            if peer_id != self.local_node_id {
+                self.prioritize_workload_sync_with_peer(peer_id);
+            }
         }
     }
 
