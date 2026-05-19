@@ -7726,6 +7726,129 @@ async fn service_creating_and_running_updates_emit_compact_progress_only() {
 }
 
 #[tokio::test]
+async fn service_progress_cleanup_tombstones_stale_generations() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let service_name = "svc";
+    let service_id = crate::services::types::compute_service_id(service_name);
+
+    let epoch_one_progress_id =
+        compute_service_generation_progress_id(service_id, 1, manager.local_node_id);
+    let mut epoch_one = build_remote_task_spec(
+        Uuid::new_v4(),
+        manager.local_node_id,
+        WorkloadPhase::Running,
+        1,
+        1,
+        Utc::now().to_rfc3339(),
+    );
+    epoch_one.owner = Some(WorkloadOwner::ServiceReplica(
+        WorkloadServiceMetadata::new(service_name, "api").with_service_epoch(1),
+    ));
+    manager
+        .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(epoch_one)))
+        .await
+        .expect("record first generation progress");
+    assert!(
+        manager
+            .flush_dirty_gossip_events()
+            .await
+            .expect("flush first generation progress"),
+        "first generation should publish compact progress"
+    );
+    let _ = manager
+        .core
+        .rx
+        .recv()
+        .await
+        .expect("receive first generation progress");
+    assert!(
+        manager
+            .core
+            .store
+            .get_snapshot(&UuidKey::from(epoch_one_progress_id))
+            .expect("load first generation progress")
+            .is_some(),
+        "first generation progress should be stored before cleanup"
+    );
+
+    let mut epoch_four = build_remote_task_spec(
+        Uuid::new_v4(),
+        manager.local_node_id,
+        WorkloadPhase::Running,
+        1,
+        1,
+        Utc::now().to_rfc3339(),
+    );
+    epoch_four.owner = Some(WorkloadOwner::ServiceReplica(
+        WorkloadServiceMetadata::new(service_name, "api").with_service_epoch(4),
+    ));
+    manager
+        .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(epoch_four)))
+        .await
+        .expect("record fourth generation progress");
+    assert!(
+        manager
+            .flush_dirty_gossip_events()
+            .await
+            .expect("flush fourth generation progress"),
+        "newer generation should publish compact progress"
+    );
+    let _ = manager
+        .core
+        .rx
+        .recv()
+        .await
+        .expect("receive fourth generation progress");
+    assert!(
+        manager
+            .core
+            .store
+            .get_snapshot(&UuidKey::from(epoch_one_progress_id))
+            .expect("load cleaned first generation progress")
+            .is_none(),
+        "progress older than the retained generation window should be tombstoned"
+    );
+    manager
+        .local_state
+        .dirty_gossip_workloads
+        .lock()
+        .await
+        .clear();
+
+    let mut late_epoch_one = build_remote_task_spec(
+        Uuid::new_v4(),
+        manager.local_node_id,
+        WorkloadPhase::Running,
+        1,
+        1,
+        Utc::now().to_rfc3339(),
+    );
+    late_epoch_one.owner = Some(WorkloadOwner::ServiceReplica(
+        WorkloadServiceMetadata::new(service_name, "api").with_service_epoch(1),
+    ));
+    manager
+        .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(late_epoch_one)))
+        .await
+        .expect("record late stale generation progress");
+    assert!(
+        !manager
+            .flush_dirty_gossip_events()
+            .await
+            .expect("flush stale generation progress"),
+        "late progress from a cleaned generation should not be gossiped"
+    );
+    assert!(
+        manager
+            .core
+            .store
+            .get_snapshot(&UuidKey::from(epoch_one_progress_id))
+            .expect("reload cleaned first generation progress")
+            .is_none(),
+        "late stale progress should not recreate the cleaned row"
+    );
+}
+
+#[tokio::test]
 async fn standalone_running_update_still_enters_workload_gossip() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
     let running = build_remote_task_spec(

@@ -99,6 +99,13 @@ const SERVICE_PROGRESS_REPAIR_HINT_INTERVAL: Duration = Duration::from_secs(1);
 /// deterministic owners closer to the target nodes' progress rows without broadcasting every task
 /// lifecycle update cluster-wide.
 const SERVICE_GENERATION_PROGRESS_REPAIR_BACKUPS: usize = 2;
+/// Number of older service generations retained in compact progress storage per node.
+///
+/// Readiness only consumes the active generation, but retaining a small trailing window avoids
+/// deleting progress that a rollout or stop workflow may still be observing while a new generation
+/// starts. Rows older than this window are tombstoned locally and removed from the in-memory
+/// aggregate so frequent service updates do not leave one durable progress row per generation.
+const SERVICE_PROGRESS_RETAIN_GENERATIONS: u64 = 2;
 
 /// Converts a UTC timestamp into a non-negative Unix millisecond value.
 fn unix_ms(time: DateTime<Utc>) -> u64 {
@@ -379,6 +386,16 @@ struct ServiceProgressTracker {
     tasks: HashMap<Uuid, ServiceProgressTaskEntry>,
     // Current compact progress rows keyed by stable progress id.
     records: HashMap<Uuid, ServiceGenerationProgressRecord>,
+    // Highest generation seen for one service on one reporting node.
+    latest_epochs: HashMap<(Uuid, Uuid), u64>,
+}
+
+/// Result of applying one local lifecycle event to the compact service progress tracker.
+struct ServiceProgressTrackerUpdate {
+    // New or refreshed compact progress row that should be persisted and replicated.
+    record: Option<ServiceGenerationProgressRecord>,
+    // Older compact progress rows that are now outside the retained generation window.
+    stale_progress_ids: Vec<Uuid>,
 }
 
 /// Runtime loop cadence configuration for the workload manager reconciliation workers.

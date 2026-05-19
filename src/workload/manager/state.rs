@@ -1305,9 +1305,16 @@ impl WorkloadManager {
         let service_id = compute_service_id(&progress_event.owner.service_name);
         let service_epoch = progress_event.owner.service_epoch;
         let timestamp = Utc::now().to_rfc3339();
-        let progress = self
+        let update = self
             .update_service_progress_tracker(progress_event, service_id, timestamp)
             .await;
+
+        self.remove_stale_service_progress_records(update.stale_progress_ids)
+            .await?;
+
+        let Some(progress) = update.record else {
+            return Ok(());
+        };
 
         self.core
             .store
@@ -1331,19 +1338,63 @@ impl WorkloadManager {
         Ok(())
     }
 
-    /// Updates local service progress counts and returns the compact row to replicate.
+    /// Removes compact progress rows that fell out of the local generation retention window.
+    ///
+    /// Progress cleanup does not need workload gossip. These rows are deterministic CRDT keys, so
+    /// a local tombstone is enough for workload MST sync to repair peers that still have the old
+    /// generation's compact aggregate.
+    async fn remove_stale_service_progress_records(
+        &self,
+        progress_ids: Vec<Uuid>,
+    ) -> Result<(), anyhow::Error> {
+        for progress_id in progress_ids {
+            self.core
+                .store
+                .remove(&UuidKey::from(progress_id))
+                .await
+                .map_err(|e| anyhow!("stale service progress remove failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Updates local service progress counts and returns rows to persist or delete.
     async fn update_service_progress_tracker(
         &self,
         progress_event: ServiceProgressEventRef<'_>,
         service_id: Uuid,
         timestamp: String,
-    ) -> ServiceGenerationProgressRecord {
+    ) -> super::ServiceProgressTrackerUpdate {
         let progress_id = compute_service_generation_progress_id(
             service_id,
             progress_event.owner.service_epoch,
             progress_event.node_id,
         );
         let mut tracker = self.local_state.service_progress.lock().await;
+        let latest_key = (service_id, progress_event.node_id);
+        let latest_epoch = {
+            let entry = tracker
+                .latest_epochs
+                .entry(latest_key)
+                .or_insert(progress_event.owner.service_epoch);
+            *entry = (*entry).max(progress_event.owner.service_epoch);
+            *entry
+        };
+
+        if progress_event
+            .owner
+            .service_epoch
+            .saturating_add(super::SERVICE_PROGRESS_RETAIN_GENERATIONS)
+            < latest_epoch
+        {
+            tracker.tasks.remove(&progress_event.task_id);
+            let stale_progress_ids =
+                Self::prune_stale_service_progress_records(&mut tracker, latest_key, latest_epoch);
+            return super::ServiceProgressTrackerUpdate {
+                record: None,
+                stale_progress_ids,
+            };
+        }
+
         if let Some(previous) = tracker.tasks.remove(&progress_event.task_id)
             && let Some(record) = tracker.records.get_mut(&previous.progress_id)
         {
@@ -1385,7 +1436,52 @@ impl WorkloadManager {
             },
         );
 
-        updated
+        let stale_progress_ids =
+            Self::prune_stale_service_progress_records(&mut tracker, latest_key, latest_epoch);
+
+        super::ServiceProgressTrackerUpdate {
+            record: Some(updated),
+            stale_progress_ids,
+        }
+    }
+
+    /// Drops compact progress rows older than the retained generation window.
+    ///
+    /// This keeps one reporting node from keeping a durable row for every historical service
+    /// generation. The current and recent generations remain available for readiness, rollout, and
+    /// stop workflows that may still be catching up during replacement.
+    fn prune_stale_service_progress_records(
+        tracker: &mut super::ServiceProgressTracker,
+        latest_key: (Uuid, Uuid),
+        latest_epoch: u64,
+    ) -> Vec<Uuid> {
+        let stale_progress_ids = tracker
+            .records
+            .iter()
+            .filter_map(|(progress_id, record)| {
+                let same_service_node =
+                    record.service_id == latest_key.0 && record.node_id == latest_key.1;
+                let stale_generation = record
+                    .service_epoch
+                    .saturating_add(super::SERVICE_PROGRESS_RETAIN_GENERATIONS)
+                    < latest_epoch;
+                (same_service_node && stale_generation).then_some(*progress_id)
+            })
+            .collect::<Vec<_>>();
+
+        if stale_progress_ids.is_empty() {
+            return stale_progress_ids;
+        }
+
+        let stale_lookup = stale_progress_ids.iter().copied().collect::<HashSet<_>>();
+        for progress_id in &stale_progress_ids {
+            tracker.records.remove(progress_id);
+        }
+        tracker
+            .tasks
+            .retain(|_, entry| !stale_lookup.contains(&entry.progress_id));
+
+        stale_progress_ids
     }
 
     /// Adjusts one lifecycle counter in a compact service progress aggregate.
