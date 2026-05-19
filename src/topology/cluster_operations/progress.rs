@@ -96,12 +96,12 @@ impl Topology {
         Ok(())
     }
 
-    /// Rehydrates missing cluster lineage names from durable operation history during startup and upgrades.
-    pub(crate) async fn hydrate_cluster_names_from_operations(
+    /// Restores missing cluster lineage names from durable operation history during startup and upgrades.
+    pub(crate) async fn restore_cluster_names_from_operations(
         &self,
     ) -> Result<usize, capnp::Error> {
         let operations = self.load_cluster_operations()?;
-        let mut hydrated = 0usize;
+        let mut restored = 0usize;
         for operation in operations {
             if operation.dry_run {
                 continue;
@@ -134,11 +134,11 @@ impl Topology {
                     .upsert_cluster_name_record(target_view.cluster_id, &record)
                     .await?
                 {
-                    hydrated = hydrated.saturating_add(1);
+                    restored = restored.saturating_add(1);
                 }
             }
         }
-        Ok(hydrated)
+        Ok(restored)
     }
 
     /// Maps operation stage values into a monotonic ordering used for conflict resolution.

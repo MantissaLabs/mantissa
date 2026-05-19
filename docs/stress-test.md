@@ -90,6 +90,19 @@ cargo test --test stress_large_cluster -- --ignored --nocapture
   - Max entries per sync delta chunk.
 - `MANTISSA_SYNC_DELTA_CHUNK_TARGET_BYTES`
   - Approximate payload target per sync delta chunk.
+- `MANTISSA_STRESS_SERVICE_SHARD_TARGET_THRESHOLD`
+  - Override the target-node count required before service deployment uses
+    shard coordinators.
+  - Forwarded as `MANTISSA_SERVICE_SHARD_TARGET_THRESHOLD`.
+- `MANTISSA_STRESS_SERVICE_SHARD_TARGET_SIZE`
+  - Override the maximum target nodes assigned to one deployment target shard.
+  - Forwarded as `MANTISSA_SERVICE_SHARD_TARGET_SIZE`.
+- `MANTISSA_STRESS_SERVICE_SHARD_TASK_TARGET_SIZE`
+  - Override the maximum replica starts sent in one coordinator request.
+  - Forwarded as `MANTISSA_SERVICE_SHARD_TASK_TARGET_SIZE`.
+- `MANTISSA_STRESS_SERVICE_SHARD_PARALLELISM`
+  - Override owner-side parallelism for shard coordinator requests.
+  - Forwarded as `MANTISSA_SERVICE_SHARD_PARALLELISM`.
 
 ## Defaults Set by the Test Itself
 
@@ -161,6 +174,10 @@ The stress test logs a few high-signal checkpoints during deployment and stop:
 
 - `active task target reached`
   - The anchor sees the expected number of active tasks.
+- `service shard path logs`
+  - Counts whether spawned daemons planned a sharded deployment, delegated
+    through shard coordinators, or used the direct owner launch path. The line
+    also reports the shard shape when a sharded path was planned.
 - `task-root distribution after active convergence`
   - How many distinct task-domain MST roots exist right after the active-task
     target is reached.

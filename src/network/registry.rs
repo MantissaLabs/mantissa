@@ -491,7 +491,7 @@ impl NetworkRegistry {
     /// Purges the local replica of peer-state rows owned by the provided peers without tombstones.
     ///
     /// Split-time isolation uses this to drop out-of-scope runtime state reversibly so later
-    /// merge or anti-entropy can rehydrate the rows from the retained partition.
+    /// merge or anti-entropy can restore the rows from the retained partition.
     pub async fn purge_local_peer_states_for_peers(
         &self,
         peer_ids: &HashSet<Uuid>,

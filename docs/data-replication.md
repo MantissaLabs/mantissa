@@ -303,7 +303,7 @@ Durable cluster operation records are separate:
 - cluster names and per-lineage node counts are replicated through the
   `cluster_views` domain,
 - merge/split operation records live in `ClusterOperationStore`,
-- startup hydration can rebuild missing cluster names from operation history.
+- startup recovery can rebuild missing cluster names from operation history.
 
 Relevant code:
 

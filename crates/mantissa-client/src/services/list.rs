@@ -69,7 +69,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<Vec<ServiceRow>> {
         .collect();
 
     if !display_rows.is_empty() {
-        hydrate_public_endpoints(cfg, &mut display_rows).await;
+        attach_public_endpoints(cfg, &mut display_rows).await;
     }
 
     Ok(display_rows)
@@ -511,7 +511,7 @@ impl ServiceRolloutPhaseRow {
 
 /// Best-effort enrichment that computes per-service public VIP endpoints so operators can
 /// `curl` services from the host without issuing manual DNS lookups.
-async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
+async fn attach_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
     if !rows.iter().any(|row| {
         row.task_templates
             .iter()
@@ -628,10 +628,10 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
     }
 }
 
-/// Maps template names to replica ids for endpoint hydration.
+/// Maps template names to replica ids for endpoint attachment.
 ///
 /// Service list decoding preserves compact assignment ranges. Endpoint
-/// hydration is the uncommon path that needs concrete task ids to match
+/// attachment is the uncommon path that needs concrete task ids to match
 /// network attachments, so derivation stays local to this helper.
 fn build_template_replica_ids(row: &ServiceRow) -> HashMap<String, HashSet<Uuid>> {
     let mut out: HashMap<String, HashSet<Uuid>> = HashMap::new();

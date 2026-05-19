@@ -336,7 +336,7 @@ impl ClusterViewStore {
 
     /// Purges all replicated cluster-view metadata rows from local storage.
     ///
-    /// This provides the hard-cutover path for metadata schema changes: names can be rehydrated
+    /// This provides the hard-cutover path for metadata schema changes: names can be restored
     /// from durable cluster operations and node counts are republished from live membership state.
     fn purge_cluster_view_domain_data(&self) -> io::Result<()> {
         with_write_tx(&self.db, |tx| {

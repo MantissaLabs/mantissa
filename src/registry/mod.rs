@@ -46,7 +46,7 @@ struct PeerStoreSnapshotCache {
 impl PeerStoreSnapshotCache {
     /// # Description:
     ///
-    /// Builds an empty peer snapshot cache for lazy first-use hydration.
+    /// Builds an empty peer snapshot cache that is populated on first use.
     fn new() -> Self {
         Self {
             generation: 0,

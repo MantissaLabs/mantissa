@@ -51,12 +51,12 @@ mod placement;
 mod readiness;
 #[path = "rollout.rs"]
 mod rollout;
+mod sharding;
 #[path = "slot_reconcile.rs"]
 mod slot_reconcile;
 mod state;
 use crate::services::ownership::{
-    SlotKey, build_service_deployment_shards, compute_slot_targets_with_placement,
-    select_generation_owner,
+    SlotKey, compute_slot_targets_with_placement, select_generation_owner,
 };
 use inventory::TaskInventory;
 use placement::build_eligible_nodes;

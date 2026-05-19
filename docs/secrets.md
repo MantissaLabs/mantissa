@@ -1,6 +1,6 @@
 # Secrets in Manifests
 
-Service and agent manifests can hydrate container environment variables or
+Service and agent manifests can populate container environment variables or
 files with cluster secrets. Before deploying a manifest that references
 secrets, seed them on a node that is already part of the cluster:
 

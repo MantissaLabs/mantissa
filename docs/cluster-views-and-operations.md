@@ -213,7 +213,7 @@ not become ambiguous mid-transition.
 
 Startup performs three recovery steps:
 
-1. rehydrate cluster lineage names from durable operation history,
+1. restore cluster lineage names from durable operation history,
 2. replay any non-finalized cluster operations,
 3. restore split peer scope from durable history.
 

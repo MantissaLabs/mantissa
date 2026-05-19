@@ -91,6 +91,12 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
         global_metadata_sync_tick_ms: 5000,
         global_metadata_sync_fanout: 8,
         workload_repair_fanout: 1,
+        remote_admission_parallelism: 16,
+        remote_assignment_parallelism: 16,
+        service_shard_target_threshold: 256,
+        service_shard_target_size: 128,
+        service_shard_task_target_size: 128,
+        service_shard_parallelism: 16,
     ),
 )
 ```
@@ -138,6 +144,39 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 - `replication.global_metadata_sync_tick_ms` (legacy: `MANTISSA_GLOBAL_METADATA_SYNC_TICK_MS`)
 - `replication.global_metadata_sync_fanout` (legacy: `MANTISSA_GLOBAL_METADATA_SYNC_FANOUT`)
 - `replication.workload_repair_fanout` (legacy: `MANTISSA_WORKLOAD_REPAIR_FANOUT`)
+- `replication.remote_admission_parallelism` (legacy: `MANTISSA_REMOTE_ADMISSION_PARALLELISM`)
+- `replication.remote_assignment_parallelism` (legacy: `MANTISSA_REMOTE_ASSIGNMENT_PARALLELISM`)
+- `replication.service_shard_target_threshold` (legacy: `MANTISSA_SERVICE_SHARD_TARGET_THRESHOLD`)
+- `replication.service_shard_target_size` (legacy: `MANTISSA_SERVICE_SHARD_TARGET_SIZE`)
+- `replication.service_shard_task_target_size` (legacy: `MANTISSA_SERVICE_SHARD_TASK_TARGET_SIZE`)
+- `replication.service_shard_parallelism` (legacy: `MANTISSA_SERVICE_SHARD_PARALLELISM`)
+
+## Service deployment sharding guidance
+
+These settings bound the owner fanout used when deploying a large service
+generation. They do not change the placement model: target nodes still prepare
+capacity locally, and workload rows are still the replicated source of truth.
+
+- `replication.service_shard_target_threshold`
+  Minimum unique target-node count before the owner uses shard coordinators
+  instead of contacting every target directly.
+- `replication.service_shard_target_size`
+  Maximum target nodes assigned to one target-peer shard.
+- `replication.service_shard_task_target_size`
+  Maximum replica starts sent in one coordinator request. Keep this separate
+  from target size because one target node can receive many replicas.
+- `replication.service_shard_parallelism`
+  Maximum shard coordinator requests the generation owner keeps in flight.
+- `replication.remote_admission_parallelism`
+  Maximum remote peers contacted in parallel while preparing capacity.
+- `replication.remote_assignment_parallelism`
+  Maximum remote peers contacted in parallel while delivering workload
+  assignment work.
+
+Lower shard sizes create more coordinator requests with smaller batches. Higher
+values reduce RPC count but put more placement and row-publishing work on each
+coordinator. The defaults prefer fewer moving parts until a deployment targets
+hundreds of nodes.
 
 ## Storage GC Guidance
 

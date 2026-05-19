@@ -498,7 +498,7 @@ async fn build_runtime_components(
         },
         runtime_support,
     })?;
-    hydrate_topology(&topology).await?;
+    restore_topology_derived_state(&topology).await?;
     let topology_client = capnp_rpc::new_client(topology.clone());
     let sync_client = build_sync_client(cluster_view.clone(), root_schema, sync_stores.clone());
 
@@ -875,24 +875,24 @@ fn build_topology(inputs: TopologyBuildInputs<'_>) -> BootstrapResult<Topology> 
     .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
 }
 
-/// Rehydrates topology-derived state before the node begins serving traffic.
+/// Restores topology-derived state before the node begins serving traffic.
 ///
 /// This keeps startup recovery side effects explicit instead of burying them in
 /// the main runtime construction flow.
-async fn hydrate_topology(topology: &Topology) -> BootstrapResult<()> {
-    match topology.hydrate_cluster_names_from_operations().await {
-        Ok(hydrated) if hydrated > 0 => {
+async fn restore_topology_derived_state(topology: &Topology) -> BootstrapResult<()> {
+    match topology.restore_cluster_names_from_operations().await {
+        Ok(restored) if restored > 0 => {
             info!(
                 target: "cluster_view",
-                hydrated,
-                "rehydrated cluster lineage names from durable operation history"
+                restored,
+                "restored cluster lineage names from durable operation history"
             );
         }
         Ok(_) => {}
         Err(error) => {
             tracing::warn!(
                 target: "cluster_view",
-                "failed to hydrate cluster lineage names from operation history: {error}"
+                "failed to restore cluster lineage names from operation history: {error}"
             );
         }
     }
@@ -918,7 +918,7 @@ async fn hydrate_topology(topology: &Topology) -> BootstrapResult<()> {
     if let Err(error) = topology.publish_local_cluster_node_count().await {
         tracing::warn!(
             target: "cluster_view",
-            "failed to publish local cluster node count during startup hydration: {error}"
+            "failed to publish local cluster node count during startup recovery: {error}"
         );
     }
 

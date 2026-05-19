@@ -135,6 +135,101 @@ sequenceDiagram
     RT->>RT: Start runtime instance and manage lifecycle
 ```
 
+## Large Service Deployment Sharding
+
+Small service generations still use the direct owner launch path. The
+generation owner builds pinned workload start requests, prepares capacity on
+target nodes, and publishes the accepted workload rows.
+
+For large generations, a single owner-to-every-target fanout becomes too much
+work for one node. The sharded launch path keeps the same scheduling and lease
+rules, but splits the owner fanout into deterministic coordinator batches.
+
+The owner builds shards only when all of these are true:
+
+- every start request has a pinned target node,
+- every start request has a deterministic task id,
+- every request belongs to one service generation,
+- the unique target-node count reaches
+  `replication.service_shard_target_threshold`.
+
+The owner then partitions target nodes into stable target shards and sends each
+bounded task batch to a selected coordinator. Each coordinator uses the normal
+pinned workload start path for its assigned requests, so this does not
+introduce a second scheduler or a second reservation model.
+
+```mermaid
+sequenceDiagram
+    participant OW as Generation owner
+    participant C1 as Shard coordinator A
+    participant C2 as Shard coordinator B
+    participant T1 as Target nodes in shard A
+    participant T2 as Target nodes in shard B
+    participant RS as Replicated workload store
+
+    OW->>OW: Build deterministic shard plan
+    OW->>C1: coordinateServiceShard(requests A)
+    OW->>C2: coordinateServiceShard(requests B)
+    C1->>T1: prepareLeases(batch)
+    C2->>T2: prepareLeases(batch)
+    T1-->>C1: accepted leases
+    T2-->>C2: accepted leases
+    C1->>RS: publish workload rows A
+    C2->>RS: publish workload rows B
+    C1-->>OW: started or reused specs A
+    C2-->>OW: started or reused specs B
+```
+
+The important property is idempotence. If a coordinator request is retried, the
+coordinator validates existing workload rows for the same deterministic task
+ids and reuses them when they match the delegated request. That lets the owner
+retry a failed coordinator handoff without creating duplicate replicas.
+
+The sharding shape is intentionally simple:
+
+```text
+DeploymentShardPlan
+  service_id
+  service_epoch
+  eligible_nodes
+  target_peer_count
+  target_shards[]
+
+ServiceDeploymentShard
+  shard_index
+  coordinator_node_id
+  target_node_ids[]
+
+ServiceShardAssignmentRequest
+  owner_node_id
+  coordinator_node_id
+  service_id
+  service_epoch
+  shard_index
+  requests[]
+```
+
+`service_shard_target_size` caps how many target nodes belong to one target
+shard. `service_shard_task_target_size` caps how many replica starts ride in
+one coordinator request. Those are separate limits because a deployment can
+target a small number of nodes with many replicas per node.
+
+## Shard Failure Model
+
+Shard coordination is a launch fanout optimization, not a durability layer.
+Cluster-wide durability still comes from replicated service state, workload
+rows, gossip, and MST sync.
+
+If a remote coordinator handoff fails before the coordinator processes the
+request, the generation stays `Deploying` and retries later. The owner can
+reconstruct the same deterministic shard plan from replicated service state.
+
+If the coordinator processes the request and the owner does not receive the
+reply, a retry is still safe because the coordinator validates and returns the
+existing matching workload rows. If target placement or reservation truly
+fails, the normal workload start errors still decide whether deployment should
+retry or fail.
+
 ## Why One Generation Owner Matters
 
 Service generations are not executed by every node that notices a new
@@ -251,6 +346,7 @@ the move and avoids a visible control-plane gap.
 Main files for this flow:
 
 - `src/services/manager.rs`
+- `src/services/manager/sharding.rs`
 - `src/services/ownership.rs`
 - `src/task/manager/planner.rs`
 - `src/task/manager/reservation.rs`
