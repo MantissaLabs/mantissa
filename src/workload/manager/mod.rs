@@ -997,8 +997,12 @@ impl WorkloadManager {
                 .id
                 .ok_or_else(|| anyhow!("service shard {shard_index} request is missing task id"))?;
 
-            match self.load_spec(task_id).await {
-                Ok(existing) => {
+            match self.try_load_spec(task_id).await.with_context(|| {
+                format!(
+                    "failed to load task {task_id} while coordinating service shard {shard_index} for service {service_id}"
+                )
+            })? {
+                Some(existing) => {
                     validate_existing_service_shard_assignment(
                         service_id,
                         service_epoch,
@@ -1008,7 +1012,7 @@ impl WorkloadManager {
                     )?;
                     ordered[index] = Some(existing);
                 }
-                Err(_) => missing.push((index, launch_request)),
+                None => missing.push((index, launch_request)),
             }
         }
 

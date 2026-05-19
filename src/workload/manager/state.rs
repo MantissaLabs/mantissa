@@ -3258,11 +3258,19 @@ impl WorkloadManager {
         Ok(workload_values)
     }
 
-    /// Loads the current persisted spec for a task by identifier.
-    pub(super) async fn load_spec(&self, id: Uuid) -> Result<WorkloadSpec, anyhow::Error> {
+    /// Attempts to load the current persisted spec for a task by identifier.
+    ///
+    /// This is used by idempotent launch paths that must distinguish an absent
+    /// task from a store failure. Missing rows are safe to create, while lookup
+    /// failures must be surfaced so callers do not accidentally launch duplicate
+    /// work when the local store is unhealthy.
+    pub(super) async fn try_load_spec(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<WorkloadSpec>, anyhow::Error> {
         let change_clock = self.core.store.change_clock();
         if let Some(spec) = self.cached_spec(id, change_clock) {
-            return Ok(spec);
+            return Ok(Some(spec));
         }
 
         if let Some(workload_values) = self.cached_workload_value_index(change_clock)
@@ -3270,21 +3278,32 @@ impl WorkloadManager {
         {
             let spec = value_to_spec(id, value.clone());
             self.cache_spec(change_clock, spec.clone());
-            return Ok(spec);
+            return Ok(Some(spec));
         }
 
         let key = UuidKey::from(id);
-        let snapshot = self
+        let Some(snapshot) = self
             .core
             .store
             .get_snapshot(&key)
             .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("unknown task {id}"))?;
+        else {
+            return Ok(None);
+        };
 
-        let value = select_best_workload_value(snapshot.as_slice())
-            .ok_or_else(|| anyhow::anyhow!("task {id} has no value"))?;
+        let Some(value) = select_best_workload_value(snapshot.as_slice()) else {
+            return Ok(None);
+        };
         let spec = value_to_spec(id, value);
         self.cache_spec(change_clock, spec.clone());
+        Ok(Some(spec))
+    }
+
+    /// Loads the current persisted spec for a task by identifier.
+    pub(super) async fn load_spec(&self, id: Uuid) -> Result<WorkloadSpec, anyhow::Error> {
+        let Some(spec) = self.try_load_spec(id).await? else {
+            return Err(anyhow::anyhow!("unknown task {id}"));
+        };
         Ok(spec)
     }
 
