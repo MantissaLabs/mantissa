@@ -1398,6 +1398,91 @@ fn deploying_assignment_incomplete_detected() {
     assert!(!deploying_assignment_incomplete(&running));
 }
 
+/// Compact service progress should satisfy status output once one template is fully running.
+#[test]
+fn compact_progress_builds_single_template_running_status() {
+    let manifest_id = Uuid::new_v4();
+    let tasks = vec![TaskTemplateSpecValue {
+        name: "api".into(),
+        execution: empty_service_execution("ghcr.io/demo/api:latest"),
+        depends_on: Vec::new(),
+        replicas: 3,
+        readiness: None,
+        public_port: None,
+        public_protocol: None,
+        placement_preferences: Vec::new(),
+    }];
+    let mut service = ServiceSpecValue::new(
+        manifest_id,
+        "manifest",
+        "demo-service",
+        tasks,
+        vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()],
+    );
+    service.service_epoch = 7;
+
+    let mut progress = ServiceGenerationProgressRecord::new(
+        service.id,
+        service.service_name.clone(),
+        service.service_epoch,
+        Uuid::new_v4(),
+        "node-a",
+        "2026-01-01T00:00:00Z",
+    );
+    progress.counts.observed = 3;
+    progress.counts.running = 3;
+
+    let rows = compact_running_task_progress_for_service(&service, &[progress])
+        .expect("complete compact progress should produce a status row");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name, "api");
+    assert_eq!(rows[0].desired, 3);
+    assert_eq!(rows[0].assigned, 3);
+    assert_eq!(rows[0].running, 3);
+    assert_eq!(rows[0].unknown, 0);
+}
+
+/// Partial compact progress should keep status on the exact task-row inspection path.
+#[test]
+fn compact_progress_defers_partial_status_to_exact_rows() {
+    let manifest_id = Uuid::new_v4();
+    let tasks = vec![TaskTemplateSpecValue {
+        name: "api".into(),
+        execution: empty_service_execution("ghcr.io/demo/api:latest"),
+        depends_on: Vec::new(),
+        replicas: 3,
+        readiness: None,
+        public_port: None,
+        public_protocol: None,
+        placement_preferences: Vec::new(),
+    }];
+    let mut service = ServiceSpecValue::new(
+        manifest_id,
+        "manifest",
+        "demo-service",
+        tasks,
+        vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()],
+    );
+    service.service_epoch = 7;
+
+    let mut progress = ServiceGenerationProgressRecord::new(
+        service.id,
+        service.service_name.clone(),
+        service.service_epoch,
+        Uuid::new_v4(),
+        "node-a",
+        "2026-01-01T00:00:00Z",
+    );
+    progress.counts.observed = 3;
+    progress.counts.running = 2;
+    progress.counts.starting = 1;
+
+    assert!(
+        compact_running_task_progress_for_service(&service, &[progress]).is_none(),
+        "partial compact progress lacks enough detail for status output"
+    );
+}
+
 /// Deploying specs with persisted prior-generation state must keep generation execution active.
 #[test]
 fn deploying_generation_requires_execution_for_redeploy_context() {

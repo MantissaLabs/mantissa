@@ -21,7 +21,9 @@ use crate::workload::manager::{
     WorkloadStartRequest, workload_start_error_consumes_service_failure_budget,
     workload_start_error_requires_service_requeue, workload_start_retryable_detail,
 };
-use crate::workload::model::{WorkloadPhase, WorkloadSpec, WorkloadVolumeMount};
+use crate::workload::model::{
+    ServiceGenerationProgressRecord, WorkloadPhase, WorkloadSpec, WorkloadVolumeMount,
+};
 use crate::workload::network_prerequisites::{
     WorkloadNetworkPrerequisites, WorkloadNetworkRequirement,
 };
@@ -370,11 +372,35 @@ impl ServiceController {
         Ok(specs)
     }
 
-    /// Builds task-template aggregate progress for one service using only its replica ids.
+    /// Builds task-template aggregate progress for one service status request.
+    ///
+    /// Large service generations publish compact per-node progress records. When those records
+    /// prove a single-template generation is fully running, status can return the aggregate without
+    /// inspecting every replica row. Partial, failed, or multi-template generations still use exact
+    /// task-row inspection because compact progress is not template-granular yet.
     pub async fn task_progress_for_service(
         &self,
         service: &ServiceSpecValue,
     ) -> anyhow::Result<Vec<ServiceTaskProgressSnapshot>> {
+        match self
+            .workload_manager
+            .service_generation_progress(service.id, service.service_epoch)
+            .await
+        {
+            Ok(progress) => {
+                if let Some(rows) = compact_running_task_progress_for_service(service, &progress) {
+                    return Ok(rows);
+                }
+            }
+            Err(err) => {
+                tracing::debug!(
+                    target: "services",
+                    "failed to load compact progress for service '{}' status snapshot: {err:#}",
+                    service.service_name
+                );
+            }
+        }
+
         let mut rows: Vec<ServiceTaskProgressSnapshot> = service
             .task_templates
             .iter()
@@ -812,6 +838,46 @@ fn service_slot_template_names(service: &ServiceSpecValue) -> Vec<String> {
         }
     }
     slots
+}
+
+/// Builds a status snapshot from compact progress when it is exact enough for API output.
+///
+/// Compact service progress is currently aggregated by node, not by task template. A single
+/// template service has no ambiguity, so an all-running compact projection is equivalent to the
+/// old per-task scan and avoids one workload lookup per replica. Other shapes still fall back to
+/// the exact path in `task_progress_for_service`.
+fn compact_running_task_progress_for_service(
+    service: &ServiceSpecValue,
+    progress: &[ServiceGenerationProgressRecord],
+) -> Option<Vec<ServiceTaskProgressSnapshot>> {
+    let [template] = service.task_templates.as_slice() else {
+        return None;
+    };
+
+    let desired = u64::from(template.replicas);
+    if desired == 0 {
+        return Some(vec![ServiceTaskProgressSnapshot::new(&template.name, 0)]);
+    }
+
+    let mut observed = 0u64;
+    let mut running = 0u64;
+    for record in progress {
+        if record.service_id != service.id || record.service_epoch != service.service_epoch {
+            continue;
+        }
+        observed = observed.saturating_add(record.counts.observed);
+        running = running.saturating_add(record.counts.running);
+    }
+
+    if observed < desired || running < desired {
+        return None;
+    }
+
+    let desired = u32::from(template.replicas);
+    let mut row = ServiceTaskProgressSnapshot::new(&template.name, desired);
+    row.assigned = desired;
+    row.running = desired;
+    Some(vec![row])
 }
 
 /// Returns a short stable workload id for status details.
