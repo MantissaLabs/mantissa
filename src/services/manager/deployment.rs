@@ -1192,6 +1192,12 @@ impl ServiceController {
                 .await;
         }
 
+        let group_id = compute_service_admission_group_id(
+            service_id,
+            manifest_id,
+            service_epoch,
+            ServiceAdmissionGroupScope::ServiceGeneration,
+        )?;
         let ordered_indices: Vec<usize> = stages
             .iter()
             .flat_map(|stage| stage.template_indices.iter().copied())
@@ -1253,7 +1259,12 @@ impl ServiceController {
                 "service '{}' deployment for template '{}'",
                 service_name, template.name
             );
-            let task_specs = match self.start_tasks_with_fallback(requests, &context).await {
+            // The non-gang dependency path still uses incremental admission, but it must enter
+            // the shared launcher so large template stages can use deployment shard coordinators.
+            let task_specs = match self
+                .start_tasks_for_admission_policy(admission_policy, group_id, requests, &context)
+                .await
+            {
                 Ok(specs) => specs,
                 Err(err) if launched_task_ids.is_empty() => {
                     self.handle_initial_deployment_launch_failure(
