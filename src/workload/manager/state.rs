@@ -1343,7 +1343,7 @@ impl WorkloadManager {
     /// Progress cleanup does not need workload gossip. These rows are deterministic CRDT keys, so
     /// a local tombstone is enough for workload MST sync to repair peers that still have the old
     /// generation's compact aggregate.
-    async fn remove_stale_service_progress_records(
+    pub(super) async fn remove_stale_service_progress_records(
         &self,
         progress_ids: Vec<Uuid>,
     ) -> Result<(), anyhow::Error> {
@@ -1482,6 +1482,83 @@ impl WorkloadManager {
             .retain(|_, entry| !stale_lookup.contains(&entry.progress_id));
 
         stale_progress_ids
+    }
+
+    /// Returns true when an inbound compact progress row is outside the retained generation window.
+    ///
+    /// Local progress cleanup tombstones old generation rows, but stale gossip can
+    /// arrive after that tombstone is written. This guard uses the service
+    /// registry and the in-memory progress high watermark to reject old inbound
+    /// rows before they can recreate compact progress that this node already
+    /// knows is obsolete.
+    pub(super) async fn should_ignore_stale_service_progress(
+        &self,
+        record: &ServiceGenerationProgressRecord,
+    ) -> bool {
+        let mut latest_epoch = record.service_epoch;
+        match self.core.service_registry.get(record.service_id) {
+            Ok(Some(service)) => {
+                latest_epoch = latest_epoch.max(service.service_epoch);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(
+                    target: "task",
+                    service = %record.service_id,
+                    progress = %record.id,
+                    "failed to load service while checking compact progress retention: {err:#}"
+                );
+            }
+        }
+
+        let latest_key = (record.service_id, record.node_id);
+        if let Some(tracked_epoch) = self
+            .local_state
+            .service_progress
+            .lock()
+            .await
+            .latest_epochs
+            .get(&latest_key)
+            .copied()
+        {
+            latest_epoch = latest_epoch.max(tracked_epoch);
+        }
+
+        let stale = record
+            .service_epoch
+            .saturating_add(super::SERVICE_PROGRESS_RETAIN_GENERATIONS)
+            < latest_epoch;
+        if stale {
+            debug!(
+                target: "task",
+                progress = %record.id,
+                service = %record.service_name,
+                epoch = record.service_epoch,
+                latest_epoch,
+                node = %record.node_id,
+                "ignoring stale compact service progress outside retained generation window"
+            );
+        }
+        stale
+    }
+
+    /// Records the newest accepted compact progress generation for one service/node pair.
+    ///
+    /// Inbound progress may be observed before this node publishes any local
+    /// progress for that service. Recording accepted epochs lets later stale
+    /// progress from the same reporting node be rejected without scanning the
+    /// workload store.
+    pub(super) async fn remember_service_progress_epoch(
+        &self,
+        record: &ServiceGenerationProgressRecord,
+    ) {
+        let latest_key = (record.service_id, record.node_id);
+        let mut tracker = self.local_state.service_progress.lock().await;
+        let entry = tracker
+            .latest_epochs
+            .entry(latest_key)
+            .or_insert(record.service_epoch);
+        *entry = (*entry).max(record.service_epoch);
     }
 
     /// Adjusts one lifecycle counter in a compact service progress aggregate.

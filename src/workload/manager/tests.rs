@@ -7808,6 +7808,32 @@ async fn service_progress_cleanup_tombstones_stale_generations() {
             .is_none(),
         "progress older than the retained generation window should be tombstoned"
     );
+
+    let mut stale_inbound_progress = crate::workload::model::ServiceGenerationProgressRecord::new(
+        service_id,
+        service_name,
+        1,
+        manager.local_node_id,
+        "local",
+        Utc::now().to_rfc3339(),
+    );
+    stale_inbound_progress.add_phase(&WorkloadPhase::Running);
+    manager
+        .handle_event(WorkloadEvent::UpsertServiceProgress(Box::new(
+            stale_inbound_progress,
+        )))
+        .await
+        .expect("ignore stale inbound service progress");
+    assert!(
+        manager
+            .core
+            .store
+            .get_snapshot(&UuidKey::from(epoch_one_progress_id))
+            .expect("reload cleaned first generation after inbound stale progress")
+            .is_none(),
+        "stale inbound progress should not recreate a tombstoned generation row"
+    );
+
     manager
         .local_state
         .dirty_gossip_workloads

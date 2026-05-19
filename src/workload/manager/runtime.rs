@@ -689,6 +689,12 @@ impl WorkloadManager {
             }
             WorkloadEvent::UpsertServiceProgress(record_box) => {
                 let record = *record_box;
+                if self.should_ignore_stale_service_progress(&record).await {
+                    self.remove_stale_service_progress_records(vec![record.id])
+                        .await?;
+                    return Ok(());
+                }
+
                 let current = self
                     .core
                     .store
@@ -721,6 +727,8 @@ impl WorkloadManager {
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("service progress upsert failed: {e}"))?;
+
+                self.remember_service_progress_epoch(&record).await;
 
                 Ok(())
             }
