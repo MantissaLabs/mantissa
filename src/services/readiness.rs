@@ -35,7 +35,7 @@ const SERVICE_DEPLOYMENT_PROGRESS_DEADLINE_SECS: u64 = 600;
 
 enum ReadinessOutcome {
     Success(ServiceSpecValue),
-    Pending,
+    Pending { running_count: usize },
     Degraded(ServiceSpecValue),
     Failure(ServiceSpecValue),
     Abort,
@@ -47,6 +47,12 @@ pub(super) enum ReadinessClass {
     Inflight,
     Degraded,
     Unhealthy,
+}
+
+/// Compact readiness projection derived from service-generation progress rows.
+struct ProgressReadinessProjection {
+    class: ReadinessClass,
+    running_count: usize,
 }
 
 /// Waits until a deployment converges or repeatedly reports terminal unhealthy states.
@@ -120,8 +126,12 @@ pub(super) async fn start_readiness_wait(
         }
 
         let now = Instant::now();
+        let observed_running = match &outcome {
+            ReadinessOutcome::Pending { running_count } => *running_count,
+            _ => running_readiness_state_count(&last_observed_states),
+        };
         if deployment_running_progress_advanced(
-            &last_observed_states,
+            observed_running,
             &mut running_high_watermark,
             now,
             progress_window,
@@ -192,7 +202,7 @@ pub(super) async fn start_readiness_wait(
                 }
                 break;
             }
-            ReadinessOutcome::Pending => {
+            ReadinessOutcome::Pending { .. } => {
                 success_since = None;
                 if deployment_progress_timed_out(now, progress_deadline) {
                     let snapshot = match controller.registry.get(service_id) {
@@ -381,14 +391,30 @@ async fn poll_service_attempt(
             .await
         {
             Ok(progress) => {
-                if let Some(progress_states) =
-                    readiness_states_from_progress(&current, progress.as_slice())
+                if let Some(projection) =
+                    readiness_projection_from_progress(&current, progress.as_slice())
                 {
-                    last_states.clear();
-                    last_states.extend(progress_states);
                     last_phase_versions.clear();
                     last_terminal_launches.clear();
-                    return ReadinessOutcome::Success(current);
+                    match projection.class {
+                        ReadinessClass::AllRunning => {
+                            last_states.clear();
+                            return ReadinessOutcome::Success(current);
+                        }
+                        ReadinessClass::Inflight => {
+                            last_states.clear();
+                            return ReadinessOutcome::Pending {
+                                running_count: projection.running_count,
+                            };
+                        }
+                        ReadinessClass::Degraded | ReadinessClass::Unhealthy => {
+                            tracing::debug!(
+                                target: "services",
+                                "compact progress for service '{}' contains terminal work; falling back to task-row inspection for failure details",
+                                current.service_name
+                            );
+                        }
+                    }
                 }
             }
             Err(err) => {
@@ -456,7 +482,9 @@ async fn poll_service_attempt(
                         current.service_name,
                         format_task_state_summary(last_states)
                     );
-                    return ReadinessOutcome::Pending;
+                    return ReadinessOutcome::Pending {
+                        running_count: running_readiness_state_count(last_states),
+                    };
                 }
                 ReadinessClass::Degraded => {
                     tracing::debug!(
@@ -483,18 +511,17 @@ async fn poll_service_attempt(
     }
 }
 
-/// Returns synthetic readiness states from compact service generation progress.
+/// Returns a readiness classification from compact service generation progress.
 ///
 /// Large service deployments suppress routine full-row workload gossip, so the
 /// generation owner may receive compact per-node progress before it can inspect
-/// every replica row directly. This projection lets readiness track partial
-/// running progress and in-flight work from those compact records. It uses the
-/// service replica ids only as stable labels for the existing readiness
-/// accounting; the lifecycle counts come from the aggregate progress rows.
-fn readiness_states_from_progress(
+/// every replica row directly. This projection lets readiness use aggregate
+/// counts for the common healthy path and only falls back to full task rows
+/// when terminal progress needs task-level failure accounting.
+fn readiness_projection_from_progress(
     current: &ServiceSpecValue,
     progress: &[ServiceGenerationProgressRecord],
-) -> Option<Vec<(Uuid, Option<WorkloadPhase>)>> {
+) -> Option<ProgressReadinessProjection> {
     if progress.is_empty() {
         return None;
     }
@@ -517,56 +544,24 @@ fn readiness_states_from_progress(
         return None;
     }
 
-    let expected = expected as usize;
-    let mut phases = Vec::with_capacity(expected);
-    push_compact_progress_phases(
-        &mut phases,
-        counts.running,
-        WorkloadPhase::Running,
-        expected,
-    );
-    push_compact_progress_phases(
-        &mut phases,
-        counts.starting,
-        WorkloadPhase::Creating,
-        expected,
-    );
-    push_compact_progress_phases(
-        &mut phases,
-        counts.blocked,
-        WorkloadPhase::VolumeUnavailable,
-        expected,
-    );
-    push_compact_progress_phases(
-        &mut phases,
-        counts.stopping,
-        WorkloadPhase::Stopping,
-        expected,
-    );
-    push_compact_progress_phases(
-        &mut phases,
-        counts.terminal,
-        WorkloadPhase::Failed,
-        expected,
-    );
+    let running_count = (counts.running.min(expected)) as usize;
+    let observed_deficit = counts.observed < expected;
+    let has_inflight =
+        observed_deficit || counts.starting > 0 || counts.blocked > 0 || counts.stopping > 0;
+    let class = if counts.running >= expected {
+        ReadinessClass::AllRunning
+    } else if has_inflight {
+        ReadinessClass::Inflight
+    } else if counts.terminal > 0 && counts.running > 0 {
+        ReadinessClass::Degraded
+    } else {
+        ReadinessClass::Unhealthy
+    };
 
-    let mut states = Vec::with_capacity(expected);
-    for (idx, task_id) in current.replica_ids.iter().take(expected).enumerate() {
-        states.push((*task_id, phases.get(idx).cloned()));
-    }
-    Some(states)
-}
-
-/// Appends synthetic lifecycle phases from compact progress while respecting desired count.
-fn push_compact_progress_phases(
-    phases: &mut Vec<WorkloadPhase>,
-    count: u64,
-    phase: WorkloadPhase,
-    expected: usize,
-) {
-    let remaining = expected.saturating_sub(phases.len());
-    let take = remaining.min(count as usize);
-    phases.extend(std::iter::repeat_n(phase, take));
+    Some(ProgressReadinessProjection {
+        class,
+        running_count,
+    })
 }
 
 /// Records terminal task transitions and returns the task that exceeded deployment failure budget.
@@ -697,16 +692,12 @@ fn readiness_backoff(attempt: u32) -> Duration {
 /// Running-replica growth is treated as deployment progress and extends the global progress
 /// deadline so large services can converge incrementally without being prematurely failed.
 fn deployment_running_progress_advanced(
-    states: &[(Uuid, Option<WorkloadPhase>)],
+    running: usize,
     running_high_watermark: &mut usize,
     now: Instant,
     progress_window: Duration,
     progress_deadline: &mut Instant,
 ) -> bool {
-    let running = states
-        .iter()
-        .filter(|(_, state)| matches!(state, Some(WorkloadPhase::Running)))
-        .count();
     if running <= *running_high_watermark {
         return false;
     }
@@ -714,6 +705,14 @@ fn deployment_running_progress_advanced(
     *running_high_watermark = running;
     *progress_deadline = now + progress_window;
     true
+}
+
+/// Counts running task states in the detailed fallback readiness snapshot.
+fn running_readiness_state_count(states: &[(Uuid, Option<WorkloadPhase>)]) -> usize {
+    states
+        .iter()
+        .filter(|(_, state)| matches!(state, Some(WorkloadPhase::Running)))
+        .count()
 }
 
 /// Returns true when deployment has exceeded its readiness progress deadline.
@@ -790,7 +789,7 @@ mod tests {
 
     /// Ensures partial compact progress is enough to keep readiness in-flight.
     #[test]
-    fn partial_progress_projects_inflight_readiness_states() {
+    fn partial_progress_projects_inflight_readiness() {
         let spec = service_with_replica_ids(4);
         let progress = progress_record(
             &spec,
@@ -803,36 +802,15 @@ mod tests {
             },
         );
 
-        let states = readiness_states_from_progress(&spec, &[progress])
-            .expect("partial progress should produce readiness states");
-        assert_eq!(states.len(), 4);
-        assert_eq!(
-            states
-                .iter()
-                .filter(|(_, state)| matches!(state, Some(WorkloadPhase::Running)))
-                .count(),
-            2
-        );
-        assert_eq!(
-            states
-                .iter()
-                .filter(|(_, state)| matches!(state, Some(WorkloadPhase::Creating)))
-                .count(),
-            1
-        );
-        assert_eq!(
-            states.iter().filter(|(_, state)| state.is_none()).count(),
-            1
-        );
-        assert!(matches!(
-            classify_readiness_states(&states),
-            ReadinessClass::Inflight
-        ));
+        let projection = readiness_projection_from_progress(&spec, &[progress])
+            .expect("partial progress should produce readiness projection");
+        assert_eq!(projection.running_count, 2);
+        assert!(matches!(projection.class, ReadinessClass::Inflight));
     }
 
     /// Ensures complete compact running progress still acknowledges readiness.
     #[test]
-    fn complete_progress_projects_all_running_readiness_states() {
+    fn complete_progress_projects_all_running_readiness() {
         let spec = service_with_replica_ids(3);
         let progress = progress_record(
             &spec,
@@ -844,18 +822,30 @@ mod tests {
             },
         );
 
-        let states = readiness_states_from_progress(&spec, &[progress])
-            .expect("complete progress should produce readiness states");
-        assert_eq!(states.len(), 3);
-        assert!(
-            states
-                .iter()
-                .all(|(_, state)| matches!(state, Some(WorkloadPhase::Running)))
+        let projection = readiness_projection_from_progress(&spec, &[progress])
+            .expect("complete progress should produce readiness projection");
+        assert_eq!(projection.running_count, 3);
+        assert!(matches!(projection.class, ReadinessClass::AllRunning));
+    }
+
+    /// Ensures terminal compact progress does not get misclassified as successful readiness.
+    #[test]
+    fn terminal_progress_projects_unhealthy_readiness() {
+        let spec = service_with_replica_ids(3);
+        let progress = progress_record(
+            &spec,
+            Uuid::new_v4(),
+            ServiceGenerationProgressCounts {
+                observed: 3,
+                terminal: 3,
+                ..ServiceGenerationProgressCounts::default()
+            },
         );
-        assert!(matches!(
-            classify_readiness_states(&states),
-            ReadinessClass::AllRunning
-        ));
+
+        let projection = readiness_projection_from_progress(&spec, &[progress])
+            .expect("terminal progress should produce readiness projection");
+        assert_eq!(projection.running_count, 0);
+        assert!(matches!(projection.class, ReadinessClass::Unhealthy));
     }
 
     /// Ensures progress from another generation is ignored instead of polluting readiness.
@@ -874,7 +864,7 @@ mod tests {
         stale.service_epoch = stale.service_epoch.saturating_add(1);
 
         assert!(
-            readiness_states_from_progress(&spec, &[stale]).is_none(),
+            readiness_projection_from_progress(&spec, &[stale]).is_none(),
             "stale progress must not affect the active generation"
         );
     }
@@ -882,18 +872,13 @@ mod tests {
     /// Ensures the progress deadline extends only when running replicas increase.
     #[test]
     fn running_progress_extends_deadline_on_high_watermark() {
-        let task_a = Uuid::new_v4();
-        let task_b = Uuid::new_v4();
         let mut running_high_watermark = 0usize;
         let now = Instant::now();
         let progress_window = Duration::from_secs(30);
         let mut progress_deadline = now + Duration::from_secs(5);
 
         let advanced = deployment_running_progress_advanced(
-            &[
-                (task_a, Some(WorkloadPhase::Running)),
-                (task_b, Some(WorkloadPhase::Pending)),
-            ],
+            1,
             &mut running_high_watermark,
             now,
             progress_window,
@@ -910,10 +895,7 @@ mod tests {
         );
 
         let unchanged = deployment_running_progress_advanced(
-            &[
-                (task_a, Some(WorkloadPhase::Running)),
-                (task_b, Some(WorkloadPhase::Creating)),
-            ],
+            1,
             &mut running_high_watermark,
             now + Duration::from_secs(1),
             progress_window,
