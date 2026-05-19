@@ -13,6 +13,12 @@ const SERVICE_READY_POLL_INTERVAL_MS: u64 = 200;
 
 /// Maximum duration for a single readiness probe window before control returns to the outer loop.
 const SERVICE_READY_TIMEOUT_SECS: u64 = 60;
+/// Replica count below which partial compact progress still falls back to task-row inspection.
+///
+/// Compact progress rows are eventually replicated, so a small deployment should not wait only on
+/// aggregate propagation when exact task rows are cheap to inspect. Larger deployments keep the
+/// compact path during in-flight progress to avoid repeatedly scanning thousands of task rows.
+const SERVICE_READY_TASK_ROW_FALLBACK_LIMIT: usize = 256;
 /// Base delay (in milliseconds) for exponential backoff between deployment retries.
 const SERVICE_READY_BACKOFF_BASE_MS: u64 = 500;
 /// Maximum consecutive unhealthy readiness probe results before marking the service failed.
@@ -228,6 +234,8 @@ pub(super) async fn start_readiness_wait(
                     mark_service_failed(&controller, snapshot, &last_observed_states).await;
                     break;
                 }
+
+                sleep(Duration::from_millis(SERVICE_READY_POLL_INTERVAL_MS)).await;
             }
             ReadinessOutcome::Degraded(snapshot) => {
                 success_since = None;
@@ -323,6 +331,7 @@ async fn poll_service_attempt(
     last_terminal_launches: &mut HashMap<Uuid, Option<u64>>,
 ) -> ReadinessOutcome {
     let deadline = Instant::now() + Duration::from_secs(SERVICE_READY_TIMEOUT_SECS);
+    let mut progress_running_hint: Option<usize> = None;
 
     loop {
         let current = match controller.registry.get(service_id) {
@@ -402,10 +411,19 @@ async fn poll_service_attempt(
                             return ReadinessOutcome::Success(current);
                         }
                         ReadinessClass::Inflight => {
-                            last_states.clear();
-                            return ReadinessOutcome::Pending {
-                                running_count: projection.running_count,
-                            };
+                            progress_running_hint = Some(projection.running_count);
+                            if current.replica_ids.len() > SERVICE_READY_TASK_ROW_FALLBACK_LIMIT {
+                                last_states.clear();
+                                return ReadinessOutcome::Pending {
+                                    running_count: projection.running_count,
+                                };
+                            }
+
+                            tracing::debug!(
+                                target: "services",
+                                "compact progress for service '{}' is partial; checking task rows because the generation is small enough",
+                                current.service_name
+                            );
                         }
                         ReadinessClass::Degraded | ReadinessClass::Unhealthy => {
                             tracing::debug!(
@@ -483,7 +501,8 @@ async fn poll_service_attempt(
                         format_task_state_summary(last_states)
                     );
                     return ReadinessOutcome::Pending {
-                        running_count: running_readiness_state_count(last_states),
+                        running_count: progress_running_hint
+                            .unwrap_or_else(|| running_readiness_state_count(last_states)),
                     };
                 }
                 ReadinessClass::Degraded => {
