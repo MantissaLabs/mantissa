@@ -126,7 +126,7 @@ local_test!(
             .expect("load service spec")
             .expect("service spec should be present");
         assert_eq!(
-            service_spec.replica_ids.len(),
+            service_spec.assigned_replica_count(),
             3,
             "service spec should track exactly three replicas"
         );
@@ -134,11 +134,11 @@ local_test!(
         let mut tasks_by_node: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
         let mut slots_by_node: HashMap<Uuid, usize> = HashMap::new();
 
-        for task_id in &service_spec.replica_ids {
+        for task_id in service_spec.assigned_replica_ids() {
             let task = cluster[0]
                 .node
                 .workload_manager
-                .inspect_workload(*task_id)
+                .inspect_workload(task_id)
                 .await
                 .expect("inspect service task");
             assert!(
@@ -327,17 +327,17 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
         .expect("load final service spec")
         .expect("final service spec should be present");
     assert_eq!(
-        final_spec.replica_ids.len(),
+        final_spec.assigned_replica_count(),
         expected_replicas,
         "scaled service should track {expected_replicas} task ids"
     );
 
     let mut counts: HashMap<Uuid, usize> = HashMap::new();
-    for task_id in &final_spec.replica_ids {
+    for task_id in final_spec.assigned_replica_ids() {
         let task = cluster[0]
             .node
             .workload_manager
-            .inspect_workload(*task_id)
+            .inspect_workload(task_id)
             .await
             .expect("inspect scaled task");
         *counts.entry(task.node_id).or_insert(0) += 1;

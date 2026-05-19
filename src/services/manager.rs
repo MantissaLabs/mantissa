@@ -416,7 +416,7 @@ impl ServiceController {
             .collect();
         let slot_templates = service_slot_template_names(service);
 
-        for (slot_idx, task_id) in service.replica_ids.iter().enumerate() {
+        for (slot_idx, task_id) in service.assigned_replica_ids().iter().enumerate() {
             let Some(expected_template) = slot_templates.get(slot_idx) else {
                 continue;
             };
@@ -712,7 +712,7 @@ impl ServiceController {
                 }
             });
         };
-        let desired_ids: HashSet<Uuid> = spec.replica_ids.iter().copied().collect();
+        let desired_ids: HashSet<Uuid> = spec.assigned_replica_ids().into_iter().collect();
         let service_tasks = inventory.service_task_snapshot(&spec.service_name, desired_ids);
         for task_id in service_tasks.all_known_task_ids() {
             let Some(task) = inventory.by_id.get(&task_id) else {

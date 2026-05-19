@@ -707,7 +707,8 @@ fn compare_ip_addrs(left: IpAddr, right: IpAddr) -> std::cmp::Ordering {
 fn build_task_template_index(specs: &[ServiceSpecValue]) -> HashMap<Uuid, (String, String)> {
     let mut index = HashMap::new();
     for spec in specs {
-        let mut ids = spec.replica_ids.iter();
+        let replica_ids = spec.assigned_replica_ids();
+        let mut ids = replica_ids.iter();
         for template in &spec.task_templates {
             for _ in 0..template.replicas {
                 let Some(task_id) = ids.next() else { break };

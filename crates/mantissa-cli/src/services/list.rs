@@ -50,7 +50,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
             templates_summary,
             public_summary,
             host_ports_summary(&row),
-            row.replica_ids.len(),
+            row.assigned_replica_count(),
             row.updated_at,
             row.id,
         )?;

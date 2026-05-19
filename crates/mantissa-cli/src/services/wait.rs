@@ -296,7 +296,7 @@ impl From<&ServiceRow> for ProgressKey {
             rollout_completed_steps: row.rollout.completed_steps,
             rollout_failed_steps: row.rollout.failed_steps,
             rollout_last_error: row.rollout.last_error.clone(),
-            assigned_replicas: row.replica_ids.len(),
+            assigned_replicas: row.assigned_replica_count(),
             desired_replicas: desired_replicas(row),
             task_progress: row.task_progress.clone(),
         }
@@ -367,7 +367,7 @@ fn desired_replicas(row: &ServiceRow) -> usize {
 
 /// Renders assigned replica count against desired replica count.
 fn replica_label(row: &ServiceRow) -> String {
-    format!("{}/{}", row.replica_ids.len(), desired_replicas(row))
+    format!("{}/{}", row.assigned_replica_count(), desired_replicas(row))
 }
 
 /// Renders the rollout phase and step counters in one compact label.
@@ -404,7 +404,7 @@ fn progress_bar(row: &ServiceRow) -> String {
             row.rollout.total_steps as usize,
         )
     } else {
-        (row.replica_ids.len(), desired_replicas(row))
+        (row.assigned_replica_count(), desired_replicas(row))
     };
 
     if total == 0 {

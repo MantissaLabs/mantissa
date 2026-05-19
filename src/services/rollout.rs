@@ -370,8 +370,9 @@ impl ServiceController {
         } = job;
 
         let previous_status = current_spec.status();
+        let current_replica_ids = current_spec.assigned_replica_ids();
         let current_assignments = self
-            .collect_assignments(&service_name, &current_spec.replica_ids)
+            .collect_assignments(&service_name, &current_replica_ids)
             .await;
         let desired_graph = RolloutTemplateGraph::from_templates(&service_name, &task_templates)?;
         let current_graph =
@@ -1179,7 +1180,7 @@ impl ServiceController {
         next_spec.manifest_name = target.manifest_name.to_string();
         next_spec.service_name = service_name.to_string();
         next_spec.task_templates = target.task_templates.to_vec();
-        next_spec.replica_ids = ordered_task_ids;
+        next_spec.set_replica_ids_compact_when_derived(ordered_task_ids);
         next_spec.update_strategy = target.update_strategy.clone();
         next_spec.admission_policy = *target.admission_policy;
         next_spec.service_epoch = current_spec.service_epoch.saturating_add(1);
@@ -1557,8 +1558,9 @@ impl ServiceController {
                 .await
             {
                 Ok(()) => {
+                    let rollback_target_ids = current_spec.assigned_replica_ids();
                     if let Err(validation_err) = self
-                        .verify_rollback_target_assignments(service_name, &current_spec.replica_ids)
+                        .verify_rollback_target_assignments(service_name, &rollback_target_ids)
                         .await
                     {
                         tracing::warn!(
@@ -1628,7 +1630,7 @@ impl ServiceController {
                     max_failures: settings.max_failures,
                     last_error: Some(rollout_error.to_string()),
                 });
-                failed_spec.replica_ids.clear();
+                failed_spec.clear_replica_assignments();
                 failed_spec.set_status(ServiceStatus::Failed);
                 if let Err(err) = self.apply_upsert(failed_spec.clone()).await {
                     tracing::warn!(

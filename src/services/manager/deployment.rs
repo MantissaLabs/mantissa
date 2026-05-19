@@ -445,7 +445,7 @@ impl ServiceController {
                 pending_spec.update_strategy = update_strategy.clone();
                 pending_spec.admission_policy = admission_policy;
                 pending_spec.start_new_generation();
-                pending_spec.replica_ids.clear();
+                pending_spec.clear_replica_assignments();
                 pending_spec.set_rollout(ServiceRolloutState::default());
                 pending_spec.previous_generation = None;
                 pending_spec.set_status(ServiceStatus::Deploying);
@@ -479,7 +479,7 @@ impl ServiceController {
             pending_spec.start_new_generation();
             // A new deployment generation must start from an empty assignment set so peers can
             // observe a clean Deploying bootstrap before task ids are repopulated.
-            pending_spec.replica_ids.clear();
+            pending_spec.clear_replica_assignments();
             pending_spec.previous_generation =
                 Some(ServicePreviousGeneration::from_service(&current_spec));
             pending_spec.set_status(ServiceStatus::Deploying);
@@ -819,7 +819,7 @@ impl ServiceController {
                 update_strategy: current.update_strategy.clone(),
                 admission_policy: current.admission_policy,
                 service_epoch: current.service_epoch,
-                assigned_task_ids: current.replica_ids.clone(),
+                assigned_task_ids: current.assigned_replica_ids(),
             };
             return self.clone().execute_deployment(job).await;
         }
@@ -952,7 +952,8 @@ impl ServiceController {
                 let detail = service_error_detail(&err);
                 match self.registry.get(service_id) {
                     Ok(Some(mut persisted_spec)) if is_local_volume_unavailable_error(&err) => {
-                        persisted_spec.replica_ids = desired_task_ids.clone();
+                        persisted_spec
+                            .set_replica_ids_compact_when_derived(desired_task_ids.clone());
                         persisted_spec.set_rollout(ServiceRolloutState::default());
                         persisted_spec.set_status(ServiceStatus::VolumeUnavailable);
                         if let Err(upsert_err) = self.apply_upsert(persisted_spec.clone()).await {
@@ -1074,7 +1075,7 @@ impl ServiceController {
         spec.manifest_name = manifest_name;
         spec.service_name = service_name.clone();
         spec.task_templates = task_templates;
-        spec.replica_ids = replica_ids;
+        spec.set_replica_ids_compact_when_derived(replica_ids);
         spec.update_strategy = update_strategy;
         spec.admission_policy = admission_policy;
         spec.service_epoch = service_epoch;
@@ -1841,7 +1842,7 @@ impl ServiceController {
         spec.manifest_name = deployment.manifest_name.to_string();
         spec.service_name = deployment.service_name.to_string();
         spec.task_templates = deployment.task_templates.to_vec();
-        spec.replica_ids = replica_ids;
+        spec.set_replica_ids_compact_when_derived(replica_ids);
         spec.update_strategy = deployment.update_strategy.clone();
         spec.admission_policy = *deployment.admission_policy;
         spec.previous_generation = None;
@@ -1885,7 +1886,7 @@ impl ServiceController {
         let detail = service_error_detail(err);
         match self.registry.get(service_id) {
             Ok(Some(mut persisted_spec)) if is_local_volume_unavailable_error(err) => {
-                persisted_spec.replica_ids = desired_task_ids.to_vec();
+                persisted_spec.set_replica_ids_compact_when_derived(desired_task_ids.to_vec());
                 persisted_spec.previous_generation = None;
                 persisted_spec.set_rollout(ServiceRolloutState::default());
                 persisted_spec.set_status(ServiceStatus::VolumeUnavailable);
@@ -2022,8 +2023,8 @@ impl ServiceController {
             last_error: detail.clone(),
             ..ServiceRolloutState::default()
         });
-        let task_ids_to_stop = failed_spec.replica_ids.clone();
-        failed_spec.replica_ids.clear();
+        let task_ids_to_stop = failed_spec.assigned_replica_ids();
+        failed_spec.clear_replica_assignments();
         failed_spec.set_status(ServiceStatus::Failed);
         failed_spec.set_status_detail(detail);
         self.apply_upsert(failed_spec.clone()).await?;
@@ -2031,7 +2032,7 @@ impl ServiceController {
             .await?;
         if !task_ids_to_stop.is_empty() {
             let mut stop_spec = failed_spec;
-            stop_spec.replica_ids = task_ids_to_stop;
+            stop_spec.set_replica_ids(task_ids_to_stop);
             self.stop_tasks(&stop_spec).await;
         }
         Ok(())
@@ -2583,7 +2584,7 @@ impl ServiceController {
             ));
         };
 
-        let Some(current_task_id) = current.replica_ids.get(slot_index).copied() else {
+        let Some(current_task_id) = current.assigned_replica_id(slot_index) else {
             return Err(anyhow!(
                 "service '{}' slot '{}' replica {} lost its desired task id during cutover",
                 current.service_name,
@@ -2606,7 +2607,14 @@ impl ServiceController {
             ));
         }
 
-        current.replica_ids[slot_index] = replacement_task_id;
+        if !current.replace_assigned_replica_id(slot_index, replacement_task_id) {
+            return Err(anyhow!(
+                "service '{}' slot '{}' replica {} lost its desired task id during cutover",
+                current.service_name,
+                template_name,
+                replica
+            ));
+        }
         current.phase_version = current.phase_version.saturating_add(1);
         current.touch();
         self.apply_upsert(current.clone()).await?;

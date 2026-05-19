@@ -50,7 +50,7 @@ pub(super) fn build_replica_slots(spec: &ServiceSpecValue) -> Vec<ReplicaSlot> {
 
     for template in &spec.task_templates {
         for replica in 1..=template.replicas {
-            let replica_id = spec.replica_ids.get(cursor).copied();
+            let replica_id = spec.assigned_replica_id(cursor);
             slots.push(ReplicaSlot {
                 template: template.clone(),
                 replica,

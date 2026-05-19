@@ -45,9 +45,8 @@ local_test!(services_node_drain_migrates_singleton_service, {
         .get(service_id)
         .expect("load singleton service")
         .expect("singleton service should exist");
-    let task_id = *service
-        .replica_ids
-        .first()
+    let task_id = service
+        .assigned_replica_id(0)
         .expect("singleton service should have one task id");
     let initial_task = cluster[0]
         .node
@@ -83,7 +82,7 @@ local_test!(services_node_drain_migrates_singleton_service, {
             else {
                 return false;
             };
-            let Some(replacement_task_id) = service.replica_ids.first().copied() else {
+            let Some(replacement_task_id) = service.assigned_replica_id(0) else {
                 return false;
             };
             if replacement_task_id == task_id {
@@ -129,9 +128,8 @@ local_test!(services_node_drain_migrates_singleton_service, {
         .get(service_id)
         .expect("load migrated singleton service")
         .expect("migrated singleton service should exist");
-    let replacement_task_id = *migrated_service
-        .replica_ids
-        .first()
+    let replacement_task_id = migrated_service
+        .assigned_replica_id(0)
         .expect("singleton service should still own one replica id after drain");
     assert_ne!(
         replacement_task_id, task_id,
@@ -283,7 +281,7 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
         .get(service_id)
         .expect("load baseline service before node-down reschedule")
         .expect("baseline service should exist");
-    let baseline_ids: BTreeSet<Uuid> = baseline_spec.replica_ids.iter().copied().collect();
+    let baseline_ids: BTreeSet<Uuid> = baseline_spec.assigned_replica_ids().into_iter().collect();
 
     let rescheduled = wait_until(
         Duration::from_secs(30),
@@ -298,16 +296,16 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
             else {
                 return false;
             };
-            if current.status() != ServiceStatus::Running || current.replica_ids.len() != 3 {
+            if current.status() != ServiceStatus::Running || current.assigned_replica_count() != 3 {
                 return false;
             }
 
             let mut saw_replacement = false;
-            for task_id in &current.replica_ids {
+            for task_id in current.assigned_replica_ids() {
                 let Ok(task) = cluster[0]
                     .node
                     .workload_manager
-                    .inspect_workload(*task_id)
+                    .inspect_workload(task_id)
                     .await
                 else {
                     return false;
@@ -315,7 +313,7 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
                 if task.node_id == down_node_id || task.state != WorkloadPhase::Running {
                     return false;
                 }
-                if !baseline_ids.contains(task_id) {
+                if !baseline_ids.contains(&task_id) {
                     saw_replacement = true;
                 }
             }
@@ -410,7 +408,7 @@ local_test!(
                 .get(service_id)
                 .expect("load slow service")
                 && spec.status() == ServiceStatus::Deploying
-                && let Some(task_id) = spec.replica_ids.first().copied()
+                && let Some(task_id) = spec.assigned_replica_id(0)
                 && let Ok(task) = cluster[0]
                     .node
                     .workload_manager
@@ -472,7 +470,7 @@ local_test!(
                 else {
                     return false;
                 };
-                let Some(replacement_task_id) = service.replica_ids.first().copied() else {
+                let Some(replacement_task_id) = service.assigned_replica_id(0) else {
                     return false;
                 };
                 if replacement_task_id == task_id {
@@ -559,9 +557,8 @@ local_test!(services_node_drain_reports_capacity_blocker, {
         .get(service_id)
         .expect("load capacity-blocked service")
         .expect("capacity-blocked service should exist");
-    let task_id = *service
-        .replica_ids
-        .first()
+    let task_id = service
+        .assigned_replica_id(0)
         .expect("singleton service should have one task id");
     let initial_task = cluster[0]
         .node
@@ -766,9 +763,8 @@ local_test!(services_node_list_reports_drained_node_after_evacuation, {
         .get(service_id)
         .expect("load singleton service")
         .expect("singleton service should exist");
-    let task_id = *service
-        .replica_ids
-        .first()
+    let task_id = service
+        .assigned_replica_id(0)
         .expect("singleton service should have one task id");
     let initial_task = cluster[0]
         .node

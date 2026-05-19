@@ -71,9 +71,8 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
         .get(service_id)
         .expect("read running service spec")
         .expect("running service spec present");
-    let task_id = *running
-        .replica_ids
-        .first()
+    let task_id = running
+        .assigned_replica_id(0)
         .expect("service should own one task id");
 
     assert!(

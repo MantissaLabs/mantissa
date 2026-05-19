@@ -33,6 +33,8 @@ pub struct ServiceSpecValue {
     pub service_name: String,
     pub task_templates: Vec<TaskTemplateSpecValue>,
     pub replica_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub replica_assignment_segments: Vec<ServiceReplicaAssignmentSegment>,
     pub updated_at: String,
     #[serde(default)]
     pub update_strategy: ServiceUpdateStrategy,
@@ -94,6 +96,16 @@ impl ServiceReplicaAssignmentSegment {
             })
             .collect()
     }
+
+    /// Returns the number of replica ids represented by this compact segment.
+    pub fn len(&self) -> usize {
+        usize::from(self.replica_count)
+    }
+
+    /// Returns true when the segment represents no replica ids.
+    pub fn is_empty(&self) -> bool {
+        self.replica_count == 0
+    }
 }
 
 impl ServiceSpecValue {
@@ -116,6 +128,7 @@ impl ServiceSpecValue {
             service_name,
             task_templates,
             replica_ids,
+            replica_assignment_segments: Vec::new(),
             updated_at: current_timestamp(),
             update_strategy: ServiceUpdateStrategy::default(),
             admission_policy: WorkloadAdmissionPolicy::default(),
@@ -207,6 +220,98 @@ impl ServiceSpecValue {
         self.rollout = rollout;
         self.touch();
     }
+
+    /// Returns true when this service generation has any assigned replica slots.
+    pub fn has_assigned_replicas(&self) -> bool {
+        !self.replica_ids.is_empty() || !self.replica_assignment_segments.is_empty()
+    }
+
+    /// Returns the number of assigned replica slots without expanding compact assignments.
+    pub fn assigned_replica_count(&self) -> usize {
+        if self.replica_assignment_segments.is_empty() {
+            self.replica_ids.len()
+        } else {
+            self.replica_assignment_segments
+                .iter()
+                .map(ServiceReplicaAssignmentSegment::len)
+                .sum()
+        }
+    }
+
+    /// Materializes the current assignment into ordered workload ids for task-level callers.
+    pub fn assigned_replica_ids(&self) -> Vec<Uuid> {
+        if self.replica_assignment_segments.is_empty() {
+            return self.replica_ids.clone();
+        }
+
+        self.replica_assignment_segments
+            .iter()
+            .flat_map(|segment| segment.replica_ids(self.id, self.service_epoch))
+            .collect()
+    }
+
+    /// Returns one assigned replica id by flattened template/replica slot index.
+    pub fn assigned_replica_id(&self, slot_index: usize) -> Option<Uuid> {
+        if self.replica_assignment_segments.is_empty() {
+            return self.replica_ids.get(slot_index).copied();
+        }
+
+        let mut cursor = 0usize;
+        for segment in &self.replica_assignment_segments {
+            let next = cursor.saturating_add(segment.len());
+            if slot_index < next {
+                let offset = slot_index.saturating_sub(cursor);
+                let replica = segment.first_replica.saturating_add(offset as u16);
+                return Some(derive_service_replica_id(
+                    self.id,
+                    self.service_epoch,
+                    &segment.template_name,
+                    replica,
+                ));
+            }
+            cursor = next;
+        }
+        None
+    }
+
+    /// Stores explicit replica ids and clears any compact assignment view.
+    pub fn set_replica_ids(&mut self, replica_ids: Vec<Uuid>) {
+        self.replica_ids = replica_ids;
+        self.replica_assignment_segments.clear();
+    }
+
+    /// Stores compact deterministic assignments when the provided ids match the generation.
+    pub fn set_replica_ids_compact_when_derived(&mut self, replica_ids: Vec<Uuid>) {
+        match compact_service_replica_assignment_segments(
+            self.id,
+            self.service_epoch,
+            &self.task_templates,
+            &replica_ids,
+        ) {
+            Some(segments) if !segments.is_empty() => {
+                self.replica_ids.clear();
+                self.replica_assignment_segments = segments;
+            }
+            _ => self.set_replica_ids(replica_ids),
+        }
+    }
+
+    /// Clears every assigned replica slot from the service generation.
+    pub fn clear_replica_assignments(&mut self) {
+        self.replica_ids.clear();
+        self.replica_assignment_segments.clear();
+    }
+
+    /// Replaces one assigned replica slot, materializing compact assignments when needed.
+    pub fn replace_assigned_replica_id(&mut self, slot_index: usize, replacement: Uuid) -> bool {
+        let mut replica_ids = self.assigned_replica_ids();
+        let Some(current) = replica_ids.get_mut(slot_index) else {
+            return false;
+        };
+        *current = replacement;
+        self.set_replica_ids(replica_ids);
+        true
+    }
 }
 
 /// Derives the stable workload id for one service generation replica slot.
@@ -228,6 +333,55 @@ pub fn derive_service_replica_id(
     Uuid::from_bytes(bytes)
 }
 
+/// Finds a compact representation for deterministic service replica ids.
+pub fn compact_service_replica_assignment_segments(
+    service_id: Uuid,
+    service_epoch: u64,
+    task_templates: &[TaskTemplateSpecValue],
+    replica_ids: &[Uuid],
+) -> Option<Vec<ServiceReplicaAssignmentSegment>> {
+    if replica_ids.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut cursor = 0usize;
+    let mut segments = Vec::new();
+    for template in task_templates {
+        let mut first_replica = None;
+        let mut replica_count = 0u16;
+        for replica in 1..=template.replicas {
+            let Some(actual_id) = replica_ids.get(cursor) else {
+                break;
+            };
+            let expected_id =
+                derive_service_replica_id(service_id, service_epoch, &template.name, replica);
+            if *actual_id != expected_id {
+                return None;
+            }
+
+            if first_replica.is_none() {
+                first_replica = Some(replica);
+            }
+            replica_count = replica_count.checked_add(1)?;
+            cursor += 1;
+        }
+
+        if let Some(first_replica) = first_replica {
+            segments.push(ServiceReplicaAssignmentSegment::new(
+                template.name.clone(),
+                first_replica,
+                replica_count,
+            )?);
+        }
+
+        if cursor == replica_ids.len() {
+            break;
+        }
+    }
+
+    (cursor == replica_ids.len()).then_some(segments)
+}
+
 /// Snapshot of the prior service generation kept long enough for deterministic owner adoption.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ServicePreviousGeneration {
@@ -235,6 +389,8 @@ pub struct ServicePreviousGeneration {
     pub manifest_name: String,
     pub task_templates: Vec<TaskTemplateSpecValue>,
     pub replica_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub replica_assignment_segments: Vec<ServiceReplicaAssignmentSegment>,
     #[serde(default)]
     pub update_strategy: ServiceUpdateStrategy,
     #[serde(default)]
@@ -253,6 +409,7 @@ impl ServicePreviousGeneration {
             manifest_name: spec.manifest_name.clone(),
             task_templates: spec.task_templates.clone(),
             replica_ids: spec.replica_ids.clone(),
+            replica_assignment_segments: spec.replica_assignment_segments.clone(),
             update_strategy: spec.update_strategy.clone(),
             admission_policy: spec.admission_policy,
             service_epoch: spec.service_epoch,
@@ -274,6 +431,7 @@ impl ServicePreviousGeneration {
             self.replica_ids.clone(),
         );
         spec.id = service_id;
+        spec.replica_assignment_segments = self.replica_assignment_segments.clone();
         spec.update_strategy = self.update_strategy.clone();
         spec.admission_policy = self.admission_policy;
         spec.service_epoch = self.service_epoch;

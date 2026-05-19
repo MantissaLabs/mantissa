@@ -365,7 +365,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
         .expect("service spec present after failure");
     assert_eq!(failed_spec.status(), ServiceStatus::Failed);
     assert!(
-        failed_spec.replica_ids.is_empty(),
+        !failed_spec.has_assigned_replicas(),
         "failed service should clear task assignments so operators can see an explicit failed state"
     );
 
@@ -429,7 +429,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
         "recovery deployment should activate the new manifest generation"
     );
     assert_eq!(
-        recovered.replica_ids.len(),
+        recovered.assigned_replica_count(),
         1,
         "recovery deployment should repopulate task ids"
     );
@@ -510,7 +510,7 @@ local_test!(services_deploying_generation_resumes_after_restart, {
                     return false;
                 };
 
-                spec.status() == ServiceStatus::Deploying && spec.replica_ids.len() == 1
+                spec.status() == ServiceStatus::Deploying && spec.assigned_replica_count() == 1
             }
         )
         .await,
@@ -521,7 +521,7 @@ local_test!(services_deploying_generation_resumes_after_restart, {
         .registry()
         .get(service_id)
         .expect("reload persisted deploying spec")
-        .and_then(|spec| spec.replica_ids.first().copied())
+        .and_then(|spec| spec.assigned_replica_id(0))
         .expect("backend task id should be persisted before restart");
 
     node.shutdown().await.expect("shut down first node");
@@ -550,8 +550,10 @@ local_test!(services_deploying_generation_resumes_after_restart, {
                 };
 
                 spec.status() == ServiceStatus::Running
-                    && spec.replica_ids.len() == 2
-                    && spec.replica_ids.contains(&persisted_backend_task_id)
+                    && spec.assigned_replica_count() == 2
+                    && spec
+                        .assigned_replica_ids()
+                        .contains(&persisted_backend_task_id)
             }
         )
         .await,
@@ -659,7 +661,7 @@ local_test!(
             "deployment should start as pending because the selected owner is gone"
         );
         assert!(
-            initial.replica_ids.is_empty(),
+            !initial.has_assigned_replicas(),
             "no live node should assign task ids while the down owner still wins rendezvous hashing"
         );
 
@@ -786,8 +788,8 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
             .expect("read service after failed wait")
             .expect("service should still be present");
         let mut task_details = Vec::new();
-        for task_id in &current.replica_ids {
-            let detail = match node.node.workload_manager.inspect_workload(*task_id).await {
+        for task_id in current.assigned_replica_ids() {
+            let detail = match node.node.workload_manager.inspect_workload(task_id).await {
                 Ok(task) => format!("{}:{:?}:phase{}", task.id, task.state, task.phase_version),
                 Err(err) => format!("{task_id}:inspect-error:{err}"),
             };
@@ -796,7 +798,7 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
         panic!(
             "deployment with runtime exit signals should converge to failed instead of looping; current status={:?}, task_ids={}, rollout_phase={:?}, rollout_failed_steps={}, rollout_error={:?}, task_details={:?}",
             current.status(),
-            current.replica_ids.len(),
+            current.assigned_replica_count(),
             current.rollout.phase,
             current.rollout.failed_steps,
             current.rollout.last_error,
@@ -813,7 +815,7 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
         .expect("failed service spec present");
     assert_eq!(failed_spec.status(), ServiceStatus::Failed);
     assert!(
-        failed_spec.replica_ids.is_empty(),
+        !failed_spec.has_assigned_replicas(),
         "failed service should clear task ids after runtime-exit-driven readiness failure"
     );
 });
@@ -935,7 +937,7 @@ local_test!(services_deployment_replicates_across_cluster, {
             .iter()
             .find(|svc| svc.id == service_id)
             .expect("service should replicate to every node");
-        let service_ids: BTreeSet<Uuid> = service.replica_ids.iter().cloned().collect();
+        let service_ids: BTreeSet<Uuid> = service.assigned_replica_ids().into_iter().collect();
         assert_eq!(
             service_ids,
             expected_task_ids,

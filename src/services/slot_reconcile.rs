@@ -71,7 +71,7 @@ impl ServiceController {
                 target: "services",
                 service = %spec.service_name,
                 expected_slots = expected_task_id_count(&spec),
-                assigned_slots = spec.replica_ids.len(),
+                assigned_slots = spec.assigned_replica_count(),
                 "skipping deploy reconciliation until task ids are fully assigned"
             );
             return Ok(());

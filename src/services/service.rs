@@ -9,7 +9,7 @@ use crate::services::types::{
     ServiceRescheduleReason, ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase,
     ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy,
     ServiceUpdateStrategyMode, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
-    derive_service_replica_id,
+    compact_service_replica_assignment_segments,
 };
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
@@ -392,7 +392,7 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
 
     let service_epoch = reader.get_service_epoch();
     let explicit_replica_ids = read_expanded_replica_ids(reader.get_replica_ids()?)?;
-    let replica_ids = read_service_replica_ids(
+    let (replica_ids, replica_assignment_segments) = read_service_replica_assignments(
         id,
         service_epoch,
         &task_templates,
@@ -408,6 +408,7 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
         replica_ids,
     );
     value.id = id;
+    value.replica_assignment_segments = replica_assignment_segments;
     value.updated_at = reader.get_updated_at()?.to_str()?.to_string();
     value.service_epoch = service_epoch;
     value.phase_version = reader.get_phase_version();
@@ -457,8 +458,17 @@ fn write_replica_ids(
     value: &ServiceSpecValue,
     replica_id_encoding: ReplicaIdEncoding,
 ) {
+    if !value.replica_assignment_segments.is_empty() {
+        builder.reborrow().init_replica_ids(0);
+        let segments_builder = builder
+            .reborrow()
+            .init_replica_assignment_segments(value.replica_assignment_segments.len() as u32);
+        write_replica_assignment_segments(segments_builder, &value.replica_assignment_segments);
+        return;
+    }
+
     if matches!(replica_id_encoding, ReplicaIdEncoding::CompactWhenDerived)
-        && let Some(segments) = compact_replica_assignment_segments(
+        && let Some(segments) = compact_service_replica_assignment_segments(
             value.id,
             value.service_epoch,
             &value.task_templates,
@@ -490,8 +500,17 @@ fn write_previous_replica_ids(
     service_id: Uuid,
     replica_id_encoding: ReplicaIdEncoding,
 ) {
+    if !previous.replica_assignment_segments.is_empty() {
+        builder.reborrow().init_replica_ids(0);
+        let segments_builder = builder
+            .reborrow()
+            .init_replica_assignment_segments(previous.replica_assignment_segments.len() as u32);
+        write_replica_assignment_segments(segments_builder, &previous.replica_assignment_segments);
+        return;
+    }
+
     if matches!(replica_id_encoding, ReplicaIdEncoding::CompactWhenDerived)
-        && let Some(segments) = compact_replica_assignment_segments(
+        && let Some(segments) = compact_service_replica_assignment_segments(
             service_id,
             previous.service_epoch,
             &previous.task_templates,
@@ -516,55 +535,6 @@ fn write_previous_replica_ids(
     builder.reborrow().init_replica_assignment_segments(0);
 }
 
-/// Finds a compact prefix representation for deterministic service replica ids.
-fn compact_replica_assignment_segments(
-    service_id: Uuid,
-    service_epoch: u64,
-    task_templates: &[TaskTemplateSpecValue],
-    replica_ids: &[Uuid],
-) -> Option<Vec<ServiceReplicaAssignmentSegment>> {
-    if replica_ids.is_empty() {
-        return Some(Vec::new());
-    }
-
-    let mut cursor = 0usize;
-    let mut segments = Vec::new();
-    for template in task_templates {
-        let mut first_replica = None;
-        let mut replica_count = 0u16;
-        for replica in 1..=template.replicas {
-            let Some(actual_id) = replica_ids.get(cursor) else {
-                break;
-            };
-            let expected_id =
-                derive_service_replica_id(service_id, service_epoch, &template.name, replica);
-            if *actual_id != expected_id {
-                return None;
-            }
-
-            if first_replica.is_none() {
-                first_replica = Some(replica);
-            }
-            replica_count = replica_count.checked_add(1)?;
-            cursor += 1;
-        }
-
-        if let Some(first_replica) = first_replica {
-            segments.push(ServiceReplicaAssignmentSegment::new(
-                template.name.clone(),
-                first_replica,
-                replica_count,
-            )?);
-        }
-
-        if cursor == replica_ids.len() {
-            break;
-        }
-    }
-
-    (cursor == replica_ids.len()).then_some(segments)
-}
-
 /// Writes compact replica assignment ranges into the Cap'n Proto payload.
 fn write_replica_assignment_segments(
     mut builder: struct_list::Builder<'_, replica_assignment_segment::Owned>,
@@ -587,17 +557,17 @@ fn read_expanded_replica_ids(reader: capnp::data_list::Reader<'_>) -> Result<Vec
     Ok(replica_ids)
 }
 
-/// Resolves either explicit or compact replica ids into the in-memory service representation.
-fn read_service_replica_ids(
+/// Resolves explicit or compact assignment payloads into the service representation.
+fn read_service_replica_assignments(
     service_id: Uuid,
     service_epoch: u64,
     task_templates: &[TaskTemplateSpecValue],
     explicit_replica_ids: Vec<Uuid>,
     segment_reader: struct_list::Reader<'_, replica_assignment_segment::Owned>,
-) -> Result<Vec<Uuid>, Error> {
+) -> Result<(Vec<Uuid>, Vec<ServiceReplicaAssignmentSegment>), Error> {
     let segments = read_replica_assignment_segments(segment_reader)?;
     if segments.is_empty() {
-        return Ok(explicit_replica_ids);
+        return Ok((explicit_replica_ids, Vec::new()));
     }
     if !explicit_replica_ids.is_empty() {
         return Err(Error::failed(
@@ -605,7 +575,8 @@ fn read_service_replica_ids(
         ));
     }
 
-    expand_replica_assignment_segments(service_id, service_epoch, task_templates, &segments)
+    expand_replica_assignment_segments(service_id, service_epoch, task_templates, &segments)?;
+    Ok((Vec::new(), segments))
 }
 
 /// Reads compact assignment ranges from the service wire payload.
@@ -767,7 +738,7 @@ fn read_previous_generation(
 
     let service_epoch = reader.get_service_epoch();
     let explicit_replica_ids = read_expanded_replica_ids(reader.get_replica_ids()?)?;
-    let replica_ids = read_service_replica_ids(
+    let (replica_ids, replica_assignment_segments) = read_service_replica_assignments(
         service_id,
         service_epoch,
         &task_templates,
@@ -791,6 +762,7 @@ fn read_previous_generation(
         manifest_name,
         task_templates,
         replica_ids,
+        replica_assignment_segments,
         update_strategy,
         admission_policy,
         service_epoch,

@@ -56,7 +56,7 @@ local_test!(services_redeploy_scales_replicas, {
         .get(service_id)
         .expect("read initial spec")
         .expect("initial spec present");
-    let initial_ids: BTreeSet<Uuid> = initial_spec.replica_ids.iter().cloned().collect();
+    let initial_ids: BTreeSet<Uuid> = initial_spec.assigned_replica_ids().into_iter().collect();
     assert_eq!(
         initial_ids.len(),
         1,
@@ -93,7 +93,7 @@ local_test!(services_redeploy_scales_replicas, {
         panic!(
             "service should return to running after scale-out redeploy; current status={:?}, task_ids={}, rollout_phase={:?}, rollout_failed_steps={}, rollout_error={:?}",
             current.status(),
-            current.replica_ids.len(),
+            current.assigned_replica_count(),
             current.rollout.phase,
             current.rollout.failed_steps,
             current.rollout.last_error
@@ -111,7 +111,7 @@ local_test!(services_redeploy_scales_replicas, {
         .get(service_id)
         .expect("read updated spec")
         .expect("updated spec present");
-    let updated_ids: BTreeSet<Uuid> = updated_spec.replica_ids.iter().cloned().collect();
+    let updated_ids: BTreeSet<Uuid> = updated_spec.assigned_replica_ids().into_iter().collect();
     assert_eq!(
         updated_ids.len(),
         3,
@@ -178,9 +178,8 @@ local_test!(services_redeploy_updates_resources, {
         .get(service_id)
         .expect("read baseline spec")
         .expect("baseline spec present");
-    let initial_id = *initial_spec
-        .replica_ids
-        .first()
+    let initial_id = initial_spec
+        .assigned_replica_id(0)
         .expect("baseline spec should include one task id");
 
     tasks[0].execution.cpu_millis = 750;
@@ -214,7 +213,7 @@ local_test!(services_redeploy_updates_resources, {
         panic!(
             "service should return to running after resource refresh; current status={:?}, task_ids={}, rollout_phase={:?}, rollout_failed_steps={}, rollout_error={:?}",
             current.status(),
-            current.replica_ids.len(),
+            current.assigned_replica_count(),
             current.rollout.phase,
             current.rollout.failed_steps,
             current.rollout.last_error
@@ -228,11 +227,13 @@ local_test!(services_redeploy_updates_resources, {
         .expect("read updated spec")
         .expect("updated spec present");
     assert_eq!(
-        updated_spec.replica_ids.len(),
+        updated_spec.assigned_replica_count(),
         1,
         "resource refresh should maintain a single replica"
     );
-    let replacement_id = updated_spec.replica_ids[0];
+    let replacement_id = updated_spec
+        .assigned_replica_id(0)
+        .expect("updated spec should include one task id");
     assert_ne!(
         replacement_id, initial_id,
         "resource change should replace the existing replica"
@@ -358,7 +359,8 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
         "unchanged redeploy should keep the active manifest id"
     );
     assert_eq!(
-        after.replica_ids, baseline.replica_ids,
+        after.assigned_replica_ids(),
+        baseline.assigned_replica_ids(),
         "unchanged redeploy should not churn task assignments"
     );
     assert_eq!(
@@ -423,7 +425,7 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
         .expect("read baseline spec")
         .expect("baseline spec present");
     let baseline_manifest_id = baseline_spec.manifest_id;
-    let baseline_task_ids = baseline_spec.replica_ids.clone();
+    let baseline_task_ids = baseline_spec.assigned_replica_ids();
 
     let mut failing_tasks = tasks;
     failing_tasks[0].execution.cpu_millis = 500_000;
@@ -457,7 +459,8 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
         "failed rollout should restore previous manifest generation"
     );
     assert_eq!(
-        rolled_back.replica_ids, baseline_task_ids,
+        rolled_back.assigned_replica_ids(),
+        baseline_task_ids,
         "failed rollout should restore previous task assignments"
     );
 });
@@ -514,7 +517,7 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
         .expect("read baseline spec")
         .expect("baseline spec present");
     let baseline_manifest_id = baseline_spec.manifest_id;
-    let baseline_task_ids = baseline_spec.replica_ids.clone();
+    let baseline_task_ids = baseline_spec.assigned_replica_ids();
 
     let mut failing_tasks = tasks;
     failing_tasks[0].execution.cpu_millis = 500_000;
@@ -566,7 +569,8 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
         "failing rollout should keep previous manifest after rollback"
     );
     assert_eq!(
-        rolled_back.replica_ids, baseline_task_ids,
+        rolled_back.assigned_replica_ids(),
+        baseline_task_ids,
         "failing rollout should keep previous task ids after rollback"
     );
     assert_eq!(
@@ -637,7 +641,9 @@ local_test!(
             .get(service_id)
             .expect("read baseline spec")
             .expect("baseline spec present");
-        let old_task_id = baseline_spec.replica_ids[0];
+        let old_task_id = baseline_spec
+            .assigned_replica_id(0)
+            .expect("baseline spec should include one task id");
 
         tasks[0].execution.image = "alpine:3.19".into();
         let strategy = rollout_strategy(1, ServiceRolloutOrder::StopFirst, 1, 1, true);

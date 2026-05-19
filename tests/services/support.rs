@@ -1602,7 +1602,10 @@ pub(crate) async fn wait_for_service_replica_ids_converged_all(
                     break;
                 }
             };
-            let replica_ids = spec.replica_ids.iter().copied().collect::<BTreeSet<_>>();
+            let replica_ids = spec
+                .assigned_replica_ids()
+                .into_iter()
+                .collect::<BTreeSet<_>>();
             if replica_ids.len() != expected_count {
                 all_match = false;
                 break;
@@ -1819,7 +1822,8 @@ pub(crate) fn service_spec_matches_expected(
         && actual.manifest_name == expected.manifest_name
         && actual.service_name == expected.service_name
         && actual.task_templates == expected.task_templates
-        && actual.replica_ids == expected.replica_ids
+        && actual.assigned_replica_ids() == expected.assigned_replica_ids()
+        && actual.replica_assignment_segments == expected.replica_assignment_segments
         && actual.update_strategy == expected.update_strategy
         && actual.service_epoch == expected.service_epoch
         && actual.phase_version == expected.phase_version

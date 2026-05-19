@@ -192,9 +192,9 @@ pub(super) async fn start_readiness_wait(
                             );
                         }
 
-                        for task_id in &running_spec.replica_ids {
+                        for task_id in running_spec.assigned_replica_ids() {
                             controller
-                                .publish_running_task_traffic_best_effort(&service_name, *task_id)
+                                .publish_running_task_traffic_best_effort(&service_name, task_id)
                                 .await;
                         }
                     }
@@ -373,7 +373,7 @@ async fn poll_service_attempt(
             ServiceStatus::Deploying => {}
         }
 
-        if current.replica_ids.is_empty() {
+        if !current.has_assigned_replicas() {
             last_states.clear();
             last_phase_versions.clear();
             last_terminal_launches.clear();
@@ -412,7 +412,9 @@ async fn poll_service_attempt(
                         }
                         ReadinessClass::Inflight => {
                             progress_running_hint = Some(projection.running_count);
-                            if current.replica_ids.len() > SERVICE_READY_TASK_ROW_FALLBACK_LIMIT {
+                            if current.assigned_replica_count()
+                                > SERVICE_READY_TASK_ROW_FALLBACK_LIMIT
+                            {
                                 last_states.clear();
                                 return ReadinessOutcome::Pending {
                                     running_count: projection.running_count,
@@ -447,12 +449,12 @@ async fn poll_service_attempt(
         last_states.clear();
         last_phase_versions.clear();
         last_terminal_launches.clear();
-        for task_id in &current.replica_ids {
-            match controller.workload_manager.inspect_workload(*task_id).await {
+        for task_id in current.assigned_replica_ids() {
+            match controller.workload_manager.inspect_workload(task_id).await {
                 Ok(spec) => {
-                    last_states.push((*task_id, Some(spec.state.clone())));
-                    last_phase_versions.insert(*task_id, spec.phase_version);
-                    last_terminal_launches.insert(*task_id, spec.last_terminal_observed_launch);
+                    last_states.push((task_id, Some(spec.state.clone())));
+                    last_phase_versions.insert(task_id, spec.phase_version);
+                    last_terminal_launches.insert(task_id, spec.last_terminal_observed_launch);
                 }
                 Err(err) => {
                     tracing::debug!(
@@ -461,8 +463,8 @@ async fn poll_service_attempt(
                         task_id,
                         current.service_name
                     );
-                    last_states.push((*task_id, None));
-                    last_terminal_launches.insert(*task_id, None);
+                    last_states.push((task_id, None));
+                    last_terminal_launches.insert(task_id, None);
                 }
             }
         }
@@ -545,7 +547,7 @@ fn readiness_projection_from_progress(
         return None;
     }
 
-    let expected = current.replica_ids.len() as u64;
+    let expected = current.assigned_replica_count() as u64;
     let mut counts = ServiceGenerationProgressCounts::default();
     for record in progress {
         if record.service_id != current.id || record.service_epoch != current.service_epoch {
@@ -673,7 +675,7 @@ async fn mark_service_failed(
     };
     failed_spec.previous_generation = None;
     failed_spec.set_rollout(ServiceRolloutState::default());
-    failed_spec.replica_ids.clear();
+    failed_spec.clear_replica_assignments();
     failed_spec.set_status(ServiceStatus::Failed);
 
     if let Err(err) = controller.apply_upsert(failed_spec.clone()).await {

@@ -123,7 +123,7 @@ pub(super) fn expected_task_id_count(spec: &ServiceSpecValue) -> usize {
 /// Returns true when deployment has not yet assigned task ids for every desired replica.
 pub(super) fn deploying_assignment_incomplete(spec: &ServiceSpecValue) -> bool {
     spec.status() == ServiceStatus::Deploying
-        && spec.replica_ids.len() < expected_task_id_count(spec)
+        && spec.assigned_replica_count() < expected_task_id_count(spec)
 }
 
 #[cfg(test)]

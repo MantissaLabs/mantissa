@@ -124,7 +124,7 @@ fn blocks_cross_manifest_reactivation(
         current.status,
         ServiceStatus::Stopped | ServiceStatus::Failed
     ) && candidate.service_epoch > current.service_epoch
-        && !(candidate.status == ServiceStatus::Deploying && candidate.replica_ids.is_empty())
+        && (candidate.status != ServiceStatus::Deploying || candidate.has_assigned_replicas())
 }
 
 /// Returns true when the spec carries persisted rollout evidence from a failed redeploy.

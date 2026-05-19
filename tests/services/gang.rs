@@ -842,7 +842,7 @@ local_test!(
             .expect("empty gang service should be persisted");
         assert_eq!(spec.admission_policy.mode, WorkloadAdmissionMode::Gang);
         assert!(
-            spec.replica_ids.is_empty(),
+            !spec.has_assigned_replicas(),
             "zero-replica gang service should not record replicas"
         );
         assert!(
@@ -1426,9 +1426,8 @@ local_test!(
             .expect("load baseline service")
             .expect("baseline service should be persisted");
         let baseline_ids = baseline_spec
-            .replica_ids
-            .iter()
-            .copied()
+            .assigned_replica_ids()
+            .into_iter()
             .collect::<BTreeSet<_>>();
 
         let blocker_owner = Uuid::new_v4();

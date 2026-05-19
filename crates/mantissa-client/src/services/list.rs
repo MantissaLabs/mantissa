@@ -78,11 +78,15 @@ pub async fn list(cfg: &ClientConfig) -> Result<Vec<ServiceRow>> {
 #[derive(Clone, Debug)]
 pub struct ServiceRow {
     pub id: String,
+    pub service_id: Uuid,
     pub manifest_id: Uuid,
     pub service_name: String,
     pub task_templates: Vec<TaskTemplateRow>,
     pub updated_at: String,
     pub replica_ids: Vec<Uuid>,
+    pub replica_assignments: Vec<ServiceReplicaAssignmentRow>,
+    pub replica_count: usize,
+    pub service_epoch: u64,
     pub status: ServiceStatusRow,
     pub status_detail: Option<String>,
     pub rollout: ServiceRolloutRow,
@@ -103,19 +107,23 @@ impl ServiceRow {
             task_templates.push(TaskTemplateRow::from_reader(tmpl)?);
         }
 
-        let replica_ids =
-            read_service_replica_ids(service_id, spec.get_service_epoch(), &task_templates, spec)?;
+        let service_epoch = spec.get_service_epoch();
+        let replica_assignment = read_service_replica_assignment(&task_templates, spec)?;
 
         let rollout = ServiceRolloutRow::from_reader(spec.get_rollout()?)?;
         let status_detail = spec.get_status_detail()?.to_str()?.trim().to_string();
 
         Ok(Self {
             id,
+            service_id,
             manifest_id,
             service_name,
             task_templates,
             updated_at: spec.get_updated_at()?.to_str()?.to_string(),
-            replica_ids,
+            replica_ids: replica_assignment.replica_ids,
+            replica_assignments: replica_assignment.compact,
+            replica_count: replica_assignment.count,
+            service_epoch,
             status: ServiceStatusRow::from_proto(spec.get_status()?),
             status_detail: if status_detail.is_empty() {
                 None
@@ -127,19 +135,41 @@ impl ServiceRow {
             task_progress: Vec::new(),
         })
     }
+
+    /// Returns the logical assigned replica count without expanding compact ranges.
+    pub fn assigned_replica_count(&self) -> usize {
+        self.replica_count
+    }
 }
 
-/// Reads service replica ids from either explicit UUIDs or compact deterministic ranges.
-fn read_service_replica_ids(
-    service_id: Uuid,
-    service_epoch: u64,
+/// Assignment metadata decoded from one service row.
+struct ServiceReplicaAssignment {
+    replica_ids: Vec<Uuid>,
+    compact: Vec<ServiceReplicaAssignmentRow>,
+    count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceReplicaAssignmentRow {
+    pub template_name: String,
+    pub first_replica: u16,
+    pub replica_count: u16,
+}
+
+/// Reads service replica assignment metadata without expanding compact ranges eagerly.
+fn read_service_replica_assignment(
     task_templates: &[TaskTemplateRow],
     spec: service_spec::Reader<'_>,
-) -> Result<Vec<Uuid>, CapnpError> {
+) -> Result<ServiceReplicaAssignment, CapnpError> {
     let explicit = read_explicit_service_replica_ids(spec.get_replica_ids()?)?;
     let compact = spec.get_replica_assignment_segments()?;
     if compact.is_empty() {
-        return Ok(explicit);
+        let count = explicit.len();
+        return Ok(ServiceReplicaAssignment {
+            replica_ids: explicit,
+            compact: Vec::new(),
+            count,
+        });
     }
     if !explicit.is_empty() {
         return Err(CapnpError::failed(
@@ -147,7 +177,7 @@ fn read_service_replica_ids(
         ));
     }
 
-    expand_replica_assignment_segments(service_id, service_epoch, task_templates, compact)
+    read_compact_replica_assignment_segments(task_templates, compact)
 }
 
 /// Reads explicit service replica UUIDs from protocol payloads that choose the expanded form.
@@ -169,19 +199,18 @@ fn read_explicit_service_replica_ids(
     Ok(replica_ids)
 }
 
-/// Expands compact service replica ranges using the same deterministic task-id formula as the daemon.
-fn expand_replica_assignment_segments(
-    service_id: Uuid,
-    service_epoch: u64,
+/// Validates compact service replica ranges without building every task id.
+fn read_compact_replica_assignment_segments(
     task_templates: &[TaskTemplateRow],
     segments: struct_list::Reader<'_, replica_assignment_segment::Owned>,
-) -> Result<Vec<Uuid>, CapnpError> {
+) -> Result<ServiceReplicaAssignment, CapnpError> {
     let template_replicas: HashMap<&str, u16> = task_templates
         .iter()
         .map(|template| (template.name.as_str(), template.replicas))
         .collect();
     let mut seen_slots = HashSet::new();
-    let mut replica_ids = Vec::new();
+    let mut compact = Vec::with_capacity(segments.len() as usize);
+    let mut count = 0usize;
 
     for segment in segments.iter() {
         let template_name = segment.get_template_name()?.to_str()?;
@@ -215,16 +244,20 @@ fn expand_replica_assignment_segments(
                     "duplicate replica assignment for template '{template_name}' replica {replica}"
                 )));
             }
-            replica_ids.push(derive_service_replica_id(
-                service_id,
-                service_epoch,
-                template_name,
-                replica,
-            ));
         }
+        compact.push(ServiceReplicaAssignmentRow {
+            template_name: template_name.to_string(),
+            first_replica,
+            replica_count,
+        });
+        count = count.saturating_add(usize::from(replica_count));
     }
 
-    Ok(replica_ids)
+    Ok(ServiceReplicaAssignment {
+        replica_ids: Vec::new(),
+        compact,
+        count,
+    })
 }
 
 /// Derives the stable workload id for one service generation replica slot.
@@ -500,8 +533,7 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
     let mut attachments_cache: HashMap<Uuid, Vec<NetworkAttachment>> = HashMap::new();
 
     for row in rows.iter_mut() {
-        let template_replica_ids =
-            build_template_replica_ids(&row.task_templates, &row.replica_ids);
+        let template_replica_ids = build_template_replica_ids(row);
         let mut endpoints = Vec::new();
 
         for template in &row.task_templates {
@@ -596,23 +628,38 @@ async fn hydrate_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
     }
 }
 
-/// Map template names to their replica identifiers based on the ordered `replicaIds` list
-/// returned by the service registry so we can select the correct backend attachments for VIP
-/// collision avoidance.
-fn build_template_replica_ids(
-    task_templates: &[TaskTemplateRow],
-    replica_ids: &[Uuid],
-) -> HashMap<String, HashSet<Uuid>> {
+/// Maps template names to replica ids for endpoint hydration.
+///
+/// Service list decoding preserves compact assignment ranges. Endpoint
+/// hydration is the uncommon path that needs concrete task ids to match
+/// network attachments, so derivation stays local to this helper.
+fn build_template_replica_ids(row: &ServiceRow) -> HashMap<String, HashSet<Uuid>> {
     let mut out: HashMap<String, HashSet<Uuid>> = HashMap::new();
+    if !row.replica_assignments.is_empty() {
+        for segment in &row.replica_assignments {
+            let key = segment.template_name.to_ascii_lowercase();
+            let entry = out.entry(key).or_default();
+            for offset in 0..segment.replica_count {
+                entry.insert(derive_service_replica_id(
+                    row.service_id,
+                    row.service_epoch,
+                    &segment.template_name,
+                    segment.first_replica + offset,
+                ));
+            }
+        }
+        return out;
+    }
+
     let mut cursor = 0usize;
 
-    for template in task_templates {
+    for template in &row.task_templates {
         let key = template.name.to_ascii_lowercase();
         let entry = out.entry(key).or_default();
         let count = template.replicas as usize;
 
         for _ in 0..count {
-            if let Some(replica_id) = replica_ids.get(cursor) {
+            if let Some(replica_id) = row.replica_ids.get(cursor) {
                 entry.insert(*replica_id);
             }
             cursor = cursor.saturating_add(1);
@@ -760,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    /// Decodes compact service-list replica assignments into the same deterministic task ids.
+    /// Decodes compact service-list replica assignments without expanding the row eagerly.
     fn service_row_reads_compact_replica_assignments() {
         let service_id =
             Uuid::parse_str("4e83fe38-d78a-4e42-8e31-27234ee34a5c").expect("valid service id");
@@ -801,12 +848,27 @@ mod tests {
             .into_reader();
         let row = ServiceRow::from_reader(reader).expect("decode compact service row");
 
+        assert!(
+            row.replica_ids.is_empty(),
+            "compact service rows should not expand replica ids during list decoding"
+        );
+        assert_eq!(row.assigned_replica_count(), 2);
         assert_eq!(
-            row.replica_ids,
-            vec![
+            row.replica_assignments,
+            vec![ServiceReplicaAssignmentRow {
+                template_name: "backend".to_string(),
+                first_replica: 1,
+                replica_count: 2,
+            }]
+        );
+        assert_eq!(
+            build_template_replica_ids(&row)
+                .remove("backend")
+                .expect("backend ids"),
+            HashSet::from([
                 derive_service_replica_id(service_id, service_epoch, "backend", 1),
                 derive_service_replica_id(service_id, service_epoch, "backend", 2),
-            ]
+            ])
         );
     }
 

@@ -41,9 +41,8 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
         .get(service_id)
         .expect("load running service")
         .expect("running service spec present");
-    let task_id = *running_spec
-        .replica_ids
-        .first()
+    let task_id = running_spec
+        .assigned_replica_id(0)
         .expect("running service should expose one task id");
     let original_task = node
         .node
@@ -199,7 +198,7 @@ local_test!(
             .expect("load running service")
             .expect("running service present");
         assert_eq!(
-            baseline.replica_ids.len(),
+            baseline.assigned_replica_count(),
             2,
             "baseline deployment should allocate both replicas"
         );
@@ -256,7 +255,7 @@ local_test!(
             "deploying from stopped should activate the new manifest generation"
         );
         assert_eq!(
-            redeployed.replica_ids.len(),
+            redeployed.assigned_replica_count(),
             2,
             "deploying from stopped should repopulate assignments for all replicas"
         );

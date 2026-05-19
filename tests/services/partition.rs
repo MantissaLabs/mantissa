@@ -783,7 +783,7 @@ local_test!(services_sync_recovers_missing_entries, {
         .expect("lookup service spec")
         .expect("service spec present");
 
-    let expected_task_ids: Vec<Uuid> = expected_spec.replica_ids.clone();
+    let expected_task_ids: Vec<Uuid> = expected_spec.assigned_replica_ids();
 
     peer.node
         .services
