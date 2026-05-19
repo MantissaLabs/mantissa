@@ -1269,6 +1269,50 @@ async fn wait_for_service_status(
     false
 }
 
+/// Waits until every node observes the provided service status.
+async fn wait_for_service_status_all(
+    nodes: &[ProcessNode],
+    service_id: Uuid,
+    expected: ProtoServiceStatus,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut last_seen: BTreeMap<String, Option<ProtoServiceStatus>> = BTreeMap::new();
+    while Instant::now() < deadline {
+        let mut all_observed = true;
+        for node in nodes {
+            match node.list_services().await {
+                Ok(services) => {
+                    let current = services.into_iter().find(|spec| spec.id == service_id);
+                    let current_status = current.as_ref().map(|spec| spec.status);
+                    last_seen.insert(node.node_name.clone(), current_status);
+                    if current_status != Some(expected) {
+                        all_observed = false;
+                    }
+                }
+                Err(err) => {
+                    last_seen.insert(node.node_name.clone(), None);
+                    all_observed = false;
+                    eprintln!(
+                        "stress: service status read failed on {} while waiting for all nodes: {err:#}",
+                        node.node_name
+                    );
+                }
+            }
+        }
+
+        if all_observed {
+            return true;
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    eprintln!(
+        "stress: all-node service status timeout expected={expected:?} last_seen={last_seen:?}"
+    );
+    false
+}
+
 /// Waits until one node reports the expected service task count for one lifecycle filter.
 async fn wait_for_service_task_count(
     node: &ProcessNode,
@@ -1748,10 +1792,12 @@ fn stress_converges_large_service() {
         }
         eprintln!("stress: cluster views after roots {views:?}");
 
+        let deployment_sent_at = Instant::now();
         let service_id = cluster.nodes[0]
             .deploy_service(SERVICE_NAME, target_tasks)
             .await
             .expect("submit stress deployment");
+        let deployment_submit_elapsed = deployment_sent_at.elapsed();
         eprintln!("stress: deployment submitted ({service_id})");
 
         assert!(
@@ -1766,6 +1812,7 @@ fn stress_converges_large_service() {
             .await,
             "anchor should converge to target active service tasks"
         );
+        let active_target_elapsed = deployment_sent_at.elapsed();
         eprintln!("stress: active task target reached ({target_tasks})");
         let shard_logs = deployment_shard_log_summary(&cluster.nodes);
         let shard_threshold =
@@ -1845,7 +1892,33 @@ fn stress_converges_large_service() {
         )
         .await;
         if running_target_reached {
+            let running_target_elapsed = deployment_sent_at.elapsed();
             eprintln!("stress: running task target reached ({target_tasks})");
+            if wait_for_service_status_all(
+                &cluster.nodes,
+                service_id,
+                ProtoServiceStatus::Running,
+                Duration::from_secs(300),
+            )
+            .await
+            {
+                eprintln!(
+                    "stress: deployment ready observed elapsed={:?} submit_elapsed={:?} active_target_elapsed={:?} running_target_elapsed={:?} nodes_observed_running={}",
+                    deployment_sent_at.elapsed(),
+                    deployment_submit_elapsed,
+                    active_target_elapsed,
+                    running_target_elapsed,
+                    cluster.nodes.len(),
+                );
+            } else {
+                eprintln!(
+                    "stress: deployment ready not observed on all nodes within timeout elapsed={:?} submit_elapsed={:?} active_target_elapsed={:?} running_target_elapsed={:?}",
+                    deployment_sent_at.elapsed(),
+                    deployment_submit_elapsed,
+                    active_target_elapsed,
+                    running_target_elapsed,
+                );
+            }
         } else {
             eprintln!(
                 "stress: running task target not reached yet; continuing with reservation safety checks"
