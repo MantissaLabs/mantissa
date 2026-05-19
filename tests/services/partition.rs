@@ -27,14 +27,20 @@ local_test!(
             .await
             .expect("submit deployment");
 
+        // The split repair path below is validating steady-state partition
+        // rebalance. Every node must first observe the `Running` service spec;
+        // a partition that only has the older `Deploying` spec will treat
+        // split-pruned task rows as possible deployment propagation lag and
+        // intentionally wait longer before replacing them.
         assert!(
-            wait_for_service_status(
-                &cluster[0].node.service_controller,
+            wait_for_service_status_all(
+                &cluster,
                 service_id,
-                ServiceStatus::Running
+                ServiceStatus::Running,
+                Duration::from_secs(20)
             )
             .await,
-            "anchor should observe running service before split"
+            "all nodes should observe running service before split"
         );
         assert!(
             wait_for_service_task_count_all(&cluster, service_name, 8, Duration::from_secs(20))
@@ -101,11 +107,13 @@ local_test!(
         wait_for_cluster_view(&right_a.topology(), right_view, Duration::from_secs(15)).await;
         wait_for_cluster_view(&right_b.topology(), right_view, Duration::from_secs(15)).await;
 
-        assert!(
+        let split_task_count_converged =
             wait_for_service_task_count_all(&cluster, service_name, 8, Duration::from_secs(30))
-                .await,
-            "each partition should converge on eight active tasks after split"
-        );
+                .await;
+        if !split_task_count_converged {
+            let details = collect_service_task_count_debug(&cluster, service_name).await;
+            panic!("each partition should converge on eight active tasks after split: {details}");
+        }
         assert!(
             wait_for_min_local_service_task_count_refs(
                 &[left_a, left_b],

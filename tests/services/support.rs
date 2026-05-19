@@ -840,6 +840,58 @@ pub(crate) async fn all_nodes_have_service_task_count(
     true
 }
 
+/// Renders active service task counts and placements for assertion failures.
+pub(crate) async fn collect_service_task_count_debug(
+    cluster: &[TestNode],
+    service_name: &str,
+) -> String {
+    let mut rows = Vec::with_capacity(cluster.len());
+    for node in cluster {
+        let mut tasks = list_active_service_tasks(&node.node.workload_manager, service_name).await;
+        let service_summary = node
+            .node
+            .service_controller
+            .list_services()
+            .map(|services| {
+                services
+                    .into_iter()
+                    .find(|service| service.service_name == service_name)
+                    .map(|service| {
+                        format!(
+                            "status={:?} epoch={} phase={} assigned={} compact_segments={} explicit_ids={}",
+                            service.status(),
+                            service.service_epoch,
+                            service.phase_version,
+                            service.assigned_replica_count(),
+                            service.replica_assignment_segments.len(),
+                            service.replica_ids.len()
+                        )
+                    })
+                    .unwrap_or_else(|| "missing_service".to_string())
+            })
+            .unwrap_or_else(|err| format!("service_error={err:#}"));
+        tasks.sort_by_key(|task| (task.node_id, task.name.clone(), task.id));
+        let summary = tasks
+            .iter()
+            .map(|task| {
+                format!(
+                    "{}:{}@{}:{:?}",
+                    task.name, task.id, task.node_id, task.state
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        rows.push(format!(
+            "node={} {} count={} tasks=[{}]",
+            node.id(),
+            service_summary,
+            tasks.len(),
+            summary
+        ));
+    }
+    rows.join(" | ")
+}
+
 /// Waits until every node converges on the expected active task count for a service.
 pub(crate) async fn wait_for_service_task_count_all(
     cluster: &[TestNode],
@@ -1535,6 +1587,25 @@ pub(crate) async fn wait_for_service_status(
             false
         },
     )
+    .await
+}
+
+/// Waits until every node has observed the expected replicated service lifecycle status.
+pub(crate) async fn wait_for_service_status_all(
+    cluster: &[TestNode],
+    service_id: Uuid,
+    expected: ServiceStatus,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(50), || async {
+        for node in cluster {
+            match node.node.service_controller.registry().get(service_id) {
+                Ok(Some(spec)) if spec.status() == expected => {}
+                _ => return false,
+            }
+        }
+        true
+    })
     .await
 }
 
