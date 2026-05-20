@@ -627,6 +627,26 @@ struct ServiceShardAssignmentRequest {
 struct ServiceShardAssignmentResponse {
   specs @0 :List(WorkloadSpec);
   # Workload rows created or reused by the shard coordinator, in request order.
+
+  success @1 :Bool;
+  # True when specs contains the successful coordinator result.
+
+  failureKind @2 :ServiceShardAssignmentFailureKind;
+  # Coordinator-side failure class when success is false.
+
+  failureMessage @3 :Text;
+  # Coordinator-side failure detail when success is false.
+}
+
+enum ServiceShardAssignmentFailureKind {
+  hard @0;
+  # Deterministic scheduler/application rejection; do not treat as RPC handoff loss.
+
+  retryable @1;
+  # Coordinator accepted the request but scheduling prerequisites are still converging.
+
+  capacity @2;
+  # Coordinator accepted the request but target capacity is currently exhausted.
 }
 
 struct ServiceGenerationProgressRecord {

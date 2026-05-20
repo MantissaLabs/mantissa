@@ -590,6 +590,45 @@ pub(crate) struct ServiceShardAssignmentRequest {
     pub(crate) requests: Vec<WorkloadStartRequest>,
 }
 
+/// Coordinator-side service shard failure class preserved across the workload RPC.
+///
+/// Transport failures mean the owner does not know whether a coordinator saw
+/// the request. These classes are different: they are returned only after the
+/// coordinator accepted and attempted the shard, so the service owner can apply
+/// the same lifecycle semantics it would use for a local scheduling result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ServiceShardAssignmentFailureClass {
+    Retryable,
+    Capacity,
+    Hard,
+}
+
+/// Typed remote service shard application failure returned by a coordinator.
+#[derive(Debug, thiserror::Error)]
+#[error("remote service shard coordinator failed: {message}")]
+pub(crate) struct ServiceShardAssignmentFailure {
+    class: ServiceShardAssignmentFailureClass,
+    message: String,
+}
+
+impl ServiceShardAssignmentFailure {
+    /// Builds one typed coordinator application failure received over RPC.
+    pub(crate) fn new(
+        class: ServiceShardAssignmentFailureClass,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            class,
+            message: message.into(),
+        }
+    }
+
+    /// Returns the coordinator-side failure class for service lifecycle decisions.
+    pub(crate) fn class(&self) -> ServiceShardAssignmentFailureClass {
+        self.class
+    }
+}
+
 impl Deref for WorkloadStartRequest {
     type Target = ResolvedExecutionSpec;
 
@@ -2970,6 +3009,14 @@ fn is_retryable_scheduling_error(err: &anyhow::Error) -> bool {
 /// Higher-level controllers should keep work pending not only for short-lived convergence
 /// failures, but also for pure capacity shortages that may resolve once older workloads drain.
 pub(crate) fn workload_start_error_is_retryable(err: &anyhow::Error) -> bool {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<ServiceShardAssignmentFailure>()
+            .is_some_and(|failure| failure.class() == ServiceShardAssignmentFailureClass::Retryable)
+    }) {
+        return true;
+    }
+
     err.chain()
         .find_map(|cause| cause.downcast_ref::<SchedulingError>())
         .is_some_and(|cause| {
@@ -2991,6 +3038,14 @@ pub(crate) fn workload_start_error_is_retryable(err: &anyhow::Error) -> bool {
 /// Services already have explicit rollout failure semantics, so pure capacity shortages should
 /// consume that controller budget instead of leaving the service indefinitely pending.
 pub(crate) fn workload_start_error_requires_service_requeue(err: &anyhow::Error) -> bool {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<ServiceShardAssignmentFailure>()
+            .is_some_and(|failure| failure.class() == ServiceShardAssignmentFailureClass::Retryable)
+    }) {
+        return true;
+    }
+
     err.chain()
         .find_map(|cause| cause.downcast_ref::<SchedulingError>())
         .is_some_and(|cause| {
@@ -3005,6 +3060,14 @@ pub(crate) fn workload_start_error_requires_service_requeue(err: &anyhow::Error)
 
 /// Builds a concise service-facing detail for retryable workload start failures.
 pub(crate) fn workload_start_retryable_detail(err: &anyhow::Error) -> Option<String> {
+    if let Some(failure) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ServiceShardAssignmentFailure>())
+        .filter(|failure| failure.class() == ServiceShardAssignmentFailureClass::Retryable)
+    {
+        return Some(failure.to_string());
+    }
+
     err.chain()
         .find_map(|cause| cause.downcast_ref::<SchedulingError>())
         .and_then(|cause| match cause {
@@ -3036,6 +3099,14 @@ fn format_scheduling_networks(networks: &[Uuid]) -> String {
 
 /// Returns true when a service launch failure should consume its failure budget.
 pub(crate) fn workload_start_error_consumes_service_failure_budget(err: &anyhow::Error) -> bool {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<ServiceShardAssignmentFailure>()
+            .is_some_and(|failure| failure.class() == ServiceShardAssignmentFailureClass::Capacity)
+    }) {
+        return true;
+    }
+
     err.chain()
         .find_map(|cause| cause.downcast_ref::<SchedulingError>())
         .is_some_and(|cause| {
@@ -3046,6 +3117,47 @@ pub(crate) fn workload_start_error_consumes_service_failure_budget(err: &anyhow:
                     | SchedulingError::InsufficientCapacityOnTarget { .. }
             )
         })
+}
+
+/// Classifies one coordinator-side shard error before sending it over RPC.
+///
+/// The coordinator has already accepted the request when this function is used.
+/// Keeping the class separate from transport failure prevents the owner from
+/// retrying deterministic scheduler rejections forever as if the RPC were lost.
+pub(crate) fn classify_service_shard_assignment_failure(
+    err: &anyhow::Error,
+) -> ServiceShardAssignmentFailureClass {
+    if err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<SchedulingError>())
+        .is_some_and(|cause| {
+            matches!(
+                cause,
+                SchedulingError::SnapshotMissing
+                    | SchedulingError::NetworksBlocked { .. }
+                    | SchedulingError::LocalNetworksBlocked { .. }
+            )
+        })
+    {
+        return ServiceShardAssignmentFailureClass::Retryable;
+    }
+
+    if err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<SchedulingError>())
+        .is_some_and(|cause| {
+            matches!(
+                cause,
+                SchedulingError::NoCapacityAcrossCluster
+                    | SchedulingError::InsufficientCapacityForBatch
+                    | SchedulingError::InsufficientCapacityOnTarget { .. }
+            )
+        })
+    {
+        return ServiceShardAssignmentFailureClass::Capacity;
+    }
+
+    ServiceShardAssignmentFailureClass::Hard
 }
 
 /// Pick a smaller scheduling retry budget for targeted starts so callers can fall back quickly.

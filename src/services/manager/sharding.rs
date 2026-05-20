@@ -2,7 +2,7 @@ use super::*;
 use crate::services::ownership::{
     ServiceDeploymentShard, build_service_deployment_shards, select_shard_coordinator,
 };
-use crate::workload::manager::ServiceShardAssignmentRequest;
+use crate::workload::manager::{ServiceShardAssignmentFailure, ServiceShardAssignmentRequest};
 use crate::workload::model::WorkloadOwner;
 use anyhow::Context;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -408,11 +408,11 @@ impl ServiceController {
 
     /// Coordinates one deployment shard locally or through the selected remote coordinator.
     ///
-    /// Local coordinator errors keep their original type so real scheduling
-    /// failures still consume the normal failure budget. Remote coordinator
-    /// errors are wrapped as retryable handoff failures because the owner cannot
-    /// distinguish a temporarily unavailable coordinator from a durable launch
-    /// rejection until the request is actually processed by that coordinator.
+    /// Local coordinator errors keep their original type. Remote errors are
+    /// split into two cases: coordinator application failures keep their typed
+    /// response classification, while transport/session failures become
+    /// retryable handoff failures because the owner cannot know whether the
+    /// selected coordinator processed the request.
     async fn coordinate_deployment_shard(
         &self,
         service_id: Uuid,
@@ -447,6 +447,14 @@ impl ServiceController {
                 .coordinate_remote_service_shard_assignments(shard.coordinator_node_id, request)
                 .await
                 .map_err(|err| {
+                    if err.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<ServiceShardAssignmentFailure>()
+                            .is_some()
+                    }) {
+                        return err;
+                    }
+
                     anyhow::Error::new(ServiceShardCoordinationError {
                         shard_index: shard.shard_index,
                         coordinator_node_id: shard.coordinator_node_id,

@@ -17,7 +17,10 @@ use crate::scheduler::{
     SchedulerError, SlotId, SlotReservationRequest,
 };
 use crate::workload::model::{WorkloadAdmissionState, WorkloadPhase, WorkloadSpec};
-use crate::workload::service::{read_spec, write_service_shard_assignment_request, write_spec};
+use crate::workload::service::{
+    read_service_shard_assignment_response, read_spec, write_service_shard_assignment_request,
+    write_spec,
+};
 
 use super::planner::{BatchStartPlan, PreparedRemoteStartPlan, RemoteStartPlan};
 use super::{ServiceShardAssignmentRequest, WorkloadManager};
@@ -1281,7 +1284,7 @@ impl WorkloadManager {
                 request.shard_index
             )
         })?;
-        let specs_reader = response
+        let response_reader = response
             .get()
             .with_context(|| {
                 format!(
@@ -1295,26 +1298,13 @@ impl WorkloadManager {
                     "missing service shard {} response from peer {peer_id}",
                     request.shard_index
                 )
-            })?
-            .get_specs()
-            .with_context(|| {
-                format!(
-                    "missing service shard {} specs from peer {peer_id}",
-                    request.shard_index
-                )
             })?;
-
-        let mut specs = Vec::with_capacity(specs_reader.len() as usize);
-        for reader in specs_reader.iter() {
-            specs.push(read_spec(reader).map_err(|err| {
-                anyhow::anyhow!(
-                    "failed to decode service shard {} response from peer {peer_id}: {err}",
-                    request.shard_index
-                )
-            })?);
-        }
-
-        Ok(specs)
+        read_service_shard_assignment_response(&response_reader).with_context(|| {
+            format!(
+                "service shard {} application response failed for peer {peer_id}",
+                request.shard_index
+            )
+        })
     }
 
     /// Requests a remote peer to stop a task so the owner updates state and broadcasts it.

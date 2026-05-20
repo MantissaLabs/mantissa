@@ -519,6 +519,92 @@ local_test!(
     }
 );
 
+local_test!(
+    services_sharded_remote_scheduler_failure_is_not_treated_as_rpc_failure,
+    {
+        let _config_guard = ConfigOverrideGuard::service_sharding(1, 1, 4, 2);
+        let _runtime_guard = RuntimeBackendOverrideGuard::install_default();
+
+        let cluster = TestNode::new_cluster_inproc_with_config(2, sharded_cluster_config())
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes")
+            .await;
+
+        let remote_target = cluster[1].id();
+        let service_name = "sharded-remote-host-port-failure";
+        let mut template = demo_backend_task_template("backend", 2);
+        template.execution.placement.constraints = vec![
+            PlacementConstraint::eq(
+                PlacementConstraintSelector::NodeId,
+                remote_target.to_string(),
+            )
+            .expect("node id placement constraint should be valid"),
+        ];
+        template.execution.ports = vec![WorkloadPortBinding {
+            name: "http".to_string(),
+            target_port: 8000,
+            host_port: 18080,
+            host_ip: "0.0.0.0".to_string(),
+            protocol: WorkloadPortProtocol::Tcp,
+        }];
+
+        let service_id = cluster[0]
+            .node
+            .service_controller
+            .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
+            .await
+            .expect("submit sharded host-port-conflicting deployment");
+
+        let host_port_detail_seen = wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+            || async {
+                cluster[0]
+                    .node
+                    .service_controller
+                    .registry()
+                    .get(service_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|spec| spec.status_detail)
+                    .is_some_and(|detail| detail.contains("host ports unavailable"))
+            },
+        )
+        .await;
+        let spec = cluster[0]
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("load conflicted service spec")
+            .expect("conflicted service spec should be present");
+        let detail = spec.status_detail.clone().unwrap_or_default();
+        assert!(
+            host_port_detail_seen,
+            "remote shard coordinator scheduler failures should surface as application errors; \
+             final detail: {detail}"
+        );
+        assert!(
+            !detail.contains("did not complete"),
+            "remote coordinator application failures must not be classified as handoff loss: \
+             {detail}"
+        );
+        assert!(
+            wait_for_service_task_count_all(&cluster, service_name, 0, Duration::from_secs(20))
+                .await,
+            "remote shard scheduler failure should not leave active service tasks"
+        );
+        for node in &cluster {
+            assert!(
+                wait_for_reserved_slots(node, 0, Duration::from_secs(20)).await,
+                "node {} should not keep reservations after remote shard scheduler failure",
+                node.id()
+            );
+        }
+    }
+);
+
 local_test!(services_sharded_task_splitting_converges, {
     let _config_guard = ConfigOverrideGuard::service_sharding(1, 8, 1, 2);
     let _runtime_guard = RuntimeBackendOverrideGuard::install_default();

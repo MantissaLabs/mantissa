@@ -5,7 +5,9 @@ use crate::workload::capnp_codec::{
     encode_task_restart_policy, encode_volume_mounts,
 };
 use crate::workload::manager::{
+    ServiceShardAssignmentFailure, ServiceShardAssignmentFailureClass,
     ServiceShardAssignmentRequest, WorkloadManager, WorkloadStartRequest,
+    classify_service_shard_assignment_failure,
 };
 use crate::workload::model::{
     ExecutionPlatform, IsolationMode, ServiceGenerationProgressCounts,
@@ -20,6 +22,7 @@ use capnp::Error;
 use mantissa_protocol::gossip::gossip_message;
 use mantissa_protocol::workload::{
     AdmissionGroupPhase as ProtoAdmissionGroupPhase,
+    ServiceShardAssignmentFailureKind as ProtoServiceShardAssignmentFailureKind,
     WorkloadStateFilter as ProtoWorkloadStateFilter, admission_group_record,
     service_generation_progress_record, service_shard_assignment_request, workload,
     workload_assignment_batch_request, workload_event, workload_list_request, workload_spec,
@@ -107,16 +110,19 @@ impl workload::Server for WorkloadService {
     ) -> Result<(), Error> {
         let request = params.get()?.get_request()?;
         let request = read_service_shard_assignment_request(&request)?;
-        let specs = self
+        let response = results.get().init_response();
+
+        match self
             .manager
             .coordinate_service_shard_assignments(request)
             .await
-            .map_err(|err| Error::failed(err.to_string()))?;
-
-        let mut response = results.get().init_response();
-        let mut spec_list = response.reborrow().init_specs(specs.len() as u32);
-        for (index, spec) in specs.iter().enumerate() {
-            write_spec(spec_list.reborrow().get(index as u32), spec);
+        {
+            Ok(specs) => write_service_shard_assignment_success(response, &specs),
+            Err(err) => {
+                let failure_class = classify_service_shard_assignment_failure(&err);
+                let failure_message = service_shard_assignment_failure_message(&err);
+                write_service_shard_assignment_failure(response, failure_class, &failure_message);
+            }
         }
         Ok(())
     }
@@ -925,6 +931,114 @@ fn read_service_shard_assignment_request(
         shard_index: request.get_shard_index() as usize,
         requests,
     })
+}
+
+/// Encodes one successful service-shard coordination response.
+pub(crate) fn write_service_shard_assignment_success(
+    mut builder: mantissa_protocol::workload::service_shard_assignment_response::Builder<'_>,
+    specs: &[WorkloadSpec],
+) {
+    builder.set_success(true);
+    let mut spec_list = builder.reborrow().init_specs(specs.len() as u32);
+    for (index, spec) in specs.iter().enumerate() {
+        write_spec(spec_list.reborrow().get(index as u32), spec);
+    }
+}
+
+/// Encodes one coordinator-side service-shard application failure.
+fn write_service_shard_assignment_failure(
+    mut builder: mantissa_protocol::workload::service_shard_assignment_response::Builder<'_>,
+    failure_class: ServiceShardAssignmentFailureClass,
+    message: &str,
+) {
+    builder.set_success(false);
+    builder.set_failure_kind(service_shard_failure_class_to_proto(failure_class));
+    builder.set_failure_message(message);
+}
+
+/// Builds the coordinator-side failure text sent back to the service owner.
+///
+/// The owner persists this text into the service status detail. Keeping the
+/// full cause chain matters because most scheduler errors carry a broad context
+/// first and the operator-facing reason, such as host-port exhaustion, deeper in
+/// the chain.
+fn service_shard_assignment_failure_message(err: &anyhow::Error) -> String {
+    let parts = err
+        .chain()
+        .map(ToString::to_string)
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>();
+
+    if parts.is_empty() {
+        err.to_string()
+    } else {
+        parts.join(": ")
+    }
+}
+
+/// Converts an internal service-shard failure class to its wire representation.
+fn service_shard_failure_class_to_proto(
+    class: ServiceShardAssignmentFailureClass,
+) -> ProtoServiceShardAssignmentFailureKind {
+    match class {
+        ServiceShardAssignmentFailureClass::Retryable => {
+            ProtoServiceShardAssignmentFailureKind::Retryable
+        }
+        ServiceShardAssignmentFailureClass::Capacity => {
+            ProtoServiceShardAssignmentFailureKind::Capacity
+        }
+        ServiceShardAssignmentFailureClass::Hard => ProtoServiceShardAssignmentFailureKind::Hard,
+    }
+}
+
+/// Converts a service-shard wire failure class into the internal lifecycle class.
+fn service_shard_failure_class_from_proto(
+    class: Result<ProtoServiceShardAssignmentFailureKind, capnp::NotInSchema>,
+) -> ServiceShardAssignmentFailureClass {
+    match class {
+        Ok(ProtoServiceShardAssignmentFailureKind::Retryable) => {
+            ServiceShardAssignmentFailureClass::Retryable
+        }
+        Ok(ProtoServiceShardAssignmentFailureKind::Capacity) => {
+            ServiceShardAssignmentFailureClass::Capacity
+        }
+        Ok(ProtoServiceShardAssignmentFailureKind::Hard) | Err(_) => {
+            ServiceShardAssignmentFailureClass::Hard
+        }
+    }
+}
+
+/// Decodes one service-shard coordination response from a remote coordinator.
+pub(crate) fn read_service_shard_assignment_response(
+    response: &mantissa_protocol::workload::service_shard_assignment_response::Reader<'_>,
+) -> anyhow::Result<Vec<WorkloadSpec>> {
+    if !response.get_success() {
+        let message = response
+            .get_failure_message()
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?
+            .to_str()
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?
+            .trim();
+        let message = if message.is_empty() {
+            "remote service shard coordinator returned an empty failure".to_string()
+        } else {
+            message.to_string()
+        };
+        let failure = ServiceShardAssignmentFailure::new(
+            service_shard_failure_class_from_proto(response.get_failure_kind()),
+            message,
+        );
+        return Err(anyhow::Error::new(failure));
+    }
+
+    let specs_reader = response
+        .get_specs()
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let mut specs = Vec::with_capacity(specs_reader.len() as usize);
+    for reader in specs_reader.iter() {
+        specs.push(read_spec(reader).map_err(|err| anyhow::anyhow!(err.to_string()))?);
+    }
+    Ok(specs)
 }
 
 /// Encodes the workload-row admission barrier state into the wire schema.
