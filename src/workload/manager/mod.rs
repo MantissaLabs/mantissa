@@ -629,6 +629,26 @@ impl ServiceShardAssignmentFailure {
     }
 }
 
+/// Retryable exhaustion of one workload start transaction.
+///
+/// This is not a scheduler verdict about the workload itself. It means the
+/// start loop repeatedly hit mutable placement, reservation, or assignment
+/// contention before it could complete. Service owners and shard coordinators
+/// should retry later instead of treating this as a deterministic application
+/// failure.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to schedule workloads after {attempts} attempts")]
+struct WorkloadStartAttemptsExhausted {
+    attempts: usize,
+}
+
+impl WorkloadStartAttemptsExhausted {
+    /// Builds one typed start-loop exhaustion error for lifecycle classification.
+    fn new(attempts: usize) -> Self {
+        Self { attempts }
+    }
+}
+
 impl Deref for WorkloadStartRequest {
     type Target = ResolvedExecutionSpec;
 
@@ -1934,9 +1954,9 @@ impl WorkloadManager {
             }
         }
 
-        Err(anyhow::anyhow!(
-            "failed to schedule workloads after {WORKLOAD_START_MAX_ATTEMPTS} attempts"
-        ))
+        Err(anyhow::Error::new(WorkloadStartAttemptsExhausted::new(
+            WORKLOAD_START_MAX_ATTEMPTS,
+        )))
     }
 
     /// Returns workload specifications filtered according to the provided list policy.
@@ -3004,6 +3024,15 @@ fn is_retryable_scheduling_error(err: &anyhow::Error) -> bool {
         })
 }
 
+/// Returns true when the workload start loop exhausted retry attempts before reaching a verdict.
+fn workload_start_error_exhausted_attempts(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<WorkloadStartAttemptsExhausted>()
+            .is_some()
+    })
+}
+
 /// Returns true when one workload-start failure should stay queued at the controller layer.
 ///
 /// Higher-level controllers should keep work pending not only for short-lived convergence
@@ -3014,6 +3043,10 @@ pub(crate) fn workload_start_error_is_retryable(err: &anyhow::Error) -> bool {
             .downcast_ref::<ServiceShardAssignmentFailure>()
             .is_some_and(|failure| failure.class() == ServiceShardAssignmentFailureClass::Retryable)
     }) {
+        return true;
+    }
+
+    if workload_start_error_exhausted_attempts(err) {
         return true;
     }
 
@@ -3046,6 +3079,10 @@ pub(crate) fn workload_start_error_requires_service_requeue(err: &anyhow::Error)
         return true;
     }
 
+    if workload_start_error_exhausted_attempts(err) {
+        return true;
+    }
+
     err.chain()
         .find_map(|cause| cause.downcast_ref::<SchedulingError>())
         .is_some_and(|cause| {
@@ -3066,6 +3103,10 @@ pub(crate) fn workload_start_retryable_detail(err: &anyhow::Error) -> Option<Str
         .filter(|failure| failure.class() == ServiceShardAssignmentFailureClass::Retryable)
     {
         return Some(failure.to_string());
+    }
+
+    if workload_start_error_exhausted_attempts(err) {
+        return Some("waiting for workload scheduling contention to clear".to_string());
     }
 
     err.chain()
@@ -3156,6 +3197,10 @@ pub(crate) fn workload_start_error_is_terminal_service_launch(err: &anyhow::Erro
 pub(crate) fn classify_service_shard_assignment_failure(
     err: &anyhow::Error,
 ) -> ServiceShardAssignmentFailureClass {
+    if workload_start_error_exhausted_attempts(err) {
+        return ServiceShardAssignmentFailureClass::Retryable;
+    }
+
     if err
         .chain()
         .find_map(|cause| cause.downcast_ref::<SchedulingError>())

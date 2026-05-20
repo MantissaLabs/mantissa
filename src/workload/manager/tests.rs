@@ -8834,6 +8834,33 @@ async fn workload_start_service_requeue_excludes_capacity_shortage() {
 }
 
 #[tokio::test]
+async fn workload_start_attempt_exhaustion_is_retryable_for_service_shards() {
+    let result = anyhow::Error::new(WorkloadStartAttemptsExhausted::new(5));
+
+    assert!(
+        workload_start_error_is_retryable(&result),
+        "controller-level workload starts should retry generic transaction exhaustion"
+    );
+    assert!(
+        workload_start_error_requires_service_requeue(&result),
+        "service launches should keep deploying after generic start-loop exhaustion"
+    );
+    assert!(
+        !workload_start_error_consumes_service_failure_budget(&result),
+        "generic start-loop exhaustion is contention, not a capacity verdict"
+    );
+    assert!(
+        !workload_start_error_is_terminal_service_launch(&result),
+        "generic start-loop exhaustion should not terminally fail a service generation"
+    );
+    assert_eq!(
+        classify_service_shard_assignment_failure(&result),
+        ServiceShardAssignmentFailureClass::Retryable,
+        "remote shard coordinators must not send generic contention back as hard failure"
+    );
+}
+
+#[tokio::test]
 async fn start_tasks_batch_rejects_unsupported_local_execution_platform() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
     scheduler
