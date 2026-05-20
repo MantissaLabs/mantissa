@@ -615,6 +615,122 @@ local_test!(
     }
 );
 
+local_test!(
+    services_sharded_coordinator_unavailable_retries_and_converges,
+    {
+        let _config_guard = ConfigOverrideGuard::service_sharding(1, 1, 2, 1);
+        let _runtime_guard = RuntimeBackendOverrideGuard::install_default();
+
+        let mut cluster = TestNode::new_cluster_inproc_with_config(2, sharded_cluster_config())
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes")
+            .await;
+        assert!(
+            wait_for_cached_cluster_sessions_all(&cluster, Duration::from_secs(10)).await,
+            "nodes should cache peer sessions before the coordinator is stopped"
+        );
+
+        let coordinator_id = cluster[1].id();
+        cluster[1]
+            .stop()
+            .await
+            .expect("stop selected shard coordinator before deployment");
+        // In-process tests can keep an already-open session alive after listener stop.
+        // Clearing the owner's cached capabilities makes the deployment exercise the
+        // same reconnect and coordinator-unavailable path that a real remote outage uses.
+        cluster[0]
+            .node
+            .registry
+            .invalidate_peer_capabilities(coordinator_id)
+            .await;
+
+        let service_name = "sharded-coordinator-unavailable";
+        let mut template = demo_backend_task_template("backend", 2);
+        template.execution.placement.constraints = vec![
+            PlacementConstraint::eq(
+                PlacementConstraintSelector::NodeId,
+                coordinator_id.to_string(),
+            )
+            .expect("node id placement constraint should be valid"),
+        ];
+
+        let service_id = cluster[0]
+            .node
+            .service_controller
+            .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
+            .await
+            .expect("submit deployment pinned to the stopped shard coordinator");
+
+        let coordinator_unavailable_detail_seen = wait_until(
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+            || async {
+                cluster[0]
+                    .node
+                    .service_controller
+                    .registry()
+                    .get(service_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|spec| {
+                        spec.status() == ServiceStatus::Deploying
+                            && spec
+                                .status_detail
+                                .as_deref()
+                                .is_some_and(|detail| detail.contains("did not complete"))
+                    })
+            },
+        )
+        .await;
+        let interrupted_spec = cluster[0]
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("load interrupted service spec")
+            .expect("interrupted service spec should be present");
+
+        cluster[1]
+            .start()
+            .await
+            .expect("restart selected shard coordinator");
+
+        assert!(
+            coordinator_unavailable_detail_seen,
+            "unavailable shard coordinator should leave the service retrying; final status={:?} \
+             detail={:?}",
+            interrupted_spec.status(),
+            interrupted_spec.status_detail
+        );
+        assert_ne!(
+            interrupted_spec.status(),
+            ServiceStatus::Failed,
+            "coordinator unavailability should not terminally fail the generation"
+        );
+        TestNode::assert_cluster_size_all(
+            &cluster,
+            2,
+            "cluster should stabilise after restarting the coordinator",
+        )
+        .await;
+        assert!(
+            wait_for_service_status_all(
+                &cluster,
+                service_id,
+                ServiceStatus::Running,
+                Duration::from_secs(45)
+            )
+            .await,
+            "deployment should retry after coordinator restart and reach running everywhere"
+        );
+        assert!(
+            wait_for_sharded_service_running_all(&cluster, service_name, 2).await,
+            "retried sharded deployment should converge to two running tasks everywhere"
+        );
+    }
+);
+
 local_test!(services_sharded_hard_failure_drains_successful_shards, {
     let _config_guard = ConfigOverrideGuard::service_sharding(1, 1, 4, 1);
     let _runtime_guard = RuntimeBackendOverrideGuard::install_default();
