@@ -19,7 +19,8 @@ use crate::volumes::{LocalVolumeAccessError, VolumeRegistry};
 use crate::workload::manager::WorkloadManager;
 use crate::workload::manager::{
     WorkloadStartRequest, workload_start_error_consumes_service_failure_budget,
-    workload_start_error_requires_service_requeue, workload_start_retryable_detail,
+    workload_start_error_is_terminal_service_launch, workload_start_error_requires_service_requeue,
+    workload_start_retryable_detail,
 };
 use crate::workload::model::{
     ServiceGenerationProgressRecord, WorkloadPhase, WorkloadSpec, WorkloadVolumeMount,

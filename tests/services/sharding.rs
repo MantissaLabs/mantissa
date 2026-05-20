@@ -80,6 +80,17 @@ async fn active_target_node_count(node: &TestNode, service_name: &str) -> usize 
         .len()
 }
 
+/// Builds one static TCP host-port binding for scheduler conflict tests.
+fn static_tcp_host_port(host_port: u16) -> WorkloadPortBinding {
+    WorkloadPortBinding {
+        name: "http".to_string(),
+        target_port: 8000,
+        host_port,
+        host_ip: "0.0.0.0".to_string(),
+        protocol: WorkloadPortProtocol::Tcp,
+    }
+}
+
 /// Waits until at least one scheduler slot is reserved on any node in the cluster.
 async fn wait_for_any_reserved_slot(cluster: &[TestNode], timeout: Duration) -> bool {
     wait_until(timeout, Duration::from_millis(100), || async {
@@ -541,13 +552,7 @@ local_test!(
             )
             .expect("node id placement constraint should be valid"),
         ];
-        template.execution.ports = vec![WorkloadPortBinding {
-            name: "http".to_string(),
-            target_port: 8000,
-            host_port: 18080,
-            host_ip: "0.0.0.0".to_string(),
-            protocol: WorkloadPortProtocol::Tcp,
-        }];
+        template.execution.ports = vec![static_tcp_host_port(18080)];
 
         let service_id = cluster[0]
             .node
@@ -585,6 +590,11 @@ local_test!(
             "remote shard coordinator scheduler failures should surface as application errors; \
              final detail: {detail}"
         );
+        assert_eq!(
+            spec.status(),
+            ServiceStatus::Failed,
+            "hard remote shard scheduler failures should terminally fail the generation"
+        );
         assert!(
             !detail.contains("did not complete"),
             "remote coordinator application failures must not be classified as handoff loss: \
@@ -604,6 +614,104 @@ local_test!(
         }
     }
 );
+
+local_test!(services_sharded_hard_failure_drains_successful_shards, {
+    let _config_guard = ConfigOverrideGuard::service_sharding(1, 1, 4, 1);
+    let _runtime_guard = RuntimeBackendOverrideGuard::install_default();
+
+    let cluster = TestNode::new_cluster_inproc_with_config(2, sharded_cluster_config())
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes").await;
+
+    let mut targets = cluster.iter().map(TestNode::id).collect::<Vec<_>>();
+    targets.sort_unstable();
+    let successful_target = targets[0];
+    let failing_target = targets[1];
+
+    let service_name = "sharded-partial-hard-failure";
+    let mut successful_template = demo_backend_task_template("healthy", 1);
+    successful_template.execution.placement.constraints = vec![
+        PlacementConstraint::eq(
+            PlacementConstraintSelector::NodeId,
+            successful_target.to_string(),
+        )
+        .expect("successful node id placement constraint should be valid"),
+    ];
+    successful_template.execution.ports = vec![static_tcp_host_port(18081)];
+
+    let mut failing_template = demo_backend_task_template("conflict", 2);
+    failing_template.execution.placement.constraints = vec![
+        PlacementConstraint::eq(
+            PlacementConstraintSelector::NodeId,
+            failing_target.to_string(),
+        )
+        .expect("failing node id placement constraint should be valid"),
+    ];
+    failing_template.execution.ports = vec![static_tcp_host_port(18080)];
+
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![successful_template, failing_template],
+        )
+        .await
+        .expect("submit partially successful sharded deployment");
+
+    let failure_detail_seen = wait_until(
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        || async {
+            cluster[0]
+                .node
+                .service_controller
+                .registry()
+                .get(service_id)
+                .ok()
+                .flatten()
+                .is_some_and(|spec| {
+                    spec.status() == ServiceStatus::Failed
+                        && spec
+                            .status_detail
+                            .as_deref()
+                            .is_some_and(|detail| detail.contains("host ports unavailable"))
+                })
+        },
+    )
+    .await;
+    let spec = cluster[0]
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("load partial-failure service spec")
+        .expect("partial-failure service spec should be present");
+    assert!(
+        failure_detail_seen,
+        "hard shard failure should mark the generation failed; final status={:?} detail={:?}",
+        spec.status(),
+        spec.status_detail
+    );
+    assert!(
+        spec.assigned_replica_ids().is_empty(),
+        "failed partial sharded deployment should not retain desired replica ids"
+    );
+    assert!(
+        wait_for_service_task_count_all(&cluster, service_name, 0, Duration::from_secs(30)).await,
+        "successful shards should drain after a later hard shard failure"
+    );
+    for node in &cluster {
+        assert!(
+            wait_for_reserved_slots(node, 0, Duration::from_secs(30)).await,
+            "node {} should release reservations after partial sharded failure",
+            node.id()
+        );
+    }
+});
 
 local_test!(services_sharded_task_splitting_converges, {
     let _config_guard = ConfigOverrideGuard::service_sharding(1, 8, 1, 2);

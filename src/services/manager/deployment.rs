@@ -673,130 +673,17 @@ impl ServiceController {
         {
             Ok(specs) => specs,
             Err(err) => {
-                tracing::warn!(
-                    target: "services",
-                    "initial task launch for service '{}' failed: {err:#}",
-                    service_name
-                );
-
-                if deployment_launch_error_requires_service_requeue(&err) {
-                    self.persist_retryable_deployment_launch_error(service_id, &service_name, &err)
-                        .await;
-                    tracing::info!(
-                        target: "services",
-                        "deferring deployment retry for '{}' until scheduling prerequisites converge",
-                        service_name
-                    );
-                    return Ok(());
-                }
-
-                let detail = service_error_detail(&err);
-                match self.registry.get(service_id) {
-                    Ok(Some(mut persisted_spec)) if is_local_volume_unavailable_error(&err) => {
-                        persisted_spec
-                            .set_replica_ids_compact_when_derived(desired_task_ids.clone());
-                        persisted_spec.set_rollout(ServiceRolloutState::default());
-                        persisted_spec.set_status(ServiceStatus::VolumeUnavailable);
-                        if let Err(upsert_err) = self.apply_upsert(persisted_spec.clone()).await {
-                            tracing::warn!(
-                                target: "services",
-                                "failed to persist volume-unavailable state for '{}': {upsert_err}",
-                                service_name
-                            );
-                        } else if let Err(broadcast_err) =
-                            self.broadcast(ServiceEvent::Upsert(persisted_spec)).await
-                        {
-                            tracing::warn!(
-                                target: "services",
-                                "failed to broadcast volume-unavailable state for '{}': {broadcast_err}",
-                                service_name
-                            );
-                        }
-                    }
-                    Ok(Some(persisted_spec)) => {
-                        self.persist_deploying_launch_error(persisted_spec.clone(), detail.clone())
-                            .await;
-                        if workload_start_error_consumes_service_failure_budget(&err) {
-                            let controller = self.clone();
-                            tokio::task::spawn_local(async move {
-                                controller.await_service_readiness(persisted_spec).await;
-                            });
-                        }
-                    }
-                    Ok(None) if is_local_volume_unavailable_error(&err) => {
-                        let mut blocked_spec = ServiceSpecValue::new(
-                            manifest_id,
-                            manifest_name.clone(),
-                            service_name.clone(),
-                            task_templates.clone(),
-                            desired_task_ids,
-                        );
-                        blocked_spec.update_strategy = update_strategy.clone();
-                        blocked_spec.admission_policy = admission_policy;
-                        blocked_spec.set_rollout(ServiceRolloutState::default());
-                        blocked_spec.set_status(ServiceStatus::VolumeUnavailable);
-                        if let Err(upsert_err) = self.apply_upsert(blocked_spec.clone()).await {
-                            tracing::warn!(
-                                target: "services",
-                                "failed to persist fallback volume-unavailable state for '{}': {upsert_err}",
-                                service_name
-                            );
-                        } else if let Err(broadcast_err) =
-                            self.broadcast(ServiceEvent::Upsert(blocked_spec)).await
-                        {
-                            tracing::warn!(
-                                target: "services",
-                                "failed to broadcast fallback volume-unavailable state for '{}': {broadcast_err}",
-                                service_name
-                            );
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::warn!(
-                            target: "services",
-                            "unable to schedule deployment retry for '{}' because the service spec is missing; marking service failed",
-                            service_name
-                        );
-                        let mut failed_spec = ServiceSpecValue::new(
-                            manifest_id,
-                            manifest_name.clone(),
-                            service_name.clone(),
-                            task_templates.clone(),
-                            Vec::new(),
-                        );
-                        failed_spec.update_strategy = update_strategy.clone();
-                        failed_spec.admission_policy = admission_policy;
-                        failed_spec.set_rollout(ServiceRolloutState {
-                            last_error: Some(detail.clone()),
-                            ..ServiceRolloutState::default()
-                        });
-                        failed_spec.set_status(ServiceStatus::Failed);
-                        failed_spec.set_status_detail(Some(detail));
-                        if let Err(upsert_err) = self.apply_upsert(failed_spec.clone()).await {
-                            tracing::warn!(
-                                target: "services",
-                                "failed to persist fallback failed state for '{}': {upsert_err}",
-                                service_name
-                            );
-                        } else if let Err(broadcast_err) =
-                            self.broadcast(ServiceEvent::Upsert(failed_spec)).await
-                        {
-                            tracing::warn!(
-                                target: "services",
-                                "failed to broadcast fallback failed state for '{}': {broadcast_err}",
-                                service_name
-                            );
-                        }
-                    }
-                    Err(fetch_err) => {
-                        tracing::warn!(
-                            target: "services",
-                            "unable to load service '{}' spec for retry: {fetch_err}",
-                            service_name
-                        );
-                    }
-                }
-
+                let deployment = ServiceDeploymentContext {
+                    manifest_id,
+                    manifest_name: &manifest_name,
+                    service_name: &service_name,
+                    task_templates: &task_templates,
+                    update_strategy: &update_strategy,
+                    admission_policy: &admission_policy,
+                    service_epoch,
+                };
+                self.handle_initial_deployment_launch_failure(&deployment, &desired_task_ids, &err)
+                    .await;
                 return Ok(());
             }
         };
@@ -1625,6 +1512,7 @@ impl ServiceController {
 
         let service_id = compute_service_id(deployment.service_name);
         let detail = service_error_detail(err);
+        let terminal_launch_error = deployment_launch_error_should_fail_generation(err);
         match self.registry.get(service_id) {
             Ok(Some(mut persisted_spec)) if is_local_volume_unavailable_error(err) => {
                 persisted_spec.set_replica_ids_compact_when_derived(desired_task_ids.to_vec());
@@ -1643,6 +1531,22 @@ impl ServiceController {
                     tracing::warn!(
                         target: "services",
                         "failed to broadcast volume-unavailable state for '{}': {broadcast_err}",
+                        deployment.service_name
+                    );
+                }
+            }
+            _ if terminal_launch_error => {
+                if let Err(fail_err) = self
+                    .mark_deployment_failed_with_task_ids(
+                        deployment,
+                        desired_task_ids,
+                        Some(detail.clone()),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to persist hard deployment launch failure for '{}': {fail_err}",
                         deployment.service_name
                     );
                 }
@@ -1741,6 +1645,23 @@ impl ServiceController {
         deployment: &ServiceDeploymentContext<'_>,
         reason: Option<String>,
     ) -> anyhow::Result<()> {
+        self.mark_deployment_failed_with_task_ids(deployment, &[], reason)
+            .await
+    }
+
+    /// Marks the active deployment manifest as failed and drains every known or expected task id.
+    ///
+    /// Initial sharded deployment can fail after one coordinator has already
+    /// created rows while another coordinator reports a hard scheduler error.
+    /// Passing the deterministic ids for the attempted launch lets the terminal
+    /// state stop those partially created rows even when the current service
+    /// spec has not yet published them as assigned replicas.
+    async fn mark_deployment_failed_with_task_ids(
+        &self,
+        deployment: &ServiceDeploymentContext<'_>,
+        extra_task_ids_to_stop: &[Uuid],
+        reason: Option<String>,
+    ) -> anyhow::Result<()> {
         let service_id = compute_service_id(deployment.service_name);
         let mut failed_spec = match self.registry.get(service_id)? {
             Some(current) if current.manifest_id == deployment.manifest_id => current,
@@ -1764,7 +1685,10 @@ impl ServiceController {
             last_error: detail.clone(),
             ..ServiceRolloutState::default()
         });
-        let task_ids_to_stop = failed_spec.assigned_replica_ids();
+        let mut task_ids_to_stop = failed_spec.assigned_replica_ids();
+        task_ids_to_stop.extend_from_slice(extra_task_ids_to_stop);
+        task_ids_to_stop.sort_unstable();
+        task_ids_to_stop.dedup();
         failed_spec.clear_replica_assignments();
         failed_spec.set_status(ServiceStatus::Failed);
         failed_spec.set_status_detail(detail);
@@ -2114,6 +2038,21 @@ fn service_error_detail(err: &anyhow::Error) -> String {
     }
 
     parts.join(": ")
+}
+
+/// Returns true when an initial launch error should terminally fail the generation.
+///
+/// Retryable scheduler prerequisites keep the service in `Deploying`, and
+/// capacity shortages use the readiness failure budget so resources that free up
+/// shortly after submission can still recover. The remaining failure must also
+/// be a known deterministic launch rejection; generic start-loop exhaustion can
+/// come from short-lived reservation contention and should be retried by the
+/// service loop.
+fn deployment_launch_error_should_fail_generation(err: &anyhow::Error) -> bool {
+    !deployment_launch_error_requires_service_requeue(err)
+        && !is_local_volume_unavailable_error(err)
+        && !workload_start_error_consumes_service_failure_budget(err)
+        && workload_start_error_is_terminal_service_launch(err)
 }
 
 /// Normalizes one service-facing status detail before persisting it.

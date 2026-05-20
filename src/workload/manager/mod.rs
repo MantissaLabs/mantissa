@@ -3119,6 +3119,35 @@ pub(crate) fn workload_start_error_consumes_service_failure_budget(err: &anyhow:
         })
 }
 
+/// Returns true when a service launch failure is deterministic for the current generation.
+///
+/// This is intentionally a positive allow-list. Unknown workload-start failures
+/// can be caused by short-lived reservation contention or incomplete local
+/// scheduling views, especially in tests and large deployments where many
+/// targeted starts happen at once. Those cases should leave the service in
+/// `Deploying` so the service loop can retry instead of prematurely marking the
+/// generation failed.
+pub(crate) fn workload_start_error_is_terminal_service_launch(err: &anyhow::Error) -> bool {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<ServiceShardAssignmentFailure>()
+            .is_some_and(|failure| failure.class() == ServiceShardAssignmentFailureClass::Hard)
+    }) {
+        return true;
+    }
+
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<SchedulingError>())
+        .is_some_and(|cause| {
+            matches!(
+                cause,
+                SchedulingError::PlacementConstraintsBlocked { .. }
+                    | SchedulingError::RuntimeRequirementsBlocked { .. }
+                    | SchedulingError::HostPortsBlocked { .. }
+            )
+        })
+}
+
 /// Classifies one coordinator-side shard error before sending it over RPC.
 ///
 /// The coordinator has already accepted the request when this function is used.
