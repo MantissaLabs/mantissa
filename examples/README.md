@@ -149,7 +149,7 @@ work, and how the public jobs API relates to tasks and services, see
 ## Run a sandboxed Codex agent session
 
 ```sh
-docker build -t mantissa/codex-sandbox:0.118.0 \
+docker build -t mantissa/codex-sandbox:0.132.0 \
   examples/images/codex-sandbox
 mantissa secrets create openai-api-key --value "$OPENAI_API_KEY"
 mantissa agents run --file examples/codex_agent_nono.ron
