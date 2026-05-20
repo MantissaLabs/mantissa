@@ -1,6 +1,7 @@
 use super::support::*;
 use crate::common;
 use mantissa::scheduler::placement::{PlacementConstraint, PlacementConstraintSelector};
+use mantissa::services::types::compute_service_id;
 
 /// Builds the faster replication loop settings used by sharding convergence tests.
 fn sharded_cluster_config() -> ClusterConfig {
@@ -11,6 +12,36 @@ fn sharded_cluster_config() -> ClusterConfig {
         gossip_channel_capacity: Some(512),
         ..ClusterConfig::default()
     }
+}
+
+/// Computes the same rendezvous score used by service generation ownership.
+fn generation_owner_score_for_test(service_id: Uuid, service_epoch: u64, node_id: Uuid) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"generation");
+    hasher.update(service_id.as_bytes());
+    hasher.update(&service_epoch.to_le_bytes());
+    hasher.update(node_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    u128::from_le_bytes(bytes)
+}
+
+/// Finds a deterministic service name whose first generation is owned by `owner_id`.
+fn service_name_owned_by(prefix: &str, owner_id: Uuid, candidates: &[Uuid]) -> String {
+    for suffix in 0..10_000u32 {
+        let service_name = format!("{prefix}-{suffix}");
+        let service_id = compute_service_id(&service_name);
+        let selected_owner = candidates
+            .iter()
+            .copied()
+            .max_by_key(|candidate| generation_owner_score_for_test(service_id, 0, *candidate));
+        if selected_owner == Some(owner_id) {
+            return service_name;
+        }
+    }
+
+    panic!("failed to find service name owned by {owner_id}");
 }
 
 /// Waits until every node has observed the requested service lifecycle status.
@@ -621,31 +652,26 @@ local_test!(
         let _config_guard = ConfigOverrideGuard::service_sharding(1, 1, 2, 1);
         let _runtime_guard = RuntimeBackendOverrideGuard::install_default();
 
-        let mut cluster = TestNode::new_cluster_inproc_with_config(2, sharded_cluster_config())
+        let cluster = TestNode::new_cluster_inproc_with_config(2, sharded_cluster_config())
             .await
             .expect("cluster should start");
         TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes")
             .await;
-        assert!(
-            wait_for_cached_cluster_sessions_all(&cluster, Duration::from_secs(10)).await,
-            "nodes should cache peer sessions before the coordinator is stopped"
-        );
-
-        let coordinator_id = cluster[1].id();
-        cluster[1]
-            .stop()
+        TestNode::wait_cluster_ready_all(&cluster, 2, Duration::from_secs(20))
             .await
-            .expect("stop selected shard coordinator before deployment");
-        // In-process tests can keep an already-open session alive after listener stop.
-        // Clearing the owner's cached capabilities makes the deployment exercise the
-        // same reconnect and coordinator-unavailable path that a real remote outage uses.
-        cluster[0]
-            .node
-            .registry
-            .invalidate_peer_capabilities(coordinator_id)
+            .expect("cluster should reach ready state before partitioning coordinator");
+
+        let owner_id = cluster[0].id();
+        let coordinator_id = cluster[1].id();
+        let service_name = service_name_owned_by(
+            "sharded-coordinator-unavailable",
+            owner_id,
+            &[owner_id, coordinator_id],
+        );
+        let coordinator_partition = cluster[0]
+            .make_peer_control_plane_unreachable(&cluster[1])
             .await;
 
-        let service_name = "sharded-coordinator-unavailable";
         let mut template = demo_backend_task_template("backend", 2);
         template.execution.placement.constraints = vec![
             PlacementConstraint::eq(
@@ -658,12 +684,12 @@ local_test!(
         let service_id = cluster[0]
             .node
             .service_controller
-            .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
+            .submit_deployment(Uuid::new_v4(), &service_name, &service_name, vec![template])
             .await
-            .expect("submit deployment pinned to the stopped shard coordinator");
+            .expect("submit deployment pinned to the unavailable shard coordinator");
 
         let coordinator_unavailable_detail_seen = wait_until(
-            Duration::from_secs(10),
+            Duration::from_secs(30),
             Duration::from_millis(50),
             || async {
                 cluster[0]
@@ -691,11 +717,6 @@ local_test!(
             .expect("load interrupted service spec")
             .expect("interrupted service spec should be present");
 
-        cluster[1]
-            .start()
-            .await
-            .expect("restart selected shard coordinator");
-
         assert!(
             coordinator_unavailable_detail_seen,
             "unavailable shard coordinator should leave the service retrying; final status={:?} \
@@ -708,12 +729,9 @@ local_test!(
             ServiceStatus::Failed,
             "coordinator unavailability should not terminally fail the generation"
         );
-        TestNode::assert_cluster_size_all(
-            &cluster,
-            2,
-            "cluster should stabilise after restarting the coordinator",
-        )
-        .await;
+        cluster[0]
+            .restore_peer_control_plane(&cluster[1], coordinator_partition)
+            .await;
         assert!(
             wait_for_service_status_all(
                 &cluster,
@@ -722,10 +740,10 @@ local_test!(
                 Duration::from_secs(45)
             )
             .await,
-            "deployment should retry after coordinator restart and reach running everywhere"
+            "deployment should retry after coordinator RPC recovery and reach running everywhere"
         );
         assert!(
-            wait_for_sharded_service_running_all(&cluster, service_name, 2).await,
+            wait_for_sharded_service_running_all(&cluster, &service_name, 2).await,
             "retried sharded deployment should converge to two running tasks everywhere"
         );
     }

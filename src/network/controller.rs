@@ -1204,6 +1204,8 @@ impl NetworkController {
 
     /// Tear down local runtime and replicated rows for a network whose spec is tombstoned.
     async fn teardown_deleted_network(&self, spec: &NetworkSpecValue) -> Result<()> {
+        let plan = NetworkPlan::from_id(spec.id);
+        let interface_ctx: NetworkInterfaceContext = (&plan).into();
         let has_active = {
             let active = self.inner.active_networks.lock().await;
             active.contains(&spec.id)
@@ -1220,15 +1222,36 @@ impl NetworkController {
             .registry
             .list_attachments(Some(spec.id))?
             .is_empty();
+        let has_kernel_links = match self.inner.provisioner.network_links_exist(&plan).await {
+            Ok(exists) => exists,
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    network = %spec.id,
+                    "failed to inspect deleted network kernel links before teardown: {err:#}"
+                );
+                true
+            }
+        };
+        let has_bpf_state = match self.inner.bpf.network_state_exists(spec.id).await {
+            Ok(exists) => exists,
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    network = %spec.id,
+                    "failed to inspect deleted network bpf state before teardown: {err:#}"
+                );
+                true
+            }
+        };
 
-        let should_teardown = has_active || has_peers || has_attachments;
+        let should_teardown =
+            has_active || has_peers || has_attachments || has_kernel_links || has_bpf_state;
 
         if !should_teardown {
             return Ok(());
         }
 
-        let plan = NetworkPlan::from_id(spec.id);
-        let interface_ctx: NetworkInterfaceContext = (&plan).into();
         // Stop the discovery loop before detaching dataplane state so periodic VIP refreshes
         // cannot race teardown and try to heal maps that are intentionally being removed.
         if let Err(err) = self.inner.discovery.teardown_network(spec.id).await {

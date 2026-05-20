@@ -219,6 +219,19 @@ mod linux {
             Ok(())
         }
 
+        /// Returns whether any deterministic kernel link for this overlay still exists.
+        ///
+        /// A restarted process can lose the in-memory active-network marker while the host still
+        /// has links from the previous process. Deleted-network cleanup uses this check to avoid
+        /// skipping teardown in that state.
+        pub async fn network_links_exist(&self, plan: &NetworkPlan) -> Result<bool> {
+            let (host_ifname, peer_ifname) = Self::host_access_ifnames(plan.network_id);
+            Ok(self.find_link(&host_ifname).await?.is_some()
+                || self.find_link(&peer_ifname).await?.is_some()
+                || self.find_link(&plan.vxlan_name).await?.is_some()
+                || self.find_link(&plan.bridge_name).await?.is_some())
+        }
+
         /// Return the rtnetlink handle when kernel provisioning is available.
         fn handle(&self) -> Option<&Handle> {
             self.handle.as_ref()
@@ -2657,6 +2670,11 @@ mod stub {
             _desired: &std::collections::HashSet<uuid::Uuid>,
         ) -> Result<()> {
             Ok(())
+        }
+
+        /// Unsupported platforms never create deterministic overlay links.
+        pub async fn network_links_exist(&self, _plan: &NetworkPlan) -> Result<bool> {
+            Ok(false)
         }
 
         /// Return `None` on unsupported platforms, since no kernel interfaces are created.

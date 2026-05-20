@@ -496,6 +496,16 @@ mod linux {
             Ok(())
         }
 
+        /// Returns whether live or pinned eBPF state remains for one overlay network.
+        ///
+        /// Teardown must account for both process-local loaded handles and bpffs pins. The loaded
+        /// map is empty after a restart, but pinned maps can still be present and must force the
+        /// deleted-network cleanup path to run.
+        pub async fn network_state_exists(&self, network_id: Uuid) -> Result<bool> {
+            let loaded = self.loaded.lock().await.contains_key(&network_id);
+            Ok(loaded || Self::map_pin_path(network_id).exists())
+        }
+
         /// Remove the pinned bpffs directory for one network once no live dataplane references
         /// should remain.
         ///
@@ -2360,6 +2370,11 @@ mod stub {
         /// unconditionally.
         pub async fn teardown_programs(&self, _interfaces: &NetworkInterfaceContext) -> Result<()> {
             Ok(())
+        }
+
+        /// Non-Linux targets never create overlay eBPF state.
+        pub async fn network_state_exists(&self, _network_id: uuid::Uuid) -> Result<bool> {
+            Ok(false)
         }
     }
 }

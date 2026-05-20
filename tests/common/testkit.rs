@@ -15,10 +15,12 @@ use mantissa::{
     server::headless::{HeadlessConfig, HeadlessNode, HeadlessTransport},
 };
 use mantissa_protocol::health::NodeStatus;
+use mantissa_protocol::server as server_proto;
 use mantissa_protocol::topology::NodeReadinessState;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
@@ -32,6 +34,248 @@ where
     F: Future<Output = T>,
 {
     LocalSet::new().run_until(f).await
+}
+
+/// Previous peer routing state saved while one test simulates a control-plane outage.
+pub struct PeerControlPlaneOverride {
+    peer_id: Uuid,
+}
+
+/// Cluster session capability that rejects all peer service access.
+///
+/// The owner still obtains a session, but the first concrete service lookup
+/// fails. This models a stale or broken session without allowing registry
+/// reconnect fallback to bypass the injected test route.
+struct UnavailableClusterSession {
+    peer_id: Uuid,
+}
+
+impl UnavailableClusterSession {
+    /// Builds one Cap'n Proto session client that rejects every service lookup.
+    fn client(peer_id: Uuid) -> server_proto::cluster_session::Client {
+        capnp_rpc::new_client(Self { peer_id })
+    }
+
+    /// Returns the deterministic failure used by all session entrypoints.
+    fn unavailable_error(&self) -> capnp::Error {
+        capnp::Error::failed(format!(
+            "test control-plane session to peer {} is unavailable",
+            self.peer_id
+        ))
+    }
+}
+
+impl server_proto::cluster_session::Server for UnavailableClusterSession {
+    /// Rejects session liveness checks for the simulated unavailable route.
+    async fn ping(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::PingParams,
+        _results: server_proto::cluster_session::PingResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
+    /// Rejects bulk capability expansion for the simulated unavailable route.
+    async fn get_capabilities(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::GetCapabilitiesParams,
+        _results: server_proto::cluster_session::GetCapabilitiesResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
+    /// Rejects topology service access for the simulated unavailable route.
+    async fn get_topology(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::GetTopologyParams,
+        _results: server_proto::cluster_session::GetTopologyResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
+    /// Rejects sync service access for the simulated unavailable route.
+    async fn get_sync(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::GetSyncParams,
+        _results: server_proto::cluster_session::GetSyncResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
+    /// Rejects gossip service access for the simulated unavailable route.
+    async fn get_gossip(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::GetGossipParams,
+        _results: server_proto::cluster_session::GetGossipResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
+    /// Rejects node service access for the simulated unavailable route.
+    async fn get_node(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::GetNodeParams,
+        _results: server_proto::cluster_session::GetNodeResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
+    /// Rejects task service access for the simulated unavailable route.
+    async fn get_task(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::GetTaskParams,
+        _results: server_proto::cluster_session::GetTaskResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
+    /// Rejects workload service access for the simulated unavailable route.
+    async fn get_workload(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::GetWorkloadParams,
+        _results: server_proto::cluster_session::GetWorkloadResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
+    /// Rejects scheduler service access for the simulated unavailable route.
+    async fn get_scheduler(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::GetSchedulerParams,
+        _results: server_proto::cluster_session::GetSchedulerResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
+    /// Rejects jobs service access for the simulated unavailable route.
+    async fn get_jobs(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::GetJobsParams,
+        _results: server_proto::cluster_session::GetJobsResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
+    /// Rejects agents service access for the simulated unavailable route.
+    async fn get_agents(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::GetAgentsParams,
+        _results: server_proto::cluster_session::GetAgentsResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
+    /// Rejects services service access for the simulated unavailable route.
+    async fn get_services(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::GetServicesParams,
+        _results: server_proto::cluster_session::GetServicesResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
+    /// Rejects secrets service access for the simulated unavailable route.
+    async fn get_secrets(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::GetSecretsParams,
+        _results: server_proto::cluster_session::GetSecretsResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
+    /// Rejects networks service access for the simulated unavailable route.
+    async fn get_networks(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::GetNetworksParams,
+        _results: server_proto::cluster_session::GetNetworksResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
+    /// Rejects volumes service access for the simulated unavailable route.
+    async fn get_volumes(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::GetVolumesParams,
+        _results: server_proto::cluster_session::GetVolumesResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
+    /// Rejects cluster-view reads for the simulated unavailable route.
+    async fn get_cluster_view(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::GetClusterViewParams,
+        _results: server_proto::cluster_session::GetClusterViewResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+}
+
+/// Server capability that returns an unavailable session for one targeted peer.
+///
+/// Tests install this in a node's local registry to force the same owner-side
+/// session failure a real unavailable peer would produce, without changing
+/// production workload or service logic.
+struct UnavailablePeerServer {
+    peer_id: Uuid,
+}
+
+impl UnavailablePeerServer {
+    /// Builds one Cap'n Proto server client that rejects every session acquisition.
+    fn client(peer_id: Uuid) -> server_proto::server::Client {
+        capnp_rpc::new_client(Self { peer_id })
+    }
+
+    /// Returns the deterministic failure used by all server entrypoints.
+    fn unavailable_error(&self) -> capnp::Error {
+        capnp::Error::failed(format!(
+            "test control-plane route to peer {} is unavailable",
+            self.peer_id
+        ))
+    }
+}
+
+impl server_proto::Server for UnavailablePeerServer {
+    /// Rejects join attempts because this fake server only models an unavailable peer route.
+    async fn register_node(
+        self: Rc<Self>,
+        _params: server_proto::RegisterNodeParams,
+        _results: server_proto::RegisterNodeResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
+    /// Returns a session whose service lookups fail for ticket-based bootstrap.
+    ///
+    /// The server handshake succeeds intentionally. That keeps registry reconnect
+    /// fallback from replacing this synthetic route before the test reaches the
+    /// workload or service RPC it wants to exercise.
+    async fn get_session(
+        self: Rc<Self>,
+        _params: server_proto::GetSessionParams,
+        mut results: server_proto::GetSessionResults,
+    ) -> Result<(), capnp::Error> {
+        results
+            .get()
+            .set_session(UnavailableClusterSession::client(self.peer_id));
+        Ok(())
+    }
+
+    /// Returns the same failing session through credential bootstrap.
+    ///
+    /// Tests mostly use cached in-process handles, but covering both bootstrap
+    /// paths keeps the fake peer route consistent with the real server surface.
+    async fn get_with_credential(
+        self: Rc<Self>,
+        _params: server_proto::GetWithCredentialParams,
+        mut results: server_proto::GetWithCredentialResults,
+    ) -> Result<(), capnp::Error> {
+        let mut out = results.get();
+        out.set_session(UnavailableClusterSession::client(self.peer_id));
+        out.set_ticket(b"test-unavailable-peer-session");
+        out.set_ticket_expires_at_unix_secs(0);
+        Ok(())
+    }
 }
 
 fn default_runtime_backend() -> Arc<dyn RuntimeBackend + Send + Sync> {
@@ -255,6 +499,48 @@ impl TestNode {
     /// Returns this node's UUID (cluster node id).
     pub fn id(&self) -> Uuid {
         self.node.id
+    }
+
+    /// Makes `peer` unreachable from this node's local control-plane view.
+    ///
+    /// This is a test-harness partition, not a production behavior switch. The
+    /// peer remains online and schedulable in the replicated peer row, but this
+    /// node temporarily receives a stale-looking session that rejects service
+    /// access. That forces owner-side remote RPC failures while preserving
+    /// normal placement eligibility.
+    pub async fn make_peer_control_plane_unreachable(
+        &self,
+        peer: &TestNode,
+    ) -> PeerControlPlaneOverride {
+        let peer_id = peer.id();
+        self.node
+            .registry
+            .register_peer_handle(peer_id, UnavailablePeerServer::client(peer_id))
+            .await;
+
+        PeerControlPlaneOverride { peer_id }
+    }
+
+    /// Restores this node's local control-plane route to `peer` after a test partition.
+    ///
+    /// The restore reinstalls the peer's real in-process server handle. The
+    /// registry clears the synthetic unavailable session when the server handle
+    /// is replaced, so the next service attempt opens the real peer session.
+    pub async fn restore_peer_control_plane(
+        &self,
+        peer: &TestNode,
+        override_state: PeerControlPlaneOverride,
+    ) {
+        let peer_id = peer.id();
+        assert_eq!(
+            override_state.peer_id, peer_id,
+            "control-plane override belongs to a different peer"
+        );
+
+        self.node
+            .registry
+            .register_peer_handle(peer_id, peer.node.server_client.clone())
+            .await;
     }
 
     /// Returns the client address this node exposes:

@@ -170,6 +170,15 @@ impl NetworkBpfManager {
             }
         }
     }
+
+    /// Returns whether this node still has eBPF state for one overlay network.
+    ///
+    /// Deleted-network cleanup uses this before deciding that a network is already gone. A
+    /// restarted node may have no in-memory active-network marker while bpffs pins still exist
+    /// from the previous process, and skipping teardown in that state leaks kernel memory.
+    pub async fn network_state_exists(&self, network_id: Uuid) -> Result<bool> {
+        self.platform.network_state_exists(network_id).await
+    }
 }
 
 mod platform;
