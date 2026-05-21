@@ -968,6 +968,7 @@ impl ServiceController {
                 group_id,
                 chunk.requests.clone(),
                 &phase.start_context,
+                phase.deployment_policy,
             )
             .await
         {

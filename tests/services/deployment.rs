@@ -206,6 +206,102 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
     );
 });
 
+local_test!(services_deployment_healthy_deadline_fails_slow_bootstrap, {
+    let _guard =
+        RuntimeBackendOverrideGuard::install(Arc::new(SlowCreateRuntimeBackend::default()));
+    let node = TestNode::new().await;
+
+    let service_name = "deadline-slow-bootstrap";
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment_with_options_outcome(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![demo_backend_task_template("backend", 1)],
+            ServiceDeploymentOptions {
+                deployment_policy: ServiceDeploymentPolicy {
+                    progress_deadline_secs: 10,
+                    healthy_deadline_secs: 1,
+                    min_healthy_secs: 1,
+                },
+                ..ServiceDeploymentOptions::default()
+            },
+        )
+        .await
+        .expect("submit service deployment with a tight bootstrap deadline")
+        .service_id;
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Failed
+        )
+        .await,
+        "slow bootstrap should fail once the manifest healthy deadline expires"
+    );
+    assert!(
+        wait_for_service_status_detail_any(
+            &node.node.service_controller,
+            service_id,
+            &["healthy deadline"]
+        )
+        .await,
+        "failed deployment should retain the healthy deadline detail"
+    );
+});
+
+local_test!(
+    services_deployment_healthy_deadline_allows_slow_bootstrap,
+    {
+        let _guard =
+            RuntimeBackendOverrideGuard::install(Arc::new(SlowCreateRuntimeBackend::default()));
+        let node = TestNode::new().await;
+
+        let service_name = "deadline-slow-bootstrap-ok";
+        let service_id = node
+            .node
+            .service_controller
+            .submit_deployment_with_options_outcome(
+                Uuid::new_v4(),
+                service_name,
+                service_name,
+                vec![demo_backend_task_template("backend", 1)],
+                ServiceDeploymentOptions {
+                    deployment_policy: ServiceDeploymentPolicy {
+                        progress_deadline_secs: 10,
+                        healthy_deadline_secs: 10,
+                        min_healthy_secs: 1,
+                    },
+                    ..ServiceDeploymentOptions::default()
+                },
+            )
+            .await
+            .expect("submit service deployment with a relaxed bootstrap deadline")
+            .service_id;
+
+        assert!(
+            wait_for_service_status(
+                &node.node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "slow bootstrap should pass when the manifest healthy deadline is large enough"
+        );
+        let spec = node
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .expect("load service")
+            .expect("service present");
+        assert_eq!(spec.deployment_policy.healthy_deadline_secs, 10);
+    }
+);
+
 local_test!(services_network_delete_rejects_attached_network, {
     let _config_guard = ConfigOverrideGuard::control_plane_network_only();
     let _guard = RuntimeBackendOverrideGuard::install_default();

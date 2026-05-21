@@ -38,6 +38,7 @@ enum ReadinessOutcome {
     Pending { running_count: usize },
     Degraded(ServiceSpecValue),
     Failure(ServiceSpecValue),
+    FailureDetail(ServiceSpecValue, String),
     Abort,
 }
 
@@ -53,6 +54,15 @@ pub(super) enum ReadinessClass {
 struct ProgressReadinessProjection {
     class: ReadinessClass,
     running_count: usize,
+}
+
+/// Mutable observation buffers reused across readiness probes for one deployment wait.
+#[derive(Default)]
+struct ReadinessObservationState {
+    last_states: Vec<(Uuid, Option<WorkloadPhase>)>,
+    last_phase_versions: HashMap<Uuid, u64>,
+    last_terminal_launches: HashMap<Uuid, Option<u64>>,
+    task_startup_seen: HashMap<Uuid, Instant>,
 }
 
 /// Waits until a deployment converges or repeatedly reports terminal unhealthy states.
@@ -71,13 +81,12 @@ pub(super) async fn start_readiness_wait(
     let mut success_since: Option<Instant> = None;
     let mut failure_streak: u32 = 0;
     let mut degraded_streak: u32 = 0;
-    let mut last_observed_states: Vec<(Uuid, Option<WorkloadPhase>)> = Vec::new();
-    let mut last_observed_phase_versions: HashMap<Uuid, u64> = HashMap::new();
-    let mut last_observed_terminal_launches: HashMap<Uuid, Option<u64>> = HashMap::new();
+    let mut observations = ReadinessObservationState::default();
     let mut task_terminal_launch_seen: HashMap<Uuid, u64> = HashMap::new();
     let mut task_terminal_phase_seen: HashMap<Uuid, u64> = HashMap::new();
     let mut task_failure_counts: HashMap<Uuid, u32> = HashMap::new();
     let progress_window = initial_spec.deployment_policy.progress_deadline();
+    let healthy_window = initial_spec.deployment_policy.healthy_deadline();
     let min_healthy = initial_spec.deployment_policy.min_healthy();
     let mut running_high_watermark = 0usize;
     let mut progress_deadline = Instant::now() + progress_window;
@@ -88,16 +97,15 @@ pub(super) async fn start_readiness_wait(
             &controller,
             service_id,
             manifest_id,
-            &mut last_observed_states,
-            &mut last_observed_phase_versions,
-            &mut last_observed_terminal_launches,
+            &mut observations,
+            healthy_window,
         )
         .await;
 
         if let Some((task_id, failures)) = record_terminal_task_failure(
-            &last_observed_states,
-            &last_observed_phase_versions,
-            &last_observed_terminal_launches,
+            &observations.last_states,
+            &observations.last_phase_versions,
+            &observations.last_terminal_launches,
             &mut task_terminal_launch_seen,
             &mut task_terminal_phase_seen,
             &mut task_failure_counts,
@@ -122,14 +130,14 @@ pub(super) async fn start_readiness_wait(
                 task_id,
                 failures
             );
-            mark_service_failed(&controller, snapshot, &last_observed_states).await;
+            mark_service_failed(&controller, snapshot, &observations.last_states).await;
             break;
         }
 
         let now = Instant::now();
         let observed_running = match &outcome {
             ReadinessOutcome::Pending { running_count } => *running_count,
-            _ => running_readiness_state_count(&last_observed_states),
+            _ => running_readiness_state_count(&observations.last_states),
         };
         if deployment_running_progress_advanced(
             observed_running,
@@ -223,9 +231,9 @@ pub(super) async fn start_readiness_wait(
                         "service '{}' deployment exceeded {}s without running-replica progress; marking failed ({})",
                         service_name,
                         progress_window.as_secs(),
-                        format_task_state_summary(&last_observed_states)
+                        format_task_state_summary(&observations.last_states)
                     );
-                    mark_service_failed(&controller, snapshot, &last_observed_states).await;
+                    mark_service_failed(&controller, snapshot, &observations.last_states).await;
                     break;
                 }
 
@@ -236,12 +244,13 @@ pub(super) async fn start_readiness_wait(
                 degraded_streak = degraded_streak.saturating_add(1);
                 failure_streak = 0;
                 if degraded_streak >= SERVICE_DEPLOYMENT_MAX_DEGRADED_PROBES {
-                    mark_service_failed(&controller, snapshot.clone(), &last_observed_states).await;
+                    mark_service_failed(&controller, snapshot.clone(), &observations.last_states)
+                        .await;
                     break;
                 }
 
                 let backoff = readiness_backoff(degraded_streak + 1);
-                let summary = format_task_state_summary(&last_observed_states);
+                let summary = format_task_state_summary(&observations.last_states);
                 tracing::warn!(
                     target: "services",
                     "service '{}' reported degraded readiness ({}/{}); retrying in {:?} ({summary})",
@@ -257,12 +266,13 @@ pub(super) async fn start_readiness_wait(
                 failure_streak = failure_streak.saturating_add(1);
                 degraded_streak = 0;
                 if failure_streak >= SERVICE_DEPLOYMENT_MAX_FAILURE_PROBES {
-                    mark_service_failed(&controller, snapshot.clone(), &last_observed_states).await;
+                    mark_service_failed(&controller, snapshot.clone(), &observations.last_states)
+                        .await;
                     break;
                 }
 
                 let backoff = readiness_backoff(failure_streak + 1);
-                let summary = format_task_state_summary(&last_observed_states);
+                let summary = format_task_state_summary(&observations.last_states);
                 tracing::warn!(
                     target: "services",
                     "service '{}' reported unhealthy readiness state ({}/{}); retrying in {:?} ({summary})",
@@ -272,6 +282,21 @@ pub(super) async fn start_readiness_wait(
                     backoff
                 );
                 sleep(backoff).await;
+            }
+            ReadinessOutcome::FailureDetail(snapshot, detail) => {
+                tracing::error!(
+                    target: "services",
+                    "service '{}' deployment failed: {detail}",
+                    service_name
+                );
+                mark_service_failed_with_detail(
+                    &controller,
+                    snapshot,
+                    &observations.last_states,
+                    Some(detail),
+                )
+                .await;
+                break;
             }
             ReadinessOutcome::Abort => break,
         }
@@ -320,10 +345,13 @@ async fn poll_service_attempt(
     controller: &ServiceController,
     service_id: Uuid,
     manifest_id: Uuid,
-    last_states: &mut Vec<(Uuid, Option<WorkloadPhase>)>,
-    last_phase_versions: &mut HashMap<Uuid, u64>,
-    last_terminal_launches: &mut HashMap<Uuid, Option<u64>>,
+    observations: &mut ReadinessObservationState,
+    healthy_window: Duration,
 ) -> ReadinessOutcome {
+    let last_states = &mut observations.last_states;
+    let last_phase_versions = &mut observations.last_phase_versions;
+    let last_terminal_launches = &mut observations.last_terminal_launches;
+    let task_startup_seen = &mut observations.task_startup_seen;
     let deadline = Instant::now() + Duration::from_secs(SERVICE_READY_TIMEOUT_SECS);
     let mut progress_running_hint: Option<usize> = None;
 
@@ -461,6 +489,21 @@ async fn poll_service_attempt(
                     last_terminal_launches.insert(task_id, None);
                 }
             }
+        }
+
+        if let Some((task_id, phase)) = deployment_startup_task_timed_out(
+            last_states,
+            task_startup_seen,
+            Instant::now(),
+            healthy_window,
+        ) {
+            let detail = format!(
+                "task {} exceeded {}s healthy deadline while in {}",
+                task_id,
+                healthy_window.as_secs(),
+                readiness_phase_label(&phase)
+            );
+            return ReadinessOutcome::FailureDetail(current, detail);
         }
 
         match classify_readiness_states(last_states) {
@@ -637,6 +680,16 @@ async fn mark_service_failed(
     spec: ServiceSpecValue,
     states: &[(Uuid, Option<WorkloadPhase>)],
 ) {
+    mark_service_failed_with_detail(controller, spec, states, None).await;
+}
+
+/// Marks the service as failed with an optional operator-facing status detail.
+async fn mark_service_failed_with_detail(
+    controller: &ServiceController,
+    spec: ServiceSpecValue,
+    states: &[(Uuid, Option<WorkloadPhase>)],
+    detail: Option<String>,
+) {
     let summary = format_task_state_summary(states);
     tracing::error!(
         target: "services",
@@ -668,9 +721,14 @@ async fn mark_service_failed(
         }
     };
     failed_spec.previous_generation = None;
-    failed_spec.set_rollout(ServiceRolloutState::default());
+    let detail = detail.unwrap_or_else(|| format!("deployment failed readiness: {summary}"));
+    failed_spec.set_rollout(ServiceRolloutState {
+        last_error: Some(detail.clone()),
+        ..ServiceRolloutState::default()
+    });
     failed_spec.clear_replica_assignments();
     failed_spec.set_status(ServiceStatus::Failed);
+    failed_spec.set_status_detail(Some(detail));
 
     if let Err(err) = controller.apply_upsert(failed_spec.clone()).await {
         tracing::warn!(
@@ -733,6 +791,64 @@ fn running_readiness_state_count(states: &[(Uuid, Option<WorkloadPhase>)]) -> us
 /// Returns true when deployment has exceeded its readiness progress deadline.
 fn deployment_progress_timed_out(now: Instant, progress_deadline: Instant) -> bool {
     now >= progress_deadline
+}
+
+/// Returns a task whose startup phase has exceeded the per-workload healthy window.
+fn deployment_startup_task_timed_out(
+    states: &[(Uuid, Option<WorkloadPhase>)],
+    startup_seen: &mut HashMap<Uuid, Instant>,
+    now: Instant,
+    healthy_window: Duration,
+) -> Option<(Uuid, WorkloadPhase)> {
+    startup_seen.retain(|task_id, _| {
+        states.iter().any(|(observed_id, phase)| {
+            observed_id == task_id && phase.as_ref().is_some_and(readiness_phase_is_starting)
+        })
+    });
+
+    for (task_id, phase) in states {
+        let Some(phase) = phase.as_ref() else {
+            continue;
+        };
+        if !readiness_phase_is_starting(phase) {
+            startup_seen.remove(task_id);
+            continue;
+        }
+        let first_seen = startup_seen.entry(*task_id).or_insert(now);
+        if now.duration_since(*first_seen) >= healthy_window {
+            return Some((*task_id, phase.clone()));
+        }
+    }
+
+    None
+}
+
+/// Returns whether a workload phase is still bootstrapping for deployment purposes.
+fn readiness_phase_is_starting(phase: &WorkloadPhase) -> bool {
+    matches!(
+        phase,
+        WorkloadPhase::Pending
+            | WorkloadPhase::Pulling
+            | WorkloadPhase::Creating
+            | WorkloadPhase::VolumeUnavailable
+    )
+}
+
+/// Returns the stable operator label for a deployment readiness phase.
+fn readiness_phase_label(phase: &WorkloadPhase) -> &'static str {
+    match phase {
+        WorkloadPhase::Pending => "pending",
+        WorkloadPhase::Pulling => "pulling",
+        WorkloadPhase::Creating => "creating",
+        WorkloadPhase::VolumeUnavailable => "volume_unavailable",
+        WorkloadPhase::Running => "running",
+        WorkloadPhase::Paused => "paused",
+        WorkloadPhase::Stopping => "stopping",
+        WorkloadPhase::Stopped => "stopped",
+        WorkloadPhase::Failed => "failed",
+        WorkloadPhase::Exited(_) => "exited",
+        WorkloadPhase::Unknown => "unknown",
+    }
 }
 
 /// Builds a compact human-readable summary of observed task states for readiness logs.
@@ -936,6 +1052,74 @@ mod tests {
             now + Duration::from_secs(2),
             deadline
         ));
+    }
+
+    /// Ensures per-task healthy deadlines count continuous startup phases.
+    #[test]
+    fn startup_task_deadline_tracks_inflight_phase_duration() {
+        let task_id = Uuid::new_v4();
+        let mut startup_seen = HashMap::new();
+        let now = Instant::now();
+        let states = vec![(task_id, Some(WorkloadPhase::Creating))];
+
+        assert!(
+            deployment_startup_task_timed_out(
+                &states,
+                &mut startup_seen,
+                now,
+                Duration::from_secs(2)
+            )
+            .is_none()
+        );
+
+        let timed_out = deployment_startup_task_timed_out(
+            &states,
+            &mut startup_seen,
+            now + Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .expect("startup task should time out");
+        assert_eq!(timed_out.0, task_id);
+        assert!(matches!(timed_out.1, WorkloadPhase::Creating));
+    }
+
+    /// Ensures running observations clear startup deadline anchors.
+    #[test]
+    fn startup_task_deadline_resets_after_running() {
+        let task_id = Uuid::new_v4();
+        let mut startup_seen = HashMap::new();
+        let now = Instant::now();
+        let creating = vec![(task_id, Some(WorkloadPhase::Creating))];
+        let running = vec![(task_id, Some(WorkloadPhase::Running))];
+
+        assert!(
+            deployment_startup_task_timed_out(
+                &creating,
+                &mut startup_seen,
+                now,
+                Duration::from_secs(2)
+            )
+            .is_none()
+        );
+        assert!(
+            deployment_startup_task_timed_out(
+                &running,
+                &mut startup_seen,
+                now + Duration::from_secs(1),
+                Duration::from_secs(2)
+            )
+            .is_none()
+        );
+        assert!(
+            deployment_startup_task_timed_out(
+                &creating,
+                &mut startup_seen,
+                now + Duration::from_secs(3),
+                Duration::from_secs(2)
+            )
+            .is_none(),
+            "a new startup phase after running should start a fresh deadline"
+        );
     }
 
     /// Ensures persisted terminal launch markers increment crash-loop counters even when

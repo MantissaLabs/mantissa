@@ -29,11 +29,12 @@ pub(crate) use mantissa::server::headless::{
     HeadlessConfig, HeadlessKeys, HeadlessNode, HeadlessTransport,
 };
 pub(crate) use mantissa::services::ServiceController;
-pub(crate) use mantissa::services::manager::ServiceDeploymentOutcome;
+pub(crate) use mantissa::services::manager::{ServiceDeploymentOptions, ServiceDeploymentOutcome};
 pub(crate) use mantissa::services::types::{
-    ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState,
-    ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy, TaskTemplateNetworkRequirement,
-    TaskTemplateRestartPolicy, TaskTemplateRestartPolicyKind, TaskTemplateSpecValue,
+    ServiceDeploymentPolicy, ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase,
+    ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy,
+    TaskTemplateNetworkRequirement, TaskTemplateRestartPolicy, TaskTemplateRestartPolicyKind,
+    TaskTemplateSpecValue,
 };
 pub(crate) use mantissa::task::types::{
     TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskStateFilter, TaskValue,

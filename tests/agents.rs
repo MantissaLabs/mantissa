@@ -2,7 +2,7 @@
 mod common;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use common::convergence::wait_until;
 use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
 use mantissa::runtime::testing::InMemoryRuntimeBackend;
@@ -313,6 +313,7 @@ local_test!(agents_submit_nono_run_projects_runtime_sandbox_policy, {
             admission_mode: None,
             cpu_millis: None,
             memory_bytes: None,
+            deployment_policy: None,
         },
     )
     .await
@@ -353,6 +354,117 @@ local_test!(agents_submit_nono_run_projects_runtime_sandbox_policy, {
     }));
 
     mark_workload_exited(&node, workload_id, 0).await;
+});
+
+local_test!(
+    agents_progress_deadline_fails_queued_run_without_capacity,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+        let node = TestNode::new().await;
+
+        let session_id = submit_agent_session_with_options(
+            &node.node.agents_client,
+            "agent-progress-deadline",
+            AgentSessionSubmitOptions {
+                initial_input: Some("start"),
+                deployment_policy: Some(TestDeploymentPolicy {
+                    progress_deadline_secs: 1,
+                    healthy_deadline_secs: 600,
+                    min_healthy_secs: 1,
+                }),
+                cpu_millis: Some(OVERCOMMITTED_CPU_MILLIS),
+                memory_bytes: Some(OVERCOMMITTED_MEMORY_BYTES),
+                ..AgentSessionSubmitOptions::default()
+            },
+        )
+        .await
+        .expect("submit capacity-blocked agent session");
+
+        assert!(
+            wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+                let client = node.node.agents_client.clone();
+                async move {
+                    let sessions = list_sessions(&client).await.expect("list agent sessions");
+                    let runs = list_runs(&client, Some(session_id))
+                        .await
+                        .expect("list agent runs");
+                    sessions.iter().any(|session| {
+                        session.id == session_id
+                            && session.status == ProtoAgentSessionStatus::Failed
+                            && session.status_detail.as_deref().is_some_and(|detail| {
+                                detail.contains("deployment progress deadline")
+                            })
+                    }) && runs.iter().any(|run| {
+                        run.status == ProtoAgentRunStatus::Failed
+                            && run.status_detail.as_deref().is_some_and(|detail| {
+                                detail.contains("deployment progress deadline")
+                            })
+                    })
+                }
+            })
+            .await,
+            "agent run should fail once queued placement exceeds the progress deadline"
+        );
+    }
+);
+
+local_test!(agents_healthy_deadline_fails_bootstrapping_workload, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let node = TestNode::new().await;
+
+    let session_id = submit_agent_session_with_options(
+        &node.node.agents_client,
+        "agent-healthy-deadline",
+        AgentSessionSubmitOptions {
+            initial_input: Some("start"),
+            deployment_policy: Some(TestDeploymentPolicy {
+                progress_deadline_secs: 600,
+                healthy_deadline_secs: 1,
+                min_healthy_secs: 1,
+            }),
+            ..AgentSessionSubmitOptions::default()
+        },
+    )
+    .await
+    .expect("submit agent session with short healthy deadline");
+    let (run_id, workload_id) = wait_for_active_run(&node.node.agents_client, session_id).await;
+
+    mark_workload_phase_with_created_at(
+        &node,
+        workload_id,
+        WorkloadPhase::Pulling,
+        Utc::now() - ChronoDuration::seconds(2),
+    )
+    .await;
+
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+            let client = node.node.agents_client.clone();
+            async move {
+                let sessions = list_sessions(&client).await.expect("list agent sessions");
+                let runs = list_runs(&client, Some(session_id))
+                    .await
+                    .expect("list agent runs");
+                sessions.iter().any(|session| {
+                    session.id == session_id
+                        && session.status == ProtoAgentSessionStatus::Failed
+                        && session
+                            .status_detail
+                            .as_deref()
+                            .is_some_and(|detail| detail.contains("healthy deadline"))
+                }) && runs.iter().any(|run| {
+                    run.id == run_id
+                        && run.status == ProtoAgentRunStatus::Failed
+                        && run
+                            .status_detail
+                            .as_deref()
+                            .is_some_and(|detail| detail.contains("healthy deadline"))
+                })
+            }
+        })
+        .await,
+        "agent run should fail once the launched workload exceeds its healthy deadline"
+    );
 });
 
 local_test!(agents_cancel_active_run_returns_session_to_waiting_input, {
@@ -504,12 +616,21 @@ struct AgentSessionSubmitOptions<'a> {
     admission_mode: Option<WorkloadAdmissionMode>,
     cpu_millis: Option<u64>,
     memory_bytes: Option<u64>,
+    deployment_policy: Option<TestDeploymentPolicy>,
 }
 
 #[derive(Clone, Copy)]
+struct TestDeploymentPolicy {
+    progress_deadline_secs: u32,
+    healthy_deadline_secs: u32,
+    min_healthy_secs: u32,
+}
+
+#[derive(Clone)]
 struct AgentSessionSnapshot {
     id: Uuid,
     status: ProtoAgentSessionStatus,
+    status_detail: Option<String>,
     active_run_id: Option<Uuid>,
     last_run_id: Option<Uuid>,
 }
@@ -717,6 +838,7 @@ async fn submit_agent_session(
             admission_mode: None,
             cpu_millis: None,
             memory_bytes: None,
+            deployment_policy: None,
         },
     )
     .await
@@ -779,6 +901,13 @@ async fn submit_agent_session_with_options(
         interaction.set_require_user_input_between_runs(true);
         interaction.set_max_turns_per_run(1);
         interaction.set_idle_timeout_secs(0);
+
+        if let Some(policy) = options.deployment_policy {
+            let mut deployment = builder.reborrow().init_deployment_policy();
+            deployment.set_progress_deadline_secs(policy.progress_deadline_secs);
+            deployment.set_healthy_deadline_secs(policy.healthy_deadline_secs);
+            deployment.set_min_healthy_secs(policy.min_healthy_secs);
+        }
     }
 
     let response = request.send().promise.await?;
@@ -861,6 +990,7 @@ async fn list_sessions(client: &agents::Client) -> Result<Vec<AgentSessionSnapsh
         snapshots.push(AgentSessionSnapshot {
             id: read_uuid(reader.get_id()?)?,
             status: reader.get_status()?,
+            status_detail: read_optional_text(reader.get_status_detail()?.to_str()?),
             active_run_id: read_optional_uuid(reader.get_active_run_id()?),
             last_run_id: read_optional_uuid(reader.get_last_run_id()?),
         });
@@ -930,6 +1060,16 @@ async fn mark_workload_exited(node: &TestNode, workload_id: Uuid, exit_code: i32
 
 /// Marks one persisted workload with an arbitrary phase so the agent controller can observe it.
 async fn mark_workload_phase(node: &TestNode, workload_id: Uuid, phase: WorkloadPhase) {
+    mark_workload_phase_with_created_at(node, workload_id, phase, Utc::now()).await;
+}
+
+/// Marks one persisted workload with a phase and creation anchor for deadline tests.
+async fn mark_workload_phase_with_created_at(
+    node: &TestNode,
+    workload_id: Uuid,
+    phase: WorkloadPhase,
+    created_at: chrono::DateTime<Utc>,
+) {
     let mut task = node
         .node
         .workload_manager
@@ -937,6 +1077,7 @@ async fn mark_workload_phase(node: &TestNode, workload_id: Uuid, phase: Workload
         .await
         .expect("inspect agent workload");
     task.state = phase;
+    task.created_at = created_at.to_rfc3339();
     task.updated_at = Utc::now().to_rfc3339();
     node.node
         .workloads

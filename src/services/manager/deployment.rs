@@ -17,6 +17,8 @@ use super::sharding::{
 use super::state::deploying_assignment_incomplete;
 use super::*;
 use anyhow::Context;
+use thiserror::Error;
+use tokio::time::timeout;
 
 impl ServiceController {
     /// Schedules an asynchronous deployment for the provided service manifest and returns
@@ -677,7 +679,13 @@ impl ServiceController {
         let launch_context = format!("service '{}' deployment", service_name);
 
         let task_specs = match self
-            .start_tasks_for_admission_policy(admission_policy, group_id, requests, &launch_context)
+            .start_tasks_for_admission_policy(
+                admission_policy,
+                group_id,
+                requests,
+                &launch_context,
+                &deployment_policy,
+            )
             .await
         {
             Ok(specs) => specs,
@@ -904,7 +912,13 @@ impl ServiceController {
             // The non-gang dependency path still uses incremental admission, but it must enter
             // the shared launcher so large template stages can use deployment shard coordinators.
             let task_specs = match self
-                .start_tasks_for_admission_policy(admission_policy, group_id, requests, &context)
+                .start_tasks_for_admission_policy(
+                    admission_policy,
+                    group_id,
+                    requests,
+                    &context,
+                    deployment.deployment_policy,
+                )
                 .await
             {
                 Ok(specs) => specs,
@@ -1086,6 +1100,7 @@ impl ServiceController {
                     group_id,
                     requests,
                     &context,
+                    deployment.deployment_policy,
                 )
                 .await
             {
@@ -1831,37 +1846,51 @@ impl ServiceController {
         group_id: Uuid,
         requests: Vec<WorkloadStartRequest>,
         context: &str,
+        deployment_policy: &ServiceDeploymentPolicy,
     ) -> anyhow::Result<Vec<WorkloadSpec>> {
-        match admission_policy.mode {
-            WorkloadAdmissionMode::Incremental => match self.deployment_shard_plan(&requests) {
-                Some(plan) => {
-                    self.start_tasks_with_deployment_shards(plan, requests, context)
-                        .await
-                }
-                None => {
-                    crate::observability::metrics::record_service_deployment_launch_shape(
-                        "direct",
-                        service_launch_target_peer_count(&requests),
-                        0,
-                        0,
-                        requests.len(),
+        let task_count = requests.len();
+        let healthy_deadline = deployment_policy.healthy_deadline();
+        let context_label = context.to_string();
+        let launch = async move {
+            match admission_policy.mode {
+                WorkloadAdmissionMode::Incremental => match self.deployment_shard_plan(&requests) {
+                    Some(plan) => {
+                        self.start_tasks_with_deployment_shards(plan, requests, context)
+                            .await
+                    }
+                    None => {
+                        crate::observability::metrics::record_service_deployment_launch_shape(
+                            "direct",
+                            service_launch_target_peer_count(&requests),
+                            0,
+                            0,
+                            requests.len(),
+                        );
+                        self.start_tasks_with_fallback(requests, context).await
+                    }
+                },
+                WorkloadAdmissionMode::Gang => {
+                    tracing::info!(
+                        target: "services",
+                        admission_group = %group_id,
+                        task_count = requests.len(),
+                        "starting gang admission for {context}"
                     );
-                    self.start_tasks_with_fallback(requests, context).await
+                    self.workload_manager
+                        .start_workloads_with_admission_policy(admission_policy, group_id, requests)
+                        .await
+                        .with_context(|| format!("gang admission failed for {context}"))
                 }
-            },
-            WorkloadAdmissionMode::Gang => {
-                tracing::info!(
-                    target: "services",
-                    admission_group = %group_id,
-                    task_count = requests.len(),
-                    "starting gang admission for {context}"
-                );
-                self.workload_manager
-                    .start_workloads_with_admission_policy(admission_policy, group_id, requests)
-                    .await
-                    .with_context(|| format!("gang admission failed for {context}"))
             }
-        }
+        };
+
+        timeout(healthy_deadline, launch).await.map_err(|_| {
+            ServiceDeploymentHealthyDeadlineExceeded {
+                context: context_label,
+                healthy_deadline_secs: healthy_deadline.as_secs(),
+                task_count,
+            }
+        })?
     }
 
     /// Publishes task traffic after attachment rows exist so cutover only exposes ready endpoints.
@@ -2067,7 +2096,17 @@ fn deployment_launch_error_should_fail_generation(err: &anyhow::Error) -> bool {
     !deployment_launch_error_requires_service_requeue(err)
         && !is_local_volume_unavailable_error(err)
         && !workload_start_error_consumes_service_failure_budget(err)
-        && workload_start_error_is_terminal_service_launch(err)
+        && (deployment_launch_error_exceeded_healthy_deadline(err)
+            || workload_start_error_is_terminal_service_launch(err))
+}
+
+/// Returns true when a deployment launch exceeded its manifest healthy deadline.
+fn deployment_launch_error_exceeded_healthy_deadline(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<ServiceDeploymentHealthyDeadlineExceeded>()
+            .is_some()
+    })
 }
 
 /// Normalizes one service-facing status detail before persisting it.
@@ -2124,6 +2163,17 @@ struct ServiceDeploymentContext<'a> {
     deployment_policy: &'a ServiceDeploymentPolicy,
     admission_policy: &'a WorkloadAdmissionPolicy,
     service_epoch: u64,
+}
+
+/// Typed failure emitted when the manifest healthy deadline is exceeded during initial launch.
+#[derive(Debug, Error)]
+#[error(
+    "{context} exceeded {healthy_deadline_secs}s healthy deadline while launching {task_count} workload(s)"
+)]
+struct ServiceDeploymentHealthyDeadlineExceeded {
+    context: String,
+    healthy_deadline_secs: u64,
+    task_count: usize,
 }
 
 pub(super) struct ServiceRedeploymentJob {
@@ -2256,4 +2306,21 @@ pub(super) fn order_task_ids(
         }
     }
     ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ensures manifest healthy deadline launch expirations fail the active generation.
+    #[test]
+    fn healthy_deadline_launch_error_fails_generation() {
+        let err = anyhow::Error::new(ServiceDeploymentHealthyDeadlineExceeded {
+            context: "service 'api' deployment".to_string(),
+            healthy_deadline_secs: 1,
+            task_count: 1,
+        });
+
+        assert!(deployment_launch_error_should_fail_generation(&err));
+    }
 }

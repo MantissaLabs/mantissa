@@ -2,6 +2,7 @@
 mod common;
 
 use async_trait::async_trait;
+use chrono::{Duration as ChronoDuration, Utc};
 use common::convergence::wait_until;
 use common::testkit::{
     ClusterConfig, InMemoryRuntimeBackend, RuntimeBackendOverrideGuard, TestNode,
@@ -13,11 +14,13 @@ use mantissa::runtime::types::{
     RuntimeInfo,
 };
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode, HeadlessTransport};
-use mantissa::task::types::TaskStateFilter;
+use mantissa::task::types::{TaskStateFilter, TaskValue};
 use mantissa::workload::model::{ExecutionPlatform, IsolationMode, WorkloadAdmissionState};
+use mantissa::workload::model::{WorkloadPhase, WorkloadSpec};
 use mantissa::workload::types::WorkloadAdmissionMode;
 use mantissa_net::noise::NoiseKeys;
 use mantissa_protocol::jobs::{JobStatus as ProtoJobStatus, jobs};
+use mantissa_store::uuid_key::UuidKey;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
@@ -372,6 +375,101 @@ local_test!(jobs_runtime_selection_reaches_workload_attempts, {
     );
 });
 
+local_test!(jobs_progress_deadline_fails_attempt_waiting_for_network, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let node = TestNode::new().await;
+
+    let missing_network_id = Uuid::new_v4();
+    let job_id = submit_job_with_deployment_policy(
+        &node.node.jobs_client,
+        "network-deadline-job",
+        0,
+        0,
+        TestDeploymentPolicy {
+            progress_deadline_secs: 1,
+            healthy_deadline_secs: 600,
+            min_healthy_secs: 1,
+        },
+        &[missing_network_id],
+    )
+    .await
+    .expect("submit job blocked on a missing network");
+
+    assert!(
+        wait_for_job_status(
+            &node.node.jobs_client,
+            job_id,
+            ProtoJobStatus::Failed,
+            Duration::from_secs(10)
+        )
+        .await,
+        "job should fail once the deployment progress deadline expires"
+    );
+    let detail = inspect_job(&node.node.jobs_client, job_id)
+        .await
+        .expect("inspect failed job")
+        .snapshot
+        .status_detail
+        .expect("failed job should carry status detail");
+    assert!(
+        detail.contains("deployment progress deadline"),
+        "job failure should explain the progress deadline: {detail}"
+    );
+});
+
+local_test!(jobs_healthy_deadline_fails_bootstrapping_attempt, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let node = TestNode::new().await;
+
+    let job_id = submit_job_with_deployment_policy(
+        &node.node.jobs_client,
+        "healthy-deadline-job",
+        0,
+        0,
+        TestDeploymentPolicy {
+            progress_deadline_secs: 600,
+            healthy_deadline_secs: 1,
+            min_healthy_secs: 1,
+        },
+        &[],
+    )
+    .await
+    .expect("submit job with short healthy deadline");
+    let workload_id =
+        wait_for_active_workload(&node.node.jobs_client, job_id, Duration::from_secs(5))
+            .await
+            .expect("job should launch one workload");
+
+    mark_workload_phase_with_created_at(
+        &node,
+        workload_id,
+        WorkloadPhase::Pulling,
+        Utc::now() - ChronoDuration::seconds(2),
+    )
+    .await;
+
+    assert!(
+        wait_for_job_status(
+            &node.node.jobs_client,
+            job_id,
+            ProtoJobStatus::Failed,
+            Duration::from_secs(10)
+        )
+        .await,
+        "job should fail once the launched workload exceeds its healthy deadline"
+    );
+    let detail = inspect_job(&node.node.jobs_client, job_id)
+        .await
+        .expect("inspect failed job")
+        .snapshot
+        .status_detail
+        .expect("failed job should carry status detail");
+    assert!(
+        detail.contains("healthy deadline"),
+        "job failure should explain the healthy deadline: {detail}"
+    );
+});
+
 local_test!(jobs_retry_backoff_survives_controller_restart, {
     let state_dir = tempdir().expect("state dir");
     let db_path = state_dir.path().join("state.redb");
@@ -643,6 +741,13 @@ struct JobDetail {
     attempts: Vec<JobAttemptSnapshot>,
 }
 
+#[derive(Clone, Copy)]
+struct TestDeploymentPolicy {
+    progress_deadline_secs: u32,
+    healthy_deadline_secs: u32,
+    min_healthy_secs: u32,
+}
+
 /// Submits one first-class job through the jobs capability and returns the generated id.
 async fn submit_job(
     client: &jobs::Client,
@@ -660,6 +765,50 @@ async fn submit_job(
         None,
     )
     .await
+}
+
+/// Submits one first-class job with explicit deployment deadlines and execution networks.
+async fn submit_job_with_deployment_policy(
+    client: &jobs::Client,
+    name: &str,
+    max_retries: u32,
+    retry_backoff_secs: u32,
+    deployment_policy: TestDeploymentPolicy,
+    execution_networks: &[Uuid],
+) -> Result<Uuid, capnp::Error> {
+    let mut request = client.submit_request();
+    {
+        let mut builder = request.get().init_spec();
+        builder.set_name(name);
+        builder.set_execution_platform("oci");
+        builder.set_isolation_mode("standard");
+        builder.set_isolation_profile("");
+        let mut execution = builder.reborrow().init_execution();
+        execution.set_image("ghcr.io/mantissa/demo-job:latest");
+        execution.set_tty(false);
+        execution.set_cpu_millis(250);
+        execution.set_memory_bytes(128 * 1024 * 1024);
+        execution.set_gpu_count(0);
+        execution.reborrow().init_command(0);
+        execution.reborrow().init_env(0);
+        execution.reborrow().init_secret_files(0);
+        execution.reborrow().init_volumes(0);
+        let mut networks = execution
+            .reborrow()
+            .init_networks(execution_networks.len() as u32);
+        for (index, network_id) in execution_networks.iter().enumerate() {
+            networks.set(index as u32, network_id.as_bytes());
+        }
+        let mut retry_policy = builder.reborrow().init_retry_policy();
+        retry_policy.set_max_retries(max_retries);
+        retry_policy.set_backoff_secs(retry_backoff_secs);
+        let mut policy = builder.reborrow().init_deployment_policy();
+        policy.set_progress_deadline_secs(deployment_policy.progress_deadline_secs);
+        policy.set_healthy_deadline_secs(deployment_policy.healthy_deadline_secs);
+        policy.set_min_healthy_secs(deployment_policy.min_healthy_secs);
+    }
+    let response = request.send().promise.await?;
+    read_uuid(response.get()?.get_job_id()?)
 }
 
 /// Submits one first-class job with an explicit workload admission mode.
@@ -879,6 +1028,88 @@ async fn wait_for_job_status(
         }
     })
     .await
+}
+
+/// Forces one persisted job workload into a selected phase with an old creation timestamp.
+async fn mark_workload_phase_with_created_at(
+    node: &TestNode,
+    workload_id: Uuid,
+    phase: WorkloadPhase,
+    created_at: chrono::DateTime<Utc>,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut task = loop {
+        match node
+            .node
+            .workload_manager
+            .inspect_workload(workload_id)
+            .await
+        {
+            Ok(task) => break task,
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                let _ = error;
+                sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("inspect job workload {workload_id}: {error:#}"),
+        }
+    };
+    task.state = phase;
+    task.created_at = created_at.to_rfc3339();
+    task.updated_at = Utc::now().to_rfc3339();
+    node.node
+        .workloads
+        .upsert(
+            &UuidKey::from(workload_id),
+            task_spec_to_value(&task).into(),
+        )
+        .await
+        .expect("persist job workload state");
+}
+
+/// Rebuilds one workload-store value from a workload spec for state injection tests.
+fn task_spec_to_value(spec: &WorkloadSpec) -> TaskValue {
+    TaskValue {
+        id: spec.id,
+        name: spec.name.clone(),
+        image: spec.image.clone(),
+        execution_platform: spec.execution_platform,
+        isolation_mode: spec.isolation_mode,
+        isolation_profile: spec.isolation_profile.clone(),
+        state: spec.state.clone(),
+        phase_reason: spec.phase_reason.clone(),
+        phase_progress: spec.phase_progress.clone(),
+        created_at: spec.created_at.clone(),
+        updated_at: spec.updated_at.clone(),
+        command: spec.command.clone(),
+        tty: spec.tty,
+        node_id: spec.node_id,
+        node_name: spec.node_name.clone(),
+        slot_ids: spec.slot_ids.clone(),
+        slot_id: spec.slot_id,
+        cpu_millis: spec.cpu_millis,
+        memory_bytes: spec.memory_bytes,
+        gpu_count: spec.gpu_count,
+        gpu_device_ids: spec.gpu_device_ids.clone(),
+        restart_policy: spec.restart_policy.clone(),
+        termination_grace_period_secs: spec.termination_grace_period_secs,
+        pre_stop_command: spec.pre_stop_command.clone(),
+        liveness: spec.liveness.clone(),
+        env: spec.env.clone(),
+        secret_files: spec.secret_files.clone(),
+        volumes: spec.volumes.clone(),
+        networks: spec.networks.clone(),
+        ports: Vec::new(),
+        owner: spec.owner.clone(),
+        lease_id: spec.lease_id,
+        lease_coordinator_node_id: spec.lease_coordinator_node_id,
+        admission_group_id: spec.admission_group_id,
+        admission_state: spec.admission_state,
+        task_epoch: spec.task_epoch,
+        phase_version: spec.phase_version,
+        launch_attempt: spec.launch_attempt,
+        last_terminal_observed_launch: spec.last_terminal_observed_launch,
+        definition_complete: true,
+    }
 }
 
 /// Builds a compact diagnostic string for one job and workload across remaining nodes.
