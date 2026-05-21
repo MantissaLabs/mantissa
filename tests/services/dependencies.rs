@@ -189,7 +189,7 @@ local_test!(
                 service_name,
                 service_name,
                 vec![redeploy_backend, redeploy_frontend],
-                rollout_strategy(1, ServiceRolloutOrder::StartFirst, 1, 1, true),
+                rollout_strategy(1, ServiceRolloutOrder::StartFirst, 1, true),
             )
             .await
             .expect("submit dependency-aware redeployment");

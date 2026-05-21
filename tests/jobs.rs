@@ -1069,7 +1069,6 @@ async fn create_restartable_job_node(
             network_attachment_refresh_tick: None,
             gossip_channel_capacity: None,
             task_runtime: None,
-            service_ready_stability: None,
             runtime_set: Some(RuntimeSet::singleton(
                 IN_MEMORY_RUNTIME_BACKEND_KIND,
                 runtime_backend,

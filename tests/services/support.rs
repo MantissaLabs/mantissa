@@ -1024,7 +1024,6 @@ pub(crate) async fn create_restartable_service_node(
             network_attachment_refresh_tick: None,
             gossip_channel_capacity: None,
             task_runtime: None,
-            service_ready_stability: None,
             runtime_set: Some(RuntimeSet::singleton(
                 IN_MEMORY_RUNTIME_BACKEND_KIND,
                 runtime_backend,
@@ -1041,7 +1040,6 @@ pub(crate) async fn create_restartable_service_node(
 pub(crate) fn rollout_strategy(
     parallelism: u16,
     order: ServiceRolloutOrder,
-    monitor_secs: u32,
     max_failures: u16,
     auto_rollback: bool,
 ) -> ServiceUpdateStrategy {
@@ -1049,8 +1047,6 @@ pub(crate) fn rollout_strategy(
         rolling: ServiceRollingUpdatePolicy {
             parallelism,
             order,
-            startup_timeout_secs: 600,
-            monitor_secs,
             max_failures,
             auto_rollback,
         },

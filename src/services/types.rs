@@ -39,6 +39,8 @@ pub struct ServiceSpecValue {
     #[serde(default)]
     pub update_strategy: ServiceUpdateStrategy,
     #[serde(default)]
+    pub deployment_policy: ServiceDeploymentPolicy,
+    #[serde(default)]
     pub admission_policy: WorkloadAdmissionPolicy,
     #[serde(default)]
     pub service_epoch: u64,
@@ -131,6 +133,7 @@ impl ServiceSpecValue {
             replica_assignment_segments: Vec::new(),
             updated_at: current_timestamp(),
             update_strategy: ServiceUpdateStrategy::default(),
+            deployment_policy: ServiceDeploymentPolicy::default(),
             admission_policy: WorkloadAdmissionPolicy::default(),
             service_epoch: 0,
             phase_version: 0,
@@ -394,6 +397,8 @@ pub struct ServicePreviousGeneration {
     #[serde(default)]
     pub update_strategy: ServiceUpdateStrategy,
     #[serde(default)]
+    pub deployment_policy: ServiceDeploymentPolicy,
+    #[serde(default)]
     pub admission_policy: WorkloadAdmissionPolicy,
     #[serde(default)]
     pub service_epoch: u64,
@@ -411,6 +416,7 @@ impl ServicePreviousGeneration {
             replica_ids: spec.replica_ids.clone(),
             replica_assignment_segments: spec.replica_assignment_segments.clone(),
             update_strategy: spec.update_strategy.clone(),
+            deployment_policy: spec.deployment_policy.clone(),
             admission_policy: spec.admission_policy,
             service_epoch: spec.service_epoch,
             status: spec.status,
@@ -433,6 +439,7 @@ impl ServicePreviousGeneration {
         spec.id = service_id;
         spec.replica_assignment_segments = self.replica_assignment_segments.clone();
         spec.update_strategy = self.update_strategy.clone();
+        spec.deployment_policy = self.deployment_policy.clone();
         spec.admission_policy = self.admission_policy;
         spec.service_epoch = self.service_epoch;
         spec.status = self.status;
@@ -463,8 +470,6 @@ pub enum ServiceRolloutOrder {
 pub struct ServiceRollingUpdatePolicy {
     pub parallelism: u16,
     pub order: ServiceRolloutOrder,
-    pub startup_timeout_secs: u32,
-    pub monitor_secs: u32,
     pub max_failures: u16,
     pub auto_rollback: bool,
 }
@@ -474,8 +479,6 @@ impl Default for ServiceRollingUpdatePolicy {
         Self {
             parallelism: 1,
             order: ServiceRolloutOrder::StartFirst,
-            startup_timeout_secs: 600,
-            monitor_secs: 1,
             max_failures: 1,
             auto_rollback: true,
         }
@@ -488,6 +491,40 @@ pub struct ServiceUpdateStrategy {
     pub mode: ServiceUpdateStrategyMode,
     #[serde(default)]
     pub rolling: ServiceRollingUpdatePolicy,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ServiceDeploymentPolicy {
+    pub progress_deadline_secs: u32,
+    pub healthy_deadline_secs: u32,
+    pub min_healthy_secs: u32,
+}
+
+impl Default for ServiceDeploymentPolicy {
+    fn default() -> Self {
+        Self {
+            progress_deadline_secs: 600,
+            healthy_deadline_secs: 600,
+            min_healthy_secs: 1,
+        }
+    }
+}
+
+impl ServiceDeploymentPolicy {
+    /// Returns the maximum wall-clock window without healthy-replica progress.
+    pub fn progress_deadline(&self) -> Duration {
+        Duration::from_secs(u64::from(self.progress_deadline_secs.max(1)))
+    }
+
+    /// Returns the maximum time one workload attempt may take to become deployment-healthy.
+    pub fn healthy_deadline(&self) -> Duration {
+        Duration::from_secs(u64::from(self.healthy_deadline_secs.max(1)))
+    }
+
+    /// Returns the stability window required before healthy state unblocks deployment.
+    pub fn min_healthy(&self) -> Duration {
+        Duration::from_secs(u64::from(self.min_healthy_secs))
+    }
 }
 
 #[derive(

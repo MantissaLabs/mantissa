@@ -229,16 +229,10 @@ struct RollingUpdatePolicy {
   order @1 :RolloutOrder;
   # Replacement ordering for each slot.
 
-  startupTimeoutSecs @2 :UInt32;
-  # Maximum seconds allowed for a replacement to reach Running.
-
-  monitorSecs @3 :UInt32;
-  # Stabilization window after each step before the rollout advances.
-
-  maxFailures @4 :UInt16;
+  maxFailures @2 :UInt16;
   # Maximum failed rollout steps before marking the rollout failed.
 
-  autoRollback @5 :Bool;
+  autoRollback @3 :Bool;
   # When true, automatically roll back to the previous template on failure.
 }
 
@@ -253,6 +247,17 @@ struct UpdateStrategy {
 
   rolling @1 :RollingUpdatePolicy;
   # Rolling update policy parameters.
+}
+
+struct DeploymentPolicy {
+  progressDeadlineSecs @0 :UInt32;
+  # Maximum seconds a deployment may wait without observing healthy-replica progress.
+
+  healthyDeadlineSecs @1 :UInt32;
+  # Maximum seconds one admitted workload has to become deployment-healthy.
+
+  minHealthySecs @2 :UInt32;
+  # Stability window after a workload becomes healthy before it unblocks deployment.
 }
 
 enum ServiceStatus {
@@ -411,16 +416,19 @@ struct PreviousGeneration {
   updateStrategy @4 :UpdateStrategy;
   # Prior rollout strategy retained for rollback reconstruction.
 
-  serviceEpoch @5 :UInt64;
+  deploymentPolicy @5 :DeploymentPolicy;
+  # Prior deployment deadline policy retained for rollback reconstruction.
+
+  serviceEpoch @6 :UInt64;
   # Causal generation counter for the prior service generation.
 
-  status @6 :ServiceStatus;
+  status @7 :ServiceStatus;
   # Prior lifecycle status restored after rollback when needed.
 
-  admissionPolicy @7 :Workload.AdmissionPolicy;
+  admissionPolicy @8 :Workload.AdmissionPolicy;
   # Prior workload admission policy retained for rollback reconstruction.
 
-  replicaAssignmentSegments @8 :List(ReplicaAssignmentSegment);
+  replicaAssignmentSegments @9 :List(ReplicaAssignmentSegment);
   # Compact prior replica id ranges derived from service id, epoch, template, and replica number.
 }
 
@@ -486,6 +494,9 @@ struct ServiceSpec {
 
   replicaAssignmentSegments @16 :List(ReplicaAssignmentSegment);
   # Compact replica id ranges derived from service id, epoch, template, and replica number.
+
+  deploymentPolicy @17 :DeploymentPolicy;
+  # Controller-owned deployment deadline policy selected by the manifest.
 }
 
 struct ServiceEvent {
@@ -525,6 +536,9 @@ struct ServiceDeploySpec {
 
   admissionPolicy @6 :Workload.AdmissionPolicy;
   # Workload admission contract selected by the manifest.
+
+  deploymentPolicy @7 :DeploymentPolicy;
+  # Controller-owned deployment deadline policy selected by the manifest.
 }
 
 enum DeployOutcome {

@@ -99,6 +99,7 @@ impl ServiceController {
         let service_id = compute_service_id(&service_name);
         let ServiceDeploymentOptions {
             update_strategy,
+            deployment_policy,
             admission_policy,
             required_networks,
         } = options;
@@ -153,6 +154,7 @@ impl ServiceController {
                 &service_name,
                 &task_templates,
                 &update_strategy,
+                &deployment_policy,
                 &admission_policy,
             ) {
                 tracing::info!(
@@ -184,6 +186,7 @@ impl ServiceController {
                 pending_spec.manifest_name = manifest_name.clone();
                 pending_spec.task_templates = task_templates.clone();
                 pending_spec.update_strategy = update_strategy.clone();
+                pending_spec.deployment_policy = deployment_policy.clone();
                 pending_spec.admission_policy = admission_policy;
                 pending_spec.start_new_generation();
                 pending_spec.clear_replica_assignments();
@@ -216,6 +219,7 @@ impl ServiceController {
             pending_spec.manifest_name = manifest_name.clone();
             pending_spec.task_templates = task_templates.clone();
             pending_spec.update_strategy = update_strategy.clone();
+            pending_spec.deployment_policy = deployment_policy.clone();
             pending_spec.admission_policy = admission_policy;
             pending_spec.start_new_generation();
             // A new deployment generation must start from an empty assignment set so peers can
@@ -257,6 +261,7 @@ impl ServiceController {
             Vec::new(),
         );
         pending_spec.update_strategy = update_strategy.clone();
+        pending_spec.deployment_policy = deployment_policy.clone();
         pending_spec.admission_policy = admission_policy;
         pending_spec.previous_generation = None;
         pending_spec.set_status(ServiceStatus::Deploying);
@@ -546,6 +551,7 @@ impl ServiceController {
                 task_templates: current.task_templates.clone(),
                 current_spec: previous.to_service_spec(current.id, current.service_name.clone()),
                 update_strategy: current.update_strategy.clone(),
+                deployment_policy: current.deployment_policy.clone(),
                 admission_policy: current.admission_policy,
             };
             return self.clone().execute_redeployment(job).await;
@@ -558,6 +564,7 @@ impl ServiceController {
                 service_name: current.service_name.clone(),
                 task_templates: current.task_templates.clone(),
                 update_strategy: current.update_strategy.clone(),
+                deployment_policy: current.deployment_policy.clone(),
                 admission_policy: current.admission_policy,
                 service_epoch: current.service_epoch,
                 assigned_task_ids: current.assigned_replica_ids(),
@@ -593,6 +600,7 @@ impl ServiceController {
             service_name,
             task_templates,
             update_strategy,
+            deployment_policy,
             admission_policy,
             service_epoch,
             assigned_task_ids: _,
@@ -625,6 +633,7 @@ impl ServiceController {
             );
             let mut spec = spec;
             spec.update_strategy = update_strategy;
+            spec.deployment_policy = deployment_policy;
             spec.admission_policy = admission_policy;
             spec.service_epoch = service_epoch;
             self.apply_upsert(spec.clone()).await?;
@@ -679,6 +688,7 @@ impl ServiceController {
                     service_name: &service_name,
                     task_templates: &task_templates,
                     update_strategy: &update_strategy,
+                    deployment_policy: &deployment_policy,
                     admission_policy: &admission_policy,
                     service_epoch,
                 };
@@ -705,6 +715,7 @@ impl ServiceController {
         spec.task_templates = task_templates;
         spec.set_replica_ids_compact_when_derived(replica_ids);
         spec.update_strategy = update_strategy;
+        spec.deployment_policy = deployment_policy;
         spec.admission_policy = admission_policy;
         spec.service_epoch = service_epoch;
         spec.previous_generation = None;
@@ -741,6 +752,7 @@ impl ServiceController {
             service_name,
             task_templates,
             update_strategy,
+            deployment_policy,
             admission_policy,
             service_epoch,
             assigned_task_ids,
@@ -754,6 +766,7 @@ impl ServiceController {
             service_name: &service_name,
             task_templates: &task_templates,
             update_strategy: &update_strategy,
+            deployment_policy: &deployment_policy,
             admission_policy: &admission_policy,
             service_epoch,
         };
@@ -1353,10 +1366,8 @@ impl ServiceController {
         gate: DependencyGateContext<'_>,
         dependency_task_ids: &HashMap<String, Vec<Uuid>>,
     ) -> anyhow::Result<()> {
-        let startup_timeout =
-            Duration::from_secs(gate.update_strategy.rolling.startup_timeout_secs.max(1) as u64);
-        let monitor_window =
-            Duration::from_secs(gate.update_strategy.rolling.monitor_secs.max(1) as u64);
+        let startup_timeout = gate.deployment_policy.healthy_deadline();
+        let monitor_window = gate.deployment_policy.min_healthy();
         let deadline = Instant::now() + startup_timeout;
         let mut stable_since: Option<Instant> = None;
         let mut last_detail: Option<String> = None;
@@ -1442,7 +1453,7 @@ impl ServiceController {
                 template_name: &template.name,
                 depends_on: &template.depends_on,
                 template_replica_counts,
-                update_strategy: deployment.update_strategy,
+                deployment_policy: deployment.deployment_policy,
             },
             launched_task_ids,
         )
@@ -1472,6 +1483,7 @@ impl ServiceController {
         spec.task_templates = deployment.task_templates.to_vec();
         spec.set_replica_ids_compact_when_derived(replica_ids);
         spec.update_strategy = deployment.update_strategy.clone();
+        spec.deployment_policy = deployment.deployment_policy.clone();
         spec.admission_policy = *deployment.admission_policy;
         spec.previous_generation = None;
         spec.set_rollout(ServiceRolloutState::default());
@@ -1570,6 +1582,7 @@ impl ServiceController {
                     desired_task_ids.to_vec(),
                 );
                 blocked_spec.update_strategy = deployment.update_strategy.clone();
+                blocked_spec.deployment_policy = deployment.deployment_policy.clone();
                 blocked_spec.admission_policy = *deployment.admission_policy;
                 blocked_spec.previous_generation = None;
                 blocked_spec.set_rollout(ServiceRolloutState::default());
@@ -1604,6 +1617,7 @@ impl ServiceController {
                     Vec::new(),
                 );
                 failed_spec.update_strategy = deployment.update_strategy.clone();
+                failed_spec.deployment_policy = deployment.deployment_policy.clone();
                 failed_spec.admission_policy = *deployment.admission_policy;
                 failed_spec.previous_generation = None;
                 failed_spec.set_rollout(ServiceRolloutState {
@@ -1678,6 +1692,7 @@ impl ServiceController {
         failed_spec.service_name = deployment.service_name.to_string();
         failed_spec.task_templates = deployment.task_templates.to_vec();
         failed_spec.update_strategy = deployment.update_strategy.clone();
+        failed_spec.deployment_policy = deployment.deployment_policy.clone();
         failed_spec.admission_policy = *deployment.admission_policy;
         failed_spec.previous_generation = None;
         let detail = reason.and_then(normalize_service_status_detail);
@@ -2071,6 +2086,7 @@ fn is_running_deployment_noop(
     service_name: &str,
     task_templates: &[TaskTemplateSpecValue],
     update_strategy: &ServiceUpdateStrategy,
+    deployment_policy: &ServiceDeploymentPolicy,
     admission_policy: &WorkloadAdmissionPolicy,
 ) -> bool {
     existing.status() == ServiceStatus::Running
@@ -2078,6 +2094,7 @@ fn is_running_deployment_noop(
         && existing.service_name == service_name
         && existing.task_templates == task_templates
         && existing.update_strategy == *update_strategy
+        && existing.deployment_policy == *deployment_policy
         && existing.admission_policy == *admission_policy
 }
 
@@ -2087,6 +2104,7 @@ struct ServiceDeploymentJob {
     service_name: String,
     task_templates: Vec<TaskTemplateSpecValue>,
     update_strategy: ServiceUpdateStrategy,
+    deployment_policy: ServiceDeploymentPolicy,
     admission_policy: WorkloadAdmissionPolicy,
     service_epoch: u64,
     assigned_task_ids: Vec<Uuid>,
@@ -2103,6 +2121,7 @@ struct ServiceDeploymentContext<'a> {
     service_name: &'a str,
     task_templates: &'a [TaskTemplateSpecValue],
     update_strategy: &'a ServiceUpdateStrategy,
+    deployment_policy: &'a ServiceDeploymentPolicy,
     admission_policy: &'a WorkloadAdmissionPolicy,
     service_epoch: u64,
 }
@@ -2114,6 +2133,7 @@ pub(super) struct ServiceRedeploymentJob {
     pub(super) task_templates: Vec<TaskTemplateSpecValue>,
     pub(super) current_spec: ServiceSpecValue,
     pub(super) update_strategy: ServiceUpdateStrategy,
+    pub(super) deployment_policy: ServiceDeploymentPolicy,
     pub(super) admission_policy: WorkloadAdmissionPolicy,
 }
 
@@ -2126,7 +2146,7 @@ pub(super) struct DependencyGateContext<'a> {
     pub(super) template_name: &'a str,
     pub(super) depends_on: &'a [String],
     pub(super) template_replica_counts: &'a HashMap<String, u16>,
-    pub(super) update_strategy: &'a ServiceUpdateStrategy,
+    pub(super) deployment_policy: &'a ServiceDeploymentPolicy,
 }
 
 /// Distinguishes the dependency-gate phase that is currently blocking one downstream template.

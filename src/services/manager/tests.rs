@@ -1140,15 +1140,20 @@ async fn rollout_startup_timeout_fails_for_slow_start() {
     let task_id = Uuid::new_v4();
     let started = Instant::now();
 
-    let result =
-        wait_rollout_task_running_with_state_fetcher("timeout-service", task_id, 1, 1, || async {
+    let result = wait_rollout_task_running_with_state_fetcher(
+        "timeout-service",
+        task_id,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        || async {
             if started.elapsed() < Duration::from_secs(2) {
                 Ok(Some(WorkloadPhase::Pulling))
             } else {
                 Ok(Some(WorkloadPhase::Running))
             }
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert!(result.is_err(), "slow startup should exceed timeout budget");
     let message = format!("{:#}", result.expect_err("expected timeout failure"));
@@ -1164,15 +1169,20 @@ async fn rollout_startup_timeout_allows_slow_start_with_larger_budget() {
     let task_id = Uuid::new_v4();
     let started = Instant::now();
 
-    let result =
-        wait_rollout_task_running_with_state_fetcher("timeout-service", task_id, 10, 1, || async {
+    let result = wait_rollout_task_running_with_state_fetcher(
+        "timeout-service",
+        task_id,
+        Duration::from_secs(10),
+        Duration::from_secs(1),
+        || async {
             if started.elapsed() < Duration::from_secs(2) {
                 Ok(Some(WorkloadPhase::Pulling))
             } else {
                 Ok(Some(WorkloadPhase::Running))
             }
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert!(
         result.is_ok(),

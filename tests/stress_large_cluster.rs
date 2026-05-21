@@ -374,6 +374,7 @@ fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
         volumes: Vec::new(),
         networks: Vec::new(),
         update: ServiceUpdateStrategy::default(),
+        deployment: Default::default(),
         task_templates: vec![TaskTemplateSpec {
             name: "stress-backend".to_string(),
             image: "hashicorp/http-echo:1.0.0".to_string(),

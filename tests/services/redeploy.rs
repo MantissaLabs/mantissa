@@ -527,8 +527,6 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
         rolling: ServiceRollingUpdatePolicy {
             parallelism: 1,
             order: ServiceRolloutOrder::StartFirst,
-            startup_timeout_secs: 600,
-            monitor_secs: 1,
             max_failures: 2,
             auto_rollback: true,
         },
@@ -646,7 +644,7 @@ local_test!(
             .expect("baseline spec should include one task id");
 
         tasks[0].execution.image = "alpine:3.19".into();
-        let strategy = rollout_strategy(1, ServiceRolloutOrder::StopFirst, 1, 1, true);
+        let strategy = rollout_strategy(1, ServiceRolloutOrder::StopFirst, 1, true);
 
         node.node
             .service_controller
@@ -764,7 +762,7 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
     );
 
     tasks[0].execution.image = "alpine:3.19".into();
-    let strategy = rollout_strategy(2, ServiceRolloutOrder::StartFirst, 1, 1, true);
+    let strategy = rollout_strategy(2, ServiceRolloutOrder::StartFirst, 1, true);
     node.node
         .service_controller
         .submit_deployment_with_strategy(
@@ -870,7 +868,7 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
     let mut failing_tasks = tasks;
     failing_tasks[0].execution.cpu_millis = 500_000;
     failing_tasks[0].execution.memory_bytes = 8 * 1024 * 1024 * 1024;
-    let strategy = rollout_strategy(1, ServiceRolloutOrder::StartFirst, 1, 1, false);
+    let strategy = rollout_strategy(1, ServiceRolloutOrder::StartFirst, 1, false);
 
     node.node
         .service_controller
@@ -960,7 +958,7 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
     let failing_manifest_id = Uuid::new_v4();
     let mut failing_tasks = tasks;
     failing_tasks[0].execution.image = "alpine:3.19".into();
-    let strategy = rollout_strategy(1, ServiceRolloutOrder::StopFirst, 1, 1, true);
+    let strategy = rollout_strategy(1, ServiceRolloutOrder::StopFirst, 1, true);
     manager.enable_create_failures();
 
     node.node

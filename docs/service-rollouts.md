@@ -14,11 +14,14 @@ with safe defaults.
         rolling: (
             parallelism: 2,
             order: start_first,
-            startup_timeout_secs: 600,
-            monitor_secs: 15,
             max_failures: 2,
             auto_rollback: true,
         ),
+    ),
+    deployment: (
+        progress_deadline_secs: 600,
+        healthy_deadline_secs: 600,
+        min_healthy_secs: 15,
     ),
     tasks: [
         (
@@ -41,10 +44,11 @@ If `update` is omitted, Mantissa uses:
 - `mode: rolling`
 - `parallelism: 1`
 - `order: start_first`
-- `startup_timeout_secs: 600`
-- `monitor_secs: 1`
 - `max_failures: 1`
 - `auto_rollback: true`
+- `progress_deadline_secs: 600`
+- `healthy_deadline_secs: 600`
+- `min_healthy_secs: 1`
 
 ## Rolling fields
 
@@ -73,16 +77,6 @@ container owns the node socket until it stops, so this is the only reliable
 way to replace the replica on its deterministic slot target. Chunks without
 overlapping host ports still follow the configured order.
 
-`monitor_secs`
-
-The number of seconds a replacement replica must remain `Running` before the
-rollout step is considered successful.
-
-`startup_timeout_secs`
-
-The number of seconds Mantissa allows a replacement replica to spend in startup
-states (`Pending`, `Pulling`, `Creating`) before that rollout step fails.
-
 `max_failures`
 
 The rollout failure budget. Mantissa counts failed rollout steps and keeps
@@ -96,6 +90,27 @@ Controls what happens when `max_failures` is exhausted.
 - `true`: Mantissa rolls back to the previous generation.
 - `false`: Mantissa leaves the failed generation active and marks the service
   `Failed`.
+
+## Deployment Fields
+
+`progress_deadline_secs`
+
+The maximum wall-clock time a deployment may go without observing additional
+healthy replica progress. Mantissa extends this deadline each time another
+replica becomes healthy, which lets large services keep advancing without
+remaining in `Deploying` forever when progress stops.
+
+`healthy_deadline_secs`
+
+The maximum time one admitted workload has to leave startup states
+(`Pending`, `Pulling`, `Creating`) and become deployment-healthy. Initial
+deployment, dependency gates, rollback restarts, and rolling replacement steps
+use the same deadline.
+
+`min_healthy_secs`
+
+The number of seconds a workload or dependency set must remain healthy before
+it unblocks deployment progress.
 
 ## Operational notes
 

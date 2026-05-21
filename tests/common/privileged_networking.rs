@@ -305,7 +305,6 @@ pub fn privileged_headless_config() -> HeadlessConfig {
         network_attachment_refresh_tick: Some(Duration::from_millis(100)),
         gossip_channel_capacity: None,
         task_runtime: Some(privileged_task_runtime_config()),
-        service_ready_stability: Some(Duration::from_secs(1)),
         runtime_set: None,
         local_volume_root: None,
         master_key_kdf_params: None,

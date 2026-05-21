@@ -1,8 +1,8 @@
 use super::manifest::{
     EnvironmentVariable, LivenessKind, LivenessProbe, ReadinessKind, ReadinessProbe,
-    RestartPolicyName, RolloutOrder, SecretFileProjection, SecretReference, ServiceManifest,
-    ServicePlacementPreference, ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskTemplateSpec,
-    VolumeMount,
+    RestartPolicyName, RolloutOrder, SecretFileProjection, SecretReference,
+    ServiceDeploymentPolicy, ServiceManifest, ServicePlacementPreference, ServiceUpdateStrategy,
+    ServiceUpdateStrategyMode, TaskTemplateSpec, VolumeMount,
 };
 use crate::config::ClientConfig;
 use crate::connection;
@@ -72,10 +72,17 @@ fn write_update_strategy(
         RolloutOrder::StopFirst => mantissa_protocol::services::RolloutOrder::StopFirst,
     };
     rolling.set_order(order);
-    rolling.set_startup_timeout_secs(strategy.rolling.startup_timeout_secs);
-    rolling.set_monitor_secs(strategy.rolling.monitor_secs);
     rolling.set_max_failures(strategy.rolling.max_failures);
     rolling.set_auto_rollback(strategy.rolling.auto_rollback);
+}
+
+fn write_deployment_policy(
+    mut builder: mantissa_protocol::services::deployment_policy::Builder<'_>,
+    policy: &ServiceDeploymentPolicy,
+) {
+    builder.set_progress_deadline_secs(policy.progress_deadline_secs);
+    builder.set_healthy_deadline_secs(policy.healthy_deadline_secs);
+    builder.set_min_healthy_secs(policy.min_healthy_secs);
 }
 
 fn write_env_vars(
@@ -204,6 +211,10 @@ pub async fn deploy_manifest(
         spec.set_manifest_name(&manifest.name);
         spec.set_service_name(&manifest.name);
         write_update_strategy(spec.reborrow().init_update_strategy(), &manifest.update);
+        write_deployment_policy(
+            spec.reborrow().init_deployment_policy(),
+            &manifest.deployment,
+        );
         write_admission_policy(spec.reborrow().init_admission_policy(), &manifest.admission);
         write_network_requirements(
             &mut spec

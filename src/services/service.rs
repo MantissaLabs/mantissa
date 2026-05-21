@@ -4,12 +4,12 @@ use crate::services::manager::{
     ServiceTaskProgressSnapshot,
 };
 use crate::services::types::{
-    ServiceEvent, ServicePortProtocol, ServicePreviousGeneration, ServiceReadinessProbe,
-    ServiceReadinessProbeKind, ServiceReplicaAssignmentSegment, ServiceRescheduleLock,
-    ServiceRescheduleReason, ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase,
-    ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy,
-    ServiceUpdateStrategyMode, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
-    compact_service_replica_assignment_segments,
+    ServiceDeploymentPolicy, ServiceEvent, ServicePortProtocol, ServicePreviousGeneration,
+    ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceReplicaAssignmentSegment,
+    ServiceRescheduleLock, ServiceRescheduleReason, ServiceRollingUpdatePolicy,
+    ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue, ServiceStatus,
+    ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskTemplateNetworkRequirement,
+    TaskTemplateSpecValue, compact_service_replica_assignment_segments,
 };
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
@@ -78,6 +78,11 @@ impl services::Server for ServicesRPC {
         } else {
             WorkloadAdmissionPolicy::default()
         };
+        let deployment_policy = if spec.has_deployment_policy() {
+            read_deployment_policy(spec.get_deployment_policy()?)
+        } else {
+            ServiceDeploymentPolicy::default()
+        };
 
         let submission = self
             .manager
@@ -88,6 +93,7 @@ impl services::Server for ServicesRPC {
                 task_templates,
                 ServiceDeploymentOptions {
                     update_strategy,
+                    deployment_policy,
                     admission_policy,
                     required_networks,
                 },
@@ -264,6 +270,10 @@ fn write_service_spec_with_replica_id_mode(
         builder.reborrow().init_update_strategy(),
         &value.update_strategy,
     );
+    write_deployment_policy(
+        builder.reborrow().init_deployment_policy(),
+        &value.deployment_policy,
+    );
     write_admission_policy(
         builder.reborrow().init_admission_policy(),
         &value.admission_policy,
@@ -430,6 +440,11 @@ fn read_service_spec(reader: service_spec::Reader<'_>) -> Result<ServiceSpecValu
         read_update_strategy(reader.get_update_strategy()?)?
     } else {
         ServiceUpdateStrategy::default()
+    };
+    value.deployment_policy = if reader.has_deployment_policy() {
+        read_deployment_policy(reader.get_deployment_policy()?)
+    } else {
+        ServiceDeploymentPolicy::default()
     };
     value.admission_policy = if reader.has_admission_policy() {
         read_admission_policy(reader.get_admission_policy()?)?
@@ -707,6 +722,10 @@ fn write_previous_generation(
         builder.reborrow().init_update_strategy(),
         &previous.update_strategy,
     );
+    write_deployment_policy(
+        builder.reborrow().init_deployment_policy(),
+        &previous.deployment_policy,
+    );
     write_admission_policy(
         builder.reborrow().init_admission_policy(),
         &previous.admission_policy,
@@ -751,6 +770,11 @@ fn read_previous_generation(
     } else {
         ServiceUpdateStrategy::default()
     };
+    let deployment_policy = if reader.has_deployment_policy() {
+        read_deployment_policy(reader.get_deployment_policy()?)
+    } else {
+        ServiceDeploymentPolicy::default()
+    };
     let admission_policy = if reader.has_admission_policy() {
         read_admission_policy(reader.get_admission_policy()?)?
     } else {
@@ -764,6 +788,7 @@ fn read_previous_generation(
         replica_ids,
         replica_assignment_segments,
         update_strategy,
+        deployment_policy,
         admission_policy,
         service_epoch,
         status: proto_to_service_status(reader.get_status()?),
@@ -1012,8 +1037,6 @@ fn write_update_strategy(
         ServiceRolloutOrder::StopFirst => mantissa_protocol::services::RolloutOrder::StopFirst,
     };
     rolling.set_order(order);
-    rolling.set_startup_timeout_secs(strategy.rolling.startup_timeout_secs);
-    rolling.set_monitor_secs(strategy.rolling.monitor_secs);
     rolling.set_max_failures(strategy.rolling.max_failures);
     rolling.set_auto_rollback(strategy.rolling.auto_rollback);
 }
@@ -1040,18 +1063,9 @@ fn read_update_strategy(
             }
             Err(_) => ServiceRolloutOrder::StartFirst,
         };
-        let startup_timeout_secs = rolling_reader.get_startup_timeout_secs();
-        let default_startup_timeout_secs =
-            ServiceRollingUpdatePolicy::default().startup_timeout_secs;
         ServiceRollingUpdatePolicy {
             parallelism: rolling_reader.get_parallelism().max(1),
             order,
-            startup_timeout_secs: if startup_timeout_secs == 0 {
-                default_startup_timeout_secs
-            } else {
-                startup_timeout_secs
-            },
-            monitor_secs: rolling_reader.get_monitor_secs().max(1),
             max_failures: rolling_reader.get_max_failures(),
             auto_rollback: rolling_reader.get_auto_rollback(),
         }
@@ -1060,6 +1074,38 @@ fn read_update_strategy(
     };
 
     Ok(ServiceUpdateStrategy { mode, rolling })
+}
+
+/// Encodes deployment deadline policy alongside the service generation.
+fn write_deployment_policy(
+    mut builder: mantissa_protocol::services::deployment_policy::Builder<'_>,
+    policy: &ServiceDeploymentPolicy,
+) {
+    builder.set_progress_deadline_secs(policy.progress_deadline_secs);
+    builder.set_healthy_deadline_secs(policy.healthy_deadline_secs);
+    builder.set_min_healthy_secs(policy.min_healthy_secs);
+}
+
+/// Decodes deployment deadline policy, applying runtime-safe lower bounds.
+fn read_deployment_policy(
+    reader: mantissa_protocol::services::deployment_policy::Reader<'_>,
+) -> ServiceDeploymentPolicy {
+    let defaults = ServiceDeploymentPolicy::default();
+    let progress_deadline_secs = reader.get_progress_deadline_secs();
+    let healthy_deadline_secs = reader.get_healthy_deadline_secs();
+    ServiceDeploymentPolicy {
+        progress_deadline_secs: if progress_deadline_secs == 0 {
+            defaults.progress_deadline_secs
+        } else {
+            progress_deadline_secs
+        },
+        healthy_deadline_secs: if healthy_deadline_secs == 0 {
+            defaults.healthy_deadline_secs
+        } else {
+            healthy_deadline_secs
+        },
+        min_healthy_secs: reader.get_min_healthy_secs(),
+    }
 }
 
 /// Maps an internal reschedule reason into the protocol wire enum.
@@ -1269,11 +1315,11 @@ mod tests {
     };
     use crate::services::registry::ServiceRegistry;
     use crate::services::types::{
-        ServiceLivenessProbe, ServiceLivenessProbeKind, ServicePortProtocol,
-        ServicePreviousGeneration, ServiceReadinessProbe, ServiceReadinessProbeKind,
-        ServiceRescheduleLock, ServiceRescheduleReason, ServiceRollingUpdatePolicy,
-        ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue,
-        ServiceStatus, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
+        ServiceDeploymentPolicy, ServiceLivenessProbe, ServiceLivenessProbeKind,
+        ServicePortProtocol, ServicePreviousGeneration, ServiceReadinessProbe,
+        ServiceReadinessProbeKind, ServiceRescheduleLock, ServiceRescheduleReason,
+        ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState,
+        ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
         TaskTemplateNetworkRequirement, TaskTemplateRestartPolicy, TaskTemplateRestartPolicyKind,
         TaskTemplateSpecValue, derive_service_replica_id,
     };
@@ -1545,11 +1591,14 @@ mod tests {
             rolling: ServiceRollingUpdatePolicy {
                 parallelism: 2,
                 order: ServiceRolloutOrder::StopFirst,
-                startup_timeout_secs: 120,
-                monitor_secs: 5,
                 max_failures: 2,
                 auto_rollback: false,
             },
+        };
+        previous.deployment_policy = ServiceDeploymentPolicy {
+            progress_deadline_secs: 300,
+            healthy_deadline_secs: 120,
+            min_healthy_secs: 5,
         };
         previous.admission_policy = WorkloadAdmissionPolicy {
             mode: WorkloadAdmissionMode::Incremental,
@@ -1573,11 +1622,14 @@ mod tests {
             rolling: ServiceRollingUpdatePolicy {
                 parallelism: 3,
                 order: ServiceRolloutOrder::StartFirst,
-                startup_timeout_secs: 180,
-                monitor_secs: 8,
                 max_failures: 1,
                 auto_rollback: true,
             },
+        };
+        spec.deployment_policy = ServiceDeploymentPolicy {
+            progress_deadline_secs: 420,
+            healthy_deadline_secs: 180,
+            min_healthy_secs: 8,
         };
         spec.admission_policy = WorkloadAdmissionPolicy {
             mode: WorkloadAdmissionMode::Gang,

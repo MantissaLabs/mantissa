@@ -38,14 +38,15 @@ mantissa services run examples/rolling_update.ron
 The command follows rollout progress and reports rollback or failure as a
 non-zero CLI result.
 
-This manifest shows the full `update.rolling` surface:
+This manifest shows the rollout and deployment timing surface:
 
 - `parallelism`
 - `order`
-- `startup_timeout_secs`
-- `monitor_secs`
 - `max_failures`
 - `auto_rollback`
+- `deployment.progress_deadline_secs`
+- `deployment.healthy_deadline_secs`
+- `deployment.min_healthy_secs`
 
 See `docs/service-rollouts.md` for field semantics and defaults.
 

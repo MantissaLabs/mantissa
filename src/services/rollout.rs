@@ -19,6 +19,7 @@ struct ServiceRedeploymentTarget<'a> {
     manifest_name: &'a str,
     task_templates: &'a [TaskTemplateSpecValue],
     update_strategy: &'a ServiceUpdateStrategy,
+    deployment_policy: &'a ServiceDeploymentPolicy,
     admission_policy: &'a WorkloadAdmissionPolicy,
 }
 
@@ -32,8 +33,8 @@ struct RollbackTaskRecord {
 #[derive(Clone, Debug)]
 struct RolloutSettings {
     parallelism: usize,
-    startup_timeout_secs: u32,
-    monitor_secs: u32,
+    healthy_deadline: Duration,
+    min_healthy: Duration,
     order: ServiceRolloutOrder,
     max_failures: u16,
     total_steps: u32,
@@ -41,15 +42,16 @@ struct RolloutSettings {
 
 impl RolloutSettings {
     /// Builds rollout execution knobs from strategy values, applying safe minimum bounds.
-    fn from_update_strategy(
+    fn from_policies(
         update_strategy: &ServiceUpdateStrategy,
+        deployment_policy: &ServiceDeploymentPolicy,
         replacement_count: usize,
         removal_count: usize,
     ) -> Self {
         Self {
             parallelism: update_strategy.rolling.parallelism.max(1) as usize,
-            startup_timeout_secs: update_strategy.rolling.startup_timeout_secs.max(1),
-            monitor_secs: update_strategy.rolling.monitor_secs.max(1),
+            healthy_deadline: deployment_policy.healthy_deadline(),
+            min_healthy: deployment_policy.min_healthy(),
             order: update_strategy.rolling.order,
             max_failures: update_strategy.rolling.max_failures,
             total_steps: replacement_count.saturating_add(removal_count) as u32,
@@ -100,7 +102,7 @@ struct ReplacementPhaseContext<'a> {
     task_templates: &'a [TaskTemplateSpecValue],
     template_graph: &'a RolloutTemplateGraph,
     replace: &'a [ReplicaReplacement],
-    update_strategy: &'a ServiceUpdateStrategy,
+    deployment_policy: &'a ServiceDeploymentPolicy,
     admission_policy: &'a WorkloadAdmissionPolicy,
     start_context: String,
 }
@@ -112,7 +114,7 @@ impl<'a> ReplacementPhaseContext<'a> {
         task_templates: &'a [TaskTemplateSpecValue],
         template_graph: &'a RolloutTemplateGraph,
         replace: &'a [ReplicaReplacement],
-        update_strategy: &'a ServiceUpdateStrategy,
+        deployment_policy: &'a ServiceDeploymentPolicy,
         admission_policy: &'a WorkloadAdmissionPolicy,
     ) -> Self {
         Self {
@@ -120,7 +122,7 @@ impl<'a> ReplacementPhaseContext<'a> {
             task_templates,
             template_graph,
             replace,
-            update_strategy,
+            deployment_policy,
             admission_policy,
             start_context: format!("service '{}' rolling replacement", rollout.service_name),
         }
@@ -366,6 +368,7 @@ impl ServiceController {
             task_templates,
             current_spec,
             update_strategy,
+            deployment_policy,
             admission_policy,
         } = job;
 
@@ -383,6 +386,7 @@ impl ServiceController {
             manifest_name: &manifest_name,
             task_templates: &task_templates,
             update_strategy: &update_strategy,
+            deployment_policy: &deployment_policy,
             admission_policy: &admission_policy,
         };
 
@@ -401,8 +405,12 @@ impl ServiceController {
         let retain = plan.retain;
         let replace = plan.replace;
         let remove = plan.remove;
-        let settings =
-            RolloutSettings::from_update_strategy(&update_strategy, replace.len(), remove.len());
+        let settings = RolloutSettings::from_policies(
+            &update_strategy,
+            &deployment_policy,
+            replace.len(),
+            remove.len(),
+        );
         let rollout = RolloutRunContext {
             service_name: &service_name,
             service_id: current_spec.id,
@@ -415,7 +423,7 @@ impl ServiceController {
             &task_templates,
             &desired_graph,
             &replace,
-            &update_strategy,
+            &deployment_policy,
             &admission_policy,
         );
         let removal_phase = RemovalPhaseContext {
@@ -492,6 +500,7 @@ impl ServiceController {
         updated.manifest_name = target.manifest_name.to_string();
         updated.task_templates = target.task_templates.to_vec();
         updated.update_strategy = target.update_strategy.clone();
+        updated.deployment_policy = target.deployment_policy.clone();
         updated.admission_policy = *target.admission_policy;
         updated.start_new_generation();
         updated.previous_generation = None;
@@ -525,15 +534,15 @@ impl ServiceController {
     ) {
         tracing::info!(
             target: "services",
-            "redeployment plan for '{}': {} replacements, {} removals, {} retained replicas (parallelism={}, order={:?}, startup_timeout={}s, monitor={}s, auto_rollback={})",
+            "redeployment plan for '{}': {} replacements, {} removals, {} retained replicas (parallelism={}, order={:?}, healthy_deadline={}s, min_healthy={}s, auto_rollback={})",
             service_name,
             replacement_count,
             removal_count,
             retain_count,
             settings.parallelism,
             settings.order,
-            settings.startup_timeout_secs,
-            settings.monitor_secs,
+            settings.healthy_deadline.as_secs(),
+            settings.min_healthy.as_secs(),
             update_strategy.rolling.auto_rollback
         );
 
@@ -734,7 +743,7 @@ impl ServiceController {
                     template_name: &template.name,
                     depends_on: &template.depends_on,
                     template_replica_counts: &phase.template_graph.replica_counts,
-                    update_strategy: phase.update_strategy,
+                    deployment_policy: phase.deployment_policy,
                 },
                 &dependency_replica_ids,
             )
@@ -829,15 +838,15 @@ impl ServiceController {
             self.wait_rollout_task_running(
                 service_name,
                 spec.id,
-                settings.startup_timeout_secs,
-                settings.monitor_secs,
+                settings.healthy_deadline,
+                settings.min_healthy,
             )
             .await?;
 
             self.publish_task_traffic_for_cutover(
                 service_name,
                 spec.id,
-                Duration::from_secs(settings.startup_timeout_secs.max(5) as u64),
+                settings.healthy_deadline.max(Duration::from_secs(5)),
             )
             .await?;
         }
@@ -1182,6 +1191,7 @@ impl ServiceController {
         next_spec.task_templates = target.task_templates.to_vec();
         next_spec.set_replica_ids_compact_when_derived(ordered_task_ids);
         next_spec.update_strategy = target.update_strategy.clone();
+        next_spec.deployment_policy = target.deployment_policy.clone();
         next_spec.admission_policy = *target.admission_policy;
         next_spec.service_epoch = current_spec.service_epoch.saturating_add(1);
         next_spec.previous_generation = None;
@@ -1205,14 +1215,14 @@ impl ServiceController {
         &self,
         service_name: &str,
         task_id: Uuid,
-        startup_timeout_secs: u32,
-        monitor_secs: u32,
+        healthy_deadline: Duration,
+        min_healthy: Duration,
     ) -> anyhow::Result<()> {
         wait_rollout_task_running_with_state_fetcher(
             service_name,
             task_id,
-            startup_timeout_secs,
-            monitor_secs,
+            healthy_deadline,
+            min_healthy,
             || async {
                 let states = self
                     .workload_manager
@@ -1321,8 +1331,8 @@ impl ServiceController {
         service_name: &str,
         current_spec: &ServiceSpecValue,
         current_graph: &RolloutTemplateGraph,
-        startup_timeout_secs: u32,
-        monitor_secs: u32,
+        healthy_deadline: Duration,
+        min_healthy: Duration,
         rollback_new_task_ids: &HashSet<Uuid>,
         rollback_old_tasks: &HashMap<Uuid, RollbackTaskRecord>,
     ) -> anyhow::Result<()> {
@@ -1412,8 +1422,8 @@ impl ServiceController {
             self.wait_rollout_task_running(
                 service_name,
                 step.task_id,
-                startup_timeout_secs,
-                monitor_secs,
+                healthy_deadline,
+                min_healthy,
             )
             .await?;
         }
@@ -1550,8 +1560,8 @@ impl ServiceController {
                     service_name,
                     current_spec,
                     current_graph,
-                    settings.startup_timeout_secs,
-                    settings.monitor_secs,
+                    settings.healthy_deadline,
+                    settings.min_healthy,
                     rollback_new_task_ids,
                     rollback_old_tasks,
                 )
@@ -1671,15 +1681,15 @@ impl ServiceController {
 pub(super) async fn wait_rollout_task_running_with_state_fetcher<F, Fut>(
     service_name: &str,
     task_id: Uuid,
-    startup_timeout_secs: u32,
-    monitor_secs: u32,
+    healthy_deadline: Duration,
+    min_healthy: Duration,
     mut fetch_state: F,
 ) -> anyhow::Result<()>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = anyhow::Result<Option<WorkloadPhase>>>,
 {
-    let readiness_deadline = Instant::now() + Duration::from_secs(startup_timeout_secs as u64);
+    let readiness_deadline = Instant::now() + healthy_deadline;
     loop {
         if Instant::now() >= readiness_deadline {
             return Err(anyhow!(
@@ -1709,7 +1719,7 @@ where
         sleep(Duration::from_millis(SERVICE_ROLLOUT_POLL_INTERVAL_MS)).await;
     }
 
-    let monitor_deadline = Instant::now() + Duration::from_secs(monitor_secs as u64);
+    let monitor_deadline = Instant::now() + min_healthy;
     while Instant::now() < monitor_deadline {
         let state = fetch_state().await?;
         if !matches!(state, Some(WorkloadPhase::Running)) {

@@ -451,7 +451,7 @@ local_test!(
                 service_name,
                 service_name,
                 vec![replacement_template],
-                rollout_strategy(8, ServiceRolloutOrder::StartFirst, 1, 1, true),
+                rollout_strategy(8, ServiceRolloutOrder::StartFirst, 1, true),
             )
             .await
             .expect("submit sharded replacement deployment");

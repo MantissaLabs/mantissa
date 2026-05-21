@@ -66,7 +66,6 @@ use tracing::{error, info};
 #[derive(Clone)]
 pub struct BootstrapOptions {
     pub task_runtime: Option<WorkloadRuntimeConfig>,
-    pub service_ready_stability: Option<Duration>,
     pub runtime_set: Option<RuntimeSet>,
     pub root_schema_override: Option<RootSchemaState>,
     pub local_volume_root: Option<PathBuf>,
@@ -93,7 +92,6 @@ impl Default for BootstrapOptions {
     fn default() -> Self {
         Self {
             task_runtime: None,
-            service_ready_stability: None,
             runtime_set: None,
             root_schema_override: None,
             local_volume_root: None,
@@ -653,7 +651,6 @@ async fn build_runtime_components(
         gossip_rx: service_rx,
         local_node_id: ctx.self_id,
         health_monitor: health_monitor.clone(),
-        readiness_stability: options.service_ready_stability,
     });
     let services_service = ServicesRPC::new(service_controller.clone(), topology.clone());
     let services_client = capnp_rpc::new_client(services_service);

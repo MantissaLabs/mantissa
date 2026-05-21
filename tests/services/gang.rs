@@ -1167,7 +1167,7 @@ local_test!(services_gang_rollout_commits_parallel_replacement_chunk, {
 
     tasks[0].execution.image = "hashicorp/http-echo:1.0.1".to_string();
     let rollout_manifest_id = Uuid::new_v4();
-    let strategy = rollout_strategy(2, ServiceRolloutOrder::StartFirst, 1, 1, true);
+    let strategy = rollout_strategy(2, ServiceRolloutOrder::StartFirst, 1, true);
     node.node
         .service_controller
         .submit_deployment_with_options_outcome(
@@ -1300,7 +1300,7 @@ local_test!(services_gang_rollout_commits_remote_replacement_groups, {
 
     tasks[0].execution.image = "hashicorp/http-echo:1.0.1".to_string();
     let rollout_manifest_id = Uuid::new_v4();
-    let strategy = rollout_strategy(2, ServiceRolloutOrder::StartFirst, 1, 1, true);
+    let strategy = rollout_strategy(2, ServiceRolloutOrder::StartFirst, 1, true);
     cluster[0]
         .node
         .service_controller
@@ -1439,7 +1439,7 @@ local_test!(
 
         tasks[0].execution.image = "hashicorp/http-echo:1.0.1".to_string();
         let rollout_manifest_id = Uuid::new_v4();
-        let strategy = rollout_strategy(1, ServiceRolloutOrder::StartFirst, 1, 1, true);
+        let strategy = rollout_strategy(1, ServiceRolloutOrder::StartFirst, 1, true);
         node.node
             .service_controller
             .submit_deployment_with_options_outcome(

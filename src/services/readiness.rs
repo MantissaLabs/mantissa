@@ -33,12 +33,6 @@ const SERVICE_DEPLOYMENT_MAX_FAILURE_PROBES: u32 = 5;
 const SERVICE_DEPLOYMENT_MAX_DEGRADED_PROBES: u32 = 6;
 /// Maximum number of terminal failures tolerated for any single task during one deployment.
 const SERVICE_DEPLOYMENT_MAX_TASK_FAILURES: u32 = 3;
-/// Maximum wall-clock window without running-replica progress before failing deployment.
-///
-/// This prevents services from remaining in Deploying forever when replicas stay stuck in
-/// pending/pulling/creating loops without converging to a stable Running set.
-const SERVICE_DEPLOYMENT_PROGRESS_DEADLINE_SECS: u64 = 600;
-
 enum ReadinessOutcome {
     Success(ServiceSpecValue),
     Pending { running_count: usize },
@@ -83,7 +77,8 @@ pub(super) async fn start_readiness_wait(
     let mut task_terminal_launch_seen: HashMap<Uuid, u64> = HashMap::new();
     let mut task_terminal_phase_seen: HashMap<Uuid, u64> = HashMap::new();
     let mut task_failure_counts: HashMap<Uuid, u32> = HashMap::new();
-    let progress_window = Duration::from_secs(SERVICE_DEPLOYMENT_PROGRESS_DEADLINE_SECS);
+    let progress_window = initial_spec.deployment_policy.progress_deadline();
+    let min_healthy = initial_spec.deployment_policy.min_healthy();
     let mut running_high_watermark = 0usize;
     let mut progress_deadline = Instant::now() + progress_window;
 
@@ -148,7 +143,7 @@ pub(super) async fn start_readiness_wait(
                 "service '{}' readiness progressed to {} running replica(s); extending progress deadline by {}s",
                 service_name,
                 running_high_watermark,
-                SERVICE_DEPLOYMENT_PROGRESS_DEADLINE_SECS
+                progress_window.as_secs()
             );
         }
 
@@ -156,14 +151,13 @@ pub(super) async fn start_readiness_wait(
             ReadinessOutcome::Success(snapshot) => {
                 let stable_since = success_since.get_or_insert_with(Instant::now);
                 let stable_elapsed = stable_since.elapsed();
-                let stability = controller.readiness_stability();
-                if stable_elapsed < stability {
+                if stable_elapsed < min_healthy {
                     tracing::debug!(
                         target: "services",
                         "service '{}' readiness running state observed for {:?}; waiting for {:?} stability window",
                         service_name,
                         stable_elapsed,
-                        stability
+                        min_healthy
                     );
                     sleep(Duration::from_millis(SERVICE_READY_POLL_INTERVAL_MS)).await;
                     continue;
@@ -228,7 +222,7 @@ pub(super) async fn start_readiness_wait(
                         target: "services",
                         "service '{}' deployment exceeded {}s without running-replica progress; marking failed ({})",
                         service_name,
-                        SERVICE_DEPLOYMENT_PROGRESS_DEADLINE_SECS,
+                        progress_window.as_secs(),
                         format_task_state_summary(&last_observed_states)
                     );
                     mark_service_failed(&controller, snapshot, &last_observed_states).await;
