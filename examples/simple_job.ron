@@ -18,4 +18,9 @@
         max_retries: 0,
         backoff_secs: 2,
     ),
+    deployment: (
+        progress_deadline_secs: 600,
+        healthy_deadline_secs: 600,
+        min_healthy_secs: 1,
+    ),
 )

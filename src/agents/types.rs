@@ -165,6 +165,8 @@ pub struct AgentSessionSpecValue {
     #[serde(default)]
     pub interaction: AgentInteractionPolicy,
     #[serde(default)]
+    pub deployment_policy: AgentDeploymentPolicy,
+    #[serde(default)]
     pub admission_policy: WorkloadAdmissionPolicy,
     #[serde(default)]
     pub active_run_id: Option<Uuid>,
@@ -211,6 +213,7 @@ impl AgentSessionSpecValue {
             tools,
             checkpoint,
             interaction,
+            deployment_policy: AgentDeploymentPolicy::default(),
             admission_policy: WorkloadAdmissionPolicy::default(),
             active_run_id: None,
             last_run_id: None,
@@ -480,6 +483,8 @@ pub struct AgentRunSpecValue {
     #[serde(default)]
     pub status_detail: Option<String>,
     #[serde(default)]
+    pub deployment_policy: AgentDeploymentPolicy,
+    #[serde(default)]
     pub admission_policy: WorkloadAdmissionPolicy,
     #[serde(default)]
     /// Underlying scheduled workload id once the run has been placed.
@@ -521,6 +526,7 @@ impl AgentRunSpecValue {
             phase_version: 0,
             status: AgentRunStatus::Pending,
             status_detail: Some("sandbox run pending".to_string()),
+            deployment_policy: AgentDeploymentPolicy::default(),
             admission_policy: WorkloadAdmissionPolicy::default(),
             workload_id: None,
             prompt: normalize_optional_text(prompt),
@@ -624,6 +630,37 @@ pub enum AgentEvent {
     UpsertSession(Box<AgentSessionSpecValue>),
     UpsertRun(Box<AgentRunSpecValue>),
     Remove { id: Uuid },
+}
+
+/// Deadline policy used while the agent controller deploys each sandbox run.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AgentDeploymentPolicy {
+    pub progress_deadline_secs: u32,
+    pub healthy_deadline_secs: u32,
+    pub min_healthy_secs: u32,
+}
+
+impl Default for AgentDeploymentPolicy {
+    /// Returns the default deployment deadline policy for agent runs.
+    fn default() -> Self {
+        Self {
+            progress_deadline_secs: 600,
+            healthy_deadline_secs: 600,
+            min_healthy_secs: 1,
+        }
+    }
+}
+
+impl AgentDeploymentPolicy {
+    /// Returns the launch-progress deadline with a runtime-safe lower bound.
+    pub fn progress_deadline_secs(&self) -> u32 {
+        self.progress_deadline_secs.max(1)
+    }
+
+    /// Returns the workload startup deadline with a runtime-safe lower bound.
+    pub fn healthy_deadline_secs(&self) -> u32 {
+        self.healthy_deadline_secs.max(1)
+    }
 }
 
 /// Returns the current RFC3339 timestamp used for replicated agent updates.

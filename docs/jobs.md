@@ -85,6 +85,11 @@ The top-level job manifest separates controller fields from execution fields.
         max_retries: 0,
         backoff_secs: 2,
     ),
+    deployment: (
+        progress_deadline_secs: 600,
+        healthy_deadline_secs: 600,
+        min_healthy_secs: 1,
+    ),
 )
 ```
 
@@ -98,6 +103,7 @@ The top level answers controller and runtime questions:
 | `isolation_profile` | Optional named isolation profile |
 | `volumes` | Declared volumes to provision before submission |
 | `retry_policy` | Controller-owned retry budget and backoff |
+| `deployment` | Controller-owned scheduling and bootstrap deadlines |
 
 The nested `execution` block answers execution-template questions:
 
@@ -174,6 +180,30 @@ If an attempt exits with a non-zero status and retries remain, the job moves to
 attempt. If retries are exhausted, the job moves to `failed`.
 
 If an attempt exits with status code `0`, the job moves to `succeeded`.
+
+## Deployment Deadlines
+
+Job manifests accept a top-level `deployment` block with the same default
+values as services:
+
+- `progress_deadline_secs: 600`
+- `healthy_deadline_secs: 600`
+- `min_healthy_secs: 1`
+
+`progress_deadline_secs` applies while the job controller has reserved a new
+attempt but has not launched the backing workload yet. If that deadline expires,
+the attempt fails or retries according to `retry_policy`.
+
+`healthy_deadline_secs` applies after the workload exists and is still
+bootstrapping. If the attempt remains in startup phases such as `pending`,
+`pulling`, `creating`, or `volume_unavailable` past the deadline, the controller
+records a diagnostic status detail and then fails or retries the attempt.
+
+`min_healthy_secs` is carried for manifest consistency with services. Jobs do
+not currently have a multi-replica stability gate.
+
+For the shared deployment timing model, see
+[docs/deployment-deadlines.md](/Users/abronan/hack/mantissa/docs/deployment-deadlines.md).
 
 ## Observing Jobs
 

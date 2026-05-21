@@ -150,9 +150,9 @@ commands, see [docs/jobs.md](/Users/abronan/hack/mantissa/docs/jobs.md).
 Agents are deliberately split in two.
 
 An `AgentSession` is the durable control-plane object. It owns workspace
-policy, tool policy, checkpoint policy, interaction policy, queued input, and
-recent structured event history. It may exist while consuming no runtime
-capacity at all.
+policy, tool policy, checkpoint policy, interaction policy, deployment
+deadlines, queued input, and recent structured event history. It may exist while
+consuming no runtime capacity at all.
 
 An `AgentRun` is the schedulable execution slice created from that session. It
 is the thing that actually turns into an underlying workload and then into a
@@ -467,6 +467,12 @@ The current default for agent sessions and runs is `oci` plus
 `sandboxed` isolation, which matches their need for stronger isolation and
 explicit interaction policy. That default is a controller choice, not a
 special case in the shared workload manager.
+
+Agent manifests accept the same top-level `deployment` defaults as services and
+jobs. The agent controller uses `progress_deadline_secs` while a run is queued
+before workload launch and `healthy_deadline_secs` while the launched workload
+is still bootstrapping. See
+[docs/deployment-deadlines.md](/Users/abronan/hack/mantissa/docs/deployment-deadlines.md).
 
 ### `src/runtime`
 

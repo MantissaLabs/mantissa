@@ -230,6 +230,7 @@ The manifest path is the production-oriented one. It supports:
 
 - the shared execution template,
 - retry policy,
+- deployment deadlines,
 - declared volumes,
 - named networks,
 - platform and isolation selection,

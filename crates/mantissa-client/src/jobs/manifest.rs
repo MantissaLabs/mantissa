@@ -37,6 +37,8 @@ pub struct JobManifest {
     #[serde(default)]
     pub retry_policy: JobRetryPolicySpec,
     #[serde(default)]
+    pub deployment: JobDeploymentPolicySpec,
+    #[serde(default)]
     pub admission: WorkloadAdmissionPolicy,
 }
 
@@ -74,6 +76,28 @@ impl Default for JobRetryPolicySpec {
         Self {
             max_retries: 0,
             backoff_secs: default_retry_backoff_secs(),
+        }
+    }
+}
+
+/// Controller-owned deployment deadlines declared by one job manifest.
+#[derive(Debug, Deserialize, Clone)]
+pub struct JobDeploymentPolicySpec {
+    #[serde(default = "default_deployment_progress_deadline_secs")]
+    pub progress_deadline_secs: u32,
+    #[serde(default = "default_deployment_healthy_deadline_secs")]
+    pub healthy_deadline_secs: u32,
+    #[serde(default = "default_deployment_min_healthy_secs")]
+    pub min_healthy_secs: u32,
+}
+
+impl Default for JobDeploymentPolicySpec {
+    /// Returns the default deployment policy used by manifest-submitted jobs.
+    fn default() -> Self {
+        Self {
+            progress_deadline_secs: default_deployment_progress_deadline_secs(),
+            healthy_deadline_secs: default_deployment_healthy_deadline_secs(),
+            min_healthy_secs: default_deployment_min_healthy_secs(),
         }
     }
 }
@@ -279,6 +303,21 @@ impl JobManifest {
             &self.execution.placement,
             "job manifest execution.placement",
         )?;
+        if self.retry_policy.backoff_secs == 0 && self.retry_policy.max_retries > 0 {
+            return Err(anyhow!(
+                "job manifest retry_policy.backoff_secs must be greater than zero when retries are enabled"
+            ));
+        }
+        if self.deployment.progress_deadline_secs == 0 {
+            return Err(anyhow!(
+                "job manifest deployment.progress_deadline_secs must be at least 1"
+            ));
+        }
+        if self.deployment.healthy_deadline_secs == 0 {
+            return Err(anyhow!(
+                "job manifest deployment.healthy_deadline_secs must be at least 1"
+            ));
+        }
         Ok(())
     }
 
@@ -638,6 +677,18 @@ fn default_retry_backoff_secs() -> u32 {
     2
 }
 
+fn default_deployment_progress_deadline_secs() -> u32 {
+    600
+}
+
+fn default_deployment_healthy_deadline_secs() -> u32 {
+    600
+}
+
+fn default_deployment_min_healthy_secs() -> u32 {
+    1
+}
+
 fn default_execution_platform() -> String {
     DEFAULT_EXECUTION_PLATFORM.to_string()
 }
@@ -722,6 +773,7 @@ mod tests {
                 placement: PlacementSpec::default(),
             },
             retry_policy: JobRetryPolicySpec::default(),
+            deployment: JobDeploymentPolicySpec::default(),
             admission: WorkloadAdmissionPolicy::default(),
         }
     }

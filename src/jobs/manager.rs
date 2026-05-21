@@ -1,6 +1,8 @@
 use crate::gossip::Message;
 use crate::jobs::registry::JobRegistry;
-use crate::jobs::types::{JobEvent, JobRetryPolicy, JobSpecValue, JobStatus};
+use crate::jobs::types::{
+    JobDeploymentPolicy, JobEvent, JobRetryPolicy, JobSpecValue, JobStatus, parse_timestamp,
+};
 use crate::registry::Registry;
 use crate::workload::manager::workload_start_error_is_retryable;
 use crate::workload::manager::{WorkloadManager, WorkloadStartRequest};
@@ -41,6 +43,7 @@ pub struct JobSubmitRequest {
     pub isolation_mode: IsolationMode,
     pub isolation_profile: Option<String>,
     pub retry_policy: JobRetryPolicy,
+    pub deployment_policy: JobDeploymentPolicy,
     pub admission_policy: WorkloadAdmissionPolicy,
     pub required_networks: Vec<WorkloadNetworkRequirement>,
 }
@@ -136,6 +139,7 @@ impl JobController {
             request.isolation_profile,
             request.retry_policy,
         );
+        spec.deployment_policy = request.deployment_policy;
         spec.admission_policy = request.admission_policy;
         self.apply_upsert(spec.clone()).await?;
         self.broadcast(JobEvent::Upsert(Box::new(spec.clone())))
@@ -532,6 +536,17 @@ impl JobController {
             return Ok(());
         }
 
+        if job_attempt_progress_deadline_expired(&latest) {
+            let detail = format!(
+                "launch attempt {} exceeded {}s deployment progress deadline before workload start",
+                latest.attempts_started,
+                latest.deployment_policy.progress_deadline_secs()
+            );
+            return self
+                .fail_or_retry_task(latest, Some(workload_id), detail, None)
+                .await;
+        }
+
         let request = WorkloadStartRequest {
             name: format!("{}-attempt-{}", latest.name, latest.attempts_started),
             execution: latest.execution.clone(),
@@ -633,6 +648,22 @@ impl JobController {
         }
 
         match task.state {
+            WorkloadPhase::Pending
+            | WorkloadPhase::Pulling
+            | WorkloadPhase::Creating
+            | WorkloadPhase::VolumeUnavailable
+                if job_workload_health_deadline_expired(&task, &current.deployment_policy) =>
+            {
+                let detail = format!(
+                    "attempt {} exceeded {}s healthy deadline while in {:?}",
+                    current.attempts_started,
+                    current.deployment_policy.healthy_deadline_secs(),
+                    task.state
+                );
+                return self
+                    .fail_or_retry_task(current, Some(task.id), detail, None)
+                    .await;
+            }
             WorkloadPhase::Exited(0) => {
                 current.mark_succeeded(task.id, Some("completed successfully".to_string()));
             }
@@ -741,6 +772,31 @@ impl JobController {
             peer_states,
         )
     }
+}
+
+/// Returns true once a reserved job attempt has made no launch progress within its deadline.
+fn job_attempt_progress_deadline_expired(spec: &JobSpecValue) -> bool {
+    let Some(started_at) = spec.active_attempt_started_at.as_deref() else {
+        return false;
+    };
+    timestamp_age_exceeds(started_at, spec.deployment_policy.progress_deadline_secs())
+}
+
+/// Returns true when a launched job workload stays in startup phases past its healthy deadline.
+fn job_workload_health_deadline_expired(
+    workload: &WorkloadSpec,
+    policy: &JobDeploymentPolicy,
+) -> bool {
+    timestamp_age_exceeds(&workload.created_at, policy.healthy_deadline_secs())
+}
+
+/// Compares an RFC3339 timestamp against a second-based deadline using wall-clock UTC.
+fn timestamp_age_exceeds(timestamp: &str, deadline_secs: u32) -> bool {
+    let Some(anchor) = parse_timestamp(timestamp) else {
+        return false;
+    };
+    Utc::now().signed_duration_since(anchor)
+        >= chrono::Duration::seconds(i64::from(deadline_secs.max(1)))
 }
 
 /// Orders job-owned workload attempts from newest to oldest for operator-facing inspection.
@@ -942,5 +998,22 @@ mod tests {
 
         assert!(!job_tracks_workload_attempt(&job, first_workload_id));
         assert!(job_tracks_workload_attempt(&job, retry_workload_id));
+    }
+
+    /// Reserved attempts expire when they do not reach workload launch in time.
+    #[test]
+    fn job_attempt_progress_deadline_expires_reserved_attempt() {
+        let workload_id = Uuid::new_v4();
+        let mut job = test_job();
+        job.deployment_policy.progress_deadline_secs = 1;
+        job.reserve_attempt(workload_id);
+        job.active_attempt_started_at =
+            Some((Utc::now() - chrono::Duration::seconds(2)).to_rfc3339());
+
+        assert!(job_attempt_progress_deadline_expired(&job));
+
+        job.mark_running(workload_id, Some("attempt running".to_string()));
+
+        assert!(!job_attempt_progress_deadline_expired(&job));
     }
 }

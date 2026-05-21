@@ -130,3 +130,6 @@ it unblocks deployment progress.
 See
 [`examples/rolling_update.ron`](/Users/abronan/hack/mantissa/examples/rolling_update.ron)
 for a complete manifest that exercises the rollout fields.
+
+For the shared manifest timing model across services, jobs, and agents, see
+[docs/deployment-deadlines.md](/Users/abronan/hack/mantissa/docs/deployment-deadlines.md).

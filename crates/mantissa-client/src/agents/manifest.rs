@@ -45,6 +45,8 @@ pub struct AgentManifest {
     #[serde(default)]
     pub interaction: AgentInteractionSpec,
     #[serde(default)]
+    pub deployment: AgentDeploymentPolicySpec,
+    #[serde(default)]
     pub pending_input: Option<String>,
     #[serde(default)]
     pub admission: WorkloadAdmissionPolicy,
@@ -171,6 +173,28 @@ impl Default for AgentInteractionSpec {
     }
 }
 
+/// Controller-owned deployment deadlines declared by one agent manifest.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AgentDeploymentPolicySpec {
+    #[serde(default = "default_deployment_progress_deadline_secs")]
+    pub progress_deadline_secs: u32,
+    #[serde(default = "default_deployment_healthy_deadline_secs")]
+    pub healthy_deadline_secs: u32,
+    #[serde(default = "default_deployment_min_healthy_secs")]
+    pub min_healthy_secs: u32,
+}
+
+impl Default for AgentDeploymentPolicySpec {
+    /// Returns the default deployment policy used by manifest-submitted agents.
+    fn default() -> Self {
+        Self {
+            progress_deadline_secs: default_deployment_progress_deadline_secs(),
+            healthy_deadline_secs: default_deployment_healthy_deadline_secs(),
+            min_healthy_secs: default_deployment_min_healthy_secs(),
+        }
+    }
+}
+
 impl AgentManifest {
     /// Validates one agent manifest before it is submitted to the coordinator.
     pub fn validate(&self) -> Result<()> {
@@ -197,6 +221,7 @@ impl AgentManifest {
         validate_checkpoint(&self.checkpoint, &declared_volume_names)?;
         validate_tools(&self.tools)?;
         validate_interaction(&self.interaction)?;
+        validate_deployment(&self.deployment)?;
         validate_mount_targets(
             &self.execution.volumes,
             self.workspace.mount.as_ref(),
@@ -703,6 +728,32 @@ fn default_agent_max_turns_per_run() -> u16 {
     1
 }
 
+fn default_deployment_progress_deadline_secs() -> u32 {
+    600
+}
+
+fn default_deployment_healthy_deadline_secs() -> u32 {
+    600
+}
+
+fn default_deployment_min_healthy_secs() -> u32 {
+    1
+}
+
+fn validate_deployment(policy: &AgentDeploymentPolicySpec) -> Result<()> {
+    if policy.progress_deadline_secs == 0 {
+        return Err(anyhow!(
+            "agent manifest deployment.progress_deadline_secs must be at least 1"
+        ));
+    }
+    if policy.healthy_deadline_secs == 0 {
+        return Err(anyhow!(
+            "agent manifest deployment.healthy_deadline_secs must be at least 1"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,6 +821,7 @@ mod tests {
             },
             checkpoint: AgentCheckpointSpec::default(),
             interaction: AgentInteractionSpec::default(),
+            deployment: AgentDeploymentPolicySpec::default(),
             pending_input: Some("Summarize the repository".to_string()),
             admission: WorkloadAdmissionPolicy::default(),
         }

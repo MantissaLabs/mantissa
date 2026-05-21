@@ -84,6 +84,7 @@ surface:
 - top-level runtime selection through `execution_platform` and `isolation_mode`
 - one shared execution template under `execution`
 - controller-owned retry policy under `retry_policy`
+- deployment deadlines under `deployment`
 
 Once submitted, inspect the job with:
 
@@ -145,7 +146,8 @@ mantissa jobs delete <JOB_ID>
 
 For a deeper explanation of how jobs map to workload attempts, how retries
 work, and how the public jobs API relates to tasks and services, see
-`docs/jobs.md`.
+`docs/jobs.md`. For manifest deployment deadlines shared by services, jobs, and
+agents, see `docs/deployment-deadlines.md`.
 
 ## Run a sandboxed Codex agent session
 
@@ -163,6 +165,7 @@ This manifest shows the first real agent-shaped `nono` example:
 - file-backed OpenAI API key projection at `/run/secrets/codex-api-key`
 - a Mantissa-owned Codex image with a pinned CLI version, non-root user, and
   image-owned entrypoint so the manifest does not need a shell command
+- deployment deadlines for queued and bootstrapping agent runs
 
 The example image lives at `examples/images/codex-sandbox/Dockerfile`. It uses
 the official `node:22-bookworm-slim` base, installs a pinned

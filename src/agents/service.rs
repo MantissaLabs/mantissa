@@ -1,8 +1,8 @@
 use crate::agents::manager::{AgentController, AgentSubmission};
 use crate::agents::types::{
-    AgentCheckpointPolicy, AgentEvent, AgentEventEntry, AgentEventKind, AgentRecordValue,
-    AgentRunSpecValue, AgentRunStatus, AgentSessionSpecValue, AgentSessionStatus, AgentToolPolicy,
-    AgentWorkspacePolicy,
+    AgentCheckpointPolicy, AgentDeploymentPolicy, AgentEvent, AgentEventEntry, AgentEventKind,
+    AgentRecordValue, AgentRunSpecValue, AgentRunStatus, AgentSessionSpecValue, AgentSessionStatus,
+    AgentToolPolicy, AgentWorkspacePolicy,
 };
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
@@ -63,6 +63,7 @@ impl agents::Server for AgentsRpc {
                 session.checkpoint,
                 session.interaction,
                 session.pending_input,
+                session.deployment_policy,
                 session.admission_policy,
                 required_networks,
             )
@@ -330,6 +331,10 @@ pub fn write_agent_session_spec(
     write_tool_policy(builder.reborrow().init_tools(), &value.tools);
     write_checkpoint_policy(builder.reborrow().init_checkpoint(), &value.checkpoint)?;
     write_interaction_policy(builder.reborrow().init_interaction(), &value.interaction);
+    write_deployment_policy(
+        builder.reborrow().init_deployment_policy(),
+        &value.deployment_policy,
+    );
     encode_admission_policy(
         builder.reborrow().init_admission_policy(),
         &value.admission_policy,
@@ -371,6 +376,11 @@ pub fn read_agent_session_spec(
     value.active_run_id = read_optional_uuid(reader.get_active_run_id()?);
     value.last_run_id = read_optional_uuid(reader.get_last_run_id()?);
     value.pending_input = normalize_text(reader.get_pending_input()?);
+    value.deployment_policy = if reader.has_deployment_policy() {
+        read_deployment_policy(reader.get_deployment_policy()?)
+    } else {
+        AgentDeploymentPolicy::default()
+    };
     value.admission_policy = if reader.has_admission_policy() {
         decode_admission_policy(reader.get_admission_policy()?)?
     } else {
@@ -407,6 +417,10 @@ pub fn write_agent_run_spec(
     builder.set_exit_code(value.exit_code.unwrap_or_default());
     builder.set_started_at(value.started_at.as_deref().unwrap_or(""));
     builder.set_finished_at(value.finished_at.as_deref().unwrap_or(""));
+    write_deployment_policy(
+        builder.reborrow().init_deployment_policy(),
+        &value.deployment_policy,
+    );
     encode_admission_policy(
         builder.reborrow().init_admission_policy(),
         &value.admission_policy,
@@ -438,6 +452,11 @@ pub fn read_agent_run_spec(reader: agent_run_spec::Reader<'_>) -> Result<AgentRu
     value.exit_code = reader.get_has_exit_code().then_some(reader.get_exit_code());
     value.started_at = normalize_text(reader.get_started_at()?);
     value.finished_at = normalize_text(reader.get_finished_at()?);
+    value.deployment_policy = if reader.has_deployment_policy() {
+        read_deployment_policy(reader.get_deployment_policy()?)
+    } else {
+        AgentDeploymentPolicy::default()
+    };
     value.admission_policy = if reader.has_admission_policy() {
         decode_admission_policy(reader.get_admission_policy()?)?
     } else {
@@ -749,6 +768,36 @@ fn read_interaction_policy(
             value => Some(value),
         },
     })
+}
+
+fn write_deployment_policy(
+    mut builder: mantissa_protocol::agents::agent_deployment_policy::Builder<'_>,
+    policy: &AgentDeploymentPolicy,
+) {
+    builder.set_progress_deadline_secs(policy.progress_deadline_secs);
+    builder.set_healthy_deadline_secs(policy.healthy_deadline_secs);
+    builder.set_min_healthy_secs(policy.min_healthy_secs);
+}
+
+fn read_deployment_policy(
+    reader: mantissa_protocol::agents::agent_deployment_policy::Reader<'_>,
+) -> AgentDeploymentPolicy {
+    let defaults = AgentDeploymentPolicy::default();
+    let progress_deadline_secs = reader.get_progress_deadline_secs();
+    let healthy_deadline_secs = reader.get_healthy_deadline_secs();
+    AgentDeploymentPolicy {
+        progress_deadline_secs: if progress_deadline_secs == 0 {
+            defaults.progress_deadline_secs
+        } else {
+            progress_deadline_secs
+        },
+        healthy_deadline_secs: if healthy_deadline_secs == 0 {
+            defaults.healthy_deadline_secs
+        } else {
+            healthy_deadline_secs
+        },
+        min_healthy_secs: reader.get_min_healthy_secs(),
+    }
 }
 
 fn write_agent_event_entry(mut builder: agent_event_entry::Builder<'_>, value: &AgentEventEntry) {

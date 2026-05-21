@@ -35,6 +35,8 @@ pub struct JobSpecValue {
     #[serde(default)]
     pub retry_policy: JobRetryPolicy,
     #[serde(default)]
+    pub deployment_policy: JobDeploymentPolicy,
+    #[serde(default)]
     pub admission_policy: WorkloadAdmissionPolicy,
     #[serde(default)]
     pub active_workload_id: Option<Uuid>,
@@ -44,6 +46,8 @@ pub struct JobSpecValue {
     pub successful_workload_id: Option<Uuid>,
     #[serde(default)]
     pub attempts_started: u32,
+    #[serde(default)]
+    pub active_attempt_started_at: Option<String>,
     #[serde(default)]
     pub retry_not_before: Option<String>,
     #[serde(default)]
@@ -78,11 +82,13 @@ impl JobSpecValue {
             status_detail: None,
             completion_policy: JobCompletionPolicy::default(),
             retry_policy,
+            deployment_policy: JobDeploymentPolicy::default(),
             admission_policy: WorkloadAdmissionPolicy::default(),
             active_workload_id: None,
             last_workload_id: None,
             successful_workload_id: None,
             attempts_started: 0,
+            active_attempt_started_at: None,
             retry_not_before: None,
             terminal_exit_code: None,
         }
@@ -122,16 +128,18 @@ impl JobSpecValue {
     /// This keeps launch idempotent across owner changes because another node can
     /// either observe the reserved workload attempt or start the same reservation itself.
     pub fn reserve_attempt(&mut self, workload_id: Uuid) {
+        let now = current_timestamp();
         self.phase_version = self.phase_version.saturating_add(1);
         self.attempts_started = self.attempts_started.saturating_add(1);
         self.status = JobStatus::Pending;
         self.status_detail = Some(format!("launch attempt {} pending", self.attempts_started));
         self.active_workload_id = Some(workload_id);
         self.last_workload_id = Some(workload_id);
+        self.active_attempt_started_at = Some(now.clone());
         self.retry_not_before = None;
         self.completed_at = None;
         self.terminal_exit_code = None;
-        self.touch();
+        self.updated_at = now;
     }
 
     /// Updates the pending launch detail without consuming another retry attempt.
@@ -148,6 +156,7 @@ impl JobSpecValue {
         self.status = JobStatus::Running;
         self.status_detail = normalize_detail(detail);
         self.retry_not_before = None;
+        self.active_attempt_started_at = None;
         if self.started_at.is_none() {
             self.started_at = Some(current_timestamp());
         }
@@ -167,6 +176,7 @@ impl JobSpecValue {
         self.status = JobStatus::Retrying;
         self.status_detail = normalize_detail(detail);
         self.active_workload_id = None;
+        self.active_attempt_started_at = None;
         self.completed_at = None;
         self.terminal_exit_code = None;
         let deadline = now + ChronoDuration::seconds(i64::from(self.retry_policy.backoff_secs));
@@ -181,6 +191,7 @@ impl JobSpecValue {
         self.status = JobStatus::Succeeded;
         self.status_detail = normalize_detail(detail);
         self.active_workload_id = None;
+        self.active_attempt_started_at = None;
         self.successful_workload_id = Some(workload_id);
         self.last_workload_id = Some(workload_id);
         self.retry_not_before = None;
@@ -200,6 +211,7 @@ impl JobSpecValue {
         self.status = JobStatus::Failed;
         self.status_detail = normalize_detail(detail);
         self.active_workload_id = None;
+        self.active_attempt_started_at = None;
         if let Some(workload_id) = workload_id {
             self.last_workload_id = Some(workload_id);
         }
@@ -215,6 +227,7 @@ impl JobSpecValue {
         self.status = JobStatus::Cancelling;
         self.status_detail = normalize_detail(detail);
         self.retry_not_before = None;
+        self.active_attempt_started_at = None;
         self.completed_at = None;
         self.terminal_exit_code = None;
         self.touch();
@@ -226,6 +239,7 @@ impl JobSpecValue {
         self.status = JobStatus::Cancelled;
         self.status_detail = normalize_detail(detail);
         self.active_workload_id = None;
+        self.active_attempt_started_at = None;
         if let Some(workload_id) = workload_id {
             self.last_workload_id = Some(workload_id);
         }
@@ -290,6 +304,37 @@ impl JobRetryPolicy {
     /// Returns the total number of workload attempts permitted for this policy.
     pub fn total_attempts(&self) -> u32 {
         self.max_retries.saturating_add(1)
+    }
+}
+
+/// Deadline policy used while the job controller deploys each workload attempt.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct JobDeploymentPolicy {
+    pub progress_deadline_secs: u32,
+    pub healthy_deadline_secs: u32,
+    pub min_healthy_secs: u32,
+}
+
+impl Default for JobDeploymentPolicy {
+    /// Returns the default deployment deadline policy for job attempts.
+    fn default() -> Self {
+        Self {
+            progress_deadline_secs: 600,
+            healthy_deadline_secs: 600,
+            min_healthy_secs: 1,
+        }
+    }
+}
+
+impl JobDeploymentPolicy {
+    /// Returns the launch-progress deadline with a runtime-safe lower bound.
+    pub fn progress_deadline_secs(&self) -> u32 {
+        self.progress_deadline_secs.max(1)
+    }
+
+    /// Returns the workload startup deadline with a runtime-safe lower bound.
+    pub fn healthy_deadline_secs(&self) -> u32 {
+        self.healthy_deadline_secs.max(1)
     }
 }
 

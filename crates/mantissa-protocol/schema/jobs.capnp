@@ -74,6 +74,17 @@ struct JobRetryPolicy {
   # Backoff delay before the next retry attempt.
 }
 
+struct JobDeploymentPolicy {
+  progressDeadlineSecs @0 :UInt32;
+  # Maximum seconds a job attempt may wait without launch progress.
+
+  healthyDeadlineSecs @1 :UInt32;
+  # Maximum seconds a launched workload attempt may spend becoming healthy.
+
+  minHealthySecs @2 :UInt32;
+  # Stability window retained for deployment-policy consistency.
+}
+
 struct JobSubmitSpec {
   name @0 :Text;
   # Human-facing job name.
@@ -98,6 +109,9 @@ struct JobSubmitSpec {
 
   admissionPolicy @7 :Workload.AdmissionPolicy;
   # Workload admission contract selected for each job attempt.
+
+  deploymentPolicy @8 :JobDeploymentPolicy;
+  # Controller-owned deadline policy for each job attempt.
 }
 
 struct JobSnapshot {
@@ -160,6 +174,9 @@ struct JobSnapshot {
 
   admissionPolicy @19 :Workload.AdmissionPolicy;
   # Workload admission contract selected for each job attempt.
+
+  deploymentPolicy @20 :JobDeploymentPolicy;
+  # Controller-owned deadline policy for each job attempt.
 }
 
 struct JobAttemptSnapshot {
@@ -283,6 +300,12 @@ struct JobRecord {
 
   admissionPolicy @20 :Workload.AdmissionPolicy;
   # Workload admission contract selected for each job attempt.
+
+  deploymentPolicy @21 :JobDeploymentPolicy;
+  # Controller-owned deadline policy for each job attempt.
+
+  activeAttemptStartedAt @22 :Text;
+  # RFC3339 timestamp when the active attempt was reserved, empty when none is active.
 }
 
 enum JobStatus {

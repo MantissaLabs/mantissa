@@ -1,8 +1,9 @@
 use crate::agents::registry::AgentRegistry;
 use crate::agents::types::{
     AGENT_ALLOW_NETWORK_ENV_VAR, AGENT_ALLOW_WRITE_ENV_VAR, AGENT_WORKDIR_ENV_VAR,
-    AgentCheckpointPolicy, AgentEvent, AgentRunSpecValue, AgentRunStatus, AgentSessionSpecValue,
-    AgentSessionStatus, AgentToolPolicy, AgentWorkspacePolicy, normalize_optional_text,
+    AgentCheckpointPolicy, AgentDeploymentPolicy, AgentEvent, AgentRunSpecValue, AgentRunStatus,
+    AgentSessionSpecValue, AgentSessionStatus, AgentToolPolicy, AgentWorkspacePolicy,
+    normalize_optional_text, parse_timestamp,
 };
 use crate::gossip::Message;
 use crate::registry::Registry;
@@ -133,6 +134,7 @@ impl AgentController {
         checkpoint: AgentCheckpointPolicy,
         interaction: crate::agents::types::AgentInteractionPolicy,
         initial_input: Option<String>,
+        deployment_policy: AgentDeploymentPolicy,
         admission_policy: WorkloadAdmissionPolicy,
         required_networks: Vec<WorkloadNetworkRequirement>,
     ) -> Result<AgentSubmission> {
@@ -154,6 +156,7 @@ impl AgentController {
             interaction,
             initial_input,
         );
+        session.deployment_policy = deployment_policy;
         session.admission_policy = admission_policy;
         self.apply_session(session.clone()).await?;
         self.broadcast(AgentEvent::UpsertSession(Box::new(session.clone())))
@@ -480,7 +483,31 @@ impl AgentController {
             WorkloadPhase::Pending
             | WorkloadPhase::Pulling
             | WorkloadPhase::Creating
-            | WorkloadPhase::VolumeUnavailable => Ok(()),
+            | WorkloadPhase::VolumeUnavailable => {
+                if agent_workload_health_deadline_expired(&spec, &run.deployment_policy) {
+                    let mut failed_run = run.clone();
+                    failed_run.mark_failed(
+                        None,
+                        Some(format!(
+                            "sandbox workload exceeded {}s healthy deadline while in {:?}",
+                            run.deployment_policy.healthy_deadline_secs(),
+                            spec.state
+                        )),
+                    );
+                    let mut failed_session = session.clone();
+                    failed_session.mark_failed(
+                        run.id,
+                        Some(format!(
+                            "sandbox workload exceeded {}s healthy deadline while in {:?}",
+                            run.deployment_policy.healthy_deadline_secs(),
+                            spec.state
+                        )),
+                    );
+                    self.persist_run_and_session(&failed_run, &failed_session)
+                        .await?;
+                }
+                Ok(())
+            }
             WorkloadPhase::Running | WorkloadPhase::Paused => {
                 if !matches!(shutdown_intent, RunShutdownIntent::None) {
                     return Ok(());
@@ -640,6 +667,7 @@ impl AgentController {
         );
         let mut run = run;
         run.admission_policy = session.admission_policy;
+        run.deployment_policy = session.deployment_policy.clone();
         let mut updated_session = session.clone();
         updated_session.mark_run_queued(run_id);
         self.apply_run(run.clone()).await?;
@@ -658,6 +686,28 @@ impl AgentController {
         run: AgentRunSpecValue,
     ) -> Result<()> {
         if run.workload_id.is_some() {
+            return Ok(());
+        }
+
+        if agent_run_progress_deadline_expired(&run) {
+            let mut failed_run = run.clone();
+            failed_run.mark_failed(
+                None,
+                Some(format!(
+                    "sandbox run exceeded {}s deployment progress deadline before workload start",
+                    run.deployment_policy.progress_deadline_secs()
+                )),
+            );
+            let mut failed_session = session.clone();
+            failed_session.mark_failed(
+                run.id,
+                Some(format!(
+                    "sandbox run exceeded {}s deployment progress deadline before workload start",
+                    run.deployment_policy.progress_deadline_secs()
+                )),
+            );
+            self.persist_run_and_session(&failed_run, &failed_session)
+                .await?;
             return Ok(());
         }
 
@@ -1105,6 +1155,31 @@ fn build_agent_run_name(session: &AgentSessionSpecValue, run_id: Uuid) -> String
     format!("agent-{prefix}-{run_id}")
 }
 
+/// Returns true once a queued agent run has made no launch progress within its deadline.
+fn agent_run_progress_deadline_expired(run: &AgentRunSpecValue) -> bool {
+    timestamp_age_exceeds(
+        &run.created_at,
+        run.deployment_policy.progress_deadline_secs(),
+    )
+}
+
+/// Returns true when a launched agent workload stays in startup phases past its deadline.
+fn agent_workload_health_deadline_expired(
+    workload: &crate::workload::model::WorkloadSpec,
+    policy: &AgentDeploymentPolicy,
+) -> bool {
+    timestamp_age_exceeds(&workload.created_at, policy.healthy_deadline_secs())
+}
+
+/// Compares an RFC3339 timestamp against a second-based deadline using wall-clock UTC.
+fn timestamp_age_exceeds(timestamp: &str, deadline_secs: u32) -> bool {
+    let Some(anchor) = parse_timestamp(timestamp) else {
+        return false;
+    };
+    chrono::Utc::now().signed_duration_since(anchor)
+        >= chrono::Duration::seconds(i64::from(deadline_secs.max(1)))
+}
+
 /// Computes the stable admission group id for one durable agent run workload.
 fn compute_agent_run_admission_group_id(session_id: Uuid, run_id: Uuid) -> Uuid {
     let mut hasher = blake3::Hasher::new();
@@ -1115,4 +1190,54 @@ fn compute_agent_run_admission_group_id(session_id: Uuid, run_id: Uuid) -> Uuid 
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest.as_bytes()[..16]);
     Uuid::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workload::model::{ExecutionPlatform, IsolationMode};
+
+    fn test_execution() -> ResolvedExecutionSpec {
+        ResolvedExecutionSpec {
+            image: "ghcr.io/demo/agent:latest".to_string(),
+            command: Vec::new(),
+            tty: false,
+            cpu_millis: 0,
+            memory_bytes: 0,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: Vec::new(),
+            ports: Vec::new(),
+            placement: Default::default(),
+        }
+    }
+
+    /// Queued agent runs expire when they do not reach workload launch in time.
+    #[test]
+    fn agent_run_progress_deadline_expires_queued_run() {
+        let mut run = AgentRunSpecValue::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "demo-agent",
+            test_execution(),
+            ExecutionPlatform::Oci,
+            IsolationMode::Sandboxed,
+            None,
+            Some("hello".to_string()),
+        );
+        run.deployment_policy.progress_deadline_secs = 1;
+        run.created_at = (chrono::Utc::now() - chrono::Duration::seconds(2)).to_rfc3339();
+
+        assert!(agent_run_progress_deadline_expired(&run));
+
+        run.created_at = chrono::Utc::now().to_rfc3339();
+
+        assert!(!agent_run_progress_deadline_expired(&run));
+    }
 }

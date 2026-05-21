@@ -55,5 +55,10 @@
         require_user_input_between_runs: true,
         max_turns_per_run: 1,
     ),
+    deployment: (
+        progress_deadline_secs: 600,
+        healthy_deadline_secs: 600,
+        min_healthy_secs: 1,
+    ),
     pending_input: Some("Inside the workspace, create a file named hello.txt containing a one-line greeting from Codex running inside a Mantissa nono sandbox, then print the file contents."),
 )

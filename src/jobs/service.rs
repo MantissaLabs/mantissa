@@ -1,5 +1,5 @@
 use crate::jobs::manager::{JobController, JobSubmission, JobSubmitRequest};
-use crate::jobs::types::{JobEvent, JobRetryPolicy, JobSpecValue, JobStatus};
+use crate::jobs::types::{JobDeploymentPolicy, JobEvent, JobRetryPolicy, JobSpecValue, JobStatus};
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
     decode_admission_policy, decode_env_vars, decode_network_requirements, decode_placement_policy,
@@ -35,6 +35,7 @@ struct DecodedJobSubmitSpec {
     isolation_mode: IsolationMode,
     isolation_profile: Option<String>,
     retry_policy: JobRetryPolicy,
+    deployment_policy: JobDeploymentPolicy,
     admission_policy: WorkloadAdmissionPolicy,
     required_networks: Vec<WorkloadNetworkRequirement>,
 }
@@ -67,6 +68,7 @@ impl jobs::Server for JobsRpc {
                 isolation_mode: spec.isolation_mode,
                 isolation_profile: spec.isolation_profile,
                 retry_policy: spec.retry_policy,
+                deployment_policy: spec.deployment_policy,
                 admission_policy: spec.admission_policy,
                 required_networks: spec.required_networks,
             })
@@ -321,6 +323,38 @@ fn read_job_retry_policy(reader: job_retry_policy::Reader<'_>) -> JobRetryPolicy
     }
 }
 
+/// Encodes one job deployment deadline policy into the jobs wire payload.
+fn write_job_deployment_policy(
+    mut builder: mantissa_protocol::jobs::job_deployment_policy::Builder<'_>,
+    policy: &JobDeploymentPolicy,
+) {
+    builder.set_progress_deadline_secs(policy.progress_deadline_secs);
+    builder.set_healthy_deadline_secs(policy.healthy_deadline_secs);
+    builder.set_min_healthy_secs(policy.min_healthy_secs);
+}
+
+/// Decodes one job deployment deadline policy, restoring defaults for unset deadlines.
+fn read_job_deployment_policy(
+    reader: mantissa_protocol::jobs::job_deployment_policy::Reader<'_>,
+) -> JobDeploymentPolicy {
+    let defaults = JobDeploymentPolicy::default();
+    let progress_deadline_secs = reader.get_progress_deadline_secs();
+    let healthy_deadline_secs = reader.get_healthy_deadline_secs();
+    JobDeploymentPolicy {
+        progress_deadline_secs: if progress_deadline_secs == 0 {
+            defaults.progress_deadline_secs
+        } else {
+            progress_deadline_secs
+        },
+        healthy_deadline_secs: if healthy_deadline_secs == 0 {
+            defaults.healthy_deadline_secs
+        } else {
+            healthy_deadline_secs
+        },
+        min_healthy_secs: reader.get_min_healthy_secs(),
+    }
+}
+
 /// Encodes one replicated job record into the internal jobs wire payload.
 fn write_job_record(
     mut builder: job_record::Builder<'_>,
@@ -337,6 +371,10 @@ fn write_job_record(
     builder.set_status(job_status_to_proto(value.status));
     builder.set_status_detail(value.status_detail.as_deref().unwrap_or(""));
     write_job_retry_policy(builder.reborrow().init_retry_policy(), &value.retry_policy);
+    write_job_deployment_policy(
+        builder.reborrow().init_deployment_policy(),
+        &value.deployment_policy,
+    );
     builder.set_attempts_started(value.attempts_started);
     builder.set_active_workload_id(
         value
@@ -363,6 +401,7 @@ fn write_job_record(
             .unwrap_or(&[]),
     );
     builder.set_retry_not_before(value.retry_not_before.as_deref().unwrap_or(""));
+    builder.set_active_attempt_started_at(value.active_attempt_started_at.as_deref().unwrap_or(""));
     builder.set_terminal_exit_code(value.terminal_exit_code.unwrap_or(-1));
     builder.set_execution_platform(value.execution_platform.as_str());
     builder.set_isolation_mode(value.isolation_mode.as_str());
@@ -446,6 +485,19 @@ fn read_job_record(reader: job_record::Reader<'_>) -> Result<JobSpecValue, Error
     };
     value.terminal_exit_code =
         (reader.get_terminal_exit_code() >= 0).then(|| reader.get_terminal_exit_code());
+    value.active_attempt_started_at = {
+        let raw = reader
+            .get_active_attempt_started_at()?
+            .to_str()?
+            .trim()
+            .to_string();
+        (!raw.is_empty()).then_some(raw)
+    };
+    value.deployment_policy = if reader.has_deployment_policy() {
+        read_job_deployment_policy(reader.get_deployment_policy()?)
+    } else {
+        JobDeploymentPolicy::default()
+    };
     value.admission_policy = if reader.has_admission_policy() {
         decode_admission_policy(reader.get_admission_policy()?)?
     } else {
@@ -469,6 +521,10 @@ fn write_job_snapshot(
     builder.set_status(job_status_to_proto(value.status));
     builder.set_status_detail(value.status_detail.as_deref().unwrap_or(""));
     write_job_retry_policy(builder.reborrow().init_retry_policy(), &value.retry_policy);
+    write_job_deployment_policy(
+        builder.reborrow().init_deployment_policy(),
+        &value.deployment_policy,
+    );
     builder.set_attempts_started(value.attempts_started);
     builder.set_active_workload_id(
         value
@@ -555,6 +611,11 @@ fn read_job_submit_spec(
         isolation_mode: parse_isolation_mode(reader.get_isolation_mode()?.to_str()?)?,
         isolation_profile: read_optional_text(reader.get_isolation_profile()?.to_str()?),
         retry_policy: read_job_retry_policy(reader.get_retry_policy()?),
+        deployment_policy: if reader.has_deployment_policy() {
+            read_job_deployment_policy(reader.get_deployment_policy()?)
+        } else {
+            JobDeploymentPolicy::default()
+        },
         admission_policy: if reader.has_admission_policy() {
             decode_admission_policy(reader.get_admission_policy()?)?
         } else {
