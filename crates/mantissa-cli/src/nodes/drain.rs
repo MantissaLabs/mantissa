@@ -1,3 +1,4 @@
+use crate::output;
 use anyhow::Result;
 use mantissa_client::config::ClientConfig;
 use std::time::Duration;
@@ -14,21 +15,21 @@ pub async fn drain(
     timeout: Duration,
     no_wait: bool,
 ) -> Result<()> {
-    let result =
-        mantissa_client::nodes::drain(cfg, node_id, reason, task_stop_timeout, timeout, no_wait)
-            .await?;
+    let operation =
+        mantissa_client::nodes::request_drain(cfg, node_id, reason, task_stop_timeout).await?;
 
-    if !result.waited {
-        println!("drain requested for node {}", result.node_id);
+    if no_wait {
+        output::emit_line(format!("drain requested for node {}", operation.node_id));
         return Ok(());
     }
 
-    println!(
+    output::emit_line(format!(
         "drain requested for node {}; waiting for completion",
-        result.node_id
-    );
-    for status in &result.progress {
-        println!("{}", compact_progress_line(status));
+        operation.node_id
+    ));
+
+    for status in operation.wait_for_completion(timeout).await? {
+        output::emit_line(compact_progress_line(&status));
     }
     Ok(())
 }

@@ -8,7 +8,7 @@ pub mod list;
 pub mod resume;
 pub mod status;
 
-pub use self::drain::{DrainResult, drain};
+pub use self::drain::{DrainOperation, DrainResult, drain, request_drain};
 pub use self::evict::evict;
 pub use self::info::{
     LoadBalancerFlowDiagnosticsView, NodeInfoView, NodePortFlowDiagnosticsView,
