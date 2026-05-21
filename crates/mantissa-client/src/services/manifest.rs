@@ -6,13 +6,16 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::workload_submit::{
-    ManifestNetworkSpec, RequestedNetworkSpec, resolve_requested_networks,
-    validate_declared_networks, validate_manifest_ports, validate_placement_constraints,
+    DeploymentPolicySpec, ManifestNetworkSpec, RequestedNetworkSpec, resolve_requested_networks,
+    validate_declared_networks, validate_deployment_policy, validate_manifest_ports,
+    validate_placement_constraints,
 };
 pub use crate::workload_submit::{
     ManifestPortBinding, ManifestPortProtocol, PlacementConstraint, PlacementConstraintOperator,
     PlacementConstraintSelector, PlacementStrategy, WorkloadAdmissionMode, WorkloadAdmissionPolicy,
 };
+
+pub type ServiceDeploymentPolicy = DeploymentPolicySpec;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -355,26 +358,6 @@ pub struct ServiceUpdateStrategy {
     pub mode: ServiceUpdateStrategyMode,
     #[serde(default)]
     pub rolling: RollingUpdatePolicy,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ServiceDeploymentPolicy {
-    #[serde(default = "default_deployment_progress_deadline_secs")]
-    pub progress_deadline_secs: u32,
-    #[serde(default = "default_deployment_healthy_deadline_secs")]
-    pub healthy_deadline_secs: u32,
-    #[serde(default = "default_deployment_min_healthy_secs")]
-    pub min_healthy_secs: u32,
-}
-
-impl Default for ServiceDeploymentPolicy {
-    fn default() -> Self {
-        Self {
-            progress_deadline_secs: default_deployment_progress_deadline_secs(),
-            healthy_deadline_secs: default_deployment_healthy_deadline_secs(),
-            min_healthy_secs: default_deployment_min_healthy_secs(),
-        }
-    }
 }
 
 impl ServiceManifest {
@@ -840,17 +823,7 @@ impl ServiceManifest {
             ));
         }
 
-        if self.deployment.progress_deadline_secs == 0 {
-            return Err(anyhow!(
-                "service manifest must set deployment.progress_deadline_secs to at least 1"
-            ));
-        }
-
-        if self.deployment.healthy_deadline_secs == 0 {
-            return Err(anyhow!(
-                "service manifest must set deployment.healthy_deadline_secs to at least 1"
-            ));
-        }
+        validate_deployment_policy(&self.deployment, "service")?;
 
         Ok(())
     }
@@ -990,18 +963,6 @@ fn default_volume_reclaim_policy() -> VolumeReclaimPolicy {
 }
 
 fn default_rollout_parallelism() -> u16 {
-    1
-}
-
-fn default_deployment_progress_deadline_secs() -> u32 {
-    600
-}
-
-fn default_deployment_healthy_deadline_secs() -> u32 {
-    600
-}
-
-fn default_deployment_min_healthy_secs() -> u32 {
     1
 }
 

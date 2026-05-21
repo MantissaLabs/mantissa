@@ -1,8 +1,8 @@
 use super::manifest::{
     EnvironmentVariable, LivenessKind, LivenessProbe, ReadinessKind, ReadinessProbe,
-    RestartPolicyName, RolloutOrder, SecretFileProjection, SecretReference,
-    ServiceDeploymentPolicy, ServiceManifest, ServicePlacementPreference, ServiceUpdateStrategy,
-    ServiceUpdateStrategyMode, TaskTemplateSpec, VolumeMount,
+    RestartPolicyName, RolloutOrder, SecretFileProjection, SecretReference, ServiceManifest,
+    ServicePlacementPreference, ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskTemplateSpec,
+    VolumeMount,
 };
 use crate::config::ClientConfig;
 use crate::connection;
@@ -12,8 +12,8 @@ use crate::workload_submit::{
     compute_network_id, ensure_declared_volumes,
 };
 use crate::workload_wire::{
-    write_admission_policy, write_local_volume_ownership, write_network_requirements,
-    write_placement_policy_parts, write_port_bindings,
+    write_admission_policy, write_deployment_policy, write_local_volume_ownership,
+    write_network_requirements, write_placement_policy_parts, write_port_bindings,
 };
 use anyhow::{Context, Result, anyhow};
 use capnp::{Error as CapnpError, struct_list};
@@ -74,15 +74,6 @@ fn write_update_strategy(
     rolling.set_order(order);
     rolling.set_max_failures(strategy.rolling.max_failures);
     rolling.set_auto_rollback(strategy.rolling.auto_rollback);
-}
-
-fn write_deployment_policy(
-    mut builder: mantissa_protocol::services::deployment_policy::Builder<'_>,
-    policy: &ServiceDeploymentPolicy,
-) {
-    builder.set_progress_deadline_secs(policy.progress_deadline_secs);
-    builder.set_healthy_deadline_secs(policy.healthy_deadline_secs);
-    builder.set_min_healthy_secs(policy.min_healthy_secs);
 }
 
 fn write_env_vars(

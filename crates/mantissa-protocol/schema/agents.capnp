@@ -2,17 +2,6 @@
 
 using Workload = import "workload.capnp";
 
-struct AgentDeploymentPolicy {
-  progressDeadlineSecs @0 :UInt32;
-  # Maximum seconds a run may wait without launch progress.
-
-  healthyDeadlineSecs @1 :UInt32;
-  # Maximum seconds a launched run workload may spend becoming healthy.
-
-  minHealthySecs @2 :UInt32;
-  # Stability window retained for deployment-policy consistency.
-}
-
 interface Agents {
   submit @0 (session :AgentSessionSpec) -> (sessionId :Data);
   # Submit one new durable agent session and return its generated identifier.
@@ -145,7 +134,7 @@ struct AgentSessionSpec {
   placement @34 :Workload.PlacementPolicy;
   # Generic workload placement policy for runs launched from this session.
 
-  deploymentPolicy @35 :AgentDeploymentPolicy;
+  deploymentPolicy @35 :Workload.DeploymentPolicy;
   # Controller-owned deadline policy for runs launched from this session.
 }
 
@@ -249,7 +238,7 @@ struct AgentRunSpec {
   placement @32 :Workload.PlacementPolicy;
   # Generic workload placement policy for this run.
 
-  deploymentPolicy @33 :AgentDeploymentPolicy;
+  deploymentPolicy @33 :Workload.DeploymentPolicy;
   # Controller-owned deadline policy for this run.
 }
 

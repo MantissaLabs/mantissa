@@ -13,10 +13,13 @@ use crate::services::types::{
 };
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
-    decode_admission_policy as read_admission_policy, decode_env_vars, decode_network_requirements,
-    decode_placement_policy as read_placement_policy, decode_port_bindings, decode_secret_files,
-    decode_service_liveness_probe, decode_service_restart_policy, decode_volume_mounts,
-    encode_admission_policy as write_admission_policy, encode_env_vars,
+    decode_admission_policy as read_admission_policy,
+    decode_deployment_policy as read_deployment_policy, decode_env_vars,
+    decode_network_requirements, decode_placement_policy as read_placement_policy,
+    decode_port_bindings, decode_secret_files, decode_service_liveness_probe,
+    decode_service_restart_policy, decode_volume_mounts,
+    encode_admission_policy as write_admission_policy,
+    encode_deployment_policy as write_deployment_policy, encode_env_vars,
     encode_placement_policy as write_placement_policy, encode_port_bindings, encode_secret_files,
     encode_service_liveness_probe, encode_service_restart_policy, encode_volume_mounts,
 };
@@ -1074,38 +1077,6 @@ fn read_update_strategy(
     };
 
     Ok(ServiceUpdateStrategy { mode, rolling })
-}
-
-/// Encodes deployment deadline policy alongside the service generation.
-fn write_deployment_policy(
-    mut builder: mantissa_protocol::services::deployment_policy::Builder<'_>,
-    policy: &ServiceDeploymentPolicy,
-) {
-    builder.set_progress_deadline_secs(policy.progress_deadline_secs);
-    builder.set_healthy_deadline_secs(policy.healthy_deadline_secs);
-    builder.set_min_healthy_secs(policy.min_healthy_secs);
-}
-
-/// Decodes deployment deadline policy, applying runtime-safe lower bounds.
-fn read_deployment_policy(
-    reader: mantissa_protocol::services::deployment_policy::Reader<'_>,
-) -> ServiceDeploymentPolicy {
-    let defaults = ServiceDeploymentPolicy::default();
-    let progress_deadline_secs = reader.get_progress_deadline_secs();
-    let healthy_deadline_secs = reader.get_healthy_deadline_secs();
-    ServiceDeploymentPolicy {
-        progress_deadline_secs: if progress_deadline_secs == 0 {
-            defaults.progress_deadline_secs
-        } else {
-            progress_deadline_secs
-        },
-        healthy_deadline_secs: if healthy_deadline_secs == 0 {
-            defaults.healthy_deadline_secs
-        } else {
-            healthy_deadline_secs
-        },
-        min_healthy_secs: reader.get_min_healthy_secs(),
-    }
 }
 
 /// Maps an internal reschedule reason into the protocol wire enum.

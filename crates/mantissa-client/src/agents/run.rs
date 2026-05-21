@@ -1,8 +1,8 @@
 use crate::agents::manifest::{AgentManifest, load_manifest_from_path};
 use crate::agents::submit::{
-    AgentSubmitResult, PreparedAgentCheckpointPolicy, PreparedAgentDeploymentPolicy,
-    PreparedAgentExecution, PreparedAgentInteractionPolicy, PreparedAgentSessionSpec,
-    PreparedAgentToolPolicy, PreparedAgentWorkspacePolicy, submit_prepared_session,
+    AgentSubmitResult, PreparedAgentCheckpointPolicy, PreparedAgentExecution,
+    PreparedAgentInteractionPolicy, PreparedAgentSessionSpec, PreparedAgentToolPolicy,
+    PreparedAgentWorkspacePolicy, submit_prepared_session,
 };
 use crate::config::ClientConfig;
 use crate::workload_submit::{ResolvedDeclaredVolume, compute_network_id, ensure_declared_volumes};
@@ -66,7 +66,7 @@ async fn prepare_manifest_submit_spec(
             max_turns_per_run: manifest.interaction.max_turns_per_run,
             idle_timeout_secs: manifest.interaction.idle_timeout_secs,
         },
-        deployment_policy: PreparedAgentDeploymentPolicy::from_manifest(&manifest.deployment),
+        deployment_policy: manifest.deployment.clone(),
         pending_input: manifest.pending_input.clone(),
         admission_policy: manifest.admission,
         required_networks,

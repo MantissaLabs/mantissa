@@ -1,4 +1,5 @@
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
+pub use crate::workload::types::WorkloadDeploymentPolicy as JobDeploymentPolicy;
 use crate::workload::types::{ResolvedExecutionSpec, WorkloadAdmissionPolicy};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
@@ -304,37 +305,6 @@ impl JobRetryPolicy {
     /// Returns the total number of workload attempts permitted for this policy.
     pub fn total_attempts(&self) -> u32 {
         self.max_retries.saturating_add(1)
-    }
-}
-
-/// Deadline policy used while the job controller deploys each workload attempt.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct JobDeploymentPolicy {
-    pub progress_deadline_secs: u32,
-    pub healthy_deadline_secs: u32,
-    pub min_healthy_secs: u32,
-}
-
-impl Default for JobDeploymentPolicy {
-    /// Returns the default deployment deadline policy for job attempts.
-    fn default() -> Self {
-        Self {
-            progress_deadline_secs: 600,
-            healthy_deadline_secs: 600,
-            min_healthy_secs: 1,
-        }
-    }
-}
-
-impl JobDeploymentPolicy {
-    /// Returns the launch-progress deadline with a runtime-safe lower bound.
-    pub fn progress_deadline_secs(&self) -> u32 {
-        self.progress_deadline_secs.max(1)
-    }
-
-    /// Returns the workload startup deadline with a runtime-safe lower bound.
-    pub fn healthy_deadline_secs(&self) -> u32 {
-        self.healthy_deadline_secs.max(1)
     }
 }
 

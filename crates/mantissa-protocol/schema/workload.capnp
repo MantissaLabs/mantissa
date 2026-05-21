@@ -175,6 +175,17 @@ struct AdmissionPolicy {
   # Generic workload admission contract selected by the owning controller.
 }
 
+struct DeploymentPolicy {
+  progressDeadlineSecs @0 :UInt32;
+  # Maximum seconds a controller may wait without observing deployment progress.
+
+  healthyDeadlineSecs @1 :UInt32;
+  # Maximum seconds one admitted workload has to become deployment-healthy.
+
+  minHealthySecs @2 :UInt32;
+  # Stability window after a workload becomes healthy before it unblocks deployment.
+}
+
 struct PlacementPolicy {
   constraints @0 :List(PlacementConstraint);
   # Hard scheduler constraints evaluated as typed selector/operator/value predicates.

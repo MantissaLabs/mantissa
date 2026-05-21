@@ -14,7 +14,7 @@ use mantissa::runtime::types::{
 use mantissa::task::types::{TaskStateFilter, TaskValue};
 use mantissa::workload::model::{ExecutionPlatform, IsolationMode};
 use mantissa::workload::model::{WorkloadAdmissionState, WorkloadPhase, WorkloadSpec};
-use mantissa::workload::types::WorkloadAdmissionMode;
+use mantissa::workload::types::{WorkloadAdmissionMode, WorkloadDeploymentPolicy};
 use mantissa_protocol::agents::{
     AgentRunStatus as ProtoAgentRunStatus, AgentSessionStatus as ProtoAgentSessionStatus, agents,
 };
@@ -367,7 +367,7 @@ local_test!(
             "agent-progress-deadline",
             AgentSessionSubmitOptions {
                 initial_input: Some("start"),
-                deployment_policy: Some(TestDeploymentPolicy {
+                deployment_policy: Some(WorkloadDeploymentPolicy {
                     progress_deadline_secs: 1,
                     healthy_deadline_secs: 600,
                     min_healthy_secs: 1,
@@ -417,7 +417,7 @@ local_test!(agents_healthy_deadline_fails_bootstrapping_workload, {
         "agent-healthy-deadline",
         AgentSessionSubmitOptions {
             initial_input: Some("start"),
-            deployment_policy: Some(TestDeploymentPolicy {
+            deployment_policy: Some(WorkloadDeploymentPolicy {
                 progress_deadline_secs: 600,
                 healthy_deadline_secs: 1,
                 min_healthy_secs: 1,
@@ -606,7 +606,7 @@ local_test!(agents_delete_closed_session_removes_session_and_runs, {
     );
 });
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct AgentSessionSubmitOptions<'a> {
     initial_input: Option<&'a str>,
     isolation_profile: Option<&'a str>,
@@ -616,14 +616,7 @@ struct AgentSessionSubmitOptions<'a> {
     admission_mode: Option<WorkloadAdmissionMode>,
     cpu_millis: Option<u64>,
     memory_bytes: Option<u64>,
-    deployment_policy: Option<TestDeploymentPolicy>,
-}
-
-#[derive(Clone, Copy)]
-struct TestDeploymentPolicy {
-    progress_deadline_secs: u32,
-    healthy_deadline_secs: u32,
-    min_healthy_secs: u32,
+    deployment_policy: Option<WorkloadDeploymentPolicy>,
 }
 
 #[derive(Clone)]

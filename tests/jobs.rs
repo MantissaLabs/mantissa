@@ -17,7 +17,7 @@ use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode, Hea
 use mantissa::task::types::{TaskStateFilter, TaskValue};
 use mantissa::workload::model::{ExecutionPlatform, IsolationMode, WorkloadAdmissionState};
 use mantissa::workload::model::{WorkloadPhase, WorkloadSpec};
-use mantissa::workload::types::WorkloadAdmissionMode;
+use mantissa::workload::types::{WorkloadAdmissionMode, WorkloadDeploymentPolicy};
 use mantissa_net::noise::NoiseKeys;
 use mantissa_protocol::jobs::{JobStatus as ProtoJobStatus, jobs};
 use mantissa_store::uuid_key::UuidKey;
@@ -385,7 +385,7 @@ local_test!(jobs_progress_deadline_fails_attempt_waiting_for_network, {
         "network-deadline-job",
         0,
         0,
-        TestDeploymentPolicy {
+        WorkloadDeploymentPolicy {
             progress_deadline_secs: 1,
             healthy_deadline_secs: 600,
             min_healthy_secs: 1,
@@ -426,7 +426,7 @@ local_test!(jobs_healthy_deadline_fails_bootstrapping_attempt, {
         "healthy-deadline-job",
         0,
         0,
-        TestDeploymentPolicy {
+        WorkloadDeploymentPolicy {
             progress_deadline_secs: 600,
             healthy_deadline_secs: 1,
             min_healthy_secs: 1,
@@ -741,13 +741,6 @@ struct JobDetail {
     attempts: Vec<JobAttemptSnapshot>,
 }
 
-#[derive(Clone, Copy)]
-struct TestDeploymentPolicy {
-    progress_deadline_secs: u32,
-    healthy_deadline_secs: u32,
-    min_healthy_secs: u32,
-}
-
 /// Submits one first-class job through the jobs capability and returns the generated id.
 async fn submit_job(
     client: &jobs::Client,
@@ -773,7 +766,7 @@ async fn submit_job_with_deployment_policy(
     name: &str,
     max_retries: u32,
     retry_backoff_secs: u32,
-    deployment_policy: TestDeploymentPolicy,
+    deployment_policy: WorkloadDeploymentPolicy,
     execution_networks: &[Uuid],
 ) -> Result<Uuid, capnp::Error> {
     let mut request = client.submit_request();

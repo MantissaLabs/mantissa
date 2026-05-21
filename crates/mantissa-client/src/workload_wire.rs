@@ -4,16 +4,16 @@ use crate::jobs::manifest::{
 use crate::volumes::LocalVolumeOwnership;
 use crate::volumes::ResolvedVolumeMount;
 use crate::workload_submit::{
-    ManifestPortBinding, ManifestPortProtocol, PlacementConstraint, PlacementConstraintOperator,
-    PlacementConstraintSelector, PlacementSpec, PlacementStrategy, RequestedNetworkSpec,
-    WorkloadAdmissionMode, WorkloadAdmissionPolicy,
+    DeploymentPolicySpec, ManifestPortBinding, ManifestPortProtocol, PlacementConstraint,
+    PlacementConstraintOperator, PlacementConstraintSelector, PlacementSpec, PlacementStrategy,
+    RequestedNetworkSpec, WorkloadAdmissionMode, WorkloadAdmissionPolicy,
 };
 use capnp::struct_list;
 use mantissa_protocol::volumes::local_volume_ownership;
 use mantissa_protocol::workload::{
-    admission_policy, environment_var, liveness_probe, network_requirement, placement_constraint,
-    placement_constraint_selector, placement_policy, port_binding, secret_file, secret_ref,
-    volume_mount,
+    admission_policy, deployment_policy, environment_var, liveness_probe, network_requirement,
+    placement_constraint, placement_constraint_selector, placement_policy, port_binding,
+    secret_file, secret_ref, volume_mount,
 };
 use uuid::Uuid;
 
@@ -38,6 +38,16 @@ pub fn write_admission_policy(
         WorkloadAdmissionMode::Gang => mantissa_protocol::workload::AdmissionMode::Gang,
     };
     builder.set_mode(mode);
+}
+
+/// Encodes one manifest-selected deployment policy into the shared workload wire shape.
+pub fn write_deployment_policy(
+    mut builder: deployment_policy::Builder<'_>,
+    policy: &DeploymentPolicySpec,
+) {
+    builder.set_progress_deadline_secs(policy.progress_deadline_secs);
+    builder.set_healthy_deadline_secs(policy.healthy_deadline_secs);
+    builder.set_min_healthy_secs(policy.min_healthy_secs);
 }
 
 /// Encodes one generic workload placement policy into the shared wire shape.

@@ -249,17 +249,6 @@ struct UpdateStrategy {
   # Rolling update policy parameters.
 }
 
-struct DeploymentPolicy {
-  progressDeadlineSecs @0 :UInt32;
-  # Maximum seconds a deployment may wait without observing healthy-replica progress.
-
-  healthyDeadlineSecs @1 :UInt32;
-  # Maximum seconds one admitted workload has to become deployment-healthy.
-
-  minHealthySecs @2 :UInt32;
-  # Stability window after a workload becomes healthy before it unblocks deployment.
-}
-
 enum ServiceStatus {
   deploying @0;
   # Service is deploying or reconciling.
@@ -416,7 +405,7 @@ struct PreviousGeneration {
   updateStrategy @4 :UpdateStrategy;
   # Prior rollout strategy retained for rollback reconstruction.
 
-  deploymentPolicy @5 :DeploymentPolicy;
+  deploymentPolicy @5 :Workload.DeploymentPolicy;
   # Prior deployment deadline policy retained for rollback reconstruction.
 
   serviceEpoch @6 :UInt64;
@@ -495,7 +484,7 @@ struct ServiceSpec {
   replicaAssignmentSegments @16 :List(ReplicaAssignmentSegment);
   # Compact replica id ranges derived from service id, epoch, template, and replica number.
 
-  deploymentPolicy @17 :DeploymentPolicy;
+  deploymentPolicy @17 :Workload.DeploymentPolicy;
   # Controller-owned deployment deadline policy selected by the manifest.
 }
 
@@ -537,7 +526,7 @@ struct ServiceDeploySpec {
   admissionPolicy @6 :Workload.AdmissionPolicy;
   # Workload admission contract selected by the manifest.
 
-  deploymentPolicy @7 :DeploymentPolicy;
+  deploymentPolicy @7 :Workload.DeploymentPolicy;
   # Controller-owned deployment deadline policy selected by the manifest.
 }
 

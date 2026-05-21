@@ -11,6 +11,7 @@ use crate::workload::model::{
 };
 use crate::workload::types::{ExecutionSpec, ResolvedExecutionSpec, WorkloadAdmissionPolicy};
 pub use crate::workload::types::{
+    WorkloadDeploymentPolicy as ServiceDeploymentPolicy,
     WorkloadLivenessProbe as ServiceLivenessProbe,
     WorkloadLivenessProbeKind as ServiceLivenessProbeKind,
     WorkloadRestartPolicy as TaskTemplateRestartPolicy,
@@ -491,40 +492,6 @@ pub struct ServiceUpdateStrategy {
     pub mode: ServiceUpdateStrategyMode,
     #[serde(default)]
     pub rolling: ServiceRollingUpdatePolicy,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ServiceDeploymentPolicy {
-    pub progress_deadline_secs: u32,
-    pub healthy_deadline_secs: u32,
-    pub min_healthy_secs: u32,
-}
-
-impl Default for ServiceDeploymentPolicy {
-    fn default() -> Self {
-        Self {
-            progress_deadline_secs: 600,
-            healthy_deadline_secs: 600,
-            min_healthy_secs: 1,
-        }
-    }
-}
-
-impl ServiceDeploymentPolicy {
-    /// Returns the maximum wall-clock window without healthy-replica progress.
-    pub fn progress_deadline(&self) -> Duration {
-        Duration::from_secs(u64::from(self.progress_deadline_secs.max(1)))
-    }
-
-    /// Returns the maximum time one workload attempt may take to become deployment-healthy.
-    pub fn healthy_deadline(&self) -> Duration {
-        Duration::from_secs(u64::from(self.healthy_deadline_secs.max(1)))
-    }
-
-    /// Returns the stability window required before healthy state unblocks deployment.
-    pub fn min_healthy(&self) -> Duration {
-        Duration::from_secs(u64::from(self.min_healthy_secs))
-    }
 }
 
 #[derive(

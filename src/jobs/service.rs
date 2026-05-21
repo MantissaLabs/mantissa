@@ -2,10 +2,12 @@ use crate::jobs::manager::{JobController, JobSubmission, JobSubmitRequest};
 use crate::jobs::types::{JobDeploymentPolicy, JobEvent, JobRetryPolicy, JobSpecValue, JobStatus};
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
-    decode_admission_policy, decode_env_vars, decode_network_requirements, decode_placement_policy,
-    decode_port_bindings, decode_secret_files, decode_task_liveness_probe, decode_volume_mounts,
-    encode_admission_policy, encode_env_vars, encode_placement_policy, encode_port_bindings,
-    encode_secret_files, encode_task_liveness_probe, encode_volume_mounts,
+    decode_admission_policy, decode_deployment_policy as read_job_deployment_policy,
+    decode_env_vars, decode_network_requirements, decode_placement_policy, decode_port_bindings,
+    decode_secret_files, decode_task_liveness_probe, decode_volume_mounts, encode_admission_policy,
+    encode_deployment_policy as write_job_deployment_policy, encode_env_vars,
+    encode_placement_policy, encode_port_bindings, encode_secret_files, encode_task_liveness_probe,
+    encode_volume_mounts,
 };
 use crate::workload::model::{ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec};
 use crate::workload::network_prerequisites::WorkloadNetworkRequirement;
@@ -320,38 +322,6 @@ fn read_job_retry_policy(reader: job_retry_policy::Reader<'_>) -> JobRetryPolicy
     JobRetryPolicy {
         max_retries: reader.get_max_retries(),
         backoff_secs: reader.get_backoff_secs(),
-    }
-}
-
-/// Encodes one job deployment deadline policy into the jobs wire payload.
-fn write_job_deployment_policy(
-    mut builder: mantissa_protocol::jobs::job_deployment_policy::Builder<'_>,
-    policy: &JobDeploymentPolicy,
-) {
-    builder.set_progress_deadline_secs(policy.progress_deadline_secs);
-    builder.set_healthy_deadline_secs(policy.healthy_deadline_secs);
-    builder.set_min_healthy_secs(policy.min_healthy_secs);
-}
-
-/// Decodes one job deployment deadline policy, restoring defaults for unset deadlines.
-fn read_job_deployment_policy(
-    reader: mantissa_protocol::jobs::job_deployment_policy::Reader<'_>,
-) -> JobDeploymentPolicy {
-    let defaults = JobDeploymentPolicy::default();
-    let progress_deadline_secs = reader.get_progress_deadline_secs();
-    let healthy_deadline_secs = reader.get_healthy_deadline_secs();
-    JobDeploymentPolicy {
-        progress_deadline_secs: if progress_deadline_secs == 0 {
-            defaults.progress_deadline_secs
-        } else {
-            progress_deadline_secs
-        },
-        healthy_deadline_secs: if healthy_deadline_secs == 0 {
-            defaults.healthy_deadline_secs
-        } else {
-            healthy_deadline_secs
-        },
-        min_healthy_secs: reader.get_min_healthy_secs(),
     }
 }
 

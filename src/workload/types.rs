@@ -146,6 +146,52 @@ impl Default for WorkloadAdmissionPolicy {
     }
 }
 
+/// Shared deployment deadline policy selected by workload-owning controllers.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorkloadDeploymentPolicy {
+    pub progress_deadline_secs: u32,
+    pub healthy_deadline_secs: u32,
+    pub min_healthy_secs: u32,
+}
+
+impl Default for WorkloadDeploymentPolicy {
+    /// Returns the default deployment deadline policy for workload controllers.
+    fn default() -> Self {
+        Self {
+            progress_deadline_secs: 600,
+            healthy_deadline_secs: 600,
+            min_healthy_secs: 1,
+        }
+    }
+}
+
+impl WorkloadDeploymentPolicy {
+    /// Returns the launch-progress deadline with a runtime-safe lower bound.
+    pub fn progress_deadline_secs(&self) -> u32 {
+        self.progress_deadline_secs.max(1)
+    }
+
+    /// Returns the workload startup deadline with a runtime-safe lower bound.
+    pub fn healthy_deadline_secs(&self) -> u32 {
+        self.healthy_deadline_secs.max(1)
+    }
+
+    /// Returns the maximum wall-clock window without healthy-replica progress.
+    pub fn progress_deadline(&self) -> Duration {
+        Duration::from_secs(u64::from(self.progress_deadline_secs()))
+    }
+
+    /// Returns the maximum time one workload attempt may take to become deployment-healthy.
+    pub fn healthy_deadline(&self) -> Duration {
+        Duration::from_secs(u64::from(self.healthy_deadline_secs()))
+    }
+
+    /// Returns the stability window required before healthy state unblocks deployment.
+    pub fn min_healthy(&self) -> Duration {
+        Duration::from_secs(u64::from(self.min_healthy_secs))
+    }
+}
+
 /// Default liveness probe interval in milliseconds.
 fn default_liveness_interval_ms() -> u64 {
     10_000

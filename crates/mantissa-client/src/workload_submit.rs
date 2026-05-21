@@ -62,6 +62,46 @@ pub struct RequestedNetworkSpec {
     pub ip_family: Option<NetworkIpFamily>,
 }
 
+/// Shared deployment deadlines declared by workload-owning manifests.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct DeploymentPolicySpec {
+    #[serde(default = "default_deployment_progress_deadline_secs")]
+    pub progress_deadline_secs: u32,
+    #[serde(default = "default_deployment_healthy_deadline_secs")]
+    pub healthy_deadline_secs: u32,
+    #[serde(default = "default_deployment_min_healthy_secs")]
+    pub min_healthy_secs: u32,
+}
+
+impl Default for DeploymentPolicySpec {
+    /// Returns the default deployment policy used by manifest-submitted controllers.
+    fn default() -> Self {
+        Self {
+            progress_deadline_secs: default_deployment_progress_deadline_secs(),
+            healthy_deadline_secs: default_deployment_healthy_deadline_secs(),
+            min_healthy_secs: default_deployment_min_healthy_secs(),
+        }
+    }
+}
+
+/// Validates shared deployment deadline policy fields for one manifest kind.
+pub fn validate_deployment_policy(
+    policy: &DeploymentPolicySpec,
+    manifest_kind: &str,
+) -> Result<()> {
+    if policy.progress_deadline_secs == 0 {
+        return Err(anyhow!(
+            "{manifest_kind} manifest deployment.progress_deadline_secs must be at least 1"
+        ));
+    }
+    if policy.healthy_deadline_secs == 0 {
+        return Err(anyhow!(
+            "{manifest_kind} manifest deployment.healthy_deadline_secs must be at least 1"
+        ));
+    }
+    Ok(())
+}
+
 /// Transport protocol for one manifest-declared node-local host port binding.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -420,6 +460,21 @@ fn parse_cidr(value: &str) -> Option<(IpAddr, u8)> {
 /// Return the default host bind address for node-local host ports.
 fn default_host_port_ip() -> String {
     "0.0.0.0".to_string()
+}
+
+/// Default launch progress deadline in seconds for workload controller manifests.
+fn default_deployment_progress_deadline_secs() -> u32 {
+    600
+}
+
+/// Default workload healthy deadline in seconds for workload controller manifests.
+fn default_deployment_healthy_deadline_secs() -> u32 {
+    600
+}
+
+/// Default post-healthy stability window in seconds for workload controller manifests.
+fn default_deployment_min_healthy_secs() -> u32 {
+    1
 }
 
 /// Normalized host port request used for duplicate and wildcard conflict detection.

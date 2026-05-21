@@ -1,4 +1,5 @@
 use crate::workload::model::{ExecutionPlatform, IsolationMode, WorkloadVolumeMount};
+pub use crate::workload::types::WorkloadDeploymentPolicy as AgentDeploymentPolicy;
 use crate::workload::types::{ResolvedExecutionSpec, WorkloadAdmissionPolicy};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -630,37 +631,6 @@ pub enum AgentEvent {
     UpsertSession(Box<AgentSessionSpecValue>),
     UpsertRun(Box<AgentRunSpecValue>),
     Remove { id: Uuid },
-}
-
-/// Deadline policy used while the agent controller deploys each sandbox run.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AgentDeploymentPolicy {
-    pub progress_deadline_secs: u32,
-    pub healthy_deadline_secs: u32,
-    pub min_healthy_secs: u32,
-}
-
-impl Default for AgentDeploymentPolicy {
-    /// Returns the default deployment deadline policy for agent runs.
-    fn default() -> Self {
-        Self {
-            progress_deadline_secs: 600,
-            healthy_deadline_secs: 600,
-            min_healthy_secs: 1,
-        }
-    }
-}
-
-impl AgentDeploymentPolicy {
-    /// Returns the launch-progress deadline with a runtime-safe lower bound.
-    pub fn progress_deadline_secs(&self) -> u32 {
-        self.progress_deadline_secs.max(1)
-    }
-
-    /// Returns the workload startup deadline with a runtime-safe lower bound.
-    pub fn healthy_deadline_secs(&self) -> u32 {
-        self.healthy_deadline_secs.max(1)
-    }
 }
 
 /// Returns the current RFC3339 timestamp used for replicated agent updates.

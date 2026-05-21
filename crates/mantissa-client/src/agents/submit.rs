@@ -10,8 +10,8 @@ use crate::volumes;
 use crate::workload_submit::{PlacementSpec, RequestedNetworkSpec, WorkloadAdmissionPolicy};
 use crate::workload_wire::{
     PreparedVolumeMount, prepared_volume_mount_from_resolved, write_admission_policy,
-    write_env_vars, write_liveness_probe, write_network_requirements, write_optional_volume_mount,
-    write_placement_policy, write_secret_files, write_volume_mounts,
+    write_deployment_policy, write_env_vars, write_liveness_probe, write_network_requirements,
+    write_optional_volume_mount, write_placement_policy, write_secret_files, write_volume_mounts,
 };
 use anyhow::{Result, anyhow};
 use mantissa_protocol::agents::agent_session_spec;
@@ -71,7 +71,7 @@ pub(crate) struct PreparedAgentSessionSpec {
     pub tools: PreparedAgentToolPolicy,
     pub checkpoint: PreparedAgentCheckpointPolicy,
     pub interaction: PreparedAgentInteractionPolicy,
-    pub deployment_policy: PreparedAgentDeploymentPolicy,
+    pub deployment_policy: AgentDeploymentPolicySpec,
     pub pending_input: Option<String>,
     pub admission_policy: WorkloadAdmissionPolicy,
     pub required_networks: Vec<RequestedNetworkSpec>,
@@ -122,20 +122,6 @@ pub(crate) struct PreparedAgentInteractionPolicy {
     pub require_user_input_between_runs: bool,
     pub max_turns_per_run: u16,
     pub idle_timeout_secs: Option<u32>,
-}
-
-/// One prepared deployment policy ready for agents wire encoding.
-pub(crate) struct PreparedAgentDeploymentPolicy {
-    pub progress_deadline_secs: u32,
-    pub healthy_deadline_secs: u32,
-    pub min_healthy_secs: u32,
-}
-
-impl Default for PreparedAgentDeploymentPolicy {
-    /// Returns the default prepared deployment policy for raw CLI submissions.
-    fn default() -> Self {
-        Self::from_manifest(&AgentDeploymentPolicySpec::default())
-    }
 }
 
 /// Submits one durable agent session through the agents control-plane capability.
@@ -211,7 +197,7 @@ async fn prepare_raw_submit_spec(
             max_turns_per_run: options.max_turns_per_run,
             idle_timeout_secs: options.idle_timeout_secs,
         },
-        deployment_policy: PreparedAgentDeploymentPolicy::default(),
+        deployment_policy: AgentDeploymentPolicySpec::default(),
         pending_input: normalize_optional_text(options.initial_input),
         admission_policy: WorkloadAdmissionPolicy::default(),
         required_networks: Vec::new(),
@@ -384,26 +370,6 @@ fn write_interaction_policy(
     interaction.set_require_user_input_between_runs(policy.require_user_input_between_runs);
     interaction.set_max_turns_per_run(policy.max_turns_per_run);
     interaction.set_idle_timeout_secs(policy.idle_timeout_secs.unwrap_or_default());
-}
-
-fn write_deployment_policy(
-    mut builder: mantissa_protocol::agents::agent_deployment_policy::Builder<'_>,
-    policy: &PreparedAgentDeploymentPolicy,
-) {
-    builder.set_progress_deadline_secs(policy.progress_deadline_secs);
-    builder.set_healthy_deadline_secs(policy.healthy_deadline_secs);
-    builder.set_min_healthy_secs(policy.min_healthy_secs);
-}
-
-impl PreparedAgentDeploymentPolicy {
-    /// Copies a manifest deployment policy into the prepared wire-friendly shape.
-    pub(crate) fn from_manifest(policy: &AgentDeploymentPolicySpec) -> Self {
-        Self {
-            progress_deadline_secs: policy.progress_deadline_secs,
-            healthy_deadline_secs: policy.healthy_deadline_secs,
-            min_healthy_secs: policy.min_healthy_secs,
-        }
-    }
 }
 
 /// Resolves one optional workspace or checkpoint mount flag into a concrete volume mount.

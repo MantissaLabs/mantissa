@@ -8,16 +8,16 @@ use crate::workload::model::{
 };
 use crate::workload::network_prerequisites::{WorkloadNetworkIpFamily, WorkloadNetworkRequirement};
 use crate::workload::types::{
-    WorkloadAdmissionMode, WorkloadAdmissionPolicy, WorkloadLivenessProbe,
-    WorkloadLivenessProbeKind, WorkloadPortBinding, WorkloadPortProtocol, WorkloadRestartPolicy,
-    WorkloadRestartPolicyKind,
+    WorkloadAdmissionMode, WorkloadAdmissionPolicy, WorkloadDeploymentPolicy,
+    WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadPortBinding, WorkloadPortProtocol,
+    WorkloadRestartPolicy, WorkloadRestartPolicyKind,
 };
 use capnp::{Error, struct_list};
 use mantissa_protocol::volumes::local_volume_ownership;
 use mantissa_protocol::workload::{
-    admission_policy, environment_var, network_requirement, placement_constraint,
-    placement_constraint_selector, placement_policy, port_binding, secret_file, secret_ref,
-    volume_mount,
+    admission_policy, deployment_policy, environment_var, network_requirement,
+    placement_constraint, placement_constraint_selector, placement_policy, port_binding,
+    secret_file, secret_ref, volume_mount,
 };
 use uuid::Uuid;
 
@@ -47,6 +47,36 @@ pub fn decode_admission_policy(
         Err(_) => WorkloadAdmissionMode::Incremental,
     };
     Ok(WorkloadAdmissionPolicy { mode })
+}
+
+/// Encodes one workload deployment deadline policy into the shared wire shape.
+pub fn encode_deployment_policy(
+    mut builder: deployment_policy::Builder<'_>,
+    policy: &WorkloadDeploymentPolicy,
+) {
+    builder.set_progress_deadline_secs(policy.progress_deadline_secs);
+    builder.set_healthy_deadline_secs(policy.healthy_deadline_secs);
+    builder.set_min_healthy_secs(policy.min_healthy_secs);
+}
+
+/// Decodes one workload deployment policy, restoring defaults for unset deadlines.
+pub fn decode_deployment_policy(reader: deployment_policy::Reader<'_>) -> WorkloadDeploymentPolicy {
+    let defaults = WorkloadDeploymentPolicy::default();
+    let progress_deadline_secs = reader.get_progress_deadline_secs();
+    let healthy_deadline_secs = reader.get_healthy_deadline_secs();
+    WorkloadDeploymentPolicy {
+        progress_deadline_secs: if progress_deadline_secs == 0 {
+            defaults.progress_deadline_secs
+        } else {
+            progress_deadline_secs
+        },
+        healthy_deadline_secs: if healthy_deadline_secs == 0 {
+            defaults.healthy_deadline_secs
+        } else {
+            healthy_deadline_secs
+        },
+        min_healthy_secs: reader.get_min_healthy_secs(),
+    }
 }
 
 /// Encodes one generic workload placement policy into the shared wire shape.

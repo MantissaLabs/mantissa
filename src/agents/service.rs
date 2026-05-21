@@ -6,11 +6,12 @@ use crate::agents::types::{
 };
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
-    decode_admission_policy, decode_env_vars, decode_network_requirements, decode_placement_policy,
-    decode_secret_files, decode_task_liveness_probe, decode_task_restart_policy,
-    decode_volume_mounts, encode_admission_policy, encode_env_vars, encode_placement_policy,
-    encode_secret_files, encode_task_liveness_probe, encode_task_restart_policy,
-    encode_volume_mounts,
+    decode_admission_policy, decode_deployment_policy as read_deployment_policy, decode_env_vars,
+    decode_network_requirements, decode_placement_policy, decode_secret_files,
+    decode_task_liveness_probe, decode_task_restart_policy, decode_volume_mounts,
+    encode_admission_policy, encode_deployment_policy as write_deployment_policy, encode_env_vars,
+    encode_placement_policy, encode_secret_files, encode_task_liveness_probe,
+    encode_task_restart_policy, encode_volume_mounts,
 };
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
 use crate::workload::types::ResolvedExecutionSpec;
@@ -768,36 +769,6 @@ fn read_interaction_policy(
             value => Some(value),
         },
     })
-}
-
-fn write_deployment_policy(
-    mut builder: mantissa_protocol::agents::agent_deployment_policy::Builder<'_>,
-    policy: &AgentDeploymentPolicy,
-) {
-    builder.set_progress_deadline_secs(policy.progress_deadline_secs);
-    builder.set_healthy_deadline_secs(policy.healthy_deadline_secs);
-    builder.set_min_healthy_secs(policy.min_healthy_secs);
-}
-
-fn read_deployment_policy(
-    reader: mantissa_protocol::agents::agent_deployment_policy::Reader<'_>,
-) -> AgentDeploymentPolicy {
-    let defaults = AgentDeploymentPolicy::default();
-    let progress_deadline_secs = reader.get_progress_deadline_secs();
-    let healthy_deadline_secs = reader.get_healthy_deadline_secs();
-    AgentDeploymentPolicy {
-        progress_deadline_secs: if progress_deadline_secs == 0 {
-            defaults.progress_deadline_secs
-        } else {
-            progress_deadline_secs
-        },
-        healthy_deadline_secs: if healthy_deadline_secs == 0 {
-            defaults.healthy_deadline_secs
-        } else {
-            healthy_deadline_secs
-        },
-        min_healthy_secs: reader.get_min_healthy_secs(),
-    }
 }
 
 fn write_agent_event_entry(mut builder: agent_event_entry::Builder<'_>, value: &AgentEventEntry) {

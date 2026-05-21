@@ -15,8 +15,9 @@ use crate::workload_submit::{
 };
 use crate::workload_wire::{
     PreparedVolumeMount, prepared_volume_mount_from_resolved, write_admission_policy,
-    write_env_vars, write_liveness_probe, write_network_requirements, write_placement_policy,
-    write_port_bindings, write_secret_files, write_volume_mounts,
+    write_deployment_policy as write_job_deployment_policy, write_env_vars, write_liveness_probe,
+    write_network_requirements, write_placement_policy, write_port_bindings, write_secret_files,
+    write_volume_mounts,
 };
 use anyhow::{Result, anyhow};
 use mantissa_protocol::jobs::{job_execution, job_retry_policy, job_submit_spec};
@@ -77,7 +78,7 @@ struct PreparedJobSubmitSpec {
     name: String,
     execution: PreparedJobExecution,
     retry_policy: PreparedJobRetryPolicy,
-    deployment_policy: PreparedJobDeploymentPolicy,
+    deployment_policy: JobDeploymentPolicySpec,
     admission_policy: WorkloadAdmissionPolicy,
     execution_platform: String,
     isolation_mode: String,
@@ -108,20 +109,6 @@ struct PreparedJobExecution {
 struct PreparedJobRetryPolicy {
     max_retries: u32,
     backoff_secs: u32,
-}
-
-/// One prepared deployment policy ready for jobs wire encoding.
-struct PreparedJobDeploymentPolicy {
-    progress_deadline_secs: u32,
-    healthy_deadline_secs: u32,
-    min_healthy_secs: u32,
-}
-
-impl Default for PreparedJobDeploymentPolicy {
-    /// Returns the default prepared deployment policy for raw CLI submissions.
-    fn default() -> Self {
-        Self::from_manifest(&JobDeploymentPolicySpec::default())
-    }
 }
 
 /// Submits one first-class job through the jobs control-plane capability.
@@ -212,7 +199,7 @@ async fn prepare_raw_submit_spec(
                 .retry_backoff_secs
                 .unwrap_or(DEFAULT_RETRY_BACKOFF_SECS),
         },
-        deployment_policy: PreparedJobDeploymentPolicy::default(),
+        deployment_policy: JobDeploymentPolicySpec::default(),
         admission_policy: WorkloadAdmissionPolicy::default(),
         execution_platform,
         isolation_mode,
@@ -237,7 +224,7 @@ async fn prepare_manifest_submit_spec(
             max_retries: manifest.retry_policy.max_retries,
             backoff_secs: manifest.retry_policy.backoff_secs,
         },
-        deployment_policy: PreparedJobDeploymentPolicy::from_manifest(&manifest.deployment),
+        deployment_policy: manifest.deployment.clone(),
         admission_policy: manifest.admission,
         execution_platform: manifest.execution_platform.clone(),
         isolation_mode: manifest.isolation_mode.clone(),
@@ -385,25 +372,4 @@ fn write_job_retry_policy(
 ) {
     builder.set_max_retries(retry_policy.max_retries);
     builder.set_backoff_secs(retry_policy.backoff_secs);
-}
-
-/// Encodes one prepared deployment policy into the jobs submit payload.
-fn write_job_deployment_policy(
-    mut builder: mantissa_protocol::jobs::job_deployment_policy::Builder<'_>,
-    policy: &PreparedJobDeploymentPolicy,
-) {
-    builder.set_progress_deadline_secs(policy.progress_deadline_secs);
-    builder.set_healthy_deadline_secs(policy.healthy_deadline_secs);
-    builder.set_min_healthy_secs(policy.min_healthy_secs);
-}
-
-impl PreparedJobDeploymentPolicy {
-    /// Copies a manifest deployment policy into the prepared wire-friendly shape.
-    fn from_manifest(policy: &JobDeploymentPolicySpec) -> Self {
-        Self {
-            progress_deadline_secs: policy.progress_deadline_secs,
-            healthy_deadline_secs: policy.healthy_deadline_secs,
-            min_healthy_secs: policy.min_healthy_secs,
-        }
-    }
 }
