@@ -145,6 +145,22 @@ impl SecretMasterStore {
         Ok(records)
     }
 
+    /// Loads local master-key descriptors without unwrapping protected key material.
+    pub fn load_all_key_descriptors(&self) -> io::Result<Vec<MasterKeyDescriptor>> {
+        let _guard = self.policy_guard();
+        let mut descriptors = with_read_tx(&self.db, |tx| {
+            let table = tx.open_table(T_MASTER_KEY_ENVELOPES).map_err(into_io)?;
+            let mut out = Vec::new();
+            for entry in table.iter().map_err(into_io)? {
+                let (_, raw_envelope) = entry.map_err(into_io)?;
+                out.push(WrappedMasterKeyRecord::decode(raw_envelope.value())?.descriptor);
+            }
+            Ok(out)
+        })?;
+        descriptors.sort_by_key(|descriptor| descriptor.key_id);
+        Ok(descriptors)
+    }
+
     /// Returns true when a wrapped envelope exists locally for `key_id`.
     pub fn contains_key(&self, key_id: Uuid) -> io::Result<bool> {
         self.load_wrapped_key(key_id).map(|record| record.is_some())

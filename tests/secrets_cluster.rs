@@ -8,7 +8,7 @@ use common::testkit::{ClusterConfig, RuntimeBackendOverrideGuard, TestNode};
 use mantissa::cluster::ClusterViewId;
 use mantissa::node::id::set_node_id;
 use mantissa::secrets::master_key::envelope::PassphraseKdfParams;
-use mantissa::store::replicated::secret_key_sync::current_for_scope;
+use mantissa::store::replicated::secret_key_sync::{SecretMasterKeySyncRecord, current_for_scope};
 use mantissa_protocol::secrets::secrets;
 use mantissa_protocol::topology::ClusterOperationStage;
 use std::time::{Duration, Instant};
@@ -233,6 +233,65 @@ async fn split_four_node_cluster(cluster: &[TestNode]) -> (Uuid, ClusterViewId, 
     (split_id, left_view, right_view)
 }
 
+/// Splits a three-node cluster into one singleton and one two-node target view.
+async fn split_three_node_cluster(cluster: &[TestNode]) -> (Uuid, ClusterViewId, ClusterViewId) {
+    assert_eq!(cluster.len(), 3, "split helper expects three nodes");
+    let left = &cluster[0];
+    let right_a = &cluster[1];
+    let right_b = &cluster[2];
+    let source_view = current_cluster_view(&left.topology()).await;
+    let mut split_req = left.topology().split_cluster_request();
+    {
+        let mut req = split_req.get().init_req();
+        source_view.write_capnp(req.reborrow().init_source_view());
+
+        let mut targets = req.reborrow().init_targets(2);
+        let mut left_target = targets.reborrow().get(0);
+        left_target.set_name("left");
+        let mut left_selector = left_target.reborrow().init_selector();
+        left_selector.reborrow().init_clauses(0);
+        let mut left_nodes = left_selector.reborrow().init_explicit_nodes(1);
+        set_node_id(left_nodes.reborrow().get(0), &left.id());
+
+        let mut right_target = targets.reborrow().get(1);
+        right_target.set_name("right");
+        let mut right_selector = right_target.reborrow().init_selector();
+        right_selector.reborrow().init_clauses(0);
+        let mut right_nodes = right_selector.reborrow().init_explicit_nodes(2);
+        set_node_id(right_nodes.reborrow().get(0), &right_a.id());
+        set_node_id(right_nodes.reborrow().get(1), &right_b.id());
+
+        req.set_dry_run(false);
+    }
+
+    let split_resp = split_req.send().promise.await.expect("splitCluster send");
+    let split_op = split_resp
+        .get()
+        .expect("splitCluster get")
+        .get_op()
+        .expect("split operation");
+    let split_targets = split_op.get_target_views().expect("split target views");
+    let left_view = ClusterViewId::from_capnp(split_targets.get(0)).expect("left split view");
+    let right_view = ClusterViewId::from_capnp(split_targets.get(1)).expect("right split view");
+    let split_id = split_op.get_id().expect("split operation id").to_vec();
+    let split_id = Uuid::from_slice(&split_id).expect("split operation UUID");
+
+    for node in cluster {
+        wait_for_operation_stage(
+            &node.topology(),
+            split_id.as_bytes(),
+            ClusterOperationStage::Finalized,
+            Duration::from_secs(15),
+        )
+        .await;
+    }
+    wait_for_cluster_view(&left.topology(), left_view, Duration::from_secs(15)).await;
+    wait_for_cluster_view(&right_a.topology(), right_view, Duration::from_secs(15)).await;
+    wait_for_cluster_view(&right_b.topology(), right_view, Duration::from_secs(15)).await;
+
+    (split_id, left_view, right_view)
+}
+
 /// Merges two cluster views through the public topology RPC and returns the operation id.
 async fn merge_cluster_views(
     requester: &TestNode,
@@ -271,6 +330,59 @@ async fn merge_cluster_views(
     .await;
 
     merge_id
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MasterKeyRowShape {
+    rows: usize,
+    values: usize,
+    descriptors: usize,
+    grants: usize,
+    currents: usize,
+    tombs: usize,
+}
+
+/// Counts replicated secret-master-key rows without printing sensitive grant metadata.
+fn master_key_row_shape(node: &TestNode) -> MasterKeyRowShape {
+    let (rows, tombs) = node
+        .node
+        .secret_master_keys
+        .load_all()
+        .expect("load replicated master-key rows");
+    let mut descriptors = 0usize;
+    let mut grants = 0usize;
+    let mut currents = 0usize;
+    let mut values = 0usize;
+    for (_, snapshot) in &rows {
+        values += snapshot.as_slice().len();
+        for record in snapshot.as_slice() {
+            match record {
+                SecretMasterKeySyncRecord::Descriptor(_) => descriptors += 1,
+                SecretMasterKeySyncRecord::Grant(_) => grants += 1,
+                SecretMasterKeySyncRecord::Current(_) => currents += 1,
+            }
+        }
+    }
+
+    MasterKeyRowShape {
+        rows: rows.len(),
+        values,
+        descriptors,
+        grants,
+        currents,
+        tombs: tombs.len(),
+    }
+}
+
+/// Returns true once a merged node has adopted the replicated destination current.
+fn local_current_matches_scope(node: &TestNode, scope_view: ClusterViewId) -> bool {
+    let Ok(current) = node.node.secret_master_store.current() else {
+        return false;
+    };
+    let Ok(Some(replicated)) = current_for_scope(&node.node.secret_master_keys, scope_view) else {
+        return false;
+    };
+    current.descriptor.scope_view == scope_view && current.key_id() == replicated.key_id
 }
 
 /// Reads cluster-view summary rows so tests can assert split views are retired.
@@ -405,6 +517,57 @@ local_test!(master_key_exchange_supports_three_node_secret_decryption, {
             .await,
             "node {} should decrypt the third-created secret",
             node.id()
+        );
+    }
+});
+
+local_test!(empty_split_merge_keeps_master_key_sync_rows_bounded, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(4),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
+        .await
+        .expect("three-node cluster");
+    TestNode::assert_cluster_size_all(&cluster, 3, "three-node cluster before split").await;
+
+    let (_split_id, left_view, right_view) = split_three_node_cluster(&cluster).await;
+    let _merge_id = merge_cluster_views(&cluster[0], left_view, right_view).await;
+    for node in &cluster {
+        wait_for_cluster_view(&node.topology(), right_view, Duration::from_secs(15)).await;
+    }
+    TestNode::assert_cluster_size_all(&cluster, 3, "merged cluster after split").await;
+
+    assert!(
+        wait_until(
+            Duration::from_secs(15),
+            Duration::from_millis(50),
+            || async {
+                cluster
+                    .iter()
+                    .all(|node| local_current_matches_scope(node, right_view))
+            }
+        )
+        .await,
+        "all nodes should adopt the destination-view current after merge"
+    );
+
+    let shapes = cluster.iter().map(master_key_row_shape).collect::<Vec<_>>();
+    for shape in &shapes {
+        assert_eq!(
+            shape.tombs, 0,
+            "fresh split/merge should not tombstone keys"
+        );
+        assert!(
+            shape.rows <= 15
+                && shape.values <= 16
+                && shape.descriptors <= 4
+                && shape.grants <= 8
+                && shape.currents <= 4,
+            "unexpected master-key sync row growth after empty split/merge: {shape:?}"
         );
     }
 });

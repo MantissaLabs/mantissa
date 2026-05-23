@@ -752,6 +752,7 @@ fn build_topology_stores(
         token_store: stores.token_store.clone(),
         secret_master_store: stores.secret_master_store.clone(),
         secret_keyring: stores.secret_keyring.clone(),
+        secrets: stores.secrets.clone(),
         secret_master_keys: stores.secret_master_keys.clone(),
         secret_master_key_publisher,
     }

@@ -897,3 +897,74 @@ local_test!(publish_current_with_key_grants_includes_historical_keys, {
         .expect("decrypt historical grant");
     assert_eq!(granted_plaintext, old_record.key);
 });
+
+local_test!(publish_master_key_rows_skips_visible_grants_and_current, {
+    let node_id = Uuid::new_v4();
+    let local_dir = tempdir().expect("local master key dir");
+    let local_db = Arc::new(
+        redb::Database::create(local_dir.path().join("secret-master.redb"))
+            .expect("create local master key db"),
+    );
+    let secret_master_store = SecretMasterStore::new(
+        local_db,
+        Arc::new(PassphraseProvider::for_test().expect("test passphrase provider")),
+    )
+    .expect("open local master key store");
+    let record = secret_master_store
+        .ensure_current_for_node(ClusterViewId::legacy_default(), node_id)
+        .expect("ensure current master key");
+
+    let (gossip_tx, gossip_rx) = async_channel::unbounded::<Message>();
+    let sender_noise = Arc::new(NoiseKeys::from_private_bytes([9u8; 32]));
+    let (_master_key_replication_dir, secret_master_keys, master_key_publisher) =
+        temp_master_key_replication(node_id, gossip_tx, sender_noise).await;
+    let recipient_id = Uuid::new_v4();
+    let recipient_noise = Arc::new(NoiseKeys::from_private_bytes([11u8; 32]));
+    let recipient = SecretMasterKeyGrantRecipient {
+        node_id: recipient_id,
+        noise_static_pub: recipient_noise.public_bytes(),
+    };
+
+    master_key_publisher
+        .publish_key_grants(std::slice::from_ref(&record), &[recipient])
+        .await
+        .expect("publish first grants");
+    assert_eq!(drain_master_key_gossip(&gossip_rx), 2);
+
+    master_key_publisher
+        .publish_key_grants(std::slice::from_ref(&record), &[recipient])
+        .await
+        .expect("replay grants");
+    assert_eq!(drain_master_key_gossip(&gossip_rx), 0);
+
+    master_key_publisher
+        .publish_current_key(&record, &[recipient])
+        .await
+        .expect("publish current");
+    assert_eq!(drain_master_key_gossip(&gossip_rx), 1);
+
+    master_key_publisher
+        .publish_current_key(&record, &[recipient])
+        .await
+        .expect("replay current");
+    assert_eq!(drain_master_key_gossip(&gossip_rx), 0);
+
+    let grant_snapshot = secret_master_keys
+        .get_snapshot(&UuidKey::from(grant_row_id(record.key_id(), recipient_id)))
+        .expect("load grant")
+        .expect("grant missing");
+    let grant_count = grant_snapshot
+        .as_slice()
+        .iter()
+        .filter(|row| matches!(row, SecretMasterKeySyncRecord::Grant(_)))
+        .count();
+    assert_eq!(grant_count, 1);
+});
+
+fn drain_master_key_gossip(gossip_rx: &async_channel::Receiver<Message>) -> usize {
+    let mut drained = 0usize;
+    while gossip_rx.try_recv().is_ok() {
+        drained = drained.saturating_add(1);
+    }
+    drained
+}

@@ -19,6 +19,7 @@ use crate::store::replicated::cluster_views::ClusterNameRecord;
 use crate::store::replicated::cluster_views::ClusterViewStore;
 use crate::store::replicated::peers::PeersStore;
 use crate::store::replicated::secret_key_sync::SecretMasterKeyStore;
+use crate::store::replicated::secrets::SecretStore;
 use crate::sync::{SyncRunner, SyncTraceContext};
 use crate::token::TokenStore;
 use crate::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue};
@@ -164,6 +165,7 @@ pub struct TopologyStorage {
     pub token_store: TokenStore,
     pub secret_master_store: SecretMasterStore,
     pub secret_keyring: Arc<RwLock<SecretKeyring>>,
+    pub secrets: SecretStore,
     pub secret_master_keys: SecretMasterKeyStore,
     pub secret_master_key_publisher: SecretMasterKeyPublisher,
 }

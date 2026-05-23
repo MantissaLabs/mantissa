@@ -2,6 +2,7 @@ use crate::cluster::operations::{
     ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage,
 };
 use crate::cluster::{ClusterId, ClusterViewId};
+use crate::secrets::master_key::reconciler::SecretMasterKeyReconciler;
 use crate::store::replicated::cluster_views::{ClusterNameRecord, ClusterNodeCountRecord};
 use crate::topology::Topology;
 use crate::topology::cluster_operations::{
@@ -673,6 +674,8 @@ impl Topology {
 
         self.persist_active_cluster_view(transition.local_target_view)?;
         let previous = self.set_active_cluster_view(transition.local_target_view);
+        self.reconcile_secret_master_keys_for_view(transition.local_target_view)
+            .await;
         self.deps.registry.clear().await;
         match self.publish_local_cluster_node_count().await {
             Ok(true) => self.sync_once_now(),
@@ -695,6 +698,41 @@ impl Topology {
         );
 
         Ok(())
+    }
+
+    /// Re-runs master-key adoption after a committed transition changes the active view.
+    async fn reconcile_secret_master_keys_for_view(&self, view: ClusterViewId) {
+        let reconciler = SecretMasterKeyReconciler::new(
+            self.local.node.id,
+            self.deps.registry.noise_keys(),
+            self.deps.registry.clone(),
+            self.stores.secret_master_keys.clone(),
+            self.stores.secret_master_store.clone(),
+            self.stores.secret_keyring.clone(),
+            self.local.cluster_view.clone(),
+        );
+
+        match reconciler.reconcile_view(view).await {
+            Ok(report)
+                if report.current_waiting_for_descriptor || report.current_waiting_for_key =>
+            {
+                warn!(
+                    target: "secrets",
+                    cluster_view = %view,
+                    waiting_for_descriptor = report.current_waiting_for_descriptor,
+                    waiting_for_key = report.current_waiting_for_key,
+                    "secret master-key current not yet adoptable after cluster transition"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    target: "secrets",
+                    cluster_view = %view,
+                    "failed to reconcile secret master keys after cluster transition: {error:#}"
+                );
+            }
+        }
     }
 
     /// Starts asynchronous local progression for a cluster operation if it is not a dry run.

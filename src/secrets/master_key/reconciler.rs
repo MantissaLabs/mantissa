@@ -81,10 +81,17 @@ impl SecretMasterKeyReconciler {
     /// Reconciles grants and current metadata for the active cluster view.
     pub async fn reconcile_active_view(&self) -> Result<SecretMasterKeyReconcileReport> {
         let active_view = self.cluster_view.active_view();
+        self.reconcile_view(active_view).await
+    }
+
+    /// Reconciles grants and current metadata for a specific cluster view.
+    pub async fn reconcile_view(
+        &self,
+        view: ClusterViewId,
+    ) -> Result<SecretMasterKeyReconcileReport> {
         let snapshot = self.load_sync_snapshot()?;
         let mut report = self.import_local_grants(&snapshot).await?;
-        self.adopt_current(active_view, &snapshot, &mut report)
-            .await?;
+        self.adopt_current(view, &snapshot, &mut report).await?;
         Ok(report)
     }
 
