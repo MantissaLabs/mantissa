@@ -24,6 +24,15 @@ pub struct ClusterSummary {
     pub local_active: bool,
 }
 
+/// Running reducer for one cluster lineage while folding raw view rows.
+struct ClusterSummaryAccumulator {
+    cluster_name: Option<String>,
+    epoch: u64,
+    node_count: u32,
+    local_active: bool,
+    selected_rank: (u8, u32, u64),
+}
+
 /// Node candidate row returned for interactive split planning.
 #[derive(Clone, Debug)]
 pub struct SplitCandidate {
@@ -59,51 +68,57 @@ pub(crate) fn resolve_view_from_summaries(
     summaries
         .iter()
         .filter(|summary| summary.view.cluster_id == cluster_id)
-        .max_by_key(|summary| {
-            (
-                if summary.local_active { 1u8 } else { 0u8 },
-                summary.node_count,
-                summary.view.epoch,
-            )
-        })
+        .max_by_key(|summary| cluster_view_rank(summary))
         .map(|summary| summary.view)
         .ok_or_else(|| anyhow!("cluster {cluster_id} is not known on this node"))
 }
 
+/// Returns the stable precedence key used to choose the representative view for one cluster.
+fn cluster_view_rank(row: &ClusterViewSummary) -> (u8, u32, u64) {
+    (
+        if row.local_active { 1u8 } else { 0u8 },
+        row.node_count,
+        row.view.epoch,
+    )
+}
+
 /// Aggregates view rows into one deterministic summary per cluster lineage id.
 pub(crate) fn aggregate_cluster_summaries(view_rows: &[ClusterViewSummary]) -> Vec<ClusterSummary> {
-    let mut grouped = BTreeMap::<Uuid, Vec<&ClusterViewSummary>>::new();
+    let mut grouped = BTreeMap::<Uuid, ClusterSummaryAccumulator>::new();
     for row in view_rows {
-        grouped.entry(row.view.cluster_id).or_default().push(row);
-    }
-
-    let mut clusters = Vec::with_capacity(grouped.len());
-    for (cluster_id, rows) in grouped {
-        let local_active = rows.iter().any(|row| row.local_active);
-        let selected = rows
-            .iter()
-            .copied()
-            .max_by_key(|row| {
-                (
-                    if row.local_active { 1u8 } else { 0u8 },
-                    row.node_count,
-                    row.view.epoch,
-                )
+        let rank = cluster_view_rank(row);
+        grouped
+            .entry(row.view.cluster_id)
+            .and_modify(|summary| {
+                summary.local_active |= row.local_active;
+                if summary.cluster_name.is_none() {
+                    summary.cluster_name.clone_from(&row.cluster_name);
+                }
+                if rank >= summary.selected_rank {
+                    summary.selected_rank = rank;
+                    summary.epoch = row.view.epoch;
+                    summary.node_count = row.node_count;
+                }
             })
-            .expect("grouped rows are never empty");
-
-        clusters.push(ClusterSummary {
-            cluster_id,
-            cluster_name: rows
-                .iter()
-                .find_map(|row| row.cluster_name.as_ref().cloned()),
-            epoch: selected.view.epoch,
-            node_count: selected.node_count,
-            local_active,
-        });
+            .or_insert_with(|| ClusterSummaryAccumulator {
+                cluster_name: row.cluster_name.clone(),
+                epoch: row.view.epoch,
+                node_count: row.node_count,
+                local_active: row.local_active,
+                selected_rank: rank,
+            });
     }
 
-    clusters
+    grouped
+        .into_iter()
+        .map(|(cluster_id, summary)| ClusterSummary {
+            cluster_id,
+            cluster_name: summary.cluster_name,
+            epoch: summary.epoch,
+            node_count: summary.node_count,
+            local_active: summary.local_active,
+        })
+        .collect()
 }
 
 /// Queries the local node for all known cluster views and member counts.
