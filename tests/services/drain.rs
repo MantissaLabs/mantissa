@@ -369,7 +369,9 @@ local_test!(
     {
         let _guard = RuntimeBackendOverrideGuard::install_factory(Arc::new(
             || -> Arc<dyn RuntimeBackend + Send + Sync> {
-                Arc::new(SlowCreateRuntimeBackend::default())
+                Arc::new(SlowCreateRuntimeBackend::with_create_delay(
+                    Duration::from_millis(500),
+                ))
             },
         ));
 

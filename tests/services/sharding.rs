@@ -3,13 +3,15 @@ use crate::common;
 use mantissa::scheduler::placement::{PlacementConstraint, PlacementConstraintSelector};
 use mantissa::services::types::compute_service_id;
 
-/// Builds the faster replication loop settings used by sharding convergence tests.
+/// Builds faster control-plane and task loop settings used by sharding convergence tests.
 fn sharded_cluster_config() -> ClusterConfig {
     ClusterConfig {
-        sync_tick_ms: Some(100),
-        gossip_tick_ms: Some(100),
+        sync_tick_ms: Some(50),
+        gossip_tick_ms: Some(50),
         gossip_fanout: Some(2),
         gossip_channel_capacity: Some(512),
+        task_reconcile_tick_ms: Some(100),
+        task_repair_tick_ms: Some(100),
         ..ClusterConfig::default()
     }
 }
@@ -320,7 +322,9 @@ local_test!(
     {
         let _config_guard = ConfigOverrideGuard::service_sharding(1, 1, 2, 2);
         let _runtime_guard = RuntimeBackendOverrideGuard::install_factory(Arc::new(|| {
-            Arc::new(SlowCreateRuntimeBackend::default())
+            Arc::new(SlowCreateRuntimeBackend::with_create_delay(
+                Duration::from_millis(500),
+            ))
         }));
 
         let cluster = TestNode::new_cluster_inproc_with_config(4, sharded_cluster_config())
@@ -888,7 +892,9 @@ local_test!(services_sharded_task_splitting_converges, {
 local_test!(services_sharded_dependency_ordered_templates_converge, {
     let _config_guard = ConfigOverrideGuard::service_sharding(1, 1, 2, 2);
     let _runtime_guard = RuntimeBackendOverrideGuard::install_factory(Arc::new(|| {
-        Arc::new(SlowCreateRuntimeBackend::default())
+        Arc::new(SlowCreateRuntimeBackend::with_create_delay(
+            Duration::from_millis(500),
+        ))
     }));
 
     let cluster = TestNode::new_cluster_inproc_with_config(3, sharded_cluster_config())

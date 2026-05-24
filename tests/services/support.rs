@@ -1056,15 +1056,32 @@ pub(crate) fn rollout_strategy(
     }
 }
 
-#[derive(Default)]
 pub(crate) struct SlowCreateRuntimeBackend {
     inner: InMemoryRuntimeBackend,
+    create_delay: Duration,
+}
+
+impl Default for SlowCreateRuntimeBackend {
+    /// Builds the deadline-test backend with a create delay longer than the tight deadline.
+    fn default() -> Self {
+        Self::with_create_delay(Duration::from_secs(3))
+    }
+}
+
+impl SlowCreateRuntimeBackend {
+    /// Builds a backend whose create call stays pending for the requested test delay.
+    pub(crate) fn with_create_delay(create_delay: Duration) -> Self {
+        Self {
+            inner: InMemoryRuntimeBackend::default(),
+            create_delay,
+        }
+    }
 }
 
 #[async_trait]
 impl RuntimeBackend for SlowCreateRuntimeBackend {
     async fn create_instance(&self, request: RuntimeCreateRequest) -> Result<String, RuntimeError> {
-        sleep(Duration::from_secs(3)).await;
+        sleep(self.create_delay).await;
         self.inner.create_instance(request).await
     }
 

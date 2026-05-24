@@ -539,7 +539,9 @@ local_test!(services_deploying_generation_resumes_after_restart, {
     let noise_keys = Arc::new(NoiseKeys::from_private_bytes([0x63; 32]));
     let signing = ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]);
     let local_volume_root = state_dir.path().join("volumes");
-    let runtime_backend = Arc::new(SlowCreateRuntimeBackend::default());
+    let runtime_backend = Arc::new(SlowCreateRuntimeBackend::with_create_delay(
+        Duration::from_millis(500),
+    ));
 
     let node = create_restartable_service_node(
         db.clone(),
