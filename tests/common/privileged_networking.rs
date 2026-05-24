@@ -283,9 +283,9 @@ fn bpf_artifact_exists(dir: &Path, artifact: &str) -> bool {
 /// Return fast workload reconciliation ticks for Docker-backed privileged dataplane tests.
 fn privileged_task_runtime_config() -> WorkloadRuntimeConfig {
     WorkloadRuntimeConfig {
-        repair_tick: Duration::from_millis(500),
-        reconcile_tick: Duration::from_millis(500),
-        runtime_event_debounce: Duration::from_millis(100),
+        repair_tick: Duration::from_millis(100),
+        reconcile_tick: Duration::from_millis(100),
+        runtime_event_debounce: Duration::from_millis(50),
     }
 }
 
@@ -295,14 +295,14 @@ pub fn privileged_headless_config() -> HeadlessConfig {
         listen_addr: "127.0.0.1:0".to_string(),
         transport: HeadlessTransport::Inproc,
         root_schema_override: None,
-        sync_tick: Some(Duration::from_millis(100)),
+        sync_tick: Some(Duration::from_millis(50)),
         sync_fanout: None,
-        global_metadata_sync_tick: Some(Duration::from_millis(100)),
+        global_metadata_sync_tick: Some(Duration::from_millis(50)),
         global_metadata_sync_fanout: None,
-        gossip_tick: Some(Duration::from_millis(100)),
+        gossip_tick: Some(Duration::from_millis(50)),
         gossip_fanout: None,
-        network_reconcile_tick: Some(Duration::from_secs(1)),
-        network_attachment_refresh_tick: Some(Duration::from_millis(100)),
+        network_reconcile_tick: Some(Duration::from_millis(100)),
+        network_attachment_refresh_tick: Some(Duration::from_millis(50)),
         gossip_channel_capacity: None,
         task_runtime: Some(privileged_task_runtime_config()),
         runtime_set: None,
