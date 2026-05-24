@@ -9,7 +9,7 @@ use mantissa_net::noise::NoiseKeys;
 use mantissa_protocol::secrets::{
     master_key_descriptor, passphrase_master_key_metadata, wrapped_secret_master_key,
 };
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::io;
 use std::sync::Arc;
@@ -44,6 +44,12 @@ const TRANSFER_AAD_PREFIX: &[u8] = b"mantissa.secret-master.transfer.v1";
 const TRANSFER_HKDF_SALT: &[u8] = b"mantissa.secret-master.transfer.hkdf.v1";
 /// HKDF info string for node-to-node master-key transfer AEAD keys.
 const TRANSFER_HKDF_INFO: &[u8] = b"mantissa.secret-master.transfer.aead-key.v1";
+/// Domain separator for split child key derivation from the current parent key.
+const SPLIT_CHILD_HKDF_SALT: &[u8] = b"mantissa.secret-master.split-child.v1";
+/// HKDF info prefix for deterministic split child keys.
+const SPLIT_CHILD_HKDF_INFO: &[u8] = b"mantissa.secret-master.split-child.key.v1";
+/// Public hash domain for deterministic split child key ids.
+const SPLIT_CHILD_KEY_ID_PREFIX: &[u8] = b"mantissa.secret-master.split-child.key-id.v1";
 /// Random Argon2id salt size persisted in passphrase provider metadata.
 const PASSPHRASE_SALT_SIZE: usize = 16;
 /// Nonce size required by XChaCha20-Poly1305.
@@ -93,6 +99,31 @@ impl MasterKeyPlaintext {
     /// Borrows the raw key bytes for immediate cryptographic use.
     pub fn as_bytes(&self) -> &[u8; MASTER_KEY_SIZE] {
         &self.bytes
+    }
+
+    /// Derives the split child key shared by all retained nodes in one target view.
+    pub fn derive_split_child(
+        parent_key: &Self,
+        parent_descriptor: &MasterKeyDescriptor,
+        scope_view: ClusterViewId,
+        created_by_node_id: Uuid,
+        operation_id: Uuid,
+    ) -> io::Result<Self> {
+        let mut info = Vec::with_capacity(128);
+        info.extend_from_slice(SPLIT_CHILD_HKDF_INFO);
+        extend_split_child_context(
+            &mut info,
+            parent_descriptor,
+            scope_view,
+            created_by_node_id,
+            operation_id,
+        );
+
+        let hkdf = Hkdf::<Sha256>::new(Some(SPLIT_CHILD_HKDF_SALT), parent_key.as_bytes());
+        let mut key = [0u8; MASTER_KEY_SIZE];
+        hkdf.expand(&info, &mut key)
+            .map_err(|_| io::Error::other("derive split child master key"))?;
+        Ok(Self::new(key))
     }
 }
 
@@ -166,6 +197,28 @@ impl MasterKeyDescriptor {
             created_by_operation_id: operation_id,
             parent_key_ids: vec![parent.key_id],
             created_at_unix_secs: unix_now_secs()?,
+        })
+    }
+
+    /// Builds the deterministic child descriptor used by one split target view.
+    pub fn split_child(
+        parent: &Self,
+        scope_view: ClusterViewId,
+        created_by_node_id: Uuid,
+        operation_id: Uuid,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            key_id: split_child_key_id(parent, scope_view, created_by_node_id, operation_id),
+            generation: parent
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("master key generation overflow"))?,
+            scope_view,
+            origin_view: scope_view,
+            created_by_node_id,
+            created_by_operation_id: Some(operation_id),
+            parent_key_ids: vec![parent.key_id],
+            created_at_unix_secs: parent.created_at_unix_secs,
         })
     }
 }
@@ -832,6 +885,46 @@ fn extend_descriptor_aad(out: &mut Vec<u8>, descriptor: &MasterKeyDescriptor) {
     out.extend_from_slice(&descriptor.created_at_unix_secs.to_be_bytes());
 }
 
+/// Computes the stable key id for a deterministic split child descriptor.
+fn split_child_key_id(
+    parent: &MasterKeyDescriptor,
+    scope_view: ClusterViewId,
+    created_by_node_id: Uuid,
+    operation_id: Uuid,
+) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(SPLIT_CHILD_KEY_ID_PREFIX);
+    let mut context = Vec::with_capacity(96);
+    extend_split_child_context(
+        &mut context,
+        parent,
+        scope_view,
+        created_by_node_id,
+        operation_id,
+    );
+    hasher.update(context);
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+/// Appends the public split-child derivation context in a stable byte order.
+fn extend_split_child_context(
+    out: &mut Vec<u8>,
+    parent: &MasterKeyDescriptor,
+    scope_view: ClusterViewId,
+    created_by_node_id: Uuid,
+    operation_id: Uuid,
+) {
+    out.extend_from_slice(parent.key_id.as_bytes());
+    out.extend_from_slice(&parent.generation.to_be_bytes());
+    extend_view_aad(out, parent.scope_view);
+    extend_view_aad(out, scope_view);
+    out.extend_from_slice(created_by_node_id.as_bytes());
+    out.extend_from_slice(operation_id.as_bytes());
+}
+
 /// Appends a cluster view id to authenticated data without allocation.
 fn extend_view_aad(out: &mut Vec<u8>, view: ClusterViewId) {
     out.extend_from_slice(view.cluster_id.as_bytes());
@@ -877,7 +970,7 @@ mod tests {
         PASSPHRASE_SALT_SIZE, PassphraseKdfParams, PassphraseProvider, Provider, SecretPassphrase,
         encode_passphrase_metadata,
     };
-    use crate::cluster::ClusterViewId;
+    use crate::cluster::{ClusterId, ClusterViewId};
     use mantissa_net::noise::NoiseKeys;
     use uuid::Uuid;
 
@@ -892,6 +985,68 @@ mod tests {
             parent_key_ids: Vec::new(),
             created_at_unix_secs: 1,
         }
+    }
+
+    #[test]
+    fn split_child_derivation_is_stable_for_same_operation_target() {
+        let parent = descriptor(7);
+        let parent_key = MasterKeyPlaintext::generate().expect("parent key");
+        let target = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 2);
+        let issuer = Uuid::new_v4();
+        let operation = Uuid::new_v4();
+
+        let first_descriptor = MasterKeyDescriptor::split_child(&parent, target, issuer, operation)
+            .expect("first descriptor");
+        let second_descriptor =
+            MasterKeyDescriptor::split_child(&parent, target, issuer, operation)
+                .expect("second descriptor");
+        let first_key =
+            MasterKeyPlaintext::derive_split_child(&parent_key, &parent, target, issuer, operation)
+                .expect("first key");
+        let second_key =
+            MasterKeyPlaintext::derive_split_child(&parent_key, &parent, target, issuer, operation)
+                .expect("second key");
+
+        assert_eq!(first_descriptor, second_descriptor);
+        assert_eq!(first_key.as_bytes(), second_key.as_bytes());
+        assert_eq!(first_descriptor.parent_key_ids, vec![parent.key_id]);
+        assert_eq!(first_descriptor.created_by_operation_id, Some(operation));
+    }
+
+    #[test]
+    fn split_child_derivation_changes_between_targets() {
+        let parent = descriptor(7);
+        let parent_key = MasterKeyPlaintext::generate().expect("parent key");
+        let first_target = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 2);
+        let second_target = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 2);
+        let issuer = Uuid::new_v4();
+        let operation = Uuid::new_v4();
+
+        let first_descriptor =
+            MasterKeyDescriptor::split_child(&parent, first_target, issuer, operation)
+                .expect("first descriptor");
+        let second_descriptor =
+            MasterKeyDescriptor::split_child(&parent, second_target, issuer, operation)
+                .expect("second descriptor");
+        let first_key = MasterKeyPlaintext::derive_split_child(
+            &parent_key,
+            &parent,
+            first_target,
+            issuer,
+            operation,
+        )
+        .expect("first key");
+        let second_key = MasterKeyPlaintext::derive_split_child(
+            &parent_key,
+            &parent,
+            second_target,
+            issuer,
+            operation,
+        )
+        .expect("second key");
+
+        assert_ne!(first_descriptor.key_id, second_descriptor.key_id);
+        assert_ne!(first_key.as_bytes(), second_key.as_bytes());
     }
 
     #[test]

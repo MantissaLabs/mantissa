@@ -34,7 +34,7 @@ impl ClusterTransitionParticipant for SplitSecretMasterKeyParticipant {
         "split_secret_master_key"
     }
 
-    /// Publishes a master-key current row scoped to this node's split target view.
+    /// Installs the deterministic master-key current for this node's split target view.
     async fn on_commit(
         &self,
         transition: &ClusterTransition,
@@ -54,61 +54,66 @@ impl ClusterTransitionParticipant for SplitSecretMasterKeyParticipant {
             )));
         }
 
-        let recipients = self.split_master_key_recipients(transition)?;
-        let keyring_handle = self.topology.stores.secret_keyring.clone();
-        let keyring = keyring_handle.write().await;
-        let current = keyring
-            .current_record()
-            .map_err(|err| capnp::Error::failed(format!("load active master key: {err}")))?;
-
-        // A crash can happen after the split-scoped key is installed but before
-        // the topology operation reaches Finalized. Startup replay must publish
-        // the same current row again instead of creating a second key for the
-        // same split operation.
-        let (record, generated) = if current.descriptor.scope_view == transition.local_target_view {
-            (current, false)
-        } else {
-            let record = self
-                .topology
-                .stores
-                .secret_master_store
-                .prepare_rotation(
-                    transition.local_target_view,
-                    self.topology.local.node.id,
-                    Some(transition.operation_id),
-                )
-                .map_err(|err| {
-                    capnp::Error::failed(format!("prepare split-scoped master key: {err}"))
-                })?;
-            (record, true)
+        let issuer = self.split_master_key_issuer(transition)?;
+        let current = {
+            let keyring_handle = self.topology.stores.secret_keyring.clone();
+            let keyring = keyring_handle.read().await;
+            keyring
+                .current_record()
+                .map_err(|err| capnp::Error::failed(format!("load active master key: {err}")))?
         };
+        let (record, derived) = self.split_master_key_record(transition, current, issuer)?;
+        let action = if issuer == self.topology.local.node.id {
+            let recipients = self.split_master_key_recipients(transition)?;
 
-        self.topology
-            .stores
-            .secret_master_key_publisher
-            .publish_current_key(&record, &recipients)
-            .await
-            .map_err(|err| {
-                capnp::Error::failed(format!("publish split-scoped master key: {err}"))
-            })?;
-        self.topology
-            .stores
-            .secret_master_store
-            .activate_current(&record)
-            .map_err(|err| capnp::Error::failed(format!("activate split master key: {err}")))?;
-        keyring.install_current(&record);
+            self.topology
+                .stores
+                .secret_master_key_publisher
+                .publish_current_key(&record, &recipients)
+                .await
+                .map_err(|err| {
+                    capnp::Error::failed(format!("publish split-scoped master key: {err}"))
+                })?;
+            "published"
+        } else {
+            "derived"
+        };
+        self.activate_split_master_key(&record).await?;
 
         report = report
             .add_detail("scope_view", transition.local_target_view.to_string())
+            .add_detail("issuer", issuer.to_string())
+            .add_detail("action", action.to_string())
             .add_detail("key_id", record.key_id().to_string())
             .add_detail("generation", record.generation().to_string())
-            .add_detail("recipient_count", recipients.len().to_string())
-            .add_detail("generated", generated.to_string());
+            .add_detail(
+                "recipient_count",
+                transition.retained_node_ids.len().to_string(),
+            )
+            .add_detail("derived", derived.to_string());
         Ok(report)
     }
 }
 
 impl SplitSecretMasterKeyParticipant {
+    /// Selects the one retained node allowed to mint the split key for this target view.
+    fn split_master_key_issuer(
+        &self,
+        transition: &ClusterTransition,
+    ) -> Result<uuid::Uuid, capnp::Error> {
+        transition
+            .retained_node_ids
+            .iter()
+            .copied()
+            .min()
+            .ok_or_else(|| {
+                capnp::Error::failed(format!(
+                    "split operation {} target view {} has no retained nodes",
+                    transition.operation_id, transition.local_target_view
+                ))
+            })
+    }
+
     /// Builds the exact recipient grant set for this node's retained split peers.
     fn split_master_key_recipients(
         &self,
@@ -128,6 +133,92 @@ impl SplitSecretMasterKeyParticipant {
 
         Ok(recipients)
     }
+
+    /// Returns the existing or newly derived split key for this target view.
+    fn split_master_key_record(
+        &self,
+        transition: &ClusterTransition,
+        current: MasterKeyRecord,
+        issuer: uuid::Uuid,
+    ) -> Result<(MasterKeyRecord, bool), capnp::Error> {
+        if current.descriptor.scope_view == transition.local_target_view {
+            return Ok((current, false));
+        }
+
+        if let Some(record) = replicated_current_record_for_scope(
+            &self.topology,
+            transition.local_target_view,
+            &current,
+        )? {
+            return Ok((record, false));
+        }
+
+        let record = self
+            .topology
+            .stores
+            .secret_master_store
+            .prepare_split_child(
+                transition.local_target_view,
+                issuer,
+                transition.operation_id,
+            )
+            .map_err(|err| {
+                capnp::Error::failed(format!("derive split-scoped master key: {err}"))
+            })?;
+        Ok((record, true))
+    }
+
+    /// Activates the adopted split key in both durable metadata and the live keyring.
+    async fn activate_split_master_key(
+        &self,
+        record: &MasterKeyRecord,
+    ) -> Result<(), capnp::Error> {
+        self.topology
+            .stores
+            .secret_master_store
+            .activate_current(record)
+            .map_err(|err| capnp::Error::failed(format!("activate split master key: {err}")))?;
+        let keyring = self.topology.stores.secret_keyring.clone();
+        keyring.write().await.install_current(record);
+        Ok(())
+    }
+}
+
+/// Loads the local plaintext record selected by an already replicated current row.
+fn replicated_current_record_for_scope(
+    topology: &Topology,
+    scope_view: ClusterViewId,
+    cached_current: &MasterKeyRecord,
+) -> Result<Option<MasterKeyRecord>, capnp::Error> {
+    let Some(current) = current_for_scope(&topology.stores.secret_master_keys, scope_view)
+        .map_err(|err| {
+            capnp::Error::failed(format!("load replicated master-key current: {err}"))
+        })?
+    else {
+        return Ok(None);
+    };
+
+    let record = if cached_current.key_id() == current.key_id {
+        cached_current.clone()
+    } else {
+        let Some(record) = topology
+            .stores
+            .secret_master_store
+            .load_key(current.key_id)
+            .map_err(|err| capnp::Error::failed(format!("load replicated master key: {err}")))?
+        else {
+            return Ok(None);
+        };
+        record
+    };
+
+    if record.descriptor.scope_view != scope_view {
+        return Err(capnp::Error::failed(format!(
+            "replicated master-key current {} has local scope {} instead of {}",
+            current.key_id, record.descriptor.scope_view, scope_view
+        )));
+    }
+    Ok(Some(record))
 }
 
 struct MergeSecretMasterKeyParticipant {

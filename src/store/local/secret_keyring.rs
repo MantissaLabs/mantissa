@@ -276,6 +276,44 @@ impl SecretMasterStore {
         MasterKeyRecord::new(descriptor, key)
     }
 
+    /// Derives and stores the deterministic split child key without activating it yet.
+    pub fn prepare_split_child(
+        &self,
+        scope_view: ClusterViewId,
+        created_by_node_id: Uuid,
+        operation_id: Uuid,
+    ) -> io::Result<MasterKeyRecord> {
+        let _guard = self.policy_guard();
+        let parent = self
+            .load_current()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "secret master key missing"))?;
+        let descriptor = MasterKeyDescriptor::split_child(
+            &parent.descriptor,
+            scope_view,
+            created_by_node_id,
+            operation_id,
+        )?;
+        if let Some(existing) = self.load_key(descriptor.key_id)? {
+            if existing.descriptor != descriptor {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "conflicting deterministic split master key envelope rejected",
+                ));
+            }
+            return Ok(existing);
+        }
+
+        let key = MasterKeyPlaintext::derive_split_child(
+            &parent.key,
+            &parent.descriptor,
+            scope_view,
+            created_by_node_id,
+            operation_id,
+        )?;
+        self.persist_record(&descriptor, &key, false, None)?;
+        MasterKeyRecord::new(descriptor, key)
+    }
+
     /// Locks local master-key policy decisions for this daemon instance.
     fn policy_guard(&self) -> MutexGuard<'_, ()> {
         self.policy_lock.lock()

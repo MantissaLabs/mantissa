@@ -10,6 +10,7 @@ use mantissa::node::id::set_node_id;
 use mantissa::secrets::master_key::envelope::PassphraseKdfParams;
 use mantissa::store::replicated::secret_key_sync::{SecretMasterKeySyncRecord, current_for_scope};
 use mantissa_protocol::secrets::secrets;
+use mantissa_protocol::sync::Domain;
 use mantissa_protocol::topology::ClusterOperationStage;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -292,6 +293,86 @@ async fn split_three_node_cluster(cluster: &[TestNode]) -> (Uuid, ClusterViewId,
     (split_id, left_view, right_view)
 }
 
+/// Splits an even-sized cluster into two explicit, equally sized target views.
+async fn split_balanced_cluster(cluster: &[TestNode]) -> (Uuid, ClusterViewId, ClusterViewId) {
+    assert!(
+        cluster.len() >= 2 && cluster.len().is_multiple_of(2),
+        "split helper expects an even cluster with at least two nodes"
+    );
+    let half = cluster.len() / 2;
+    let source_view = current_cluster_view(&cluster[0].topology()).await;
+    let mut split_req = cluster[0].topology().split_cluster_request();
+    {
+        let mut req = split_req.get().init_req();
+        source_view.write_capnp(req.reborrow().init_source_view());
+
+        let mut targets = req.reborrow().init_targets(2);
+        let mut left = targets.reborrow().get(0);
+        left.set_name("left");
+        let mut left_selector = left.reborrow().init_selector();
+        left_selector.reborrow().init_clauses(0);
+        let mut left_nodes = left_selector
+            .reborrow()
+            .init_explicit_nodes(u32::try_from(half).expect("left split size fits u32"));
+        for (idx, node) in cluster[..half].iter().enumerate() {
+            set_node_id(
+                left_nodes
+                    .reborrow()
+                    .get(u32::try_from(idx).expect("left index fits u32")),
+                &node.id(),
+            );
+        }
+
+        let mut right = targets.reborrow().get(1);
+        right.set_name("right");
+        let mut right_selector = right.reborrow().init_selector();
+        right_selector.reborrow().init_clauses(0);
+        let mut right_nodes = right_selector
+            .reborrow()
+            .init_explicit_nodes(u32::try_from(half).expect("right split size fits u32"));
+        for (idx, node) in cluster[half..].iter().enumerate() {
+            set_node_id(
+                right_nodes
+                    .reborrow()
+                    .get(u32::try_from(idx).expect("right index fits u32")),
+                &node.id(),
+            );
+        }
+
+        req.set_dry_run(false);
+    }
+
+    let split_resp = split_req.send().promise.await.expect("splitCluster send");
+    let split_op = split_resp
+        .get()
+        .expect("splitCluster get")
+        .get_op()
+        .expect("split operation");
+    let split_targets = split_op.get_target_views().expect("split target views");
+    let left_view = ClusterViewId::from_capnp(split_targets.get(0)).expect("left split view");
+    let right_view = ClusterViewId::from_capnp(split_targets.get(1)).expect("right split view");
+    let split_id = split_op.get_id().expect("split operation id").to_vec();
+    let split_id = Uuid::from_slice(&split_id).expect("split operation UUID");
+
+    for node in cluster {
+        wait_for_operation_stage(
+            &node.topology(),
+            split_id.as_bytes(),
+            ClusterOperationStage::Finalized,
+            Duration::from_secs(30),
+        )
+        .await;
+    }
+    for node in &cluster[..half] {
+        wait_for_cluster_view(&node.topology(), left_view, Duration::from_secs(30)).await;
+    }
+    for node in &cluster[half..] {
+        wait_for_cluster_view(&node.topology(), right_view, Duration::from_secs(30)).await;
+    }
+
+    (split_id, left_view, right_view)
+}
+
 /// Merges two cluster views through the public topology RPC and returns the operation id.
 async fn merge_cluster_views(
     requester: &TestNode,
@@ -330,6 +411,84 @@ async fn merge_cluster_views(
     .await;
 
     merge_id
+}
+
+/// Encodes a digest using lowercase hex for stable test diagnostics.
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Reads the SecretMasterKeys root for the node's active cluster view.
+async fn secret_master_key_root_hex(node: &TestNode) -> String {
+    let cluster_view = current_cluster_view(&node.topology()).await;
+    let mut roots_req = node.node.sync_client.get_roots_for_view_request();
+    {
+        let mut req = roots_req.get().init_req();
+        cluster_view.write_capnp(req.reborrow().init_view());
+    }
+
+    match roots_req.send().promise.await {
+        Ok(resp) => match resp.get().and_then(|reader| reader.get_roots()) {
+            Ok(list) => {
+                for idx in 0..list.len() {
+                    let entry = list.get(idx);
+                    if matches!(entry.get_domain(), Ok(Domain::SecretMasterKeys))
+                        && let Ok(digest) = entry.get_root_digest()
+                    {
+                        return bytes_to_hex(digest);
+                    }
+                }
+                String::new()
+            }
+            Err(_) => String::new(),
+        },
+        Err(_) => String::new(),
+    }
+}
+
+/// Waits until every node has converged on the same SecretMasterKeys root.
+async fn wait_secret_master_key_roots_equal_all(
+    cluster: &[TestNode],
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut roots = Vec::with_capacity(cluster.len());
+        for node in cluster {
+            roots.push((node.id(), secret_master_key_root_hex(node).await));
+        }
+
+        let all_non_empty = roots.iter().all(|(_, root)| !root.is_empty());
+        let all_equal = roots
+            .first()
+            .is_none_or(|(_, first)| roots.iter().all(|(_, root)| root == first));
+        if all_non_empty && all_equal {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            let snapshot = roots
+                .into_iter()
+                .map(|(id, root)| {
+                    format!(
+                        "{}={}",
+                        &id.to_string()[..8],
+                        if root.is_empty() {
+                            "<empty>".to_string()
+                        } else {
+                            root
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "secret master-key roots diverged after {timeout:?}: {snapshot}"
+            ));
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -554,6 +713,9 @@ local_test!(empty_split_merge_keeps_master_key_sync_rows_bounded, {
         .await,
         "all nodes should adopt the destination-view current after merge"
     );
+    wait_secret_master_key_roots_equal_all(&cluster, Duration::from_secs(15))
+        .await
+        .expect("secret master-key rows converge after empty split/merge");
 
     let shapes = cluster.iter().map(master_key_row_shape).collect::<Vec<_>>();
     for shape in &shapes {
@@ -568,6 +730,61 @@ local_test!(empty_split_merge_keeps_master_key_sync_rows_bounded, {
                 && shape.grants <= 8
                 && shape.currents <= 4,
             "unexpected master-key sync row growth after empty split/merge: {shape:?}"
+        );
+    }
+});
+
+local_test!(ten_node_empty_split_merge_keeps_master_key_rows_linear, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(10),
+        gossip_channel_capacity: Some(4096),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(10, cfg)
+        .await
+        .expect("ten-node cluster");
+    TestNode::assert_cluster_size_all(&cluster, 10, "ten-node cluster before split").await;
+
+    let (_split_id, left_view, right_view) = split_balanced_cluster(&cluster).await;
+    let _merge_id = merge_cluster_views(&cluster[0], left_view, right_view).await;
+    for node in &cluster {
+        wait_for_cluster_view(&node.topology(), right_view, Duration::from_secs(30)).await;
+    }
+    TestNode::assert_cluster_size_all(&cluster, 10, "ten-node merged cluster").await;
+
+    assert!(
+        wait_until(
+            Duration::from_secs(30),
+            Duration::from_millis(50),
+            || async {
+                cluster
+                    .iter()
+                    .all(|node| local_current_matches_scope(node, right_view))
+            }
+        )
+        .await,
+        "all ten nodes should adopt the destination-view current after merge"
+    );
+    wait_secret_master_key_roots_equal_all(&cluster, Duration::from_secs(30))
+        .await
+        .expect("secret master-key rows converge across ten nodes after split/merge");
+
+    let shapes = cluster.iter().map(master_key_row_shape).collect::<Vec<_>>();
+    for shape in &shapes {
+        assert_eq!(
+            shape.tombs, 0,
+            "fresh ten-node split/merge should not tombstone keys"
+        );
+        assert!(
+            shape.rows <= 30
+                && shape.values <= 30
+                && shape.descriptors <= 3
+                && shape.grants <= 24
+                && shape.currents <= 3,
+            "ten-node empty split/merge should stay linear and tightly bounded: {shape:?}"
         );
     }
 });
@@ -997,6 +1214,83 @@ local_test!(split_merge_grants_partition_keys_for_secret_decryption, {
         "all merged nodes should decrypt a post-merge secret"
     );
 });
+
+local_test!(
+    split_merge_grants_split_current_keys_for_secret_decryption,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+        let cfg = ClusterConfig {
+            sync_tick_ms: Some(100),
+            gossip_tick_ms: Some(100),
+            gossip_fanout: Some(4),
+            ..ClusterConfig::default()
+        };
+        let cluster = TestNode::new_cluster_inproc_with_config(4, cfg)
+            .await
+            .expect("four-node secrets cluster");
+        TestNode::assert_cluster_size_all(&cluster, 4, "four-node cluster before split").await;
+
+        let (_split_id, left_view, right_view) = split_four_node_cluster(&cluster).await;
+        let left_a = &cluster[0];
+        let left_b = &cluster[1];
+        let right_a = &cluster[2];
+        let right_b = &cluster[3];
+
+        let left_secret = b"left-secret-under-split-current";
+        create_secret(
+            &left_a.node.secrets_client,
+            "left-split-current-secret",
+            left_secret,
+        )
+        .await
+        .expect("create left split-current secret");
+        assert!(
+            wait_for_plaintext(
+                &left_b.node.secrets_client,
+                "left-split-current-secret",
+                left_secret,
+                Duration::from_secs(15),
+            )
+            .await,
+            "left partition peer should decrypt the split-current secret"
+        );
+
+        let right_secret = b"right-secret-under-split-current";
+        create_secret(
+            &right_a.node.secrets_client,
+            "right-split-current-secret",
+            right_secret,
+        )
+        .await
+        .expect("create right split-current secret");
+        assert!(
+            wait_for_plaintext(
+                &right_b.node.secrets_client,
+                "right-split-current-secret",
+                right_secret,
+                Duration::from_secs(15),
+            )
+            .await,
+            "right partition peer should decrypt the split-current secret"
+        );
+
+        let _merge_id = merge_cluster_views(left_a, left_view, right_view).await;
+        for node in &cluster {
+            wait_for_cluster_view(&node.topology(), right_view, Duration::from_secs(15)).await;
+        }
+        TestNode::assert_cluster_size_all(&cluster, 4, "merged cluster after split").await;
+
+        for (name, plaintext) in [
+            ("left-split-current-secret", left_secret.as_slice()),
+            ("right-split-current-secret", right_secret.as_slice()),
+        ] {
+            assert!(
+                wait_for_plaintext_all(&cluster, name, plaintext, Duration::from_secs(30)).await,
+                "all merged nodes should decrypt {name}"
+            );
+        }
+    }
+);
 
 local_test!(master_key_rotation_replicates_through_sync_domain, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
