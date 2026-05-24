@@ -946,7 +946,7 @@ local_test!(ebpf_overlay_programs_runtime_mss_for_small_mtu, {
     assert!(
         common::convergence::wait_until(
             Duration::from_secs(60),
-            Duration::from_millis(250),
+            Duration::from_millis(100),
             || async {
                 matches!(
                     http_get(&vip_addr).await,

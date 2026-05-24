@@ -690,7 +690,7 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
     let addr = format!("127.0.0.1:{NODEPORT_HTTP_PORT}");
     let http_ok = wait_until(
         Duration::from_secs(60),
-        Duration::from_millis(250),
+        Duration::from_millis(100),
         || async {
             match http_get(&addr).await {
                 Ok(response) => response.contains(NODEPORT_RESPONSE),
@@ -906,7 +906,7 @@ local_test!(nodeport_restart_restores_public_service_publication, {
     assert!(
         wait_until(
             Duration::from_secs(60),
-            Duration::from_millis(250),
+            Duration::from_millis(100),
             || async {
                 matches!(
                     http_get(&addr).await,
@@ -1043,7 +1043,7 @@ local_test!(nodeport_restart_restores_public_service_publication, {
 
     let http_ok_after_restart = wait_until(
         Duration::from_secs(60),
-        Duration::from_millis(250),
+        Duration::from_millis(100),
         || async {
             matches!(
                 http_get(&addr).await,
@@ -1181,7 +1181,7 @@ local_test!(nodeport_tcp_syn_mss_clamps_to_host_access_mtu, {
     let addr = format!("127.0.0.1:{NODEPORT_HTTP_MTU_PORT}");
     let http_ok = wait_until(
         Duration::from_secs(60),
-        Duration::from_millis(250),
+        Duration::from_millis(100),
         || async {
             matches!(
                 http_get(&addr).await,
@@ -1331,7 +1331,7 @@ local_test!(
         let addr = format!("[{loopback_ip}]:{NODEPORT_HTTP_PORT_V6}");
         let http_ok = wait_until(
             Duration::from_secs(60),
-            Duration::from_millis(250),
+            Duration::from_millis(100),
             || async {
                 match http_get(&addr).await {
                     Ok(response) => response.contains(NODEPORT_RESPONSE),
@@ -1492,7 +1492,7 @@ local_test!(
         let addr = format!("127.0.0.1:{NODEPORT_HTTP_REMAP_PORT}");
         let http_ok = wait_until(
             Duration::from_secs(60),
-            Duration::from_millis(250),
+            Duration::from_millis(100),
             || async {
                 match http_get(&addr).await {
                     Ok(response) => response.contains(NODEPORT_RESPONSE),
@@ -1608,7 +1608,7 @@ local_test!(nodeport_udp_public_service_reaches_backend_and_cleans_up, {
     let payload = NODEPORT_UDP_RESPONSE.as_bytes();
     let udp_ok = wait_until(
         Duration::from_secs(60),
-        Duration::from_millis(250),
+        Duration::from_millis(100),
         || async { matches!(udp_echo(&addr, payload).await, Ok(response) if response == payload) },
     )
     .await;
@@ -1743,7 +1743,7 @@ local_test!(nodeport_udp_service_removal_clears_stale_flow_maps, {
     assert!(
         wait_until(
             Duration::from_secs(60),
-            Duration::from_millis(250),
+            Duration::from_millis(100),
             || async {
                 matches!(udp_echo(&addr, payload).await, Ok(response) if response == payload)
             },
@@ -1861,7 +1861,7 @@ local_test!(nodeport_udp_public_port_remap_clears_stale_flow_maps, {
     assert!(
         wait_until(
             Duration::from_secs(60),
-            Duration::from_millis(250),
+            Duration::from_millis(100),
             || async {
                 matches!(udp_echo(&old_addr, payload).await, Ok(response) if response == payload)
             },
@@ -1949,7 +1949,7 @@ local_test!(nodeport_udp_public_port_remap_clears_stale_flow_maps, {
     assert!(
         wait_until(
             Duration::from_secs(60),
-            Duration::from_millis(250),
+            Duration::from_millis(100),
             || async {
                 matches!(udp_echo(&new_addr, payload).await, Ok(response) if response == payload)
             },
@@ -2037,7 +2037,7 @@ local_test!(nodeport_small_flow_capacity_reports_estimated_evictions, {
     assert!(
         wait_until(
             Duration::from_secs(60),
-            Duration::from_millis(250),
+            Duration::from_millis(100),
             || async {
                 matches!(
                     udp_echo_with_socket(&socket_a, &addr, payload).await,
@@ -2187,7 +2187,7 @@ local_test!(
         assert!(
             wait_until(
                 Duration::from_secs(30),
-                Duration::from_millis(250),
+                Duration::from_millis(100),
                 || async {
                     matches!(udp_echo(&addr, payload).await, Ok(response) if response == payload)
                 },
@@ -2290,7 +2290,7 @@ local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
     let owner_addr = format!("127.0.0.1:{NODEPORT_HTTP_PORT}");
     let owner_http_ok = wait_until(
         Duration::from_secs(60),
-        Duration::from_millis(250),
+        Duration::from_millis(100),
         || async {
             match http_get(&owner_addr).await {
                 Ok(response) => response.contains(NODEPORT_CONFLICT_RESPONSE),
@@ -2565,7 +2565,7 @@ local_test!(nodeport_runtime_autodetects_identity_by_default, {
     assert!(
         wait_until(
             Duration::from_secs(60),
-            Duration::from_millis(250),
+            Duration::from_millis(100),
             || async {
                 match http_get(&addr).await {
                     Ok(response) => response.contains(NODEPORT_RESPONSE),
@@ -2656,7 +2656,7 @@ local_test!(
 
         let bypass_reported = wait_until(
             Duration::from_secs(60),
-            Duration::from_millis(250),
+            Duration::from_millis(100),
             || async {
                 let status = node.network_controller.nodeport_manager().status().await;
                 matches!(
