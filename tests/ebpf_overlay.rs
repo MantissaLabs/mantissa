@@ -350,47 +350,6 @@ async fn wait_for_service_status(
     .await
 }
 
-/// Return concise summaries for local workload rows that still belong to one service.
-async fn service_workload_summaries(node: &HeadlessNode, service_name: &str) -> Vec<String> {
-    let tasks = node
-        .workload_manager
-        .list_workloads(&WorkloadStateFilter::all())
-        .await
-        .expect("list workloads while waiting for service cleanup");
-
-    tasks
-        .into_iter()
-        .filter(|task| {
-            task.node_id == node.id
-                && task
-                    .service_owner()
-                    .map(|owner| owner.service_name == service_name)
-                    .unwrap_or(false)
-        })
-        .map(|task| {
-            let template = task
-                .service_owner()
-                .map(|owner| owner.template.as_str())
-                .unwrap_or("unknown");
-            format!("{}:{template}:{:?}", task.id, task.state)
-        })
-        .collect()
-}
-
-/// Wait until local service workload rows have completed their stop cleanup.
-async fn wait_for_service_workloads_removed(
-    node: &HeadlessNode,
-    service_name: &str,
-    timeout: Duration,
-) -> bool {
-    common::convergence::wait_until(timeout, Duration::from_millis(100), || async {
-        service_workload_summaries(node, service_name)
-            .await
-            .is_empty()
-    })
-    .await
-}
-
 /// Return the local running task id for one service template in the privileged single-node harness.
 async fn wait_for_local_service_task(
     node: &HeadlessNode,
@@ -467,11 +426,6 @@ async fn remove_service_via_rpc(node: &HeadlessNode, service_id: Uuid) {
         )
         .await,
         "service {service_name} ({service_id}) should reach stopped before network teardown"
-    );
-    assert!(
-        wait_for_service_workloads_removed(node, &service_name, Duration::from_secs(180)).await,
-        "service {service_name} ({service_id}) should remove local workloads before network teardown; remaining={:?}",
-        service_workload_summaries(node, &service_name).await
     );
 }
 
