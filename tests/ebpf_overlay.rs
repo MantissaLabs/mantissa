@@ -1516,7 +1516,7 @@ local_test!(ebpf_overlay_task_dns_reaches_service_vip, {
     .expect("discover IPv4 VIP for task-facing eBPF test");
 
     let curl_command = format!(
-        "curl -sS --connect-timeout 2 --max-time 5 -w '\\nREMOTE=%{{remote_ip}}\\n' http://{vip}:{EBPF_HTTP_PORT}/"
+        "curl -sS --connect-timeout 1 --max-time 2 -w '\\nREMOTE=%{{remote_ip}}\\n' http://{vip}:{EBPF_HTTP_PORT}/"
     );
     let task_vip_ready = common::convergence::wait_until(
         Duration::from_secs(30),
@@ -1540,7 +1540,7 @@ local_test!(ebpf_overlay_task_dns_reaches_service_vip, {
         let direct_backend = exec_task_container(
             frontend_task_id,
             &format!(
-                "curl -sS --connect-timeout 2 --max-time 5 http://{}:{EBPF_HTTP_PORT}/ || true",
+                "curl -sS --connect-timeout 1 --max-time 2 http://{}:{EBPF_HTTP_PORT}/ || true",
                 backend_ips[0]
             ),
         );
@@ -1687,7 +1687,7 @@ local_test!(ebpf_overlay_ipv6_task_dns_reaches_service_vip, {
     .expect("discover IPv6 VIP for task-facing eBPF test");
 
     let curl_command = format!(
-        "curl -g -6 -sS --connect-timeout 2 --max-time 5 -w '\\nREMOTE=%{{remote_ip}}\\n' http://[{vip}]:{EBPF_HTTP_PORT}/"
+        "curl -g -6 -sS --connect-timeout 1 --max-time 2 -w '\\nREMOTE=%{{remote_ip}}\\n' http://[{vip}]:{EBPF_HTTP_PORT}/"
     );
     let task_vip_ready = common::convergence::wait_until(
         Duration::from_secs(30),
@@ -1711,7 +1711,7 @@ local_test!(ebpf_overlay_ipv6_task_dns_reaches_service_vip, {
         let direct_backend = exec_task_container(
             frontend_task_id,
             &format!(
-                "curl -g -6 --connect-timeout 2 --max-time 5 http://[{}]:{EBPF_HTTP_PORT}/ || true",
+                "curl -g -6 --connect-timeout 1 --max-time 2 http://[{}]:{EBPF_HTTP_PORT}/ || true",
                 backend_ips[0]
             ),
         );
