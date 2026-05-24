@@ -503,6 +503,41 @@ fn http_body(response: &str) -> &str {
         .unwrap_or(response)
 }
 
+/// Probe an HTTP VIP until distinct response bodies prove that traffic reached local replicas.
+async fn wait_for_distinct_http_bodies(
+    addr: &str,
+    expected_count: usize,
+    timeout: Duration,
+) -> (BTreeSet<String>, Option<String>) {
+    let deadline = Instant::now() + timeout;
+    let mut responses = BTreeSet::new();
+    let mut last_response = None;
+
+    while Instant::now() < deadline && responses.len() < expected_count {
+        for _ in 0..16 {
+            if Instant::now() >= deadline || responses.len() >= expected_count {
+                break;
+            }
+
+            match http_get(addr).await {
+                Ok(response) => {
+                    responses.insert(http_body(&response).trim().to_string());
+                    last_response = Some(response);
+                }
+                Err(err) => {
+                    last_response = Some(err.to_string());
+                }
+            }
+        }
+
+        if responses.len() < expected_count {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    (responses, last_response)
+}
+
 /// Send one UDP datagram to the supplied address and return the echoed reply bytes.
 async fn udp_echo(addr: &str, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -1788,21 +1823,8 @@ local_test!(ebpf_overlay_vip_load_balances_across_local_replicas, {
         .expect("discover VIP for local load-balancing test");
     let vip_addr = format!("{vip}:{EBPF_HTTP_PORT}");
 
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut responses = BTreeSet::new();
-    let mut last_response = None;
-    while Instant::now() < deadline && responses.len() < 2 {
-        match http_get(&vip_addr).await {
-            Ok(response) => {
-                responses.insert(http_body(&response).trim().to_string());
-                last_response = Some(response);
-            }
-            Err(err) => {
-                last_response = Some(err.to_string());
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let (responses, last_response) =
+        wait_for_distinct_http_bodies(&vip_addr, 2, Duration::from_secs(30)).await;
 
     assert!(
         responses.len() >= 2,
@@ -1882,21 +1904,8 @@ local_test!(
             .expect("discover IPv6 VIP for local load-balancing test");
         let vip_addr = format!("[{vip}]:{EBPF_HTTP_PORT}");
 
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut responses = BTreeSet::new();
-        let mut last_response = None;
-        while Instant::now() < deadline && responses.len() < 2 {
-            match http_get(&vip_addr).await {
-                Ok(response) => {
-                    responses.insert(http_body(&response).trim().to_string());
-                    last_response = Some(response);
-                }
-                Err(err) => {
-                    last_response = Some(err.to_string());
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        let (responses, last_response) =
+            wait_for_distinct_http_bodies(&vip_addr, 2, Duration::from_secs(30)).await;
 
         assert!(
             responses.len() >= 2,
