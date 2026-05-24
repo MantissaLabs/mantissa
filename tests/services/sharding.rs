@@ -323,7 +323,7 @@ local_test!(
         let _config_guard = ConfigOverrideGuard::service_sharding(1, 1, 2, 2);
         let _runtime_guard = RuntimeBackendOverrideGuard::install_factory(Arc::new(|| {
             Arc::new(SlowCreateRuntimeBackend::with_create_delay(
-                Duration::from_millis(500),
+                Duration::from_millis(250),
             ))
         }));
 
@@ -893,7 +893,7 @@ local_test!(services_sharded_dependency_ordered_templates_converge, {
     let _config_guard = ConfigOverrideGuard::service_sharding(1, 1, 2, 2);
     let _runtime_guard = RuntimeBackendOverrideGuard::install_factory(Arc::new(|| {
         Arc::new(SlowCreateRuntimeBackend::with_create_delay(
-            Duration::from_millis(500),
+            Duration::from_millis(250),
         ))
     }));
 

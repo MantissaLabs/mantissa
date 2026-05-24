@@ -540,7 +540,7 @@ local_test!(services_deploying_generation_resumes_after_restart, {
     let signing = ed25519_dalek::SigningKey::from_bytes(&[0x73; 32]);
     let local_volume_root = state_dir.path().join("volumes");
     let runtime_backend = Arc::new(SlowCreateRuntimeBackend::with_create_delay(
-        Duration::from_millis(500),
+        Duration::from_millis(250),
     ));
 
     let node = create_restartable_service_node(

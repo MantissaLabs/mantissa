@@ -1064,7 +1064,7 @@ pub(crate) struct SlowCreateRuntimeBackend {
 impl Default for SlowCreateRuntimeBackend {
     /// Builds the deadline-test backend with a create delay longer than the tight deadline.
     fn default() -> Self {
-        Self::with_create_delay(Duration::from_secs(3))
+        Self::with_create_delay(Duration::from_millis(1_500))
     }
 }
 
