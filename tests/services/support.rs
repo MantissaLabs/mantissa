@@ -1,6 +1,6 @@
 pub(crate) use crate::common::convergence::{
-    current_cluster_view, swim_down_transition_timeout, wait_for_cluster_view,
-    wait_for_operation_stage, wait_until,
+    current_cluster_view, swim_down_transition_timeout, swim_down_transition_timeout_for,
+    wait_for_cluster_view, wait_for_operation_stage, wait_until,
 };
 pub(crate) use crate::common::testkit::{
     ClusterConfig, InMemoryRuntimeBackend, RuntimeBackendOverrideGuard, TestNode,
@@ -10,7 +10,8 @@ pub(crate) use capnp::Error as CapnpError;
 pub(crate) use chrono::{DateTime, Duration as ChronoDuration, Utc};
 pub(crate) use mantissa::cluster::ClusterViewId;
 pub(crate) use mantissa::config::{
-    Config, ConfigSource, global_config, global_config_source, set_global_config_with_source,
+    Config, ConfigSource, RuntimeHealthConfig, global_config, global_config_source,
+    set_global_config_with_source,
 };
 pub(crate) use mantissa::network::types::{
     NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver, NetworkSpecDraft,
@@ -76,6 +77,19 @@ pub(crate) use tokio::time::sleep;
 pub(crate) use uuid::Uuid;
 
 pub(crate) use mantissa_net::noise::NoiseKeys;
+
+/// Returns the fast SWIM timing profile used by service tests that exercise node failure.
+pub(crate) fn fast_health_runtime_config() -> RuntimeHealthConfig {
+    RuntimeHealthConfig {
+        probe_fanout: 1,
+        probe_interval: Duration::from_millis(50),
+        probe_timeout: Duration::from_millis(100),
+        suspect_after: Duration::from_millis(150),
+        down_after: Duration::from_millis(300),
+        indirect_fanout_min: 1,
+        indirect_fanout_max: 1,
+    }
+}
 
 /// Restores the global Mantissa config after a test-scoped override.
 pub(crate) struct ConfigOverrideGuard {
@@ -1035,6 +1049,7 @@ pub(crate) async fn create_restartable_service_node(
             master_key_kdf_params: None,
             store_gc_config: None,
             service_timing: None,
+            runtime_health: None,
         },
     )
     .await

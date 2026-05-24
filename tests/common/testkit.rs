@@ -11,7 +11,7 @@ use mantissa::services::ServiceControllerTiming;
 use mantissa::topology_capnp::topology;
 use mantissa::workload::manager::WorkloadRuntimeConfig;
 use mantissa::{
-    config::RuntimeStoreGcConfig,
+    config::{RuntimeHealthConfig, RuntimeStoreGcConfig},
     node,
     secrets::master_key::envelope::PassphraseKdfParams,
     server::headless::{HeadlessConfig, HeadlessNode, HeadlessTransport},
@@ -380,6 +380,7 @@ impl TestNode {
         gossip_channel_capacity: Option<usize>,
         task_runtime: Option<WorkloadRuntimeConfig>,
         service_timing: Option<ServiceControllerTiming>,
+        runtime_health: Option<RuntimeHealthConfig>,
     ) -> HeadlessConfig {
         HeadlessConfig {
             listen_addr: "127.0.0.1:0".to_string(),
@@ -400,13 +401,14 @@ impl TestNode {
             master_key_kdf_params: None,
             store_gc_config: None,
             service_timing,
+            runtime_health,
         }
     }
 
     /// Start a node with in-process transport (fast path).
     pub async fn new() -> Self {
         let node = HeadlessNode::new_with_config(Self::apply_test_runtime_backend(
-            Self::inproc_config(None, None, None, None, None, None),
+            Self::inproc_config(None, None, None, None, None, None, None),
         ))
         .await
         .expect("headless inproc node");
@@ -417,7 +419,7 @@ impl TestNode {
 
     pub async fn new_with_fanout(fanout: usize) -> Self {
         let node = HeadlessNode::new_with_config(Self::apply_test_runtime_backend(
-            Self::inproc_config(None, None, Some(fanout), None, None, None),
+            Self::inproc_config(None, None, Some(fanout), None, None, None, None),
         ))
         .await
         .expect("headless inproc node (custom fanout)");
@@ -450,6 +452,7 @@ impl TestNode {
         let node =
             HeadlessNode::new_with_config(Self::apply_test_runtime_backend(Self::inproc_config(
                 Some(Duration::from_millis(ms)),
+                None,
                 None,
                 None,
                 None,
@@ -1062,6 +1065,7 @@ pub struct ClusterConfig {
     pub master_key_kdf_params: Option<PassphraseKdfParams>,
     pub store_gc_config: Option<RuntimeStoreGcConfig>,
     pub service_timing: Option<ServiceControllerTiming>,
+    pub runtime_health: Option<RuntimeHealthConfig>,
 }
 
 impl Default for ClusterConfig {
@@ -1078,6 +1082,7 @@ impl Default for ClusterConfig {
             master_key_kdf_params: None,
             store_gc_config: None,
             service_timing: None,
+            runtime_health: None,
         }
     }
 }
@@ -1115,6 +1120,7 @@ async fn build_inproc_node_with_config(cfg: ClusterConfig) -> HeadlessNode {
         gossip_channel_capacity,
         cfg.task_runtime_config(),
         cfg.service_timing,
+        cfg.runtime_health,
     );
     let headless_cfg = HeadlessConfig {
         master_key_kdf_params: cfg.master_key_kdf_params,

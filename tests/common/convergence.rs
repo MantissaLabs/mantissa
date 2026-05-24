@@ -1,4 +1,5 @@
 use mantissa::cluster::ClusterViewId;
+use mantissa::config::RuntimeHealthConfig;
 use mantissa_protocol::topology::ClusterOperationStage;
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -118,6 +119,14 @@ pub async fn current_cluster_view(
 /// - and a small scheduler margin.
 pub fn swim_down_transition_timeout(candidate_count: usize) -> Duration {
     let health = mantissa::config::health_runtime_config();
+    swim_down_transition_timeout_for(candidate_count, health)
+}
+
+/// Returns the SWIM down-transition timeout for an explicit runtime health profile.
+pub fn swim_down_transition_timeout_for(
+    candidate_count: usize,
+    health: RuntimeHealthConfig,
+) -> Duration {
     let cadence = health
         .probe_interval
         .saturating_mul(u32::try_from(candidate_count.max(1)).unwrap_or(u32::MAX));

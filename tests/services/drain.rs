@@ -223,11 +223,13 @@ local_test!(services_node_drain_migrates_multi_replica_service, {
 
 local_test!(services_node_down_reschedules_multi_replica_service, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
+    let runtime_health = fast_health_runtime_config();
 
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
         gossip_tick_ms: Some(100),
         gossip_fanout: Some(2),
+        runtime_health: Some(runtime_health),
         ..ClusterConfig::default()
     };
     let mut cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
@@ -270,7 +272,7 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
         .wait_status_of(
             down_node_id,
             NodeStatus::Down,
-            swim_down_transition_timeout(2),
+            swim_down_transition_timeout_for(2, runtime_health),
         )
         .await
         .expect("cluster should mark failed node as down");

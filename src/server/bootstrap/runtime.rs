@@ -85,6 +85,7 @@ pub struct BootstrapOptions {
     pub master_key_passphrase: Option<SecretPassphrase>,
     pub store_gc_config: Option<config::RuntimeStoreGcConfig>,
     pub service_timing: ServiceControllerTiming,
+    pub runtime_health: config::RuntimeHealthConfig,
     /// KDF cost for passphrase-backed master-key envelopes.
     ///
     /// Production uses the hardened default; headless tests lower only this
@@ -113,6 +114,7 @@ impl Default for BootstrapOptions {
             master_key_passphrase: None,
             store_gc_config: None,
             service_timing: ServiceControllerTiming::default(),
+            runtime_health: config::health_runtime_config(),
             master_key_kdf_params: PassphraseKdfParams::production(),
         }
     }
@@ -457,7 +459,7 @@ async fn build_runtime_components(
     let root_schema = stores.restore_root_schema_state(&ctx.db, options.root_schema_override)?;
     let (gossip_client, gossip_dedupe) = build_gossip_client(&cluster_view, &gossip_routes);
 
-    let runtime_health = config::health_runtime_config();
+    let runtime_health = options.runtime_health;
     let health_monitor = mantissa_health::HealthMonitor::new(ctx.self_id);
     let secret_master_key_replication_notify = Arc::new(Notify::new());
     let secret_master_key_publisher = SecretMasterKeyPublisher::new(

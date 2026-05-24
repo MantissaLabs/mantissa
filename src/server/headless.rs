@@ -69,6 +69,7 @@ pub struct HeadlessConfig {
     pub master_key_kdf_params: Option<PassphraseKdfParams>,
     pub store_gc_config: Option<crate::config::RuntimeStoreGcConfig>,
     pub service_timing: Option<ServiceControllerTiming>,
+    pub runtime_health: Option<crate::config::RuntimeHealthConfig>,
 }
 
 impl Default for HeadlessConfig {
@@ -92,6 +93,7 @@ impl Default for HeadlessConfig {
             master_key_kdf_params: None,
             store_gc_config: None,
             service_timing: None,
+            runtime_health: None,
         }
     }
 }
@@ -198,6 +200,7 @@ impl HeadlessNode {
             master_key_kdf_params,
             store_gc_config,
             service_timing,
+            runtime_health,
         } = cfg;
         // Local Node + client
         let mut node_obj = node::Node::new();
@@ -242,6 +245,7 @@ impl HeadlessNode {
             master_key_kdf_params: master_key_kdf_params.unwrap_or_else(PassphraseKdfParams::test),
             store_gc_config,
             service_timing: service_timing.unwrap_or(defaults.service_timing),
+            runtime_health: runtime_health.unwrap_or(defaults.runtime_health),
         };
 
         let BootedRuntime {
@@ -561,6 +565,7 @@ impl HeadlessNode {
                 master_key_kdf_params: None,
                 store_gc_config: None,
                 service_timing: None,
+                runtime_health: None,
             },
         )
         .await

@@ -310,6 +310,7 @@ pub fn privileged_headless_config() -> HeadlessConfig {
         master_key_kdf_params: None,
         store_gc_config: None,
         service_timing: None,
+        runtime_health: None,
     }
 }
 

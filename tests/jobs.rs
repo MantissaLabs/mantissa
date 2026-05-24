@@ -1301,6 +1301,7 @@ async fn create_restartable_job_node(
             master_key_kdf_params: None,
             store_gc_config: None,
             service_timing: None,
+            runtime_health: None,
         },
     )
     .await
