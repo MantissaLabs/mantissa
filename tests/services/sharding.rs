@@ -16,6 +16,17 @@ fn sharded_cluster_config() -> ClusterConfig {
     }
 }
 
+/// Builds deployment options for sharding tests that do not exercise min-healthy monitoring.
+fn fast_sharded_deployment_options() -> ServiceDeploymentOptions {
+    ServiceDeploymentOptions {
+        deployment_policy: ServiceDeploymentPolicy {
+            min_healthy_secs: 0,
+            ..ServiceDeploymentPolicy::default()
+        },
+        ..ServiceDeploymentOptions::default()
+    }
+}
+
 /// Computes the same rendezvous score used by service generation ownership.
 fn generation_owner_score_for_test(service_id: Uuid, service_epoch: u64, node_id: Uuid) -> u128 {
     let mut hasher = blake3::Hasher::new();
@@ -257,14 +268,16 @@ local_test!(services_sharded_deployment_converges_and_stops, {
     let service_id = cluster[0]
         .node
         .service_controller
-        .submit_deployment(
+        .submit_deployment_with_options_outcome(
             Uuid::new_v4(),
             service_name,
             service_name,
             vec![demo_backend_task_template("backend", 8)],
+            fast_sharded_deployment_options(),
         )
         .await
-        .expect("submit sharded deployment");
+        .expect("submit sharded deployment")
+        .service_id;
 
     assert!(
         wait_for_service_status_all(
@@ -337,14 +350,16 @@ local_test!(
         let service_id = cluster[0]
             .node
             .service_controller
-            .submit_deployment(
+            .submit_deployment_with_options_outcome(
                 Uuid::new_v4(),
                 service_name,
                 service_name,
                 vec![demo_backend_task_template("backend", 12)],
+                fast_sharded_deployment_options(),
             )
             .await
-            .expect("submit slow sharded deployment");
+            .expect("submit slow sharded deployment")
+            .service_id;
 
         assert!(
             wait_for_any_reserved_slot(&cluster, Duration::from_secs(10)).await,
@@ -706,9 +721,16 @@ local_test!(
         let service_id = cluster[0]
             .node
             .service_controller
-            .submit_deployment(Uuid::new_v4(), &service_name, &service_name, vec![template])
+            .submit_deployment_with_options_outcome(
+                Uuid::new_v4(),
+                &service_name,
+                &service_name,
+                vec![template],
+                fast_sharded_deployment_options(),
+            )
             .await
-            .expect("submit deployment pinned to the unavailable shard coordinator");
+            .expect("submit deployment pinned to the unavailable shard coordinator")
+            .service_id;
 
         let coordinator_unavailable_detail_seen = wait_until(
             Duration::from_secs(30),
@@ -809,14 +831,16 @@ local_test!(services_sharded_hard_failure_drains_successful_shards, {
     let service_id = cluster[0]
         .node
         .service_controller
-        .submit_deployment(
+        .submit_deployment_with_options_outcome(
             Uuid::new_v4(),
             service_name,
             service_name,
             vec![successful_template, failing_template],
+            fast_sharded_deployment_options(),
         )
         .await
-        .expect("submit partially successful sharded deployment");
+        .expect("submit partially successful sharded deployment")
+        .service_id;
 
     let failure_detail_seen = wait_until(
         Duration::from_secs(60),
@@ -882,14 +906,16 @@ local_test!(services_sharded_task_splitting_converges, {
     let service_id = cluster[0]
         .node
         .service_controller
-        .submit_deployment(
+        .submit_deployment_with_options_outcome(
             Uuid::new_v4(),
             service_name,
             service_name,
             vec![demo_backend_task_template("backend", 6)],
+            fast_sharded_deployment_options(),
         )
         .await
-        .expect("submit task-split sharded deployment");
+        .expect("submit task-split sharded deployment")
+        .service_id;
 
     assert!(
         wait_for_service_status_all(
