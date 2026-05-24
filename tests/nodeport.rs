@@ -43,7 +43,7 @@ const NODEPORT_RESPONSE: &str = "hello from nodeport privileged test";
 const NODEPORT_CONFLICT_RESPONSE: &str = "hello from nodeport owner";
 const NODEPORT_DEGRADED_RESPONSE: &str = "hello from degraded nodeport service";
 const NODEPORT_UDP_RESPONSE: &str = "hello from nodeport privileged udp test";
-const NODEPORT_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+const NODEPORT_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Resolve optional NodePort dataplane artifact overrides for the privileged validation lane.
 fn privileged_nodeport_artifact_dir() -> Option<PrivilegedBpfArtifacts> {
