@@ -180,7 +180,7 @@ impl ServiceController {
             if !task_state_healthy(&task.state) {
                 continue;
             }
-            if !task_age_allows_cleanup(task) {
+            if !task_age_allows_cleanup(task, self.timing.cleanup_min_age) {
                 continue;
             }
             let Some(owner) = select_task_owner(task.id, eligible_nodes) else {

@@ -81,6 +81,8 @@ const SERVICE_SLOT_MISSING_GRACE_SECS: u64 = 6;
 const SERVICE_DEPLOYING_SLOT_VISIBILITY_GRACE_SECS: u64 = 120;
 /// Minimum age (in seconds) before a running task is eligible for rebalancing.
 const SERVICE_REBALANCE_MIN_AGE_SECS: i64 = 20;
+/// Minimum age (in seconds) before an unreferenced healthy task can be stopped.
+const SERVICE_EXTRA_TASK_CLEANUP_MIN_AGE_SECS: i64 = 20;
 /// Cooldown window between rebalance attempts for the same slot.
 const SERVICE_REBALANCE_COOLDOWN_SECS: u64 = 30;
 /// Maximum time to wait for one rollout task to fully stop before id reuse.
@@ -100,6 +102,7 @@ const SERVICE_ENABLE_PROACTIVE_REBALANCE: bool = true;
 pub struct ServiceControllerTiming {
     pub reschedule_tick: Duration,
     pub rebalance_min_age: ChronoDuration,
+    pub cleanup_min_age: ChronoDuration,
     pub rebalance_cooldown: Duration,
 }
 
@@ -122,8 +125,15 @@ impl ServiceControllerTiming {
         Self {
             reschedule_tick: reschedule_tick.max(Duration::from_millis(1)),
             rebalance_min_age,
+            cleanup_min_age: ChronoDuration::seconds(SERVICE_EXTRA_TASK_CLEANUP_MIN_AGE_SECS),
             rebalance_cooldown,
         }
+    }
+
+    /// Returns the timing profile with a custom extra-task cleanup age.
+    pub fn with_cleanup_min_age(mut self, cleanup_min_age: ChronoDuration) -> Self {
+        self.cleanup_min_age = cleanup_min_age;
+        self
     }
 }
 

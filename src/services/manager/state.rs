@@ -38,13 +38,12 @@ pub(super) fn task_age_allows_rebalance(task: &WorkloadSpec, min_age: ChronoDura
 }
 
 /// Returns true when a task is old enough to be considered for cleanup.
-pub(super) fn task_age_allows_cleanup(task: &WorkloadSpec) -> bool {
+pub(super) fn task_age_allows_cleanup(task: &WorkloadSpec, min_age: ChronoDuration) -> bool {
     let Some(anchor) =
         parse_timestamp(&task.updated_at).or_else(|| parse_timestamp(&task.created_at))
     else {
         return false;
     };
-    let min_age = ChronoDuration::seconds(SERVICE_REBALANCE_MIN_AGE_SECS);
     Utc::now().signed_duration_since(anchor) >= min_age
 }
 

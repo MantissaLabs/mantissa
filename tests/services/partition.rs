@@ -10,11 +10,14 @@ local_test!(
             sync_tick_ms: Some(100),
             gossip_tick_ms: Some(100),
             gossip_fanout: Some(2),
-            service_timing: Some(ServiceControllerTiming::new(
-                Duration::from_millis(100),
-                ChronoDuration::seconds(0),
-                Duration::from_millis(100),
-            )),
+            service_timing: Some(
+                ServiceControllerTiming::new(
+                    Duration::from_millis(100),
+                    ChronoDuration::seconds(0),
+                    Duration::from_millis(100),
+                )
+                .with_cleanup_min_age(ChronoDuration::seconds(10)),
+            ),
             ..ClusterConfig::default()
         };
         let cluster = TestNode::new_cluster_inproc_with_config(4, cfg)
