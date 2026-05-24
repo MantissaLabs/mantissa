@@ -16,7 +16,7 @@ local_test!(
                     ChronoDuration::seconds(0),
                     Duration::from_millis(100),
                 )
-                .with_cleanup_min_age(ChronoDuration::seconds(10)),
+                .with_cleanup_min_age(ChronoDuration::seconds(5)),
             ),
             ..ClusterConfig::default()
         };
