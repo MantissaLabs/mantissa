@@ -309,6 +309,7 @@ pub fn privileged_headless_config() -> HeadlessConfig {
         local_volume_root: None,
         master_key_kdf_params: None,
         store_gc_config: None,
+        service_timing: None,
     }
 }
 

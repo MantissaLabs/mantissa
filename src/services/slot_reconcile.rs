@@ -10,7 +10,7 @@ use super::state::{
 };
 use super::{
     SERVICE_DEPLOYING_SLOT_VISIBILITY_GRACE_SECS, SERVICE_ENABLE_PROACTIVE_REBALANCE,
-    SERVICE_REBALANCE_COOLDOWN_SECS, SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController,
+    SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController,
 };
 use crate::services::ownership::{
     ReplicaSlot, SlotKey, build_replica_slots, select_slot_owner, select_task_owner,
@@ -378,7 +378,7 @@ impl ServiceController {
         if !task_state_rebalanceable(&task.state) {
             return Ok(());
         }
-        if !task_age_allows_rebalance(task) {
+        if !task_age_allows_rebalance(task, self.timing.rebalance_min_age) {
             return Ok(());
         }
         if !self.rebalance_allowed(key).await {
@@ -892,10 +892,7 @@ impl ServiceController {
     /// Sets a cooldown window to prevent repeated rebalance attempts for the same slot.
     async fn set_rebalance_cooldown(&self, key: &SlotKey) {
         let mut guard = self.slot_rebalance_after.lock().await;
-        guard.insert(
-            key.clone(),
-            Instant::now() + Duration::from_secs(SERVICE_REBALANCE_COOLDOWN_SECS),
-        );
+        guard.insert(key.clone(), Instant::now() + self.timing.rebalance_cooldown);
     }
 }
 

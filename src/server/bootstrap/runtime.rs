@@ -27,7 +27,9 @@ use crate::secrets::master_key::replication::{
 };
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerDependencies};
-use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
+use crate::services::{
+    ServiceController, ServiceControllerConfig, ServiceControllerTiming, ServicesRPC,
+};
 use crate::store::path::default_db_path;
 use crate::store::replicated::gc::{StoreGcRunner, StoreGcRunnerInputs};
 use crate::store::replicated::registry::{ReplicatedStoreHandles, replicated_store_registry};
@@ -82,6 +84,7 @@ pub struct BootstrapOptions {
     pub advertise_override: Option<String>,
     pub master_key_passphrase: Option<SecretPassphrase>,
     pub store_gc_config: Option<config::RuntimeStoreGcConfig>,
+    pub service_timing: ServiceControllerTiming,
     /// KDF cost for passphrase-backed master-key envelopes.
     ///
     /// Production uses the hardened default; headless tests lower only this
@@ -109,6 +112,7 @@ impl Default for BootstrapOptions {
             advertise_override: None,
             master_key_passphrase: None,
             store_gc_config: None,
+            service_timing: ServiceControllerTiming::default(),
             master_key_kdf_params: PassphraseKdfParams::production(),
         }
     }
@@ -664,6 +668,7 @@ async fn build_runtime_components(
         gossip_rx: service_rx,
         local_node_id: ctx.self_id,
         health_monitor: health_monitor.clone(),
+        timing: options.service_timing,
     });
     let services_service = ServicesRPC::new(service_controller.clone(), topology.clone());
     let services_client = capnp_rpc::new_client(services_service);

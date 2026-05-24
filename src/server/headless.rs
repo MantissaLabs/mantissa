@@ -18,7 +18,7 @@ use crate::{
         RunHandles, Server,
         bootstrap::{BootedRuntime, BootstrapContext, BootstrapOptions, RuntimeTaskHandles, boot},
     },
-    services::ServiceController,
+    services::{ServiceController, ServiceControllerTiming},
     store::replicated::scheduler_digests::SchedulerDigestStore,
     workload::manager::{WorkloadManager, WorkloadRuntimeConfig},
 };
@@ -68,6 +68,7 @@ pub struct HeadlessConfig {
     pub local_volume_root: Option<PathBuf>,
     pub master_key_kdf_params: Option<PassphraseKdfParams>,
     pub store_gc_config: Option<crate::config::RuntimeStoreGcConfig>,
+    pub service_timing: Option<ServiceControllerTiming>,
 }
 
 impl Default for HeadlessConfig {
@@ -90,6 +91,7 @@ impl Default for HeadlessConfig {
             local_volume_root: None,
             master_key_kdf_params: None,
             store_gc_config: None,
+            service_timing: None,
         }
     }
 }
@@ -195,6 +197,7 @@ impl HeadlessNode {
             local_volume_root,
             master_key_kdf_params,
             store_gc_config,
+            service_timing,
         } = cfg;
         // Local Node + client
         let mut node_obj = node::Node::new();
@@ -238,6 +241,7 @@ impl HeadlessNode {
             // code paths, but avoid production Argon2 cost in broad integration tests.
             master_key_kdf_params: master_key_kdf_params.unwrap_or_else(PassphraseKdfParams::test),
             store_gc_config,
+            service_timing: service_timing.unwrap_or(defaults.service_timing),
         };
 
         let BootedRuntime {
@@ -556,6 +560,7 @@ impl HeadlessNode {
                 local_volume_root: Some(state.tmp_dir.join("volumes")),
                 master_key_kdf_params: None,
                 store_gc_config: None,
+                service_timing: None,
             },
         )
         .await

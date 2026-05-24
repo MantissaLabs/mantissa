@@ -7,6 +7,7 @@ use mantissa::runtime::testing::IN_MEMORY_RUNTIME_BACKEND_KIND;
 pub use mantissa::runtime::testing::InMemoryRuntimeBackend;
 use mantissa::runtime::testing::new_in_memory_runtime_backend;
 use mantissa::runtime::types::RuntimeBackend;
+use mantissa::services::ServiceControllerTiming;
 use mantissa::topology_capnp::topology;
 use mantissa::workload::manager::WorkloadRuntimeConfig;
 use mantissa::{
@@ -378,6 +379,7 @@ impl TestNode {
         gossip_fanout: Option<usize>,
         gossip_channel_capacity: Option<usize>,
         task_runtime: Option<WorkloadRuntimeConfig>,
+        service_timing: Option<ServiceControllerTiming>,
     ) -> HeadlessConfig {
         HeadlessConfig {
             listen_addr: "127.0.0.1:0".to_string(),
@@ -397,13 +399,14 @@ impl TestNode {
             local_volume_root: None,
             master_key_kdf_params: None,
             store_gc_config: None,
+            service_timing,
         }
     }
 
     /// Start a node with in-process transport (fast path).
     pub async fn new() -> Self {
         let node = HeadlessNode::new_with_config(Self::apply_test_runtime_backend(
-            Self::inproc_config(None, None, None, None, None),
+            Self::inproc_config(None, None, None, None, None, None),
         ))
         .await
         .expect("headless inproc node");
@@ -414,7 +417,7 @@ impl TestNode {
 
     pub async fn new_with_fanout(fanout: usize) -> Self {
         let node = HeadlessNode::new_with_config(Self::apply_test_runtime_backend(
-            Self::inproc_config(None, None, Some(fanout), None, None),
+            Self::inproc_config(None, None, Some(fanout), None, None, None),
         ))
         .await
         .expect("headless inproc node (custom fanout)");
@@ -444,11 +447,17 @@ impl TestNode {
 
     /// Start a node with in-process transport and a custom periodic sync tick.
     pub async fn new_with_tick_ms(ms: u64) -> Self {
-        let node = HeadlessNode::new_with_config(Self::apply_test_runtime_backend(
-            Self::inproc_config(Some(Duration::from_millis(ms)), None, None, None, None),
-        ))
-        .await
-        .expect("headless inproc node (with tick)");
+        let node =
+            HeadlessNode::new_with_config(Self::apply_test_runtime_backend(Self::inproc_config(
+                Some(Duration::from_millis(ms)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )))
+            .await
+            .expect("headless inproc node (with tick)");
         Self {
             node: Box::new(node),
         }
@@ -1052,6 +1061,7 @@ pub struct ClusterConfig {
     pub task_repair_tick_ms: Option<u64>,
     pub master_key_kdf_params: Option<PassphraseKdfParams>,
     pub store_gc_config: Option<RuntimeStoreGcConfig>,
+    pub service_timing: Option<ServiceControllerTiming>,
 }
 
 impl Default for ClusterConfig {
@@ -1067,6 +1077,7 @@ impl Default for ClusterConfig {
             task_repair_tick_ms: Some(500),
             master_key_kdf_params: None,
             store_gc_config: None,
+            service_timing: None,
         }
     }
 }
@@ -1103,6 +1114,7 @@ async fn build_inproc_node_with_config(cfg: ClusterConfig) -> HeadlessNode {
         fanout,
         gossip_channel_capacity,
         cfg.task_runtime_config(),
+        cfg.service_timing,
     );
     let headless_cfg = HeadlessConfig {
         master_key_kdf_params: cfg.master_key_kdf_params,

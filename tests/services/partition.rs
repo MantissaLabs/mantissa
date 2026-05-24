@@ -10,6 +10,11 @@ local_test!(
             sync_tick_ms: Some(100),
             gossip_tick_ms: Some(100),
             gossip_fanout: Some(2),
+            service_timing: Some(ServiceControllerTiming::new(
+                Duration::from_millis(100),
+                ChronoDuration::seconds(0),
+                Duration::from_millis(100),
+            )),
             ..ClusterConfig::default()
         };
         let cluster = TestNode::new_cluster_inproc_with_config(4, cfg)
@@ -821,20 +826,31 @@ local_test!(services_sync_recovers_missing_entries, {
         .expect("list tasks after removal");
     assert!(specs_after_remove.is_empty(), "peer tasks cleared");
 
-    sleep(Duration::from_secs(1)).await;
-
     assert!(
         wait_for_service_state(&peer.node.service_controller, service_id, true).await,
         "periodic sync should restore service spec"
     );
 
-    let restored_specs = peer
-        .node
-        .workload_manager
-        .list_workloads(&TaskStateFilter::all())
-        .await
-        .expect("list tasks after sync");
-    let restored_ids: BTreeSet<Uuid> = restored_specs.iter().map(|spec| spec.id).collect();
     let expected_ids: BTreeSet<Uuid> = expected_task_ids.iter().cloned().collect();
-    assert_eq!(restored_ids, expected_ids, "sync restored tasks");
+    assert!(
+        wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            || async {
+                let Ok(restored_specs) = peer
+                    .node
+                    .workload_manager
+                    .list_workloads(&TaskStateFilter::all())
+                    .await
+                else {
+                    return false;
+                };
+                let restored_ids: BTreeSet<Uuid> =
+                    restored_specs.iter().map(|spec| spec.id).collect();
+                restored_ids == expected_ids
+            }
+        )
+        .await,
+        "sync restored tasks"
+    );
 });

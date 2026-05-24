@@ -120,6 +120,7 @@ async fn create_restartable_node_with_root_schema(
             local_volume_root: Some(local_volume_root),
             master_key_kdf_params: None,
             store_gc_config: None,
+            service_timing: None,
         },
     )
     .await

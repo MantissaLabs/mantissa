@@ -95,6 +95,45 @@ const SERVICE_FALLBACK_SCHEDULING_RETRY_MAX_ATTEMPTS: usize = 1;
 /// the unified cluster view is restored.
 const SERVICE_ENABLE_PROACTIVE_REBALANCE: bool = true;
 
+/// Runtime timing knobs used by the service controller reconciliation loop.
+#[derive(Clone, Copy, Debug)]
+pub struct ServiceControllerTiming {
+    pub reschedule_tick: Duration,
+    pub rebalance_min_age: ChronoDuration,
+    pub rebalance_cooldown: Duration,
+}
+
+impl ServiceControllerTiming {
+    /// Returns the production timing profile for service reconciliation.
+    pub fn production() -> Self {
+        Self::new(
+            Duration::from_secs(SERVICE_RESCHEDULE_TICK_SECS),
+            ChronoDuration::seconds(SERVICE_REBALANCE_MIN_AGE_SECS),
+            Duration::from_secs(SERVICE_REBALANCE_COOLDOWN_SECS),
+        )
+    }
+
+    /// Builds a timing profile, preserving a non-zero periodic reconciliation tick.
+    pub fn new(
+        reschedule_tick: Duration,
+        rebalance_min_age: ChronoDuration,
+        rebalance_cooldown: Duration,
+    ) -> Self {
+        Self {
+            reschedule_tick: reschedule_tick.max(Duration::from_millis(1)),
+            rebalance_min_age,
+            rebalance_cooldown,
+        }
+    }
+}
+
+impl Default for ServiceControllerTiming {
+    /// Returns the production service-controller timing profile.
+    fn default() -> Self {
+        Self::production()
+    }
+}
+
 /// Outcome returned when submitting a service deployment request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceDeploymentOutcome {
@@ -211,6 +250,7 @@ pub struct ServiceController {
     inflight_traffic_publish_waiters: Arc<AsyncMutex<HashSet<Uuid>>>,
     slot_missing_since: Arc<AsyncMutex<HashMap<SlotKey, Instant>>>,
     slot_rebalance_after: Arc<AsyncMutex<HashMap<SlotKey, Instant>>>,
+    timing: ServiceControllerTiming,
 }
 
 /// Stable key for one in-flight service generation execution owned by this node.
@@ -243,6 +283,7 @@ pub struct ServiceControllerConfig {
     pub gossip_rx: Receiver<Message>,
     pub local_node_id: Uuid,
     pub health_monitor: Arc<HealthMonitor>,
+    pub timing: ServiceControllerTiming,
 }
 
 impl ServiceController {
@@ -259,6 +300,7 @@ impl ServiceController {
             gossip_rx,
             local_node_id,
             health_monitor,
+            timing,
         } = config;
         Self {
             registry,
@@ -276,12 +318,13 @@ impl ServiceController {
             inflight_traffic_publish_waiters: Arc::new(AsyncMutex::new(HashSet::new())),
             slot_missing_since: Arc::new(AsyncMutex::new(HashMap::new())),
             slot_rebalance_after: Arc::new(AsyncMutex::new(HashMap::new())),
+            timing,
         }
     }
 
     /// Runs the service controller loop, handling gossip events and periodic rescheduling.
     pub async fn run(&mut self) {
-        let mut reschedule_tick = interval(Duration::from_secs(SERVICE_RESCHEDULE_TICK_SECS));
+        let mut reschedule_tick = interval(self.timing.reschedule_tick);
 
         loop {
             tokio::select! {

@@ -29,7 +29,9 @@ pub(crate) use mantissa::server::headless::{
     HeadlessConfig, HeadlessKeys, HeadlessNode, HeadlessTransport,
 };
 pub(crate) use mantissa::services::ServiceController;
-pub(crate) use mantissa::services::manager::{ServiceDeploymentOptions, ServiceDeploymentOutcome};
+pub(crate) use mantissa::services::manager::{
+    ServiceControllerTiming, ServiceDeploymentOptions, ServiceDeploymentOutcome,
+};
 pub(crate) use mantissa::services::types::{
     ServiceDeploymentPolicy, ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase,
     ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy,
@@ -1032,6 +1034,7 @@ pub(crate) async fn create_restartable_service_node(
             local_volume_root: Some(local_volume_root),
             master_key_kdf_params: None,
             store_gc_config: None,
+            service_timing: None,
         },
     )
     .await
