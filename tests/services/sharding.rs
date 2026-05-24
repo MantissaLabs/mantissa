@@ -401,14 +401,23 @@ local_test!(
         let service_id = cluster[0]
             .node
             .service_controller
-            .submit_deployment(
+            .submit_deployment_with_options_outcome(
                 initial_manifest_id,
                 service_name,
                 service_name,
                 vec![initial_template.clone()],
+                ServiceDeploymentOptions {
+                    deployment_policy: ServiceDeploymentPolicy {
+                        progress_deadline_secs: 10,
+                        healthy_deadline_secs: 10,
+                        min_healthy_secs: 0,
+                    },
+                    ..ServiceDeploymentOptions::default()
+                },
             )
             .await
-            .expect("submit initial sharded deployment");
+            .expect("submit initial sharded deployment")
+            .service_id;
 
         assert!(
             wait_for_service_manifest_running_all(
@@ -450,15 +459,24 @@ local_test!(
         let redeploy_id = cluster[0]
             .node
             .service_controller
-            .submit_deployment_with_strategy(
+            .submit_deployment_with_options_outcome(
                 replacement_manifest_id,
                 service_name,
                 service_name,
                 vec![replacement_template],
-                rollout_strategy(8, ServiceRolloutOrder::StartFirst, 1, true),
+                ServiceDeploymentOptions {
+                    update_strategy: rollout_strategy(8, ServiceRolloutOrder::StartFirst, 1, true),
+                    deployment_policy: ServiceDeploymentPolicy {
+                        progress_deadline_secs: 10,
+                        healthy_deadline_secs: 10,
+                        min_healthy_secs: 0,
+                    },
+                    ..ServiceDeploymentOptions::default()
+                },
             )
             .await
-            .expect("submit sharded replacement deployment");
+            .expect("submit sharded replacement deployment")
+            .service_id;
         assert_eq!(
             redeploy_id, service_id,
             "redeploy should preserve the stable service id"
