@@ -10,6 +10,7 @@ use mantissa::runtime::types::RuntimeBackend;
 use mantissa::topology_capnp::topology;
 use mantissa::workload::manager::WorkloadRuntimeConfig;
 use mantissa::{
+    config::RuntimeStoreGcConfig,
     node,
     secrets::master_key::envelope::PassphraseKdfParams,
     server::headless::{HeadlessConfig, HeadlessNode, HeadlessTransport},
@@ -395,6 +396,7 @@ impl TestNode {
             runtime_set: None,
             local_volume_root: None,
             master_key_kdf_params: None,
+            store_gc_config: None,
         }
     }
 
@@ -1040,7 +1042,7 @@ impl TestNode {
         }
     }
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ClusterConfig {
     pub sync_tick_ms: Option<u64>,
     pub gossip_tick_ms: Option<u64>,
@@ -1049,6 +1051,7 @@ pub struct ClusterConfig {
     pub task_reconcile_tick_ms: Option<u64>,
     pub task_repair_tick_ms: Option<u64>,
     pub master_key_kdf_params: Option<PassphraseKdfParams>,
+    pub store_gc_config: Option<RuntimeStoreGcConfig>,
 }
 
 impl Default for ClusterConfig {
@@ -1063,6 +1066,7 @@ impl Default for ClusterConfig {
             task_reconcile_tick_ms: Some(500),
             task_repair_tick_ms: Some(500),
             master_key_kdf_params: None,
+            store_gc_config: None,
         }
     }
 }
@@ -1102,6 +1106,7 @@ async fn build_inproc_node_with_config(cfg: ClusterConfig) -> HeadlessNode {
     );
     let headless_cfg = HeadlessConfig {
         master_key_kdf_params: cfg.master_key_kdf_params,
+        store_gc_config: cfg.store_gc_config,
         ..headless_cfg
     };
     HeadlessNode::new_with_config(TestNode::apply_test_runtime_backend(headless_cfg))
@@ -1124,7 +1129,7 @@ impl TestNode {
     ) -> Result<Vec<TestNode>, capnp::Error> {
         assert!(n >= 1, "cluster size must be >= 1");
 
-        let anchor_node = build_inproc_node_with_config(cfg).await;
+        let anchor_node = build_inproc_node_with_config(cfg.clone()).await;
         let anchor = TestNode {
             node: Box::new(anchor_node),
         };
@@ -1132,7 +1137,7 @@ impl TestNode {
         cluster.push(anchor);
 
         for _ in 1..n {
-            let node = build_inproc_node_with_config(cfg).await;
+            let node = build_inproc_node_with_config(cfg.clone()).await;
             let test_node = TestNode {
                 node: Box::new(node),
             };

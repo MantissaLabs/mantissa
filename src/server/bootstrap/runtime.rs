@@ -29,7 +29,7 @@ use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{ServiceController, ServiceControllerConfig, ServicesRPC};
 use crate::store::path::default_db_path;
-use crate::store::replicated::gc::StoreGcRunner;
+use crate::store::replicated::gc::{StoreGcRunner, StoreGcRunnerInputs};
 use crate::store::replicated::registry::{ReplicatedStoreHandles, replicated_store_registry};
 use crate::sync::{SyncGcProgress, SyncRunner, SyncService, SyncStores};
 use crate::task::service::TaskService;
@@ -81,6 +81,7 @@ pub struct BootstrapOptions {
     pub network_attachment_refresh_tick: Option<Duration>,
     pub advertise_override: Option<String>,
     pub master_key_passphrase: Option<SecretPassphrase>,
+    pub store_gc_config: Option<config::RuntimeStoreGcConfig>,
     /// KDF cost for passphrase-backed master-key envelopes.
     ///
     /// Production uses the hardened default; headless tests lower only this
@@ -107,6 +108,7 @@ impl Default for BootstrapOptions {
             network_attachment_refresh_tick: None,
             advertise_override: None,
             master_key_passphrase: None,
+            store_gc_config: None,
             master_key_kdf_params: PassphraseKdfParams::production(),
         }
     }
@@ -334,6 +336,13 @@ struct TopologyBuildInputs<'a> {
     runtime_support: crate::runtime::types::RuntimeSupportProfile,
 }
 
+/// Options consumed only while spawning long-running runtime tasks.
+struct RuntimeTaskOptions {
+    signing_key: ed25519_dalek::SigningKey,
+    gossip_fanout: usize,
+    store_gc_config: Option<config::RuntimeStoreGcConfig>,
+}
+
 /// Boots the full server runtime from an initialized bootstrap context.
 ///
 /// This is the shared startup pipeline used by both the daemon and headless
@@ -351,11 +360,15 @@ pub async fn boot(
     let server = build_server(&ctx, &stores, &components);
     let runtime_tasks = spawn_runtime_tasks(
         &components,
+        &stores,
         actors,
         gossip_rx,
         gossip_dedupe,
-        ctx.signing_key.clone(),
-        options.gossip_fanout,
+        RuntimeTaskOptions {
+            signing_key: ctx.signing_key.clone(),
+            gossip_fanout: options.gossip_fanout,
+            store_gc_config: options.store_gc_config.clone(),
+        },
     )
     .await;
     finish_boot(&server, &components).await?;
@@ -1072,12 +1085,17 @@ async fn finish_boot(server: &Server, components: &RuntimeComponents) -> Bootstr
 /// not drift in which actors are actually running.
 async fn spawn_runtime_tasks(
     components: &RuntimeComponents,
+    stores: &BootstrapStores,
     actors: RuntimeActors,
     gossip_rx: Receiver<Message>,
     gossip_dedupe: DedupeStateHandle,
-    signing_key: ed25519_dalek::SigningKey,
-    gossip_fanout: usize,
+    options: RuntimeTaskOptions,
 ) -> RuntimeTaskHandles {
+    let RuntimeTaskOptions {
+        signing_key,
+        gossip_fanout,
+        store_gc_config,
+    } = options;
     let RuntimeActors {
         runtime_health: _runtime_health,
         secret_replicator,
@@ -1175,14 +1193,16 @@ async fn spawn_runtime_tasks(
         network_gossiper.run().await;
     }));
 
-    let store_gc_runner = StoreGcRunner::new(
-        components.sync_stores.clone(),
-        components.registry.clone(),
-        components.sync_gc_progress.clone(),
-        components.cluster_view.clone(),
-        components.root_schema,
-        config::store_gc_runtime_config(),
-    );
+    let store_gc_runner = StoreGcRunner::new(StoreGcRunnerInputs {
+        stores: components.sync_stores.clone(),
+        registry: components.registry.clone(),
+        progress: components.sync_gc_progress.clone(),
+        cluster_view: components.cluster_view.clone(),
+        root_schema: components.root_schema,
+        secrets: stores.secrets.clone(),
+        secret_master_keys: stores.secret_master_keys.clone(),
+        config: store_gc_config.unwrap_or_else(config::store_gc_runtime_config),
+    });
     if let Some(task) = store_gc_runner.spawn() {
         tasks.push(task);
     }

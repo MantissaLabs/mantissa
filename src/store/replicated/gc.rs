@@ -9,9 +9,14 @@ use crate::cluster::{ClusterViewState, RootSchemaState};
 use crate::config::RuntimeStoreGcConfig;
 use crate::registry::Registry;
 use crate::store::replicated::registry::ReplicatedStoreEntry;
+use crate::store::replicated::secret_key_sync::{
+    SecretMasterKeyStore, SecretMasterKeySyncRecord, current_for_scope,
+};
+use crate::store::replicated::secrets::SecretStore;
 use crate::sync::{SyncGcProgress, SyncStores};
 use mantissa_protocol::sync::Domain;
 use mantissa_store::gc::{GcBarrier, StoreGcReport};
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
@@ -25,26 +30,35 @@ pub struct StoreGcRunner {
     progress: SyncGcProgress,
     cluster_view: ClusterViewState,
     root_schema: RootSchemaState,
+    secrets: SecretStore,
+    secret_master_keys: SecretMasterKeyStore,
     config: RuntimeStoreGcConfig,
+}
+
+/// Dependencies needed to build the replicated store GC runner.
+pub struct StoreGcRunnerInputs {
+    pub stores: SyncStores,
+    pub registry: Registry,
+    pub progress: SyncGcProgress,
+    pub cluster_view: ClusterViewState,
+    pub root_schema: RootSchemaState,
+    pub secrets: SecretStore,
+    pub secret_master_keys: SecretMasterKeyStore,
+    pub config: RuntimeStoreGcConfig,
 }
 
 impl StoreGcRunner {
     /// Builds the store GC runner from the already-wired runtime dependencies.
-    pub fn new(
-        stores: SyncStores,
-        registry: Registry,
-        progress: SyncGcProgress,
-        cluster_view: ClusterViewState,
-        root_schema: RootSchemaState,
-        config: RuntimeStoreGcConfig,
-    ) -> Self {
+    pub fn new(inputs: StoreGcRunnerInputs) -> Self {
         Self {
-            stores,
-            registry,
-            progress,
-            cluster_view,
-            root_schema,
-            config,
+            stores: inputs.stores,
+            registry: inputs.registry,
+            progress: inputs.progress,
+            cluster_view: inputs.cluster_view,
+            root_schema: inputs.root_schema,
+            secrets: inputs.secrets,
+            secret_master_keys: inputs.secret_master_keys,
+            config: inputs.config,
         }
     }
 
@@ -154,6 +168,35 @@ impl StoreGcRunner {
 
             pass_failed |= self.compact_domain_registers_with_trace(entry).await;
         }
+        if let Some(active_remote_peers) = &active_remote_peers {
+            match prune_unreferenced_secret_master_key_rows(
+                &self.secrets,
+                &self.secret_master_keys,
+                &self.progress,
+                active_remote_peers,
+                cluster_view,
+                root_schema_version,
+                now_unix_ms,
+            )
+            .await
+            {
+                Ok(pruned) if pruned > 0 => {
+                    debug!(
+                        target: "store.gc",
+                        pruned,
+                        "pruned unreferenced secret master-key rows"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    pass_failed = true;
+                    error!(
+                        target: "store.gc",
+                        "secret master-key semantic GC failed: {error}"
+                    );
+                }
+            }
+        }
         crate::observability::metrics::set_store_gc_last_duration(started_at.elapsed());
         crate::observability::metrics::record_store_gc_run(if pass_failed {
             "failure"
@@ -223,6 +266,102 @@ impl StoreGcRunner {
     }
 }
 
+/// Tombstones secret-master-key rows that no converged secret or active current uses.
+async fn prune_unreferenced_secret_master_key_rows(
+    secrets: &SecretStore,
+    secret_master_keys: &SecretMasterKeyStore,
+    progress: &SyncGcProgress,
+    active_remote_peers: &[uuid::Uuid],
+    cluster_view: crate::cluster::ClusterViewId,
+    root_schema_version: u32,
+    now_unix_ms: u64,
+) -> mantissa_store::Result<usize> {
+    let Some(_secrets_barrier) = progress.barrier_for_domain(
+        active_remote_peers.iter().copied(),
+        Domain::Secrets,
+        cluster_view,
+        root_schema_version,
+        now_unix_ms,
+    ) else {
+        return Ok(0);
+    };
+    let Some(_master_keys_barrier) = progress.barrier_for_domain(
+        active_remote_peers.iter().copied(),
+        Domain::SecretMasterKeys,
+        cluster_view,
+        root_schema_version,
+        now_unix_ms,
+    ) else {
+        return Ok(0);
+    };
+
+    let Some(active_current) = current_for_scope(secret_master_keys, cluster_view)? else {
+        return Ok(0);
+    };
+
+    let mut referenced_key_ids = referenced_secret_master_key_ids(secrets)?;
+    referenced_key_ids.insert(active_current.key_id);
+
+    let (rows, _) = secret_master_keys.load_all()?;
+    let mut prune_rows = Vec::new();
+    for (row_id, snapshot) in rows {
+        let mut has_prunable_record = false;
+        let mut has_retained_record = false;
+        for record in snapshot.as_slice() {
+            match record {
+                SecretMasterKeySyncRecord::Descriptor(descriptor) => {
+                    if referenced_key_ids.contains(&descriptor.key_id) {
+                        has_retained_record = true;
+                    } else {
+                        has_prunable_record = true;
+                    }
+                }
+                SecretMasterKeySyncRecord::Grant(grant) => {
+                    if referenced_key_ids.contains(&grant.descriptor.key_id) {
+                        has_retained_record = true;
+                    } else {
+                        has_prunable_record = true;
+                    }
+                }
+                SecretMasterKeySyncRecord::Current(current) => {
+                    if current.scope_view == cluster_view && current.key_id == active_current.key_id
+                    {
+                        has_retained_record = true;
+                    } else {
+                        has_prunable_record = true;
+                    }
+                }
+            }
+        }
+
+        if has_prunable_record && !has_retained_record {
+            prune_rows.push(row_id);
+        }
+    }
+
+    let mut pruned = 0usize;
+    for row_id in prune_rows {
+        secret_master_keys.remove(&row_id).await?;
+        pruned = pruned.saturating_add(1);
+    }
+    Ok(pruned)
+}
+
+/// Returns master-key ids referenced by the converged visible secret set.
+fn referenced_secret_master_key_ids(
+    secrets: &SecretStore,
+) -> mantissa_store::Result<HashSet<uuid::Uuid>> {
+    let (entries, _) = secrets.load_all()?;
+    let mut key_ids = HashSet::new();
+    for (_, snapshot) in entries {
+        for secret in snapshot.as_slice() {
+            key_ids.insert(secret.current_version.master_key_id);
+            key_ids.insert(secret.current_version.ciphertext.master_key_id);
+        }
+    }
+    Ok(key_ids)
+}
+
 /// Computes a small startup jitter so nodes do not sweep at exactly the same instant.
 fn initial_jitter(interval: Duration) -> Duration {
     let interval_ms = interval.as_millis().min(u128::from(u64::MAX)) as u64;
@@ -238,4 +377,193 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::{ClusterId, ClusterViewId};
+    use crate::secrets::master_key::envelope::{
+        MasterKeyDescriptor, MasterKeyPlaintext, MasterKeyTransfer,
+    };
+    use crate::secrets::types::{SecretCiphertext, SecretMetadata, SecretValue, SecretVersion};
+    use crate::store::replicated::secret_key_sync::{
+        current_from_descriptor, current_row_id, descriptor_row_id, grant_row_id,
+        open_secret_master_key_store, upsert_record,
+    };
+    use crate::store::replicated::secrets::open_secret_store;
+    use mantissa_net::noise::NoiseKeys;
+    use mantissa_store::uuid_key::UuidKey;
+    use std::sync::Arc;
+
+    /// Builds deterministic descriptor metadata for semantic master-key GC tests.
+    fn descriptor(
+        key_id: uuid::Uuid,
+        generation: u64,
+        scope_view: ClusterViewId,
+    ) -> MasterKeyDescriptor {
+        MasterKeyDescriptor {
+            key_id,
+            generation,
+            scope_view,
+            origin_view: scope_view,
+            created_by_node_id: uuid::Uuid::from_u128(10),
+            created_by_operation_id: None,
+            parent_key_ids: Vec::new(),
+            created_at_unix_secs: generation,
+        }
+    }
+
+    /// Builds one replicated secret value referencing the provided master key.
+    fn secret_value(name: &str, key_id: uuid::Uuid, generation: u64) -> SecretValue {
+        let ciphertext = SecretCiphertext {
+            master_key_id: key_id,
+            master_key_generation: generation,
+            nonce: [1; 12],
+            ciphertext: vec![2, 3, 4],
+            digest: [5; 32],
+        };
+        let version = SecretVersion::new(
+            uuid::Uuid::from_u128(50),
+            ciphertext,
+            "now",
+            None,
+            key_id,
+            generation,
+        );
+        SecretValue::new(name, SecretMetadata::default(), "now", version)
+    }
+
+    /// Builds one encrypted grant row for the provided master-key descriptor.
+    fn grant_record(descriptor: &MasterKeyDescriptor) -> SecretMasterKeySyncRecord {
+        let sender_id = uuid::Uuid::from_u128(20);
+        let recipient_id = uuid::Uuid::from_u128(21);
+        let sender = NoiseKeys::from_private_bytes([7; 32]);
+        let recipient = NoiseKeys::from_private_bytes([8; 32]);
+        let plaintext = MasterKeyPlaintext::new([9; 32]);
+        SecretMasterKeySyncRecord::Grant(
+            MasterKeyTransfer::encrypt(
+                descriptor.clone(),
+                &plaintext,
+                sender_id,
+                &sender,
+                recipient_id,
+                recipient.public_bytes(),
+            )
+            .expect("encrypt test master-key grant"),
+        )
+    }
+
+    #[tokio::test]
+    async fn semantic_master_key_gc_prunes_only_converged_unreferenced_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(redb::Database::create(dir.path().join("gc.redb")).expect("db"));
+        let actor = uuid::Uuid::from_u128(1);
+        let peer = uuid::Uuid::from_u128(2);
+        let secrets = open_secret_store(db.clone(), actor).expect("secret store");
+        let master_keys = open_secret_master_key_store(db, actor).expect("secret master-key store");
+        let progress = SyncGcProgress::new();
+        let active_view = ClusterViewId::new(ClusterId::from_uuid(uuid::Uuid::from_u128(100)), 3);
+        let referenced_view =
+            ClusterViewId::new(ClusterId::from_uuid(uuid::Uuid::from_u128(101)), 2);
+        let unreferenced_view =
+            ClusterViewId::new(ClusterId::from_uuid(uuid::Uuid::from_u128(102)), 2);
+
+        let active_key = uuid::Uuid::from_u128(1_000);
+        let referenced_key = uuid::Uuid::from_u128(1_001);
+        let unreferenced_key = uuid::Uuid::from_u128(1_002);
+        let active = descriptor(active_key, 3, active_view);
+        let referenced = descriptor(referenced_key, 2, referenced_view);
+        let unreferenced = descriptor(unreferenced_key, 2, unreferenced_view);
+
+        for record in [
+            SecretMasterKeySyncRecord::Descriptor(active.clone()),
+            SecretMasterKeySyncRecord::Current(current_from_descriptor(&active)),
+            SecretMasterKeySyncRecord::Descriptor(referenced.clone()),
+            SecretMasterKeySyncRecord::Current(current_from_descriptor(&referenced)),
+            SecretMasterKeySyncRecord::Descriptor(unreferenced.clone()),
+            SecretMasterKeySyncRecord::Current(current_from_descriptor(&unreferenced)),
+            grant_record(&unreferenced),
+        ] {
+            upsert_record(&master_keys, record)
+                .await
+                .expect("upsert master-key row");
+        }
+
+        let secret = secret_value("referenced-key-secret", referenced_key, 2);
+        secrets
+            .upsert(&UuidKey::from(secret.id), secret)
+            .await
+            .expect("upsert secret");
+
+        progress.record_equal_root(peer, Domain::Secrets, active_view, 1, 10);
+        let skipped = prune_unreferenced_secret_master_key_rows(
+            &secrets,
+            &master_keys,
+            &progress,
+            &[peer],
+            active_view,
+            1,
+            20,
+        )
+        .await
+        .expect("skip without master-key barrier");
+        assert_eq!(skipped, 0);
+
+        progress.record_equal_root(peer, Domain::SecretMasterKeys, active_view, 1, 10);
+        let pruned = prune_unreferenced_secret_master_key_rows(
+            &secrets,
+            &master_keys,
+            &progress,
+            &[peer],
+            active_view,
+            1,
+            20,
+        )
+        .await
+        .expect("semantic master-key prune");
+        assert_eq!(pruned, 4);
+
+        assert!(
+            master_keys
+                .has_tombstone(&UuidKey::from(descriptor_row_id(unreferenced_key)))
+                .expect("unreferenced descriptor tombstone")
+        );
+        assert!(
+            master_keys
+                .has_tombstone(&UuidKey::from(current_row_id(referenced_view)))
+                .expect("referenced stale current tombstone")
+        );
+        assert!(
+            master_keys
+                .has_tombstone(&UuidKey::from(current_row_id(unreferenced_view)))
+                .expect("unreferenced current tombstone")
+        );
+        assert!(
+            master_keys
+                .has_tombstone(&UuidKey::from(grant_row_id(
+                    unreferenced_key,
+                    uuid::Uuid::from_u128(21),
+                )))
+                .expect("unreferenced grant tombstone")
+        );
+        assert!(
+            master_keys
+                .get_snapshot(&UuidKey::from(descriptor_row_id(active_key)))
+                .expect("active descriptor snapshot")
+                .is_some()
+        );
+        assert!(
+            master_keys
+                .get_snapshot(&UuidKey::from(descriptor_row_id(referenced_key)))
+                .expect("referenced descriptor snapshot")
+                .is_some()
+        );
+        assert!(
+            master_keys
+                .get_snapshot(&UuidKey::from(current_row_id(active_view)))
+                .expect("active current snapshot")
+                .is_some()
+        );
+    }
 }

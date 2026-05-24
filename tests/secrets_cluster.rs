@@ -6,12 +6,14 @@ use common::convergence::{
 };
 use common::testkit::{ClusterConfig, RuntimeBackendOverrideGuard, TestNode};
 use mantissa::cluster::ClusterViewId;
+use mantissa::config::RuntimeStoreGcConfig;
 use mantissa::node::id::set_node_id;
 use mantissa::secrets::master_key::envelope::PassphraseKdfParams;
 use mantissa::store::replicated::secret_key_sync::{SecretMasterKeySyncRecord, current_for_scope};
 use mantissa_protocol::secrets::secrets;
 use mantissa_protocol::sync::Domain;
 use mantissa_protocol::topology::ClusterOperationStage;
+use mantissa_store::gc::StoreGcPolicy;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -533,6 +535,21 @@ fn master_key_row_shape(node: &TestNode) -> MasterKeyRowShape {
     }
 }
 
+/// Builds an aggressive per-node store-GC runtime config for bounded integration tests.
+fn fast_store_gc_config() -> RuntimeStoreGcConfig {
+    RuntimeStoreGcConfig {
+        enabled: true,
+        interval: Duration::from_millis(25),
+        stale_peer_rejoin_after: Duration::from_millis(1),
+        policy: StoreGcPolicy {
+            tombstone_min_retention_ms: 1,
+            tombstone_batch_limit: 512,
+            mvreg_batch_limit: 512,
+            mvreg_max_values: Some(1),
+        },
+    }
+}
+
 /// Returns true once a merged node has adopted the replicated destination current.
 fn local_current_matches_scope(node: &TestNode, scope_view: ClusterViewId) -> bool {
     let Ok(current) = node.node.secret_master_store.current() else {
@@ -789,6 +806,72 @@ local_test!(ten_node_empty_split_merge_keeps_master_key_rows_linear, {
     }
 });
 
+local_test!(
+    ten_node_empty_split_merge_gc_prunes_to_active_master_key_rows,
+    {
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+        let cfg = ClusterConfig {
+            sync_tick_ms: Some(25),
+            gossip_tick_ms: Some(25),
+            gossip_fanout: Some(10),
+            gossip_channel_capacity: Some(4096),
+            store_gc_config: Some(fast_store_gc_config()),
+            ..ClusterConfig::default()
+        };
+        let cluster = TestNode::new_cluster_inproc_with_config(10, cfg)
+            .await
+            .expect("ten-node cluster");
+        TestNode::assert_cluster_size_all(&cluster, 10, "ten-node cluster before split").await;
+
+        let (_split_id, left_view, right_view) = split_balanced_cluster(&cluster).await;
+        let _merge_id = merge_cluster_views(&cluster[0], left_view, right_view).await;
+        for node in &cluster {
+            wait_for_cluster_view(&node.topology(), right_view, Duration::from_secs(30)).await;
+        }
+        TestNode::assert_cluster_size_all(&cluster, 10, "ten-node merged cluster").await;
+
+        assert!(
+            wait_until(
+                Duration::from_secs(30),
+                Duration::from_millis(50),
+                || async {
+                    cluster
+                        .iter()
+                        .all(|node| local_current_matches_scope(node, right_view))
+                }
+            )
+            .await,
+            "all ten nodes should adopt the destination-view current after merge"
+        );
+        wait_secret_master_key_roots_equal_all(&cluster, Duration::from_secs(30))
+            .await
+            .expect("secret master-key rows converge across ten nodes after split/merge");
+
+        assert!(
+            wait_until(
+                Duration::from_secs(30),
+                Duration::from_millis(50),
+                || async {
+                    cluster.iter().all(|node| {
+                        let shape = master_key_row_shape(node);
+                        shape.rows == 12
+                            && shape.values == 12
+                            && shape.descriptors == 1
+                            && shape.grants == 10
+                            && shape.currents == 1
+                            && shape.tombs == 0
+                    })
+                },
+            )
+            .await,
+            "runtime GC should prune unused split/merge master-key rows down to the active key"
+        );
+        wait_secret_master_key_roots_equal_all(&cluster, Duration::from_secs(30))
+            .await
+            .expect("secret master-key roots reconverge after semantic master-key GC");
+    }
+);
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "uses production Argon2 cost and prints a join latency baseline"]
 async fn production_kdf_join_latency_baseline() {
@@ -801,7 +884,7 @@ async fn production_kdf_join_latency_baseline() {
             master_key_kdf_params: Some(PassphraseKdfParams::production()),
             ..ClusterConfig::default()
         };
-        let anchor = TestNode::new_inproc_with_config(cfg).await;
+        let anchor = TestNode::new_inproc_with_config(cfg.clone()).await;
         let joiner = TestNode::new_inproc_with_config(cfg).await;
 
         let started = Instant::now();
