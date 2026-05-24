@@ -43,6 +43,7 @@ const NODEPORT_RESPONSE: &str = "hello from nodeport privileged test";
 const NODEPORT_CONFLICT_RESPONSE: &str = "hello from nodeport owner";
 const NODEPORT_DEGRADED_RESPONSE: &str = "hello from degraded nodeport service";
 const NODEPORT_UDP_RESPONSE: &str = "hello from nodeport privileged udp test";
+const NODEPORT_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// Resolve optional NodePort dataplane artifact overrides for the privileged validation lane.
 fn privileged_nodeport_artifact_dir() -> Option<PrivilegedBpfArtifacts> {
@@ -266,11 +267,23 @@ async fn remove_service_via_rpc(client: &services::Client, service_id: Uuid) {
 
 /// Performs one HTTP GET against the published NodePort endpoint and returns the raw response.
 async fn http_get(addr: &str) -> anyhow::Result<String> {
-    let mut stream = TcpStream::connect(addr).await?;
+    let mut stream = tokio::time::timeout(NODEPORT_PROBE_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .with_context(|| {
+            format!("connect to {addr} timed out after {NODEPORT_PROBE_TIMEOUT:?}")
+        })??;
     let request = format!("GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await?;
+    tokio::time::timeout(NODEPORT_PROBE_TIMEOUT, stream.write_all(request.as_bytes()))
+        .await
+        .with_context(|| {
+            format!("write request to {addr} timed out after {NODEPORT_PROBE_TIMEOUT:?}")
+        })??;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).await?;
+    tokio::time::timeout(NODEPORT_PROBE_TIMEOUT, stream.read_to_end(&mut response))
+        .await
+        .with_context(|| {
+            format!("read response from {addr} timed out after {NODEPORT_PROBE_TIMEOUT:?}")
+        })??;
     Ok(String::from_utf8_lossy(&response).into_owned())
 }
 
@@ -282,8 +295,11 @@ async fn udp_echo_with_socket(
 ) -> anyhow::Result<Vec<u8>> {
     socket.send_to(payload, addr).await?;
     let mut response = [0u8; 2048];
-    let (len, _) =
-        tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut response)).await??;
+    let (len, _) = tokio::time::timeout(NODEPORT_PROBE_TIMEOUT, socket.recv_from(&mut response))
+        .await
+        .with_context(|| {
+            format!("receive udp reply from {addr} timed out after {NODEPORT_PROBE_TIMEOUT:?}")
+        })??;
     Ok(response[..len].to_vec())
 }
 

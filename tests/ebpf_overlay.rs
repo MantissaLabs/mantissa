@@ -40,7 +40,7 @@ const EBPF_HTTP_PORT: u16 = 18081;
 const EBPF_UDP_PORT: u16 = 18083;
 const EBPF_HTTP_RESPONSE: &str = "hello from ebpf overlay privileged test";
 const EBPF_UDP_RESPONSE: &str = "hello from ebpf overlay privileged udp test";
-const HTTP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const HTTP_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -590,16 +590,21 @@ async fn query_a_records(
     query.add_query(Query::query(Name::from_ascii(fqdn)?, RecordType::A));
     let payload = query.to_vec()?;
 
-    socket
-        .send_to(&payload, SocketAddr::new(IpAddr::V4(server_ip), 53))
-        .await
-        .with_context(|| format!("send dns query to resolver {server_ip}"))?;
+    tokio::time::timeout(
+        HTTP_PROBE_TIMEOUT,
+        socket.send_to(&payload, SocketAddr::new(IpAddr::V4(server_ip), 53)),
+    )
+    .await
+    .with_context(|| {
+        format!("send dns query to resolver {server_ip} timed out after {HTTP_PROBE_TIMEOUT:?}")
+    })??;
 
     let mut buf = [0u8; 2048];
-    let (len, _) = socket
-        .recv_from(&mut buf)
+    let (len, _) = tokio::time::timeout(HTTP_PROBE_TIMEOUT, socket.recv_from(&mut buf))
         .await
-        .context("recv dns response")?;
+        .with_context(|| {
+            format!("recv dns response from {server_ip} timed out after {HTTP_PROBE_TIMEOUT:?}")
+        })??;
     let response = Message::from_vec(&buf[..len]).context("decode dns response")?;
     let mut ips = Vec::new();
     for answer in response.answers() {
