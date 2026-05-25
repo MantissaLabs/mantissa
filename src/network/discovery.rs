@@ -909,11 +909,7 @@ async fn refresh_backend_catalog_if_needed(
             let public_port = template.public_port();
             let public_target_port = template.public_target_port();
             let public_protocols = if public_port.is_some() {
-                template
-                    .public_protocols()
-                    .into_iter()
-                    .map(nodeport_protocol)
-                    .collect()
+                template.public_protocols().map(nodeport_protocol).collect()
             } else {
                 Vec::new()
             };
@@ -998,9 +994,9 @@ async fn refresh_network_services(runtime: &DiscoveryRuntime) -> Result<()> {
         let guard = runtime.backend_catalog.lock().await;
         guard.services.values().cloned().collect()
     };
-    let mut nodeport_entries = Vec::new();
-    let mut public_endpoint_observations = Vec::new();
-    let mut host_vips = HashSet::new();
+    let mut nodeport_entries = Vec::with_capacity(entries.len().saturating_mul(2));
+    let mut public_endpoint_observations = Vec::with_capacity(entries.len());
+    let mut host_vips = HashSet::with_capacity(entries.len());
 
     for entry in entries {
         let result = refresh_single_service(runtime, &entry).await?;
@@ -1133,8 +1129,8 @@ async fn refresh_single_service(
             });
         }
 
-        let mut mappings = Vec::new();
-        for protocol in service.public_protocols.clone() {
+        let mut mappings = Vec::with_capacity(service.public_protocols.len());
+        for protocol in service.public_protocols.iter().copied() {
             mappings.push(NodePortMapping {
                 port,
                 vip,

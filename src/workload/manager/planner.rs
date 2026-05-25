@@ -906,8 +906,10 @@ fn service_reserves_public_ports(status: ServiceStatus) -> bool {
     !matches!(status, ServiceStatus::Stopping | ServiceStatus::Stopped)
 }
 
-/// Expands one service public protocol into workload-level transport protocols.
-fn public_port_protocols(protocols: Vec<ServicePortProtocol>) -> Vec<WorkloadPortProtocol> {
+/// Expands service public protocols into workload-level transport protocols.
+fn public_port_protocols(
+    protocols: impl IntoIterator<Item = ServicePortProtocol>,
+) -> Vec<WorkloadPortProtocol> {
     let mut expanded = Vec::new();
     for protocol in protocols {
         match protocol {

@@ -749,12 +749,16 @@ impl TaskTemplateSpecValue {
     ///
     /// The default remains TCP-only to match historical behavior unless the manifest opts in
     /// to UDP or both protocols.
-    pub fn public_protocols(&self) -> Vec<ServicePortProtocol> {
-        match self.public_protocol.unwrap_or_default() {
-            ServicePortProtocol::Tcp => vec![ServicePortProtocol::Tcp],
-            ServicePortProtocol::Udp => vec![ServicePortProtocol::Udp],
-            ServicePortProtocol::TcpUdp => vec![ServicePortProtocol::Tcp, ServicePortProtocol::Udp],
-        }
+    pub fn public_protocols(&self) -> impl Iterator<Item = ServicePortProtocol> {
+        let protocols = match self.public_protocol.unwrap_or_default() {
+            ServicePortProtocol::Tcp => [Some(ServicePortProtocol::Tcp), None],
+            ServicePortProtocol::Udp => [Some(ServicePortProtocol::Udp), None],
+            ServicePortProtocol::TcpUdp => [
+                Some(ServicePortProtocol::Tcp),
+                Some(ServicePortProtocol::Udp),
+            ],
+        };
+        protocols.into_iter().flatten()
     }
 }
 
