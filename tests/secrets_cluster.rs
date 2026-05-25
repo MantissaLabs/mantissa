@@ -550,6 +550,16 @@ fn fast_store_gc_config() -> RuntimeStoreGcConfig {
     }
 }
 
+/// Builds a disabled store-GC config for tests that assert pre-GC row shape.
+fn disabled_store_gc_config() -> RuntimeStoreGcConfig {
+    RuntimeStoreGcConfig {
+        enabled: false,
+        interval: Duration::from_secs(60),
+        stale_peer_rejoin_after: Duration::from_secs(60),
+        policy: StoreGcPolicy::default(),
+    }
+}
+
 /// Returns true once a merged node has adopted the replicated destination current.
 fn local_current_matches_scope(node: &TestNode, scope_view: ClusterViewId) -> bool {
     let Ok(current) = node.node.secret_master_store.current() else {
@@ -703,6 +713,7 @@ local_test!(empty_split_merge_keeps_master_key_sync_rows_bounded, {
         sync_tick_ms: Some(100),
         gossip_tick_ms: Some(100),
         gossip_fanout: Some(4),
+        store_gc_config: Some(disabled_store_gc_config()),
         ..ClusterConfig::default()
     };
     let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
@@ -758,6 +769,7 @@ local_test!(ten_node_empty_split_merge_keeps_master_key_rows_linear, {
         gossip_tick_ms: Some(100),
         gossip_fanout: Some(10),
         gossip_channel_capacity: Some(4096),
+        store_gc_config: Some(disabled_store_gc_config()),
         ..ClusterConfig::default()
     };
     let cluster = TestNode::new_cluster_inproc_with_config(10, cfg)
