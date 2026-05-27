@@ -813,7 +813,6 @@ impl AutoscaleLocalSampleStore {
             if state.hot_windows >= accumulator.policy.trigger_windows.max(1)
                 && interval_elapsed(state.last_hot_signal_at, min_interval, now)
             {
-                state.last_hot_signal_at = Some(now);
                 return Some(build_signal(
                     local_node_id,
                     &accumulator,
@@ -829,7 +828,6 @@ impl AutoscaleLocalSampleStore {
         state.last_hot_window_at = None;
         let summary_interval = quiet_summary_interval();
         if interval_elapsed(state.last_summary_signal_at, summary_interval, now) {
-            state.last_summary_signal_at = Some(now);
             return Some(build_signal(
                 local_node_id,
                 &accumulator,
@@ -842,19 +840,12 @@ impl AutoscaleLocalSampleStore {
         None
     }
 
-    /// Removes local autoscale sample state for runtimes and groups no longer observed.
-    fn prune(&mut self, now: Instant) {
-        self.runtime_samples
-            .retain(|_, (_, seen_at)| now.saturating_duration_since(*seen_at) <= self.ttl);
-        self.group_states.retain(|_, state| {
-            state
-                .last_seen_at
-                .is_some_and(|seen_at| now.saturating_duration_since(seen_at) <= self.ttl)
-        });
-    }
-
-    /// Clears local delivery throttle for one signal so failed owner sends retry on the next tick.
-    fn mark_signal_delivery_failed(&mut self, signal: &ServiceAutoscaleSignal) {
+    /// Records that the owner accepted one signal and starts the local resend throttle.
+    fn mark_signal_delivery_accepted(
+        &mut self,
+        signal: &ServiceAutoscaleSignal,
+        accepted_at: Instant,
+    ) {
         let key = AutoscaleGroupKey::new(
             signal.service_id,
             signal.service_epoch,
@@ -865,10 +856,23 @@ impl AutoscaleLocalSampleStore {
             return;
         };
 
+        // The send throttle is ack-based. Signal construction can be cancelled by the bounded
+        // autoscale tick, so only an accepted owner response should suppress the next retry.
         match signal.kind {
-            ServiceAutoscaleSignalKind::Hot => state.last_hot_signal_at = None,
-            ServiceAutoscaleSignalKind::Summary => state.last_summary_signal_at = None,
+            ServiceAutoscaleSignalKind::Hot => state.last_hot_signal_at = Some(accepted_at),
+            ServiceAutoscaleSignalKind::Summary => state.last_summary_signal_at = Some(accepted_at),
         }
+    }
+
+    /// Removes local autoscale sample state for runtimes and groups no longer observed.
+    fn prune(&mut self, now: Instant) {
+        self.runtime_samples
+            .retain(|_, (_, seen_at)| now.saturating_duration_since(*seen_at) <= self.ttl);
+        self.group_states.retain(|_, state| {
+            state
+                .last_seen_at
+                .is_some_and(|seen_at| now.saturating_duration_since(seen_at) <= self.ttl)
+        });
     }
 }
 
@@ -1222,12 +1226,13 @@ impl ServiceController {
         for signal in signals {
             let kind = autoscale_signal_kind_label(signal.kind);
             match self.send_autoscale_signal(signal.clone()).await {
-                Ok(report) if report.accepted => {}
-                Ok(report) => {
+                Ok(report) if report.accepted => {
                     self.autoscale_local_samples
                         .lock()
                         .await
-                        .mark_signal_delivery_failed(&signal);
+                        .mark_signal_delivery_accepted(&signal, Instant::now());
+                }
+                Ok(report) => {
                     tracing::debug!(
                         target: "services",
                         detail = %report.detail,
@@ -1235,10 +1240,6 @@ impl ServiceController {
                     );
                 }
                 Err(err) => {
-                    self.autoscale_local_samples
-                        .lock()
-                        .await
-                        .mark_signal_delivery_failed(&signal);
                     metrics::record_autoscale_signal(kind, "error");
                     tracing::debug!(
                         target: "services",
@@ -2022,6 +2023,7 @@ mod tests {
             .expect("initial quiet summary");
         assert_eq!(signal.kind, ServiceAutoscaleSignalKind::Summary);
         assert_eq!(signal.reason, ServiceAutoscaleSignalReason::Quiet);
+        store.mark_signal_delivery_accepted(&signal, now);
 
         let interval = quiet_summary_interval();
         assert!(interval < Duration::from_secs(AUTOSCALE_SIGNAL_TTL_SECS));
@@ -2051,9 +2053,9 @@ mod tests {
         assert_eq!(signal.reason, ServiceAutoscaleSignalReason::Quiet);
     }
 
-    /// Failed quiet-summary delivery should retry without waiting for the heartbeat interval.
+    /// Unaccepted quiet summaries should retry without waiting for the heartbeat interval.
     #[test]
-    fn local_sample_store_retries_quiet_summary_after_delivery_failure() {
+    fn local_sample_store_retries_quiet_summary_until_delivery_is_accepted() {
         let now = Instant::now();
         let service_id = Uuid::new_v4();
         let local_node_id = Uuid::new_v4();
@@ -2061,10 +2063,12 @@ mod tests {
         let mut accumulator = test_accumulator(service_id);
         accumulator.push(&test_usage_sample(0, 64, 1_000), 0);
 
-        let signal = store
-            .signal_for_accumulator(local_node_id, local_node_id, accumulator, now)
-            .expect("initial quiet summary");
-        store.mark_signal_delivery_failed(&signal);
+        assert!(
+            store
+                .signal_for_accumulator(local_node_id, local_node_id, accumulator, now)
+                .is_some(),
+            "initial quiet summary"
+        );
 
         let mut accumulator = test_accumulator(service_id);
         accumulator.push(&test_usage_sample(0, 64, 2_000), 0);
@@ -2079,9 +2083,24 @@ mod tests {
 
         assert_eq!(retry.kind, ServiceAutoscaleSignalKind::Summary);
         assert_eq!(retry.reason, ServiceAutoscaleSignalReason::Quiet);
+        store.mark_signal_delivery_accepted(&retry, now + Duration::from_secs(1));
+
+        let mut accumulator = test_accumulator(service_id);
+        accumulator.push(&test_usage_sample(0, 64, 3_000), 0);
+        assert!(
+            store
+                .signal_for_accumulator(
+                    local_node_id,
+                    local_node_id,
+                    accumulator,
+                    now + Duration::from_secs(2),
+                )
+                .is_none(),
+            "accepted quiet summary should throttle the next retry"
+        );
     }
 
-    /// Owner changes should clear hot-signal throttles accepted by the previous owner.
+    /// Hot signals should retry until accepted, then owner changes should clear the throttle.
     #[test]
     fn local_sample_store_resends_hot_signal_after_owner_change() {
         let now = Instant::now();
@@ -2102,13 +2121,27 @@ mod tests {
         let mut accumulator = test_accumulator(service_id);
         accumulator.policy.sample_window_secs = 60;
         accumulator.push(&test_usage_sample(0, 128, 2_000), 0);
+        let retry = store
+            .signal_for_accumulator(
+                local_node_id,
+                first_owner,
+                accumulator,
+                now + Duration::from_secs(1),
+            )
+            .expect("unaccepted hot signal should retry");
+        assert_eq!(retry.kind, ServiceAutoscaleSignalKind::Hot);
+        store.mark_signal_delivery_accepted(&retry, now + Duration::from_secs(1));
+
+        let mut accumulator = test_accumulator(service_id);
+        accumulator.policy.sample_window_secs = 60;
+        accumulator.push(&test_usage_sample(0, 128, 3_000), 0);
         assert!(
             store
                 .signal_for_accumulator(
                     local_node_id,
                     first_owner,
                     accumulator,
-                    now + Duration::from_secs(1),
+                    now + Duration::from_secs(2),
                 )
                 .is_none(),
             "same owner should still honor the hot throttle"
@@ -2116,13 +2149,13 @@ mod tests {
 
         let mut accumulator = test_accumulator(service_id);
         accumulator.policy.sample_window_secs = 60;
-        accumulator.push(&test_usage_sample(0, 128, 3_000), 0);
+        accumulator.push(&test_usage_sample(0, 128, 4_000), 0);
         let after_owner_change = store
             .signal_for_accumulator(
                 local_node_id,
                 second_owner,
                 accumulator,
-                now + Duration::from_secs(2),
+                now + Duration::from_secs(3),
             )
             .expect("owner change should force hot resend");
         assert_eq!(after_owner_change.kind, ServiceAutoscaleSignalKind::Hot);
