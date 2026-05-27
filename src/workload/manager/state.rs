@@ -2588,14 +2588,14 @@ impl WorkloadManager {
         Ok(replicas)
     }
 
-    /// Samples runtime usage for every locally running service replica that supports it.
+    /// Samples runtime usage for the provided local service replicas.
     ///
     /// Runtime usage is soft telemetry. Missing instances and unsupported backend sampling are
     /// logged at debug level and skipped so autoscale control input never blocks reconciliation.
-    pub(crate) async fn sample_local_service_runtime_usage(
+    pub(crate) async fn sample_local_service_runtime_replicas_usage(
         &self,
+        replicas: Vec<LocalServiceRuntimeReplica>,
     ) -> anyhow::Result<Vec<LocalServiceRuntimeUsageSample>> {
-        let replicas = self.list_local_running_service_replicas().await?;
         let mut samples = Vec::with_capacity(replicas.len());
 
         for replica in replicas {

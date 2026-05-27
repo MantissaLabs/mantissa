@@ -117,7 +117,7 @@ struct AutoscalePolicy {
   # Quiet period required before reducing desired replicas.
 
   sampleWindowSecs @4 :UInt64;
-  # Local usage sample window in seconds.
+  # Minimum seconds between hot sample windows.
 
   triggerWindows @5 :UInt32;
   # Consecutive hot sample windows required before sending a hot signal.

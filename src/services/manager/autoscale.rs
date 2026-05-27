@@ -12,7 +12,7 @@ use crate::services::types::{
     ServiceEvent, ServicePreviousGeneration, ServiceSpecValue, ServiceStatus,
     TaskTemplateAutoscaleMetricKindValue, TaskTemplateAutoscalePolicyValue,
 };
-use crate::workload::manager::LocalServiceRuntimeUsageSample;
+use crate::workload::manager::{LocalServiceRuntimeReplica, LocalServiceRuntimeUsageSample};
 
 /// Default time after which owner-side autoscale signals are discarded.
 const AUTOSCALE_SIGNAL_TTL_SECS: u64 = 180;
@@ -491,6 +491,7 @@ struct AutoscaleLocalGroupState {
     cpu_observed_millis_ewma: u64,
     memory_observed_bytes_ewma: u64,
     hot_windows: u32,
+    last_hot_window_at: Option<Instant>,
     last_hot_signal_at: Option<Instant>,
     last_summary_signal_at: Option<Instant>,
     last_seen_at: Option<Instant>,
@@ -692,8 +693,11 @@ impl AutoscaleLocalSampleStore {
         state.last_seen_at = Some(now);
 
         if let Some(reason) = accumulator.hot_reason() {
-            state.hot_windows = state.hot_windows.saturating_add(1);
             let min_interval = Duration::from_secs(accumulator.policy.sample_window_secs.max(1));
+            if interval_elapsed(state.last_hot_window_at, min_interval, now) {
+                state.hot_windows = state.hot_windows.saturating_add(1);
+                state.last_hot_window_at = Some(now);
+            }
             if state.hot_windows >= accumulator.policy.trigger_windows.max(1)
                 && interval_elapsed(state.last_hot_signal_at, min_interval, now)
             {
@@ -710,6 +714,7 @@ impl AutoscaleLocalSampleStore {
         }
 
         state.hot_windows = 0;
+        state.last_hot_window_at = None;
         let summary_interval = quiet_summary_interval();
         if interval_elapsed(state.last_summary_signal_at, summary_interval, now) {
             state.last_summary_signal_at = Some(now);
@@ -818,7 +823,7 @@ fn policy_target_percent(
 fn usage_exceeds_target(observed: u64, requested: u64, target_percent: u16) -> bool {
     requested > 0
         && u128::from(observed).saturating_mul(100)
-            >= u128::from(requested).saturating_mul(u128::from(target_percent))
+            > u128::from(requested).saturating_mul(u128::from(target_percent))
 }
 
 /// Builds the next deploying service generation for accepted autoscale decisions.
@@ -871,6 +876,31 @@ fn build_autoscale_pending_spec(
     Some(pending)
 }
 
+/// Returns the active autoscale policy for one local service replica from a service snapshot.
+fn autoscale_policy_for_replica(
+    specs: &HashMap<Uuid, ServiceSpecValue>,
+    replica: &LocalServiceRuntimeReplica,
+) -> Option<AutoscaleSamplePolicy> {
+    let spec = specs.get(&replica.service_id)?;
+    if spec.status() != ServiceStatus::Running || spec.service_name != replica.service_name {
+        return None;
+    }
+    if replica.service_epoch != spec.service_epoch && !spec.has_assigned_replica_id(replica.task_id)
+    {
+        return None;
+    }
+
+    let policy = spec
+        .task_templates
+        .iter()
+        .find(|template| template.name == replica.template_name)
+        .and_then(|template| template.autoscale.clone())?;
+    Some(AutoscaleSamplePolicy {
+        service_epoch: spec.service_epoch,
+        policy,
+    })
+}
+
 /// Returns the bounded metrics label for an autoscale signal kind.
 fn autoscale_signal_kind_label(kind: ServiceAutoscaleSignalKind) -> &'static str {
     match kind {
@@ -905,9 +935,26 @@ fn rejected_signal_report(
 impl ServiceController {
     /// Samples local service replicas and emits sparse autoscale signals to the owner.
     pub(super) async fn emit_local_autoscale_signals(&self) -> anyhow::Result<()> {
+        let active_specs = self.active_autoscale_specs()?;
+        if active_specs.is_empty() {
+            return Ok(());
+        }
+
+        let replicas = self
+            .workload_manager
+            .list_local_running_service_replicas()
+            .await?;
+        let autoscale_replicas = replicas
+            .into_iter()
+            .filter(|replica| autoscale_policy_for_replica(&active_specs, replica).is_some())
+            .collect::<Vec<_>>();
+        if autoscale_replicas.is_empty() {
+            return Ok(());
+        }
+
         let samples = self
             .workload_manager
-            .sample_local_service_runtime_usage()
+            .sample_local_service_runtime_replicas_usage(autoscale_replicas)
             .await?;
         if samples.is_empty() {
             return Ok(());
@@ -922,7 +969,9 @@ impl ServiceController {
                 HashMap::new();
 
             for sample in samples {
-                let Some(active_policy) = self.autoscale_policy_for_sample(&sample) else {
+                let Some(active_policy) =
+                    autoscale_policy_for_replica(&active_specs, &sample.replica)
+                else {
                     continue;
                 };
                 let cpu_observed_millis = store.cpu_millis_for_sample(&sample, now);
@@ -1072,36 +1121,22 @@ impl ServiceController {
         Ok(true)
     }
 
-    /// Returns the active autoscale policy for one sampled local service replica.
-    fn autoscale_policy_for_sample(
-        &self,
-        sample: &LocalServiceRuntimeUsageSample,
-    ) -> Option<AutoscaleSamplePolicy> {
-        let spec = self
+    /// Returns active running service specs that contain at least one autoscale policy.
+    fn active_autoscale_specs(&self) -> anyhow::Result<HashMap<Uuid, ServiceSpecValue>> {
+        let specs = self
             .registry
-            .get(sample.replica.service_id)
-            .ok()
-            .flatten()?;
-        if spec.status() != ServiceStatus::Running
-            || spec.service_name != sample.replica.service_name
-        {
-            return None;
-        }
-        if sample.replica.service_epoch != spec.service_epoch
-            && !spec.has_assigned_replica_id(sample.replica.task_id)
-        {
-            return None;
-        }
-
-        let policy = spec
-            .task_templates
-            .iter()
-            .find(|template| template.name == sample.replica.template_name)
-            .and_then(|template| template.autoscale.clone())?;
-        Some(AutoscaleSamplePolicy {
-            service_epoch: spec.service_epoch,
-            policy,
-        })
+            .list()?
+            .into_iter()
+            .filter(|spec| {
+                spec.status() == ServiceStatus::Running
+                    && spec
+                        .task_templates
+                        .iter()
+                        .any(|template| template.autoscale.is_some())
+            })
+            .map(|spec| (spec.id, spec))
+            .collect();
+        Ok(specs)
     }
 
     /// Records one autoscale signal when this node is the deterministic service owner.
@@ -1442,6 +1477,13 @@ mod tests {
         assert!(build_autoscale_pending_spec(&changed_policy, &[decision]).is_none());
     }
 
+    /// Autoscale thresholds should require usage above the target, not equal to it.
+    #[test]
+    fn autoscale_usage_threshold_is_strictly_greater_than_target() {
+        assert!(!usage_exceeds_target(800, 1_000, 80));
+        assert!(usage_exceeds_target(801, 1_000, 80));
+    }
+
     /// Local sampling should convert cumulative CPU time into milli-core usage.
     #[test]
     fn local_sample_store_computes_cpu_millis_from_cumulative_usage() {
@@ -1520,6 +1562,43 @@ mod tests {
 
         assert_eq!(retry.kind, ServiceAutoscaleSignalKind::Summary);
         assert_eq!(retry.reason, ServiceAutoscaleSignalReason::Quiet);
+    }
+
+    /// Hot windows should advance only once per configured sample window.
+    #[test]
+    fn local_sample_store_counts_hot_windows_by_sample_window() {
+        let now = Instant::now();
+        let service_id = Uuid::new_v4();
+        let local_node_id = Uuid::new_v4();
+        let mut store = AutoscaleLocalSampleStore::default();
+
+        let mut accumulator = test_accumulator(service_id);
+        accumulator.policy.trigger_windows = 2;
+        accumulator.push(&test_usage_sample(0, 128, 1_000), 0);
+        assert!(
+            store
+                .signal_for_accumulator(local_node_id, accumulator, now)
+                .is_none()
+        );
+
+        let mut accumulator = test_accumulator(service_id);
+        accumulator.policy.trigger_windows = 2;
+        accumulator.push(&test_usage_sample(0, 128, 2_000), 0);
+        assert!(
+            store
+                .signal_for_accumulator(local_node_id, accumulator, now + Duration::from_secs(5))
+                .is_none()
+        );
+
+        let mut accumulator = test_accumulator(service_id);
+        accumulator.policy.trigger_windows = 2;
+        accumulator.push(&test_usage_sample(0, 128, 11_000), 0);
+        let signal = store
+            .signal_for_accumulator(local_node_id, accumulator, now + Duration::from_secs(10))
+            .expect("second hot sample window should emit");
+
+        assert_eq!(signal.kind, ServiceAutoscaleSignalKind::Hot);
+        assert_eq!(signal.reason, ServiceAutoscaleSignalReason::MemoryHigh);
     }
 
     /// Builds one minimal autoscale signal for owner-side store tests.

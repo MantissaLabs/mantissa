@@ -33,7 +33,7 @@ Field summary:
 - `max_replicas`: upper bound for desired replicas.
 - `cooldown_secs`: minimum time between accepted scale decisions.
 - `scale_down_stabilization_secs`: quiet period before reducing replicas.
-- `sample_window_secs`: local runtime usage window used to compute utilization.
+- `sample_window_secs`: minimum interval between consecutive hot windows.
 - `trigger_windows`: consecutive hot windows required before a node sends a
   hot signal.
 - `metrics`: CPU and/or memory target utilization percentages.
