@@ -254,6 +254,29 @@ impl ServiceSpecValue {
             .collect()
     }
 
+    /// Returns true when the provided workload id belongs to this service assignment.
+    pub fn has_assigned_replica_id(&self, task_id: Uuid) -> bool {
+        if self.replica_assignment_segments.is_empty() {
+            return self.replica_ids.contains(&task_id);
+        }
+
+        for segment in &self.replica_assignment_segments {
+            for offset in 0..segment.replica_count {
+                let replica = segment.first_replica.saturating_add(offset);
+                if derive_service_replica_id(
+                    self.id,
+                    self.service_epoch,
+                    &segment.template_name,
+                    replica,
+                ) == task_id
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Returns one assigned replica id by flattened template/replica slot index.
     pub fn assigned_replica_id(&self, slot_index: usize) -> Option<Uuid> {
         if self.replica_assignment_segments.is_empty() {

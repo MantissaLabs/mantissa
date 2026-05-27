@@ -20,8 +20,8 @@ const AUTOSCALE_SIGNAL_TTL_SECS: u64 = 180;
 const AUTOSCALE_MAX_SCALE_UP_FACTOR: u16 = 2;
 /// Local runtime usage sampling interval for autoscale-enabled service replicas.
 pub(super) const AUTOSCALE_LOCAL_SAMPLE_TICK_SECS: u64 = 10;
-/// Minimum interval for quiet summary signals used by later downscale decisions.
-const AUTOSCALE_SUMMARY_SIGNAL_MIN_SECS: u64 = 60;
+/// Quiet summary heartbeat interval used to keep owner-side downscale coverage alive.
+const AUTOSCALE_QUIET_SUMMARY_INTERVAL_SECS: u64 = 60;
 /// Retention window for local runtime deltas and per-template signal state.
 const AUTOSCALE_LOCAL_SAMPLE_TTL_SECS: u64 = 10 * 60;
 
@@ -511,6 +511,12 @@ struct AutoscaleSignalAccumulator {
     observed_at_unix_ms: u64,
 }
 
+#[derive(Clone, Debug)]
+struct AutoscaleSamplePolicy {
+    service_epoch: u64,
+    policy: TaskTemplateAutoscalePolicyValue,
+}
+
 impl AutoscaleSignalAccumulator {
     /// Starts a local signal aggregate for one service/template generation.
     fn new(
@@ -704,17 +710,7 @@ impl AutoscaleLocalSampleStore {
         }
 
         state.hot_windows = 0;
-        let summary_interval = Duration::from_secs(
-            accumulator
-                .policy
-                .scale_down_stabilization_secs
-                .max(accumulator.policy.sample_window_secs)
-                .max(AUTOSCALE_SUMMARY_SIGNAL_MIN_SECS),
-        );
-        if state.last_summary_signal_at.is_none() {
-            state.last_summary_signal_at = Some(now);
-            return None;
-        }
+        let summary_interval = quiet_summary_interval();
         if interval_elapsed(state.last_summary_signal_at, summary_interval, now) {
             state.last_summary_signal_at = Some(now);
             return Some(build_signal(
@@ -739,6 +735,29 @@ impl AutoscaleLocalSampleStore {
                 .is_some_and(|seen_at| now.saturating_duration_since(seen_at) <= self.ttl)
         });
     }
+
+    /// Clears local delivery throttle for one signal so failed owner sends retry on the next tick.
+    fn mark_signal_delivery_failed(&mut self, signal: &ServiceAutoscaleSignal) {
+        let key = AutoscaleGroupKey::new(
+            signal.service_id,
+            signal.service_epoch,
+            signal.template_name.clone(),
+        );
+        let Some(state) = self.group_states.get_mut(&key) else {
+            return;
+        };
+
+        match signal.kind {
+            ServiceAutoscaleSignalKind::Hot => state.last_hot_signal_at = None,
+            ServiceAutoscaleSignalKind::Summary => state.last_summary_signal_at = None,
+        }
+    }
+}
+
+/// Returns the quiet summary heartbeat interval, capped below the owner signal TTL.
+fn quiet_summary_interval() -> Duration {
+    let max_interval_secs = AUTOSCALE_SIGNAL_TTL_SECS.saturating_sub(1).max(1);
+    Duration::from_secs(AUTOSCALE_QUIET_SUMMARY_INTERVAL_SECS.min(max_interval_secs))
 }
 
 /// Builds the wire-independent signal value sent to the deterministic autoscale owner.
@@ -903,21 +922,21 @@ impl ServiceController {
                 HashMap::new();
 
             for sample in samples {
-                let Some(policy) = self.autoscale_policy_for_sample(&sample) else {
+                let Some(active_policy) = self.autoscale_policy_for_sample(&sample) else {
                     continue;
                 };
                 let cpu_observed_millis = store.cpu_millis_for_sample(&sample, now);
                 let key = AutoscaleGroupKey::new(
                     sample.replica.service_id,
-                    sample.replica.service_epoch,
+                    active_policy.service_epoch,
                     sample.replica.template_name.clone(),
                 );
                 let accumulator = accumulators.entry(key).or_insert_with(|| {
                     AutoscaleSignalAccumulator::new(
                         sample.replica.service_id,
-                        sample.replica.service_epoch,
+                        active_policy.service_epoch,
                         sample.replica.template_name.clone(),
-                        policy,
+                        active_policy.policy,
                     )
                 });
                 accumulator.push(&sample, cpu_observed_millis);
@@ -934,9 +953,13 @@ impl ServiceController {
 
         for signal in signals {
             let kind = autoscale_signal_kind_label(signal.kind);
-            match self.send_autoscale_signal(signal).await {
+            match self.send_autoscale_signal(signal.clone()).await {
                 Ok(report) if report.accepted => {}
                 Ok(report) => {
+                    self.autoscale_local_samples
+                        .lock()
+                        .await
+                        .mark_signal_delivery_failed(&signal);
                     tracing::debug!(
                         target: "services",
                         detail = %report.detail,
@@ -944,6 +967,10 @@ impl ServiceController {
                     );
                 }
                 Err(err) => {
+                    self.autoscale_local_samples
+                        .lock()
+                        .await
+                        .mark_signal_delivery_failed(&signal);
                     metrics::record_autoscale_signal(kind, "error");
                     tracing::debug!(
                         target: "services",
@@ -1049,23 +1076,32 @@ impl ServiceController {
     fn autoscale_policy_for_sample(
         &self,
         sample: &LocalServiceRuntimeUsageSample,
-    ) -> Option<TaskTemplateAutoscalePolicyValue> {
+    ) -> Option<AutoscaleSamplePolicy> {
         let spec = self
             .registry
             .get(sample.replica.service_id)
             .ok()
             .flatten()?;
         if spec.status() != ServiceStatus::Running
-            || spec.service_epoch != sample.replica.service_epoch
             || spec.service_name != sample.replica.service_name
         {
             return None;
         }
+        if sample.replica.service_epoch != spec.service_epoch
+            && !spec.has_assigned_replica_id(sample.replica.task_id)
+        {
+            return None;
+        }
 
-        spec.task_templates
+        let policy = spec
+            .task_templates
             .iter()
             .find(|template| template.name == sample.replica.template_name)
-            .and_then(|template| template.autoscale.clone())
+            .and_then(|template| template.autoscale.clone())?;
+        Some(AutoscaleSamplePolicy {
+            service_epoch: spec.service_epoch,
+            policy,
+        })
     }
 
     /// Records one autoscale signal when this node is the deterministic service owner.
@@ -1304,6 +1340,54 @@ mod tests {
         );
     }
 
+    /// Refreshed quiet summaries should keep coverage alive across stabilization windows over TTL.
+    #[test]
+    fn autoscale_signal_store_scales_down_with_refreshed_long_stabilization_summary() {
+        let now = Instant::now();
+        let mut spec = test_service_spec(3);
+        let mut policy = test_policy();
+        policy.scale_down_stabilization_secs = AUTOSCALE_SIGNAL_TTL_SECS + 120;
+        spec.task_templates[0].autoscale = Some(policy.clone());
+        let mut store = AutoscaleSignalStore::default();
+        let node_id = Uuid::new_v4();
+
+        for elapsed in [0, 60, 120, 180, 240] {
+            let mut signal = test_quiet_signal(&spec, 3);
+            signal.node_id = node_id;
+            store.record(signal, now + Duration::from_secs(elapsed));
+            assert!(
+                store
+                    .decisions_for_service(&spec, now + Duration::from_secs(elapsed))
+                    .is_empty()
+            );
+        }
+
+        let mut signal = test_quiet_signal(&spec, 3);
+        signal.node_id = node_id;
+        store.record(
+            signal,
+            now + Duration::from_secs(policy.scale_down_stabilization_secs),
+        );
+        let decisions = store.decisions_for_service(
+            &spec,
+            now + Duration::from_secs(policy.scale_down_stabilization_secs),
+        );
+
+        assert_eq!(
+            decisions,
+            vec![AutoscaleScaleDecision {
+                service_id: spec.id,
+                service_epoch: spec.service_epoch,
+                observed_phase_version: spec.phase_version,
+                template_name: "api".to_string(),
+                policy,
+                current_replicas: 3,
+                desired_replicas: 2,
+                direction: AutoscaleScaleDirection::Down,
+            }]
+        );
+    }
+
     /// Autoscale scale mutations should use the existing deploying generation path.
     #[test]
     fn autoscale_pending_spec_starts_deploying_generation() {
@@ -1373,33 +1457,69 @@ mod tests {
         );
     }
 
-    /// Quiet summaries should wait for the slow summary interval instead of firing immediately.
+    /// Quiet summaries should fire immediately and then refresh before owner TTL expires.
     #[test]
-    fn local_sample_store_delays_initial_quiet_summary() {
+    fn local_sample_store_emits_initial_and_periodic_quiet_summary() {
         let now = Instant::now();
         let service_id = Uuid::new_v4();
+        let local_node_id = Uuid::new_v4();
         let mut store = AutoscaleLocalSampleStore::default();
         let mut accumulator = test_accumulator(service_id);
+        accumulator.policy.scale_down_stabilization_secs = AUTOSCALE_SIGNAL_TTL_SECS + 120;
         accumulator.push(&test_usage_sample(0, 64, 1_000), 0);
 
+        let signal = store
+            .signal_for_accumulator(local_node_id, accumulator, now)
+            .expect("initial quiet summary");
+        assert_eq!(signal.kind, ServiceAutoscaleSignalKind::Summary);
+        assert_eq!(signal.reason, ServiceAutoscaleSignalReason::Quiet);
+
+        let interval = quiet_summary_interval();
+        assert!(interval < Duration::from_secs(AUTOSCALE_SIGNAL_TTL_SECS));
+
+        let mut accumulator = test_accumulator(service_id);
+        accumulator.policy.scale_down_stabilization_secs = AUTOSCALE_SIGNAL_TTL_SECS + 120;
+        accumulator.push(&test_usage_sample(0, 64, 2_000), 0);
         assert!(
             store
-                .signal_for_accumulator(Uuid::new_v4(), accumulator, now)
+                .signal_for_accumulator(local_node_id, accumulator, now + interval / 2)
                 .is_none()
         );
 
         let mut accumulator = test_accumulator(service_id);
+        accumulator.policy.scale_down_stabilization_secs = AUTOSCALE_SIGNAL_TTL_SECS + 120;
         accumulator.push(&test_usage_sample(0, 64, 61_000), 0);
         let signal = store
-            .signal_for_accumulator(
-                Uuid::new_v4(),
-                accumulator,
-                now + Duration::from_secs(AUTOSCALE_SUMMARY_SIGNAL_MIN_SECS),
-            )
-            .expect("quiet summary after interval");
+            .signal_for_accumulator(local_node_id, accumulator, now + interval)
+            .expect("periodic quiet summary");
 
         assert_eq!(signal.kind, ServiceAutoscaleSignalKind::Summary);
         assert_eq!(signal.reason, ServiceAutoscaleSignalReason::Quiet);
+    }
+
+    /// Failed quiet-summary delivery should retry without waiting for the heartbeat interval.
+    #[test]
+    fn local_sample_store_retries_quiet_summary_after_delivery_failure() {
+        let now = Instant::now();
+        let service_id = Uuid::new_v4();
+        let local_node_id = Uuid::new_v4();
+        let mut store = AutoscaleLocalSampleStore::default();
+        let mut accumulator = test_accumulator(service_id);
+        accumulator.push(&test_usage_sample(0, 64, 1_000), 0);
+
+        let signal = store
+            .signal_for_accumulator(local_node_id, accumulator, now)
+            .expect("initial quiet summary");
+        store.mark_signal_delivery_failed(&signal);
+
+        let mut accumulator = test_accumulator(service_id);
+        accumulator.push(&test_usage_sample(0, 64, 2_000), 0);
+        let retry = store
+            .signal_for_accumulator(local_node_id, accumulator, now + Duration::from_secs(1))
+            .expect("quiet summary retry");
+
+        assert_eq!(retry.kind, ServiceAutoscaleSignalKind::Summary);
+        assert_eq!(retry.reason, ServiceAutoscaleSignalReason::Quiet);
     }
 
     /// Builds one minimal autoscale signal for owner-side store tests.

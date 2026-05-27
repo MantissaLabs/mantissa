@@ -182,6 +182,153 @@ local_test!(services_autoscale_scales_cpu_hot_template, {
     );
 });
 
+local_test!(services_autoscale_scales_down_distributed_quiet_template, {
+    let runtimes: Arc<Mutex<Vec<Arc<InMemoryRuntimeBackend>>>> = Arc::new(Mutex::new(Vec::new()));
+    let factory_runtimes = runtimes.clone();
+    let _guard = RuntimeBackendOverrideGuard::install_factory(Arc::new(
+        move || -> Arc<dyn RuntimeBackend + Send + Sync> {
+            let runtime = Arc::new(InMemoryRuntimeBackend::default());
+            factory_runtimes.lock().push(runtime.clone());
+            runtime
+        },
+    ));
+
+    let cluster = TestNode::new_cluster_inproc_with_config(
+        3,
+        ClusterConfig {
+            sync_tick_ms: Some(100),
+            gossip_tick_ms: Some(100),
+            service_timing: Some(
+                ServiceControllerTiming::production()
+                    .with_autoscale_tick(Duration::from_millis(100)),
+            ),
+            ..ClusterConfig::default()
+        },
+    )
+    .await
+    .expect("create distributed autoscale downscale cluster");
+    TestNode::wait_cluster_ready_all(&cluster, 3, Duration::from_secs(10))
+        .await
+        .expect("distributed autoscale downscale cluster should converge");
+
+    let runtime_handles = runtimes.lock().clone();
+    for runtime in runtime_handles {
+        runtime.set_default_usage_sample(0, 1024 * 1024).await;
+    }
+
+    let service_name = "autoscale-distributed-down";
+    let manifest_name = "autoscale-distributed-down";
+    let mut template = demo_backend_task_template("api", 4);
+    template.execution.cpu_millis = 100;
+    template.execution.memory_bytes = 64 * 1024 * 1024;
+
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            manifest_name,
+            service_name,
+            vec![template.clone()],
+        )
+        .await
+        .expect("submit non-autoscaled baseline service");
+
+    assert!(
+        wait_for_service_status_all(
+            &cluster,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(20)
+        )
+        .await,
+        "baseline service should reach running before autoscale is enabled"
+    );
+    assert!(
+        wait_for_service_running_tasks_stable_all(
+            &cluster,
+            service_name,
+            4,
+            3,
+            Duration::from_secs(20)
+        )
+        .await,
+        "baseline service should converge on four running replicas"
+    );
+    assert!(
+        wait_for_min_local_service_task_count(&cluster, service_name, 1, Duration::from_secs(10))
+            .await,
+        "baseline replicas should be distributed across the three nodes"
+    );
+
+    template.autoscale = Some(TaskTemplateAutoscalePolicyValue {
+        min_replicas: 2,
+        max_replicas: 4,
+        cooldown_secs: 1,
+        scale_down_stabilization_secs: 2,
+        sample_window_secs: 1,
+        trigger_windows: 1,
+        metrics: vec![TaskTemplateAutoscaleMetricValue {
+            kind: TaskTemplateAutoscaleMetricKindValue::Memory,
+            target_percent: 80,
+        }],
+    });
+    let update = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment_with_options_outcome(
+            Uuid::new_v4(),
+            manifest_name,
+            service_name,
+            vec![template],
+            ServiceDeploymentOptions::default(),
+        )
+        .await
+        .expect("enable autoscale on distributed service");
+    assert_eq!(update.outcome, ServiceDeploymentOutcome::Accepted);
+
+    assert!(
+        wait_for_service_status_all(
+            &cluster,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(20)
+        )
+        .await,
+        "autoscale policy update should converge before downscale"
+    );
+    if !wait_for_template_replicas_all(&cluster, service_id, "api", 2, Duration::from_secs(30))
+        .await
+    {
+        let service_debug = collect_autoscale_template_debug(&cluster, service_id, "api").await;
+        let task_debug = collect_service_task_count_debug(&cluster, service_name).await;
+        panic!(
+            "distributed quiet summaries should drive repeated downscale to the policy minimum: {service_debug}; {task_debug}"
+        );
+    }
+    assert!(
+        wait_for_service_status_all(
+            &cluster,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(20)
+        )
+        .await,
+        "downscaled service should return to running"
+    );
+    assert!(
+        wait_for_service_running_tasks_stable_all(
+            &cluster,
+            service_name,
+            2,
+            3,
+            Duration::from_secs(20)
+        )
+        .await,
+        "downscaled service should converge on two running replicas"
+    );
+});
+
 local_test!(services_autoscale_skips_decisions_while_deploying, {
     let runtime = Arc::new(SlowCreateRuntimeBackend::with_create_delay(
         Duration::from_secs(3),
@@ -544,6 +691,76 @@ async fn wait_for_template_replicas(
             .unwrap_or(false)
     })
     .await
+}
+
+/// Waits until every node records one task template with the expected desired replica count.
+async fn wait_for_template_replicas_all(
+    cluster: &[TestNode],
+    service_id: Uuid,
+    template_name: &str,
+    replicas: u16,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(50), || async {
+        for node in cluster {
+            let matches = node
+                .node
+                .service_controller
+                .registry()
+                .get(service_id)
+                .ok()
+                .flatten()
+                .and_then(|spec| {
+                    spec.task_templates
+                        .iter()
+                        .find(|template| template.name == template_name)
+                        .map(|template| spec.service_epoch > 0 && template.replicas == replicas)
+                })
+                .unwrap_or(false);
+            if !matches {
+                return false;
+            }
+        }
+        true
+    })
+    .await
+}
+
+/// Renders compact per-node desired replica state for autoscale assertions.
+async fn collect_autoscale_template_debug(
+    cluster: &[TestNode],
+    service_id: Uuid,
+    template_name: &str,
+) -> String {
+    let mut rows = Vec::with_capacity(cluster.len());
+    for node in cluster {
+        let row = node
+            .node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .ok()
+            .flatten()
+            .map(|spec| {
+                let replicas = spec
+                    .task_templates
+                    .iter()
+                    .find(|template| template.name == template_name)
+                    .map(|template| template.replicas)
+                    .unwrap_or(0);
+                format!(
+                    "node={} status={:?} epoch={} phase={} replicas={}",
+                    node.id(),
+                    spec.status(),
+                    spec.service_epoch,
+                    spec.phase_version,
+                    replicas
+                )
+            })
+            .unwrap_or_else(|| format!("node={} missing service", node.id()));
+        rows.push(row);
+    }
+    rows.join(" | ")
 }
 
 /// Finds a deterministic service name whose autoscale owner is `owner_id`.
