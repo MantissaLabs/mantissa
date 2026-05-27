@@ -449,7 +449,8 @@ pub struct RuntimeInfo {
 ///
 /// CPU usage is cumulative nanoseconds consumed since runtime creation. Callers
 /// compute rates from deltas so the runtime backend stays a thin accounting
-/// adapter.
+/// adapter. Memory usage is a point-in-time pressure estimate that runtime
+/// backends should normalize away from easily reclaimable cache when possible.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeUsageSample {
     pub runtime_id: String,

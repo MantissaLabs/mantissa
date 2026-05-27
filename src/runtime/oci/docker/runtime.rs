@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use bollard::container::AttachContainerResults;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, DeviceRequest, EventMessageTypeEnum, HostConfig, PortBinding,
-    RestartPolicy, RestartPolicyNameEnum,
+    ContainerCreateBody, ContainerMemoryStats, DeviceRequest, EventMessageTypeEnum, HostConfig,
+    PortBinding, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     AttachContainerOptionsBuilder, CreateContainerOptions, CreateImageOptions, EventsOptions,
@@ -338,7 +338,7 @@ impl RuntimeBackend for DockerRuntimeBackend {
         Ok(runtime_info_from_inspect(inspect))
     }
 
-    /// Samples Docker's cumulative CPU and current memory accounting for one container.
+    /// Samples Docker's cumulative CPU and working-set memory for one container.
     async fn sample_instance_usage(&self, container_id: &str) -> RuntimeResult<RuntimeUsageSample> {
         let options = StatsOptionsBuilder::default()
             .stream(false)
@@ -364,12 +364,7 @@ impl RuntimeBackend for DockerRuntimeBackend {
         let memory_current_bytes = stats
             .memory_stats
             .as_ref()
-            .and_then(|stats| {
-                stats
-                    .usage
-                    .or(stats.privateworkingset)
-                    .or(stats.commitbytes)
-            })
+            .map(docker_memory_current_bytes)
             .unwrap_or(0);
         let runtime_id = stats.id.unwrap_or_else(|| container_id.to_string());
 
@@ -619,6 +614,27 @@ fn exposed_port_keys(bindings: &[RuntimePortBinding]) -> Vec<String> {
     keys
 }
 
+/// Returns Docker memory usage bytes after subtracting reclaimable inactive file cache.
+fn docker_memory_current_bytes(stats: &ContainerMemoryStats) -> u64 {
+    if let Some(usage) = stats.usage {
+        return match docker_memory_inactive_file_bytes(stats) {
+            Some(cache_bytes) if cache_bytes <= usage => usage - cache_bytes,
+            _ => usage,
+        };
+    }
+
+    stats.privateworkingset.or(stats.commitbytes).unwrap_or(0)
+}
+
+/// Returns the Linux inactive file cache counter Docker exposes through memory.stat.
+fn docker_memory_inactive_file_bytes(stats: &ContainerMemoryStats) -> Option<u64> {
+    let memory_stats = stats.stats.as_ref()?;
+    memory_stats
+        .get("inactive_file")
+        .or_else(|| memory_stats.get("total_inactive_file"))
+        .copied()
+}
+
 /// Builds Docker host port bindings keyed by `<container-port>/<protocol>`.
 fn docker_port_bindings(
     bindings: &[RuntimePortBinding],
@@ -653,6 +669,84 @@ fn current_unix_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::runtime::types::RuntimePortProtocol;
+
+    /// Builds Docker memory stats with Linux usage and memory.stat counters.
+    fn linux_memory_stats(usage: u64, memory_stats: &[(&str, u64)]) -> ContainerMemoryStats {
+        ContainerMemoryStats {
+            usage: Some(usage),
+            stats: Some(
+                memory_stats
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), *value))
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// Docker memory accounting should subtract cgroup v2 inactive file cache.
+    #[test]
+    fn docker_memory_current_bytes_subtracts_cgroup_v2_inactive_file() {
+        let stats = linux_memory_stats(512, &[("inactive_file", 128)]);
+
+        assert_eq!(docker_memory_current_bytes(&stats), 384);
+    }
+
+    /// Docker memory accounting should subtract cgroup v1 inactive file cache.
+    #[test]
+    fn docker_memory_current_bytes_subtracts_cgroup_v1_total_inactive_file() {
+        let stats = linux_memory_stats(512, &[("total_inactive_file", 160)]);
+
+        assert_eq!(docker_memory_current_bytes(&stats), 352);
+    }
+
+    /// Docker memory accounting should prefer cgroup v2 counters if both keys exist.
+    #[test]
+    fn docker_memory_current_bytes_prefers_cgroup_v2_inactive_file() {
+        let stats =
+            linux_memory_stats(512, &[("inactive_file", 128), ("total_inactive_file", 160)]);
+
+        assert_eq!(docker_memory_current_bytes(&stats), 384);
+    }
+
+    /// Docker memory accounting should keep raw usage when cache data is missing.
+    #[test]
+    fn docker_memory_current_bytes_falls_back_to_linux_usage_without_cache() {
+        let stats = linux_memory_stats(512, &[]);
+
+        assert_eq!(docker_memory_current_bytes(&stats), 512);
+    }
+
+    /// Docker memory accounting should not under-report malformed cache counters.
+    #[test]
+    fn docker_memory_current_bytes_keeps_usage_when_cache_exceeds_usage() {
+        let stats = linux_memory_stats(512, &[("inactive_file", 768)]);
+
+        assert_eq!(docker_memory_current_bytes(&stats), 512);
+    }
+
+    /// Docker memory accounting should use Windows private working set before commit bytes.
+    #[test]
+    fn docker_memory_current_bytes_uses_windows_private_working_set() {
+        let stats = ContainerMemoryStats {
+            privateworkingset: Some(256),
+            commitbytes: Some(512),
+            ..Default::default()
+        };
+
+        assert_eq!(docker_memory_current_bytes(&stats), 256);
+    }
+
+    /// Docker memory accounting should use Windows commit bytes when needed.
+    #[test]
+    fn docker_memory_current_bytes_uses_windows_commit_bytes_fallback() {
+        let stats = ContainerMemoryStats {
+            commitbytes: Some(512),
+            ..Default::default()
+        };
+
+        assert_eq!(docker_memory_current_bytes(&stats), 512);
+    }
 
     /// Docker port helper output should expose unique target keys and bind static host ports.
     #[test]
