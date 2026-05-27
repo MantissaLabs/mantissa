@@ -16,6 +16,8 @@ use crate::workload::manager::LocalServiceRuntimeUsageSample;
 
 /// Default time after which owner-side autoscale signals are discarded.
 const AUTOSCALE_SIGNAL_TTL_SECS: u64 = 180;
+/// Internal cap for one autoscale scale-up write relative to the current replica count.
+const AUTOSCALE_MAX_SCALE_UP_FACTOR: u16 = 2;
 /// Local runtime usage sampling interval for autoscale-enabled service replicas.
 pub(super) const AUTOSCALE_LOCAL_SAMPLE_TICK_SECS: u64 = 10;
 /// Minimum interval for quiet summary signals used by later downscale decisions.
@@ -139,7 +141,9 @@ enum AutoscaleScaleDirection {
 struct AutoscaleScaleDecision {
     service_id: Uuid,
     service_epoch: u64,
+    observed_phase_version: u64,
     template_name: String,
+    policy: TaskTemplateAutoscalePolicyValue,
     current_replicas: u16,
     desired_replicas: u16,
     direction: AutoscaleScaleDirection,
@@ -294,7 +298,7 @@ fn current_template_signals(
         .collect()
 }
 
-/// Builds a one-step scale-up decision from hot signals when policy bounds allow it.
+/// Builds a utilization-based scale-up decision from hot signals when policy bounds allow it.
 fn scale_up_decision(
     spec: &ServiceSpecValue,
     template_name: &str,
@@ -302,17 +306,28 @@ fn scale_up_decision(
     policy: &TaskTemplateAutoscalePolicyValue,
     signals: &[ServiceAutoscaleSignal],
 ) -> Option<AutoscaleScaleDecision> {
-    if !signals
+    let mut saw_hot_signal = false;
+    let mut extra_replicas = 0u16;
+    for signal in signals
         .iter()
-        .any(|signal| signal.kind == ServiceAutoscaleSignalKind::Hot && signal.hot_replicas > 0)
+        .filter(|signal| signal.kind == ServiceAutoscaleSignalKind::Hot && signal.hot_replicas > 0)
     {
+        saw_hot_signal = true;
+        extra_replicas = extra_replicas.saturating_add(scale_up_extra_for_signal(policy, signal));
+    }
+    if !saw_hot_signal {
         return None;
     }
-    let desired_replicas = current_replicas.saturating_add(1).min(policy.max_replicas);
+    let desired_replicas = current_replicas
+        .saturating_add(extra_replicas.max(1))
+        .min(max_scale_up_replicas(current_replicas))
+        .min(policy.max_replicas);
     (desired_replicas > current_replicas).then(|| AutoscaleScaleDecision {
         service_id: spec.id,
         service_epoch: spec.service_epoch,
+        observed_phase_version: spec.phase_version,
         template_name: template_name.to_string(),
+        policy: policy.clone(),
         current_replicas,
         desired_replicas,
         direction: AutoscaleScaleDirection::Up,
@@ -330,11 +345,83 @@ fn scale_down_decision(
     (desired_replicas < current_replicas).then(|| AutoscaleScaleDecision {
         service_id: spec.id,
         service_epoch: spec.service_epoch,
+        observed_phase_version: spec.phase_version,
         template_name: template_name.to_string(),
+        policy: policy.clone(),
         current_replicas,
         desired_replicas,
         direction: AutoscaleScaleDirection::Down,
     })
+}
+
+/// Returns the extra replicas implied by one hot signal's strongest metric.
+fn scale_up_extra_for_signal(
+    policy: &TaskTemplateAutoscalePolicyValue,
+    signal: &ServiceAutoscaleSignal,
+) -> u16 {
+    let accounted_replicas = signal
+        .ready_replicas
+        .max(signal.running_replicas)
+        .min(u32::from(u16::MAX)) as u16;
+    if accounted_replicas == 0 {
+        return 0;
+    }
+
+    let recommended_replicas = policy
+        .metrics
+        .iter()
+        .filter_map(|metric| match metric.kind {
+            TaskTemplateAutoscaleMetricKindValue::Cpu => recommended_replicas_for_usage(
+                accounted_replicas,
+                signal.cpu_observed_millis_ewma,
+                signal.cpu_requested_millis_total,
+                metric.target_percent,
+            ),
+            TaskTemplateAutoscaleMetricKindValue::Memory => recommended_replicas_for_usage(
+                accounted_replicas,
+                signal.memory_observed_bytes_ewma,
+                signal.memory_requested_bytes_total,
+                metric.target_percent,
+            ),
+        })
+        .max()
+        .unwrap_or(accounted_replicas);
+
+    recommended_replicas.saturating_sub(accounted_replicas)
+}
+
+/// Computes a replica recommendation from one aggregate utilization sample.
+fn recommended_replicas_for_usage(
+    accounted_replicas: u16,
+    observed: u64,
+    requested: u64,
+    target_percent: u16,
+) -> Option<u16> {
+    if accounted_replicas == 0 || requested == 0 || target_percent == 0 {
+        return None;
+    }
+
+    let numerator = u128::from(accounted_replicas)
+        .saturating_mul(u128::from(observed))
+        .saturating_mul(100);
+    let denominator = u128::from(requested).saturating_mul(u128::from(target_percent));
+    let recommendation = ceil_div_u128(numerator, denominator)?;
+    Some(recommendation.clamp(1, u128::from(u16::MAX)) as u16)
+}
+
+/// Returns the maximum target replicas allowed for one scale-up decision.
+fn max_scale_up_replicas(current_replicas: u16) -> u16 {
+    current_replicas
+        .saturating_mul(AUTOSCALE_MAX_SCALE_UP_FACTOR)
+        .max(current_replicas.saturating_add(1))
+}
+
+/// Divides two unsigned integers and rounds up, returning none for zero denominators.
+fn ceil_div_u128(numerator: u128, denominator: u128) -> Option<u128> {
+    if denominator == 0 {
+        return None;
+    }
+    Some(numerator.saturating_add(denominator - 1) / denominator)
 }
 
 /// Returns true once quiet summaries account for every desired replica in the template.
@@ -727,7 +814,10 @@ fn build_autoscale_pending_spec(
     let mut templates = current.task_templates.clone();
     let mut changed = false;
     for decision in decisions {
-        if decision.service_id != current.id || decision.service_epoch != current.service_epoch {
+        if decision.service_id != current.id
+            || decision.service_epoch != current.service_epoch
+            || decision.observed_phase_version != current.phase_version
+        {
             continue;
         }
         let Some(template) = templates
@@ -737,6 +827,9 @@ fn build_autoscale_pending_spec(
             continue;
         };
         if template.replicas != decision.current_replicas
+            || template.autoscale.as_ref() != Some(&decision.policy)
+            || decision.desired_replicas < decision.policy.min_replicas.max(1)
+            || decision.desired_replicas > decision.policy.max_replicas
             || template.replicas == decision.desired_replicas
         {
             continue;
@@ -1124,9 +1217,42 @@ mod tests {
             vec![AutoscaleScaleDecision {
                 service_id: spec.id,
                 service_epoch: spec.service_epoch,
+                observed_phase_version: spec.phase_version,
                 template_name: "api".to_string(),
+                policy: test_policy(),
                 current_replicas: 2,
                 desired_replicas: 3,
+                direction: AutoscaleScaleDirection::Up,
+            }]
+        );
+    }
+
+    /// Hot owner signals should use utilization severity while keeping a hard scale-up cap.
+    #[test]
+    fn autoscale_signal_store_scales_up_from_hot_utilization() {
+        let now = Instant::now();
+        let mut spec = test_service_spec(4);
+        let mut policy = test_policy();
+        policy.max_replicas = 10;
+        spec.task_templates[0].autoscale = Some(policy.clone());
+        let mut signal = test_hot_signal(&spec);
+        signal.cpu_requested_millis_total = 1_000;
+        signal.cpu_observed_millis_ewma = 2_000;
+        let mut store = AutoscaleSignalStore::default();
+        store.record(signal, now);
+
+        let decisions = store.decisions_for_service(&spec, now);
+
+        assert_eq!(
+            decisions,
+            vec![AutoscaleScaleDecision {
+                service_id: spec.id,
+                service_epoch: spec.service_epoch,
+                observed_phase_version: spec.phase_version,
+                template_name: "api".to_string(),
+                policy,
+                current_replicas: 4,
+                desired_replicas: 8,
                 direction: AutoscaleScaleDirection::Up,
             }]
         );
@@ -1168,7 +1294,9 @@ mod tests {
             vec![AutoscaleScaleDecision {
                 service_id: spec.id,
                 service_epoch: spec.service_epoch,
+                observed_phase_version: spec.phase_version,
                 template_name: "api".to_string(),
+                policy: test_policy(),
                 current_replicas: 3,
                 desired_replicas: 2,
                 direction: AutoscaleScaleDirection::Down,
@@ -1183,7 +1311,9 @@ mod tests {
         let decision = AutoscaleScaleDecision {
             service_id: spec.id,
             service_epoch: spec.service_epoch,
+            observed_phase_version: spec.phase_version,
             template_name: "api".to_string(),
+            policy: test_policy(),
             current_replicas: 2,
             desired_replicas: 3,
             direction: AutoscaleScaleDirection::Up,
@@ -1196,6 +1326,36 @@ mod tests {
         assert_eq!(pending.task_templates[0].replicas, 3);
         assert!(!pending.has_assigned_replicas());
         assert!(pending.previous_generation.is_some());
+    }
+
+    /// Autoscale writes should drop decisions made against an older service phase or policy.
+    #[test]
+    fn autoscale_pending_spec_rejects_stale_decision_fence() {
+        let spec = test_service_spec(2);
+        let decision = AutoscaleScaleDecision {
+            service_id: spec.id,
+            service_epoch: spec.service_epoch,
+            observed_phase_version: spec.phase_version,
+            template_name: "api".to_string(),
+            policy: test_policy(),
+            current_replicas: 2,
+            desired_replicas: 3,
+            direction: AutoscaleScaleDirection::Up,
+        };
+
+        let mut changed_phase = spec.clone();
+        changed_phase.set_status_detail(Some("rollout settled".to_string()));
+        assert!(
+            build_autoscale_pending_spec(&changed_phase, std::slice::from_ref(&decision)).is_none()
+        );
+
+        let mut changed_policy = spec.clone();
+        changed_policy.task_templates[0]
+            .autoscale
+            .as_mut()
+            .expect("autoscale policy")
+            .max_replicas = 8;
+        assert!(build_autoscale_pending_spec(&changed_policy, &[decision]).is_none());
     }
 
     /// Local sampling should convert cumulative CPU time into milli-core usage.
