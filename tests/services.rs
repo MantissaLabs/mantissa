@@ -1,6 +1,8 @@
 #[macro_use]
 mod common;
 
+#[path = "services/autoscale.rs"]
+mod autoscale;
 #[path = "services/dependencies.rs"]
 mod dependencies;
 #[path = "services/deployment.rs"]

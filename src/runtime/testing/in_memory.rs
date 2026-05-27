@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;
@@ -9,7 +9,7 @@ use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender};
 use crate::runtime::types::{
     RuntimeAttachmentTarget, RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest,
     RuntimeError, RuntimeExecOptions, RuntimeExecResult, RuntimeInfo, RuntimeLogFrame,
-    RuntimeLogsOptions, RuntimeResult, RuntimeStateInfo, RuntimeSupportProfile,
+    RuntimeLogsOptions, RuntimeResult, RuntimeStateInfo, RuntimeSupportProfile, RuntimeUsageSample,
 };
 use crate::workload::model::ExecutionPlatform;
 
@@ -25,6 +25,7 @@ pub fn use_in_memory_runtime_backend_from_env() -> bool {
 pub struct InMemoryRuntimeBackend {
     instances: AsyncMutex<HashMap<String, InMemoryRuntimeEntry>>,
     names: AsyncMutex<HashMap<String, String>>,
+    default_usage: AsyncMutex<InMemoryRuntimeUsage>,
 }
 
 #[derive(Clone)]
@@ -34,6 +35,12 @@ struct InMemoryRuntimeEntry {
     image: String,
     labels: HashMap<String, String>,
     running: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct InMemoryRuntimeUsage {
+    cpu_usage_nanos: u64,
+    memory_current_bytes: u64,
 }
 
 impl InMemoryRuntimeBackend {
@@ -58,6 +65,14 @@ impl InMemoryRuntimeBackend {
 
         let names = self.names.lock().await;
         names.get(key).cloned()
+    }
+
+    /// Sets the usage sample returned for every in-memory runtime instance.
+    pub async fn set_default_usage_sample(&self, cpu_usage_nanos: u64, memory_current_bytes: u64) {
+        *self.default_usage.lock().await = InMemoryRuntimeUsage {
+            cpu_usage_nanos,
+            memory_current_bytes,
+        };
     }
 }
 
@@ -293,6 +308,21 @@ impl RuntimeBackend for InMemoryRuntimeBackend {
         })
     }
 
+    /// Returns one synthetic usage sample for the requested in-memory runtime.
+    async fn sample_instance_usage(&self, runtime_id: &str) -> RuntimeResult<RuntimeUsageSample> {
+        let Some(id) = self.resolve_runtime_id(runtime_id).await else {
+            return Err(Self::not_found(runtime_id));
+        };
+
+        let usage = *self.default_usage.lock().await;
+        Ok(RuntimeUsageSample {
+            runtime_id: id,
+            sampled_at_unix_ms: current_unix_time_millis(),
+            cpu_usage_nanos: usage.cpu_usage_nanos,
+            memory_current_bytes: usage.memory_current_bytes,
+        })
+    }
+
     /// Reports that every image is locally available in the in-memory backend.
     async fn image_present(&self, _image: &str) -> RuntimeResult<bool> {
         Ok(true)
@@ -340,4 +370,12 @@ impl RuntimeBackend for InMemoryRuntimeBackend {
         };
         Ok(())
     }
+}
+
+/// Returns the current Unix timestamp in milliseconds for synthetic usage samples.
+fn current_unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }

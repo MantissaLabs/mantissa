@@ -106,6 +106,7 @@ const SERVICE_ENABLE_PROACTIVE_REBALANCE: bool = true;
 #[derive(Clone, Copy, Debug)]
 pub struct ServiceControllerTiming {
     pub reschedule_tick: Duration,
+    pub autoscale_tick: Duration,
     pub rebalance_min_age: ChronoDuration,
     pub cleanup_min_age: ChronoDuration,
     pub rebalance_cooldown: Duration,
@@ -129,10 +130,17 @@ impl ServiceControllerTiming {
     ) -> Self {
         Self {
             reschedule_tick: reschedule_tick.max(Duration::from_millis(1)),
+            autoscale_tick: Duration::from_secs(autoscale::AUTOSCALE_LOCAL_SAMPLE_TICK_SECS),
             rebalance_min_age,
             cleanup_min_age: ChronoDuration::seconds(SERVICE_EXTRA_TASK_CLEANUP_MIN_AGE_SECS),
             rebalance_cooldown,
         }
+    }
+
+    /// Returns the timing profile with a custom autoscale sampling and decision tick.
+    pub fn with_autoscale_tick(mut self, autoscale_tick: Duration) -> Self {
+        self.autoscale_tick = autoscale_tick.max(Duration::from_millis(1));
+        self
     }
 
     /// Returns the timing profile with a custom extra-task cleanup age.
@@ -346,9 +354,7 @@ impl ServiceController {
     /// Runs the service controller loop, handling gossip events and periodic rescheduling.
     pub async fn run(&mut self) {
         let mut reschedule_tick = interval(self.timing.reschedule_tick);
-        let mut autoscale_tick = interval(Duration::from_secs(
-            autoscale::AUTOSCALE_LOCAL_SAMPLE_TICK_SECS,
-        ));
+        let mut autoscale_tick = interval(self.timing.autoscale_tick);
 
         loop {
             tokio::select! {

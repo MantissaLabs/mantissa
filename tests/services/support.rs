@@ -36,8 +36,9 @@ pub(crate) use mantissa::services::manager::{
 pub(crate) use mantissa::services::types::{
     ServiceDeploymentPolicy, ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase,
     ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy,
-    TaskTemplateNetworkRequirement, TaskTemplateRestartPolicy, TaskTemplateRestartPolicyKind,
-    TaskTemplateSpecValue,
+    TaskTemplateAutoscaleMetricKindValue, TaskTemplateAutoscaleMetricValue,
+    TaskTemplateAutoscalePolicyValue, TaskTemplateNetworkRequirement, TaskTemplateRestartPolicy,
+    TaskTemplateRestartPolicyKind, TaskTemplateSpecValue,
 };
 pub(crate) use mantissa::task::types::{
     TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference, TaskStateFilter, TaskValue,
