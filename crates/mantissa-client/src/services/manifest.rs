@@ -53,6 +53,30 @@ impl TaskTemplateResources {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+pub struct TaskTemplateAutoscalePolicy {
+    pub min_replicas: u16,
+    pub max_replicas: u16,
+    pub cooldown_secs: u64,
+    pub scale_down_stabilization_secs: u64,
+    pub sample_window_secs: u64,
+    pub trigger_windows: u32,
+    pub metrics: Vec<TaskTemplateAutoscaleMetric>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TaskTemplateAutoscaleMetric {
+    pub kind: TaskTemplateAutoscaleMetricKind,
+    pub target_percent: u16,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskTemplateAutoscaleMetricKind {
+    Cpu,
+    Memory,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct TaskTemplateRestartPolicy {
     pub name: RestartPolicyName,
     #[serde(default)]
@@ -286,6 +310,8 @@ pub struct TaskTemplateSpec {
     pub replicas: u16,
     #[serde(default)]
     pub resources: TaskTemplateResources,
+    #[serde(default)]
+    pub autoscale: Option<TaskTemplateAutoscalePolicy>,
     #[serde(default)]
     pub restart_policy: Option<TaskTemplateRestartPolicy>,
     #[serde(default)]
@@ -603,6 +629,8 @@ impl ServiceManifest {
                 }
             }
 
+            validate_template_autoscale(template)?;
+
             if let Some(policy) = &template.restart_policy {
                 if policy.max_retry_count.is_some()
                     && !matches!(policy.name, RestartPolicyName::OnFailure)
@@ -779,7 +807,11 @@ impl ServiceManifest {
                         mount.target
                     ));
                 }
-                if template.replicas > 1 {
+                let max_replicas = template
+                    .autoscale
+                    .as_ref()
+                    .map_or(template.replicas, |policy| policy.max_replicas);
+                if max_replicas > 1 {
                     let volume = self
                         .volumes
                         .iter()
@@ -787,7 +819,7 @@ impl ServiceManifest {
                         .ok_or_else(|| anyhow!("volume lookup failed for '{}'", source))?;
                     if matches!(volume.access_mode, VolumeAccessMode::ReadWriteOnce) {
                         return Err(anyhow!(
-                            "template '{}' cannot use read_write_once volume '{}' with replicas > 1",
+                            "template '{}' cannot use read_write_once volume '{}' with max replicas > 1",
                             template.name,
                             source
                         ));
@@ -838,6 +870,88 @@ impl ServiceManifest {
             "service manifest",
         )
     }
+}
+
+/// Validates one task template autoscale policy and its resource denominators.
+fn validate_template_autoscale(template: &TaskTemplateSpec) -> Result<()> {
+    let Some(policy) = template.autoscale.as_ref() else {
+        return Ok(());
+    };
+
+    if policy.metrics.is_empty() {
+        return Err(anyhow!(
+            "template '{}' autoscale.metrics must not be empty",
+            template.name
+        ));
+    }
+    if policy.min_replicas == 0 {
+        return Err(anyhow!(
+            "template '{}' autoscale.min_replicas must be at least 1",
+            template.name
+        ));
+    }
+    if policy.max_replicas < policy.min_replicas {
+        return Err(anyhow!(
+            "template '{}' autoscale.max_replicas must be >= min_replicas",
+            template.name
+        ));
+    }
+    if template.replicas < policy.min_replicas || template.replicas > policy.max_replicas {
+        return Err(anyhow!(
+            "template '{}' replicas must be within autoscale min_replicas..=max_replicas",
+            template.name
+        ));
+    }
+    if policy.cooldown_secs == 0 {
+        return Err(anyhow!(
+            "template '{}' autoscale.cooldown_secs must be greater than zero",
+            template.name
+        ));
+    }
+    if policy.scale_down_stabilization_secs < policy.cooldown_secs {
+        return Err(anyhow!(
+            "template '{}' autoscale.scale_down_stabilization_secs must be >= cooldown_secs",
+            template.name
+        ));
+    }
+    if policy.sample_window_secs == 0 {
+        return Err(anyhow!(
+            "template '{}' autoscale.sample_window_secs must be greater than zero",
+            template.name
+        ));
+    }
+    if policy.trigger_windows == 0 {
+        return Err(anyhow!(
+            "template '{}' autoscale.trigger_windows must be greater than zero",
+            template.name
+        ));
+    }
+
+    for metric in &policy.metrics {
+        if metric.target_percent == 0 || metric.target_percent > 1000 {
+            return Err(anyhow!(
+                "template '{}' autoscale metric target_percent must be in 1..=1000",
+                template.name
+            ));
+        }
+        match metric.kind {
+            TaskTemplateAutoscaleMetricKind::Cpu if template.resources.cpu_millis == 0 => {
+                return Err(anyhow!(
+                    "template '{}' autoscale cpu metric requires resources.cpu_millis",
+                    template.name
+                ));
+            }
+            TaskTemplateAutoscaleMetricKind::Memory if template.resources.memory_mb == 0 => {
+                return Err(anyhow!(
+                    "template '{}' autoscale memory metric requires resources.memory_mb",
+                    template.name
+                ));
+            }
+            TaskTemplateAutoscaleMetricKind::Cpu | TaskTemplateAutoscaleMetricKind::Memory => {}
+        }
+    }
+
+    Ok(())
 }
 
 /// Validates same-manifest template dependencies and rejects invalid graphs early.
@@ -1058,6 +1172,96 @@ mod tests {
         manifest
             .validate()
             .expect("gang admission should be accepted by the manifest layer");
+    }
+
+    #[test]
+    fn manifest_accepts_task_template_autoscale_policy() {
+        let manifest: ServiceManifest = ron::from_str(
+            r#"
+            (
+                name: "autoscale-demo",
+                tasks: [
+                    (
+                        name: "api",
+                        image: "ghcr.io/demo/api:latest",
+                        replicas: 2,
+                        resources: (
+                            cpu_millis: 500,
+                            memory_mb: 256,
+                        ),
+                        autoscale: Some((
+                            min_replicas: 2,
+                            max_replicas: 8,
+                            cooldown_secs: 60,
+                            scale_down_stabilization_secs: 300,
+                            sample_window_secs: 15,
+                            trigger_windows: 2,
+                            metrics: [
+                                (
+                                    kind: cpu,
+                                    target_percent: 70,
+                                ),
+                                (
+                                    kind: memory,
+                                    target_percent: 80,
+                                ),
+                            ],
+                        )),
+                    ),
+                ],
+            )
+            "#,
+        )
+        .expect("parse manifest");
+
+        manifest
+            .validate()
+            .expect("autoscale policy should be accepted");
+        let policy = manifest.task_templates[0]
+            .autoscale
+            .as_ref()
+            .expect("autoscale policy");
+        assert_eq!(policy.min_replicas, 2);
+        assert_eq!(policy.max_replicas, 8);
+        assert_eq!(policy.metrics.len(), 2);
+    }
+
+    #[test]
+    fn manifest_rejects_cpu_autoscale_without_cpu_request() {
+        let manifest: ServiceManifest = ron::from_str(
+            r#"
+            (
+                name: "autoscale-demo",
+                tasks: [
+                    (
+                        name: "api",
+                        image: "ghcr.io/demo/api:latest",
+                        replicas: 2,
+                        autoscale: Some((
+                            min_replicas: 2,
+                            max_replicas: 8,
+                            cooldown_secs: 60,
+                            scale_down_stabilization_secs: 300,
+                            sample_window_secs: 15,
+                            trigger_windows: 2,
+                            metrics: [
+                                (
+                                    kind: cpu,
+                                    target_percent: 70,
+                                ),
+                            ],
+                        )),
+                    ),
+                ],
+            )
+            "#,
+        )
+        .expect("parse manifest");
+
+        let error = manifest
+            .validate()
+            .expect_err("cpu autoscale without cpu request must fail");
+        assert!(error.to_string().contains("resources.cpu_millis"));
     }
 
     #[test]
@@ -1346,6 +1550,7 @@ mod tests {
                 depends_on: Vec::new(),
                 replicas: 1,
                 resources: TaskTemplateResources::default(),
+                autoscale: None,
                 restart_policy: None,
                 termination_grace_period_secs: None,
                 pre_stop_command: Some(Vec::new()),
@@ -1386,6 +1591,7 @@ mod tests {
                 depends_on: Vec::new(),
                 replicas: 1,
                 resources: TaskTemplateResources::default(),
+                autoscale: None,
                 restart_policy: None,
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
@@ -1435,6 +1641,7 @@ mod tests {
                 depends_on: Vec::new(),
                 replicas: 1,
                 resources: TaskTemplateResources::default(),
+                autoscale: None,
                 restart_policy: None,
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
@@ -1486,6 +1693,7 @@ mod tests {
                 depends_on: Vec::new(),
                 replicas: 1,
                 resources: TaskTemplateResources::default(),
+                autoscale: None,
                 restart_policy: None,
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
@@ -1532,6 +1740,7 @@ mod tests {
                 depends_on: Vec::new(),
                 replicas: 1,
                 resources: TaskTemplateResources::default(),
+                autoscale: None,
                 restart_policy: None,
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
@@ -1588,6 +1797,7 @@ mod tests {
                 depends_on: Vec::new(),
                 replicas: 2,
                 resources: TaskTemplateResources::default(),
+                autoscale: None,
                 restart_policy: None,
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
@@ -1635,6 +1845,7 @@ mod tests {
                     depends_on: vec!["frontend".into()],
                     replicas: 1,
                     resources: TaskTemplateResources::default(),
+                    autoscale: None,
                     restart_policy: None,
                     termination_grace_period_secs: None,
                     pre_stop_command: None,
@@ -1656,6 +1867,7 @@ mod tests {
                     depends_on: vec!["backend".into()],
                     replicas: 1,
                     resources: TaskTemplateResources::default(),
+                    autoscale: None,
                     restart_policy: None,
                     termination_grace_period_secs: None,
                     pre_stop_command: None,

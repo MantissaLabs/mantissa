@@ -391,6 +391,7 @@ fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
                 memory_mb: STRESS_TASK_MEMORY_MB,
                 gpu_count: 0,
             },
+            autoscale: None,
             restart_policy: None,
             termination_grace_period_secs: None,
             pre_stop_command: None,

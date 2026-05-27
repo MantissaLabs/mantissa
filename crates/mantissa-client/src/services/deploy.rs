@@ -1,8 +1,9 @@
 use super::manifest::{
     EnvironmentVariable, LivenessKind, LivenessProbe, ReadinessKind, ReadinessProbe,
     RestartPolicyName, RolloutOrder, SecretFileProjection, SecretReference, ServiceManifest,
-    ServicePlacementPreference, ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskTemplateSpec,
-    VolumeMount,
+    ServicePlacementPreference, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
+    TaskTemplateAutoscaleMetric, TaskTemplateAutoscaleMetricKind, TaskTemplateAutoscalePolicy,
+    TaskTemplateSpec, VolumeMount,
 };
 use crate::config::ClientConfig;
 use crate::connection;
@@ -389,8 +390,46 @@ fn write_task_template(
         &template.volumes,
         resolved_volumes,
     )?;
+    if let Some(policy) = template.autoscale.as_ref() {
+        write_autoscale_policy(builder.reborrow().init_autoscale(), policy);
+    }
 
     Ok(())
+}
+
+/// Writes one autoscale policy into the service deployment payload.
+fn write_autoscale_policy(
+    mut builder: mantissa_protocol::services::autoscale_policy::Builder<'_>,
+    policy: &TaskTemplateAutoscalePolicy,
+) {
+    builder.set_min_replicas(policy.min_replicas);
+    builder.set_max_replicas(policy.max_replicas);
+    builder.set_cooldown_secs(policy.cooldown_secs);
+    builder.set_scale_down_stabilization_secs(policy.scale_down_stabilization_secs);
+    builder.set_sample_window_secs(policy.sample_window_secs);
+    builder.set_trigger_windows(policy.trigger_windows);
+
+    let mut metrics = builder.reborrow().init_metrics(policy.metrics.len() as u32);
+    for (idx, metric) in policy.metrics.iter().enumerate() {
+        write_autoscale_metric(metrics.reborrow().get(idx as u32), metric);
+    }
+}
+
+/// Writes one autoscale metric into the service deployment payload.
+fn write_autoscale_metric(
+    mut builder: mantissa_protocol::services::autoscale_metric::Builder<'_>,
+    metric: &TaskTemplateAutoscaleMetric,
+) {
+    let kind = match metric.kind {
+        TaskTemplateAutoscaleMetricKind::Cpu => {
+            mantissa_protocol::services::AutoscaleMetricKind::Cpu
+        }
+        TaskTemplateAutoscaleMetricKind::Memory => {
+            mantissa_protocol::services::AutoscaleMetricKind::Memory
+        }
+    };
+    builder.set_kind(kind);
+    builder.set_target_percent(metric.target_percent);
 }
 
 /// Writes one readiness probe into the service deployment payload.

@@ -21,6 +21,12 @@ interface Services {
 
   status @4 (serviceId :Data) -> (snapshot :ServiceStatusSnapshot);
   # Fetch one service and its task-template progress by deterministic UUID.
+
+  reportAutoscaleSignal @5 (signal :AutoscaleSignal) -> (
+    accepted :Bool,
+    detail :Text
+  );
+  # Internal owner-directed autoscale signal. This is not an operator API.
 }
 
 struct TaskTemplate {
@@ -92,6 +98,111 @@ struct TaskTemplate {
 
   ports @22 :List(Workload.PortBinding);
   # Node-local host port bindings for each replica of this template.
+
+  autoscale @23 :AutoscalePolicy;
+  # Optional horizontal autoscale policy. Empty means autoscaling is disabled.
+}
+
+struct AutoscalePolicy {
+  minReplicas @0 :UInt16;
+  # Lower desired replica bound for this template.
+
+  maxReplicas @1 :UInt16;
+  # Upper desired replica bound for this template.
+
+  cooldownSecs @2 :UInt64;
+  # Minimum seconds between accepted scale decisions.
+
+  scaleDownStabilizationSecs @3 :UInt64;
+  # Quiet period required before reducing desired replicas.
+
+  sampleWindowSecs @4 :UInt64;
+  # Local usage sample window in seconds.
+
+  triggerWindows @5 :UInt32;
+  # Consecutive hot sample windows required before sending a hot signal.
+
+  metrics @6 :List(AutoscaleMetric);
+  # Metric targets evaluated by the autoscale owner.
+}
+
+struct AutoscaleMetric {
+  kind @0 :AutoscaleMetricKind;
+  # Built-in metric source.
+
+  targetPercent @1 :UInt16;
+  # Target utilization percentage.
+}
+
+enum AutoscaleMetricKind {
+  cpu @0;
+  # CPU utilization against requested milli-cores.
+
+  memory @1;
+  # Memory utilization against requested bytes.
+}
+
+struct AutoscaleSignal {
+  serviceId @0 :Data;
+  # 16-byte service UUID.
+
+  serviceEpoch @1 :UInt64;
+  # Service generation observed by the signal sender.
+
+  templateName @2 :Text;
+  # Task template name inside the service.
+
+  nodeId @3 :Data;
+  # 16-byte node UUID that observed the local aggregate.
+
+  kind @4 :AutoscaleSignalKind;
+  # Signal cadence class.
+
+  reason @5 :AutoscaleSignalReason;
+  # Primary reason the signal was emitted.
+
+  runningReplicas @6 :UInt32;
+  # Local running replica count for the service/template.
+
+  readyReplicas @7 :UInt32;
+  # Local ready replica count for the service/template.
+
+  hotReplicas @8 :UInt32;
+  # Local replicas currently above a configured threshold.
+
+  cpuRequestedMillisTotal @9 :UInt64;
+  # Local requested CPU sum for the service/template.
+
+  cpuObservedMillisEwma @10 :UInt64;
+  # Smoothed local observed CPU milli-core usage.
+
+  memoryRequestedBytesTotal @11 :UInt64;
+  # Local requested memory sum for the service/template.
+
+  memoryObservedBytesEwma @12 :UInt64;
+  # Smoothed local observed memory usage.
+
+  observedAtUnixMs @13 :UInt64;
+  # Sender-side observation timestamp in milliseconds since the Unix epoch.
+}
+
+enum AutoscaleSignalKind {
+  hot @0;
+  # Threshold-triggered signal.
+
+  summary @1;
+  # Slow quiet summary used for conservative downscale.
+}
+
+enum AutoscaleSignalReason {
+  cpuHigh @0;
+  # CPU threshold crossed.
+
+  memoryHigh @1;
+  # Memory threshold crossed.
+
+  quiet @2;
+  # Slow summary with no hot local aggregate.
 }
 
 struct TaskTemplateNetwork {

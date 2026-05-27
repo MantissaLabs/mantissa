@@ -809,6 +809,7 @@ mod tests {
                 },
             },
             placement_preferences: vec![ServicePlacementPreference::ServiceAffinity],
+            autoscale: None,
             depends_on: Vec::new(),
             replicas,
             readiness: None,

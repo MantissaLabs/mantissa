@@ -45,6 +45,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
         public_port: None,
         public_protocol: None,
         placement_preferences: Vec::new(),
+        autoscale: None,
     }];
 
     let service_id = node

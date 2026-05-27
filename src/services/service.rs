@@ -8,8 +8,10 @@ use crate::services::types::{
     ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceReplicaAssignmentSegment,
     ServiceRescheduleLock, ServiceRescheduleReason, ServiceRollingUpdatePolicy,
     ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue, ServiceStatus,
-    ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskTemplateNetworkRequirement,
-    TaskTemplateSpecValue, compact_service_replica_assignment_segments,
+    ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskTemplateAutoscaleMetricKindValue,
+    TaskTemplateAutoscaleMetricValue, TaskTemplateAutoscalePolicyValue,
+    TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
+    compact_service_replica_assignment_segments,
 };
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
@@ -26,8 +28,8 @@ use crate::workload::capnp_codec::{
 use crate::workload::types::{ExecutionSpec, WorkloadAdmissionPolicy};
 use capnp::{Error, struct_list};
 use mantissa_protocol::services::{
-    replica_assignment_segment, service_event, service_spec, service_task_progress, services,
-    task_template,
+    autoscale_metric, autoscale_policy, replica_assignment_segment, service_event, service_spec,
+    service_task_progress, services, task_template,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::collections::HashSet;
@@ -190,6 +192,18 @@ impl services::Server for ServicesRPC {
         for (idx, progress) in task_progress.iter().enumerate() {
             write_service_task_progress(tasks.reborrow().get(idx as u32), progress);
         }
+        Ok(())
+    }
+
+    /// Accepts owner-directed autoscale control signals once the controller is implemented.
+    async fn report_autoscale_signal(
+        self: Rc<Self>,
+        _params: services::ReportAutoscaleSignalParams,
+        mut results: services::ReportAutoscaleSignalResults,
+    ) -> Result<(), Error> {
+        let mut result = results.get();
+        result.set_accepted(false);
+        result.set_detail("autoscale signal handling is not implemented yet");
         Ok(())
     }
 
@@ -858,6 +872,126 @@ fn placement_preference_to_proto(
     }
 }
 
+/// Decodes one autoscale metric target from the wire payload.
+fn read_autoscale_metric(
+    reader: autoscale_metric::Reader<'_>,
+) -> Result<TaskTemplateAutoscaleMetricValue, Error> {
+    let kind = match reader.get_kind()? {
+        mantissa_protocol::services::AutoscaleMetricKind::Cpu => {
+            TaskTemplateAutoscaleMetricKindValue::Cpu
+        }
+        mantissa_protocol::services::AutoscaleMetricKind::Memory => {
+            TaskTemplateAutoscaleMetricKindValue::Memory
+        }
+    };
+
+    Ok(TaskTemplateAutoscaleMetricValue {
+        kind,
+        target_percent: reader.get_target_percent(),
+    })
+}
+
+/// Decodes one task-template autoscale policy from the wire payload.
+fn read_autoscale_policy(
+    reader: autoscale_policy::Reader<'_>,
+    template_name: &str,
+    replicas: u16,
+    cpu_millis: u64,
+    memory_bytes: u64,
+) -> Result<TaskTemplateAutoscalePolicyValue, Error> {
+    let metrics_reader = reader.get_metrics()?;
+    let mut metrics = Vec::with_capacity(metrics_reader.len() as usize);
+    for metric in metrics_reader.iter() {
+        metrics.push(read_autoscale_metric(metric)?);
+    }
+
+    let policy = TaskTemplateAutoscalePolicyValue {
+        min_replicas: reader.get_min_replicas(),
+        max_replicas: reader.get_max_replicas(),
+        cooldown_secs: reader.get_cooldown_secs(),
+        scale_down_stabilization_secs: reader.get_scale_down_stabilization_secs(),
+        sample_window_secs: reader.get_sample_window_secs(),
+        trigger_windows: reader.get_trigger_windows(),
+        metrics,
+    };
+    validate_autoscale_policy(template_name, replicas, cpu_millis, memory_bytes, &policy)?;
+    Ok(policy)
+}
+
+/// Validates one decoded autoscale policy before storing it as service intent.
+fn validate_autoscale_policy(
+    template_name: &str,
+    replicas: u16,
+    cpu_millis: u64,
+    memory_bytes: u64,
+    policy: &TaskTemplateAutoscalePolicyValue,
+) -> Result<(), Error> {
+    if policy.metrics.is_empty() {
+        return Err(Error::failed(format!(
+            "template '{template_name}' autoscale.metrics must not be empty"
+        )));
+    }
+    if policy.min_replicas == 0 {
+        return Err(Error::failed(format!(
+            "template '{template_name}' autoscale.min_replicas must be at least 1"
+        )));
+    }
+    if policy.max_replicas < policy.min_replicas {
+        return Err(Error::failed(format!(
+            "template '{template_name}' autoscale.max_replicas must be >= min_replicas"
+        )));
+    }
+    if replicas < policy.min_replicas || replicas > policy.max_replicas {
+        return Err(Error::failed(format!(
+            "template '{template_name}' replicas must be within autoscale min_replicas..=max_replicas"
+        )));
+    }
+    if policy.cooldown_secs == 0 {
+        return Err(Error::failed(format!(
+            "template '{template_name}' autoscale.cooldown_secs must be greater than zero"
+        )));
+    }
+    if policy.scale_down_stabilization_secs < policy.cooldown_secs {
+        return Err(Error::failed(format!(
+            "template '{template_name}' autoscale.scale_down_stabilization_secs must be >= cooldown_secs"
+        )));
+    }
+    if policy.sample_window_secs == 0 {
+        return Err(Error::failed(format!(
+            "template '{template_name}' autoscale.sample_window_secs must be greater than zero"
+        )));
+    }
+    if policy.trigger_windows == 0 {
+        return Err(Error::failed(format!(
+            "template '{template_name}' autoscale.trigger_windows must be greater than zero"
+        )));
+    }
+
+    for metric in &policy.metrics {
+        if metric.target_percent == 0 || metric.target_percent > 1000 {
+            return Err(Error::failed(format!(
+                "template '{template_name}' autoscale metric target_percent must be in 1..=1000"
+            )));
+        }
+        match metric.kind {
+            TaskTemplateAutoscaleMetricKindValue::Cpu if cpu_millis == 0 => {
+                return Err(Error::failed(format!(
+                    "template '{template_name}' autoscale cpu metric requires cpu_millis"
+                )));
+            }
+            TaskTemplateAutoscaleMetricKindValue::Memory if memory_bytes == 0 => {
+                return Err(Error::failed(format!(
+                    "template '{template_name}' autoscale memory metric requires memory_bytes"
+                )));
+            }
+            TaskTemplateAutoscaleMetricKindValue::Cpu
+            | TaskTemplateAutoscaleMetricKindValue::Memory => {}
+        }
+    }
+
+    Ok(())
+}
+
 fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateSpecValue, Error> {
     let command_reader = reader.get_command()?;
     let mut command = Vec::with_capacity(command_reader.len() as usize);
@@ -962,15 +1096,30 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
         placement_preferences.push(placement_preference_from_proto(entry?));
     }
     let ports = decode_port_bindings(reader.get_ports()?)?;
+    let name = reader.get_name()?.to_str()?.to_string();
+    let replicas = reader.get_replicas();
+    let cpu_millis = reader.get_cpu_millis();
+    let memory_bytes = reader.get_memory_bytes();
+    let autoscale = if reader.has_autoscale() {
+        Some(read_autoscale_policy(
+            reader.get_autoscale()?,
+            &name,
+            replicas,
+            cpu_millis,
+            memory_bytes,
+        )?)
+    } else {
+        None
+    };
 
     Ok(TaskTemplateSpecValue {
-        name: reader.get_name()?.to_str()?.to_string(),
+        name,
         execution: ExecutionSpec {
             image: reader.get_image()?.to_str()?.to_string(),
             command,
             tty: reader.get_tty(),
-            cpu_millis: reader.get_cpu_millis(),
-            memory_bytes: reader.get_memory_bytes(),
+            cpu_millis,
+            memory_bytes,
             gpu_count: reader.get_gpu_count(),
             restart_policy,
             termination_grace_period_secs: match reader.get_termination_grace_period_secs() {
@@ -988,10 +1137,11 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
         },
         placement_preferences,
         depends_on,
-        replicas: reader.get_replicas(),
+        replicas,
         readiness,
         public_port,
         public_protocol,
+        autoscale,
     })
 }
 
@@ -1144,6 +1294,41 @@ fn read_reschedule_lock(
     ))
 }
 
+/// Encodes one autoscale metric target into the wire payload.
+fn write_autoscale_metric(
+    mut builder: autoscale_metric::Builder<'_>,
+    metric: &TaskTemplateAutoscaleMetricValue,
+) {
+    let kind = match metric.kind {
+        TaskTemplateAutoscaleMetricKindValue::Cpu => {
+            mantissa_protocol::services::AutoscaleMetricKind::Cpu
+        }
+        TaskTemplateAutoscaleMetricKindValue::Memory => {
+            mantissa_protocol::services::AutoscaleMetricKind::Memory
+        }
+    };
+    builder.set_kind(kind);
+    builder.set_target_percent(metric.target_percent);
+}
+
+/// Encodes one task-template autoscale policy into the wire payload.
+fn write_autoscale_policy(
+    mut builder: autoscale_policy::Builder<'_>,
+    policy: &TaskTemplateAutoscalePolicyValue,
+) {
+    builder.set_min_replicas(policy.min_replicas);
+    builder.set_max_replicas(policy.max_replicas);
+    builder.set_cooldown_secs(policy.cooldown_secs);
+    builder.set_scale_down_stabilization_secs(policy.scale_down_stabilization_secs);
+    builder.set_sample_window_secs(policy.sample_window_secs);
+    builder.set_trigger_windows(policy.trigger_windows);
+
+    let mut metrics = builder.reborrow().init_metrics(policy.metrics.len() as u32);
+    for (idx, metric) in policy.metrics.iter().enumerate() {
+        write_autoscale_metric(metrics.reborrow().get(idx as u32), metric);
+    }
+}
+
 fn write_task_template(
     mut builder: task_template::Builder<'_>,
     template: &TaskTemplateSpecValue,
@@ -1230,6 +1415,9 @@ fn write_task_template(
         .init_service_placement_preferences(template.placement_preferences().len() as u32);
     for (idx, preference) in template.placement_preferences().iter().enumerate() {
         placement_preferences.set(idx as u32, placement_preference_to_proto(*preference));
+    }
+    if let Some(policy) = template.autoscale.as_ref() {
+        write_autoscale_policy(builder.reborrow().init_autoscale(), policy);
     }
 
     Ok(())
@@ -1345,6 +1533,7 @@ mod tests {
                 public_port: Some(8080),
                 public_protocol: Some(ServicePortProtocol::Tcp),
                 placement_preferences: Vec::new(),
+                autoscale: None,
             }],
             vec![Uuid::new_v4(), Uuid::new_v4()],
         );
@@ -1390,6 +1579,7 @@ mod tests {
                 },
             },
             placement_preferences: vec![ServicePlacementPreference::ServiceAffinity],
+            autoscale: None,
             depends_on: Vec::new(),
             replicas: 1,
             readiness: None,
@@ -1519,6 +1709,7 @@ mod tests {
             public_port: Some(443),
             public_protocol: Some(ServicePortProtocol::TcpUdp),
             placement_preferences: Vec::new(),
+            autoscale: None,
         };
 
         let mut previous = ServiceSpecValue::new(
@@ -1554,6 +1745,7 @@ mod tests {
                 public_port: None,
                 public_protocol: None,
                 placement_preferences: Vec::new(),
+                autoscale: None,
             }],
             vec![Uuid::new_v4()],
         );

@@ -26,6 +26,7 @@ local_test!(services_redeploy_scales_replicas, {
         public_port: None,
         public_protocol: None,
         placement_preferences: Vec::new(),
+        autoscale: None,
     }];
 
     let service_id = node
@@ -148,6 +149,7 @@ local_test!(services_redeploy_updates_resources, {
         public_port: None,
         public_protocol: None,
         placement_preferences: Vec::new(),
+        autoscale: None,
     }];
 
     let service_id = node
@@ -280,6 +282,7 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
         public_port: None,
         public_protocol: None,
         placement_preferences: Vec::new(),
+        autoscale: None,
     }];
 
     let service_id = node
@@ -398,6 +401,7 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
         public_port: None,
         public_protocol: None,
         placement_preferences: Vec::new(),
+        autoscale: None,
     }];
 
     let service_id = node
@@ -490,6 +494,7 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
         public_port: None,
         public_protocol: None,
         placement_preferences: Vec::new(),
+        autoscale: None,
     }];
 
     let service_id = node
@@ -613,6 +618,7 @@ local_test!(
             public_port: None,
             public_protocol: None,
             placement_preferences: Vec::new(),
+            autoscale: None,
         }];
 
         let service_id = node
@@ -742,6 +748,7 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
         public_port: None,
         public_protocol: None,
         placement_preferences: Vec::new(),
+        autoscale: None,
     }];
 
     let service_id = node
@@ -845,6 +852,7 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
         public_port: None,
         public_protocol: None,
         placement_preferences: Vec::new(),
+        autoscale: None,
     }];
 
     let service_id = node
@@ -936,6 +944,7 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
         public_port: None,
         public_protocol: None,
         placement_preferences: Vec::new(),
+        autoscale: None,
     }];
 
     let service_id = node

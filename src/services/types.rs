@@ -622,6 +622,39 @@ pub struct TaskTemplateSpecValue {
     /// Service-only soft placement preferences for this task template.
     #[serde(default)]
     pub placement_preferences: Vec<ServicePlacementPreference>,
+    /// Optional horizontal autoscale policy evaluated by the service controller.
+    #[serde(default)]
+    pub autoscale: Option<TaskTemplateAutoscalePolicyValue>,
+}
+
+/// Horizontal autoscale policy attached to one service task template.
+///
+/// The policy is durable service intent. Runtime usage samples that feed this
+/// policy stay node-local or owner-directed soft state.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskTemplateAutoscalePolicyValue {
+    pub min_replicas: u16,
+    pub max_replicas: u16,
+    pub cooldown_secs: u64,
+    pub scale_down_stabilization_secs: u64,
+    pub sample_window_secs: u64,
+    pub trigger_windows: u32,
+    pub metrics: Vec<TaskTemplateAutoscaleMetricValue>,
+}
+
+/// One autoscale target used to convert observed usage into desired replicas.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskTemplateAutoscaleMetricValue {
+    pub kind: TaskTemplateAutoscaleMetricKindValue,
+    pub target_percent: u16,
+}
+
+/// Built-in autoscale metric sources supported by the first controller version.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskTemplateAutoscaleMetricKindValue {
+    Cpu,
+    Memory,
 }
 
 /// Supported transport protocols for publicly exposed service ports.
@@ -932,6 +965,7 @@ mod tests {
                 public_port: Some(443),
                 public_protocol: None,
                 placement_preferences: Vec::new(),
+                autoscale: None,
             }],
             Vec::new(),
         );

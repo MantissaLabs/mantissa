@@ -613,6 +613,7 @@ async fn upsert_catalog_service_with_public_port(
             public_port,
             public_protocol: None,
             placement_preferences: Vec::new(),
+            autoscale: None,
         }],
         replica_ids,
     );

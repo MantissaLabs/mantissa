@@ -2482,6 +2482,7 @@ mod tests {
                 public_port: Some(18080),
                 public_protocol: Some(ServicePortProtocol::TcpUdp),
                 placement_preferences: Vec::new(),
+                autoscale: None,
             }],
             Vec::new(),
         );

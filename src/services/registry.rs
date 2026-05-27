@@ -190,6 +190,7 @@ mod tests {
                 public_port: None,
                 public_protocol: None,
                 placement_preferences: Vec::new(),
+                autoscale: None,
             }],
             vec![Uuid::new_v4()],
         );
@@ -254,6 +255,7 @@ mod tests {
                 public_port: None,
                 public_protocol: None,
                 placement_preferences: Vec::new(),
+                autoscale: None,
             }],
             vec![Uuid::new_v4(), Uuid::new_v4()],
         );
@@ -354,6 +356,7 @@ mod tests {
             public_port: None,
             public_protocol: None,
             placement_preferences: Vec::new(),
+            autoscale: None,
         }];
 
         let mut value =
