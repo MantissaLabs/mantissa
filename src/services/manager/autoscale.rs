@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
+use mantissa_health::Status as HealthStatus;
 use uuid::Uuid;
 
 use crate::observability::metrics;
@@ -109,6 +110,15 @@ impl AutoscaleSignalKey {
     }
 }
 
+/// Returns true when two signal keys describe the same node's view of one template.
+fn same_autoscale_signal_source(left: &AutoscaleSignalKey, right: &AutoscaleSignalKey) -> bool {
+    left.service_id == right.service_id
+        && left.service_epoch == right.service_epoch
+        && left.service_phase_version == right.service_phase_version
+        && left.template_name == right.template_name
+        && left.node_id == right.node_id
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct AutoscaleDecisionKey {
     service_id: Uuid,
@@ -179,8 +189,16 @@ impl AutoscaleSignalStore {
     /// Records the latest signal for one service/template/node/kind tuple.
     fn record(&mut self, signal: ServiceAutoscaleSignal, now: Instant) {
         self.prune(now);
+        let key = AutoscaleSignalKey::from_signal(&signal);
+        if self.signals.iter().any(|(existing, (current, _))| {
+            same_autoscale_signal_source(existing, &key)
+                && current.observed_at_unix_ms > signal.observed_at_unix_ms
+        }) {
+            return;
+        }
         self.signals
-            .insert(AutoscaleSignalKey::from_signal(&signal), (signal, now));
+            .retain(|existing, _| !same_autoscale_signal_source(existing, &key));
+        self.signals.insert(key, (signal, now));
     }
 
     /// Removes expired soft-state signals from the owner-side cache.
@@ -446,17 +464,18 @@ fn quiet_signals_cover_replicas(signals: &[ServiceAutoscaleSignal], desired_repl
         return false;
     }
 
-    let mut running_replicas = 0u32;
+    let mut ready_replicas = 0u32;
     for signal in signals {
         if signal.kind != ServiceAutoscaleSignalKind::Summary
             || signal.reason != ServiceAutoscaleSignalReason::Quiet
             || signal.hot_replicas != 0
+            || signal.ready_replicas > signal.running_replicas
         {
             return false;
         }
-        running_replicas = running_replicas.saturating_add(signal.running_replicas);
+        ready_replicas = ready_replicas.saturating_add(signal.ready_replicas);
     }
-    running_replicas >= u32::from(desired_replicas)
+    ready_replicas >= u32::from(desired_replicas)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -854,6 +873,93 @@ fn usage_exceeds_target(observed: u64, requested: u64, target_percent: u16) -> b
             > u128::from(requested).saturating_mul(u128::from(target_percent))
 }
 
+/// Validates one owner-side signal against the current template policy before caching it.
+fn validate_autoscale_signal(
+    signal: &ServiceAutoscaleSignal,
+    desired_replicas: u16,
+    policy: &TaskTemplateAutoscalePolicyValue,
+) -> Result<(), &'static str> {
+    if signal.running_replicas == 0 {
+        return Err("signal has no running replicas");
+    }
+    if signal.running_replicas > u32::from(desired_replicas) {
+        return Err("signal running replicas exceed template replicas");
+    }
+    if signal.ready_replicas > signal.running_replicas {
+        return Err("signal ready replicas exceed running replicas");
+    }
+    if signal.hot_replicas > signal.running_replicas {
+        return Err("signal hot replicas exceed running replicas");
+    }
+
+    match signal.kind {
+        ServiceAutoscaleSignalKind::Hot => validate_hot_autoscale_signal(signal, policy),
+        ServiceAutoscaleSignalKind::Summary => {
+            if signal.reason != ServiceAutoscaleSignalReason::Quiet {
+                return Err("summary signal must be quiet");
+            }
+            if signal.hot_replicas != 0 {
+                return Err("summary signal reports hot replicas");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Validates hot-signal specific fields against the autoscale policy metrics.
+fn validate_hot_autoscale_signal(
+    signal: &ServiceAutoscaleSignal,
+    policy: &TaskTemplateAutoscalePolicyValue,
+) -> Result<(), &'static str> {
+    if signal.hot_replicas == 0 {
+        return Err("hot signal has no hot replicas");
+    }
+
+    match signal.reason {
+        ServiceAutoscaleSignalReason::CpuHigh => {
+            if policy_target_percent(policy, TaskTemplateAutoscaleMetricKindValue::Cpu).is_none() {
+                return Err("hot CPU signal is not enabled by policy");
+            }
+            if signal.cpu_requested_millis_total == 0 {
+                return Err("hot CPU signal is missing requested CPU");
+            }
+        }
+        ServiceAutoscaleSignalReason::MemoryHigh => {
+            if policy_target_percent(policy, TaskTemplateAutoscaleMetricKindValue::Memory).is_none()
+            {
+                return Err("hot memory signal is not enabled by policy");
+            }
+            if signal.memory_requested_bytes_total == 0 {
+                return Err("hot memory signal is missing requested memory");
+            }
+        }
+        ServiceAutoscaleSignalReason::Quiet => {
+            return Err("hot signal must report a hot metric");
+        }
+    }
+
+    Ok(())
+}
+
+/// Builds the live sender set for owner-directed autoscale signals.
+fn live_autoscale_signal_node_set(
+    local_node_id: Uuid,
+    known_peers: impl IntoIterator<Item = Uuid>,
+    health_snapshot: &HashMap<Uuid, HealthStatus>,
+) -> HashSet<Uuid> {
+    let mut nodes: HashSet<Uuid> = known_peers
+        .into_iter()
+        .filter(|peer_id| !matches!(health_snapshot.get(peer_id), Some(HealthStatus::Down)))
+        .collect();
+    if !matches!(
+        health_snapshot.get(&local_node_id),
+        Some(HealthStatus::Down)
+    ) {
+        nodes.insert(local_node_id);
+    }
+    nodes
+}
+
 /// Builds the next deploying service generation for accepted autoscale decisions.
 fn build_autoscale_pending_spec(
     current: &ServiceSpecValue,
@@ -1194,13 +1300,16 @@ impl ServiceController {
         else {
             return rejected_signal_report(kind, "template not found");
         };
-        if template.autoscale.is_none() {
+        let Some(policy) = template.autoscale.as_ref() else {
             return rejected_signal_report(kind, "template autoscale disabled");
+        };
+        if let Err(detail) = validate_autoscale_signal(&signal, template.replicas, policy) {
+            return rejected_signal_report(kind, detail);
         }
 
-        let known_nodes = self.known_autoscale_signal_nodes();
-        if !known_nodes.contains(&signal.node_id) {
-            return rejected_signal_report(kind, "signal node is unknown");
+        let live_nodes = self.live_autoscale_signal_nodes();
+        if !live_nodes.contains(&signal.node_id) {
+            return rejected_signal_report(kind, "signal node is not live");
         }
 
         let eligible_nodes = self.collect_eligible_nodes();
@@ -1269,16 +1378,14 @@ impl ServiceController {
         })
     }
 
-    /// Returns nodes allowed to send local autoscale observations to this controller.
-    fn known_autoscale_signal_nodes(&self) -> HashSet<Uuid> {
-        let mut nodes: HashSet<Uuid> = self
-            .cluster_registry
-            .known_peers()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        nodes.insert(self.local_node_id);
-        nodes
+    /// Returns live nodes allowed to send local autoscale observations to this controller.
+    fn live_autoscale_signal_nodes(&self) -> HashSet<Uuid> {
+        let health_snapshot = self.health_monitor.snapshot();
+        live_autoscale_signal_node_set(
+            self.local_node_id,
+            self.cluster_registry.known_peers().unwrap_or_default(),
+            &health_snapshot,
+        )
     }
 }
 
@@ -1304,6 +1411,78 @@ mod tests {
         );
 
         assert_eq!(store.len_after_prune(now + Duration::from_secs(11)), 1);
+    }
+
+    /// A node's latest signal should replace its previous hot/quiet state.
+    #[test]
+    fn autoscale_signal_store_keeps_latest_signal_per_node() {
+        let now = Instant::now();
+        let spec = test_service_spec(3);
+        let node_id = Uuid::new_v4();
+        let mut hot = test_hot_signal(&spec);
+        hot.node_id = node_id;
+        let mut quiet = test_quiet_signal(&spec, 3);
+        quiet.node_id = node_id;
+        let mut store = AutoscaleSignalStore::default();
+
+        store.record(hot, now);
+        store.record(quiet, now + Duration::from_secs(1));
+
+        let signals = current_template_signals(
+            &store.signals,
+            spec.id,
+            spec.service_epoch,
+            spec.phase_version,
+            "api",
+        );
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].kind, ServiceAutoscaleSignalKind::Summary);
+        assert!(
+            store
+                .decisions_for_service(&spec, now + Duration::from_secs(1))
+                .is_empty()
+        );
+        assert_eq!(
+            store.decisions_for_service(&spec, now + Duration::from_secs(61)),
+            vec![AutoscaleScaleDecision {
+                service_id: spec.id,
+                service_epoch: spec.service_epoch,
+                observed_phase_version: spec.phase_version,
+                template_name: "api".to_string(),
+                policy: test_policy(),
+                current_replicas: 3,
+                desired_replicas: 2,
+                direction: AutoscaleScaleDirection::Down,
+            }]
+        );
+    }
+
+    /// Older observations that arrive late must not replace newer same-node signals.
+    #[test]
+    fn autoscale_signal_store_ignores_late_older_same_node_signal() {
+        let now = Instant::now();
+        let spec = test_service_spec(3);
+        let node_id = Uuid::new_v4();
+        let mut quiet = test_quiet_signal(&spec, 3);
+        quiet.node_id = node_id;
+        quiet.observed_at_unix_ms = 2_000;
+        let mut hot = test_hot_signal(&spec);
+        hot.node_id = node_id;
+        hot.observed_at_unix_ms = 1_000;
+        let mut store = AutoscaleSignalStore::default();
+
+        store.record(quiet, now);
+        store.record(hot, now + Duration::from_secs(1));
+
+        let signals = current_template_signals(
+            &store.signals,
+            spec.id,
+            spec.service_epoch,
+            spec.phase_version,
+            "api",
+        );
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].kind, ServiceAutoscaleSignalKind::Summary);
     }
 
     /// Hot owner signals should produce one bounded scale-up decision.
@@ -1395,6 +1574,48 @@ mod tests {
 
         assert_eq!(
             decisions,
+            vec![AutoscaleScaleDecision {
+                service_id: spec.id,
+                service_epoch: spec.service_epoch,
+                observed_phase_version: spec.phase_version,
+                template_name: "api".to_string(),
+                policy: test_policy(),
+                current_replicas: 3,
+                desired_replicas: 2,
+                direction: AutoscaleScaleDirection::Down,
+            }]
+        );
+    }
+
+    /// Quiet summaries should only cover replicas that the sender reports ready.
+    #[test]
+    fn autoscale_signal_store_scales_down_from_ready_quiet_coverage() {
+        let now = Instant::now();
+        let spec = test_service_spec(3);
+        let node_id = Uuid::new_v4();
+        let mut quiet = test_quiet_signal(&spec, 3);
+        quiet.node_id = node_id;
+        quiet.ready_replicas = 2;
+        let mut store = AutoscaleSignalStore::default();
+        store.record(quiet, now);
+
+        assert!(
+            store
+                .decisions_for_service(&spec, now + Duration::from_secs(60))
+                .is_empty()
+        );
+
+        let mut quiet = test_quiet_signal(&spec, 3);
+        quiet.node_id = node_id;
+        quiet.ready_replicas = 3;
+        store.record(quiet, now + Duration::from_secs(61));
+        assert!(
+            store
+                .decisions_for_service(&spec, now + Duration::from_secs(61))
+                .is_empty()
+        );
+        assert_eq!(
+            store.decisions_for_service(&spec, now + Duration::from_secs(121)),
             vec![AutoscaleScaleDecision {
                 service_id: spec.id,
                 service_epoch: spec.service_epoch,
@@ -1584,6 +1805,65 @@ mod tests {
         assert_eq!(policy.service_epoch, spec.service_epoch);
         assert_eq!(policy.service_phase_version, spec.phase_version);
         assert_eq!(policy.policy, test_policy());
+    }
+
+    /// Owner-side validation should reject malformed or policy-incompatible signals.
+    #[test]
+    fn autoscale_signal_validation_rejects_malformed_signals() {
+        let spec = test_service_spec(2);
+        let policy = spec.task_templates[0]
+            .autoscale
+            .as_ref()
+            .expect("autoscale policy");
+        assert!(validate_autoscale_signal(&test_hot_signal(&spec), 2, policy).is_ok());
+        assert!(validate_autoscale_signal(&test_quiet_signal(&spec, 2), 2, policy).is_ok());
+
+        let mut hot_without_running = test_hot_signal(&spec);
+        hot_without_running.running_replicas = 0;
+        assert_eq!(
+            validate_autoscale_signal(&hot_without_running, 2, policy),
+            Err("signal has no running replicas")
+        );
+
+        let mut hot_with_bad_count = test_hot_signal(&spec);
+        hot_with_bad_count.hot_replicas = 3;
+        assert_eq!(
+            validate_autoscale_signal(&hot_with_bad_count, 2, policy),
+            Err("signal hot replicas exceed running replicas")
+        );
+
+        let mut summary_with_bad_reason = test_quiet_signal(&spec, 2);
+        summary_with_bad_reason.reason = ServiceAutoscaleSignalReason::CpuHigh;
+        assert_eq!(
+            validate_autoscale_signal(&summary_with_bad_reason, 2, policy),
+            Err("summary signal must be quiet")
+        );
+
+        let mut memory_policy = test_policy();
+        memory_policy.metrics[0].kind = TaskTemplateAutoscaleMetricKindValue::Memory;
+        assert_eq!(
+            validate_autoscale_signal(&test_hot_signal(&spec), 2, &memory_policy),
+            Err("hot CPU signal is not enabled by policy")
+        );
+    }
+
+    /// Autoscale signal senders should exclude members currently marked down.
+    #[test]
+    fn autoscale_signal_live_nodes_exclude_down_members() {
+        let local = Uuid::from_bytes([1u8; 16]);
+        let down_peer = Uuid::from_bytes([2u8; 16]);
+        let live_peer = Uuid::from_bytes([3u8; 16]);
+        let health = HashMap::from([
+            (local, HealthStatus::Alive),
+            (down_peer, HealthStatus::Down),
+            (live_peer, HealthStatus::Alive),
+        ]);
+
+        let nodes = live_autoscale_signal_node_set(local, [down_peer, live_peer], &health);
+
+        assert!(nodes.contains(&local));
+        assert!(nodes.contains(&live_peer));
+        assert!(!nodes.contains(&down_peer));
     }
 
     /// Autoscale thresholds should require usage above the target, not equal to it.
