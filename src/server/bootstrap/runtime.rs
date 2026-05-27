@@ -345,6 +345,7 @@ struct TopologyBuildInputs<'a> {
 /// Options consumed only while spawning long-running runtime tasks.
 struct RuntimeTaskOptions {
     signing_key: ed25519_dalek::SigningKey,
+    local_node_id: uuid::Uuid,
     gossip_fanout: usize,
     store_gc_config: Option<config::RuntimeStoreGcConfig>,
 }
@@ -372,6 +373,7 @@ pub async fn boot(
         gossip_dedupe,
         RuntimeTaskOptions {
             signing_key: ctx.signing_key.clone(),
+            local_node_id: ctx.self_id,
             gossip_fanout: options.gossip_fanout,
             store_gc_config: options.store_gc_config.clone(),
         },
@@ -1100,6 +1102,7 @@ async fn spawn_runtime_tasks(
 ) -> RuntimeTaskHandles {
     let RuntimeTaskOptions {
         signing_key,
+        local_node_id,
         gossip_fanout,
         store_gc_config,
     } = options;
@@ -1206,6 +1209,7 @@ async fn spawn_runtime_tasks(
         progress: components.sync_gc_progress.clone(),
         cluster_view: components.cluster_view.clone(),
         root_schema: components.root_schema,
+        local_node_id,
         secrets: stores.secrets.clone(),
         secret_master_keys: stores.secret_master_keys.clone(),
         config: store_gc_config.unwrap_or_else(config::store_gc_runtime_config),

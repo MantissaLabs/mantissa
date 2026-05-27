@@ -16,7 +16,7 @@ use crate::store::replicated::secrets::SecretStore;
 use crate::sync::{SyncGcProgress, SyncStores};
 use mantissa_protocol::sync::Domain;
 use mantissa_store::gc::{GcBarrier, StoreGcReport};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
@@ -30,6 +30,7 @@ pub struct StoreGcRunner {
     progress: SyncGcProgress,
     cluster_view: ClusterViewState,
     root_schema: RootSchemaState,
+    local_node_id: uuid::Uuid,
     secrets: SecretStore,
     secret_master_keys: SecretMasterKeyStore,
     config: RuntimeStoreGcConfig,
@@ -42,6 +43,7 @@ pub struct StoreGcRunnerInputs {
     pub progress: SyncGcProgress,
     pub cluster_view: ClusterViewState,
     pub root_schema: RootSchemaState,
+    pub local_node_id: uuid::Uuid,
     pub secrets: SecretStore,
     pub secret_master_keys: SecretMasterKeyStore,
     pub config: RuntimeStoreGcConfig,
@@ -56,6 +58,7 @@ impl StoreGcRunner {
             progress: inputs.progress,
             cluster_view: inputs.cluster_view,
             root_schema: inputs.root_schema,
+            local_node_id: inputs.local_node_id,
             secrets: inputs.secrets,
             secret_master_keys: inputs.secret_master_keys,
             config: inputs.config,
@@ -169,32 +172,47 @@ impl StoreGcRunner {
             pass_failed |= self.compact_domain_registers_with_trace(entry).await;
         }
         if let Some(active_remote_peers) = &active_remote_peers {
-            match prune_unreferenced_secret_master_key_rows(
-                &self.secrets,
-                &self.secret_master_keys,
-                &self.progress,
-                active_remote_peers,
+            let owner = select_secret_master_key_gc_owner(
                 cluster_view,
-                root_schema_version,
-                now_unix_ms,
-            )
-            .await
-            {
-                Ok(pruned) if pruned > 0 => {
-                    debug!(
-                        target: "store.gc",
-                        pruned,
-                        "pruned unreferenced secret master-key rows"
-                    );
+                self.local_node_id,
+                active_remote_peers,
+            );
+            if owner == Some(self.local_node_id) {
+                match prune_unreferenced_secret_master_key_rows(
+                    &self.secrets,
+                    &self.secret_master_keys,
+                    &self.progress,
+                    active_remote_peers,
+                    cluster_view,
+                    root_schema_version,
+                    now_unix_ms,
+                )
+                .await
+                {
+                    Ok(pruned) if pruned > 0 => {
+                        debug!(
+                            target: "store.gc",
+                            pruned,
+                            "pruned unreferenced secret master-key rows"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        pass_failed = true;
+                        error!(
+                            target: "store.gc",
+                            "secret master-key semantic GC failed: {error}"
+                        );
+                    }
                 }
-                Ok(_) => {}
-                Err(error) => {
-                    pass_failed = true;
-                    error!(
-                        target: "store.gc",
-                        "secret master-key semantic GC failed: {error}"
-                    );
-                }
+            } else if let Some(owner) = owner {
+                trace!(
+                    target: "store.gc",
+                    owner = %owner,
+                    local_node = %self.local_node_id,
+                    %cluster_view,
+                    "skipping secret master-key semantic GC on non-owner"
+                );
             }
         }
         crate::observability::metrics::set_store_gc_last_duration(started_at.elapsed());
@@ -264,6 +282,44 @@ impl StoreGcRunner {
             "store GC pass completed"
         );
     }
+}
+
+/// Selects the single node allowed to author semantic master-key GC for a view.
+fn select_secret_master_key_gc_owner(
+    cluster_view: crate::cluster::ClusterViewId,
+    local_node_id: uuid::Uuid,
+    active_remote_peers: &[uuid::Uuid],
+) -> Option<uuid::Uuid> {
+    let mut candidates = BTreeSet::new();
+    candidates.insert(local_node_id);
+    candidates.extend(active_remote_peers.iter().copied());
+
+    let mut best: Option<(uuid::Uuid, u128)> = None;
+    for node_id in candidates {
+        let score = secret_master_key_gc_owner_score(cluster_view, node_id);
+        match best {
+            None => best = Some((node_id, score)),
+            Some((_, best_score)) if score > best_score => best = Some((node_id, score)),
+            _ => {}
+        }
+    }
+    best.map(|(node_id, _)| node_id)
+}
+
+/// Computes the rendezvous score for semantic master-key GC ownership.
+fn secret_master_key_gc_owner_score(
+    cluster_view: crate::cluster::ClusterViewId,
+    node_id: uuid::Uuid,
+) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"secret-master-key-gc");
+    hasher.update(cluster_view.cluster_id.as_bytes());
+    hasher.update(&cluster_view.epoch.to_le_bytes());
+    hasher.update(node_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    u128::from_le_bytes(bytes)
 }
 
 /// Tombstones secret-master-key rows that no converged secret or active current uses.
@@ -432,6 +488,42 @@ mod tests {
             generation,
         );
         SecretValue::new(name, SecretMetadata::default(), "now", version)
+    }
+
+    #[test]
+    fn semantic_master_key_gc_owner_is_order_independent() {
+        let active_view = ClusterViewId::new(ClusterId::from_uuid(uuid::Uuid::from_u128(100)), 3);
+        let local = uuid::Uuid::from_u128(1);
+        let peer_a = uuid::Uuid::from_u128(2);
+        let peer_b = uuid::Uuid::from_u128(3);
+
+        let first = select_secret_master_key_gc_owner(active_view, local, &[peer_a, peer_b]);
+        let second = select_secret_master_key_gc_owner(active_view, local, &[peer_b, peer_a]);
+
+        assert_eq!(first, second);
+        assert!(matches!(first, Some(owner) if [local, peer_a, peer_b].contains(&owner)));
+    }
+
+    #[test]
+    fn semantic_master_key_gc_owner_moves_when_owner_is_not_active() {
+        let active_view = ClusterViewId::new(ClusterId::from_uuid(uuid::Uuid::from_u128(100)), 3);
+        let nodes = [
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(2),
+            uuid::Uuid::from_u128(3),
+        ];
+        let owner = select_secret_master_key_gc_owner(active_view, nodes[0], &nodes[1..])
+            .expect("owner selected");
+        let remaining = nodes
+            .into_iter()
+            .filter(|node_id| *node_id != owner)
+            .collect::<Vec<_>>();
+
+        let next = select_secret_master_key_gc_owner(active_view, remaining[0], &remaining[1..])
+            .expect("replacement owner selected");
+
+        assert_ne!(next, owner);
+        assert!(remaining.contains(&next));
     }
 
     /// Builds one encrypted grant row for the provided master-key descriptor.
