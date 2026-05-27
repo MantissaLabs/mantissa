@@ -2576,7 +2576,6 @@ impl WorkloadManager {
             replicas.push(LocalServiceRuntimeReplica {
                 service_id: compute_service_id(&owner.service_name),
                 service_name: owner.service_name.clone(),
-                service_epoch: owner.service_epoch,
                 template_name: owner.template.clone(),
                 task_id: value.id,
                 runtime,

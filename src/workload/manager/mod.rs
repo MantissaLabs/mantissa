@@ -540,7 +540,6 @@ pub enum WorkloadTrafficPublicationUpdate {
 pub(crate) struct LocalServiceRuntimeReplica {
     pub service_id: Uuid,
     pub service_name: String,
-    pub service_epoch: u64,
     pub template_name: String,
     pub task_id: Uuid,
     pub runtime: RuntimeInstanceRef,

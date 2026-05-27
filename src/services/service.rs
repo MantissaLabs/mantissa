@@ -1021,6 +1021,7 @@ fn read_autoscale_signal(
     Ok(ServiceAutoscaleSignal {
         service_id: read_uuid(reader.get_service_id()?)?,
         service_epoch: reader.get_service_epoch(),
+        service_phase_version: reader.get_service_phase_version(),
         template_name: reader.get_template_name()?.to_str()?.to_string(),
         node_id: read_uuid(reader.get_node_id()?)?,
         kind,
@@ -1380,6 +1381,7 @@ pub(crate) fn write_autoscale_signal(
 ) {
     builder.set_service_id(signal.service_id.as_bytes());
     builder.set_service_epoch(signal.service_epoch);
+    builder.set_service_phase_version(signal.service_phase_version);
     builder.set_template_name(&signal.template_name);
     builder.set_node_id(signal.node_id.as_bytes());
     let kind = match signal.kind {

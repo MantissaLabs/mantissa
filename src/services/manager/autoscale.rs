@@ -30,6 +30,7 @@ const AUTOSCALE_LOCAL_SAMPLE_TTL_SECS: u64 = 10 * 60;
 pub(crate) struct ServiceAutoscaleSignal {
     pub service_id: Uuid,
     pub service_epoch: u64,
+    pub service_phase_version: u64,
     pub template_name: String,
     pub node_id: Uuid,
     pub kind: ServiceAutoscaleSignalKind,
@@ -88,6 +89,7 @@ impl ServiceAutoscaleSignalReport {
 struct AutoscaleSignalKey {
     service_id: Uuid,
     service_epoch: u64,
+    service_phase_version: u64,
     template_name: String,
     node_id: Uuid,
     kind: ServiceAutoscaleSignalKind,
@@ -99,6 +101,7 @@ impl AutoscaleSignalKey {
         Self {
             service_id: signal.service_id,
             service_epoch: signal.service_epoch,
+            service_phase_version: signal.service_phase_version,
             template_name: signal.template_name.clone(),
             node_id: signal.node_id,
             kind: signal.kind,
@@ -125,6 +128,7 @@ impl AutoscaleDecisionKey {
 #[derive(Clone, Debug, Default)]
 struct AutoscaleDecisionState {
     service_epoch: u64,
+    service_phase_version: u64,
     last_scale_at: Option<Instant>,
     quiet_since: Option<Instant>,
 }
@@ -201,6 +205,10 @@ impl AutoscaleSignalStore {
             let state = self.decisions.entry(key).or_default();
             if state.service_epoch != spec.service_epoch {
                 state.service_epoch = spec.service_epoch;
+                state.service_phase_version = spec.phase_version;
+                state.quiet_since = None;
+            } else if state.service_phase_version != spec.phase_version {
+                state.service_phase_version = spec.phase_version;
                 state.quiet_since = None;
             }
             if !interval_elapsed(
@@ -215,6 +223,7 @@ impl AutoscaleSignalStore {
                 &self.signals,
                 spec.id,
                 spec.service_epoch,
+                spec.phase_version,
                 &template.name,
             );
             if let Some(decision) =
@@ -248,6 +257,7 @@ impl AutoscaleSignalStore {
                 AutoscaleDecisionKey::new(decision.service_id, decision.template_name.clone());
             let state = self.decisions.entry(key).or_default();
             state.service_epoch = decision.service_epoch;
+            state.service_phase_version = decision.observed_phase_version;
             state.last_scale_at = Some(now);
             state.quiet_since = None;
             self.clear_template_signals(
@@ -285,6 +295,7 @@ fn current_template_signals(
     signals: &HashMap<AutoscaleSignalKey, (ServiceAutoscaleSignal, Instant)>,
     service_id: Uuid,
     service_epoch: u64,
+    service_phase_version: u64,
     template_name: &str,
 ) -> Vec<ServiceAutoscaleSignal> {
     signals
@@ -292,6 +303,7 @@ fn current_template_signals(
         .filter(|(key, _)| {
             key.service_id == service_id
                 && key.service_epoch == service_epoch
+                && key.service_phase_version == service_phase_version
                 && key.template_name == template_name
         })
         .map(|(_, (signal, _))| signal.clone())
@@ -472,15 +484,22 @@ impl AutoscaleRuntimeSampleKey {
 struct AutoscaleGroupKey {
     service_id: Uuid,
     service_epoch: u64,
+    service_phase_version: u64,
     template_name: String,
 }
 
 impl AutoscaleGroupKey {
     /// Builds the local aggregate key for one service/template generation.
-    fn new(service_id: Uuid, service_epoch: u64, template_name: impl Into<String>) -> Self {
+    fn new(
+        service_id: Uuid,
+        service_epoch: u64,
+        service_phase_version: u64,
+        template_name: impl Into<String>,
+    ) -> Self {
         Self {
             service_id,
             service_epoch,
+            service_phase_version,
             template_name: template_name.into(),
         }
     }
@@ -515,6 +534,7 @@ struct AutoscaleSignalAccumulator {
 #[derive(Clone, Debug)]
 struct AutoscaleSamplePolicy {
     service_epoch: u64,
+    service_phase_version: u64,
     policy: TaskTemplateAutoscalePolicyValue,
 }
 
@@ -523,11 +543,17 @@ impl AutoscaleSignalAccumulator {
     fn new(
         service_id: Uuid,
         service_epoch: u64,
+        service_phase_version: u64,
         template_name: String,
         policy: TaskTemplateAutoscalePolicyValue,
     ) -> Self {
         Self {
-            key: AutoscaleGroupKey::new(service_id, service_epoch, template_name),
+            key: AutoscaleGroupKey::new(
+                service_id,
+                service_epoch,
+                service_phase_version,
+                template_name,
+            ),
             policy,
             running_replicas: 0,
             hot_replicas: 0,
@@ -746,6 +772,7 @@ impl AutoscaleLocalSampleStore {
         let key = AutoscaleGroupKey::new(
             signal.service_id,
             signal.service_epoch,
+            signal.service_phase_version,
             signal.template_name.clone(),
         );
         let Some(state) = self.group_states.get_mut(&key) else {
@@ -776,6 +803,7 @@ fn build_signal(
     ServiceAutoscaleSignal {
         service_id: accumulator.key.service_id,
         service_epoch: accumulator.key.service_epoch,
+        service_phase_version: accumulator.key.service_phase_version,
         template_name: accumulator.key.template_name.clone(),
         node_id: local_node_id,
         kind,
@@ -885,8 +913,7 @@ fn autoscale_policy_for_replica(
     if spec.status() != ServiceStatus::Running || spec.service_name != replica.service_name {
         return None;
     }
-    if replica.service_epoch != spec.service_epoch && !spec.has_assigned_replica_id(replica.task_id)
-    {
+    if !spec.has_assigned_replica_id(replica.task_id) {
         return None;
     }
 
@@ -897,6 +924,7 @@ fn autoscale_policy_for_replica(
         .and_then(|template| template.autoscale.clone())?;
     Some(AutoscaleSamplePolicy {
         service_epoch: spec.service_epoch,
+        service_phase_version: spec.phase_version,
         policy,
     })
 }
@@ -978,12 +1006,14 @@ impl ServiceController {
                 let key = AutoscaleGroupKey::new(
                     sample.replica.service_id,
                     active_policy.service_epoch,
+                    active_policy.service_phase_version,
                     sample.replica.template_name.clone(),
                 );
                 let accumulator = accumulators.entry(key).or_insert_with(|| {
                     AutoscaleSignalAccumulator::new(
                         sample.replica.service_id,
                         active_policy.service_epoch,
+                        active_policy.service_phase_version,
                         sample.replica.template_name.clone(),
                         active_policy.policy,
                     )
@@ -1153,6 +1183,9 @@ impl ServiceController {
         }
         if signal.service_epoch != spec.service_epoch {
             return rejected_signal_report(kind, "stale service epoch");
+        }
+        if signal.service_phase_version != spec.phase_version {
+            return rejected_signal_report(kind, "stale service phase");
         }
         let Some(template) = spec
             .task_templates
@@ -1375,6 +1408,59 @@ mod tests {
         );
     }
 
+    /// Quiet stabilization should restart when same-generation phase metadata changes.
+    #[test]
+    fn autoscale_signal_store_resets_quiet_window_on_phase_change() {
+        let now = Instant::now();
+        let spec = test_service_spec(3);
+        let mut store = AutoscaleSignalStore::default();
+        store.record(test_quiet_signal(&spec, 3), now);
+
+        assert!(store.decisions_for_service(&spec, now).is_empty());
+        let mut changed_phase = spec.clone();
+        changed_phase.set_status_detail(Some("slot replaced".to_string()));
+        store.record(
+            test_quiet_signal(&changed_phase, 3),
+            now + Duration::from_secs(60),
+        );
+
+        assert!(
+            store
+                .decisions_for_service(&changed_phase, now + Duration::from_secs(60))
+                .is_empty()
+        );
+        assert_eq!(
+            store.decisions_for_service(&changed_phase, now + Duration::from_secs(120)),
+            vec![AutoscaleScaleDecision {
+                service_id: changed_phase.id,
+                service_epoch: changed_phase.service_epoch,
+                observed_phase_version: changed_phase.phase_version,
+                template_name: "api".to_string(),
+                policy: test_policy(),
+                current_replicas: 3,
+                desired_replicas: 2,
+                direction: AutoscaleScaleDirection::Down,
+            }]
+        );
+    }
+
+    /// Owner-side signal reads should ignore stale same-generation phase signals.
+    #[test]
+    fn autoscale_signal_store_ignores_stale_phase_signals() {
+        let now = Instant::now();
+        let spec = test_service_spec(2);
+        let mut changed_phase = spec.clone();
+        changed_phase.set_status_detail(Some("slot replaced".to_string()));
+        let mut store = AutoscaleSignalStore::default();
+        store.record(test_hot_signal(&spec), now);
+
+        assert!(
+            store
+                .decisions_for_service(&changed_phase, now + Duration::from_secs(1))
+                .is_empty()
+        );
+    }
+
     /// Refreshed quiet summaries should keep coverage alive across stabilization windows over TTL.
     #[test]
     fn autoscale_signal_store_scales_down_with_refreshed_long_stabilization_summary() {
@@ -1475,6 +1561,29 @@ mod tests {
             .expect("autoscale policy")
             .max_replicas = 8;
         assert!(build_autoscale_pending_spec(&changed_policy, &[decision]).is_none());
+    }
+
+    /// Local sampling policy lookup should ignore replicas no longer assigned to the spec.
+    #[test]
+    fn autoscale_policy_for_replica_requires_current_assignment() {
+        let mut spec = test_service_spec(1);
+        let assigned = Uuid::new_v4();
+        spec.set_replica_ids(vec![assigned]);
+        let specs = HashMap::from([(spec.id, spec.clone())]);
+        let mut sample = test_usage_sample(0, 64, 1_000);
+        sample.replica.service_id = spec.id;
+        sample.replica.service_name = spec.service_name.clone();
+        sample.replica.template_name = "api".to_string();
+        sample.replica.task_id = Uuid::new_v4();
+
+        assert!(autoscale_policy_for_replica(&specs, &sample.replica).is_none());
+
+        sample.replica.task_id = assigned;
+        let policy =
+            autoscale_policy_for_replica(&specs, &sample.replica).expect("assigned replica");
+        assert_eq!(policy.service_epoch, spec.service_epoch);
+        assert_eq!(policy.service_phase_version, spec.phase_version);
+        assert_eq!(policy.policy, test_policy());
     }
 
     /// Autoscale thresholds should require usage above the target, not equal to it.
@@ -1606,6 +1715,7 @@ mod tests {
         ServiceAutoscaleSignal {
             service_id: Uuid::new_v4(),
             service_epoch: 1,
+            service_phase_version: 0,
             template_name: "api".to_string(),
             node_id: Uuid::new_v4(),
             kind,
@@ -1626,6 +1736,7 @@ mod tests {
         ServiceAutoscaleSignal {
             service_id: spec.id,
             service_epoch: spec.service_epoch,
+            service_phase_version: spec.phase_version,
             template_name: "api".to_string(),
             node_id: Uuid::new_v4(),
             kind: ServiceAutoscaleSignalKind::Hot,
@@ -1646,6 +1757,7 @@ mod tests {
         ServiceAutoscaleSignal {
             service_id: spec.id,
             service_epoch: spec.service_epoch,
+            service_phase_version: spec.phase_version,
             template_name: "api".to_string(),
             node_id: Uuid::new_v4(),
             kind: ServiceAutoscaleSignalKind::Summary,
@@ -1728,6 +1840,7 @@ mod tests {
         AutoscaleSignalAccumulator::new(
             service_id,
             1,
+            0,
             "api".to_string(),
             TaskTemplateAutoscalePolicyValue {
                 min_replicas: 1,
@@ -1754,7 +1867,6 @@ mod tests {
             replica: crate::workload::manager::LocalServiceRuntimeReplica {
                 service_id: Uuid::new_v4(),
                 service_name: "web".to_string(),
-                service_epoch: 1,
                 template_name: "api".to_string(),
                 task_id: Uuid::new_v4(),
                 runtime: RuntimeInstanceRef::new("mock", "container-1"),

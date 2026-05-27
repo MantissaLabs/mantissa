@@ -184,6 +184,9 @@ struct AutoscaleSignal {
 
   observedAtUnixMs @13 :UInt64;
   # Sender-side observation timestamp in milliseconds since the Unix epoch.
+
+  servicePhaseVersion @14 :UInt64;
+  # Service phase version observed by the signal sender.
 }
 
 enum AutoscaleSignalKind {
