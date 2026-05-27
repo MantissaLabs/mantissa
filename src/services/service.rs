@@ -1,5 +1,6 @@
 use crate::scheduler::placement::ServicePlacementPreference as SchedulerPlacementPreference;
 use crate::services::manager::{
+    ServiceAutoscaleSignal, ServiceAutoscaleSignalKind, ServiceAutoscaleSignalReason,
     ServiceController, ServiceDeploymentOptions, ServiceDeploymentOutcome,
     ServiceTaskProgressSnapshot,
 };
@@ -28,8 +29,8 @@ use crate::workload::capnp_codec::{
 use crate::workload::types::{ExecutionSpec, WorkloadAdmissionPolicy};
 use capnp::{Error, struct_list};
 use mantissa_protocol::services::{
-    autoscale_metric, autoscale_policy, replica_assignment_segment, service_event, service_spec,
-    service_task_progress, services, task_template,
+    autoscale_metric, autoscale_policy, autoscale_signal, replica_assignment_segment,
+    service_event, service_spec, service_task_progress, services, task_template,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::collections::HashSet;
@@ -198,12 +199,15 @@ impl services::Server for ServicesRPC {
     /// Accepts owner-directed autoscale control signals once the controller is implemented.
     async fn report_autoscale_signal(
         self: Rc<Self>,
-        _params: services::ReportAutoscaleSignalParams,
+        params: services::ReportAutoscaleSignalParams,
         mut results: services::ReportAutoscaleSignalResults,
     ) -> Result<(), Error> {
+        let signal = read_autoscale_signal(params.get()?.get_signal()?)?;
+        let report = self.manager.report_autoscale_signal(signal).await;
+
         let mut result = results.get();
-        result.set_accepted(false);
-        result.set_detail("autoscale signal handling is not implemented yet");
+        result.set_accepted(report.accepted);
+        result.set_detail(&report.detail);
         Ok(())
     }
 
@@ -992,6 +996,46 @@ fn validate_autoscale_policy(
     Ok(())
 }
 
+/// Decodes one owner-directed autoscale signal from the internal services RPC.
+fn read_autoscale_signal(
+    reader: autoscale_signal::Reader<'_>,
+) -> Result<ServiceAutoscaleSignal, Error> {
+    let kind = match reader.get_kind()? {
+        mantissa_protocol::services::AutoscaleSignalKind::Hot => ServiceAutoscaleSignalKind::Hot,
+        mantissa_protocol::services::AutoscaleSignalKind::Summary => {
+            ServiceAutoscaleSignalKind::Summary
+        }
+    };
+    let reason = match reader.get_reason()? {
+        mantissa_protocol::services::AutoscaleSignalReason::CpuHigh => {
+            ServiceAutoscaleSignalReason::CpuHigh
+        }
+        mantissa_protocol::services::AutoscaleSignalReason::MemoryHigh => {
+            ServiceAutoscaleSignalReason::MemoryHigh
+        }
+        mantissa_protocol::services::AutoscaleSignalReason::Quiet => {
+            ServiceAutoscaleSignalReason::Quiet
+        }
+    };
+
+    Ok(ServiceAutoscaleSignal {
+        service_id: read_uuid(reader.get_service_id()?)?,
+        service_epoch: reader.get_service_epoch(),
+        template_name: reader.get_template_name()?.to_str()?.to_string(),
+        node_id: read_uuid(reader.get_node_id()?)?,
+        kind,
+        reason,
+        running_replicas: reader.get_running_replicas(),
+        ready_replicas: reader.get_ready_replicas(),
+        hot_replicas: reader.get_hot_replicas(),
+        cpu_requested_millis_total: reader.get_cpu_requested_millis_total(),
+        cpu_observed_millis_ewma: reader.get_cpu_observed_millis_ewma(),
+        memory_requested_bytes_total: reader.get_memory_requested_bytes_total(),
+        memory_observed_bytes_ewma: reader.get_memory_observed_bytes_ewma(),
+        observed_at_unix_ms: reader.get_observed_at_unix_ms(),
+    })
+}
+
 fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateSpecValue, Error> {
     let command_reader = reader.get_command()?;
     let mut command = Vec::with_capacity(command_reader.len() as usize);
@@ -1327,6 +1371,44 @@ fn write_autoscale_policy(
     for (idx, metric) in policy.metrics.iter().enumerate() {
         write_autoscale_metric(metrics.reborrow().get(idx as u32), metric);
     }
+}
+
+/// Encodes one owner-directed autoscale signal into the internal services RPC payload.
+pub(crate) fn write_autoscale_signal(
+    mut builder: autoscale_signal::Builder<'_>,
+    signal: &ServiceAutoscaleSignal,
+) {
+    builder.set_service_id(signal.service_id.as_bytes());
+    builder.set_service_epoch(signal.service_epoch);
+    builder.set_template_name(&signal.template_name);
+    builder.set_node_id(signal.node_id.as_bytes());
+    let kind = match signal.kind {
+        ServiceAutoscaleSignalKind::Hot => mantissa_protocol::services::AutoscaleSignalKind::Hot,
+        ServiceAutoscaleSignalKind::Summary => {
+            mantissa_protocol::services::AutoscaleSignalKind::Summary
+        }
+    };
+    builder.set_kind(kind);
+    let reason = match signal.reason {
+        ServiceAutoscaleSignalReason::CpuHigh => {
+            mantissa_protocol::services::AutoscaleSignalReason::CpuHigh
+        }
+        ServiceAutoscaleSignalReason::MemoryHigh => {
+            mantissa_protocol::services::AutoscaleSignalReason::MemoryHigh
+        }
+        ServiceAutoscaleSignalReason::Quiet => {
+            mantissa_protocol::services::AutoscaleSignalReason::Quiet
+        }
+    };
+    builder.set_reason(reason);
+    builder.set_running_replicas(signal.running_replicas);
+    builder.set_ready_replicas(signal.ready_replicas);
+    builder.set_hot_replicas(signal.hot_replicas);
+    builder.set_cpu_requested_millis_total(signal.cpu_requested_millis_total);
+    builder.set_cpu_observed_millis_ewma(signal.cpu_observed_millis_ewma);
+    builder.set_memory_requested_bytes_total(signal.memory_requested_bytes_total);
+    builder.set_memory_observed_bytes_ewma(signal.memory_observed_bytes_ewma);
+    builder.set_observed_at_unix_ms(signal.observed_at_unix_ms);
 }
 
 fn write_task_template(

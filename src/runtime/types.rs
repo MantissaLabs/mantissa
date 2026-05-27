@@ -445,6 +445,19 @@ pub struct RuntimeInfo {
     pub network_endpoints: Vec<RuntimeNetworkEndpoint>,
 }
 
+/// Point-in-time resource usage sample for one runtime instance.
+///
+/// CPU usage is cumulative nanoseconds consumed since runtime creation. Callers
+/// compute rates from deltas so the runtime backend stays a thin accounting
+/// adapter.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeUsageSample {
+    pub runtime_id: String,
+    pub sampled_at_unix_ms: u64,
+    pub cpu_usage_nanos: u64,
+    pub memory_current_bytes: u64,
+}
+
 /// Capability flags exposed by one runtime backend.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeCapabilities {
@@ -920,6 +933,13 @@ pub trait RuntimeBackend {
 
     /// Returns inspect-level metadata for one runtime instance.
     async fn inspect_instance(&self, runtime_id: &str) -> RuntimeResult<RuntimeInfo>;
+
+    /// Returns a point-in-time usage sample for one runtime instance.
+    async fn sample_instance_usage(&self, _runtime_id: &str) -> RuntimeResult<RuntimeUsageSample> {
+        Err(RuntimeError::OperationFailed(
+            "runtime usage sampling is not supported by this backend".to_string(),
+        ))
+    }
 
     /// Returns whether the named image is already present in the local image store.
     async fn image_present(&self, _image: &str) -> RuntimeResult<bool> {

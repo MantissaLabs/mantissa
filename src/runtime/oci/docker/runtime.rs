@@ -5,7 +5,7 @@
 //! trait implementation stays focused on the scheduler-facing behavior.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bollard::container::AttachContainerResults;
@@ -17,7 +17,7 @@ use bollard::models::{
 use bollard::query_parameters::{
     AttachContainerOptionsBuilder, CreateContainerOptions, CreateImageOptions, EventsOptions,
     InspectContainerOptions, ListContainersOptions, LogsOptionsBuilder, RemoveContainerOptions,
-    RestartContainerOptions, StartContainerOptions, StopContainerOptions,
+    RestartContainerOptions, StartContainerOptions, StatsOptionsBuilder, StopContainerOptions,
 };
 use futures::StreamExt;
 use log::{debug, info, trace, warn};
@@ -27,7 +27,7 @@ use crate::runtime::types::{
     RestartPolicyType, RuntimeAttachOptions, RuntimeBackend, RuntimeCapabilities,
     RuntimeCreateRequest, RuntimeError, RuntimeEvent, RuntimeExecOptions, RuntimeExecResult,
     RuntimeInfo, RuntimeLogFrame, RuntimeLogsOptions, RuntimePortBinding, RuntimeResult,
-    RuntimeSupportProfile,
+    RuntimeSupportProfile, RuntimeUsageSample,
 };
 
 use super::conversions::{
@@ -338,6 +338,49 @@ impl RuntimeBackend for DockerRuntimeBackend {
         Ok(runtime_info_from_inspect(inspect))
     }
 
+    /// Samples Docker's cumulative CPU and current memory accounting for one container.
+    async fn sample_instance_usage(&self, container_id: &str) -> RuntimeResult<RuntimeUsageSample> {
+        let options = StatsOptionsBuilder::default()
+            .stream(false)
+            .one_shot(true)
+            .build();
+        let mut stream = self.docker.stats(container_id, Some(options));
+        let stats = match stream.next().await {
+            Some(Ok(stats)) => stats,
+            Some(Err(err)) => return Err(classify_runtime_error(container_id, err)),
+            None => {
+                return Err(RuntimeError::OperationFailed(format!(
+                    "docker stats returned no usage sample for container {container_id}"
+                )));
+            }
+        };
+
+        let cpu_usage_nanos = stats
+            .cpu_stats
+            .as_ref()
+            .and_then(|stats| stats.cpu_usage.as_ref())
+            .and_then(|usage| usage.total_usage)
+            .unwrap_or(0);
+        let memory_current_bytes = stats
+            .memory_stats
+            .as_ref()
+            .and_then(|stats| {
+                stats
+                    .usage
+                    .or(stats.privateworkingset)
+                    .or(stats.commitbytes)
+            })
+            .unwrap_or(0);
+        let runtime_id = stats.id.unwrap_or_else(|| container_id.to_string());
+
+        Ok(RuntimeUsageSample {
+            runtime_id,
+            sampled_at_unix_ms: current_unix_ms(),
+            cpu_usage_nanos,
+            memory_current_bytes,
+        })
+    }
+
     /// Reports whether one Docker image already exists locally.
     async fn image_present(&self, image: &str) -> RuntimeResult<bool> {
         trace!("Inspecting image: {image}");
@@ -596,6 +639,14 @@ fn docker_port_bindings(
         }
     }
     map
+}
+
+/// Returns the current unix timestamp in milliseconds for runtime usage samples.
+fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

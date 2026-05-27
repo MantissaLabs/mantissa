@@ -528,6 +528,25 @@ pub(crate) fn select_generation_owner(
     best.map(|(node_id, _)| node_id)
 }
 
+/// Selects the deterministic autoscale owner for one service.
+///
+/// Autoscale ownership intentionally excludes the service epoch so the owner
+/// remains stable across the generation updates produced by scale decisions.
+pub(crate) fn select_autoscale_owner(service_id: Uuid, candidates: &[Uuid]) -> Option<Uuid> {
+    let mut best: Option<(Uuid, u128)> = None;
+    for node_id in candidates {
+        let score = autoscale_owner_score(service_id, *node_id);
+        match best {
+            None => best = Some((*node_id, score)),
+            Some((_, best_score)) if score > best_score => {
+                best = Some((*node_id, score));
+            }
+            _ => {}
+        }
+    }
+    best.map(|(node_id, _)| node_id)
+}
+
 /// Selects the deterministic owner plus backup owners for service-generation repair.
 ///
 /// Targets send compact progress through the workload store instead of gossiping every routine
@@ -683,6 +702,18 @@ fn generation_owner_score(service_id: Uuid, service_epoch: u64, node_id: Uuid) -
     u128::from_le_bytes(bytes)
 }
 
+/// Computes the rendezvous score used to choose one autoscale owner for a service.
+fn autoscale_owner_score(service_id: Uuid, node_id: Uuid) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"autoscale");
+    hasher.update(service_id.as_bytes());
+    hasher.update(node_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    u128::from_le_bytes(bytes)
+}
+
 /// Computes the rendezvous score used to choose one deployment shard coordinator.
 fn shard_coordinator_score(
     service_id: Uuid,
@@ -704,7 +735,7 @@ fn shard_coordinator_score(
 
 #[cfg(test)]
 mod tests {
-    use super::{SlotKey, compute_slot_targets_with_placement};
+    use super::{SlotKey, compute_slot_targets_with_placement, select_autoscale_owner};
     use crate::scheduler::placement::{
         PlacementConstraint, PlacementConstraintSelector, PlacementNode, PlacementPolicy,
         PlacementPreferenceInventory, PlacementStrategy, ServicePlacementPreference,
@@ -713,6 +744,18 @@ mod tests {
     use crate::topology::peers::PeerLabel;
     use crate::workload::types::ExecutionSpec;
     use uuid::Uuid;
+
+    /// Autoscale owner selection should be deterministic and independent from service epochs.
+    #[test]
+    fn autoscale_owner_selection_is_stable_for_service() {
+        let service_id = Uuid::new_v4();
+        let mut candidates = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let first = select_autoscale_owner(service_id, &candidates).expect("owner");
+        candidates.reverse();
+        let second = select_autoscale_owner(service_id, &candidates).expect("owner");
+
+        assert_eq!(first, second);
+    }
 
     /// Hard placement constraints should restrict deterministic slot targeting to matching nodes.
     #[test]

@@ -45,6 +45,7 @@ use uuid::Uuid;
 
 mod admission;
 mod admission_group;
+mod autoscale;
 mod deployment;
 mod inventory;
 mod placement;
@@ -58,6 +59,10 @@ mod slot_reconcile;
 mod state;
 use crate::services::ownership::{
     SlotKey, compute_slot_targets_with_placement, select_generation_owner,
+};
+use autoscale::{AutoscaleLocalSampleStore, AutoscaleSignalStore};
+pub(crate) use autoscale::{
+    ServiceAutoscaleSignal, ServiceAutoscaleSignalKind, ServiceAutoscaleSignalReason,
 };
 use inventory::TaskInventory;
 use placement::build_eligible_nodes;
@@ -260,6 +265,8 @@ pub struct ServiceController {
     inflight_traffic_publish_waiters: Arc<AsyncMutex<HashSet<Uuid>>>,
     slot_missing_since: Arc<AsyncMutex<HashMap<SlotKey, Instant>>>,
     slot_rebalance_after: Arc<AsyncMutex<HashMap<SlotKey, Instant>>>,
+    autoscale_signals: Arc<AsyncMutex<AutoscaleSignalStore>>,
+    autoscale_local_samples: Arc<AsyncMutex<AutoscaleLocalSampleStore>>,
     timing: ServiceControllerTiming,
 }
 
@@ -328,6 +335,10 @@ impl ServiceController {
             inflight_traffic_publish_waiters: Arc::new(AsyncMutex::new(HashSet::new())),
             slot_missing_since: Arc::new(AsyncMutex::new(HashMap::new())),
             slot_rebalance_after: Arc::new(AsyncMutex::new(HashMap::new())),
+            autoscale_signals: Arc::new(AsyncMutex::new(AutoscaleSignalStore::default())),
+            autoscale_local_samples: Arc::new(
+                AsyncMutex::new(AutoscaleLocalSampleStore::default()),
+            ),
             timing,
         }
     }
@@ -335,6 +346,9 @@ impl ServiceController {
     /// Runs the service controller loop, handling gossip events and periodic rescheduling.
     pub async fn run(&mut self) {
         let mut reschedule_tick = interval(self.timing.reschedule_tick);
+        let mut autoscale_tick = interval(Duration::from_secs(
+            autoscale::AUTOSCALE_LOCAL_SAMPLE_TICK_SECS,
+        ));
 
         loop {
             tokio::select! {
@@ -343,6 +357,14 @@ impl ServiceController {
                         tracing::warn!(
                             target: "services",
                             "failed to reconcile service replicas: {err}"
+                        );
+                    }
+                }
+                _ = autoscale_tick.tick() => {
+                    if let Err(err) = self.emit_local_autoscale_signals().await {
+                        tracing::warn!(
+                            target: "services",
+                            "failed to emit local autoscale signals: {err:#}"
                         );
                     }
                 }

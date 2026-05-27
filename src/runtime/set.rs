@@ -9,7 +9,7 @@ use crate::runtime::types::{
     RuntimeAttachOptions, RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError,
     RuntimeEvent, RuntimeExecOptions, RuntimeExecResult, RuntimeInfo, RuntimeInstanceRef,
     RuntimeLogFrame, RuntimeLogsOptions, RuntimeResult, RuntimeSupportContract,
-    RuntimeSupportProfile,
+    RuntimeSupportProfile, RuntimeUsageSample,
 };
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
 
@@ -302,6 +302,24 @@ impl RuntimeSet {
             Ok(info) => Ok(info),
             Err(error) => {
                 crate::observability::metrics::record_runtime_failure("inspect", &error);
+                Err(error)
+            }
+        }
+    }
+
+    /// Returns a point-in-time usage sample for one known runtime instance.
+    pub async fn sample_instance_usage(
+        &self,
+        runtime: &RuntimeInstanceRef,
+    ) -> RuntimeResult<RuntimeUsageSample> {
+        match self
+            .backend_for_runtime(runtime)?
+            .sample_instance_usage(&runtime.handle)
+            .await
+        {
+            Ok(sample) => Ok(sample),
+            Err(error) => {
+                crate::observability::metrics::record_runtime_failure("usage", &error);
                 Err(error)
             }
         }

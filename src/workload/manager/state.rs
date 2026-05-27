@@ -34,7 +34,8 @@ use crate::workload::types::{
 };
 
 use super::{
-    WorkloadManager, instance_remove_in_progress, launch::InstanceLaunchRequest,
+    LocalServiceRuntimeReplica, LocalServiceRuntimeUsageSample, WorkloadManager,
+    instance_remove_in_progress, launch::InstanceLaunchRequest,
     reservation::DEFAULT_PREPARED_LEASE_TTL_MS, spec_to_status, spec_to_value, value_to_spec,
 };
 
@@ -2541,6 +2542,84 @@ impl WorkloadManager {
         }
 
         Ok(servers)
+    }
+
+    /// Lists local running service replicas that have an addressable runtime instance.
+    ///
+    /// Autoscale sampling only needs the local service slice, so this walks the cached workload
+    /// index and skips non-service rows, remote rows, non-running rows, and rows whose runtime
+    /// instance has already disappeared.
+    pub(crate) async fn list_local_running_service_replicas(
+        &self,
+    ) -> anyhow::Result<Vec<LocalServiceRuntimeReplica>> {
+        let values = self.load_workload_value_index().await?;
+        let mut replicas = Vec::new();
+
+        for value in values.values() {
+            if value.node_id != self.local_node_id || value.state != WorkloadPhase::Running {
+                continue;
+            }
+            let Some(owner) = value.service_owner() else {
+                continue;
+            };
+            let owner = owner.clone();
+
+            let spec = value_to_spec(value.id, value.clone());
+            let Some(runtime) = self
+                .resolve_live_or_named_runtime_for_task(&spec)
+                .await
+                .with_context(|| format!("failed to resolve runtime for task {}", value.id))?
+            else {
+                continue;
+            };
+
+            replicas.push(LocalServiceRuntimeReplica {
+                service_id: compute_service_id(&owner.service_name),
+                service_name: owner.service_name.clone(),
+                service_epoch: owner.service_epoch,
+                template_name: owner.template.clone(),
+                task_id: value.id,
+                runtime,
+                cpu_requested_millis: value.cpu_millis,
+                memory_requested_bytes: value.memory_bytes,
+            });
+        }
+
+        Ok(replicas)
+    }
+
+    /// Samples runtime usage for every locally running service replica that supports it.
+    ///
+    /// Runtime usage is soft telemetry. Missing instances and unsupported backend sampling are
+    /// logged at debug level and skipped so autoscale control input never blocks reconciliation.
+    pub(crate) async fn sample_local_service_runtime_usage(
+        &self,
+    ) -> anyhow::Result<Vec<LocalServiceRuntimeUsageSample>> {
+        let replicas = self.list_local_running_service_replicas().await?;
+        let mut samples = Vec::with_capacity(replicas.len());
+
+        for replica in replicas {
+            match self
+                .runtime
+                .runtime_set
+                .sample_instance_usage(&replica.runtime)
+                .await
+            {
+                Ok(usage) => samples.push(LocalServiceRuntimeUsageSample { replica, usage }),
+                Err(RuntimeError::NotFound(_)) => {}
+                Err(err) => {
+                    debug!(
+                        target: "task",
+                        task_id = %replica.task_id,
+                        runtime_backend = %replica.runtime.backend_kind,
+                        runtime_handle = %replica.runtime.handle,
+                        "failed to sample runtime usage: {err}"
+                    );
+                }
+            }
+        }
+
+        Ok(samples)
     }
 
     /// Inspect the currently tracked instance names and return terminal exit details when

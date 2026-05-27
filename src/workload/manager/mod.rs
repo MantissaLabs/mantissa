@@ -6,7 +6,7 @@ use crate::registry::Registry;
 use crate::runtime::set::RuntimeSet;
 use crate::runtime::types::{
     RuntimeAttachOptions, RuntimeCapabilities, RuntimeError, RuntimeExecOptions, RuntimeExecResult,
-    RuntimeInstanceRef, RuntimeLogFrame, RuntimeLogsOptions,
+    RuntimeInstanceRef, RuntimeLogFrame, RuntimeLogsOptions, RuntimeUsageSample,
 };
 use crate::scheduler::placement::ServicePlacementPreference;
 use crate::scheduler::{Scheduler, SchedulerError, SlotId};
@@ -533,6 +533,26 @@ pub enum WorkloadTrafficPublicationUpdate {
     NoAttachments,
     Unchanged,
     Updated,
+}
+
+/// Local runtime replica metadata needed by service-level autoscale sampling.
+#[derive(Clone, Debug)]
+pub(crate) struct LocalServiceRuntimeReplica {
+    pub service_id: Uuid,
+    pub service_name: String,
+    pub service_epoch: u64,
+    pub template_name: String,
+    pub task_id: Uuid,
+    pub runtime: RuntimeInstanceRef,
+    pub cpu_requested_millis: u64,
+    pub memory_requested_bytes: u64,
+}
+
+/// Runtime usage sample paired with the service replica that produced it.
+#[derive(Clone, Debug)]
+pub(crate) struct LocalServiceRuntimeUsageSample {
+    pub replica: LocalServiceRuntimeReplica,
+    pub usage: RuntimeUsageSample,
 }
 
 /// Generic launch request consumed by the shared workload manager.
