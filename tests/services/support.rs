@@ -22,7 +22,7 @@ pub(crate) use mantissa::runtime::set::RuntimeSet;
 pub(crate) use mantissa::runtime::testing::IN_MEMORY_RUNTIME_BACKEND_KIND;
 pub(crate) use mantissa::runtime::types::{
     RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError, RuntimeEvent,
-    RuntimeInfo,
+    RuntimeInfo, RuntimeUsageSample,
 };
 pub(crate) use mantissa::scheduler::SlotReservationRequest;
 pub(crate) use mantissa::scheduler::SlotState;
@@ -1096,6 +1096,17 @@ impl SlowCreateRuntimeBackend {
             create_delay,
         }
     }
+
+    /// Sets the usage sample returned for every in-memory runtime instance.
+    pub(crate) async fn set_default_usage_sample(
+        &self,
+        cpu_usage_nanos: u64,
+        memory_current_bytes: u64,
+    ) {
+        self.inner
+            .set_default_usage_sample(cpu_usage_nanos, memory_current_bytes)
+            .await;
+    }
 }
 
 #[async_trait]
@@ -1145,6 +1156,13 @@ impl RuntimeBackend for SlowCreateRuntimeBackend {
 
     async fn inspect_instance(&self, container_id: &str) -> Result<RuntimeInfo, RuntimeError> {
         self.inner.inspect_instance(container_id).await
+    }
+
+    async fn sample_instance_usage(
+        &self,
+        container_id: &str,
+    ) -> Result<RuntimeUsageSample, RuntimeError> {
+        self.inner.sample_instance_usage(container_id).await
     }
 
     async fn pull_image(&self, _image: &str) -> Result<(), RuntimeError> {

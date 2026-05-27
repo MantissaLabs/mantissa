@@ -1265,6 +1265,101 @@ mod tests {
     }
 
     #[test]
+    fn manifest_rejects_memory_autoscale_without_memory_request() {
+        let mut manifest = valid_autoscale_manifest();
+        let template = &mut manifest.task_templates[0];
+        template.resources.cpu_millis = 0;
+        template.resources.memory_mb = 0;
+        let policy = template.autoscale.as_mut().expect("autoscale policy");
+        policy.metrics = vec![TaskTemplateAutoscaleMetric {
+            kind: TaskTemplateAutoscaleMetricKind::Memory,
+            target_percent: 80,
+        }];
+
+        let error = manifest
+            .validate()
+            .expect_err("memory autoscale without memory request must fail");
+
+        assert!(error.to_string().contains("resources.memory_mb"));
+    }
+
+    #[test]
+    fn manifest_rejects_autoscale_replicas_outside_policy_bounds() {
+        let mut manifest = valid_autoscale_manifest();
+        manifest.task_templates[0].replicas = 1;
+
+        let error = manifest
+            .validate()
+            .expect_err("autoscale replicas below minimum must fail");
+
+        assert!(error.to_string().contains("min_replicas..=max_replicas"));
+    }
+
+    #[test]
+    fn manifest_rejects_empty_autoscale_metrics() {
+        let mut manifest = valid_autoscale_manifest();
+        manifest.task_templates[0]
+            .autoscale
+            .as_mut()
+            .expect("autoscale policy")
+            .metrics
+            .clear();
+
+        let error = manifest
+            .validate()
+            .expect_err("autoscale policy without metrics must fail");
+
+        assert!(error.to_string().contains("autoscale.metrics"));
+    }
+
+    #[test]
+    fn manifest_rejects_invalid_autoscale_timing() {
+        let mut zero_cooldown = valid_autoscale_manifest();
+        zero_cooldown.task_templates[0]
+            .autoscale
+            .as_mut()
+            .expect("autoscale policy")
+            .cooldown_secs = 0;
+        let error = zero_cooldown
+            .validate()
+            .expect_err("zero autoscale cooldown must fail");
+        assert!(error.to_string().contains("cooldown_secs"));
+
+        let mut short_stabilization = valid_autoscale_manifest();
+        short_stabilization.task_templates[0]
+            .autoscale
+            .as_mut()
+            .expect("autoscale policy")
+            .scale_down_stabilization_secs = 1;
+        let error = short_stabilization
+            .validate()
+            .expect_err("short autoscale stabilization must fail");
+        assert!(error.to_string().contains("scale_down_stabilization_secs"));
+
+        let mut zero_sample_window = valid_autoscale_manifest();
+        zero_sample_window.task_templates[0]
+            .autoscale
+            .as_mut()
+            .expect("autoscale policy")
+            .sample_window_secs = 0;
+        let error = zero_sample_window
+            .validate()
+            .expect_err("zero autoscale sample window must fail");
+        assert!(error.to_string().contains("sample_window_secs"));
+
+        let mut zero_trigger_windows = valid_autoscale_manifest();
+        zero_trigger_windows.task_templates[0]
+            .autoscale
+            .as_mut()
+            .expect("autoscale policy")
+            .trigger_windows = 0;
+        let error = zero_trigger_windows
+            .validate()
+            .expect_err("zero autoscale trigger windows must fail");
+        assert!(error.to_string().contains("trigger_windows"));
+    }
+
+    #[test]
     fn gang_service_example_manifest_is_runnable() {
         let manifest =
             load_manifest_from_path(&example_manifest("gang_service.ron")).expect("manifest");
@@ -1283,6 +1378,47 @@ mod tests {
         manifest
             .validate()
             .expect("gang service example should validate");
+    }
+
+    /// Builds one valid autoscale manifest used as a mutation base for validation tests.
+    fn valid_autoscale_manifest() -> ServiceManifest {
+        ron::from_str(
+            r#"
+            (
+                name: "autoscale-demo",
+                tasks: [
+                    (
+                        name: "api",
+                        image: "ghcr.io/demo/api:latest",
+                        replicas: 2,
+                        resources: (
+                            cpu_millis: 500,
+                            memory_mb: 256,
+                        ),
+                        autoscale: Some((
+                            min_replicas: 2,
+                            max_replicas: 8,
+                            cooldown_secs: 60,
+                            scale_down_stabilization_secs: 300,
+                            sample_window_secs: 15,
+                            trigger_windows: 2,
+                            metrics: [
+                                (
+                                    kind: cpu,
+                                    target_percent: 70,
+                                ),
+                                (
+                                    kind: memory,
+                                    target_percent: 80,
+                                ),
+                            ],
+                        )),
+                    ),
+                ],
+            )
+            "#,
+        )
+        .expect("parse valid autoscale manifest")
     }
 
     #[test]

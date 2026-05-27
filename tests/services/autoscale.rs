@@ -95,6 +95,213 @@ local_test!(services_autoscale_scales_memory_hot_template, {
     );
 });
 
+local_test!(services_autoscale_scales_cpu_hot_template, {
+    let runtime = Arc::new(InMemoryRuntimeBackend::default());
+    let _guard = RuntimeBackendOverrideGuard::install(runtime.clone());
+    let node = TestNode::new_inproc_with_config(ClusterConfig {
+        service_timing: Some(
+            ServiceControllerTiming::production().with_autoscale_tick(Duration::from_millis(100)),
+        ),
+        ..ClusterConfig::default()
+    })
+    .await;
+
+    let service_name = "autoscale-cpu-hot";
+    let manifest_name = "autoscale-cpu-hot";
+    let mut template = demo_backend_task_template("api", 1);
+    template.execution.cpu_millis = 100;
+    template.execution.memory_bytes = 64 * 1024 * 1024;
+    template.autoscale = Some(TaskTemplateAutoscalePolicyValue {
+        min_replicas: 1,
+        max_replicas: 3,
+        cooldown_secs: 60,
+        scale_down_stabilization_secs: 60,
+        sample_window_secs: 1,
+        trigger_windows: 1,
+        metrics: vec![TaskTemplateAutoscaleMetricValue {
+            kind: TaskTemplateAutoscaleMetricKindValue::Cpu,
+            target_percent: 50,
+        }],
+    });
+
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(Uuid::new_v4(), manifest_name, service_name, vec![template])
+        .await
+        .expect("submit CPU-autoscaled service");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "CPU-autoscaled service should reach initial running state"
+    );
+
+    let stop_cpu_driver = Arc::new(AtomicBool::new(false));
+    let cpu_driver = spawn_cpu_usage_driver(
+        runtime,
+        stop_cpu_driver.clone(),
+        Duration::from_millis(50),
+        500_000_000,
+        0,
+    );
+
+    assert!(
+        wait_for_template_replicas(&node, service_id, "api", 2, Duration::from_secs(10)).await,
+        "CPU autoscale should persist a larger desired replica count"
+    );
+
+    stop_cpu_driver.store(true, Ordering::Relaxed);
+    cpu_driver
+        .await
+        .expect("CPU usage driver should stop cleanly");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "CPU autoscale generation should converge through normal rollout"
+    );
+
+    assert!(
+        wait_for_service_task_count_all(
+            std::slice::from_ref(&node),
+            service_name,
+            2,
+            Duration::from_secs(10)
+        )
+        .await,
+        "CPU autoscale generation should run the extra replica"
+    );
+});
+
+local_test!(services_autoscale_skips_decisions_while_deploying, {
+    let runtime = Arc::new(SlowCreateRuntimeBackend::with_create_delay(
+        Duration::from_secs(3),
+    ));
+    let _guard = RuntimeBackendOverrideGuard::install(runtime.clone());
+    let node = TestNode::new_inproc_with_config(ClusterConfig {
+        service_timing: Some(
+            ServiceControllerTiming::production().with_autoscale_tick(Duration::from_millis(100)),
+        ),
+        ..ClusterConfig::default()
+    })
+    .await;
+
+    let service_name = "autoscale-deploying-guard";
+    let mut template = demo_backend_task_template("api", 1);
+    template.execution.cpu_millis = 100;
+    template.execution.memory_bytes = 64 * 1024 * 1024;
+    template.autoscale = Some(TaskTemplateAutoscalePolicyValue {
+        min_replicas: 1,
+        max_replicas: 3,
+        cooldown_secs: 60,
+        scale_down_stabilization_secs: 60,
+        sample_window_secs: 1,
+        trigger_windows: 1,
+        metrics: vec![TaskTemplateAutoscaleMetricValue {
+            kind: TaskTemplateAutoscaleMetricKindValue::Memory,
+            target_percent: 50,
+        }],
+    });
+
+    let service_id = node
+        .node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![template.clone()],
+        )
+        .await
+        .expect("submit autoscaled service");
+
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "autoscaled service should reach initial running state"
+    );
+
+    let mut replacement = template;
+    replacement.execution.command.push("v2".to_string());
+    let redeploy = node
+        .node
+        .service_controller
+        .submit_deployment_with_options_outcome(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![replacement],
+            ServiceDeploymentOptions::default(),
+        )
+        .await
+        .expect("submit slow redeployment");
+    assert_eq!(redeploy.outcome, ServiceDeploymentOutcome::Accepted);
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Deploying
+        )
+        .await,
+        "redeployment should enter deploying before autoscale samples are heated"
+    );
+
+    runtime.set_default_usage_sample(0, 96 * 1024 * 1024).await;
+    let scaled_while_deploying = wait_until(
+        Duration::from_secs(1),
+        Duration::from_millis(100),
+        || async {
+            node.node
+                .service_controller
+                .registry()
+                .get(service_id)
+                .ok()
+                .flatten()
+                .is_some_and(|spec| {
+                    spec.status() == ServiceStatus::Deploying
+                        && spec
+                            .task_templates
+                            .iter()
+                            .find(|template| template.name == "api")
+                            .is_some_and(|template| template.replicas > 1)
+                })
+        },
+    )
+    .await;
+    assert!(
+        !scaled_while_deploying,
+        "autoscale must not start a competing generation while service is deploying"
+    );
+
+    runtime.set_default_usage_sample(0, 0).await;
+    assert!(
+        wait_for_service_status(
+            &node.node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "slow redeployment should still converge after autoscale is cooled"
+    );
+    assert!(
+        wait_for_template_replicas(&node, service_id, "api", 1, Duration::from_secs(2)).await,
+        "deploying guard should preserve the submitted replica count"
+    );
+});
+
 local_test!(services_autoscale_owner_failover_scales_on_new_owner, {
     let runtimes: Arc<Mutex<Vec<Arc<InMemoryRuntimeBackend>>>> = Arc::new(Mutex::new(Vec::new()));
     let factory_runtimes = runtimes.clone();
@@ -292,6 +499,52 @@ local_test!(services_autoscale_owner_failover_scales_on_new_owner, {
         "failed autoscale owner should not host active tasks after live-owner rollout"
     );
 });
+
+/// Drives a synthetic cumulative CPU counter until the caller stops the loop.
+fn spawn_cpu_usage_driver(
+    runtime: Arc<InMemoryRuntimeBackend>,
+    stop: Arc<AtomicBool>,
+    interval: Duration,
+    cpu_step_nanos: u64,
+    memory_current_bytes: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut cpu_usage_nanos = 0u64;
+        while !stop.load(Ordering::Relaxed) {
+            cpu_usage_nanos = cpu_usage_nanos.saturating_add(cpu_step_nanos);
+            runtime
+                .set_default_usage_sample(cpu_usage_nanos, memory_current_bytes)
+                .await;
+            sleep(interval).await;
+        }
+    })
+}
+
+/// Waits until one task template records the expected desired replica count.
+async fn wait_for_template_replicas(
+    node: &TestNode,
+    service_id: Uuid,
+    template_name: &str,
+    replicas: u16,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(50), || async {
+        node.node
+            .service_controller
+            .registry()
+            .get(service_id)
+            .ok()
+            .flatten()
+            .and_then(|spec| {
+                spec.task_templates
+                    .iter()
+                    .find(|template| template.name == template_name)
+                    .map(|template| spec.service_epoch > 0 && template.replicas == replicas)
+            })
+            .unwrap_or(false)
+    })
+    .await
+}
 
 /// Finds a deterministic service name whose autoscale owner is `owner_id`.
 fn service_name_for_autoscale_owner(
