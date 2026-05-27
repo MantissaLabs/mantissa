@@ -71,6 +71,20 @@ mantissa services list
 mantissa tasks list
 ```
 
+## Deploy the autoscaled service example
+
+```sh
+mantissa services run examples/autoscaled_service.ron
+```
+
+This manifest starts an `api` template with two replicas and lets the service
+controller move it between two and eight replicas based on local CPU and memory
+usage signals. `mantissa services list` renders the policy compactly in the task
+template column, for example `api (3x, auto 2-8)`.
+
+See `docs/service-autoscaling.md` for the policy fields and distributed owner
+model.
+
 ## Submit a simple finite job
 
 ```sh

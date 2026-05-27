@@ -30,12 +30,13 @@ Common commands:
 - `mantissa services run <manifest>` - deploy a RON service manifest and follow service/task progress
 - `mantissa services run <manifest> --detach` - submit a service deployment and print the service id
 - `mantissa services run <manifest> --timeout 10m` - bound how long progress following waits
-- `mantissa services list|stop ...` - inspect or stop services
+- `mantissa services list|stop ...` - inspect or stop services; autoscaled templates render as `api (3x, auto 2-8)`
 - `mantissa volumes create|import|list|inspect|status|delete ...` - manage named local volumes
 - `mantissa info` - emit local system and capacity diagnostics
 - `mantissa config show|validate|path` - inspect configuration
 
 For rollout fields and manifest examples, see `docs/service-rollouts.md`.
+For autoscale policy fields and ownership, see `docs/service-autoscaling.md`.
 For node drain behavior, see `docs/node-maintenance.md`.
 For backup and restore behavior, see `docs/disaster-recovery.md`.
 For volume semantics, see `docs/volumes.md`.

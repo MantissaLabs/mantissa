@@ -24,15 +24,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     )?;
 
     for row in rows {
-        let templates_summary = if row.task_templates.is_empty() {
-            "-".to_string()
-        } else {
-            row.task_templates
-                .iter()
-                .map(|template| format!("{} ({}x)", template.name, template.replicas))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
+        let templates_summary = templates_summary(&row);
 
         let public_summary = if row.public_endpoints.is_empty() {
             "-".to_string()
@@ -61,6 +53,30 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     output::emit_block(output);
 
     Ok(())
+}
+
+/// Returns a compact task-template summary for service-list table output.
+pub(super) fn templates_summary(row: &ServiceRow) -> String {
+    if row.task_templates.is_empty() {
+        return "-".to_string();
+    }
+
+    row.task_templates
+        .iter()
+        .map(task_template_summary)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Returns one compact task-template label including autoscale bounds when present.
+fn task_template_summary(template: &TaskTemplateRow) -> String {
+    if let Some(policy) = template.autoscale.as_ref() {
+        return format!(
+            "{} ({}x, auto {}-{})",
+            template.name, template.replicas, policy.min_replicas, policy.max_replicas
+        );
+    }
+    format!("{} ({}x)", template.name, template.replicas)
 }
 
 /// Returns a compact rollout progress label for tabular list output.
@@ -155,4 +171,88 @@ fn truncate_for_table(value: &str, max_chars: usize) -> String {
     }
     out.push_str("...");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mantissa_client::services::list::{
+        TaskTemplateAutoscaleMetricKindRow, TaskTemplateAutoscaleMetricRow,
+        TaskTemplateAutoscalePolicyRow,
+    };
+    use uuid::Uuid;
+
+    /// Builds one minimal service row for table-summary rendering tests.
+    fn test_row(task_templates: Vec<TaskTemplateRow>) -> ServiceRow {
+        ServiceRow {
+            id: Uuid::new_v4().to_string(),
+            service_id: Uuid::new_v4(),
+            manifest_id: Uuid::new_v4(),
+            service_name: "svc".to_string(),
+            task_templates,
+            updated_at: "2026-05-27T00:00:00Z".to_string(),
+            replica_ids: Vec::new(),
+            replica_assignments: Vec::new(),
+            replica_count: 0,
+            service_epoch: 0,
+            status: ServiceStatusRow::Running,
+            status_detail: None,
+            rollout: ServiceRolloutRow {
+                phase: ServiceRolloutPhaseRow::Idle,
+                total_steps: 0,
+                completed_steps: 0,
+                failed_steps: 0,
+                max_failures: 0,
+                last_error: None,
+            },
+            public_endpoints: Vec::new(),
+            task_progress: Vec::new(),
+        }
+    }
+
+    /// Builds one task-template row with the requested replica count and autoscale policy.
+    fn test_template(
+        name: &str,
+        replicas: u16,
+        autoscale: Option<TaskTemplateAutoscalePolicyRow>,
+    ) -> TaskTemplateRow {
+        TaskTemplateRow {
+            name: name.to_string(),
+            image: "busybox:1.36".to_string(),
+            command: Vec::new(),
+            replicas,
+            autoscale,
+            networks: Vec::new(),
+            public_port: None,
+            readiness_port: None,
+            liveness_port: None,
+            ports: Vec::new(),
+        }
+    }
+
+    /// Keeps autoscale policy visibility compact in the service-list task column.
+    #[test]
+    fn templates_summary_includes_autoscale_bounds() {
+        let row = test_row(vec![
+            test_template(
+                "api",
+                3,
+                Some(TaskTemplateAutoscalePolicyRow {
+                    min_replicas: 2,
+                    max_replicas: 8,
+                    cooldown_secs: 60,
+                    scale_down_stabilization_secs: 300,
+                    sample_window_secs: 15,
+                    trigger_windows: 2,
+                    metrics: vec![TaskTemplateAutoscaleMetricRow {
+                        kind: TaskTemplateAutoscaleMetricKindRow::Cpu,
+                        target_percent: 70,
+                    }],
+                }),
+            ),
+            test_template("worker", 1, None),
+        ]);
+
+        assert_eq!(templates_summary(&row), "api (3x, auto 2-8), worker (1x)");
+    }
 }

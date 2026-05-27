@@ -1,0 +1,40 @@
+(
+    name: "autoscaled-demo",
+    tasks: [
+        (
+            name: "api",
+            image: "nginx:1.27-alpine",
+            replicas: 2,
+            resources: (
+                cpu_millis: 500,
+                memory_mb: 256,
+            ),
+            autoscale: Some((
+                min_replicas: 2,
+                max_replicas: 8,
+                cooldown_secs: 60,
+                scale_down_stabilization_secs: 300,
+                sample_window_secs: 15,
+                trigger_windows: 2,
+                metrics: [
+                    (
+                        kind: cpu,
+                        target_percent: 70,
+                    ),
+                    (
+                        kind: memory,
+                        target_percent: 80,
+                    ),
+                ],
+            )),
+            readiness: Some((
+                kind: tcp,
+                port: 80,
+                interval_ms: 1000,
+                timeout_ms: 500,
+                failure_threshold: 3,
+            )),
+            networks: ["default"],
+        ),
+    ],
+)

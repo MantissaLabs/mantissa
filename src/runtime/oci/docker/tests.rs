@@ -338,9 +338,94 @@ async fn docker_test_manager() -> Option<Arc<DockerRuntimeBackend>> {
     match DockerRuntimeBackend::new().await {
         Ok(manager) => Some(Arc::new(manager)),
         Err(err) => {
-            eprintln!("skipping Docker-backed attach test: {err}");
+            eprintln!("skipping Docker-backed runtime test: {err}");
             None
         }
+    }
+}
+
+#[tokio::test]
+/// Validates Docker stats expose cumulative CPU and current memory usage.
+async fn usage_sample_real_docker_reports_cpu_delta_and_memory() {
+    let Some(manager) = docker_test_manager().await else {
+        return;
+    };
+    manager
+        .pull_image("busybox:1.36")
+        .await
+        .expect("pull busybox image");
+
+    let container_name = format!("mantissa-usage-sample-test-{}", Uuid::new_v4());
+    let container_id = manager
+        .create_instance(RuntimeCreateRequest {
+            name: container_name,
+            image: "busybox:1.36".to_string(),
+            command: Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "while true; do :; done".to_string(),
+            ]),
+            ..Default::default()
+        })
+        .await
+        .expect("create usage sample test container");
+
+    let result: Result<(), String> = async {
+        manager
+            .start_instance(&container_id)
+            .await
+            .map_err(|err| format!("start usage sample test container failed: {err}"))?;
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.sample_instance_usage(&container_id),
+        )
+        .await
+        .map_err(|_| "first usage sample timed out".to_string())?
+        .map_err(|err| format!("first usage sample failed: {err}"))?;
+
+        let mut second = None;
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let sample = tokio::time::timeout(
+                Duration::from_secs(5),
+                manager.sample_instance_usage(&container_id),
+            )
+            .await
+            .map_err(|_| "second usage sample timed out".to_string())?
+            .map_err(|err| format!("second usage sample failed: {err}"))?;
+            let cpu_advanced = sample.cpu_usage_nanos > first.cpu_usage_nanos;
+            second = Some(sample);
+            if cpu_advanced {
+                break;
+            }
+        }
+        let second = second.expect("sample loop always records one usage sample");
+
+        if second.sampled_at_unix_ms < first.sampled_at_unix_ms {
+            return Err(format!(
+                "usage sample timestamps regressed: first={} second={}",
+                first.sampled_at_unix_ms, second.sampled_at_unix_ms
+            ));
+        }
+        if second.cpu_usage_nanos <= first.cpu_usage_nanos {
+            return Err(format!(
+                "expected busy container CPU to increase: first={} second={}",
+                first.cpu_usage_nanos, second.cpu_usage_nanos
+            ));
+        }
+        if second.memory_current_bytes == 0 {
+            return Err("expected Docker memory sample to report non-zero bytes".to_string());
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = manager.remove_instance(&container_id, true, true).await {
+        panic!("cleanup usage sample test container failed: {err}");
+    }
+    if let Err(err) = result {
+        panic!("{err}");
     }
 }
 

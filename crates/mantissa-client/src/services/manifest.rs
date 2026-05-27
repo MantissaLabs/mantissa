@@ -1380,6 +1380,31 @@ mod tests {
             .expect("gang service example should validate");
     }
 
+    #[test]
+    /// Loads the autoscale example through the public manifest parser.
+    fn autoscaled_service_example_manifest_loads_policy() {
+        let manifest =
+            load_manifest_from_path(&example_manifest("autoscaled_service.ron")).expect("manifest");
+
+        assert_eq!(manifest.name, "autoscaled-demo");
+        assert_eq!(manifest.task_templates.len(), 1);
+        let template = &manifest.task_templates[0];
+        assert_eq!(template.name, "api");
+        assert_eq!(template.replicas, 2);
+        let policy = template.autoscale.as_ref().expect("autoscale policy");
+        assert_eq!(policy.min_replicas, 2);
+        assert_eq!(policy.max_replicas, 8);
+        assert_eq!(policy.metrics.len(), 2);
+        assert!(matches!(
+            policy.metrics[0].kind,
+            TaskTemplateAutoscaleMetricKind::Cpu
+        ));
+        assert!(matches!(
+            policy.metrics[1].kind,
+            TaskTemplateAutoscaleMetricKind::Memory
+        ));
+    }
+
     /// Builds one valid autoscale manifest used as a mutation base for validation tests.
     fn valid_autoscale_manifest() -> ServiceManifest {
         ron::from_str(

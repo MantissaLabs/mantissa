@@ -9,8 +9,9 @@ use blake3::Hasher;
 use capnp::Error as CapnpError;
 use capnp::struct_list;
 use mantissa_protocol::services::{
-    LivenessProbeKind as ProtoLivenessProbeKind, ReadinessProbeKind as ProtoReadinessProbeKind,
-    RolloutPhase as ProtoRolloutPhase, ServiceStatus as ProtoServiceStatus,
+    AutoscaleMetricKind as ProtoAutoscaleMetricKind, LivenessProbeKind as ProtoLivenessProbeKind,
+    ReadinessProbeKind as ProtoReadinessProbeKind, RolloutPhase as ProtoRolloutPhase,
+    ServiceStatus as ProtoServiceStatus, autoscale_metric, autoscale_policy,
     replica_assignment_segment, service_spec, service_task_progress, task_template,
 };
 use std::collections::{HashMap, HashSet};
@@ -343,11 +344,69 @@ pub struct TaskTemplateRow {
     pub image: String,
     pub command: Vec<String>,
     pub replicas: u16,
+    pub autoscale: Option<TaskTemplateAutoscalePolicyRow>,
     pub networks: Vec<String>,
     pub public_port: Option<u16>,
     pub readiness_port: Option<u16>,
     pub liveness_port: Option<u16>,
     pub ports: Vec<HostPortView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskTemplateAutoscalePolicyRow {
+    pub min_replicas: u16,
+    pub max_replicas: u16,
+    pub cooldown_secs: u64,
+    pub scale_down_stabilization_secs: u64,
+    pub sample_window_secs: u64,
+    pub trigger_windows: u32,
+    pub metrics: Vec<TaskTemplateAutoscaleMetricRow>,
+}
+
+impl TaskTemplateAutoscalePolicyRow {
+    /// Builds a client-facing autoscale policy row from one protocol payload.
+    fn from_reader(reader: autoscale_policy::Reader<'_>) -> Result<Self, CapnpError> {
+        let mut metrics = Vec::new();
+        for metric in reader.get_metrics()?.iter() {
+            metrics.push(TaskTemplateAutoscaleMetricRow::from_reader(metric)?);
+        }
+
+        Ok(Self {
+            min_replicas: reader.get_min_replicas(),
+            max_replicas: reader.get_max_replicas(),
+            cooldown_secs: reader.get_cooldown_secs(),
+            scale_down_stabilization_secs: reader.get_scale_down_stabilization_secs(),
+            sample_window_secs: reader.get_sample_window_secs(),
+            trigger_windows: reader.get_trigger_windows(),
+            metrics,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskTemplateAutoscaleMetricRow {
+    pub kind: TaskTemplateAutoscaleMetricKindRow,
+    pub target_percent: u16,
+}
+
+impl TaskTemplateAutoscaleMetricRow {
+    /// Builds a client-facing autoscale metric row from one protocol payload.
+    fn from_reader(reader: autoscale_metric::Reader<'_>) -> Result<Self, CapnpError> {
+        let kind = match reader.get_kind()? {
+            ProtoAutoscaleMetricKind::Cpu => TaskTemplateAutoscaleMetricKindRow::Cpu,
+            ProtoAutoscaleMetricKind::Memory => TaskTemplateAutoscaleMetricKindRow::Memory,
+        };
+        Ok(Self {
+            kind,
+            target_percent: reader.get_target_percent(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskTemplateAutoscaleMetricKindRow {
+    Cpu,
+    Memory,
 }
 
 impl TaskTemplateRow {
@@ -394,11 +453,20 @@ impl TaskTemplateRow {
             None
         };
 
+        let autoscale = if reader.has_autoscale() {
+            Some(TaskTemplateAutoscalePolicyRow::from_reader(
+                reader.get_autoscale()?,
+            )?)
+        } else {
+            None
+        };
+
         Ok(Self {
             name: reader.get_name()?.to_str()?.to_string(),
             image: reader.get_image()?.to_str()?.to_string(),
             command,
             replicas: reader.get_replicas(),
+            autoscale,
             networks,
             public_port,
             readiness_port,
@@ -798,6 +866,7 @@ mod tests {
             image: "hashicorp/http-echo:1.0.0".to_string(),
             command: Vec::new(),
             replicas: 1,
+            autoscale: None,
             networks: vec!["default".to_string()],
             public_port,
             readiness_port,
@@ -833,6 +902,20 @@ mod tests {
             template.reborrow().init_command(0);
             template.reborrow().init_networks(0);
             template.reborrow().init_ports(0);
+            let mut autoscale = template.reborrow().init_autoscale();
+            autoscale.set_min_replicas(2);
+            autoscale.set_max_replicas(8);
+            autoscale.set_cooldown_secs(60);
+            autoscale.set_scale_down_stabilization_secs(300);
+            autoscale.set_sample_window_secs(15);
+            autoscale.set_trigger_windows(2);
+            let mut metrics = autoscale.reborrow().init_metrics(2);
+            let mut cpu_metric = metrics.reborrow().get(0);
+            cpu_metric.set_kind(ProtoAutoscaleMetricKind::Cpu);
+            cpu_metric.set_target_percent(70);
+            let mut memory_metric = metrics.reborrow().get(1);
+            memory_metric.set_kind(ProtoAutoscaleMetricKind::Memory);
+            memory_metric.set_target_percent(80);
 
             builder.reborrow().init_replica_ids(0);
             let mut segments = builder.reborrow().init_replica_assignment_segments(1);
@@ -860,6 +943,29 @@ mod tests {
                 first_replica: 1,
                 replica_count: 2,
             }]
+        );
+        let policy = row.task_templates[0]
+            .autoscale
+            .as_ref()
+            .expect("autoscale policy");
+        assert_eq!(policy.min_replicas, 2);
+        assert_eq!(policy.max_replicas, 8);
+        assert_eq!(policy.cooldown_secs, 60);
+        assert_eq!(policy.scale_down_stabilization_secs, 300);
+        assert_eq!(policy.sample_window_secs, 15);
+        assert_eq!(policy.trigger_windows, 2);
+        assert_eq!(
+            policy.metrics,
+            vec![
+                TaskTemplateAutoscaleMetricRow {
+                    kind: TaskTemplateAutoscaleMetricKindRow::Cpu,
+                    target_percent: 70,
+                },
+                TaskTemplateAutoscaleMetricRow {
+                    kind: TaskTemplateAutoscaleMetricKindRow::Memory,
+                    target_percent: 80,
+                },
+            ]
         );
         assert_eq!(
             build_template_replica_ids(&row)
