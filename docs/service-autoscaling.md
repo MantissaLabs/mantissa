@@ -53,6 +53,9 @@ Every node samples usage only for the service replicas it runs locally. Nodes do
 not gossip periodic per-replica usage samples. A node sends an owner-directed
 autoscale signal only when its local aggregate crosses a configured hot
 threshold, or when a quiet summary is needed for scale-down stabilization.
+Scale-down summaries account for local replicas in `Running` state; deployment
+readiness has already gated the service generation before autoscaling evaluates
+it.
 
 For each service, one active node is selected as the autoscale owner with
 rendezvous hashing over the active cluster view. Only that owner evaluates

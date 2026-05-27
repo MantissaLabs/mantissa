@@ -21,6 +21,8 @@ const AUTOSCALE_SIGNAL_TTL_SECS: u64 = 180;
 const AUTOSCALE_MAX_SCALE_UP_FACTOR: u16 = 2;
 /// Local runtime usage sampling interval for autoscale-enabled service replicas.
 pub(super) const AUTOSCALE_LOCAL_SAMPLE_TICK_SECS: u64 = 10;
+/// Maximum time one local telemetry emit pass may occupy a controller worker.
+pub(super) const AUTOSCALE_LOCAL_EMIT_TIMEOUT_SECS: u64 = 5;
 /// Quiet summary heartbeat interval used to keep owner-side downscale coverage alive.
 const AUTOSCALE_QUIET_SUMMARY_INTERVAL_SECS: u64 = 60;
 /// Retention window for local runtime deltas and per-template signal state.
@@ -533,6 +535,7 @@ struct AutoscaleLocalGroupState {
     last_hot_signal_at: Option<Instant>,
     last_summary_signal_at: Option<Instant>,
     last_seen_at: Option<Instant>,
+    last_owner_node_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug)]
@@ -775,6 +778,7 @@ impl AutoscaleLocalSampleStore {
     fn signal_for_accumulator(
         &mut self,
         local_node_id: Uuid,
+        owner_node_id: Uuid,
         accumulator: AutoscaleSignalAccumulator,
         now: Instant,
     ) -> Option<ServiceAutoscaleSignal> {
@@ -791,6 +795,14 @@ impl AutoscaleLocalSampleStore {
             accumulator.memory_observed_bytes_total,
         );
         state.last_seen_at = Some(now);
+        // Owner-side signal caches are in-memory soft state. When ownership moves, resend the
+        // current local condition immediately instead of honoring a throttle accepted by the
+        // previous owner.
+        if state.last_owner_node_id != Some(owner_node_id) {
+            state.last_owner_node_id = Some(owner_node_id);
+            state.last_hot_signal_at = None;
+            state.last_summary_signal_at = None;
+        }
 
         if let Some(reason) = accumulator.hot_reason() {
             let min_interval = Duration::from_secs(accumulator.policy.sample_window_secs.max(1));
@@ -883,6 +895,9 @@ fn build_signal(
         kind,
         reason,
         running_replicas: accumulator.running_replicas,
+        // Autoscale observes runtime rows after service readiness has admitted the generation.
+        // Until there is a separate live readiness signal, downscale coverage uses Running
+        // replicas as the local ready count.
         ready_replicas: accumulator.running_replicas,
         hot_replicas: accumulator.hot_replicas,
         cpu_requested_millis_total: accumulator.cpu_requested_millis_total,
@@ -1154,6 +1169,7 @@ impl ServiceController {
         }
 
         let now = Instant::now();
+        let eligible_nodes = self.collect_eligible_nodes();
         let mut signals = Vec::new();
         {
             let mut store = self.autoscale_local_samples.lock().await;
@@ -1187,9 +1203,17 @@ impl ServiceController {
             }
 
             for accumulator in accumulators.into_values() {
-                if let Some(signal) =
-                    store.signal_for_accumulator(self.local_node_id, accumulator, now)
-                {
+                let Some(owner_node_id) =
+                    select_autoscale_owner(accumulator.key.service_id, &eligible_nodes)
+                else {
+                    continue;
+                };
+                if let Some(signal) = store.signal_for_accumulator(
+                    self.local_node_id,
+                    owner_node_id,
+                    accumulator,
+                    now,
+                ) {
                     signals.push(signal);
                 }
             }
@@ -1994,7 +2018,7 @@ mod tests {
         accumulator.push(&test_usage_sample(0, 64, 1_000), 0);
 
         let signal = store
-            .signal_for_accumulator(local_node_id, accumulator, now)
+            .signal_for_accumulator(local_node_id, local_node_id, accumulator, now)
             .expect("initial quiet summary");
         assert_eq!(signal.kind, ServiceAutoscaleSignalKind::Summary);
         assert_eq!(signal.reason, ServiceAutoscaleSignalReason::Quiet);
@@ -2007,7 +2031,12 @@ mod tests {
         accumulator.push(&test_usage_sample(0, 64, 2_000), 0);
         assert!(
             store
-                .signal_for_accumulator(local_node_id, accumulator, now + interval / 2)
+                .signal_for_accumulator(
+                    local_node_id,
+                    local_node_id,
+                    accumulator,
+                    now + interval / 2
+                )
                 .is_none()
         );
 
@@ -2015,7 +2044,7 @@ mod tests {
         accumulator.policy.scale_down_stabilization_secs = AUTOSCALE_SIGNAL_TTL_SECS + 120;
         accumulator.push(&test_usage_sample(0, 64, 61_000), 0);
         let signal = store
-            .signal_for_accumulator(local_node_id, accumulator, now + interval)
+            .signal_for_accumulator(local_node_id, local_node_id, accumulator, now + interval)
             .expect("periodic quiet summary");
 
         assert_eq!(signal.kind, ServiceAutoscaleSignalKind::Summary);
@@ -2033,18 +2062,70 @@ mod tests {
         accumulator.push(&test_usage_sample(0, 64, 1_000), 0);
 
         let signal = store
-            .signal_for_accumulator(local_node_id, accumulator, now)
+            .signal_for_accumulator(local_node_id, local_node_id, accumulator, now)
             .expect("initial quiet summary");
         store.mark_signal_delivery_failed(&signal);
 
         let mut accumulator = test_accumulator(service_id);
         accumulator.push(&test_usage_sample(0, 64, 2_000), 0);
         let retry = store
-            .signal_for_accumulator(local_node_id, accumulator, now + Duration::from_secs(1))
+            .signal_for_accumulator(
+                local_node_id,
+                local_node_id,
+                accumulator,
+                now + Duration::from_secs(1),
+            )
             .expect("quiet summary retry");
 
         assert_eq!(retry.kind, ServiceAutoscaleSignalKind::Summary);
         assert_eq!(retry.reason, ServiceAutoscaleSignalReason::Quiet);
+    }
+
+    /// Owner changes should clear hot-signal throttles accepted by the previous owner.
+    #[test]
+    fn local_sample_store_resends_hot_signal_after_owner_change() {
+        let now = Instant::now();
+        let service_id = Uuid::new_v4();
+        let local_node_id = Uuid::new_v4();
+        let first_owner = Uuid::new_v4();
+        let second_owner = Uuid::new_v4();
+        let mut store = AutoscaleLocalSampleStore::default();
+
+        let mut accumulator = test_accumulator(service_id);
+        accumulator.policy.sample_window_secs = 60;
+        accumulator.push(&test_usage_sample(0, 128, 1_000), 0);
+        let initial = store
+            .signal_for_accumulator(local_node_id, first_owner, accumulator, now)
+            .expect("initial hot signal");
+        assert_eq!(initial.kind, ServiceAutoscaleSignalKind::Hot);
+
+        let mut accumulator = test_accumulator(service_id);
+        accumulator.policy.sample_window_secs = 60;
+        accumulator.push(&test_usage_sample(0, 128, 2_000), 0);
+        assert!(
+            store
+                .signal_for_accumulator(
+                    local_node_id,
+                    first_owner,
+                    accumulator,
+                    now + Duration::from_secs(1),
+                )
+                .is_none(),
+            "same owner should still honor the hot throttle"
+        );
+
+        let mut accumulator = test_accumulator(service_id);
+        accumulator.policy.sample_window_secs = 60;
+        accumulator.push(&test_usage_sample(0, 128, 3_000), 0);
+        let after_owner_change = store
+            .signal_for_accumulator(
+                local_node_id,
+                second_owner,
+                accumulator,
+                now + Duration::from_secs(2),
+            )
+            .expect("owner change should force hot resend");
+        assert_eq!(after_owner_change.kind, ServiceAutoscaleSignalKind::Hot);
     }
 
     /// Hot windows should advance only once per configured sample window.
@@ -2060,7 +2141,7 @@ mod tests {
         accumulator.push(&test_usage_sample(0, 128, 1_000), 0);
         assert!(
             store
-                .signal_for_accumulator(local_node_id, accumulator, now)
+                .signal_for_accumulator(local_node_id, local_node_id, accumulator, now)
                 .is_none()
         );
 
@@ -2069,7 +2150,12 @@ mod tests {
         accumulator.push(&test_usage_sample(0, 128, 2_000), 0);
         assert!(
             store
-                .signal_for_accumulator(local_node_id, accumulator, now + Duration::from_secs(5))
+                .signal_for_accumulator(
+                    local_node_id,
+                    local_node_id,
+                    accumulator,
+                    now + Duration::from_secs(5),
+                )
                 .is_none()
         );
 
@@ -2077,7 +2163,12 @@ mod tests {
         accumulator.policy.trigger_windows = 2;
         accumulator.push(&test_usage_sample(0, 128, 11_000), 0);
         let signal = store
-            .signal_for_accumulator(local_node_id, accumulator, now + Duration::from_secs(10))
+            .signal_for_accumulator(
+                local_node_id,
+                local_node_id,
+                accumulator,
+                now + Duration::from_secs(10),
+            )
             .expect("second hot sample window should emit");
 
         assert_eq!(signal.kind, ServiceAutoscaleSignalKind::Hot);

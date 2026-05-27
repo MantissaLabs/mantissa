@@ -38,9 +38,10 @@ use mantissa_health::{HealthMonitor, Status as HealthStatus};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::time::{interval, sleep};
+use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use uuid::Uuid;
 
 mod admission;
@@ -275,6 +276,7 @@ pub struct ServiceController {
     slot_rebalance_after: Arc<AsyncMutex<HashMap<SlotKey, Instant>>>,
     autoscale_signals: Arc<AsyncMutex<AutoscaleSignalStore>>,
     autoscale_local_samples: Arc<AsyncMutex<AutoscaleLocalSampleStore>>,
+    autoscale_inflight: Arc<AtomicBool>,
     timing: ServiceControllerTiming,
 }
 
@@ -294,6 +296,18 @@ impl ServiceGenerationExecutionKey {
             manifest_id: spec.manifest_id,
             service_epoch: spec.service_epoch,
         }
+    }
+}
+
+/// Resets the autoscale tick guard after one local background pass completes.
+struct AutoscaleInflightGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for AutoscaleInflightGuard {
+    /// Clears the shared autoscale in-flight flag when a spawned tick exits.
+    fn drop(&mut self) {
+        self.flag.store(false, AtomicOrdering::Release);
     }
 }
 
@@ -347,6 +361,7 @@ impl ServiceController {
             autoscale_local_samples: Arc::new(
                 AsyncMutex::new(AutoscaleLocalSampleStore::default()),
             ),
+            autoscale_inflight: Arc::new(AtomicBool::new(false)),
             timing,
         }
     }
@@ -355,6 +370,7 @@ impl ServiceController {
     pub async fn run(&mut self) {
         let mut reschedule_tick = interval(self.timing.reschedule_tick);
         let mut autoscale_tick = interval(self.timing.autoscale_tick);
+        autoscale_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -367,18 +383,7 @@ impl ServiceController {
                     }
                 }
                 _ = autoscale_tick.tick() => {
-                    if let Err(err) = self.emit_local_autoscale_signals().await {
-                        tracing::warn!(
-                            target: "services",
-                            "failed to emit local autoscale signals: {err:#}"
-                        );
-                    }
-                    if let Err(err) = self.reconcile_autoscale_decisions().await {
-                        tracing::warn!(
-                            target: "services",
-                            "failed to reconcile autoscale decisions: {err:#}"
-                        );
-                    }
+                    self.spawn_autoscale_tick();
                 }
                 message = self.gossip_rx.recv() => {
                     let Ok(message) = message else { break; };
@@ -391,6 +396,57 @@ impl ServiceController {
                         }
                 }
             }
+        }
+    }
+
+    /// Spawns one guarded local autoscale tick without blocking service reconciliation.
+    fn spawn_autoscale_tick(&self) {
+        if self
+            .autoscale_inflight
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_err()
+        {
+            tracing::debug!(
+                target: "services",
+                "skipping autoscale tick while previous tick is still running"
+            );
+            return;
+        }
+
+        let controller = self.clone();
+        tokio::task::spawn_local(async move {
+            let _guard = AutoscaleInflightGuard {
+                flag: controller.autoscale_inflight.clone(),
+            };
+            controller.run_autoscale_tick().await;
+        });
+    }
+
+    /// Runs one bounded autoscale control pass from the service controller loop.
+    async fn run_autoscale_tick(&self) {
+        let emit_timeout = Duration::from_secs(autoscale::AUTOSCALE_LOCAL_EMIT_TIMEOUT_SECS);
+        match timeout(emit_timeout, self.emit_local_autoscale_signals()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    target: "services",
+                    "failed to emit local autoscale signals: {err:#}"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "services",
+                    timeout_secs = autoscale::AUTOSCALE_LOCAL_EMIT_TIMEOUT_SECS,
+                    "local autoscale telemetry emit timed out"
+                );
+            }
+        }
+
+        if let Err(err) = self.reconcile_autoscale_decisions().await {
+            tracing::warn!(
+                target: "services",
+                "failed to reconcile autoscale decisions: {err:#}"
+            );
         }
     }
 

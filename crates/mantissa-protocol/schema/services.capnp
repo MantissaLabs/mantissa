@@ -165,7 +165,8 @@ struct AutoscaleSignal {
   # Local running replica count for the service/template.
 
   readyReplicas @7 :UInt32;
-  # Local ready replica count for the service/template.
+  # Local replicas treated as ready for autoscale coverage. The current sampler
+  # reports running replicas after the service generation has passed readiness.
 
   hotReplicas @8 :UInt32;
   # Local replicas currently above a configured threshold.
