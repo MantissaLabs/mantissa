@@ -4,11 +4,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, anyhow};
 use uuid::Uuid;
 
+use crate::observability::metrics;
 use crate::runtime::types::RuntimeUsageSample;
 use crate::services::manager::ServiceController;
 use crate::services::ownership::select_autoscale_owner;
 use crate::services::types::{
-    ServiceStatus, TaskTemplateAutoscaleMetricKindValue, TaskTemplateAutoscalePolicyValue,
+    ServiceEvent, ServicePreviousGeneration, ServiceSpecValue, ServiceStatus,
+    TaskTemplateAutoscaleMetricKindValue, TaskTemplateAutoscalePolicyValue,
 };
 use crate::workload::manager::LocalServiceRuntimeUsageSample;
 
@@ -102,6 +104,47 @@ impl AutoscaleSignalKey {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct AutoscaleDecisionKey {
+    service_id: Uuid,
+    template_name: String,
+}
+
+impl AutoscaleDecisionKey {
+    /// Builds the owner-side cooldown key for one autoscaled service template.
+    fn new(service_id: Uuid, template_name: impl Into<String>) -> Self {
+        Self {
+            service_id,
+            template_name: template_name.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct AutoscaleDecisionState {
+    service_epoch: u64,
+    last_scale_at: Option<Instant>,
+    quiet_since: Option<Instant>,
+}
+
+/// Direction of one accepted autoscale replica-count mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutoscaleScaleDirection {
+    Up,
+    Down,
+}
+
+/// Bounded autoscale decision returned by the owner-side signal evaluator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutoscaleScaleDecision {
+    service_id: Uuid,
+    service_epoch: u64,
+    template_name: String,
+    current_replicas: u16,
+    desired_replicas: u16,
+    direction: AutoscaleScaleDirection,
+}
+
 /// In-memory owner-side autoscale signal cache.
 ///
 /// Signals are soft control input. The durable service spec is updated only
@@ -110,6 +153,7 @@ impl AutoscaleSignalKey {
 pub(super) struct AutoscaleSignalStore {
     ttl: Duration,
     signals: HashMap<AutoscaleSignalKey, (ServiceAutoscaleSignal, Instant)>,
+    decisions: HashMap<AutoscaleDecisionKey, AutoscaleDecisionState>,
 }
 
 impl Default for AutoscaleSignalStore {
@@ -118,6 +162,7 @@ impl Default for AutoscaleSignalStore {
         Self {
             ttl: Duration::from_secs(AUTOSCALE_SIGNAL_TTL_SECS),
             signals: HashMap::new(),
+            decisions: HashMap::new(),
         }
     }
 }
@@ -136,12 +181,183 @@ impl AutoscaleSignalStore {
             .retain(|_, (_, received_at)| now.duration_since(*received_at) <= self.ttl);
     }
 
+    /// Computes bounded replica-count decisions for the current service generation.
+    fn decisions_for_service(
+        &mut self,
+        spec: &ServiceSpecValue,
+        now: Instant,
+    ) -> Vec<AutoscaleScaleDecision> {
+        self.prune(now);
+        let mut decisions = Vec::new();
+        for template in &spec.task_templates {
+            let Some(policy) = template.autoscale.as_ref() else {
+                continue;
+            };
+            let key = AutoscaleDecisionKey::new(spec.id, template.name.clone());
+            let state = self.decisions.entry(key).or_default();
+            if state.service_epoch != spec.service_epoch {
+                state.service_epoch = spec.service_epoch;
+                state.quiet_since = None;
+            }
+            if !interval_elapsed(
+                state.last_scale_at,
+                Duration::from_secs(policy.cooldown_secs),
+                now,
+            ) {
+                continue;
+            }
+
+            let signals = current_template_signals(
+                &self.signals,
+                spec.id,
+                spec.service_epoch,
+                &template.name,
+            );
+            if let Some(decision) =
+                scale_up_decision(spec, &template.name, template.replicas, policy, &signals)
+            {
+                state.quiet_since = None;
+                decisions.push(decision);
+                continue;
+            }
+
+            if quiet_signals_cover_replicas(&signals, template.replicas) {
+                let quiet_since = state.quiet_since.get_or_insert(now);
+                if now.saturating_duration_since(*quiet_since)
+                    >= Duration::from_secs(policy.scale_down_stabilization_secs)
+                    && let Some(decision) =
+                        scale_down_decision(spec, &template.name, template.replicas, policy)
+                {
+                    decisions.push(decision);
+                }
+            } else {
+                state.quiet_since = None;
+            }
+        }
+        decisions
+    }
+
+    /// Marks successful decisions so stale signals cannot drive repeated scaling.
+    fn mark_decisions_applied(&mut self, decisions: &[AutoscaleScaleDecision], now: Instant) {
+        for decision in decisions {
+            let key =
+                AutoscaleDecisionKey::new(decision.service_id, decision.template_name.clone());
+            let state = self.decisions.entry(key).or_default();
+            state.service_epoch = decision.service_epoch;
+            state.last_scale_at = Some(now);
+            state.quiet_since = None;
+            self.clear_template_signals(
+                decision.service_id,
+                decision.service_epoch,
+                &decision.template_name,
+            );
+        }
+    }
+
+    /// Drops soft signals for one template after their decision has been persisted.
+    fn clear_template_signals(
+        &mut self,
+        service_id: Uuid,
+        service_epoch: u64,
+        template_name: &str,
+    ) {
+        self.signals.retain(|key, _| {
+            key.service_id != service_id
+                || key.service_epoch != service_epoch
+                || key.template_name != template_name
+        });
+    }
+
     /// Returns the number of currently retained signals after pruning.
     #[cfg(test)]
     fn len_after_prune(&mut self, now: Instant) -> usize {
         self.prune(now);
         self.signals.len()
     }
+}
+
+/// Returns non-expired owner-side signals for one service template generation.
+fn current_template_signals(
+    signals: &HashMap<AutoscaleSignalKey, (ServiceAutoscaleSignal, Instant)>,
+    service_id: Uuid,
+    service_epoch: u64,
+    template_name: &str,
+) -> Vec<ServiceAutoscaleSignal> {
+    signals
+        .iter()
+        .filter(|(key, _)| {
+            key.service_id == service_id
+                && key.service_epoch == service_epoch
+                && key.template_name == template_name
+        })
+        .map(|(_, (signal, _))| signal.clone())
+        .collect()
+}
+
+/// Builds a one-step scale-up decision from hot signals when policy bounds allow it.
+fn scale_up_decision(
+    spec: &ServiceSpecValue,
+    template_name: &str,
+    current_replicas: u16,
+    policy: &TaskTemplateAutoscalePolicyValue,
+    signals: &[ServiceAutoscaleSignal],
+) -> Option<AutoscaleScaleDecision> {
+    if !signals
+        .iter()
+        .any(|signal| signal.kind == ServiceAutoscaleSignalKind::Hot && signal.hot_replicas > 0)
+    {
+        return None;
+    }
+    let desired_replicas = current_replicas.saturating_add(1).min(policy.max_replicas);
+    (desired_replicas > current_replicas).then(|| AutoscaleScaleDecision {
+        service_id: spec.id,
+        service_epoch: spec.service_epoch,
+        template_name: template_name.to_string(),
+        current_replicas,
+        desired_replicas,
+        direction: AutoscaleScaleDirection::Up,
+    })
+}
+
+/// Builds a one-step scale-down decision when policy bounds allow it.
+fn scale_down_decision(
+    spec: &ServiceSpecValue,
+    template_name: &str,
+    current_replicas: u16,
+    policy: &TaskTemplateAutoscalePolicyValue,
+) -> Option<AutoscaleScaleDecision> {
+    let desired_replicas = current_replicas.saturating_sub(1).max(policy.min_replicas);
+    (desired_replicas < current_replicas).then(|| AutoscaleScaleDecision {
+        service_id: spec.id,
+        service_epoch: spec.service_epoch,
+        template_name: template_name.to_string(),
+        current_replicas,
+        desired_replicas,
+        direction: AutoscaleScaleDirection::Down,
+    })
+}
+
+/// Returns true once quiet summaries account for every desired replica in the template.
+fn quiet_signals_cover_replicas(signals: &[ServiceAutoscaleSignal], desired_replicas: u16) -> bool {
+    if desired_replicas == 0
+        || signals
+            .iter()
+            .any(|signal| signal.kind == ServiceAutoscaleSignalKind::Hot)
+    {
+        return false;
+    }
+
+    let mut running_replicas = 0u32;
+    for signal in signals {
+        if signal.kind != ServiceAutoscaleSignalKind::Summary
+            || signal.reason != ServiceAutoscaleSignalReason::Quiet
+            || signal.hot_replicas != 0
+        {
+            return false;
+        }
+        running_replicas = running_replicas.saturating_add(signal.running_replicas);
+    }
+    running_replicas >= u32::from(desired_replicas)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -499,6 +715,81 @@ fn usage_exceeds_target(observed: u64, requested: u64, target_percent: u16) -> b
             >= u128::from(requested).saturating_mul(u128::from(target_percent))
 }
 
+/// Builds the next deploying service generation for accepted autoscale decisions.
+fn build_autoscale_pending_spec(
+    current: &ServiceSpecValue,
+    decisions: &[AutoscaleScaleDecision],
+) -> Option<ServiceSpecValue> {
+    if decisions.is_empty() {
+        return None;
+    }
+
+    let mut templates = current.task_templates.clone();
+    let mut changed = false;
+    for decision in decisions {
+        if decision.service_id != current.id || decision.service_epoch != current.service_epoch {
+            continue;
+        }
+        let Some(template) = templates
+            .iter_mut()
+            .find(|template| template.name == decision.template_name)
+        else {
+            continue;
+        };
+        if template.replicas != decision.current_replicas
+            || template.replicas == decision.desired_replicas
+        {
+            continue;
+        }
+
+        template.replicas = decision.desired_replicas;
+        changed = true;
+    }
+
+    if !changed {
+        return None;
+    }
+
+    let mut pending = current.clone();
+    pending.task_templates = templates;
+    pending.start_new_generation();
+    pending.clear_replica_assignments();
+    pending.previous_generation = Some(ServicePreviousGeneration::from_service(current));
+    pending.set_status(ServiceStatus::Deploying);
+    Some(pending)
+}
+
+/// Returns the bounded metrics label for an autoscale signal kind.
+fn autoscale_signal_kind_label(kind: ServiceAutoscaleSignalKind) -> &'static str {
+    match kind {
+        ServiceAutoscaleSignalKind::Hot => "hot",
+        ServiceAutoscaleSignalKind::Summary => "summary",
+    }
+}
+
+/// Returns the bounded metrics label for an autoscale scale direction.
+fn autoscale_direction_label(direction: AutoscaleScaleDirection) -> &'static str {
+    match direction {
+        AutoscaleScaleDirection::Up => "up",
+        AutoscaleScaleDirection::Down => "down",
+    }
+}
+
+/// Records and returns an accepted autoscale signal response.
+fn accepted_signal_report(kind: &'static str) -> ServiceAutoscaleSignalReport {
+    metrics::record_autoscale_signal(kind, "accepted");
+    ServiceAutoscaleSignalReport::accepted()
+}
+
+/// Records and returns a rejected autoscale signal response.
+fn rejected_signal_report(
+    kind: &'static str,
+    detail: impl Into<String>,
+) -> ServiceAutoscaleSignalReport {
+    metrics::record_autoscale_signal(kind, "rejected");
+    ServiceAutoscaleSignalReport::rejected(detail)
+}
+
 impl ServiceController {
     /// Samples local service replicas and emits sparse autoscale signals to the owner.
     pub(super) async fn emit_local_autoscale_signals(&self) -> anyhow::Result<()> {
@@ -549,17 +840,116 @@ impl ServiceController {
         }
 
         for signal in signals {
-            let report = self.send_autoscale_signal(signal).await?;
-            if !report.accepted {
-                tracing::debug!(
-                    target: "services",
-                    detail = %report.detail,
-                    "autoscale owner rejected local signal"
-                );
+            let kind = autoscale_signal_kind_label(signal.kind);
+            match self.send_autoscale_signal(signal).await {
+                Ok(report) if report.accepted => {}
+                Ok(report) => {
+                    tracing::debug!(
+                        target: "services",
+                        detail = %report.detail,
+                        "autoscale owner rejected local signal"
+                    );
+                }
+                Err(err) => {
+                    metrics::record_autoscale_signal(kind, "error");
+                    tracing::debug!(
+                        target: "services",
+                        "failed to deliver local autoscale signal: {err:#}"
+                    );
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Evaluates owner-side autoscale signals and persists service scale decisions.
+    pub(super) async fn reconcile_autoscale_decisions(&self) -> anyhow::Result<()> {
+        let eligible_nodes = self.collect_eligible_nodes();
+        if eligible_nodes.is_empty() {
+            return Ok(());
+        }
+
+        for spec in self.registry.list()? {
+            if spec.status() != ServiceStatus::Running
+                || select_autoscale_owner(spec.id, &eligible_nodes) != Some(self.local_node_id)
+            {
+                continue;
+            }
+
+            let now = Instant::now();
+            let decisions = {
+                self.autoscale_signals
+                    .lock()
+                    .await
+                    .decisions_for_service(&spec, now)
+            };
+            if decisions.is_empty() {
+                continue;
+            }
+
+            match self.apply_autoscale_decisions(&spec, &decisions).await {
+                Ok(true) => {
+                    self.autoscale_signals
+                        .lock()
+                        .await
+                        .mark_decisions_applied(&decisions, now);
+                    for decision in &decisions {
+                        metrics::record_autoscale_decision(
+                            autoscale_direction_label(decision.direction),
+                            "applied",
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    for decision in &decisions {
+                        metrics::record_autoscale_decision(
+                            autoscale_direction_label(decision.direction),
+                            "failed",
+                        );
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Applies template autoscale decisions through the normal service generation path.
+    async fn apply_autoscale_decisions(
+        &self,
+        observed: &ServiceSpecValue,
+        decisions: &[AutoscaleScaleDecision],
+    ) -> anyhow::Result<bool> {
+        let Some(current) = self.registry.get(observed.id)? else {
+            return Ok(false);
+        };
+        if current.service_epoch != observed.service_epoch
+            || current.status() != ServiceStatus::Running
+        {
+            return Ok(false);
+        }
+
+        let Some(pending) = build_autoscale_pending_spec(&current, decisions) else {
+            return Ok(false);
+        };
+        let service_name = pending.service_name.clone();
+        let service_epoch = pending.service_epoch;
+        self.apply_upsert(pending.clone()).await?;
+        self.broadcast(ServiceEvent::Upsert(pending.clone()))
+            .await?;
+        self.maybe_spawn_generation_execution_for_service(pending.id)
+            .await;
+
+        tracing::info!(
+            target: "services",
+            service = %service_name,
+            epoch = service_epoch,
+            "autoscale decision started service generation"
+        );
+        Ok(true)
     }
 
     /// Returns the active autoscale policy for one sampled local service replica.
@@ -590,44 +980,45 @@ impl ServiceController {
         &self,
         signal: ServiceAutoscaleSignal,
     ) -> ServiceAutoscaleSignalReport {
+        let kind = autoscale_signal_kind_label(signal.kind);
         let Some(spec) = self.registry.get(signal.service_id).ok().flatten() else {
-            return ServiceAutoscaleSignalReport::rejected("service not found");
+            return rejected_signal_report(kind, "service not found");
         };
         if spec.status() != ServiceStatus::Running {
-            return ServiceAutoscaleSignalReport::rejected("service is not running");
+            return rejected_signal_report(kind, "service is not running");
         }
         if signal.service_epoch != spec.service_epoch {
-            return ServiceAutoscaleSignalReport::rejected("stale service epoch");
+            return rejected_signal_report(kind, "stale service epoch");
         }
         let Some(template) = spec
             .task_templates
             .iter()
             .find(|template| template.name == signal.template_name)
         else {
-            return ServiceAutoscaleSignalReport::rejected("template not found");
+            return rejected_signal_report(kind, "template not found");
         };
         if template.autoscale.is_none() {
-            return ServiceAutoscaleSignalReport::rejected("template autoscale disabled");
+            return rejected_signal_report(kind, "template autoscale disabled");
         }
 
         let known_nodes = self.known_autoscale_signal_nodes();
         if !known_nodes.contains(&signal.node_id) {
-            return ServiceAutoscaleSignalReport::rejected("signal node is unknown");
+            return rejected_signal_report(kind, "signal node is unknown");
         }
 
         let eligible_nodes = self.collect_eligible_nodes();
         let Some(owner) = select_autoscale_owner(spec.id, &eligible_nodes) else {
-            return ServiceAutoscaleSignalReport::rejected("no autoscale owner available");
+            return rejected_signal_report(kind, "no autoscale owner available");
         };
         if owner != self.local_node_id {
-            return ServiceAutoscaleSignalReport::rejected("receiver is not autoscale owner");
+            return rejected_signal_report(kind, "receiver is not autoscale owner");
         }
 
         self.autoscale_signals
             .lock()
             .await
             .record(signal, Instant::now());
-        ServiceAutoscaleSignalReport::accepted()
+        accepted_signal_report(kind)
     }
 
     /// Sends one autoscale signal to the current owner, or records it locally when owned here.
@@ -698,6 +1089,7 @@ impl ServiceController {
 mod tests {
     use super::*;
     use crate::runtime::types::RuntimeInstanceRef;
+    use crate::workload::types::ExecutionSpec;
 
     /// Signal storage should keep only the latest unexpired soft-state entries.
     #[test]
@@ -706,6 +1098,7 @@ mod tests {
         let mut store = AutoscaleSignalStore {
             ttl: Duration::from_secs(10),
             signals: HashMap::new(),
+            decisions: HashMap::new(),
         };
         store.record(test_signal(ServiceAutoscaleSignalKind::Hot), now);
         store.record(
@@ -714,6 +1107,95 @@ mod tests {
         );
 
         assert_eq!(store.len_after_prune(now + Duration::from_secs(11)), 1);
+    }
+
+    /// Hot owner signals should produce one bounded scale-up decision.
+    #[test]
+    fn autoscale_signal_store_scales_up_from_hot_signal() {
+        let now = Instant::now();
+        let spec = test_service_spec(2);
+        let mut store = AutoscaleSignalStore::default();
+        store.record(test_hot_signal(&spec), now);
+
+        let decisions = store.decisions_for_service(&spec, now);
+
+        assert_eq!(
+            decisions,
+            vec![AutoscaleScaleDecision {
+                service_id: spec.id,
+                service_epoch: spec.service_epoch,
+                template_name: "api".to_string(),
+                current_replicas: 2,
+                desired_replicas: 3,
+                direction: AutoscaleScaleDirection::Up,
+            }]
+        );
+    }
+
+    /// Applied decisions should clear stale signals and enforce policy cooldown.
+    #[test]
+    fn autoscale_signal_store_clears_signals_and_honors_cooldown() {
+        let now = Instant::now();
+        let spec = test_service_spec(2);
+        let mut store = AutoscaleSignalStore::default();
+        store.record(test_hot_signal(&spec), now);
+        let decisions = store.decisions_for_service(&spec, now);
+
+        store.mark_decisions_applied(&decisions, now);
+        store.record(test_hot_signal(&spec), now + Duration::from_secs(1));
+
+        assert_eq!(store.len_after_prune(now + Duration::from_secs(1)), 1);
+        assert!(
+            store
+                .decisions_for_service(&spec, now + Duration::from_secs(1))
+                .is_empty()
+        );
+    }
+
+    /// Quiet summaries should scale down only after covering all current replicas.
+    #[test]
+    fn autoscale_signal_store_scales_down_after_stabilized_quiet_summary() {
+        let now = Instant::now();
+        let spec = test_service_spec(3);
+        let mut store = AutoscaleSignalStore::default();
+        store.record(test_quiet_signal(&spec, 3), now);
+
+        assert!(store.decisions_for_service(&spec, now).is_empty());
+        let decisions = store.decisions_for_service(&spec, now + Duration::from_secs(60));
+
+        assert_eq!(
+            decisions,
+            vec![AutoscaleScaleDecision {
+                service_id: spec.id,
+                service_epoch: spec.service_epoch,
+                template_name: "api".to_string(),
+                current_replicas: 3,
+                desired_replicas: 2,
+                direction: AutoscaleScaleDirection::Down,
+            }]
+        );
+    }
+
+    /// Autoscale scale mutations should use the existing deploying generation path.
+    #[test]
+    fn autoscale_pending_spec_starts_deploying_generation() {
+        let spec = test_service_spec(2);
+        let decision = AutoscaleScaleDecision {
+            service_id: spec.id,
+            service_epoch: spec.service_epoch,
+            template_name: "api".to_string(),
+            current_replicas: 2,
+            desired_replicas: 3,
+            direction: AutoscaleScaleDirection::Up,
+        };
+
+        let pending = build_autoscale_pending_spec(&spec, &[decision]).expect("pending spec");
+
+        assert_eq!(pending.service_epoch, spec.service_epoch + 1);
+        assert_eq!(pending.status(), ServiceStatus::Deploying);
+        assert_eq!(pending.task_templates[0].replicas, 3);
+        assert!(!pending.has_assigned_replicas());
+        assert!(pending.previous_generation.is_some());
     }
 
     /// Local sampling should convert cumulative CPU time into milli-core usage.
@@ -777,6 +1259,108 @@ mod tests {
             memory_requested_bytes_total: 128 * 1024 * 1024,
             memory_observed_bytes_ewma: 32 * 1024 * 1024,
             observed_at_unix_ms: 1,
+        }
+    }
+
+    /// Builds a hot signal that points at the provided service spec.
+    fn test_hot_signal(spec: &ServiceSpecValue) -> ServiceAutoscaleSignal {
+        ServiceAutoscaleSignal {
+            service_id: spec.id,
+            service_epoch: spec.service_epoch,
+            template_name: "api".to_string(),
+            node_id: Uuid::new_v4(),
+            kind: ServiceAutoscaleSignalKind::Hot,
+            reason: ServiceAutoscaleSignalReason::CpuHigh,
+            running_replicas: spec.task_templates[0].replicas as u32,
+            ready_replicas: spec.task_templates[0].replicas as u32,
+            hot_replicas: 1,
+            cpu_requested_millis_total: 1_000,
+            cpu_observed_millis_ewma: 900,
+            memory_requested_bytes_total: 128,
+            memory_observed_bytes_ewma: 64,
+            observed_at_unix_ms: 1,
+        }
+    }
+
+    /// Builds a quiet summary signal that points at the provided service spec.
+    fn test_quiet_signal(spec: &ServiceSpecValue, running_replicas: u32) -> ServiceAutoscaleSignal {
+        ServiceAutoscaleSignal {
+            service_id: spec.id,
+            service_epoch: spec.service_epoch,
+            template_name: "api".to_string(),
+            node_id: Uuid::new_v4(),
+            kind: ServiceAutoscaleSignalKind::Summary,
+            reason: ServiceAutoscaleSignalReason::Quiet,
+            running_replicas,
+            ready_replicas: running_replicas,
+            hot_replicas: 0,
+            cpu_requested_millis_total: 1_000,
+            cpu_observed_millis_ewma: 100,
+            memory_requested_bytes_total: 128,
+            memory_observed_bytes_ewma: 64,
+            observed_at_unix_ms: 1,
+        }
+    }
+
+    /// Builds one minimal running service spec with autoscale enabled.
+    fn test_service_spec(replicas: u16) -> ServiceSpecValue {
+        let mut spec = ServiceSpecValue::new(
+            Uuid::new_v4(),
+            "demo",
+            "web",
+            vec![test_template(replicas)],
+            Vec::new(),
+        );
+        spec.service_epoch = 7;
+        spec.set_status(ServiceStatus::Running);
+        spec
+    }
+
+    /// Builds one autoscale-enabled task template for owner decision tests.
+    fn test_template(replicas: u16) -> crate::services::types::TaskTemplateSpecValue {
+        crate::services::types::TaskTemplateSpecValue {
+            name: "api".to_string(),
+            execution: ExecutionSpec {
+                image: "ghcr.io/demo/api:latest".to_string(),
+                command: Vec::new(),
+                tty: false,
+                cpu_millis: 1_000,
+                memory_bytes: 128,
+                gpu_count: 0,
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                liveness: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: Vec::new(),
+                ports: Vec::new(),
+                placement: Default::default(),
+            },
+            depends_on: Vec::new(),
+            replicas,
+            readiness: None,
+            public_port: None,
+            public_protocol: None,
+            placement_preferences: Vec::new(),
+            autoscale: Some(test_policy()),
+        }
+    }
+
+    /// Builds one autoscale policy for owner decision tests.
+    fn test_policy() -> TaskTemplateAutoscalePolicyValue {
+        TaskTemplateAutoscalePolicyValue {
+            min_replicas: 1,
+            max_replicas: 4,
+            cooldown_secs: 30,
+            scale_down_stabilization_secs: 60,
+            sample_window_secs: 10,
+            trigger_windows: 1,
+            metrics: vec![crate::services::types::TaskTemplateAutoscaleMetricValue {
+                kind: TaskTemplateAutoscaleMetricKindValue::Cpu,
+                target_percent: 80,
+            }],
         }
     }
 

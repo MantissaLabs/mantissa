@@ -246,6 +246,26 @@ pub fn record_service_deployment_launch_shape(
     gauge!("mantissa_service_deployment_last_tasks", "mode" => mode).set(tasks as f64);
 }
 
+/// Records one autoscale signal outcome with bounded labels.
+pub fn record_autoscale_signal(kind: &'static str, result: &'static str) {
+    counter!(
+        "mantissa_autoscale_signals_total",
+        "kind" => kind,
+        "result" => result
+    )
+    .increment(1);
+}
+
+/// Records one autoscale replica-count decision with bounded labels.
+pub fn record_autoscale_decision(direction: &'static str, result: &'static str) {
+    counter!(
+        "mantissa_autoscale_decisions_total",
+        "direction" => direction,
+        "result" => result
+    )
+    .increment(1);
+}
+
 /// Records one sync attempt outcome.
 pub fn record_sync_attempt(scope: &'static str, result: &'static str, reason: &'static str) {
     counter!(
@@ -821,6 +841,16 @@ fn describe_metrics() {
         "mantissa_service_deployment_last_tasks",
         Unit::Count,
         "Task starts in the most recent service deployment launch."
+    );
+    describe_counter!(
+        "mantissa_autoscale_signals_total",
+        Unit::Count,
+        "Autoscale signal outcomes by signal kind."
+    );
+    describe_counter!(
+        "mantissa_autoscale_decisions_total",
+        Unit::Count,
+        "Autoscale replica-count decision outcomes by direction."
     );
     describe_counter!(
         "mantissa_sync_attempts_total",

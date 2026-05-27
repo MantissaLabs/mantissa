@@ -367,6 +367,12 @@ impl ServiceController {
                             "failed to emit local autoscale signals: {err:#}"
                         );
                     }
+                    if let Err(err) = self.reconcile_autoscale_decisions().await {
+                        tracing::warn!(
+                            target: "services",
+                            "failed to reconcile autoscale decisions: {err:#}"
+                        );
+                    }
                 }
                 message = self.gossip_rx.recv() => {
                     let Ok(message) = message else { break; };
