@@ -557,6 +557,61 @@ struct AutoscaleSamplePolicy {
     policy: TaskTemplateAutoscalePolicyValue,
 }
 
+#[derive(Clone, Debug)]
+struct ActiveAutoscaleService {
+    service_name: String,
+    service_epoch: u64,
+    service_phase_version: u64,
+    templates: HashMap<String, ActiveAutoscaleTemplate>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveAutoscaleTemplate {
+    policy: TaskTemplateAutoscalePolicyValue,
+    assigned_task_ids: HashSet<Uuid>,
+}
+
+impl ActiveAutoscaleService {
+    /// Builds a template-aware local sampling index from one running service spec.
+    fn from_spec(spec: &ServiceSpecValue) -> Option<Self> {
+        if spec.status() != ServiceStatus::Running {
+            return None;
+        }
+
+        let mut templates = HashMap::new();
+        let mut slot_index = 0usize;
+        for template in &spec.task_templates {
+            let Some(policy) = template.autoscale.clone() else {
+                slot_index = slot_index.saturating_add(usize::from(template.replicas));
+                continue;
+            };
+
+            let mut assigned_task_ids = HashSet::with_capacity(template.replicas as usize);
+            for _ in 0..template.replicas {
+                if let Some(task_id) = spec.assigned_replica_id(slot_index) {
+                    assigned_task_ids.insert(task_id);
+                }
+                slot_index = slot_index.saturating_add(1);
+            }
+
+            templates.insert(
+                template.name.clone(),
+                ActiveAutoscaleTemplate {
+                    policy,
+                    assigned_task_ids,
+                },
+            );
+        }
+
+        (!templates.is_empty()).then(|| Self {
+            service_name: spec.service_name.clone(),
+            service_epoch: spec.service_epoch,
+            service_phase_version: spec.phase_version,
+            templates,
+        })
+    }
+}
+
 impl AutoscaleSignalAccumulator {
     /// Starts a local signal aggregate for one service/template generation.
     fn new(
@@ -1012,26 +1067,22 @@ fn build_autoscale_pending_spec(
 
 /// Returns the active autoscale policy for one local service replica from a service snapshot.
 fn autoscale_policy_for_replica(
-    specs: &HashMap<Uuid, ServiceSpecValue>,
+    specs: &HashMap<Uuid, ActiveAutoscaleService>,
     replica: &LocalServiceRuntimeReplica,
 ) -> Option<AutoscaleSamplePolicy> {
     let spec = specs.get(&replica.service_id)?;
-    if spec.status() != ServiceStatus::Running || spec.service_name != replica.service_name {
+    if spec.service_name != replica.service_name {
         return None;
     }
-    if !spec.has_assigned_replica_id(replica.task_id) {
+    let template = spec.templates.get(&replica.template_name)?;
+    if !template.assigned_task_ids.contains(&replica.task_id) {
         return None;
     }
 
-    let policy = spec
-        .task_templates
-        .iter()
-        .find(|template| template.name == replica.template_name)
-        .and_then(|template| template.autoscale.clone())?;
     Some(AutoscaleSamplePolicy {
         service_epoch: spec.service_epoch,
-        service_phase_version: spec.phase_version,
-        policy,
+        service_phase_version: spec.service_phase_version,
+        policy: template.policy.clone(),
     })
 }
 
@@ -1069,15 +1120,23 @@ fn rejected_signal_report(
 impl ServiceController {
     /// Samples local service replicas and emits sparse autoscale signals to the owner.
     pub(super) async fn emit_local_autoscale_signals(&self) -> anyhow::Result<()> {
-        let active_specs = self.active_autoscale_specs()?;
-        if active_specs.is_empty() {
-            return Ok(());
-        }
-
         let replicas = self
             .workload_manager
             .list_local_running_service_replicas()
             .await?;
+        if replicas.is_empty() {
+            return Ok(());
+        }
+
+        let candidate_service_ids = replicas
+            .iter()
+            .map(|replica| replica.service_id)
+            .collect::<HashSet<_>>();
+        let active_specs = self.active_autoscale_specs(&candidate_service_ids)?;
+        if active_specs.is_empty() {
+            return Ok(());
+        }
+
         let autoscale_replicas = replicas
             .into_iter()
             .filter(|replica| autoscale_policy_for_replica(&active_specs, replica).is_some())
@@ -1257,21 +1316,20 @@ impl ServiceController {
         Ok(true)
     }
 
-    /// Returns active running service specs that contain at least one autoscale policy.
-    fn active_autoscale_specs(&self) -> anyhow::Result<HashMap<Uuid, ServiceSpecValue>> {
-        let specs = self
-            .registry
-            .list()?
-            .into_iter()
-            .filter(|spec| {
-                spec.status() == ServiceStatus::Running
-                    && spec
-                        .task_templates
-                        .iter()
-                        .any(|template| template.autoscale.is_some())
-            })
-            .map(|spec| (spec.id, spec))
-            .collect();
+    /// Returns a template-aware index for locally observed service specs with autoscale policies.
+    fn active_autoscale_specs(
+        &self,
+        service_ids: &HashSet<Uuid>,
+    ) -> anyhow::Result<HashMap<Uuid, ActiveAutoscaleService>> {
+        let mut specs = HashMap::new();
+        for service_id in service_ids {
+            let Some(spec) = self.registry.get(*service_id)? else {
+                continue;
+            };
+            if let Some(active) = ActiveAutoscaleService::from_spec(&spec) {
+                specs.insert(*service_id, active);
+            }
+        }
         Ok(specs)
     }
 
@@ -1790,7 +1848,10 @@ mod tests {
         let mut spec = test_service_spec(1);
         let assigned = Uuid::new_v4();
         spec.set_replica_ids(vec![assigned]);
-        let specs = HashMap::from([(spec.id, spec.clone())]);
+        let specs = HashMap::from([(
+            spec.id,
+            ActiveAutoscaleService::from_spec(&spec).expect("active autoscale service"),
+        )]);
         let mut sample = test_usage_sample(0, 64, 1_000);
         sample.replica.service_id = spec.id;
         sample.replica.service_name = spec.service_name.clone();
@@ -1805,6 +1866,39 @@ mod tests {
         assert_eq!(policy.service_epoch, spec.service_epoch);
         assert_eq!(policy.service_phase_version, spec.phase_version);
         assert_eq!(policy.policy, test_policy());
+    }
+
+    /// Local sampling policy lookup should require assignment in the sampled template.
+    #[test]
+    fn autoscale_policy_for_replica_requires_template_assignment() {
+        let mut api = test_template(1);
+        api.name = "api".to_string();
+        let mut worker = test_template(1);
+        worker.name = "worker".to_string();
+        let mut spec =
+            ServiceSpecValue::new(Uuid::new_v4(), "demo", "web", vec![api, worker], Vec::new());
+        spec.service_epoch = 7;
+        spec.set_status(ServiceStatus::Running);
+        let api_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4();
+        spec.set_replica_ids(vec![api_id, worker_id]);
+        let specs = HashMap::from([(
+            spec.id,
+            ActiveAutoscaleService::from_spec(&spec).expect("active autoscale service"),
+        )]);
+
+        let mut sample = test_usage_sample(0, 64, 1_000);
+        sample.replica.service_id = spec.id;
+        sample.replica.service_name = spec.service_name.clone();
+        sample.replica.template_name = "worker".to_string();
+        sample.replica.task_id = api_id;
+
+        assert!(autoscale_policy_for_replica(&specs, &sample.replica).is_none());
+
+        sample.replica.task_id = worker_id;
+        let policy = autoscale_policy_for_replica(&specs, &sample.replica).expect("worker replica");
+        assert_eq!(policy.service_epoch, spec.service_epoch);
+        assert_eq!(policy.service_phase_version, spec.phase_version);
     }
 
     /// Owner-side validation should reject malformed or policy-incompatible signals.
