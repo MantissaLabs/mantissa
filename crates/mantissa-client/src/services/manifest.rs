@@ -818,8 +818,13 @@ impl ServiceManifest {
                         .find(|volume| volume.name == source)
                         .ok_or_else(|| anyhow!("volume lookup failed for '{}'", source))?;
                     if matches!(volume.access_mode, VolumeAccessMode::ReadWriteOnce) {
+                        let replica_detail = if template.autoscale.is_some() {
+                            "max replicas > 1"
+                        } else {
+                            "replicas > 1"
+                        };
                         return Err(anyhow!(
-                            "template '{}' cannot use read_write_once volume '{}' with max replicas > 1",
+                            "template '{}' cannot use read_write_once volume '{}' with {replica_detail}",
                             template.name,
                             source
                         ));
@@ -1988,6 +1993,70 @@ mod tests {
             error
                 .to_string()
                 .contains("cannot use read_write_once volume 'pgdata' with replicas > 1")
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_rwo_volume_with_autoscale_max_replicas_gt_one() {
+        let manifest: ServiceManifest = ron::from_str(
+            r#"
+            (
+                name: "demo",
+                volumes: [
+                    (
+                        name: "pgdata",
+                        driver: local((
+                            source: managed,
+                        )),
+                        access_mode: read_write_once,
+                        binding_mode: wait_for_first_consumer,
+                        reclaim_policy: retain,
+                        capacity_mb: Some(1024),
+                    ),
+                ],
+                tasks: [
+                    (
+                        name: "api",
+                        image: "ghcr.io/demo/api:latest",
+                        replicas: 1,
+                        resources: (
+                            cpu_millis: 500,
+                            memory_mb: 256,
+                        ),
+                        autoscale: Some((
+                            min_replicas: 1,
+                            max_replicas: 2,
+                            cooldown_secs: 60,
+                            scale_down_stabilization_secs: 300,
+                            sample_window_secs: 15,
+                            trigger_windows: 2,
+                            metrics: [
+                                (
+                                    kind: memory,
+                                    target_percent: 80,
+                                ),
+                            ],
+                        )),
+                        volumes: [
+                            (
+                                source: "pgdata",
+                                target: "/data",
+                            ),
+                        ],
+                    ),
+                ],
+            )
+            "#,
+        )
+        .expect("parse manifest");
+
+        let error = manifest
+            .validate()
+            .expect_err("autoscaled rwo volume must fail when max_replicas can exceed one");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot use read_write_once volume 'pgdata' with max replicas > 1")
         );
     }
 
