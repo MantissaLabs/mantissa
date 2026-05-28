@@ -1139,6 +1139,7 @@ async fn spawn_runtime_tasks(
                     scheduler: components.scheduler.clone(),
                     registry: components.registry.clone(),
                     nodeport: components.network_controller.nodeport_manager(),
+                    stores: components.sync_stores.clone(),
                     progress: components.sync_gc_progress.clone(),
                     cluster_view: components.cluster_view.clone(),
                     root_schema: components.root_schema,

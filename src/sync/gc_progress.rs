@@ -4,6 +4,8 @@
 //! know whether every active peer has observed the delete. This module records
 //! the anti-entropy signal needed by the future GC runner: a peer/domain/view is
 //! safe up to the last local time when both sides reported the same MST root.
+//! Observations are bound to the exact root digest so a later local mutation
+//! cannot reuse stale equality to prune tombstones or compact registers.
 
 use crate::cluster::ClusterViewId;
 use crate::store::replicated::registry::domain_key;
@@ -18,7 +20,7 @@ use uuid::Uuid;
 /// In-memory tracker for root-equality observations produced by anti-entropy.
 #[derive(Clone, Debug, Default)]
 pub struct SyncGcProgress {
-    inner: Arc<Mutex<HashMap<ProgressKey, u64>>>,
+    inner: Arc<Mutex<HashMap<ProgressKey, EqualRootObservation>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -27,6 +29,12 @@ struct ProgressKey {
     domain: u16,
     cluster_view: ClusterViewId,
     root_schema_version: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EqualRootObservation {
+    root_digest: [u8; 16],
+    observed_at_unix_ms: u64,
 }
 
 impl ProgressKey {
@@ -59,12 +67,14 @@ impl SyncGcProgress {
         domain: Domain,
         cluster_view: ClusterViewId,
         root_schema_version: u32,
+        root_digest: [u8; 16],
     ) {
         self.record_equal_root(
             peer_id,
             domain,
             cluster_view,
             root_schema_version,
+            root_digest,
             now_unix_ms(),
         );
     }
@@ -79,14 +89,23 @@ impl SyncGcProgress {
         domain: Domain,
         cluster_view: ClusterViewId,
         root_schema_version: u32,
+        root_digest: [u8; 16],
         observed_at_unix_ms: u64,
     ) {
         let key = ProgressKey::new(peer_id, domain, cluster_view, root_schema_version);
+        let observation = EqualRootObservation {
+            root_digest,
+            observed_at_unix_ms,
+        };
         let mut observations = self.inner.lock();
         observations
             .entry(key)
-            .and_modify(|current| *current = (*current).max(observed_at_unix_ms))
-            .or_insert(observed_at_unix_ms);
+            .and_modify(|current| {
+                if observed_at_unix_ms >= current.observed_at_unix_ms {
+                    *current = observation;
+                }
+            })
+            .or_insert(observation);
     }
 
     /// Returns the last equal-root observation for one peer/domain/view/schema.
@@ -98,7 +117,10 @@ impl SyncGcProgress {
         root_schema_version: u32,
     ) -> Option<u64> {
         let key = ProgressKey::new(peer_id, domain, cluster_view, root_schema_version);
-        self.inner.lock().get(&key).copied()
+        self.inner
+            .lock()
+            .get(&key)
+            .map(|observation| observation.observed_at_unix_ms)
     }
 
     /// Builds a GC barrier for one domain from active remote peer observations.
@@ -113,6 +135,7 @@ impl SyncGcProgress {
         domain: Domain,
         cluster_view: ClusterViewId,
         root_schema_version: u32,
+        current_root_digest: [u8; 16],
         now_unix_ms: u64,
     ) -> Option<GcBarrier>
     where
@@ -125,8 +148,12 @@ impl SyncGcProgress {
         for peer_id in active_remote_peers {
             remote_peer_count = remote_peer_count.saturating_add(1);
             let key = ProgressKey::new(peer_id, domain, cluster_view, root_schema_version);
-            let observed_at = *observations.get(&key)?;
-            safe_observed_before_unix_ms = safe_observed_before_unix_ms.min(observed_at);
+            let observation = observations.get(&key)?;
+            if observation.root_digest != current_root_digest {
+                return None;
+            }
+            safe_observed_before_unix_ms =
+                safe_observed_before_unix_ms.min(observation.observed_at_unix_ms);
         }
 
         if remote_peer_count == 0 {
@@ -177,6 +204,10 @@ mod tests {
         ClusterViewId::new(ClusterId::from_uuid(Uuid::from_u128(n)), epoch)
     }
 
+    fn digest(byte: u8) -> [u8; 16] {
+        [byte; 16]
+    }
+
     /// Equal-root observations should be scoped by peer, domain, view, and schema.
     #[test]
     fn records_equal_root_observations_by_scope() {
@@ -184,7 +215,7 @@ mod tests {
         let peer = Uuid::from_u128(1);
         let cluster_view = view(100, 2);
 
-        progress.record_equal_root(peer, Domain::Workloads, cluster_view, 3, 42);
+        progress.record_equal_root(peer, Domain::Workloads, cluster_view, 3, digest(1), 42);
 
         assert_eq!(
             progress.last_equal_at(peer, Domain::Workloads, cluster_view, 3),
@@ -211,8 +242,8 @@ mod tests {
         let peer = Uuid::from_u128(1);
         let cluster_view = view(100, 2);
 
-        progress.record_equal_root(peer, Domain::Workloads, cluster_view, 3, 90);
-        progress.record_equal_root(peer, Domain::Workloads, cluster_view, 3, 20);
+        progress.record_equal_root(peer, Domain::Workloads, cluster_view, 3, digest(1), 90);
+        progress.record_equal_root(peer, Domain::Workloads, cluster_view, 3, digest(2), 20);
 
         assert_eq!(
             progress.last_equal_at(peer, Domain::Workloads, cluster_view, 3),
@@ -228,15 +259,29 @@ mod tests {
         let peer_b = Uuid::from_u128(2);
         let cluster_view = view(100, 2);
 
-        progress.record_equal_root(peer_a, Domain::Workloads, cluster_view, 3, 90);
+        progress.record_equal_root(peer_a, Domain::Workloads, cluster_view, 3, digest(1), 90);
         assert_eq!(
-            progress.barrier_for_domain([peer_a, peer_b], Domain::Workloads, cluster_view, 3, 200,),
+            progress.barrier_for_domain(
+                [peer_a, peer_b],
+                Domain::Workloads,
+                cluster_view,
+                3,
+                digest(1),
+                200,
+            ),
             None
         );
 
-        progress.record_equal_root(peer_b, Domain::Workloads, cluster_view, 3, 70);
+        progress.record_equal_root(peer_b, Domain::Workloads, cluster_view, 3, digest(1), 70);
         assert_eq!(
-            progress.barrier_for_domain([peer_a, peer_b], Domain::Workloads, cluster_view, 3, 200,),
+            progress.barrier_for_domain(
+                [peer_a, peer_b],
+                Domain::Workloads,
+                cluster_view,
+                3,
+                digest(1),
+                200,
+            ),
             Some(GcBarrier {
                 safe_observed_before_unix_ms: 70,
                 active_peer_count: 3,
@@ -252,10 +297,33 @@ mod tests {
         let cluster_view = view(100, 2);
 
         assert_eq!(
-            progress.barrier_for_domain([], Domain::Workloads, cluster_view, 3, 200),
+            progress.barrier_for_domain([], Domain::Workloads, cluster_view, 3, digest(1), 200),
             Some(GcBarrier {
                 safe_observed_before_unix_ms: 200,
                 active_peer_count: 1,
+                root_schema_version: 3,
+            })
+        );
+    }
+
+    /// Barriers must not reuse equality recorded for an older local root.
+    #[test]
+    fn barrier_requires_current_root_digest() {
+        let progress = SyncGcProgress::new();
+        let peer = Uuid::from_u128(1);
+        let cluster_view = view(100, 2);
+
+        progress.record_equal_root(peer, Domain::Workloads, cluster_view, 3, digest(1), 90);
+
+        assert_eq!(
+            progress.barrier_for_domain([peer], Domain::Workloads, cluster_view, 3, digest(2), 200),
+            None
+        );
+        assert_eq!(
+            progress.barrier_for_domain([peer], Domain::Workloads, cluster_view, 3, digest(1), 200),
+            Some(GcBarrier {
+                safe_observed_before_unix_ms: 90,
+                active_peer_count: 2,
                 root_schema_version: 3,
             })
         );
@@ -270,9 +338,9 @@ mod tests {
         let current_view = view(100, 2);
         let old_view = view(100, 1);
 
-        progress.record_equal_root(peer_a, Domain::Workloads, current_view, 3, 90);
-        progress.record_equal_root(peer_a, Domain::Workloads, old_view, 3, 80);
-        progress.record_equal_root(peer_b, Domain::Workloads, current_view, 2, 70);
+        progress.record_equal_root(peer_a, Domain::Workloads, current_view, 3, digest(1), 90);
+        progress.record_equal_root(peer_a, Domain::Workloads, old_view, 3, digest(1), 80);
+        progress.record_equal_root(peer_b, Domain::Workloads, current_view, 2, digest(1), 70);
 
         assert_eq!(progress.retain_view_schema(current_view, 3), 2);
         assert_eq!(

@@ -13,6 +13,7 @@ use mantissa::store::replicated::secret_key_sync::{SecretMasterKeySyncRecord, cu
 use mantissa_protocol::secrets::secrets;
 use mantissa_protocol::sync::Domain;
 use mantissa_protocol::topology::ClusterOperationStage;
+use mantissa_store::codec::StoreValueCodec;
 use mantissa_store::gc::StoreGcPolicy;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -535,6 +536,60 @@ fn master_key_row_shape(node: &TestNode) -> MasterKeyRowShape {
     }
 }
 
+/// Renders non-plaintext master-key row identities for convergence failure diagnostics.
+fn master_key_row_debug(node: &TestNode) -> String {
+    let (rows, tombs) = node
+        .node
+        .secret_master_keys
+        .load_all()
+        .expect("load replicated master-key rows");
+    let mut parts = Vec::new();
+    for (row_id, snapshot) in rows {
+        let mut labels = Vec::new();
+        for record in snapshot.as_slice() {
+            let digest = blake3::hash(
+                &record
+                    .encode_store_value()
+                    .expect("encode master-key diagnostic row"),
+            );
+            let digest = bytes_to_hex(&digest.as_bytes()[..8]);
+            let label = match record {
+                SecretMasterKeySyncRecord::Descriptor(descriptor) => {
+                    format!(
+                        "descriptor:{}:{}:{}",
+                        descriptor.key_id, descriptor.generation, digest
+                    )
+                }
+                SecretMasterKeySyncRecord::Grant(grant) => {
+                    format!(
+                        "grant:{}:{}->{}:{}",
+                        grant.descriptor.key_id,
+                        grant.sender_node_id,
+                        grant.recipient_node_id,
+                        digest
+                    )
+                }
+                SecretMasterKeySyncRecord::Current(current) => {
+                    format!(
+                        "current:{}:{}:{}:{}",
+                        current.scope_view, current.key_id, current.generation, digest
+                    )
+                }
+            };
+            labels.push(label);
+        }
+        labels.sort();
+        parts.push(format!("{row_id:?}=[{}]", labels.join("|")));
+    }
+    parts.sort();
+    format!(
+        "{} rows; {} tombs; {}",
+        parts.len(),
+        tombs.len(),
+        parts.join(", ")
+    )
+}
+
 /// Builds an aggressive per-node store-GC runtime config for bounded integration tests.
 fn fast_store_gc_config() -> RuntimeStoreGcConfig {
     RuntimeStoreGcConfig {
@@ -878,9 +933,18 @@ local_test!(
             .await,
             "runtime GC should prune unused split/merge master-key rows down to the active key"
         );
-        wait_secret_master_key_roots_equal_all(&cluster, Duration::from_secs(30))
-            .await
-            .expect("secret master-key roots reconverge after semantic master-key GC");
+        if let Err(error) =
+            wait_secret_master_key_roots_equal_all(&cluster, Duration::from_secs(30)).await
+        {
+            let rows = cluster
+                .iter()
+                .map(|node| format!("{}: {}", node.id(), master_key_row_debug(node)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "secret master-key roots reconverge after semantic master-key GC: {error}\n{rows}"
+            );
+        }
     }
 );
 

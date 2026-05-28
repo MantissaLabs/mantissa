@@ -131,11 +131,28 @@ impl StoreGcRunner {
         for entry in self.stores.entries() {
             let domain = entry.domain;
             if let Some(active_remote_peers) = &active_remote_peers {
+                let local_root_digest = match entry
+                    .store
+                    .root_digest_at_version(root_schema_version)
+                    .await
+                {
+                    Ok(root_digest) => root_digest,
+                    Err(error) => {
+                        pass_failed = true;
+                        error!(
+                            target: "store.gc",
+                            ?domain,
+                            "failed to load local root for GC barrier: {error}"
+                        );
+                        continue;
+                    }
+                };
                 let Some(barrier) = self.progress.barrier_for_domain(
                     active_remote_peers.iter().copied(),
                     domain,
                     cluster_view,
                     root_schema_version,
+                    local_root_digest,
                     now_unix_ms,
                 ) else {
                     trace!(
@@ -149,15 +166,18 @@ impl StoreGcRunner {
                         domain,
                         "no_barrier",
                     );
-                    pass_failed |= self.compact_domain_registers_with_trace(entry).await;
                     continue;
                 };
 
-                match self
+                let tombstones_pruned = match self
                     .garbage_collect_domain_tombstones(entry, barrier, now_unix_ms)
                     .await
                 {
-                    Ok(report) => self.trace_domain_report(domain, &report),
+                    Ok(report) => {
+                        let tombstones_pruned = report.tombstones_pruned;
+                        self.trace_domain_report(domain, &report);
+                        tombstones_pruned
+                    }
                     Err(error) => {
                         pass_failed = true;
                         error!(
@@ -165,8 +185,15 @@ impl StoreGcRunner {
                             ?domain,
                             "tombstone GC failed: {error}"
                         );
+                        continue;
                     }
+                };
+                if tombstones_pruned > 0 {
+                    continue;
                 }
+            } else {
+                crate::observability::metrics::record_store_gc_skipped_domain(domain, "no_barrier");
+                continue;
             }
 
             pass_failed |= self.compact_domain_registers_with_trace(entry).await;
@@ -332,20 +359,26 @@ async fn prune_unreferenced_secret_master_key_rows(
     root_schema_version: u32,
     now_unix_ms: u64,
 ) -> mantissa_store::Result<usize> {
+    let secrets_root_digest = secrets.root_digest_at_version(root_schema_version).await?;
     let Some(_secrets_barrier) = progress.barrier_for_domain(
         active_remote_peers.iter().copied(),
         Domain::Secrets,
         cluster_view,
         root_schema_version,
+        secrets_root_digest,
         now_unix_ms,
     ) else {
         return Ok(0);
     };
+    let master_keys_root_digest = secret_master_keys
+        .root_digest_at_version(root_schema_version)
+        .await?;
     let Some(_master_keys_barrier) = progress.barrier_for_domain(
         active_remote_peers.iter().copied(),
         Domain::SecretMasterKeys,
         cluster_view,
         root_schema_version,
+        master_keys_root_digest,
         now_unix_ms,
     ) else {
         return Ok(0);
@@ -588,7 +621,18 @@ mod tests {
             .await
             .expect("upsert secret");
 
-        progress.record_equal_root(peer, Domain::Secrets, active_view, 1, 10);
+        let secrets_root_digest = secrets
+            .root_digest_at_version(1)
+            .await
+            .expect("secret root digest");
+        progress.record_equal_root(
+            peer,
+            Domain::Secrets,
+            active_view,
+            1,
+            secrets_root_digest,
+            10,
+        );
         let skipped = prune_unreferenced_secret_master_key_rows(
             &secrets,
             &master_keys,
@@ -602,7 +646,18 @@ mod tests {
         .expect("skip without master-key barrier");
         assert_eq!(skipped, 0);
 
-        progress.record_equal_root(peer, Domain::SecretMasterKeys, active_view, 1, 10);
+        let master_keys_root_digest = master_keys
+            .root_digest_at_version(1)
+            .await
+            .expect("master-key root digest");
+        progress.record_equal_root(
+            peer,
+            Domain::SecretMasterKeys,
+            active_view,
+            1,
+            master_keys_root_digest,
+            10,
+        );
         let pruned = prune_unreferenced_secret_master_key_rows(
             &secrets,
             &master_keys,
@@ -656,6 +711,84 @@ mod tests {
                 .get_snapshot(&UuidKey::from(current_row_id(active_view)))
                 .expect("active current snapshot")
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_master_key_gc_rejects_stale_master_key_root_barrier() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(redb::Database::create(dir.path().join("gc.redb")).expect("db"));
+        let actor = uuid::Uuid::from_u128(1);
+        let peer = uuid::Uuid::from_u128(2);
+        let secrets = open_secret_store(db.clone(), actor).expect("secret store");
+        let master_keys = open_secret_master_key_store(db, actor).expect("secret master-key store");
+        let progress = SyncGcProgress::new();
+        let active_view = ClusterViewId::new(ClusterId::from_uuid(uuid::Uuid::from_u128(100)), 3);
+
+        let active_key = uuid::Uuid::from_u128(2_000);
+        let stale_key = uuid::Uuid::from_u128(2_001);
+        let active = descriptor(active_key, 3, active_view);
+        for record in [
+            SecretMasterKeySyncRecord::Descriptor(active.clone()),
+            SecretMasterKeySyncRecord::Current(current_from_descriptor(&active)),
+        ] {
+            upsert_record(&master_keys, record)
+                .await
+                .expect("upsert active master-key row");
+        }
+
+        let secrets_root_digest = secrets
+            .root_digest_at_version(1)
+            .await
+            .expect("secret root digest");
+        let stale_master_keys_root_digest = master_keys
+            .root_digest_at_version(1)
+            .await
+            .expect("stale master-key root digest");
+        progress.record_equal_root(
+            peer,
+            Domain::Secrets,
+            active_view,
+            1,
+            secrets_root_digest,
+            10,
+        );
+        progress.record_equal_root(
+            peer,
+            Domain::SecretMasterKeys,
+            active_view,
+            1,
+            stale_master_keys_root_digest,
+            10,
+        );
+
+        let stale = descriptor(stale_key, 2, active_view);
+        upsert_record(
+            &master_keys,
+            SecretMasterKeySyncRecord::Descriptor(stale.clone()),
+        )
+        .await
+        .expect("upsert stale unreferenced descriptor after barrier");
+
+        let pruned = prune_unreferenced_secret_master_key_rows(
+            &secrets,
+            &master_keys,
+            &progress,
+            &[peer],
+            active_view,
+            1,
+            20,
+        )
+        .await
+        .expect("semantic master-key prune with stale barrier");
+
+        assert_eq!(pruned, 0);
+        assert!(
+            master_keys
+                .get_snapshot(&UuidKey::from(descriptor_row_id(stale_key)))
+                .expect("stale descriptor snapshot")
+                .is_some(),
+            "stale root equality must not authorize pruning rows added after that equality"
         );
     }
 }

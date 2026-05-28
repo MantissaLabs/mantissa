@@ -16,13 +16,14 @@ use crate::registry::Registry;
 use crate::runtime::types::RuntimeError;
 use crate::scheduler::{GpuDeviceState, Scheduler, SchedulerError, SchedulerSnapshot, SlotState};
 use crate::store::replicated::registry::{REPLICATED_DOMAINS, domain_label};
-use crate::sync::SyncGcProgress;
+use crate::sync::{SyncGcProgress, SyncStores};
 
 /// Runtime handles used by the low-cost metrics sampler.
 pub struct MetricsSamplerInputs {
     pub scheduler: Rc<Scheduler>,
     pub registry: Registry,
     pub nodeport: NodePortManager,
+    pub stores: SyncStores,
     pub progress: SyncGcProgress,
     pub cluster_view: ClusterViewState,
     pub root_schema: RootSchemaState,
@@ -528,7 +529,7 @@ impl MetricsSampler {
         }
 
         record_nodeport_status(self.inputs.nodeport.status().await);
-        self.sample_sync_progress();
+        self.sample_sync_progress().await;
     }
 
     /// Samples the durable Redb file size using filesystem metadata only.
@@ -548,7 +549,7 @@ impl MetricsSampler {
     }
 
     /// Samples aggregate sync GC barrier gauges.
-    fn sample_sync_progress(&self) {
+    async fn sample_sync_progress(&self) {
         let cluster_view = self.inputs.cluster_view.active_view();
         let root_schema_version = self.inputs.root_schema.supported_version();
         let now_unix_ms = now_unix_ms();
@@ -562,11 +563,30 @@ impl MetricsSampler {
 
         for domain in REPLICATED_DOMAINS {
             let label = metrics_domain_label(domain);
+            let root_digest = match self
+                .inputs
+                .stores
+                .root_digest_at_version(domain, root_schema_version)
+                .await
+            {
+                Ok(root_digest) => root_digest,
+                Err(error) => {
+                    warn!(
+                        target: "metrics",
+                        ?domain,
+                        "failed to sample sync GC root digest: {error}"
+                    );
+                    gauge!("mantissa_sync_gc_barrier_available", "domain" => label).set(0.0);
+                    gauge!("mantissa_sync_gc_barrier_age_seconds", "domain" => label).set(0.0);
+                    continue;
+                }
+            };
             match self.inputs.progress.barrier_for_domain(
                 active_remote_peers.iter().copied(),
                 domain,
                 cluster_view,
                 root_schema_version,
+                root_digest,
                 now_unix_ms,
             ) {
                 Some(barrier) => {

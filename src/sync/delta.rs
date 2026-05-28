@@ -417,7 +417,7 @@ async fn find_domains_with_different_roots(
 
         match remote_root.map(|root| root.digest) {
             Some(remote_root_digest) if remote_root_digest == local_root_digest => {
-                record_equal_domain_root(*domain, scope, context);
+                record_equal_domain_root(*domain, scope, local_root_digest, context);
             }
             Some(_) | None => domains_requiring_ranges.push(*domain),
         }
@@ -427,13 +427,19 @@ async fn find_domains_with_different_roots(
 }
 
 /// Records one equal-root observation for GC when peer trace context is available.
-fn record_equal_domain_root(domain: Domain, scope: SyncAttemptScope, context: &SyncClientContext) {
+fn record_equal_domain_root(
+    domain: Domain,
+    scope: SyncAttemptScope,
+    root_digest: [u8; 16],
+    context: &SyncClientContext,
+) {
     if let Some(trace) = context.trace.as_ref() {
         context.gc_progress.record_equal_root_now(
             trace.peer_id,
             domain,
             scope.cluster_view,
             scope.root_schema_version,
+            root_digest,
         );
     }
 }
