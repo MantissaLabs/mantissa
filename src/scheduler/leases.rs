@@ -110,7 +110,7 @@ impl Scheduler {
             let mut best_choice = None;
             let mut best_score = 0u128;
 
-            for &idx in &candidates {
+            for (candidate_pos, &idx) in candidates.iter().enumerate() {
                 let slot = &snapshot.slots[idx];
                 let cpu_contrib = std::cmp::min(slot.capacity.cpu_millis, remaining_cpu);
                 let memory_contrib = std::cmp::min(slot.capacity.memory_bytes, remaining_memory);
@@ -118,11 +118,11 @@ impl Scheduler {
 
                 if score > best_score {
                     best_score = score;
-                    best_choice = Some(idx);
+                    best_choice = Some((candidate_pos, idx));
                 }
             }
 
-            let best_idx = best_choice?;
+            let (best_pos, best_idx) = best_choice?;
             if best_score == 0 {
                 return None;
             }
@@ -131,10 +131,27 @@ impl Scheduler {
             selected.push(best_idx);
             remaining_cpu = remaining_cpu.saturating_sub(slot.capacity.cpu_millis);
             remaining_memory = remaining_memory.saturating_sub(slot.capacity.memory_bytes);
-            candidates.retain(|idx| *idx != best_idx);
+            candidates.remove(best_pos);
         }
 
         Some(selected)
+    }
+
+    /// Removes selected snapshot indices from an available-index list without hashing.
+    fn remove_selected_indices(available_indices: &mut Vec<usize>, selected_indices: &mut [usize]) {
+        if selected_indices.is_empty() {
+            return;
+        }
+
+        selected_indices.sort_unstable();
+        let mut selected_pos = 0;
+        available_indices.retain(|idx| {
+            while selected_pos < selected_indices.len() && selected_indices[selected_pos] < *idx {
+                selected_pos += 1;
+            }
+
+            selected_pos >= selected_indices.len() || selected_indices[selected_pos] != *idx
+        });
     }
 
     /// Selects exact free GPU indices that satisfy one GPU count request.
@@ -434,8 +451,8 @@ impl Scheduler {
                     return Err(error);
                 };
 
-                let slot_index_set: HashSet<usize> = slot_indices.iter().copied().collect();
-                let gpu_index_set: HashSet<usize> = gpu_indices.iter().copied().collect();
+                let mut slot_indices = slot_indices;
+                let mut gpu_indices = gpu_indices;
                 let lease_id = Uuid::new_v4();
                 let reservation = LeaseReservation {
                     lease_id,
@@ -461,8 +478,8 @@ impl Scheduler {
                 }
                 gpu_device_ids.sort();
 
-                free_slot_indices.retain(|idx| !slot_index_set.contains(idx));
-                free_gpu_indices.retain(|idx| !gpu_index_set.contains(idx));
+                Self::remove_selected_indices(&mut free_slot_indices, &mut slot_indices);
+                Self::remove_selected_indices(&mut free_gpu_indices, &mut gpu_indices);
                 leases.push(PreparedTaskLease {
                     lease_id,
                     task_id: intent.task_id,
