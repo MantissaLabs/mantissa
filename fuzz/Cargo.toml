@@ -1,0 +1,22 @@
+[package]
+name = "mantissa-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+capnp = "0.25"
+libfuzzer-sys = "0.4"
+mantissa-protocol = { path = "../crates/mantissa-protocol" }
+
+[[bin]]
+name = "raw_capnp_decode"
+path = "fuzz_targets/raw_capnp_decode.rs"
+test = false
+doc = false
+bench = false
