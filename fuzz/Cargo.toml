@@ -70,3 +70,10 @@ path = "fuzz_targets/placement_constraints.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "scheduler_snapshot_codec"
+path = "fuzz_targets/scheduler_snapshot_codec.rs"
+test = false
+doc = false
+bench = false
