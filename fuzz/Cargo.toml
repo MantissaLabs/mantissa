@@ -13,6 +13,7 @@ cargo-fuzz = true
 arbitrary = { version = "1", features = ["derive"] }
 capnp = "0.25"
 libfuzzer-sys = "0.4"
+mantissa = { path = ".." }
 mantissa-net = { path = "../crates/mantissa-net" }
 mantissa-protocol = { path = "../crates/mantissa-protocol" }
 mantissa-store = { path = "../crates/mantissa-store" }
@@ -59,6 +60,13 @@ bench = false
 [[bin]]
 name = "mst_store_sequences"
 path = "fuzz_targets/mst_store_sequences.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "placement_constraints"
+path = "fuzz_targets/placement_constraints.rs"
 test = false
 doc = false
 bench = false
