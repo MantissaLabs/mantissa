@@ -10,13 +10,23 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
+arbitrary = { version = "1", features = ["derive"] }
 capnp = "0.25"
 libfuzzer-sys = "0.4"
 mantissa-protocol = { path = "../crates/mantissa-protocol" }
+mantissa-store = { path = "../crates/mantissa-store" }
+uuid = "1"
 
 [[bin]]
 name = "raw_capnp_decode"
 path = "fuzz_targets/raw_capnp_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "store_codecs"
+path = "fuzz_targets/store_codecs.rs"
 test = false
 doc = false
 bench = false
