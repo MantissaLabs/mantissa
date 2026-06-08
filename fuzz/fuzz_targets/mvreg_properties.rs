@@ -1,6 +1,7 @@
 #![no_main]
 
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
@@ -45,6 +46,10 @@ fuzz_target!(|input: MvRegInput| {
     let right = build_register(&input.right);
     let third = build_register(&input.third);
 
+    if has_invalid_event_history(&[&left, &right, &third]) {
+        return;
+    }
+
     assert_register_is_normalized(&left);
     assert_register_is_normalized(&right);
     assert_register_is_normalized(&third);
@@ -75,6 +80,32 @@ fn build_register(ops: &[Operation]) -> Register {
         }
     }
     reg
+}
+
+/// Returns whether generated entries violate MVReg event identity assumptions.
+fn has_invalid_event_history(registers: &[&Register]) -> bool {
+    let mut events = BTreeMap::new();
+
+    for reg in registers {
+        let mut clocks = BTreeSet::new();
+        for entry in reg.entries() {
+            let clock = canonical_clock(entry.clock());
+            if !clocks.insert(clock.clone()) {
+                return true;
+            }
+
+            // A vector clock identifies one logical write in valid MVReg state.
+            // Different values for the same clock model corrupt input, not a CRDT
+            // merge law that Mantissa-owned writers can produce.
+            if let Some(existing_value) = events.insert(clock, entry.value().clone())
+                && existing_value != *entry.value()
+            {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Verifies no visible entry is causally dominated by another visible entry.

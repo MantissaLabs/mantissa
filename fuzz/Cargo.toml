@@ -13,8 +13,10 @@ cargo-fuzz = true
 arbitrary = { version = "1", features = ["derive"] }
 capnp = "0.25"
 libfuzzer-sys = "0.4"
+mantissa-net = { path = "../crates/mantissa-net" }
 mantissa-protocol = { path = "../crates/mantissa-protocol" }
 mantissa-store = { path = "../crates/mantissa-store" }
+tokio = { version = "1", features = ["io-util", "rt"] }
 uuid = "1"
 
 [[bin]]
@@ -41,6 +43,13 @@ bench = false
 [[bin]]
 name = "sync_encoding"
 path = "fuzz_targets/sync_encoding.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "noise_framing"
+path = "fuzz_targets/noise_framing.rs"
 test = false
 doc = false
 bench = false
