@@ -89,12 +89,12 @@ where
         }
     }
 
-    /// Increments one actor counter in place.
+    /// Increments one actor counter in place while preserving monotonic ordering.
     pub fn increment(&mut self, actor: A)
     where
         A: Clone,
     {
-        let next = self.get(&actor) + 1;
+        let next = self.get(&actor).saturating_add(1);
         self.apply(actor, next);
     }
 
@@ -556,6 +556,22 @@ mod tests {
 
         assert_eq!(mantissa_values(&mantissa_old), oracle_values(&oracle_old));
         assert_eq!(mantissa_values(&mantissa_old), vec!["new".to_string()]);
+    }
+
+    /// Writing after a malformed maxed actor counter must not panic or wrap.
+    #[test]
+    fn mantissa_mvreg_write_saturates_max_counter() {
+        let actor_a = actor(1);
+        let actor_b = actor(2);
+        let mut reg = MvReg::from_entries(vec![entry(actor_a, u64::MAX, "max")]);
+
+        reg.write(actor_a, "same-actor".to_string());
+        reg.write(actor_b, "other-actor".to_string());
+
+        let merged_clock = reg.clock();
+        assert_eq!(merged_clock.get(&actor_a), u64::MAX);
+        assert_eq!(merged_clock.get(&actor_b), 1);
+        assert_eq!(mantissa_values(&reg), vec!["other-actor".to_string()]);
     }
 
     /// Snapshots must remain sorted and deduplicated for stable MST hashing.
