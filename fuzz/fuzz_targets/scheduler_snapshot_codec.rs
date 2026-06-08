@@ -152,15 +152,27 @@ fn assert_malformed_lease_uuid_fields_are_rejected(input: &MalformedSnapshot) {
 
 /// Builds one bounded scheduler snapshot from generated state.
 fn build_snapshot(input: &GeneratedSnapshot) -> SchedulerSnapshot {
+    let mut slot_ids = BTreeSet::new();
+    let mut slots = Vec::new();
+    for slot in input.slots.iter().take(MAX_SLOTS) {
+        if slot_ids.insert(slot.slot_id) {
+            slots.push(build_slot(slot));
+        }
+    }
+
+    let mut gpu_device_ids = BTreeSet::new();
+    let mut gpu_devices = Vec::new();
+    for device in input.gpu_devices.iter().take(MAX_DEVICES) {
+        let device = build_gpu_device(device);
+        if gpu_device_ids.insert(device.device_id.clone()) {
+            gpu_devices.push(device);
+        }
+    }
+
     SchedulerSnapshot {
         version: input.version,
-        slots: input.slots.iter().take(MAX_SLOTS).map(build_slot).collect(),
-        gpu_devices: input
-            .gpu_devices
-            .iter()
-            .take(MAX_DEVICES)
-            .map(build_gpu_device)
-            .collect(),
+        slots,
+        gpu_devices,
     }
 }
 

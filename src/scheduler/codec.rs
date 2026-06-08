@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::{collections::HashSet, io::Cursor};
 
 use mantissa_protocol::scheduling::{
     scheduler_store_gpu_device, scheduler_store_gpu_device_reservation,
@@ -12,6 +12,10 @@ use super::{
     GpuDevice, GpuDeviceReservation, GpuDeviceState, LeaseReservation, ResourceSlot,
     SchedulerSnapshot, SlotCapacity, SlotReservation, SlotState,
 };
+
+const MAX_SCHEDULER_STORE_SLOTS: u32 = 65_536;
+const MAX_SCHEDULER_STORE_GPU_DEVICES: u32 = 4_096;
+const MAX_SCHEDULER_STORE_TEXT_BYTES: usize = 1_024;
 
 impl StoreValueCodec for SchedulerSnapshot {
     /// Encodes one scheduler snapshot as the stable Cap'n Proto store value.
@@ -62,15 +66,39 @@ fn read_scheduler_store_snapshot(
     reader: scheduler_store_snapshot::Reader<'_>,
 ) -> Result<SchedulerSnapshot, capnp::Error> {
     let slots_reader = reader.get_slots()?;
-    let mut slots = Vec::with_capacity(slots_reader.len() as usize);
+    let mut slots = Vec::with_capacity(validate_store_list_len(
+        "scheduler snapshot slots",
+        slots_reader.len(),
+        MAX_SCHEDULER_STORE_SLOTS,
+    )?);
+    let mut slot_ids = HashSet::with_capacity(slots.capacity());
     for slot in slots_reader.iter() {
-        slots.push(read_scheduler_store_slot(slot)?);
+        let slot = read_scheduler_store_slot(slot)?;
+        if !slot_ids.insert(slot.slot_id) {
+            return Err(capnp::Error::failed(format!(
+                "duplicate scheduler snapshot slot id {}",
+                slot.slot_id
+            )));
+        }
+        slots.push(slot);
     }
 
     let devices_reader = reader.get_gpu_devices()?;
-    let mut gpu_devices = Vec::with_capacity(devices_reader.len() as usize);
+    let mut gpu_devices = Vec::with_capacity(validate_store_list_len(
+        "scheduler snapshot gpu devices",
+        devices_reader.len(),
+        MAX_SCHEDULER_STORE_GPU_DEVICES,
+    )?);
+    let mut gpu_device_ids = HashSet::with_capacity(gpu_devices.capacity());
     for device in devices_reader.iter() {
-        gpu_devices.push(read_scheduler_store_gpu_device(device)?);
+        let device = read_scheduler_store_gpu_device(device)?;
+        if !gpu_device_ids.insert(device.device_id.clone()) {
+            return Err(capnp::Error::failed(format!(
+                "duplicate scheduler snapshot gpu device id {}",
+                device.device_id
+            )));
+        }
+        gpu_devices.push(device);
     }
 
     Ok(SchedulerSnapshot {
@@ -163,11 +191,11 @@ fn read_scheduler_store_gpu_device(
     };
 
     Ok(GpuDevice {
-        device_id: reader.get_device_id()?.to_str()?.to_string(),
+        device_id: read_required_store_text(reader.get_device_id()?, "gpu device id")?,
         index: reader.get_index(),
-        uuid: read_optional_store_text(reader.get_uuid()?),
-        pci_bus_id: read_optional_store_text(reader.get_pci_bus_id()?),
-        name: reader.get_name()?.to_str()?.to_string(),
+        uuid: read_optional_store_text(reader.get_uuid()?, "gpu uuid")?,
+        pci_bus_id: read_optional_store_text(reader.get_pci_bus_id()?, "gpu pci bus id")?,
+        name: read_required_store_text(reader.get_name()?, "gpu name")?,
         memory_total_bytes: reader.get_memory_total_bytes(),
         state,
     })
@@ -287,10 +315,49 @@ fn read_optional_uuid_data(
     Ok(Some(read_uuid_data(data, field)?))
 }
 
+/// Validates a scheduler store list length before allocating decoded output.
+fn validate_store_list_len(field: &str, len: u32, max_len: u32) -> Result<usize, capnp::Error> {
+    if len > max_len {
+        return Err(capnp::Error::failed(format!(
+            "{field} length {len} exceeds maximum {max_len}"
+        )));
+    }
+
+    Ok(len as usize)
+}
+
+/// Decodes required scheduler store text after enforcing a small byte limit.
+fn read_required_store_text(
+    reader: capnp::text::Reader<'_>,
+    field: &str,
+) -> Result<String, capnp::Error> {
+    validate_store_text_len(reader, field)?;
+    Ok(reader.to_str()?.to_string())
+}
+
 /// Decodes optional scheduler store text where empty text means absent.
-fn read_optional_store_text(reader: capnp::text::Reader<'_>) -> Option<String> {
-    let value = reader.to_str().ok()?.trim().to_string();
-    (!value.is_empty()).then_some(value)
+fn read_optional_store_text(
+    reader: capnp::text::Reader<'_>,
+    field: &str,
+) -> Result<Option<String>, capnp::Error> {
+    validate_store_text_len(reader, field)?;
+    let value = reader.to_str()?.trim().to_string();
+    Ok((!value.is_empty()).then_some(value))
+}
+
+/// Validates scheduler store text before copying it into owned strings.
+fn validate_store_text_len(
+    reader: capnp::text::Reader<'_>,
+    field: &str,
+) -> Result<(), capnp::Error> {
+    let len = reader.len();
+    if len > MAX_SCHEDULER_STORE_TEXT_BYTES {
+        return Err(capnp::Error::failed(format!(
+            "scheduler {field} length {len} exceeds maximum {MAX_SCHEDULER_STORE_TEXT_BYTES}"
+        )));
+    }
+
+    Ok(())
 }
 
 /// Converts scheduler store-codec errors into the CRDT store error type.
