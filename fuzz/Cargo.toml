@@ -30,3 +30,17 @@ path = "fuzz_targets/store_codecs.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "mvreg_properties"
+path = "fuzz_targets/mvreg_properties.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_encoding"
+path = "fuzz_targets/sync_encoding.rs"
+test = false
+doc = false
+bench = false
