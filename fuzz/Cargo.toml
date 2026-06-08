@@ -16,6 +16,8 @@ libfuzzer-sys = "0.4"
 mantissa-net = { path = "../crates/mantissa-net" }
 mantissa-protocol = { path = "../crates/mantissa-protocol" }
 mantissa-store = { path = "../crates/mantissa-store" }
+redb = "3.1.1"
+tempfile = "3"
 tokio = { version = "1", features = ["io-util", "rt"] }
 uuid = "1"
 
@@ -50,6 +52,13 @@ bench = false
 [[bin]]
 name = "noise_framing"
 path = "fuzz_targets/noise_framing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mst_store_sequences"
+path = "fuzz_targets/mst_store_sequences.rs"
 test = false
 doc = false
 bench = false
