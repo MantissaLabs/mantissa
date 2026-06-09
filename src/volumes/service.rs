@@ -11,9 +11,8 @@ use anyhow::Result;
 use capnp::Error;
 use capnp::struct_list;
 use mantissa_protocol::volumes::{
-    LocalVolumeSourceKind, local_volume_ownership, local_volume_spec, volume_driver_spec,
-    volume_event, volume_inspect, volume_label, volume_node_status, volume_spec, volume_summary,
-    volumes,
+    local_volume_ownership, local_volume_spec, volume_driver_spec, volume_event, volume_inspect,
+    volume_label, volume_node_status, volume_spec, volume_summary, volumes,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::fs;
@@ -179,17 +178,11 @@ fn write_volume_driver(mut builder: volume_driver_spec::Builder<'_>, driver: &Vo
 fn write_local_volume_spec(mut builder: local_volume_spec::Builder<'_>, spec: &LocalVolumeSpec) {
     match spec {
         LocalVolumeSpec::Managed { ownership } => {
-            builder.set_source_kind(LocalVolumeSourceKind::Managed);
-            builder.set_imported_path("");
-            write_local_volume_ownership(builder.reborrow().init_ownership(), *ownership);
+            let mut managed = builder.reborrow().init_managed();
+            write_local_volume_ownership(managed.reborrow().init_ownership(), *ownership);
         }
         LocalVolumeSpec::ImportedPath { path } => {
-            builder.set_source_kind(LocalVolumeSourceKind::ImportedPath);
             builder.set_imported_path(path);
-            write_local_volume_ownership(
-                builder.reborrow().init_ownership(),
-                LocalVolumeOwnership::Daemon,
-            );
         }
     }
 }
@@ -239,26 +232,22 @@ fn read_volume_driver(reader: volume_driver_spec::Reader<'_>) -> Result<VolumeDr
 
 /// Deserializes one local-driver configuration from the Cap'n Proto wire representation.
 fn read_local_volume_spec(reader: local_volume_spec::Reader<'_>) -> Result<LocalVolumeSpec, Error> {
-    match reader.get_source_kind()? {
-        LocalVolumeSourceKind::Managed => {
-            let ownership = read_local_volume_ownership(reader.get_ownership()?)?;
+    match reader.which()? {
+        local_volume_spec::Which::Managed(Ok(managed)) => {
+            let ownership = read_local_volume_ownership(managed.get_ownership()?)?;
             Ok(LocalVolumeSpec::managed(ownership))
         }
-        LocalVolumeSourceKind::ImportedPath => {
-            let path = reader.get_imported_path()?.to_str()?.trim().to_string();
+        local_volume_spec::Which::Managed(Err(err)) => Err(err),
+        local_volume_spec::Which::ImportedPath(Ok(path)) => {
+            let path = path.to_str()?.trim().to_string();
             if path.is_empty() {
                 return Err(Error::failed(
                     "local imported volume requires a non-empty imported_path".to_string(),
                 ));
             }
-            let ownership = read_local_volume_ownership(reader.get_ownership()?)?;
-            if !matches!(ownership, LocalVolumeOwnership::Daemon) {
-                return Err(Error::failed(
-                    "imported local volumes cannot override ownership".to_string(),
-                ));
-            }
             Ok(LocalVolumeSpec::imported_path(path))
         }
+        local_volume_spec::Which::ImportedPath(Err(err)) => Err(err),
     }
 }
 
@@ -948,33 +937,29 @@ mod tests {
         assert_eq!(decoded, state);
     }
 
-    /// Imported local volume rows with ownership overrides should fail at decode.
+    /// Imported local volume rows should round-trip without any ownership payload.
     #[test]
-    fn volume_store_codec_rejects_imported_path_ownership_override() {
-        let mut message = capnp::message::Builder::new_default();
-        let mut spec = message.init_root::<volume_spec::Builder<'_>>();
-        spec.set_id(crate::volumes::types::compute_volume_id("imported").as_bytes());
-        spec.set_name("imported");
-        let mut local = spec.reborrow().init_driver().init_local();
-        local.set_source_kind(LocalVolumeSourceKind::ImportedPath);
-        local.set_imported_path("/var/lib/mantissa/imported");
-        let mut fs_group = local.reborrow().init_ownership().init_fs_group();
-        fs_group.set_gid(2_000);
-        spec.set_access_mode(VolumeAccessMode::ReadWriteOnce.to_proto());
-        spec.set_binding_mode(VolumeBindingMode::Immediate.to_proto());
-        spec.set_reclaim_policy(VolumeReclaimPolicy::Retain.to_proto());
-        spec.set_status(VolumeStatus::Ready.to_proto());
-        spec.set_created_at("2026-03-25T12:00:00Z");
-        spec.set_updated_at("2026-03-25T12:00:00Z");
+    fn volume_store_codec_roundtrips_imported_path_spec() {
+        let spec = VolumeSpecValue::new(VolumeSpecDraft {
+            name: "imported".to_string(),
+            driver: VolumeDriver::Local(LocalVolumeSpec::imported_path(
+                "/var/lib/mantissa/imported",
+            )),
+            access_mode: VolumeAccessMode::ReadWriteOnce,
+            binding_mode: VolumeBindingMode::Immediate,
+            reclaim_policy: VolumeReclaimPolicy::Retain,
+            requested_bytes: None,
+            labels: Vec::new(),
+            bound_node_id: Some(Uuid::new_v4()),
+            bound_node_name: Some("node-a".to_string()),
+        });
 
-        let encoded = capnp::serialize::write_message_to_words(&message);
-        let error = VolumeSpecValue::decode_store_value(&encoded)
-            .expect_err("decode should reject imported ownership override");
-        let message = error.to_string();
-        assert!(
-            message.contains("imported local volumes cannot override ownership"),
-            "{message}"
-        );
+        let encoded = spec
+            .encode_store_value()
+            .expect("encode imported volume spec store value");
+        let decoded = VolumeSpecValue::decode_store_value(&encoded)
+            .expect("decode imported volume spec store value");
+        assert_eq!(decoded, spec);
     }
 
     /// Reopening volume stores should decode Cap'n Proto MVReg rows from Redb.

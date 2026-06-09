@@ -22,7 +22,7 @@ use mantissa::workload::manager::{WorkloadRuntimeConfig, WorkloadStartRequest};
 use mantissa::workload::model::ExecutionPlatform;
 use mantissa::workload::types::ResolvedExecutionSpec;
 use mantissa_protocol::topology::topology;
-use mantissa_protocol::volumes::{LocalVolumeSourceKind, volumes};
+use mantissa_protocol::volumes::volumes;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -225,8 +225,11 @@ async fn create_managed_volume_with(
         inner.set_name(name);
         let mut driver = inner.reborrow().init_driver();
         let mut local = driver.reborrow().init_local();
-        local.set_source_kind(LocalVolumeSourceKind::Managed);
-        local.set_imported_path("");
+        local
+            .reborrow()
+            .init_managed()
+            .init_ownership()
+            .set_daemon(());
         inner.set_access_mode(mantissa_protocol::volumes::VolumeAccessMode::ReadWriteOnce);
         inner.set_binding_mode(binding_mode);
         inner.set_reclaim_policy(reclaim_policy);
@@ -267,8 +270,11 @@ async fn create_immediate_managed_volume_on_node(
         inner.set_name(name);
         let mut driver = inner.reborrow().init_driver();
         let mut local = driver.reborrow().init_local();
-        local.set_source_kind(LocalVolumeSourceKind::Managed);
-        local.set_imported_path("");
+        local
+            .reborrow()
+            .init_managed()
+            .init_ownership()
+            .set_daemon(());
         inner.set_access_mode(mantissa_protocol::volumes::VolumeAccessMode::ReadWriteOnce);
         inner.set_binding_mode(mantissa_protocol::volumes::VolumeBindingMode::Immediate);
         inner.set_reclaim_policy(reclaim_policy);

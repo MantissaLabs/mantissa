@@ -81,14 +81,6 @@ enum VolumeNodeState {
   # Node-local realization failed.
 }
 
-enum LocalVolumeSourceKind {
-  managed @0;
-  # Mantissa manages the backing directory lifecycle.
-
-  importedPath @1;
-  # Operator imported an existing host path.
-}
-
 struct VolumeLabel {
   key @0 :Text;
   # Metadata key.
@@ -98,13 +90,17 @@ struct VolumeLabel {
 }
 
 struct LocalVolumeSpec {
-  sourceKind @0 :LocalVolumeSourceKind;
-  # Backing path source model.
+  union {
+    managed @0 :ManagedLocalVolumeSpec;
+    # Mantissa manages the backing directory lifecycle.
 
-  importedPath @1 :Text;
-  # Imported host path when sourceKind=importedPath, empty otherwise.
+    importedPath @1 :Text;
+    # Operator imported an existing host path.
+  }
+}
 
-  ownership @2 :LocalVolumeOwnership;
+struct ManagedLocalVolumeSpec {
+  ownership @0 :LocalVolumeOwnership;
   # Ownership and permission policy for Mantissa-managed local directories.
 }
 

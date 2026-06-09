@@ -1,10 +1,9 @@
 use anyhow::{Result, anyhow};
 use mantissa_protocol::volumes::{
-    LocalVolumeSourceKind, VolumeAccessMode as ProtoVolumeAccessMode,
-    VolumeBindingMode as ProtoVolumeBindingMode, VolumeNodeState as ProtoVolumeNodeState,
-    VolumeReclaimPolicy as ProtoVolumeReclaimPolicy, VolumeStatus as ProtoVolumeStatus,
-    local_volume_ownership, volume_driver_spec, volume_inspect, volume_node_status, volume_spec,
-    volume_summary,
+    VolumeAccessMode as ProtoVolumeAccessMode, VolumeBindingMode as ProtoVolumeBindingMode,
+    VolumeNodeState as ProtoVolumeNodeState, VolumeReclaimPolicy as ProtoVolumeReclaimPolicy,
+    VolumeStatus as ProtoVolumeStatus, local_volume_ownership, local_volume_spec,
+    volume_driver_spec, volume_inspect, volume_node_status, volume_spec, volume_summary,
 };
 use serde::Deserialize;
 use std::fmt;
@@ -431,20 +430,20 @@ fn parse_driver(
     reader: volume_driver_spec::Reader<'_>,
 ) -> Result<(VolumeDriver, Option<LocalVolumeOwnership>)> {
     match reader.which()? {
-        volume_driver_spec::Which::Local(Ok(local_reader)) => {
-            match local_reader.get_source_kind()? {
-                LocalVolumeSourceKind::Managed => Ok((
-                    VolumeDriver::LocalManaged,
-                    Some(parse_local_volume_ownership(local_reader.get_ownership()?)?),
-                )),
-                LocalVolumeSourceKind::ImportedPath => Ok((
-                    VolumeDriver::LocalImportedPath(
-                        local_reader.get_imported_path()?.to_str()?.to_string(),
-                    ),
-                    None,
-                )),
-            }
-        }
+        volume_driver_spec::Which::Local(Ok(local_reader)) => match local_reader.which()? {
+            local_volume_spec::Which::Managed(Ok(managed_reader)) => Ok((
+                VolumeDriver::LocalManaged,
+                Some(parse_local_volume_ownership(
+                    managed_reader.get_ownership()?,
+                )?),
+            )),
+            local_volume_spec::Which::Managed(Err(err)) => Err(anyhow!(err.to_string())),
+            local_volume_spec::Which::ImportedPath(Ok(path)) => Ok((
+                VolumeDriver::LocalImportedPath(path.to_str()?.to_string()),
+                None,
+            )),
+            local_volume_spec::Which::ImportedPath(Err(err)) => Err(anyhow!(err.to_string())),
+        },
         volume_driver_spec::Which::Local(Err(err)) => Err(anyhow!(err.to_string())),
         volume_driver_spec::Which::External(Ok(external_reader)) => Ok((
             VolumeDriver::External {

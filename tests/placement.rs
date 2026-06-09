@@ -24,7 +24,7 @@ use mantissa::workload::types::{
     ExecutionSpec, ResolvedExecutionSpec, WorkloadPortBinding, WorkloadPortProtocol,
 };
 use mantissa_health::Status as HealthStatus;
-use mantissa_protocol::volumes::{LocalVolumeSourceKind, volumes};
+use mantissa_protocol::volumes::volumes;
 use mantissa_store::uuid_key::UuidKey;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -1869,8 +1869,11 @@ async fn create_immediate_managed_volume_on_node(
         inner.set_name(name);
         let mut driver = inner.reborrow().init_driver();
         let mut local = driver.reborrow().init_local();
-        local.set_source_kind(LocalVolumeSourceKind::Managed);
-        local.set_imported_path("");
+        local
+            .reborrow()
+            .init_managed()
+            .init_ownership()
+            .set_daemon(());
         inner.set_access_mode(mantissa_protocol::volumes::VolumeAccessMode::ReadWriteOnce);
         inner.set_binding_mode(mantissa_protocol::volumes::VolumeBindingMode::Immediate);
         inner.set_reclaim_policy(mantissa_protocol::volumes::VolumeReclaimPolicy::Retain);

@@ -58,19 +58,18 @@ pub async fn create_with_request(
         inner.set_name(&request.name);
         let mut driver = inner.reborrow().init_driver();
         let mut local = driver.reborrow().init_local();
-        local.set_source_kind(mantissa_protocol::volumes::LocalVolumeSourceKind::Managed);
-        local.set_imported_path("");
+        let mut managed = local.reborrow().init_managed();
         match &request.ownership {
             LocalVolumeOwnership::Daemon => {
-                local.reborrow().init_ownership().set_daemon(());
+                managed.reborrow().init_ownership().set_daemon(());
             }
             LocalVolumeOwnership::User { uid, gid } => {
-                let mut user = local.reborrow().init_ownership().init_user();
+                let mut user = managed.reborrow().init_ownership().init_user();
                 user.set_uid(*uid);
                 user.set_gid(*gid);
             }
             LocalVolumeOwnership::FsGroup { gid } => {
-                let mut fs_group = local.reborrow().init_ownership().init_fs_group();
+                let mut fs_group = managed.reborrow().init_ownership().init_fs_group();
                 fs_group.set_gid(*gid);
             }
         }
