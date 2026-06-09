@@ -77,3 +77,24 @@ path = "fuzz_targets/scheduler_snapshot_codec.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "domain_store_value_codecs"
+path = "fuzz_targets/domain_store_value_codecs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "infra_store_value_codecs"
+path = "fuzz_targets/infra_store_value_codecs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "controller_store_value_codecs"
+path = "fuzz_targets/controller_store_value_codecs.rs"
+test = false
+doc = false
+bench = false
