@@ -112,3 +112,10 @@ path = "fuzz_targets/task_spec_codec.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "control_plane_parsers"
+path = "fuzz_targets/control_plane_parsers.rs"
+test = false
+doc = false
+bench = false
