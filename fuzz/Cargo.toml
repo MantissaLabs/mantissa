@@ -98,3 +98,17 @@ path = "fuzz_targets/controller_store_value_codecs.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "workload_capnp_codecs"
+path = "fuzz_targets/workload_capnp_codecs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "task_spec_codec"
+path = "fuzz_targets/task_spec_codec.rs"
+test = false
+doc = false
+bench = false
