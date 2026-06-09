@@ -3,9 +3,9 @@ use crate::topology::Topology;
 use crate::volumes::gossip::VolumeReplicator;
 use crate::volumes::registry::VolumeRegistry;
 use crate::volumes::types::{
-    ExternalVolumeSpec, LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode,
-    VolumeBindingMode, VolumeDriver, VolumeEvent, VolumeLabel, VolumeNodeState,
-    VolumeNodeStateValue, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
+    ExternalVolumeSpec, LocalVolumeOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode,
+    VolumeDriver, VolumeEvent, VolumeLabel, VolumeNodeState, VolumeNodeStateValue,
+    VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
 };
 use anyhow::Result;
 use capnp::Error;
@@ -177,17 +177,21 @@ fn write_volume_driver(mut builder: volume_driver_spec::Builder<'_>, driver: &Vo
 
 /// Serializes one local-driver configuration into the Cap'n Proto wire representation.
 fn write_local_volume_spec(mut builder: local_volume_spec::Builder<'_>, spec: &LocalVolumeSpec) {
-    match &spec.source {
-        LocalVolumeSource::Managed => {
+    match spec {
+        LocalVolumeSpec::Managed { ownership } => {
             builder.set_source_kind(LocalVolumeSourceKind::Managed);
             builder.set_imported_path("");
+            write_local_volume_ownership(builder.reborrow().init_ownership(), *ownership);
         }
-        LocalVolumeSource::ImportedPath(path) => {
+        LocalVolumeSpec::ImportedPath { path } => {
             builder.set_source_kind(LocalVolumeSourceKind::ImportedPath);
             builder.set_imported_path(path);
+            write_local_volume_ownership(
+                builder.reborrow().init_ownership(),
+                LocalVolumeOwnership::Daemon,
+            );
         }
     }
-    write_local_volume_ownership(builder.reborrow().init_ownership(), spec.ownership);
 }
 
 /// Serializes one managed-volume ownership policy into the Cap'n Proto wire representation.
@@ -235,8 +239,11 @@ fn read_volume_driver(reader: volume_driver_spec::Reader<'_>) -> Result<VolumeDr
 
 /// Deserializes one local-driver configuration from the Cap'n Proto wire representation.
 fn read_local_volume_spec(reader: local_volume_spec::Reader<'_>) -> Result<LocalVolumeSpec, Error> {
-    let source = match reader.get_source_kind()? {
-        LocalVolumeSourceKind::Managed => LocalVolumeSource::Managed,
+    match reader.get_source_kind()? {
+        LocalVolumeSourceKind::Managed => {
+            let ownership = read_local_volume_ownership(reader.get_ownership()?)?;
+            Ok(LocalVolumeSpec::managed(ownership))
+        }
         LocalVolumeSourceKind::ImportedPath => {
             let path = reader.get_imported_path()?.to_str()?.trim().to_string();
             if path.is_empty() {
@@ -244,18 +251,15 @@ fn read_local_volume_spec(reader: local_volume_spec::Reader<'_>) -> Result<Local
                     "local imported volume requires a non-empty imported_path".to_string(),
                 ));
             }
-            LocalVolumeSource::ImportedPath(path)
+            let ownership = read_local_volume_ownership(reader.get_ownership()?)?;
+            if !matches!(ownership, LocalVolumeOwnership::Daemon) {
+                return Err(Error::failed(
+                    "imported local volumes cannot override ownership".to_string(),
+                ));
+            }
+            Ok(LocalVolumeSpec::imported_path(path))
         }
-    };
-    let ownership = read_local_volume_ownership(reader.get_ownership()?)?;
-    if matches!(source, LocalVolumeSource::ImportedPath(_))
-        && !matches!(ownership, LocalVolumeOwnership::Daemon)
-    {
-        return Err(Error::failed(
-            "imported local volumes cannot override ownership".to_string(),
-        ));
     }
-    Ok(LocalVolumeSpec { source, ownership })
 }
 
 /// Deserializes one managed-volume ownership policy from the Cap'n Proto wire representation.
@@ -556,14 +560,8 @@ impl volumes::Server for VolumesRpc {
 
         let driver = read_volume_driver(request.get_driver()?)?;
         match &driver {
-            VolumeDriver::Local(LocalVolumeSpec {
-                source: LocalVolumeSource::Managed,
-                ..
-            }) => {}
-            VolumeDriver::Local(LocalVolumeSpec {
-                source: LocalVolumeSource::ImportedPath(_),
-                ..
-            }) => {
+            VolumeDriver::Local(LocalVolumeSpec::Managed { .. }) => {}
+            VolumeDriver::Local(LocalVolumeSpec::ImportedPath { .. }) => {
                 return Err(Error::failed(
                     "use 'mantissa volumes import' for imported host paths".to_string(),
                 ));
@@ -691,10 +689,7 @@ impl volumes::Server for VolumesRpc {
 
         let requested_bytes = zero_means_none(request.get_requested_bytes());
         let labels = read_labels(request.get_labels()?)?;
-        let driver = VolumeDriver::Local(LocalVolumeSpec {
-            source: LocalVolumeSource::ImportedPath(path.clone()),
-            ownership: LocalVolumeOwnership::Daemon,
-        });
+        let driver = VolumeDriver::Local(LocalVolumeSpec::imported_path(path.clone()));
         let mut spec = VolumeSpecValue::new(VolumeSpecDraft {
             name,
             driver,
@@ -767,10 +762,7 @@ impl volumes::Server for VolumesRpc {
         if matches!(
             (&spec.driver, spec.reclaim_policy),
             (
-                VolumeDriver::Local(LocalVolumeSpec {
-                    source: LocalVolumeSource::Managed,
-                    ..
-                }),
+                VolumeDriver::Local(LocalVolumeSpec::Managed { .. }),
                 VolumeReclaimPolicy::Delete,
             )
         ) {
@@ -792,10 +784,7 @@ impl volumes::Server for VolumesRpc {
             if let Some(path) = &state.local_path {
                 match (&spec.driver, spec.reclaim_policy) {
                     (
-                        VolumeDriver::Local(LocalVolumeSpec {
-                            source: LocalVolumeSource::Managed,
-                            ..
-                        }),
+                        VolumeDriver::Local(LocalVolumeSpec::Managed { .. }),
                         VolumeReclaimPolicy::Delete,
                     ) => {
                         if Path::new(path).exists() {
@@ -897,10 +886,9 @@ mod tests {
         VolumeSpecValue {
             id: crate::volumes::types::compute_volume_id("cache"),
             name: "cache".to_string(),
-            driver: VolumeDriver::Local(LocalVolumeSpec {
-                source: LocalVolumeSource::Managed,
-                ownership: LocalVolumeOwnership::FsGroup { gid: 2_000 },
-            }),
+            driver: VolumeDriver::Local(LocalVolumeSpec::managed(LocalVolumeOwnership::FsGroup {
+                gid: 2_000,
+            })),
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,
             reclaim_policy: VolumeReclaimPolicy::Retain,
@@ -958,6 +946,35 @@ mod tests {
         let decoded = VolumeNodeStateValue::decode_store_value(&encoded)
             .expect("decode volume node store value");
         assert_eq!(decoded, state);
+    }
+
+    /// Imported local volume rows with ownership overrides should fail at decode.
+    #[test]
+    fn volume_store_codec_rejects_imported_path_ownership_override() {
+        let mut message = capnp::message::Builder::new_default();
+        let mut spec = message.init_root::<volume_spec::Builder<'_>>();
+        spec.set_id(crate::volumes::types::compute_volume_id("imported").as_bytes());
+        spec.set_name("imported");
+        let mut local = spec.reborrow().init_driver().init_local();
+        local.set_source_kind(LocalVolumeSourceKind::ImportedPath);
+        local.set_imported_path("/var/lib/mantissa/imported");
+        let mut fs_group = local.reborrow().init_ownership().init_fs_group();
+        fs_group.set_gid(2_000);
+        spec.set_access_mode(VolumeAccessMode::ReadWriteOnce.to_proto());
+        spec.set_binding_mode(VolumeBindingMode::Immediate.to_proto());
+        spec.set_reclaim_policy(VolumeReclaimPolicy::Retain.to_proto());
+        spec.set_status(VolumeStatus::Ready.to_proto());
+        spec.set_created_at("2026-03-25T12:00:00Z");
+        spec.set_updated_at("2026-03-25T12:00:00Z");
+
+        let encoded = capnp::serialize::write_message_to_words(&message);
+        let error = VolumeSpecValue::decode_store_value(&encoded)
+            .expect_err("decode should reject imported ownership override");
+        let message = error.to_string();
+        assert!(
+            message.contains("imported local volumes cannot override ownership"),
+            "{message}"
+        );
     }
 
     /// Reopening volume stores should decode Cap'n Proto MVReg rows from Redb.

@@ -35,9 +35,9 @@ use mantissa::store::replicated::workloads::{
     WorkloadRegAdapter, WorkloadStore, open_workload_store,
 };
 use mantissa::volumes::types::{
-    LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode,
-    VolumeDriver, VolumeNodeState, VolumeNodeStateValue, VolumeReclaimPolicy, VolumeSpecDraft,
-    VolumeSpecValue, VolumeStatus,
+    LocalVolumeOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
+    VolumeNodeState, VolumeNodeStateValue, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
+    VolumeStatus,
 };
 use mantissa::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadStoreValue, WorkloadValue,
@@ -361,10 +361,7 @@ fn secret_master_key_current_value(key_id: Uuid, generation: u64) -> SecretMaste
 fn volume_spec_value(name: &str, version: u64, status: VolumeStatus) -> VolumeSpecValue {
     let mut value = VolumeSpecValue::new(VolumeSpecDraft {
         name: name.to_string(),
-        driver: VolumeDriver::Local(LocalVolumeSpec {
-            source: LocalVolumeSource::Managed,
-            ownership: LocalVolumeOwnership::Daemon,
-        }),
+        driver: VolumeDriver::Local(LocalVolumeSpec::managed(LocalVolumeOwnership::Daemon)),
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode: VolumeBindingMode::Immediate,
         reclaim_policy: VolumeReclaimPolicy::Retain,

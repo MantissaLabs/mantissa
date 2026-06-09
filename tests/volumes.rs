@@ -15,9 +15,8 @@ use mantissa::store::replicated::volumes::{open_volume_node_store, open_volume_s
 use mantissa::task::types::TaskVolumeMount;
 use mantissa::volumes::registry::VolumeRegistry;
 use mantissa::volumes::types::{
-    LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode,
-    VolumeDriver, VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
-    VolumeStatus,
+    LocalVolumeOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
+    VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue, VolumeStatus,
 };
 use mantissa::workload::manager::{WorkloadRuntimeConfig, WorkloadStartRequest};
 use mantissa::workload::model::ExecutionPlatform;
@@ -667,10 +666,7 @@ local_test!(volumes_import_binds_immediately_to_selected_node, {
     assert!(matches!(spec.status, VolumeStatus::Ready));
     assert!(matches!(
         spec.driver,
-        VolumeDriver::Local(LocalVolumeSpec {
-            source: LocalVolumeSource::ImportedPath(_),
-            ..
-        })
+        VolumeDriver::Local(LocalVolumeSpec::ImportedPath { .. })
     ));
 
     let node_states = cluster[1]
@@ -836,10 +832,7 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
 
     let left = VolumeSpecValue::new(VolumeSpecDraft {
         name: "left".to_string(),
-        driver: VolumeDriver::Local(LocalVolumeSpec {
-            source: LocalVolumeSource::Managed,
-            ownership: LocalVolumeOwnership::Daemon,
-        }),
+        driver: VolumeDriver::Local(LocalVolumeSpec::managed(LocalVolumeOwnership::Daemon)),
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode: VolumeBindingMode::Immediate,
         reclaim_policy: VolumeReclaimPolicy::Retain,
@@ -850,10 +843,7 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
     });
     let right = VolumeSpecValue::new(VolumeSpecDraft {
         name: "right".to_string(),
-        driver: VolumeDriver::Local(LocalVolumeSpec {
-            source: LocalVolumeSource::Managed,
-            ownership: LocalVolumeOwnership::Daemon,
-        }),
+        driver: VolumeDriver::Local(LocalVolumeSpec::managed(LocalVolumeOwnership::Daemon)),
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode: VolumeBindingMode::Immediate,
         reclaim_policy: VolumeReclaimPolicy::Retain,

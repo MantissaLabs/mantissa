@@ -170,14 +170,6 @@ impl VolumeNodeState {
     }
 }
 
-/// The source kind used by the built-in local driver.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum LocalVolumeSource {
-    Managed,
-    ImportedPath(String),
-}
-
 /// Explicit ownership policy applied to Mantissa-managed local volume directories.
 #[derive(
     Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
@@ -215,10 +207,35 @@ impl LocalVolumeOwnership {
 }
 
 /// Built-in local driver specification stored on one volume object.
+///
+/// Imported host paths are not owned by Mantissa, so they cannot carry a managed-volume
+/// ownership policy. Keeping the variants separate makes that invalid state unrepresentable
+/// inside persisted volume rows.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LocalVolumeSpec {
-    pub source: LocalVolumeSource,
-    pub ownership: LocalVolumeOwnership,
+#[serde(rename_all = "snake_case")]
+pub enum LocalVolumeSpec {
+    Managed { ownership: LocalVolumeOwnership },
+    ImportedPath { path: String },
+}
+
+impl LocalVolumeSpec {
+    /// Builds one managed local volume spec with the selected ownership policy.
+    pub fn managed(ownership: LocalVolumeOwnership) -> Self {
+        Self::Managed { ownership }
+    }
+
+    /// Builds one imported host-path local volume spec.
+    pub fn imported_path(path: impl Into<String>) -> Self {
+        Self::ImportedPath { path: path.into() }
+    }
+
+    /// Returns the effective ownership policy applied by the local volume driver.
+    pub fn ownership(&self) -> LocalVolumeOwnership {
+        match self {
+            Self::Managed { ownership } => *ownership,
+            Self::ImportedPath { .. } => LocalVolumeOwnership::Daemon,
+        }
+    }
 }
 
 /// Future external driver specification stored on one volume object.
@@ -263,13 +280,9 @@ impl VolumeSpecValue {
     pub fn new(draft: VolumeSpecDraft) -> Self {
         let now = current_timestamp();
         let status = match (&draft.driver, draft.bound_node_id) {
-            (
-                VolumeDriver::Local(LocalVolumeSpec {
-                    source: LocalVolumeSource::ImportedPath(_),
-                    ..
-                }),
-                Some(_),
-            ) => VolumeStatus::Ready,
+            (VolumeDriver::Local(LocalVolumeSpec::ImportedPath { .. }), Some(_)) => {
+                VolumeStatus::Ready
+            }
             (_, Some(_)) => VolumeStatus::Bound,
             _ => VolumeStatus::Pending,
         };

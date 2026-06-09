@@ -15,8 +15,8 @@ use crate::store::replicated::networks::{
 };
 use crate::store::replicated::volumes::{open_volume_node_store, open_volume_spec_store};
 use crate::volumes::types::{
-    LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode,
-    VolumeDriver, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
+    LocalVolumeOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
+    VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
 };
 use crate::workload::model::{
     ExecutionPlatform, WorkloadAdmissionState, WorkloadOwner, WorkloadServiceMetadata,
@@ -226,10 +226,7 @@ fn service_reserves_public_ports_until_stop_finishes() {
 fn make_local_volume_spec(name: &str, bound_node_id: Option<Uuid>) -> VolumeSpecValue {
     VolumeSpecValue::new(VolumeSpecDraft {
         name: name.to_string(),
-        driver: VolumeDriver::Local(LocalVolumeSpec {
-            source: LocalVolumeSource::Managed,
-            ownership: LocalVolumeOwnership::Daemon,
-        }),
+        driver: VolumeDriver::Local(LocalVolumeSpec::managed(LocalVolumeOwnership::Daemon)),
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode: if bound_node_id.is_some() {
             VolumeBindingMode::Immediate

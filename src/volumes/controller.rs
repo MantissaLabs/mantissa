@@ -251,8 +251,8 @@ mod tests {
     use super::*;
     use crate::store::replicated::volumes::{open_volume_node_store, open_volume_spec_store};
     use crate::volumes::types::{
-        LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode,
-        VolumeBindingMode, VolumeDriver, VolumeReclaimPolicy, VolumeSpecDraft, VolumeStatus,
+        LocalVolumeOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
+        VolumeReclaimPolicy, VolumeSpecDraft, VolumeStatus,
     };
     use async_channel::bounded;
     use std::sync::Arc;
@@ -293,10 +293,7 @@ mod tests {
     ) -> VolumeSpecValue {
         let spec = VolumeSpecValue::new(VolumeSpecDraft {
             name: name.to_string(),
-            driver: VolumeDriver::Local(LocalVolumeSpec {
-                source: LocalVolumeSource::Managed,
-                ownership: LocalVolumeOwnership::Daemon,
-            }),
+            driver: VolumeDriver::Local(LocalVolumeSpec::managed(LocalVolumeOwnership::Daemon)),
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::Immediate,
             reclaim_policy: VolumeReclaimPolicy::Retain,

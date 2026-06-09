@@ -13,9 +13,9 @@ use mantissa::store::replicated::cluster_views::{
     ClusterNameRecord, ClusterNodeCountRecord, ClusterViewMetadataRecord,
 };
 use mantissa::volumes::types::{
-    LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode,
-    VolumeBindingMode, VolumeDriver, VolumeLabel, VolumeNodeState, VolumeNodeStateValue,
-    VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
+    LocalVolumeOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
+    VolumeLabel, VolumeNodeState, VolumeNodeStateValue, VolumeReclaimPolicy, VolumeSpecDraft,
+    VolumeSpecValue,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::collections::BTreeMap;
@@ -160,25 +160,22 @@ fn assert_secret_value_roundtrips(input: &InfraInput) {
 
 /// Verifies generated volume store values survive their Cap'n Proto codecs.
 fn assert_volume_values_roundtrip(input: &InfraInput) {
-    let source = if flag(input.flags, 12) {
-        LocalVolumeSource::ImportedPath(format!(
+    let local_spec = if flag(input.flags, 12) {
+        LocalVolumeSpec::imported_path(format!(
             "/var/lib/mantissa/{}",
             token("vol", &input.text)
         ))
-    } else {
-        LocalVolumeSource::Managed
-    };
-    let ownership = match &source {
-        LocalVolumeSource::ImportedPath(_) => LocalVolumeOwnership::Daemon,
-        LocalVolumeSource::Managed if flag(input.flags, 13) => LocalVolumeOwnership::FsGroup {
+    } else if flag(input.flags, 13) {
+        LocalVolumeSpec::managed(LocalVolumeOwnership::FsGroup {
             gid: input.numbers[0] as u32,
-        },
-        LocalVolumeSource::Managed => LocalVolumeOwnership::Daemon,
+        })
+    } else {
+        LocalVolumeSpec::managed(LocalVolumeOwnership::Daemon)
     };
 
     let mut spec = VolumeSpecValue::new(VolumeSpecDraft {
         name: token("volume", &input.text),
-        driver: VolumeDriver::Local(LocalVolumeSpec { source, ownership }),
+        driver: VolumeDriver::Local(local_spec),
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode: if flag(input.flags, 14) {
             VolumeBindingMode::WaitForFirstConsumer

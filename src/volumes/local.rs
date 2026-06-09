@@ -4,9 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use uuid::Uuid;
 
-use crate::volumes::types::{
-    LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeDriver, VolumeSpecValue,
-};
+use crate::volumes::types::{LocalVolumeOwnership, LocalVolumeSpec, VolumeDriver, VolumeSpecValue};
 
 #[cfg(unix)]
 const ROOT_VOLUME_WRAPPER_DIR_MODE: u32 = 0o710;
@@ -30,14 +28,10 @@ pub fn ensure_local_volume_root(root: &Path) -> Result<()> {
 /// Resolves the concrete local filesystem path for one local-driver volume on its bound node.
 pub fn resolve_local_volume_path(root: &Path, spec: &VolumeSpecValue) -> Result<PathBuf> {
     match &spec.driver {
-        VolumeDriver::Local(LocalVolumeSpec {
-            source: LocalVolumeSource::Managed,
-            ..
-        }) => Ok(managed_volume_data_path(root, spec.id)),
-        VolumeDriver::Local(LocalVolumeSpec {
-            source: LocalVolumeSource::ImportedPath(path),
-            ..
-        }) => Ok(PathBuf::from(path)),
+        VolumeDriver::Local(LocalVolumeSpec::Managed { .. }) => {
+            Ok(managed_volume_data_path(root, spec.id))
+        }
+        VolumeDriver::Local(LocalVolumeSpec::ImportedPath { path }) => Ok(PathBuf::from(path)),
         VolumeDriver::External(_) => Err(anyhow!(
             "volume '{}' uses an external driver, which is not implemented yet",
             spec.name
@@ -49,10 +43,7 @@ pub fn resolve_local_volume_path(root: &Path, spec: &VolumeSpecValue) -> Result<
 pub fn ensure_local_volume_path(root: &Path, spec: &VolumeSpecValue) -> Result<PathBuf> {
     let path = resolve_local_volume_path(root, spec)?;
     match &spec.driver {
-        VolumeDriver::Local(LocalVolumeSpec {
-            source: LocalVolumeSource::Managed,
-            ownership,
-        }) => {
+        VolumeDriver::Local(LocalVolumeSpec::Managed { ownership }) => {
             ensure_local_volume_root(root)?;
             let wrapper_path = managed_volume_wrapper_path(root, spec.id);
             fs::create_dir_all(&wrapper_path).with_context(|| {
@@ -84,10 +75,7 @@ pub fn ensure_local_volume_path(root: &Path, spec: &VolumeSpecValue) -> Result<P
                 )
             })?;
         }
-        VolumeDriver::Local(LocalVolumeSpec {
-            source: LocalVolumeSource::ImportedPath(_),
-            ..
-        }) => {
+        VolumeDriver::Local(LocalVolumeSpec::ImportedPath { .. }) => {
             if !path.exists() {
                 return Err(anyhow!(
                     "imported local volume path {} for '{}' does not exist",
@@ -226,8 +214,8 @@ fn chown_path(path: &Path, uid: u32, gid: u32) -> Result<()> {
 mod tests {
     use super::*;
     use crate::volumes::types::{
-        LocalVolumeOwnership, LocalVolumeSource, LocalVolumeSpec, VolumeAccessMode,
-        VolumeBindingMode, VolumeDriver, VolumeReclaimPolicy, VolumeSpecValue, VolumeStatus,
+        LocalVolumeOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
+        VolumeReclaimPolicy, VolumeSpecValue, VolumeStatus,
     };
     use tempfile::tempdir;
 
@@ -236,10 +224,7 @@ mod tests {
         VolumeSpecValue {
             id: Uuid::new_v4(),
             name: "workspace".to_string(),
-            driver: VolumeDriver::Local(LocalVolumeSpec {
-                source: LocalVolumeSource::Managed,
-                ownership: LocalVolumeOwnership::Daemon,
-            }),
+            driver: VolumeDriver::Local(LocalVolumeSpec::managed(LocalVolumeOwnership::Daemon)),
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,
             reclaim_policy: VolumeReclaimPolicy::Retain,
@@ -326,10 +311,10 @@ mod tests {
         let root = tempdir().expect("create temp volume root");
         let (uid, gid) = current_process_ids();
         let mut spec = managed_volume_spec();
-        spec.driver = VolumeDriver::Local(LocalVolumeSpec {
-            source: LocalVolumeSource::Managed,
-            ownership: LocalVolumeOwnership::User { uid, gid },
-        });
+        spec.driver = VolumeDriver::Local(LocalVolumeSpec::managed(LocalVolumeOwnership::User {
+            uid,
+            gid,
+        }));
 
         let path = ensure_local_volume_path(root.path(), &spec).expect("realize managed volume");
         let metadata = fs::metadata(&path).expect("stat managed volume path");
