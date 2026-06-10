@@ -14,10 +14,12 @@ arbitrary = { version = "1", features = ["derive"] }
 capnp = "0.25"
 libfuzzer-sys = "0.4"
 mantissa = { path = ".." }
+mantissa-client = { path = "../crates/mantissa-client" }
 mantissa-net = { path = "../crates/mantissa-net" }
 mantissa-protocol = { path = "../crates/mantissa-protocol" }
 mantissa-store = { path = "../crates/mantissa-store" }
 redb = "3.1.1"
+ron = "0.10.1"
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "rt"] }
 uuid = "1"
@@ -116,6 +118,20 @@ bench = false
 [[bin]]
 name = "control_plane_parsers"
 path = "fuzz_targets/control_plane_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "network_overlay_allocation"
+path = "fuzz_targets/network_overlay_allocation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_manifest_parsers"
+path = "fuzz_targets/client_manifest_parsers.rs"
 test = false
 doc = false
 bench = false
