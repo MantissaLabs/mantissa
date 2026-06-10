@@ -339,6 +339,10 @@ provision:
       if ! cargo install --list | grep -q '^flamegraph v'; then
         cargo install flamegraph
       fi
+
+      if ! cargo install --list | grep -q '^cargo-fuzz v'; then
+        cargo install cargo-fuzz
+      fi
 PROVISION_1
 
   # Separate step to set hostname with ${NAME} (needs host-side expansion)
