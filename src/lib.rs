@@ -9,7 +9,7 @@ pub mod agents;
 pub mod cluster;
 pub mod config;
 pub mod crypto;
-mod dedupe;
+pub mod dedupe;
 pub mod gossip;
 pub mod gpu;
 mod ip_family;

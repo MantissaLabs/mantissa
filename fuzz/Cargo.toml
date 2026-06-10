@@ -12,9 +12,11 @@ cargo-fuzz = true
 [dependencies]
 arbitrary = { version = "1", features = ["derive"] }
 capnp = "0.25"
+ed25519-dalek = "2"
 libfuzzer-sys = "0.4"
 mantissa = { path = ".." }
 mantissa-client = { path = "../crates/mantissa-client" }
+mantissa-health = { path = "../crates/mantissa-health" }
 mantissa-net = { path = "../crates/mantissa-net" }
 mantissa-protocol = { path = "../crates/mantissa-protocol" }
 mantissa-store = { path = "../crates/mantissa-store" }
@@ -132,6 +134,27 @@ bench = false
 [[bin]]
 name = "client_manifest_parsers"
 path = "fuzz_targets/client_manifest_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scheduler_state_machine"
+path = "fuzz_targets/scheduler_state_machine.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dedupe_cache_sequences"
+path = "fuzz_targets/dedupe_cache_sequences.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "replicated_domain_delta"
+path = "fuzz_targets/replicated_domain_delta.rs"
 test = false
 doc = false
 bench = false
