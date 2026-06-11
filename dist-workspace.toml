@@ -1,0 +1,21 @@
+[workspace]
+members = ["dist:dist/mantissa"]
+
+[dist]
+cargo-dist-version = "0.32.0"
+ci = ["github"]
+pr-run-mode = "skip"
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+installers = ["shell"]
+unix-archive = ".tar.xz"
+checksum = "sha256"
+github-attestations = true
+github-build-setup = "../dist-build-setup.yml"
+
+[dist.github-custom-runners]
+global = "mantissa-linux-x64-8-core"
+x86_64-unknown-linux-gnu = "mantissa-linux-x64-8-core"
+aarch64-unknown-linux-gnu = "mantissa-linux-arm64-8-core"

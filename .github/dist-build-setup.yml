@@ -1,0 +1,28 @@
+- name: Install system build dependencies
+  shell: bash
+  run: |
+    sudo apt-get update
+    sudo apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      capnproto \
+      clang \
+      cmake \
+      curl \
+      git \
+      lld \
+      llvm \
+      pkg-config
+
+- name: Install Rust nightly for eBPF
+  shell: bash
+  run: |
+    rustup toolchain install nightly --profile minimal --component rust-src
+    echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+- name: Install bpf-linker
+  shell: bash
+  run: |
+    if ! command -v bpf-linker >/dev/null 2>&1; then
+      cargo install --git https://github.com/aya-rs/bpf-linker bpf-linker
+    fi

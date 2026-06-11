@@ -25,6 +25,8 @@ default-members = [".", "crates/mantissa-cli", "crates/mantissa-sandbox"]
 
 [workspace.package]
 license = "Apache-2.0"
+homepage = "https://mantissa.io"
+repository = "https://github.com/abronan/mantissa"
 
 [workspace.dependencies]
 capnp = "0.25"
