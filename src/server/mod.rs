@@ -6,6 +6,7 @@ use crate::topology::Topology;
 use ed25519_dalek::SigningKey;
 use mantissa_net::noise::NoiseKeys;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -346,6 +347,12 @@ impl Server {
         handles.wait_ready().await;
         handles.join().await;
         Ok(())
+    }
+
+    /// Starts one explicit local admin Unix socket for tests and local wrappers.
+    pub async fn start_local_admin_socket_at(&self, path: PathBuf) -> std::io::Result<PathBuf> {
+        let local_session = self.sessions.new_local_client();
+        mantissa_net::unix_socket::start_unix_socket_server_at(local_session, path).await
     }
 }
 

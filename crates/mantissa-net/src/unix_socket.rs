@@ -132,9 +132,25 @@ fn prepare_socket_file(path: &Path) -> io::Result<()> {
 pub async fn start_unix_socket_server_auto(
     server_handle: cluster_session::Client,
 ) -> io::Result<PathBuf> {
+    start_unix_socket_server_on_paths(server_handle, candidate_unix_socket_paths()).await
+}
+
+/// Start a Unix socket server at one explicit local admin socket path.
+pub async fn start_unix_socket_server_at(
+    server_handle: cluster_session::Client,
+    path: PathBuf,
+) -> io::Result<PathBuf> {
+    start_unix_socket_server_on_paths(server_handle, vec![path]).await
+}
+
+/// Starts a Unix socket server at the first usable candidate path.
+async fn start_unix_socket_server_on_paths(
+    server_handle: cluster_session::Client,
+    paths: Vec<PathBuf>,
+) -> io::Result<PathBuf> {
     let mut last_err: Option<io::Error> = None;
 
-    for path in candidate_unix_socket_paths() {
+    for path in paths {
         if let Err(e) = prepare_socket_file(&path) {
             last_err = Some(e);
             continue;

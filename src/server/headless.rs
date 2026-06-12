@@ -582,6 +582,11 @@ impl HeadlessNode {
         }
     }
 
+    /// Starts an explicit local admin Unix socket for integration tests.
+    pub async fn start_local_admin_socket_at(&self, path: PathBuf) -> io::Result<PathBuf> {
+        self.server.start_local_admin_socket_at(path).await
+    }
+
     /// Call real Topology.join on **this** node to join an anchor address.
     pub async fn join_anchor_addr(
         &self,
