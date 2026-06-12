@@ -1,0 +1,1 @@
+//! REST-facing secret types.

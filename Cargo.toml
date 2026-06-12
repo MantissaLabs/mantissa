@@ -17,6 +17,7 @@ members = [
     "crates/mantissa-net",
     "crates/mantissa-client",
     "crates/mantissa-cli",
+    "crates/mantissa-rest",
     "crates/mantissa-health",
     "crates/mantissa-ui",
     "crates/mantissa-ebpf",
