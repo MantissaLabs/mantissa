@@ -1,5 +1,9 @@
 use crate::stream::task_logs::{TASK_LOG_EVENT_BUFFER, TaskLogEvent, TaskLogHttpStream};
 use crate::types::{
+    agents::{
+        AgentInputRequest, AgentInputResponse, AgentRunSummary, AgentSession, AgentSessionDetail,
+        AgentSessionSummary, AgentSubmitRequest, AgentSubmitResponse,
+    },
     clusters::{ClusterSummary, ClusterView, ClusterViewSummary},
     jobs::{JobDetail, JobSubmitRequest, JobSubmitResponse, JobSummary},
     networks::{
@@ -17,7 +21,7 @@ use crate::types::{
     },
 };
 use mantissa_client::{
-    clusters, config::ClientConfig, connection, jobs, networks, nodes, scheduler, secrets,
+    agents, clusters, config::ClientConfig, connection, jobs, networks, nodes, scheduler, secrets,
     services, tasks, volumes,
 };
 use std::time::Duration;
@@ -57,6 +61,97 @@ impl ClientWorkerHandle {
     pub async fn get_node(&self, node_id: String) -> Result<NodeSummary, ClientWorkerError> {
         self.send(|respond_to| ClientCommand::GetNode {
             node_id,
+            respond_to,
+        })
+        .await
+    }
+
+    /// Lists durable agent sessions visible through the agents capability.
+    pub async fn list_agent_sessions(&self) -> Result<Vec<AgentSessionSummary>, ClientWorkerError> {
+        self.send(ClientCommand::ListAgentSessions).await
+    }
+
+    /// Submits one durable agent session from a REST manifest request.
+    pub async fn submit_agent_session(
+        &self,
+        request: AgentSubmitRequest,
+    ) -> Result<AgentSubmitResponse, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::SubmitAgentSession {
+            request: Box::new(request),
+            respond_to,
+        })
+        .await
+    }
+
+    /// Fetches one durable agent session and its run history by UUID string.
+    pub async fn get_agent_session(
+        &self,
+        session_id: String,
+    ) -> Result<AgentSessionDetail, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::GetAgentSession {
+            session_id,
+            respond_to,
+        })
+        .await
+    }
+
+    /// Lists durable runs for one agent session by UUID string.
+    pub async fn list_agent_runs(
+        &self,
+        session_id: String,
+    ) -> Result<Vec<AgentRunSummary>, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::ListAgentRuns {
+            session_id,
+            respond_to,
+        })
+        .await
+    }
+
+    /// Queues structured input for one idle agent session.
+    pub async fn submit_agent_input(
+        &self,
+        session_id: String,
+        request: AgentInputRequest,
+    ) -> Result<AgentInputResponse, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::SubmitAgentInput {
+            session_id,
+            request: Box::new(request),
+            respond_to,
+        })
+        .await
+    }
+
+    /// Requests cancellation for one active or queued agent session run.
+    pub async fn cancel_agent_session(
+        &self,
+        session_id: String,
+    ) -> Result<AgentSession, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::CancelAgentSession {
+            session_id,
+            respond_to,
+        })
+        .await
+    }
+
+    /// Closes one durable agent session and cancels any active run.
+    pub async fn close_agent_session(
+        &self,
+        session_id: String,
+    ) -> Result<AgentSession, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::CloseAgentSession {
+            session_id,
+            respond_to,
+        })
+        .await
+    }
+
+    /// Deletes one closed agent session and its retained run history.
+    pub async fn delete_agent_session(
+        &self,
+        session_id: String,
+    ) -> Result<AgentSession, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::DeleteAgentSession {
+            session_id,
             respond_to,
         })
         .await
@@ -467,6 +562,22 @@ impl ClientWorkerHandle {
         });
         Self { sender }
     }
+
+    /// Builds a deterministic agent-session-list worker handle for route tests.
+    #[cfg(test)]
+    pub fn fixed_agent_sessions_for_tests(
+        result: Result<Vec<AgentSessionSummary>, ClientWorkerError>,
+    ) -> Self {
+        let (sender, mut receiver) = mpsc::channel(CLIENT_COMMAND_BUFFER);
+        tokio::spawn(async move {
+            while let Some(command) = receiver.recv().await {
+                if let ClientCommand::ListAgentSessions(respond_to) = command {
+                    let _ignored = respond_to.send(result.clone());
+                }
+            }
+        });
+        Self { sender }
+    }
 }
 
 /// Minimal daemon health result returned by the local client worker.
@@ -511,6 +622,36 @@ enum ClientCommand {
     GetNode {
         node_id: String,
         respond_to: oneshot::Sender<Result<NodeSummary, ClientWorkerError>>,
+    },
+    ListAgentSessions(oneshot::Sender<Result<Vec<AgentSessionSummary>, ClientWorkerError>>),
+    SubmitAgentSession {
+        request: Box<AgentSubmitRequest>,
+        respond_to: oneshot::Sender<Result<AgentSubmitResponse, ClientWorkerError>>,
+    },
+    GetAgentSession {
+        session_id: String,
+        respond_to: oneshot::Sender<Result<AgentSessionDetail, ClientWorkerError>>,
+    },
+    ListAgentRuns {
+        session_id: String,
+        respond_to: oneshot::Sender<Result<Vec<AgentRunSummary>, ClientWorkerError>>,
+    },
+    SubmitAgentInput {
+        session_id: String,
+        request: Box<AgentInputRequest>,
+        respond_to: oneshot::Sender<Result<AgentInputResponse, ClientWorkerError>>,
+    },
+    CancelAgentSession {
+        session_id: String,
+        respond_to: oneshot::Sender<Result<AgentSession, ClientWorkerError>>,
+    },
+    CloseAgentSession {
+        session_id: String,
+        respond_to: oneshot::Sender<Result<AgentSession, ClientWorkerError>>,
+    },
+    DeleteAgentSession {
+        session_id: String,
+        respond_to: oneshot::Sender<Result<AgentSession, ClientWorkerError>>,
     },
     ListJobs(oneshot::Sender<Result<Vec<JobSummary>, ClientWorkerError>>),
     SubmitJob {
@@ -669,6 +810,53 @@ async fn client_worker_loop(config: ClientConfig, mut receiver: mpsc::Receiver<C
                 respond_to,
             } => {
                 let _ignored = respond_to.send(get_node(&config, &node_id).await);
+            }
+            ClientCommand::ListAgentSessions(respond_to) => {
+                let _ignored = respond_to.send(list_agent_sessions(&config).await);
+            }
+            ClientCommand::SubmitAgentSession {
+                request,
+                respond_to,
+            } => {
+                let _ignored = respond_to.send(submit_agent_session(&config, *request).await);
+            }
+            ClientCommand::GetAgentSession {
+                session_id,
+                respond_to,
+            } => {
+                let _ignored = respond_to.send(get_agent_session(&config, &session_id).await);
+            }
+            ClientCommand::ListAgentRuns {
+                session_id,
+                respond_to,
+            } => {
+                let _ignored = respond_to.send(list_agent_runs(&config, &session_id).await);
+            }
+            ClientCommand::SubmitAgentInput {
+                session_id,
+                request,
+                respond_to,
+            } => {
+                let _ignored =
+                    respond_to.send(submit_agent_input(&config, &session_id, *request).await);
+            }
+            ClientCommand::CancelAgentSession {
+                session_id,
+                respond_to,
+            } => {
+                let _ignored = respond_to.send(cancel_agent_session(&config, &session_id).await);
+            }
+            ClientCommand::CloseAgentSession {
+                session_id,
+                respond_to,
+            } => {
+                let _ignored = respond_to.send(close_agent_session(&config, &session_id).await);
+            }
+            ClientCommand::DeleteAgentSession {
+                session_id,
+                respond_to,
+            } => {
+                let _ignored = respond_to.send(delete_agent_session(&config, &session_id).await);
             }
             ClientCommand::ListJobs(respond_to) => {
                 let _ignored = respond_to.send(list_jobs(&config).await);
@@ -894,6 +1082,106 @@ async fn get_node(config: &ClientConfig, node_id: &str) -> Result<NodeSummary, C
         .into_iter()
         .find(|node| node.id == node_id)
         .ok_or_else(|| ClientWorkerError::NotFound(format!("node '{node_id}' not found")))
+}
+
+/// Lists agent sessions through the reusable Mantissa client API.
+async fn list_agent_sessions(
+    config: &ClientConfig,
+) -> Result<Vec<AgentSessionSummary>, ClientWorkerError> {
+    agents::list_sessions(config)
+        .await
+        .map(|sessions| {
+            sessions
+                .into_iter()
+                .map(AgentSessionSummary::from)
+                .collect()
+        })
+        .map_err(operation_error)
+}
+
+/// Submits one agent manifest through the reusable Mantissa client API.
+async fn submit_agent_session(
+    config: &ClientConfig,
+    request: AgentSubmitRequest,
+) -> Result<AgentSubmitResponse, ClientWorkerError> {
+    agents::run_manifest(config, &request.manifest)
+        .await
+        .map(AgentSubmitResponse::from)
+        .map_err(operation_error)
+}
+
+/// Fetches one agent session detail through the reusable Mantissa client API.
+async fn get_agent_session(
+    config: &ClientConfig,
+    session_id: &str,
+) -> Result<AgentSessionDetail, ClientWorkerError> {
+    parse_uuid("agent session id", session_id)?;
+    agents::inspect(config, session_id)
+        .await
+        .map(AgentSessionDetail::from)
+        .map_err(operation_error)
+}
+
+/// Lists one agent session's durable runs through the reusable client API.
+async fn list_agent_runs(
+    config: &ClientConfig,
+    session_id: &str,
+) -> Result<Vec<AgentRunSummary>, ClientWorkerError> {
+    let session_id = parse_uuid("agent session id", session_id)?;
+    agents::list_runs(config, Some(session_id))
+        .await
+        .map(|runs| runs.into_iter().map(AgentRunSummary::from).collect())
+        .map_err(operation_error)
+}
+
+/// Queues one structured input message through the reusable client API.
+async fn submit_agent_input(
+    config: &ClientConfig,
+    session_id: &str,
+    request: AgentInputRequest,
+) -> Result<AgentInputResponse, ClientWorkerError> {
+    let session_id = parse_uuid("agent session id", session_id)?;
+    let input = clean_required_name("agent input", &request.input)?;
+    agents::submit_input(config, session_id, input)
+        .await
+        .map(|()| AgentInputResponse::accepted())
+        .map_err(operation_error)
+}
+
+/// Cancels one agent session through the reusable client API.
+async fn cancel_agent_session(
+    config: &ClientConfig,
+    session_id: &str,
+) -> Result<AgentSession, ClientWorkerError> {
+    parse_uuid("agent session id", session_id)?;
+    agents::cancel(config, session_id)
+        .await
+        .map(AgentSession::from)
+        .map_err(operation_error)
+}
+
+/// Closes one agent session through the reusable client API.
+async fn close_agent_session(
+    config: &ClientConfig,
+    session_id: &str,
+) -> Result<AgentSession, ClientWorkerError> {
+    parse_uuid("agent session id", session_id)?;
+    agents::close(config, session_id)
+        .await
+        .map(AgentSession::from)
+        .map_err(operation_error)
+}
+
+/// Deletes one closed agent session through the reusable client API.
+async fn delete_agent_session(
+    config: &ClientConfig,
+    session_id: &str,
+) -> Result<AgentSession, ClientWorkerError> {
+    parse_uuid("agent session id", session_id)?;
+    agents::delete(config, session_id)
+        .await
+        .map(AgentSession::from)
+        .map_err(operation_error)
 }
 
 /// Lists jobs through the reusable Mantissa client API.

@@ -5,6 +5,9 @@ use crate::agents::submit::{
     PreparedAgentWorkspacePolicy, submit_prepared_session,
 };
 use crate::config::ClientConfig;
+use crate::runtime_contract::{
+    normalize_execution_platform, normalize_isolation_mode, normalize_isolation_profile,
+};
 use crate::workload_submit::{ResolvedDeclaredVolume, compute_network_id, ensure_declared_volumes};
 use crate::workload_wire::PreparedVolumeMount;
 use anyhow::{Result, anyhow};
@@ -22,12 +25,36 @@ pub async fn run(cfg: &ClientConfig, options: &AgentRunOptions<'_>) -> Result<Ag
     submit_prepared_session(cfg, &prepared).await
 }
 
+/// Submits one already parsed agent manifest through the agents capability.
+pub async fn run_manifest(
+    cfg: &ClientConfig,
+    manifest: &AgentManifest,
+) -> Result<AgentSubmitResult> {
+    let prepared = prepare_manifest_submit_spec_from_manifest(cfg, manifest).await?;
+    submit_prepared_session(cfg, &prepared).await
+}
+
 /// Normalizes one manifest-backed agent submission into the public agents submit contract.
 async fn prepare_manifest_submit_spec(
     cfg: &ClientConfig,
     path: &Path,
 ) -> Result<PreparedAgentSessionSpec> {
     let manifest = load_manifest_from_path(path)?;
+    prepare_manifest_submit_spec_from_manifest(cfg, &manifest).await
+}
+
+/// Normalizes one parsed agent manifest into the public agents submit contract.
+async fn prepare_manifest_submit_spec_from_manifest(
+    cfg: &ClientConfig,
+    manifest: &AgentManifest,
+) -> Result<PreparedAgentSessionSpec> {
+    let mut manifest = manifest.clone();
+    manifest.execution_platform = normalize_execution_platform(&manifest.execution_platform)?;
+    manifest.isolation_mode = normalize_isolation_mode(&manifest.isolation_mode)?;
+    manifest.isolation_profile = normalize_isolation_profile(manifest.isolation_profile.as_deref());
+    manifest.pending_input = normalize_optional_text(manifest.pending_input.as_deref());
+    manifest.validate()?;
+
     let required_networks = manifest.requested_networks()?;
     let resolved_volumes = ensure_declared_volumes(cfg, &manifest.declared_volume_specs()).await?;
 
@@ -137,4 +164,11 @@ fn resolve_named_mount(
         target: mount.target.clone(),
         read_only: mount.read_only,
     })
+}
+
+/// Normalizes one optional string so empty values do not leak into submissions.
+fn normalize_optional_text(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }

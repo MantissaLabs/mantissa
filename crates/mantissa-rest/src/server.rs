@@ -23,6 +23,30 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/nodes/{node_id}/drain", post(routes::nodes::drain))
         .route("/v1/nodes/{node_id}/resume", post(routes::nodes::resume))
         .route(
+            "/v1/agents/sessions",
+            get(routes::agents::list_sessions).post(routes::agents::submit_session),
+        )
+        .route(
+            "/v1/agents/sessions/{session_id}",
+            get(routes::agents::get_session).delete(routes::agents::delete_session),
+        )
+        .route(
+            "/v1/agents/sessions/{session_id}/runs",
+            get(routes::agents::list_runs),
+        )
+        .route(
+            "/v1/agents/sessions/{session_id}/input",
+            post(routes::agents::submit_input),
+        )
+        .route(
+            "/v1/agents/sessions/{session_id}/cancel",
+            post(routes::agents::cancel_session),
+        )
+        .route(
+            "/v1/agents/sessions/{session_id}/close",
+            post(routes::agents::close_session),
+        )
+        .route(
             "/v1/jobs",
             get(routes::jobs::list).post(routes::jobs::submit),
         )

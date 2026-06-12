@@ -20,7 +20,7 @@ pub use inspect::inspect;
 pub use list::list_sessions;
 pub use logs::{AgentLogsOptions, logs_workload_id};
 pub use manifest::{AgentManifest, load_manifest_from_path};
-pub use run::{AgentRunOptions, run};
+pub use run::{AgentRunOptions, run, run_manifest};
 pub use runs::list_runs;
 pub use submit::{AgentSubmitOptions, AgentSubmitResult, submit};
 pub use wait::wait;
