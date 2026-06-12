@@ -1,6 +1,7 @@
 use crate::{
     auth::RestAuth,
     error::RestError,
+    extract::RestJson,
     routes::worker_error_to_rest,
     state::AppState,
     types::services::{ServiceDeployRequest, ServiceDeployResponse, ServiceSummary},
@@ -27,7 +28,7 @@ pub async fn list(
 pub async fn deploy(
     State(state): State<AppState>,
     _auth: RestAuth,
-    Json(request): Json<ServiceDeployRequest>,
+    RestJson(request): RestJson<ServiceDeployRequest>,
 ) -> Result<Json<ServiceDeployResponse>, RestError> {
     state
         .client()

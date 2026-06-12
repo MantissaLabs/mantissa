@@ -1,6 +1,7 @@
 use crate::{
     auth::RestAuth,
     error::RestError,
+    extract::RestJson,
     routes::worker_error_to_rest,
     state::AppState,
     types::networks::{
@@ -30,7 +31,7 @@ pub async fn list(
 pub async fn create(
     State(state): State<AppState>,
     _auth: RestAuth,
-    Json(request): Json<NetworkCreateRequest>,
+    RestJson(request): RestJson<NetworkCreateRequest>,
 ) -> Result<Json<NetworkCreateResponse>, RestError> {
     state
         .client()

@@ -2577,6 +2577,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
+ "tracing",
  "uuid",
 ]
 

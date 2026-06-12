@@ -77,8 +77,14 @@ REST response bodies use explicit JSON types, not raw Cap'n Proto JSON shapes.
 }
 ```
 
+Malformed JSON, missing JSON content types, and unknown request fields return
+this same error envelope.
+
 Task log streaming uses newline-delimited JSON with content type
 `application/x-ndjson`.
+
+Task attach and exec use WebSocket JSON text frames. Binary WebSocket messages
+sent by the client are treated as raw stdin bytes.
 
 ## Health
 
@@ -100,12 +106,20 @@ List nodes:
 
 ```bash
 curl -sS "${AUTH[@]}" "$REST/v1/nodes"
+curl -sS "${AUTH[@]}" "$REST/v1/nodes/$NODE_ID"
 ```
 
-Drain and resume a node:
+Inspect drain status, update labels, drain, resume, and evict a node:
 
 ```bash
 NODE_ID=00000000-0000-0000-0000-000000000000
+
+curl -sS "${AUTH[@]}" "$REST/v1/nodes/$NODE_ID/drain"
+
+curl -sS -X PUT "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  -d '{"labels":["role=worker","zone=west"],"remove":[],"replace":true}' \
+  "$REST/v1/nodes/$NODE_ID/labels"
 
 curl -sS "${AUTH[@]}" \
   -H "Content-Type: application/json" \
@@ -113,7 +127,34 @@ curl -sS "${AUTH[@]}" \
   "$REST/v1/nodes/$NODE_ID/drain"
 
 curl -sS -X POST "${AUTH[@]}" "$REST/v1/nodes/$NODE_ID/resume"
+curl -sS -X DELETE "${AUTH[@]}" "$REST/v1/nodes/$NODE_ID"
 ```
+
+## Clusters
+
+List cluster lineages, raw views, and the local active view:
+
+```bash
+curl -sS "${AUTH[@]}" "$REST/v1/clusters"
+curl -sS "${AUTH[@]}" "$REST/v1/clusters/views"
+curl -sS "${AUTH[@]}" "$REST/v1/clusters/current"
+```
+
+Show split candidates for the active view or a selected cluster lineage:
+
+```bash
+curl -sS "${AUTH[@]}" "$REST/v1/clusters/split-candidates"
+curl -sS "${AUTH[@]}" "$REST/v1/clusters/$CLUSTER_ID/split-candidates"
+```
+
+Fetch a known cluster operation:
+
+```bash
+curl -sS "${AUTH[@]}" "$REST/v1/clusters/operations/$OPERATION_ID"
+```
+
+The protocol currently exposes operation lookup by id, not a retained operation
+list route. REST mirrors that instead of inventing a registry read path.
 
 ## Jobs
 
@@ -198,7 +239,51 @@ curl -sS "${AUTH[@]}" "$REST/v1/services/demo-service/status"
 curl -sS -X DELETE "${AUTH[@]}" "$REST/v1/services/demo-service"
 ```
 
-## Tasks And Logs
+## Agents
+
+Submit and inspect durable agent sessions:
+
+```bash
+curl -sS "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "manifest": {
+      "name": "demo-agent",
+      "execution": {
+        "image": "ghcr.io/mantissa/demo-agent:latest",
+        "resources": {
+          "cpu_millis": 250,
+          "memory_mb": 128
+        }
+      }
+    }
+  }' \
+  "$REST/v1/agents/sessions"
+
+curl -sS "${AUTH[@]}" "$REST/v1/agents/sessions"
+curl -sS "${AUTH[@]}" "$REST/v1/agents/sessions/$SESSION_ID"
+curl -sS "${AUTH[@]}" "$REST/v1/agents/sessions/$SESSION_ID/runs"
+```
+
+Send input, cancel, close, or delete a session:
+
+```bash
+curl -sS "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  -d '{"input":"continue"}' \
+  "$REST/v1/agents/sessions/$SESSION_ID/input"
+
+curl -sS -X POST "${AUTH[@]}" \
+  "$REST/v1/agents/sessions/$SESSION_ID/cancel"
+
+curl -sS -X POST "${AUTH[@]}" \
+  "$REST/v1/agents/sessions/$SESSION_ID/close"
+
+curl -sS -X DELETE "${AUTH[@]}" \
+  "$REST/v1/agents/sessions/$SESSION_ID"
+```
+
+## Tasks, Logs, Attach, And Exec
 
 Start a standalone task:
 
@@ -231,6 +316,49 @@ Each line is one JSON event:
 Decode `data_base64` to recover the original bytes. `stream` is one of
 `stdout`, `stderr`, or `console`.
 
+Attach and exec use WebSocket upgrade requests:
+
+```bash
+WS_AUTH="Authorization: Bearer dev-token"
+
+websocat -H "$WS_AUTH" \
+  "ws://127.0.0.1:6579/v1/tasks/sleepy/attach?stdin=true&stdout=true&stderr=true"
+
+websocat -H "$WS_AUTH" \
+  "ws://127.0.0.1:6579/v1/tasks/sleepy/exec?command=sh&command=-lc&command=id"
+```
+
+Client-to-server text frames:
+
+```json
+{"type":"input","data_base64":"ZWNobyBoaQo="}
+```
+
+```json
+{"type":"close_input"}
+```
+
+Server-to-client text frames:
+
+```json
+{"type":"frame","stream":"stdout","data_base64":"aGkK"}
+```
+
+```json
+{"type":"result","has_exit_code":true,"exit_code":0}
+```
+
+```json
+{"type":"end"}
+```
+
+```json
+{"type":"error","message":"task stream session is closed"}
+```
+
+Exec sockets close after both the output stream has ended and the result or
+terminal error has been sent. Attach sockets close after the output stream ends.
+
 Stop the task:
 
 ```bash
@@ -246,6 +374,16 @@ curl -sS "${AUTH[@]}" \
   -H "Content-Type: application/json" \
   -d '{"name":"demo-overlay","driver":"vxlan","subnet_cidr":"10.240.0.0/16"}' \
   "$REST/v1/networks"
+```
+
+Inspect network peers and workload attachments:
+
+```bash
+curl -sS "${AUTH[@]}" "$REST/v1/networks"
+curl -sS "${AUTH[@]}" "$REST/v1/networks/$NETWORK_ID"
+curl -sS "${AUTH[@]}" "$REST/v1/networks/$NETWORK_ID/peers"
+curl -sS "${AUTH[@]}" "$REST/v1/networks/$NETWORK_ID/attachments"
+curl -sS -X DELETE "${AUTH[@]}" "$REST/v1/networks/$NETWORK_ID"
 ```
 
 Create a managed local volume:
@@ -279,13 +417,14 @@ curl -sS "${AUTH[@]}" "$REST/v1/secrets/demo-token"
 Exposed now:
 
 - health;
-- nodes list/get/drain/resume/evict;
-- clusters list/views/current;
+- nodes list/get/drain-status/labels/drain/resume/evict;
+- clusters list/views/current/split-candidates/operation lookup;
+- agents session and run lifecycle;
 - jobs list/submit/get/cancel/delete;
 - services list/deploy/get/status/delete;
-- networks list/create/get/delete;
+- networks list/create/get/peers/attachments/delete;
 - volumes list/create/import/get/status/delete;
-- tasks list/start/get/logs/stop;
+- tasks list/start/get/logs/attach/exec/stop;
 - secrets list/create/update/get/delete;
 - scheduler summary.
 
@@ -294,6 +433,7 @@ Not exposed:
 - node-to-node gossip or anti-entropy internals;
 - scheduler lease prepare/commit/abort;
 - peer bootstrap or join-token rotation;
+- cluster operation listing without an operation id;
 - public internet API guarantees;
 - fine-grained RBAC.
 

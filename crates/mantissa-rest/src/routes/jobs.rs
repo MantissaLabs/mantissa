@@ -1,6 +1,7 @@
 use crate::{
     auth::RestAuth,
     error::RestError,
+    extract::RestJson,
     routes::worker_error_to_rest,
     state::AppState,
     types::jobs::{JobDetail, JobSubmitRequest, JobSubmitResponse, JobSummary},
@@ -27,7 +28,7 @@ pub async fn list(
 pub async fn submit(
     State(state): State<AppState>,
     _auth: RestAuth,
-    Json(request): Json<JobSubmitRequest>,
+    RestJson(request): RestJson<JobSubmitRequest>,
 ) -> Result<Json<JobSubmitResponse>, RestError> {
     state
         .client()

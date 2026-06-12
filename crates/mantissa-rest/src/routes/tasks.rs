@@ -3,6 +3,7 @@
 use crate::{
     auth::RestAuth,
     error::RestError,
+    extract::RestJson,
     routes::worker_error_to_rest,
     state::AppState,
     stream::task_exec::{
@@ -38,7 +39,7 @@ pub async fn list(
 pub async fn start(
     State(state): State<AppState>,
     _auth: RestAuth,
-    Json(request): Json<TaskStartRequest>,
+    RestJson(request): RestJson<TaskStartRequest>,
 ) -> Result<Json<TaskSummary>, RestError> {
     state
         .client()

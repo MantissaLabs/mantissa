@@ -3,6 +3,7 @@
 use crate::{
     auth::RestAuth,
     error::RestError,
+    extract::RestJson,
     routes::worker_error_to_rest,
     state::AppState,
     types::secrets::{
@@ -31,7 +32,7 @@ pub async fn list(
 pub async fn create(
     State(state): State<AppState>,
     _auth: RestAuth,
-    Json(request): Json<SecretCreateRequest>,
+    RestJson(request): RestJson<SecretCreateRequest>,
 ) -> Result<Json<SecretSummary>, RestError> {
     let (name, request) = request.into_named_upsert();
     state
@@ -47,7 +48,7 @@ pub async fn update(
     State(state): State<AppState>,
     _auth: RestAuth,
     Path(name): Path<String>,
-    Json(request): Json<SecretUpsertRequest>,
+    RestJson(request): RestJson<SecretUpsertRequest>,
 ) -> Result<Json<SecretSummary>, RestError> {
     state
         .client()

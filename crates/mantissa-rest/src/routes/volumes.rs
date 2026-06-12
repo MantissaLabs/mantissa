@@ -1,6 +1,7 @@
 use crate::{
     auth::RestAuth,
     error::RestError,
+    extract::RestJson,
     routes::worker_error_to_rest,
     state::AppState,
     types::volumes::{
@@ -30,7 +31,7 @@ pub async fn list(
 pub async fn create(
     State(state): State<AppState>,
     _auth: RestAuth,
-    Json(request): Json<VolumeCreateRequest>,
+    RestJson(request): RestJson<VolumeCreateRequest>,
 ) -> Result<Json<VolumeSpec>, RestError> {
     state
         .client()
@@ -44,7 +45,7 @@ pub async fn create(
 pub async fn import(
     State(state): State<AppState>,
     _auth: RestAuth,
-    Json(request): Json<VolumeImportRequest>,
+    RestJson(request): RestJson<VolumeImportRequest>,
 ) -> Result<Json<VolumeSpec>, RestError> {
     state
         .client()

@@ -1,6 +1,7 @@
 use crate::{
     auth::RestAuth,
     error::RestError,
+    extract::RestJson,
     routes::worker_error_to_rest,
     state::AppState,
     types::nodes::{
@@ -59,7 +60,7 @@ pub async fn drain(
     State(state): State<AppState>,
     _auth: RestAuth,
     Path(node_id): Path<String>,
-    Json(request): Json<NodeDrainRequest>,
+    RestJson(request): RestJson<NodeDrainRequest>,
 ) -> Result<Json<NodeActionResponse>, RestError> {
     state
         .client()
@@ -74,7 +75,7 @@ pub async fn labels(
     State(state): State<AppState>,
     _auth: RestAuth,
     Path(node_id): Path<String>,
-    Json(request): Json<NodeLabelsRequest>,
+    RestJson(request): RestJson<NodeLabelsRequest>,
 ) -> Result<Json<NodeLabelsResponse>, RestError> {
     state
         .client()

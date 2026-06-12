@@ -3,6 +3,7 @@
 use crate::{
     auth::RestAuth,
     error::RestError,
+    extract::RestJson,
     routes::worker_error_to_rest,
     state::AppState,
     types::agents::{
@@ -32,7 +33,7 @@ pub async fn list_sessions(
 pub async fn submit_session(
     State(state): State<AppState>,
     _auth: RestAuth,
-    Json(request): Json<AgentSubmitRequest>,
+    RestJson(request): RestJson<AgentSubmitRequest>,
 ) -> Result<Json<AgentSubmitResponse>, RestError> {
     state
         .client()
@@ -75,7 +76,7 @@ pub async fn submit_input(
     State(state): State<AppState>,
     _auth: RestAuth,
     Path(session_id): Path<String>,
-    Json(request): Json<AgentInputRequest>,
+    RestJson(request): RestJson<AgentInputRequest>,
 ) -> Result<Json<AgentInputResponse>, RestError> {
     state
         .client()

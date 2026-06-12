@@ -6,8 +6,13 @@ use crate::{
 };
 use axum::{
     Router,
+    body::Body,
+    http::Request,
+    middleware::{self, Next},
+    response::Response,
     routing::{get, post, put},
 };
+use std::time::Instant;
 use tokio::net::TcpListener;
 
 /// Builds the Axum router for the REST facade.
@@ -139,6 +144,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/clusters/operations/{operation_id}",
             get(routes::clusters::operation),
         )
+        .layer(middleware::from_fn(log_request))
         .with_state(state)
 }
 
@@ -148,8 +154,34 @@ pub async fn serve(config: RestConfig) -> Result<(), RestServerError> {
     let client = ClientWorkerHandle::spawn(config.client_config())?;
     let state = AppState::new(config.auth.clone(), client);
     let listener = TcpListener::bind(config.bind_addr).await?;
-    axum::serve(listener, router(state)).await?;
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+/// Logs one completed REST request with compact operational fields.
+async fn log_request(request: Request<Body>, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let status = response.status();
+    tracing::info!(
+        method = %method,
+        path = %path,
+        status = status.as_u16(),
+        latency_ms = started.elapsed().as_millis(),
+        "REST request completed"
+    );
+    response
+}
+
+/// Waits for process termination before gracefully stopping the HTTP server.
+async fn shutdown_signal() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::warn!(%error, "failed to install REST shutdown signal handler");
+    }
 }
 
 /// Startup and listener errors returned by the standalone REST server.
