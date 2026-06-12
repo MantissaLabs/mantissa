@@ -20,6 +20,7 @@ main local admin surfaces that were missing from the first implementation:
 - cluster split-candidate reads and operation lookup by id;
 - task attach and exec WebSocket transports with bounded worker bridges;
 - docs that describe the registered route surface and stream framing;
+- embedded daemon startup through `mantissa init --rest`;
 - graceful standalone shutdown on Ctrl-C;
 - request completion logs with method, path, status, and latency;
 - stable JSON error envelopes for malformed request bodies and unknown fields.

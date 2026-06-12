@@ -68,6 +68,7 @@ pub(crate) async fn start_detached(options: DetachedInitOptions<'_>) -> Result<(
     prepare_log_file(&log_path, &state_dir)?;
     ensure_no_recorded_daemon(&state_dir)?;
     ensure_no_reachable_daemon(preferred_socket.clone()).await?;
+    let rest_config = crate::rest::config_from_init(options.init)?;
 
     let stdout = open_log_append(&log_path)?;
     let stderr = stdout
@@ -99,6 +100,9 @@ pub(crate) async fn start_detached(options: DetachedInitOptions<'_>) -> Result<(
             println!("Mantissa daemon started");
             println!("pid: {pid}");
             println!("socket: {}", socket_path.display());
+            if let Some(rest_config) = rest_config {
+                println!("rest: http://{}", rest_config.bind_addr);
+            }
             println!("logs: {}", log_path.display());
             Ok(())
         }
@@ -374,6 +378,18 @@ fn push_init_args(command: &mut Command, init: &InitArgs, prompted_passphrase_fd
         command
             .arg("--master-key-passphrase-fd")
             .arg(fd.to_string());
+    }
+    if init.rest {
+        command.arg("--rest");
+    }
+    if let Some(addr) = init.rest_addr {
+        command.arg("--rest-addr").arg(addr.to_string());
+    }
+    if let Some(token) = &init.rest_token {
+        command.arg("--rest-token").arg(token);
+    }
+    if init.rest_insecure_no_auth {
+        command.arg("--rest-insecure-no-auth");
     }
 }
 
@@ -1231,6 +1247,46 @@ mod tests {
         } else {
             USER_DAEMON_FILE_MODE
         }
+    }
+
+    #[test]
+    fn push_init_args_preserves_rest_options() {
+        let init = InitArgs {
+            debug: false,
+            detach: false,
+            daemon_child: false,
+            advertise: None,
+            reset_identity: false,
+            state_dir: None,
+            log_file: None,
+            detach_timeout: Duration::from_secs(10),
+            master_key_passphrase_file: None,
+            master_key_passphrase_fd: None,
+            rest: true,
+            rest_addr: Some("127.0.0.1:6580".parse().unwrap()),
+            rest_token: Some("dev-token".to_string()),
+            rest_insecure_no_auth: false,
+        };
+        let mut command = Command::new("mantissa");
+
+        push_init_args(&mut command, &init, None);
+
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "init",
+                "--daemon-child",
+                "--rest",
+                "--rest-addr",
+                "127.0.0.1:6580",
+                "--rest-token",
+                "dev-token",
+            ]
+        );
     }
 
     #[cfg(unix)]

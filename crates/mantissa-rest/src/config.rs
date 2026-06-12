@@ -23,6 +23,13 @@ pub struct RestConfig {
 impl RestConfig {
     /// Builds REST configuration from environment variables and defaults.
     pub fn from_env() -> Result<Self, RestConfigError> {
+        let config = Self::from_env_unvalidated()?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Builds REST configuration from environment variables without validating it.
+    pub fn from_env_unvalidated() -> Result<Self, RestConfigError> {
         let bind_addr = match env::var(ENV_BIND_ADDR) {
             Ok(value) => value
                 .parse()
@@ -55,13 +62,11 @@ impl RestConfig {
             RestAuthConfig::Bearer { token }
         };
 
-        let config = Self {
+        Ok(Self {
             bind_addr,
             socket,
             auth,
-        };
-        config.validate()?;
-        Ok(config)
+        })
     }
 
     /// Converts REST configuration into the local Mantissa client config.

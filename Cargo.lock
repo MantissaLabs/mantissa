@@ -2481,6 +2481,7 @@ dependencies = [
  "mantissa-client",
  "mantissa-net",
  "mantissa-protocol",
+ "mantissa-rest",
  "mantissa-ui",
  "parking_lot",
  "rpassword",

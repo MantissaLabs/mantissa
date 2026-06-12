@@ -24,34 +24,54 @@ such as SSH forwarding, a private WireGuard link, or a host-local sidecar.
 Secrets routes can return decrypted secret payloads as base64. Treat REST access
 as cluster-admin access.
 
-## Start The Gateway
+## Start The Daemon With REST
 
-Start a local daemon first:
+Start Mantissa with the embedded REST listener enabled:
 
 ```bash
+MANTISSA_REST_TOKEN=dev-token mantissa init --detach --rest
+```
+
+The same setting can be environment-only:
+
+```bash
+MANTISSA_REST_ENABLED=true \
+MANTISSA_REST_TOKEN=dev-token \
 mantissa init --detach
 ```
 
-Start the REST gateway:
+The REST token is local HTTP bearer auth for this facade. It is separate from
+the join token used for cluster membership.
+
+For development, the standalone REST wrapper still exists and connects to an
+already-running local daemon:
 
 ```bash
+mantissa init --detach
 MANTISSA_REST_TOKEN=dev-token cargo run -p mantissa-rest -- serve
 ```
 
-The standalone binary accepts one command:
+Embedded REST can also be enabled with CLI flags:
 
 ```bash
-mantissa-rest serve
+mantissa init --detach \
+  --rest \
+  --rest-addr 127.0.0.1:6579 \
+  --rest-token dev-token
 ```
 
-Configuration is environment-driven:
+Configuration:
 
 | Variable | Meaning |
 | --- | --- |
+| `MANTISSA_REST_ENABLED` | Start embedded REST from `mantissa init`. |
 | `MANTISSA_REST_ADDR` | Bind address, default `127.0.0.1:6579`. |
 | `MANTISSA_REST_SOCKET` | Optional daemon Unix socket path override. |
 | `MANTISSA_REST_TOKEN` | Bearer token accepted by REST handlers. |
 | `MANTISSA_REST_INSECURE_NO_AUTH` | Disable auth only for loopback dev use. |
+
+The equivalent `mantissa init` flags are `--rest`, `--rest-addr`,
+`--rest-token`, and `--rest-insecure-no-auth`.
 
 Use this shell helper for examples:
 

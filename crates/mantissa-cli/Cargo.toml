@@ -23,6 +23,7 @@ mantissa = { path = "../.." }
 mantissa-client = { path = "../mantissa-client" }
 mantissa-net = { path = "../mantissa-net" }
 mantissa-protocol = { path = "../mantissa-protocol" }
+mantissa-rest = { path = "../mantissa-rest" }
 mantissa-ui = { path = "../mantissa-ui" }
 parking_lot = { workspace = true }
 rpassword = "7.4.0"

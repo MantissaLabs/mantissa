@@ -12,7 +12,7 @@ use axum::{
     response::Response,
     routing::{get, post, put},
 };
-use std::time::Instant;
+use std::{future::Future, net::SocketAddr, time::Instant};
 use tokio::net::TcpListener;
 
 /// Builds the Axum router for the REST facade.
@@ -148,16 +148,56 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Starts the REST listener and serves requests until the listener exits.
-pub async fn serve(config: RestConfig) -> Result<(), RestServerError> {
+/// Bound REST listener ready to serve requests.
+pub struct BoundRestServer {
+    listener: TcpListener,
+    router: Router,
+    local_addr: SocketAddr,
+}
+
+impl BoundRestServer {
+    /// Returns the local address assigned to the REST listener.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Serves REST requests until the listener exits or shutdown resolves.
+    pub async fn serve_until<S>(self, shutdown: S) -> Result<(), RestServerError>
+    where
+        S: Future<Output = ()> + Send + 'static,
+    {
+        axum::serve(self.listener, self.router)
+            .with_graceful_shutdown(shutdown)
+            .await?;
+        Ok(())
+    }
+}
+
+/// Binds the REST listener and prepares the router without serving requests.
+pub async fn bind(config: RestConfig) -> Result<BoundRestServer, RestServerError> {
     config.validate()?;
+    let listener = TcpListener::bind(config.bind_addr).await?;
+    let local_addr = listener.local_addr()?;
     let client = ClientWorkerHandle::spawn(config.client_config())?;
     let state = AppState::new(config.auth.clone(), client);
-    let listener = TcpListener::bind(config.bind_addr).await?;
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    Ok(())
+    Ok(BoundRestServer {
+        listener,
+        router: router(state),
+        local_addr,
+    })
+}
+
+/// Starts the REST listener and serves requests until shutdown resolves.
+pub async fn serve_until<S>(config: RestConfig, shutdown: S) -> Result<(), RestServerError>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
+    bind(config).await?.serve_until(shutdown).await
+}
+
+/// Starts the standalone REST listener and stops it on process termination.
+pub async fn serve(config: RestConfig) -> Result<(), RestServerError> {
+    serve_until(config, shutdown_signal()).await
 }
 
 /// Logs one completed REST request with compact operational fields.

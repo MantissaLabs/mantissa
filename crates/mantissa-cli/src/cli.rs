@@ -1,5 +1,6 @@
 use crate::tasks::{TasksListOutput, TasksListState};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
@@ -270,6 +271,32 @@ pub struct InitArgs {
         conflicts_with = "master_key_passphrase_file"
     )]
     pub master_key_passphrase_fd: Option<i32>,
+
+    /// Serve the local REST API from this daemon process
+    #[arg(long = "rest", action = ArgAction::SetTrue)]
+    pub rest: bool,
+
+    /// Bind address for the embedded REST API
+    #[arg(long = "rest-addr", value_name = "ADDR", requires = "rest")]
+    pub rest_addr: Option<SocketAddr>,
+
+    /// Bearer token accepted by embedded REST handlers
+    #[arg(
+        long = "rest-token",
+        value_name = "TOKEN",
+        requires = "rest",
+        conflicts_with = "rest_insecure_no_auth"
+    )]
+    pub rest_token: Option<String>,
+
+    /// Disable embedded REST auth for loopback-only local development
+    #[arg(
+        long = "rest-insecure-no-auth",
+        action = ArgAction::SetTrue,
+        requires = "rest",
+        conflicts_with = "rest_token"
+    )]
+    pub rest_insecure_no_auth: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1815,6 +1842,30 @@ mod tests {
                 assert!(args.detach);
                 assert_eq!(args.log_file, Some(PathBuf::from("/tmp/mantissa.log")));
                 assert_eq!(args.detach_timeout, Duration::from_millis(250));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_rest_options_parse() {
+        let cli = MantissaCli::try_parse_from([
+            "mantissa",
+            "init",
+            "--rest",
+            "--rest-addr",
+            "127.0.0.1:6580",
+            "--rest-token",
+            "dev-token",
+        ])
+        .unwrap();
+
+        match cli.cmd {
+            Command::Init(args) => {
+                assert!(args.rest);
+                assert_eq!(args.rest_addr, Some("127.0.0.1:6580".parse().unwrap()));
+                assert_eq!(args.rest_token.as_deref(), Some("dev-token"));
+                assert!(!args.rest_insecure_no_auth);
             }
             other => panic!("unexpected command: {other:?}"),
         }

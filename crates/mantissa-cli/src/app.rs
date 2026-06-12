@@ -127,8 +127,12 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                 Some(crate::daemon::record_foreground_start(&state_dir, &listen)?)
             };
             let master_key_passphrase = resolve_master_key_passphrase(&init)?;
-            let advertise_addr = init.advertise.or_else(config::advertise_addr);
-            local
+            let rest_server = crate::rest::start_embedded(&init).await?;
+            if let Some(rest_server) = rest_server.as_ref() {
+                println!("REST API: http://{}", rest_server.local_addr());
+            }
+            let advertise_addr = init.advertise.clone().or_else(config::advertise_addr);
+            let daemon_result = local
                 .run_until(mantissa::server::bootstrap::start(
                     listen,
                     advertise_addr,
@@ -137,7 +141,11 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     master_key_passphrase,
                 ))
                 .await
-                .map_err(|error| anyhow::anyhow!("{error}"))?;
+                .map_err(|error| anyhow::anyhow!("{error}"));
+            if let Some(rest_server) = rest_server {
+                rest_server.shutdown().await;
+            }
+            daemon_result?;
         }
 
         Command::Status(args) => {
