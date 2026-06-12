@@ -1,9 +1,49 @@
 use crate::types::{common::HostPort, common::debug_variant_label};
-use mantissa_client::services::list::{
-    ServiceReplicaAssignmentRow, ServiceRolloutRow, ServiceRow, ServiceTaskProgressRow,
-    TaskTemplateAutoscaleMetricRow, TaskTemplateAutoscalePolicyRow, TaskTemplateRow,
+use mantissa_client::services::{
+    deploy::{ServiceDeployOutcome, ServiceDeploymentHandle},
+    list::{
+        ServiceReplicaAssignmentRow, ServiceRolloutRow, ServiceRow, ServiceTaskProgressRow,
+        TaskTemplateAutoscaleMetricRow, TaskTemplateAutoscalePolicyRow, TaskTemplateRow,
+    },
+    manifest::ServiceManifest,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// REST request body for deploying one service manifest.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceDeployRequest {
+    pub manifest: ServiceManifest,
+}
+
+/// REST response returned after submitting one service deployment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ServiceDeployResponse {
+    pub service_id: String,
+    pub manifest_id: String,
+    pub outcome: String,
+    pub detail: Option<String>,
+}
+
+impl From<ServiceDeploymentHandle> for ServiceDeployResponse {
+    /// Converts the client deployment handle into the REST JSON shape.
+    fn from(value: ServiceDeploymentHandle) -> Self {
+        Self {
+            service_id: value.service_id.to_string(),
+            manifest_id: value.manifest_id.to_string(),
+            outcome: deploy_outcome_label(value.outcome).to_string(),
+            detail: value.detail,
+        }
+    }
+}
+
+/// Returns the stable REST label for a service deploy outcome.
+fn deploy_outcome_label(outcome: ServiceDeployOutcome) -> &'static str {
+    match outcome {
+        ServiceDeployOutcome::Accepted => "accepted",
+        ServiceDeployOutcome::Unchanged => "unchanged",
+    }
+}
 
 /// REST-facing service summary and inspection response.
 #[derive(Clone, Debug, Serialize)]

@@ -1,10 +1,135 @@
 use mantissa_client::volumes::{
-    LocalVolumeOwnership as ClientLocalVolumeOwnership, VolumeDriver as ClientVolumeDriver,
-    VolumeInspect as ClientVolumeInspect, VolumeLabel as ClientVolumeLabel,
-    VolumeNodeStatus as ClientVolumeNodeStatus, VolumeSpec as ClientVolumeSpec,
+    LocalVolumeOwnership as ClientLocalVolumeOwnership,
+    VolumeBindingMode as ClientVolumeBindingMode, VolumeCreateRequest as ClientVolumeCreateRequest,
+    VolumeDeleteResult, VolumeDriver as ClientVolumeDriver,
+    VolumeImportRequest as ClientVolumeImportRequest, VolumeInspect as ClientVolumeInspect,
+    VolumeLabel as ClientVolumeLabel, VolumeNodeStatus as ClientVolumeNodeStatus,
+    VolumeReclaimPolicy as ClientVolumeReclaimPolicy, VolumeSpec as ClientVolumeSpec,
     VolumeSummary as ClientVolumeSummary,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// REST request body for creating one managed local volume.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeCreateRequest {
+    pub name: String,
+    #[serde(default)]
+    pub ownership: VolumeOwnershipRequest,
+    #[serde(default = "default_binding_mode")]
+    pub binding_mode: String,
+    #[serde(default = "default_reclaim_policy")]
+    pub reclaim_policy: String,
+    #[serde(default)]
+    pub requested_bytes: Option<u64>,
+    #[serde(default)]
+    pub labels: Vec<VolumeLabel>,
+    #[serde(default)]
+    pub node_selector: Option<String>,
+}
+
+impl VolumeCreateRequest {
+    /// Converts this REST request into the reusable client request.
+    pub fn into_client(self) -> Result<ClientVolumeCreateRequest, String> {
+        Ok(ClientVolumeCreateRequest {
+            name: self.name,
+            ownership: self.ownership.into_client(),
+            binding_mode: parse_binding_mode(&self.binding_mode)?,
+            reclaim_policy: parse_reclaim_policy(&self.reclaim_policy)?,
+            requested_bytes: self.requested_bytes,
+            labels: self
+                .labels
+                .into_iter()
+                .map(ClientVolumeLabel::from)
+                .collect(),
+            node_selector: self.node_selector,
+        })
+    }
+}
+
+/// REST request body for importing an existing local path as a volume.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeImportRequest {
+    pub name: String,
+    pub node_selector: String,
+    pub path: String,
+    #[serde(default)]
+    pub requested_bytes: Option<u64>,
+    #[serde(default)]
+    pub labels: Vec<VolumeLabel>,
+}
+
+impl From<VolumeImportRequest> for ClientVolumeImportRequest {
+    /// Converts the REST import request into the reusable client request.
+    fn from(value: VolumeImportRequest) -> Self {
+        Self {
+            name: value.name,
+            node_selector: value.node_selector,
+            path: value.path,
+            requested_bytes: value.requested_bytes,
+            labels: value
+                .labels
+                .into_iter()
+                .map(ClientVolumeLabel::from)
+                .collect(),
+        }
+    }
+}
+
+/// REST request ownership policy for managed local volumes.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum VolumeOwnershipRequest {
+    #[default]
+    Daemon,
+    User {
+        uid: u32,
+        gid: u32,
+    },
+    FsGroup {
+        gid: u32,
+    },
+}
+
+impl VolumeOwnershipRequest {
+    /// Converts this REST ownership request into the reusable client enum.
+    fn into_client(self) -> ClientLocalVolumeOwnership {
+        match self {
+            Self::Daemon => ClientLocalVolumeOwnership::Daemon,
+            Self::User { uid, gid } => ClientLocalVolumeOwnership::User { uid, gid },
+            Self::FsGroup { gid } => ClientLocalVolumeOwnership::FsGroup { gid },
+        }
+    }
+}
+
+/// Returns the default binding mode for REST volume create requests.
+fn default_binding_mode() -> String {
+    "wait_for_first_consumer".to_string()
+}
+
+/// Returns the default reclaim policy for REST volume create requests.
+fn default_reclaim_policy() -> String {
+    "retain".to_string()
+}
+
+/// Parses one REST binding mode into the reusable client enum.
+fn parse_binding_mode(value: &str) -> Result<ClientVolumeBindingMode, String> {
+    match value {
+        "immediate" => Ok(ClientVolumeBindingMode::Immediate),
+        "wait_for_first_consumer" => Ok(ClientVolumeBindingMode::WaitForFirstConsumer),
+        _ => Err(format!("invalid volume binding_mode '{value}'")),
+    }
+}
+
+/// Parses one REST reclaim policy into the reusable client enum.
+fn parse_reclaim_policy(value: &str) -> Result<ClientVolumeReclaimPolicy, String> {
+    match value {
+        "retain" => Ok(ClientVolumeReclaimPolicy::Retain),
+        "delete" => Ok(ClientVolumeReclaimPolicy::Delete),
+        _ => Err(format!("invalid volume reclaim_policy '{value}'")),
+    }
+}
 
 /// REST-facing volume summary row.
 #[derive(Clone, Debug, Serialize)]
@@ -166,10 +291,21 @@ impl From<ClientVolumeSpec> for VolumeSpec {
 }
 
 /// REST-facing volume label.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolumeLabel {
     pub key: String,
     pub value: String,
+}
+
+impl From<VolumeLabel> for ClientVolumeLabel {
+    /// Converts the REST volume label into the reusable client label.
+    fn from(value: VolumeLabel) -> Self {
+        Self {
+            key: value.key,
+            value: value.value,
+        }
+    }
 }
 
 impl From<ClientVolumeLabel> for VolumeLabel {
@@ -238,6 +374,23 @@ impl From<ClientVolumeInspect> for VolumeInspect {
                 .into_iter()
                 .map(VolumeNodeStatus::from)
                 .collect(),
+        }
+    }
+}
+
+/// REST response returned after deleting one volume.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct VolumeDeleteResponse {
+    pub preserved_path: Option<String>,
+    pub deleted_data: bool,
+}
+
+impl From<VolumeDeleteResult> for VolumeDeleteResponse {
+    /// Converts the client delete result into the REST JSON shape.
+    fn from(value: VolumeDeleteResult) -> Self {
+        Self {
+            preserved_path: value.preserved_path,
+            deleted_data: value.deleted_data,
         }
     }
 }

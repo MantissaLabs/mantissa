@@ -1,6 +1,9 @@
 use crate::{
-    auth::RestAuth, error::RestError, routes::worker_error_to_rest, state::AppState,
-    types::nodes::NodeSummary,
+    auth::RestAuth,
+    error::RestError,
+    routes::worker_error_to_rest,
+    state::AppState,
+    types::nodes::{NodeActionResponse, NodeDrainRequest, NodeSummary},
 };
 use axum::{
     Json,
@@ -29,6 +32,49 @@ pub async fn get(
     state
         .client()
         .get_node(node_id)
+        .await
+        .map(Json)
+        .map_err(worker_error_to_rest)
+}
+
+/// Requests drain for one node by UUID string.
+pub async fn drain(
+    State(state): State<AppState>,
+    _auth: RestAuth,
+    Path(node_id): Path<String>,
+    Json(request): Json<NodeDrainRequest>,
+) -> Result<Json<NodeActionResponse>, RestError> {
+    state
+        .client()
+        .drain_node(node_id, request)
+        .await
+        .map(Json)
+        .map_err(worker_error_to_rest)
+}
+
+/// Resumes scheduling for one drained node by UUID string.
+pub async fn resume(
+    State(state): State<AppState>,
+    _auth: RestAuth,
+    Path(node_id): Path<String>,
+) -> Result<Json<NodeActionResponse>, RestError> {
+    state
+        .client()
+        .resume_node(node_id)
+        .await
+        .map(Json)
+        .map_err(worker_error_to_rest)
+}
+
+/// Evicts one stale node identity by UUID string.
+pub async fn evict(
+    State(state): State<AppState>,
+    _auth: RestAuth,
+    Path(node_id): Path<String>,
+) -> Result<Json<NodeActionResponse>, RestError> {
+    state
+        .client()
+        .evict_node(node_id)
         .await
         .map(Json)
         .map_err(worker_error_to_rest)

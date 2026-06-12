@@ -1,8 +1,57 @@
 use mantissa_client::networks::{
+    NetworkCreateRequest as ClientNetworkCreateRequest, NetworkDriver as ClientNetworkDriver,
     NetworkInspect as ClientNetworkInspect, NetworkPeerStatus as ClientNetworkPeerStatus,
     NetworkSpec as ClientNetworkSpec, NetworkSummary as ClientNetworkSummary,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// REST request body for creating an overlay network.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkCreateRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub driver: ClientNetworkDriver,
+    #[serde(default)]
+    pub subnet_cidr: Option<String>,
+    #[serde(default)]
+    pub vni: Option<u32>,
+    #[serde(default)]
+    pub mtu: Option<u32>,
+    #[serde(default)]
+    pub bpf_programs: Vec<String>,
+    #[serde(default)]
+    pub sealed: bool,
+}
+
+impl From<NetworkCreateRequest> for ClientNetworkCreateRequest {
+    /// Converts the REST create request into the reusable client request.
+    fn from(value: NetworkCreateRequest) -> Self {
+        Self {
+            name: value.name,
+            description: value.description,
+            driver: value.driver,
+            subnet_cidr: value.subnet_cidr,
+            vni: value.vni,
+            mtu: value.mtu,
+            bpf_programs: value.bpf_programs,
+            sealed: value.sealed,
+        }
+    }
+}
+
+/// REST response returned after creating one network.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NetworkCreateResponse {
+    pub network_id: String,
+}
+
+/// REST response returned after deleting networks.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NetworkDeleteResponse {
+    pub deleted: usize,
+}
 
 /// REST-facing network summary row.
 #[derive(Clone, Debug, Serialize)]

@@ -2559,12 +2559,14 @@ name = "mantissa-rest"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "mantissa-client",
  "mantissa-protocol",
  "serde",
  "serde_json",
  "tokio",
  "tower",
+ "uuid",
 ]
 
 [[package]]

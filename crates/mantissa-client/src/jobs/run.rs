@@ -114,6 +114,20 @@ struct PreparedJobRetryPolicy {
 /// Submits one first-class job through the jobs control-plane capability.
 pub async fn run(cfg: &ClientConfig, options: &JobRunOptions<'_>) -> Result<JobRunResult> {
     let prepared = prepare_submit_spec(cfg, options).await?;
+    submit_prepared_job(cfg, prepared).await
+}
+
+/// Submits one already parsed job manifest through the jobs control-plane capability.
+pub async fn run_manifest(cfg: &ClientConfig, manifest: &JobManifest) -> Result<JobRunResult> {
+    let prepared = prepare_manifest_submit_spec_from_manifest(cfg, manifest).await?;
+    submit_prepared_job(cfg, prepared).await
+}
+
+/// Submits one prepared job spec through the jobs control-plane capability.
+async fn submit_prepared_job(
+    cfg: &ClientConfig,
+    prepared: PreparedJobSubmitSpec,
+) -> Result<JobRunResult> {
     let session = connection::get_local_session(cfg).await?;
 
     let request = session.get_jobs_request();
@@ -214,12 +228,20 @@ async fn prepare_manifest_submit_spec(
     path: &Path,
 ) -> Result<PreparedJobSubmitSpec> {
     let manifest = load_manifest_from_path(path)?;
+    prepare_manifest_submit_spec_from_manifest(cfg, &manifest).await
+}
+
+/// Normalizes one parsed job manifest into the public jobs submit contract.
+async fn prepare_manifest_submit_spec_from_manifest(
+    cfg: &ClientConfig,
+    manifest: &JobManifest,
+) -> Result<PreparedJobSubmitSpec> {
     let required_networks = manifest.requested_networks()?;
     let resolved_volumes = ensure_declared_volumes(cfg, &manifest.declared_volume_specs()).await?;
 
     Ok(PreparedJobSubmitSpec {
         name: manifest.name.clone(),
-        execution: prepared_execution_from_manifest(&manifest, &resolved_volumes)?,
+        execution: prepared_execution_from_manifest(manifest, &resolved_volumes)?,
         retry_policy: PreparedJobRetryPolicy {
             max_retries: manifest.retry_policy.max_retries,
             backoff_secs: manifest.retry_policy.backoff_secs,

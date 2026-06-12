@@ -1,8 +1,50 @@
 use crate::types::common::HostPort;
-use mantissa_client::jobs::snapshot::{
-    JobAttemptView, JobDetailView, JobRetryPolicyView, JobSnapshotView,
+use mantissa_client::jobs::{
+    manifest::JobManifest,
+    run::JobRunResult,
+    snapshot::{JobAttemptView, JobDetailView, JobRetryPolicyView, JobSnapshotView},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// REST request body for submitting a first-class job manifest.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobSubmitRequest {
+    pub manifest: JobManifest,
+}
+
+/// REST response returned after submitting one first-class job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct JobSubmitResponse {
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    pub cpu_millis: u64,
+    pub memory_mib: u64,
+    pub gpu_count: u32,
+    pub execution_platform: String,
+    pub isolation_mode: String,
+    pub isolation_profile: Option<String>,
+    pub max_retries: u32,
+}
+
+impl From<JobRunResult> for JobSubmitResponse {
+    /// Converts the client job submission result into the REST JSON shape.
+    fn from(value: JobRunResult) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            image: value.image,
+            cpu_millis: value.cpu_millis,
+            memory_mib: value.memory_mib,
+            gpu_count: value.gpu_count,
+            execution_platform: value.execution_platform,
+            isolation_mode: value.isolation_mode,
+            isolation_profile: value.isolation_profile,
+            max_retries: value.max_retries,
+        }
+    }
+}
 
 /// REST-facing retry policy summary for one job.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

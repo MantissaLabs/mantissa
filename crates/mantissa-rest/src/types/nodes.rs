@@ -1,6 +1,6 @@
 use crate::types::common::debug_variant_label;
 use mantissa_client::nodes::NodeListEntry;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// REST-facing node summary returned by topology read routes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -14,6 +14,23 @@ pub struct NodeSummary {
     pub drain_state: String,
     pub labels: Vec<String>,
     pub scheduling_reason: Option<String>,
+}
+
+/// REST request body for requesting node drain.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeDrainRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub task_stop_timeout_secs: Option<u64>,
+}
+
+/// REST response returned after a node maintenance action is accepted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NodeActionResponse {
+    pub node_id: String,
+    pub accepted: bool,
 }
 
 impl From<NodeListEntry> for NodeSummary {

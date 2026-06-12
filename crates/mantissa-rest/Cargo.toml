@@ -14,11 +14,13 @@ workspace = true
 
 [dependencies]
 axum = "0.8"
+base64 = "0.22.1"
 mantissa-client = { path = "../mantissa-client" }
 mantissa-protocol = { path = "../mantissa-protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "sync"] }
+uuid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
