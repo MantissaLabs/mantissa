@@ -2560,6 +2560,10 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64",
+ "capnp",
+ "capnp-rpc",
+ "futures-core",
+ "futures-util",
  "mantissa-client",
  "mantissa-protocol",
  "serde",

@@ -69,6 +69,7 @@ pub fn router(state: AppState) -> Router {
             get(routes::tasks::list).post(routes::tasks::start),
         )
         .route("/v1/tasks/{selector}", get(routes::tasks::get))
+        .route("/v1/tasks/{selector}/logs", get(routes::tasks::logs))
         .route("/v1/tasks/{selector}/stop", post(routes::tasks::stop))
         .route(
             "/v1/secrets",

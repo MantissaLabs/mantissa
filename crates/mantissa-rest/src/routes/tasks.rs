@@ -5,11 +5,14 @@ use crate::{
     error::RestError,
     routes::worker_error_to_rest,
     state::AppState,
-    types::tasks::{TaskStartRequest, TaskSummary},
+    types::tasks::{TaskLogsQuery, TaskStartRequest, TaskSummary},
 };
 use axum::{
     Json,
-    extract::{Path, State},
+    body::Body,
+    extract::{Path, Query, State},
+    http::header::CONTENT_TYPE,
+    response::{IntoResponse, Response},
 };
 
 /// Lists standalone tasks visible to the local daemon.
@@ -51,6 +54,25 @@ pub async fn get(
         .await
         .map(Json)
         .map_err(worker_error_to_rest)
+}
+
+/// Streams standalone task logs as newline-delimited JSON frames.
+pub async fn logs(
+    State(state): State<AppState>,
+    _auth: RestAuth,
+    Path(selector): Path<String>,
+    Query(query): Query<TaskLogsQuery>,
+) -> Result<Response, RestError> {
+    let stream = state
+        .client()
+        .task_logs(selector, query)
+        .await
+        .map_err(worker_error_to_rest)?;
+    Ok((
+        [(CONTENT_TYPE, "application/x-ndjson")],
+        Body::from_stream(stream),
+    )
+        .into_response())
 }
 
 /// Stops one standalone task by UUID text or accepted selector.

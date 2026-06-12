@@ -1,3 +1,4 @@
+use crate::stream::task_logs::{TASK_LOG_EVENT_BUFFER, TaskLogEvent, TaskLogHttpStream};
 use crate::types::{
     clusters::{ClusterSummary, ClusterView, ClusterViewSummary},
     jobs::{JobDetail, JobSubmitRequest, JobSubmitResponse, JobSummary},
@@ -9,7 +10,7 @@ use crate::types::{
     scheduler::SchedulerSummary,
     secrets::{SecretDeleteResponse, SecretDetail, SecretSummary, SecretUpsertRequest},
     services::{ServiceDeployRequest, ServiceDeployResponse, ServiceSummary},
-    tasks::{TaskStartRequest, TaskSummary},
+    tasks::{TaskLogsQuery, TaskStartRequest, TaskSummary},
     volumes::{
         VolumeCreateRequest, VolumeDeleteResponse, VolumeImportRequest, VolumeInspect, VolumeSpec,
         VolumeSummary,
@@ -246,6 +247,20 @@ impl ClientWorkerHandle {
     pub async fn get_task(&self, selector: String) -> Result<TaskSummary, ClientWorkerError> {
         self.send(|respond_to| ClientCommand::GetTask {
             selector,
+            respond_to,
+        })
+        .await
+    }
+
+    /// Streams standalone task logs as newline-delimited JSON events.
+    pub async fn task_logs(
+        &self,
+        selector: String,
+        request: TaskLogsQuery,
+    ) -> Result<TaskLogHttpStream, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::TaskLogs {
+            selector,
+            request: Box::new(request),
             respond_to,
         })
         .await
@@ -570,6 +585,11 @@ enum ClientCommand {
         selector: String,
         respond_to: oneshot::Sender<Result<TaskSummary, ClientWorkerError>>,
     },
+    TaskLogs {
+        selector: String,
+        request: Box<TaskLogsQuery>,
+        respond_to: oneshot::Sender<Result<TaskLogHttpStream, ClientWorkerError>>,
+    },
     StartTask {
         request: Box<TaskStartRequest>,
         respond_to: oneshot::Sender<Result<TaskSummary, ClientWorkerError>>,
@@ -757,6 +777,13 @@ async fn client_worker_loop(config: ClientConfig, mut receiver: mpsc::Receiver<C
                 respond_to,
             } => {
                 let _ignored = respond_to.send(get_task(&config, &selector).await);
+            }
+            ClientCommand::TaskLogs {
+                selector,
+                request,
+                respond_to,
+            } => {
+                let _ignored = respond_to.send(start_task_logs(&config, selector, *request));
             }
             ClientCommand::StartTask {
                 request,
@@ -1099,6 +1126,43 @@ async fn get_task(config: &ClientConfig, selector: &str) -> Result<TaskSummary, 
         .into_iter()
         .find(|task| task.id == selector || task.name == selector)
         .ok_or_else(|| ClientWorkerError::NotFound(format!("task '{selector}' not found")))
+}
+
+/// Starts one worker-local task log stream and returns its HTTP receiver.
+fn start_task_logs(
+    config: &ClientConfig,
+    selector: String,
+    request: TaskLogsQuery,
+) -> Result<TaskLogHttpStream, ClientWorkerError> {
+    request
+        .validate()
+        .map_err(ClientWorkerError::InvalidRequest)?;
+    let selector = clean_required_name("task selector", &selector)?.to_string();
+    let config = config.clone();
+    let (events_tx, events_rx) = mpsc::channel(TASK_LOG_EVENT_BUFFER);
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+
+    tokio::task::spawn_local(async move {
+        let sink = crate::stream::task_logs::new_task_log_sink(events_tx.clone());
+        let options = tasks::TaskLogsOptions {
+            follow: request.follow,
+            tail: &request.tail,
+            stdout: request.stdout,
+            stderr: request.stderr,
+            timestamps: request.timestamps,
+        };
+
+        let result = tokio::select! {
+            result = tasks::logs_with_sink(&config, &selector, &options, sink) => Some(result),
+            _ = cancel_rx => None,
+        };
+
+        if let Some(Err(error)) = result {
+            let _ignored = events_tx.send(TaskLogEvent::error(error.to_string())).await;
+        }
+    });
+
+    Ok(TaskLogHttpStream::new(events_rx, cancel_tx))
 }
 
 /// Starts one standalone task through the reusable Mantissa client API.

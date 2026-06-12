@@ -57,6 +57,38 @@ pub struct TaskStartRequest {
     pub volumes: Vec<String>,
 }
 
+/// REST query parameters for streaming standalone task logs.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskLogsQuery {
+    #[serde(default)]
+    pub follow: bool,
+    #[serde(default = "default_log_tail")]
+    pub tail: String,
+    #[serde(default)]
+    pub stdout: bool,
+    #[serde(default)]
+    pub stderr: bool,
+    #[serde(default)]
+    pub timestamps: bool,
+}
+
+impl TaskLogsQuery {
+    /// Validates query options before the worker starts a Cap'n Proto log stream.
+    pub fn validate(&self) -> Result<(), String> {
+        let tail = self.tail.trim();
+        if tail.is_empty() {
+            return Err("tail must not be empty".to_string());
+        }
+        if tail.eq_ignore_ascii_case("all") || tail.parse::<u64>().is_ok() {
+            return Ok(());
+        }
+        Err(format!(
+            "invalid tail '{tail}': expected a non-negative integer or 'all'"
+        ))
+    }
+}
+
 /// Returns the default CPU request for REST task submissions.
 fn default_cpu_millis() -> u64 {
     1_000
@@ -65,4 +97,9 @@ fn default_cpu_millis() -> u64 {
 /// Returns the default memory request for REST task submissions.
 fn default_memory_bytes() -> u64 {
     536_870_912
+}
+
+/// Returns the default task log tail request.
+fn default_log_tail() -> String {
+    "all".to_string()
 }
