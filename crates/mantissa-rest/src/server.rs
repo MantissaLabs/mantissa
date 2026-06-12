@@ -6,7 +6,7 @@ use crate::{
 };
 use axum::{
     Router,
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use tokio::net::TcpListener;
 
@@ -20,7 +20,11 @@ pub fn router(state: AppState) -> Router {
             "/v1/nodes/{node_id}",
             get(routes::nodes::get).delete(routes::nodes::evict),
         )
-        .route("/v1/nodes/{node_id}/drain", post(routes::nodes::drain))
+        .route(
+            "/v1/nodes/{node_id}/drain",
+            get(routes::nodes::drain_status).post(routes::nodes::drain),
+        )
+        .route("/v1/nodes/{node_id}/labels", put(routes::nodes::labels))
         .route("/v1/nodes/{node_id}/resume", post(routes::nodes::resume))
         .route(
             "/v1/agents/sessions",
@@ -76,6 +80,14 @@ pub fn router(state: AppState) -> Router {
             get(routes::networks::get).delete(routes::networks::delete),
         )
         .route(
+            "/v1/networks/{network_id}/peers",
+            get(routes::networks::peers),
+        )
+        .route(
+            "/v1/networks/{network_id}/attachments",
+            get(routes::networks::attachments),
+        )
+        .route(
             "/v1/volumes",
             get(routes::volumes::list).post(routes::volumes::create),
         )
@@ -113,6 +125,18 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/clusters", get(routes::clusters::list))
         .route("/v1/clusters/views", get(routes::clusters::views))
         .route("/v1/clusters/current", get(routes::clusters::current))
+        .route(
+            "/v1/clusters/split-candidates",
+            get(routes::clusters::split_candidates),
+        )
+        .route(
+            "/v1/clusters/{cluster_id}/split-candidates",
+            get(routes::clusters::split_candidates_for_cluster),
+        )
+        .route(
+            "/v1/clusters/operations/{operation_id}",
+            get(routes::clusters::operation),
+        )
         .with_state(state)
 }
 

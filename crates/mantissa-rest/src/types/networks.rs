@@ -1,4 +1,5 @@
 use mantissa_client::networks::{
+    NetworkAttachment as ClientNetworkAttachment,
     NetworkCreateRequest as ClientNetworkCreateRequest, NetworkDriver as ClientNetworkDriver,
     NetworkInspect as ClientNetworkInspect, NetworkPeerStatus as ClientNetworkPeerStatus,
     NetworkSpec as ClientNetworkSpec, NetworkSummary as ClientNetworkSummary,
@@ -142,6 +143,45 @@ impl From<ClientNetworkPeerStatus> for NetworkPeerStatus {
             state: value.state.to_string(),
             error: value.error,
             updated_at: value.updated_at,
+        }
+    }
+}
+
+/// REST-facing workload attachment row for one overlay network.
+#[derive(Clone, Debug, Serialize)]
+pub struct NetworkAttachment {
+    pub attachment_id: String,
+    pub task_id: String,
+    pub node_id: String,
+    pub instance_id: String,
+    pub network_id: String,
+    pub requested_ip: Option<String>,
+    pub assigned_ip: Option<String>,
+    pub mac: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub state: String,
+    pub error: Option<String>,
+    pub traffic_published: bool,
+}
+
+impl From<ClientNetworkAttachment> for NetworkAttachment {
+    /// Converts the client network attachment into the REST JSON shape.
+    fn from(value: ClientNetworkAttachment) -> Self {
+        Self {
+            attachment_id: value.attachment_id.to_string(),
+            task_id: value.task_id.to_string(),
+            node_id: value.node_id.to_string(),
+            instance_id: value.instance_id,
+            network_id: value.network_id.to_string(),
+            requested_ip: value.requested_ip,
+            assigned_ip: value.assigned_ip,
+            mac: value.mac,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            state: value.state.to_string(),
+            error: value.error,
+            traffic_published: value.traffic_published,
         }
     }
 }

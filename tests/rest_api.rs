@@ -248,3 +248,109 @@ local_test!(rest_agent_session_lifecycle_uses_real_local_session, {
     assert_eq!(value["id"], delete_session);
     assert_eq!(value["status"], "closed");
 });
+
+local_test!(rest_admin_read_routes_use_real_local_session, {
+    let harness = RestTestHarness::new().await;
+    let node_id = harness.node_id.to_string();
+
+    let (status, value) = harness
+        .json_request(
+            Method::GET,
+            &format!("/v1/nodes/{node_id}/drain"),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["node_id"], node_id);
+    assert_eq!(value["schedulable"], true);
+
+    let (status, value) = harness
+        .json_request(
+            Method::PUT,
+            &format!("/v1/nodes/{node_id}/labels"),
+            true,
+            Some(json!({
+                "labels": ["rest=api", "role=gateway-test"],
+                "replace": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["node_id"], node_id);
+    assert_eq!(value["cleared"], false);
+
+    let (status, value) = harness
+        .json_request(Method::GET, &format!("/v1/nodes/{node_id}"), true, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let labels = value["labels"].as_array().expect("node labels are array");
+    assert!(labels.iter().any(|label| label == "rest=api"));
+    assert!(labels.iter().any(|label| label == "role=gateway-test"));
+
+    let (status, value) = harness
+        .json_request(Method::GET, "/v1/clusters/split-candidates", true, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let source_cluster_id = value["source_view"]["cluster_id"]
+        .as_str()
+        .expect("split candidates include source cluster")
+        .to_string();
+    assert_eq!(
+        value["candidates"]
+            .as_array()
+            .expect("split candidates are array")
+            .len(),
+        1
+    );
+
+    let (status, value) = harness
+        .json_request(
+            Method::GET,
+            &format!("/v1/clusters/{source_cluster_id}/split-candidates"),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["source_view"]["cluster_id"], source_cluster_id);
+
+    let (status, value) = harness
+        .json_request(
+            Method::POST,
+            "/v1/networks",
+            true,
+            Some(json!({
+                "name": "rest-admin-read-network",
+                "driver": "vxlan"
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let network_id = value["network_id"]
+        .as_str()
+        .expect("network create returns id")
+        .to_string();
+
+    let (status, value) = harness
+        .json_request(
+            Method::GET,
+            &format!("/v1/networks/{network_id}/peers"),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(value.as_array().is_some());
+
+    let (status, value) = harness
+        .json_request(
+            Method::GET,
+            &format!("/v1/networks/{network_id}/attachments"),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(value.as_array().is_some());
+});

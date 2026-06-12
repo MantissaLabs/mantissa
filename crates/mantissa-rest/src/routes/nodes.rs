@@ -3,7 +3,10 @@ use crate::{
     error::RestError,
     routes::worker_error_to_rest,
     state::AppState,
-    types::nodes::{NodeActionResponse, NodeDrainRequest, NodeSummary},
+    types::nodes::{
+        NodeActionResponse, NodeDrainRequest, NodeDrainStatus, NodeLabelsRequest,
+        NodeLabelsResponse, NodeSummary,
+    },
 };
 use axum::{
     Json,
@@ -37,6 +40,20 @@ pub async fn get(
         .map_err(worker_error_to_rest)
 }
 
+/// Fetches the current drain-status snapshot for one node.
+pub async fn drain_status(
+    State(state): State<AppState>,
+    _auth: RestAuth,
+    Path(node_id): Path<String>,
+) -> Result<Json<NodeDrainStatus>, RestError> {
+    state
+        .client()
+        .node_drain_status(node_id)
+        .await
+        .map(Json)
+        .map_err(worker_error_to_rest)
+}
+
 /// Requests drain for one node by UUID string.
 pub async fn drain(
     State(state): State<AppState>,
@@ -47,6 +64,21 @@ pub async fn drain(
     state
         .client()
         .drain_node(node_id, request)
+        .await
+        .map(Json)
+        .map_err(worker_error_to_rest)
+}
+
+/// Applies one node label update by UUID string.
+pub async fn labels(
+    State(state): State<AppState>,
+    _auth: RestAuth,
+    Path(node_id): Path<String>,
+    Json(request): Json<NodeLabelsRequest>,
+) -> Result<Json<NodeLabelsResponse>, RestError> {
+    state
+        .client()
+        .update_node_labels(node_id, request)
         .await
         .map(Json)
         .map_err(worker_error_to_rest)

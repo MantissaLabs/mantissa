@@ -4,8 +4,8 @@ use crate::{
     routes::worker_error_to_rest,
     state::AppState,
     types::networks::{
-        NetworkCreateRequest, NetworkCreateResponse, NetworkDeleteResponse, NetworkInspect,
-        NetworkSummary,
+        NetworkAttachment, NetworkCreateRequest, NetworkCreateResponse, NetworkDeleteResponse,
+        NetworkInspect, NetworkPeerStatus, NetworkSummary,
     },
 };
 use axum::{
@@ -49,6 +49,34 @@ pub async fn get(
     state
         .client()
         .get_network(network_id)
+        .await
+        .map(Json)
+        .map_err(worker_error_to_rest)
+}
+
+/// Lists per-peer convergence rows for one overlay network.
+pub async fn peers(
+    State(state): State<AppState>,
+    _auth: RestAuth,
+    Path(network_id): Path<String>,
+) -> Result<Json<Vec<NetworkPeerStatus>>, RestError> {
+    state
+        .client()
+        .list_network_peers(network_id)
+        .await
+        .map(Json)
+        .map_err(worker_error_to_rest)
+}
+
+/// Lists workload attachment rows for one overlay network.
+pub async fn attachments(
+    State(state): State<AppState>,
+    _auth: RestAuth,
+    Path(network_id): Path<String>,
+) -> Result<Json<Vec<NetworkAttachment>>, RestError> {
+    state
+        .client()
+        .list_network_attachments(network_id)
         .await
         .map(Json)
         .map_err(worker_error_to_rest)

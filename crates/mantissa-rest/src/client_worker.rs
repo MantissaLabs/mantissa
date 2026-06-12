@@ -4,13 +4,18 @@ use crate::types::{
         AgentInputRequest, AgentInputResponse, AgentRunSummary, AgentSession, AgentSessionDetail,
         AgentSessionSummary, AgentSubmitRequest, AgentSubmitResponse,
     },
-    clusters::{ClusterSummary, ClusterView, ClusterViewSummary},
+    clusters::{
+        ClusterOperation, ClusterSummary, ClusterView, ClusterViewSummary, SplitCandidateList,
+    },
     jobs::{JobDetail, JobSubmitRequest, JobSubmitResponse, JobSummary},
     networks::{
-        NetworkCreateRequest, NetworkCreateResponse, NetworkDeleteResponse, NetworkInspect,
-        NetworkSummary,
+        NetworkAttachment, NetworkCreateRequest, NetworkCreateResponse, NetworkDeleteResponse,
+        NetworkInspect, NetworkPeerStatus, NetworkSummary,
     },
-    nodes::{NodeActionResponse, NodeDrainRequest, NodeSummary},
+    nodes::{
+        NodeActionResponse, NodeDrainRequest, NodeDrainStatus, NodeLabelsRequest,
+        NodeLabelsResponse, NodeSummary,
+    },
     scheduler::SchedulerSummary,
     secrets::{SecretDeleteResponse, SecretDetail, SecretSummary, SecretUpsertRequest},
     services::{ServiceDeployRequest, ServiceDeployResponse, ServiceSummary},
@@ -271,6 +276,30 @@ impl ClientWorkerHandle {
         .await
     }
 
+    /// Lists peer reconciliation status rows for one overlay network.
+    pub async fn list_network_peers(
+        &self,
+        network_id: String,
+    ) -> Result<Vec<NetworkPeerStatus>, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::ListNetworkPeers {
+            network_id,
+            respond_to,
+        })
+        .await
+    }
+
+    /// Lists workload attachment rows for one overlay network.
+    pub async fn list_network_attachments(
+        &self,
+        network_id: String,
+    ) -> Result<Vec<NetworkAttachment>, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::ListNetworkAttachments {
+            network_id,
+            respond_to,
+        })
+        .await
+    }
+
     /// Deletes one overlay network by UUID string.
     pub async fn delete_network(
         &self,
@@ -476,6 +505,32 @@ impl ClientWorkerHandle {
         .await
     }
 
+    /// Fetches one node drain-status snapshot by UUID string.
+    pub async fn node_drain_status(
+        &self,
+        node_id: String,
+    ) -> Result<NodeDrainStatus, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::NodeDrainStatus {
+            node_id,
+            respond_to,
+        })
+        .await
+    }
+
+    /// Applies one node label mutation by UUID string.
+    pub async fn update_node_labels(
+        &self,
+        node_id: String,
+        request: NodeLabelsRequest,
+    ) -> Result<NodeLabelsResponse, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::UpdateNodeLabels {
+            node_id,
+            request: Box::new(request),
+            respond_to,
+        })
+        .await
+    }
+
     /// Fetches one volume status snapshot by UUID text or exact volume name.
     pub async fn get_volume_status(
         &self,
@@ -515,6 +570,30 @@ impl ClientWorkerHandle {
     /// Fetches the active cluster view associated with the local session.
     pub async fn active_cluster_view(&self) -> Result<ClusterView, ClientWorkerError> {
         self.send(ClientCommand::ActiveClusterView).await
+    }
+
+    /// Fetches the latest locally known state for one cluster operation.
+    pub async fn cluster_operation(
+        &self,
+        operation_id: String,
+    ) -> Result<ClusterOperation, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::ClusterOperation {
+            operation_id,
+            respond_to,
+        })
+        .await
+    }
+
+    /// Lists split candidates for the active or selected cluster lineage.
+    pub async fn list_split_candidates(
+        &self,
+        cluster_id: Option<String>,
+    ) -> Result<SplitCandidateList, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::ListSplitCandidates {
+            cluster_id,
+            respond_to,
+        })
+        .await
     }
 
     /// Sends one typed command to the worker and awaits its typed response.
@@ -696,6 +775,14 @@ enum ClientCommand {
         network_id: String,
         respond_to: oneshot::Sender<Result<NetworkInspect, ClientWorkerError>>,
     },
+    ListNetworkPeers {
+        network_id: String,
+        respond_to: oneshot::Sender<Result<Vec<NetworkPeerStatus>, ClientWorkerError>>,
+    },
+    ListNetworkAttachments {
+        network_id: String,
+        respond_to: oneshot::Sender<Result<Vec<NetworkAttachment>, ClientWorkerError>>,
+    },
     DeleteNetwork {
         network_id: String,
         respond_to: oneshot::Sender<Result<NetworkDeleteResponse, ClientWorkerError>>,
@@ -772,6 +859,15 @@ enum ClientCommand {
         node_id: String,
         respond_to: oneshot::Sender<Result<NodeActionResponse, ClientWorkerError>>,
     },
+    NodeDrainStatus {
+        node_id: String,
+        respond_to: oneshot::Sender<Result<NodeDrainStatus, ClientWorkerError>>,
+    },
+    UpdateNodeLabels {
+        node_id: String,
+        request: Box<NodeLabelsRequest>,
+        respond_to: oneshot::Sender<Result<NodeLabelsResponse, ClientWorkerError>>,
+    },
     SchedulerSummary {
         peer_id: Option<String>,
         details: bool,
@@ -780,6 +876,14 @@ enum ClientCommand {
     ListClusters(oneshot::Sender<Result<Vec<ClusterSummary>, ClientWorkerError>>),
     ListClusterViews(oneshot::Sender<Result<Vec<ClusterViewSummary>, ClientWorkerError>>),
     ActiveClusterView(oneshot::Sender<Result<ClusterView, ClientWorkerError>>),
+    ClusterOperation {
+        operation_id: String,
+        respond_to: oneshot::Sender<Result<ClusterOperation, ClientWorkerError>>,
+    },
+    ListSplitCandidates {
+        cluster_id: Option<String>,
+        respond_to: oneshot::Sender<Result<SplitCandidateList, ClientWorkerError>>,
+    },
 }
 
 /// Runs the client worker on a current-thread runtime with a local task set.
@@ -918,6 +1022,19 @@ async fn client_worker_loop(config: ClientConfig, mut receiver: mpsc::Receiver<C
             } => {
                 let _ignored = respond_to.send(get_network(&config, &network_id).await);
             }
+            ClientCommand::ListNetworkPeers {
+                network_id,
+                respond_to,
+            } => {
+                let _ignored = respond_to.send(list_network_peers(&config, &network_id).await);
+            }
+            ClientCommand::ListNetworkAttachments {
+                network_id,
+                respond_to,
+            } => {
+                let _ignored =
+                    respond_to.send(list_network_attachments(&config, &network_id).await);
+            }
             ClientCommand::DeleteNetwork {
                 network_id,
                 respond_to,
@@ -1031,6 +1148,20 @@ async fn client_worker_loop(config: ClientConfig, mut receiver: mpsc::Receiver<C
             } => {
                 let _ignored = respond_to.send(evict_node(&config, &node_id).await);
             }
+            ClientCommand::NodeDrainStatus {
+                node_id,
+                respond_to,
+            } => {
+                let _ignored = respond_to.send(node_drain_status(&config, &node_id).await);
+            }
+            ClientCommand::UpdateNodeLabels {
+                node_id,
+                request,
+                respond_to,
+            } => {
+                let _ignored =
+                    respond_to.send(update_node_labels(&config, &node_id, *request).await);
+            }
             ClientCommand::SchedulerSummary {
                 peer_id,
                 details,
@@ -1046,6 +1177,19 @@ async fn client_worker_loop(config: ClientConfig, mut receiver: mpsc::Receiver<C
             }
             ClientCommand::ActiveClusterView(respond_to) => {
                 let _ignored = respond_to.send(active_cluster_view(&config).await);
+            }
+            ClientCommand::ClusterOperation {
+                operation_id,
+                respond_to,
+            } => {
+                let _ignored = respond_to.send(cluster_operation(&config, &operation_id).await);
+            }
+            ClientCommand::ListSplitCandidates {
+                cluster_id,
+                respond_to,
+            } => {
+                let _ignored =
+                    respond_to.send(list_split_candidates(&config, cluster_id.as_deref()).await);
             }
         }
     }
@@ -1316,6 +1460,35 @@ async fn get_network(
     networks::inspect(config, network_id)
         .await
         .map(NetworkInspect::from)
+        .map_err(operation_error)
+}
+
+/// Lists network peer status rows through the reusable Mantissa client API.
+async fn list_network_peers(
+    config: &ClientConfig,
+    network_id: &str,
+) -> Result<Vec<NetworkPeerStatus>, ClientWorkerError> {
+    parse_uuid("network id", network_id)?;
+    networks::peer_status(config, network_id)
+        .await
+        .map(|peers| peers.into_iter().map(NetworkPeerStatus::from).collect())
+        .map_err(operation_error)
+}
+
+/// Lists network attachment rows through the reusable Mantissa client API.
+async fn list_network_attachments(
+    config: &ClientConfig,
+    network_id: &str,
+) -> Result<Vec<NetworkAttachment>, ClientWorkerError> {
+    parse_uuid("network id", network_id)?;
+    networks::attachments(config, network_id)
+        .await
+        .map(|attachments| {
+            attachments
+                .into_iter()
+                .map(NetworkAttachment::from)
+                .collect()
+        })
         .map_err(operation_error)
 }
 
@@ -1613,6 +1786,37 @@ async fn evict_node(
         .map_err(operation_error)
 }
 
+/// Fetches one node drain-status snapshot through the reusable Mantissa client API.
+async fn node_drain_status(
+    config: &ClientConfig,
+    node_id: &str,
+) -> Result<NodeDrainStatus, ClientWorkerError> {
+    let node_id = parse_uuid("node id", node_id)?;
+    nodes::status(config, node_id)
+        .await
+        .map(NodeDrainStatus::from)
+        .map_err(operation_error)
+}
+
+/// Applies one node label mutation through the reusable Mantissa client API.
+async fn update_node_labels(
+    config: &ClientConfig,
+    node_id: &str,
+    request: NodeLabelsRequest,
+) -> Result<NodeLabelsResponse, ClientWorkerError> {
+    let node_id = parse_uuid("node id", node_id)?;
+    nodes::labels(
+        config,
+        node_id,
+        &request.labels,
+        &request.remove,
+        request.replace,
+    )
+    .await
+    .map(NodeLabelsResponse::from)
+    .map_err(operation_error)
+}
+
 /// Fetches scheduler summary through the reusable Mantissa client API.
 async fn scheduler_summary(
     config: &ClientConfig,
@@ -1648,6 +1852,39 @@ async fn active_cluster_view(config: &ClientConfig) -> Result<ClusterView, Clien
     clusters::active_cluster_view(config)
         .await
         .map(ClusterView::from)
+        .map_err(operation_error)
+}
+
+/// Fetches one cluster operation through the reusable Mantissa client API.
+async fn cluster_operation(
+    config: &ClientConfig,
+    operation_id: &str,
+) -> Result<ClusterOperation, ClientWorkerError> {
+    parse_uuid("cluster operation id", operation_id)?;
+    clusters::get_cluster_operation(config, operation_id)
+        .await
+        .map(ClusterOperation::from)
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("cluster operation not found") {
+                ClientWorkerError::NotFound(message)
+            } else {
+                operation_error(message)
+            }
+        })
+}
+
+/// Lists split candidates through the reusable Mantissa client API.
+async fn list_split_candidates(
+    config: &ClientConfig,
+    cluster_id: Option<&str>,
+) -> Result<SplitCandidateList, ClientWorkerError> {
+    if let Some(cluster_id) = cluster_id {
+        parse_uuid("cluster id", cluster_id)?;
+    }
+    clusters::list_split_candidates(config, cluster_id)
+        .await
+        .map(SplitCandidateList::from)
         .map_err(operation_error)
 }
 

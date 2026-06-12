@@ -10,7 +10,9 @@ pub use list::{
 };
 pub use merge::{MergeServicePolicy, merge_by_cluster_id};
 pub use name::set_cluster_name;
-pub use operations::{ClusterOperationSummary, ClusterViewSpec};
+pub use operations::{
+    ClusterOperationSummary, ClusterSplitAssignment, ClusterViewSpec, get_cluster_operation,
+};
 pub use split::{
     ExplicitSplitTarget, SplitCommandRequest, SplitFilterKind, SplitNetworkPolicy,
     SplitServicePolicy, split, split_by_explicit_nodes, split_by_explicit_targets, split_by_filter,

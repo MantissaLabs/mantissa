@@ -57,9 +57,23 @@ pub struct ClusterOperationSummary {
     pub id: Uuid,
     pub kind: String,
     pub stage: String,
+    pub dry_run: bool,
     pub source_views: Vec<ClusterViewSpec>,
     pub target_views: Vec<ClusterViewSpec>,
+    pub target_cluster_names: Vec<String>,
+    pub split_assignments: Vec<ClusterSplitAssignment>,
+    pub split_service_policy: String,
+    pub split_network_policy: String,
+    pub merge_service_policy: String,
+    pub updated_at_unix_ms: u64,
     pub details: String,
+}
+
+/// Deterministic assignment of one node to one split target.
+#[derive(Clone, Debug)]
+pub struct ClusterSplitAssignment {
+    pub node_id: Uuid,
+    pub target_index: u64,
 }
 
 impl ClusterOperationSummary {
@@ -86,6 +100,45 @@ impl ClusterOperationSummary {
             target_views.push(ClusterViewSpec::from_capnp(targets.get(idx))?);
         }
 
+        let target_names = reader
+            .get_target_cluster_names()
+            .context("operation target cluster names missing")?;
+        let mut target_cluster_names = Vec::with_capacity(target_names.len() as usize);
+        for idx in 0..target_names.len() {
+            target_cluster_names.push(
+                target_names
+                    .get(idx)
+                    .context("operation target cluster name missing")?
+                    .to_string()
+                    .context("operation target cluster name invalid utf8")?,
+            );
+        }
+
+        let assignments = reader
+            .get_split_assignments()
+            .context("operation split assignments missing")?;
+        let mut split_assignments = Vec::with_capacity(assignments.len() as usize);
+        for idx in 0..assignments.len() {
+            let assignment = assignments.get(idx);
+            let node_bytes = assignment
+                .get_node_id()
+                .context("split assignment missing node id")?
+                .get_bytes()
+                .context("split assignment missing node id bytes")?
+                .to_vec();
+            if node_bytes.len() != 16 {
+                return Err(anyhow!(
+                    "split assignment contained invalid node id length {}",
+                    node_bytes.len()
+                ));
+            }
+            split_assignments.push(ClusterSplitAssignment {
+                node_id: Uuid::from_slice(&node_bytes)
+                    .context("invalid split assignment node id bytes")?,
+                target_index: assignment.get_target_index(),
+            });
+        }
+
         Ok(Self {
             id: Uuid::from_slice(&id).context("invalid operation id bytes")?,
             kind: format!(
@@ -100,8 +153,30 @@ impl ClusterOperationSummary {
                     .get_stage()
                     .context("operation stage missing from response")?
             ),
+            dry_run: reader.get_dry_run(),
             source_views,
             target_views,
+            target_cluster_names,
+            split_assignments,
+            split_service_policy: format!(
+                "{:?}",
+                reader
+                    .get_split_service_policy()
+                    .context("operation split service policy missing from response")?
+            ),
+            split_network_policy: format!(
+                "{:?}",
+                reader
+                    .get_split_network_policy()
+                    .context("operation split network policy missing from response")?
+            ),
+            merge_service_policy: format!(
+                "{:?}",
+                reader
+                    .get_merge_service_policy()
+                    .context("operation merge service policy missing from response")?
+            ),
+            updated_at_unix_ms: reader.get_updated_at_unix_ms(),
             details: reader
                 .get_details()
                 .context("operation details missing")?
@@ -109,6 +184,30 @@ impl ClusterOperationSummary {
                 .context("operation details invalid utf8")?,
         })
     }
+}
+
+/// Fetches the latest locally known state for one cluster operation.
+pub async fn get_cluster_operation(
+    cfg: &ClientConfig,
+    operation_id: &str,
+) -> Result<ClusterOperationSummary> {
+    let operation_id = Uuid::parse_str(operation_id)
+        .with_context(|| format!("invalid cluster operation id: {operation_id}"))?;
+    let topology = topology_capability(cfg).await?;
+    let mut request = topology.get_cluster_operation_request();
+    request.get().set_id(operation_id.as_bytes());
+
+    let response = request
+        .send()
+        .promise
+        .await
+        .context("getClusterOperation RPC failed")?;
+    let op = response
+        .get()
+        .context("failed to read getClusterOperation response")?
+        .get_op()
+        .context("getClusterOperation response missing operation")?;
+    ClusterOperationSummary::from_capnp(op)
 }
 
 /// Returns the topology capability from the local session for cluster orchestration RPCs.
