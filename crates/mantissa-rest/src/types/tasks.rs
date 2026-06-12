@@ -73,6 +73,50 @@ pub struct TaskLogsQuery {
     pub timestamps: bool,
 }
 
+/// REST WebSocket query parameters for attaching to one task.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskAttachQuery {
+    #[serde(default = "default_true")]
+    pub logs: bool,
+    #[serde(default = "default_true")]
+    pub stream: bool,
+    #[serde(default = "default_true")]
+    pub stdin: bool,
+    #[serde(default = "default_true")]
+    pub stdout: bool,
+    #[serde(default = "default_true")]
+    pub stderr: bool,
+    #[serde(default)]
+    pub detach_keys: Option<String>,
+    #[serde(default)]
+    pub tty_width: Option<u16>,
+    #[serde(default)]
+    pub tty_height: Option<u16>,
+}
+
+/// REST WebSocket query parameters for starting one task exec session.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskExecQuery {
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default = "default_true")]
+    pub stdin: bool,
+    #[serde(default = "default_true")]
+    pub stdout: bool,
+    #[serde(default = "default_true")]
+    pub stderr: bool,
+    #[serde(default)]
+    pub tty: bool,
+    #[serde(default)]
+    pub detach_keys: Option<String>,
+    #[serde(default)]
+    pub tty_width: Option<u16>,
+    #[serde(default)]
+    pub tty_height: Option<u16>,
+}
+
 impl TaskLogsQuery {
     /// Validates query options before the worker starts a Cap'n Proto log stream.
     pub fn validate(&self) -> Result<(), String> {
@@ -87,6 +131,24 @@ impl TaskLogsQuery {
             "invalid tail '{tail}': expected a non-negative integer or 'all'"
         ))
     }
+}
+
+impl TaskExecQuery {
+    /// Validates query options before the worker starts a Cap'n Proto exec session.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.command.is_empty() {
+            return Err("command must contain at least one argument".to_string());
+        }
+        if self.command.iter().any(|arg| arg.trim().is_empty()) {
+            return Err("command arguments must not be empty".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Returns true for enabled-by-default stream options.
+fn default_true() -> bool {
+    true
 }
 
 /// Returns the default CPU request for REST task submissions.

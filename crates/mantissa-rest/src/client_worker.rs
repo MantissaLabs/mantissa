@@ -1,4 +1,10 @@
-use crate::stream::task_logs::{TASK_LOG_EVENT_BUFFER, TaskLogEvent, TaskLogHttpStream};
+use crate::stream::{
+    task_exec::{
+        TASK_INTERACTIVE_EVENT_BUFFER, TaskInteractiveEvent, TaskInteractiveInput,
+        TaskInteractiveSession,
+    },
+    task_logs::{TASK_LOG_EVENT_BUFFER, TaskLogEvent, TaskLogHttpStream},
+};
 use crate::types::{
     agents::{
         AgentInputRequest, AgentInputResponse, AgentRunSummary, AgentSession, AgentSessionDetail,
@@ -19,7 +25,7 @@ use crate::types::{
     scheduler::SchedulerSummary,
     secrets::{SecretDeleteResponse, SecretDetail, SecretSummary, SecretUpsertRequest},
     services::{ServiceDeployRequest, ServiceDeployResponse, ServiceSummary},
-    tasks::{TaskLogsQuery, TaskStartRequest, TaskSummary},
+    tasks::{TaskAttachQuery, TaskExecQuery, TaskLogsQuery, TaskStartRequest, TaskSummary},
     volumes::{
         VolumeCreateRequest, VolumeDeleteResponse, VolumeImportRequest, VolumeInspect, VolumeSpec,
         VolumeSummary,
@@ -383,6 +389,34 @@ impl ClientWorkerHandle {
         request: TaskLogsQuery,
     ) -> Result<TaskLogHttpStream, ClientWorkerError> {
         self.send(|respond_to| ClientCommand::TaskLogs {
+            selector,
+            request: Box::new(request),
+            respond_to,
+        })
+        .await
+    }
+
+    /// Opens one bidirectional task attach WebSocket bridge.
+    pub async fn task_attach(
+        &self,
+        selector: String,
+        request: TaskAttachQuery,
+    ) -> Result<TaskInteractiveSession, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::TaskAttach {
+            selector,
+            request: Box::new(request),
+            respond_to,
+        })
+        .await
+    }
+
+    /// Opens one bidirectional task exec WebSocket bridge.
+    pub async fn task_exec(
+        &self,
+        selector: String,
+        request: TaskExecQuery,
+    ) -> Result<TaskInteractiveSession, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::TaskExec {
             selector,
             request: Box::new(request),
             respond_to,
@@ -818,6 +852,16 @@ enum ClientCommand {
         request: Box<TaskLogsQuery>,
         respond_to: oneshot::Sender<Result<TaskLogHttpStream, ClientWorkerError>>,
     },
+    TaskAttach {
+        selector: String,
+        request: Box<TaskAttachQuery>,
+        respond_to: oneshot::Sender<Result<TaskInteractiveSession, ClientWorkerError>>,
+    },
+    TaskExec {
+        selector: String,
+        request: Box<TaskExecQuery>,
+        respond_to: oneshot::Sender<Result<TaskInteractiveSession, ClientWorkerError>>,
+    },
     StartTask {
         request: Box<TaskStartRequest>,
         respond_to: oneshot::Sender<Result<TaskSummary, ClientWorkerError>>,
@@ -1089,6 +1133,20 @@ async fn client_worker_loop(config: ClientConfig, mut receiver: mpsc::Receiver<C
                 respond_to,
             } => {
                 let _ignored = respond_to.send(start_task_logs(&config, selector, *request));
+            }
+            ClientCommand::TaskAttach {
+                selector,
+                request,
+                respond_to,
+            } => {
+                let _ignored = respond_to.send(start_task_attach(&config, selector, *request));
+            }
+            ClientCommand::TaskExec {
+                selector,
+                request,
+                respond_to,
+            } => {
+                let _ignored = respond_to.send(start_task_exec(&config, selector, *request));
             }
             ClientCommand::StartTask {
                 request,
@@ -1626,6 +1684,229 @@ fn start_task_logs(
     Ok(TaskLogHttpStream::new(events_rx, cancel_tx))
 }
 
+/// Starts one worker-local task attach bridge and returns its WebSocket channels.
+fn start_task_attach(
+    config: &ClientConfig,
+    selector: String,
+    request: TaskAttachQuery,
+) -> Result<TaskInteractiveSession, ClientWorkerError> {
+    let selector = clean_required_name("task selector", &selector)?.to_string();
+    let config = config.clone();
+    let (events_tx, events_rx) = mpsc::channel(TASK_INTERACTIVE_EVENT_BUFFER);
+    let (input_tx, input_rx) = mpsc::channel(TASK_INTERACTIVE_EVENT_BUFFER);
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+
+    tokio::task::spawn_local(async move {
+        let sink = crate::stream::task_exec::new_task_interactive_sink(events_tx.clone());
+        let options = tasks::TaskAttachOptions {
+            logs: request.logs,
+            stream: request.stream,
+            stdin: request.stdin,
+            stdout: request.stdout,
+            stderr: request.stderr,
+            detach_keys: clean_optional_text(request.detach_keys),
+            tty_width: request.tty_width,
+            tty_height: request.tty_height,
+        };
+
+        match tasks::attach_with_sink(&config, &selector, &options, sink).await {
+            Ok(session) => drive_attach_session(session, input_rx, cancel_rx, events_tx).await,
+            Err(error) => {
+                let _ignored = events_tx
+                    .send(TaskInteractiveEvent::error(error.to_string()))
+                    .await;
+            }
+        }
+    });
+
+    Ok(TaskInteractiveSession::new(
+        input_tx, events_rx, cancel_tx, false,
+    ))
+}
+
+/// Starts one worker-local task exec bridge and returns its WebSocket channels.
+fn start_task_exec(
+    config: &ClientConfig,
+    selector: String,
+    request: TaskExecQuery,
+) -> Result<TaskInteractiveSession, ClientWorkerError> {
+    request
+        .validate()
+        .map_err(ClientWorkerError::InvalidRequest)?;
+    let selector = clean_required_name("task selector", &selector)?.to_string();
+    let config = config.clone();
+    let (events_tx, events_rx) = mpsc::channel(TASK_INTERACTIVE_EVENT_BUFFER);
+    let (input_tx, input_rx) = mpsc::channel(TASK_INTERACTIVE_EVENT_BUFFER);
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+
+    tokio::task::spawn_local(async move {
+        let sink = crate::stream::task_exec::new_task_interactive_sink(events_tx.clone());
+        let options = tasks::TaskExecOptions {
+            command: request.command,
+            stdin: request.stdin,
+            stdout: request.stdout,
+            stderr: request.stderr,
+            tty: request.tty,
+            detach_keys: clean_optional_text(request.detach_keys),
+            tty_width: request.tty_width,
+            tty_height: request.tty_height,
+        };
+
+        match tasks::exec_with_sink(&config, &selector, &options, sink).await {
+            Ok(session) => {
+                let wait_session = session.clone();
+                let wait_events = events_tx.clone();
+                tokio::task::spawn_local(async move {
+                    match tasks::wait_exec_result(&wait_session).await {
+                        Ok(result) => {
+                            let _ignored = wait_events
+                                .send(TaskInteractiveEvent::result(result.exit_code))
+                                .await;
+                        }
+                        Err(error) => {
+                            let _ignored = wait_events
+                                .send(TaskInteractiveEvent::error(error.to_string()))
+                                .await;
+                        }
+                    }
+                });
+                drive_exec_session(session, input_rx, cancel_rx, events_tx).await;
+            }
+            Err(error) => {
+                let _ignored = events_tx
+                    .send(TaskInteractiveEvent::error(error.to_string()))
+                    .await;
+            }
+        }
+    });
+
+    Ok(TaskInteractiveSession::new(
+        input_tx, events_rx, cancel_tx, true,
+    ))
+}
+
+/// Forwards WebSocket input events into one Cap'n Proto attach session.
+async fn drive_attach_session(
+    session: mantissa_protocol::task::task_attach_session::Client,
+    mut input_rx: mpsc::Receiver<TaskInteractiveInput>,
+    mut cancel_rx: oneshot::Receiver<()>,
+    events_tx: mpsc::Sender<TaskInteractiveEvent>,
+) {
+    loop {
+        tokio::select! {
+            _ = &mut cancel_rx => {
+                close_attach_input(&session, &events_tx).await;
+                return;
+            }
+            input = input_rx.recv() => {
+                match input {
+                    Some(TaskInteractiveInput::Data(bytes)) => {
+                        if !push_attach_input(&session, bytes, &events_tx).await {
+                            return;
+                        }
+                    }
+                    Some(TaskInteractiveInput::CloseInput) | None => {
+                        close_attach_input(&session, &events_tx).await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Forwards WebSocket input events into one Cap'n Proto exec session.
+async fn drive_exec_session(
+    session: mantissa_protocol::task::task_exec_session::Client,
+    mut input_rx: mpsc::Receiver<TaskInteractiveInput>,
+    mut cancel_rx: oneshot::Receiver<()>,
+    events_tx: mpsc::Sender<TaskInteractiveEvent>,
+) {
+    loop {
+        tokio::select! {
+            _ = &mut cancel_rx => {
+                close_exec_input(&session, &events_tx).await;
+                return;
+            }
+            input = input_rx.recv() => {
+                match input {
+                    Some(TaskInteractiveInput::Data(bytes)) => {
+                        if !push_exec_input(&session, bytes, &events_tx).await {
+                            return;
+                        }
+                    }
+                    Some(TaskInteractiveInput::CloseInput) | None => {
+                        close_exec_input(&session, &events_tx).await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Pushes one stdin chunk into an attach session and reports failures in-band.
+async fn push_attach_input(
+    session: &mantissa_protocol::task::task_attach_session::Client,
+    bytes: Vec<u8>,
+    events_tx: &mpsc::Sender<TaskInteractiveEvent>,
+) -> bool {
+    let mut request = session.push_input_request();
+    request.get().set_data(&bytes);
+    match request.send().await {
+        Ok(()) => true,
+        Err(error) => {
+            let _ignored = events_tx
+                .send(TaskInteractiveEvent::error(error.to_string()))
+                .await;
+            false
+        }
+    }
+}
+
+/// Pushes one stdin chunk into an exec session and reports failures in-band.
+async fn push_exec_input(
+    session: &mantissa_protocol::task::task_exec_session::Client,
+    bytes: Vec<u8>,
+    events_tx: &mpsc::Sender<TaskInteractiveEvent>,
+) -> bool {
+    let mut request = session.push_input_request();
+    request.get().set_data(&bytes);
+    match request.send().await {
+        Ok(()) => true,
+        Err(error) => {
+            let _ignored = events_tx
+                .send(TaskInteractiveEvent::error(error.to_string()))
+                .await;
+            false
+        }
+    }
+}
+
+/// Closes stdin on an attach session and reports failures in-band.
+async fn close_attach_input(
+    session: &mantissa_protocol::task::task_attach_session::Client,
+    events_tx: &mpsc::Sender<TaskInteractiveEvent>,
+) {
+    if let Err(error) = session.close_input_request().send().promise.await {
+        let _ignored = events_tx
+            .send(TaskInteractiveEvent::error(error.to_string()))
+            .await;
+    }
+}
+
+/// Closes stdin on an exec session and reports failures in-band.
+async fn close_exec_input(
+    session: &mantissa_protocol::task::task_exec_session::Client,
+    events_tx: &mpsc::Sender<TaskInteractiveEvent>,
+) {
+    if let Err(error) = session.close_input_request().send().promise.await {
+        let _ignored = events_tx
+            .send(TaskInteractiveEvent::error(error.to_string()))
+            .await;
+    }
+}
+
 /// Starts one standalone task through the reusable Mantissa client API.
 async fn start_task(
     config: &ClientConfig,
@@ -1909,4 +2190,12 @@ fn clean_required_name<'a>(field: &str, value: &'a str) -> Result<&'a str, Clien
         )));
     }
     Ok(value)
+}
+
+/// Normalizes optional text fields and drops empty values.
+fn clean_optional_text(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    })
 }

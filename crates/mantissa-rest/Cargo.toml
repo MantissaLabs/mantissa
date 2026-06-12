@@ -13,7 +13,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22.1"
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
