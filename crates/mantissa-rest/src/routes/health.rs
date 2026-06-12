@@ -1,7 +1,7 @@
 use crate::{
     auth::RestAuth,
-    client_worker::ClientWorkerError,
     error::RestError,
+    routes::worker_error_to_rest,
     state::AppState,
     types::health::{HealthResponse, LivenessResponse},
 };
@@ -21,7 +21,7 @@ pub async fn health(
         .client()
         .health()
         .await
-        .map_err(client_worker_error_to_rest)?;
+        .map_err(worker_error_to_rest)?;
     if health.daemon_reachable {
         Ok(Json(HealthResponse::daemon_reachable()))
     } else {
@@ -29,17 +29,12 @@ pub async fn health(
     }
 }
 
-/// Maps client worker failures to HTTP service-unavailable errors.
-fn client_worker_error_to_rest(error: ClientWorkerError) -> RestError {
-    RestError::service_unavailable(error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         auth::RestAuthConfig,
-        client_worker::{ClientHealth, ClientWorkerHandle},
+        client_worker::{ClientHealth, ClientWorkerError, ClientWorkerHandle},
         server,
     };
     use axum::{

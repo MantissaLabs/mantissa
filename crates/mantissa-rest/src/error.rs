@@ -35,6 +35,16 @@ impl RestError {
         Self::new(StatusCode::UNAUTHORIZED, "unauthorized", message)
     }
 
+    /// Creates an HTTP 400 error.
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "bad_request", message)
+    }
+
+    /// Creates an HTTP 404 error.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, "not_found", message)
+    }
+
     /// Creates an HTTP 503 error for local daemon or worker unavailability.
     pub fn service_unavailable(message: impl Into<String>) -> Self {
         Self::new(
@@ -42,6 +52,11 @@ impl RestError {
             "service_unavailable",
             message,
         )
+    }
+
+    /// Creates an HTTP 500 error for unexpected gateway or client failures.
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
     }
 
     /// Returns the HTTP status attached to this error.

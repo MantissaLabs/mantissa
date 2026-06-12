@@ -1,1 +1,121 @@
-//! REST-facing network types.
+use mantissa_client::networks::{
+    NetworkInspect as ClientNetworkInspect, NetworkPeerStatus as ClientNetworkPeerStatus,
+    NetworkSpec as ClientNetworkSpec, NetworkSummary as ClientNetworkSummary,
+};
+use serde::Serialize;
+
+/// REST-facing network summary row.
+#[derive(Clone, Debug, Serialize)]
+pub struct NetworkSummary {
+    pub id: String,
+    pub name: String,
+    pub driver: String,
+    pub status: String,
+    pub vni: u32,
+    pub subnet_cidr: String,
+    pub peer_count: u32,
+    pub ready_peers: u32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<ClientNetworkSummary> for NetworkSummary {
+    /// Converts the client network summary into the REST JSON shape.
+    fn from(value: ClientNetworkSummary) -> Self {
+        Self {
+            id: value.id.to_string(),
+            name: value.name,
+            driver: value.driver.to_string(),
+            status: value.status.to_string(),
+            vni: value.vni,
+            subnet_cidr: value.subnet_cidr,
+            peer_count: value.peer_count,
+            ready_peers: value.ready_peers,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+/// REST-facing canonical network specification.
+#[derive(Clone, Debug, Serialize)]
+pub struct NetworkSpec {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub driver: String,
+    pub subnet_cidr: String,
+    pub vni: u32,
+    pub mtu: u32,
+    pub created_at: String,
+    pub updated_at: String,
+    pub status: String,
+    pub sealed: bool,
+    pub bpf_programs: Vec<String>,
+}
+
+impl From<ClientNetworkSpec> for NetworkSpec {
+    /// Converts the client network spec into the REST JSON shape.
+    fn from(value: ClientNetworkSpec) -> Self {
+        Self {
+            id: value.id.to_string(),
+            name: value.name,
+            description: value.description,
+            driver: value.driver.to_string(),
+            subnet_cidr: value.subnet_cidr,
+            vni: value.vni,
+            mtu: value.mtu,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            status: value.status.to_string(),
+            sealed: value.sealed,
+            bpf_programs: value.bpf_programs,
+        }
+    }
+}
+
+/// REST-facing network peer convergence row.
+#[derive(Clone, Debug, Serialize)]
+pub struct NetworkPeerStatus {
+    pub peer_id: String,
+    pub peer_name: String,
+    pub state: String,
+    pub error: Option<String>,
+    pub updated_at: String,
+}
+
+impl From<ClientNetworkPeerStatus> for NetworkPeerStatus {
+    /// Converts the client peer status into the REST JSON shape.
+    fn from(value: ClientNetworkPeerStatus) -> Self {
+        Self {
+            peer_id: value.peer_id.to_string(),
+            peer_name: value.peer_name,
+            state: value.state.to_string(),
+            error: value.error,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+/// REST-facing network inspection response.
+#[derive(Clone, Debug, Serialize)]
+pub struct NetworkInspect {
+    pub spec: NetworkSpec,
+    pub peers: Vec<NetworkPeerStatus>,
+    pub attachment_count: u32,
+}
+
+impl From<ClientNetworkInspect> for NetworkInspect {
+    /// Converts the client network inspect view into the REST JSON shape.
+    fn from(value: ClientNetworkInspect) -> Self {
+        Self {
+            spec: value.spec.into(),
+            peers: value
+                .peers
+                .into_iter()
+                .map(NetworkPeerStatus::from)
+                .collect(),
+            attachment_count: value.attachment_count,
+        }
+    }
+}

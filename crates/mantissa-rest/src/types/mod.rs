@@ -2,6 +2,7 @@
 
 pub mod agents;
 pub mod clusters;
+pub mod common;
 pub mod health;
 pub mod jobs;
 pub mod networks;
