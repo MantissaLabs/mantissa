@@ -1,529 +1,381 @@
-# Local REST API Facade Plan
+# Local REST API Facade Completion Plan
 
 ## Goal
 
-Add a local, typed REST API facade for Mantissa that is convenient for local
-programs, dashboards, and scripts while keeping Cap'n Proto as the real node and
-client protocol.
+Finish the local, typed REST API facade so it is a credible local admin
+convenience layer over the existing Cap'n Proto session.
 
-This is not a public internet-facing cluster API. The first implementation
-should be a local admin gateway over the existing daemon Unix socket, with the
-same effective authority as any client that can connect to that socket.
+The baseline crate, loopback gateway, auth, client worker, health routes, and
+several resource routes already exist. This plan only tracks remaining work.
+Do not reimplement completed foundation work unless a later step finds a bug.
 
-## Non-Goals
+REST remains a local cluster-admin interface. It is not a public internet API,
+not a node-to-node protocol, and not a generated projection of Cap'n Proto.
 
-- Do not generate REST code from Cap'n Proto.
-- Do not expose peer bootstrap, gossip, anti-entropy sync, internal workload
-  assignment, or scheduler lease mutation over REST.
-- Do not make REST part of the node-to-node protocol.
-- Do not promise Kubernetes-compatible semantics or public API stability.
-- Do not add fine-grained RBAC in the first version.
+## Ground Rules
 
-## High-Level Shape
+- Keep Cap'n Proto as the real node and client protocol.
+- Keep `mantissa-rest` as a manual, typed facade with explicit JSON types.
+- Add reusable typed helpers to `mantissa-client` when REST needs behavior that
+  is currently only available through CLI-local protocol code.
+- Do not expose gossip, anti-entropy sync, internal workload mutation, or
+  scheduler lease prepare/commit/abort over REST.
+- Keep every `/v1` route authenticated except `/healthz`.
+- Keep CORS disabled unless a concrete local-browser use case is accepted.
+- Use "types" for REST JSON structs and request/response objects.
+- When commits are requested, use the repository style from `master`: subject
+  line plus wrapped explanatory paragraphs, with body lines no longer than 80
+  columns.
 
-The recommended first implementation is a new workspace crate:
-
-```text
-crates/
-  mantissa-rest/
-    Cargo.toml
-    src/
-      lib.rs
-      config.rs
-      server.rs
-      state.rs
-      error.rs
-      auth.rs
-      client_worker.rs
-      types/
-        mod.rs
-        agents.rs
-        clusters.rs
-        jobs.rs
-        networks.rs
-        nodes.rs
-        scheduler.rs
-        secrets.rs
-        services.rs
-        tasks.rs
-        volumes.rs
-      routes/
-        mod.rs
-        agents.rs
-        clusters.rs
-        jobs.rs
-        networks.rs
-        nodes.rs
-        scheduler.rs
-        secrets.rs
-        services.rs
-        tasks.rs
-        volumes.rs
-      stream/
-        mod.rs
-        task_logs.rs
-        task_exec.rs
-```
-
-The dependency direction should be:
-
-```text
-local HTTP client
-  -> mantissa-rest
-    -> mantissa-client / mantissa-protocol
-      -> local Unix socket
-        -> daemon ClusterSession
-```
-
-`mantissa-rest` owns HTTP details: routing, path/query parsing, JSON types,
-HTTP status codes, auth headers, CORS posture, and streaming choices.
-
-`mantissa-client` should remain the reusable typed client/domain layer. If a
-REST route needs an operation that only exists inline in the CLI today, add a
-typed function to `mantissa-client` first, then call it from REST.
-
-## Runtime Constraint: Cap'n Proto Local Worker
-
-The current Cap'n Proto client path uses local tasks and `Rc`-backed RPC
-capabilities. HTTP handlers should not directly store or await those clients in
-Axum state.
-
-Use a local client worker:
-
-```text
-Axum handler, Send future
-  -> mpsc command + oneshot response
-    -> client_worker on LocalSet
-      -> mantissa-client / capnp RPC
-```
-
-This keeps HTTP handlers ordinary `Send` futures while all Cap'n Proto RPC work
-runs on a single local task executor. It also creates one place to handle Unix
-socket reconnects and Cap'n Proto session invalidation.
-
-Initial worker behavior:
-
-- Own a `mantissa_client::config::ClientConfig`.
-- Accept typed commands such as `JobsList`, `ServicesInspect`, `TaskStart`.
-- Open a local session lazily.
-- Reconnect on transport/session failure.
-- Return owned HTTP-ready Rust values, not Cap'n Proto readers.
-
-Later worker behavior:
-
-- Cache capability handles if that proves useful.
-- Track basic per-command latency and failure metrics.
-- Support a second backend for embedded daemon mode.
-
-## Configuration
-
-Add a REST config type in `mantissa-rest`:
-
-```rust
-pub struct RestConfig {
-    pub bind_addr: std::net::SocketAddr,
-    pub socket: Option<std::path::PathBuf>,
-    pub auth: RestAuthConfig,
-}
-```
-
-Defaults:
-
-- Bind to `127.0.0.1:6579`.
-- Use normal Mantissa Unix socket auto-discovery when `socket` is unset.
-- Disable CORS by default.
-- Reject non-loopback bind addresses unless auth is explicitly configured.
-
-Auth policy:
-
-- Treat access as cluster-admin.
-- Support `Authorization: Bearer <token>`.
-- Accept token from explicit config or `MANTISSA_REST_TOKEN`.
-- Allow unauthenticated mode only behind an explicit dev flag.
-- Do not expose secrets through browser-friendly CORS by default.
-
-This keeps the security model simple and avoids accidentally turning the local
-admin API into a remotely reachable control plane.
-
-## Crate Dependencies
-
-Add new dependencies only to `crates/mantissa-rest` first:
-
-- `axum` for routing and extractors.
-- `tower-http` only if needed for tracing or compression.
-- `serde` and `serde_json` for JSON types.
-- `tokio` for async runtime, channels, and local tasks.
-- `uuid` with `serde` for public UUID strings.
-- `anyhow` or `thiserror` for internal errors.
-- `mantissa-client` and `mantissa-protocol`.
-
-Do not add these dependencies to the root daemon until embedded REST serving is
-actually needed.
-
-## Public REST Data Rules
-
-Do not serialize raw Cap'n Proto JSON shapes.
-
-Use explicit REST-facing types with these conventions:
-
-- IDs are UUID strings, not raw 16-byte arrays.
-- Opaque binary data is base64 only when it truly must be exposed.
-- Timestamps stay RFC3339 strings until the internal API provides typed time.
-- Empty protocol strings that mean "unset" become `null` in JSON where useful.
-- Enums are lowercase snake-case strings.
-- Request types should use `deny_unknown_fields` once the surface stabilizes.
-
-Example:
-
-```json
-{
-  "id": "ab8d4db5-c4cb-4f18-a97d-9fbefb457163",
-  "name": "api",
-  "status": "running"
-}
-```
-
-## Route Scope
-
-Use `/v1` from the beginning. This does not promise external stability, but it
-keeps route evolution explicit.
-
-### Health
-
-- `GET /healthz`
-- `GET /v1/health`
-
-These should validate that the gateway is running and can ping the local
-Mantissa session.
-
-### Nodes
-
-- `GET /v1/nodes`
-- `GET /v1/nodes/{node_id}`
-- `POST /v1/nodes/{node_id}/drain`
-- `POST /v1/nodes/{node_id}/resume`
-- `DELETE /v1/nodes/{node_id}`
-
-Do not expose join token rotation in the first REST pass unless there is a
-specific local automation use case.
-
-### Clusters
-
-- `GET /v1/clusters/views`
-- `GET /v1/clusters/current`
-- `GET /v1/clusters/operations`
-- `GET /v1/clusters/operations/{operation_id}`
-
-Cluster split/merge can wait until the read-only cluster routes are stable.
-
-### Services
-
-- `GET /v1/services`
-- `POST /v1/services`
-- `GET /v1/services/{selector}`
-- `GET /v1/services/{selector}/status`
-- `DELETE /v1/services/{selector}`
-
-The `POST /v1/services` body should use a JSON type aligned with the existing
-service manifest model, not the raw Cap'n Proto `ServiceDeploySpec`.
-
-### Jobs
-
-- `GET /v1/jobs`
-- `POST /v1/jobs`
-- `GET /v1/jobs/{job_id}`
-- `POST /v1/jobs/{job_id}/cancel`
-- `DELETE /v1/jobs/{job_id}`
-
-The submit body should mirror first-class job intent. Manifest-backed submission
-can be added after raw JSON submission works.
+## Current Missing Work
 
 ### Agents
+
+The agent modules currently exist only as placeholders. Implement the REST
+surface for first-class agent sessions and runs.
+
+Routes:
 
 - `GET /v1/agents/sessions`
 - `POST /v1/agents/sessions`
 - `GET /v1/agents/sessions/{session_id}`
+- `GET /v1/agents/sessions/{session_id}/runs`
 - `POST /v1/agents/sessions/{session_id}/input`
 - `POST /v1/agents/sessions/{session_id}/cancel`
 - `POST /v1/agents/sessions/{session_id}/close`
 - `DELETE /v1/agents/sessions/{session_id}`
 
-Agent logs and snapshots can follow the same streaming pattern as task logs.
+Tasks:
 
-### Tasks
+- Add REST-facing agent session and run types.
+- Add request types for session submission and input submission.
+- Add client worker commands for every agent operation.
+- Add or reuse `mantissa-client` agent helpers rather than decoding protocol
+  responses directly in route handlers.
+- Decide whether agent session submission should accept the same manifest shape
+  used by the CLI or a narrower first-class JSON request. Prefer reusing the
+  manifest normalization path when it already exists.
+- Map closed, active, missing, and invalid session states to stable REST errors.
 
-- `GET /v1/tasks`
-- `POST /v1/tasks`
-- `GET /v1/tasks/{selector}`
-- `POST /v1/tasks/{selector}/stop`
-- `GET /v1/tasks/{selector}/logs`
+Completion criteria:
+
+- Agent REST routes cover the same public operations as `Agents` Cap'n Proto.
+- Agent routes have unit tests for auth, validation, and not-found behavior.
+- At least one integration test submits, inspects, sends input, closes, and
+  deletes an agent session through REST.
+
+### Integration Tests
+
+There is no root-level REST integration suite. Add one that exercises HTTP
+against a real local test node.
+
+Tasks:
+
+- Add `tests/rest_api.rs` or a small `tests/rest_api/` module tree.
+- Reuse the existing `TestNode` harness.
+- Start an Axum listener on an ephemeral loopback port, or call the router
+  directly when a real TCP listener is not required.
+- Use a real `ClientWorkerHandle` against the test node socket for at least the
+  Cap'n Proto integration path.
+- Keep route-only tests in `crates/mantissa-rest` for fast worker-mock checks.
+- Avoid arbitrary sleeps; use existing convergence helpers.
+- Do not run more than one `cargo test` process at a time.
+
+Minimum integration scenarios:
+
+- `/healthz` works without auth.
+- `/v1/health` rejects missing auth and succeeds with a valid token.
+- Nodes list returns the test node.
+- Job submit/list/inspect/cancel/delete works for a small manifest.
+- Service deploy/list/status/delete works for a small manifest.
+- Task start/list/logs/stop works, including log stream closure.
+- Network create/list/inspect/peers/attachments/delete works where attachments
+  can be produced deterministically.
+- Volume create/list/status/delete works for a managed local volume.
+- Secret create/list/get/update/delete works and preserves base64 payload rules.
+- Agent session lifecycle works once agent routes are implemented.
+
+Completion criteria:
+
+- The REST facade is exercised through HTTP and the real Cap'n Proto session.
+- Integration tests are deterministic on the existing local test harness.
+- `cargo test --test rest_api` passes independently.
+
+### Task Attach And Exec
+
+Task logs are implemented, but attach and exec are not exposed over REST.
+
+Routes:
+
 - `POST /v1/tasks/{selector}/exec`
+- `POST /v1/tasks/{selector}/attach`
 
-Use a streaming HTTP response or server-sent events for logs. Use WebSocket for
-interactive attach and exec after basic logs work.
+Tasks:
 
-### Networks
+- Pick one streaming transport for interactive stdin/stdout. WebSocket is the
+  most practical fit because it supports bidirectional byte streams.
+- Define a small framed JSON protocol for stdin, stdout, stderr, console,
+  terminal resize, close-input, exit status, and errors.
+- Bridge Cap'n Proto `TaskAttachSession` and `TaskExecSession` to the HTTP
+  stream without blocking the single client worker command loop.
+- Preserve backpressure with bounded channels.
+- Cancel the Cap'n Proto session when the HTTP client disconnects.
+- Return exec exit status in a terminal frame.
 
-- `GET /v1/networks`
-- `POST /v1/networks`
-- `GET /v1/networks/{network_id}`
+Completion criteria:
+
+- Non-interactive exec works for a command that exits.
+- Interactive stdin forwarding works.
+- Client disconnect releases the worker-local task.
+- Tests cover frame encoding, close-input, exit status, and cancellation.
+
+### Network Peer And Attachment Subroutes
+
+Network inspect embeds peer summaries, but the protocol exposes peer and
+attachment listings as distinct operations.
+
+Routes:
+
 - `GET /v1/networks/{network_id}/peers`
 - `GET /v1/networks/{network_id}/attachments`
-- `DELETE /v1/networks/{network_id}`
-
-### Volumes
-
-- `GET /v1/volumes`
-- `POST /v1/volumes`
-- `POST /v1/volumes/import`
-- `GET /v1/volumes/{selector}`
-- `GET /v1/volumes/{selector}/status`
-- `DELETE /v1/volumes/{selector}`
-
-### Secrets
-
-- `GET /v1/secrets`
-- `POST /v1/secrets`
-- `PUT /v1/secrets/{name}`
-- `GET /v1/secrets/{name}`
-- `GET /v1/secrets/{name}/versions/{version_id}`
-- `DELETE /v1/secrets/{name}`
-
-Secrets expose sensitive values. Keep auth mandatory for these routes and do
-not add permissive CORS.
-
-### Scheduler
-
-- `GET /v1/scheduler/summary`
-
-Do not expose lease prepare, commit, or abort over REST initially. Those are
-internal distributed scheduling primitives.
-
-## Error Mapping
-
-Create one `RestError` type implementing `IntoResponse`.
-
-Initial mapping:
-
-- `400 Bad Request`: invalid JSON, bad UUID, invalid query option.
-- `401 Unauthorized`: missing or invalid bearer token.
-- `403 Forbidden`: route disabled by config or non-loopback bind without auth.
-- `404 Not Found`: missing resource when the client layer can identify it.
-- `409 Conflict`: duplicate or conflicting desired state.
-- `422 Unprocessable Entity`: valid JSON with invalid domain intent.
-- `503 Service Unavailable`: local daemon socket missing, refused, or session
-  revoked.
-- `500 Internal Server Error`: unexpected gateway or conversion failure.
-
-Cap'n Proto errors are currently mostly stringly typed. The first version can
-classify obvious local socket failures through `ClientSocketError` and return
-other protocol failures as `500` or `422` depending on context. A later pass can
-improve `mantissa-client` domain errors.
-
-## Implementation Phases
-
-### Phase 0: Planning
-
-Status: current step.
-
-Outputs:
-
-- This note.
-- User ACK before implementation.
-
-### Phase 1: Crate Skeleton And Server
 
 Tasks:
 
-- Add `crates/mantissa-rest` to the workspace.
-- Add `Cargo.toml` and module skeleton.
-- Add `RestConfig`, `RestAuthConfig`, `RestError`, and `AppState`.
-- Add Axum router with `/healthz` and `/v1/health`.
-- Add bearer-token middleware or extractor.
-- Add the local Cap'n Proto `ClientWorker` skeleton.
-- Add unit tests for auth and health error mapping.
+- Add REST-facing `NetworkAttachment` types.
+- Add client worker commands for peer status and attachments.
+- Add or reuse typed `mantissa-client` helpers for `Networks.peerStatus` and
+  `Networks.attachments`.
+- Keep `GET /v1/networks/{network_id}` as the compact inspect response.
 
 Completion criteria:
 
-- `cargo fmt --all` passes.
-- `cargo clippy -p mantissa-rest --all-targets -- -D warnings` passes.
-- `cargo test -p mantissa-rest` passes.
-- Running the binary can bind to loopback and return health status.
+- Peer route returns only peer rows.
+- Attachment route returns task, node, assigned IP, MAC, state, traffic
+  publication, and service ownership fields.
+- Integration coverage verifies attachment rows after a networked workload.
 
-### Phase 2: Read-Only Operator Endpoints
+### Cluster Operations And Admin Reads
 
-Start with low-risk read paths.
+Cluster view reads exist, but operation visibility is incomplete.
+
+Routes:
+
+- `GET /v1/clusters/operations`
+- `GET /v1/clusters/operations/{operation_id}`
+- `GET /v1/clusters/split-candidates`
 
 Tasks:
 
-- Add types and routes for nodes list/info.
-- Add jobs list/inspect.
-- Add services list/inspect/status.
-- Add networks list/inspect.
-- Add volumes list/get/status.
-- Add scheduler summary.
-- Add missing typed read functions to `mantissa-client` when CLI-only code is
-  currently doing protocol decoding inline.
+- Confirm whether `mantissa-client` exposes operation listing. If not, add a
+  typed helper around the existing topology capability or registry-backed
+  protocol path.
+- Add REST-facing cluster operation types with status, source view, target
+  views, timestamps, and error detail when available.
+- Add split-candidate types for local dashboard use.
+- Leave split and merge mutation routes out until the read side is stable.
 
 Completion criteria:
 
-- All read routes return owned JSON types.
-- No handler returns or stores Cap'n Proto readers/builders.
-- Route tests cover success and representative error cases.
+- REST can show active and retained cluster operations.
+- A split or merge protocol integration test can observe the operation through
+  REST.
 
-### Phase 3: Mutating Resource Endpoints
+### Node Admin Completeness
+
+Drain, resume, and evict exist. Useful local admin reads and label mutation are
+still missing.
+
+Routes:
+
+- `GET /v1/nodes/{node_id}/drain`
+- `PUT /v1/nodes/{node_id}/labels`
+
+Deferred routes, only if accepted later:
+
+- `GET /v1/nodes/join-token`
+- `POST /v1/nodes/join-token/rotate`
 
 Tasks:
 
-- Add service deploy/delete.
-- Add job submit/cancel/delete.
-- Add task start/stop.
-- Add network create/delete.
-- Add volume create/import/delete.
-- Add secret create/update/delete/get.
-- Add node drain/resume/evict.
-- Keep every route behind bearer auth.
+- Add a drain-status response type.
+- Add a label update request that supports set, remove, and replace semantics.
+- Reuse topology `getNodeDrainStatus` and `setNodeLabels`.
+- Keep join-token routes out unless there is a concrete local automation need.
 
 Completion criteria:
 
-- Mutating routes are deterministic and idempotent where the domain supports it.
-- Domain validation happens before calling Cap'n Proto where reasonable.
-- Errors map to stable JSON error bodies.
+- Operators can see why a drain is blocked through REST.
+- Label changes through REST are visible in node list output and scheduling
+  constraints after convergence.
 
-### Phase 4: Streaming
+### REST Type Coverage
+
+Some current request types are narrower than the underlying domain model. That
+is acceptable for an MVP but incomplete for a practical facade.
 
 Tasks:
 
-- Implement `GET /v1/tasks/{selector}/logs`.
-- Bridge Cap'n Proto `TaskLogSink` into an HTTP body stream.
-- Start with non-interactive log streaming before attach/exec.
-- Add WebSocket support for `exec` only after log streaming is correct.
-- Preserve backpressure through bounded channels.
+- Expand standalone task start to support environment variables, secret files,
+  networks, placement, liveness, isolation, admission, deadlines, graceful
+  termination, and pre-stop commands when supported by the client layer.
+- Audit service, job, and agent manifest request coverage against CLI manifest
+  behavior.
+- Add `deny_unknown_fields` to every stable request type.
+- Normalize optional empty strings to `null` in response types where this makes
+  the API clearer.
+- Keep binary fields base64 encoded.
 
 Completion criteria:
 
-- A log stream closes cleanly on task completion.
-- Client disconnect cancels the Cap'n Proto sink bridge.
-- Follow mode does not leak tasks after disconnect.
+- REST can express the same common workload intent as CLI manifests.
+- Missing fields are explicitly documented as unsupported rather than silently
+  ignored.
 
-### Phase 5: CLI Or Daemon Integration
+### Error Classification
 
-Pick one of these after the standalone gateway works:
-
-Option A, separate binary:
-
-- Add `mantissa-rest` binary.
-- Run with `mantissa-rest serve`.
-- Keep process lifecycle independent from the daemon.
-
-Option B, daemon subcommand/listener:
-
-- Add an optional REST listener to the main daemon.
-- Reuse the `mantissa-rest` crate.
-- Provide an embedded backend that receives local service clients directly.
-
-Recommendation:
-
-- Start with Option A.
-- Add Option B only when there is a concrete operational reason.
-
-### Phase 6: Documentation And Examples
+Many errors still flow through string-based operation failures. Improve this
+before treating the API as dependable for automation.
 
 Tasks:
 
-- Add docs under `docs/rest-api.md`.
-- Document trust boundary and loopback-only default.
-- Document token configuration.
-- Add curl examples for health, jobs, services, and logs.
-- Document that REST is a local convenience facade over the Cap'n Proto local
-  admin session.
+- Add typed error categories to `mantissa-client` where domain operations can
+  distinguish invalid input, missing resources, conflicts, and unavailable
+  daemon/session failures.
+- Map domain categories to `400`, `404`, `409`, `422`, `503`, or `500`.
+- Keep error bodies stable:
+
+```json
+{
+  "code": "not_found",
+  "message": "task 'demo' not found"
+}
+```
+
+- Add tests for representative errors from jobs, services, tasks, networks,
+  volumes, secrets, agents, and nodes.
 
 Completion criteria:
 
-- Docs explain what is and is not exposed.
-- Docs include examples that can be run against a local daemon.
+- Automation can make decisions from status code and `code`, not from message
+  string parsing.
+- Cap'n Proto transport failures consistently map to `503`.
 
-## Testing Strategy
+### Documentation Accuracy
 
-Unit tests:
+The REST docs must match what is actually exposed.
 
-- JSON type serialization and deserialization.
-- UUID and enum conversion.
-- Auth extractor/middleware.
-- Error response bodies.
+Tasks:
 
-Route tests:
+- Update `docs/rest-api.md` to include the new missing routes as they land.
+- Add a clear "not implemented yet" section until the backlog is complete.
+- Document agent lifecycle examples.
+- Document task exec and attach framing.
+- Document network peers and attachments.
+- Document cluster operations and node drain status.
+- Keep the local cluster-admin trust boundary explicit.
 
-- Use a mock worker for fast HTTP behavior tests.
-- Avoid requiring a real daemon for simple route coverage.
+Completion criteria:
 
-Integration tests:
+- Docs never claim a route exists before it is registered.
+- Curl or WebSocket examples are runnable against a local daemon.
 
-- Add root-level tests only when a route needs real daemon behavior.
-- Use existing testkit/headless helpers where possible.
-- Avoid arbitrary sleeps.
-- Do not run multiple `cargo test` processes concurrently.
+### Operational Readiness
 
-Manual checks:
+The standalone gateway works, but it lacks the operational polish expected for
+regular local use.
 
-- Start a local daemon.
-- Start the REST gateway on loopback.
-- `curl /healthz`.
-- Submit/list/inspect/cancel one job.
-- Deploy/list/inspect/delete one service.
-- Stream logs from a short-lived task.
+Tasks:
 
-Required before marking implementation complete:
+- Add graceful shutdown support to the standalone binary.
+- Add request tracing with route, method, status, and latency fields.
+- Add simple in-process metrics if there is an existing metrics pattern to
+  follow. Otherwise defer metrics.
+- Confirm non-loopback binding is rejected without auth in integration coverage.
+- Add a development example for running the gateway next to a local daemon.
+- Decide whether an embedded daemon listener is still needed. Keep it deferred
+  unless a concrete deployment workflow requires it.
 
-- `cargo fmt --all`
-- `cargo clippy --all-targets -- -D warnings`
-- `cargo test`
+Completion criteria:
 
-## First Implementation Slice After ACK
+- The gateway shuts down cleanly on process termination.
+- Request failures are visible in structured logs.
+- Unsafe bind/auth combinations are covered by tests.
 
-After ACK, implement only Phase 1 unless you explicitly ask for a larger first
-slice.
+### Optional Schema Artifact
 
-Expected first code change:
+This is not required for the first complete local API, but it may be useful for
+client generation.
 
-- New `crates/mantissa-rest` workspace member.
-- `/healthz` and `/v1/health`.
-- Auth plumbing.
-- Local client worker skeleton.
-- Tests for auth/error behavior.
+Tasks:
 
-This creates the foundation without committing to the full endpoint surface in
-one large change.
+- Decide whether to expose an OpenAPI document generated from the manual Axum
+  route/types layer.
+- If adopted, use the REST types as the source of truth rather than Cap'n Proto.
+- Keep the artifact local-facade scoped and do not imply public API stability.
 
-## Risks
+Completion criteria:
 
-Cap'n Proto client `Send` boundaries:
+- OpenAPI generation does not introduce large dependencies into the daemon.
+- The generated schema matches registered routes.
 
-- Mitigation: keep RPC calls inside `ClientWorker` running on a LocalSet.
+## Suggested Next Goal Phases
 
-Stringly typed domain errors:
+### Phase 1: Agents And Route Coverage
 
-- Mitigation: start with conservative HTTP status mapping and improve
-  `mantissa-client` typed errors incrementally.
+- Implement agent types, routes, worker commands, and client helpers.
+- Add focused crate tests.
+- Add at least one real REST integration test for agent lifecycle.
+- Update docs to list agent routes.
 
-REST type drift from CLI/domain behavior:
+### Phase 2: REST Integration Harness
 
-- Mitigation: add reusable typed functions to `mantissa-client` and share them
-  between CLI and REST.
+- Build the root REST integration harness.
+- Cover health, auth, nodes, jobs, services, tasks/logs, networks, volumes,
+  secrets, and agents.
+- Keep tests deterministic and scoped.
 
-Accidental public exposure:
+### Phase 3: Missing Read Routes
 
-- Mitigation: loopback default, auth required for non-loopback, CORS disabled,
-  explicit docs that this is cluster-admin.
+- Add network peers.
+- Add network attachments.
+- Add cluster operation reads.
+- Add split-candidate reads if the client surface supports it cleanly.
+- Add node drain status and labels.
 
-Streaming lifecycle leaks:
+### Phase 4: Interactive Task Streams
 
-- Mitigation: bounded channels, cancellation on client disconnect, focused
-  tests for log stream shutdown.
+- Implement task exec.
+- Implement task attach if the framing works cleanly after exec.
+- Add stream lifecycle and disconnect tests.
+
+### Phase 5: Type And Error Hardening
+
+- Expand workload request coverage.
+- Add typed client errors.
+- Tighten REST error mapping and request validation.
+- Add missing negative tests.
+
+### Phase 6: Docs And Operations
+
+- Correct `docs/rest-api.md` to match the final exposed surface.
+- Add graceful shutdown and request tracing.
+- Add optional OpenAPI only if it stays lean.
+
+## Verification Before Completion
+
+Run these before the next goal is marked complete:
+
+```bash
+cargo fmt --all
+cargo clippy --all-targets -- -D warnings
+cargo test
+git diff --check
+```
+
+Also verify that no `cargo`, `rustc`, or test process is left running after the
+work completes.
 
 ## ACK Checkpoint
 
-Implementation should not begin until the user ACKs this plan.
-
-When ACKed, proceed with Phase 1 and keep changes scoped to the new crate and
-the minimum workspace wiring needed to build it.
+This note is the backlog for the next REST completion goal. Do not start
+implementation from this plan until the user explicitly ACKs the next goal.
