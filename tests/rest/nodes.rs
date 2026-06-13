@@ -1,0 +1,52 @@
+use axum::http::{Method, StatusCode};
+use serde_json::json;
+
+use crate::common;
+use crate::harness::RestTestHarness;
+
+local_test!(rest_nodes_use_real_local_session, {
+    let harness = RestTestHarness::new().await;
+    let node_id = harness.node_id.to_string();
+
+    let (status, value) = harness
+        .json_request(Method::GET, "/v1/nodes", true, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value.as_array().expect("nodes response is array").len(), 1);
+    assert_eq!(value[0]["id"], node_id);
+
+    let (status, value) = harness
+        .json_request(
+            Method::GET,
+            &format!("/v1/nodes/{node_id}/drain"),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["node_id"], node_id);
+    assert_eq!(value["schedulable"], true);
+
+    let (status, value) = harness
+        .json_request(
+            Method::PUT,
+            &format!("/v1/nodes/{node_id}/labels"),
+            true,
+            Some(json!({
+                "labels": ["rest=api", "role=gateway-test"],
+                "replace": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["node_id"], node_id);
+    assert_eq!(value["cleared"], false);
+
+    let (status, value) = harness
+        .json_request(Method::GET, &format!("/v1/nodes/{node_id}"), true, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let labels = value["labels"].as_array().expect("node labels are array");
+    assert!(labels.iter().any(|label| label == "rest=api"));
+    assert!(labels.iter().any(|label| label == "role=gateway-test"));
+});

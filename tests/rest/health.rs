@@ -1,0 +1,49 @@
+use axum::http::{Method, StatusCode};
+
+use crate::common;
+use crate::harness::RestTestHarness;
+
+local_test!(rest_health_uses_real_local_session, {
+    let harness = RestTestHarness::new().await;
+
+    let (status, value) = harness
+        .json_request(Method::GET, "/healthz", false, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["status"], "ok");
+
+    let (status, value) = harness
+        .json_request(Method::GET, "/v1/health", false, None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(value["code"], "unauthorized");
+
+    let (status, value) = harness
+        .json_request(Method::GET, "/v1/health", true, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["daemon"]["reachable"], true);
+});
+
+local_test!(rest_token_rotation_invalidates_old_token, {
+    let harness = RestTestHarness::new().await;
+    let old_token = mantissa_client::rest::show_token(&harness.client_config)
+        .await
+        .expect("show REST token");
+    assert_eq!(old_token, harness.rest_token);
+
+    let new_token = mantissa_client::rest::rotate_token(&harness.client_config)
+        .await
+        .expect("rotate REST token");
+    assert_ne!(new_token, old_token);
+
+    let old_response = harness
+        .request_with_token(Method::GET, "/v1/health", Some(&old_token), None)
+        .await;
+    assert_eq!(old_response.status(), StatusCode::UNAUTHORIZED);
+
+    let new_response = harness
+        .request_with_token(Method::GET, "/v1/health", Some(&new_token), None)
+        .await;
+    assert_eq!(new_response.status(), StatusCode::OK);
+});
