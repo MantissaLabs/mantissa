@@ -78,9 +78,22 @@ impl RestTestHarness {
         token: Option<&str>,
         body: Option<Value>,
     ) -> Response<Body> {
+        let authorization = token.map(|token| format!("Bearer {token}"));
+        self.request_with_authorization(method, uri, authorization.as_deref(), body)
+            .await
+    }
+
+    /// Sends one request through the REST router with a raw authorization header.
+    pub async fn request_with_authorization(
+        &self,
+        method: Method,
+        uri: &str,
+        authorization: Option<&str>,
+        body: Option<Value>,
+    ) -> Response<Body> {
         let mut builder = Request::builder().method(method).uri(uri);
-        if let Some(token) = token {
-            builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
+        if let Some(authorization) = authorization {
+            builder = builder.header(AUTHORIZATION, authorization);
         }
 
         let body = if let Some(value) = body {

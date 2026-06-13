@@ -5,6 +5,8 @@ mod common;
 
 #[path = "rest/agents.rs"]
 mod agents;
+#[path = "rest/auth.rs"]
+mod auth;
 #[path = "rest/clusters.rs"]
 mod clusters;
 #[path = "rest/harness.rs"]
