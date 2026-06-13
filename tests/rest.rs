@@ -19,7 +19,13 @@ mod jobs;
 mod networks;
 #[path = "rest/nodes.rs"]
 mod nodes;
+#[path = "rest/scheduler.rs"]
+mod scheduler;
+#[path = "rest/secrets.rs"]
+mod secrets;
 #[path = "rest/services.rs"]
 mod services;
 #[path = "rest/tasks.rs"]
 mod tasks;
+#[path = "rest/volumes.rs"]
+mod volumes;
