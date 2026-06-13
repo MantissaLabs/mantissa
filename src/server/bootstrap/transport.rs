@@ -38,6 +38,7 @@ fn parse_test_master_key_kdf_profile(raw: &str) -> Option<PassphraseKdfParams> {
 pub(super) fn daemon_bootstrap_options(
     advertise_override: Option<String>,
     master_key_passphrase: SecretPassphrase,
+    rest_token_enabled: bool,
 ) -> BootstrapOptions {
     let replication = config::replication_runtime_config();
     BootstrapOptions {
@@ -51,6 +52,7 @@ pub(super) fn daemon_bootstrap_options(
         gossip_tick: Some(replication.gossip_tick),
         advertise_override,
         master_key_passphrase: Some(master_key_passphrase),
+        rest_token_enabled,
         master_key_kdf_params: daemon_master_key_kdf_params(),
         ..BootstrapOptions::default()
     }

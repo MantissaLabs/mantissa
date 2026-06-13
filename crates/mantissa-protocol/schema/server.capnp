@@ -16,6 +16,7 @@ using import "secrets.capnp".Secrets;
 using import "secrets.capnp".SecretMasterKeySyncRecord;
 using import "network.capnp".Networks;
 using import "volumes.capnp".Volumes;
+using import "rest.capnp".RestAdmin;
 using import "topology.capnp".ClusterViewId;
 
 interface Server {
@@ -141,6 +142,9 @@ interface ClusterSession {
 
   getClusterView @12 () -> (view :ClusterViewId);
   # Returns the active cluster view associated with this session.
+
+  getRestAdmin @16 () -> (restAdmin :RestAdmin);
+  # Access the node-local REST facade administration interface.
 }
 
 struct Capabilities {
@@ -164,6 +168,9 @@ struct Capabilities {
 
   workload @14 :Workload;
   # Internal workload interface capability.
+
+  restAdmin @15 :RestAdmin;
+  # Node-local REST facade administration interface.
 
   scheduler @6 :Scheduler;
   # Scheduler interface capability.

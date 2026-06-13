@@ -131,7 +131,7 @@ pub async fn delete_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{auth::RestAuthConfig, client_worker::ClientWorkerHandle, server};
+    use crate::{client_worker::ClientWorkerHandle, server};
     use axum::{
         body::{self, Body},
         http::{Request, StatusCode, header::AUTHORIZATION},
@@ -151,12 +151,9 @@ mod tests {
             isolation_profile: Some("nono-default".to_string()),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         };
-        let state = AppState::new(
-            RestAuthConfig::Bearer {
-                token: Some("secret".to_string()),
-            },
-            ClientWorkerHandle::fixed_agent_sessions_for_tests(Ok(vec![session])),
-        );
+        let state = AppState::new(ClientWorkerHandle::fixed_agent_sessions_for_tests(Ok(
+            vec![session],
+        )));
 
         let response = server::router(state)
             .oneshot(

@@ -12,8 +12,10 @@ Usage:
 Environment:
   MANTISSA_REST_ADDR              bind address, default 127.0.0.1:6579
   MANTISSA_REST_SOCKET            optional Mantissa daemon Unix socket path
-  MANTISSA_REST_TOKEN             bearer token required by REST handlers
-  MANTISSA_REST_INSECURE_NO_AUTH  set to true only for loopback dev use
+
+Auth:
+  REST bearer auth uses the daemon-owned local REST token.
+  Run `mantissa rest token show` to print it.
 ";
 
 /// Standalone REST binary commands.

@@ -141,6 +141,13 @@ pub enum Command {
         cmd: TokenCommand,
     },
 
+    /// REST API subcommands
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Rest {
+        #[command(subcommand)]
+        cmd: RestCommand,
+    },
+
     /// Tasks subcommands
     #[command(alias = "t")]
     Tasks {
@@ -279,24 +286,6 @@ pub struct InitArgs {
     /// Bind address for the embedded REST API
     #[arg(long = "rest-addr", value_name = "ADDR", requires = "rest")]
     pub rest_addr: Option<SocketAddr>,
-
-    /// Bearer token accepted by embedded REST handlers
-    #[arg(
-        long = "rest-token",
-        value_name = "TOKEN",
-        requires = "rest",
-        conflicts_with = "rest_insecure_no_auth"
-    )]
-    pub rest_token: Option<String>,
-
-    /// Disable embedded REST auth for loopback-only local development
-    #[arg(
-        long = "rest-insecure-no-auth",
-        action = ArgAction::SetTrue,
-        requires = "rest",
-        conflicts_with = "rest_token"
-    )]
-    pub rest_insecure_no_auth: bool,
 }
 
 #[derive(Args, Debug)]
@@ -501,6 +490,24 @@ pub enum TokenCommand {
     /// Shows the join token on this node
     Show,
     /// Rotates the token on the node
+    Rotate,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RestCommand {
+    /// REST token subcommands
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Token {
+        #[command(subcommand)]
+        cmd: RestTokenCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RestTokenCommand {
+    /// Shows the local REST bearer token
+    Show,
+    /// Rotates the local REST bearer token
     Rotate,
 }
 
@@ -1855,8 +1862,6 @@ mod tests {
             "--rest",
             "--rest-addr",
             "127.0.0.1:6580",
-            "--rest-token",
-            "dev-token",
         ])
         .unwrap();
 
@@ -1864,11 +1869,32 @@ mod tests {
             Command::Init(args) => {
                 assert!(args.rest);
                 assert_eq!(args.rest_addr, Some("127.0.0.1:6580".parse().unwrap()));
-                assert_eq!(args.rest_token.as_deref(), Some("dev-token"));
-                assert!(!args.rest_insecure_no_auth);
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rest_token_commands_parse() {
+        let show = MantissaCli::try_parse_from(["mantissa", "rest", "token", "show"]).unwrap();
+        assert!(matches!(
+            show.cmd,
+            Command::Rest {
+                cmd: RestCommand::Token {
+                    cmd: RestTokenCommand::Show
+                }
+            }
+        ));
+
+        let rotate = MantissaCli::try_parse_from(["mantissa", "rest", "token", "rotate"]).unwrap();
+        assert!(matches!(
+            rotate.cmd,
+            Command::Rest {
+                cmd: RestCommand::Token {
+                    cmd: RestTokenCommand::Rotate
+                }
+            }
+        ));
     }
 
     #[test]

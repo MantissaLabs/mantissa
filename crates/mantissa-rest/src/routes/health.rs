@@ -33,7 +33,6 @@ pub async fn health(
 mod tests {
     use super::*;
     use crate::{
-        auth::RestAuthConfig,
         client_worker::{ClientHealth, ClientWorkerError, ClientWorkerHandle},
         server,
     };
@@ -45,14 +44,11 @@ mod tests {
 
     #[tokio::test]
     async fn liveness_route_returns_ok_without_auth() {
-        let state = AppState::new(
-            RestAuthConfig::Bearer {
-                token: Some("secret".to_string()),
-            },
-            ClientWorkerHandle::fixed_health_for_tests(Ok(ClientHealth {
+        let state = AppState::new(ClientWorkerHandle::fixed_health_for_tests(Ok(
+            ClientHealth {
                 daemon_reachable: true,
-            })),
-        );
+            },
+        )));
         let response = server::router(state)
             .oneshot(
                 Request::builder()
@@ -73,14 +69,11 @@ mod tests {
 
     #[tokio::test]
     async fn health_route_requires_auth() {
-        let state = AppState::new(
-            RestAuthConfig::Bearer {
-                token: Some("secret".to_string()),
-            },
-            ClientWorkerHandle::fixed_health_for_tests(Ok(ClientHealth {
+        let state = AppState::new(ClientWorkerHandle::fixed_health_for_tests(Ok(
+            ClientHealth {
                 daemon_reachable: true,
-            })),
-        );
+            },
+        )));
         let response = server::router(state)
             .oneshot(
                 Request::builder()
@@ -96,14 +89,11 @@ mod tests {
 
     #[tokio::test]
     async fn health_route_returns_daemon_status() {
-        let state = AppState::new(
-            RestAuthConfig::Bearer {
-                token: Some("secret".to_string()),
-            },
-            ClientWorkerHandle::fixed_health_for_tests(Ok(ClientHealth {
+        let state = AppState::new(ClientWorkerHandle::fixed_health_for_tests(Ok(
+            ClientHealth {
                 daemon_reachable: true,
-            })),
-        );
+            },
+        )));
         let response = server::router(state)
             .oneshot(
                 Request::builder()
@@ -126,14 +116,9 @@ mod tests {
 
     #[tokio::test]
     async fn health_route_maps_worker_failure_to_unavailable() {
-        let state = AppState::new(
-            RestAuthConfig::Bearer {
-                token: Some("secret".to_string()),
-            },
-            ClientWorkerHandle::fixed_health_for_tests(Err(ClientWorkerError::DaemonUnavailable(
-                "daemon down".to_string(),
-            ))),
-        );
+        let state = AppState::new(ClientWorkerHandle::fixed_health_for_tests(Err(
+            ClientWorkerError::DaemonUnavailable("daemon down".to_string()),
+        )));
         let response = server::router(state)
             .oneshot(
                 Request::builder()

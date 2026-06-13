@@ -9,6 +9,7 @@ pub mod host_ports;
 pub mod jobs;
 pub mod networks;
 pub mod nodes;
+pub mod rest;
 mod runtime_contract;
 pub mod scheduler;
 pub mod secrets;

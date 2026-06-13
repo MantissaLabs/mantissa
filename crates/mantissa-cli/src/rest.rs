@@ -1,7 +1,8 @@
 use crate::cli::InitArgs;
+use crate::output;
 use anyhow::{Context, Result};
+use mantissa_client::config::ClientConfig;
 use mantissa_rest::{
-    auth::RestAuthConfig,
     config::RestConfig,
     server::{self, RestServerError},
 };
@@ -69,16 +70,22 @@ pub(crate) fn config_from_init(init: &InitArgs) -> Result<Option<RestConfig>> {
     if let Some(bind_addr) = init.rest_addr {
         config.bind_addr = bind_addr;
     }
-    if init.rest_insecure_no_auth {
-        config.auth = RestAuthConfig::Disabled;
-    }
-    if let Some(token) = &init.rest_token {
-        config.auth = RestAuthConfig::Bearer {
-            token: Some(token.clone()),
-        };
-    }
     config.validate().context("validate embedded REST config")?;
     Ok(Some(config))
+}
+
+/// Prints the daemon-owned local REST bearer token.
+pub async fn show_token(cfg: &ClientConfig) -> Result<()> {
+    let token = mantissa_client::rest::show_token(cfg).await?;
+    output::emit_line(token);
+    Ok(())
+}
+
+/// Rotates the daemon-owned local REST bearer token and prints the new value.
+pub async fn rotate_token(cfg: &ClientConfig) -> Result<()> {
+    let token = mantissa_client::rest::rotate_token(cfg).await?;
+    output::emit_line(token);
+    Ok(())
 }
 
 /// Returns true when embedded REST was requested by flag or environment.
@@ -114,17 +121,14 @@ mod tests {
             master_key_passphrase_fd: None,
             rest: false,
             rest_addr: None,
-            rest_token: None,
-            rest_insecure_no_auth: false,
         }
     }
 
     #[test]
-    fn config_from_init_applies_cli_overrides_before_validation() {
+    fn config_from_init_applies_cli_addr_override() {
         let init = InitArgs {
             rest: true,
             rest_addr: Some("0.0.0.0:6580".parse().unwrap()),
-            rest_token: Some("dev-token".to_string()),
             ..init_args()
         };
 
@@ -133,12 +137,6 @@ mod tests {
             .expect("REST config requested");
 
         assert_eq!(config.bind_addr, "0.0.0.0:6580".parse().unwrap());
-        match config.auth {
-            RestAuthConfig::Bearer { token } => {
-                assert_eq!(token.as_deref(), Some("dev-token"));
-            }
-            RestAuthConfig::Disabled => panic!("expected bearer auth"),
-        }
     }
 
     #[test]

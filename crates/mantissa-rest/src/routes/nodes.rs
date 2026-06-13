@@ -116,7 +116,7 @@ pub async fn evict(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{auth::RestAuthConfig, client_worker::ClientWorkerHandle, server};
+    use crate::{client_worker::ClientWorkerHandle, server};
     use axum::{
         body::{self, Body},
         http::{Request, StatusCode, header::AUTHORIZATION},
@@ -136,12 +136,7 @@ mod tests {
             labels: vec!["role=dev".to_string()],
             scheduling_reason: None,
         };
-        let state = AppState::new(
-            RestAuthConfig::Bearer {
-                token: Some("secret".to_string()),
-            },
-            ClientWorkerHandle::fixed_nodes_for_tests(Ok(vec![node])),
-        );
+        let state = AppState::new(ClientWorkerHandle::fixed_nodes_for_tests(Ok(vec![node])));
 
         let response = server::router(state)
             .oneshot(

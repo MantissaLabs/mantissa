@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use mantissa_protocol::{
     agents::AgentsClient, gossip::GossipClient, jobs::JobsClient, network::NetworksClient,
-    node::NodeClient, scheduling::scheduler::Client as SchedulerClient,
+    node::NodeClient, rest::RestAdminClient, scheduling::scheduler::Client as SchedulerClient,
     secrets::secrets::Client as SecretsClient, services::ServicesClient, sync::SyncClient,
     task::TaskClient, topology::TopologyClient, volumes::VolumesClient, workload::WorkloadClient,
 };
@@ -375,6 +375,7 @@ pub struct ServerClients {
     pub secrets_client: SecretsClient,
     pub networks_client: NetworksClient,
     pub volumes_client: VolumesClient,
+    pub rest_admin_client: RestAdminClient,
 }
 
 impl From<ServerClients> for ClusterSessionServices {
@@ -397,6 +398,7 @@ impl From<ServerClients> for ClusterSessionServices {
             secrets: clients.secrets_client,
             networks: clients.networks_client,
             volumes: clients.volumes_client,
+            rest_admin: clients.rest_admin_client,
         }
     }
 }

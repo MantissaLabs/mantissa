@@ -23,11 +23,16 @@ pub async fn start(
     mode: server::RunMode,
     enable_unix_socket: bool,
     master_key_passphrase: SecretPassphrase,
+    rest_token_enabled: bool,
 ) -> BootstrapResult<Option<server::RunHandles>> {
     let ctx = BootstrapContext::init_base(listen_addr).await?;
     let runtime = boot(
         ctx,
-        transport::daemon_bootstrap_options(advertise_addr, master_key_passphrase),
+        transport::daemon_bootstrap_options(
+            advertise_addr,
+            master_key_passphrase,
+            rest_token_enabled,
+        ),
     )
     .await?;
     match mode {

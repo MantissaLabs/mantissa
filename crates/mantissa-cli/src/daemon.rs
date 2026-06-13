@@ -102,6 +102,7 @@ pub(crate) async fn start_detached(options: DetachedInitOptions<'_>) -> Result<(
             println!("socket: {}", socket_path.display());
             if let Some(rest_config) = rest_config {
                 println!("rest: http://{}", rest_config.bind_addr);
+                println!("rest token: mantissa rest token show");
             }
             println!("logs: {}", log_path.display());
             Ok(())
@@ -384,12 +385,6 @@ fn push_init_args(command: &mut Command, init: &InitArgs, prompted_passphrase_fd
     }
     if let Some(addr) = init.rest_addr {
         command.arg("--rest-addr").arg(addr.to_string());
-    }
-    if let Some(token) = &init.rest_token {
-        command.arg("--rest-token").arg(token);
-    }
-    if init.rest_insecure_no_auth {
-        command.arg("--rest-insecure-no-auth");
     }
 }
 
@@ -1264,8 +1259,6 @@ mod tests {
             master_key_passphrase_fd: None,
             rest: true,
             rest_addr: Some("127.0.0.1:6580".parse().unwrap()),
-            rest_token: Some("dev-token".to_string()),
-            rest_insecure_no_auth: false,
         };
         let mut command = Command::new("mantissa");
 
@@ -1283,8 +1276,6 @@ mod tests {
                 "--rest",
                 "--rest-addr",
                 "127.0.0.1:6580",
-                "--rest-token",
-                "dev-token",
             ]
         );
     }

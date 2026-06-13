@@ -13,8 +13,7 @@ Default behavior is deliberately narrow:
 
 - bind to `127.0.0.1:6579`;
 - use the normal local daemon socket discovery path;
-- require bearer auth when a token is configured;
-- reject non-loopback bind addresses unless `MANTISSA_REST_TOKEN` is set;
+- require bearer auth with a daemon-owned local REST token;
 - do not enable browser CORS.
 
 Do not expose this listener directly to the public internet. If a program needs
@@ -29,26 +28,32 @@ as cluster-admin access.
 Start Mantissa with the embedded REST listener enabled:
 
 ```bash
-MANTISSA_REST_TOKEN=dev-token mantissa init --detach --rest
+mantissa init --detach --rest
 ```
 
 The same setting can be environment-only:
 
 ```bash
-MANTISSA_REST_ENABLED=true \
-MANTISSA_REST_TOKEN=dev-token \
-mantissa init --detach
+MANTISSA_REST_ENABLED=true mantissa init --detach
 ```
 
-The REST token is local HTTP bearer auth for this facade. It is separate from
-the join token used for cluster membership.
+The daemon generates and persists the REST token when REST support is enabled.
+The token is local HTTP bearer auth for this facade. It is separate from the
+join token used for cluster membership.
+
+Show or rotate the token through the local client API:
+
+```bash
+mantissa rest token show
+mantissa rest token rotate
+```
 
 For development, the standalone REST wrapper still exists and connects to an
 already-running local daemon:
 
 ```bash
 mantissa init --detach
-MANTISSA_REST_TOKEN=dev-token cargo run -p mantissa-rest -- serve
+cargo run -p mantissa-rest -- serve
 ```
 
 Embedded REST can also be enabled with CLI flags:
@@ -56,8 +61,7 @@ Embedded REST can also be enabled with CLI flags:
 ```bash
 mantissa init --detach \
   --rest \
-  --rest-addr 127.0.0.1:6579 \
-  --rest-token dev-token
+  --rest-addr 127.0.0.1:6579
 ```
 
 Configuration:
@@ -67,17 +71,15 @@ Configuration:
 | `MANTISSA_REST_ENABLED` | Start embedded REST from `mantissa init`. |
 | `MANTISSA_REST_ADDR` | Bind address, default `127.0.0.1:6579`. |
 | `MANTISSA_REST_SOCKET` | Optional daemon Unix socket path override. |
-| `MANTISSA_REST_TOKEN` | Bearer token accepted by REST handlers. |
-| `MANTISSA_REST_INSECURE_NO_AUTH` | Disable auth only for loopback dev use. |
 
-The equivalent `mantissa init` flags are `--rest`, `--rest-addr`,
-`--rest-token`, and `--rest-insecure-no-auth`.
+The equivalent `mantissa init` flags are `--rest` and `--rest-addr`.
 
 Use this shell helper for examples:
 
 ```bash
+TOKEN="$(mantissa rest token show)"
 REST=http://127.0.0.1:6579
-AUTH=(-H "Authorization: Bearer dev-token")
+AUTH=(-H "Authorization: Bearer $TOKEN")
 ```
 
 ## Response Rules
@@ -339,7 +341,7 @@ Decode `data_base64` to recover the original bytes. `stream` is one of
 Attach and exec use WebSocket upgrade requests:
 
 ```bash
-WS_AUTH="Authorization: Bearer dev-token"
+WS_AUTH="Authorization: Bearer $TOKEN"
 
 websocat -H "$WS_AUTH" \
   "ws://127.0.0.1:6579/v1/tasks/sleepy/attach?stdin=true&stdout=true&stderr=true"

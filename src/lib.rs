@@ -1,8 +1,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 pub use mantissa_protocol::{
-    gossip_capnp, health_capnp, info_capnp, node_capnp, scheduling_capnp, server_capnp, sync_capnp,
-    topology_capnp, volumes_capnp,
+    gossip_capnp, health_capnp, info_capnp, node_capnp, rest_capnp, scheduling_capnp, server_capnp,
+    sync_capnp, topology_capnp, volumes_capnp,
 };
 
 pub mod agents;
@@ -20,6 +20,7 @@ pub mod node;
 pub mod observability;
 pub mod recovery;
 pub mod registry;
+pub mod rest;
 pub mod runtime;
 pub mod scheduler;
 pub mod secrets;

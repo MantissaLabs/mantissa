@@ -3,6 +3,7 @@ use crate::cluster::{
     ClusterViewId, ClusterViewState, MIN_SUPPORTED_ROOT_SCHEMA_VERSION, RootSchemaState,
     SUPPORTED_ROOT_SCHEMA_VERSION,
 };
+use crate::rest::RestTokenStore;
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::master_key::envelope::PassphraseProvider;
 use crate::server::auth::AuthStore;
@@ -57,6 +58,7 @@ pub struct BootstrapStores {
     pub local_sessions: LocalSessionStore,
     pub local_creds: LocalCredentialStore,
     pub token_store: TokenStore,
+    pub rest_token_store: RestTokenStore,
     pub secret_master_store: SecretMasterStore,
     pub workloads: WorkloadStore,
     pub jobs: JobStore,
@@ -101,6 +103,8 @@ impl BootstrapStores {
 
         let token_store = TokenStore::load(ctx.db.clone())
             .map_err(|error| store_error("load persistent join token", error))?;
+        let rest_token_store = RestTokenStore::load(ctx.db.clone(), options.rest_token_enabled)
+            .map_err(|error| store_error("load persistent REST token", error))?;
 
         let passphrase = options.master_key_passphrase.clone().ok_or_else(|| {
             store_error(
@@ -172,6 +176,7 @@ impl BootstrapStores {
             local_sessions,
             local_creds,
             token_store,
+            rest_token_store,
             secret_master_store,
             workloads,
             jobs,

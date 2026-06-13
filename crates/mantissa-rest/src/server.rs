@@ -179,7 +179,7 @@ pub async fn bind(config: RestConfig) -> Result<BoundRestServer, RestServerError
     let listener = TcpListener::bind(config.bind_addr).await?;
     let local_addr = listener.local_addr()?;
     let client = ClientWorkerHandle::spawn(config.client_config())?;
-    let state = AppState::new(config.auth.clone(), client);
+    let state = AppState::new(client);
     Ok(BoundRestServer {
         listener,
         router: router(state),

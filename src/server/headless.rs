@@ -240,6 +240,7 @@ impl HeadlessNode {
             master_key_passphrase: Some(SecretPassphrase::new(
                 b"mantissa-headless-master-key-passphrase".to_vec(),
             )?),
+            rest_token_enabled: defaults.rest_token_enabled,
             // Headless nodes still exercise the real master-key envelope and transfer
             // code paths, but avoid production Argon2 cost in broad integration tests.
             master_key_kdf_params: master_key_kdf_params.unwrap_or_else(PassphraseKdfParams::test),

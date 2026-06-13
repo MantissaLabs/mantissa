@@ -83,6 +83,7 @@ pub struct BootstrapOptions {
     pub network_attachment_refresh_tick: Option<Duration>,
     pub advertise_override: Option<String>,
     pub master_key_passphrase: Option<SecretPassphrase>,
+    pub rest_token_enabled: bool,
     pub store_gc_config: Option<config::RuntimeStoreGcConfig>,
     pub service_timing: ServiceControllerTiming,
     pub runtime_health: config::RuntimeHealthConfig,
@@ -112,6 +113,7 @@ impl Default for BootstrapOptions {
             network_attachment_refresh_tick: None,
             advertise_override: None,
             master_key_passphrase: None,
+            rest_token_enabled: false,
             store_gc_config: None,
             service_timing: ServiceControllerTiming::default(),
             runtime_health: config::health_runtime_config(),
@@ -1045,6 +1047,9 @@ fn build_server(
         secrets_client: components.secrets_client.clone(),
         networks_client: components.networks_client.clone(),
         volumes_client: components.volumes_client.clone(),
+        rest_admin_client: capnp_rpc::new_client(crate::rest::RestAdmin::new(
+            stores.rest_token_store.clone(),
+        )),
     };
 
     Server::new(

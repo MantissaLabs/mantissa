@@ -128,8 +128,10 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             };
             let master_key_passphrase = resolve_master_key_passphrase(&init)?;
             let rest_server = crate::rest::start_embedded(&init).await?;
+            let rest_token_enabled = rest_server.is_some();
             if let Some(rest_server) = rest_server.as_ref() {
                 println!("REST API: http://{}", rest_server.local_addr());
+                println!("REST token: mantissa rest token show");
             }
             let advertise_addr = init.advertise.clone().or_else(config::advertise_addr);
             let daemon_result = local
@@ -139,6 +141,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     RunMode::Blocking,
                     true,
                     master_key_passphrase,
+                    rest_token_enabled,
                 ))
                 .await
                 .map_err(|error| anyhow::anyhow!("{error}"));
@@ -254,6 +257,15 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
         Command::Token { cmd } => match cmd {
             TokenCommand::Show => local.run_until(crate::token::show(&cfg)).await?,
             TokenCommand::Rotate => local.run_until(crate::token::rotate(&cfg)).await?,
+        },
+
+        Command::Rest { cmd } => match cmd {
+            RestCommand::Token { cmd } => match cmd {
+                RestTokenCommand::Show => local.run_until(crate::rest::show_token(&cfg)).await?,
+                RestTokenCommand::Rotate => {
+                    local.run_until(crate::rest::rotate_token(&cfg)).await?
+                }
+            },
         },
 
         Command::Tasks { cmd } => match cmd {

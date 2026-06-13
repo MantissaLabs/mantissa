@@ -63,6 +63,12 @@ impl ClientWorkerHandle {
         self.send(ClientCommand::Health).await
     }
 
+    /// Validates one REST bearer token through the daemon-owned token store.
+    pub async fn validate_rest_token(&self, token: String) -> Result<bool, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::ValidateRestToken { token, respond_to })
+            .await
+    }
+
     /// Lists cluster nodes visible through the local topology capability.
     pub async fn list_nodes(&self) -> Result<Vec<NodeSummary>, ClientWorkerError> {
         self.send(ClientCommand::ListNodes).await
@@ -654,8 +660,14 @@ impl ClientWorkerHandle {
         let (sender, mut receiver) = mpsc::channel(CLIENT_COMMAND_BUFFER);
         tokio::spawn(async move {
             while let Some(command) = receiver.recv().await {
-                if let ClientCommand::Health(respond_to) = command {
-                    let _ignored = respond_to.send(result.clone());
+                match command {
+                    ClientCommand::Health(respond_to) => {
+                        let _ignored = respond_to.send(result.clone());
+                    }
+                    ClientCommand::ValidateRestToken { token, respond_to } => {
+                        let _ignored = respond_to.send(Ok(token == "secret"));
+                    }
+                    _ => {}
                 }
             }
         });
@@ -668,8 +680,14 @@ impl ClientWorkerHandle {
         let (sender, mut receiver) = mpsc::channel(CLIENT_COMMAND_BUFFER);
         tokio::spawn(async move {
             while let Some(command) = receiver.recv().await {
-                if let ClientCommand::ListNodes(respond_to) = command {
-                    let _ignored = respond_to.send(result.clone());
+                match command {
+                    ClientCommand::ListNodes(respond_to) => {
+                        let _ignored = respond_to.send(result.clone());
+                    }
+                    ClientCommand::ValidateRestToken { token, respond_to } => {
+                        let _ignored = respond_to.send(Ok(token == "secret"));
+                    }
+                    _ => {}
                 }
             }
         });
@@ -684,8 +702,14 @@ impl ClientWorkerHandle {
         let (sender, mut receiver) = mpsc::channel(CLIENT_COMMAND_BUFFER);
         tokio::spawn(async move {
             while let Some(command) = receiver.recv().await {
-                if let ClientCommand::ListAgentSessions(respond_to) = command {
-                    let _ignored = respond_to.send(result.clone());
+                match command {
+                    ClientCommand::ListAgentSessions(respond_to) => {
+                        let _ignored = respond_to.send(result.clone());
+                    }
+                    ClientCommand::ValidateRestToken { token, respond_to } => {
+                        let _ignored = respond_to.send(Ok(token == "secret"));
+                    }
+                    _ => {}
                 }
             }
         });
@@ -731,6 +755,10 @@ impl std::error::Error for ClientWorkerError {}
 /// Commands accepted by the local Cap'n Proto client worker.
 enum ClientCommand {
     Health(oneshot::Sender<Result<ClientHealth, ClientWorkerError>>),
+    ValidateRestToken {
+        token: String,
+        respond_to: oneshot::Sender<Result<bool, ClientWorkerError>>,
+    },
     ListNodes(oneshot::Sender<Result<Vec<NodeSummary>, ClientWorkerError>>),
     GetNode {
         node_id: String,
@@ -949,6 +977,9 @@ async fn client_worker_loop(config: ClientConfig, mut receiver: mpsc::Receiver<C
             ClientCommand::Health(respond_to) => {
                 let result = check_daemon_health(&config).await;
                 let _ignored = respond_to.send(result);
+            }
+            ClientCommand::ValidateRestToken { token, respond_to } => {
+                let _ignored = respond_to.send(validate_rest_token(&config, &token).await);
             }
             ClientCommand::ListNodes(respond_to) => {
                 let _ignored = respond_to.send(list_nodes(&config).await);
@@ -1267,6 +1298,16 @@ async fn check_daemon_health(config: &ClientConfig) -> Result<ClientHealth, Clie
     Ok(ClientHealth {
         daemon_reachable: true,
     })
+}
+
+/// Validates one REST bearer token through the local daemon session.
+async fn validate_rest_token(
+    config: &ClientConfig,
+    token: &str,
+) -> Result<bool, ClientWorkerError> {
+    mantissa_client::rest::validate_token(config, token)
+        .await
+        .map_err(|error| ClientWorkerError::DaemonUnavailable(error.to_string()))
 }
 
 /// Lists nodes through the reusable Mantissa client API.

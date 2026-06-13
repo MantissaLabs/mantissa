@@ -4,44 +4,6 @@ use axum::{
     http::{HeaderMap, header::AUTHORIZATION, request::Parts},
 };
 
-/// Authentication policy for REST control routes.
-#[derive(Clone, Debug)]
-pub enum RestAuthConfig {
-    Bearer { token: Option<String> },
-    Disabled,
-}
-
-impl RestAuthConfig {
-    /// Returns whether this policy has an active bearer token configured.
-    pub fn has_bearer_token(&self) -> bool {
-        matches!(self, Self::Bearer { token: Some(_) })
-    }
-
-    /// Validates one request header map against this authentication policy.
-    pub fn authorize_headers(&self, headers: &HeaderMap) -> Result<(), RestAuthError> {
-        match self {
-            Self::Disabled => Ok(()),
-            Self::Bearer {
-                token: Some(expected),
-            } => {
-                let value = headers
-                    .get(AUTHORIZATION)
-                    .ok_or(RestAuthError::MissingBearer)?;
-                let value = value.to_str().map_err(|_| RestAuthError::InvalidBearer)?;
-                let Some(token) = value.strip_prefix("Bearer ") else {
-                    return Err(RestAuthError::InvalidBearer);
-                };
-                if token == expected {
-                    Ok(())
-                } else {
-                    Err(RestAuthError::InvalidBearer)
-                }
-            }
-            Self::Bearer { token: None } => Err(RestAuthError::TokenNotConfigured),
-        }
-    }
-}
-
 /// Marker extractor for routes that require REST authorization.
 pub struct RestAuth;
 
@@ -53,9 +15,32 @@ impl FromRequestParts<AppState> for RestAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        state.auth().authorize_headers(&parts.headers)?;
+        let token = bearer_token(&parts.headers)?;
+        let valid = state
+            .client()
+            .validate_rest_token(token.to_string())
+            .await
+            .map_err(|error| RestError::service_unavailable(error.to_string()))?;
+        if !valid {
+            return Err(RestAuthError::InvalidBearer.into());
+        }
         Ok(Self)
     }
+}
+
+/// Extracts the bearer token from one request header map.
+fn bearer_token(headers: &HeaderMap) -> Result<&str, RestAuthError> {
+    let value = headers
+        .get(AUTHORIZATION)
+        .ok_or(RestAuthError::MissingBearer)?;
+    let value = value.to_str().map_err(|_| RestAuthError::InvalidBearer)?;
+    let Some(token) = value.strip_prefix("Bearer ") else {
+        return Err(RestAuthError::InvalidBearer);
+    };
+    if token.is_empty() {
+        return Err(RestAuthError::InvalidBearer);
+    }
+    Ok(token)
 }
 
 /// Authentication failures surfaced through stable REST error bodies.
@@ -63,7 +48,6 @@ impl FromRequestParts<AppState> for RestAuth {
 pub enum RestAuthError {
     MissingBearer,
     InvalidBearer,
-    TokenNotConfigured,
 }
 
 impl From<RestAuthError> for RestError {
@@ -72,9 +56,6 @@ impl From<RestAuthError> for RestError {
         match error {
             RestAuthError::MissingBearer => RestError::unauthorized("missing bearer token"),
             RestAuthError::InvalidBearer => RestError::unauthorized("invalid bearer token"),
-            RestAuthError::TokenNotConfigured => {
-                RestError::unauthorized("REST bearer token is not configured")
-            }
         }
     }
 }
@@ -85,35 +66,29 @@ mod tests {
     use axum::http::HeaderValue;
 
     #[test]
-    fn authorize_headers_accepts_matching_bearer_token() {
-        let auth = RestAuthConfig::Bearer {
-            token: Some("secret".to_string()),
-        };
+    fn bearer_token_accepts_valid_header() {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
 
-        auth.authorize_headers(&headers).unwrap();
+        assert_eq!(bearer_token(&headers).unwrap(), "secret");
     }
 
     #[test]
-    fn authorize_headers_rejects_missing_bearer_token() {
-        let auth = RestAuthConfig::Bearer {
-            token: Some("secret".to_string()),
-        };
-
+    fn bearer_token_rejects_missing_header() {
         assert!(matches!(
-            auth.authorize_headers(&HeaderMap::new()),
+            bearer_token(&HeaderMap::new()),
             Err(RestAuthError::MissingBearer)
         ));
     }
 
     #[test]
-    fn authorize_headers_rejects_unconfigured_token() {
-        let auth = RestAuthConfig::Bearer { token: None };
+    fn bearer_token_rejects_malformed_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("secret"));
 
         assert!(matches!(
-            auth.authorize_headers(&HeaderMap::new()),
-            Err(RestAuthError::TokenNotConfigured)
+            bearer_token(&headers),
+            Err(RestAuthError::InvalidBearer)
         ));
     }
 }

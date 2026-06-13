@@ -2,8 +2,9 @@ use super::Liveness;
 use crate::{cluster::ClusterViewId, topology::Topology};
 use mantissa_protocol::{
     agents::agents, gossip::gossip, health::health, jobs::jobs, network::networks, node::node,
-    scheduling::scheduler, secrets::secrets, server::cluster_session, services::services,
-    sync::sync, task::task, topology::topology, volumes::volumes, workload::workload,
+    rest::rest_admin, scheduling::scheduler, secrets::secrets, server::cluster_session,
+    services::services, sync::sync, task::task, topology::topology, volumes::volumes,
+    workload::workload,
 };
 use std::rc::Rc;
 use uuid::Uuid;
@@ -27,6 +28,7 @@ pub struct ClusterSessionServices {
     pub secrets: secrets::Client,
     pub networks: networks::Client,
     pub volumes: volumes::Client,
+    pub rest_admin: rest_admin::Client,
 }
 
 /// Factory for cluster session capabilities served to peers and local clients.
@@ -173,6 +175,17 @@ impl ClusterSessionImpl {
         }
         Ok(())
     }
+
+    /// Rejects local-only capabilities for peer-authenticated sessions.
+    fn ensure_local_admin(&self) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
+        if self.peer_scope.is_some() {
+            return Err(capnp::Error::failed(
+                "REST admin capability is only available to local sessions".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl cluster_session::Server for ClusterSessionImpl {
@@ -211,6 +224,9 @@ impl cluster_session::Server for ClusterSessionImpl {
         caps.set_secrets(self.services.secrets.clone());
         caps.set_networks(self.services.networks.clone());
         caps.set_volumes(self.services.volumes.clone());
+        if self.peer_scope.is_none() {
+            caps.set_rest_admin(self.services.rest_admin.clone());
+        }
         self.cluster_view
             .write_capnp(caps.reborrow().init_active_view());
 
@@ -370,6 +386,20 @@ impl cluster_session::Server for ClusterSessionImpl {
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
         self.cluster_view.write_capnp(results.get().init_view());
+        Ok(())
+    }
+
+    /// Returns the local REST administration capability.
+    async fn get_rest_admin(
+        self: Rc<Self>,
+        _params: cluster_session::GetRestAdminParams,
+        mut results: cluster_session::GetRestAdminResults,
+    ) -> Result<(), capnp::Error> {
+        self.ensure_local_admin()?;
+
+        results
+            .get()
+            .set_rest_admin(self.services.rest_admin.clone());
         Ok(())
     }
 }
