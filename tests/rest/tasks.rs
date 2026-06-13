@@ -54,6 +54,23 @@ local_test!(rest_task_lifecycle_uses_real_local_session, {
 
     let (status, value) = harness
         .json_request(
+            Method::GET,
+            "/v1/tasks/rest-task-lifecycle/logs?tail=never",
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "bad_request");
+
+    let (status, value) = harness
+        .json_request(Method::GET, "/v1/tasks/missing-task", true, None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["code"], "not_found");
+
+    let (status, value) = harness
+        .json_request(
             Method::POST,
             &format!("/v1/tasks/{task_id}/stop"),
             true,
