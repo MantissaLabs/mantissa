@@ -13,7 +13,13 @@ mod clusters;
 mod harness;
 #[path = "rest/health.rs"]
 mod health;
+#[path = "rest/jobs.rs"]
+mod jobs;
 #[path = "rest/networks.rs"]
 mod networks;
 #[path = "rest/nodes.rs"]
 mod nodes;
+#[path = "rest/services.rs"]
+mod services;
+#[path = "rest/tasks.rs"]
+mod tasks;
