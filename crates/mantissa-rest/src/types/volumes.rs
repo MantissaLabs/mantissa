@@ -31,10 +31,17 @@ pub struct VolumeCreateRequest {
 impl VolumeCreateRequest {
     /// Converts this REST request into the reusable client request.
     pub fn into_client(self) -> Result<ClientVolumeCreateRequest, String> {
+        let binding_mode = parse_binding_mode(&self.binding_mode)?;
+        if matches!(binding_mode, ClientVolumeBindingMode::Immediate)
+            && self.node_selector.is_none()
+        {
+            return Err("immediate local volumes require node_selector".to_string());
+        }
+
         Ok(ClientVolumeCreateRequest {
             name: self.name,
             ownership: self.ownership.into_client(),
-            binding_mode: parse_binding_mode(&self.binding_mode)?,
+            binding_mode,
             reclaim_policy: parse_reclaim_policy(&self.reclaim_policy)?,
             requested_bytes: self.requested_bytes,
             labels: self

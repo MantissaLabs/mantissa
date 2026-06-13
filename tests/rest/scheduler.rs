@@ -3,7 +3,7 @@ use axum::http::{Method, StatusCode};
 use crate::common;
 use crate::harness::RestTestHarness;
 
-local_test!(rest_scheduler_summary_uses_real_local_session, {
+local_test!(rest_scheduler_summary_reports_capacity_totals, {
     let harness = RestTestHarness::new().await;
     let node_id = harness.node_id.to_string();
 
@@ -26,6 +26,11 @@ local_test!(rest_scheduler_summary_uses_real_local_session, {
         .expect("summary includes reserved slots");
     assert!(total_slots >= free_slots);
     assert!(total_slots >= reserved_slots);
+});
+
+local_test!(rest_scheduler_detailed_summary_includes_slot_rows, {
+    let harness = RestTestHarness::new().await;
+    let node_id = harness.node_id.to_string();
 
     let (status, value) = harness
         .json_request(

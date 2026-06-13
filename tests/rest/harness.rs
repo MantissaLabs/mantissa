@@ -2,7 +2,7 @@ use axum::{
     Router,
     body::{self, Body},
     http::header::CONTENT_TYPE,
-    http::{Method, Request, Response, StatusCode, header::AUTHORIZATION},
+    http::{HeaderMap, Method, Request, Response, StatusCode, header::AUTHORIZATION},
 };
 use mantissa_client::config::ClientConfig;
 use mantissa_rest::{client_worker::ClientWorkerHandle, server, state::AppState};
@@ -131,5 +131,26 @@ impl RestTestHarness {
             );
         });
         (status, value)
+    }
+
+    /// Sends one request and returns its status, headers, and UTF-8 body.
+    pub async fn text_request(
+        &self,
+        method: Method,
+        uri: &str,
+        authenticated: bool,
+        request_body: Option<Value>,
+    ) -> (StatusCode, HeaderMap, String) {
+        let method_for_error = method.clone();
+        let response = self.request(method, uri, authenticated, request_body).await;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read REST response body");
+        let body = String::from_utf8(bytes.to_vec()).unwrap_or_else(|err| {
+            panic!("decode REST text response for {method_for_error} {uri}: {err}; status={status}")
+        });
+        (status, headers, body)
     }
 }

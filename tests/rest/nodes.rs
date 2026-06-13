@@ -4,7 +4,7 @@ use serde_json::json;
 use crate::common;
 use crate::harness::RestTestHarness;
 
-local_test!(rest_nodes_use_real_local_session, {
+local_test!(rest_nodes_list_get_and_report_initial_drain_status, {
     let harness = RestTestHarness::new().await;
     let node_id = harness.node_id.to_string();
 
@@ -26,6 +26,11 @@ local_test!(rest_nodes_use_real_local_session, {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["node_id"], node_id);
     assert_eq!(value["schedulable"], true);
+});
+
+local_test!(rest_nodes_replace_and_remove_labels, {
+    let harness = RestTestHarness::new().await;
+    let node_id = harness.node_id.to_string();
 
     let (status, value) = harness
         .json_request(
@@ -49,6 +54,32 @@ local_test!(rest_nodes_use_real_local_session, {
     let labels = value["labels"].as_array().expect("node labels are array");
     assert!(labels.iter().any(|label| label == "rest=api"));
     assert!(labels.iter().any(|label| label == "role=gateway-test"));
+
+    let (status, value) = harness
+        .json_request(
+            Method::PUT,
+            &format!("/v1/nodes/{node_id}/labels"),
+            true,
+            Some(json!({
+                "remove": ["rest"]
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["node_id"], node_id);
+
+    let (status, value) = harness
+        .json_request(Method::GET, &format!("/v1/nodes/{node_id}"), true, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let labels = value["labels"].as_array().expect("node labels are array");
+    assert!(!labels.iter().any(|label| label == "rest=api"));
+    assert!(labels.iter().any(|label| label == "role=gateway-test"));
+});
+
+local_test!(rest_nodes_drain_and_resume_node, {
+    let harness = RestTestHarness::new().await;
+    let node_id = harness.node_id.to_string();
 
     let (status, value) = harness
         .json_request(
@@ -76,27 +107,10 @@ local_test!(rest_nodes_use_real_local_session, {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["node_id"], node_id);
     assert_eq!(value["accepted"], true);
+});
 
-    let (status, value) = harness
-        .json_request(
-            Method::PUT,
-            &format!("/v1/nodes/{node_id}/labels"),
-            true,
-            Some(json!({
-                "remove": ["rest"]
-            })),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(value["node_id"], node_id);
-
-    let (status, value) = harness
-        .json_request(Method::GET, &format!("/v1/nodes/{node_id}"), true, None)
-        .await;
-    assert_eq!(status, StatusCode::OK);
-    let labels = value["labels"].as_array().expect("node labels are array");
-    assert!(!labels.iter().any(|label| label == "rest=api"));
-    assert!(labels.iter().any(|label| label == "role=gateway-test"));
+local_test!(rest_nodes_reject_invalid_node_id, {
+    let harness = RestTestHarness::new().await;
 
     let (status, value) = harness
         .json_request(Method::GET, "/v1/nodes/not-a-uuid/drain", true, None)

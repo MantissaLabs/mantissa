@@ -25,23 +25,29 @@ fn job_manifest(name: &str) -> Value {
     })
 }
 
-local_test!(rest_job_lifecycle_uses_real_local_session, {
-    let harness = RestTestHarness::new().await;
-
+/// Submits one job and returns the response id plus decoded body.
+async fn submit_job(harness: &RestTestHarness, name: &str) -> (String, Value) {
     let (status, value) = harness
-        .json_request(
-            Method::POST,
-            "/v1/jobs",
-            true,
-            Some(job_manifest("rest-job-lifecycle")),
-        )
+        .json_request(Method::POST, "/v1/jobs", true, Some(job_manifest(name)))
         .await;
     assert_eq!(status, StatusCode::OK);
     let job_id = value["id"].as_str().expect("job response id").to_string();
-    assert_eq!(value["name"], "rest-job-lifecycle");
+    (job_id, value)
+}
+
+local_test!(rest_jobs_submit_returns_manifest_summary, {
+    let harness = RestTestHarness::new().await;
+
+    let (_job_id, value) = submit_job(&harness, "rest-job-submit").await;
+    assert_eq!(value["name"], "rest-job-submit");
     assert_eq!(value["cpu_millis"], 250);
     assert_eq!(value["memory_mib"], 128);
     assert_eq!(value["max_retries"], 0);
+});
+
+local_test!(rest_jobs_list_and_inspect_submitted_job, {
+    let harness = RestTestHarness::new().await;
+    let (job_id, _value) = submit_job(&harness, "rest-job-read").await;
 
     let (status, value) = harness
         .json_request(Method::GET, "/v1/jobs", true, None)
@@ -52,7 +58,7 @@ local_test!(rest_job_lifecycle_uses_real_local_session, {
             .as_array()
             .expect("jobs response is array")
             .iter()
-            .any(|job| job["id"] == job_id && job["name"] == "rest-job-lifecycle")
+            .any(|job| job["id"] == job_id && job["name"] == "rest-job-read")
     );
 
     let (status, value) = harness
@@ -62,6 +68,11 @@ local_test!(rest_job_lifecycle_uses_real_local_session, {
     assert_eq!(value["snapshot"]["id"], job_id);
     assert_eq!(value["snapshot"]["retry_policy"]["max_retries"], 0);
     assert!(value["attempts"].as_array().is_some());
+});
+
+local_test!(rest_jobs_cancel_submitted_job, {
+    let harness = RestTestHarness::new().await;
+    let (job_id, _value) = submit_job(&harness, "rest-job-cancel").await;
 
     let (status, value) = harness
         .json_request(
@@ -74,6 +85,10 @@ local_test!(rest_job_lifecycle_uses_real_local_session, {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["id"], job_id);
     assert_eq!(value["status"], "cancelling");
+});
+
+local_test!(rest_jobs_reject_invalid_manifest_and_job_id, {
+    let harness = RestTestHarness::new().await;
 
     let (status, value) = harness
         .json_request(
@@ -82,6 +97,12 @@ local_test!(rest_job_lifecycle_uses_real_local_session, {
             true,
             Some(json!({"manifest": {"name": ""}})),
         )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "bad_request");
+
+    let (status, value) = harness
+        .json_request(Method::GET, "/v1/jobs/not-a-uuid", true, None)
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(value["code"], "bad_request");

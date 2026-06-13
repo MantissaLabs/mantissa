@@ -4,27 +4,40 @@ use serde_json::json;
 use crate::common;
 use crate::harness::RestTestHarness;
 
-local_test!(rest_volume_lifecycle_uses_real_local_session, {
-    let harness = RestTestHarness::new().await;
-    let node_id = harness.node_id.to_string();
+/// Builds one immediate local volume create request for the harness node.
+fn volume_create_request(name: &str, node_id: &str) -> serde_json::Value {
+    json!({
+        "name": name,
+        "binding_mode": "immediate",
+        "reclaim_policy": "retain",
+        "requested_bytes": 1048576,
+        "node_selector": node_id,
+        "labels": [{"key": "purpose", "value": "rest"}]
+    })
+}
 
+/// Creates one volume and returns its id plus decoded response body.
+async fn create_volume(harness: &RestTestHarness, name: &str) -> (String, serde_json::Value) {
+    let node_id = harness.node_id.to_string();
     let (status, value) = harness
         .json_request(
             Method::POST,
             "/v1/volumes",
             true,
-            Some(json!({
-                "name": "rest-volume-lifecycle",
-                "binding_mode": "immediate",
-                "reclaim_policy": "retain",
-                "requested_bytes": 1048576,
-                "node_selector": node_id,
-                "labels": [{"key": "purpose", "value": "rest"}]
-            })),
+            Some(volume_create_request(name, &node_id)),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "create response body={value}");
-    assert_eq!(value["name"], "rest-volume-lifecycle");
+    let volume_id = value["id"].as_str().expect("volume id").to_string();
+    (volume_id, value)
+}
+
+local_test!(rest_volumes_create_and_list_bound_local_volume, {
+    let harness = RestTestHarness::new().await;
+    let node_id = harness.node_id.to_string();
+    let (volume_id, value) = create_volume(&harness, "rest-volume-list").await;
+
+    assert_eq!(value["name"], "rest-volume-list");
     assert_eq!(value["driver"]["kind"], "local_managed");
     assert_eq!(value["binding_mode"], "immediate");
     assert_eq!(value["reclaim_policy"], "retain");
@@ -32,7 +45,6 @@ local_test!(rest_volume_lifecycle_uses_real_local_session, {
     assert_eq!(value["bound_node_id"], node_id);
     assert_eq!(value["labels"][0]["key"], "purpose");
     assert_eq!(value["labels"][0]["value"], "rest");
-    let volume_id = value["id"].as_str().expect("volume id").to_string();
 
     let (status, value) = harness
         .json_request(Method::GET, "/v1/volumes", true, None)
@@ -45,40 +57,74 @@ local_test!(rest_volume_lifecycle_uses_real_local_session, {
             .iter()
             .any(|volume| {
                 volume["id"] == volume_id
-                    && volume["name"] == "rest-volume-lifecycle"
+                    && volume["name"] == "rest-volume-list"
                     && volume["binding_mode"] == "immediate"
             })
     );
+});
+
+local_test!(rest_volumes_inspect_and_status_by_name, {
+    let harness = RestTestHarness::new().await;
+    let (volume_id, _value) = create_volume(&harness, "rest-volume-status").await;
 
     let (status, value) = harness
-        .json_request(Method::GET, "/v1/volumes/rest-volume-lifecycle", true, None)
+        .json_request(Method::GET, "/v1/volumes/rest-volume-status", true, None)
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["spec"]["id"], volume_id);
-    assert_eq!(value["spec"]["name"], "rest-volume-lifecycle");
+    assert_eq!(value["spec"]["name"], "rest-volume-status");
     assert!(value["node_states"].as_array().is_some());
 
     let (status, value) = harness
         .json_request(
             Method::GET,
-            "/v1/volumes/rest-volume-lifecycle/status",
+            "/v1/volumes/rest-volume-status/status",
             true,
             None,
         )
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["spec"]["id"], volume_id);
+});
+
+local_test!(rest_volumes_delete_retained_local_volume, {
+    let harness = RestTestHarness::new().await;
+    let (_volume_id, _value) = create_volume(&harness, "rest-volume-delete").await;
 
     let (status, value) = harness
-        .json_request(
-            Method::DELETE,
-            "/v1/volumes/rest-volume-lifecycle",
-            true,
-            None,
-        )
+        .json_request(Method::DELETE, "/v1/volumes/rest-volume-delete", true, None)
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["deleted_data"], false);
+});
+
+local_test!(rest_volumes_import_existing_local_path, {
+    let harness = RestTestHarness::new().await;
+    let import_dir = tempfile::tempdir().expect("create import volume dir");
+
+    let (status, value) = harness
+        .json_request(
+            Method::POST,
+            "/v1/volumes/import",
+            true,
+            Some(json!({
+                "name": "rest-volume-import",
+                "node_selector": harness.node_id.to_string(),
+                "path": import_dir.path().to_string_lossy(),
+                "requested_bytes": 4096,
+                "labels": [{"key": "kind", "value": "import"}]
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "import response body={value}");
+    assert_eq!(value["name"], "rest-volume-import");
+    assert_eq!(value["driver"]["kind"], "local_imported_path");
+    assert_eq!(value["requested_bytes"], 4096);
+    assert_eq!(value["labels"][0]["value"], "import");
+});
+
+local_test!(rest_volumes_reject_invalid_create_requests, {
+    let harness = RestTestHarness::new().await;
 
     let (status, value) = harness
         .json_request(
@@ -88,6 +134,20 @@ local_test!(rest_volume_lifecycle_uses_real_local_session, {
             Some(json!({
                 "name": "bad-volume",
                 "binding_mode": "sometimes"
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "bad_request");
+
+    let (status, value) = harness
+        .json_request(
+            Method::POST,
+            "/v1/volumes",
+            true,
+            Some(json!({
+                "name": "bad-immediate-volume",
+                "binding_mode": "immediate"
             })),
         )
         .await;

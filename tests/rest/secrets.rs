@@ -4,16 +4,15 @@ use serde_json::json;
 use crate::common;
 use crate::harness::RestTestHarness;
 
-local_test!(rest_secret_lifecycle_uses_real_local_session, {
-    let harness = RestTestHarness::new().await;
-
+/// Creates one secret and returns its version id plus decoded response body.
+async fn create_secret(harness: &RestTestHarness, name: &str) -> (String, serde_json::Value) {
     let (status, value) = harness
         .json_request(
             Method::POST,
             "/v1/secrets",
             true,
             Some(json!({
-                "name": "rest-secret-lifecycle",
+                "name": name,
                 "plaintext_base64": "cmVzdC1zZWNyZXQtb25l",
                 "description": "created through REST",
                 "labels": [{"key": "purpose", "value": "rest"}]
@@ -21,14 +20,21 @@ local_test!(rest_secret_lifecycle_uses_real_local_session, {
         )
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(value["name"], "rest-secret-lifecycle");
-    assert_eq!(value["description"], "created through REST");
-    assert_eq!(value["labels"][0]["key"], "purpose");
-    assert_eq!(value["labels"][0]["value"], "rest");
-    let first_version = value["version_id"]
+    let version_id = value["version_id"]
         .as_str()
         .expect("create returns version id")
         .to_string();
+    (version_id, value)
+}
+
+local_test!(rest_secrets_create_list_and_show_plaintext, {
+    let harness = RestTestHarness::new().await;
+    let (version_id, value) = create_secret(&harness, "rest-secret-read").await;
+
+    assert_eq!(value["name"], "rest-secret-read");
+    assert_eq!(value["description"], "created through REST");
+    assert_eq!(value["labels"][0]["key"], "purpose");
+    assert_eq!(value["labels"][0]["value"], "rest");
 
     let (status, value) = harness
         .json_request(Method::GET, "/v1/secrets", true, None)
@@ -40,24 +46,29 @@ local_test!(rest_secret_lifecycle_uses_real_local_session, {
             .expect("secrets response is array")
             .iter()
             .any(|secret| {
-                secret["name"] == "rest-secret-lifecycle"
-                    && secret["version_id"] == first_version
+                secret["name"] == "rest-secret-read"
+                    && secret["version_id"] == version_id
                     && secret["description"] == "created through REST"
             })
     );
 
     let (status, value) = harness
-        .json_request(Method::GET, "/v1/secrets/rest-secret-lifecycle", true, None)
+        .json_request(Method::GET, "/v1/secrets/rest-secret-read", true, None)
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(value["summary"]["name"], "rest-secret-lifecycle");
-    assert_eq!(value["summary"]["version_id"], first_version);
+    assert_eq!(value["summary"]["name"], "rest-secret-read");
+    assert_eq!(value["summary"]["version_id"], version_id);
     assert_eq!(value["plaintext_base64"], "cmVzdC1zZWNyZXQtb25l");
+});
+
+local_test!(rest_secrets_update_replaces_current_version, {
+    let harness = RestTestHarness::new().await;
+    let (first_version, _value) = create_secret(&harness, "rest-secret-update").await;
 
     let (status, value) = harness
         .json_request(
             Method::PUT,
-            "/v1/secrets/rest-secret-lifecycle",
+            "/v1/secrets/rest-secret-update",
             true,
             Some(json!({
                 "plaintext_base64": "cmVzdC1zZWNyZXQtdHdv",
@@ -67,7 +78,7 @@ local_test!(rest_secret_lifecycle_uses_real_local_session, {
         )
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(value["name"], "rest-secret-lifecycle");
+    assert_eq!(value["name"], "rest-secret-update");
     assert_ne!(value["version_id"], first_version);
     let second_version = value["version_id"]
         .as_str()
@@ -75,34 +86,43 @@ local_test!(rest_secret_lifecycle_uses_real_local_session, {
         .to_string();
 
     let (status, value) = harness
-        .json_request(Method::GET, "/v1/secrets/rest-secret-lifecycle", true, None)
+        .json_request(Method::GET, "/v1/secrets/rest-secret-update", true, None)
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["summary"]["version_id"], second_version);
     assert_eq!(value["plaintext_base64"], "cmVzdC1zZWNyZXQtdHdv");
+});
+
+local_test!(rest_secrets_fetch_explicit_current_version, {
+    let harness = RestTestHarness::new().await;
+    let (version_id, _value) = create_secret(&harness, "rest-secret-version").await;
 
     let (status, value) = harness
         .json_request(
             Method::GET,
-            &format!("/v1/secrets/rest-secret-lifecycle/versions/{second_version}"),
+            &format!("/v1/secrets/rest-secret-version/versions/{version_id}"),
             true,
             None,
         )
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(value["summary"]["version_id"], second_version);
-    assert_eq!(value["plaintext_base64"], "cmVzdC1zZWNyZXQtdHdv");
+    assert_eq!(value["summary"]["version_id"], version_id);
+    assert_eq!(value["plaintext_base64"], "cmVzdC1zZWNyZXQtb25l");
+});
+
+local_test!(rest_secrets_delete_by_name, {
+    let harness = RestTestHarness::new().await;
+    let (_version_id, _value) = create_secret(&harness, "rest-secret-delete").await;
 
     let (status, value) = harness
-        .json_request(
-            Method::DELETE,
-            "/v1/secrets/rest-secret-lifecycle",
-            true,
-            None,
-        )
+        .json_request(Method::DELETE, "/v1/secrets/rest-secret-delete", true, None)
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["deleted"], 1);
+});
+
+local_test!(rest_secrets_reject_invalid_base64_and_version_id, {
+    let harness = RestTestHarness::new().await;
 
     let (status, value) = harness
         .json_request(
@@ -113,6 +133,17 @@ local_test!(rest_secret_lifecycle_uses_real_local_session, {
                 "name": "bad-secret",
                 "plaintext_base64": "@@@not-base64@@@"
             })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "bad_request");
+
+    let (status, value) = harness
+        .json_request(
+            Method::GET,
+            "/v1/secrets/demo/versions/not-a-uuid",
+            true,
+            None,
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);

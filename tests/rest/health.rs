@@ -3,7 +3,7 @@ use axum::http::{Method, StatusCode};
 use crate::common;
 use crate::harness::RestTestHarness;
 
-local_test!(rest_health_uses_real_local_session, {
+local_test!(rest_liveness_probe_is_public, {
     let harness = RestTestHarness::new().await;
 
     let (status, value) = harness
@@ -11,12 +11,20 @@ local_test!(rest_health_uses_real_local_session, {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["status"], "ok");
+});
+
+local_test!(rest_daemon_health_requires_bearer_token, {
+    let harness = RestTestHarness::new().await;
 
     let (status, value) = harness
         .json_request(Method::GET, "/v1/health", false, None)
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(value["code"], "unauthorized");
+});
+
+local_test!(rest_daemon_health_reports_local_session_reachable, {
+    let harness = RestTestHarness::new().await;
 
     let (status, value) = harness
         .json_request(Method::GET, "/v1/health", true, None)
