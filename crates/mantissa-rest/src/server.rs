@@ -187,17 +187,12 @@ pub async fn bind(config: RestConfig) -> Result<BoundRestServer, RestServerError
     })
 }
 
-/// Starts the REST listener and serves requests until shutdown resolves.
+/// Binds and serves REST requests until shutdown resolves.
 pub async fn serve_until<S>(config: RestConfig, shutdown: S) -> Result<(), RestServerError>
 where
     S: Future<Output = ()> + Send + 'static,
 {
     bind(config).await?.serve_until(shutdown).await
-}
-
-/// Starts the standalone REST listener and stops it on process termination.
-pub async fn serve(config: RestConfig) -> Result<(), RestServerError> {
-    serve_until(config, shutdown_signal()).await
 }
 
 /// Logs one completed REST request with compact operational fields.
@@ -217,14 +212,7 @@ async fn log_request(request: Request<Body>, next: Next) -> Response {
     response
 }
 
-/// Waits for process termination before gracefully stopping the HTTP server.
-async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::warn!(%error, "failed to install REST shutdown signal handler");
-    }
-}
-
-/// Startup and listener errors returned by the standalone REST server.
+/// Startup and listener errors returned by the REST listener.
 #[derive(Debug)]
 pub enum RestServerError {
     Config(crate::config::RestConfigError),
