@@ -4,6 +4,7 @@ pub mod agents;
 pub mod clusters;
 pub mod config;
 pub mod connection;
+pub mod error;
 mod errors;
 pub mod host_ports;
 pub mod jobs;

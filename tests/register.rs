@@ -571,6 +571,53 @@ local_test!(node_evict_revokes_existing_peer_session_inproc, {
     );
 });
 
+local_test!(peer_session_cannot_access_rest_admin_inproc, {
+    let anchor = TestNode::new_with_tick_ms(100).await;
+    let peer = TestNode::new_with_tick_ms(100).await;
+
+    peer.join(&anchor).await.expect("peer join ok");
+    anchor.assert_cluster_size(2, "anchor sees peer").await;
+    peer.assert_cluster_size(2, "peer sees anchor").await;
+
+    let peer_session_to_anchor = peer
+        .node
+        .registry
+        .session_for_peer(anchor.id())
+        .await
+        .expect("peer should have a session to anchor");
+
+    let capabilities_response = peer_session_to_anchor
+        .get_capabilities_request()
+        .send()
+        .promise
+        .await
+        .expect("peer should read its capability bundle");
+    let capabilities_reader = capabilities_response
+        .get()
+        .expect("peer capability response reader");
+    let capabilities = capabilities_reader
+        .get_caps()
+        .expect("peer capability bundle");
+    assert!(
+        !capabilities.has_rest_admin(),
+        "peer capability bundle must not include REST admin"
+    );
+
+    let result = peer_session_to_anchor
+        .get_rest_admin_request()
+        .send()
+        .promise
+        .await;
+    let Err(err) = result else {
+        panic!("peer session should not get REST admin");
+    };
+    assert!(
+        err.to_string()
+            .contains("REST admin capability is only available to local sessions"),
+        "unexpected REST admin denial error: {err}"
+    );
+});
+
 // Leaving should clear locally cached peer auth material so the node does not
 // keep reconnecting or auto-resume the old cluster after restart.
 local_test!(node_leave_clears_local_peer_auth_tcp, {

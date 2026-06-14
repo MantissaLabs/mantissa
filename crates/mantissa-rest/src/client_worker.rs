@@ -32,8 +32,11 @@ use crate::types::{
     },
 };
 use mantissa_client::{
-    agents, clusters, config::ClientConfig, connection, jobs, networks, nodes, scheduler, secrets,
-    services, tasks, volumes,
+    agents, clusters,
+    config::ClientConfig,
+    connection,
+    error::{ClientError, ClientErrorKind},
+    jobs, networks, nodes, scheduler, secrets, services, tasks, volumes,
 };
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -754,6 +757,19 @@ impl std::fmt::Display for ClientWorkerError {
 
 impl std::error::Error for ClientWorkerError {}
 
+impl From<ClientError> for ClientWorkerError {
+    /// Maps reusable client error classes into REST worker failures.
+    fn from(error: ClientError) -> Self {
+        let message = error.to_string();
+        match error.kind() {
+            ClientErrorKind::InvalidRequest => Self::InvalidRequest(message),
+            ClientErrorKind::NotFound => Self::NotFound(message),
+            ClientErrorKind::Conflict => Self::Conflict(message),
+            ClientErrorKind::OperationFailed => Self::OperationFailed(message),
+        }
+    }
+}
+
 /// Commands accepted by the local Cap'n Proto client worker.
 enum ClientCommand {
     Health(oneshot::Sender<Result<ClientHealth, ClientWorkerError>>),
@@ -1317,7 +1333,7 @@ async fn list_nodes(config: &ClientConfig) -> Result<Vec<NodeSummary>, ClientWor
     nodes::list(config)
         .await
         .map(|nodes| nodes.into_iter().map(NodeSummary::from).collect())
-        .map_err(operation_error)
+        .map_err(operation_failed_error)
 }
 
 /// Fetches one node summary from the topology list response.
@@ -1341,7 +1357,7 @@ async fn list_agent_sessions(
                 .map(AgentSessionSummary::from)
                 .collect()
         })
-        .map_err(operation_error)
+        .map_err(operation_failed_error)
 }
 
 /// Submits one agent manifest through the reusable Mantissa client API.
@@ -1352,7 +1368,7 @@ async fn submit_agent_session(
     agents::run_manifest(config, &request.manifest)
         .await
         .map(AgentSubmitResponse::from)
-        .map_err(operation_error)
+        .map_err(invalid_request_error)
 }
 
 /// Fetches one agent session detail through the reusable Mantissa client API.
@@ -1364,7 +1380,7 @@ async fn get_agent_session(
     agents::inspect(config, session_id)
         .await
         .map(AgentSessionDetail::from)
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Lists one agent session's durable runs through the reusable client API.
@@ -1376,7 +1392,7 @@ async fn list_agent_runs(
     agents::list_runs(config, Some(session_id))
         .await
         .map(|runs| runs.into_iter().map(AgentRunSummary::from).collect())
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Queues one structured input message through the reusable client API.
@@ -1385,12 +1401,15 @@ async fn submit_agent_input(
     session_id: &str,
     request: AgentInputRequest,
 ) -> Result<AgentInputResponse, ClientWorkerError> {
-    let session_id = parse_uuid("agent session id", session_id)?;
+    let parsed_session_id = parse_uuid("agent session id", session_id)?;
     let input = clean_required_name("agent input", &request.input)?;
-    agents::submit_input(config, session_id, input)
+    agents::inspect(config, session_id)
+        .await
+        .map_err(not_found_error)?;
+    agents::submit_input(config, parsed_session_id, input)
         .await
         .map(|()| AgentInputResponse::accepted())
-        .map_err(operation_error)
+        .map_err(conflict_error)
 }
 
 /// Cancels one agent session through the reusable client API.
@@ -1399,10 +1418,13 @@ async fn cancel_agent_session(
     session_id: &str,
 ) -> Result<AgentSession, ClientWorkerError> {
     parse_uuid("agent session id", session_id)?;
+    agents::inspect(config, session_id)
+        .await
+        .map_err(not_found_error)?;
     agents::cancel(config, session_id)
         .await
         .map(AgentSession::from)
-        .map_err(operation_error)
+        .map_err(conflict_error)
 }
 
 /// Closes one agent session through the reusable client API.
@@ -1411,10 +1433,13 @@ async fn close_agent_session(
     session_id: &str,
 ) -> Result<AgentSession, ClientWorkerError> {
     parse_uuid("agent session id", session_id)?;
+    agents::inspect(config, session_id)
+        .await
+        .map_err(not_found_error)?;
     agents::close(config, session_id)
         .await
         .map(AgentSession::from)
-        .map_err(operation_error)
+        .map_err(conflict_error)
 }
 
 /// Deletes one closed agent session through the reusable client API.
@@ -1423,10 +1448,13 @@ async fn delete_agent_session(
     session_id: &str,
 ) -> Result<AgentSession, ClientWorkerError> {
     parse_uuid("agent session id", session_id)?;
+    agents::inspect(config, session_id)
+        .await
+        .map_err(not_found_error)?;
     agents::delete(config, session_id)
         .await
         .map(AgentSession::from)
-        .map_err(operation_error)
+        .map_err(conflict_error)
 }
 
 /// Lists jobs through the reusable Mantissa client API.
@@ -1434,7 +1462,7 @@ async fn list_jobs(config: &ClientConfig) -> Result<Vec<JobSummary>, ClientWorke
     jobs::list(config)
         .await
         .map(|jobs| jobs.into_iter().map(JobSummary::from).collect())
-        .map_err(operation_error)
+        .map_err(operation_failed_error)
 }
 
 /// Fetches one job detail through the reusable Mantissa client API.
@@ -1443,7 +1471,7 @@ async fn get_job(config: &ClientConfig, job_id: &str) -> Result<JobDetail, Clien
     jobs::inspect(config, job_id)
         .await
         .map(JobDetail::from)
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Submits one job manifest through the reusable Mantissa client API.
@@ -1454,25 +1482,31 @@ async fn submit_job(
     jobs::run_manifest(config, &request.manifest)
         .await
         .map(JobSubmitResponse::from)
-        .map_err(operation_error)
+        .map_err(invalid_request_error)
 }
 
 /// Cancels one job through the reusable Mantissa client API.
 async fn cancel_job(config: &ClientConfig, job_id: &str) -> Result<JobSummary, ClientWorkerError> {
     parse_uuid("job id", job_id)?;
+    jobs::inspect(config, job_id)
+        .await
+        .map_err(not_found_error)?;
     jobs::cancel(config, job_id)
         .await
         .map(JobSummary::from)
-        .map_err(operation_error)
+        .map_err(conflict_error)
 }
 
 /// Deletes one terminal job through the reusable Mantissa client API.
 async fn delete_job(config: &ClientConfig, job_id: &str) -> Result<JobSummary, ClientWorkerError> {
     parse_uuid("job id", job_id)?;
+    jobs::inspect(config, job_id)
+        .await
+        .map_err(not_found_error)?;
     jobs::delete(config, job_id)
         .await
         .map(JobSummary::from)
-        .map_err(operation_error)
+        .map_err(conflict_error)
 }
 
 /// Lists services through the reusable Mantissa client API.
@@ -1480,7 +1514,7 @@ async fn list_services(config: &ClientConfig) -> Result<Vec<ServiceSummary>, Cli
     services::list(config)
         .await
         .map(|services| services.into_iter().map(ServiceSummary::from).collect())
-        .map_err(operation_error)
+        .map_err(operation_failed_error)
 }
 
 /// Deploys one service manifest through the reusable Mantissa client API.
@@ -1491,7 +1525,7 @@ async fn deploy_service(
     services::deploy_manifest(config, &request.manifest)
         .await
         .map(ServiceDeployResponse::from)
-        .map_err(operation_error)
+        .map_err(invalid_request_error)
 }
 
 /// Fetches one service through the reusable Mantissa client API.
@@ -1502,7 +1536,7 @@ async fn get_service(
     services::list::inspect_service_row(config, selector)
         .await
         .map(ServiceSummary::from)
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Fetches one service status through the reusable Mantissa client API.
@@ -1513,7 +1547,7 @@ async fn get_service_status(
     services::rollout_status(config, selector)
         .await
         .map(ServiceSummary::from)
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Deletes one service through the reusable Mantissa client API.
@@ -1523,11 +1557,11 @@ async fn delete_service(
 ) -> Result<ServiceSummary, ClientWorkerError> {
     let service = services::list::inspect_service_row(config, selector)
         .await
-        .map_err(operation_error)?;
+        .map_err(not_found_error)?;
     services::stop(config, &service.service_id.to_string())
         .await
         .map(ServiceSummary::from)
-        .map_err(operation_error)
+        .map_err(operation_failed_error)
 }
 
 /// Lists networks through the reusable Mantissa client API.
@@ -1535,7 +1569,7 @@ async fn list_networks(config: &ClientConfig) -> Result<Vec<NetworkSummary>, Cli
     networks::list(config)
         .await
         .map(|networks| networks.into_iter().map(NetworkSummary::from).collect())
-        .map_err(operation_error)
+        .map_err(operation_failed_error)
 }
 
 /// Creates one network through the reusable Mantissa client API.
@@ -1549,7 +1583,7 @@ async fn create_network(
         .map(|network_id| NetworkCreateResponse {
             network_id: network_id.to_string(),
         })
-        .map_err(operation_error)
+        .map_err(conflict_error)
 }
 
 /// Fetches one network inspection through the reusable Mantissa client API.
@@ -1561,7 +1595,7 @@ async fn get_network(
     networks::inspect(config, network_id)
         .await
         .map(NetworkInspect::from)
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Lists network peer status rows through the reusable Mantissa client API.
@@ -1573,7 +1607,7 @@ async fn list_network_peers(
     networks::peer_status(config, network_id)
         .await
         .map(|peers| peers.into_iter().map(NetworkPeerStatus::from).collect())
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Lists network attachment rows through the reusable Mantissa client API.
@@ -1590,7 +1624,7 @@ async fn list_network_attachments(
                 .map(NetworkAttachment::from)
                 .collect()
         })
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Deletes one network through the reusable Mantissa client API.
@@ -1602,7 +1636,7 @@ async fn delete_network(
     networks::delete(config, &[network_id])
         .await
         .map(|deleted| NetworkDeleteResponse { deleted })
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Lists volumes through the reusable Mantissa client API.
@@ -1610,7 +1644,7 @@ async fn list_volumes(config: &ClientConfig) -> Result<Vec<VolumeSummary>, Clien
     volumes::list(config)
         .await
         .map(|volumes| volumes.into_iter().map(VolumeSummary::from).collect())
-        .map_err(operation_error)
+        .map_err(operation_failed_error)
 }
 
 /// Creates one volume through the reusable Mantissa client API.
@@ -1624,7 +1658,7 @@ async fn create_volume(
     volumes::create_with_request(config, &request)
         .await
         .map(VolumeSpec::from)
-        .map_err(operation_error)
+        .map_err(conflict_error)
 }
 
 /// Imports one volume through the reusable Mantissa client API.
@@ -1636,7 +1670,7 @@ async fn import_volume(
     volumes::import_with_request(config, &request)
         .await
         .map(VolumeSpec::from)
-        .map_err(operation_error)
+        .map_err(conflict_error)
 }
 
 /// Fetches one volume inspection through the reusable Mantissa client API.
@@ -1647,7 +1681,7 @@ async fn get_volume(
     volumes::inspect(config, selector)
         .await
         .map(VolumeInspect::from)
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Fetches one volume status through the reusable Mantissa client API.
@@ -1658,7 +1692,7 @@ async fn get_volume_status(
     volumes::status(config, selector)
         .await
         .map(VolumeInspect::from)
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Deletes one volume through the reusable Mantissa client API.
@@ -1666,10 +1700,13 @@ async fn delete_volume(
     config: &ClientConfig,
     selector: &str,
 ) -> Result<VolumeDeleteResponse, ClientWorkerError> {
+    volumes::inspect(config, selector)
+        .await
+        .map_err(not_found_error)?;
     volumes::delete(config, selector)
         .await
         .map(VolumeDeleteResponse::from)
-        .map_err(operation_error)
+        .map_err(conflict_error)
 }
 
 /// Lists standalone tasks through the reusable Mantissa client API.
@@ -1677,7 +1714,7 @@ async fn list_tasks(config: &ClientConfig) -> Result<Vec<TaskSummary>, ClientWor
     tasks::list(config, &[])
         .await
         .map(|tasks| tasks.into_iter().map(TaskSummary::from).collect())
-        .map_err(operation_error)
+        .map_err(operation_failed_error)
 }
 
 /// Fetches one standalone task from the task list response.
@@ -1967,7 +2004,7 @@ async fn start_task(
     tasks::start(config, &options)
         .await
         .map(TaskSummary::from)
-        .map_err(operation_error)
+        .map_err(invalid_request_error)
 }
 
 /// Stops one standalone task through the reusable Mantissa client API.
@@ -1978,7 +2015,7 @@ async fn stop_task(
     tasks::stop(config, selector)
         .await
         .map(TaskSummary::from)
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Lists secrets through the reusable Mantissa client API.
@@ -1986,7 +2023,7 @@ async fn list_secrets(config: &ClientConfig) -> Result<Vec<SecretSummary>, Clien
     secrets::list(config)
         .await
         .map(|secrets| secrets.into_iter().map(SecretSummary::from).collect())
-        .map_err(operation_error)
+        .map_err(operation_failed_error)
 }
 
 /// Creates one secret through the reusable Mantissa client API.
@@ -2007,7 +2044,7 @@ async fn create_secret(
     )
     .await
     .map(SecretSummary::from)
-    .map_err(operation_error)
+    .map_err(conflict_error)
 }
 
 /// Updates one secret through the reusable Mantissa client API.
@@ -2028,7 +2065,7 @@ async fn update_secret(
     )
     .await
     .map(SecretSummary::from)
-    .map_err(operation_error)
+    .map_err(not_found_error)
 }
 
 /// Fetches one secret detail through the reusable Mantissa client API.
@@ -2048,7 +2085,7 @@ async fn get_secret(
     )
     .await
     .map(SecretDetail::from)
-    .map_err(operation_error)
+    .map_err(not_found_error)
 }
 
 /// Deletes one secret through the reusable Mantissa client API.
@@ -2060,7 +2097,7 @@ async fn delete_secret(
     secrets::delete(config, &[name])
         .await
         .map(|deleted| SecretDeleteResponse { deleted })
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Requests one node drain through the reusable Mantissa client API.
@@ -2077,7 +2114,7 @@ async fn drain_node(
             node_id: operation.node_id.to_string(),
             accepted: true,
         })
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Resumes one node through the reusable Mantissa client API.
@@ -2092,7 +2129,7 @@ async fn resume_node(
             node_id: node_id.to_string(),
             accepted: true,
         })
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Evicts one node through the reusable Mantissa client API.
@@ -2107,7 +2144,7 @@ async fn evict_node(
             node_id: node_id.to_string(),
             accepted: true,
         })
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Fetches one node drain-status snapshot through the reusable Mantissa client API.
@@ -2119,7 +2156,7 @@ async fn node_drain_status(
     nodes::status(config, node_id)
         .await
         .map(NodeDrainStatus::from)
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
 /// Applies one node label mutation through the reusable Mantissa client API.
@@ -2138,7 +2175,7 @@ async fn update_node_labels(
     )
     .await
     .map(NodeLabelsResponse::from)
-    .map_err(operation_error)
+    .map_err(not_found_error)
 }
 
 /// Fetches scheduler summary through the reusable Mantissa client API.
@@ -2147,10 +2184,13 @@ async fn scheduler_summary(
     peer_id: Option<String>,
     details: bool,
 ) -> Result<SchedulerSummary, ClientWorkerError> {
+    if let Some(peer_id) = peer_id.as_deref() {
+        parse_uuid("peer id", peer_id)?;
+    }
     scheduler::slots(config, peer_id.as_deref(), details)
         .await
         .map(SchedulerSummary::from)
-        .map_err(operation_error)
+        .map_err(operation_failed_error)
 }
 
 /// Lists cluster lineage summaries through the reusable Mantissa client API.
@@ -2158,7 +2198,7 @@ async fn list_clusters(config: &ClientConfig) -> Result<Vec<ClusterSummary>, Cli
     clusters::list_clusters(config)
         .await
         .map(|clusters| clusters.into_iter().map(ClusterSummary::from).collect())
-        .map_err(operation_error)
+        .map_err(operation_failed_error)
 }
 
 /// Lists cluster view summaries through the reusable Mantissa client API.
@@ -2168,7 +2208,7 @@ async fn list_cluster_views(
     clusters::list_cluster_views(config)
         .await
         .map(|views| views.into_iter().map(ClusterViewSummary::from).collect())
-        .map_err(operation_error)
+        .map_err(operation_failed_error)
 }
 
 /// Fetches the active cluster view through the reusable Mantissa client API.
@@ -2176,7 +2216,7 @@ async fn active_cluster_view(config: &ClientConfig) -> Result<ClusterView, Clien
     clusters::active_cluster_view(config)
         .await
         .map(ClusterView::from)
-        .map_err(operation_error)
+        .map_err(operation_failed_error)
 }
 
 /// Fetches one cluster operation through the reusable Mantissa client API.
@@ -2188,14 +2228,7 @@ async fn cluster_operation(
     clusters::get_cluster_operation(config, operation_id)
         .await
         .map(ClusterOperation::from)
-        .map_err(|error| {
-            let message = error.to_string();
-            if message.contains("cluster operation not found") {
-                ClientWorkerError::NotFound(message)
-            } else {
-                operation_error(message)
-            }
-        })
+        .map_err(not_found_error)
 }
 
 /// Lists split candidates through the reusable Mantissa client API.
@@ -2209,33 +2242,32 @@ async fn list_split_candidates(
     clusters::list_split_candidates(config, cluster_id)
         .await
         .map(SplitCandidateList::from)
-        .map_err(operation_error)
+        .map_err(not_found_error)
 }
 
-/// Converts a client operation failure into a worker error.
-fn operation_error(error: impl std::fmt::Display) -> ClientWorkerError {
-    let message = format!("{error:#}");
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("not found")
-        || lower.contains("does not exist")
-        || lower.contains("not present")
-        || lower.contains("unknown resource")
-        || lower.contains("unknown job")
-        || lower.contains("unknown volume")
-    {
-        ClientWorkerError::NotFound(message)
-    } else if lower.contains("already exists")
-        || lower.contains("already registered")
-        || lower.contains("already in use")
-        || lower.contains("conflict")
-        || lower.contains("duplicate")
-        || lower.contains("non-terminal")
-        || lower.contains("not terminal")
-    {
-        ClientWorkerError::Conflict(message)
-    } else {
-        ClientWorkerError::OperationFailed(message)
-    }
+/// Converts a known client error class into a worker error.
+fn client_error(kind: ClientErrorKind, error: impl std::fmt::Display) -> ClientWorkerError {
+    ClientError::from_display(kind, error).into()
+}
+
+/// Marks reusable client failures caused by invalid REST input.
+fn invalid_request_error(error: impl std::fmt::Display) -> ClientWorkerError {
+    client_error(ClientErrorKind::InvalidRequest, error)
+}
+
+/// Marks reusable client failures caused by a missing selected resource.
+fn not_found_error(error: impl std::fmt::Display) -> ClientWorkerError {
+    client_error(ClientErrorKind::NotFound, error)
+}
+
+/// Marks reusable client failures caused by a conflicting resource state.
+fn conflict_error(error: impl std::fmt::Display) -> ClientWorkerError {
+    client_error(ClientErrorKind::Conflict, error)
+}
+
+/// Marks reusable client failures that do not map to a domain status.
+fn operation_failed_error(error: impl std::fmt::Display) -> ClientWorkerError {
+    client_error(ClientErrorKind::OperationFailed, error)
 }
 
 /// Parses a REST UUID path segment before issuing a client request.
