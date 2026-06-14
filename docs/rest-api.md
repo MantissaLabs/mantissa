@@ -48,14 +48,6 @@ mantissa rest token show
 mantissa rest token rotate
 ```
 
-For development, the standalone REST wrapper still exists and connects to an
-already-running local daemon:
-
-```bash
-mantissa init --detach
-cargo run -p mantissa-rest -- serve
-```
-
 Embedded REST can also be enabled with CLI flags:
 
 ```bash
@@ -70,7 +62,6 @@ Configuration:
 | --- | --- |
 | `MANTISSA_REST_ENABLED` | Start embedded REST from `mantissa init`. |
 | `MANTISSA_REST_ADDR` | Bind address, default `127.0.0.1:6579`. |
-| `MANTISSA_REST_SOCKET` | Optional daemon Unix socket path override. |
 
 The equivalent `mantissa init` flags are `--rest` and `--rest-addr`.
 

@@ -7,7 +7,6 @@ use std::{
 
 const DEFAULT_BIND_PORT: u16 = 6579;
 const ENV_BIND_ADDR: &str = "MANTISSA_REST_ADDR";
-const ENV_SOCKET: &str = "MANTISSA_REST_SOCKET";
 
 /// Runtime configuration for the local REST gateway.
 #[derive(Clone, Debug)]
@@ -34,13 +33,10 @@ impl RestConfig {
             Err(env::VarError::NotUnicode(_)) => return Err(RestConfigError::InvalidEnvUnicode),
         };
 
-        let socket = match env::var(ENV_SOCKET) {
-            Ok(value) => Some(PathBuf::from(value)),
-            Err(env::VarError::NotPresent) => None,
-            Err(env::VarError::NotUnicode(_)) => return Err(RestConfigError::InvalidEnvUnicode),
-        };
-
-        Ok(Self { bind_addr, socket })
+        Ok(Self {
+            bind_addr,
+            socket: None,
+        })
     }
 
     /// Converts REST configuration into the local Mantissa client config.
