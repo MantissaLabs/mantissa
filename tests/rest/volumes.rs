@@ -132,6 +132,21 @@ local_test!(rest_volumes_reject_invalid_create_requests, {
             "/v1/volumes",
             true,
             Some(json!({
+                "name": "bad-volume-extra",
+                "binding_mode": "wait_for_first_consumer",
+                "extra": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "bad_request");
+
+    let (status, value) = harness
+        .json_request(
+            Method::POST,
+            "/v1/volumes",
+            true,
+            Some(json!({
                 "name": "bad-volume",
                 "binding_mode": "sometimes"
             })),
@@ -153,4 +168,29 @@ local_test!(rest_volumes_reject_invalid_create_requests, {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(value["code"], "bad_request");
+});
+
+local_test!(rest_volumes_return_not_found_and_conflict_errors, {
+    let harness = RestTestHarness::new().await;
+    let (_volume_id, _value) = create_volume(&harness, "rest-volume-conflict").await;
+
+    let (status, value) = harness
+        .json_request(
+            Method::POST,
+            "/v1/volumes",
+            true,
+            Some(volume_create_request(
+                "rest-volume-conflict",
+                &harness.node_id.to_string(),
+            )),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(value["code"], "conflict");
+
+    let (status, value) = harness
+        .json_request(Method::GET, "/v1/volumes/missing-volume", true, None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["code"], "not_found");
 });

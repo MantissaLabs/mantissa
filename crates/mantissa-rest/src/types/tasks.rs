@@ -1,6 +1,6 @@
 use crate::types::common::HostPort;
 use mantissa_client::tasks::TaskRow;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 /// REST-facing task summary returned by task routes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -99,7 +99,7 @@ pub struct TaskAttachQuery {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskExecQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_command_query")]
     pub command: Vec<String>,
     #[serde(default = "default_true")]
     pub stdin: bool,
@@ -115,6 +115,14 @@ pub struct TaskExecQuery {
     pub tty_width: Option<u16>,
     #[serde(default)]
     pub tty_height: Option<u16>,
+}
+
+/// Raw query representation accepted for the exec command vector.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CommandQueryField {
+    Args(Vec<String>),
+    Text(String),
 }
 
 impl TaskLogsQuery {
@@ -164,4 +172,24 @@ fn default_memory_bytes() -> u64 {
 /// Returns the default task log tail request.
 fn default_log_tail() -> String {
     "all".to_string()
+}
+
+/// Decodes the exec command from a URL query field.
+fn deserialize_command_query<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match CommandQueryField::deserialize(deserializer)? {
+        CommandQueryField::Args(args) => Ok(args),
+        CommandQueryField::Text(text) => {
+            let trimmed = text.trim();
+            if trimmed.starts_with('[') {
+                serde_json::from_str::<Vec<String>>(trimmed).map_err(de::Error::custom)
+            } else if trimmed.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![text])
+            }
+        }
+    }
 }

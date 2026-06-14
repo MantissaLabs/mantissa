@@ -95,6 +95,17 @@ local_test!(rest_jobs_reject_invalid_manifest_and_job_id, {
             Method::POST,
             "/v1/jobs",
             true,
+            Some(json!({"manifest": {"name": "bad-job"}, "extra": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "bad_request");
+
+    let (status, value) = harness
+        .json_request(
+            Method::POST,
+            "/v1/jobs",
+            true,
             Some(json!({"manifest": {"name": ""}})),
         )
         .await;
@@ -106,4 +117,27 @@ local_test!(rest_jobs_reject_invalid_manifest_and_job_id, {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(value["code"], "bad_request");
+
+    let missing_job_id = uuid::Uuid::new_v4();
+    let (status, value) = harness
+        .json_request(
+            Method::GET,
+            &format!("/v1/jobs/{missing_job_id}"),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["code"], "not_found");
+});
+
+local_test!(rest_jobs_delete_rejects_non_terminal_job, {
+    let harness = RestTestHarness::new().await;
+    let (job_id, _value) = submit_job(&harness, "rest-job-delete-active").await;
+
+    let (status, value) = harness
+        .json_request(Method::DELETE, &format!("/v1/jobs/{job_id}"), true, None)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(value["code"], "conflict");
 });

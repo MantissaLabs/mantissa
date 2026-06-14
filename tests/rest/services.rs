@@ -161,9 +161,26 @@ local_test!(rest_services_reject_invalid_manifest, {
             Method::POST,
             "/v1/services",
             true,
+            Some(json!({"manifest": {"name": "bad"}, "extra": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "bad_request");
+
+    let (status, value) = harness
+        .json_request(
+            Method::POST,
+            "/v1/services",
+            true,
             Some(json!({"manifest": {"name": "bad", "tasks": [{"name": ""}]}})),
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(value["code"], "bad_request");
+
+    let (status, value) = harness
+        .json_request(Method::GET, "/v1/services/missing-service", true, None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["code"], "not_found");
 });

@@ -45,6 +45,11 @@ impl RestError {
         Self::new(StatusCode::NOT_FOUND, "not_found", message)
     }
 
+    /// Creates an HTTP 409 error for conflicting resource state.
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, "conflict", message)
+    }
+
     /// Creates an HTTP 503 error for local daemon or worker unavailability.
     pub fn service_unavailable(message: impl Into<String>) -> Self {
         Self::new(

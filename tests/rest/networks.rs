@@ -111,6 +111,17 @@ local_test!(rest_networks_reject_invalid_driver_and_network_id, {
             Method::POST,
             "/v1/networks",
             true,
+            Some(json!({"name": "bad-network", "driver": "vxlan", "extra": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "bad_request");
+
+    let (status, value) = harness
+        .json_request(
+            Method::POST,
+            "/v1/networks",
+            true,
             Some(json!({"name": "bad-network", "driver": "invalid"})),
         )
         .await;
@@ -122,4 +133,16 @@ local_test!(rest_networks_reject_invalid_driver_and_network_id, {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(value["code"], "bad_request");
+
+    let missing_network_id = uuid::Uuid::new_v4();
+    let (status, value) = harness
+        .json_request(
+            Method::GET,
+            &format!("/v1/networks/{missing_network_id}"),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["code"], "not_found");
 });

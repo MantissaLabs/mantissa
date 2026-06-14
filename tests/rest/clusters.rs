@@ -33,6 +33,25 @@ local_test!(rest_clusters_list_active_lineage, {
     assert!(!cluster_id.is_empty());
 });
 
+local_test!(rest_clusters_current_view_reports_joined_cluster_members, {
+    let harness = RestTestHarness::new_cluster(2).await;
+
+    let (status, value) = harness
+        .json_request(Method::GET, "/v1/clusters", true, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "clusters response body={value}");
+    let clusters = value.as_array().expect("clusters response is array");
+    assert_eq!(clusters.len(), 1);
+    assert_eq!(clusters[0]["node_count"], 2);
+    assert_eq!(clusters[0]["local_active"], true);
+
+    let (status, value) = harness
+        .json_request(Method::GET, "/v1/clusters/current", true, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "current view body={value}");
+    assert_eq!(value["cluster_id"], clusters[0]["cluster_id"]);
+});
+
 local_test!(rest_clusters_list_views_and_current_view, {
     let harness = RestTestHarness::new().await;
     let cluster_id = active_cluster_id(&harness).await;

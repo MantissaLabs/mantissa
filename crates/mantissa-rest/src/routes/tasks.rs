@@ -3,7 +3,7 @@
 use crate::{
     auth::RestAuth,
     error::RestError,
-    extract::RestJson,
+    extract::{RestJson, RestQuery},
     routes::worker_error_to_rest,
     state::AppState,
     stream::task_exec::{
@@ -15,7 +15,7 @@ use axum::{
     Json,
     body::Body,
     extract::{
-        Path, Query, State,
+        Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::header::CONTENT_TYPE,
@@ -68,7 +68,7 @@ pub async fn logs(
     State(state): State<AppState>,
     _auth: RestAuth,
     Path(selector): Path<String>,
-    Query(query): Query<TaskLogsQuery>,
+    RestQuery(query): RestQuery<TaskLogsQuery>,
 ) -> Result<Response, RestError> {
     let stream = state
         .client()
@@ -87,7 +87,7 @@ pub async fn attach(
     State(state): State<AppState>,
     _auth: RestAuth,
     Path(selector): Path<String>,
-    Query(query): Query<TaskAttachQuery>,
+    RestQuery(query): RestQuery<TaskAttachQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, RestError> {
     let session = state
@@ -105,7 +105,7 @@ pub async fn exec(
     State(state): State<AppState>,
     _auth: RestAuth,
     Path(selector): Path<String>,
-    Query(query): Query<TaskExecQuery>,
+    RestQuery(query): RestQuery<TaskExecQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, RestError> {
     let session = state

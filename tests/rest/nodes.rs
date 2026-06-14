@@ -28,6 +28,29 @@ local_test!(rest_nodes_list_get_and_report_initial_drain_status, {
     assert_eq!(value["schedulable"], true);
 });
 
+local_test!(rest_nodes_list_reports_joined_cluster_members, {
+    let harness = RestTestHarness::new_cluster(2).await;
+    let mut expected = harness
+        .node_ids()
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>();
+    expected.sort();
+
+    let (status, value) = harness
+        .json_request(Method::GET, "/v1/nodes", true, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "nodes response body={value}");
+    let mut observed = value
+        .as_array()
+        .expect("nodes response is array")
+        .iter()
+        .map(|node| node["id"].as_str().expect("node id").to_string())
+        .collect::<Vec<_>>();
+    observed.sort();
+    assert_eq!(observed, expected);
+});
+
 local_test!(rest_nodes_replace_and_remove_labels, {
     let harness = RestTestHarness::new().await;
     let node_id = harness.node_id.to_string();
@@ -114,6 +137,44 @@ local_test!(rest_nodes_reject_invalid_node_id, {
 
     let (status, value) = harness
         .json_request(Method::GET, "/v1/nodes/not-a-uuid/drain", true, None)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "bad_request");
+});
+
+local_test!(rest_nodes_return_not_found_and_reject_bad_bodies, {
+    let harness = RestTestHarness::new().await;
+    let missing_node_id = uuid::Uuid::new_v4();
+
+    let (status, value) = harness
+        .json_request(
+            Method::GET,
+            &format!("/v1/nodes/{missing_node_id}"),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["code"], "not_found");
+
+    let (status, value) = harness
+        .json_request(
+            Method::POST,
+            &format!("/v1/nodes/{}/drain", harness.node_id),
+            true,
+            Some(json!({"reason": "maintenance", "extra": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "bad_request");
+
+    let (status, value) = harness
+        .json_request(
+            Method::PUT,
+            &format!("/v1/nodes/{}/labels", harness.node_id),
+            true,
+            Some(json!({"labels": ["role=api"], "unknown": true})),
+        )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(value["code"], "bad_request");

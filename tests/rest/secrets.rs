@@ -91,6 +91,17 @@ local_test!(rest_secrets_update_replaces_current_version, {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["summary"]["version_id"], second_version);
     assert_eq!(value["plaintext_base64"], "cmVzdC1zZWNyZXQtdHdv");
+
+    let (status, value) = harness
+        .json_request(
+            Method::GET,
+            &format!("/v1/secrets/rest-secret-update/versions/{first_version}"),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["code"], "not_found");
 });
 
 local_test!(rest_secrets_fetch_explicit_current_version, {
@@ -119,10 +130,31 @@ local_test!(rest_secrets_delete_by_name, {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["deleted"], 1);
+
+    let (status, value) = harness
+        .json_request(Method::GET, "/v1/secrets/rest-secret-delete", true, None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["code"], "not_found");
 });
 
 local_test!(rest_secrets_reject_invalid_base64_and_version_id, {
     let harness = RestTestHarness::new().await;
+
+    let (status, value) = harness
+        .json_request(
+            Method::POST,
+            "/v1/secrets",
+            true,
+            Some(json!({
+                "name": "bad-secret-extra",
+                "plaintext_base64": "cmVzdA==",
+                "extra": true
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "bad_request");
 
     let (status, value) = harness
         .json_request(

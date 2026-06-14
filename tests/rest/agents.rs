@@ -153,6 +153,17 @@ local_test!(rest_agents_reject_invalid_manifest_and_session_id, {
             Method::POST,
             "/v1/agents/sessions",
             true,
+            Some(json!({"manifest": {"name": "bad-agent"}, "extra": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "bad_request");
+
+    let (status, value) = harness
+        .json_request(
+            Method::POST,
+            "/v1/agents/sessions",
+            true,
             Some(json!({"manifest": {"name": ""}})),
         )
         .await;
@@ -164,4 +175,16 @@ local_test!(rest_agents_reject_invalid_manifest_and_session_id, {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(value["code"], "bad_request");
+
+    let missing_session_id = uuid::Uuid::new_v4();
+    let (status, value) = harness
+        .json_request(
+            Method::GET,
+            &format!("/v1/agents/sessions/{missing_session_id}"),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["code"], "not_found");
 });

@@ -20,6 +20,7 @@ pub(crate) fn worker_error_to_rest(error: ClientWorkerError) -> RestError {
         ClientWorkerError::DaemonUnavailable(message) => RestError::service_unavailable(message),
         ClientWorkerError::InvalidRequest(message) => RestError::bad_request(message),
         ClientWorkerError::NotFound(message) => RestError::not_found(message),
+        ClientWorkerError::Conflict(message) => RestError::conflict(message),
         ClientWorkerError::OperationFailed(message) => RestError::internal(message),
         ClientWorkerError::RequestChannelClosed
         | ClientWorkerError::ResponseChannelClosed

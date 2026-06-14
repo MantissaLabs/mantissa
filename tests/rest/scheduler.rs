@@ -28,6 +28,28 @@ local_test!(rest_scheduler_summary_reports_capacity_totals, {
     assert!(total_slots >= reserved_slots);
 });
 
+local_test!(rest_scheduler_summary_can_read_joined_peer_by_id, {
+    let harness = RestTestHarness::new_cluster(2).await;
+    let remote_node_id = harness
+        .node_ids()
+        .into_iter()
+        .find(|id| *id != harness.node_id)
+        .expect("remote node id")
+        .to_string();
+
+    let (status, value) = harness
+        .json_request(
+            Method::GET,
+            &format!("/v1/scheduler/summary?peer_id={remote_node_id}"),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "remote scheduler body={value}");
+    assert_eq!(value["node_id"], remote_node_id);
+    assert!(value["total_slots"].as_u64().is_some());
+});
+
 local_test!(rest_scheduler_detailed_summary_includes_slot_rows, {
     let harness = RestTestHarness::new().await;
     let node_id = harness.node_id.to_string();
@@ -49,4 +71,19 @@ local_test!(rest_scheduler_detailed_summary_includes_slot_rows, {
             .expect("detailed slots are array")
             .len() as u64
     );
+});
+
+local_test!(rest_scheduler_summary_rejects_unknown_query_fields, {
+    let harness = RestTestHarness::new().await;
+
+    let (status, value) = harness
+        .json_request(
+            Method::GET,
+            "/v1/scheduler/summary?details=true&extra=true",
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "bad_request");
 });

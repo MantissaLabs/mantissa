@@ -729,6 +729,7 @@ pub enum ClientWorkerError {
     DaemonUnavailable(String),
     InvalidRequest(String),
     NotFound(String),
+    Conflict(String),
     OperationFailed(String),
     RequestChannelClosed,
     ResponseChannelClosed,
@@ -742,6 +743,7 @@ impl std::fmt::Display for ClientWorkerError {
             Self::DaemonUnavailable(message) => write!(formatter, "{message}"),
             Self::InvalidRequest(message) => write!(formatter, "{message}"),
             Self::NotFound(message) => write!(formatter, "{message}"),
+            Self::Conflict(message) => write!(formatter, "{message}"),
             Self::OperationFailed(message) => write!(formatter, "{message}"),
             Self::RequestChannelClosed => write!(formatter, "REST client worker is closed"),
             Self::ResponseChannelClosed => write!(formatter, "REST client worker stopped"),
@@ -2212,7 +2214,28 @@ async fn list_split_candidates(
 
 /// Converts a client operation failure into a worker error.
 fn operation_error(error: impl std::fmt::Display) -> ClientWorkerError {
-    ClientWorkerError::OperationFailed(error.to_string())
+    let message = format!("{error:#}");
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("not found")
+        || lower.contains("does not exist")
+        || lower.contains("not present")
+        || lower.contains("unknown resource")
+        || lower.contains("unknown job")
+        || lower.contains("unknown volume")
+    {
+        ClientWorkerError::NotFound(message)
+    } else if lower.contains("already exists")
+        || lower.contains("already registered")
+        || lower.contains("already in use")
+        || lower.contains("conflict")
+        || lower.contains("duplicate")
+        || lower.contains("non-terminal")
+        || lower.contains("not terminal")
+    {
+        ClientWorkerError::Conflict(message)
+    } else {
+        ClientWorkerError::OperationFailed(message)
+    }
 }
 
 /// Parses a REST UUID path segment before issuing a client request.
