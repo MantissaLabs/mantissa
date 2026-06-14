@@ -160,6 +160,7 @@ impl RestTlsFixture {
                 cert_path: Some(server_cert_path),
                 key_path: Some(server_key_path),
                 client_ca_path: Some(client_ca_path),
+                client_cert_sha256: Vec::new(),
             },
             ca_cert: ca_cert.der().clone(),
             client_cert: client_cert.der().clone(),

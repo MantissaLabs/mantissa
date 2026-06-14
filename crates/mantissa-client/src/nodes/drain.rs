@@ -1,5 +1,6 @@
 use crate::config::ClientConfig;
 use crate::connection;
+use crate::error::{ClientError, ClientErrorKind};
 use anyhow::{Result, anyhow};
 use mantissa_protocol::{server::ClusterSessionClient, topology::TopologyClient};
 use std::time::{Duration, Instant};
@@ -63,7 +64,21 @@ pub async fn request_drain(
     reason: Option<&str>,
     task_stop_timeout: Option<Duration>,
 ) -> Result<DrainOperation> {
-    let session = connection::get_local_session(cfg).await?;
+    request_drain_typed(cfg, node_id, reason, task_stop_timeout)
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+/// Requests maintenance drain with stable error classifications.
+pub async fn request_drain_typed(
+    cfg: &ClientConfig,
+    node_id: Uuid,
+    reason: Option<&str>,
+    task_stop_timeout: Option<Duration>,
+) -> Result<DrainOperation, ClientError> {
+    let session = connection::get_local_session(cfg)
+        .await
+        .map_err(|error| ClientError::from_display(ClientErrorKind::OperationFailed, error))?;
 
     let request = session.get_topology_request();
     let topology = request.send().pipeline.get_topology();
@@ -74,8 +89,12 @@ pub async fn request_drain(
         .init_node_id()
         .set_bytes(node_id.as_bytes());
     params.set_reason(reason.unwrap_or_default());
-    params.set_task_stop_timeout_secs(duration_to_wire_secs(task_stop_timeout)?);
-    request.send().promise.await?;
+    params.set_task_stop_timeout_secs(duration_to_wire_secs_typed(task_stop_timeout)?);
+    request
+        .send()
+        .promise
+        .await
+        .map_err(|error| ClientError::from_capnp_domain_error(ClientErrorKind::Conflict, error))?;
 
     Ok(DrainOperation {
         node_id,
@@ -84,13 +103,18 @@ pub async fn request_drain(
     })
 }
 
-/// Converts one optional duration into the wire-level seconds field.
-fn duration_to_wire_secs(duration: Option<Duration>) -> Result<u32> {
+/// Converts one optional duration with a stable invalid-request classification.
+fn duration_to_wire_secs_typed(duration: Option<Duration>) -> Result<u32, ClientError> {
     let Some(duration) = duration else {
         return Ok(0);
     };
     let secs = duration.as_secs();
-    u32::try_from(secs).map_err(|_| anyhow!("duration {duration:?} exceeds protocol limit"))
+    u32::try_from(secs).map_err(|_| {
+        ClientError::new(
+            ClientErrorKind::InvalidRequest,
+            format!("duration {duration:?} exceeds protocol limit"),
+        )
+    })
 }
 
 /// Polls the drain-status RPC until the node is fully drained or the timeout expires.

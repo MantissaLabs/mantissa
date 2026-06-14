@@ -1641,10 +1641,10 @@ async fn delete_network(
 ) -> Result<NetworkDeleteResponse, ClientWorkerError> {
     parse_uuid("network id", &network_id)?;
     ensure_network_exists(config, &network_id).await?;
-    networks::delete(config, &[network_id])
+    networks::delete_typed(config, &[network_id])
         .await
         .map(|deleted| NetworkDeleteResponse { deleted })
-        .map_err(conflict_error)
+        .map_err(ClientWorkerError::from)
 }
 
 /// Lists volumes through the reusable Mantissa client API.
@@ -2130,13 +2130,13 @@ async fn drain_node(
     let node_id = parse_uuid("node id", node_id)?;
     ensure_node_exists(config, node_id).await?;
     let timeout = drain_timeout(request.task_stop_timeout_secs)?;
-    nodes::request_drain(config, node_id, request.reason.as_deref(), timeout)
+    nodes::request_drain_typed(config, node_id, request.reason.as_deref(), timeout)
         .await
         .map(|operation| NodeActionResponse {
             node_id: operation.node_id.to_string(),
             accepted: true,
         })
-        .map_err(conflict_error)
+        .map_err(ClientWorkerError::from)
 }
 
 /// Resumes one node through the reusable Mantissa client API.

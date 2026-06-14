@@ -30,6 +30,15 @@ impl ClientError {
         Self::new(kind, format!("{error:#}"))
     }
 
+    /// Classifies a Cap'n Proto RPC error without treating transport loss as a domain error.
+    pub fn from_capnp_domain_error(domain_kind: ClientErrorKind, error: capnp::Error) -> Self {
+        let kind = match error.kind {
+            capnp::ErrorKind::Failed => domain_kind,
+            _ => ClientErrorKind::OperationFailed,
+        };
+        Self::from_display(kind, error)
+    }
+
     /// Returns the stable classification for callers that map to other APIs.
     pub fn kind(&self) -> ClientErrorKind {
         self.kind

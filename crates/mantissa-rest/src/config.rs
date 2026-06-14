@@ -10,6 +10,7 @@ const ENV_BIND_ADDR: &str = "MANTISSA_REST_ADDR";
 const ENV_TLS_CERT: &str = "MANTISSA_REST_TLS_CERT";
 const ENV_TLS_KEY: &str = "MANTISSA_REST_TLS_KEY";
 const ENV_CLIENT_CA: &str = "MANTISSA_REST_CLIENT_CA";
+const ENV_CLIENT_CERT_SHA256: &str = "MANTISSA_REST_CLIENT_CERT_SHA256";
 
 /// Runtime configuration for the local REST gateway.
 #[derive(Clone, Debug)]
@@ -28,6 +29,7 @@ pub struct RestTlsConfig {
     pub cert_path: Option<PathBuf>,
     pub key_path: Option<PathBuf>,
     pub client_ca_path: Option<PathBuf>,
+    pub client_cert_sha256: Vec<String>,
 }
 
 impl RestConfig {
@@ -59,6 +61,7 @@ impl RestConfig {
                 cert_path: read_optional_path_env(ENV_TLS_CERT)?,
                 key_path: read_optional_path_env(ENV_TLS_KEY)?,
                 client_ca_path: read_optional_path_env(ENV_CLIENT_CA)?,
+                client_cert_sha256: read_optional_list_env(ENV_CLIENT_CERT_SHA256)?,
             },
         })
     }
@@ -129,6 +132,12 @@ impl RestTlsConfig {
         if self.client_ca_path.is_some() && !self.server_tls_enabled() {
             return Err(RestConfigError::ClientCaWithoutTls);
         }
+        if !self.client_cert_sha256.is_empty() && !self.client_cert_required() {
+            return Err(RestConfigError::ClientCertFingerprintWithoutClientCa);
+        }
+        for value in &self.client_cert_sha256 {
+            normalize_client_cert_sha256(value)?;
+        }
 
         Ok(())
     }
@@ -155,6 +164,47 @@ fn read_optional_path_env(name: &'static str) -> Result<Option<PathBuf>, RestCon
     }
 }
 
+/// Reads one comma-separated optional environment variable list.
+fn read_optional_list_env(name: &'static str) -> Result<Vec<String>, RestConfigError> {
+    match env::var(name) {
+        Ok(value) => Ok(value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()),
+        Err(env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(env::VarError::NotUnicode(_)) => Err(RestConfigError::InvalidEnvUnicode { name }),
+    }
+}
+
+/// Normalizes one configured client certificate SHA-256 fingerprint.
+pub fn normalize_client_cert_sha256(raw: &str) -> Result<String, RestConfigError> {
+    let trimmed = raw.trim();
+    let without_prefix = trimmed
+        .strip_prefix("sha256:")
+        .or_else(|| trimmed.strip_prefix("SHA256:"))
+        .unwrap_or(trimmed);
+    let normalized: String = without_prefix
+        .chars()
+        .filter(|character| *character != ':')
+        .flat_map(char::to_lowercase)
+        .collect();
+    if normalized.len() != 64 {
+        return Err(RestConfigError::InvalidClientCertFingerprint {
+            value: raw.to_string(),
+            reason: "expected 64 hexadecimal SHA-256 characters".to_string(),
+        });
+    }
+    if !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(RestConfigError::InvalidClientCertFingerprint {
+            value: raw.to_string(),
+            reason: "fingerprint must contain only hexadecimal characters".to_string(),
+        });
+    }
+    Ok(normalized)
+}
+
 /// Configuration errors detected before the REST listener starts.
 #[derive(Debug)]
 pub enum RestConfigError {
@@ -172,6 +222,11 @@ pub enum RestConfigError {
         key_path: PathBuf,
     },
     ClientCaWithoutTls,
+    ClientCertFingerprintWithoutClientCa,
+    InvalidClientCertFingerprint {
+        value: String,
+        reason: String,
+    },
     NonLoopbackRequiresTls {
         bind_addr: SocketAddr,
     },
@@ -214,6 +269,18 @@ impl std::fmt::Display for RestConfigError {
                 write!(
                     formatter,
                     "REST client CA requires server TLS certificate and key"
+                )
+            }
+            Self::ClientCertFingerprintWithoutClientCa => {
+                write!(
+                    formatter,
+                    "REST client certificate fingerprints require --rest-client-ca or {ENV_CLIENT_CA}"
+                )
+            }
+            Self::InvalidClientCertFingerprint { value, reason } => {
+                write!(
+                    formatter,
+                    "invalid REST client certificate SHA-256 fingerprint '{value}': {reason}"
                 )
             }
             Self::NonLoopbackRequiresTls { bind_addr } => {
@@ -287,6 +354,23 @@ mod tests {
     }
 
     #[test]
+    fn accepts_normalized_client_certificate_fingerprints() {
+        let mut config = config();
+        config.tls.cert_path = Some("/tmp/rest.crt".into());
+        config.tls.key_path = Some("/tmp/rest.key".into());
+        config.tls.client_ca_path = Some("/tmp/rest-clients.pem".into());
+        config.tls.client_cert_sha256 = vec![
+            "sha256:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99".into(),
+        ];
+
+        config.validate().unwrap();
+        assert_eq!(
+            normalize_client_cert_sha256(&config.tls.client_cert_sha256[0]).unwrap(),
+            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+        );
+    }
+
+    #[test]
     fn rejects_incomplete_tls_pairs() {
         let mut config = config();
         config.tls.cert_path = Some("/tmp/rest.crt".into());
@@ -311,6 +395,33 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(RestConfigError::ClientCaWithoutTls)
+        ));
+    }
+
+    #[test]
+    fn rejects_client_certificate_fingerprints_without_client_ca() {
+        let mut config = config();
+        config.tls.cert_path = Some("/tmp/rest.crt".into());
+        config.tls.key_path = Some("/tmp/rest.key".into());
+        config.tls.client_cert_sha256 = vec!["aabb".into()];
+
+        assert!(matches!(
+            config.validate(),
+            Err(RestConfigError::ClientCertFingerprintWithoutClientCa)
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_client_certificate_fingerprint_format() {
+        let mut config = config();
+        config.tls.cert_path = Some("/tmp/rest.crt".into());
+        config.tls.key_path = Some("/tmp/rest.key".into());
+        config.tls.client_ca_path = Some("/tmp/rest-clients.pem".into());
+        config.tls.client_cert_sha256 = vec!["not-a-sha256".into()];
+
+        assert!(matches!(
+            config.validate(),
+            Err(RestConfigError::InvalidClientCertFingerprint { .. })
         ));
     }
 }

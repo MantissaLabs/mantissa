@@ -22,6 +22,12 @@ configured. That means a direct network listener requires HTTPS and mTLS before
 the daemon starts. The bearer token is still required for authenticated REST
 routes after the TLS handshake succeeds.
 
+Use a dedicated REST client CA. If that CA can issue certificates for more than
+one program or operator, pin the exact allowed client certificate fingerprints
+with `--rest-client-cert-sha256`. Fingerprints are SHA-256 digests of the DER
+client certificate and may be written as raw hex, `sha256:<hex>`, or
+colon-separated hex pairs.
+
 Do not expose this listener directly to the public internet without a private
 network boundary and tightly managed client certificates. Prefer localhost,
 SSH forwarding, a private WireGuard link, or a host-local sidecar for ordinary
@@ -71,7 +77,8 @@ mantissa init --detach \
   --rest-addr 0.0.0.0:6579 \
   --rest-tls-cert /etc/mantissa/rest/server.crt \
   --rest-tls-key /etc/mantissa/rest/server.key \
-  --rest-client-ca /etc/mantissa/rest/clients-ca.crt
+  --rest-client-ca /etc/mantissa/rest/clients-ca.crt \
+  --rest-client-cert-sha256 sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
 Configuration:
@@ -83,9 +90,16 @@ Configuration:
 | `MANTISSA_REST_TLS_CERT` | PEM server certificate chain for HTTPS. |
 | `MANTISSA_REST_TLS_KEY` | PEM server private key for HTTPS. |
 | `MANTISSA_REST_CLIENT_CA` | PEM client CA bundle used to require mTLS. |
+| `MANTISSA_REST_CLIENT_CERT_SHA256` | Comma-separated allowed mTLS client certificate SHA-256 fingerprints. |
 
 The equivalent `mantissa init` flags are `--rest`, `--rest-addr`,
-`--rest-tls-cert`, `--rest-tls-key`, and `--rest-client-ca`.
+`--rest-tls-cert`, `--rest-tls-key`, `--rest-client-ca`, and repeatable
+`--rest-client-cert-sha256`.
+
+TLS certificates, private keys, client CA bundles, and fingerprint pins are
+loaded when the REST listener starts. Restart the daemon after rotating any of
+that material. Rotate the REST bearer token independently with
+`mantissa rest token rotate`.
 
 Use this shell helper for examples:
 
@@ -374,6 +388,15 @@ websocat -H "$WS_AUTH" \
 
 websocat -H "$WS_AUTH" \
   "ws://127.0.0.1:6579/v1/tasks/sleepy/exec?command=sh&command=-lc&command=id"
+```
+
+For an mTLS listener, use the same paths with `wss://` and configure the
+WebSocket client with the same server CA, client certificate, and client key
+used for `curl`:
+
+```bash
+websocat -H "$WS_AUTH" \
+  "wss://mantissa-node.example.com:6579/v1/tasks/sleepy/attach?stdin=true&stdout=true&stderr=true"
 ```
 
 Client-to-server text frames:

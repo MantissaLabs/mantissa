@@ -1,6 +1,6 @@
 use crate::{
     client_worker::{ClientWorkerError, ClientWorkerHandle},
-    config::{RestConfig, RestTlsConfig},
+    config::{RestConfig, RestTlsConfig, normalize_client_cert_sha256},
     routes,
     state::AppState,
 };
@@ -13,8 +13,20 @@ use axum::{
     routing::{get, post, put},
 };
 use axum_server::{Handle, tls_rustls::RustlsConfig};
-use rustls::{RootCertStore, ServerConfig, server::WebPkiClientVerifier};
+use rustls::{
+    DigitallySignedStruct, DistinguishedName, Error as TlsError, RootCertStore, ServerConfig,
+    SignatureScheme,
+    client::danger::HandshakeSignatureValid,
+    pki_types::{CertificateDer, UnixTime},
+    server::{
+        WebPkiClientVerifier,
+        danger::{ClientCertVerified, ClientCertVerifier},
+    },
+};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
+    fmt,
     fs::File,
     future::Future,
     io::BufReader,
@@ -269,7 +281,7 @@ fn build_rustls_config(tls: &RestTlsConfig) -> Result<Option<RustlsConfig>, Rest
 
     let mut config = if let Some(client_ca_path) = tls.client_ca_path.as_deref() {
         let client_roots = read_root_store(client_ca_path)?;
-        let client_verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
+        let base_verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
             .build()
             .map_err(|error| {
                 RestServerError::tls(format!(
@@ -277,6 +289,10 @@ fn build_rustls_config(tls: &RestTlsConfig) -> Result<Option<RustlsConfig>, Rest
                     client_ca_path.display()
                 ))
             })?;
+        let client_verifier = Arc::new(ClientFingerprintVerifier::new(
+            base_verifier,
+            &tls.client_cert_sha256,
+        )?);
         ServerConfig::builder()
             .with_client_cert_verifier(client_verifier)
             .with_single_cert(certs, key)
@@ -302,6 +318,117 @@ fn build_rustls_config(tls: &RestTlsConfig) -> Result<Option<RustlsConfig>, Rest
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     Ok(Some(RustlsConfig::from_config(Arc::new(config))))
+}
+
+/// Client certificate verifier that adds optional exact fingerprint pinning.
+#[derive(Debug)]
+struct ClientFingerprintVerifier {
+    inner: Arc<dyn ClientCertVerifier>,
+    allowed_sha256: HashSet<String>,
+}
+
+impl ClientFingerprintVerifier {
+    /// Builds a verifier around rustls' default WebPKI client certificate verifier.
+    fn new(
+        inner: Arc<dyn ClientCertVerifier>,
+        configured: &[String],
+    ) -> Result<Self, RestServerError> {
+        let allowed_sha256 = configured
+            .iter()
+            .map(|value| normalize_client_cert_sha256(value))
+            .collect::<Result<HashSet<_>, _>>()?;
+        Ok(Self {
+            inner,
+            allowed_sha256,
+        })
+    }
+
+    /// Returns true when the presented certificate matches the configured allow-list.
+    fn fingerprint_allowed(&self, end_entity: &CertificateDer<'_>) -> bool {
+        if self.allowed_sha256.is_empty() {
+            return true;
+        }
+        let fingerprint = sha256_hex(end_entity.as_ref());
+        self.allowed_sha256.contains(&fingerprint)
+    }
+}
+
+impl ClientCertVerifier for ClientFingerprintVerifier {
+    /// Delegates whether client certificates should be requested to rustls' verifier.
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    /// Delegates client certificate mandatory behavior to rustls' verifier.
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    /// Delegates certificate authority hints to rustls' verifier.
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    /// Validates the certificate chain, then enforces optional fingerprint pinning.
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, TlsError> {
+        let verified = self
+            .inner
+            .verify_client_cert(end_entity, intermediates, now)?;
+        if !self.fingerprint_allowed(end_entity) {
+            return Err(TlsError::General(
+                "REST client certificate SHA-256 fingerprint is not allowed".to_string(),
+            ));
+        }
+        Ok(verified)
+    }
+
+    /// Delegates TLS 1.2 client certificate signature validation to rustls.
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    /// Delegates TLS 1.3 client certificate signature validation to rustls.
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    /// Delegates supported signature schemes to rustls.
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// Encodes a SHA-256 digest as lowercase hexadecimal.
+fn sha256_hex(bytes: &[u8]) -> String {
+    struct LowerHex<'a>(&'a [u8]);
+
+    impl fmt::Display for LowerHex<'_> {
+        /// Formats digest bytes without allocating per-byte strings.
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            for byte in self.0 {
+                write!(formatter, "{byte:02x}")?;
+            }
+            Ok(())
+        }
+    }
+
+    let digest = Sha256::digest(bytes);
+    format!("{}", LowerHex(digest.as_ref()))
 }
 
 /// Reads one PEM certificate chain used by the REST TLS server.

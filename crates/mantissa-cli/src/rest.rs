@@ -87,6 +87,9 @@ pub(crate) fn config_from_init(init: &InitArgs) -> Result<Option<RestConfig>> {
     if let Some(path) = init.rest_client_ca.as_ref() {
         config.tls.client_ca_path = Some(path.clone());
     }
+    if !init.rest_client_cert_sha256.is_empty() {
+        config.tls.client_cert_sha256 = init.rest_client_cert_sha256.clone();
+    }
     config.validate().context("validate embedded REST config")?;
     Ok(Some(config))
 }
@@ -141,6 +144,7 @@ mod tests {
             rest_tls_cert: None,
             rest_tls_key: None,
             rest_client_ca: None,
+            rest_client_cert_sha256: Vec::new(),
         }
     }
 
@@ -166,6 +170,9 @@ mod tests {
             rest_tls_cert: Some("/tmp/rest.crt".into()),
             rest_tls_key: Some("/tmp/rest.key".into()),
             rest_client_ca: Some("/tmp/rest-clients.pem".into()),
+            rest_client_cert_sha256: vec![
+                "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+            ],
             ..init_args()
         };
 
@@ -178,6 +185,10 @@ mod tests {
         assert_eq!(
             config.tls.client_ca_path,
             Some("/tmp/rest-clients.pem".into())
+        );
+        assert_eq!(
+            config.tls.client_cert_sha256,
+            vec!["aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"]
         );
     }
 

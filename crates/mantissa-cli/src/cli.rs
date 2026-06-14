@@ -298,6 +298,15 @@ pub struct InitArgs {
     /// PEM client CA bundle used to require mTLS on the embedded REST listener
     #[arg(long = "rest-client-ca", value_name = "FILE", requires = "rest")]
     pub rest_client_ca: Option<PathBuf>,
+
+    /// Allowed mTLS client certificate SHA-256 fingerprint, repeatable
+    #[arg(
+        long = "rest-client-cert-sha256",
+        value_name = "SHA256",
+        requires = "rest",
+        action = ArgAction::Append
+    )]
+    pub rest_client_cert_sha256: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1880,6 +1889,8 @@ mod tests {
             "/tmp/rest.key",
             "--rest-client-ca",
             "/tmp/rest-clients.pem",
+            "--rest-client-cert-sha256",
+            "sha256:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99",
         ])
         .unwrap();
 
@@ -1892,6 +1903,13 @@ mod tests {
                 assert_eq!(
                     args.rest_client_ca,
                     Some(PathBuf::from("/tmp/rest-clients.pem"))
+                );
+                assert_eq!(
+                    args.rest_client_cert_sha256,
+                    vec![
+                        "sha256:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99"
+                            .to_string()
+                    ]
                 );
             }
             other => panic!("unexpected command: {other:?}"),

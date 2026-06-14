@@ -395,6 +395,9 @@ fn push_init_args(command: &mut Command, init: &InitArgs, prompted_passphrase_fd
     if let Some(path) = &init.rest_client_ca {
         command.arg("--rest-client-ca").arg(path);
     }
+    for fingerprint in &init.rest_client_cert_sha256 {
+        command.arg("--rest-client-cert-sha256").arg(fingerprint);
+    }
 }
 
 /// Waits until the spawned daemon either answers the local socket or exits.
@@ -1271,6 +1274,9 @@ mod tests {
             rest_tls_cert: Some("/tmp/rest.crt".into()),
             rest_tls_key: Some("/tmp/rest.key".into()),
             rest_client_ca: Some("/tmp/rest-clients.pem".into()),
+            rest_client_cert_sha256: vec![
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            ],
         };
         let mut command = Command::new("mantissa");
 
@@ -1294,6 +1300,8 @@ mod tests {
                 "/tmp/rest.key",
                 "--rest-client-ca",
                 "/tmp/rest-clients.pem",
+                "--rest-client-cert-sha256",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             ]
         );
     }

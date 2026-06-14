@@ -8,7 +8,7 @@ mod types;
 
 pub use attachments::attachments;
 pub use create::{NetworkCreateRequest, create};
-pub use delete::delete;
+pub use delete::{delete, delete_typed};
 pub use inspect::{inspect, inspect_by_id};
 pub use list::list;
 pub use status::peer_status;
