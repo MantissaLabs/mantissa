@@ -4,6 +4,26 @@ use serde_json::json;
 use crate::common;
 use crate::harness::RestTestHarness;
 
+/// Starts one standalone task through REST and returns its task id.
+async fn start_task(harness: &RestTestHarness, name: &str) -> String {
+    let (status, value) = harness
+        .json_request(
+            Method::POST,
+            "/v1/tasks",
+            true,
+            Some(json!({
+                "name": name,
+                "image": "alpine:3.20",
+                "command": ["sh", "-lc", "sleep 60"],
+                "cpu_millis": 250,
+                "memory_bytes": 134217728
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "task start response body={value}");
+    value["id"].as_str().expect("task id").to_string()
+}
+
 local_test!(rest_nodes_list_get_and_report_initial_drain_status, {
     let harness = RestTestHarness::new().await;
     let node_id = harness.node_id.to_string();
@@ -132,6 +152,34 @@ local_test!(rest_nodes_drain_and_resume_node, {
     assert_eq!(value["accepted"], true);
 });
 
+local_test!(rest_nodes_drain_active_standalone_task_returns_conflict, {
+    let harness = RestTestHarness::new().await;
+    let node_id = harness.node_id.to_string();
+    let _task_id = start_task(&harness, "rest-drain-blocker").await;
+
+    let (status, value) = harness
+        .json_request(
+            Method::POST,
+            &format!("/v1/nodes/{node_id}/drain"),
+            true,
+            Some(json!({"reason": "standalone-task-blocker"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(value["code"], "conflict");
+});
+
+local_test!(rest_nodes_evict_local_node_returns_conflict, {
+    let harness = RestTestHarness::new().await;
+    let node_id = harness.node_id.to_string();
+
+    let (status, value) = harness
+        .json_request(Method::DELETE, &format!("/v1/nodes/{node_id}"), true, None)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(value["code"], "conflict");
+});
+
 local_test!(rest_nodes_reject_invalid_node_id, {
     let harness = RestTestHarness::new().await;
 
@@ -174,6 +222,17 @@ local_test!(rest_nodes_return_not_found_and_reject_bad_bodies, {
             &format!("/v1/nodes/{}/labels", harness.node_id),
             true,
             Some(json!({"labels": ["role=api"], "unknown": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "bad_request");
+
+    let (status, value) = harness
+        .json_request(
+            Method::PUT,
+            &format!("/v1/nodes/{}/labels", harness.node_id),
+            true,
+            Some(json!({})),
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);

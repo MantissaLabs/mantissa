@@ -690,6 +690,12 @@ local_test!(rest_tasks_return_not_found_for_unknown_selector, {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(value["code"], "not_found");
+
+    let (status, value) = harness
+        .json_request(Method::POST, "/v1/tasks/missing-task/stop", true, None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["code"], "not_found");
 });
 
 local_test!(rest_tasks_stop_started_task_by_id, {

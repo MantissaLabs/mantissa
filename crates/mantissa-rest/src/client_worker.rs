@@ -1389,10 +1389,11 @@ async fn list_agent_runs(
     session_id: &str,
 ) -> Result<Vec<AgentRunSummary>, ClientWorkerError> {
     let session_id = parse_uuid("agent session id", session_id)?;
+    get_agent_session(config, &session_id.to_string()).await?;
     agents::list_runs(config, Some(session_id))
         .await
         .map(|runs| runs.into_iter().map(AgentRunSummary::from).collect())
-        .map_err(not_found_error)
+        .map_err(operation_failed_error)
 }
 
 /// Queues one structured input message through the reusable client API.
@@ -1544,10 +1545,11 @@ async fn get_service_status(
     config: &ClientConfig,
     selector: &str,
 ) -> Result<ServiceSummary, ClientWorkerError> {
+    get_service(config, selector).await?;
     services::rollout_status(config, selector)
         .await
         .map(ServiceSummary::from)
-        .map_err(not_found_error)
+        .map_err(operation_failed_error)
 }
 
 /// Deletes one service through the reusable Mantissa client API.
@@ -1575,15 +1577,18 @@ async fn list_networks(config: &ClientConfig) -> Result<Vec<NetworkSummary>, Cli
 /// Creates one network through the reusable Mantissa client API.
 async fn create_network(
     config: &ClientConfig,
-    request: NetworkCreateRequest,
+    mut request: NetworkCreateRequest,
 ) -> Result<NetworkCreateResponse, ClientWorkerError> {
+    let name = clean_required_name("network name", &request.name)?.to_string();
+    ensure_unique_network_name(config, &name).await?;
+    request.name = name;
     let request = request.into();
     networks::create(config, &request)
         .await
         .map(|network_id| NetworkCreateResponse {
             network_id: network_id.to_string(),
         })
-        .map_err(conflict_error)
+        .map_err(invalid_request_error)
 }
 
 /// Fetches one network inspection through the reusable Mantissa client API.
@@ -1604,10 +1609,11 @@ async fn list_network_peers(
     network_id: &str,
 ) -> Result<Vec<NetworkPeerStatus>, ClientWorkerError> {
     parse_uuid("network id", network_id)?;
+    ensure_network_exists(config, network_id).await?;
     networks::peer_status(config, network_id)
         .await
         .map(|peers| peers.into_iter().map(NetworkPeerStatus::from).collect())
-        .map_err(not_found_error)
+        .map_err(operation_failed_error)
 }
 
 /// Lists network attachment rows through the reusable Mantissa client API.
@@ -1616,6 +1622,7 @@ async fn list_network_attachments(
     network_id: &str,
 ) -> Result<Vec<NetworkAttachment>, ClientWorkerError> {
     parse_uuid("network id", network_id)?;
+    ensure_network_exists(config, network_id).await?;
     networks::attachments(config, network_id)
         .await
         .map(|attachments| {
@@ -1624,7 +1631,7 @@ async fn list_network_attachments(
                 .map(NetworkAttachment::from)
                 .collect()
         })
-        .map_err(not_found_error)
+        .map_err(operation_failed_error)
 }
 
 /// Deletes one network through the reusable Mantissa client API.
@@ -1633,10 +1640,11 @@ async fn delete_network(
     network_id: String,
 ) -> Result<NetworkDeleteResponse, ClientWorkerError> {
     parse_uuid("network id", &network_id)?;
+    ensure_network_exists(config, &network_id).await?;
     networks::delete(config, &[network_id])
         .await
         .map(|deleted| NetworkDeleteResponse { deleted })
-        .map_err(not_found_error)
+        .map_err(conflict_error)
 }
 
 /// Lists volumes through the reusable Mantissa client API.
@@ -1652,13 +1660,16 @@ async fn create_volume(
     config: &ClientConfig,
     request: VolumeCreateRequest,
 ) -> Result<VolumeSpec, ClientWorkerError> {
-    let request = request
+    let mut request = request
         .into_client()
         .map_err(ClientWorkerError::InvalidRequest)?;
+    let name = clean_required_name("volume name", &request.name)?.to_string();
+    ensure_unique_volume_name(config, &name).await?;
+    request.name = name;
     volumes::create_with_request(config, &request)
         .await
         .map(VolumeSpec::from)
-        .map_err(conflict_error)
+        .map_err(invalid_request_error)
 }
 
 /// Imports one volume through the reusable Mantissa client API.
@@ -1666,11 +1677,14 @@ async fn import_volume(
     config: &ClientConfig,
     request: VolumeImportRequest,
 ) -> Result<VolumeSpec, ClientWorkerError> {
-    let request = request.into();
+    let mut request: mantissa_client::volumes::VolumeImportRequest = request.into();
+    let name = clean_required_name("volume name", &request.name)?.to_string();
+    ensure_unique_volume_name(config, &name).await?;
+    request.name = name;
     volumes::import_with_request(config, &request)
         .await
         .map(VolumeSpec::from)
-        .map_err(conflict_error)
+        .map_err(invalid_request_error)
 }
 
 /// Fetches one volume inspection through the reusable Mantissa client API.
@@ -1689,10 +1703,11 @@ async fn get_volume_status(
     config: &ClientConfig,
     selector: &str,
 ) -> Result<VolumeInspect, ClientWorkerError> {
+    get_volume(config, selector).await?;
     volumes::status(config, selector)
         .await
         .map(VolumeInspect::from)
-        .map_err(not_found_error)
+        .map_err(operation_failed_error)
 }
 
 /// Deletes one volume through the reusable Mantissa client API.
@@ -2012,10 +2027,11 @@ async fn stop_task(
     config: &ClientConfig,
     selector: &str,
 ) -> Result<TaskSummary, ClientWorkerError> {
+    get_task(config, selector).await?;
     tasks::stop(config, selector)
         .await
         .map(TaskSummary::from)
-        .map_err(not_found_error)
+        .map_err(conflict_error)
 }
 
 /// Lists secrets through the reusable Mantissa client API.
@@ -2032,19 +2048,21 @@ async fn create_secret(
     name: &str,
     request: SecretUpsertRequest,
 ) -> Result<SecretSummary, ClientWorkerError> {
+    let name = clean_required_name("secret name", name)?;
+    ensure_unique_secret_name(config, name).await?;
     let plaintext = request
         .plaintext()
         .map_err(ClientWorkerError::InvalidRequest)?;
     secrets::create(
         config,
-        clean_required_name("secret name", name)?,
+        name,
         &plaintext,
         request.description.as_deref(),
         &request.labels(),
     )
     .await
     .map(SecretSummary::from)
-    .map_err(conflict_error)
+    .map_err(invalid_request_error)
 }
 
 /// Updates one secret through the reusable Mantissa client API.
@@ -2053,19 +2071,21 @@ async fn update_secret(
     name: &str,
     request: SecretUpsertRequest,
 ) -> Result<SecretSummary, ClientWorkerError> {
+    let name = clean_required_name("secret name", name)?;
+    ensure_secret_exists(config, name).await?;
     let plaintext = request
         .plaintext()
         .map_err(ClientWorkerError::InvalidRequest)?;
     secrets::update(
         config,
-        clean_required_name("secret name", name)?,
+        name,
         &plaintext,
         request.description.as_deref(),
         &request.labels(),
     )
     .await
     .map(SecretSummary::from)
-    .map_err(not_found_error)
+    .map_err(operation_failed_error)
 }
 
 /// Fetches one secret detail through the reusable Mantissa client API.
@@ -2094,10 +2114,11 @@ async fn delete_secret(
     name: &str,
 ) -> Result<SecretDeleteResponse, ClientWorkerError> {
     let name = clean_required_name("secret name", name)?.to_string();
+    ensure_secret_exists(config, &name).await?;
     secrets::delete(config, &[name])
         .await
         .map(|deleted| SecretDeleteResponse { deleted })
-        .map_err(not_found_error)
+        .map_err(operation_failed_error)
 }
 
 /// Requests one node drain through the reusable Mantissa client API.
@@ -2107,14 +2128,15 @@ async fn drain_node(
     request: NodeDrainRequest,
 ) -> Result<NodeActionResponse, ClientWorkerError> {
     let node_id = parse_uuid("node id", node_id)?;
-    let timeout = request.task_stop_timeout_secs.map(Duration::from_secs);
+    ensure_node_exists(config, node_id).await?;
+    let timeout = drain_timeout(request.task_stop_timeout_secs)?;
     nodes::request_drain(config, node_id, request.reason.as_deref(), timeout)
         .await
         .map(|operation| NodeActionResponse {
             node_id: operation.node_id.to_string(),
             accepted: true,
         })
-        .map_err(not_found_error)
+        .map_err(conflict_error)
 }
 
 /// Resumes one node through the reusable Mantissa client API.
@@ -2123,13 +2145,14 @@ async fn resume_node(
     node_id: &str,
 ) -> Result<NodeActionResponse, ClientWorkerError> {
     let node_id = parse_uuid("node id", node_id)?;
+    ensure_node_exists(config, node_id).await?;
     nodes::resume(config, node_id)
         .await
         .map(|()| NodeActionResponse {
             node_id: node_id.to_string(),
             accepted: true,
         })
-        .map_err(not_found_error)
+        .map_err(operation_failed_error)
 }
 
 /// Evicts one node through the reusable Mantissa client API.
@@ -2138,13 +2161,14 @@ async fn evict_node(
     node_id: &str,
 ) -> Result<NodeActionResponse, ClientWorkerError> {
     let node_id = parse_uuid("node id", node_id)?;
+    ensure_node_exists(config, node_id).await?;
     nodes::evict(config, node_id)
         .await
         .map(|()| NodeActionResponse {
             node_id: node_id.to_string(),
             accepted: true,
         })
-        .map_err(not_found_error)
+        .map_err(conflict_error)
 }
 
 /// Fetches one node drain-status snapshot through the reusable Mantissa client API.
@@ -2153,10 +2177,11 @@ async fn node_drain_status(
     node_id: &str,
 ) -> Result<NodeDrainStatus, ClientWorkerError> {
     let node_id = parse_uuid("node id", node_id)?;
+    ensure_node_exists(config, node_id).await?;
     nodes::status(config, node_id)
         .await
         .map(NodeDrainStatus::from)
-        .map_err(not_found_error)
+        .map_err(operation_failed_error)
 }
 
 /// Applies one node label mutation through the reusable Mantissa client API.
@@ -2166,6 +2191,12 @@ async fn update_node_labels(
     request: NodeLabelsRequest,
 ) -> Result<NodeLabelsResponse, ClientWorkerError> {
     let node_id = parse_uuid("node id", node_id)?;
+    ensure_node_exists(config, node_id).await?;
+    if !request.replace && request.labels.is_empty() && request.remove.is_empty() {
+        return Err(ClientWorkerError::InvalidRequest(
+            "label update requires labels, remove, or replace".to_string(),
+        ));
+    }
     nodes::labels(
         config,
         node_id,
@@ -2175,7 +2206,7 @@ async fn update_node_labels(
     )
     .await
     .map(NodeLabelsResponse::from)
-    .map_err(not_found_error)
+    .map_err(invalid_request_error)
 }
 
 /// Fetches scheduler summary through the reusable Mantissa client API.
@@ -2185,7 +2216,8 @@ async fn scheduler_summary(
     details: bool,
 ) -> Result<SchedulerSummary, ClientWorkerError> {
     if let Some(peer_id) = peer_id.as_deref() {
-        parse_uuid("peer id", peer_id)?;
+        let peer_id = parse_uuid("peer id", peer_id)?;
+        ensure_node_exists(config, peer_id).await?;
     }
     scheduler::slots(config, peer_id.as_deref(), details)
         .await
@@ -2268,6 +2300,90 @@ fn conflict_error(error: impl std::fmt::Display) -> ClientWorkerError {
 /// Marks reusable client failures that do not map to a domain status.
 fn operation_failed_error(error: impl std::fmt::Display) -> ClientWorkerError {
     client_error(ClientErrorKind::OperationFailed, error)
+}
+
+/// Builds a conflict error for a unique resource name that is already visible.
+fn already_exists(kind: &str, name: &str) -> ClientWorkerError {
+    ClientWorkerError::Conflict(format!("{kind} '{name}' already exists"))
+}
+
+/// Ensures one node id is visible before running a node mutation.
+async fn ensure_node_exists(config: &ClientConfig, node_id: Uuid) -> Result<(), ClientWorkerError> {
+    get_node(config, &node_id.to_string()).await.map(|_| ())
+}
+
+/// Ensures one network id is visible before running a network subresource operation.
+async fn ensure_network_exists(
+    config: &ClientConfig,
+    network_id: &str,
+) -> Result<(), ClientWorkerError> {
+    get_network(config, network_id).await.map(|_| ())
+}
+
+/// Ensures one secret name is visible before running a secret mutation.
+async fn ensure_secret_exists(config: &ClientConfig, name: &str) -> Result<(), ClientWorkerError> {
+    secrets::show(config, name, None)
+        .await
+        .map(|_| ())
+        .map_err(not_found_error)
+}
+
+/// Rejects a network create request if another network already owns the name.
+async fn ensure_unique_network_name(
+    config: &ClientConfig,
+    name: &str,
+) -> Result<(), ClientWorkerError> {
+    if list_networks(config)
+        .await?
+        .iter()
+        .any(|network| network.name == name)
+    {
+        return Err(already_exists("network", name));
+    }
+    Ok(())
+}
+
+/// Rejects a volume create request if another volume already owns the name.
+async fn ensure_unique_volume_name(
+    config: &ClientConfig,
+    name: &str,
+) -> Result<(), ClientWorkerError> {
+    if list_volumes(config)
+        .await?
+        .iter()
+        .any(|volume| volume.name == name)
+    {
+        return Err(already_exists("volume", name));
+    }
+    Ok(())
+}
+
+/// Rejects a secret create request if another secret already owns the name.
+async fn ensure_unique_secret_name(
+    config: &ClientConfig,
+    name: &str,
+) -> Result<(), ClientWorkerError> {
+    if list_secrets(config)
+        .await?
+        .iter()
+        .any(|secret| secret.name == name)
+    {
+        return Err(already_exists("secret", name));
+    }
+    Ok(())
+}
+
+/// Converts the REST drain timeout into the protocol-supported duration range.
+fn drain_timeout(value: Option<u64>) -> Result<Option<Duration>, ClientWorkerError> {
+    let Some(secs) = value else {
+        return Ok(None);
+    };
+    let _wire_secs = u32::try_from(secs).map_err(|_| {
+        ClientWorkerError::InvalidRequest(format!(
+            "task_stop_timeout_secs {secs} exceeds protocol limit"
+        ))
+    })?;
+    Ok(Some(Duration::from_secs(secs)))
 }
 
 /// Parses a REST UUID path segment before issuing a client request.

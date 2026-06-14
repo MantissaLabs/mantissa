@@ -168,6 +168,20 @@ local_test!(rest_volumes_reject_invalid_create_requests, {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(value["code"], "bad_request");
+
+    let (status, value) = harness
+        .json_request(
+            Method::POST,
+            "/v1/volumes",
+            true,
+            Some(volume_create_request(
+                "bad-unknown-node-volume",
+                &uuid::Uuid::new_v4().to_string(),
+            )),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "bad_request");
 });
 
 local_test!(rest_volumes_return_not_found_and_conflict_errors, {

@@ -136,6 +136,31 @@ local_test!(rest_secrets_delete_by_name, {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(value["code"], "not_found");
+
+    let (status, value) = harness
+        .json_request(Method::DELETE, "/v1/secrets/rest-secret-delete", true, None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["code"], "not_found");
+});
+
+local_test!(rest_secrets_duplicate_create_returns_conflict, {
+    let harness = RestTestHarness::new().await;
+    let (_version_id, _value) = create_secret(&harness, "rest-secret-conflict").await;
+
+    let (status, value) = harness
+        .json_request(
+            Method::POST,
+            "/v1/secrets",
+            true,
+            Some(json!({
+                "name": "rest-secret-conflict",
+                "plaintext_base64": "cmVzdC1zZWNyZXQtZHVwZQ=="
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(value["code"], "conflict");
 });
 
 local_test!(rest_secrets_reject_invalid_base64_and_version_id, {

@@ -87,3 +87,19 @@ local_test!(rest_scheduler_summary_rejects_unknown_query_fields, {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(value["code"], "bad_request");
 });
+
+local_test!(rest_scheduler_summary_returns_not_found_for_unknown_peer, {
+    let harness = RestTestHarness::new().await;
+    let missing_peer_id = uuid::Uuid::new_v4();
+
+    let (status, value) = harness
+        .json_request(
+            Method::GET,
+            &format!("/v1/scheduler/summary?peer_id={missing_peer_id}"),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["code"], "not_found");
+});

@@ -1,5 +1,10 @@
 use axum::http::{Method, StatusCode};
+use mantissa::network::types::{
+    NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue,
+    compute_network_attachment_id,
+};
 use serde_json::json;
+use uuid::Uuid;
 
 use crate::common;
 use crate::harness::RestTestHarness;
@@ -22,6 +27,35 @@ async fn create_network(harness: &RestTestHarness, name: &str) -> String {
         .as_str()
         .expect("network create returns id")
         .to_string()
+}
+
+/// Seeds one replicated attachment row for the selected network.
+async fn seed_network_attachment(harness: &RestTestHarness, network_id: &str) {
+    let network_id = Uuid::parse_str(network_id).expect("network id uuid");
+    let task_id = Uuid::new_v4();
+    let attachment = NetworkAttachmentValue::new(NetworkAttachmentDraft {
+        id: compute_network_attachment_id(task_id, network_id),
+        task_id,
+        node_id: harness.node_id,
+        instance_id: "rest-attached-instance".to_string(),
+        network_id,
+        task_updated_at: None,
+        requested_ip: None,
+        assigned_ip: Some("10.42.0.2".to_string()),
+        mac: Some("02:00:00:00:00:02".to_string()),
+        state: NetworkAttachmentState::Ready,
+        error: None,
+        traffic_published: true,
+        service_name: Some("rest-network-attached-service".to_string()),
+        template_name: Some("web".to_string()),
+    });
+    harness
+        .node()
+        .node
+        .network_registry
+        .upsert_attachment(attachment)
+        .await
+        .expect("seed network attachment");
 }
 
 local_test!(rest_networks_create_and_list_overlay_network, {
@@ -101,6 +135,40 @@ local_test!(rest_networks_delete_overlay_network, {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["deleted"], 1);
+});
+
+local_test!(rest_networks_delete_missing_network_returns_not_found, {
+    let harness = RestTestHarness::new().await;
+    let missing_network_id = uuid::Uuid::new_v4();
+
+    let (status, value) = harness
+        .json_request(
+            Method::DELETE,
+            &format!("/v1/networks/{missing_network_id}"),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["code"], "not_found");
+});
+
+local_test!(rest_networks_delete_attached_network_returns_conflict, {
+    let harness = RestTestHarness::new().await;
+    let network_name = "rest-network-attached-delete";
+    let network_id = create_network(&harness, network_name).await;
+    seed_network_attachment(&harness, &network_id).await;
+
+    let (status, value) = harness
+        .json_request(
+            Method::DELETE,
+            &format!("/v1/networks/{network_id}"),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(value["code"], "conflict");
 });
 
 local_test!(rest_networks_reject_invalid_driver_and_network_id, {
