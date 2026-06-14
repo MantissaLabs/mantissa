@@ -138,8 +138,11 @@ tempfile = "3"
 anyhow = "1"
 axum = "0.8"
 mantissa-rest = { path = "crates/mantissa-rest" }
+rcgen = { version = "0.14", features = ["pem"] }
+rustls = "0.23"
 serde_json = "1"
 tokio-tungstenite = "0.27"
+tokio-rustls = "0.26"
 tower = { version = "0.5", features = ["util"] }
 
 # eBPF / Networking / Linux only dependencies

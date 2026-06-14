@@ -1,6 +1,6 @@
 use crate::{
     client_worker::{ClientWorkerError, ClientWorkerHandle},
-    config::RestConfig,
+    config::{RestConfig, RestTlsConfig},
     routes,
     state::AppState,
 };
@@ -12,8 +12,17 @@ use axum::{
     response::Response,
     routing::{get, post, put},
 };
-use std::{future::Future, net::SocketAddr, time::Instant};
-use tokio::net::TcpListener;
+use axum_server::{Handle, tls_rustls::RustlsConfig};
+use rustls::{RootCertStore, ServerConfig, server::WebPkiClientVerifier};
+use std::{
+    fs::File,
+    future::Future,
+    io::BufReader,
+    net::{SocketAddr, TcpListener},
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 /// Builds the Axum router for the REST facade.
 pub fn router(state: AppState) -> Router {
@@ -153,6 +162,8 @@ pub struct BoundRestServer {
     listener: TcpListener,
     router: Router,
     local_addr: SocketAddr,
+    scheme: &'static str,
+    tls_config: Option<RustlsConfig>,
 }
 
 impl BoundRestServer {
@@ -161,14 +172,37 @@ impl BoundRestServer {
         self.local_addr
     }
 
+    /// Returns the URL scheme served by this REST listener.
+    pub fn scheme(&self) -> &'static str {
+        self.scheme
+    }
+
     /// Serves REST requests until the listener exits or shutdown resolves.
     pub async fn serve_until<S>(self, shutdown: S) -> Result<(), RestServerError>
     where
         S: Future<Output = ()> + Send + 'static,
     {
-        axum::serve(self.listener, self.router)
-            .with_graceful_shutdown(shutdown)
-            .await?;
+        let handle = Handle::new();
+        let shutdown_handle = handle.clone();
+        let shutdown_task = tokio::spawn(async move {
+            shutdown.await;
+            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+        });
+
+        let result = if let Some(tls_config) = self.tls_config {
+            axum_server::from_tcp_rustls(self.listener, tls_config)?
+                .handle(handle)
+                .serve(self.router.into_make_service())
+                .await
+        } else {
+            axum_server::from_tcp(self.listener)?
+                .handle(handle)
+                .serve(self.router.into_make_service())
+                .await
+        };
+
+        shutdown_task.abort();
+        result?;
         Ok(())
     }
 }
@@ -176,7 +210,10 @@ impl BoundRestServer {
 /// Binds the REST listener and prepares the router without serving requests.
 pub async fn bind(config: RestConfig) -> Result<BoundRestServer, RestServerError> {
     config.validate()?;
-    let listener = TcpListener::bind(config.bind_addr).await?;
+    let scheme = config.scheme();
+    let tls_config = build_rustls_config(&config.tls)?;
+    let listener = TcpListener::bind(config.bind_addr)?;
+    listener.set_nonblocking(true)?;
     let local_addr = listener.local_addr()?;
     let client = ClientWorkerHandle::spawn(config.client_config())?;
     let state = AppState::new(client);
@@ -184,6 +221,8 @@ pub async fn bind(config: RestConfig) -> Result<BoundRestServer, RestServerError
         listener,
         router: router(state),
         local_addr,
+        scheme,
+        tls_config,
     })
 }
 
@@ -212,12 +251,142 @@ async fn log_request(request: Request<Body>, next: Next) -> Response {
     response
 }
 
+/// Builds the optional rustls server config for one REST listener.
+fn build_rustls_config(tls: &RestTlsConfig) -> Result<Option<RustlsConfig>, RestServerError> {
+    if !tls.server_tls_enabled() {
+        return Ok(None);
+    }
+
+    let cert_path = tls.cert_path.as_deref().ok_or_else(|| {
+        RestServerError::tls("REST TLS certificate path is missing after validation")
+    })?;
+    let key_path = tls
+        .key_path
+        .as_deref()
+        .ok_or_else(|| RestServerError::tls("REST TLS key path is missing after validation"))?;
+    let certs = read_certificate_chain(cert_path)?;
+    let key = read_private_key(key_path)?;
+
+    let mut config = if let Some(client_ca_path) = tls.client_ca_path.as_deref() {
+        let client_roots = read_root_store(client_ca_path)?;
+        let client_verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
+            .build()
+            .map_err(|error| {
+                RestServerError::tls(format!(
+                    "build REST client certificate verifier from {}: {error}",
+                    client_ca_path.display()
+                ))
+            })?;
+        ServerConfig::builder()
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(certs, key)
+            .map_err(|error| {
+                RestServerError::tls(format!(
+                    "build REST TLS server config from {} and {}: {error}",
+                    cert_path.display(),
+                    key_path.display()
+                ))
+            })?
+    } else {
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|error| {
+                RestServerError::tls(format!(
+                    "build REST TLS server config from {} and {}: {error}",
+                    cert_path.display(),
+                    key_path.display()
+                ))
+            })?
+    };
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    Ok(Some(RustlsConfig::from_config(Arc::new(config))))
+}
+
+/// Reads one PEM certificate chain used by the REST TLS server.
+fn read_certificate_chain(
+    path: &Path,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, RestServerError> {
+    let file = File::open(path).map_err(|error| {
+        RestServerError::tls(format!(
+            "open REST TLS certificate chain {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut reader = BufReader::new(file);
+    let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<_, _>>()
+        .map_err(|error| {
+            RestServerError::tls(format!(
+                "parse REST TLS certificate chain {}: {error}",
+                path.display()
+            ))
+        })?;
+    if certs.is_empty() {
+        return Err(RestServerError::tls(format!(
+            "REST TLS certificate chain {} contains no certificates",
+            path.display()
+        )));
+    }
+    Ok(certs)
+}
+
+/// Reads one PEM private key used by the REST TLS server.
+fn read_private_key(
+    path: &Path,
+) -> Result<rustls::pki_types::PrivateKeyDer<'static>, RestServerError> {
+    let file = File::open(path).map_err(|error| {
+        RestServerError::tls(format!("open REST TLS key {}: {error}", path.display()))
+    })?;
+    let mut reader = BufReader::new(file);
+    rustls_pemfile::private_key(&mut reader)
+        .map_err(|error| {
+            RestServerError::tls(format!("parse REST TLS key {}: {error}", path.display()))
+        })?
+        .ok_or_else(|| {
+            RestServerError::tls(format!(
+                "REST TLS key {} contains no private key",
+                path.display()
+            ))
+        })
+}
+
+/// Reads a strict PEM root store used for REST client certificate validation.
+fn read_root_store(path: &Path) -> Result<RootCertStore, RestServerError> {
+    let certs = read_certificate_chain(path)?;
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots.add(cert).map_err(|error| {
+            RestServerError::tls(format!(
+                "parse REST client CA certificate {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    if roots.is_empty() {
+        return Err(RestServerError::tls(format!(
+            "REST client CA {} contains no trusted roots",
+            path.display()
+        )));
+    }
+    Ok(roots)
+}
+
 /// Startup and listener errors returned by the REST listener.
 #[derive(Debug)]
 pub enum RestServerError {
     Config(crate::config::RestConfigError),
     ClientWorker(ClientWorkerError),
     Io(std::io::Error),
+    Tls(String),
+}
+
+impl RestServerError {
+    /// Builds one TLS startup error message.
+    fn tls(message: impl Into<String>) -> Self {
+        Self::Tls(message.into())
+    }
 }
 
 impl std::fmt::Display for RestServerError {
@@ -227,6 +396,7 @@ impl std::fmt::Display for RestServerError {
             Self::Config(error) => write!(formatter, "{error}"),
             Self::ClientWorker(error) => write!(formatter, "{error}"),
             Self::Io(error) => write!(formatter, "{error}"),
+            Self::Tls(message) => write!(formatter, "{message}"),
         }
     }
 }

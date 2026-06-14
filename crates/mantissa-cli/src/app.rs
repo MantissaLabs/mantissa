@@ -130,7 +130,11 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             let rest_server = crate::rest::start_embedded(&init).await?;
             let rest_token_enabled = rest_server.is_some();
             if let Some(rest_server) = rest_server.as_ref() {
-                println!("REST API: http://{}", rest_server.local_addr());
+                println!(
+                    "REST API: {}://{}",
+                    rest_server.scheme(),
+                    rest_server.local_addr()
+                );
                 println!("REST token: mantissa rest token show");
             }
             let advertise_addr = init.advertise.clone().or_else(config::advertise_addr);

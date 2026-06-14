@@ -286,6 +286,18 @@ pub struct InitArgs {
     /// Bind address for the embedded REST API
     #[arg(long = "rest-addr", value_name = "ADDR", requires = "rest")]
     pub rest_addr: Option<SocketAddr>,
+
+    /// PEM certificate chain used by the embedded REST TLS listener
+    #[arg(long = "rest-tls-cert", value_name = "FILE", requires = "rest")]
+    pub rest_tls_cert: Option<PathBuf>,
+
+    /// PEM private key used by the embedded REST TLS listener
+    #[arg(long = "rest-tls-key", value_name = "FILE", requires = "rest")]
+    pub rest_tls_key: Option<PathBuf>,
+
+    /// PEM client CA bundle used to require mTLS on the embedded REST listener
+    #[arg(long = "rest-client-ca", value_name = "FILE", requires = "rest")]
+    pub rest_client_ca: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1862,6 +1874,12 @@ mod tests {
             "--rest",
             "--rest-addr",
             "127.0.0.1:6580",
+            "--rest-tls-cert",
+            "/tmp/rest.crt",
+            "--rest-tls-key",
+            "/tmp/rest.key",
+            "--rest-client-ca",
+            "/tmp/rest-clients.pem",
         ])
         .unwrap();
 
@@ -1869,6 +1887,12 @@ mod tests {
             Command::Init(args) => {
                 assert!(args.rest);
                 assert_eq!(args.rest_addr, Some("127.0.0.1:6580".parse().unwrap()));
+                assert_eq!(args.rest_tls_cert, Some(PathBuf::from("/tmp/rest.crt")));
+                assert_eq!(args.rest_tls_key, Some(PathBuf::from("/tmp/rest.key")));
+                assert_eq!(
+                    args.rest_client_ca,
+                    Some(PathBuf::from("/tmp/rest-clients.pem"))
+                );
             }
             other => panic!("unexpected command: {other:?}"),
         }

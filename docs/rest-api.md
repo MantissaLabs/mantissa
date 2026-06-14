@@ -14,11 +14,18 @@ Default behavior is deliberately narrow:
 - bind to `127.0.0.1:6579`;
 - use the normal local daemon socket discovery path;
 - require bearer auth with a daemon-owned local REST token;
+- allow plain HTTP only on loopback binds;
 - do not enable browser CORS.
 
-Do not expose this listener directly to the public internet. If a program needs
-remote access, put an authenticated local transport boundary in front of it
-such as SSH forwarding, a private WireGuard link, or a host-local sidecar.
+Non-loopback REST binds fail closed unless server TLS and a client CA are
+configured. That means a direct network listener requires HTTPS and mTLS before
+the daemon starts. The bearer token is still required for authenticated REST
+routes after the TLS handshake succeeds.
+
+Do not expose this listener directly to the public internet without a private
+network boundary and tightly managed client certificates. Prefer localhost,
+SSH forwarding, a private WireGuard link, or a host-local sidecar for ordinary
+automation.
 
 Secrets routes can return decrypted secret payloads as base64. Treat REST access
 as cluster-admin access.
@@ -56,14 +63,29 @@ mantissa init --detach \
   --rest-addr 127.0.0.1:6579
 ```
 
+Binding REST to a non-loopback interface requires TLS and mTLS:
+
+```bash
+mantissa init --detach \
+  --rest \
+  --rest-addr 0.0.0.0:6579 \
+  --rest-tls-cert /etc/mantissa/rest/server.crt \
+  --rest-tls-key /etc/mantissa/rest/server.key \
+  --rest-client-ca /etc/mantissa/rest/clients-ca.crt
+```
+
 Configuration:
 
 | Variable | Meaning |
 | --- | --- |
 | `MANTISSA_REST_ENABLED` | Start embedded REST from `mantissa init`. |
 | `MANTISSA_REST_ADDR` | Bind address, default `127.0.0.1:6579`. |
+| `MANTISSA_REST_TLS_CERT` | PEM server certificate chain for HTTPS. |
+| `MANTISSA_REST_TLS_KEY` | PEM server private key for HTTPS. |
+| `MANTISSA_REST_CLIENT_CA` | PEM client CA bundle used to require mTLS. |
 
-The equivalent `mantissa init` flags are `--rest` and `--rest-addr`.
+The equivalent `mantissa init` flags are `--rest`, `--rest-addr`,
+`--rest-tls-cert`, `--rest-tls-key`, and `--rest-client-ca`.
 
 Use this shell helper for examples:
 
@@ -71,6 +93,19 @@ Use this shell helper for examples:
 TOKEN="$(mantissa rest token show)"
 REST=http://127.0.0.1:6579
 AUTH=(-H "Authorization: Bearer $TOKEN")
+```
+
+For an mTLS listener, include the server CA and client certificate material:
+
+```bash
+TOKEN="$(mantissa rest token show)"
+REST=https://mantissa-node.example.com:6579
+AUTH=(-H "Authorization: Bearer $TOKEN")
+TLS=(--cacert /etc/mantissa/rest/ca.crt \
+  --cert /etc/mantissa/rest/client.crt \
+  --key /etc/mantissa/rest/client.key)
+
+curl -sS "${TLS[@]}" "${AUTH[@]}" "$REST/v1/health"
 ```
 
 ## Response Rules

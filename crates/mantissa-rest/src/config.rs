@@ -2,17 +2,32 @@ use mantissa_client::config::ClientConfig;
 use std::{
     env,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 const DEFAULT_BIND_PORT: u16 = 6579;
 const ENV_BIND_ADDR: &str = "MANTISSA_REST_ADDR";
+const ENV_TLS_CERT: &str = "MANTISSA_REST_TLS_CERT";
+const ENV_TLS_KEY: &str = "MANTISSA_REST_TLS_KEY";
+const ENV_CLIENT_CA: &str = "MANTISSA_REST_CLIENT_CA";
 
 /// Runtime configuration for the local REST gateway.
 #[derive(Clone, Debug)]
 pub struct RestConfig {
     pub bind_addr: SocketAddr,
     pub socket: Option<PathBuf>,
+    pub tls: RestTlsConfig,
+}
+
+/// TLS file paths used by the REST listener.
+///
+/// Server certificate and key are optional for loopback-only HTTP. A configured
+/// client CA enables mTLS and is mandatory for non-loopback direct binds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RestTlsConfig {
+    pub cert_path: Option<PathBuf>,
+    pub key_path: Option<PathBuf>,
+    pub client_ca_path: Option<PathBuf>,
 }
 
 impl RestConfig {
@@ -30,12 +45,21 @@ impl RestConfig {
                 .parse()
                 .map_err(|source| RestConfigError::InvalidBindAddr { value, source })?,
             Err(env::VarError::NotPresent) => default_bind_addr(),
-            Err(env::VarError::NotUnicode(_)) => return Err(RestConfigError::InvalidEnvUnicode),
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(RestConfigError::InvalidEnvUnicode {
+                    name: ENV_BIND_ADDR,
+                });
+            }
         };
 
         Ok(Self {
             bind_addr,
             socket: None,
+            tls: RestTlsConfig {
+                cert_path: read_optional_path_env(ENV_TLS_CERT)?,
+                key_path: read_optional_path_env(ENV_TLS_KEY)?,
+                client_ca_path: read_optional_path_env(ENV_CLIENT_CA)?,
+            },
         })
     }
 
@@ -49,6 +73,63 @@ impl RestConfig {
 
     /// Validates REST listener configuration before binding.
     pub fn validate(&self) -> Result<(), RestConfigError> {
+        self.tls.validate()?;
+        if !self.bind_addr.ip().is_loopback() {
+            if !self.tls.server_tls_enabled() {
+                return Err(RestConfigError::NonLoopbackRequiresTls {
+                    bind_addr: self.bind_addr,
+                });
+            }
+            if !self.tls.client_cert_required() {
+                return Err(RestConfigError::NonLoopbackRequiresClientCa {
+                    bind_addr: self.bind_addr,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the URL scheme used by this REST listener.
+    pub fn scheme(&self) -> &'static str {
+        if self.tls.server_tls_enabled() {
+            "https"
+        } else {
+            "http"
+        }
+    }
+}
+
+impl RestTlsConfig {
+    /// Returns true when a server certificate/key pair is configured.
+    pub fn server_tls_enabled(&self) -> bool {
+        self.cert_path.is_some() && self.key_path.is_some()
+    }
+
+    /// Returns true when TLS client certificates are required.
+    pub fn client_cert_required(&self) -> bool {
+        self.client_ca_path.is_some()
+    }
+
+    /// Validates the local consistency of TLS path settings.
+    fn validate(&self) -> Result<(), RestConfigError> {
+        match (&self.cert_path, &self.key_path) {
+            (Some(_), Some(_)) | (None, None) => {}
+            (Some(cert_path), None) => {
+                return Err(RestConfigError::TlsCertWithoutKey {
+                    cert_path: cert_path.clone(),
+                });
+            }
+            (None, Some(key_path)) => {
+                return Err(RestConfigError::TlsKeyWithoutCert {
+                    key_path: key_path.clone(),
+                });
+            }
+        }
+
+        if self.client_ca_path.is_some() && !self.server_tls_enabled() {
+            return Err(RestConfigError::ClientCaWithoutTls);
+        }
+
         Ok(())
     }
 }
@@ -58,6 +139,22 @@ fn default_bind_addr() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_BIND_PORT)
 }
 
+/// Reads one optional path environment variable.
+fn read_optional_path_env(name: &'static str) -> Result<Option<PathBuf>, RestConfigError> {
+    match env::var(name) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(Path::new(trimmed).to_path_buf()))
+            }
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(RestConfigError::InvalidEnvUnicode { name }),
+    }
+}
+
 /// Configuration errors detected before the REST listener starts.
 #[derive(Debug)]
 pub enum RestConfigError {
@@ -65,7 +162,22 @@ pub enum RestConfigError {
         value: String,
         source: std::net::AddrParseError,
     },
-    InvalidEnvUnicode,
+    InvalidEnvUnicode {
+        name: &'static str,
+    },
+    TlsCertWithoutKey {
+        cert_path: PathBuf,
+    },
+    TlsKeyWithoutCert {
+        key_path: PathBuf,
+    },
+    ClientCaWithoutTls,
+    NonLoopbackRequiresTls {
+        bind_addr: SocketAddr,
+    },
+    NonLoopbackRequiresClientCa {
+        bind_addr: SocketAddr,
+    },
 }
 
 impl std::fmt::Display for RestConfigError {
@@ -78,11 +190,127 @@ impl std::fmt::Display for RestConfigError {
                     "invalid {ENV_BIND_ADDR} value '{value}': {source}"
                 )
             }
-            Self::InvalidEnvUnicode => {
-                write!(formatter, "REST environment contains non-Unicode data")
+            Self::InvalidEnvUnicode { name } => {
+                write!(
+                    formatter,
+                    "REST environment variable {name} contains non-Unicode data"
+                )
+            }
+            Self::TlsCertWithoutKey { cert_path } => {
+                write!(
+                    formatter,
+                    "REST TLS certificate {} requires --rest-tls-key or {ENV_TLS_KEY}",
+                    cert_path.display()
+                )
+            }
+            Self::TlsKeyWithoutCert { key_path } => {
+                write!(
+                    formatter,
+                    "REST TLS key {} requires --rest-tls-cert or {ENV_TLS_CERT}",
+                    key_path.display()
+                )
+            }
+            Self::ClientCaWithoutTls => {
+                write!(
+                    formatter,
+                    "REST client CA requires server TLS certificate and key"
+                )
+            }
+            Self::NonLoopbackRequiresTls { bind_addr } => {
+                write!(
+                    formatter,
+                    "REST bind address {bind_addr} is not loopback; configure --rest-tls-cert and --rest-tls-key"
+                )
+            }
+            Self::NonLoopbackRequiresClientCa { bind_addr } => {
+                write!(
+                    formatter,
+                    "REST bind address {bind_addr} is not loopback; configure --rest-client-ca to require mTLS"
+                )
             }
         }
     }
 }
 
 impl std::error::Error for RestConfigError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a REST config with loopback defaults and no TLS paths.
+    fn config() -> RestConfig {
+        RestConfig {
+            bind_addr: "127.0.0.1:6579".parse().unwrap(),
+            socket: None,
+            tls: RestTlsConfig::default(),
+        }
+    }
+
+    #[test]
+    fn loopback_allows_plain_http() {
+        let config = config();
+
+        config.validate().unwrap();
+        assert_eq!(config.scheme(), "http");
+    }
+
+    #[test]
+    fn loopback_allows_tls_without_client_ca() {
+        let mut config = config();
+        config.tls.cert_path = Some("/tmp/rest.crt".into());
+        config.tls.key_path = Some("/tmp/rest.key".into());
+
+        config.validate().unwrap();
+        assert_eq!(config.scheme(), "https");
+    }
+
+    #[test]
+    fn non_loopback_requires_tls_and_client_ca() {
+        let mut config = config();
+        config.bind_addr = "0.0.0.0:6579".parse().unwrap();
+
+        assert!(matches!(
+            config.validate(),
+            Err(RestConfigError::NonLoopbackRequiresTls { .. })
+        ));
+
+        config.tls.cert_path = Some("/tmp/rest.crt".into());
+        config.tls.key_path = Some("/tmp/rest.key".into());
+        assert!(matches!(
+            config.validate(),
+            Err(RestConfigError::NonLoopbackRequiresClientCa { .. })
+        ));
+
+        config.tls.client_ca_path = Some("/tmp/rest-clients.pem".into());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_incomplete_tls_pairs() {
+        let mut config = config();
+        config.tls.cert_path = Some("/tmp/rest.crt".into());
+        assert!(matches!(
+            config.validate(),
+            Err(RestConfigError::TlsCertWithoutKey { .. })
+        ));
+
+        config.tls.cert_path = None;
+        config.tls.key_path = Some("/tmp/rest.key".into());
+        assert!(matches!(
+            config.validate(),
+            Err(RestConfigError::TlsKeyWithoutCert { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_client_ca_without_server_tls() {
+        let mut config = config();
+        config.tls.client_ca_path = Some("/tmp/rest-clients.pem".into());
+
+        assert!(matches!(
+            config.validate(),
+            Err(RestConfigError::ClientCaWithoutTls)
+        ));
+    }
+}

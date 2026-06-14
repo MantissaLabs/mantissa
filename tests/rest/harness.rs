@@ -8,7 +8,7 @@ use mantissa::runtime::types::RuntimeBackend;
 use mantissa_client::config::ClientConfig;
 use mantissa_rest::{
     client_worker::ClientWorkerHandle,
-    config::RestConfig,
+    config::{RestConfig, RestTlsConfig},
     server::{self, RestServerError},
     state::AppState,
 };
@@ -106,12 +106,19 @@ impl RestTestHarness {
 
     /// Starts a real HTTP listener for tests that need transport-level behavior.
     pub async fn start_listener(&self) -> RestTestListener {
+        self.start_listener_with_tls(RestTlsConfig::default()).await
+    }
+
+    /// Starts a real listener with explicit TLS settings for transport-level tests.
+    pub async fn start_listener_with_tls(&self, tls: RestTlsConfig) -> RestTestListener {
         let config = RestConfig {
             bind_addr: "127.0.0.1:0".parse().expect("loopback bind address"),
             socket: self.client_config.socket.clone(),
+            tls,
         };
         let server = server::bind(config).await.expect("bind REST test listener");
         let local_addr = server.local_addr();
+        let scheme = server.scheme();
         let (shutdown, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             server
@@ -122,6 +129,7 @@ impl RestTestHarness {
         });
         RestTestListener {
             local_addr,
+            scheme,
             shutdown: Some(shutdown),
             task: Some(task),
         }
@@ -282,6 +290,7 @@ impl RestTestHarness {
 /// Real REST listener handle used by transport-level integration tests.
 pub struct RestTestListener {
     local_addr: SocketAddr,
+    scheme: &'static str,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<(), RestServerError>>>,
 }
@@ -292,9 +301,15 @@ impl RestTestListener {
         self.local_addr
     }
 
+    /// Returns the URL scheme used by this listener.
+    pub fn scheme(&self) -> &'static str {
+        self.scheme
+    }
+
     /// Returns one absolute WebSocket URL for this listener.
     pub fn ws_url(&self, path: &str) -> String {
-        format!("ws://{}{}", self.local_addr, path)
+        let ws_scheme = if self.scheme == "https" { "wss" } else { "ws" };
+        format!("{ws_scheme}://{}{}", self.local_addr, path)
     }
 
     /// Requests graceful shutdown and waits for the listener task to finish.

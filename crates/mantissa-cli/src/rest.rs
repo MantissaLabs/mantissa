@@ -14,6 +14,7 @@ const ENV_REST_ENABLED: &str = "MANTISSA_REST_ENABLED";
 /// Handle for an embedded REST listener owned by the daemon lifecycle.
 pub(crate) struct EmbeddedRestServer {
     local_addr: SocketAddr,
+    scheme: &'static str,
     shutdown: oneshot::Sender<()>,
     task: JoinHandle<Result<(), RestServerError>>,
 }
@@ -22,6 +23,11 @@ impl EmbeddedRestServer {
     /// Returns the bound address where the embedded REST API is listening.
     pub(crate) fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Returns the URL scheme used by the embedded REST listener.
+    pub(crate) fn scheme(&self) -> &'static str {
+        self.scheme
     }
 
     /// Requests graceful REST shutdown and waits for the listener task to exit.
@@ -44,6 +50,7 @@ pub(crate) async fn start_embedded(init: &InitArgs) -> Result<Option<EmbeddedRes
         .await
         .context("bind embedded REST API")?;
     let local_addr = server.local_addr();
+    let scheme = server.scheme();
     let (shutdown, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         server
@@ -55,6 +62,7 @@ pub(crate) async fn start_embedded(init: &InitArgs) -> Result<Option<EmbeddedRes
 
     Ok(Some(EmbeddedRestServer {
         local_addr,
+        scheme,
         shutdown,
         task,
     }))
@@ -69,6 +77,15 @@ pub(crate) fn config_from_init(init: &InitArgs) -> Result<Option<RestConfig>> {
     let mut config = RestConfig::from_env_unvalidated().context("load REST environment")?;
     if let Some(bind_addr) = init.rest_addr {
         config.bind_addr = bind_addr;
+    }
+    if let Some(path) = init.rest_tls_cert.as_ref() {
+        config.tls.cert_path = Some(path.clone());
+    }
+    if let Some(path) = init.rest_tls_key.as_ref() {
+        config.tls.key_path = Some(path.clone());
+    }
+    if let Some(path) = init.rest_client_ca.as_ref() {
+        config.tls.client_ca_path = Some(path.clone());
     }
     config.validate().context("validate embedded REST config")?;
     Ok(Some(config))
@@ -121,6 +138,9 @@ mod tests {
             master_key_passphrase_fd: None,
             rest: false,
             rest_addr: None,
+            rest_tls_cert: None,
+            rest_tls_key: None,
+            rest_client_ca: None,
         }
     }
 
@@ -128,7 +148,7 @@ mod tests {
     fn config_from_init_applies_cli_addr_override() {
         let init = InitArgs {
             rest: true,
-            rest_addr: Some("0.0.0.0:6580".parse().unwrap()),
+            rest_addr: Some("127.0.0.1:6580".parse().unwrap()),
             ..init_args()
         };
 
@@ -136,7 +156,43 @@ mod tests {
             .unwrap()
             .expect("REST config requested");
 
-        assert_eq!(config.bind_addr, "0.0.0.0:6580".parse().unwrap());
+        assert_eq!(config.bind_addr, "127.0.0.1:6580".parse().unwrap());
+    }
+
+    #[test]
+    fn config_from_init_applies_cli_tls_overrides() {
+        let init = InitArgs {
+            rest: true,
+            rest_tls_cert: Some("/tmp/rest.crt".into()),
+            rest_tls_key: Some("/tmp/rest.key".into()),
+            rest_client_ca: Some("/tmp/rest-clients.pem".into()),
+            ..init_args()
+        };
+
+        let config = config_from_init(&init)
+            .unwrap()
+            .expect("REST config requested");
+
+        assert_eq!(config.tls.cert_path, Some("/tmp/rest.crt".into()));
+        assert_eq!(config.tls.key_path, Some("/tmp/rest.key".into()));
+        assert_eq!(
+            config.tls.client_ca_path,
+            Some("/tmp/rest-clients.pem".into())
+        );
+    }
+
+    #[test]
+    fn config_from_init_rejects_non_loopback_without_mtls() {
+        let init = InitArgs {
+            rest: true,
+            rest_addr: Some("0.0.0.0:6580".parse().unwrap()),
+            ..init_args()
+        };
+
+        let error = config_from_init(&init).unwrap_err();
+        let error_chain = format!("{error:#}");
+
+        assert!(error_chain.contains("is not loopback"), "{error_chain}");
     }
 
     #[test]

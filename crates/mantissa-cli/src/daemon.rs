@@ -101,7 +101,7 @@ pub(crate) async fn start_detached(options: DetachedInitOptions<'_>) -> Result<(
             println!("pid: {pid}");
             println!("socket: {}", socket_path.display());
             if let Some(rest_config) = rest_config {
-                println!("rest: http://{}", rest_config.bind_addr);
+                println!("rest: {}://{}", rest_config.scheme(), rest_config.bind_addr);
                 println!("rest token: mantissa rest token show");
             }
             println!("logs: {}", log_path.display());
@@ -385,6 +385,15 @@ fn push_init_args(command: &mut Command, init: &InitArgs, prompted_passphrase_fd
     }
     if let Some(addr) = init.rest_addr {
         command.arg("--rest-addr").arg(addr.to_string());
+    }
+    if let Some(path) = &init.rest_tls_cert {
+        command.arg("--rest-tls-cert").arg(path);
+    }
+    if let Some(path) = &init.rest_tls_key {
+        command.arg("--rest-tls-key").arg(path);
+    }
+    if let Some(path) = &init.rest_client_ca {
+        command.arg("--rest-client-ca").arg(path);
     }
 }
 
@@ -1259,6 +1268,9 @@ mod tests {
             master_key_passphrase_fd: None,
             rest: true,
             rest_addr: Some("127.0.0.1:6580".parse().unwrap()),
+            rest_tls_cert: Some("/tmp/rest.crt".into()),
+            rest_tls_key: Some("/tmp/rest.key".into()),
+            rest_client_ca: Some("/tmp/rest-clients.pem".into()),
         };
         let mut command = Command::new("mantissa");
 
@@ -1276,6 +1288,12 @@ mod tests {
                 "--rest",
                 "--rest-addr",
                 "127.0.0.1:6580",
+                "--rest-tls-cert",
+                "/tmp/rest.crt",
+                "--rest-tls-key",
+                "/tmp/rest.key",
+                "--rest-client-ca",
+                "/tmp/rest-clients.pem",
             ]
         );
     }
