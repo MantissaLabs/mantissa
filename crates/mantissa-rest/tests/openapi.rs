@@ -40,6 +40,75 @@ fn openapi_spec_documents_security_contract() {
     assert!(value["paths"]["/v1/health"]["get"]["responses"]["401"].is_object());
 }
 
+/// Ensures docs renderers get short titles and separate descriptive text.
+#[test]
+fn openapi_spec_separates_operation_titles_from_descriptions() {
+    let value = openapi::json_value(&server::openapi());
+
+    assert_eq!(value["paths"]["/v1/nodes"]["get"]["summary"], "List nodes");
+    assert_eq!(
+        value["paths"]["/v1/nodes"]["get"]["description"],
+        "Lists cluster nodes visible to the local daemon."
+    );
+    assert_eq!(
+        value["paths"]["/v1/nodes/{node_id}"]["get"]["summary"],
+        "Node status"
+    );
+    assert_eq!(
+        value["paths"]["/v1/nodes/{node_id}"]["delete"]["summary"],
+        "Evict node"
+    );
+    assert_eq!(
+        value["paths"]["/v1/nodes/{node_id}/drain"]["get"]["summary"],
+        "Drain status"
+    );
+    assert_eq!(
+        value["paths"]["/v1/nodes/{node_id}/drain"]["post"]["summary"],
+        "Drain node"
+    );
+    assert_eq!(
+        value["paths"]["/v1/nodes/{node_id}/labels"]["put"]["summary"],
+        "Label node"
+    );
+}
+
+/// Ensures generated sidebar labels stay compact as new REST routes are added.
+#[test]
+fn openapi_operation_summaries_stay_short() {
+    let value = openapi::json_value(&server::openapi());
+    let paths = value["paths"]
+        .as_object()
+        .expect("OpenAPI paths should be an object");
+
+    for (path, item) in paths {
+        let methods = item.as_object().expect("path item should be an object");
+        for (method, operation) in methods {
+            if !is_http_method(method) {
+                continue;
+            }
+
+            let summary = operation["summary"]
+                .as_str()
+                .expect("operation should have a summary");
+            let description = operation["description"]
+                .as_str()
+                .expect("operation should have a description");
+            assert!(
+                summary.split_whitespace().count() <= 4,
+                "{method} {path} summary is too long: {summary}"
+            );
+            assert!(
+                !summary.ends_with('.'),
+                "{method} {path} summary should be a title: {summary}"
+            );
+            assert_ne!(
+                summary, description,
+                "{method} {path} summary should not duplicate the description"
+            );
+        }
+    }
+}
+
 /// Collects method/path pairs from the generated OpenAPI JSON.
 fn documented_operations(value: &Value) -> BTreeSet<(String, String)> {
     let paths = value["paths"]

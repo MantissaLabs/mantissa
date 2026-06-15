@@ -4596,6 +4596,7 @@
   "paths": {
     "/healthz": {
       "get": {
+        "description": "Reports whether the REST gateway process itself is alive.",
         "operationId": "liveness",
         "responses": {
           "200": {
@@ -4610,7 +4611,7 @@
           }
         },
         "security": [],
-        "summary": "Reports whether the REST gateway process itself is alive.",
+        "summary": "Liveness",
         "tags": [
           "health"
         ]
@@ -4618,6 +4619,7 @@
     },
     "/v1/agents/sessions": {
       "get": {
+        "description": "Lists durable agent sessions visible to the local daemon.",
         "operationId": "list_sessions",
         "responses": {
           "200": {
@@ -4694,12 +4696,13 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Lists durable agent sessions visible to the local daemon.",
+        "summary": "List sessions",
         "tags": [
           "agents"
         ]
       },
       "post": {
+        "description": "Submits one durable agent session manifest to the local daemon.",
         "operationId": "submit_session",
         "requestBody": {
           "content": {
@@ -4783,7 +4786,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Submits one durable agent session manifest to the local daemon.",
+        "summary": "Submit session",
         "tags": [
           "agents"
         ]
@@ -4791,6 +4794,7 @@
     },
     "/v1/agents/sessions/{session_id}": {
       "delete": {
+        "description": "Deletes one closed durable agent session and its retained run history.",
         "operationId": "delete_session",
         "parameters": [
           {
@@ -4875,12 +4879,13 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Deletes one closed durable agent session and its retained run history.",
+        "summary": "Delete session",
         "tags": [
           "agents"
         ]
       },
       "get": {
+        "description": "Fetches one durable agent session and its retained run history.",
         "operationId": "get_session",
         "parameters": [
           {
@@ -4965,7 +4970,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Fetches one durable agent session and its retained run history.",
+        "summary": "Get session",
         "tags": [
           "agents"
         ]
@@ -4973,6 +4978,7 @@
     },
     "/v1/agents/sessions/{session_id}/cancel": {
       "post": {
+        "description": "Requests cancellation for one active or queued agent session run.",
         "operationId": "cancel_session",
         "parameters": [
           {
@@ -5057,7 +5063,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Requests cancellation for one active or queued agent session run.",
+        "summary": "Cancel session",
         "tags": [
           "agents"
         ]
@@ -5065,6 +5071,7 @@
     },
     "/v1/agents/sessions/{session_id}/close": {
       "post": {
+        "description": "Closes one durable agent session and rejects future input.",
         "operationId": "close_session",
         "parameters": [
           {
@@ -5149,7 +5156,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Closes one durable agent session and rejects future input.",
+        "summary": "Close session",
         "tags": [
           "agents"
         ]
@@ -5157,6 +5164,7 @@
     },
     "/v1/agents/sessions/{session_id}/input": {
       "post": {
+        "description": "Queues structured input on one idle agent session.",
         "operationId": "submit_input",
         "parameters": [
           {
@@ -5251,7 +5259,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Queues structured input on one idle agent session.",
+        "summary": "Submit input",
         "tags": [
           "agents"
         ]
@@ -5259,6 +5267,7 @@
     },
     "/v1/agents/sessions/{session_id}/runs": {
       "get": {
+        "description": "Lists durable runs for one agent session.",
         "operationId": "list_runs",
         "parameters": [
           {
@@ -5346,7 +5355,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Lists durable runs for one agent session.",
+        "summary": "List runs",
         "tags": [
           "agents"
         ]
@@ -5354,6 +5363,7 @@
     },
     "/v1/clusters": {
       "get": {
+        "description": "Lists cluster lineage summaries known to the local daemon.",
         "operationId": "list",
         "responses": {
           "200": {
@@ -5430,7 +5440,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Lists cluster lineage summaries known to the local daemon.",
+        "summary": "List clusters",
         "tags": [
           "clusters"
         ]
@@ -5438,6 +5448,7 @@
     },
     "/v1/clusters/current": {
       "get": {
+        "description": "Returns the active cluster view associated with the local session.",
         "operationId": "current",
         "responses": {
           "200": {
@@ -5511,7 +5522,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Returns the active cluster view associated with the local session.",
+        "summary": "Current cluster",
         "tags": [
           "clusters"
         ]
@@ -5519,6 +5530,7 @@
     },
     "/v1/clusters/operations/{operation_id}": {
       "get": {
+        "description": "Fetches the latest locally known cluster operation state by UUID string.",
         "operationId": "operation",
         "parameters": [
           {
@@ -5603,7 +5615,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Fetches the latest locally known cluster operation state by UUID string.",
+        "summary": "Get operation",
         "tags": [
           "clusters"
         ]
@@ -5611,6 +5623,7 @@
     },
     "/v1/clusters/split-candidates": {
       "get": {
+        "description": "Lists split candidates for the local active cluster view.",
         "operationId": "split_candidates",
         "responses": {
           "200": {
@@ -5684,7 +5697,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Lists split candidates for the local active cluster view.",
+        "summary": "Split candidates",
         "tags": [
           "clusters"
         ]
@@ -5692,6 +5705,7 @@
     },
     "/v1/clusters/views": {
       "get": {
+        "description": "Lists raw cluster view summaries known to the local daemon.",
         "operationId": "views",
         "responses": {
           "200": {
@@ -5768,7 +5782,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Lists raw cluster view summaries known to the local daemon.",
+        "summary": "List views",
         "tags": [
           "clusters"
         ]
@@ -5776,6 +5790,7 @@
     },
     "/v1/clusters/{cluster_id}/split-candidates": {
       "get": {
+        "description": "Lists split candidates for one explicit cluster lineage id.",
         "operationId": "split_candidates_for_cluster",
         "parameters": [
           {
@@ -5860,7 +5875,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Lists split candidates for one explicit cluster lineage id.",
+        "summary": "Cluster split candidates",
         "tags": [
           "clusters"
         ]
@@ -5868,6 +5883,7 @@
     },
     "/v1/health": {
       "get": {
+        "description": "Reports whether the REST gateway can authenticate and ping the daemon.",
         "operationId": "health",
         "responses": {
           "200": {
@@ -5941,7 +5957,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Reports whether the REST gateway can authenticate and ping the daemon.",
+        "summary": "Health check",
         "tags": [
           "health"
         ]
@@ -5949,6 +5965,7 @@
     },
     "/v1/jobs": {
       "get": {
+        "description": "Lists first-class jobs visible to the local daemon.",
         "operationId": "list",
         "responses": {
           "200": {
@@ -6025,12 +6042,13 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Lists first-class jobs visible to the local daemon.",
+        "summary": "List jobs",
         "tags": [
           "jobs"
         ]
       },
       "post": {
+        "description": "Submits one first-class job manifest to the local daemon.",
         "operationId": "submit",
         "requestBody": {
           "content": {
@@ -6114,7 +6132,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Submits one first-class job manifest to the local daemon.",
+        "summary": "Submit job",
         "tags": [
           "jobs"
         ]
@@ -6122,6 +6140,7 @@
     },
     "/v1/jobs/{job_id}": {
       "delete": {
+        "description": "Deletes one terminal first-class job by UUID string.",
         "operationId": "delete",
         "parameters": [
           {
@@ -6206,12 +6225,13 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Deletes one terminal first-class job by UUID string.",
+        "summary": "Delete job",
         "tags": [
           "jobs"
         ]
       },
       "get": {
+        "description": "Fetches one first-class job by UUID string.",
         "operationId": "get",
         "parameters": [
           {
@@ -6296,7 +6316,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Fetches one first-class job by UUID string.",
+        "summary": "Get job",
         "tags": [
           "jobs"
         ]
@@ -6304,6 +6324,7 @@
     },
     "/v1/jobs/{job_id}/cancel": {
       "post": {
+        "description": "Cancels one first-class job by UUID string.",
         "operationId": "cancel",
         "parameters": [
           {
@@ -6388,7 +6409,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Cancels one first-class job by UUID string.",
+        "summary": "Cancel job",
         "tags": [
           "jobs"
         ]
@@ -6396,6 +6417,7 @@
     },
     "/v1/networks": {
       "get": {
+        "description": "Lists overlay networks visible to the local daemon.",
         "operationId": "list",
         "responses": {
           "200": {
@@ -6472,12 +6494,13 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Lists overlay networks visible to the local daemon.",
+        "summary": "List networks",
         "tags": [
           "networks"
         ]
       },
       "post": {
+        "description": "Creates one overlay network through the local daemon.",
         "operationId": "create",
         "requestBody": {
           "content": {
@@ -6561,7 +6584,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Creates one overlay network through the local daemon.",
+        "summary": "Create network",
         "tags": [
           "networks"
         ]
@@ -6569,6 +6592,7 @@
     },
     "/v1/networks/{network_id}": {
       "delete": {
+        "description": "Deletes one overlay network by UUID string.",
         "operationId": "delete",
         "parameters": [
           {
@@ -6653,12 +6677,13 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Deletes one overlay network by UUID string.",
+        "summary": "Delete network",
         "tags": [
           "networks"
         ]
       },
       "get": {
+        "description": "Fetches one overlay network inspection by UUID string.",
         "operationId": "get",
         "parameters": [
           {
@@ -6743,7 +6768,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Fetches one overlay network inspection by UUID string.",
+        "summary": "Get network",
         "tags": [
           "networks"
         ]
@@ -6751,6 +6776,7 @@
     },
     "/v1/networks/{network_id}/attachments": {
       "get": {
+        "description": "Lists workload attachment rows for one overlay network.",
         "operationId": "attachments",
         "parameters": [
           {
@@ -6838,7 +6864,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Lists workload attachment rows for one overlay network.",
+        "summary": "Network attachments",
         "tags": [
           "networks"
         ]
@@ -6846,6 +6872,7 @@
     },
     "/v1/networks/{network_id}/peers": {
       "get": {
+        "description": "Lists per-peer convergence rows for one overlay network.",
         "operationId": "peers",
         "parameters": [
           {
@@ -6933,7 +6960,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Lists per-peer convergence rows for one overlay network.",
+        "summary": "Network peers",
         "tags": [
           "networks"
         ]
@@ -6941,6 +6968,7 @@
     },
     "/v1/nodes": {
       "get": {
+        "description": "Lists cluster nodes visible to the local daemon.",
         "operationId": "list",
         "responses": {
           "200": {
@@ -7017,7 +7045,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Lists cluster nodes visible to the local daemon.",
+        "summary": "List nodes",
         "tags": [
           "nodes"
         ]
@@ -7025,6 +7053,7 @@
     },
     "/v1/nodes/{node_id}": {
       "delete": {
+        "description": "Evicts one stale node identity by UUID string.",
         "operationId": "evict",
         "parameters": [
           {
@@ -7109,12 +7138,13 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Evicts one stale node identity by UUID string.",
+        "summary": "Evict node",
         "tags": [
           "nodes"
         ]
       },
       "get": {
+        "description": "Fetches one cluster node by UUID string.",
         "operationId": "get",
         "parameters": [
           {
@@ -7199,7 +7229,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Fetches one cluster node by UUID string.",
+        "summary": "Node status",
         "tags": [
           "nodes"
         ]
@@ -7207,6 +7237,7 @@
     },
     "/v1/nodes/{node_id}/drain": {
       "get": {
+        "description": "Fetches the current drain-status snapshot for one node.",
         "operationId": "drain_status",
         "parameters": [
           {
@@ -7291,12 +7322,13 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Fetches the current drain-status snapshot for one node.",
+        "summary": "Drain status",
         "tags": [
           "nodes"
         ]
       },
       "post": {
+        "description": "Requests drain for one node by UUID string.",
         "operationId": "drain",
         "parameters": [
           {
@@ -7391,7 +7423,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Requests drain for one node by UUID string.",
+        "summary": "Drain node",
         "tags": [
           "nodes"
         ]
@@ -7399,6 +7431,7 @@
     },
     "/v1/nodes/{node_id}/labels": {
       "put": {
+        "description": "Applies one node label update by UUID string.",
         "operationId": "labels",
         "parameters": [
           {
@@ -7493,7 +7526,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Applies one node label update by UUID string.",
+        "summary": "Label node",
         "tags": [
           "nodes"
         ]
@@ -7501,6 +7534,7 @@
     },
     "/v1/nodes/{node_id}/resume": {
       "post": {
+        "description": "Resumes scheduling for one drained node by UUID string.",
         "operationId": "resume",
         "parameters": [
           {
@@ -7585,7 +7619,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Resumes scheduling for one drained node by UUID string.",
+        "summary": "Resume node",
         "tags": [
           "nodes"
         ]
@@ -7593,6 +7627,7 @@
     },
     "/v1/scheduler/summary": {
       "get": {
+        "description": "Fetches scheduler capacity summary from the local scheduler capability.",
         "operationId": "summary",
         "parameters": [
           {
@@ -7690,7 +7725,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Fetches scheduler capacity summary from the local scheduler capability.",
+        "summary": "Capacity summary",
         "tags": [
           "scheduler"
         ]
@@ -7698,6 +7733,7 @@
     },
     "/v1/secrets": {
       "get": {
+        "description": "Lists secret summaries visible to the local daemon.",
         "operationId": "list",
         "responses": {
           "200": {
@@ -7774,12 +7810,13 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Lists secret summaries visible to the local daemon.",
+        "summary": "List secrets",
         "tags": [
           "secrets"
         ]
       },
       "post": {
+        "description": "Creates one secret with base64-encoded plaintext.",
         "operationId": "create",
         "requestBody": {
           "content": {
@@ -7863,7 +7900,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Creates one secret with base64-encoded plaintext.",
+        "summary": "Create secret",
         "tags": [
           "secrets"
         ]
@@ -7871,6 +7908,7 @@
     },
     "/v1/secrets/{name}": {
       "delete": {
+        "description": "Deletes one secret by name.",
         "operationId": "delete",
         "parameters": [
           {
@@ -7955,12 +7993,13 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Deletes one secret by name.",
+        "summary": "Delete secret",
         "tags": [
           "secrets"
         ]
       },
       "get": {
+        "description": "Fetches the current plaintext version for one secret.",
         "operationId": "get",
         "parameters": [
           {
@@ -8045,12 +8084,13 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Fetches the current plaintext version for one secret.",
+        "summary": "Get secret",
         "tags": [
           "secrets"
         ]
       },
       "put": {
+        "description": "Updates one secret with a new base64-encoded plaintext version.",
         "operationId": "update",
         "parameters": [
           {
@@ -8145,7 +8185,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Updates one secret with a new base64-encoded plaintext version.",
+        "summary": "Update secret",
         "tags": [
           "secrets"
         ]
@@ -8153,6 +8193,7 @@
     },
     "/v1/secrets/{name}/versions/{version_id}": {
       "get": {
+        "description": "Fetches one explicit plaintext secret version by UUID string.",
         "operationId": "get_version",
         "parameters": [
           {
@@ -8246,7 +8287,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Fetches one explicit plaintext secret version by UUID string.",
+        "summary": "Secret version",
         "tags": [
           "secrets"
         ]
@@ -8254,6 +8295,7 @@
     },
     "/v1/services": {
       "get": {
+        "description": "Lists services visible to the local daemon.",
         "operationId": "list",
         "responses": {
           "200": {
@@ -8330,12 +8372,13 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Lists services visible to the local daemon.",
+        "summary": "List services",
         "tags": [
           "services"
         ]
       },
       "post": {
+        "description": "Deploys or updates one service manifest through the local daemon.",
         "operationId": "deploy",
         "requestBody": {
           "content": {
@@ -8419,7 +8462,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Deploys or updates one service manifest through the local daemon.",
+        "summary": "Deploy service",
         "tags": [
           "services"
         ]
@@ -8427,6 +8470,7 @@
     },
     "/v1/services/{selector}": {
       "delete": {
+        "description": "Deletes one service by UUID text or exact service name.",
         "operationId": "delete",
         "parameters": [
           {
@@ -8511,12 +8555,13 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Deletes one service by UUID text or exact service name.",
+        "summary": "Delete service",
         "tags": [
           "services"
         ]
       },
       "get": {
+        "description": "Fetches one service by UUID text or exact service name.",
         "operationId": "get",
         "parameters": [
           {
@@ -8601,7 +8646,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Fetches one service by UUID text or exact service name.",
+        "summary": "Get service",
         "tags": [
           "services"
         ]
@@ -8609,6 +8654,7 @@
     },
     "/v1/services/{selector}/status": {
       "get": {
+        "description": "Fetches one service status snapshot by UUID text or exact service name.",
         "operationId": "status",
         "parameters": [
           {
@@ -8693,7 +8739,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Fetches one service status snapshot by UUID text or exact service name.",
+        "summary": "Service status",
         "tags": [
           "services"
         ]
@@ -8701,6 +8747,7 @@
     },
     "/v1/tasks": {
       "get": {
+        "description": "Lists standalone tasks visible to the local daemon.",
         "operationId": "list",
         "responses": {
           "200": {
@@ -8777,12 +8824,13 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Lists standalone tasks visible to the local daemon.",
+        "summary": "List tasks",
         "tags": [
           "tasks"
         ]
       },
       "post": {
+        "description": "Starts one standalone task through the local daemon.",
         "operationId": "start",
         "requestBody": {
           "content": {
@@ -8866,7 +8914,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Starts one standalone task through the local daemon.",
+        "summary": "Start task",
         "tags": [
           "tasks"
         ]
@@ -8874,6 +8922,7 @@
     },
     "/v1/tasks/{selector}": {
       "get": {
+        "description": "Fetches one standalone task by UUID text or exact task name.",
         "operationId": "get",
         "parameters": [
           {
@@ -8958,7 +9007,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Fetches one standalone task by UUID text or exact task name.",
+        "summary": "Get task",
         "tags": [
           "tasks"
         ]
@@ -8966,6 +9015,7 @@
     },
     "/v1/tasks/{selector}/attach": {
       "get": {
+        "description": "Opens a WebSocket bridge to one running task's stdio streams.",
         "operationId": "attach",
         "parameters": [
           {
@@ -9127,7 +9177,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Opens a WebSocket bridge to one running task's stdio streams.",
+        "summary": "Attach task",
         "tags": [
           "tasks"
         ]
@@ -9135,6 +9185,7 @@
     },
     "/v1/tasks/{selector}/exec": {
       "get": {
+        "description": "Opens a WebSocket bridge to one command exec session inside a running task.",
         "operationId": "exec",
         "parameters": [
           {
@@ -9299,7 +9350,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Opens a WebSocket bridge to one command exec session inside a running task.",
+        "summary": "Exec task",
         "tags": [
           "tasks"
         ]
@@ -9307,6 +9358,7 @@
     },
     "/v1/tasks/{selector}/logs": {
       "get": {
+        "description": "Streams standalone task logs as newline-delimited JSON frames.",
         "operationId": "logs",
         "parameters": [
           {
@@ -9431,7 +9483,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Streams standalone task logs as newline-delimited JSON frames.",
+        "summary": "Task logs",
         "tags": [
           "tasks"
         ]
@@ -9439,6 +9491,7 @@
     },
     "/v1/tasks/{selector}/stop": {
       "post": {
+        "description": "Stops one standalone task by UUID text or accepted selector.",
         "operationId": "stop",
         "parameters": [
           {
@@ -9523,7 +9576,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Stops one standalone task by UUID text or accepted selector.",
+        "summary": "Stop task",
         "tags": [
           "tasks"
         ]
@@ -9531,6 +9584,7 @@
     },
     "/v1/volumes": {
       "get": {
+        "description": "Lists volumes visible to the local daemon.",
         "operationId": "list",
         "responses": {
           "200": {
@@ -9607,12 +9661,13 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Lists volumes visible to the local daemon.",
+        "summary": "List volumes",
         "tags": [
           "volumes"
         ]
       },
       "post": {
+        "description": "Creates one managed local volume through the local daemon.",
         "operationId": "create",
         "requestBody": {
           "content": {
@@ -9696,7 +9751,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Creates one managed local volume through the local daemon.",
+        "summary": "Create volume",
         "tags": [
           "volumes"
         ]
@@ -9704,6 +9759,7 @@
     },
     "/v1/volumes/import": {
       "post": {
+        "description": "Imports one existing local path as a volume through the local daemon.",
         "operationId": "import",
         "requestBody": {
           "content": {
@@ -9787,7 +9843,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Imports one existing local path as a volume through the local daemon.",
+        "summary": "Import volume",
         "tags": [
           "volumes"
         ]
@@ -9795,6 +9851,7 @@
     },
     "/v1/volumes/{selector}": {
       "delete": {
+        "description": "Deletes one volume by UUID text or exact volume name.",
         "operationId": "delete",
         "parameters": [
           {
@@ -9879,12 +9936,13 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Deletes one volume by UUID text or exact volume name.",
+        "summary": "Delete volume",
         "tags": [
           "volumes"
         ]
       },
       "get": {
+        "description": "Fetches one volume by UUID text or exact volume name.",
         "operationId": "get",
         "parameters": [
           {
@@ -9969,7 +10027,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Fetches one volume by UUID text or exact volume name.",
+        "summary": "Get volume",
         "tags": [
           "volumes"
         ]
@@ -9977,6 +10035,7 @@
     },
     "/v1/volumes/{selector}/status": {
       "get": {
+        "description": "Fetches one volume status by UUID text or exact volume name.",
         "operationId": "status",
         "parameters": [
           {
@@ -10061,7 +10120,7 @@
             "description": "Local daemon or REST worker is unavailable."
           }
         },
-        "summary": "Fetches one volume status by UUID text or exact volume name.",
+        "summary": "Volume status",
         "tags": [
           "volumes"
         ]

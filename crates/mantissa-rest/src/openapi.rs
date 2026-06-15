@@ -7,6 +7,7 @@ use utoipa::{
     OpenApi,
     openapi::{
         Components, OpenApi as OpenApiDocument,
+        path::Operation,
         security::{HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme},
         tag::Tag,
     },
@@ -66,12 +67,38 @@ pub fn base_document() -> OpenApiDocument {
 
 /// Finalizes route-generated metadata before serialization.
 pub fn finalize_document(mut document: OpenApiDocument) -> OpenApiDocument {
+    apply_operation_docs(&mut document);
     if let Some(path) = document.paths.paths.get_mut("/healthz")
         && let Some(operation) = path.get.as_mut()
     {
         operation.security = Some(Vec::new());
     }
     document
+}
+
+/// Applies human-curated titles and descriptions used by rendered API docs.
+fn apply_operation_docs(document: &mut OpenApiDocument) {
+    for &(method, path, summary, description) in OPERATION_DOCS {
+        if let Some(operation) = operation_mut(document, method, path) {
+            operation.summary = Some(summary.to_string());
+            operation.description = Some(description.to_string());
+        }
+    }
+}
+
+/// Returns one mutable OpenAPI operation by method and path.
+fn operation_mut<'a>(
+    document: &'a mut OpenApiDocument,
+    method: OperationMethod,
+    path: &str,
+) -> Option<&'a mut Operation> {
+    let path_item = document.paths.paths.get_mut(path)?;
+    match method {
+        OperationMethod::Get => path_item.get.as_mut(),
+        OperationMethod::Put => path_item.put.as_mut(),
+        OperationMethod::Post => path_item.post.as_mut(),
+        OperationMethod::Delete => path_item.delete.as_mut(),
+    }
 }
 
 /// Converts the typed OpenAPI document into the checked-in JSON representation.
@@ -211,4 +238,371 @@ const COMMON_ERROR_RESPONSES: [(&str, &str); 6] = [
     ("409", "Request conflicts with the current resource state."),
     ("500", "Unexpected REST facade or local client failure."),
     ("503", "Local daemon or REST worker is unavailable."),
+];
+
+#[derive(Clone, Copy)]
+enum OperationMethod {
+    Get,
+    Put,
+    Post,
+    Delete,
+}
+
+type OperationDoc = (OperationMethod, &'static str, &'static str, &'static str);
+
+const OPERATION_DOCS: &[OperationDoc] = &[
+    (
+        OperationMethod::Get,
+        "/healthz",
+        "Liveness",
+        "Reports whether the REST gateway process itself is alive.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/health",
+        "Health check",
+        "Reports whether the REST gateway can authenticate and ping the daemon.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/nodes",
+        "List nodes",
+        "Lists cluster nodes visible to the local daemon.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/nodes/{node_id}",
+        "Node status",
+        "Fetches one cluster node by UUID string.",
+    ),
+    (
+        OperationMethod::Delete,
+        "/v1/nodes/{node_id}",
+        "Evict node",
+        "Evicts one stale node identity by UUID string.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/nodes/{node_id}/drain",
+        "Drain status",
+        "Fetches the current drain-status snapshot for one node.",
+    ),
+    (
+        OperationMethod::Post,
+        "/v1/nodes/{node_id}/drain",
+        "Drain node",
+        "Requests drain for one node by UUID string.",
+    ),
+    (
+        OperationMethod::Put,
+        "/v1/nodes/{node_id}/labels",
+        "Label node",
+        "Applies one node label update by UUID string.",
+    ),
+    (
+        OperationMethod::Post,
+        "/v1/nodes/{node_id}/resume",
+        "Resume node",
+        "Resumes scheduling for one drained node by UUID string.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/agents/sessions",
+        "List sessions",
+        "Lists durable agent sessions visible to the local daemon.",
+    ),
+    (
+        OperationMethod::Post,
+        "/v1/agents/sessions",
+        "Submit session",
+        "Submits one durable agent session manifest to the local daemon.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/agents/sessions/{session_id}",
+        "Get session",
+        "Fetches one durable agent session and its retained run history.",
+    ),
+    (
+        OperationMethod::Delete,
+        "/v1/agents/sessions/{session_id}",
+        "Delete session",
+        "Deletes one closed durable agent session and its retained run history.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/agents/sessions/{session_id}/runs",
+        "List runs",
+        "Lists durable runs for one agent session.",
+    ),
+    (
+        OperationMethod::Post,
+        "/v1/agents/sessions/{session_id}/input",
+        "Submit input",
+        "Queues structured input on one idle agent session.",
+    ),
+    (
+        OperationMethod::Post,
+        "/v1/agents/sessions/{session_id}/cancel",
+        "Cancel session",
+        "Requests cancellation for one active or queued agent session run.",
+    ),
+    (
+        OperationMethod::Post,
+        "/v1/agents/sessions/{session_id}/close",
+        "Close session",
+        "Closes one durable agent session and rejects future input.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/jobs",
+        "List jobs",
+        "Lists first-class jobs visible to the local daemon.",
+    ),
+    (
+        OperationMethod::Post,
+        "/v1/jobs",
+        "Submit job",
+        "Submits one first-class job manifest to the local daemon.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/jobs/{job_id}",
+        "Get job",
+        "Fetches one first-class job by UUID string.",
+    ),
+    (
+        OperationMethod::Post,
+        "/v1/jobs/{job_id}/cancel",
+        "Cancel job",
+        "Cancels one first-class job by UUID string.",
+    ),
+    (
+        OperationMethod::Delete,
+        "/v1/jobs/{job_id}",
+        "Delete job",
+        "Deletes one terminal first-class job by UUID string.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/services",
+        "List services",
+        "Lists services visible to the local daemon.",
+    ),
+    (
+        OperationMethod::Post,
+        "/v1/services",
+        "Deploy service",
+        "Deploys or updates one service manifest through the local daemon.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/services/{selector}",
+        "Get service",
+        "Fetches one service by UUID text or exact service name.",
+    ),
+    (
+        OperationMethod::Delete,
+        "/v1/services/{selector}",
+        "Delete service",
+        "Deletes one service by UUID text or exact service name.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/services/{selector}/status",
+        "Service status",
+        "Fetches one service status snapshot by UUID text or exact service name.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/networks",
+        "List networks",
+        "Lists overlay networks visible to the local daemon.",
+    ),
+    (
+        OperationMethod::Post,
+        "/v1/networks",
+        "Create network",
+        "Creates one overlay network through the local daemon.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/networks/{network_id}",
+        "Get network",
+        "Fetches one overlay network inspection by UUID string.",
+    ),
+    (
+        OperationMethod::Delete,
+        "/v1/networks/{network_id}",
+        "Delete network",
+        "Deletes one overlay network by UUID string.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/networks/{network_id}/peers",
+        "Network peers",
+        "Lists per-peer convergence rows for one overlay network.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/networks/{network_id}/attachments",
+        "Network attachments",
+        "Lists workload attachment rows for one overlay network.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/volumes",
+        "List volumes",
+        "Lists volumes visible to the local daemon.",
+    ),
+    (
+        OperationMethod::Post,
+        "/v1/volumes",
+        "Create volume",
+        "Creates one managed local volume through the local daemon.",
+    ),
+    (
+        OperationMethod::Post,
+        "/v1/volumes/import",
+        "Import volume",
+        "Imports one existing local path as a volume through the local daemon.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/volumes/{selector}",
+        "Get volume",
+        "Fetches one volume by UUID text or exact volume name.",
+    ),
+    (
+        OperationMethod::Delete,
+        "/v1/volumes/{selector}",
+        "Delete volume",
+        "Deletes one volume by UUID text or exact volume name.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/volumes/{selector}/status",
+        "Volume status",
+        "Fetches one volume status by UUID text or exact volume name.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/tasks",
+        "List tasks",
+        "Lists standalone tasks visible to the local daemon.",
+    ),
+    (
+        OperationMethod::Post,
+        "/v1/tasks",
+        "Start task",
+        "Starts one standalone task through the local daemon.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/tasks/{selector}",
+        "Get task",
+        "Fetches one standalone task by UUID text or exact task name.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/tasks/{selector}/logs",
+        "Task logs",
+        "Streams standalone task logs as newline-delimited JSON frames.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/tasks/{selector}/attach",
+        "Attach task",
+        "Opens a WebSocket bridge to one running task's stdio streams.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/tasks/{selector}/exec",
+        "Exec task",
+        "Opens a WebSocket bridge to one command exec session inside a running task.",
+    ),
+    (
+        OperationMethod::Post,
+        "/v1/tasks/{selector}/stop",
+        "Stop task",
+        "Stops one standalone task by UUID text or accepted selector.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/secrets",
+        "List secrets",
+        "Lists secret summaries visible to the local daemon.",
+    ),
+    (
+        OperationMethod::Post,
+        "/v1/secrets",
+        "Create secret",
+        "Creates one secret with base64-encoded plaintext.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/secrets/{name}",
+        "Get secret",
+        "Fetches the current plaintext version for one secret.",
+    ),
+    (
+        OperationMethod::Put,
+        "/v1/secrets/{name}",
+        "Update secret",
+        "Updates one secret with a new base64-encoded plaintext version.",
+    ),
+    (
+        OperationMethod::Delete,
+        "/v1/secrets/{name}",
+        "Delete secret",
+        "Deletes one secret by name.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/secrets/{name}/versions/{version_id}",
+        "Secret version",
+        "Fetches one explicit plaintext secret version by UUID string.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/scheduler/summary",
+        "Capacity summary",
+        "Fetches scheduler capacity summary from the local scheduler capability.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/clusters",
+        "List clusters",
+        "Lists cluster lineage summaries known to the local daemon.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/clusters/views",
+        "List views",
+        "Lists raw cluster view summaries known to the local daemon.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/clusters/current",
+        "Current cluster",
+        "Returns the active cluster view associated with the local session.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/clusters/operations/{operation_id}",
+        "Get operation",
+        "Fetches the latest locally known cluster operation state by UUID string.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/clusters/split-candidates",
+        "Split candidates",
+        "Lists split candidates for the local active cluster view.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/clusters/{cluster_id}/split-candidates",
+        "Cluster split candidates",
+        "Lists split candidates for one explicit cluster lineage id.",
+    ),
 ];
