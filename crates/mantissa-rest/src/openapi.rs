@@ -107,7 +107,7 @@ pub fn json_value(document: &OpenApiDocument) -> Value {
         serde_json::to_value(document).expect("OpenAPI document should serialize to JSON");
     value["openapi"] = Value::String(OPENAPI_VERSION.to_string());
     inject_common_error_responses(&mut value);
-    value
+    sort_json_objects(value)
 }
 
 /// Serializes the OpenAPI document as stable, pretty-printed JSON.
@@ -176,6 +176,27 @@ fn error_response(description: &'static str) -> Value {
             }
         }
     })
+}
+
+/// Returns JSON with every object key sorted for feature-independent output.
+fn sort_json_objects(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.into_iter().map(sort_json_objects).collect()),
+        Value::Object(map) => {
+            let mut entries: Vec<_> = map
+                .into_iter()
+                .map(|(key, value)| (key, sort_json_objects(value)))
+                .collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+            let mut sorted = serde_json::Map::new();
+            for (key, value) in entries {
+                sorted.insert(key, value);
+            }
+            Value::Object(sorted)
+        }
+        other => other,
+    }
 }
 
 /// Returns whether one serialized path item key is an HTTP method.
