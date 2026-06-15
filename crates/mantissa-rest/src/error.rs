@@ -4,9 +4,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
+use utoipa::ToSchema;
 
 /// Stable JSON error body returned by REST handlers.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct RestErrorBody {
     pub code: &'static str,
     pub message: String,

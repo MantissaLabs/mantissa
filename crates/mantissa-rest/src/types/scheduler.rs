@@ -5,9 +5,10 @@ use mantissa_client::scheduler::{
     SchedulerSlotsSummary as ClientSchedulerSlotsSummary,
 };
 use serde::Serialize;
+use utoipa::ToSchema;
 
 /// REST-facing scheduler capacity summary.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, ToSchema)]
 pub struct SchedulerSummary {
     pub node_id: String,
     pub node_name: String,
@@ -54,7 +55,7 @@ impl From<ClientSchedulerSlotsSummary> for SchedulerSummary {
 }
 
 /// REST-facing scheduler slot detail.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct SchedulerSlotDetail {
     pub slot_id: u64,
     pub cpu_millis: u64,
@@ -79,7 +80,7 @@ impl From<ClientSchedulerSlotDetail> for SchedulerSlotDetail {
 }
 
 /// REST-facing scheduler GPU detail.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, ToSchema)]
 pub struct SchedulerGpuDetail {
     pub device_id: String,
     pub name: String,

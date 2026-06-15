@@ -3,9 +3,10 @@ use mantissa_client::secrets::{
     SecretDetail as ClientSecretDetail, SecretSummary as ClientSecretSummary,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// REST-facing secret metadata label.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SecretLabel {
     pub key: String,
@@ -27,7 +28,7 @@ impl SecretLabel {
 }
 
 /// REST-facing secret summary.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct SecretSummary {
     pub name: String,
     pub description: Option<String>,
@@ -52,7 +53,7 @@ impl From<ClientSecretSummary> for SecretSummary {
 }
 
 /// REST-facing decrypted secret detail.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct SecretDetail {
     pub summary: SecretSummary,
     pub plaintext_base64: String,
@@ -69,7 +70,7 @@ impl From<ClientSecretDetail> for SecretDetail {
 }
 
 /// REST request body for creating or updating one secret.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SecretUpsertRequest {
     pub plaintext_base64: String,
@@ -98,7 +99,7 @@ impl SecretUpsertRequest {
 }
 
 /// REST request body for creating one named secret.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SecretCreateRequest {
     pub name: String,
@@ -124,7 +125,7 @@ impl SecretCreateRequest {
 }
 
 /// REST response returned after deleting one or more secrets.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct SecretDeleteResponse {
     pub deleted: usize,
 }

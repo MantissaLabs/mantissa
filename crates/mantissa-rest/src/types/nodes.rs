@@ -1,9 +1,10 @@
 use crate::types::common::debug_variant_label;
 use mantissa_client::nodes::{DrainStatusView, NodeLabelsResult, NodeListEntry};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// REST-facing node summary returned by topology read routes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct NodeSummary {
     pub id: String,
     pub hostname: String,
@@ -17,7 +18,7 @@ pub struct NodeSummary {
 }
 
 /// REST request body for requesting node drain.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NodeDrainRequest {
     #[serde(default)]
@@ -27,14 +28,14 @@ pub struct NodeDrainRequest {
 }
 
 /// REST response returned after a node maintenance action is accepted.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct NodeActionResponse {
     pub node_id: String,
     pub accepted: bool,
 }
 
 /// REST-facing drain status snapshot for one node.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct NodeDrainStatus {
     pub node_id: String,
     pub schedulable: bool,
@@ -73,7 +74,7 @@ impl From<DrainStatusView> for NodeDrainStatus {
 }
 
 /// REST request body for updating node labels.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NodeLabelsRequest {
     #[serde(default)]
@@ -85,7 +86,7 @@ pub struct NodeLabelsRequest {
 }
 
 /// REST response returned after one node label update is accepted.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct NodeLabelsResponse {
     pub node_id: String,
     pub cleared: bool,

@@ -5,16 +5,17 @@ use mantissa_client::jobs::{
     snapshot::{JobAttemptView, JobDetailView, JobRetryPolicyView, JobSnapshotView},
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// REST request body for submitting a first-class job manifest.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JobSubmitRequest {
     pub manifest: JobManifest,
 }
 
 /// REST response returned after submitting one first-class job.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct JobSubmitResponse {
     pub id: String,
     pub name: String,
@@ -47,7 +48,7 @@ impl From<JobRunResult> for JobSubmitResponse {
 }
 
 /// REST-facing retry policy summary for one job.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct JobRetryPolicy {
     pub max_retries: u32,
     pub backoff_secs: u32,
@@ -64,7 +65,7 @@ impl From<JobRetryPolicyView> for JobRetryPolicy {
 }
 
 /// REST-facing compact job summary.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct JobSummary {
     pub id: String,
     pub name: String,
@@ -125,7 +126,7 @@ impl From<JobSnapshotView> for JobSummary {
 }
 
 /// REST-facing job attempt detail.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct JobAttempt {
     pub workload_id: String,
     pub workload_name: String,
@@ -170,7 +171,7 @@ impl From<JobAttemptView> for JobAttempt {
 }
 
 /// REST-facing detailed job inspection response.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct JobDetail {
     pub snapshot: JobSummary,
     pub attempts: Vec<JobAttempt>,

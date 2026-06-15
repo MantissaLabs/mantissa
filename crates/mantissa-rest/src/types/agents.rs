@@ -10,16 +10,17 @@ use mantissa_client::agents::{
     },
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// REST request body for submitting one durable agent session.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSubmitRequest {
     pub manifest: AgentManifest,
 }
 
 /// REST response returned after submitting one durable agent session.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct AgentSubmitResponse {
     pub session_id: String,
     pub name: String,
@@ -50,7 +51,7 @@ impl From<AgentSubmitResult> for AgentSubmitResponse {
 }
 
 /// REST-facing compact agent session row.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct AgentSessionSummary {
     pub id: String,
     pub name: String,
@@ -81,7 +82,7 @@ impl From<AgentSessionRow> for AgentSessionSummary {
 }
 
 /// REST-facing compact agent run row.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct AgentRunSummary {
     pub id: String,
     pub session_name: String,
@@ -112,7 +113,7 @@ impl From<AgentRunRow> for AgentRunSummary {
 }
 
 /// REST-facing session-scoped volume mount policy.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct AgentVolumeMount {
     pub volume_name: String,
     pub target: String,
@@ -131,7 +132,7 @@ impl From<AgentVolumeMountView> for AgentVolumeMount {
 }
 
 /// REST-facing recent structured agent event.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct AgentEvent {
     pub sequence: u64,
     pub created_at: String,
@@ -156,7 +157,7 @@ impl From<AgentEventView> for AgentEvent {
 }
 
 /// REST-facing detailed durable agent session snapshot.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct AgentSession {
     pub id: String,
     pub name: String,
@@ -237,7 +238,7 @@ impl From<AgentSessionSnapshotView> for AgentSession {
 }
 
 /// REST-facing durable agent run snapshot.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct AgentRun {
     pub id: String,
     pub session_id: String,
@@ -272,7 +273,7 @@ impl From<AgentRunView> for AgentRun {
 }
 
 /// REST-facing detailed agent inspection response.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct AgentSessionDetail {
     pub session: AgentSession,
     pub runs: Vec<AgentRun>,
@@ -289,14 +290,14 @@ impl From<AgentSessionDetailView> for AgentSessionDetail {
 }
 
 /// REST request body for queuing input on an agent session.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentInputRequest {
     pub input: String,
 }
 
 /// REST response returned after queuing input on an agent session.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct AgentInputResponse {
     pub accepted: bool,
 }

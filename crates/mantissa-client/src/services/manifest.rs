@@ -18,6 +18,7 @@ pub use crate::workload_submit::{
 pub type ServiceDeploymentPolicy = DeploymentPolicySpec;
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ServiceManifest {
     pub name: String,
@@ -36,6 +37,7 @@ pub struct ServiceManifest {
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TaskTemplateResources {
     #[serde(default)]
     pub cpu_millis: u64,
@@ -53,6 +55,7 @@ impl TaskTemplateResources {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TaskTemplateAutoscalePolicy {
     pub min_replicas: u16,
     pub max_replicas: u16,
@@ -64,12 +67,14 @@ pub struct TaskTemplateAutoscalePolicy {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TaskTemplateAutoscaleMetric {
     pub kind: TaskTemplateAutoscaleMetricKind,
     pub target_percent: u16,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TaskTemplateAutoscaleMetricKind {
     Cpu,
@@ -77,6 +82,7 @@ pub enum TaskTemplateAutoscaleMetricKind {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TaskTemplateRestartPolicy {
     pub name: RestartPolicyName,
     #[serde(default)]
@@ -84,6 +90,7 @@ pub struct TaskTemplateRestartPolicy {
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RestartPolicyName {
     No,
@@ -93,6 +100,7 @@ pub enum RestartPolicyName {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct SecretReference {
     pub name: String,
     #[serde(default)]
@@ -100,6 +108,7 @@ pub struct SecretReference {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct EnvironmentVariable {
     pub name: String,
     #[serde(default)]
@@ -109,6 +118,7 @@ pub struct EnvironmentVariable {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct SecretFileProjection {
     pub path: String,
     pub secret: SecretReference,
@@ -121,18 +131,21 @@ pub struct SecretFileProjection {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct VolumeLabel {
     pub key: String,
     pub value: String,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeAccessMode {
     ReadWriteOnce,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeBindingMode {
     Immediate,
@@ -140,6 +153,7 @@ pub enum VolumeBindingMode {
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeReclaimPolicy {
     Retain,
@@ -147,6 +161,7 @@ pub enum VolumeReclaimPolicy {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct LocalVolumeSpec {
     pub source: LocalVolumeSource,
     #[serde(default)]
@@ -154,6 +169,7 @@ pub struct LocalVolumeSpec {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum LocalVolumeSource {
     Managed,
@@ -161,12 +177,14 @@ pub enum LocalVolumeSource {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ExternalVolumeSpec {
     pub driver_name: String,
     pub handle: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeDriver {
     Local(LocalVolumeSpec),
@@ -174,6 +192,7 @@ pub enum VolumeDriver {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct VolumeSpec {
     pub name: String,
     pub driver: VolumeDriver,
@@ -190,6 +209,7 @@ pub struct VolumeSpec {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct VolumeMount {
     pub source: String,
     pub target: String,
@@ -226,6 +246,7 @@ fn default_liveness_start_period_ms() -> u64 {
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ReadinessKind {
     #[default]
@@ -234,6 +255,7 @@ pub enum ReadinessKind {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ReadinessProbe {
     #[serde(default)]
     pub kind: ReadinessKind,
@@ -249,6 +271,7 @@ pub struct ReadinessProbe {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct LivenessProbe {
     #[serde(default)]
     pub kind: LivenessKind,
@@ -269,6 +292,7 @@ pub struct LivenessProbe {
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum LivenessKind {
     #[default]
@@ -279,6 +303,7 @@ pub enum LivenessKind {
 
 /// Service-only placement preference that depends on service replica metadata.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ServicePlacementPreference {
     ServiceAffinity,
@@ -288,6 +313,7 @@ pub enum ServicePlacementPreference {
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PlacementSpec {
     #[serde(default)]
     pub constraints: Vec<PlacementConstraint>,
@@ -298,6 +324,7 @@ pub struct PlacementSpec {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TaskTemplateSpec {
     pub name: String,
     pub image: String,
@@ -341,6 +368,7 @@ pub struct TaskTemplateSpec {
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceUpdateStrategyMode {
     #[default]
@@ -348,6 +376,7 @@ pub enum ServiceUpdateStrategyMode {
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RolloutOrder {
     #[default]
@@ -356,6 +385,7 @@ pub enum RolloutOrder {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct RollingUpdatePolicy {
     #[serde(default = "default_rollout_parallelism")]
     pub parallelism: u16,
@@ -379,6 +409,7 @@ impl Default for RollingUpdatePolicy {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ServiceUpdateStrategy {
     #[serde(default)]
     pub mode: ServiceUpdateStrategyMode,

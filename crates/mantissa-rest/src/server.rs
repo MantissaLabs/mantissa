@@ -1,7 +1,7 @@
 use crate::{
     client_worker::{ClientWorkerError, ClientWorkerHandle},
     config::{RestConfig, RestTlsConfig, normalize_client_cert_sha256},
-    routes,
+    openapi, routes,
     state::AppState,
 };
 use axum::{
@@ -10,7 +10,6 @@ use axum::{
     http::Request,
     middleware::{self, Next},
     response::Response,
-    routing::{get, post, put},
 };
 use axum_server::{Handle, tls_rustls::RustlsConfig};
 use rustls::{
@@ -35,138 +34,112 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use utoipa::openapi::OpenApi;
+use utoipa_axum::{router::OpenApiRouter, routes as openapi_routes};
 
 /// Builds the Axum router for the REST facade.
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/healthz", get(routes::health::liveness))
-        .route("/v1/health", get(routes::health::health))
-        .route("/v1/nodes", get(routes::nodes::list))
-        .route(
-            "/v1/nodes/{node_id}",
-            get(routes::nodes::get).delete(routes::nodes::evict),
-        )
-        .route(
-            "/v1/nodes/{node_id}/drain",
-            get(routes::nodes::drain_status).post(routes::nodes::drain),
-        )
-        .route("/v1/nodes/{node_id}/labels", put(routes::nodes::labels))
-        .route("/v1/nodes/{node_id}/resume", post(routes::nodes::resume))
-        .route(
-            "/v1/agents/sessions",
-            get(routes::agents::list_sessions).post(routes::agents::submit_session),
-        )
-        .route(
-            "/v1/agents/sessions/{session_id}",
-            get(routes::agents::get_session).delete(routes::agents::delete_session),
-        )
-        .route(
-            "/v1/agents/sessions/{session_id}/runs",
-            get(routes::agents::list_runs),
-        )
-        .route(
-            "/v1/agents/sessions/{session_id}/input",
-            post(routes::agents::submit_input),
-        )
-        .route(
-            "/v1/agents/sessions/{session_id}/cancel",
-            post(routes::agents::cancel_session),
-        )
-        .route(
-            "/v1/agents/sessions/{session_id}/close",
-            post(routes::agents::close_session),
-        )
-        .route(
-            "/v1/jobs",
-            get(routes::jobs::list).post(routes::jobs::submit),
-        )
-        .route(
-            "/v1/jobs/{job_id}",
-            get(routes::jobs::get).delete(routes::jobs::delete),
-        )
-        .route("/v1/jobs/{job_id}/cancel", post(routes::jobs::cancel))
-        .route(
-            "/v1/services",
-            get(routes::services::list).post(routes::services::deploy),
-        )
-        .route(
-            "/v1/services/{selector}",
-            get(routes::services::get).delete(routes::services::delete),
-        )
-        .route(
-            "/v1/services/{selector}/status",
-            get(routes::services::status),
-        )
-        .route(
-            "/v1/networks",
-            get(routes::networks::list).post(routes::networks::create),
-        )
-        .route(
-            "/v1/networks/{network_id}",
-            get(routes::networks::get).delete(routes::networks::delete),
-        )
-        .route(
-            "/v1/networks/{network_id}/peers",
-            get(routes::networks::peers),
-        )
-        .route(
-            "/v1/networks/{network_id}/attachments",
-            get(routes::networks::attachments),
-        )
-        .route(
-            "/v1/volumes",
-            get(routes::volumes::list).post(routes::volumes::create),
-        )
-        .route("/v1/volumes/import", post(routes::volumes::import))
-        .route(
-            "/v1/volumes/{selector}",
-            get(routes::volumes::get).delete(routes::volumes::delete),
-        )
-        .route(
-            "/v1/volumes/{selector}/status",
-            get(routes::volumes::status),
-        )
-        .route(
-            "/v1/tasks",
-            get(routes::tasks::list).post(routes::tasks::start),
-        )
-        .route("/v1/tasks/{selector}", get(routes::tasks::get))
-        .route("/v1/tasks/{selector}/logs", get(routes::tasks::logs))
-        .route("/v1/tasks/{selector}/attach", get(routes::tasks::attach))
-        .route("/v1/tasks/{selector}/exec", get(routes::tasks::exec))
-        .route("/v1/tasks/{selector}/stop", post(routes::tasks::stop))
-        .route(
-            "/v1/secrets",
-            get(routes::secrets::list).post(routes::secrets::create),
-        )
-        .route(
-            "/v1/secrets/{name}",
-            get(routes::secrets::get)
-                .put(routes::secrets::update)
-                .delete(routes::secrets::delete),
-        )
-        .route(
-            "/v1/secrets/{name}/versions/{version_id}",
-            get(routes::secrets::get_version),
-        )
-        .route("/v1/scheduler/summary", get(routes::scheduler::summary))
-        .route("/v1/clusters", get(routes::clusters::list))
-        .route("/v1/clusters/views", get(routes::clusters::views))
-        .route("/v1/clusters/current", get(routes::clusters::current))
-        .route(
-            "/v1/clusters/split-candidates",
-            get(routes::clusters::split_candidates),
-        )
-        .route(
-            "/v1/clusters/{cluster_id}/split-candidates",
-            get(routes::clusters::split_candidates_for_cluster),
-        )
-        .route(
-            "/v1/clusters/operations/{operation_id}",
-            get(routes::clusters::operation),
-        )
+    openapi_router(state).0
+}
+
+/// Builds the Axum router and OpenAPI document from the same route declarations.
+pub fn openapi_router(state: AppState) -> (Router, OpenApi) {
+    documented_router()
         .layer(middleware::from_fn(log_request))
         .with_state(state)
+        .split_for_parts()
+}
+
+/// Builds the OpenAPI document without binding a REST listener.
+pub fn openapi() -> OpenApi {
+    documented_router().into_openapi()
+}
+
+/// Builds the stateful OpenAPI router before concrete application state is attached.
+fn documented_router() -> OpenApiRouter<AppState> {
+    let mut router = OpenApiRouter::with_openapi(openapi::base_document())
+        .routes(openapi_routes!(routes::health::liveness))
+        .routes(openapi_routes!(routes::health::health))
+        .routes(openapi_routes!(routes::nodes::list))
+        .routes(openapi_routes!(routes::nodes::get, routes::nodes::evict))
+        .routes(openapi_routes!(
+            routes::nodes::drain_status,
+            routes::nodes::drain
+        ))
+        .routes(openapi_routes!(routes::nodes::labels))
+        .routes(openapi_routes!(routes::nodes::resume))
+        .routes(openapi_routes!(
+            routes::agents::list_sessions,
+            routes::agents::submit_session
+        ))
+        .routes(openapi_routes!(
+            routes::agents::get_session,
+            routes::agents::delete_session
+        ))
+        .routes(openapi_routes!(routes::agents::list_runs))
+        .routes(openapi_routes!(routes::agents::submit_input))
+        .routes(openapi_routes!(routes::agents::cancel_session))
+        .routes(openapi_routes!(routes::agents::close_session))
+        .routes(openapi_routes!(routes::jobs::list, routes::jobs::submit))
+        .routes(openapi_routes!(routes::jobs::get, routes::jobs::delete))
+        .routes(openapi_routes!(routes::jobs::cancel))
+        .routes(openapi_routes!(
+            routes::services::list,
+            routes::services::deploy
+        ))
+        .routes(openapi_routes!(
+            routes::services::get,
+            routes::services::delete
+        ))
+        .routes(openapi_routes!(routes::services::status))
+        .routes(openapi_routes!(
+            routes::networks::list,
+            routes::networks::create
+        ))
+        .routes(openapi_routes!(
+            routes::networks::get,
+            routes::networks::delete
+        ))
+        .routes(openapi_routes!(routes::networks::peers))
+        .routes(openapi_routes!(routes::networks::attachments))
+        .routes(openapi_routes!(
+            routes::volumes::list,
+            routes::volumes::create
+        ))
+        .routes(openapi_routes!(routes::volumes::import))
+        .routes(openapi_routes!(
+            routes::volumes::get,
+            routes::volumes::delete
+        ))
+        .routes(openapi_routes!(routes::volumes::status))
+        .routes(openapi_routes!(routes::tasks::list, routes::tasks::start))
+        .routes(openapi_routes!(routes::tasks::get))
+        .routes(openapi_routes!(routes::tasks::logs))
+        .routes(openapi_routes!(routes::tasks::attach))
+        .routes(openapi_routes!(routes::tasks::exec))
+        .routes(openapi_routes!(routes::tasks::stop))
+        .routes(openapi_routes!(
+            routes::secrets::list,
+            routes::secrets::create
+        ))
+        .routes(openapi_routes!(
+            routes::secrets::get,
+            routes::secrets::update,
+            routes::secrets::delete
+        ))
+        .routes(openapi_routes!(routes::secrets::get_version))
+        .routes(openapi_routes!(routes::scheduler::summary))
+        .routes(openapi_routes!(routes::clusters::list))
+        .routes(openapi_routes!(routes::clusters::views))
+        .routes(openapi_routes!(routes::clusters::current))
+        .routes(openapi_routes!(routes::clusters::split_candidates))
+        .routes(openapi_routes!(
+            routes::clusters::split_candidates_for_cluster
+        ))
+        .routes(openapi_routes!(routes::clusters::operation));
+    let document = std::mem::take(router.get_openapi_mut());
+    *router.get_openapi_mut() = openapi::finalize_document(document);
+    router
 }
 
 /// Bound REST listener ready to serve requests.

@@ -8,16 +8,17 @@ use mantissa_client::services::{
     manifest::ServiceManifest,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// REST request body for deploying one service manifest.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceDeployRequest {
     pub manifest: ServiceManifest,
 }
 
 /// REST response returned after submitting one service deployment.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct ServiceDeployResponse {
     pub service_id: String,
     pub manifest_id: String,
@@ -46,7 +47,7 @@ fn deploy_outcome_label(outcome: ServiceDeployOutcome) -> &'static str {
 }
 
 /// REST-facing service summary and inspection response.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ServiceSummary {
     pub id: String,
     pub service_id: String,
@@ -105,7 +106,7 @@ impl From<ServiceRow> for ServiceSummary {
 }
 
 /// REST-facing task template embedded in a service.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct TaskTemplate {
     pub name: String,
     pub image: String,
@@ -138,7 +139,7 @@ impl From<TaskTemplateRow> for TaskTemplate {
 }
 
 /// REST-facing autoscale policy for one task template.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct TaskTemplateAutoscalePolicy {
     pub min_replicas: u16,
     pub max_replicas: u16,
@@ -169,7 +170,7 @@ impl From<TaskTemplateAutoscalePolicyRow> for TaskTemplateAutoscalePolicy {
 }
 
 /// REST-facing autoscale metric for one task template.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct TaskTemplateAutoscaleMetric {
     pub kind: String,
     pub target_percent: u16,
@@ -186,7 +187,7 @@ impl From<TaskTemplateAutoscaleMetricRow> for TaskTemplateAutoscaleMetric {
 }
 
 /// REST-facing compact service replica assignment segment.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ServiceReplicaAssignment {
     pub template_name: String,
     pub first_replica: u16,
@@ -205,7 +206,7 @@ impl From<ServiceReplicaAssignmentRow> for ServiceReplicaAssignment {
 }
 
 /// REST-facing service rollout state.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ServiceRollout {
     pub phase: String,
     pub total_steps: u32,
@@ -230,7 +231,7 @@ impl From<ServiceRolloutRow> for ServiceRollout {
 }
 
 /// REST-facing per-template service progress counters.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct ServiceTaskProgress {
     pub name: String,
     pub desired: u32,

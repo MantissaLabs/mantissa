@@ -1,8 +1,9 @@
 use mantissa_client::host_ports::HostPortView;
 use serde::Serialize;
+use utoipa::ToSchema;
 
 /// REST-facing host-port binding shared by jobs and services.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct HostPort {
     pub name: String,
     pub target_port: u16,

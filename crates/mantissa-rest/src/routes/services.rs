@@ -12,6 +12,12 @@ use axum::{
 };
 
 /// Lists services visible to the local daemon.
+#[utoipa::path(
+    get,
+    path = "/v1/services",
+    tag = "services",
+    responses((status = 200, description = "Services visible to the local daemon.", body = [ServiceSummary]))
+)]
 pub async fn list(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -25,6 +31,13 @@ pub async fn list(
 }
 
 /// Deploys or updates one service manifest through the local daemon.
+#[utoipa::path(
+    post,
+    path = "/v1/services",
+    tag = "services",
+    request_body = ServiceDeployRequest,
+    responses((status = 200, description = "Service deployment result.", body = ServiceDeployResponse))
+)]
 pub async fn deploy(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -39,6 +52,13 @@ pub async fn deploy(
 }
 
 /// Fetches one service by UUID text or exact service name.
+#[utoipa::path(
+    get,
+    path = "/v1/services/{selector}",
+    tag = "services",
+    params(("selector" = String, Path, description = "Service UUID string or exact service name.")),
+    responses((status = 200, description = "Service summary.", body = ServiceSummary))
+)]
 pub async fn get(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -53,6 +73,13 @@ pub async fn get(
 }
 
 /// Deletes one service by UUID text or exact service name.
+#[utoipa::path(
+    delete,
+    path = "/v1/services/{selector}",
+    tag = "services",
+    params(("selector" = String, Path, description = "Service UUID string or exact service name.")),
+    responses((status = 200, description = "Deleted service summary.", body = ServiceSummary))
+)]
 pub async fn delete(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -67,6 +94,13 @@ pub async fn delete(
 }
 
 /// Fetches one service status snapshot by UUID text or exact service name.
+#[utoipa::path(
+    get,
+    path = "/v1/services/{selector}/status",
+    tag = "services",
+    params(("selector" = String, Path, description = "Service UUID string or exact service name.")),
+    responses((status = 200, description = "Service status snapshot.", body = ServiceSummary))
+)]
 pub async fn status(
     State(state): State<AppState>,
     _auth: RestAuth,

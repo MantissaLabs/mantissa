@@ -1,9 +1,10 @@
 use crate::types::common::HostPort;
 use mantissa_client::tasks::TaskRow;
 use serde::{Deserialize, Deserializer, Serialize, de};
+use utoipa::{IntoParams, ToSchema};
 
 /// REST-facing task summary returned by task routes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct TaskSummary {
     pub id: String,
     pub name: String,
@@ -40,7 +41,7 @@ impl From<TaskRow> for TaskSummary {
 }
 
 /// REST request body for starting one standalone task.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TaskStartRequest {
     pub name: String,
@@ -58,7 +59,7 @@ pub struct TaskStartRequest {
 }
 
 /// REST query parameters for streaming standalone task logs.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
 pub struct TaskLogsQuery {
     #[serde(default)]
@@ -74,7 +75,7 @@ pub struct TaskLogsQuery {
 }
 
 /// REST WebSocket query parameters for attaching to one task.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
 pub struct TaskAttachQuery {
     #[serde(default = "default_true")]
@@ -96,7 +97,7 @@ pub struct TaskAttachQuery {
 }
 
 /// REST WebSocket query parameters for starting one task exec session.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
 pub struct TaskExecQuery {
     #[serde(default, deserialize_with = "deserialize_command_query")]

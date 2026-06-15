@@ -6,8 +6,12 @@ use crate::{
     extract::{RestJson, RestQuery},
     routes::worker_error_to_rest,
     state::AppState,
-    stream::task_exec::{
-        TaskInteractiveEvent, TaskInteractiveInput, TaskInteractiveSession, decode_client_message,
+    stream::{
+        task_exec::{
+            TaskInteractiveEvent, TaskInteractiveInput, TaskInteractiveSession,
+            decode_client_message,
+        },
+        task_logs::TaskLogEvent,
     },
     types::tasks::{TaskAttachQuery, TaskExecQuery, TaskLogsQuery, TaskStartRequest, TaskSummary},
 };
@@ -23,6 +27,12 @@ use axum::{
 };
 
 /// Lists standalone tasks visible to the local daemon.
+#[utoipa::path(
+    get,
+    path = "/v1/tasks",
+    tag = "tasks",
+    responses((status = 200, description = "Standalone tasks visible to the local daemon.", body = [TaskSummary]))
+)]
 pub async fn list(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -36,6 +46,13 @@ pub async fn list(
 }
 
 /// Starts one standalone task through the local daemon.
+#[utoipa::path(
+    post,
+    path = "/v1/tasks",
+    tag = "tasks",
+    request_body = TaskStartRequest,
+    responses((status = 200, description = "Started standalone task summary.", body = TaskSummary))
+)]
 pub async fn start(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -50,6 +67,13 @@ pub async fn start(
 }
 
 /// Fetches one standalone task by UUID text or exact task name.
+#[utoipa::path(
+    get,
+    path = "/v1/tasks/{selector}",
+    tag = "tasks",
+    params(("selector" = String, Path, description = "Task UUID string or exact task name.")),
+    responses((status = 200, description = "Standalone task summary.", body = TaskSummary))
+)]
 pub async fn get(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -64,6 +88,16 @@ pub async fn get(
 }
 
 /// Streams standalone task logs as newline-delimited JSON frames.
+#[utoipa::path(
+    get,
+    path = "/v1/tasks/{selector}/logs",
+    tag = "tasks",
+    params(
+        ("selector" = String, Path, description = "Task UUID string or exact task name."),
+        TaskLogsQuery
+    ),
+    responses((status = 200, description = "Newline-delimited task log events.", body = TaskLogEvent, content_type = "application/x-ndjson"))
+)]
 pub async fn logs(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -83,6 +117,16 @@ pub async fn logs(
 }
 
 /// Opens a WebSocket bridge to one running task's stdio streams.
+#[utoipa::path(
+    get,
+    path = "/v1/tasks/{selector}/attach",
+    tag = "tasks",
+    params(
+        ("selector" = String, Path, description = "Task UUID string or exact task name."),
+        TaskAttachQuery
+    ),
+    responses((status = 101, description = "WebSocket upgrade. Clients may send TaskInteractiveClientMessage JSON frames and receive TaskInteractiveEvent JSON frames.", body = TaskInteractiveEvent))
+)]
 pub async fn attach(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -101,6 +145,16 @@ pub async fn attach(
 }
 
 /// Opens a WebSocket bridge to one command exec session inside a running task.
+#[utoipa::path(
+    get,
+    path = "/v1/tasks/{selector}/exec",
+    tag = "tasks",
+    params(
+        ("selector" = String, Path, description = "Task UUID string or exact task name."),
+        TaskExecQuery
+    ),
+    responses((status = 101, description = "WebSocket upgrade. Clients may send TaskInteractiveClientMessage JSON frames and receive TaskInteractiveEvent JSON frames.", body = TaskInteractiveEvent))
+)]
 pub async fn exec(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -119,6 +173,13 @@ pub async fn exec(
 }
 
 /// Stops one standalone task by UUID text or accepted selector.
+#[utoipa::path(
+    post,
+    path = "/v1/tasks/{selector}/stop",
+    tag = "tasks",
+    params(("selector" = String, Path, description = "Task UUID string or exact task name.")),
+    responses((status = 200, description = "Stopped task summary.", body = TaskSummary))
+)]
 pub async fn stop(
     State(state): State<AppState>,
     _auth: RestAuth,

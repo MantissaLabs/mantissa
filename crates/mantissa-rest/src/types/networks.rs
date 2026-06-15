@@ -5,9 +5,10 @@ use mantissa_client::networks::{
     NetworkSpec as ClientNetworkSpec, NetworkSummary as ClientNetworkSummary,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// REST request body for creating an overlay network.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkCreateRequest {
     pub name: String,
@@ -43,19 +44,19 @@ impl From<NetworkCreateRequest> for ClientNetworkCreateRequest {
 }
 
 /// REST response returned after creating one network.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct NetworkCreateResponse {
     pub network_id: String,
 }
 
 /// REST response returned after deleting networks.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct NetworkDeleteResponse {
     pub deleted: usize,
 }
 
 /// REST-facing network summary row.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct NetworkSummary {
     pub id: String,
     pub name: String,
@@ -88,7 +89,7 @@ impl From<ClientNetworkSummary> for NetworkSummary {
 }
 
 /// REST-facing canonical network specification.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct NetworkSpec {
     pub id: String,
     pub name: String,
@@ -125,7 +126,7 @@ impl From<ClientNetworkSpec> for NetworkSpec {
 }
 
 /// REST-facing network peer convergence row.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct NetworkPeerStatus {
     pub peer_id: String,
     pub peer_name: String,
@@ -148,7 +149,7 @@ impl From<ClientNetworkPeerStatus> for NetworkPeerStatus {
 }
 
 /// REST-facing workload attachment row for one overlay network.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct NetworkAttachment {
     pub attachment_id: String,
     pub task_id: String,
@@ -187,7 +188,7 @@ impl From<ClientNetworkAttachment> for NetworkAttachment {
 }
 
 /// REST-facing network inspection response.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct NetworkInspect {
     pub spec: NetworkSpec,
     pub peers: Vec<NetworkPeerStatus>,

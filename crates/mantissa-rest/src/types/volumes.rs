@@ -8,9 +8,10 @@ use mantissa_client::volumes::{
     VolumeSummary as ClientVolumeSummary,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// REST request body for creating one managed local volume.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VolumeCreateRequest {
     pub name: String,
@@ -55,7 +56,7 @@ impl VolumeCreateRequest {
 }
 
 /// REST request body for importing an existing local path as a volume.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VolumeImportRequest {
     pub name: String,
@@ -85,7 +86,7 @@ impl From<VolumeImportRequest> for ClientVolumeImportRequest {
 }
 
 /// REST request ownership policy for managed local volumes.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum VolumeOwnershipRequest {
     #[default]
@@ -139,7 +140,7 @@ fn parse_reclaim_policy(value: &str) -> Result<ClientVolumeReclaimPolicy, String
 }
 
 /// REST-facing volume summary row.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct VolumeSummary {
     pub id: String,
     pub name: String,
@@ -180,7 +181,7 @@ impl From<ClientVolumeSummary> for VolumeSummary {
 }
 
 /// REST-facing volume driver.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct VolumeDriver {
     pub kind: String,
     pub path: Option<String>,
@@ -218,7 +219,7 @@ impl From<ClientVolumeDriver> for VolumeDriver {
 }
 
 /// REST-facing ownership policy for local volume materialization.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct LocalVolumeOwnership {
     pub kind: String,
     pub uid: Option<u32>,
@@ -249,7 +250,7 @@ impl From<ClientLocalVolumeOwnership> for LocalVolumeOwnership {
 }
 
 /// REST-facing persisted volume specification.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct VolumeSpec {
     pub id: String,
     pub name: String,
@@ -298,7 +299,7 @@ impl From<ClientVolumeSpec> for VolumeSpec {
 }
 
 /// REST-facing volume label.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VolumeLabel {
     pub key: String,
@@ -326,7 +327,7 @@ impl From<ClientVolumeLabel> for VolumeLabel {
 }
 
 /// REST-facing node-local volume status row.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct VolumeNodeStatus {
     pub id: String,
     pub volume_id: String,
@@ -365,7 +366,7 @@ impl From<ClientVolumeNodeStatus> for VolumeNodeStatus {
 }
 
 /// REST-facing volume inspection payload.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct VolumeInspect {
     pub spec: VolumeSpec,
     pub node_states: Vec<VolumeNodeStatus>,
@@ -386,7 +387,7 @@ impl From<ClientVolumeInspect> for VolumeInspect {
 }
 
 /// REST response returned after deleting one volume.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct VolumeDeleteResponse {
     pub preserved_path: Option<String>,
     pub deleted_data: bool,

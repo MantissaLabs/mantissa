@@ -8,11 +8,23 @@ use crate::{
 use axum::{Json, extract::State};
 
 /// Reports whether the REST gateway process itself is alive.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "health",
+    responses((status = 200, description = "REST listener is alive.", body = LivenessResponse))
+)]
 pub async fn liveness() -> Json<LivenessResponse> {
     Json(LivenessResponse::ok())
 }
 
 /// Reports whether the REST gateway can authenticate and ping the daemon.
+#[utoipa::path(
+    get,
+    path = "/v1/health",
+    tag = "health",
+    responses((status = 200, description = "Local daemon is reachable.", body = HealthResponse))
+)]
 pub async fn health(
     State(state): State<AppState>,
     _auth: RestAuth,

@@ -15,6 +15,12 @@ use axum::{
 };
 
 /// Lists overlay networks visible to the local daemon.
+#[utoipa::path(
+    get,
+    path = "/v1/networks",
+    tag = "networks",
+    responses((status = 200, description = "Overlay networks visible to the local daemon.", body = [NetworkSummary]))
+)]
 pub async fn list(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -28,6 +34,13 @@ pub async fn list(
 }
 
 /// Creates one overlay network through the local daemon.
+#[utoipa::path(
+    post,
+    path = "/v1/networks",
+    tag = "networks",
+    request_body = NetworkCreateRequest,
+    responses((status = 200, description = "Created network identifier.", body = NetworkCreateResponse))
+)]
 pub async fn create(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -42,6 +55,13 @@ pub async fn create(
 }
 
 /// Fetches one overlay network inspection by UUID string.
+#[utoipa::path(
+    get,
+    path = "/v1/networks/{network_id}",
+    tag = "networks",
+    params(("network_id" = String, Path, description = "Network UUID string.")),
+    responses((status = 200, description = "Network inspection response.", body = NetworkInspect))
+)]
 pub async fn get(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -56,6 +76,13 @@ pub async fn get(
 }
 
 /// Lists per-peer convergence rows for one overlay network.
+#[utoipa::path(
+    get,
+    path = "/v1/networks/{network_id}/peers",
+    tag = "networks",
+    params(("network_id" = String, Path, description = "Network UUID string.")),
+    responses((status = 200, description = "Network peer convergence rows.", body = [NetworkPeerStatus]))
+)]
 pub async fn peers(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -70,6 +97,13 @@ pub async fn peers(
 }
 
 /// Lists workload attachment rows for one overlay network.
+#[utoipa::path(
+    get,
+    path = "/v1/networks/{network_id}/attachments",
+    tag = "networks",
+    params(("network_id" = String, Path, description = "Network UUID string.")),
+    responses((status = 200, description = "Network workload attachment rows.", body = [NetworkAttachment]))
+)]
 pub async fn attachments(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -84,6 +118,13 @@ pub async fn attachments(
 }
 
 /// Deletes one overlay network by UUID string.
+#[utoipa::path(
+    delete,
+    path = "/v1/networks/{network_id}",
+    tag = "networks",
+    params(("network_id" = String, Path, description = "Network UUID string.")),
+    responses((status = 200, description = "Deleted network count.", body = NetworkDeleteResponse))
+)]
 pub async fn delete(
     State(state): State<AppState>,
     _auth: RestAuth,

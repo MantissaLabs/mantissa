@@ -15,6 +15,12 @@ use axum::{
 };
 
 /// Lists volumes visible to the local daemon.
+#[utoipa::path(
+    get,
+    path = "/v1/volumes",
+    tag = "volumes",
+    responses((status = 200, description = "Volumes visible to the local daemon.", body = [VolumeSummary]))
+)]
 pub async fn list(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -28,6 +34,13 @@ pub async fn list(
 }
 
 /// Creates one managed local volume through the local daemon.
+#[utoipa::path(
+    post,
+    path = "/v1/volumes",
+    tag = "volumes",
+    request_body = VolumeCreateRequest,
+    responses((status = 200, description = "Created volume specification.", body = VolumeSpec))
+)]
 pub async fn create(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -42,6 +55,13 @@ pub async fn create(
 }
 
 /// Imports one existing local path as a volume through the local daemon.
+#[utoipa::path(
+    post,
+    path = "/v1/volumes/import",
+    tag = "volumes",
+    request_body = VolumeImportRequest,
+    responses((status = 200, description = "Imported volume specification.", body = VolumeSpec))
+)]
 pub async fn import(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -56,6 +76,13 @@ pub async fn import(
 }
 
 /// Fetches one volume by UUID text or exact volume name.
+#[utoipa::path(
+    get,
+    path = "/v1/volumes/{selector}",
+    tag = "volumes",
+    params(("selector" = String, Path, description = "Volume UUID string or exact volume name.")),
+    responses((status = 200, description = "Volume inspection payload.", body = VolumeInspect))
+)]
 pub async fn get(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -70,6 +97,13 @@ pub async fn get(
 }
 
 /// Deletes one volume by UUID text or exact volume name.
+#[utoipa::path(
+    delete,
+    path = "/v1/volumes/{selector}",
+    tag = "volumes",
+    params(("selector" = String, Path, description = "Volume UUID string or exact volume name.")),
+    responses((status = 200, description = "Volume delete result.", body = VolumeDeleteResponse))
+)]
 pub async fn delete(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -84,6 +118,13 @@ pub async fn delete(
 }
 
 /// Fetches one volume status by UUID text or exact volume name.
+#[utoipa::path(
+    get,
+    path = "/v1/volumes/{selector}/status",
+    tag = "volumes",
+    params(("selector" = String, Path, description = "Volume UUID string or exact volume name.")),
+    responses((status = 200, description = "Volume status inspection payload.", body = VolumeInspect))
+)]
 pub async fn status(
     State(state): State<AppState>,
     _auth: RestAuth,

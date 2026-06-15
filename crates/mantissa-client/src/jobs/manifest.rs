@@ -24,6 +24,7 @@ pub type JobDeploymentPolicySpec = DeploymentPolicySpec;
 
 /// File-based job manifest describing one finite workload submission.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct JobManifest {
     pub name: String,
     #[serde(default = "default_execution_platform")]
@@ -47,6 +48,7 @@ pub struct JobManifest {
 
 /// Resource requests declared for one job execution template.
 #[derive(Debug, Default, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct JobExecutionResources {
     #[serde(default)]
     pub cpu_millis: u64,
@@ -66,6 +68,7 @@ impl JobExecutionResources {
 
 /// Controller-owned retry settings declared by one job manifest.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct JobRetryPolicySpec {
     #[serde(default)]
     pub max_retries: u32,
@@ -85,6 +88,7 @@ impl Default for JobRetryPolicySpec {
 
 /// Environment variable declared on one job execution template.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct EnvironmentVariable {
     pub name: String,
     #[serde(default)]
@@ -95,6 +99,7 @@ pub struct EnvironmentVariable {
 
 /// Secret reference declared by one environment variable or secret file.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct SecretReference {
     pub name: String,
     #[serde(default)]
@@ -103,6 +108,7 @@ pub struct SecretReference {
 
 /// Secret-backed file projection declared on one job execution template.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct SecretFileProjection {
     pub path: String,
     pub secret: SecretReference,
@@ -116,6 +122,7 @@ pub struct SecretFileProjection {
 
 /// Cluster volume label declared in the manifest.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct VolumeLabel {
     pub key: String,
     pub value: String,
@@ -123,6 +130,7 @@ pub struct VolumeLabel {
 
 /// Access mode for one declared manifest volume.
 #[derive(Debug, Deserialize, Clone, Copy)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeAccessMode {
     ReadWriteOnce,
@@ -130,6 +138,7 @@ pub enum VolumeAccessMode {
 
 /// Binding mode for one declared manifest volume.
 #[derive(Debug, Deserialize, Clone, Copy)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeBindingMode {
     Immediate,
@@ -138,6 +147,7 @@ pub enum VolumeBindingMode {
 
 /// Reclaim policy for one declared manifest volume.
 #[derive(Debug, Deserialize, Clone, Copy)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeReclaimPolicy {
     Retain,
@@ -146,6 +156,7 @@ pub enum VolumeReclaimPolicy {
 
 /// Local backing for one declared manifest volume.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct LocalVolumeSpec {
     pub source: LocalVolumeSource,
     #[serde(default)]
@@ -154,6 +165,7 @@ pub struct LocalVolumeSpec {
 
 /// Local volume source declared in the manifest.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum LocalVolumeSource {
     Managed,
@@ -162,6 +174,7 @@ pub enum LocalVolumeSource {
 
 /// External backing for one declared manifest volume.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ExternalVolumeSpec {
     pub driver_name: String,
     pub handle: String,
@@ -169,6 +182,7 @@ pub struct ExternalVolumeSpec {
 
 /// Driver backing for one declared manifest volume.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeDriver {
     Local(LocalVolumeSpec),
@@ -177,6 +191,7 @@ pub enum VolumeDriver {
 
 /// Top-level declared volume for one job manifest.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct JobVolumeSpec {
     pub name: String,
     pub driver: VolumeDriver,
@@ -194,6 +209,7 @@ pub struct JobVolumeSpec {
 
 /// One volume mount declared on the job execution template.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct VolumeMount {
     pub source: String,
     pub target: String,
@@ -203,6 +219,7 @@ pub struct VolumeMount {
 
 /// Liveness probe transport style for a finite job execution template.
 #[derive(Debug, Deserialize, Clone, Copy, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum LivenessKind {
     #[default]
@@ -213,6 +230,7 @@ pub enum LivenessKind {
 
 /// Local liveness probe for one job execution template.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct LivenessProbe {
     #[serde(default)]
     pub kind: LivenessKind,
@@ -234,6 +252,7 @@ pub struct LivenessProbe {
 
 /// Shared execution template repeated for each job attempt.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct JobExecutionSpec {
     pub image: String,
     #[serde(default)]

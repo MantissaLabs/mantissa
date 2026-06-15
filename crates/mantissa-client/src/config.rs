@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 /// IP family requested by a workload manifest network dependency.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkIpFamily {
     #[default]

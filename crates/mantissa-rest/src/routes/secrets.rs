@@ -16,6 +16,12 @@ use axum::{
 };
 
 /// Lists secret summaries visible to the local daemon.
+#[utoipa::path(
+    get,
+    path = "/v1/secrets",
+    tag = "secrets",
+    responses((status = 200, description = "Secret summaries visible to the local daemon.", body = [SecretSummary]))
+)]
 pub async fn list(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -29,6 +35,13 @@ pub async fn list(
 }
 
 /// Creates one secret with base64-encoded plaintext.
+#[utoipa::path(
+    post,
+    path = "/v1/secrets",
+    tag = "secrets",
+    request_body = SecretCreateRequest,
+    responses((status = 200, description = "Created secret summary.", body = SecretSummary))
+)]
 pub async fn create(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -44,6 +57,14 @@ pub async fn create(
 }
 
 /// Updates one secret with a new base64-encoded plaintext version.
+#[utoipa::path(
+    put,
+    path = "/v1/secrets/{name}",
+    tag = "secrets",
+    params(("name" = String, Path, description = "Secret name.")),
+    request_body = SecretUpsertRequest,
+    responses((status = 200, description = "Updated secret summary.", body = SecretSummary))
+)]
 pub async fn update(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -59,6 +80,13 @@ pub async fn update(
 }
 
 /// Fetches the current plaintext version for one secret.
+#[utoipa::path(
+    get,
+    path = "/v1/secrets/{name}",
+    tag = "secrets",
+    params(("name" = String, Path, description = "Secret name.")),
+    responses((status = 200, description = "Current plaintext secret version.", body = SecretDetail))
+)]
 pub async fn get(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -73,6 +101,16 @@ pub async fn get(
 }
 
 /// Fetches one explicit plaintext secret version by UUID string.
+#[utoipa::path(
+    get,
+    path = "/v1/secrets/{name}/versions/{version_id}",
+    tag = "secrets",
+    params(
+        ("name" = String, Path, description = "Secret name."),
+        ("version_id" = String, Path, description = "Secret version UUID string.")
+    ),
+    responses((status = 200, description = "Explicit plaintext secret version.", body = SecretDetail))
+)]
 pub async fn get_version(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -87,6 +125,13 @@ pub async fn get_version(
 }
 
 /// Deletes one secret by name.
+#[utoipa::path(
+    delete,
+    path = "/v1/secrets/{name}",
+    tag = "secrets",
+    params(("name" = String, Path, description = "Secret name.")),
+    responses((status = 200, description = "Deleted secret count.", body = SecretDeleteResponse))
+)]
 pub async fn delete(
     State(state): State<AppState>,
     _auth: RestAuth,

@@ -15,6 +15,12 @@ use axum::{
 };
 
 /// Lists cluster nodes visible to the local daemon.
+#[utoipa::path(
+    get,
+    path = "/v1/nodes",
+    tag = "nodes",
+    responses((status = 200, description = "Cluster nodes visible to the local daemon.", body = [NodeSummary]))
+)]
 pub async fn list(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -28,6 +34,13 @@ pub async fn list(
 }
 
 /// Fetches one cluster node by UUID string.
+#[utoipa::path(
+    get,
+    path = "/v1/nodes/{node_id}",
+    tag = "nodes",
+    params(("node_id" = String, Path, description = "Node UUID string.")),
+    responses((status = 200, description = "Cluster node summary.", body = NodeSummary))
+)]
 pub async fn get(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -42,6 +55,13 @@ pub async fn get(
 }
 
 /// Fetches the current drain-status snapshot for one node.
+#[utoipa::path(
+    get,
+    path = "/v1/nodes/{node_id}/drain",
+    tag = "nodes",
+    params(("node_id" = String, Path, description = "Node UUID string.")),
+    responses((status = 200, description = "Current node drain status.", body = NodeDrainStatus))
+)]
 pub async fn drain_status(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -56,6 +76,14 @@ pub async fn drain_status(
 }
 
 /// Requests drain for one node by UUID string.
+#[utoipa::path(
+    post,
+    path = "/v1/nodes/{node_id}/drain",
+    tag = "nodes",
+    params(("node_id" = String, Path, description = "Node UUID string.")),
+    request_body = NodeDrainRequest,
+    responses((status = 200, description = "Drain request accepted.", body = NodeActionResponse))
+)]
 pub async fn drain(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -71,6 +99,14 @@ pub async fn drain(
 }
 
 /// Applies one node label update by UUID string.
+#[utoipa::path(
+    put,
+    path = "/v1/nodes/{node_id}/labels",
+    tag = "nodes",
+    params(("node_id" = String, Path, description = "Node UUID string.")),
+    request_body = NodeLabelsRequest,
+    responses((status = 200, description = "Label update accepted.", body = NodeLabelsResponse))
+)]
 pub async fn labels(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -86,6 +122,13 @@ pub async fn labels(
 }
 
 /// Resumes scheduling for one drained node by UUID string.
+#[utoipa::path(
+    post,
+    path = "/v1/nodes/{node_id}/resume",
+    tag = "nodes",
+    params(("node_id" = String, Path, description = "Node UUID string.")),
+    responses((status = 200, description = "Resume request accepted.", body = NodeActionResponse))
+)]
 pub async fn resume(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -100,6 +143,13 @@ pub async fn resume(
 }
 
 /// Evicts one stale node identity by UUID string.
+#[utoipa::path(
+    delete,
+    path = "/v1/nodes/{node_id}",
+    tag = "nodes",
+    params(("node_id" = String, Path, description = "Node UUID string.")),
+    responses((status = 200, description = "Eviction request accepted.", body = NodeActionResponse))
+)]
 pub async fn evict(
     State(state): State<AppState>,
     _auth: RestAuth,

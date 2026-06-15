@@ -12,6 +12,12 @@ use axum::{
 };
 
 /// Lists first-class jobs visible to the local daemon.
+#[utoipa::path(
+    get,
+    path = "/v1/jobs",
+    tag = "jobs",
+    responses((status = 200, description = "Jobs visible to the local daemon.", body = [JobSummary]))
+)]
 pub async fn list(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -25,6 +31,13 @@ pub async fn list(
 }
 
 /// Submits one first-class job manifest to the local daemon.
+#[utoipa::path(
+    post,
+    path = "/v1/jobs",
+    tag = "jobs",
+    request_body = JobSubmitRequest,
+    responses((status = 200, description = "Submitted job metadata.", body = JobSubmitResponse))
+)]
 pub async fn submit(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -39,6 +52,13 @@ pub async fn submit(
 }
 
 /// Fetches one first-class job by UUID string.
+#[utoipa::path(
+    get,
+    path = "/v1/jobs/{job_id}",
+    tag = "jobs",
+    params(("job_id" = String, Path, description = "Job UUID string.")),
+    responses((status = 200, description = "Detailed job inspection response.", body = JobDetail))
+)]
 pub async fn get(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -53,6 +73,13 @@ pub async fn get(
 }
 
 /// Cancels one first-class job by UUID string.
+#[utoipa::path(
+    post,
+    path = "/v1/jobs/{job_id}/cancel",
+    tag = "jobs",
+    params(("job_id" = String, Path, description = "Job UUID string.")),
+    responses((status = 200, description = "Updated job summary.", body = JobSummary))
+)]
 pub async fn cancel(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -67,6 +94,13 @@ pub async fn cancel(
 }
 
 /// Deletes one terminal first-class job by UUID string.
+#[utoipa::path(
+    delete,
+    path = "/v1/jobs/{job_id}",
+    tag = "jobs",
+    params(("job_id" = String, Path, description = "Job UUID string.")),
+    responses((status = 200, description = "Deleted job summary.", body = JobSummary))
+)]
 pub async fn delete(
     State(state): State<AppState>,
     _auth: RestAuth,

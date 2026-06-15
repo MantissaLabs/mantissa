@@ -4,9 +4,10 @@ use crate::{
 };
 use axum::{Json, extract::State};
 use serde::Deserialize;
+use utoipa::IntoParams;
 
 /// Query options accepted by the scheduler summary route.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
 pub struct SchedulerSummaryQuery {
     pub peer_id: Option<String>,
@@ -14,6 +15,13 @@ pub struct SchedulerSummaryQuery {
 }
 
 /// Fetches scheduler capacity summary from the local scheduler capability.
+#[utoipa::path(
+    get,
+    path = "/v1/scheduler/summary",
+    tag = "scheduler",
+    params(SchedulerSummaryQuery),
+    responses((status = 200, description = "Scheduler capacity summary.", body = SchedulerSummary))
+)]
 pub async fn summary(
     State(state): State<AppState>,
     _auth: RestAuth,

@@ -5,9 +5,10 @@ use mantissa_client::clusters::{
     SplitCandidate as ClientSplitCandidate, SplitCandidateList as ClientSplitCandidateList,
 };
 use serde::Serialize;
+use utoipa::ToSchema;
 
 /// REST-facing cluster view identifier.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct ClusterView {
     pub cluster_id: String,
     pub epoch: u64,
@@ -24,7 +25,7 @@ impl From<ClusterViewSpec> for ClusterView {
 }
 
 /// REST-facing cluster lineage summary.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ClusterSummary {
     pub cluster_id: String,
     pub cluster_name: Option<String>,
@@ -47,7 +48,7 @@ impl From<ClientClusterSummary> for ClusterSummary {
 }
 
 /// REST-facing cluster view summary row.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ClusterViewSummary {
     pub view: ClusterView,
     pub node_count: u32,
@@ -68,7 +69,7 @@ impl From<ClientClusterViewSummary> for ClusterViewSummary {
 }
 
 /// REST-facing deterministic split assignment.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ClusterSplitAssignment {
     pub node_id: String,
     pub target_index: u64,
@@ -85,7 +86,7 @@ impl From<ClientClusterSplitAssignment> for ClusterSplitAssignment {
 }
 
 /// REST-facing cluster operation details.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ClusterOperation {
     pub id: String,
     pub kind: String,
@@ -136,7 +137,7 @@ impl From<ClientClusterOperationSummary> for ClusterOperation {
 }
 
 /// REST-facing split candidate row.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct SplitCandidate {
     pub node_id: String,
     pub hostname: String,
@@ -179,7 +180,7 @@ impl From<ClientSplitCandidate> for SplitCandidate {
 }
 
 /// REST-facing split-candidate list for one source cluster view.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct SplitCandidateList {
     pub source_view: ClusterView,
     pub candidates: Vec<SplitCandidate>,

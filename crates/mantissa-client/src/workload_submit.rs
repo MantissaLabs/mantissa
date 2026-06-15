@@ -46,6 +46,7 @@ pub struct ResolvedDeclaredVolume {
 
 /// One top-level manifest network declaration used to override auto-created network defaults.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ManifestNetworkSpec {
     pub name: String,
     #[serde(default, deserialize_with = "deserialize_optional_network_driver")]
@@ -64,6 +65,7 @@ pub struct RequestedNetworkSpec {
 
 /// Shared deployment deadlines declared by workload-owning manifests.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct DeploymentPolicySpec {
     #[serde(default = "default_deployment_progress_deadline_secs")]
     pub progress_deadline_secs: u32,
@@ -104,6 +106,7 @@ pub fn validate_deployment_policy(
 
 /// Transport protocol for one manifest-declared node-local host port binding.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ManifestPortProtocol {
     #[default]
@@ -113,6 +116,7 @@ pub enum ManifestPortProtocol {
 
 /// Static node-local host port binding shared by service and job manifests.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ManifestPortBinding {
     pub name: String,
     pub target: u16,
@@ -125,6 +129,7 @@ pub struct ManifestPortBinding {
 
 /// Candidate ranking mode applied after hard placement filters pass.
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PlacementStrategy {
     #[default]
@@ -134,6 +139,7 @@ pub enum PlacementStrategy {
 
 /// Typed scheduler-visible field used by one hard placement constraint.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PlacementConstraintSelector {
     NodeId,
@@ -167,6 +173,7 @@ impl PlacementConstraintSelector {
 
 /// Supported comparison operators for hard placement constraints.
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PlacementConstraintOperator {
     #[default]
@@ -176,6 +183,7 @@ pub enum PlacementConstraintOperator {
 
 /// One hard placement predicate interpreted against a candidate node.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PlacementConstraint {
     pub selector: PlacementConstraintSelector,
     #[serde(default)]
@@ -205,6 +213,7 @@ impl PlacementConstraint {
 
 /// Generic workload placement policy shared by services, jobs, and agents.
 #[derive(Debug, Default, Deserialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PlacementSpec {
     #[serde(default)]
     pub constraints: Vec<PlacementConstraint>,
@@ -214,6 +223,7 @@ pub struct PlacementSpec {
 
 /// Admission behavior requested by a manifest-level workload controller.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkloadAdmissionMode {
     /// Batch-aware placement without a strict all-or-nothing admission barrier.
@@ -225,6 +235,7 @@ pub enum WorkloadAdmissionMode {
 
 /// Shared manifest-side admission policy for controller-owned workload groups.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct WorkloadAdmissionPolicy {
     #[serde(default)]
     pub mode: WorkloadAdmissionMode,

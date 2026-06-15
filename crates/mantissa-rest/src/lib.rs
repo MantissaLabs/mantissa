@@ -7,6 +7,7 @@ pub mod client_worker;
 pub mod config;
 pub mod error;
 pub mod extract;
+pub mod openapi;
 pub mod routes;
 pub mod server;
 pub mod state;

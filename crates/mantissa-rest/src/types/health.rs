@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// Liveness response returned without touching the local daemon session.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize, ToSchema)]
 pub struct LivenessResponse {
     pub status: String,
 }
@@ -16,7 +17,7 @@ impl LivenessResponse {
 }
 
 /// Full health response returned after pinging the local daemon session.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize, ToSchema)]
 pub struct HealthResponse {
     pub status: String,
     pub daemon: DaemonHealth,
@@ -33,7 +34,7 @@ impl HealthResponse {
 }
 
 /// Health details for the local Mantissa daemon.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize, ToSchema)]
 pub struct DaemonHealth {
     pub reachable: bool,
 }

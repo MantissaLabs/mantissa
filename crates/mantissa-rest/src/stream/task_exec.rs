@@ -6,6 +6,7 @@ use mantissa_protocol::task::{TaskLogStream, task_log_sink};
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 use tokio::sync::{mpsc, oneshot};
+use utoipa::ToSchema;
 
 /// Bounded event buffer between Cap'n Proto streams and WebSocket writers.
 pub const TASK_INTERACTIVE_EVENT_BUFFER: usize = 16;
@@ -18,15 +19,15 @@ pub enum TaskInteractiveInput {
 }
 
 /// One JSON message accepted from REST WebSocket clients.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum TaskInteractiveClientMessage {
+pub enum TaskInteractiveClientMessage {
     Input { data_base64: String },
     CloseInput,
 }
 
 /// One JSON event emitted to REST WebSocket clients.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TaskInteractiveEvent {
     Frame {

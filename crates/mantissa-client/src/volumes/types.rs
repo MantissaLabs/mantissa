@@ -18,6 +18,7 @@ pub struct VolumeLabel {
 
 /// Client-side ownership policy for one Mantissa-managed local volume.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum LocalVolumeOwnership {
     #[default]

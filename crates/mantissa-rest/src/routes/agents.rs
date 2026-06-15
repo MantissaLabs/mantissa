@@ -17,6 +17,12 @@ use axum::{
 };
 
 /// Lists durable agent sessions visible to the local daemon.
+#[utoipa::path(
+    get,
+    path = "/v1/agents/sessions",
+    tag = "agents",
+    responses((status = 200, description = "Durable agent sessions.", body = [AgentSessionSummary]))
+)]
 pub async fn list_sessions(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -30,6 +36,13 @@ pub async fn list_sessions(
 }
 
 /// Submits one durable agent session manifest to the local daemon.
+#[utoipa::path(
+    post,
+    path = "/v1/agents/sessions",
+    tag = "agents",
+    request_body = AgentSubmitRequest,
+    responses((status = 200, description = "Submitted agent session metadata.", body = AgentSubmitResponse))
+)]
 pub async fn submit_session(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -44,6 +57,13 @@ pub async fn submit_session(
 }
 
 /// Fetches one durable agent session and its retained run history.
+#[utoipa::path(
+    get,
+    path = "/v1/agents/sessions/{session_id}",
+    tag = "agents",
+    params(("session_id" = String, Path, description = "Agent session UUID string or exact session name.")),
+    responses((status = 200, description = "Agent session detail.", body = AgentSessionDetail))
+)]
 pub async fn get_session(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -58,6 +78,13 @@ pub async fn get_session(
 }
 
 /// Lists durable runs for one agent session.
+#[utoipa::path(
+    get,
+    path = "/v1/agents/sessions/{session_id}/runs",
+    tag = "agents",
+    params(("session_id" = String, Path, description = "Agent session UUID string or exact session name.")),
+    responses((status = 200, description = "Agent runs owned by the session.", body = [AgentRunSummary]))
+)]
 pub async fn list_runs(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -72,6 +99,14 @@ pub async fn list_runs(
 }
 
 /// Queues structured input on one idle agent session.
+#[utoipa::path(
+    post,
+    path = "/v1/agents/sessions/{session_id}/input",
+    tag = "agents",
+    params(("session_id" = String, Path, description = "Agent session UUID string or exact session name.")),
+    request_body = AgentInputRequest,
+    responses((status = 200, description = "Input was accepted for the session.", body = AgentInputResponse))
+)]
 pub async fn submit_input(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -87,6 +122,13 @@ pub async fn submit_input(
 }
 
 /// Requests cancellation for one active or queued agent session run.
+#[utoipa::path(
+    post,
+    path = "/v1/agents/sessions/{session_id}/cancel",
+    tag = "agents",
+    params(("session_id" = String, Path, description = "Agent session UUID string or exact session name.")),
+    responses((status = 200, description = "Updated agent session snapshot.", body = AgentSession))
+)]
 pub async fn cancel_session(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -101,6 +143,13 @@ pub async fn cancel_session(
 }
 
 /// Closes one durable agent session and rejects future input.
+#[utoipa::path(
+    post,
+    path = "/v1/agents/sessions/{session_id}/close",
+    tag = "agents",
+    params(("session_id" = String, Path, description = "Agent session UUID string or exact session name.")),
+    responses((status = 200, description = "Updated agent session snapshot.", body = AgentSession))
+)]
 pub async fn close_session(
     State(state): State<AppState>,
     _auth: RestAuth,
@@ -115,6 +164,13 @@ pub async fn close_session(
 }
 
 /// Deletes one closed durable agent session and its retained run history.
+#[utoipa::path(
+    delete,
+    path = "/v1/agents/sessions/{session_id}",
+    tag = "agents",
+    params(("session_id" = String, Path, description = "Agent session UUID string or exact session name.")),
+    responses((status = 200, description = "Deleted agent session snapshot.", body = AgentSession))
+)]
 pub async fn delete_session(
     State(state): State<AppState>,
     _auth: RestAuth,

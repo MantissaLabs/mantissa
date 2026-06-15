@@ -26,6 +26,7 @@ pub type AgentDeploymentPolicySpec = DeploymentPolicySpec;
 
 /// File-based agent manifest describing one durable agent session submission.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AgentManifest {
     pub name: String,
     #[serde(default = "default_execution_platform")]
@@ -57,6 +58,7 @@ pub struct AgentManifest {
 
 /// Resource requests declared for one agent run template.
 #[derive(Debug, Default, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AgentExecutionResources {
     #[serde(default)]
     pub cpu_millis: u64,
@@ -76,6 +78,7 @@ impl AgentExecutionResources {
 
 /// Top-level declared volume for one agent manifest.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AgentVolumeSpec {
     pub name: String,
     pub driver: VolumeDriver,
@@ -93,6 +96,7 @@ pub struct AgentVolumeSpec {
 
 /// Shared execution template copied into each run launched from the session.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AgentExecutionSpec {
     pub image: String,
     #[serde(default)]
@@ -121,6 +125,7 @@ pub struct AgentExecutionSpec {
 
 /// Persistent workspace policy owned by one agent session.
 #[derive(Debug, Default, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AgentWorkspaceSpec {
     #[serde(default)]
     pub mount: Option<VolumeMount>,
@@ -132,6 +137,7 @@ pub struct AgentWorkspaceSpec {
 
 /// Tooling and ambient capability policy attached to one agent session.
 #[derive(Debug, Default, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AgentToolSpec {
     #[serde(default)]
     pub allowed_tools: Vec<String>,
@@ -145,6 +151,7 @@ pub struct AgentToolSpec {
 
 /// Checkpointing policy owned by one agent session.
 #[derive(Debug, Default, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AgentCheckpointSpec {
     #[serde(default)]
     pub enabled: bool,
@@ -156,6 +163,7 @@ pub struct AgentCheckpointSpec {
 
 /// Human-in-the-loop interaction policy owned by one agent session.
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AgentInteractionSpec {
     #[serde(default = "default_agent_require_input")]
     pub require_user_input_between_runs: bool,

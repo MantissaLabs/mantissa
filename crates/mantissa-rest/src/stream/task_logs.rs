@@ -13,12 +13,13 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::sync::{mpsc, oneshot};
+use utoipa::ToSchema;
 
 /// Bounded frame buffer between the Cap'n Proto sink and HTTP response body.
 pub const TASK_LOG_EVENT_BUFFER: usize = 16;
 
 /// One task log event emitted by the REST streaming endpoint.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TaskLogEvent {
     Frame { stream: String, data_base64: String },
