@@ -19,61 +19,26 @@ interface Topology {
   leave @1 () -> ();
   # Leave the pool.
 
-  list @2 () -> (nodes :NodeList);
-  # List machines in the cluster.
+  evict @2 (nodeId :Node.NodeId) -> ();
+  # Evicts a node or one stale peer identity from the cluster given a node ID.
 
-  showToken @3 () -> (token :Text);
-  # Show the token for other nodes to use during join.
-
-  rotateToken @4 () -> (token :Text);
-  # Rotates the token for the node, invalidates existing token.
-
-  getClusterView @5 () -> (view :ClusterViewId);
-  # Returns the local node's currently active cluster view identifier.
-
-  mergeClusters @6 (req :MergeRequest) -> (op :ClusterOperation);
-  # Starts a merge operation between source and destination views.
-
-  splitCluster @7 (req :SplitRequest) -> (op :ClusterOperation);
-  # Starts a split operation from one source view into target views.
-
-  getClusterOperation @8 (id :Data) -> (op :ClusterOperation);
-  # Fetches the latest known state for a cluster operation id.
-
-  submitClusterOperation @9 (id :Data, payload :Data) -> ();
-  # Replicates a serialized cluster operation record to this node.
-
-  listClusterViews @10 () -> (views :List(ClusterViewSummary));
-  # Lists known cluster views and per-view node counts from this node's control-plane perspective.
-
-  listSplitCandidates @11 (sourceView :ClusterViewId) -> (nodes :List(SplitCandidate));
-  # Lists node candidates and host metadata used to prepare interactive split assignments.
-
-  setClusterName @12 (clusterId :ClusterId, name :Text) -> ();
-  # Sets or updates the friendly name for one cluster lineage identifier.
-
-  submitClusterName @13 (
-    clusterId :ClusterId,
-    name :Text,
-    updatedAtUnixMs :UInt64,
-    actorNodeId :Node.NodeId
-  ) -> ();
-  # Replicates one cluster-name update payload to this node.
-
-  drainNode @14 (
+  drain @3 (
     nodeId :Node.NodeId,
     reason :Text,
     taskStopTimeoutSecs :UInt32
   ) -> ();
   # Marks one node unschedulable for maintenance and starts cluster-wide drain fencing.
 
-  resumeNode @15 (nodeId :Node.NodeId) -> ();
-  # Clears maintenance fencing so one node can receive placements again.
-
-  getNodeDrainStatus @16 (nodeId :Node.NodeId) -> (status :NodeDrainStatus);
+  getDrainStatus @4 (nodeId :Node.NodeId) -> (status :NodeDrainStatus);
   # Returns the best-known drain progress and diagnostics for one node.
 
-  setNodeLabels @17 (
+  resume @5 (nodeId :Node.NodeId) -> ();
+  # Clears maintenance fencing so one node can receive placements again.
+
+  list @6 () -> (nodes :NodeList);
+  # List machines in the cluster.
+
+  setLabels @7 (
     nodeId :Node.NodeId,
     labels :List(Text),
     removeKeys :List(Text),
@@ -81,8 +46,43 @@ interface Topology {
   ) -> ();
   # Applies node labels to one peer entry and relays the converged update through topology gossip.
 
-  evictNode @18 (nodeId :Node.NodeId) -> ();
-  # Evicts a node or one stale peer identity from the cluster given a node ID.
+  showToken @8 () -> (token :Text);
+  # Show the token for other nodes to use during join.
+
+  rotateToken @9 () -> (token :Text);
+  # Rotates the token for the node, invalidates existing token.
+
+  getClusterView @10 () -> (view :ClusterViewId);
+  # Returns the local node's currently active cluster view identifier.
+
+  mergeClusters @11 (req :MergeRequest) -> (op :ClusterOperation);
+  # Starts a merge operation between source and destination views.
+
+  splitCluster @12 (req :SplitRequest) -> (op :ClusterOperation);
+  # Starts a split operation from one source view into target views.
+
+  getClusterOperation @13 (id :Data) -> (op :ClusterOperation);
+  # Fetches the latest known state for a cluster operation id.
+
+  submitClusterOperation @14 (id :Data, payload :Data) -> ();
+  # Replicates a serialized cluster operation record to this node.
+
+  listClusterViews @15 () -> (views :List(ClusterViewSummary));
+  # Lists known cluster views and per-view node counts from this node's control-plane perspective.
+
+  listSplitCandidates @16 (sourceView :ClusterViewId) -> (nodes :List(SplitCandidate));
+  # Lists node candidates and host metadata used to prepare interactive split assignments.
+
+  setClusterName @17 (clusterId :ClusterId, name :Text) -> ();
+  # Sets or updates the friendly name for one cluster lineage identifier.
+
+  submitClusterName @18 (
+    clusterId :ClusterId,
+    name :Text,
+    updatedAtUnixMs :UInt64,
+    actorNodeId :Node.NodeId
+  ) -> ();
+  # Replicates one cluster-name update payload to this node.
 }
 
 enum NodeDrainState {

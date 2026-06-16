@@ -355,7 +355,7 @@ async fn drain_node_via_topology(
     node_id: Uuid,
     reason: &str,
 ) -> Result<(), capnp::Error> {
-    let mut request = client.drain_node_request();
+    let mut request = client.drain_request();
     let mut params = request.get();
     params
         .reborrow()

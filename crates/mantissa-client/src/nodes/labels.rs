@@ -24,7 +24,7 @@ pub async fn labels(
     let client = connection::get_local_session(cfg).await?;
     let request = client.get_topology_request();
     let topology = request.send().pipeline.get_topology();
-    let mut request = topology.set_node_labels_request();
+    let mut request = topology.set_labels_request();
     {
         let mut params = request.get();
         params

@@ -1487,7 +1487,7 @@ pub(crate) async fn drain_node_with_timeout_via_topology(
     reason: &str,
     task_stop_timeout_secs: Option<u32>,
 ) -> Result<(), CapnpError> {
-    let mut request = client.drain_node_request();
+    let mut request = client.drain_request();
     let mut params = request.get();
     params
         .reborrow()
@@ -1521,7 +1521,7 @@ pub(crate) async fn drain_status_via_topology(
     client: &topology::Client,
     node_id: Uuid,
 ) -> Result<TestDrainStatus, CapnpError> {
-    let mut request = client.get_node_drain_status_request();
+    let mut request = client.get_drain_status_request();
     request.get().init_node_id().set_bytes(node_id.as_bytes());
     let response = request.send().promise.await?;
     let status = response.get()?.get_status()?;

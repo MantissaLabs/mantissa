@@ -301,7 +301,7 @@ async fn drain_node_with_timeout(
     reason: &str,
     task_stop_timeout_secs: Option<u32>,
 ) {
-    let mut request = node.topology().drain_node_request();
+    let mut request = node.topology().drain_request();
     {
         let mut params = request.get();
         params
@@ -311,7 +311,7 @@ async fn drain_node_with_timeout(
         params.set_reason(reason);
         params.set_task_stop_timeout_secs(task_stop_timeout_secs.unwrap_or(0));
     }
-    request.send().promise.await.expect("drainNode send");
+    request.send().promise.await.expect("drain send");
 }
 
 /// Marks one node drained through the real topology RPC so sync exercises a root-visible field.

@@ -82,7 +82,7 @@ pub async fn request_drain_typed(
 
     let request = session.get_topology_request();
     let topology = request.send().pipeline.get_topology();
-    let mut request = topology.drain_node_request();
+    let mut request = topology.drain_request();
     let mut params = request.get();
     params
         .reborrow()

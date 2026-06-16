@@ -73,7 +73,7 @@ pub async fn fetch_drain_status_via_topology(
     topology: &topology::topology::Client,
     node_id: Uuid,
 ) -> Result<DrainStatusView> {
-    let mut request = topology.get_node_drain_status_request();
+    let mut request = topology.get_drain_status_request();
     request.get().init_node_id().set_bytes(node_id.as_bytes());
     let response = request.send().promise.await?;
     let reader = response.get()?.get_status()?;

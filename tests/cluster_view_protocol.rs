@@ -76,7 +76,7 @@ async fn set_node_labels(
     labels: &[&str],
     replace: bool,
 ) {
-    let mut request = topology.set_node_labels_request();
+    let mut request = topology.set_labels_request();
     {
         let mut params = request.get();
         params
@@ -90,7 +90,7 @@ async fn set_node_labels(
         params.reborrow().init_remove_keys(0);
         params.set_replace(replace);
     }
-    request.send().promise.await.expect("setNodeLabels send");
+    request.send().promise.await.expect("setLabels send");
 }
 
 async fn node_labels_from_list(

@@ -943,10 +943,10 @@ impl topology::Server for Topology {
     }
 
     /// Evicts one stale peer identity from the cluster by publishing a newer left membership.
-    async fn evict_node(
+    async fn evict(
         self: Rc<Self>,
-        params: topology::EvictNodeParams,
-        _results: topology::EvictNodeResults,
+        params: topology::EvictParams,
+        _results: topology::EvictResults,
     ) -> Result<(), capnp::Error> {
         let request = params.get()?;
         let node_id = read_node_id(request.get_node_id()?)?;
@@ -1169,10 +1169,10 @@ impl topology::Server for Topology {
     }
 
     /// Marks one node unschedulable and gossips the maintenance fence cluster-wide.
-    async fn drain_node(
+    async fn drain(
         self: Rc<Self>,
-        params: topology::DrainNodeParams,
-        _results: topology::DrainNodeResults,
+        params: topology::DrainParams,
+        _results: topology::DrainResults,
     ) -> Result<(), capnp::Error> {
         let request = params.get()?;
         let node_id = read_node_id(request.get_node_id()?)?;
@@ -1211,10 +1211,10 @@ impl topology::Server for Topology {
     }
 
     /// Clears one node maintenance fence so schedulers may place new work on it again.
-    async fn resume_node(
+    async fn resume(
         self: Rc<Self>,
-        params: topology::ResumeNodeParams,
-        _results: topology::ResumeNodeResults,
+        params: topology::ResumeParams,
+        _results: topology::ResumeResults,
     ) -> Result<(), capnp::Error> {
         let request = params.get()?;
         let node_id = read_node_id(request.get_node_id()?)?;
@@ -1240,10 +1240,10 @@ impl topology::Server for Topology {
     }
 
     /// Applies operator-managed labels to one node and relays the converged update through gossip.
-    async fn set_node_labels(
+    async fn set_labels(
         self: Rc<Self>,
-        params: topology::SetNodeLabelsParams,
-        _results: topology::SetNodeLabelsResults,
+        params: topology::SetLabelsParams,
+        _results: topology::SetLabelsResults,
     ) -> Result<(), capnp::Error> {
         let request = params.get()?;
         let node_id = read_node_id(request.get_node_id()?)?;
@@ -1310,10 +1310,10 @@ impl topology::Server for Topology {
     }
 
     /// Returns a derived drain progress snapshot for one node so operators can wait safely.
-    async fn get_node_drain_status(
+    async fn get_drain_status(
         self: Rc<Self>,
-        params: topology::GetNodeDrainStatusParams,
-        mut results: topology::GetNodeDrainStatusResults,
+        params: topology::GetDrainStatusParams,
+        mut results: topology::GetDrainStatusResults,
     ) -> Result<(), capnp::Error> {
         let request = params.get()?;
         let node_id = read_node_id(request.get_node_id()?)?;

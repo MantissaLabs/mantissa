@@ -100,7 +100,7 @@ Drain is considered complete when all of these are true:
 - the local scheduler shows no remaining reserved slots,
 - the local scheduler shows no remaining reserved GPUs.
 
-The blocking client path polls `getNodeDrainStatus` until the node reaches
+The blocking client path polls `getDrainStatus` until the node reaches
 `drained` or the CLI timeout expires.
 
 ## Blockers

@@ -1668,7 +1668,7 @@ async fn set_node_labels(
     labels: &[&str],
     replace: bool,
 ) {
-    let mut request = topology.set_node_labels_request();
+    let mut request = topology.set_labels_request();
     {
         let mut params = request.get();
         set_node_id(params.reborrow().init_node_id(), &node_id);
@@ -1679,7 +1679,7 @@ async fn set_node_labels(
         params.reborrow().init_remove_keys(0);
         params.set_replace(replace);
     }
-    request.send().promise.await.expect("setNodeLabels send");
+    request.send().promise.await.expect("setLabels send");
 }
 
 /// Applies topology-zone labels to every node and waits until the registry view converges.
