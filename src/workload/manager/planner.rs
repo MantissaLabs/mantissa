@@ -35,6 +35,9 @@ use super::remote_advisory::{
 };
 use super::{WorkloadManager, WorkloadStartRequest};
 
+/// Minimum number of eligible nodes evaluated for spread placement before capacity shortlisting.
+const SPREAD_PLACEMENT_SHORTLIST_NODES: usize = 32;
+
 /// Scheduling failures that indicate transient prerequisites are blocking placement decisions.
 #[derive(Error, Debug)]
 pub(super) enum SchedulingError {
@@ -685,10 +688,13 @@ fn prefers_binpack_score(left: BinpackScore, right: BinpackScore) -> bool {
 
 /// Returns true when a spread candidate should replace the current best untargeted choice.
 ///
-/// Operator-declared preferences win first. When preferences tie, the earlier queue position keeps
-/// the ring rotation stable, and the lower node id is only a deterministic last-resort tie-break.
+/// Operator-declared preferences win first. When preferences tie, the node with fewer active
+/// workloads wins so independent single-task submissions still spread over time. Queue position
+/// keeps batch-local ring rotation stable after load counts tie.
 fn prefers_spread_candidate(
     preference_cmp: Ordering,
+    candidate_workload_count: usize,
+    best_workload_count: usize,
     candidate_index: usize,
     best_index: usize,
     candidate_node_id: Uuid,
@@ -702,6 +708,11 @@ fn prefers_spread_candidate(
     let preferences_tie = preference_cmp == Ordering::Equal;
     if !preferences_tie {
         return false;
+    }
+
+    let load_comparison = candidate_workload_count.cmp(&best_workload_count);
+    if load_comparison != Ordering::Equal {
+        return load_comparison.is_lt();
     }
 
     let appears_earlier_in_ring = candidate_index < best_index;
@@ -1019,6 +1030,17 @@ fn build_preference_inventory(
     inventory
 }
 
+/// Counts active workloads by assigned node for generic spread placement decisions.
+fn build_active_workload_counts(workloads: &HashMap<Uuid, WorkloadValue>) -> HashMap<Uuid, usize> {
+    let mut counts = HashMap::new();
+    for workload in workloads.values() {
+        if workload_counts_toward_preferences(workload) {
+            *counts.entry(workload.node_id).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
 /// Returns the preference counts visible on one candidate for the provided scheduling intent.
 fn candidate_preference_counts(
     inventory: &PlacementPreferenceInventory,
@@ -1119,6 +1141,25 @@ pub(super) struct Assignment {
     pub(super) local_version: u64,
     pub(super) local: Vec<BatchStartPlan>,
     pub(super) remote: Vec<RemoteStartPlan>,
+}
+
+/// Returns the minimum candidate-node count needed before capacity-based shortlisting can stop.
+fn minimum_candidate_nodes_for_intents(
+    intents: &[&StartIntent],
+    demand: WorkloadDemand,
+    available_nodes: usize,
+) -> usize {
+    let has_untargeted_spread = intents.iter().any(|intent| {
+        intent.target_node.is_none() && intent.placement.strategy == PlacementStrategy::Spread
+    });
+    let demand_nodes = demand.task_count as usize;
+    let target_nodes = if has_untargeted_spread {
+        demand_nodes.max(SPREAD_PLACEMENT_SHORTLIST_NODES)
+    } else {
+        demand_nodes
+    };
+
+    target_nodes.min(available_nodes)
 }
 
 /// # Description:
@@ -1291,6 +1332,7 @@ impl WorkloadManager {
         let health_snapshot = self.core.registry.health_monitor().snapshot();
         let workload_values = self.load_workload_value_index().await?;
         let mut preference_inventory = build_preference_inventory(workload_values.as_ref());
+        let mut active_workload_counts = build_active_workload_counts(workload_values.as_ref());
         let mut occupied_host_ports = build_occupied_host_ports(workload_values.as_ref());
         let public_host_ports = self.collect_public_host_ports()?;
         record_host_ports_for_node(
@@ -1346,6 +1388,7 @@ impl WorkloadManager {
             &mut candidates,
             remaining_intents,
             &mut preference_inventory,
+            &mut active_workload_counts,
             &health_snapshot,
         )?;
         assignment.local.sort_by_key(|plan| plan.index);
@@ -1749,7 +1792,8 @@ impl WorkloadManager {
         let demand = WorkloadDemand::from_intents(intents);
         let hints =
             self.build_remote_candidate_hints(intents, context.readiness, context.health_snapshot)?;
-        let minimum_candidate_nodes = usize::min(demand.task_count as usize, hints.len() + 1);
+        let minimum_candidate_nodes =
+            minimum_candidate_nodes_for_intents(intents, demand, hints.len() + 1);
         let required_target_nodes: HashSet<Uuid> = hints
             .iter()
             .filter(|hint| hint.targeted)
@@ -1913,6 +1957,7 @@ impl WorkloadManager {
         candidates: &mut VecDeque<Candidate>,
         intent: &StartIntent,
         preference_inventory: &PlacementPreferenceInventory,
+        active_workload_counts: &HashMap<Uuid, usize>,
     ) -> Result<(CandidateLocation, ResourceAllocation), anyhow::Error> {
         if candidates.is_empty() {
             return Err(SchedulingError::InsufficientCapacityForBatch.into());
@@ -1922,6 +1967,7 @@ impl WorkloadManager {
         let mut best_index: Option<usize> = None;
         let mut best_node_id = Uuid::nil();
         let mut best_preference_counts = PlacementPreferenceCounts::default();
+        let mut best_workload_count = 0usize;
         let mut skipped_for_constraints = false;
         let mut skipped_for_networks = false;
         let mut skipped_for_runtime = false;
@@ -1956,12 +2002,14 @@ impl WorkloadManager {
 
             let preference_counts =
                 candidate_preference_counts(preference_inventory, node_id, preference_context);
+            let workload_count = active_workload_counts.get(&node_id).copied().unwrap_or(0);
 
             match best_index {
                 None => {
                     best_index = Some(idx);
                     best_node_id = node_id;
                     best_preference_counts = preference_counts;
+                    best_workload_count = workload_count;
                 }
                 Some(current_best_index) => {
                     let preference_cmp = compare_placement_preference_counts(
@@ -1971,6 +2019,8 @@ impl WorkloadManager {
                     );
                     if prefers_spread_candidate(
                         preference_cmp,
+                        workload_count,
+                        best_workload_count,
                         idx,
                         current_best_index,
                         node_id,
@@ -1979,6 +2029,7 @@ impl WorkloadManager {
                         best_index = Some(idx);
                         best_node_id = node_id;
                         best_preference_counts = preference_counts;
+                        best_workload_count = workload_count;
                     }
                 }
             }
@@ -2196,6 +2247,7 @@ impl WorkloadManager {
         candidates: &mut VecDeque<Candidate>,
         intents: Vec<&StartIntent>,
         preference_inventory: &mut PlacementPreferenceInventory,
+        active_workload_counts: &mut HashMap<Uuid, usize>,
         health_snapshot: &HashMap<Uuid, HealthStatus>,
     ) -> Result<(), anyhow::Error> {
         for intent in intents {
@@ -2203,9 +2255,12 @@ impl WorkloadManager {
                 self.allocate_targeted_intent(candidates, intent, target_node, health_snapshot)?
             } else {
                 match intent.placement.strategy {
-                    PlacementStrategy::Spread => {
-                        self.allocate_spread_intent(candidates, intent, preference_inventory)?
-                    }
+                    PlacementStrategy::Spread => self.allocate_spread_intent(
+                        candidates,
+                        intent,
+                        preference_inventory,
+                        active_workload_counts,
+                    )?,
                     PlacementStrategy::Binpack => {
                         self.allocate_binpack_intent(candidates, intent, preference_inventory)?
                     }
@@ -2226,6 +2281,7 @@ impl WorkloadManager {
                     &owner.template,
                 );
             }
+            *active_workload_counts.entry(assigned_node_id).or_insert(0) += 1;
             self.push_assignment(assignment, intent, location, allocation);
         }
 
