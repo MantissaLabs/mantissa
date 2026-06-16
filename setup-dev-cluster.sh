@@ -22,7 +22,8 @@ Defaults: COUNT=2, REPO=\$HOME/dev/mantissa, SSH_BASE=7200, CPUS=10, MEM=24GiB, 
 Notes:
   - Prefers VZ + virtiofs on supported macOS hosts and falls back to QEMU + 9p otherwise.
   - Enables Lima nested virtualization automatically on supported M3+ macOS 15+ hosts.
-  - Mounts "~" read-write, and mounts the repo at /mantissa inside each VM.
+  - Mounts only the repo at /mantissa inside each VM.
+  - Use "limactl shell --workdir /mantissa mantissa-N" to enter a VM.
   - Enables shared VM <-> VM network (user-v2) so VMs can ping each other.
   - Set LIMA_ENABLE_VZNAT=1 to add a secondary vzNAT interface on supported macOS hosts.
 Examples:
@@ -222,8 +223,6 @@ EOF
 
 mountType: "${MOUNT_TYPE}"
 mounts:
-  - location: "~"
-    writable: true
   - location: "${REPO}"
     mountPoint: "/mantissa"
     writable: true
@@ -471,13 +470,17 @@ done
 echo
 echo "Requested ${COUNT} VM(s): created ${CREATED_COUNT}, already present ${SKIPPED_COUNT}."
 echo
+echo "Shell from host:"
+for i in $(seq 1 "${COUNT}"); do
+  echo "  limactl shell --workdir /mantissa mantissa-${i}"
+done
+echo
 echo "SSH from host:"
 for i in $(seq 1 "${COUNT}"); do
-  echo "  ssh -p $((SSH_BASE + i)) \$(whoami)@127.0.0.1   # mantissa-${i}"
+  echo "  ssh -p $((SSH_BASE + i)) \$(whoami)@127.0.0.1   # then cd /mantissa"
 done
 echo
 echo "Inside each VM (open a new shell so env/alias apply):"
-echo "  cd /mantissa"
 echo "  cargo build -p mantissa"
 echo "  sudo mantissa init"
 echo

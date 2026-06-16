@@ -51,10 +51,15 @@ Install lima, clone the mantissa repository and navigate to the project director
 ./setup-dev-cluster.sh -n 3 -r $(pwd)
 ```
 
-2. SSH into each VM (as printed by the script), then build once:
+2. Open a shell into each VM with the repo as the working directory:
 
 ```bash
-cd /mantissa
+limactl shell --workdir /mantissa mantissa-1
+```
+
+Then build once inside each VM:
+
+```bash
 cargo build
 ```
 

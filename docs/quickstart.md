@@ -80,10 +80,15 @@ Stop each node with `Ctrl+C` when finished.
 ./setup-dev-cluster.sh -n 2 -r $(pwd)
 ```
 
-2) SSH into each VM (as printed by the script), then build once:
+2) Open a shell into each VM with the repo as the working directory:
 
 ```bash
-cd /mantissa
+limactl shell --workdir /mantissa mantissa-1
+```
+
+Then build once inside each VM:
+
+```bash
 cargo build
 ```
 
