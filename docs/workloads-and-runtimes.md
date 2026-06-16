@@ -193,6 +193,13 @@ TTY behavior, CPU and memory requests, GPU count, restart policy, termination
 grace period, pre-stop hooks, liveness probes, environment variables, secret
 files, volume mounts, and networks.
 
+CPU and memory requests are mandatory for every schedulable workload: direct
+tasks, service replicas, job attempts, and agent runs. Mantissa rejects zero
+`cpu_millis` or zero `memory_bytes` before scheduler admission so a workload
+cannot reserve only a placeholder slot or reach a container runtime without
+limits. GPU remains optional and is accounted separately through `gpu_count`
+and explicit GPU device reservations.
+
 By contrast, the following policy stays above the execution layer:
 
 | Shared execution concerns | Controller-owned concerns |

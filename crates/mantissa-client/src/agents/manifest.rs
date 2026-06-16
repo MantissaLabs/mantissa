@@ -10,7 +10,7 @@ use crate::workload_submit::{
     DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec, DeploymentPolicySpec,
     ManifestNetworkSpec, PlacementSpec, RequestedNetworkSpec, WorkloadAdmissionPolicy,
     resolve_requested_networks, validate_declared_networks, validate_deployment_policy,
-    validate_placement,
+    validate_placement, validate_required_cpu_memory,
 };
 pub use crate::workload_submit::{
     PlacementConstraint, PlacementConstraintOperator, PlacementConstraintSelector,
@@ -57,12 +57,12 @@ pub struct AgentManifest {
 }
 
 /// Resource requests declared for one agent run template.
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AgentExecutionResources {
-    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(minimum = 1))]
     pub cpu_millis: u64,
-    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(minimum = 1))]
     pub memory_mb: u64,
     #[serde(default)]
     pub gpu_count: u32,
@@ -103,7 +103,6 @@ pub struct AgentExecutionSpec {
     pub command: Vec<String>,
     #[serde(default)]
     pub tty: bool,
-    #[serde(default)]
     pub resources: AgentExecutionResources,
     #[serde(default)]
     pub termination_grace_period_secs: Option<u32>,
@@ -372,18 +371,13 @@ fn validate_execution(
     execution: &AgentExecutionSpec,
     declared_volume_names: &HashSet<String>,
 ) -> Result<()> {
-    if execution.resources.cpu_millis != 0 || execution.resources.memory_mb != 0 {
-        if execution.resources.cpu_millis == 0 {
-            return Err(anyhow!(
-                "agent manifest must set execution.resources.cpu_millis when memory_mb is specified"
-            ));
-        }
-        if execution.resources.memory_mb == 0 {
-            return Err(anyhow!(
-                "agent manifest must set execution.resources.memory_mb when cpu_millis is specified"
-            ));
-        }
-    }
+    validate_required_cpu_memory(
+        "agent manifest",
+        execution.resources.cpu_millis,
+        execution.resources.memory_mb,
+        "execution.resources.cpu_millis",
+        "execution.resources.memory_mb",
+    )?;
 
     validate_command_list(
         execution.pre_stop_command.as_deref(),
@@ -842,6 +836,25 @@ mod tests {
             .expect("HTTP liveness should default to the workload root path");
     }
 
+    /// Rejects agent manifests that would launch without scheduler and runtime bounds.
+    #[test]
+    fn manifest_rejects_missing_resource_request() {
+        let mut manifest = base_manifest();
+        manifest.execution.resources.cpu_millis = 0;
+        manifest.execution.resources.memory_mb = 0;
+
+        let error = manifest
+            .validate()
+            .expect_err("missing resource request must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("execution.resources.cpu_millis and execution.resources.memory_mb"),
+            "unexpected error: {error:#}"
+        );
+    }
+
     /// Resolves declared network family overrides onto execution network references.
     #[test]
     fn requested_networks_preserve_declared_family_override() {
@@ -872,6 +885,10 @@ mod tests {
             ),
             execution: (
                 image: "ghcr.io/demo/codex:latest",
+                resources: (
+                    cpu_millis: 500,
+                    memory_mb: 512,
+                ),
             ),
         )"#;
         let manifest: AgentManifest = ron::from_str(raw).expect("parse gang manifest");
@@ -886,6 +903,10 @@ mod tests {
             name: "codex-demo",
             execution: (
                 image: "ghcr.io/demo/codex:latest",
+                resources: (
+                    cpu_millis: 500,
+                    memory_mb: 512,
+                ),
                 placement: (
                     constraints: [(
                         selector: node_label(key: "workload.pool"),

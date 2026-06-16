@@ -117,6 +117,42 @@ local_test!(task_list_includes_service_owned_workloads, {
     assert_eq!(task_ids, vec![task_id]);
 });
 
+local_test!(task_start_rejects_missing_resource_request, {
+    let node = TestNode::new().await;
+    let socket_dir = common::temp_db_dir();
+    let socket_path = socket_dir.path().join("mantissa.sock");
+    node.node
+        .start_local_admin_socket_at(socket_path.clone())
+        .await
+        .expect("start local admin socket for CLI client path");
+    let client_config = ClientConfig {
+        socket: Some(socket_path),
+        ..ClientConfig::default()
+    };
+    let command = vec!["sh".to_string(), "-lc".to_string(), "sleep 60".to_string()];
+    let volumes = Vec::new();
+
+    let error = client_tasks::start(
+        &client_config,
+        &TaskStartOptions {
+            name: "missing-resource-task",
+            image: "alpine:3.20",
+            command: &command,
+            cpu_millis: 0,
+            memory_bytes: 0,
+            gpu_count: 0,
+            volumes: &volumes,
+        },
+    )
+    .await
+    .expect_err("zero resource task must fail through CLI client path");
+
+    assert!(
+        error.to_string().contains("cpu_millis and memory_bytes"),
+        "unexpected error: {error:#}"
+    );
+});
+
 local_test!(
     task_start_spreads_independent_cli_submissions_across_cluster,
     {

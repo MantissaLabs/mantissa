@@ -7,6 +7,30 @@ use crate::workload::model::{
     WorkloadEnvironmentVariable, WorkloadSecretFile, WorkloadVolumeMount,
 };
 
+/// Validates that one schedulable workload declares bounded CPU and memory resources.
+pub fn validate_execution_resource_request(
+    context: &str,
+    cpu_millis: u64,
+    memory_bytes: u64,
+) -> Result<(), anyhow::Error> {
+    if cpu_millis == 0 && memory_bytes == 0 {
+        return Err(anyhow::anyhow!(
+            "{context} must request non-zero cpu_millis and memory_bytes"
+        ));
+    }
+    if cpu_millis == 0 {
+        return Err(anyhow::anyhow!(
+            "{context} must request non-zero cpu_millis"
+        ));
+    }
+    if memory_bytes == 0 {
+        return Err(anyhow::anyhow!(
+            "{context} must request non-zero memory_bytes"
+        ));
+    }
+    Ok(())
+}
+
 /// Transport protocol used by one node-local runtime port binding.
 #[derive(
     Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,

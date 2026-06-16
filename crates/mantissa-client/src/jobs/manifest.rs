@@ -7,7 +7,7 @@ use crate::workload_submit::{
     DeclaredVolumeDriverKind, DeclaredVolumeLabel, DeclaredVolumeSpec, DeploymentPolicySpec,
     ManifestNetworkSpec, PlacementSpec, RequestedNetworkSpec, resolve_requested_networks,
     validate_declared_networks, validate_deployment_policy, validate_manifest_ports,
-    validate_placement,
+    validate_placement, validate_required_cpu_memory,
 };
 pub use crate::workload_submit::{
     ManifestPortBinding, ManifestPortProtocol, PlacementConstraint, PlacementConstraintOperator,
@@ -47,12 +47,12 @@ pub struct JobManifest {
 }
 
 /// Resource requests declared for one job execution template.
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct JobExecutionResources {
-    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(minimum = 1))]
     pub cpu_millis: u64,
-    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(minimum = 1))]
     pub memory_mb: u64,
     #[serde(default)]
     pub gpu_count: u32,
@@ -259,7 +259,6 @@ pub struct JobExecutionSpec {
     pub command: Vec<String>,
     #[serde(default)]
     pub tty: bool,
-    #[serde(default)]
     pub resources: JobExecutionResources,
     #[serde(default)]
     pub termination_grace_period_secs: Option<u32>,
@@ -458,18 +457,13 @@ fn validate_execution(
     execution: &JobExecutionSpec,
     declared_volume_names: &HashSet<String>,
 ) -> Result<()> {
-    if execution.resources.cpu_millis != 0 || execution.resources.memory_mb != 0 {
-        if execution.resources.cpu_millis == 0 {
-            return Err(anyhow!(
-                "job manifest must set execution.resources.cpu_millis when memory_mb is specified"
-            ));
-        }
-        if execution.resources.memory_mb == 0 {
-            return Err(anyhow!(
-                "job manifest must set execution.resources.memory_mb when cpu_millis is specified"
-            ));
-        }
-    }
+    validate_required_cpu_memory(
+        "job manifest",
+        execution.resources.cpu_millis,
+        execution.resources.memory_mb,
+        "execution.resources.cpu_millis",
+        "execution.resources.memory_mb",
+    )?;
 
     if let Some(command) = &execution.pre_stop_command {
         if command.is_empty() {
@@ -783,6 +777,25 @@ mod tests {
         );
     }
 
+    /// Rejects job manifests that would launch without scheduler and runtime bounds.
+    #[test]
+    fn manifest_rejects_missing_resource_request() {
+        let mut manifest = base_manifest();
+        manifest.execution.resources.cpu_millis = 0;
+        manifest.execution.resources.memory_mb = 0;
+
+        let error = manifest
+            .validate()
+            .expect_err("missing resource request must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("execution.resources.cpu_millis and execution.resources.memory_mb"),
+            "unexpected error: {error:#}"
+        );
+    }
+
     /// Rejects duplicate execution network references early.
     #[test]
     fn manifest_rejects_duplicate_network_names() {
@@ -826,6 +839,10 @@ mod tests {
             name: "demo-job",
             execution: (
                 image: "alpine:3.20",
+                resources: (
+                    cpu_millis: 250,
+                    memory_mb: 128,
+                ),
                 ports: [(
                     name: "metrics",
                     target: 9100,
@@ -852,6 +869,10 @@ mod tests {
             ),
             execution: (
                 image: "alpine:3.20",
+                resources: (
+                    cpu_millis: 250,
+                    memory_mb: 128,
+                ),
             ),
         )"#;
         let manifest: JobManifest = ron::from_str(raw).expect("parse gang manifest");
@@ -866,6 +887,10 @@ mod tests {
             name: "demo-job",
             execution: (
                 image: "alpine:3.20",
+                resources: (
+                    cpu_millis: 250,
+                    memory_mb: 128,
+                ),
                 placement: (
                     constraints: [(
                         selector: node_label(key: "workload.pool"),

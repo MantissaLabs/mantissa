@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::workload_submit::{
     DeploymentPolicySpec, ManifestNetworkSpec, RequestedNetworkSpec, resolve_requested_networks,
     validate_declared_networks, validate_deployment_policy, validate_manifest_ports,
-    validate_placement_constraints,
+    validate_placement_constraints, validate_required_cpu_memory,
 };
 pub use crate::workload_submit::{
     ManifestPortBinding, ManifestPortProtocol, PlacementConstraint, PlacementConstraintOperator,
@@ -36,12 +36,12 @@ pub struct ServiceManifest {
     pub deployment: ServiceDeploymentPolicy,
 }
 
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TaskTemplateResources {
-    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(minimum = 1))]
     pub cpu_millis: u64,
-    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(minimum = 1))]
     pub memory_mb: u64,
     #[serde(default)]
     pub gpu_count: u32,
@@ -335,7 +335,6 @@ pub struct TaskTemplateSpec {
     pub depends_on: Vec<String>,
     #[serde(default = "default_replicas")]
     pub replicas: u16,
-    #[serde(default)]
     pub resources: TaskTemplateResources,
     #[serde(default)]
     pub autoscale: Option<TaskTemplateAutoscalePolicy>,
@@ -644,21 +643,13 @@ impl ServiceManifest {
                 ));
             }
 
-            if template.resources.cpu_millis != 0 || template.resources.memory_mb != 0 {
-                if template.resources.cpu_millis == 0 {
-                    return Err(anyhow!(
-                        "template '{}' must set cpu_millis when memory_mb is specified",
-                        template.name
-                    ));
-                }
-
-                if template.resources.memory_mb == 0 {
-                    return Err(anyhow!(
-                        "template '{}' must set memory_mb when cpu_millis is specified",
-                        template.name
-                    ));
-                }
-            }
+            validate_required_cpu_memory(
+                &format!("template '{}'", template.name),
+                template.resources.cpu_millis,
+                template.resources.memory_mb,
+                "resources.cpu_millis",
+                "resources.memory_mb",
+            )?;
 
             validate_template_autoscale(template)?;
 
@@ -1134,6 +1125,14 @@ mod tests {
             .join(path)
     }
 
+    fn valid_resources() -> TaskTemplateResources {
+        TaskTemplateResources {
+            cpu_millis: 250,
+            memory_mb: 128,
+            gpu_count: 0,
+        }
+    }
+
     #[test]
     fn replicated_service_manifest_uses_default_rolling_strategy() {
         let manifest =
@@ -1172,6 +1171,10 @@ mod tests {
                     (
                         name: "api",
                         image: "ghcr.io/demo/api:latest",
+                        resources: (
+                            cpu_millis: 250,
+                            memory_mb: 128,
+                        ),
                     ),
                 ],
             )
@@ -1198,6 +1201,10 @@ mod tests {
                     (
                         name: "api",
                         image: "ghcr.io/demo/api:latest",
+                        resources: (
+                            cpu_millis: 250,
+                            memory_mb: 128,
+                        ),
                     ),
                 ],
             )
@@ -1273,6 +1280,10 @@ mod tests {
                         name: "api",
                         image: "ghcr.io/demo/api:latest",
                         replicas: 2,
+                        resources: (
+                            cpu_millis: 0,
+                            memory_mb: 256,
+                        ),
                         autoscale: Some((
                             min_replicas: 2,
                             max_replicas: 8,
@@ -1492,6 +1503,10 @@ mod tests {
                     (
                         name: "api",
                         image: "ghcr.io/demo/api:latest",
+                        resources: (
+                            cpu_millis: 250,
+                            memory_mb: 128,
+                        ),
                     ),
                 ],
             )
@@ -1501,6 +1516,26 @@ mod tests {
 
         assert_eq!(manifest.task_templates.len(), 1);
         assert_eq!(manifest.task_templates[0].name, "api");
+    }
+
+    #[test]
+    fn service_manifest_rejects_missing_resource_request() {
+        let error = ron::from_str::<ServiceManifest>(
+            r#"
+            (
+                name: "demo",
+                tasks: [
+                    (
+                        name: "api",
+                        image: "ghcr.io/demo/api:latest",
+                    ),
+                ],
+            )
+            "#,
+        )
+        .expect_err("missing resource request must fail deserialization");
+
+        assert!(error.to_string().contains("resources"));
     }
 
     #[test]
@@ -1520,6 +1555,10 @@ mod tests {
                     (
                         name: "api",
                         image: "ghcr.io/demo/api:latest",
+                        resources: (
+                            cpu_millis: 250,
+                            memory_mb: 128,
+                        ),
                         networks: ["frontend"],
                     ),
                 ],
@@ -1568,6 +1607,10 @@ mod tests {
                     (
                         name: "api",
                         image: "ghcr.io/demo/api:latest",
+                        resources: (
+                            cpu_millis: 250,
+                            memory_mb: 128,
+                        ),
                         placement: (
                             constraints: [
                                 (
@@ -1694,6 +1737,10 @@ mod tests {
             tasks: [(
                 name: "api",
                 image: "ghcr.io/demo/api:latest",
+                resources: (
+                    cpu_millis: 250,
+                    memory_mb: 128,
+                ),
                 ports: [(
                     name: "http",
                     target: 8080,
@@ -1719,6 +1766,10 @@ mod tests {
             tasks: [(
                 name: "api",
                 image: "ghcr.io/demo/api:latest",
+                resources: (
+                    cpu_millis: 250,
+                    memory_mb: 128,
+                ),
                 ports: [
                     (name: "public", target: 8080, host: 18080, host_ip: "0.0.0.0"),
                     (name: "local", target: 8081, host: 18080, host_ip: "127.0.0.1"),
@@ -1746,7 +1797,7 @@ mod tests {
                 command: Vec::new(),
                 depends_on: Vec::new(),
                 replicas: 1,
-                resources: TaskTemplateResources::default(),
+                resources: valid_resources(),
                 autoscale: None,
                 restart_policy: None,
                 termination_grace_period_secs: None,
@@ -1787,7 +1838,7 @@ mod tests {
                 command: Vec::new(),
                 depends_on: Vec::new(),
                 replicas: 1,
-                resources: TaskTemplateResources::default(),
+                resources: valid_resources(),
                 autoscale: None,
                 restart_policy: None,
                 termination_grace_period_secs: None,
@@ -1837,7 +1888,7 @@ mod tests {
                 command: Vec::new(),
                 depends_on: Vec::new(),
                 replicas: 1,
-                resources: TaskTemplateResources::default(),
+                resources: valid_resources(),
                 autoscale: None,
                 restart_policy: None,
                 termination_grace_period_secs: None,
@@ -1889,7 +1940,7 @@ mod tests {
                 command: Vec::new(),
                 depends_on: Vec::new(),
                 replicas: 1,
-                resources: TaskTemplateResources::default(),
+                resources: valid_resources(),
                 autoscale: None,
                 restart_policy: None,
                 termination_grace_period_secs: None,
@@ -1936,7 +1987,7 @@ mod tests {
                 command: Vec::new(),
                 depends_on: Vec::new(),
                 replicas: 1,
-                resources: TaskTemplateResources::default(),
+                resources: valid_resources(),
                 autoscale: None,
                 restart_policy: None,
                 termination_grace_period_secs: None,
@@ -1993,7 +2044,7 @@ mod tests {
                 command: Vec::new(),
                 depends_on: Vec::new(),
                 replicas: 2,
-                resources: TaskTemplateResources::default(),
+                resources: valid_resources(),
                 autoscale: None,
                 restart_policy: None,
                 termination_grace_period_secs: None,
@@ -2105,7 +2156,7 @@ mod tests {
                     command: Vec::new(),
                     depends_on: vec!["frontend".into()],
                     replicas: 1,
-                    resources: TaskTemplateResources::default(),
+                    resources: valid_resources(),
                     autoscale: None,
                     restart_policy: None,
                     termination_grace_period_secs: None,
@@ -2127,7 +2178,7 @@ mod tests {
                     command: Vec::new(),
                     depends_on: vec!["backend".into()],
                     replicas: 1,
-                    resources: TaskTemplateResources::default(),
+                    resources: valid_resources(),
                     autoscale: None,
                     restart_policy: None,
                     termination_grace_period_secs: None,

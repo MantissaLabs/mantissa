@@ -36,6 +36,11 @@ automation.
 Secrets routes can return decrypted secret payloads as base64. Treat REST access
 as cluster-admin access.
 
+Task, service template, job execution, and agent execution payloads must include
+non-zero CPU and memory requests. The same values are used for scheduler
+reservation and runtime limits, so omitting them is rejected instead of creating
+an unbounded container. GPU requests are optional and accounted separately.
+
 ## Start The Daemon With REST
 
 Start Mantissa with the embedded REST listener enabled:

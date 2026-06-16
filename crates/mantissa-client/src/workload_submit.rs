@@ -104,6 +104,26 @@ pub fn validate_deployment_policy(
     Ok(())
 }
 
+/// Validates the manifest-side CPU and memory fields required for workload admission.
+pub fn validate_required_cpu_memory(
+    context: &str,
+    cpu_millis: u64,
+    memory_value: u64,
+    cpu_field: &str,
+    memory_field: &str,
+) -> Result<()> {
+    if cpu_millis == 0 && memory_value == 0 {
+        return Err(anyhow!("{context} must set {cpu_field} and {memory_field}"));
+    }
+    if cpu_millis == 0 {
+        return Err(anyhow!("{context} must set {cpu_field}"));
+    }
+    if memory_value == 0 {
+        return Err(anyhow!("{context} must set {memory_field}"));
+    }
+    Ok(())
+}
+
 /// Transport protocol for one manifest-declared node-local host port binding.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

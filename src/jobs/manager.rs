@@ -13,7 +13,7 @@ use crate::workload::model::{
 use crate::workload::network_prerequisites::{
     WorkloadNetworkPrerequisites, WorkloadNetworkRequirement,
 };
-use crate::workload::types::WorkloadAdmissionPolicy;
+use crate::workload::types::{WorkloadAdmissionPolicy, validate_execution_resource_request};
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
 use chrono::Utc;
@@ -810,6 +810,11 @@ fn compare_job_attempt_workloads(left: &WorkloadSpec, right: &WorkloadSpec) -> s
 
 /// Rejects execution settings that conflict with the job controller's finite-run semantics.
 fn validate_job_execution(execution: &crate::workload::types::ResolvedExecutionSpec) -> Result<()> {
+    validate_execution_resource_request(
+        "job execution",
+        execution.cpu_millis,
+        execution.memory_bytes,
+    )?;
     if execution.restart_policy.is_some() {
         return Err(anyhow!(
             "jobs do not support workload restart_policy; use job retry_policy instead"
@@ -919,8 +924,8 @@ mod tests {
                 image: "ghcr.io/demo/job:latest".to_string(),
                 command: vec!["echo".to_string(), "hello".to_string()],
                 tty: false,
-                cpu_millis: 0,
-                memory_bytes: 0,
+                cpu_millis: 250,
+                memory_bytes: 128 * 1_024 * 1_024,
                 gpu_count: 0,
                 restart_policy: None,
                 termination_grace_period_secs: None,
@@ -938,6 +943,22 @@ mod tests {
             None,
             JobRetryPolicy::default(),
         )
+    }
+
+    /// Rejects finite jobs that would run without scheduler and runtime bounds.
+    #[test]
+    fn validate_job_execution_rejects_missing_resource_request() {
+        let mut execution = test_job().execution;
+        execution.cpu_millis = 0;
+        execution.memory_bytes = 0;
+
+        let error = validate_job_execution(&execution)
+            .expect_err("missing resource request must fail validation");
+
+        assert!(
+            error.to_string().contains("cpu_millis and memory_bytes"),
+            "unexpected error: {error:#}"
+        );
     }
 
     /// Ensures concurrent job values prefer later attempts over stale terminal state.

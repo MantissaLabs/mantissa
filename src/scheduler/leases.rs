@@ -97,8 +97,8 @@ impl Scheduler {
             return None;
         }
 
-        if cpu_millis == 0 && memory_bytes == 0 {
-            return Some(vec![available_indices[0]]);
+        if cpu_millis == 0 || memory_bytes == 0 {
+            return None;
         }
 
         let mut remaining_cpu = cpu_millis;

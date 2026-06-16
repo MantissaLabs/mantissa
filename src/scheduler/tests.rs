@@ -616,8 +616,8 @@ async fn prepare_task_leases_returns_gpu_bindings() {
             30_000,
             vec![TaskLeaseIntent {
                 task_id,
-                cpu_millis: 0,
-                memory_bytes: 0,
+                cpu_millis: 100,
+                memory_bytes: 128 * 1024 * 1024,
                 gpu_count: 2,
             }],
         )
@@ -638,6 +638,44 @@ async fn prepare_task_leases_returns_gpu_bindings() {
             .gpu_devices
             .iter()
             .all(|device| matches!(device.state, GpuDeviceState::Leased(_)))
+    );
+}
+
+#[tokio::test]
+async fn prepare_task_leases_rejects_missing_resource_request() {
+    let (scheduler, _dir) = make_scheduler().await;
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 512 * 1024 * 1024, 0),
+        )])
+        .await
+        .unwrap();
+
+    let err = scheduler
+        .prepare_task_leases(
+            Uuid::new_v4(),
+            30_000,
+            vec![TaskLeaseIntent {
+                task_id: Uuid::new_v4(),
+                cpu_millis: 0,
+                memory_bytes: 0,
+                gpu_count: 0,
+            }],
+        )
+        .await
+        .expect_err("zero CPU and memory request must fail");
+
+    assert!(
+        matches!(err, SchedulerError::InsufficientResources { .. }),
+        "unexpected error: {err:?}"
+    );
+    let snapshot = scheduler.snapshot().await.unwrap();
+    assert!(
+        snapshot
+            .slots
+            .iter()
+            .all(|slot| matches!(slot.state, SlotState::Free))
     );
 }
 

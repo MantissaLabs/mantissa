@@ -48,9 +48,9 @@ pub struct TaskStartRequest {
     pub image: String,
     #[serde(default)]
     pub command: Vec<String>,
-    #[serde(default = "default_cpu_millis")]
+    #[schema(minimum = 1)]
     pub cpu_millis: u64,
-    #[serde(default = "default_memory_bytes")]
+    #[schema(minimum = 1)]
     pub memory_bytes: u64,
     #[serde(default)]
     pub gpu_count: u32,
@@ -158,16 +158,6 @@ impl TaskExecQuery {
 /// Returns true for enabled-by-default stream options.
 fn default_true() -> bool {
     true
-}
-
-/// Returns the default CPU request for REST task submissions.
-fn default_cpu_millis() -> u64 {
-    1_000
-}
-
-/// Returns the default memory request for REST task submissions.
-fn default_memory_bytes() -> u64 {
-    536_870_912
 }
 
 /// Returns the default task log tail request.

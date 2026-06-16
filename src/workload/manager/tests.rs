@@ -1481,6 +1481,36 @@ fn empty_resolved_execution(image: &str) -> ResolvedExecutionSpec {
     }
 }
 
+#[test]
+fn build_start_intents_rejects_missing_resource_request() {
+    let mut execution = empty_resolved_execution("img");
+    execution.cpu_millis = 0;
+    execution.memory_bytes = 0;
+    let request = WorkloadStartRequest {
+        name: "unbounded".to_string(),
+        execution,
+        execution_platform: ExecutionPlatform::Oci,
+        isolation_mode: crate::workload::model::IsolationMode::Standard,
+        isolation_profile: None,
+        gpu_device_ids: Vec::new(),
+        id: Some(Uuid::new_v4()),
+        slot_ids: Vec::new(),
+        owner: None,
+        service_placement_preferences: Vec::new(),
+        target_node: None,
+    };
+
+    let err = match WorkloadManager::build_start_intents(vec![request]) {
+        Ok(_) => panic!("missing resource request must fail admission"),
+        Err(error) => error,
+    };
+
+    assert!(
+        err.to_string().contains("cpu_millis and memory_bytes"),
+        "unexpected error: {err:#}"
+    );
+}
+
 /// Builds one standalone task request that mounts a single resolved volume reference.
 fn standalone_volume_task_request(volume: &VolumeSpecValue, target: &str) -> WorkloadStartRequest {
     WorkloadStartRequest {

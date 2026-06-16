@@ -73,7 +73,7 @@
         "properties": {
           "cpu_millis": {
             "format": "int64",
-            "minimum": 0,
+            "minimum": 1,
             "type": "integer"
           },
           "gpu_count": {
@@ -83,10 +83,14 @@
           },
           "memory_mb": {
             "format": "int64",
-            "minimum": 0,
+            "minimum": 1,
             "type": "integer"
           }
         },
+        "required": [
+          "cpu_millis",
+          "memory_mb"
+        ],
         "type": "object"
       },
       "AgentExecutionSpec": {
@@ -163,7 +167,8 @@
           }
         },
         "required": [
-          "image"
+          "image",
+          "resources"
         ],
         "type": "object"
       },
@@ -1237,7 +1242,7 @@
         "properties": {
           "cpu_millis": {
             "format": "int64",
-            "minimum": 0,
+            "minimum": 1,
             "type": "integer"
           },
           "gpu_count": {
@@ -1247,10 +1252,14 @@
           },
           "memory_mb": {
             "format": "int64",
-            "minimum": 0,
+            "minimum": 1,
             "type": "integer"
           }
         },
+        "required": [
+          "cpu_millis",
+          "memory_mb"
+        ],
         "type": "object"
       },
       "JobExecutionSpec": {
@@ -1333,7 +1342,8 @@
           }
         },
         "required": [
-          "image"
+          "image",
+          "resources"
         ],
         "type": "object"
       },
@@ -3610,7 +3620,7 @@
           },
           "cpu_millis": {
             "format": "int64",
-            "minimum": 0,
+            "minimum": 1,
             "type": "integer"
           },
           "gpu_count": {
@@ -3623,7 +3633,7 @@
           },
           "memory_bytes": {
             "format": "int64",
-            "minimum": 0,
+            "minimum": 1,
             "type": "integer"
           },
           "name": {
@@ -3638,7 +3648,9 @@
         },
         "required": [
           "name",
-          "image"
+          "image",
+          "cpu_millis",
+          "memory_bytes"
         ],
         "type": "object"
       },
@@ -3864,7 +3876,7 @@
         "properties": {
           "cpu_millis": {
             "format": "int64",
-            "minimum": 0,
+            "minimum": 1,
             "type": "integer"
           },
           "gpu_count": {
@@ -3874,10 +3886,14 @@
           },
           "memory_mb": {
             "format": "int64",
-            "minimum": 0,
+            "minimum": 1,
             "type": "integer"
           }
         },
+        "required": [
+          "cpu_millis",
+          "memory_mb"
+        ],
         "type": "object"
       },
       "TaskTemplateRestartPolicy": {
@@ -4032,7 +4048,8 @@
         },
         "required": [
           "name",
-          "image"
+          "image",
+          "resources"
         ],
         "type": "object"
       },

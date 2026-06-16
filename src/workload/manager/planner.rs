@@ -28,6 +28,7 @@ use crate::workload::model::{
 };
 use crate::workload::types::{
     WorkloadLivenessProbe, WorkloadPortBinding, WorkloadPortProtocol, WorkloadRestartPolicy,
+    validate_execution_resource_request,
 };
 
 use super::remote_advisory::{
@@ -435,6 +436,9 @@ impl Candidate {
         memory_bytes: u64,
         gpu_count: u32,
     ) -> Option<ResourceAllocation> {
+        if cpu_millis == 0 || memory_bytes == 0 {
+            return None;
+        }
         if matches!(self.location, CandidateLocation::Remote { .. }) {
             return self.allocate_remote(cpu_millis, memory_bytes, gpu_count);
         }
@@ -464,22 +468,6 @@ impl Candidate {
 
         let mut selected_indices: Vec<usize> = Vec::new();
         let mut available_indices: Vec<usize> = (0..self.slots.len()).collect();
-
-        // Zero-capacity requests still require a single slot to run the task so
-        // we keep the previous behaviour.
-        if remaining_cpu == 0 && remaining_mem == 0 && selected_indices.is_empty() {
-            let slot = self.slots.remove(available_indices[0]);
-            if !selected_gpu_ids.is_empty() {
-                let selected: HashSet<&String> = selected_gpu_ids.iter().collect();
-                self.gpu_devices
-                    .retain(|device| !selected.contains(&device.device_id));
-            }
-            self.refresh_local_capacity();
-            return Some(ResourceAllocation {
-                slots: vec![slot],
-                gpu_device_ids: selected_gpu_ids,
-            });
-        }
 
         while remaining_cpu > 0 || remaining_mem > 0 {
             if available_indices.is_empty() {
@@ -1228,6 +1216,12 @@ impl WorkloadManager {
                 service_placement_preferences,
                 target_node,
             } = request;
+            validate_execution_resource_request(
+                &format!("workload '{name}'"),
+                execution.cpu_millis,
+                execution.memory_bytes,
+            )?;
+
             if !gpu_device_ids.is_empty() {
                 let mut seen = HashSet::with_capacity(gpu_device_ids.len());
                 for id in &gpu_device_ids {

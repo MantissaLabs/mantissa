@@ -40,6 +40,44 @@ fn openapi_spec_documents_security_contract() {
     assert!(value["paths"]["/v1/health"]["get"]["responses"]["401"].is_object());
 }
 
+/// Ensures workload submission schemas keep CPU and memory resources mandatory.
+#[test]
+fn openapi_spec_requires_workload_resource_bounds() {
+    let value = openapi::json_value(&server::openapi());
+    let schemas = &value["components"]["schemas"];
+
+    assert_required(
+        &schemas["TaskStartRequest"],
+        &["name", "image", "cpu_millis", "memory_bytes"],
+    );
+    assert_field_minimum(&schemas["TaskStartRequest"], "cpu_millis", 1);
+    assert_field_minimum(&schemas["TaskStartRequest"], "memory_bytes", 1);
+    assert_required(
+        &schemas["TaskTemplateSpec"],
+        &["name", "image", "resources"],
+    );
+    assert_required(
+        &schemas["TaskTemplateResources"],
+        &["cpu_millis", "memory_mb"],
+    );
+    assert_field_minimum(&schemas["TaskTemplateResources"], "cpu_millis", 1);
+    assert_field_minimum(&schemas["TaskTemplateResources"], "memory_mb", 1);
+    assert_required(&schemas["JobExecutionSpec"], &["image", "resources"]);
+    assert_required(
+        &schemas["JobExecutionResources"],
+        &["cpu_millis", "memory_mb"],
+    );
+    assert_field_minimum(&schemas["JobExecutionResources"], "cpu_millis", 1);
+    assert_field_minimum(&schemas["JobExecutionResources"], "memory_mb", 1);
+    assert_required(&schemas["AgentExecutionSpec"], &["image", "resources"]);
+    assert_required(
+        &schemas["AgentExecutionResources"],
+        &["cpu_millis", "memory_mb"],
+    );
+    assert_field_minimum(&schemas["AgentExecutionResources"], "cpu_millis", 1);
+    assert_field_minimum(&schemas["AgentExecutionResources"], "memory_mb", 1);
+}
+
 /// Ensures docs renderers get short titles and separate descriptive text.
 #[test]
 fn openapi_spec_separates_operation_titles_from_descriptions() {
@@ -107,6 +145,32 @@ fn openapi_operation_summaries_stay_short() {
             );
         }
     }
+}
+
+/// Asserts that one schema contains every required field listed by name.
+fn assert_required(schema: &Value, expected: &[&str]) {
+    let actual = schema["required"]
+        .as_array()
+        .expect("schema should have required fields")
+        .iter()
+        .map(|field| field.as_str().expect("required field should be a string"))
+        .collect::<BTreeSet<_>>();
+
+    for field in expected {
+        assert!(
+            actual.contains(field),
+            "schema is missing required field '{field}': {actual:?}"
+        );
+    }
+}
+
+/// Asserts that one schema field advertises the expected inclusive minimum.
+fn assert_field_minimum(schema: &Value, field: &str, expected: u64) {
+    assert_eq!(
+        schema["properties"][field]["minimum"].as_u64(),
+        Some(expected),
+        "schema field '{field}' should have minimum {expected}: {schema}"
+    );
 }
 
 /// Collects method/path pairs from the generated OpenAPI JSON.

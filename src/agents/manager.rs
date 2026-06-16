@@ -16,7 +16,9 @@ use crate::workload::model::{
 use crate::workload::network_prerequisites::{
     WorkloadNetworkPrerequisites, WorkloadNetworkRequirement,
 };
-use crate::workload::types::{ResolvedExecutionSpec, WorkloadAdmissionPolicy};
+use crate::workload::types::{
+    ResolvedExecutionSpec, WorkloadAdmissionPolicy, validate_execution_resource_request,
+};
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
 use mantissa_health::{HealthMonitor, Status as HealthStatus};
@@ -910,6 +912,11 @@ impl AgentController {
 
 /// Rejects execution settings that conflict with the durable agent-session model.
 fn validate_agent_execution(execution: &ResolvedExecutionSpec) -> Result<()> {
+    validate_execution_resource_request(
+        "agent execution",
+        execution.cpu_millis,
+        execution.memory_bytes,
+    )?;
     if execution.restart_policy.is_some() {
         return Err(anyhow!(
             "agent sessions do not support workload restart_policy; create a new run from the session instead"
@@ -1202,8 +1209,8 @@ mod tests {
             image: "ghcr.io/demo/agent:latest".to_string(),
             command: Vec::new(),
             tty: false,
-            cpu_millis: 0,
-            memory_bytes: 0,
+            cpu_millis: 500,
+            memory_bytes: 512 * 1_024 * 1_024,
             gpu_count: 0,
             restart_policy: None,
             termination_grace_period_secs: None,
@@ -1216,6 +1223,22 @@ mod tests {
             ports: Vec::new(),
             placement: Default::default(),
         }
+    }
+
+    /// Rejects agent sessions that would run without scheduler and runtime bounds.
+    #[test]
+    fn validate_agent_execution_rejects_missing_resource_request() {
+        let mut execution = test_execution();
+        execution.cpu_millis = 0;
+        execution.memory_bytes = 0;
+
+        let error = validate_agent_execution(&execution)
+            .expect_err("missing resource request must fail validation");
+
+        assert!(
+            error.to_string().contains("cpu_millis and memory_bytes"),
+            "unexpected error: {error:#}"
+        );
     }
 
     /// Queued agent runs expire when they do not reach workload launch in time.

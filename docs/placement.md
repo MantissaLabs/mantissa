@@ -12,6 +12,9 @@ Keep the model simple:
 Placement is attached per task template inside a service manifest, so different
 templates in the same service can have different rules.
 
+The snippets below focus on placement fields. Complete task templates must also
+declare non-zero CPU and memory resources before Mantissa will admit them.
+
 ## Mental Model
 
 Mantissa evaluates placement in this order:
@@ -36,6 +39,10 @@ Each task template can declare a `placement` block:
             name: "api",
             image: "ghcr.io/mantissa/demo-api:v1",
             replicas: 3,
+            resources: (
+                cpu_millis: 500,
+                memory_mb: 256,
+            ),
             placement: (
                 constraints: [],
                 preferences: [],

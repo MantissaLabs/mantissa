@@ -25,7 +25,7 @@ Common commands:
 - `mantissa clusters split --filter-per-gpu NVIDIA,AMD` - shortcut split by GPU vendor on the local active cluster
 - `mantissa clusters split --interactive --left-name blue --right-name green` - interactive left/right node picker with hover details
 - `mantissa tasks list --state running` - filter tasks by lifecycle state
-- `mantissa tasks start <name> --image <img> --command <arg>...` - launch a task
+- `mantissa tasks start <name> --image <img> --command <arg>...` - launch a task with default CPU and memory requests unless overridden
 - `mantissa scheduler slots [peer-id] --details` - inspect reserved slots
 - `mantissa services run <manifest>` - deploy a RON service manifest and follow service/task progress
 - `mantissa services run <manifest> --detach` - submit a service deployment and print the service id
@@ -41,3 +41,7 @@ For node drain behavior, see `docs/node-maintenance.md`.
 For backup and restore behavior, see `docs/disaster-recovery.md`.
 For volume semantics, see `docs/volumes.md`.
 For cluster view operations, see `docs/cluster-views-and-operations.md`.
+
+Workload CPU and memory are required admission fields. Ad hoc task, job, and
+agent commands provide bounded defaults, but manifests and direct API payloads
+must declare non-zero CPU and memory values. GPU requests remain optional.

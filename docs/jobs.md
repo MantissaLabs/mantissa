@@ -64,6 +64,10 @@ The file-based path is the production-oriented one. It carries the full shared
 execution template, declared volumes, named networks, runtime selection, and
 retry policy in one durable input.
 
+Every job execution must declare non-zero `resources.cpu_millis` and
+`resources.memory_mb`. GPU remains optional. The resource request is both the
+scheduler reservation and the runtime limit for each attempt.
+
 ## Job Manifest Shape
 
 The top-level job manifest separates controller fields from execution fields.
