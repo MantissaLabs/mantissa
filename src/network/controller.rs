@@ -1,6 +1,7 @@
 use crate::config;
 use crate::gossip::Message;
 use crate::ingress::registry::IngressPoolRegistry;
+use crate::ingress::types::{IngressPoolSpecValue, select_ingress_pool_nodes};
 use crate::network::allocator::{parse_overlay_cidr, resolver_ip_address};
 use crate::network::attachment::{PlatformAttachmentProvisioner, host_iface_name};
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext, overlay_bpf_program_specs};
@@ -18,12 +19,15 @@ use crate::network::types::{
 };
 use crate::network::wireguard::{self, WireGuardUnderlayState};
 use crate::registry::Registry;
+use crate::scheduler::placement::PlacementNode;
 use crate::services::registry::ServiceRegistry;
+use crate::services::types::{PublicIngressPolicy, ServiceSpecValue, ServiceStatus};
 use crate::store::replicated::workloads::WorkloadStore;
 use anyhow::{Context, Result, anyhow};
 use async_channel::Sender;
 #[cfg(target_os = "linux")]
 use aya::{programs::ProgramError, sys::SyscallError};
+use mantissa_health::Status as HealthStatus;
 use std::collections::{HashMap, HashSet};
 use std::future;
 use std::net::{IpAddr, SocketAddr};
@@ -69,6 +73,8 @@ struct NetworkControllerInner {
     node_id: Uuid,
     node_name: String,
     cluster_registry: Registry,
+    service_registry: ServiceRegistry,
+    ingress_pools: IngressPoolRegistry,
     provisioner: platform::NetworkProvisioner,
     bpf: NetworkBpfManager,
     discovery: ServiceDiscovery,
@@ -173,9 +179,9 @@ impl NetworkController {
         let discovery = ServiceDiscovery::new(
             registry.clone(),
             cluster_registry.clone(),
-            ingress_pools,
+            ingress_pools.clone(),
             workload_store,
-            service_registry,
+            service_registry.clone(),
             bpf.clone(),
             cluster_registry.health_monitor(),
             node_id,
@@ -187,6 +193,8 @@ impl NetworkController {
                 node_id,
                 node_name,
                 cluster_registry,
+                service_registry,
+                ingress_pools,
                 provisioner,
                 bpf,
                 discovery,
@@ -430,7 +438,140 @@ impl NetworkController {
             }
         }
 
+        demand.extend(self.ingress_pool_network_demand_snapshot()?);
+
         Ok(demand)
+    }
+
+    /// Collect local network demand created by public ingress pools that select this node.
+    fn ingress_pool_network_demand_snapshot(&self) -> Result<HashSet<Uuid>> {
+        let service_specs = self
+            .inner
+            .service_registry
+            .list()
+            .context("list service specs for ingress pool network demand")?;
+        let pool_networks = Self::referenced_ingress_pool_networks(&service_specs);
+        if pool_networks.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let pools = self.load_ingress_pool_specs(pool_networks.keys())?;
+        if pools.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let candidates = self.ingress_pool_candidate_nodes()?;
+        Ok(Self::collect_ingress_pool_network_demand(
+            &pool_networks,
+            &pools,
+            &candidates,
+            self.inner.node_id,
+        ))
+    }
+
+    /// Load the replicated ingress pool specs referenced by service public-ingress policies.
+    fn load_ingress_pool_specs<'a>(
+        &self,
+        pool_names: impl Iterator<Item = &'a String>,
+    ) -> Result<HashMap<String, IngressPoolSpecValue>> {
+        let mut pools = HashMap::new();
+        for pool_name in pool_names {
+            if let Some(pool) = self
+                .inner
+                .ingress_pools
+                .get_by_name(pool_name)
+                .with_context(|| format!("load ingress pool '{pool_name}' for network demand"))?
+            {
+                pools.insert(pool_name.clone(), pool);
+            }
+        }
+        Ok(pools)
+    }
+
+    /// Build scheduler-visible ingress pool candidates from converged peer metadata.
+    fn ingress_pool_candidate_nodes(&self) -> Result<Vec<PlacementNode>> {
+        let health_snapshot = self.inner.cluster_registry.health_monitor().snapshot();
+        let peers = self
+            .inner
+            .cluster_registry
+            .peer_values_snapshot()
+            .context("load peer metadata for ingress pool network demand")?;
+        let mut candidates = Vec::with_capacity(peers.len());
+        for (node_id, value) in peers {
+            if !value.scheduling.schedulable || !value.readiness.is_ready() {
+                continue;
+            }
+            if matches!(health_snapshot.get(&node_id), Some(HealthStatus::Down)) {
+                continue;
+            }
+            candidates.push(PlacementNode::new(
+                node_id,
+                value.hostname,
+                value.address,
+                value.platform_os,
+                value.platform_arch,
+                value.labels.labels,
+            ));
+        }
+        Ok(candidates)
+    }
+
+    /// Return networks whose public ports reference each ingress pool.
+    fn referenced_ingress_pool_networks(
+        service_specs: &[ServiceSpecValue],
+    ) -> HashMap<String, HashSet<Uuid>> {
+        let mut pool_networks: HashMap<String, HashSet<Uuid>> = HashMap::new();
+        for spec in service_specs {
+            if !Self::service_reserves_public_ingress_network(spec.status()) {
+                continue;
+            }
+            for template in &spec.task_templates {
+                if template.public_port().is_none() {
+                    continue;
+                }
+                let PublicIngressPolicy::IngressPool { pool } = &template.public_ingress else {
+                    continue;
+                };
+                let pool_name = pool.trim();
+                if pool_name.is_empty() {
+                    continue;
+                }
+                let networks = pool_networks.entry(pool_name.to_string()).or_default();
+                networks.extend(template.networks.iter().map(|network| network.network_id));
+            }
+        }
+        pool_networks
+    }
+
+    /// Return whether a service status still needs its public ingress networks realized.
+    fn service_reserves_public_ingress_network(status: ServiceStatus) -> bool {
+        !matches!(status, ServiceStatus::Stopping | ServiceStatus::Stopped)
+    }
+
+    /// Select networks that this node must realize because a ready ingress pool chose it.
+    fn collect_ingress_pool_network_demand(
+        pool_networks: &HashMap<String, HashSet<Uuid>>,
+        pools: &HashMap<String, IngressPoolSpecValue>,
+        candidates: &[PlacementNode],
+        local_node_id: Uuid,
+    ) -> HashSet<Uuid> {
+        let mut demand = HashSet::new();
+        for (pool_name, network_ids) in pool_networks {
+            let Some(pool) = pools.get(pool_name) else {
+                continue;
+            };
+            let selection = select_ingress_pool_nodes(pool, candidates);
+            if !selection.is_ready()
+                || !selection
+                    .selected_nodes
+                    .iter()
+                    .any(|node| node.node_id == local_node_id)
+            {
+                continue;
+            }
+            demand.extend(network_ids.iter().copied());
+        }
+        demand
     }
 
     /// Return whether a spec currently requires local dataplane realization on this node.

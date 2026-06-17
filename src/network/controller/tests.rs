@@ -1,10 +1,21 @@
 use super::{NetworkController, collect_orphaned_network_suffixes, is_managed_overlay_link_name};
+use crate::ingress::types::IngressPoolSpecDraft;
 use crate::network::types::{
     NetworkDriver, NetworkRealizationPolicy, NetworkSpecDraft, NetworkSpecValue,
 };
+use crate::scheduler::placement::{
+    PlacementConstraint, PlacementConstraintSelector, PlacementNode, PlacementPolicy,
+    PlacementStrategy,
+};
+use crate::services::types::{
+    PublicIngressPolicy, ServiceSpecValue, ServiceStatus, TaskTemplateNetworkRequirement,
+    TaskTemplateSpecValue,
+};
+use crate::topology::peers::PeerLabel;
+use crate::workload::types::ExecutionSpec;
 use anyhow::Context;
 use aya::{programs::ProgramError, sys::SyscallError};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 fn make_syscall_error(errno: i32) -> SyscallError {
@@ -27,6 +38,79 @@ fn test_network_spec(name: &str, realization: NetworkRealizationPolicy) -> Netwo
             bpf_programs: Vec::new(),
         },
         realization,
+    )
+}
+
+fn test_ingress_pool(name: &str, min_nodes: u16, max_nodes: Option<u16>) -> IngressPoolSpecDraft {
+    IngressPoolSpecDraft {
+        name: name.to_string(),
+        min_nodes,
+        max_nodes,
+        placement: PlacementPolicy {
+            constraints: vec![
+                PlacementConstraint::eq(
+                    PlacementConstraintSelector::node_label("mantissa.io/ingress"),
+                    name,
+                )
+                .expect("valid ingress label constraint"),
+            ],
+            strategy: PlacementStrategy::Spread,
+        },
+        spread_by: None,
+    }
+}
+
+fn test_placement_node(node_id: Uuid, hostname: &str, ingress_pool: &str) -> PlacementNode {
+    PlacementNode::new(
+        node_id,
+        hostname,
+        format!("10.0.0.{}:6578", hostname.trim_start_matches("node-")),
+        "linux",
+        "x86_64",
+        vec![PeerLabel {
+            key: "mantissa.io/ingress".to_string(),
+            value: ingress_pool.to_string(),
+        }],
+    )
+}
+
+fn service_with_ingress_pool(network_id: Uuid, pool: &str) -> ServiceSpecValue {
+    ServiceSpecValue::new(
+        Uuid::new_v4(),
+        "ingress-demo",
+        "ingress-demo",
+        vec![TaskTemplateSpecValue {
+            name: "api".to_string(),
+            execution: ExecutionSpec {
+                image: "ghcr.io/demo/api:latest".to_string(),
+                command: Vec::new(),
+                tty: false,
+                cpu_millis: 100,
+                memory_bytes: 128 * 1024 * 1024,
+                gpu_count: 0,
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                liveness: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: vec![TaskTemplateNetworkRequirement::new("frontend", network_id)],
+                ports: Vec::new(),
+                placement: PlacementPolicy::default(),
+            },
+            depends_on: Vec::new(),
+            replicas: 1,
+            readiness: None,
+            public_port: Some(8080),
+            public_protocol: None,
+            public_ingress: PublicIngressPolicy::IngressPool {
+                pool: pool.to_string(),
+            },
+            placement_preferences: Vec::new(),
+            autoscale: None,
+        }],
+        Vec::new(),
     )
 }
 
@@ -54,6 +138,104 @@ fn on_demand_network_specs_require_explicit_local_realization_demand() {
     assert!(
         NetworkController::spec_has_local_realization_demand(&spec, &local_demand),
         "on_demand specs should realize when local workload or ingress demand exists"
+    );
+}
+
+#[test]
+fn ingress_pool_network_demand_includes_ready_selected_local_node() {
+    let network_id = Uuid::new_v4();
+    let local_node = Uuid::new_v4();
+    let remote_node = Uuid::new_v4();
+    let service = service_with_ingress_pool(network_id, "public-web");
+    let pool = test_ingress_pool("public-web", 1, Some(1))
+        .into_value()
+        .expect("valid ingress pool");
+    let pool_networks = NetworkController::referenced_ingress_pool_networks(&[service]);
+    let pools = HashMap::from([("public-web".to_string(), pool)]);
+    let candidates = vec![
+        test_placement_node(local_node, "node-1", "public-web"),
+        test_placement_node(remote_node, "node-2", "public-web"),
+    ];
+
+    let demand = NetworkController::collect_ingress_pool_network_demand(
+        &pool_networks,
+        &pools,
+        &candidates,
+        local_node,
+    );
+
+    assert_eq!(
+        demand,
+        HashSet::from([network_id]),
+        "selected ready ingress pool nodes should demand the service network"
+    );
+}
+
+#[test]
+fn ingress_pool_network_demand_excludes_unselected_local_node() {
+    let network_id = Uuid::new_v4();
+    let local_node = Uuid::new_v4();
+    let remote_node = Uuid::new_v4();
+    let service = service_with_ingress_pool(network_id, "public-web");
+    let pool = test_ingress_pool("public-web", 1, Some(1))
+        .into_value()
+        .expect("valid ingress pool");
+    let pool_networks = NetworkController::referenced_ingress_pool_networks(&[service]);
+    let pools = HashMap::from([("public-web".to_string(), pool)]);
+    let candidates = vec![
+        test_placement_node(remote_node, "node-1", "public-web"),
+        test_placement_node(local_node, "node-2", "public-web"),
+    ];
+
+    let demand = NetworkController::collect_ingress_pool_network_demand(
+        &pool_networks,
+        &pools,
+        &candidates,
+        local_node,
+    );
+
+    assert!(
+        demand.is_empty(),
+        "unselected ingress pool nodes should not realize the service network"
+    );
+}
+
+#[test]
+fn ingress_pool_network_demand_waits_for_pool_readiness() {
+    let network_id = Uuid::new_v4();
+    let local_node = Uuid::new_v4();
+    let service = service_with_ingress_pool(network_id, "public-web");
+    let pool = test_ingress_pool("public-web", 2, None)
+        .into_value()
+        .expect("valid ingress pool");
+    let pool_networks = NetworkController::referenced_ingress_pool_networks(&[service]);
+    let pools = HashMap::from([("public-web".to_string(), pool)]);
+    let candidates = vec![test_placement_node(local_node, "node-1", "public-web")];
+
+    let demand = NetworkController::collect_ingress_pool_network_demand(
+        &pool_networks,
+        &pools,
+        &candidates,
+        local_node,
+    );
+
+    assert!(
+        demand.is_empty(),
+        "underfilled ingress pools should not realize service networks"
+    );
+}
+
+#[test]
+fn ingress_pool_network_demand_ignores_stopped_services() {
+    let network_id = Uuid::new_v4();
+    let mut service = service_with_ingress_pool(network_id, "public-web");
+    service.set_status(ServiceStatus::Stopped);
+
+    let pool_networks = NetworkController::referenced_ingress_pool_networks(&[service]);
+
+    assert!(
+        pool_networks.is_empty(),
+        "stopped services should not keep ingress pool networks realized"
     );
 }
 
