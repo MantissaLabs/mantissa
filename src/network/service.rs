@@ -646,9 +646,10 @@ impl networks::Server for NetworksRpc {
             ),
         };
 
-        // Newly created or revived networks start as pending.
+        // Newly created or revived specs are ready once accepted into the registry; per-node
+        // dataplane readiness is tracked by NetworkPeerState.
         if is_new {
-            spec_value.set_status(NetworkStatus::Pending);
+            spec_value.set_status(NetworkStatus::Ready);
         }
 
         self.registry

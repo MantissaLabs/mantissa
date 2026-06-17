@@ -266,16 +266,39 @@ impl WorkloadManager {
             );
         }
 
-        if let Err(err) = self
+        let removed = match self
             .networking
             .network_registry
             .remove_attachment(attachment.id)
             .await
         {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(
+                    target: "task",
+                    attachment = %attachment.id,
+                    "failed to remove stale local attachment record: {err}"
+                );
+                false
+            }
+        };
+
+        if removed {
+            self.release_idle_network_realizations(&[attachment.network_id])
+                .await;
+        }
+    }
+
+    /// Ask the network controller to release local realization for networks with no demand.
+    async fn release_idle_network_realizations(&self, network_ids: &[Uuid]) {
+        let Some(controller) = &self.networking.network_controller else {
+            return;
+        };
+
+        if let Err(err) = controller.release_idle_local_networks(network_ids).await {
             warn!(
-                target: "task",
-                attachment = %attachment.id,
-                "failed to remove stale local attachment record: {err}"
+                target: "network",
+                "failed to release idle local network realization: {err:#}"
             );
         }
     }
@@ -892,6 +915,18 @@ impl WorkloadManager {
             return Ok(());
         };
 
+        if let Some(controller) = &self.networking.network_controller {
+            controller
+                .ensure_networks_ready_for_local_use(network_ids)
+                .await
+                .with_context(|| {
+                    format!(
+                        "realize local networks before attaching task {task_id} to runtime instance {}",
+                        instance_id.handle
+                    )
+                })?;
+        }
+
         let desired: HashSet<Uuid> = network_ids.iter().copied().collect();
         let existing_list = self
             .networking
@@ -1281,6 +1316,7 @@ impl WorkloadManager {
             .network_registry
             .list_attachments(None)
             .context("list attachments for orphan cleanup")?;
+        let mut released_networks = Vec::new();
 
         for attachment in attachments {
             let task_value = self
@@ -1317,17 +1353,23 @@ impl WorkloadManager {
                         .teardown_attachment(attachment.id)
                         .await;
                 }
-                if let Err(err) = self
+                match self
                     .networking
                     .network_registry
                     .remove_attachment(attachment.id)
                     .await
                 {
-                    warn!(
-                        target: "task",
-                        attachment = %attachment.id,
-                        "failed to remove orphaned attachment record: {err}"
-                    );
+                    Ok(()) if attachment.node_id == self.local_node_id => {
+                        released_networks.push(attachment.network_id);
+                    }
+                    Ok(()) => {}
+                    Err(err) => {
+                        warn!(
+                            target: "task",
+                            attachment = %attachment.id,
+                            "failed to remove orphaned attachment record: {err}"
+                        );
+                    }
                 }
                 continue;
             }
@@ -1367,8 +1409,13 @@ impl WorkloadManager {
                     "failed to teardown orphaned attachment interface"
                 );
             }
+            if attachment.node_id == self.local_node_id {
+                released_networks.push(attachment.network_id);
+            }
         }
 
+        self.release_idle_network_realizations(&released_networks)
+            .await;
         Ok(())
     }
 
@@ -1404,6 +1451,7 @@ impl WorkloadManager {
             .network_registry
             .list_attachments_for_task(task_id)
             .context("failed to list task attachments for teardown")?;
+        let mut released_networks = Vec::new();
 
         for attachment in attachments {
             if !keep.is_empty() && keep.contains(&attachment.network_id) {
@@ -1437,20 +1485,28 @@ impl WorkloadManager {
 
             // Explicit teardown requests should remove the attachment record immediately so
             // callers (and tests) observe prompt cleanup without waiting for the orphan GC loop.
-            if let Err(err) = self
+            match self
                 .networking
                 .network_registry
                 .remove_attachment(attachment.id)
                 .await
             {
-                warn!(
-                    target: "task",
-                    attachment = %attachment.id,
-                    "failed to remove attachment record after teardown: {err}"
-                );
+                Ok(()) if attachment.node_id == self.local_node_id => {
+                    released_networks.push(attachment.network_id);
+                }
+                Ok(()) => {}
+                Err(err) => {
+                    warn!(
+                        target: "task",
+                        attachment = %attachment.id,
+                        "failed to remove attachment record after teardown: {err}"
+                    );
+                }
             }
         }
 
+        self.release_idle_network_realizations(&released_networks)
+            .await;
         Ok(())
     }
 }

@@ -411,6 +411,7 @@ async fn setup_workload_manager() -> TestHarness {
             network_peer_store,
             network_attachment_store,
         ),
+        network_controller: None,
         volume_registry,
         secret_registry: secret_registry.clone(),
         secret_keyring: secret_keyring_arc.clone(),

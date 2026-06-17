@@ -105,7 +105,7 @@ impl WorkloadNetworkPrerequisites {
                 spec = deleted;
             }
 
-            spec.set_status(NetworkStatus::Pending);
+            spec.set_status(NetworkStatus::Ready);
             self.network_registry.upsert_spec(spec.clone()).await?;
             self.gossip_tx
                 .send(Message::Network {

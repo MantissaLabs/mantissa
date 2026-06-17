@@ -1,5 +1,6 @@
 use crate::gossip::Message;
 use crate::network::attachment::{AttachmentProvisioner, AttachmentProvisionerApi};
+use crate::network::controller::NetworkController;
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
 use crate::registry::Registry;
@@ -492,6 +493,8 @@ struct WorkloadManagerSecrets {
 struct WorkloadManagerNetworking {
     // Network registry handle for attachment state and network specs.
     network_registry: NetworkRegistry,
+    // Optional controller handle used to realize local dataplane state before attachment.
+    network_controller: Option<NetworkController>,
     // Runtime attachment provisioner responsible for endpoint setup/teardown.
     attachment_provisioner: Arc<dyn AttachmentProvisionerApi>,
     // Optional best-effort signal channel for forwarding refresh events.
@@ -689,6 +692,7 @@ pub struct WorkloadManagerConfig {
     pub registry: Registry,
     pub service_registry: ServiceRegistry,
     pub network_registry: NetworkRegistry,
+    pub network_controller: Option<NetworkController>,
     pub volume_registry: VolumeRegistry,
     pub secret_registry: SecretRegistry,
     pub secret_keyring: Arc<RwLock<SecretKeyring>>,
@@ -713,6 +717,7 @@ impl WorkloadManager {
             registry,
             service_registry,
             network_registry,
+            network_controller,
             volume_registry,
             secret_registry,
             secret_keyring,
@@ -778,6 +783,7 @@ impl WorkloadManager {
             },
             networking: WorkloadManagerNetworking {
                 network_registry,
+                network_controller,
                 attachment_provisioner,
                 forwarding_events,
             },

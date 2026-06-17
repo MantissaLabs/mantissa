@@ -945,6 +945,7 @@ async fn setup_manager_with_forwarding(
         registry,
         service_registry,
         network_registry: network_registry.clone(),
+        network_controller: None,
         volume_registry,
         secret_registry,
         secret_keyring: secret_keyring.clone(),

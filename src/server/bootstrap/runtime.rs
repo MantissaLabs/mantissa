@@ -615,6 +615,7 @@ async fn build_runtime_components(
         registry: registry.clone(),
         service_registry: service_registry.clone(),
         network_registry: network_registry.clone(),
+        network_controller: Some(network_controller.clone()),
         volume_registry: volume_registry.clone(),
         secret_registry: secret_registry.clone(),
         secret_keyring: stores.secret_keyring.clone(),

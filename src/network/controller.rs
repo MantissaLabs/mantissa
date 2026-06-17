@@ -13,7 +13,7 @@ use crate::network::nodeport::NodePortManager;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
     BpfProgramSpec, NetworkAttachmentState, NetworkDriver, NetworkEvent, NetworkPeerState,
-    NetworkPeerStateValue, NetworkSpecValue, NetworkStatus,
+    NetworkPeerStateValue, NetworkSpecValue,
 };
 use crate::network::wireguard::{self, WireGuardUnderlayState};
 use crate::registry::Registry;
@@ -72,6 +72,8 @@ struct NetworkControllerInner {
     bpf: NetworkBpfManager,
     discovery: ServiceDiscovery,
     active_networks: AsyncMutex<HashSet<Uuid>>,
+    local_demand: AsyncMutex<HashSet<Uuid>>,
+    realization_locks: AsyncMutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>,
     vxlan_ifindex: AsyncMutex<HashMap<Uuid, u32>>,
     remote_fdb: AsyncMutex<HashMap<Uuid, HashMap<String, IpAddr>>>,
     flood_entries: AsyncMutex<HashMap<Uuid, HashSet<IpAddr>>>,
@@ -184,6 +186,8 @@ impl NetworkController {
                 bpf,
                 discovery,
                 active_networks: AsyncMutex::new(HashSet::new()),
+                local_demand: AsyncMutex::new(HashSet::new()),
+                realization_locks: AsyncMutex::new(HashMap::new()),
                 vxlan_ifindex: AsyncMutex::new(HashMap::new()),
                 remote_fdb: AsyncMutex::new(HashMap::new()),
                 flood_entries: AsyncMutex::new(HashMap::new()),
@@ -229,6 +233,135 @@ impl NetworkController {
         }
     }
 
+    /// Ensure each network has local dataplane resources before a runtime uses it.
+    ///
+    /// Replicated specs are control-plane intent: this method is the explicit demand gate that
+    /// turns a spec into local bridge, VXLAN, BPF, discovery, and forwarding state. It is called
+    /// by workload admission/attachment paths and is intentionally idempotent so repairs can reuse
+    /// the same path.
+    pub async fn ensure_networks_ready_for_local_use(&self, network_ids: &[Uuid]) -> Result<()> {
+        for network_id in Self::sorted_unique_network_ids(network_ids) {
+            self.ensure_network_ready_for_local_use(network_id).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Release local on-demand network realization once all local references are gone.
+    ///
+    /// This only tears down this node's dataplane and peer row. It never removes the replicated
+    /// network spec or remote peers/attachments, so other participants keep operating normally.
+    pub async fn release_idle_local_networks(&self, network_ids: &[Uuid]) -> Result<()> {
+        for network_id in Self::sorted_unique_network_ids(network_ids) {
+            let lock = self.realization_lock(network_id).await;
+            let _guard = lock.lock().await;
+
+            self.remove_explicit_local_demand(network_id).await;
+
+            let Some(spec) =
+                self.inner.registry.get_spec(network_id).with_context(|| {
+                    format!("load network spec {network_id} for demand release")
+                })?
+            else {
+                self.teardown_local_network_realization(network_id).await?;
+                continue;
+            };
+
+            if spec.realizes_on_all_nodes() || self.has_local_attachment_demand(network_id)? {
+                continue;
+            }
+
+            self.teardown_local_network_realization(network_id).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Realize one network for local use while serializing concurrent callers.
+    async fn ensure_network_ready_for_local_use(&self, network_id: Uuid) -> Result<()> {
+        let lock = self.realization_lock(network_id).await;
+        let _guard = lock.lock().await;
+
+        if self.local_network_ready(network_id).await? {
+            return Ok(());
+        }
+
+        let spec = self
+            .inner
+            .registry
+            .get_spec(network_id)
+            .with_context(|| format!("load network spec {network_id} for local realization"))?
+            .ok_or_else(|| anyhow!("network {network_id} not found"))?;
+        if spec.is_deleted() {
+            anyhow::bail!("network {network_id} is deleted");
+        }
+
+        self.add_explicit_local_demand(network_id).await;
+        let result = async {
+            let _ = self.mark_peer_configuring(network_id).await?;
+            let _ = self.reconcile_wireguard_underlay().await?;
+            self.reconcile_network(spec).await
+        }
+        .await;
+
+        if let Err(err) = result {
+            let message = format!("{err:#}");
+            self.update_peer_state_error(network_id, message).await?;
+            if !self.has_local_attachment_demand(network_id)? {
+                self.remove_explicit_local_demand(network_id).await;
+            }
+            return Err(err.context(format!("realize network {network_id} for local use")));
+        }
+
+        Ok(())
+    }
+
+    /// Return a stable per-network lock used to serialize local realization/teardown.
+    async fn realization_lock(&self, network_id: Uuid) -> Arc<AsyncMutex<()>> {
+        let mut guard = self.inner.realization_locks.lock().await;
+        guard
+            .entry(network_id)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    /// Sort and deduplicate network ids so multi-network operations take locks consistently.
+    fn sorted_unique_network_ids(network_ids: &[Uuid]) -> Vec<Uuid> {
+        let mut unique = network_ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        unique
+    }
+
+    /// Record transient local demand that exists before a durable attachment row is written.
+    async fn add_explicit_local_demand(&self, network_id: Uuid) {
+        let mut guard = self.inner.local_demand.lock().await;
+        guard.insert(network_id);
+    }
+
+    /// Remove transient local demand after attachment teardown or failed realization.
+    async fn remove_explicit_local_demand(&self, network_id: Uuid) {
+        let mut guard = self.inner.local_demand.lock().await;
+        guard.remove(&network_id);
+    }
+
+    /// Return whether the local dataplane is already active and advertised as ready.
+    async fn local_network_ready(&self, network_id: Uuid) -> Result<bool> {
+        let active = {
+            let guard = self.inner.active_networks.lock().await;
+            guard.contains(&network_id)
+        };
+        if !active {
+            return Ok(false);
+        }
+
+        Ok(self
+            .inner
+            .registry
+            .get_peer_state(network_id, self.inner.node_id)?
+            .is_some_and(|state| state.state.is_ready() && state.error.is_none()))
+    }
+
     /// Refresh discovery-derived VIP and NodePort publication for one network immediately.
     pub async fn refresh_publication(&self, network_id: Uuid) {
         if let Err(err) = self.inner.discovery.refresh_network(network_id).await {
@@ -259,12 +392,57 @@ impl NetworkController {
         }
     }
 
+    /// Return true when durable local attachment rows still demand a network.
+    fn has_local_attachment_demand(&self, network_id: Uuid) -> Result<bool> {
+        Ok(self
+            .inner
+            .registry
+            .list_attachments(Some(network_id))?
+            .into_iter()
+            .any(|attachment| {
+                attachment.node_id == self.inner.node_id
+                    && !matches!(attachment.state, NetworkAttachmentState::Removing)
+            }))
+    }
+
+    /// Collect local demand from in-flight starts and durable local attachment rows.
+    async fn local_network_demand_snapshot(&self) -> Result<HashSet<Uuid>> {
+        let mut demand = {
+            let guard = self.inner.local_demand.lock().await;
+            guard.clone()
+        };
+
+        for attachment in self
+            .inner
+            .registry
+            .list_attachments(None)
+            .context("list local attachment demand")?
+        {
+            if attachment.node_id == self.inner.node_id
+                && !matches!(attachment.state, NetworkAttachmentState::Removing)
+            {
+                demand.insert(attachment.network_id);
+            }
+        }
+
+        Ok(demand)
+    }
+
+    /// Return whether a spec currently requires local dataplane realization on this node.
+    fn spec_has_local_realization_demand(
+        spec: &NetworkSpecValue,
+        local_demand: &HashSet<Uuid>,
+    ) -> bool {
+        !spec.is_deleted() && (spec.realizes_on_all_nodes() || local_demand.contains(&spec.id))
+    }
+
     /// List every non-deleted network that currently expects a local dataplane reconcile.
     ///
     /// WireGuard failures are global to the node, but deployment gating still happens per network
     /// through `NetworkPeerState`. This helper gives the controller the network identifiers that
     /// must be marked `Error` when encrypted underlay setup is blocked.
-    fn active_network_ids(&self) -> Result<Vec<Uuid>> {
+    async fn active_network_ids(&self) -> Result<Vec<Uuid>> {
+        let local_demand = self.local_network_demand_snapshot().await?;
         let specs = self
             .inner
             .registry
@@ -272,13 +450,14 @@ impl NetworkController {
             .context("list network specs for wireguard scope")?;
         Ok(specs
             .into_iter()
-            .filter(|spec| !spec.is_deleted())
+            .filter(|spec| Self::spec_has_local_realization_demand(spec, &local_demand))
             .map(|spec| spec.id)
             .collect())
     }
 
     /// List every active VXLAN network that needs encrypted underlay reconciliation.
-    fn active_vxlan_network_ids(&self) -> Result<Vec<Uuid>> {
+    async fn active_vxlan_network_ids(&self) -> Result<Vec<Uuid>> {
+        let local_demand = self.local_network_demand_snapshot().await?;
         let specs = self
             .inner
             .registry
@@ -286,7 +465,10 @@ impl NetworkController {
             .context("list network specs for vxlan scope")?;
         Ok(specs
             .into_iter()
-            .filter(|spec| !spec.is_deleted() && spec.driver.requires_wireguard_underlay())
+            .filter(|spec| {
+                Self::spec_has_local_realization_demand(spec, &local_demand)
+                    && spec.driver.requires_wireguard_underlay()
+            })
             .map(|spec| spec.id)
             .collect())
     }
@@ -313,7 +495,7 @@ impl NetworkController {
     /// Once network peer readiness has converged, the steady-state scope comes from shared Ready
     /// networks. During bootstrap we fall back to visible cluster peers so multi-node encrypted
     /// networks can establish WireGuard before any node advertises itself Ready.
-    fn desired_wireguard_peers(&self) -> Result<HashSet<Uuid>> {
+    async fn desired_wireguard_peers(&self) -> Result<HashSet<Uuid>> {
         let scoped = self
             .inner
             .registry
@@ -323,7 +505,7 @@ impl NetworkController {
             return Ok(scoped);
         }
 
-        let active_network_ids = self.active_vxlan_network_ids()?;
+        let active_network_ids = self.active_vxlan_network_ids().await?;
         if active_network_ids.is_empty() {
             return Ok(scoped);
         }
@@ -350,7 +532,7 @@ impl NetworkController {
             *guard = WireGuardUnderlayState::default();
         }
 
-        for network_id in self.active_vxlan_network_ids()? {
+        for network_id in self.active_vxlan_network_ids().await? {
             self.update_peer_state_error(network_id, message.to_string())
                 .await?;
         }
@@ -381,7 +563,7 @@ impl NetworkController {
             *guard = Some(now);
         }
 
-        let desired_peer_ids = match self.desired_wireguard_peers() {
+        let desired_peer_ids = match self.desired_wireguard_peers().await {
             Ok(peers) => peers,
             Err(err) => {
                 let message = format!("failed to derive mandatory wireguard peer scope: {err:#}");
@@ -486,7 +668,7 @@ impl NetworkController {
     /// accompanying spec update. Scheduling active networks here forces an immediate interface
     /// rebuild instead of waiting for the slow drift sweep to notice the mismatch.
     async fn schedule_active_network_reconcile(&self) -> Result<()> {
-        let active = self.active_network_ids()?;
+        let active = self.active_network_ids().await?;
         if active.is_empty() {
             return Ok(());
         }
@@ -527,12 +709,13 @@ impl NetworkController {
             .context("shut down service discovery before headless restart")
     }
 
-    /// Queue every persisted non-deleted network for one startup reconcile.
+    /// Queue every persisted network with local demand for one startup reconcile.
     ///
     /// The controller rebuilds local interfaces, discovery listeners, and NodePort publication
     /// from durable replicated state after daemon restart. Enqueuing the known specs explicitly
     /// keeps that recovery path deterministic instead of relying on the slow drift sweep.
     async fn queue_startup_spec_reconcile(&self) -> Result<usize> {
+        let local_demand = self.local_network_demand_snapshot().await?;
         let specs = self
             .inner
             .registry
@@ -542,7 +725,7 @@ impl NetworkController {
         let mut pending = self.inner.pending_specs.lock().await;
         let mut inserted = 0usize;
         for spec in specs {
-            if spec.is_deleted() {
+            if !Self::spec_has_local_realization_demand(&spec, &local_demand) {
                 continue;
             }
             if pending.insert(spec.id) {
@@ -552,13 +735,14 @@ impl NetworkController {
         Ok(inserted)
     }
 
-    /// Mark every persisted local network as `Configuring` during startup recovery.
+    /// Mark every locally demanded network as `Configuring` during startup recovery.
     ///
     /// Peer readiness is durable replicated state, so a daemon restart can otherwise leave a
     /// stale local `Ready` row visible to the rest of the cluster until reconciliation runs. That
     /// would let discovery keep routing traffic to attachments whose local bridge, BPF, or
     /// runtime-facing network path has not been rebuilt yet.
     async fn mark_startup_networks_configuring(&self) -> Result<usize> {
+        let local_demand = self.local_network_demand_snapshot().await?;
         let specs = self
             .inner
             .registry
@@ -567,7 +751,7 @@ impl NetworkController {
 
         let mut updated = 0usize;
         for spec in specs {
-            if spec.is_deleted() {
+            if !Self::spec_has_local_realization_demand(&spec, &local_demand) {
                 continue;
             }
 
@@ -732,6 +916,7 @@ impl NetworkController {
         }
 
         let _ = self.reconcile_wireguard_underlay().await?;
+        let local_demand = self.local_network_demand_snapshot().await?;
 
         for network_id in queued {
             match self.inner.registry.get_spec(network_id) {
@@ -744,14 +929,22 @@ impl NetworkController {
                                 "teardown after gossip failed: {err:#}"
                             );
                         }
-                    } else if let Err(err) = self.reconcile_network(spec.clone()).await {
-                        warn!(
+                    } else if Self::spec_has_local_realization_demand(&spec, &local_demand) {
+                        if let Err(err) = self.reconcile_network(spec.clone()).await {
+                            warn!(
+                                target: "network",
+                                network = %network_id,
+                                "immediate reconcile failed: {err:#}"
+                            );
+                            self.update_peer_state_error(network_id, format!("{err:#}"))
+                                .await?;
+                        }
+                    } else {
+                        debug!(
                             target: "network",
                             network = %network_id,
-                            "immediate reconcile failed: {err:#}"
+                            "skipping queued network reconcile because local demand is absent"
                         );
-                        self.update_peer_state_error(network_id, format!("{err:#}"))
-                            .await?;
                     }
                 }
                 Ok(None) => {}
@@ -798,9 +991,10 @@ impl NetworkController {
             .registry
             .list_specs()
             .context("list network specs for attachment forwarding refresh")?;
+        let local_demand = self.local_network_demand_snapshot().await?;
 
         for mut spec in specs {
-            if spec.is_deleted() {
+            if !Self::spec_has_local_realization_demand(&spec, &local_demand) {
                 continue;
             }
             let (mut plan, _) = self.prepare_plan(&mut spec)?;
@@ -874,10 +1068,11 @@ impl NetworkController {
             .registry
             .list_specs()
             .context("list network specifications")?;
+        let local_demand = self.local_network_demand_snapshot().await?;
 
         let desired: HashSet<Uuid> = specs
             .iter()
-            .filter(|spec| !spec.is_deleted())
+            .filter(|spec| Self::spec_has_local_realization_demand(spec, &local_demand))
             .map(|spec| spec.id)
             .collect();
 
@@ -903,6 +1098,10 @@ impl NetworkController {
                         spec.id
                     );
                 }
+                continue;
+            }
+
+            if !Self::spec_has_local_realization_demand(&spec, &local_demand) {
                 continue;
             }
 
@@ -1062,17 +1261,6 @@ impl NetworkController {
         }
         self.mark_peer_ready(plan.network_id).await?;
 
-        if spec.status != NetworkStatus::Ready {
-            let mut updated_spec = spec.clone();
-            updated_spec.set_status(NetworkStatus::Ready);
-            self.inner
-                .registry
-                .upsert_spec(updated_spec.clone())
-                .await
-                .context("update network status to ready")?;
-            self.send_event(NetworkEvent::Upsert(updated_spec)).await;
-        }
-
         self.refresh_publication(plan.network_id).await;
 
         let mut active = self.inner.active_networks.lock().await;
@@ -1121,6 +1309,99 @@ impl NetworkController {
             .map(|attachment| host_iface_name(attachment.id));
 
         Ok(NetworkInterfaceContext::from(plan).with_attachment_host_ifnames(attachment_ifnames))
+    }
+
+    /// Tear down this node's dataplane state for an idle on-demand network.
+    ///
+    /// Unlike deleted-network teardown, this leaves the replicated spec, remote peer rows, and
+    /// remote attachment rows intact. It only withdraws local discovery, BPF, interfaces,
+    /// forwarding caches, active tracking, and this node's peer state.
+    async fn teardown_local_network_realization(&self, network_id: Uuid) -> Result<()> {
+        let plan = NetworkPlan::from_id(network_id);
+        let interface_ctx: NetworkInterfaceContext = (&plan).into();
+        let has_active = {
+            let active = self.inner.active_networks.lock().await;
+            active.contains(&network_id)
+        };
+        let has_peer = self
+            .inner
+            .registry
+            .get_peer_state(network_id, self.inner.node_id)?
+            .is_some();
+        let has_kernel_links = match self.inner.provisioner.network_links_exist(&plan).await {
+            Ok(exists) => exists,
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    network = %network_id,
+                    "failed to inspect idle network kernel links before teardown: {err:#}"
+                );
+                true
+            }
+        };
+        let has_bpf_state = match self.inner.bpf.network_state_exists(network_id).await {
+            Ok(exists) => exists,
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    network = %network_id,
+                    "failed to inspect idle network bpf state before teardown: {err:#}"
+                );
+                true
+            }
+        };
+
+        if !(has_active || has_peer || has_kernel_links || has_bpf_state) {
+            return Ok(());
+        }
+
+        let _ = self.mark_peer_removing(network_id).await?;
+        self.refresh_publication(network_id).await;
+
+        if let Err(err) = self.inner.discovery.teardown_network(network_id).await {
+            warn!(
+                target: "network",
+                network = %network_id,
+                "failed to tear down discovery service for idle network: {err:#}"
+            );
+        }
+        if let Err(err) = self.inner.bpf.teardown_network(&interface_ctx).await {
+            warn!(
+                target: "network",
+                network = %network_id,
+                "failed to tear down bpf programs for idle network: {err:#}"
+            );
+        }
+        if let Err(err) = self.inner.provisioner.teardown_network(&plan).await {
+            warn!(
+                target: "network",
+                network = %network_id,
+                "failed to tear down idle network: {err:#}"
+            );
+        }
+
+        self.clear_local_network_runtime_state(network_id).await;
+        self.remove_local_peer_state(network_id).await
+    }
+
+    /// Clear in-memory controller state owned solely by this node's local realization.
+    async fn clear_local_network_runtime_state(&self, network_id: Uuid) {
+        self.clear_forwarding_caches(network_id).await;
+
+        {
+            let mut guard = self.inner.vxlan_ifindex.lock().await;
+            guard.remove(&network_id);
+        }
+
+        {
+            let mut guard = self.inner.pending_forwarding.lock().await;
+            guard.remove(&network_id);
+        }
+
+        {
+            let mut guard = self.inner.active_networks.lock().await;
+            guard.remove(&network_id);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1564,6 +1845,52 @@ impl NetworkController {
             .context("persist peer state configuring")?;
         self.send_event(NetworkEvent::PeerUpsert(state)).await;
         Ok(true)
+    }
+
+    /// Persist the local peer as `Removing` while local dataplane state is being withdrawn.
+    async fn mark_peer_removing(&self, network_id: Uuid) -> Result<bool> {
+        if let Some(existing) = self
+            .inner
+            .registry
+            .get_peer_state(network_id, self.inner.node_id)?
+            && existing.state == NetworkPeerState::Removing
+            && existing.error.is_none()
+        {
+            return Ok(false);
+        }
+
+        let mut state = NetworkPeerStateValue::new(
+            network_id,
+            self.inner.node_id,
+            self.inner.node_name.clone(),
+            NetworkPeerState::Removing,
+            None,
+        );
+        state.touch();
+
+        self.inner
+            .registry
+            .upsert_peer_state(state.clone())
+            .await
+            .context("persist peer state removing")?;
+        self.send_event(NetworkEvent::PeerUpsert(state)).await;
+        Ok(true)
+    }
+
+    /// Remove this node's peer-state row after local dataplane teardown completes.
+    async fn remove_local_peer_state(&self, network_id: Uuid) -> Result<()> {
+        let peer_state_id = self
+            .inner
+            .registry
+            .derive_peer_state_id(network_id, self.inner.node_id);
+        self.inner
+            .registry
+            .remove_peer_state(peer_state_id)
+            .await
+            .context("remove local peer state")?;
+        self.send_event(NetworkEvent::PeerRemove(peer_state_id))
+            .await;
+        Ok(())
     }
 
     /// Withdraw local routability before rebuilding bridge, BPF, or discovery state.
