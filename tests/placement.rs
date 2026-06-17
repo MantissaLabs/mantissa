@@ -1497,6 +1497,7 @@ fn demo_backend_task_template(name: &str, replicas: u16) -> TaskTemplateSpecValu
         readiness: None,
         public_port: None,
         public_protocol: None,
+        public_ingress: Default::default(),
         placement_preferences: Vec::new(),
         autoscale: None,
     }

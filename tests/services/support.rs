@@ -232,6 +232,7 @@ pub(crate) fn demo_backend_task_template(name: &str, replicas: u16) -> TaskTempl
         readiness: None,
         public_port: None,
         public_protocol: None,
+        public_ingress: Default::default(),
         placement_preferences: Vec::new(),
         autoscale: None,
     }
@@ -1908,6 +1909,7 @@ pub(crate) fn manifest_to_task_templates(manifest: &ServiceManifest) -> Vec<Task
                 readiness: None,
                 public_port: None,
                 public_protocol: None,
+                public_ingress: Default::default(),
                 placement_preferences: Vec::new(),
                 autoscale: None,
             }

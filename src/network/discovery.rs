@@ -7,8 +7,8 @@ use crate::network::registry::NetworkRegistry;
 use crate::network::types::{NetworkAttachmentState, NetworkDriver, NetworkSpecValue};
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
-    ServicePortProtocol, ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceSpecValue,
-    ServiceStatus,
+    PublicIngressPolicy, ServicePortProtocol, ServiceReadinessProbe, ServiceReadinessProbeKind,
+    ServiceSpecValue, ServiceStatus,
 };
 use crate::store::replicated::workloads::WorkloadStore;
 use crate::workload::model::WorkloadPhase;
@@ -155,9 +155,11 @@ struct ServiceBackendCatalogEntry {
     template_name: String,
     discovery_name: String,
     candidates: Vec<BackendAddress>,
+    local_candidates: Vec<BackendAddress>,
     readiness: Option<ServiceReadinessProbe>,
     expose_to_host: bool,
     public_port: Option<u16>,
+    public_ingress: PublicIngressPolicy,
     public_target_port: Option<u16>,
     public_protocols: Vec<NodePortProtocol>,
 }
@@ -176,6 +178,12 @@ struct PublicEndpointObservation {
     template_name: String,
     port: u16,
     detail: Option<String>,
+}
+
+/// Backend resolver output split into global candidates and candidates local to this node.
+struct ResolvedServiceBackends {
+    candidates: Vec<BackendAddress>,
+    local_candidates: Vec<BackendAddress>,
 }
 
 impl ServiceDiscovery {
@@ -367,7 +375,7 @@ impl ServiceBackendResolver<'_> {
         &self,
         service_name: &str,
         template_name: &str,
-    ) -> Result<Vec<BackendAddress>> {
+    ) -> Result<ResolvedServiceBackends> {
         let network_spec = self.runtime.registry.get_spec(self.runtime.network_id)?;
         let expected_family = network_spec
             .as_ref()
@@ -392,6 +400,7 @@ impl ServiceBackendResolver<'_> {
             .context("list attachments for discovery")?;
         let mut cache: HashMap<Uuid, Option<WorkloadValue>> = HashMap::new();
         let mut results = Vec::new();
+        let mut local_results = Vec::new();
 
         tracing::trace!(
             target: "network",
@@ -602,7 +611,11 @@ impl ServiceBackendResolver<'_> {
                     continue;
                 }
             };
-            results.push(BackendAddress { ip: ip_addr, mac });
+            let backend = BackendAddress { ip: ip_addr, mac };
+            if attachment.node_id == self.runtime.local_node_id {
+                local_results.push(backend.clone());
+            }
+            results.push(backend);
         }
 
         tracing::trace!(
@@ -614,7 +627,10 @@ impl ServiceBackendResolver<'_> {
             "resolved service backends"
         );
 
-        Ok(results)
+        Ok(ResolvedServiceBackends {
+            candidates: results,
+            local_candidates: local_results,
+        })
     }
 }
 
@@ -905,7 +921,7 @@ async fn refresh_backend_catalog_if_needed(
             let service_name = spec.service_name.clone();
             let template_name = template.name.clone();
             let discovery_name = discovery_service_key(&service_name, &template_name);
-            let candidates = resolver.resolve(&service_name, &template_name).await?;
+            let resolved = resolver.resolve(&service_name, &template_name).await?;
             let public_port = template.public_port();
             let public_target_port = template.public_target_port();
             let public_protocols = if public_port.is_some() {
@@ -921,10 +937,12 @@ async fn refresh_backend_catalog_if_needed(
                     service_id: spec.id,
                     template_name,
                     discovery_name,
-                    candidates,
+                    candidates: resolved.candidates,
+                    local_candidates: resolved.local_candidates,
                     readiness: template.readiness().cloned(),
                     expose_to_host: public_port.is_some(),
                     public_port,
+                    public_ingress: template.public_ingress(),
                     public_target_port,
                     public_protocols,
                 },
@@ -1089,8 +1107,7 @@ async fn refresh_single_service(
     }
 
     if backends.is_empty() {
-        let _ = sync_service_vip_for_backends(runtime, service_name, &[], service.expose_to_host)
-            .await?;
+        let _ = sync_service_vip_for_backends(runtime, service_name, &[], false).await?;
         return Ok(ServiceRefreshResult {
             nodeport_mappings: Vec::new(),
             public_endpoint: service.public_port.map(|port| PublicEndpointObservation {
@@ -1107,12 +1124,25 @@ async fn refresh_single_service(
         });
     }
 
-    if let Some((vip, programmed)) =
-        sync_service_vip_for_backends(runtime, service_name, &backends, service.expose_to_host)
-            .await?
+    let publish_nodeport = should_publish_nodeport(service, &backends);
+    if let Some((vip, programmed)) = sync_service_vip_for_backends(
+        runtime,
+        service_name,
+        &backends,
+        service.expose_to_host && publish_nodeport,
+    )
+    .await?
         && let Some(port) = service.public_port
     {
         let vip_port = service.public_target_port.unwrap_or(port);
+        if !publish_nodeport {
+            return Ok(ServiceRefreshResult {
+                nodeport_mappings: Vec::new(),
+                public_endpoint: None,
+                host_vip: None,
+            });
+        }
+
         if !programmed {
             return Ok(ServiceRefreshResult {
                 nodeport_mappings: Vec::new(),
@@ -1125,7 +1155,7 @@ async fn refresh_single_service(
                         service.template_name, port
                     )),
                 }),
-                host_vip: service.expose_to_host.then_some(vip),
+                host_vip: (service.expose_to_host && publish_nodeport).then_some(vip),
             });
         }
 
@@ -1163,6 +1193,43 @@ async fn refresh_single_service(
         }),
         host_vip: None,
     })
+}
+
+/// Decide whether this node should publish the public NodePort for a service template.
+fn should_publish_nodeport(
+    service: &ServiceBackendCatalogEntry,
+    selected_backends: &[BackendAddress],
+) -> bool {
+    if service.public_port.is_none() {
+        return false;
+    }
+    match service.public_ingress {
+        PublicIngressPolicy::AllNodes => true,
+        PublicIngressPolicy::TaskNodes => {
+            selected_backends_include_local(selected_backends, &service.local_candidates)
+        }
+    }
+}
+
+/// Returns true when at least one selected healthy backend belongs to the local node.
+fn selected_backends_include_local(
+    selected_backends: &[BackendAddress],
+    local_candidates: &[BackendAddress],
+) -> bool {
+    if local_candidates.is_empty() {
+        return false;
+    }
+    let local_identities: HashSet<(IpAddr, [u8; 6])> =
+        local_candidates.iter().map(backend_identity).collect();
+    selected_backends
+        .iter()
+        .map(backend_identity)
+        .any(|identity| local_identities.contains(&identity))
+}
+
+/// Reduces a backend to the stable identity used by dataplane maps.
+fn backend_identity(backend: &BackendAddress) -> (IpAddr, [u8; 6]) {
+    (backend.ip, backend.mac)
 }
 
 #[cfg(test)]

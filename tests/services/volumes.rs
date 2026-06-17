@@ -44,6 +44,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
         readiness: None,
         public_port: None,
         public_protocol: None,
+        public_ingress: Default::default(),
         placement_preferences: Vec::new(),
         autoscale: None,
     }];

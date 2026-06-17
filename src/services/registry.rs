@@ -189,6 +189,7 @@ mod tests {
                 readiness: None,
                 public_port: None,
                 public_protocol: None,
+                public_ingress: Default::default(),
                 placement_preferences: Vec::new(),
                 autoscale: None,
             }],
@@ -254,6 +255,7 @@ mod tests {
                 readiness: None,
                 public_port: None,
                 public_protocol: None,
+                public_ingress: Default::default(),
                 placement_preferences: Vec::new(),
                 autoscale: None,
             }],
@@ -355,6 +357,7 @@ mod tests {
             readiness: None,
             public_port: None,
             public_protocol: None,
+            public_ingress: Default::default(),
             placement_preferences: Vec::new(),
             autoscale: None,
         }];

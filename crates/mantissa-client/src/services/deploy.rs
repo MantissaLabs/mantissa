@@ -1,7 +1,7 @@
 use super::manifest::{
-    EnvironmentVariable, LivenessKind, LivenessProbe, ReadinessKind, ReadinessProbe,
-    RestartPolicyName, RolloutOrder, SecretFileProjection, SecretReference, ServiceManifest,
-    ServicePlacementPreference, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
+    EnvironmentVariable, LivenessKind, LivenessProbe, PublicIngressPolicySpec, ReadinessKind,
+    ReadinessProbe, RestartPolicyName, RolloutOrder, SecretFileProjection, SecretReference,
+    ServiceManifest, ServicePlacementPreference, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
     TaskTemplateAutoscaleMetric, TaskTemplateAutoscaleMetricKind, TaskTemplateAutoscalePolicy,
     TaskTemplateSpec, VolumeMount,
 };
@@ -350,6 +350,15 @@ fn write_task_template(
     }
 
     builder.set_public_port(template.public_port.unwrap_or(0));
+    let public_ingress = match template.public_ingress {
+        PublicIngressPolicySpec::AllNodes => {
+            mantissa_protocol::services::PublicIngressPolicy::AllNodes
+        }
+        PublicIngressPolicySpec::TaskNodes => {
+            mantissa_protocol::services::PublicIngressPolicy::TaskNodes
+        }
+    };
+    builder.set_public_ingress(public_ingress);
     builder.set_tty(template.tty);
     write_placement_policy_parts(
         builder.reborrow().init_placement(),

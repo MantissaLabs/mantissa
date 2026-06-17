@@ -25,6 +25,7 @@ local_test!(services_redeploy_scales_replicas, {
         readiness: None,
         public_port: None,
         public_protocol: None,
+        public_ingress: Default::default(),
         placement_preferences: Vec::new(),
         autoscale: None,
     }];
@@ -148,6 +149,7 @@ local_test!(services_redeploy_updates_resources, {
         readiness: None,
         public_port: None,
         public_protocol: None,
+        public_ingress: Default::default(),
         placement_preferences: Vec::new(),
         autoscale: None,
     }];
@@ -281,6 +283,7 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
         readiness: None,
         public_port: None,
         public_protocol: None,
+        public_ingress: Default::default(),
         placement_preferences: Vec::new(),
         autoscale: None,
     }];
@@ -400,6 +403,7 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
         readiness: None,
         public_port: None,
         public_protocol: None,
+        public_ingress: Default::default(),
         placement_preferences: Vec::new(),
         autoscale: None,
     }];
@@ -493,6 +497,7 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
         readiness: None,
         public_port: None,
         public_protocol: None,
+        public_ingress: Default::default(),
         placement_preferences: Vec::new(),
         autoscale: None,
     }];
@@ -617,6 +622,7 @@ local_test!(
             readiness: None,
             public_port: None,
             public_protocol: None,
+            public_ingress: Default::default(),
             placement_preferences: Vec::new(),
             autoscale: None,
         }];
@@ -747,6 +753,7 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
         readiness: None,
         public_port: None,
         public_protocol: None,
+        public_ingress: Default::default(),
         placement_preferences: Vec::new(),
         autoscale: None,
     }];
@@ -851,6 +858,7 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
         readiness: None,
         public_port: None,
         public_protocol: None,
+        public_ingress: Default::default(),
         placement_preferences: Vec::new(),
         autoscale: None,
     }];
@@ -943,6 +951,7 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
         readiness: None,
         public_port: None,
         public_protocol: None,
+        public_ingress: Default::default(),
         placement_preferences: Vec::new(),
         autoscale: None,
     }];

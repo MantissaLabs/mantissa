@@ -3,7 +3,8 @@ use mantissa_client::services::{
     deploy::{ServiceDeployOutcome, ServiceDeploymentHandle},
     list::{
         ServiceReplicaAssignmentRow, ServiceRolloutRow, ServiceRow, ServiceTaskProgressRow,
-        TaskTemplateAutoscaleMetricRow, TaskTemplateAutoscalePolicyRow, TaskTemplateRow,
+        TaskTemplateAutoscaleMetricRow, TaskTemplateAutoscalePolicyRow,
+        TaskTemplatePublicIngressRow, TaskTemplateRow,
     },
     manifest::ServiceManifest,
 };
@@ -115,6 +116,7 @@ pub struct TaskTemplate {
     pub autoscale: Option<TaskTemplateAutoscalePolicy>,
     pub networks: Vec<String>,
     pub public_port: Option<u16>,
+    pub public_ingress: PublicIngressPolicy,
     pub readiness_port: Option<u16>,
     pub liveness_port: Option<u16>,
     pub ports: Vec<HostPort>,
@@ -131,9 +133,28 @@ impl From<TaskTemplateRow> for TaskTemplate {
             autoscale: value.autoscale.map(TaskTemplateAutoscalePolicy::from),
             networks: value.networks,
             public_port: value.public_port,
+            public_ingress: PublicIngressPolicy::from(value.public_ingress),
             readiness_port: value.readiness_port,
             liveness_port: value.liveness_port,
             ports: value.ports.into_iter().map(HostPort::from).collect(),
+        }
+    }
+}
+
+/// REST-facing host publication scope for one task template public port.
+#[derive(Clone, Copy, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicIngressPolicy {
+    AllNodes,
+    TaskNodes,
+}
+
+impl From<TaskTemplatePublicIngressRow> for PublicIngressPolicy {
+    /// Converts the client row public-ingress variant into the REST JSON enum.
+    fn from(value: TaskTemplatePublicIngressRow) -> Self {
+        match value {
+            TaskTemplatePublicIngressRow::AllNodes => Self::AllNodes,
+            TaskTemplatePublicIngressRow::TaskNodes => Self::TaskNodes,
         }
     }
 }

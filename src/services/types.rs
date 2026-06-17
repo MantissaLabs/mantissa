@@ -642,6 +642,8 @@ pub struct TaskTemplateSpecValue {
     pub public_port: Option<u16>,
     #[serde(default)]
     pub public_protocol: Option<ServicePortProtocol>,
+    #[serde(default)]
+    pub public_ingress: PublicIngressPolicy,
     /// Service-only soft placement preferences for this task template.
     #[serde(default)]
     pub placement_preferences: Vec<ServicePlacementPreference>,
@@ -689,6 +691,19 @@ pub enum ServicePortProtocol {
     Tcp,
     Udp,
     TcpUdp,
+}
+
+/// Host-facing publication scope for a service template's public port.
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicIngressPolicy {
+    /// Publish NodePort mappings from every node that realizes the network.
+    #[default]
+    AllNodes,
+    /// Publish NodePort mappings only where a selected healthy backend is local.
+    TaskNodes,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -776,6 +791,11 @@ impl TaskTemplateSpecValue {
     /// declared in the service manifest.
     pub fn public_port(&self) -> Option<u16> {
         self.public_port
+    }
+
+    /// Returns the host-facing publication policy for the public port.
+    pub fn public_ingress(&self) -> PublicIngressPolicy {
+        self.public_ingress
     }
 
     /// Returns the backend port public ingress should target for this template.
@@ -987,6 +1007,7 @@ mod tests {
                 readiness: None,
                 public_port: Some(443),
                 public_protocol: None,
+                public_ingress: Default::default(),
                 placement_preferences: Vec::new(),
                 autoscale: None,
             }],

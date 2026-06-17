@@ -75,6 +75,9 @@ struct TaskTemplate {
   publicProtocol @13 :PublicProtocol;
   # Transport protocol(s) for public port (defaults to tcp)
 
+  publicIngress @24 :PublicIngressPolicy;
+  # Nodes that publish publicPort into the host-facing NodePort dataplane.
+
   gpuCount @14 :UInt32;
   # Requested GPU count per replica.
 
@@ -291,6 +294,14 @@ enum PublicProtocol {
 
   tcpUdp @2;
   # Support both TCP and UDP.
+}
+
+enum PublicIngressPolicy {
+  allNodes @0;
+  # Publish publicPort from every node that realizes the network.
+
+  taskNodes @1;
+  # Publish publicPort only from nodes with a healthy selected backend.
 }
 
 enum ServicePlacementPreference {

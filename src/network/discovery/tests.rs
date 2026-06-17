@@ -29,6 +29,60 @@ fn backend(ip: [u8; 4], mac: [u8; 6]) -> BackendAddress {
     }
 }
 
+/// Builds one minimal catalog entry for NodePort publication policy tests.
+fn public_catalog_entry(
+    public_ingress: PublicIngressPolicy,
+    public_port: Option<u16>,
+    local_candidates: Vec<BackendAddress>,
+) -> ServiceBackendCatalogEntry {
+    ServiceBackendCatalogEntry {
+        service_id: Uuid::new_v4(),
+        template_name: "backend".to_string(),
+        discovery_name: "backend.service.svc.mantissa".to_string(),
+        candidates: Vec::new(),
+        local_candidates,
+        readiness: None,
+        expose_to_host: public_port.is_some(),
+        public_port,
+        public_ingress,
+        public_target_port: public_port,
+        public_protocols: vec![NodePortProtocol::Tcp],
+    }
+}
+
+#[test]
+fn all_nodes_public_ingress_publishes_without_local_backend() {
+    let service = public_catalog_entry(PublicIngressPolicy::AllNodes, Some(8080), Vec::new());
+    let selected = vec![backend([10, 42, 0, 10], [2, 0, 0, 0, 0, 10])];
+
+    assert!(should_publish_nodeport(&service, &selected));
+}
+
+#[test]
+fn task_nodes_public_ingress_requires_selected_local_backend() {
+    let local = backend([10, 42, 0, 10], [2, 0, 0, 0, 0, 10]);
+    let remote = backend([10, 42, 0, 11], [2, 0, 0, 0, 0, 11]);
+    let service = public_catalog_entry(
+        PublicIngressPolicy::TaskNodes,
+        Some(8080),
+        vec![local.clone()],
+    );
+
+    assert!(should_publish_nodeport(
+        &service,
+        std::slice::from_ref(&local)
+    ));
+    assert!(!should_publish_nodeport(&service, &[remote]));
+}
+
+#[test]
+fn public_ingress_nodeport_publication_requires_public_port() {
+    let local = backend([10, 42, 0, 10], [2, 0, 0, 0, 0, 10]);
+    let service = public_catalog_entry(PublicIngressPolicy::AllNodes, None, vec![local.clone()]);
+
+    assert!(!should_publish_nodeport(&service, &[local]));
+}
+
 #[test]
 fn filter_cached_backends_excludes_stale_unhealthy_when_alternative_exists() {
     let network_id = Uuid::new_v4();
@@ -612,6 +666,7 @@ async fn upsert_catalog_service_with_public_port(
             readiness,
             public_port,
             public_protocol: None,
+            public_ingress: Default::default(),
             placement_preferences: Vec::new(),
             autoscale: None,
         }],

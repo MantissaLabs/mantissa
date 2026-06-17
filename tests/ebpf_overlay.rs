@@ -219,6 +219,7 @@ fn privileged_http_service_task_template(network_id: Uuid, replicas: u16) -> Tas
         readiness: None,
         public_port: Some(EBPF_HTTP_PORT),
         public_protocol: Some(ServicePortProtocol::Tcp),
+        public_ingress: Default::default(),
         placement_preferences: Vec::new(),
         autoscale: None,
     }
@@ -261,6 +262,7 @@ fn privileged_http_hostname_task_template(
         readiness: None,
         public_port: Some(EBPF_HTTP_PORT),
         public_protocol: Some(ServicePortProtocol::Tcp),
+        public_ingress: Default::default(),
         placement_preferences: Vec::new(),
         autoscale: None,
     }
@@ -297,6 +299,7 @@ fn privileged_udp_service_task_template(network_id: Uuid) -> TaskTemplateSpecVal
         readiness: None,
         public_port: Some(EBPF_UDP_PORT),
         public_protocol: Some(ServicePortProtocol::Udp),
+        public_ingress: Default::default(),
         placement_preferences: Vec::new(),
         autoscale: None,
     }
@@ -333,6 +336,7 @@ fn privileged_frontend_task_template(network_id: Uuid) -> TaskTemplateSpecValue 
         readiness: None,
         public_port: None,
         public_protocol: None,
+        public_ingress: Default::default(),
         placement_preferences: Vec::new(),
         autoscale: None,
     }

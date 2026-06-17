@@ -10,9 +10,10 @@ use capnp::Error as CapnpError;
 use capnp::struct_list;
 use mantissa_protocol::services::{
     AutoscaleMetricKind as ProtoAutoscaleMetricKind, LivenessProbeKind as ProtoLivenessProbeKind,
-    ReadinessProbeKind as ProtoReadinessProbeKind, RolloutPhase as ProtoRolloutPhase,
-    ServiceStatus as ProtoServiceStatus, autoscale_metric, autoscale_policy,
-    replica_assignment_segment, service_spec, service_task_progress, task_template,
+    PublicIngressPolicy as ProtoPublicIngressPolicy, ReadinessProbeKind as ProtoReadinessProbeKind,
+    RolloutPhase as ProtoRolloutPhase, ServiceStatus as ProtoServiceStatus, autoscale_metric,
+    autoscale_policy, replica_assignment_segment, service_spec, service_task_progress,
+    task_template,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -347,9 +348,35 @@ pub struct TaskTemplateRow {
     pub autoscale: Option<TaskTemplateAutoscalePolicyRow>,
     pub networks: Vec<String>,
     pub public_port: Option<u16>,
+    pub public_ingress: TaskTemplatePublicIngressRow,
     pub readiness_port: Option<u16>,
     pub liveness_port: Option<u16>,
     pub ports: Vec<HostPortView>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TaskTemplatePublicIngressRow {
+    #[default]
+    AllNodes,
+    TaskNodes,
+}
+
+impl TaskTemplatePublicIngressRow {
+    /// Converts protocol public-ingress policy values into client row variants.
+    fn from_proto(value: ProtoPublicIngressPolicy) -> Self {
+        match value {
+            ProtoPublicIngressPolicy::AllNodes => Self::AllNodes,
+            ProtoPublicIngressPolicy::TaskNodes => Self::TaskNodes,
+        }
+    }
+
+    /// Returns the manifest label used for compact operator-facing output.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AllNodes => "all_nodes",
+            Self::TaskNodes => "task_nodes",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -427,6 +454,7 @@ impl TaskTemplateRow {
         } else {
             Some(raw_public)
         };
+        let public_ingress = TaskTemplatePublicIngressRow::from_proto(reader.get_public_ingress()?);
 
         let readiness_port = if reader.has_readiness() {
             let readiness = reader.get_readiness()?;
@@ -469,6 +497,7 @@ impl TaskTemplateRow {
             autoscale,
             networks,
             public_port,
+            public_ingress,
             readiness_port,
             liveness_port,
             ports: decode_host_ports(reader.get_ports()?)?,
@@ -687,6 +716,12 @@ async fn attach_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
                     render_socket_endpoint(vip, target_port)
                 )
             };
+            let rendered = match template.public_ingress {
+                TaskTemplatePublicIngressRow::AllNodes => rendered,
+                TaskTemplatePublicIngressRow::TaskNodes => {
+                    format!("{rendered} ({})", template.public_ingress.label())
+                }
+            };
             endpoints.push(rendered);
         }
 
@@ -869,6 +904,7 @@ mod tests {
             autoscale: None,
             networks: vec!["default".to_string()],
             public_port,
+            public_ingress: Default::default(),
             readiness_port,
             liveness_port,
             ports: Vec::new(),

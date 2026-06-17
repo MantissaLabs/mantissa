@@ -224,6 +224,7 @@ mod tests {
             autoscale,
             networks: Vec::new(),
             public_port: None,
+            public_ingress: Default::default(),
             readiness_port: None,
             liveness_port: None,
             ports: Vec::new(),

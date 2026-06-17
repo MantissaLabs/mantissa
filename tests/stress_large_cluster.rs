@@ -404,6 +404,7 @@ fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
             liveness: None,
             tty: false,
             public_port: None,
+            public_ingress: Default::default(),
             placement: Default::default(),
         }],
     }

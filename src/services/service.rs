@@ -5,13 +5,13 @@ use crate::services::manager::{
     ServiceTaskProgressSnapshot,
 };
 use crate::services::types::{
-    ServiceDeploymentPolicy, ServiceEvent, ServicePortProtocol, ServicePreviousGeneration,
-    ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceReplicaAssignmentSegment,
-    ServiceRescheduleLock, ServiceRescheduleReason, ServiceRollingUpdatePolicy,
-    ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue, ServiceStatus,
-    ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskTemplateAutoscaleMetricKindValue,
-    TaskTemplateAutoscaleMetricValue, TaskTemplateAutoscalePolicyValue,
-    TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
+    PublicIngressPolicy, ServiceDeploymentPolicy, ServiceEvent, ServicePortProtocol,
+    ServicePreviousGeneration, ServiceReadinessProbe, ServiceReadinessProbeKind,
+    ServiceReplicaAssignmentSegment, ServiceRescheduleLock, ServiceRescheduleReason,
+    ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState,
+    ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
+    TaskTemplateAutoscaleMetricKindValue, TaskTemplateAutoscaleMetricValue,
+    TaskTemplateAutoscalePolicyValue, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
     compact_service_replica_assignment_segments,
 };
 use crate::topology::Topology;
@@ -1134,6 +1134,12 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
     } else {
         None
     };
+    let public_ingress = match reader.get_public_ingress()? {
+        mantissa_protocol::services::PublicIngressPolicy::AllNodes => PublicIngressPolicy::AllNodes,
+        mantissa_protocol::services::PublicIngressPolicy::TaskNodes => {
+            PublicIngressPolicy::TaskNodes
+        }
+    };
     let placement = read_placement_policy(reader.get_placement()?)?;
     let placement_preferences_reader = reader.get_service_placement_preferences()?;
     let mut placement_preferences = Vec::with_capacity(placement_preferences_reader.len() as usize);
@@ -1186,6 +1192,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
         readiness,
         public_port,
         public_protocol,
+        public_ingress,
         autoscale,
     })
 }
@@ -1492,6 +1499,13 @@ fn write_task_template(
         ServicePortProtocol::TcpUdp => mantissa_protocol::services::PublicProtocol::TcpUdp,
     };
     builder.set_public_protocol(proto);
+    let public_ingress = match template.public_ingress() {
+        PublicIngressPolicy::AllNodes => mantissa_protocol::services::PublicIngressPolicy::AllNodes,
+        PublicIngressPolicy::TaskNodes => {
+            mantissa_protocol::services::PublicIngressPolicy::TaskNodes
+        }
+    };
+    builder.set_public_ingress(public_ingress);
     builder.set_tty(template.tty);
     write_placement_policy(builder.reborrow().init_placement(), template.placement());
     let mut placement_preferences = builder
@@ -1558,13 +1572,14 @@ mod tests {
     };
     use crate::services::registry::ServiceRegistry;
     use crate::services::types::{
-        ServiceDeploymentPolicy, ServiceLivenessProbe, ServiceLivenessProbeKind,
-        ServicePortProtocol, ServicePreviousGeneration, ServiceReadinessProbe,
-        ServiceReadinessProbeKind, ServiceRescheduleLock, ServiceRescheduleReason,
-        ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState,
-        ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy, ServiceUpdateStrategyMode,
-        TaskTemplateNetworkRequirement, TaskTemplateRestartPolicy, TaskTemplateRestartPolicyKind,
-        TaskTemplateSpecValue, derive_service_replica_id,
+        PublicIngressPolicy, ServiceDeploymentPolicy, ServiceLivenessProbe,
+        ServiceLivenessProbeKind, ServicePortProtocol, ServicePreviousGeneration,
+        ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceRescheduleLock,
+        ServiceRescheduleReason, ServiceRollingUpdatePolicy, ServiceRolloutOrder,
+        ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue, ServiceStatus,
+        ServiceUpdateStrategy, ServiceUpdateStrategyMode, TaskTemplateNetworkRequirement,
+        TaskTemplateRestartPolicy, TaskTemplateRestartPolicyKind, TaskTemplateSpecValue,
+        derive_service_replica_id,
     };
     use crate::store::replicated::services::open_service_store;
     use crate::task::types::{
@@ -1616,6 +1631,7 @@ mod tests {
                 readiness: None,
                 public_port: Some(8080),
                 public_protocol: Some(ServicePortProtocol::Tcp),
+                public_ingress: Default::default(),
                 placement_preferences: Vec::new(),
                 autoscale: None,
             }],
@@ -1669,6 +1685,7 @@ mod tests {
             readiness: None,
             public_port: None,
             public_protocol: None,
+            public_ingress: PublicIngressPolicy::TaskNodes,
         };
 
         let mut message = Builder::new_default();
@@ -1695,6 +1712,11 @@ mod tests {
             decoded.placement_preferences(),
             template.placement_preferences(),
             "task-template placement preferences should round-trip through the wire payload"
+        );
+        assert_eq!(
+            decoded.public_ingress(),
+            PublicIngressPolicy::TaskNodes,
+            "public ingress policy should round-trip through the wire payload"
         );
     }
 
@@ -1792,6 +1814,7 @@ mod tests {
             }),
             public_port: Some(443),
             public_protocol: Some(ServicePortProtocol::TcpUdp),
+            public_ingress: Default::default(),
             placement_preferences: Vec::new(),
             autoscale: None,
         };
@@ -1828,6 +1851,7 @@ mod tests {
                 readiness: None,
                 public_port: None,
                 public_protocol: None,
+                public_ingress: Default::default(),
                 placement_preferences: Vec::new(),
                 autoscale: None,
             }],

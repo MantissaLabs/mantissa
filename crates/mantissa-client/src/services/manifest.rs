@@ -361,9 +361,20 @@ pub struct TaskTemplateSpec {
     #[serde(default)]
     pub public_port: Option<u16>,
     #[serde(default)]
+    pub public_ingress: PublicIngressPolicySpec,
+    #[serde(default)]
     pub tty: bool,
     #[serde(default)]
     pub placement: PlacementSpec,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PublicIngressPolicySpec {
+    #[default]
+    AllNodes,
+    TaskNodes,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -639,6 +650,14 @@ impl ServiceManifest {
             if template.public_port.is_some() && template.networks.len() != 1 {
                 return Err(anyhow!(
                     "template '{}' must attach to exactly one network when public_port is set",
+                    template.name
+                ));
+            }
+            if template.public_port.is_none()
+                && template.public_ingress != PublicIngressPolicySpec::AllNodes
+            {
+                return Err(anyhow!(
+                    "template '{}' cannot set public_ingress without public_port",
                     template.name
                 ));
             }
@@ -1215,6 +1234,75 @@ mod tests {
         manifest
             .validate()
             .expect("gang admission should be accepted by the manifest layer");
+    }
+
+    #[test]
+    fn manifest_accepts_task_nodes_public_ingress_policy() {
+        let manifest: ServiceManifest = ron::from_str(
+            r#"
+            (
+                name: "ingress-demo",
+                networks: [
+                    (
+                        name: "frontend",
+                    ),
+                ],
+                tasks: [
+                    (
+                        name: "api",
+                        image: "ghcr.io/demo/api:latest",
+                        resources: (
+                            cpu_millis: 250,
+                            memory_mb: 128,
+                        ),
+                        networks: ["frontend"],
+                        public_port: Some(8080),
+                        public_ingress: task_nodes,
+                    ),
+                ],
+            )
+            "#,
+        )
+        .expect("parse manifest");
+
+        manifest
+            .validate()
+            .expect("task_nodes public ingress should be accepted");
+        assert_eq!(
+            manifest.task_templates[0].public_ingress,
+            PublicIngressPolicySpec::TaskNodes
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_public_ingress_without_public_port() {
+        let manifest: ServiceManifest = ron::from_str(
+            r#"
+            (
+                name: "ingress-demo",
+                tasks: [
+                    (
+                        name: "api",
+                        image: "ghcr.io/demo/api:latest",
+                        resources: (
+                            cpu_millis: 250,
+                            memory_mb: 128,
+                        ),
+                        public_ingress: task_nodes,
+                    ),
+                ],
+            )
+            "#,
+        )
+        .expect("parse manifest");
+
+        let err = manifest
+            .validate()
+            .expect_err("public_ingress without public_port must fail");
+        assert!(
+            err.to_string()
+                .contains("cannot set public_ingress without public_port")
+        );
     }
 
     #[test]
@@ -1815,6 +1903,7 @@ mod tests {
                 readiness: None,
                 liveness: None,
                 public_port: None,
+                public_ingress: Default::default(),
                 tty: false,
                 placement: Default::default(),
             }],
@@ -1863,6 +1952,7 @@ mod tests {
                 }),
                 liveness: None,
                 public_port: None,
+                public_ingress: Default::default(),
                 tty: false,
                 placement: Default::default(),
             }],
@@ -1915,6 +2005,7 @@ mod tests {
                     start_period_ms: 30_000,
                 }),
                 public_port: None,
+                public_ingress: Default::default(),
                 tty: false,
                 placement: Default::default(),
             }],
@@ -1962,6 +2053,7 @@ mod tests {
                 readiness: None,
                 liveness: None,
                 public_port: None,
+                public_ingress: Default::default(),
                 tty: false,
                 placement: Default::default(),
             }],
@@ -2005,6 +2097,7 @@ mod tests {
                 readiness: None,
                 liveness: None,
                 public_port: None,
+                public_ingress: Default::default(),
                 tty: false,
                 placement: PlacementSpec {
                     constraints: vec![PlacementConstraint::eq(
@@ -2066,6 +2159,7 @@ mod tests {
                 readiness: None,
                 liveness: None,
                 public_port: None,
+                public_ingress: Default::default(),
                 tty: false,
                 placement: Default::default(),
             }],
@@ -2174,6 +2268,7 @@ mod tests {
                     readiness: None,
                     liveness: None,
                     public_port: None,
+                    public_ingress: Default::default(),
                     tty: false,
                     placement: Default::default(),
                 },
@@ -2196,6 +2291,7 @@ mod tests {
                     readiness: None,
                     liveness: None,
                     public_port: None,
+                    public_ingress: Default::default(),
                     tty: false,
                     placement: Default::default(),
                 },

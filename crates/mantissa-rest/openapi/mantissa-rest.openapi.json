@@ -1832,6 +1832,16 @@
           },
           "name": {
             "type": "string"
+          },
+          "realization": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NetworkRealizationPolicy"
+              }
+            ]
           }
         },
         "required": [
@@ -1975,6 +1985,16 @@
           "name": {
             "type": "string"
           },
+          "realization": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NetworkRealizationPolicy"
+              }
+            ]
+          },
           "sealed": {
             "type": "boolean"
           },
@@ -2095,6 +2115,14 @@
         ],
         "type": "object"
       },
+      "NetworkRealizationPolicy": {
+        "description": "Policy that decides where Mantissa realizes local network dataplane resources.",
+        "enum": [
+          "all_nodes",
+          "on_demand"
+        ],
+        "type": "string"
+      },
       "NetworkSpec": {
         "description": "REST-facing canonical network specification.",
         "properties": {
@@ -2122,6 +2150,9 @@
             "type": "integer"
           },
           "name": {
+            "type": "string"
+          },
+          "realization": {
             "type": "string"
           },
           "sealed": {
@@ -2154,6 +2185,7 @@
           "updated_at",
           "status",
           "sealed",
+          "realization",
           "bpf_programs"
         ],
         "type": "object"
@@ -2183,6 +2215,9 @@
             "minimum": 0,
             "type": "integer"
           },
+          "realization": {
+            "type": "string"
+          },
           "status": {
             "type": "string"
           },
@@ -2203,6 +2238,7 @@
           "name",
           "driver",
           "status",
+          "realization",
           "vni",
           "subnet_cidr",
           "peer_count",
@@ -2524,6 +2560,21 @@
         "enum": [
           "spread",
           "binpack"
+        ],
+        "type": "string"
+      },
+      "PublicIngressPolicy": {
+        "description": "REST-facing host publication scope for one task template public port.",
+        "enum": [
+          "all_nodes",
+          "task_nodes"
+        ],
+        "type": "string"
+      },
+      "PublicIngressPolicySpec": {
+        "enum": [
+          "all_nodes",
+          "task_nodes"
         ],
         "type": "string"
       },
@@ -3764,6 +3815,9 @@
             },
             "type": "array"
           },
+          "public_ingress": {
+            "$ref": "#/components/schemas/PublicIngressPolicy"
+          },
           "public_port": {
             "format": "int32",
             "minimum": 0,
@@ -3792,6 +3846,7 @@
           "command",
           "replicas",
           "networks",
+          "public_ingress",
           "ports"
         ],
         "type": "object"
@@ -3985,6 +4040,9 @@
               "array",
               "null"
             ]
+          },
+          "public_ingress": {
+            "$ref": "#/components/schemas/PublicIngressPolicySpec"
           },
           "public_port": {
             "format": "int32",
