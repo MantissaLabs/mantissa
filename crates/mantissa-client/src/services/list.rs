@@ -354,27 +354,44 @@ pub struct TaskTemplateRow {
     pub ports: Vec<HostPortView>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum TaskTemplatePublicIngressRow {
     #[default]
     AllNodes,
     TaskNodes,
+    IngressPool {
+        pool: String,
+    },
 }
 
 impl TaskTemplatePublicIngressRow {
-    /// Converts protocol public-ingress policy values into client row variants.
-    fn from_proto(value: ProtoPublicIngressPolicy) -> Self {
-        match value {
+    /// Decodes protocol public-ingress policy values into client row variants.
+    fn from_reader(reader: task_template::Reader<'_>) -> Result<Self, CapnpError> {
+        Ok(match reader.get_public_ingress()? {
             ProtoPublicIngressPolicy::AllNodes => Self::AllNodes,
             ProtoPublicIngressPolicy::TaskNodes => Self::TaskNodes,
-        }
+            ProtoPublicIngressPolicy::IngressPool => {
+                let pool = reader
+                    .get_public_ingress_pool()?
+                    .to_str()?
+                    .trim()
+                    .to_string();
+                if pool.is_empty() {
+                    return Err(CapnpError::failed(
+                        "public ingress pool name must be non-empty".to_string(),
+                    ));
+                }
+                Self::IngressPool { pool }
+            }
+        })
     }
 
     /// Returns the manifest label used for compact operator-facing output.
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> String {
         match self {
-            Self::AllNodes => "all_nodes",
-            Self::TaskNodes => "task_nodes",
+            Self::AllNodes => "all_nodes".to_string(),
+            Self::TaskNodes => "task_nodes".to_string(),
+            Self::IngressPool { pool } => format!("ingress_pool {pool}"),
         }
     }
 }
@@ -454,7 +471,7 @@ impl TaskTemplateRow {
         } else {
             Some(raw_public)
         };
-        let public_ingress = TaskTemplatePublicIngressRow::from_proto(reader.get_public_ingress()?);
+        let public_ingress = TaskTemplatePublicIngressRow::from_reader(reader)?;
 
         let readiness_port = if reader.has_readiness() {
             let readiness = reader.get_readiness()?;
@@ -716,9 +733,10 @@ async fn attach_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
                     render_socket_endpoint(vip, target_port)
                 )
             };
-            let rendered = match template.public_ingress {
+            let rendered = match &template.public_ingress {
                 TaskTemplatePublicIngressRow::AllNodes => rendered,
-                TaskTemplatePublicIngressRow::TaskNodes => {
+                TaskTemplatePublicIngressRow::TaskNodes
+                | TaskTemplatePublicIngressRow::IngressPool { .. } => {
                     format!("{rendered} ({})", template.public_ingress.label())
                 }
             };

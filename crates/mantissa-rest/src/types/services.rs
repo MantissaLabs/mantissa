@@ -142,19 +142,38 @@ impl From<TaskTemplateRow> for TaskTemplate {
 }
 
 /// REST-facing host publication scope for one task template public port.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct PublicIngressPolicy {
+    pub mode: PublicIngressPolicyMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+}
+
+/// REST-facing public-ingress policy mode for one task template public port.
 #[derive(Clone, Copy, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum PublicIngressPolicy {
+pub enum PublicIngressPolicyMode {
     AllNodes,
     TaskNodes,
+    IngressPool,
 }
 
 impl From<TaskTemplatePublicIngressRow> for PublicIngressPolicy {
     /// Converts the client row public-ingress variant into the REST JSON enum.
     fn from(value: TaskTemplatePublicIngressRow) -> Self {
         match value {
-            TaskTemplatePublicIngressRow::AllNodes => Self::AllNodes,
-            TaskTemplatePublicIngressRow::TaskNodes => Self::TaskNodes,
+            TaskTemplatePublicIngressRow::AllNodes => Self {
+                mode: PublicIngressPolicyMode::AllNodes,
+                pool: None,
+            },
+            TaskTemplatePublicIngressRow::TaskNodes => Self {
+                mode: PublicIngressPolicyMode::TaskNodes,
+                pool: None,
+            },
+            TaskTemplatePublicIngressRow::IngressPool { pool } => Self {
+                mode: PublicIngressPolicyMode::IngressPool,
+                pool: Some(pool),
+            },
         }
     }
 }

@@ -368,13 +368,31 @@ pub struct TaskTemplateSpec {
     pub placement: PlacementSpec,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PublicIngressPolicySpec {
     #[default]
     AllNodes,
     TaskNodes,
+    IngressPool {
+        pool: String,
+    },
+}
+
+impl PublicIngressPolicySpec {
+    /// Returns true when the manifest uses the default all-node publication policy.
+    pub fn is_all_nodes(&self) -> bool {
+        matches!(self, Self::AllNodes)
+    }
+
+    /// Returns the normalized ingress pool name when the policy references a pool.
+    pub fn ingress_pool_name(&self) -> Option<&str> {
+        match self {
+            Self::IngressPool { pool } => Some(pool.trim()).filter(|pool| !pool.is_empty()),
+            Self::AllNodes | Self::TaskNodes => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -653,11 +671,19 @@ impl ServiceManifest {
                     template.name
                 ));
             }
-            if template.public_port.is_none()
-                && template.public_ingress != PublicIngressPolicySpec::AllNodes
-            {
+            if template.public_port.is_none() && !template.public_ingress.is_all_nodes() {
                 return Err(anyhow!(
                     "template '{}' cannot set public_ingress without public_port",
+                    template.name
+                ));
+            }
+            if matches!(
+                &template.public_ingress,
+                PublicIngressPolicySpec::IngressPool { .. }
+            ) && template.public_ingress.ingress_pool_name().is_none()
+            {
+                return Err(anyhow!(
+                    "template '{}' must set public_ingress ingress_pool.pool to a non-empty value",
                     template.name
                 ));
             }
@@ -1271,6 +1297,46 @@ mod tests {
         assert_eq!(
             manifest.task_templates[0].public_ingress,
             PublicIngressPolicySpec::TaskNodes
+        );
+    }
+
+    #[test]
+    fn manifest_accepts_ingress_pool_public_ingress_policy() {
+        let manifest: ServiceManifest = ron::from_str(
+            r#"
+            (
+                name: "ingress-demo",
+                networks: [
+                    (
+                        name: "frontend",
+                    ),
+                ],
+                tasks: [
+                    (
+                        name: "api",
+                        image: "ghcr.io/demo/api:latest",
+                        resources: (
+                            cpu_millis: 250,
+                            memory_mb: 128,
+                        ),
+                        networks: ["frontend"],
+                        public_port: Some(8080),
+                        public_ingress: ingress_pool(pool: "public-web"),
+                    ),
+                ],
+            )
+            "#,
+        )
+        .expect("parse manifest");
+
+        manifest
+            .validate()
+            .expect("ingress_pool public ingress should be accepted");
+        assert_eq!(
+            manifest.task_templates[0].public_ingress,
+            PublicIngressPolicySpec::IngressPool {
+                pool: "public-web".to_string()
+            }
         );
     }
 

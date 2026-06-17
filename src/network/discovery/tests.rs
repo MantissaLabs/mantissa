@@ -1,23 +1,30 @@
 use super::*;
+use crate::ingress::registry::IngressPoolRegistry;
 use crate::network::allocator::allocate_overlay_address;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
     NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver,
     NetworkPeerState, NetworkPeerStateValue, NetworkSpecDraft, NetworkSpecValue,
 };
+use crate::registry::Registry;
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
     ServiceSpecValue, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
 };
+use crate::store::local::LocalSessionStore;
+use crate::store::replicated::ingress::open_ingress_pool_store;
 use crate::store::replicated::networks::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
 };
+use crate::store::replicated::peers::open_peers_store;
 use crate::store::replicated::services::open_service_store;
 use crate::store::replicated::workloads::{WorkloadStore, open_workload_store};
 use crate::workload::model::{
     WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata, WorkloadValue, WorkloadValueDraft,
 };
 use crate::workload::types::ExecutionSpec;
+use ed25519_dalek::SigningKey;
+use mantissa_net::noise::NoiseKeys;
 use mantissa_store::uuid_key::UuidKey;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -45,6 +52,7 @@ fn public_catalog_entry(
         expose_to_host: public_port.is_some(),
         public_port,
         public_ingress,
+        ingress_pool_publication: None,
         public_target_port: public_port,
         public_protocols: vec![NodePortProtocol::Tcp],
     }
@@ -73,6 +81,39 @@ fn task_nodes_public_ingress_requires_selected_local_backend() {
         std::slice::from_ref(&local)
     ));
     assert!(!should_publish_nodeport(&service, &[remote]));
+}
+
+#[test]
+fn ingress_pool_public_ingress_requires_ready_selected_local_node() {
+    let mut service = public_catalog_entry(
+        PublicIngressPolicy::IngressPool {
+            pool: "public-web".to_string(),
+        },
+        Some(8080),
+        Vec::new(),
+    );
+    let selected = vec![backend([10, 42, 0, 10], [2, 0, 0, 0, 0, 10])];
+
+    service.ingress_pool_publication = Some(IngressPoolPublicationState {
+        selected_local: true,
+        ready: true,
+        detail: None,
+    });
+    assert!(should_publish_nodeport(&service, &selected));
+
+    service.ingress_pool_publication = Some(IngressPoolPublicationState {
+        selected_local: false,
+        ready: true,
+        detail: None,
+    });
+    assert!(!should_publish_nodeport(&service, &selected));
+
+    service.ingress_pool_publication = Some(IngressPoolPublicationState {
+        selected_local: true,
+        ready: false,
+        detail: Some("ingress pool 'public-web' selected 1/2 required nodes".to_string()),
+    });
+    assert!(!should_publish_nodeport(&service, &selected));
 }
 
 #[test]
@@ -487,6 +528,8 @@ async fn setup_catalog_harness_with_driver(driver: NetworkDriver) -> CatalogHarn
 
     let discovery = ServiceDiscovery::new_with_dns_port(
         registry.clone(),
+        test_cluster_registry(actor).await,
+        test_ingress_pool_registry(actor).await,
         workloads.clone(),
         services.clone(),
         NetworkBpfManager::unavailable(),
@@ -508,6 +551,45 @@ async fn setup_catalog_harness_with_driver(driver: NetworkDriver) -> CatalogHarn
         runtime,
         local_node_id: actor,
     }
+}
+
+/// Builds an empty cluster peer registry for discovery catalog tests.
+async fn test_cluster_registry(actor: Uuid) -> Registry {
+    let dir = tempdir().expect("peer tempdir");
+    let db = Arc::new(
+        redb::Database::create(dir.path().join(format!("peers-{}.redb", Uuid::new_v4())))
+            .expect("create peer db"),
+    );
+    let peers = open_peers_store(db.clone(), actor).expect("open peers store");
+    peers
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild peer store");
+    let noise_keys = NoiseKeys::from_private_bytes([0x31; 32]);
+    let sessions = LocalSessionStore::open(db, &noise_keys).expect("open local sessions");
+    Registry::new(
+        peers,
+        sessions,
+        SigningKey::from_bytes(&[0x32; 32]),
+        Arc::new(noise_keys),
+        actor,
+        HealthMonitor::new(actor),
+    )
+}
+
+/// Builds an empty ingress pool registry for discovery catalog tests.
+async fn test_ingress_pool_registry(actor: Uuid) -> IngressPoolRegistry {
+    let dir = tempdir().expect("ingress tempdir");
+    let db = Arc::new(
+        redb::Database::create(dir.path().join(format!("ingress-{}.redb", Uuid::new_v4())))
+            .expect("create ingress db"),
+    );
+    let store = open_ingress_pool_store(db, actor).expect("open ingress pool store");
+    store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild ingress pool store");
+    IngressPoolRegistry::new(store)
 }
 
 /// Refreshes the derived backend catalog using the same network-scoped runtime bundle as

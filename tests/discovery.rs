@@ -2,27 +2,34 @@
 mod common;
 
 use anyhow::Context;
+use ed25519_dalek::SigningKey;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
+use mantissa::ingress::registry::IngressPoolRegistry;
 use mantissa::network::discovery::ServiceDiscovery;
 use mantissa::network::registry::NetworkRegistry;
 use mantissa::network::types::{
     NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver,
     NetworkPeerState, NetworkPeerStateValue, NetworkSpecDraft, NetworkSpecValue,
 };
+use mantissa::registry::Registry;
 use mantissa::services::registry::ServiceRegistry;
 use mantissa::services::types::{
     ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceSpecValue,
     TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
 };
+use mantissa::store::local::LocalSessionStore;
+use mantissa::store::replicated::ingress::open_ingress_pool_store;
 use mantissa::store::replicated::networks::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
 };
+use mantissa::store::replicated::peers::open_peers_store;
 use mantissa::store::replicated::services::open_service_store;
 use mantissa::store::replicated::workloads::open_workload_store;
 use mantissa::task::types::{TaskServiceMetadata, TaskValue, TaskValueDraft};
 use mantissa::workload::model::{WorkloadOwner, WorkloadPhase};
 use mantissa::workload::types::ExecutionSpec;
+use mantissa_net::noise::NoiseKeys;
 use mantissa_store::uuid_key::UuidKey;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -102,6 +109,8 @@ async fn setup_discovery_harness_with_subnet(dns_port: u16, subnet_cidr: &str) -
     let registry = NetworkRegistry::new(spec_store, peer_store, attachment_store);
     let discovery = ServiceDiscovery::new_with_dns_port(
         registry.clone(),
+        test_cluster_registry(actor).await,
+        test_ingress_pool_registry(actor).await,
         workloads.clone(),
         services.clone(),
         mantissa::network::bpf::NetworkBpfManager::unavailable(),
@@ -132,6 +141,45 @@ async fn setup_discovery_harness_with_subnet(dns_port: u16, subnet_cidr: &str) -
         discovery,
         network,
     }
+}
+
+/// Builds an empty cluster peer registry for discovery integration tests.
+async fn test_cluster_registry(actor: Uuid) -> Registry {
+    let dir = tempdir().expect("peer tempdir");
+    let db = Arc::new(
+        redb::Database::create(dir.path().join(format!("peers-{}.redb", Uuid::new_v4())))
+            .expect("create peer db"),
+    );
+    let peers = open_peers_store(db.clone(), actor).expect("open peers store");
+    peers
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild peers store");
+    let noise_keys = NoiseKeys::from_private_bytes([0x41; 32]);
+    let sessions = LocalSessionStore::open(db, &noise_keys).expect("open local sessions");
+    Registry::new(
+        peers,
+        sessions,
+        SigningKey::from_bytes(&[0x42; 32]),
+        Arc::new(noise_keys),
+        actor,
+        mantissa_health::HealthMonitor::new(actor),
+    )
+}
+
+/// Builds an empty ingress pool registry for discovery integration tests.
+async fn test_ingress_pool_registry(actor: Uuid) -> IngressPoolRegistry {
+    let dir = tempdir().expect("ingress tempdir");
+    let db = Arc::new(
+        redb::Database::create(dir.path().join(format!("ingress-{}.redb", Uuid::new_v4())))
+            .expect("create ingress db"),
+    );
+    let store = open_ingress_pool_store(db, actor).expect("open ingress pool store");
+    store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild ingress pool store");
+    IngressPoolRegistry::new(store)
 }
 
 /// Creates a minimal running task value owned by the supplied node.

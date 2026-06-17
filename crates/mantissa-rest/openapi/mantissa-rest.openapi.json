@@ -2565,18 +2565,65 @@
       },
       "PublicIngressPolicy": {
         "description": "REST-facing host publication scope for one task template public port.",
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/PublicIngressPolicyMode"
+          },
+          "pool": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "type": "object"
+      },
+      "PublicIngressPolicyMode": {
+        "description": "REST-facing public-ingress policy mode for one task template public port.",
         "enum": [
           "all_nodes",
-          "task_nodes"
+          "task_nodes",
+          "ingress_pool"
         ],
         "type": "string"
       },
       "PublicIngressPolicySpec": {
-        "enum": [
-          "all_nodes",
-          "task_nodes"
-        ],
-        "type": "string"
+        "oneOf": [
+          {
+            "enum": [
+              "all_nodes"
+            ],
+            "type": "string"
+          },
+          {
+            "enum": [
+              "task_nodes"
+            ],
+            "type": "string"
+          },
+          {
+            "properties": {
+              "ingress_pool": {
+                "properties": {
+                  "pool": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pool"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "ingress_pool"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ReadinessKind": {
         "enum": [

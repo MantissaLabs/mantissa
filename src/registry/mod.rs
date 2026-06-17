@@ -700,6 +700,11 @@ impl Registry {
         Ok(out)
     }
 
+    /// Returns the peer store change clock for derived-view cache invalidation.
+    pub fn peer_store_change_clock(&self) -> u64 {
+        self.peers.change_clock()
+    }
+
     /// Updates the local node's advertised WireGuard state in the peers store.
     ///
     /// This allows the data plane (network controller) to mark WireGuard as ready once the kernel

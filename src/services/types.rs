@@ -694,9 +694,7 @@ pub enum ServicePortProtocol {
 }
 
 /// Host-facing publication scope for a service template's public port.
-#[derive(
-    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
-)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicIngressPolicy {
     /// Publish NodePort mappings from every node that realizes the network.
@@ -704,6 +702,8 @@ pub enum PublicIngressPolicy {
     AllNodes,
     /// Publish NodePort mappings only where a selected healthy backend is local.
     TaskNodes,
+    /// Publish NodePort mappings only from nodes selected by the named ingress pool.
+    IngressPool { pool: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -795,7 +795,7 @@ impl TaskTemplateSpecValue {
 
     /// Returns the host-facing publication policy for the public port.
     pub fn public_ingress(&self) -> PublicIngressPolicy {
-        self.public_ingress
+        self.public_ingress.clone()
     }
 
     /// Returns the backend port public ingress should target for this template.

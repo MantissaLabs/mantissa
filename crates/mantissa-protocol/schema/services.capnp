@@ -78,6 +78,9 @@ struct TaskTemplate {
   publicIngress @24 :PublicIngressPolicy;
   # Nodes that publish publicPort into the host-facing NodePort dataplane.
 
+  publicIngressPool @25 :Text;
+  # Ingress pool name when publicIngress is ingressPool.
+
   gpuCount @14 :UInt32;
   # Requested GPU count per replica.
 
@@ -302,6 +305,9 @@ enum PublicIngressPolicy {
 
   taskNodes @1;
   # Publish publicPort only from nodes with a healthy selected backend.
+
+  ingressPool @2;
+  # Publish publicPort only from nodes selected by a named ingress pool.
 }
 
 enum ServicePlacementPreference {

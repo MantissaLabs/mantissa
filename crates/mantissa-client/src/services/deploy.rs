@@ -350,12 +350,16 @@ fn write_task_template(
     }
 
     builder.set_public_port(template.public_port.unwrap_or(0));
-    let public_ingress = match template.public_ingress {
+    let public_ingress = match &template.public_ingress {
         PublicIngressPolicySpec::AllNodes => {
             mantissa_protocol::services::PublicIngressPolicy::AllNodes
         }
         PublicIngressPolicySpec::TaskNodes => {
             mantissa_protocol::services::PublicIngressPolicy::TaskNodes
+        }
+        PublicIngressPolicySpec::IngressPool { pool } => {
+            builder.set_public_ingress_pool(pool.trim());
+            mantissa_protocol::services::PublicIngressPolicy::IngressPool
         }
     };
     builder.set_public_ingress(public_ingress);

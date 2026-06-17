@@ -74,6 +74,11 @@ impl IngressPoolRegistry {
         Ok(specs)
     }
 
+    /// Returns the ingress pool store change clock for derived-view invalidation.
+    pub fn change_clock(&self) -> u64 {
+        self.store.change_clock()
+    }
+
     /// Derives the current selected node set for one ingress pool and candidate set.
     pub fn select_nodes(
         &self,

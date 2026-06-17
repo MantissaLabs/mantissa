@@ -1,3 +1,5 @@
+use crate::ingress::registry::IngressPoolRegistry;
+use crate::ingress::types::IngressPoolSpecValue;
 use crate::network::allocator::{OverlayIpFamily, parse_overlay_cidr};
 use crate::network::attachment::{bridge_name, host_access_host_iface_name, vxlan_name};
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
@@ -5,6 +7,8 @@ use crate::network::lb::{BackendAddress, BpfLoadBalancer};
 use crate::network::nodeport::{NodePortManager, NodePortMapping, NodePortProtocol};
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{NetworkAttachmentState, NetworkDriver, NetworkSpecValue};
+use crate::registry::Registry;
+use crate::scheduler::placement::PlacementNode;
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
     PublicIngressPolicy, ServicePortProtocol, ServiceReadinessProbe, ServiceReadinessProbeKind,
@@ -73,6 +77,8 @@ const HEALTHY_READINESS_RECHECK_FLOOR: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct ServiceDiscovery {
     registry: NetworkRegistry,
+    cluster_registry: Registry,
+    ingress_pools: IngressPoolRegistry,
     workloads: WorkloadStore,
     services: ServiceRegistry,
     bpf: NetworkBpfManager,
@@ -102,6 +108,8 @@ struct DnsServerHandle {
 #[derive(Clone)]
 struct DiscoveryRuntime {
     registry: NetworkRegistry,
+    cluster_registry: Registry,
+    ingress_pools: IngressPoolRegistry,
     workloads: WorkloadStore,
     services: ServiceRegistry,
     bpf: NetworkBpfManager,
@@ -124,6 +132,8 @@ struct NetworkBackendCatalog {
     workload_generation: u64,
     service_generation: u64,
     peer_generation: u64,
+    cluster_peer_generation: u64,
+    ingress_pool_generation: u64,
     health_fingerprint: u64,
     /// Service-template catalog entries keyed by `<template>.<service>` in DNS-normalized form.
     services: HashMap<String, ServiceBackendCatalogEntry>,
@@ -142,6 +152,8 @@ impl Default for NetworkBackendCatalog {
             workload_generation: u64::MAX,
             service_generation: u64::MAX,
             peer_generation: u64::MAX,
+            cluster_peer_generation: u64::MAX,
+            ingress_pool_generation: u64::MAX,
             health_fingerprint: u64::MAX,
             services: HashMap::new(),
         }
@@ -160,8 +172,17 @@ struct ServiceBackendCatalogEntry {
     expose_to_host: bool,
     public_port: Option<u16>,
     public_ingress: PublicIngressPolicy,
+    ingress_pool_publication: Option<IngressPoolPublicationState>,
     public_target_port: Option<u16>,
     public_protocols: Vec<NodePortProtocol>,
+}
+
+/// Derived ingress-pool publication state for one service template on this node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IngressPoolPublicationState {
+    selected_local: bool,
+    ready: bool,
+    detail: Option<String>,
 }
 
 /// Refresh result for one discoverable service label, including public endpoint status.
@@ -190,6 +211,8 @@ impl ServiceDiscovery {
     /// Build service discovery with the default DNS bind port (53).
     pub fn new(
         registry: NetworkRegistry,
+        cluster_registry: Registry,
+        ingress_pools: IngressPoolRegistry,
         workloads: WorkloadStore,
         services: ServiceRegistry,
         bpf: NetworkBpfManager,
@@ -198,6 +221,8 @@ impl ServiceDiscovery {
     ) -> Self {
         Self::new_with_dns_port(
             registry,
+            cluster_registry,
+            ingress_pools,
             workloads,
             services,
             bpf,
@@ -212,6 +237,8 @@ impl ServiceDiscovery {
     /// Tests use this to run DNS flows unprivileged on high ports while production keeps 53.
     pub fn new_with_dns_port(
         registry: NetworkRegistry,
+        cluster_registry: Registry,
+        ingress_pools: IngressPoolRegistry,
         workloads: WorkloadStore,
         services: ServiceRegistry,
         bpf: NetworkBpfManager,
@@ -221,6 +248,8 @@ impl ServiceDiscovery {
     ) -> Self {
         Self {
             registry,
+            cluster_registry,
+            ingress_pools,
             workloads,
             services,
             bpf,
@@ -250,6 +279,8 @@ impl ServiceDiscovery {
     ) -> DiscoveryRuntime {
         DiscoveryRuntime {
             registry: self.registry.clone(),
+            cluster_registry: self.cluster_registry.clone(),
+            ingress_pools: self.ingress_pools.clone(),
             workloads: self.workloads.clone(),
             services: self.services.clone(),
             bpf: self.bpf.clone(),
@@ -735,6 +766,164 @@ fn build_task_template_index(specs: &[ServiceSpecValue]) -> HashMap<Uuid, (Strin
     index
 }
 
+/// Builds ingress-pool publication state once per distinct pool referenced by this network.
+fn build_ingress_pool_publication_states(
+    runtime: &DiscoveryRuntime,
+    service_specs: &[ServiceSpecValue],
+    health_snapshot: &HashMap<Uuid, HealthStatus>,
+) -> Result<HashMap<String, IngressPoolPublicationState>> {
+    let pool_names = referenced_ingress_pool_names(service_specs, runtime.network_id);
+    if pool_names.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut states = HashMap::with_capacity(pool_names.len());
+    let mut resolved_pools = Vec::new();
+    for pool_name in pool_names {
+        match runtime
+            .ingress_pools
+            .get_by_name(&pool_name)
+            .with_context(|| format!("load ingress pool '{pool_name}'"))?
+        {
+            Some(pool) => resolved_pools.push((pool_name, pool)),
+            None => {
+                states.insert(
+                    pool_name.clone(),
+                    IngressPoolPublicationState {
+                        selected_local: false,
+                        ready: false,
+                        detail: Some(format!("ingress pool '{pool_name}' is not defined")),
+                    },
+                );
+            }
+        }
+    }
+
+    if resolved_pools.is_empty() {
+        return Ok(states);
+    }
+
+    let candidates = ingress_pool_candidate_nodes(runtime, health_snapshot)?;
+    for (pool_name, pool) in resolved_pools {
+        states.insert(
+            pool_name,
+            select_ingress_pool_publication_state(runtime, &pool, &candidates),
+        );
+    }
+
+    Ok(states)
+}
+
+/// Returns normalized ingress-pool names referenced by templates attached to one network.
+fn referenced_ingress_pool_names(
+    service_specs: &[ServiceSpecValue],
+    network_id: Uuid,
+) -> HashSet<String> {
+    let mut pool_names = HashSet::new();
+    for spec in service_specs {
+        for template in &spec.task_templates {
+            if !template
+                .networks
+                .iter()
+                .any(|net| net.network_id == network_id)
+            {
+                continue;
+            }
+            if let PublicIngressPolicy::IngressPool { pool } = &template.public_ingress {
+                let pool_name = pool.trim();
+                if !pool_name.is_empty() {
+                    pool_names.insert(pool_name.to_string());
+                }
+            }
+        }
+    }
+    pool_names
+}
+
+/// Looks up precomputed ingress-pool state for one service publication policy.
+fn ingress_pool_publication_state(
+    policy: &PublicIngressPolicy,
+    states: &HashMap<String, IngressPoolPublicationState>,
+) -> Option<IngressPoolPublicationState> {
+    let PublicIngressPolicy::IngressPool { pool } = policy else {
+        return None;
+    };
+    let pool_name = pool.trim();
+    if pool_name.is_empty() {
+        return Some(IngressPoolPublicationState {
+            selected_local: false,
+            ready: false,
+            detail: Some("ingress pool name is empty".to_string()),
+        });
+    }
+
+    states.get(pool_name).cloned().or_else(|| {
+        Some(IngressPoolPublicationState {
+            selected_local: false,
+            ready: false,
+            detail: Some(format!("ingress pool '{pool_name}' is not defined")),
+        })
+    })
+}
+
+/// Selects this node's publication state for one resolved ingress pool.
+fn select_ingress_pool_publication_state(
+    runtime: &DiscoveryRuntime,
+    pool_spec: &IngressPoolSpecValue,
+    candidates: &[PlacementNode],
+) -> IngressPoolPublicationState {
+    let selection = runtime.ingress_pools.select_nodes(pool_spec, candidates);
+    let selected_local = selection
+        .selected_nodes
+        .iter()
+        .any(|node| node.node_id == runtime.local_node_id);
+    let ready = selection.is_ready();
+    let detail = (!ready).then(|| {
+        format!(
+            "ingress pool '{}' selected {}/{} required nodes from {} eligible candidates",
+            selection.pool_name,
+            selection.selected_nodes.len(),
+            selection.min_nodes,
+            selection.eligible_count
+        )
+    });
+
+    IngressPoolPublicationState {
+        selected_local,
+        ready,
+        detail,
+    }
+}
+
+/// Builds scheduler-visible ingress pool candidates from converged peer metadata.
+fn ingress_pool_candidate_nodes(
+    runtime: &DiscoveryRuntime,
+    health_snapshot: &HashMap<Uuid, HealthStatus>,
+) -> Result<Vec<PlacementNode>> {
+    let peers = runtime
+        .cluster_registry
+        .peer_values_snapshot()
+        .context("load peer metadata for ingress pool selection")?;
+    let mut candidates = Vec::with_capacity(peers.len());
+    for (node_id, value) in peers {
+        if !value.scheduling.schedulable || !value.readiness.is_ready() {
+            continue;
+        }
+        if matches!(health_snapshot.get(&node_id), Some(HealthStatus::Down)) {
+            continue;
+        }
+        candidates.push(PlacementNode::new(
+            node_id,
+            value.hostname,
+            value.address,
+            value.platform_os,
+            value.platform_arch,
+            value.labels.labels,
+        ));
+    }
+    Ok(candidates)
+}
+
 /// Derive the deterministic service VIP from the DNS identity, network, and IP family.
 fn compute_service_vip(
     registry: &NetworkRegistry,
@@ -882,6 +1071,8 @@ async fn refresh_backend_catalog_if_needed(
     let workload_generation = runtime.workloads.change_clock();
     let service_generation = runtime.services.change_clock();
     let peer_generation = runtime.registry.peer_change_clock();
+    let cluster_peer_generation = runtime.cluster_registry.peer_store_change_clock();
+    let ingress_pool_generation = runtime.ingress_pools.change_clock();
     let health_fingerprint = health_snapshot_fingerprint(health_snapshot);
 
     let previous_services = {
@@ -890,6 +1081,8 @@ async fn refresh_backend_catalog_if_needed(
             && guard.workload_generation == workload_generation
             && guard.service_generation == service_generation
             && guard.peer_generation == peer_generation
+            && guard.cluster_peer_generation == cluster_peer_generation
+            && guard.ingress_pool_generation == ingress_pool_generation
             && guard.health_fingerprint == health_fingerprint
         {
             return Ok(());
@@ -901,6 +1094,8 @@ async fn refresh_backend_catalog_if_needed(
         .services
         .list()
         .context("load service specs for backend catalog refresh")?;
+    let ingress_pool_states =
+        build_ingress_pool_publication_states(runtime, &service_specs, health_snapshot)?;
     let template_index = build_task_template_index(&service_specs);
     let resolver = ServiceBackendResolver {
         runtime,
@@ -929,6 +1124,9 @@ async fn refresh_backend_catalog_if_needed(
             } else {
                 Vec::new()
             };
+            let public_ingress = template.public_ingress();
+            let ingress_pool_publication =
+                ingress_pool_publication_state(&public_ingress, &ingress_pool_states);
             let service_key = discovery_name.clone();
 
             next_services.insert(
@@ -942,7 +1140,8 @@ async fn refresh_backend_catalog_if_needed(
                     readiness: template.readiness().cloned(),
                     expose_to_host: public_port.is_some(),
                     public_port,
-                    public_ingress: template.public_ingress(),
+                    public_ingress,
+                    ingress_pool_publication,
                     public_target_port,
                     public_protocols,
                 },
@@ -971,6 +1170,8 @@ async fn refresh_backend_catalog_if_needed(
     guard.workload_generation = workload_generation;
     guard.service_generation = service_generation;
     guard.peer_generation = peer_generation;
+    guard.cluster_peer_generation = cluster_peer_generation;
+    guard.ingress_pool_generation = ingress_pool_generation;
     guard.health_fingerprint = health_fingerprint;
     guard.services = next_services;
     Ok(())
@@ -1136,9 +1337,17 @@ async fn refresh_single_service(
     {
         let vip_port = service.public_target_port.unwrap_or(port);
         if !publish_nodeport {
+            let public_endpoint = public_ingress_suppression_detail(service).map(|detail| {
+                PublicEndpointObservation {
+                    service_id: service.service_id,
+                    template_name: service.template_name.clone(),
+                    port,
+                    detail: Some(detail),
+                }
+            });
             return Ok(ServiceRefreshResult {
                 nodeport_mappings: Vec::new(),
-                public_endpoint: None,
+                public_endpoint,
                 host_vip: None,
             });
         }
@@ -1203,12 +1412,33 @@ fn should_publish_nodeport(
     if service.public_port.is_none() {
         return false;
     }
-    match service.public_ingress {
+    match &service.public_ingress {
         PublicIngressPolicy::AllNodes => true,
         PublicIngressPolicy::TaskNodes => {
             selected_backends_include_local(selected_backends, &service.local_candidates)
         }
+        PublicIngressPolicy::IngressPool { .. } => service
+            .ingress_pool_publication
+            .as_ref()
+            .is_some_and(|state| state.ready && state.selected_local),
     }
+}
+
+/// Returns the public-endpoint detail for publication policies that are blocked locally.
+fn public_ingress_suppression_detail(service: &ServiceBackendCatalogEntry) -> Option<String> {
+    let PublicIngressPolicy::IngressPool { pool } = &service.public_ingress else {
+        return None;
+    };
+    let state = service.ingress_pool_publication.as_ref()?;
+    if state.ready {
+        return None;
+    }
+    Some(
+        state
+            .detail
+            .clone()
+            .unwrap_or_else(|| format!("ingress pool '{pool}' is not ready")),
+    )
 }
 
 /// Returns true when at least one selected healthy backend belongs to the local node.

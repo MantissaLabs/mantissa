@@ -30,7 +30,7 @@ pub(super) async fn spawn_dns_server(
     }
     let mut refresh_shutdown = shutdown_rx.clone();
     let refresh_runtime = runtime.clone();
-    let refresh_task = tokio::spawn(async move {
+    let refresh_task = tokio::task::spawn_local(async move {
         let mut refresh = time::interval(REFRESH_INTERVAL);
         loop {
             tokio::select! {
@@ -54,7 +54,7 @@ pub(super) async fn spawn_dns_server(
 
     let mut dns_shutdown = shutdown_rx.clone();
     let dns_runtime = runtime.clone();
-    let dns_task = tokio::spawn(async move {
+    let dns_task = tokio::task::spawn_local(async move {
         let mut buf = vec![0u8; 2048];
         loop {
             tokio::select! {
@@ -94,7 +94,7 @@ pub(super) async fn spawn_dns_server(
         );
     });
 
-    let server = tokio::spawn(async move {
+    let server = tokio::task::spawn_local(async move {
         let _ = refresh_task.await;
         let _ = dns_task.await;
     });

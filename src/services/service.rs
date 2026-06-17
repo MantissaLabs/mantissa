@@ -1139,6 +1139,19 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
         mantissa_protocol::services::PublicIngressPolicy::TaskNodes => {
             PublicIngressPolicy::TaskNodes
         }
+        mantissa_protocol::services::PublicIngressPolicy::IngressPool => {
+            let pool = reader
+                .get_public_ingress_pool()?
+                .to_str()?
+                .trim()
+                .to_string();
+            if pool.is_empty() {
+                return Err(Error::failed(
+                    "public ingress pool name must be non-empty".to_string(),
+                ));
+            }
+            PublicIngressPolicy::IngressPool { pool }
+        }
     };
     let placement = read_placement_policy(reader.get_placement()?)?;
     let placement_preferences_reader = reader.get_service_placement_preferences()?;
@@ -1499,13 +1512,18 @@ fn write_task_template(
         ServicePortProtocol::TcpUdp => mantissa_protocol::services::PublicProtocol::TcpUdp,
     };
     builder.set_public_protocol(proto);
-    let public_ingress = match template.public_ingress() {
+    let public_ingress = template.public_ingress();
+    let public_ingress_proto = match &public_ingress {
         PublicIngressPolicy::AllNodes => mantissa_protocol::services::PublicIngressPolicy::AllNodes,
         PublicIngressPolicy::TaskNodes => {
             mantissa_protocol::services::PublicIngressPolicy::TaskNodes
         }
+        PublicIngressPolicy::IngressPool { pool } => {
+            builder.set_public_ingress_pool(pool);
+            mantissa_protocol::services::PublicIngressPolicy::IngressPool
+        }
     };
-    builder.set_public_ingress(public_ingress);
+    builder.set_public_ingress(public_ingress_proto);
     builder.set_tty(template.tty);
     write_placement_policy(builder.reborrow().init_placement(), template.placement());
     let mut placement_preferences = builder
@@ -1683,9 +1701,11 @@ mod tests {
             depends_on: Vec::new(),
             replicas: 1,
             readiness: None,
-            public_port: None,
+            public_port: Some(8080),
             public_protocol: None,
-            public_ingress: PublicIngressPolicy::TaskNodes,
+            public_ingress: PublicIngressPolicy::IngressPool {
+                pool: "public-web".to_string(),
+            },
         };
 
         let mut message = Builder::new_default();
@@ -1715,7 +1735,9 @@ mod tests {
         );
         assert_eq!(
             decoded.public_ingress(),
-            PublicIngressPolicy::TaskNodes,
+            PublicIngressPolicy::IngressPool {
+                pool: "public-web".to_string(),
+            },
             "public ingress policy should round-trip through the wire payload"
         );
     }

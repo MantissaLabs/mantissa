@@ -2,6 +2,7 @@ use super::{BootstrapContext, BootstrapResult, stores::BootstrapStores};
 use crate::agents::{AgentController, AgentControllerConfig, AgentRegistry, AgentsRpc};
 use crate::cluster::{ClusterViewState, RootSchemaState};
 use crate::gossip::{DEFAULT_FANOUT, DedupeStateHandle, Message};
+use crate::ingress::registry::IngressPoolRegistry;
 use crate::jobs::{JobController, JobControllerConfig, JobRegistry, JobsRpc};
 use crate::network::controller::NetworkController;
 use crate::network::gossip::NetworkGossiper;
@@ -495,6 +496,7 @@ async fn build_runtime_components(
     let workload_registry = WorkloadRegistry::new(stores.workloads.clone());
     let service_registry = services::ServiceRegistry::new(stores.services.clone());
     let volume_registry = VolumeRegistry::new(stores.volumes.clone(), stores.volume_nodes.clone());
+    let ingress_pool_registry = IngressPoolRegistry::new(stores.ingress_pools.clone());
     let registry = build_registry(ctx, stores, health_monitor.clone());
     let scheduler = build_scheduler(ctx, stores, registry.clone()).await?;
     let runtime_set = build_runtime_set(options).await?;
@@ -570,6 +572,7 @@ async fn build_runtime_components(
         NetworkController::new(crate::network::controller::NetworkControllerInit {
             registry: network_registry.clone(),
             cluster_registry: registry.clone(),
+            ingress_pools: ingress_pool_registry.clone(),
             workload_store: stores.workloads.clone(),
             service_registry: service_registry.clone(),
             node_id: ctx.self_id,

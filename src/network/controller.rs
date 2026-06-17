@@ -1,5 +1,6 @@
 use crate::config;
 use crate::gossip::Message;
+use crate::ingress::registry::IngressPoolRegistry;
 use crate::network::allocator::{parse_overlay_cidr, resolver_ip_address};
 use crate::network::attachment::{PlatformAttachmentProvisioner, host_iface_name};
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext, overlay_bpf_program_specs};
@@ -99,6 +100,7 @@ struct NetworkControllerInner {
 pub struct NetworkControllerInit {
     pub registry: NetworkRegistry,
     pub cluster_registry: Registry,
+    pub ingress_pools: IngressPoolRegistry,
     pub workload_store: WorkloadStore,
     pub service_registry: ServiceRegistry,
     pub node_id: Uuid,
@@ -133,6 +135,7 @@ impl NetworkController {
         let NetworkControllerInit {
             registry,
             cluster_registry,
+            ingress_pools,
             workload_store,
             service_registry,
             node_id,
@@ -169,6 +172,8 @@ impl NetworkController {
 
         let discovery = ServiceDiscovery::new(
             registry.clone(),
+            cluster_registry.clone(),
+            ingress_pools,
             workload_store,
             service_registry,
             bpf.clone(),
