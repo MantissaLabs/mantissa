@@ -807,6 +807,7 @@ fn build_sync_stores(stores: &BootstrapStores) -> SyncStores {
         volumes: stores.volumes.clone(),
         volume_nodes: stores.volume_nodes.clone(),
         scheduler_digests: stores.scheduler_digests.clone(),
+        ingress_pools: stores.ingress_pools.clone(),
     })
 }
 

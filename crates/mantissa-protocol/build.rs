@@ -17,6 +17,7 @@ fn main() {
         .file("schema/health.capnp")
         .file("schema/secrets.capnp")
         .file("schema/network.capnp")
+        .file("schema/ingress.capnp")
         .file("schema/volumes.capnp")
         .file("schema/rest.capnp");
     cmd.run().expect("capnp compile schemas");

@@ -68,6 +68,9 @@ enum Domain {
 
   secretMasterKeys @13;
   # Per-recipient encrypted secret master-key grants and activation metadata.
+
+  ingressPools @14;
+  # Replicated public ingress pool intent.
 }
 
 struct PageRange {

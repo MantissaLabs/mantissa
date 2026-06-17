@@ -4,6 +4,7 @@ pub mod agents;
 pub mod cluster_views;
 mod compaction;
 pub mod gc;
+pub mod ingress;
 pub mod jobs;
 pub mod networks;
 mod open;

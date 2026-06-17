@@ -14,6 +14,7 @@ use crate::store::local::{
 };
 use crate::store::replicated::agents::{AgentStore, open_agent_store};
 use crate::store::replicated::cluster_views::ClusterViewStore;
+use crate::store::replicated::ingress::{IngressPoolStore, open_ingress_pool_store};
 use crate::store::replicated::jobs::{JobStore, open_job_store};
 use crate::store::replicated::networks::{
     NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore, open_network_attachment_store,
@@ -73,6 +74,7 @@ pub struct BootstrapStores {
     pub network_attachments: NetworkAttachmentStore,
     pub volumes: VolumeSpecStore,
     pub volume_nodes: VolumeNodeStore,
+    pub ingress_pools: IngressPoolStore,
     pub secret_keyring: Arc<RwLock<SecretKeyring>>,
 }
 
@@ -168,6 +170,9 @@ impl BootstrapStores {
         let volume_nodes = open_volume_node_store(ctx.db.clone(), ctx.self_id)?;
         volume_nodes.rebuild_mst_from_disk().await?;
 
+        let ingress_pools = open_ingress_pool_store(ctx.db.clone(), ctx.self_id)?;
+        ingress_pools.rebuild_mst_from_disk().await?;
+
         Ok(Self {
             peers,
             cluster_operations,
@@ -191,6 +196,7 @@ impl BootstrapStores {
             network_attachments,
             volumes,
             volume_nodes,
+            ingress_pools,
             secret_keyring,
         })
     }

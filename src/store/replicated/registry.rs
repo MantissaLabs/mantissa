@@ -7,6 +7,7 @@
 
 use crate::store::replicated::agents::AgentStore;
 use crate::store::replicated::cluster_views::ClusterViewDomainStore;
+use crate::store::replicated::ingress::IngressPoolStore;
 use crate::store::replicated::jobs::JobStore;
 use crate::store::replicated::networks::{
     NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore,
@@ -55,7 +56,7 @@ type DecodedRegisters<C> = Registers<UuidKey, <C as RegAdapter>::Reg>;
 type DecodedDelta<C> = (DecodedRegisters<C>, Tombstones<UuidKey>);
 
 /// Canonical full-sync domain set shared by all replicated-store callers.
-pub const REPLICATED_DOMAINS: [Domain; 14] = [
+pub const REPLICATED_DOMAINS: [Domain; 15] = [
     Domain::Peers,
     Domain::Workloads,
     Domain::Services,
@@ -70,6 +71,7 @@ pub const REPLICATED_DOMAINS: [Domain; 14] = [
     Domain::VolumeNodes,
     Domain::SchedulerDigests,
     Domain::SecretMasterKeys,
+    Domain::IngressPools,
 ];
 
 /// Returns the debug label associated with one replicated sync domain.
@@ -89,6 +91,7 @@ pub fn domain_label(domain: Domain) -> &'static str {
         Domain::Volumes => "volumes",
         Domain::VolumeNodes => "volume nodes",
         Domain::SchedulerDigests => "scheduler digests",
+        Domain::IngressPools => "ingress pools",
     }
 }
 
@@ -109,6 +112,7 @@ pub fn domain_key(domain: Domain) -> u16 {
         Domain::VolumeNodes => 11,
         Domain::SchedulerDigests => 12,
         Domain::SecretMasterKeys => 13,
+        Domain::IngressPools => 14,
     }
 }
 
@@ -433,6 +437,7 @@ pub fn replicated_store_registry(stores: ReplicatedStoreHandles) -> ReplicatedSt
         ReplicatedStoreEntry::new(Domain::VolumeNodes, stores.volume_nodes),
         ReplicatedStoreEntry::new(Domain::SchedulerDigests, stores.scheduler_digests),
         ReplicatedStoreEntry::new(Domain::SecretMasterKeys, stores.secret_master_keys),
+        ReplicatedStoreEntry::new(Domain::IngressPools, stores.ingress_pools),
     ])
 }
 
@@ -452,6 +457,7 @@ pub struct ReplicatedStoreHandles {
     pub volumes: VolumeSpecStore,
     pub volume_nodes: VolumeNodeStore,
     pub scheduler_digests: SchedulerDigestStore,
+    pub ingress_pools: IngressPoolStore,
 }
 
 /// Encodes tombstone rows into the compact sync wire representation.

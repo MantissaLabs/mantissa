@@ -15,6 +15,7 @@ capnp::generated_code!(pub mod agents_capnp);
 capnp::generated_code!(pub mod services_capnp);
 capnp::generated_code!(pub mod secrets_capnp);
 capnp::generated_code!(pub mod network_capnp);
+capnp::generated_code!(pub mod ingress_capnp);
 capnp::generated_code!(pub mod volumes_capnp);
 capnp::generated_code!(pub mod rest_capnp);
 
@@ -116,6 +117,10 @@ pub mod network {
     pub use super::network_capnp::networks;
     pub use super::network_capnp::*;
     pub type NetworksClient = super::network_capnp::networks::Client;
+}
+
+pub mod ingress {
+    pub use super::ingress_capnp::*;
 }
 
 pub mod volumes {
