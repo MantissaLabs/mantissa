@@ -530,11 +530,12 @@ impl NetworkRegistry {
         })
     }
 
-    /// Collect the remote peers that share at least one Ready network with `local_peer_id`.
+    /// Collect remote peers that share at least one participating network with `local_peer_id`.
     ///
     /// WireGuard uses this derived set to avoid programming a cluster-wide full mesh. A remote peer
-    /// is only relevant when both sides report the same network as Ready, which means this node may
-    /// legitimately forward VXLAN traffic to that peer.
+    /// is relevant only when both sides report the same VXLAN network as Configuring or Ready,
+    /// which lets peers establish encrypted underlay before either side publishes dataplane
+    /// readiness.
     pub fn wireguard_scope_peers(&self, local_peer_id: Uuid) -> Result<HashSet<Uuid>> {
         let vxlan_networks: HashSet<Uuid> = self
             .list_specs()?
@@ -548,7 +549,7 @@ impl NetworkRegistry {
 
         self.refresh_peer_cache_if_needed()?;
         let cache = self.cache_read();
-        Ok(collect_shared_ready_peers(
+        Ok(collect_shared_participating_peers(
             &cache.peer_states_by_network,
             local_peer_id,
             Some(&vxlan_networks),
@@ -802,11 +803,11 @@ fn attachment_state_rank(state: crate::network::types::NetworkAttachmentState) -
     }
 }
 
-/// Derive the remote peers that currently share at least one Ready network with `local_peer_id`.
+/// Derive the remote peers that currently share a participating network with `local_peer_id`.
 ///
 /// The input is keyed by network so overlapping scopes naturally collapse into one peer entry in
 /// the returned set.
-fn collect_shared_ready_peers(
+fn collect_shared_participating_peers(
     peer_states_by_network: &HashMap<Uuid, Vec<NetworkPeerStateValue>>,
     local_peer_id: Uuid,
     network_filter: Option<&HashSet<Uuid>>,
@@ -819,15 +820,15 @@ fn collect_shared_ready_peers(
         {
             continue;
         }
-        let local_ready = states
+        let local_participates = states
             .iter()
-            .any(|state| state.peer_id == local_peer_id && state.state.is_ready());
-        if !local_ready {
+            .any(|state| state.peer_id == local_peer_id && state.state.is_participating());
+        if !local_participates {
             continue;
         }
 
         for state in states {
-            if state.peer_id == local_peer_id || !state.state.is_ready() {
+            if state.peer_id == local_peer_id || !state.state.is_participating() {
                 continue;
             }
             peers.insert(state.peer_id);
@@ -1271,9 +1272,9 @@ mod tests {
         );
     }
 
-    /// Ensure overlapping Ready networks collapse into one scoped WireGuard peer set.
+    /// Ensure overlapping participating networks collapse into one scoped WireGuard peer set.
     #[test]
-    fn collects_ready_peers_sharing_local_networks() {
+    fn collects_participating_peers_sharing_local_networks() {
         let local_peer_id = Uuid::new_v4();
         let peer_a = Uuid::new_v4();
         let peer_b = Uuid::new_v4();
@@ -1330,7 +1331,7 @@ mod tests {
                     network_b,
                     peer_b,
                     "peer-b",
-                    NetworkPeerState::Ready,
+                    NetworkPeerState::Error,
                     None,
                 ),
             ],
@@ -1342,7 +1343,7 @@ mod tests {
                     network_c,
                     local_peer_id,
                     "local",
-                    NetworkPeerState::Configuring,
+                    NetworkPeerState::AwaitingSpec,
                     None,
                 ),
                 NetworkPeerStateValue::new(
@@ -1355,7 +1356,7 @@ mod tests {
             ],
         );
 
-        let peers = collect_shared_ready_peers(&by_network, local_peer_id, None);
+        let peers = collect_shared_participating_peers(&by_network, local_peer_id, None);
 
         assert_eq!(peers.len(), 2);
         assert!(peers.contains(&peer_a));

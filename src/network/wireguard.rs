@@ -82,9 +82,9 @@ struct PeerConfigFingerprint {
 
 /// Pure summary of the remote peers this node should configure on its WireGuard interface.
 ///
-/// The controller passes a desired peer scope derived from shared Ready networks. This planner then
-/// intersects that scope with the visible peer metadata snapshot so view-scoped exclusions do not
-/// block local convergence.
+/// The controller passes a desired peer scope derived from shared participating networks. This
+/// planner then intersects that scope with the visible peer metadata snapshot so view-scoped
+/// exclusions do not block local convergence.
 struct WireGuardPeerPlan {
     peer_configs: Vec<PeerConfigFingerprint>,
     desired_peer_count: usize,
@@ -503,8 +503,8 @@ fn build_wireguard_underlay_state(
 ///   plaintext.
 /// - **Idempotent**: repeated calls converge to the same kernel configuration.
 /// - **Self-contained**: requires no external `wg` tooling and uses the Peers CRDT to discover
-///   peer keys and endpoints for the subset of nodes that currently share a Ready network with the
-///   local node.
+///   peer keys and endpoints for nodes that currently share a participating network with the local
+///   node.
 #[cfg(target_os = "linux")]
 pub async fn ensure_wireguard_underlay(
     registry: &Registry,

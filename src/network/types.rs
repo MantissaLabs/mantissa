@@ -197,6 +197,14 @@ impl NetworkPeerState {
         matches!(self, NetworkPeerState::Ready)
     }
 
+    /// Return whether a peer is actively joining or already participating in a network dataplane.
+    pub fn is_participating(self) -> bool {
+        matches!(
+            self,
+            NetworkPeerState::Configuring | NetworkPeerState::Ready
+        )
+    }
+
     /// Convert from the protocol enumeration into the internal representation.
     #[allow(dead_code)]
     pub fn from_proto(state: mantissa_protocol::network::PeerState) -> Self {

@@ -455,71 +455,83 @@ impl NetworkController {
             .collect())
     }
 
-    /// List every active VXLAN network that needs encrypted underlay reconciliation.
+    /// List VXLAN networks where the local peer is joining or already participating.
     async fn active_vxlan_network_ids(&self) -> Result<Vec<Uuid>> {
-        let local_demand = self.local_network_demand_snapshot().await?;
-        let specs = self
+        let vxlan_networks: HashSet<Uuid> = self
             .inner
             .registry
             .list_specs()
-            .context("list network specs for vxlan scope")?;
-        Ok(specs
+            .context("list network specs for active vxlan scope")?
             .into_iter()
-            .filter(|spec| {
-                Self::spec_has_local_realization_demand(spec, &local_demand)
-                    && spec.driver.requires_wireguard_underlay()
-            })
+            .filter(|spec| !spec.is_deleted() && spec.driver.requires_wireguard_underlay())
             .map(|spec| spec.id)
-            .collect())
+            .collect();
+        if vxlan_networks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let states = self
+            .inner
+            .registry
+            .list_peer_states(None)
+            .context("list peer states for active vxlan scope")?;
+        let mut network_ids = states
+            .into_iter()
+            .filter(|state| {
+                state.peer_id == self.inner.node_id
+                    && state.state.is_participating()
+                    && vxlan_networks.contains(&state.network_id)
+            })
+            .map(|state| state.network_id)
+            .collect::<Vec<_>>();
+        network_ids.sort_unstable();
+        network_ids.dedup();
+        Ok(network_ids)
     }
 
-    /// Snapshot every currently visible cluster peer except the local node.
-    ///
-    /// This acts as a bootstrap fallback while network peer readiness is still converging and the
-    /// scoped WireGuard set has not been derived from shared network state yet.
-    fn visible_cluster_peer_ids(&self) -> Result<HashSet<Uuid>> {
-        let peers = self
+    /// Return whether this node is currently joining or participating in a network dataplane.
+    fn local_peer_participates(&self, network_id: Uuid) -> Result<bool> {
+        Ok(self
             .inner
-            .cluster_registry
-            .peer_values_snapshot()
-            .context("load cluster peers for wireguard bootstrap")?;
-        Ok(peers
-            .into_iter()
-            .map(|(peer_id, _)| peer_id)
-            .filter(|peer_id| *peer_id != self.inner.node_id)
-            .collect())
+            .registry
+            .get_peer_state(network_id, self.inner.node_id)?
+            .is_some_and(|state| state.state.is_participating()))
+    }
+
+    /// Queue WireGuard and forwarding refresh after peer membership changes on a local network.
+    pub async fn refresh_peer_membership(&self, network_id: Uuid) {
+        self.refresh_publication(network_id).await;
+
+        match self.local_peer_participates(network_id) {
+            Ok(true) => {
+                let mut guard = self.inner.pending_forwarding.lock().await;
+                let inserted = guard.insert(network_id);
+                drop(guard);
+                if inserted {
+                    self.inner.wake.notify_one();
+                }
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(
+                    target: "network",
+                    network = %network_id,
+                    "failed to inspect local peer state after membership gossip: {err:#}"
+                );
+            }
+        }
     }
 
     /// Compute the remote peer set that must participate in the encrypted VXLAN underlay.
-    ///
-    /// Once network peer readiness has converged, the steady-state scope comes from shared Ready
-    /// networks. During bootstrap we fall back to visible cluster peers so multi-node encrypted
-    /// networks can establish WireGuard before any node advertises itself Ready.
     async fn desired_wireguard_peers(&self) -> Result<HashSet<Uuid>> {
-        let scoped = self
-            .inner
+        if !config::wireguard_enabled() {
+            return Ok(HashSet::new());
+        }
+
+        self.inner
             .registry
             .wireguard_scope_peers(self.inner.node_id)
-            .context("derive scoped wireguard peers")?;
-        if !config::wireguard_enabled() || !scoped.is_empty() {
-            return Ok(scoped);
-        }
-
-        let active_network_ids = self.active_vxlan_network_ids().await?;
-        if active_network_ids.is_empty() {
-            return Ok(scoped);
-        }
-
-        let bootstrap = self.visible_cluster_peer_ids()?;
-        if !bootstrap.is_empty() {
-            debug!(
-                target: "network",
-                peers = bootstrap.len(),
-                networks = active_network_ids.len(),
-                "bootstrapping wireguard peer scope from visible cluster membership until network readiness converges"
-            );
-        }
-        Ok(bootstrap)
+            .context("derive scoped wireguard peers")
     }
 
     /// Reset cached underlay state and mark active networks as blocked by WireGuard.
@@ -884,12 +896,22 @@ impl NetworkController {
         }
 
         let _ = self.reconcile_wireguard_underlay().await?;
+        let local_demand = self.local_network_demand_snapshot().await?;
 
         for network_id in pending {
             let spec_opt = self.inner.registry.get_spec(network_id)?;
             let Some(spec) = spec_opt else {
                 continue;
             };
+
+            if !Self::spec_has_local_realization_demand(&spec, &local_demand) {
+                debug!(
+                    target: "network",
+                    network = %network_id,
+                    "skipping forwarding reconcile because local demand is absent"
+                );
+                continue;
+            }
 
             if let Err(err) = self.reconcile_network(spec).await {
                 warn!(
