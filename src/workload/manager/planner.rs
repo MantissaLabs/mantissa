@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
@@ -54,9 +55,9 @@ pub(super) enum SchedulingError {
         "scheduler reservation failed: target node {target_node} unavailable for task '{task}'"
     )]
     TargetNodeUnavailable { task: String, target_node: Uuid },
-    #[error("scheduler reservation failed: networks {networks:?} unavailable on any candidate")]
+    #[error("scheduler reservation failed: network specs {networks:?} missing or unavailable")]
     NetworksBlocked { networks: Vec<Uuid> },
-    #[error("local node lacks required networks for task '{task}'")]
+    #[error("local node lacks required network specs for task '{task}'")]
     LocalNetworksBlocked { task: String },
     #[error(
         "scheduler reservation failed: placement constraints unsatisfied for task '{task}' ({constraints})"
@@ -85,7 +86,7 @@ type SeedLocalPlans<'a> = (
 );
 
 struct LocalPlacementPrereqs<'a> {
-    ready_networks: &'a HashSet<Uuid>,
+    schedulable_networks: &'a HashSet<Uuid>,
     runtime_support: &'a RuntimeSupportProfile,
     gpu_ready: bool,
     gpu_reason: Option<&'a str>,
@@ -98,6 +99,7 @@ struct HostPortReservations<'a> {
 
 /// Point-in-time cluster placement inputs used while building scheduler candidates.
 struct SchedulerCandidateBuildInputs<'a> {
+    schedulable_networks: Arc<HashSet<Uuid>>,
     readiness: &'a HashMap<Uuid, HashSet<Uuid>>,
     health_snapshot: &'a HashMap<Uuid, HealthStatus>,
     local_ready: &'a HashSet<Uuid>,
@@ -248,6 +250,7 @@ struct Candidate {
     placement: PlacementNode,
     slots: Vec<SlotChoice>,
     gpu_devices: Vec<GpuChoice>,
+    schedulable_networks: Arc<HashSet<Uuid>>,
     ready_networks: HashSet<Uuid>,
     occupied_host_ports: Vec<HostPortKey>,
     runtime_support: RuntimeSupportProfile,
@@ -265,6 +268,7 @@ impl Candidate {
         placement: PlacementNode,
         slots: Vec<SlotChoice>,
         gpu_devices: Vec<GpuChoice>,
+        schedulable_networks: Arc<HashSet<Uuid>>,
         ready_networks: HashSet<Uuid>,
         occupied_host_ports: Vec<HostPortKey>,
         runtime_support: RuntimeSupportProfile,
@@ -277,6 +281,7 @@ impl Candidate {
                 placement,
                 slots,
                 gpu_devices,
+                schedulable_networks,
                 ready_networks,
                 occupied_host_ports,
                 runtime_support,
@@ -297,6 +302,7 @@ impl Candidate {
         peer_id: Uuid,
         placement: PlacementNode,
         digest: SchedulerDigestValue,
+        schedulable_networks: Arc<HashSet<Uuid>>,
         ready_networks: HashSet<Uuid>,
         occupied_host_ports: Vec<HostPortKey>,
         runtime_support: RuntimeSupportProfile,
@@ -309,6 +315,7 @@ impl Candidate {
                 placement,
                 slots: Vec::new(),
                 gpu_devices: Vec::new(),
+                schedulable_networks,
                 ready_networks,
                 occupied_host_ports,
                 runtime_support,
@@ -346,8 +353,19 @@ impl Candidate {
             .unwrap_or(0);
     }
 
+    /// Returns true when the network specs required by an intent are schedulable.
     fn can_host(&self, networks: &[Uuid]) -> bool {
-        networks.iter().all(|net| self.ready_networks.contains(net))
+        networks
+            .iter()
+            .all(|net| self.schedulable_networks.contains(net))
+    }
+
+    /// Counts requested networks whose local dataplane is already ready on this candidate.
+    fn ready_network_count(&self, networks: &[Uuid]) -> usize {
+        networks
+            .iter()
+            .filter(|network_id| self.ready_networks.contains(network_id))
+            .count()
     }
 
     /// Returns true when the candidate has no conflicting host port reservations.
@@ -677,12 +695,14 @@ fn prefers_binpack_score(left: BinpackScore, right: BinpackScore) -> bool {
 /// Returns true when a spread candidate should replace the current best untargeted choice.
 ///
 /// Operator-declared preferences win first. When preferences tie, the node with fewer active
-/// workloads wins so independent single-task submissions still spread over time. Queue position
-/// keeps batch-local ring rotation stable after load counts tie.
+/// workloads wins so independent single-task submissions still spread over time. Already-ready
+/// networks only break equal-load choices before queue position keeps batch-local rotation stable.
 fn prefers_spread_candidate(
     preference_cmp: Ordering,
     candidate_workload_count: usize,
     best_workload_count: usize,
+    candidate_ready_network_count: usize,
+    best_ready_network_count: usize,
     candidate_index: usize,
     best_index: usize,
     candidate_node_id: Uuid,
@@ -703,6 +723,11 @@ fn prefers_spread_candidate(
         return load_comparison.is_lt();
     }
 
+    let ready_network_comparison = candidate_ready_network_count.cmp(&best_ready_network_count);
+    if ready_network_comparison != Ordering::Equal {
+        return ready_network_comparison.is_gt();
+    }
+
     let appears_earlier_in_ring = candidate_index < best_index;
     if appears_earlier_in_ring {
         return true;
@@ -719,11 +744,14 @@ fn prefers_spread_candidate(
 /// Returns true when a binpack candidate should replace the current best untargeted choice.
 ///
 /// Explicit preferences still outrank raw packing density. Once preferences tie, the tighter
-/// binpack score wins, and the lower node id only resolves perfectly identical candidates.
+/// binpack score wins. Already-ready networks only break identical packing scores before the
+/// lower node id resolves perfectly identical candidates.
 fn prefers_binpack_candidate(
     preference_cmp: Ordering,
     candidate_score: BinpackScore,
     best_score: BinpackScore,
+    candidate_ready_network_count: usize,
+    best_ready_network_count: usize,
     candidate_node_id: Uuid,
     best_node_id: Uuid,
 ) -> bool {
@@ -745,6 +773,11 @@ fn prefers_binpack_candidate(
     let has_same_binpack_score = candidate_score == best_score;
     if !has_same_binpack_score {
         return false;
+    }
+
+    let ready_network_comparison = candidate_ready_network_count.cmp(&best_ready_network_count);
+    if ready_network_comparison != Ordering::Equal {
+        return ready_network_comparison.is_gt();
     }
 
     candidate_node_id < best_node_id
@@ -1050,7 +1083,7 @@ fn candidate_preference_counts(
 fn digest_can_host_intent(
     digest: &SchedulerDigestValue,
     placement: &PlacementNode,
-    ready_networks: &HashSet<Uuid>,
+    schedulable_networks: &HashSet<Uuid>,
     runtime_support: &RuntimeSupportProfile,
     intent: &StartIntent,
 ) -> bool {
@@ -1063,8 +1096,23 @@ fn digest_can_host_intent(
         && intent
             .networks
             .iter()
-            .all(|network_id| ready_networks.contains(network_id))
+            .all(|network_id| schedulable_networks.contains(network_id))
         && intent.runtime_requirements_met(runtime_support)
+}
+
+/// Returns the network ids whose active specs are missing from the local replicated view.
+fn missing_schedulable_networks<'a>(
+    intents: impl IntoIterator<Item = &'a StartIntent>,
+    schedulable_networks: &HashSet<Uuid>,
+) -> Vec<Uuid> {
+    let mut missing = intents
+        .into_iter()
+        .flat_map(|intent| intent.networks.iter().copied())
+        .filter(|network_id| !schedulable_networks.contains(network_id))
+        .collect::<Vec<_>>();
+    missing.sort_unstable();
+    missing.dedup();
+    missing
 }
 
 #[derive(Clone)]
@@ -1322,6 +1370,14 @@ impl WorkloadManager {
             .ok_or(SchedulingError::SnapshotMissing)?;
 
         let local_version = snapshot.version;
+        let schedulable_networks = Arc::new(self.collect_schedulable_networks()?);
+        let missing_networks = missing_schedulable_networks(intents, schedulable_networks.as_ref());
+        if !missing_networks.is_empty() {
+            return Err(SchedulingError::NetworksBlocked {
+                networks: missing_networks,
+            }
+            .into());
+        }
         let readiness_map = self.collect_network_readiness()?;
         let health_snapshot = self.core.registry.health_monitor().snapshot();
         let workload_values = self.load_workload_value_index().await?;
@@ -1346,7 +1402,7 @@ impl WorkloadManager {
                 &snapshot,
                 local_version,
                 LocalPlacementPrereqs {
-                    ready_networks: &local_ready,
+                    schedulable_networks: schedulable_networks.as_ref(),
                     runtime_support: &local_runtime_support,
                     gpu_ready: local_gpu_ready,
                     gpu_reason: local_gpu_reason.as_deref(),
@@ -1363,6 +1419,7 @@ impl WorkloadManager {
             available_slots,
             available_gpus,
             SchedulerCandidateBuildInputs {
+                schedulable_networks: schedulable_networks.clone(),
                 readiness: &readiness_map,
                 health_snapshot: &health_snapshot,
                 local_ready: &local_ready,
@@ -1452,7 +1509,7 @@ impl WorkloadManager {
             if !intent
                 .networks
                 .iter()
-                .all(|net| prereqs.ready_networks.contains(net))
+                .all(|net| prereqs.schedulable_networks.contains(net))
             {
                 return Err(SchedulingError::LocalNetworksBlocked {
                     task: intent.name.clone(),
@@ -1632,6 +1689,7 @@ impl WorkloadManager {
     fn build_remote_candidate_hints(
         &self,
         intents: &[&StartIntent],
+        schedulable_networks: &HashSet<Uuid>,
         readiness: &HashMap<Uuid, HashSet<Uuid>>,
         health_snapshot: &HashMap<Uuid, HealthStatus>,
     ) -> Result<Vec<RemoteCandidateHint>, anyhow::Error> {
@@ -1698,7 +1756,7 @@ impl WorkloadManager {
                     digest_can_host_intent(
                         &digest,
                         &placement,
-                        &ready_networks,
+                        schedulable_networks,
                         &runtime_support,
                         intent,
                     )
@@ -1769,6 +1827,7 @@ impl WorkloadManager {
                 local_placement,
                 local_slots,
                 local_gpus,
+                context.schedulable_networks.clone(),
                 context.local_ready.clone(),
                 context
                     .host_ports
@@ -1784,8 +1843,12 @@ impl WorkloadManager {
         }
 
         let demand = WorkloadDemand::from_intents(intents);
-        let hints =
-            self.build_remote_candidate_hints(intents, context.readiness, context.health_snapshot)?;
+        let hints = self.build_remote_candidate_hints(
+            intents,
+            context.schedulable_networks.as_ref(),
+            context.readiness,
+            context.health_snapshot,
+        )?;
         let minimum_candidate_nodes =
             minimum_candidate_nodes_for_intents(intents, demand, hints.len() + 1);
         let required_target_nodes: HashSet<Uuid> = hints
@@ -1832,6 +1895,7 @@ impl WorkloadManager {
                 hint.peer_id,
                 placement,
                 hint.digest.clone(),
+                context.schedulable_networks.clone(),
                 hint.ready_networks.clone(),
                 node_host_ports(
                     context.host_ports.occupied,
@@ -1962,6 +2026,7 @@ impl WorkloadManager {
         let mut best_node_id = Uuid::nil();
         let mut best_preference_counts = PlacementPreferenceCounts::default();
         let mut best_workload_count = 0usize;
+        let mut best_ready_network_count = 0usize;
         let mut skipped_for_constraints = false;
         let mut skipped_for_networks = false;
         let mut skipped_for_runtime = false;
@@ -1997,6 +2062,7 @@ impl WorkloadManager {
             let preference_counts =
                 candidate_preference_counts(preference_inventory, node_id, preference_context);
             let workload_count = active_workload_counts.get(&node_id).copied().unwrap_or(0);
+            let ready_network_count = candidate.ready_network_count(&intent.networks);
 
             match best_index {
                 None => {
@@ -2004,6 +2070,7 @@ impl WorkloadManager {
                     best_node_id = node_id;
                     best_preference_counts = preference_counts;
                     best_workload_count = workload_count;
+                    best_ready_network_count = ready_network_count;
                 }
                 Some(current_best_index) => {
                     let preference_cmp = compare_placement_preference_counts(
@@ -2015,6 +2082,8 @@ impl WorkloadManager {
                         preference_cmp,
                         workload_count,
                         best_workload_count,
+                        ready_network_count,
+                        best_ready_network_count,
                         idx,
                         current_best_index,
                         node_id,
@@ -2024,6 +2093,7 @@ impl WorkloadManager {
                         best_node_id = node_id;
                         best_preference_counts = preference_counts;
                         best_workload_count = workload_count;
+                        best_ready_network_count = ready_network_count;
                     }
                 }
             }
@@ -2077,7 +2147,7 @@ impl WorkloadManager {
         }
 
         let preference_context = preference_context(intent);
-        let mut best: Option<(usize, PlacementPreferenceCounts, BinpackScore, Uuid)> = None;
+        let mut best: Option<(usize, PlacementPreferenceCounts, BinpackScore, usize, Uuid)> = None;
         let mut skipped_for_constraints = false;
         let mut skipped_for_networks = false;
         let mut skipped_for_runtime = false;
@@ -2110,9 +2180,16 @@ impl WorkloadManager {
             let node_id = candidate.node_id(self.local_node_id);
             let preference_counts =
                 candidate_preference_counts(preference_inventory, node_id, preference_context);
+            let ready_network_count = candidate.ready_network_count(&intent.networks);
             match best {
-                None => best = Some((idx, preference_counts, score, node_id)),
-                Some((_, best_preference_counts, best_score, best_node_id)) => {
+                None => best = Some((idx, preference_counts, score, ready_network_count, node_id)),
+                Some((
+                    _,
+                    best_preference_counts,
+                    best_score,
+                    best_ready_network_count,
+                    best_node_id,
+                )) => {
                     let preference_cmp = compare_placement_preference_counts(
                         intent.service_placement_preferences.as_slice(),
                         preference_counts,
@@ -2122,16 +2199,18 @@ impl WorkloadManager {
                         preference_cmp,
                         score,
                         best_score,
+                        ready_network_count,
+                        best_ready_network_count,
                         node_id,
                         best_node_id,
                     ) {
-                        best = Some((idx, preference_counts, score, node_id));
+                        best = Some((idx, preference_counts, score, ready_network_count, node_id));
                     }
                 }
             }
         }
 
-        let Some((best_index, _, _, _)) = best else {
+        let Some((best_index, _, _, _, _)) = best else {
             if skipped_for_constraints {
                 return Err(intent.placement_error().into());
             } else if skipped_for_runtime {
@@ -2300,11 +2379,12 @@ mod tests {
     use crate::workload::model::{ExecutionPlatform, IsolationMode};
     use crate::workload::types::{ExecutionSpec, WorkloadPortBinding, WorkloadPortProtocol};
     use std::collections::HashSet;
+    use std::sync::Arc;
     use uuid::Uuid;
 
-    /// Digest hostability checks should enforce networks and GPU runtime readiness.
+    /// Digest hostability checks should enforce network specs and GPU runtime readiness.
     #[test]
-    fn digest_hostability_honors_networks_and_gpu_runtime() {
+    fn digest_hostability_honors_network_specs_and_gpu_runtime() {
         let required_network = Uuid::new_v4();
         let intent = StartIntent {
             index: 0,
@@ -2357,13 +2437,13 @@ mod tests {
             &intent
         ));
 
-        let mut ready_networks = std::collections::HashSet::new();
-        ready_networks.insert(required_network);
+        let mut schedulable_networks = std::collections::HashSet::new();
+        schedulable_networks.insert(required_network);
 
         assert!(!digest_can_host_intent(
             &digest,
             &Default::default(),
-            &ready_networks,
+            &schedulable_networks,
             &RuntimeSupportProfile::default(),
             &intent
         ));
@@ -2373,7 +2453,7 @@ mod tests {
         assert!(digest_can_host_intent(
             &gpu_ready_digest,
             &Default::default(),
-            &ready_networks,
+            &schedulable_networks,
             &RuntimeSupportProfile::default(),
             &intent
         ));
@@ -2567,6 +2647,7 @@ mod tests {
                 free_gpu_count: 1,
                 gpu_runtime_ready: true,
             },
+            Arc::new(HashSet::new()),
             HashSet::new(),
             Vec::new(),
             RuntimeSupportProfile::default(),
@@ -2605,6 +2686,7 @@ mod tests {
                 free_gpu_count: 0,
                 gpu_runtime_ready: true,
             },
+            Arc::new(HashSet::new()),
             HashSet::new(),
             Vec::new(),
             RuntimeSupportProfile::default(),

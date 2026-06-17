@@ -3,6 +3,7 @@ use crate::network::attachment::{AttachmentProvisioner, AttachmentProvisionerApi
 use crate::network::controller::NetworkController;
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
+use crate::network::types::NetworkStatus;
 use crate::registry::Registry;
 use crate::runtime::set::RuntimeSet;
 use crate::runtime::types::{
@@ -2789,6 +2790,22 @@ impl WorkloadManager {
         Ok(())
     }
 
+    /// Collects replicated network specs that are eligible for task scheduling decisions.
+    fn collect_schedulable_networks(&self) -> Result<HashSet<Uuid>, anyhow::Error> {
+        let specs = self
+            .networking
+            .network_registry
+            .list_specs()
+            .map_err(|e| anyhow!("failed to load network specs: {e}"))?;
+
+        Ok(specs
+            .into_iter()
+            .filter(|spec| !spec.is_deleted() && spec.status != NetworkStatus::Deleting)
+            .map(|spec| spec.id)
+            .collect())
+    }
+
+    /// Collects peer network readiness as a placement preference signal, not a hard gate.
     fn collect_network_readiness(&self) -> Result<HashMap<Uuid, HashSet<Uuid>>, anyhow::Error> {
         let mut readiness: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
         let states = self
@@ -2916,13 +2933,13 @@ fn gang_planning_error_context(cause: &SchedulingError, request_summary: &str) -
         }
         SchedulingError::NetworksBlocked { networks } => {
             format!(
-                "no schedulable node has the required networks for gang reservation ({request_summary}); missing {}",
+                "required network specs are missing or deleting while planning gang reservation ({request_summary}); missing {}",
                 format_scheduling_networks(networks)
             )
         }
         SchedulingError::LocalNetworksBlocked { task } => {
             format!(
-                "local network readiness is blocking gang reservation for task '{task}' ({request_summary})"
+                "local network specs are unavailable while planning gang reservation for task '{task}' ({request_summary})"
             )
         }
         SchedulingError::PlacementConstraintsBlocked { task, constraints } => {
@@ -3141,11 +3158,11 @@ pub(crate) fn workload_start_retryable_detail(err: &anyhow::Error) -> Option<Str
                 Some("waiting for scheduler snapshot convergence".to_string())
             }
             SchedulingError::NetworksBlocked { networks } => Some(format!(
-                "waiting for network readiness on at least one schedulable node: {}",
+                "waiting for required network specs to replicate: {}",
                 format_scheduling_networks(networks)
             )),
             SchedulingError::LocalNetworksBlocked { task } => Some(format!(
-                "waiting for local network readiness before starting task '{task}'"
+                "waiting for local network specs before starting task '{task}'"
             )),
             _ => None,
         })

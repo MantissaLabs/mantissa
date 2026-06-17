@@ -59,6 +59,7 @@ pub(super) struct RemoteGroupReservation {
 pub(super) enum RemotePrepareRejectionReason {
     InsufficientResources,
     Uninitialized,
+    NetworkUnavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,6 +104,9 @@ fn parse_prepare_rejection(
         scheduling::PrepareLeasesRejectionReason::Uninitialized => {
             RemotePrepareRejectionReason::Uninitialized
         }
+        scheduling::PrepareLeasesRejectionReason::NetworkUnavailable => {
+            RemotePrepareRejectionReason::NetworkUnavailable
+        }
     };
     let digest = read_scheduler_digest(reader.get_current_digest()?)?;
     Ok(RemotePrepareRejection { reason, digest })
@@ -127,6 +131,7 @@ fn remote_prepare_rejection_message(
     let reason = match rejection.reason {
         RemotePrepareRejectionReason::InsufficientResources => "not enough slots or resources",
         RemotePrepareRejectionReason::Uninitialized => "scheduler uninitialized",
+        RemotePrepareRejectionReason::NetworkUnavailable => "network realization unavailable",
     };
 
     format!(
@@ -285,6 +290,32 @@ fn write_prepared_leases_for_request(
 }
 
 impl WorkloadManager {
+    /// Realizes every network needed by local start plans before local scheduler admission.
+    async fn ensure_local_networks_ready_for_plans(
+        &self,
+        plans: &[BatchStartPlan],
+    ) -> Result<(), ExecutionError> {
+        let Some(controller) = &self.networking.network_controller else {
+            return Ok(());
+        };
+
+        let mut network_ids = plans
+            .iter()
+            .flat_map(|plan| plan.networks.iter().copied())
+            .collect::<Vec<_>>();
+        network_ids.sort_unstable();
+        network_ids.dedup();
+        if network_ids.is_empty() {
+            return Ok(());
+        }
+
+        controller
+            .ensure_networks_ready_for_local_use(&network_ids)
+            .await
+            .context("realize local networks before scheduler admission")
+            .map_err(ExecutionError::Retry)
+    }
+
     /// Applies one structured remote prepare rejection so the next shortlist uses fresher peer state.
     pub(super) async fn apply_remote_prepare_rejection(
         &self,
@@ -349,6 +380,8 @@ impl WorkloadManager {
                 gpu_device_ids: Vec::new(),
             });
         }
+
+        self.ensure_local_networks_ready_for_plans(plans).await?;
 
         let mut slot_requests = Vec::new();
         let mut gpu_requests = Vec::new();
@@ -482,6 +515,8 @@ impl WorkloadManager {
         if plans.is_empty() {
             return Ok(PreparedTaskLeaseBatch { leases: Vec::new() });
         }
+
+        self.ensure_local_networks_ready_for_plans(plans).await?;
 
         let mut intents = Vec::with_capacity(plans.len());
         for plan in plans {
@@ -905,6 +940,10 @@ impl WorkloadManager {
                 entry.set_cpu_millis(plan.cpu_millis);
                 entry.set_memory_bytes(plan.memory_bytes);
                 entry.set_gpu_count(plan.gpu_count);
+                let mut networks = entry.reborrow().init_networks(plan.networks.len() as u32);
+                for (network_idx, network_id) in plan.networks.iter().enumerate() {
+                    networks.set(network_idx as u32, network_id.as_bytes());
+                }
             }
         }
 
@@ -943,6 +982,10 @@ impl WorkloadManager {
                 entry.set_cpu_millis(plan.cpu_millis);
                 entry.set_memory_bytes(plan.memory_bytes);
                 entry.set_gpu_count(plan.gpu_count);
+                let mut networks = entry.reborrow().init_networks(plan.networks.len() as u32);
+                for (network_idx, network_id) in plan.networks.iter().enumerate() {
+                    networks.set(network_idx as u32, network_id.as_bytes());
+                }
             }
         }
 

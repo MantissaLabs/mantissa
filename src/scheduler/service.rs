@@ -1,8 +1,12 @@
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mantissa_protocol::scheduling::{self, scheduler};
+use tokio::time::timeout;
+use tracing::warn;
 use uuid::Uuid;
+
+use crate::network::controller::NetworkController;
 
 use super::digest::{SchedulerDigestValue, write_scheduler_digest};
 use super::summary::SchedulerSummary;
@@ -15,17 +19,26 @@ pub struct SchedulerService {
     scheduler: Rc<Scheduler>,
     node_id: Uuid,
     node_name: String,
+    network_controller: Option<NetworkController>,
 }
 
 impl SchedulerService {
-    pub fn new(scheduler: Rc<Scheduler>, node_id: Uuid, node_name: String) -> Self {
+    /// Builds the local scheduler RPC service with optional network realization admission.
+    pub fn new(
+        scheduler: Rc<Scheduler>,
+        node_id: Uuid,
+        node_name: String,
+        network_controller: Option<NetworkController>,
+    ) -> Self {
         Self {
             scheduler,
             node_id,
             node_name,
+            network_controller,
         }
     }
 
+    /// Decodes one UUID from a Cap'n Proto data field.
     fn parse_uuid(bytes: capnp::data::Reader<'_>) -> Result<Uuid, capnp::Error> {
         if bytes.len() != 16 {
             return Err(capnp::Error::failed("UUID fields must be 16 bytes".into()));
@@ -34,6 +47,16 @@ impl SchedulerService {
         let mut arr = [0u8; 16];
         arr.copy_from_slice(bytes);
         Ok(Uuid::from_bytes(arr))
+    }
+
+    /// Decodes a Cap'n Proto list of UUID byte fields into owned UUID values.
+    fn parse_uuid_list(list: capnp::data_list::Reader<'_>) -> Result<Vec<Uuid>, capnp::Error> {
+        let mut values = Vec::with_capacity(list.len() as usize);
+        for bytes in list.iter() {
+            values.push(Self::parse_uuid(bytes?)?);
+        }
+
+        Ok(values)
     }
 
     /// Builds one zero-capacity digest for rejections emitted before the scheduler is initialized.
@@ -49,6 +72,56 @@ impl SchedulerService {
             largest_free_slot_memory_bytes: 0,
             free_gpu_count: 0,
             gpu_runtime_ready: false,
+        }
+    }
+
+    /// Returns the current digest for structured prepare rejections.
+    async fn current_prepare_rejection_digest(&self) -> SchedulerDigestValue {
+        match self.scheduler.snapshot().await {
+            Some(snapshot) => SchedulerDigestValue::from_snapshot(self.node_id, &snapshot),
+            None => self.empty_prepare_rejection_digest(),
+        }
+    }
+
+    /// Realizes all required local networks before allowing target-side lease preparation.
+    async fn ensure_network_admission(
+        &self,
+        networks: &[Uuid],
+    ) -> Result<(), SchedulerDigestValue> {
+        const NETWORK_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+        let Some(controller) = &self.network_controller else {
+            return Ok(());
+        };
+
+        let mut network_ids = networks.to_vec();
+        network_ids.sort_unstable();
+        network_ids.dedup();
+        if network_ids.is_empty() {
+            return Ok(());
+        }
+
+        match timeout(
+            NETWORK_ADMISSION_TIMEOUT,
+            controller.ensure_networks_ready_for_local_use(&network_ids),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => {
+                warn!(
+                    target: "scheduler",
+                    "network admission failed before lease prepare: {err}"
+                );
+                Err(self.current_prepare_rejection_digest().await)
+            }
+            Err(_) => {
+                warn!(
+                    target: "scheduler",
+                    "network admission timed out before lease prepare"
+                );
+                Err(self.current_prepare_rejection_digest().await)
+            }
         }
     }
 
@@ -189,8 +262,10 @@ impl scheduler::Server for SchedulerService {
         let intents = request.get_intents()?;
 
         let mut reservations = Vec::with_capacity(intents.len() as usize);
+        let mut required_networks = Vec::new();
         for intent in intents.iter() {
             let task_id = Self::parse_uuid(intent.get_task_id()?)?;
+            required_networks.extend(Self::parse_uuid_list(intent.get_networks()?)?);
             reservations.push(TaskLeaseIntent {
                 task_id,
                 cpu_millis: intent.get_cpu_millis(),
@@ -200,6 +275,15 @@ impl scheduler::Server for SchedulerService {
         }
 
         let mut response = results.get().init_response();
+        if let Err(digest) = self.ensure_network_admission(&required_networks).await {
+            Self::write_prepare_rejection(
+                scheduling::PrepareLeasesRejectionReason::NetworkUnavailable,
+                &digest,
+                response.reborrow(),
+            );
+            return Ok(());
+        }
+
         match self
             .scheduler
             .prepare_task_leases(coordinator_node_id, ttl_ms, reservations)
@@ -254,8 +338,10 @@ impl scheduler::Server for SchedulerService {
         let intents = request.get_intents()?;
 
         let mut reservations = Vec::with_capacity(intents.len() as usize);
+        let mut required_networks = Vec::new();
         for intent in intents.iter() {
             let task_id = Self::parse_uuid(intent.get_task_id()?)?;
+            required_networks.extend(Self::parse_uuid_list(intent.get_networks()?)?);
             reservations.push(TaskLeaseIntent {
                 task_id,
                 cpu_millis: intent.get_cpu_millis(),
@@ -265,6 +351,15 @@ impl scheduler::Server for SchedulerService {
         }
 
         let mut response = results.get().init_response();
+        if let Err(digest) = self.ensure_network_admission(&required_networks).await {
+            Self::write_prepare_rejection(
+                scheduling::PrepareLeasesRejectionReason::NetworkUnavailable,
+                &digest,
+                response.reborrow(),
+            );
+            return Ok(());
+        }
+
         match self
             .scheduler
             .prepare_task_lease_group(coordinator_node_id, group_id, ttl_ms, reservations)
@@ -386,7 +481,7 @@ mod tests {
 
         let scheduler =
             Rc::new(Scheduler::new(scheduler_store, registry, actor).expect("scheduler"));
-        let service = SchedulerService::new(scheduler.clone(), actor, "node-a".to_string());
+        let service = SchedulerService::new(scheduler.clone(), actor, "node-a".to_string(), None);
         let client: scheduler::Client = capnp_new_client(service);
         (client, scheduler, actor, dir)
     }

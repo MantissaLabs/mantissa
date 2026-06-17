@@ -710,8 +710,12 @@ async fn build_runtime_components(
     );
     let volumes_client = capnp_rpc::new_client(volumes_service);
 
-    let scheduler_service =
-        SchedulerService::new(scheduler.clone(), ctx.self_id, local_node_name.clone());
+    let scheduler_service = SchedulerService::new(
+        scheduler.clone(),
+        ctx.self_id,
+        local_node_name.clone(),
+        Some(network_controller.clone()),
+    );
     let scheduler_client = capnp_rpc::new_client(scheduler_service);
 
     Ok((

@@ -304,6 +304,9 @@ struct LeaseIntent {
 
   gpuCount @3 :UInt32;
   # Requested number of GPU devices.
+
+  networks @4 :List(Data);
+  # Required 16-byte network UUIDs that must be locally realized before prepare succeeds.
 }
 
 struct PreparedLease {
@@ -354,6 +357,9 @@ enum PrepareLeasesRejectionReason {
 
   uninitialized @1;
   # The target scheduler has not initialized its local resources yet.
+
+  networkUnavailable @2;
+  # The target node could not realize one or more required local networks.
 }
 
 struct PrepareLeasesRejected {
