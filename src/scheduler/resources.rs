@@ -114,9 +114,6 @@ impl Scheduler {
     ) -> Vec<SlotSpec> {
         let info = &node.system_info.info;
 
-        const MIN_SLOT_MEMORY_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
-        const MAX_SLOTS: u64 = 4_096;
-
         let logical_cpus = info
             .cpu_info
             .as_ref()
@@ -128,68 +125,69 @@ impl Scheduler {
         let allocatable_cpu_millis =
             total_cpu_millis.saturating_sub(runtime_config.reserved_cpu_millis);
         let allocatable_memory = total_memory.saturating_sub(runtime_config.reserved_memory_bytes);
+        let target_slot_cpu_millis = runtime_config.target_slot_cpu_millis.max(1);
+        let target_slot_memory_bytes = runtime_config.target_slot_memory_bytes.max(1);
+        let max_slots = runtime_config
+            .max_slots
+            .clamp(1, crate::config::SCHEDULER_MAX_SLOT_COUNT);
 
-        let mut slot_count = if allocatable_memory > 0 {
-            allocatable_memory.div_ceil(MIN_SLOT_MEMORY_BYTES).max(1)
-        } else if allocatable_cpu_millis > 0 {
-            logical_cpus.max(1)
+        let cpu_slot_count = if allocatable_cpu_millis > 0 {
+            allocatable_cpu_millis
+                .div_ceil(target_slot_cpu_millis)
+                .max(1)
+        } else {
+            0
+        };
+        let memory_slot_count = if allocatable_memory > 0 {
+            allocatable_memory.div_ceil(target_slot_memory_bytes).max(1)
         } else {
             0
         };
 
+        let mut slot_count = cpu_slot_count.max(memory_slot_count);
         if slot_count == 0 {
             return Vec::new();
         }
 
-        slot_count = slot_count.min(MAX_SLOTS.max(1));
-
-        let mut remaining_cpu = allocatable_cpu_millis;
-        let mut remaining_memory = allocatable_memory;
-        let mut specs = Vec::with_capacity(slot_count as usize);
-        for slot_idx in 0..slot_count {
-            let slots_left = slot_count - slot_idx;
-
-            let memory_bytes = if allocatable_memory == 0 || remaining_memory == 0 {
-                0
-            } else if slots_left == 1 {
-                let mem = remaining_memory;
-                remaining_memory = 0;
-                mem
-            } else {
-                let chunk = MIN_SLOT_MEMORY_BYTES.min(remaining_memory);
-                remaining_memory -= chunk;
-                chunk
-            };
-
-            let cpu_millis = if allocatable_cpu_millis == 0 || remaining_cpu == 0 {
-                0
-            } else {
-                let slots_left_cpu = slots_left;
-                let mut chunk = remaining_cpu / slots_left_cpu;
-                if chunk == 0 && remaining_cpu > 0 {
-                    chunk = 1;
-                }
-                if chunk > remaining_cpu {
-                    chunk = remaining_cpu;
-                }
-                remaining_cpu -= chunk;
-                chunk
-            };
-
-            specs.push(SlotSpec::new(
-                slot_idx,
-                SlotCapacity::new(cpu_millis, memory_bytes, 0),
-            ));
+        slot_count = slot_count.min(max_slots);
+        if allocatable_cpu_millis > 0 {
+            slot_count = slot_count.min(allocatable_cpu_millis);
+        }
+        if allocatable_memory > 0 {
+            slot_count = slot_count.min(allocatable_memory);
+        }
+        if slot_count == 0 {
+            return Vec::new();
         }
 
-        if specs.is_empty() && (allocatable_cpu_millis > 0 || allocatable_memory > 0) {
+        let mut specs = Vec::with_capacity(slot_count as usize);
+        for slot_idx in 0..slot_count {
             specs.push(SlotSpec::new(
-                0,
-                SlotCapacity::new(allocatable_cpu_millis, allocatable_memory, 0),
+                slot_idx,
+                SlotCapacity::new(
+                    Self::split_even_capacity(allocatable_cpu_millis, slot_idx, slot_count),
+                    Self::split_even_capacity(allocatable_memory, slot_idx, slot_count),
+                    0,
+                ),
             ));
         }
 
         specs
+    }
+
+    /// Splits one scalar resource into nearly equal per-slot chunks while preserving the total.
+    fn split_even_capacity(total: u64, slot_idx: u64, slot_count: u64) -> u64 {
+        if total == 0 || slot_count == 0 {
+            return 0;
+        }
+
+        let base = total / slot_count;
+        let remainder = total % slot_count;
+        if slot_idx < remainder {
+            base.saturating_add(1)
+        } else {
+            base
+        }
     }
 
     /// Derives GPU device specs from node inventory so GPUs can be reserved independently of slots.

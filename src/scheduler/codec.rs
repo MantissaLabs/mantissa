@@ -8,12 +8,14 @@ use mantissa_protocol::scheduling::{
 use mantissa_store::codec::StoreValueCodec;
 use uuid::Uuid;
 
+use crate::config::SCHEDULER_MAX_SLOT_COUNT;
+
 use super::{
     GpuDevice, GpuDeviceReservation, GpuDeviceState, LeaseReservation, ResourceSlot,
     SchedulerSnapshot, SlotCapacity, SlotReservation, SlotState,
 };
 
-const MAX_SCHEDULER_STORE_SLOTS: u32 = 65_536;
+const MAX_SCHEDULER_STORE_SLOTS: u32 = SCHEDULER_MAX_SLOT_COUNT as u32;
 const MAX_SCHEDULER_STORE_GPU_DEVICES: u32 = 4_096;
 const MAX_SCHEDULER_STORE_TEXT_BYTES: usize = 1_024;
 

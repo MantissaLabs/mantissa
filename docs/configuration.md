@@ -82,6 +82,13 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
     gpu: (
         device_overrides: "uuid:GPU-abc=id:GPU-abc; pci:0000:81:00.0=disable; index:0=id:0",
     ),
+    scheduler: (
+        reserved_cpu_millis: 250,
+        reserved_memory_bytes: 268435456,
+        target_slot_cpu_millis: 100,
+        target_slot_memory_bytes: 134217728,
+        max_slots: 65536,
+    ),
     replication: (
         gossip_channel_capacity: 128,
         gossip_fanout: 5,
@@ -136,6 +143,11 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 - `health.indirect_fanout_max`
 - `runtimes.oci.host` (env: `MANTISSA_RUNTIME_OCI_HOST`, falls back to `DOCKER_HOST` when unset)
 - `gpu.device_overrides` (legacy: `MANTISSA_GPU_DEVICE_OVERRIDES`)
+- `scheduler.reserved_cpu_millis` (env: `MANTISSA_SCHEDULER_RESERVED_CPU_MILLIS`)
+- `scheduler.reserved_memory_bytes` (env: `MANTISSA_SCHEDULER_RESERVED_MEMORY_BYTES`)
+- `scheduler.target_slot_cpu_millis` (env: `MANTISSA_SCHEDULER_TARGET_SLOT_CPU_MILLIS`)
+- `scheduler.target_slot_memory_bytes` (env: `MANTISSA_SCHEDULER_TARGET_SLOT_MEMORY_BYTES`)
+- `scheduler.max_slots` (env: `MANTISSA_SCHEDULER_MAX_SLOTS`)
 - `replication.gossip_channel_capacity` (legacy: `MANTISSA_GOSSIP_CHANNEL_CAPACITY`)
 - `replication.gossip_fanout` (legacy: `MANTISSA_GOSSIP_FANOUT`)
 - `replication.gossip_tick_ms` (legacy: `MANTISSA_GOSSIP_TICK_MS`)
@@ -150,6 +162,25 @@ Some changes require a restart to fully apply (Mantissa logs a warning when thos
 - `replication.service_shard_target_size` (legacy: `MANTISSA_SERVICE_SHARD_TARGET_SIZE`)
 - `replication.service_shard_task_target_size` (legacy: `MANTISSA_SERVICE_SHARD_TASK_TARGET_SIZE`)
 - `replication.service_shard_parallelism` (legacy: `MANTISSA_SERVICE_SHARD_PARALLELISM`)
+
+## Scheduler slot sizing guidance
+
+Mantissa derives scheduler slots from allocatable node CPU and memory after
+subtracting `scheduler.reserved_cpu_millis` and
+`scheduler.reserved_memory_bytes`. The slot count is the larger of the
+CPU-derived and memory-derived counts:
+
+- `ceil(allocatable_cpu_millis / scheduler.target_slot_cpu_millis)`
+- `ceil(allocatable_memory_bytes / scheduler.target_slot_memory_bytes)`
+
+The result is capped by `scheduler.max_slots`, and CPU and memory are then
+distributed evenly across the chosen slots. This keeps large-memory nodes from
+placing excess memory into one final oversized slot.
+
+The default target granularity is `100m` CPU and `128MiB` memory, with a
+`65536` slot safety ceiling. Lower target values increase tiny-task packing
+density but make local scheduler snapshots larger. `scheduler.max_slots` cannot
+exceed the hard scheduler snapshot decode limit.
 
 ## Service deployment sharding guidance
 

@@ -16,6 +16,9 @@ use tracing::warn;
 use crate::ip_family::DefaultIpFamilyPolicy;
 use crate::volumes::local::ensure_local_volume_root;
 
+/// Maximum scheduler slot count supported by the local scheduler snapshot codec.
+pub const SCHEDULER_MAX_SLOT_COUNT: u64 = 65_536;
+
 /// # Description:
 ///
 /// Root configuration container loaded from the Mantissa RON config file.
@@ -478,6 +481,12 @@ pub struct SchedulerConfig {
     pub reserved_cpu_millis: u64,
     #[serde(default = "default_scheduler_reserved_memory_bytes")]
     pub reserved_memory_bytes: u64,
+    #[serde(default = "default_scheduler_target_slot_cpu_millis")]
+    pub target_slot_cpu_millis: u64,
+    #[serde(default = "default_scheduler_target_slot_memory_bytes")]
+    pub target_slot_memory_bytes: u64,
+    #[serde(default = "default_scheduler_max_slots")]
+    pub max_slots: u64,
 }
 
 impl Default for SchedulerConfig {
@@ -488,6 +497,9 @@ impl Default for SchedulerConfig {
         Self {
             reserved_cpu_millis: default_scheduler_reserved_cpu_millis(),
             reserved_memory_bytes: default_scheduler_reserved_memory_bytes(),
+            target_slot_cpu_millis: default_scheduler_target_slot_cpu_millis(),
+            target_slot_memory_bytes: default_scheduler_target_slot_memory_bytes(),
+            max_slots: default_scheduler_max_slots(),
         }
     }
 }
@@ -499,6 +511,9 @@ impl Default for SchedulerConfig {
 pub struct RuntimeSchedulerConfig {
     pub reserved_cpu_millis: u64,
     pub reserved_memory_bytes: u64,
+    pub target_slot_cpu_millis: u64,
+    pub target_slot_memory_bytes: u64,
+    pub max_slots: u64,
 }
 
 impl SchedulerConfig {
@@ -509,6 +524,9 @@ impl SchedulerConfig {
         RuntimeSchedulerConfig {
             reserved_cpu_millis: self.reserved_cpu_millis,
             reserved_memory_bytes: self.reserved_memory_bytes,
+            target_slot_cpu_millis: self.target_slot_cpu_millis,
+            target_slot_memory_bytes: self.target_slot_memory_bytes,
+            max_slots: self.max_slots,
         }
     }
 }
@@ -1173,6 +1191,27 @@ fn default_scheduler_reserved_memory_bytes() -> u64 {
 
 /// # Description:
 ///
+/// Returns the default target CPU granularity used while deriving scheduler slots.
+fn default_scheduler_target_slot_cpu_millis() -> u64 {
+    100
+}
+
+/// # Description:
+///
+/// Returns the default target memory granularity used while deriving scheduler slots.
+fn default_scheduler_target_slot_memory_bytes() -> u64 {
+    128 * 1024 * 1024
+}
+
+/// # Description:
+///
+/// Returns the default operator slot cap used while deriving scheduler slots.
+fn default_scheduler_max_slots() -> u64 {
+    SCHEDULER_MAX_SLOT_COUNT
+}
+
+/// # Description:
+///
 /// Returns the default shared gossip channel capacity used by the daemon path.
 fn default_replication_gossip_channel_capacity() -> usize {
     128
@@ -1498,6 +1537,18 @@ impl Config {
             "MANTISSA_SCHEDULER_RESERVED_MEMORY_BYTES",
             &mut self.scheduler.reserved_memory_bytes,
         );
+        applied |= apply_positive_u64_env_override(
+            "MANTISSA_SCHEDULER_TARGET_SLOT_CPU_MILLIS",
+            &mut self.scheduler.target_slot_cpu_millis,
+        );
+        applied |= apply_positive_u64_env_override(
+            "MANTISSA_SCHEDULER_TARGET_SLOT_MEMORY_BYTES",
+            &mut self.scheduler.target_slot_memory_bytes,
+        );
+        applied |= apply_positive_u64_env_override(
+            "MANTISSA_SCHEDULER_MAX_SLOTS",
+            &mut self.scheduler.max_slots,
+        );
 
         applied |= apply_positive_usize_env_override(
             "MANTISSA_GOSSIP_CHANNEL_CAPACITY",
@@ -1685,6 +1736,24 @@ impl Config {
         if self.observability.metrics.state_db_sample_interval_ms == 0 {
             anyhow::bail!(
                 "observability.metrics.state_db_sample_interval_ms must be greater than zero"
+            );
+        }
+
+        if self.scheduler.target_slot_cpu_millis == 0 {
+            anyhow::bail!("scheduler.target_slot_cpu_millis must be greater than zero");
+        }
+
+        if self.scheduler.target_slot_memory_bytes == 0 {
+            anyhow::bail!("scheduler.target_slot_memory_bytes must be greater than zero");
+        }
+
+        if self.scheduler.max_slots == 0 {
+            anyhow::bail!("scheduler.max_slots must be greater than zero");
+        }
+
+        if self.scheduler.max_slots > SCHEDULER_MAX_SLOT_COUNT {
+            anyhow::bail!(
+                "scheduler.max_slots must be less than or equal to {SCHEDULER_MAX_SLOT_COUNT}"
             );
         }
 
@@ -1972,6 +2041,18 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
 
     if old.scheduler.reserved_memory_bytes != new.scheduler.reserved_memory_bytes {
         changes.push("scheduler.reserved_memory_bytes".to_string());
+    }
+
+    if old.scheduler.target_slot_cpu_millis != new.scheduler.target_slot_cpu_millis {
+        changes.push("scheduler.target_slot_cpu_millis".to_string());
+    }
+
+    if old.scheduler.target_slot_memory_bytes != new.scheduler.target_slot_memory_bytes {
+        changes.push("scheduler.target_slot_memory_bytes".to_string());
+    }
+
+    if old.scheduler.max_slots != new.scheduler.max_slots {
+        changes.push("scheduler.max_slots".to_string());
     }
 
     if old.network.nodeport.enabled != new.network.nodeport.enabled {
@@ -2362,6 +2443,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_scheduler_slot_sizing() {
+        let mut config = Config::default();
+        config.scheduler.target_slot_cpu_millis = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.scheduler.target_slot_memory_bytes = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.scheduler.max_slots = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.scheduler.max_slots = SCHEDULER_MAX_SLOT_COUNT + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn rejects_invalid_service_shard_threshold() {
         let mut config = Config::default();
         config.replication.service_shard_target_threshold = 0;
@@ -2413,6 +2513,9 @@ mod tests {
             ("MANTISSA_METRICS_STATE_DB_SAMPLE_INTERVAL_MS", "75000"),
             ("MANTISSA_SCHEDULER_RESERVED_CPU_MILLIS", "750"),
             ("MANTISSA_SCHEDULER_RESERVED_MEMORY_BYTES", "134217728"),
+            ("MANTISSA_SCHEDULER_TARGET_SLOT_CPU_MILLIS", "125"),
+            ("MANTISSA_SCHEDULER_TARGET_SLOT_MEMORY_BYTES", "67108864"),
+            ("MANTISSA_SCHEDULER_MAX_SLOTS", "8192"),
             ("MANTISSA_GOSSIP_CHANNEL_CAPACITY", "256"),
             ("MANTISSA_GOSSIP_FANOUT", "7"),
             ("MANTISSA_GOSSIP_TICK_MS", "200"),
@@ -2475,6 +2578,9 @@ mod tests {
         );
         assert_eq!(config.scheduler.reserved_cpu_millis, 750);
         assert_eq!(config.scheduler.reserved_memory_bytes, 134_217_728);
+        assert_eq!(config.scheduler.target_slot_cpu_millis, 125);
+        assert_eq!(config.scheduler.target_slot_memory_bytes, 67_108_864);
+        assert_eq!(config.scheduler.max_slots, 8_192);
         assert_eq!(config.replication.gossip_channel_capacity, 256);
         assert_eq!(config.replication.gossip_fanout, 7);
         assert_eq!(config.replication.gossip_tick_ms, 200);
@@ -2500,6 +2606,13 @@ mod tests {
             .scheduler
             .reserved_memory_bytes
             .saturating_add(128 * 1024 * 1024);
+        new.scheduler.target_slot_cpu_millis =
+            old.scheduler.target_slot_cpu_millis.saturating_add(25);
+        new.scheduler.target_slot_memory_bytes = old
+            .scheduler
+            .target_slot_memory_bytes
+            .saturating_add(64 * 1024 * 1024);
+        new.scheduler.max_slots = old.scheduler.max_slots.saturating_sub(1);
 
         let changes = restart_required_changes(&old, &new);
         assert!(
@@ -2512,6 +2625,17 @@ mod tests {
                 .iter()
                 .any(|change| change == "scheduler.reserved_memory_bytes")
         );
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "scheduler.target_slot_cpu_millis")
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|change| change == "scheduler.target_slot_memory_bytes")
+        );
+        assert!(changes.iter().any(|change| change == "scheduler.max_slots"));
     }
 
     #[test]

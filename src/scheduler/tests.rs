@@ -5,7 +5,7 @@ use mantissa_store::codec::StoreValueCodec;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::RuntimeSchedulerConfig;
+use crate::config::{RuntimeSchedulerConfig, SCHEDULER_MAX_SLOT_COUNT};
 use crate::node::info::{Cpu, Memory};
 use crate::store::local::LocalSessionStore;
 use crate::store::replicated::peers::open_peers_store;
@@ -42,6 +42,23 @@ fn make_test_node(logical_cpus: i32, memory_bytes: u64) -> crate::node::Node {
         swap_free: 0,
     });
     node
+}
+
+/// Builds one runtime scheduler config for deterministic slot derivation tests.
+fn scheduler_config(
+    reserved_cpu_millis: u64,
+    reserved_memory_bytes: u64,
+    target_slot_cpu_millis: u64,
+    target_slot_memory_bytes: u64,
+    max_slots: u64,
+) -> RuntimeSchedulerConfig {
+    RuntimeSchedulerConfig {
+        reserved_cpu_millis,
+        reserved_memory_bytes,
+        target_slot_cpu_millis,
+        target_slot_memory_bytes,
+        max_slots,
+    }
 }
 
 async fn make_scheduler() -> (Scheduler, tempfile::TempDir) {
@@ -226,13 +243,10 @@ fn derive_slot_specs_applies_scheduler_reserve() {
     let node = make_test_node(4, 512 * 1024 * 1024);
     let specs = Scheduler::derive_slot_specs(
         &node,
-        RuntimeSchedulerConfig {
-            reserved_cpu_millis: 500,
-            reserved_memory_bytes: 128 * 1024 * 1024,
-        },
+        scheduler_config(500, 128 * 1024 * 1024, 100, 128 * 1024 * 1024, 128),
     );
 
-    assert_eq!(specs.len(), 3);
+    assert_eq!(specs.len(), 35);
     assert_eq!(
         specs
             .iter()
@@ -247,7 +261,125 @@ fn derive_slot_specs_applies_scheduler_reserve() {
             .sum::<u64>(),
         384 * 1024 * 1024
     );
+    assert!(specs.iter().all(|slot| slot.capacity.cpu_millis > 0));
     assert!(specs.iter().all(|slot| slot.capacity.memory_bytes > 0));
+}
+
+#[test]
+fn derive_slot_specs_uses_memory_granularity_when_memory_dominates() {
+    let node = make_test_node(64, 1024 * 1024 * 1024);
+    let specs = Scheduler::derive_slot_specs(
+        &node,
+        scheduler_config(0, 0, 20_000, 128 * 1024 * 1024, 128),
+    );
+
+    assert_eq!(specs.len(), 8);
+    assert_eq!(
+        specs
+            .iter()
+            .map(|slot| slot.capacity.cpu_millis)
+            .sum::<u64>(),
+        64_000
+    );
+    assert_eq!(
+        specs
+            .iter()
+            .map(|slot| slot.capacity.memory_bytes)
+            .sum::<u64>(),
+        1024 * 1024 * 1024
+    );
+    assert!(
+        specs
+            .iter()
+            .all(|slot| slot.capacity.memory_bytes == 128 * 1024 * 1024)
+    );
+}
+
+#[test]
+fn derive_slot_specs_uses_cpu_granularity_when_cpu_dominates() {
+    let node = make_test_node(4, 512 * 1024 * 1024);
+    let specs =
+        Scheduler::derive_slot_specs(&node, scheduler_config(0, 0, 100, 1024 * 1024 * 1024, 128));
+
+    assert_eq!(specs.len(), 40);
+    assert!(specs.iter().all(|slot| slot.capacity.cpu_millis == 100));
+    assert_eq!(
+        specs
+            .iter()
+            .map(|slot| slot.capacity.memory_bytes)
+            .sum::<u64>(),
+        512 * 1024 * 1024
+    );
+    assert!(specs.iter().all(|slot| slot.capacity.memory_bytes > 0));
+}
+
+#[test]
+fn derive_slot_specs_honors_configured_max_slots_and_balances_capacity() {
+    let node = make_test_node(64, 2 * 1024 * 1024 * 1024);
+    let specs =
+        Scheduler::derive_slot_specs(&node, scheduler_config(0, 0, 100, 64 * 1024 * 1024, 128));
+
+    assert_eq!(specs.len(), 128);
+    assert_eq!(
+        specs
+            .iter()
+            .map(|slot| slot.capacity.cpu_millis)
+            .sum::<u64>(),
+        64_000
+    );
+    assert_eq!(
+        specs
+            .iter()
+            .map(|slot| slot.capacity.memory_bytes)
+            .sum::<u64>(),
+        2 * 1024 * 1024 * 1024
+    );
+    assert!(
+        specs
+            .iter()
+            .all(|slot| slot.capacity.memory_bytes == 16 * 1024 * 1024)
+    );
+}
+
+#[test]
+fn derive_slot_specs_caps_large_nodes_at_safety_limit_without_dumping_remainder() {
+    let node = make_test_node(768, 16 * 1024 * 1024 * 1024 * 1024);
+    let specs = Scheduler::derive_slot_specs(
+        &node,
+        scheduler_config(0, 0, 100, 128 * 1024 * 1024, SCHEDULER_MAX_SLOT_COUNT),
+    );
+
+    assert_eq!(specs.len() as u64, SCHEDULER_MAX_SLOT_COUNT);
+    assert_eq!(
+        specs
+            .iter()
+            .map(|slot| slot.capacity.cpu_millis)
+            .sum::<u64>(),
+        768_000
+    );
+    assert_eq!(
+        specs
+            .iter()
+            .map(|slot| slot.capacity.memory_bytes)
+            .sum::<u64>(),
+        16 * 1024 * 1024 * 1024 * 1024
+    );
+    assert_eq!(
+        specs
+            .iter()
+            .map(|slot| slot.capacity.memory_bytes)
+            .min()
+            .unwrap(),
+        256 * 1024 * 1024
+    );
+    assert_eq!(
+        specs
+            .iter()
+            .map(|slot| slot.capacity.memory_bytes)
+            .max()
+            .unwrap(),
+        256 * 1024 * 1024
+    );
 }
 
 #[test]
@@ -255,10 +387,7 @@ fn derive_slot_specs_returns_empty_when_reserve_consumes_capacity() {
     let node = make_test_node(1, 128 * 1024 * 1024);
     let specs = Scheduler::derive_slot_specs(
         &node,
-        RuntimeSchedulerConfig {
-            reserved_cpu_millis: 2_000,
-            reserved_memory_bytes: 256 * 1024 * 1024,
-        },
+        scheduler_config(2_000, 256 * 1024 * 1024, 100, 128 * 1024 * 1024, 128),
     );
 
     assert!(specs.is_empty());
