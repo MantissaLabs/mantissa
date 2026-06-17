@@ -655,6 +655,14 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     NetworkDriverOpt::Vxlan => mantissa_client::networks::NetworkDriver::Vxlan,
                     NetworkDriverOpt::Bridge => mantissa_client::networks::NetworkDriver::Bridge,
                 };
+                let realization = args.realization.map(|policy| match policy {
+                    NetworkRealizationOpt::AllNodes => {
+                        mantissa_client::networks::NetworkRealizationPolicy::AllNodes
+                    }
+                    NetworkRealizationOpt::OnDemand => {
+                        mantissa_client::networks::NetworkRealizationPolicy::OnDemand
+                    }
+                });
                 let request = mantissa_client::networks::NetworkCreateRequest {
                     name: args.name.clone(),
                     description: args.description.clone(),
@@ -664,6 +672,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     mtu: args.mtu,
                     bpf_programs: args.bpf_programs.clone(),
                     sealed: args.sealed,
+                    realization,
                 };
 
                 local

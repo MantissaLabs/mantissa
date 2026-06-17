@@ -6,8 +6,8 @@ use crate::network::defaults::{
 };
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
-    NetworkDriver, NetworkEvent, NetworkSpecDraft, NetworkSpecUpdate, NetworkSpecValue,
-    NetworkStatus,
+    NetworkDriver, NetworkEvent, NetworkRealizationPolicy, NetworkSpecDraft, NetworkSpecUpdate,
+    NetworkSpecValue, NetworkStatus,
 };
 use crate::registry::Registry;
 use crate::workload::manager::WorkloadStartRequest;
@@ -30,6 +30,7 @@ pub struct WorkloadNetworkRequirement {
     pub name: String,
     pub driver: NetworkDriver,
     pub ip_family: WorkloadNetworkIpFamily,
+    pub realization: Option<NetworkRealizationPolicy>,
 }
 
 /// Shared network prerequisite handler used before first-class workload placement.
@@ -98,6 +99,7 @@ impl WorkloadNetworkPrerequisites {
                     vni: spec.vni,
                     mtu: spec.mtu,
                     sealed: spec.sealed,
+                    realization: spec.realization,
                     bpf_programs: spec.bpf_programs.clone(),
                 });
                 spec = deleted;
@@ -112,7 +114,9 @@ impl WorkloadNetworkPrerequisites {
                 })
                 .await
                 .map_err(|err| anyhow!("failed to broadcast network upsert: {err}"))?;
-            self.network_controller.schedule_spec_change(spec.id).await;
+            if spec.realizes_on_all_nodes() {
+                self.network_controller.schedule_spec_change(spec.id).await;
+            }
             known_subnets
                 .insert_cidr(&spec.subnet_cidr)
                 .map_err(|err| anyhow!("network subnet index update failed: {err}"))?;
@@ -236,6 +240,16 @@ fn validate_existing_required_network(
             existing.driver
         ));
     }
+    if let Some(realization) = requested.realization
+        && existing.realization != realization
+    {
+        return Err(anyhow!(
+            "{context} requests network '{}' with realization {} but existing network uses {}",
+            requested.name,
+            realization,
+            existing.realization
+        ));
+    }
     Ok(())
 }
 
@@ -257,16 +271,23 @@ fn build_required_network_spec(
             )
         })?;
 
-    Ok(NetworkSpecValue::new(NetworkSpecDraft {
-        name: requested.name.clone(),
-        description: String::new(),
-        driver: requested.driver,
-        subnet_cidr,
-        vni: 0,
-        mtu: 0,
-        sealed: false,
-        bpf_programs,
-    }))
+    let realization = requested
+        .realization
+        .unwrap_or_else(crate::config::network_realization_default);
+
+    Ok(NetworkSpecValue::new_with_realization(
+        NetworkSpecDraft {
+            name: requested.name.clone(),
+            description: String::new(),
+            driver: requested.driver,
+            subnet_cidr,
+            vni: 0,
+            mtu: 0,
+            sealed: false,
+            bpf_programs,
+        },
+        realization,
+    ))
 }
 
 /// Deduplicates required networks while rejecting conflicting driver or family requests.
@@ -303,6 +324,18 @@ fn normalize_required_networks(
                 }
                 _ => {}
             }
+            match (existing.realization, network.realization) {
+                (Some(left), Some(right)) if left != right => {
+                    return Err(anyhow!(
+                        "{context} requests network '{}' with conflicting realization policies",
+                        name
+                    ));
+                }
+                (None, Some(policy)) => {
+                    existing.realization = Some(policy);
+                }
+                _ => {}
+            }
             continue;
         }
 
@@ -312,6 +345,7 @@ fn normalize_required_networks(
                 name: name.to_string(),
                 driver: network.driver,
                 ip_family: network.ip_family,
+                realization: network.realization,
             },
         );
     }
@@ -362,11 +396,13 @@ mod tests {
                     name: "shared".to_string(),
                     driver: NetworkDriver::Vxlan,
                     ip_family: WorkloadNetworkIpFamily::Default,
+                    realization: None,
                 },
                 WorkloadNetworkRequirement {
                     name: "shared".to_string(),
                     driver: NetworkDriver::Bridge,
                     ip_family: WorkloadNetworkIpFamily::Default,
+                    realization: None,
                 },
             ],
         )
@@ -374,6 +410,34 @@ mod tests {
 
         assert!(
             err.to_string().contains("conflicting drivers"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    /// Required network normalization rejects realization conflicts for the same network name.
+    fn normalize_required_networks_rejects_conflicting_realization() {
+        let err = normalize_required_networks(
+            "service deployment",
+            &[
+                WorkloadNetworkRequirement {
+                    name: "shared".to_string(),
+                    driver: NetworkDriver::Vxlan,
+                    ip_family: WorkloadNetworkIpFamily::Default,
+                    realization: Some(NetworkRealizationPolicy::AllNodes),
+                },
+                WorkloadNetworkRequirement {
+                    name: "shared".to_string(),
+                    driver: NetworkDriver::Vxlan,
+                    ip_family: WorkloadNetworkIpFamily::Default,
+                    realization: Some(NetworkRealizationPolicy::OnDemand),
+                },
+            ],
+        )
+        .expect_err("conflicting realization policies should fail");
+
+        assert!(
+            err.to_string().contains("conflicting realization"),
             "unexpected error: {err}"
         );
     }

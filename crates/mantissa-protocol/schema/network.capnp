@@ -48,6 +48,25 @@ enum NetworkStatus {
   # Network has been removed.
 }
 
+enum NetworkRealizationPolicy {
+  allNodes @0;
+  # Every node should realize the local dataplane for this network.
+
+  onDemand @1;
+  # Only workload and ingress participants should realize the local dataplane.
+}
+
+enum NetworkRealizationSelection {
+  default @0;
+  # Use the receiving node's configured creation default when creating the spec.
+
+  allNodes @1;
+  # Store an all-node realization policy on the replicated spec.
+
+  onDemand @2;
+  # Store an on-demand realization policy on the replicated spec.
+}
+
 enum PeerState {
   awaitingSpec @0;
   # Peer announced but missing network spec.
@@ -106,6 +125,9 @@ struct NetworkCreateSpec {
 
   sealed @7 :Bool;
   # True once the network spec should be treated as immutable.
+
+  realization @8 :NetworkRealizationSelection;
+  # Local dataplane realization policy requested for the replicated spec.
 }
 
 struct NetworkSpec {
@@ -144,6 +166,9 @@ struct NetworkSpec {
 
   bpfPrograms @11 :List(Text);
   # eBPF program identifiers attached to the network.
+
+  realization @12 :NetworkRealizationPolicy;
+  # Policy that decides which nodes realize local dataplane resources.
 }
 
 struct NetworkSummary {
@@ -176,6 +201,9 @@ struct NetworkSummary {
 
   updatedAt @9 :Text;
   # RFC3339 timestamp when the network was last updated.
+
+  realization @10 :NetworkRealizationPolicy;
+  # Policy that decides which nodes realize local dataplane resources.
 }
 
 struct NetworkPeerStatus {

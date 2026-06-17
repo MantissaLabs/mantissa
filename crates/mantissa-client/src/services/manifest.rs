@@ -1549,6 +1549,7 @@ mod tests {
                         name: "frontend",
                         driver: bridge,
                         ip_family: ipv6,
+                        realization: on_demand,
                     ),
                 ],
                 tasks: [
@@ -1574,6 +1575,10 @@ mod tests {
         assert_eq!(
             requested[0].ip_family,
             Some(crate::config::NetworkIpFamily::Ipv6)
+        );
+        assert_eq!(
+            requested[0].realization,
+            Some(crate::networks::NetworkRealizationPolicy::OnDemand)
         );
     }
 

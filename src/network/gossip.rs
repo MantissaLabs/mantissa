@@ -62,8 +62,11 @@ impl NetworkGossiper {
         match event {
             NetworkEvent::Upsert(spec) => {
                 let network_id = spec.id;
+                let should_schedule = spec.is_deleted() || spec.realizes_on_all_nodes();
                 self.registry.upsert_spec(spec).await?;
-                self.controller.schedule_spec_change(network_id).await;
+                if should_schedule {
+                    self.controller.schedule_spec_change(network_id).await;
+                }
             }
             NetworkEvent::PeerUpsert(state) => {
                 let network_id = state.network_id;

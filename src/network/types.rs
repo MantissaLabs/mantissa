@@ -55,6 +55,86 @@ impl NetworkDriver {
     }
 }
 
+/// Policy that decides which nodes should realize local network dataplane resources.
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkRealizationPolicy {
+    #[default]
+    AllNodes,
+    OnDemand,
+}
+
+impl NetworkRealizationPolicy {
+    /// Convert from the stored protocol enum into the internal representation.
+    pub fn from_proto(policy: mantissa_protocol::network::NetworkRealizationPolicy) -> Self {
+        match policy {
+            mantissa_protocol::network::NetworkRealizationPolicy::AllNodes => {
+                NetworkRealizationPolicy::AllNodes
+            }
+            mantissa_protocol::network::NetworkRealizationPolicy::OnDemand => {
+                NetworkRealizationPolicy::OnDemand
+            }
+        }
+    }
+
+    /// Convert from a create-time protocol selection into an optional explicit policy.
+    pub fn from_selection_proto(
+        selection: mantissa_protocol::network::NetworkRealizationSelection,
+    ) -> Option<Self> {
+        match selection {
+            mantissa_protocol::network::NetworkRealizationSelection::Default => None,
+            mantissa_protocol::network::NetworkRealizationSelection::AllNodes => {
+                Some(NetworkRealizationPolicy::AllNodes)
+            }
+            mantissa_protocol::network::NetworkRealizationSelection::OnDemand => {
+                Some(NetworkRealizationPolicy::OnDemand)
+            }
+        }
+    }
+
+    /// Convert the internal policy into the stored protocol enum.
+    pub fn to_proto(self) -> mantissa_protocol::network::NetworkRealizationPolicy {
+        match self {
+            NetworkRealizationPolicy::AllNodes => {
+                mantissa_protocol::network::NetworkRealizationPolicy::AllNodes
+            }
+            NetworkRealizationPolicy::OnDemand => {
+                mantissa_protocol::network::NetworkRealizationPolicy::OnDemand
+            }
+        }
+    }
+
+    /// Convert the internal policy into the create-time protocol selection enum.
+    pub fn to_selection_proto(self) -> mantissa_protocol::network::NetworkRealizationSelection {
+        match self {
+            NetworkRealizationPolicy::AllNodes => {
+                mantissa_protocol::network::NetworkRealizationSelection::AllNodes
+            }
+            NetworkRealizationPolicy::OnDemand => {
+                mantissa_protocol::network::NetworkRealizationSelection::OnDemand
+            }
+        }
+    }
+
+    /// Returns true when every node should synthesize local demand for this network.
+    pub fn realizes_on_all_nodes(self) -> bool {
+        matches!(self, NetworkRealizationPolicy::AllNodes)
+    }
+}
+
+impl fmt::Display for NetworkRealizationPolicy {
+    /// Render the policy as the stable operator-facing token.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            NetworkRealizationPolicy::AllNodes => "all_nodes",
+            NetworkRealizationPolicy::OnDemand => "on_demand",
+        };
+        f.write_str(label)
+    }
+}
+
 /// Lifecycle state for an overlay network.
 #[derive(
     Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
@@ -260,6 +340,7 @@ pub struct NetworkSpecValue {
     pub updated_at: String,
     pub status: NetworkStatus,
     pub sealed: bool,
+    pub realization: NetworkRealizationPolicy,
     pub bpf_programs: Vec<BpfProgramSpec>,
 }
 
@@ -285,6 +366,7 @@ pub struct NetworkSpecUpdate {
     pub vni: u32,
     pub mtu: u32,
     pub sealed: bool,
+    pub realization: NetworkRealizationPolicy,
     pub bpf_programs: Vec<BpfProgramSpec>,
 }
 
@@ -308,8 +390,19 @@ impl NetworkSpecValue {
             updated_at: created_at,
             status: NetworkStatus::Pending,
             sealed: draft.sealed,
+            realization: NetworkRealizationPolicy::AllNodes,
             bpf_programs: draft.bpf_programs,
         }
+    }
+
+    /// Construct a new network specification with an explicit realization policy.
+    pub fn new_with_realization(
+        draft: NetworkSpecDraft,
+        realization: NetworkRealizationPolicy,
+    ) -> Self {
+        let mut spec = Self::new(draft);
+        spec.realization = realization;
+        spec
     }
 
     /// Refresh the `updated_at` timestamp to reflect a mutating change.
@@ -331,6 +424,7 @@ impl NetworkSpecValue {
         self.vni = update.vni;
         self.mtu = update.mtu;
         self.sealed |= update.sealed;
+        self.realization = update.realization;
         self.bpf_programs = update.bpf_programs;
         self.touch();
     }
@@ -362,9 +456,15 @@ impl NetworkSpecValue {
         self.vni = update.vni;
         self.mtu = update.mtu;
         self.sealed = update.sealed;
+        self.realization = update.realization;
         self.bpf_programs = update.bpf_programs;
         self.status = NetworkStatus::Pending;
         self.touch();
+    }
+
+    /// Returns true when the local node should realize this spec due to all-node policy.
+    pub fn realizes_on_all_nodes(&self) -> bool {
+        self.realization.realizes_on_all_nodes()
     }
 }
 

@@ -1,4 +1,4 @@
-use super::types::NetworkDriver;
+use super::types::{NetworkDriver, NetworkRealizationPolicy};
 use crate::config::ClientConfig;
 use crate::connection;
 use anyhow::{Context, Result, anyhow};
@@ -15,6 +15,7 @@ pub struct NetworkCreateRequest {
     pub mtu: Option<u32>,
     pub bpf_programs: Vec<String>,
     pub sealed: bool,
+    pub realization: Option<NetworkRealizationPolicy>,
 }
 
 /// Submit a network creation request to the local node and return the new network identifier.
@@ -33,6 +34,9 @@ pub async fn create(cfg: &ClientConfig, request: &NetworkCreateRequest) -> Resul
         spec.set_vni(request.vni.unwrap_or(0));
         spec.set_mtu(request.mtu.unwrap_or(0));
         spec.set_sealed(request.sealed);
+        if let Some(realization) = request.realization {
+            spec.set_realization(realization.into());
+        }
 
         let mut programs = spec
             .reborrow()

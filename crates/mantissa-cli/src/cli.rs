@@ -1405,6 +1405,12 @@ pub enum NetworkDriverOpt {
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum NetworkRealizationOpt {
+    AllNodes,
+    OnDemand,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum VolumeBindingOpt {
     Immediate,
     WaitForFirstConsumer,
@@ -1489,6 +1495,10 @@ pub struct NetworksCreateArgs {
     /// Optional BPF program identifiers to add or use in place of driver defaults (repeat flag).
     #[arg(long = "bpf-program", value_name = "PROGRAM", action = ArgAction::Append)]
     pub bpf_programs: Vec<String>,
+
+    /// Local dataplane realization policy for this network.
+    #[arg(long = "realization", value_enum)]
+    pub realization: Option<NetworkRealizationOpt>,
 
     /// Mark the network spec read-only after creation
     #[arg(long = "sealed", action = ArgAction::SetTrue)]

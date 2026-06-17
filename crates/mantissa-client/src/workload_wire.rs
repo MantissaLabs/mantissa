@@ -214,6 +214,9 @@ pub fn write_network_requirements(
             None => mantissa_protocol::workload::NetworkRequirementIpFamily::Default,
         };
         entry.set_ip_family(family);
+        if let Some(realization) = network.realization {
+            entry.set_realization(realization.into());
+        }
     }
 }
 

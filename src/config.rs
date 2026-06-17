@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::ip_family::DefaultIpFamilyPolicy;
+use crate::network::types::NetworkRealizationPolicy;
 use crate::volumes::local::ensure_local_volume_root;
 
 /// Maximum scheduler slot count supported by the local scheduler snapshot codec.
@@ -228,6 +229,8 @@ pub struct NetworkConfig {
     pub advertise_addr: Option<String>,
     #[serde(default)]
     pub default_ip_family: DefaultIpFamilyPolicy,
+    #[serde(default)]
+    pub realization_default: NetworkRealizationPolicy,
     #[serde(default = "default_true")]
     pub provision_kernel_interfaces: bool,
     #[serde(default)]
@@ -246,6 +249,7 @@ impl Default for NetworkConfig {
         Self {
             advertise_addr: None,
             default_ip_family: DefaultIpFamilyPolicy::Auto,
+            realization_default: NetworkRealizationPolicy::AllNodes,
             provision_kernel_interfaces: true,
             wireguard: WireguardConfig::default(),
             bpf: BpfConfig::default(),
@@ -805,6 +809,13 @@ pub fn advertise_addr() -> Option<String> {
 /// node identity autodetection.
 pub fn default_ip_family_policy() -> DefaultIpFamilyPolicy {
     global_config().network.default_ip_family
+}
+
+/// # Description:
+///
+/// Resolve the default realization policy applied when creating networks without an explicit one.
+pub fn network_realization_default() -> NetworkRealizationPolicy {
+    global_config().network.realization_default
 }
 
 /// # Description:

@@ -4,8 +4,8 @@ use crate::network::gossip::NetworkGossiper;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
     BpfProgramSpec, NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue,
-    NetworkDriver, NetworkEvent, NetworkPeerState, NetworkPeerStateValue, NetworkSpecDraft,
-    NetworkSpecUpdate, NetworkSpecValue, NetworkStatus, compute_network_id,
+    NetworkDriver, NetworkEvent, NetworkPeerState, NetworkPeerStateValue, NetworkRealizationPolicy,
+    NetworkSpecDraft, NetworkSpecUpdate, NetworkSpecValue, NetworkStatus, compute_network_id,
 };
 use crate::topology::Topology;
 use capnp::Error;
@@ -227,6 +227,7 @@ fn write_network_spec(mut builder: network_spec::Builder<'_>, spec: &NetworkSpec
     builder.set_updated_at(&spec.updated_at);
     builder.set_status(spec.status.to_proto());
     builder.set_sealed(spec.sealed);
+    builder.set_realization(spec.realization.to_proto());
 
     let mut programs = builder
         .reborrow()
@@ -253,6 +254,7 @@ fn write_network_summary(
     builder.set_ready_peers(peer_counts.1);
     builder.set_created_at(&spec.created_at);
     builder.set_updated_at(&spec.updated_at);
+    builder.set_realization(spec.realization.to_proto());
 }
 
 /// Serialize one network peer-state row for inspect and status responses.
@@ -323,6 +325,7 @@ fn read_network_spec(reader: network_spec::Reader<'_>) -> Result<NetworkSpecValu
     let updated_at = reader.get_updated_at()?.to_str()?.to_string();
     let status = NetworkStatus::from_proto(reader.get_status()?);
     let sealed = reader.get_sealed();
+    let realization = NetworkRealizationPolicy::from_proto(reader.get_realization()?);
 
     let mut bpf_programs = Vec::new();
     for entry in reader.get_bpf_programs()?.iter() {
@@ -342,6 +345,7 @@ fn read_network_spec(reader: network_spec::Reader<'_>) -> Result<NetworkSpecValu
         updated_at,
         status,
         sealed,
+        realization,
         bpf_programs,
     })
 }
@@ -577,6 +581,9 @@ impl networks::Server for NetworksRpc {
         let vni = spec_reader.get_vni();
         let mtu = spec_reader.get_mtu();
         let sealed = spec_reader.get_sealed();
+        let realization =
+            NetworkRealizationPolicy::from_selection_proto(spec_reader.get_realization()?)
+                .unwrap_or_else(crate::config::network_realization_default);
         let requested_programs = collect_bpf_programs(&spec_reader)?;
         validate_driver_request(driver, vni, &requested_programs)?;
         let programs = merge_driver_default_bpf_programs(driver, requested_programs);
@@ -601,6 +608,7 @@ impl networks::Server for NetworksRpc {
             vni,
             mtu,
             sealed,
+            realization,
             bpf_programs: programs.clone(),
         };
 
@@ -621,16 +629,19 @@ impl networks::Server for NetworksRpc {
                 (current, false)
             }
             None => (
-                NetworkSpecValue::new(NetworkSpecDraft {
-                    name: name.clone(),
-                    description: description.clone(),
-                    driver,
-                    subnet_cidr: subnet.clone(),
-                    vni,
-                    mtu,
-                    sealed,
-                    bpf_programs: programs.clone(),
-                }),
+                NetworkSpecValue::new_with_realization(
+                    NetworkSpecDraft {
+                        name: name.clone(),
+                        description: description.clone(),
+                        driver,
+                        subnet_cidr: subnet.clone(),
+                        vni,
+                        mtu,
+                        sealed,
+                        bpf_programs: programs.clone(),
+                    },
+                    realization,
+                ),
                 true,
             ),
         };
@@ -650,7 +661,9 @@ impl networks::Server for NetworksRpc {
             .await
             .map_err(|e| Error::failed(e.to_string()))?;
 
-        self.controller.schedule_spec_change(spec_value.id).await;
+        if spec_value.realizes_on_all_nodes() {
+            self.controller.schedule_spec_change(spec_value.id).await;
+        }
 
         results.get().set_network_id(spec_value.id.as_bytes());
         Ok(())
@@ -811,6 +824,7 @@ mod tests {
             updated_at: "2026-03-25T12:01:00Z".to_string(),
             status: NetworkStatus::Ready,
             sealed: true,
+            realization: NetworkRealizationPolicy::OnDemand,
             bpf_programs: vec![BpfProgramSpec::with_attach_point(
                 "frontend-filter",
                 BpfAttachPoint::BridgeTcIngress,
@@ -889,6 +903,7 @@ mod tests {
             vni: 0,
             mtu: 1500,
             sealed: false,
+            realization: current.realization,
             bpf_programs: Vec::new(),
         });
 

@@ -14,5 +14,5 @@ pub use list::list;
 pub use status::peer_status;
 pub use types::{
     NetworkAttachment, NetworkAttachmentState, NetworkDriver, NetworkInspect, NetworkPeerState,
-    NetworkPeerStatus, NetworkSpec, NetworkStatus, NetworkSummary,
+    NetworkPeerStatus, NetworkRealizationPolicy, NetworkSpec, NetworkStatus, NetworkSummary,
 };

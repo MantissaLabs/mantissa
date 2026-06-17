@@ -18,6 +18,7 @@ fn render_inspect(info: &NetworkInspect) {
         "  driver: {} vni={} mtu={}",
         info.spec.driver, info.spec.vni, info.spec.mtu
     ));
+    output::emit_line(format!("  realization: {}", info.spec.realization));
     output::emit_line(format!("  subnet: {}", info.spec.subnet_cidr));
     if !info.spec.description.is_empty() {
         output::emit_line(format!("  description: {}", info.spec.description));

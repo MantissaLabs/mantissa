@@ -341,11 +341,18 @@ pub fn decode_network_requirement(
             WorkloadNetworkIpFamily::Ipv6
         }
     };
+    let realization = match reader.get_realization() {
+        Ok(selection) => {
+            crate::network::types::NetworkRealizationPolicy::from_selection_proto(selection)
+        }
+        Err(_) => None,
+    };
 
     Ok(WorkloadNetworkRequirement {
         name,
         driver,
         ip_family,
+        realization,
     })
 }
 

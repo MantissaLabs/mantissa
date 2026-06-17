@@ -821,6 +821,7 @@ mod tests {
             name: "jobs".to_string(),
             driver: None,
             ip_family: Some(crate::config::NetworkIpFamily::Ipv6),
+            realization: None,
         }];
 
         let requested = manifest.requested_networks().expect("network requests");

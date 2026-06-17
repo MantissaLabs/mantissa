@@ -53,6 +53,8 @@ pub struct ManifestNetworkSpec {
     pub driver: Option<networks::NetworkDriver>,
     #[serde(default, deserialize_with = "deserialize_optional_network_ip_family")]
     pub ip_family: Option<NetworkIpFamily>,
+    #[serde(default, deserialize_with = "deserialize_optional_network_realization")]
+    pub realization: Option<networks::NetworkRealizationPolicy>,
 }
 
 /// One normalized network request returned after manifest-side network resolution.
@@ -61,6 +63,7 @@ pub struct RequestedNetworkSpec {
     pub name: String,
     pub driver: networks::NetworkDriver,
     pub ip_family: Option<NetworkIpFamily>,
+    pub realization: Option<networks::NetworkRealizationPolicy>,
 }
 
 /// Shared deployment deadlines declared by workload-owning manifests.
@@ -299,6 +302,16 @@ where
     NetworkIpFamily::deserialize(deserializer).map(Some)
 }
 
+/// Deserialize one optional realization policy while accepting bare policy tokens.
+fn deserialize_optional_network_realization<'de, D>(
+    deserializer: D,
+) -> Result<Option<networks::NetworkRealizationPolicy>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    networks::NetworkRealizationPolicy::deserialize(deserializer).map(Some)
+}
+
 /// Validate one set of top-level manifest network declarations before submission.
 pub fn validate_declared_networks(
     declared_networks: &[ManifestNetworkSpec],
@@ -339,6 +352,7 @@ where
             (
                 network.driver.unwrap_or(networks::NetworkDriver::Vxlan),
                 network.ip_family,
+                network.realization,
             ),
         );
     }
@@ -351,14 +365,16 @@ where
             continue;
         }
         if seen.insert(trimmed.to_string()) {
-            let (driver, ip_family) = overrides
-                .get(trimmed)
-                .copied()
-                .unwrap_or((networks::NetworkDriver::Vxlan, None));
+            let (driver, ip_family, realization) = overrides.get(trimmed).copied().unwrap_or((
+                networks::NetworkDriver::Vxlan,
+                None,
+                None,
+            ));
             requested.push(RequestedNetworkSpec {
                 name: trimmed.to_string(),
                 driver,
                 ip_family,
+                realization,
             });
         }
     }

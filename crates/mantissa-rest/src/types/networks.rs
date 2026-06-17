@@ -2,7 +2,8 @@ use mantissa_client::networks::{
     NetworkAttachment as ClientNetworkAttachment,
     NetworkCreateRequest as ClientNetworkCreateRequest, NetworkDriver as ClientNetworkDriver,
     NetworkInspect as ClientNetworkInspect, NetworkPeerStatus as ClientNetworkPeerStatus,
-    NetworkSpec as ClientNetworkSpec, NetworkSummary as ClientNetworkSummary,
+    NetworkRealizationPolicy as ClientNetworkRealizationPolicy, NetworkSpec as ClientNetworkSpec,
+    NetworkSummary as ClientNetworkSummary,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -25,6 +26,8 @@ pub struct NetworkCreateRequest {
     pub bpf_programs: Vec<String>,
     #[serde(default)]
     pub sealed: bool,
+    #[serde(default)]
+    pub realization: Option<ClientNetworkRealizationPolicy>,
 }
 
 impl From<NetworkCreateRequest> for ClientNetworkCreateRequest {
@@ -39,6 +42,7 @@ impl From<NetworkCreateRequest> for ClientNetworkCreateRequest {
             mtu: value.mtu,
             bpf_programs: value.bpf_programs,
             sealed: value.sealed,
+            realization: value.realization,
         }
     }
 }
@@ -62,6 +66,7 @@ pub struct NetworkSummary {
     pub name: String,
     pub driver: String,
     pub status: String,
+    pub realization: String,
     pub vni: u32,
     pub subnet_cidr: String,
     pub peer_count: u32,
@@ -78,6 +83,7 @@ impl From<ClientNetworkSummary> for NetworkSummary {
             name: value.name,
             driver: value.driver.to_string(),
             status: value.status.to_string(),
+            realization: value.realization.to_string(),
             vni: value.vni,
             subnet_cidr: value.subnet_cidr,
             peer_count: value.peer_count,
@@ -102,6 +108,7 @@ pub struct NetworkSpec {
     pub updated_at: String,
     pub status: String,
     pub sealed: bool,
+    pub realization: String,
     pub bpf_programs: Vec<String>,
 }
 
@@ -120,6 +127,7 @@ impl From<ClientNetworkSpec> for NetworkSpec {
             updated_at: value.updated_at,
             status: value.status.to_string(),
             sealed: value.sealed,
+            realization: value.realization.to_string(),
             bpf_programs: value.bpf_programs,
         }
     }

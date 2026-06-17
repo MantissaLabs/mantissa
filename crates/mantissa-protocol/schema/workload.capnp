@@ -2,6 +2,7 @@
 
 using VolumeSchema = import "volumes.capnp";
 using import "network.capnp".NetworkDriver;
+using import "network.capnp".NetworkRealizationSelection;
 
 interface Workload {
   stop @0 (request :WorkloadStopRequest) -> (spec :WorkloadSpec);
@@ -78,6 +79,9 @@ struct NetworkRequirement {
 
   ipFamily @2 :NetworkRequirementIpFamily;
   # Optional family override for deterministic auto-created subnets.
+
+  realization @3 :NetworkRealizationSelection;
+  # Optional local dataplane realization policy for auto-created networks.
 }
 
 enum NetworkRequirementIpFamily {

@@ -1,6 +1,8 @@
 use capnp::Error as CapnpError;
 use mantissa_protocol::network::{
     AttachmentState as ProtoAttachmentState, NetworkDriver as ProtoNetworkDriver,
+    NetworkRealizationPolicy as ProtoNetworkRealizationPolicy,
+    NetworkRealizationSelection as ProtoNetworkRealizationSelection,
     NetworkStatus as ProtoNetworkStatus, PeerState as ProtoPeerState, network_attachment_spec,
     network_inspect, network_peer_status, network_spec, network_summary,
 };
@@ -39,6 +41,53 @@ impl From<ProtoNetworkDriver> for NetworkDriver {
         match value {
             ProtoNetworkDriver::Vxlan => NetworkDriver::Vxlan,
             ProtoNetworkDriver::Bridge => NetworkDriver::Bridge,
+        }
+    }
+}
+
+/// Policy that decides where Mantissa realizes local network dataplane resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkRealizationPolicy {
+    AllNodes,
+    OnDemand,
+}
+
+impl std::fmt::Display for NetworkRealizationPolicy {
+    /// Renders the policy as the stable operator-facing token.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            NetworkRealizationPolicy::AllNodes => "all_nodes",
+            NetworkRealizationPolicy::OnDemand => "on_demand",
+        };
+        write!(f, "{label}")
+    }
+}
+
+impl From<ProtoNetworkRealizationPolicy> for NetworkRealizationPolicy {
+    fn from(value: ProtoNetworkRealizationPolicy) -> Self {
+        match value {
+            ProtoNetworkRealizationPolicy::AllNodes => NetworkRealizationPolicy::AllNodes,
+            ProtoNetworkRealizationPolicy::OnDemand => NetworkRealizationPolicy::OnDemand,
+        }
+    }
+}
+
+impl From<NetworkRealizationPolicy> for ProtoNetworkRealizationPolicy {
+    fn from(value: NetworkRealizationPolicy) -> Self {
+        match value {
+            NetworkRealizationPolicy::AllNodes => ProtoNetworkRealizationPolicy::AllNodes,
+            NetworkRealizationPolicy::OnDemand => ProtoNetworkRealizationPolicy::OnDemand,
+        }
+    }
+}
+
+impl From<NetworkRealizationPolicy> for ProtoNetworkRealizationSelection {
+    fn from(value: NetworkRealizationPolicy) -> Self {
+        match value {
+            NetworkRealizationPolicy::AllNodes => ProtoNetworkRealizationSelection::AllNodes,
+            NetworkRealizationPolicy::OnDemand => ProtoNetworkRealizationSelection::OnDemand,
         }
     }
 }
@@ -158,6 +207,7 @@ pub struct NetworkSummary {
     pub name: String,
     pub driver: NetworkDriver,
     pub status: NetworkStatus,
+    pub realization: NetworkRealizationPolicy,
     pub vni: u32,
     pub subnet_cidr: String,
     pub peer_count: u32,
@@ -174,6 +224,7 @@ impl NetworkSummary {
             name: reader.get_name()?.to_str()?.to_string(),
             driver: reader.get_driver()?.into(),
             status: reader.get_status()?.into(),
+            realization: reader.get_realization()?.into(),
             vni: reader.get_vni(),
             subnet_cidr: reader.get_subnet_cidr()?.to_str()?.to_string(),
             peer_count: reader.get_peer_count(),
@@ -198,6 +249,7 @@ pub struct NetworkSpec {
     pub updated_at: String,
     pub status: NetworkStatus,
     pub sealed: bool,
+    pub realization: NetworkRealizationPolicy,
     pub bpf_programs: Vec<String>,
 }
 
@@ -221,6 +273,7 @@ impl NetworkSpec {
             updated_at: reader.get_updated_at()?.to_str()?.to_string(),
             status: reader.get_status()?.into(),
             sealed: reader.get_sealed(),
+            realization: reader.get_realization()?.into(),
             bpf_programs: programs,
         })
     }

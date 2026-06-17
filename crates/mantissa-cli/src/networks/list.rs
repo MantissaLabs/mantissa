@@ -17,15 +17,16 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "ID\tNAME\tDRIVER\tSTATUS\tVNI\tPEERS\tREADY\tSUBNET\tUPDATED"
+        "ID\tNAME\tDRIVER\tREALIZATION\tSTATUS\tVNI\tPEERS\tREADY\tSUBNET\tUPDATED"
     )?;
     for row in rows {
         writeln!(
             &mut tw,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.id,
             row.name,
             row.driver,
+            row.realization,
             row.status,
             row.vni,
             row.peer_count,
