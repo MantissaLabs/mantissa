@@ -44,6 +44,7 @@ fn public_catalog_entry(
 ) -> ServiceBackendCatalogEntry {
     ServiceBackendCatalogEntry {
         service_id: Uuid::new_v4(),
+        service_epoch: 0,
         template_name: "backend".to_string(),
         discovery_name: "backend.service.svc.mantissa".to_string(),
         candidates: Vec::new(),
@@ -122,6 +123,47 @@ fn public_ingress_nodeport_publication_requires_public_port() {
     let service = public_catalog_entry(PublicIngressPolicy::AllNodes, None, vec![local.clone()]);
 
     assert!(!should_publish_nodeport(&service, &[local]));
+}
+
+#[test]
+fn public_endpoint_snapshot_carries_lb_target_identity() {
+    let service_id = Uuid::new_v4();
+    let network_id = Uuid::new_v4();
+    let node_id = Uuid::new_v4();
+    let node_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+    let observation = PublicEndpointObservation {
+        service_id,
+        service_epoch: 9,
+        template_name: "api".to_string(),
+        network_id,
+        node_id,
+        port: 8443,
+        protocols: vec![NodePortProtocol::Tcp, NodePortProtocol::Udp],
+        ingress: PublicEndpointIngressMode::IngressPool {
+            pool: "public-web".to_string(),
+        },
+        ready: true,
+        node_ip: Some(node_ip),
+        detail: None,
+    };
+
+    let snapshot = public_endpoint_snapshot_for_protocol(&observation, NodePortProtocol::Udp);
+
+    assert_eq!(snapshot.key.service_id, service_id);
+    assert_eq!(snapshot.key.template_name, "api");
+    assert_eq!(snapshot.key.public_port, 8443);
+    assert_eq!(snapshot.key.protocol, NodePortProtocol::Udp);
+    assert_eq!(snapshot.key.node_id, node_id);
+    assert_eq!(snapshot.network_id, network_id);
+    assert_eq!(snapshot.node_ip, Some(node_ip));
+    assert_eq!(snapshot.generation, 9);
+    assert!(snapshot.ready);
+    assert_eq!(
+        snapshot.ingress,
+        PublicEndpointIngressMode::IngressPool {
+            pool: "public-web".to_string()
+        }
+    );
 }
 
 #[test]
@@ -1361,8 +1403,15 @@ async fn public_endpoint_observations_update_running_service_detail() {
         &harness.services,
         &[PublicEndpointObservation {
             service_id: service.id,
+            service_epoch: service.service_epoch,
             template_name: "backend".to_string(),
+            network_id: harness.network.id,
+            node_id: Uuid::new_v4(),
             port: 443,
+            protocols: vec![NodePortProtocol::Tcp],
+            ingress: PublicEndpointIngressMode::AllNodes,
+            ready: false,
+            node_ip: None,
             detail: Some("template 'backend' public port 443 has no healthy backends".into()),
         }],
     )
@@ -1383,8 +1432,15 @@ async fn public_endpoint_observations_update_running_service_detail() {
         &harness.services,
         &[PublicEndpointObservation {
             service_id: service.id,
+            service_epoch: service.service_epoch,
             template_name: "backend".to_string(),
+            network_id: harness.network.id,
+            node_id: Uuid::new_v4(),
             port: 443,
+            protocols: vec![NodePortProtocol::Tcp],
+            ingress: PublicEndpointIngressMode::AllNodes,
+            ready: true,
+            node_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             detail: None,
         }],
     )

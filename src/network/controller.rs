@@ -6,7 +6,7 @@ use crate::network::allocator::{parse_overlay_cidr, resolver_ip_address};
 use crate::network::attachment::{PlatformAttachmentProvisioner, host_iface_name};
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext, overlay_bpf_program_specs};
 use crate::network::defaults::merge_default_bpf_programs;
-use crate::network::discovery::ServiceDiscovery;
+use crate::network::discovery::{PublicEndpointSnapshot, ServiceDiscovery};
 use crate::network::events::ForwardingEvent;
 use crate::network::naming::{
     collect_orphaned_network_suffixes, is_managed_overlay_link_name, managed_interface_suffix,
@@ -389,6 +389,11 @@ impl NetworkController {
     /// Return the local NodePort manager used by network discovery and public-service publication.
     pub fn nodeport_manager(&self) -> NodePortManager {
         self.inner.discovery.nodeport_manager()
+    }
+
+    /// Return node-local public endpoint snapshots derived by service discovery refreshes.
+    pub async fn public_endpoint_snapshots(&self) -> Vec<PublicEndpointSnapshot> {
+        self.inner.discovery.public_endpoint_snapshots().await
     }
 
     /// Publish a network event onto the gossip plane so peers converge replicated network state.

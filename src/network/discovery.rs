@@ -91,6 +91,7 @@ pub struct ServiceDiscovery {
     bpf_lb: BpfLoadBalancer,
     nodeport: NodePortManager,
     missing_lb_maps: Arc<AsyncMutex<HashSet<Uuid>>>,
+    public_endpoints: Arc<AsyncMutex<HashMap<PublicEndpointKey, PublicEndpointSnapshot>>>,
 }
 
 struct DnsServerHandle {
@@ -123,6 +124,37 @@ struct DiscoveryRuntime {
     bpf_lb: BpfLoadBalancer,
     nodeport: NodePortManager,
     missing_lb_maps: Arc<AsyncMutex<HashSet<Uuid>>>,
+    public_endpoints: Arc<AsyncMutex<HashMap<PublicEndpointKey, PublicEndpointSnapshot>>>,
+}
+
+/// Stable key for one node-local public endpoint publication row.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PublicEndpointKey {
+    pub service_id: Uuid,
+    pub template_name: String,
+    pub public_port: u16,
+    pub protocol: NodePortProtocol,
+    pub node_id: Uuid,
+}
+
+/// Operator-facing publication mode for one public endpoint snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PublicEndpointIngressMode {
+    AllNodes,
+    TaskNodes,
+    IngressPool { pool: String },
+}
+
+/// Node-local derived view describing whether this node is a public LB target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicEndpointSnapshot {
+    pub key: PublicEndpointKey,
+    pub network_id: Uuid,
+    pub node_ip: Option<IpAddr>,
+    pub ingress: PublicEndpointIngressMode,
+    pub ready: bool,
+    pub generation: u64,
+    pub detail: Option<String>,
 }
 
 /// Cached backend-resolution metadata for one network, invalidated by store generations and
@@ -164,6 +196,7 @@ impl Default for NetworkBackendCatalog {
 #[derive(Clone)]
 struct ServiceBackendCatalogEntry {
     service_id: Uuid,
+    service_epoch: u64,
     template_name: String,
     discovery_name: String,
     candidates: Vec<BackendAddress>,
@@ -196,9 +229,136 @@ struct ServiceRefreshResult {
 #[derive(Clone, Debug)]
 struct PublicEndpointObservation {
     service_id: Uuid,
+    service_epoch: u64,
     template_name: String,
+    network_id: Uuid,
+    node_id: Uuid,
     port: u16,
+    protocols: Vec<NodePortProtocol>,
+    ingress: PublicEndpointIngressMode,
+    ready: bool,
+    node_ip: Option<IpAddr>,
     detail: Option<String>,
+}
+
+/// Convert a service public-ingress policy into the compact endpoint-view mode.
+fn public_endpoint_ingress_mode(policy: &PublicIngressPolicy) -> PublicEndpointIngressMode {
+    match policy {
+        PublicIngressPolicy::AllNodes => PublicEndpointIngressMode::AllNodes,
+        PublicIngressPolicy::TaskNodes => PublicEndpointIngressMode::TaskNodes,
+        PublicIngressPolicy::IngressPool { pool } => PublicEndpointIngressMode::IngressPool {
+            pool: pool.trim().to_string(),
+        },
+    }
+}
+
+/// Build one template-level public endpoint observation for the current refresh tick.
+fn public_endpoint_observation(
+    runtime: &DiscoveryRuntime,
+    service: &ServiceBackendCatalogEntry,
+    ready: bool,
+    detail: Option<String>,
+) -> Option<PublicEndpointObservation> {
+    let port = service.public_port?;
+    Some(PublicEndpointObservation {
+        service_id: service.service_id,
+        service_epoch: service.service_epoch,
+        template_name: service.template_name.clone(),
+        network_id: runtime.network_id,
+        node_id: runtime.local_node_id,
+        port,
+        protocols: service.public_protocols.clone(),
+        ingress: public_endpoint_ingress_mode(&service.public_ingress),
+        ready,
+        node_ip: None,
+        detail,
+    })
+}
+
+/// Attach the current NodePort publication identity to endpoint observations.
+async fn annotate_public_endpoint_observations(
+    runtime: &DiscoveryRuntime,
+    observations: &mut [PublicEndpointObservation],
+) {
+    if observations.is_empty() {
+        return;
+    }
+
+    let status = runtime.nodeport.status().await;
+    for observation in observations {
+        if observation.node_ip.is_none() {
+            observation.node_ip = status.resolved_node_ip;
+        }
+        if observation.ready && observation.node_ip.is_none() {
+            observation.ready = false;
+            if observation.detail.is_none() {
+                observation.detail =
+                    Some("nodeport publication address is not resolved".to_string());
+            }
+        }
+    }
+}
+
+/// Replace this network's derived public endpoint rows with the latest refresh observations.
+async fn replace_public_endpoint_snapshots(
+    runtime: &DiscoveryRuntime,
+    observations: &[PublicEndpointObservation],
+) {
+    let mut guard = runtime.public_endpoints.lock().await;
+    guard.retain(|_, snapshot| snapshot.network_id != runtime.network_id);
+    for observation in observations {
+        for protocol in observation.protocols.iter().copied() {
+            let snapshot = public_endpoint_snapshot_for_protocol(observation, protocol);
+            guard.insert(snapshot.key.clone(), snapshot);
+        }
+    }
+}
+
+/// Expand one template-level observation into a protocol-specific endpoint snapshot.
+fn public_endpoint_snapshot_for_protocol(
+    observation: &PublicEndpointObservation,
+    protocol: NodePortProtocol,
+) -> PublicEndpointSnapshot {
+    PublicEndpointSnapshot {
+        key: PublicEndpointKey {
+            service_id: observation.service_id,
+            template_name: observation.template_name.clone(),
+            public_port: observation.port,
+            protocol,
+            node_id: observation.node_id,
+        },
+        network_id: observation.network_id,
+        node_ip: observation.node_ip,
+        ingress: observation.ingress.clone(),
+        ready: observation.ready,
+        generation: observation.service_epoch,
+        detail: observation.detail.clone(),
+    }
+}
+
+/// Order public endpoint snapshots deterministically for stable API and diagnostic output.
+fn compare_public_endpoint_snapshots(
+    left: &PublicEndpointSnapshot,
+    right: &PublicEndpointSnapshot,
+) -> std::cmp::Ordering {
+    left.key
+        .service_id
+        .cmp(&right.key.service_id)
+        .then_with(|| left.key.template_name.cmp(&right.key.template_name))
+        .then_with(|| left.key.public_port.cmp(&right.key.public_port))
+        .then_with(|| {
+            nodeport_protocol_rank(left.key.protocol)
+                .cmp(&nodeport_protocol_rank(right.key.protocol))
+        })
+        .then_with(|| left.key.node_id.cmp(&right.key.node_id))
+}
+
+/// Assign a compact sort rank to NodePort protocols for endpoint snapshot ordering.
+fn nodeport_protocol_rank(protocol: NodePortProtocol) -> u8 {
+    match protocol {
+        NodePortProtocol::Tcp => 0,
+        NodePortProtocol::Udp => 1,
+    }
 }
 
 /// Backend resolver output split into global candidates and candidates local to this node.
@@ -262,12 +422,21 @@ impl ServiceDiscovery {
             bpf_lb: BpfLoadBalancer::new(),
             nodeport: NodePortManager::new(),
             missing_lb_maps: Arc::new(AsyncMutex::new(HashSet::new())),
+            public_endpoints: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
     /// Return the shared NodePort manager used by discovery so other local diagnostics can inspect it.
     pub fn nodeport_manager(&self) -> NodePortManager {
         self.nodeport.clone()
+    }
+
+    /// Return the current node-local public endpoint snapshots sorted for stable diagnostics.
+    pub async fn public_endpoint_snapshots(&self) -> Vec<PublicEndpointSnapshot> {
+        let guard = self.public_endpoints.lock().await;
+        let mut snapshots = guard.values().cloned().collect::<Vec<_>>();
+        snapshots.sort_by(compare_public_endpoint_snapshots);
+        snapshots
     }
 
     /// Build the network-scoped runtime bundle shared by one resolver socket and refresh loop.
@@ -294,6 +463,7 @@ impl ServiceDiscovery {
             bpf_lb: self.bpf_lb.clone(),
             nodeport: self.nodeport.clone(),
             missing_lb_maps: self.missing_lb_maps.clone(),
+            public_endpoints: self.public_endpoints.clone(),
         }
     }
 
@@ -360,6 +530,7 @@ impl ServiceDiscovery {
                 "failed to clear nodeport mappings during teardown: {err:#}"
             );
         }
+        self.clear_public_endpoint_snapshots(network_id).await;
 
         if let Some(mut handle) = handle {
             if let Some(tx) = handle.shutdown.take() {
@@ -371,6 +542,12 @@ impl ServiceDiscovery {
         }
 
         Ok(())
+    }
+
+    /// Remove all derived public endpoint rows owned by one local network runtime.
+    async fn clear_public_endpoint_snapshots(&self, network_id: Uuid) {
+        let mut guard = self.public_endpoints.lock().await;
+        guard.retain(|_, snapshot| snapshot.network_id != network_id);
     }
 
     /// Stop every active discovery listener and withdraw its local publication state.
@@ -1133,6 +1310,7 @@ async fn refresh_backend_catalog_if_needed(
                 service_key,
                 ServiceBackendCatalogEntry {
                     service_id: spec.id,
+                    service_epoch: spec.service_epoch,
                     template_name,
                     discovery_name,
                     candidates: resolved.candidates,
@@ -1234,6 +1412,7 @@ async fn refresh_network_services(runtime: &DiscoveryRuntime) -> Result<()> {
         .await
     {
         for observation in &mut public_endpoint_observations {
+            observation.ready = false;
             if observation.detail.is_none() {
                 observation.detail = Some(format!(
                     "template '{}' public port {} could not publish NodePort: {err:#}",
@@ -1247,6 +1426,8 @@ async fn refresh_network_services(runtime: &DiscoveryRuntime) -> Result<()> {
             "failed to sync public nodeport mappings: {err:#}"
         );
     }
+    annotate_public_endpoint_observations(runtime, &mut public_endpoint_observations).await;
+    replace_public_endpoint_snapshots(runtime, public_endpoint_observations.as_slice()).await;
     if let Err(err) = reconcile_host_vip_neighbors(runtime.network_id, &host_vips).await {
         warn!(
             target: "network",
@@ -1294,14 +1475,16 @@ async fn refresh_single_service(
     if !driver.supports_service_vip() {
         return Ok(ServiceRefreshResult {
             nodeport_mappings: Vec::new(),
-            public_endpoint: service.public_port.map(|port| PublicEndpointObservation {
-                service_id: service.service_id,
-                template_name: service.template_name.clone(),
-                port,
-                detail: Some(format!(
-                    "template '{}' public port {} requires a vxlan network; bridge networks only publish node-local DNS backends",
-                    service.template_name, port
-                )),
+            public_endpoint: service.public_port.and_then(|port| {
+                public_endpoint_observation(
+                    runtime,
+                    service,
+                    false,
+                    Some(format!(
+                        "template '{}' public port {} requires a vxlan network; bridge networks only publish node-local DNS backends",
+                        service.template_name, port
+                    )),
+                )
             }),
             host_vip: None,
         });
@@ -1311,14 +1494,16 @@ async fn refresh_single_service(
         let _ = sync_service_vip_for_backends(runtime, service_name, &[], false).await?;
         return Ok(ServiceRefreshResult {
             nodeport_mappings: Vec::new(),
-            public_endpoint: service.public_port.map(|port| PublicEndpointObservation {
-                service_id: service.service_id,
-                template_name: service.template_name.clone(),
-                port,
-                detail: Some(format!(
-                    "template '{}' public port {} has no healthy backends",
-                    service.template_name, port
-                )),
+            public_endpoint: service.public_port.and_then(|port| {
+                public_endpoint_observation(
+                    runtime,
+                    service,
+                    false,
+                    Some(format!(
+                        "template '{}' public port {} has no healthy backends",
+                        service.template_name, port
+                    )),
+                )
             }),
             // Only keep the host VIP neighbour alive while at least one backend is published.
             host_vip: None,
@@ -1337,13 +1522,8 @@ async fn refresh_single_service(
     {
         let vip_port = service.public_target_port.unwrap_or(port);
         if !publish_nodeport {
-            let public_endpoint = public_ingress_suppression_detail(service).map(|detail| {
-                PublicEndpointObservation {
-                    service_id: service.service_id,
-                    template_name: service.template_name.clone(),
-                    port,
-                    detail: Some(detail),
-                }
+            let public_endpoint = public_ingress_suppression_detail(service).and_then(|detail| {
+                public_endpoint_observation(runtime, service, false, Some(detail))
             });
             return Ok(ServiceRefreshResult {
                 nodeport_mappings: Vec::new(),
@@ -1355,15 +1535,15 @@ async fn refresh_single_service(
         if !programmed {
             return Ok(ServiceRefreshResult {
                 nodeport_mappings: Vec::new(),
-                public_endpoint: Some(PublicEndpointObservation {
-                    service_id: service.service_id,
-                    template_name: service.template_name.clone(),
-                    port,
-                    detail: Some(format!(
+                public_endpoint: public_endpoint_observation(
+                    runtime,
+                    service,
+                    false,
+                    Some(format!(
                         "template '{}' public port {} lost VIP programming; internal discovery is still available",
                         service.template_name, port
                     )),
-                }),
+                ),
                 host_vip: (service.expose_to_host && publish_nodeport).then_some(vip),
             });
         }
@@ -1379,26 +1559,23 @@ async fn refresh_single_service(
         }
         return Ok(ServiceRefreshResult {
             nodeport_mappings: mappings,
-            public_endpoint: Some(PublicEndpointObservation {
-                service_id: service.service_id,
-                template_name: service.template_name.clone(),
-                port,
-                detail: None,
-            }),
+            public_endpoint: public_endpoint_observation(runtime, service, true, None),
             host_vip: service.expose_to_host.then_some(vip),
         });
     }
 
     Ok(ServiceRefreshResult {
         nodeport_mappings: Vec::new(),
-        public_endpoint: service.public_port.map(|port| PublicEndpointObservation {
-            service_id: service.service_id,
-            template_name: service.template_name.clone(),
-            port,
-            detail: Some(format!(
-                "template '{}' public port {} could not assign a stable service VIP",
-                service.template_name, port
-            )),
+        public_endpoint: service.public_port.and_then(|port| {
+            public_endpoint_observation(
+                runtime,
+                service,
+                false,
+                Some(format!(
+                    "template '{}' public port {} could not assign a stable service VIP",
+                    service.template_name, port
+                )),
+            )
         }),
         host_vip: None,
     })
