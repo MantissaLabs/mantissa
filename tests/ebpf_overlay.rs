@@ -982,7 +982,7 @@ local_test!(
                 Uuid::new_v4(),
                 &service_name,
                 &service_name,
-                vec![privileged_frontend_task_template(network_id)],
+                vec![privileged_http_service_task_template(network_id, 1)],
             )
             .await
             .expect("submit privileged on-demand cold-start deployment");
@@ -1018,6 +1018,47 @@ local_test!(
             panic!("service demand should realize on-demand network kernel and BPF state; {state}");
         }
         assert_lb_maps_present(network_id, overlay_family(&subnet));
+
+        let backend_ips = wait_for_backend_ips(&node, network_id, 1, Duration::from_secs(60)).await;
+        let [
+            _vxlan_ifname,
+            _bridge_ifname,
+            _host_peer_ifname,
+            host_ifname,
+        ] = privileged_network_interfaces(network_id);
+        let resolver_ip = interface_ipv4(&host_ifname).await;
+        let fqdn = service_fqdn("backend", &service_name, &network.name);
+        let vip = wait_for_vip_record(resolver_ip, &fqdn, &backend_ips, Duration::from_secs(60))
+            .await
+            .expect("discover VIP after on-demand sparse realization");
+        let vip_addr = format!("{vip}:{EBPF_HTTP_PORT}");
+
+        let vip_ready = common::convergence::wait_until(
+            Duration::from_secs(30),
+            Duration::from_millis(100),
+            || async {
+                matches!(
+                    http_get(&vip_addr).await,
+                    Ok(response) if response.contains(EBPF_HTTP_RESPONSE)
+                )
+            },
+        )
+        .await;
+        if !vip_ready {
+            let (last_dns_code, last_dns_answers) = query_a_records(resolver_ip, &fqdn)
+                .await
+                .expect("query DNS after on-demand VIP timeout");
+            let host_link = link_summary(&host_ifname).await;
+            let host_addr = interface_addresses_summary(&host_ifname).await;
+            let neighbour = neighbour_summary(&host_ifname, IpAddr::V4(vip)).await;
+            let last_http_error = http_get(&vip_addr)
+                .await
+                .map(|response| format!("unexpected response: {response}"))
+                .unwrap_or_else(|err| err.to_string());
+            panic!(
+                "on-demand sparse realization should publish a reachable host-access VIP; vip={vip}; backend_ips={backend_ips:?}; last_dns_code={last_dns_code:?}; last_dns_answers={last_dns_answers:?}; host_link={host_link:?}; host_addr={host_addr:?}; neighbour={neighbour:?}; last_http_error={last_http_error}"
+            );
+        }
 
         remove_service_via_rpc(&node, service_id).await;
         if !common::convergence::wait_until(
