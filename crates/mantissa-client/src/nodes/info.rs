@@ -398,3 +398,89 @@ fn non_negative_u32(value: i32) -> u32 {
 fn non_negative_u64(value: i32) -> u64 {
     value.max(0) as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mantissa_protocol::info_capnp::info as system_info;
+
+    #[test]
+    /// Decodes node-info public endpoint rows into the owned client view.
+    fn decode_public_endpoints_preserves_endpoint_rows() {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut info = message.init_root::<system_info::Builder>();
+            let mut endpoints = info.reborrow().init_public_endpoints(2);
+            let mut ready = endpoints.reborrow().get(0);
+            ready.set_service_id("4e83fe38-d78a-4e42-8e31-27234ee34a5c");
+            ready.set_template_name("backend");
+            ready.set_network_id("c90d44c4-60af-4696-b3de-ef80e4037388");
+            ready.set_node_id("0d51da5f-30bf-47c7-99e9-92779b21e5f4");
+            ready.set_node_ip("10.0.0.12");
+            ready.set_public_port(443);
+            ready.set_protocol("tcp");
+            ready.set_ingress_mode("ingress_pool");
+            ready.set_ingress_pool("edge");
+            ready.set_ready(true);
+            ready.set_generation(7);
+            ready.set_detail("");
+
+            let mut not_ready = endpoints.reborrow().get(1);
+            not_ready.set_service_id("60ff682e-4955-438a-9fbb-7ffb02d5e4c0");
+            not_ready.set_template_name("api");
+            not_ready.set_network_id("8daa0a06-a2fd-4334-997b-9f370e2e0a45");
+            not_ready.set_node_id("4b8554ca-cd9b-4bdd-8c45-98b6dad23a80");
+            not_ready.set_node_ip("");
+            not_ready.set_public_port(8080);
+            not_ready.set_protocol("udp");
+            not_ready.set_ingress_mode("task_nodes");
+            not_ready.set_ingress_pool("");
+            not_ready.set_ready(false);
+            not_ready.set_generation(8);
+            not_ready.set_detail("nodeport unavailable");
+        }
+
+        let info = message
+            .get_root::<system_info::Builder>()
+            .expect("read node info")
+            .into_reader();
+        let endpoints = info
+            .get_public_endpoints()
+            .expect("read public endpoint rows");
+        let decoded = decode_public_endpoints(endpoints).expect("decode public endpoints");
+
+        assert_eq!(
+            decoded,
+            vec![
+                PublicEndpointInfoView {
+                    service_id: "4e83fe38-d78a-4e42-8e31-27234ee34a5c".to_string(),
+                    template_name: "backend".to_string(),
+                    network_id: "c90d44c4-60af-4696-b3de-ef80e4037388".to_string(),
+                    node_id: "0d51da5f-30bf-47c7-99e9-92779b21e5f4".to_string(),
+                    node_ip: Some("10.0.0.12".to_string()),
+                    public_port: 443,
+                    protocol: "tcp".to_string(),
+                    ingress_mode: "ingress_pool".to_string(),
+                    ingress_pool: Some("edge".to_string()),
+                    ready: true,
+                    generation: 7,
+                    detail: None,
+                },
+                PublicEndpointInfoView {
+                    service_id: "60ff682e-4955-438a-9fbb-7ffb02d5e4c0".to_string(),
+                    template_name: "api".to_string(),
+                    network_id: "8daa0a06-a2fd-4334-997b-9f370e2e0a45".to_string(),
+                    node_id: "4b8554ca-cd9b-4bdd-8c45-98b6dad23a80".to_string(),
+                    node_ip: None,
+                    public_port: 8080,
+                    protocol: "udp".to_string(),
+                    ingress_mode: "task_nodes".to_string(),
+                    ingress_pool: None,
+                    ready: false,
+                    generation: 8,
+                    detail: Some("nodeport unavailable".to_string()),
+                },
+            ]
+        );
+    }
+}
