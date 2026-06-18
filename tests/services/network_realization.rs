@@ -22,6 +22,111 @@ fn public_web_ingress_pool() -> IngressPoolSpecValue {
     .expect("valid ingress pool")
 }
 
+/// Creates one on-demand logical VXLAN network through the public network RPC surface.
+async fn create_restart_recovery_network(node: &HeadlessNode, name: &str) -> Uuid {
+    let mut request = node.networks_client.create_request();
+    {
+        let mut spec = request.get().init_spec();
+        spec.set_name(name);
+        spec.set_description("restart recovery on-demand network test");
+        spec.set_driver(NetworkDriver::Vxlan.to_proto());
+        spec.set_subnet_cidr("");
+        spec.set_vni(0);
+        spec.set_mtu(0);
+        spec.set_sealed(false);
+        spec.set_realization(NetworkRealizationPolicy::OnDemand.to_selection_proto());
+    }
+
+    let response = request
+        .send()
+        .promise
+        .await
+        .expect("network create RPC should succeed");
+    let network_id = Uuid::from_slice(
+        response
+            .get()
+            .expect("network create response should decode")
+            .get_network_id()
+            .expect("network create response should contain id"),
+    )
+    .expect("network create response id should be a UUID");
+
+    assert!(
+        wait_until(
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+            || async {
+                node.network_registry
+                    .get_spec(network_id)
+                    .expect("load restart recovery network spec")
+                    .is_some_and(|spec| {
+                        spec.status == NetworkStatus::Ready
+                            && spec.realization == NetworkRealizationPolicy::OnDemand
+                    })
+            }
+        )
+        .await,
+        "on-demand restart recovery network spec should be accepted"
+    );
+
+    network_id
+}
+
+/// Waits until one node has a local Ready peer row for the requested network.
+async fn wait_for_local_network_ready(
+    node: &HeadlessNode,
+    network_id: Uuid,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(50), || async {
+        node.network_registry
+            .get_peer_state(network_id, node.id)
+            .expect("load local network peer state")
+            .is_some_and(|state| state.state.is_ready())
+    })
+    .await
+}
+
+/// Waits until one headless node sees exactly the requested peer-state row set.
+async fn wait_for_network_peer_nodes_headless(
+    node: &HeadlessNode,
+    network_id: Uuid,
+    expected: &HashSet<Uuid>,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(50), || async {
+        let Ok(peers) = node.network_registry.list_peer_states(Some(network_id)) else {
+            return false;
+        };
+        let peer_ids: HashSet<Uuid> = peers.into_iter().map(|peer| peer.peer_id).collect();
+        &peer_ids == expected
+    })
+    .await
+}
+
+/// Confirms for the full observation window that one headless node sees the requested peers.
+async fn network_peer_nodes_stay_headless(
+    node: &HeadlessNode,
+    network_id: Uuid,
+    expected: &HashSet<Uuid>,
+    window: Duration,
+) -> bool {
+    let deadline = Instant::now() + window;
+    while Instant::now() < deadline {
+        let Ok(peers) = node.network_registry.list_peer_states(Some(network_id)) else {
+            return false;
+        };
+        let peer_ids: HashSet<Uuid> = peers.into_iter().map(|peer| peer.peer_id).collect();
+        if &peer_ids != expected {
+            return false;
+        }
+
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    true
+}
+
 local_test!(
     services_on_demand_network_realizes_for_task_hosts_and_releases,
     {
@@ -134,6 +239,132 @@ local_test!(
             .await,
             "last local task removal should release the on_demand network realization"
         );
+    }
+);
+
+local_test!(
+    services_on_demand_network_recovers_realization_after_restart,
+    {
+        let _config_guard = ConfigOverrideGuard::control_plane_network_only();
+
+        let state_dir = tempdir().expect("state dir");
+        let db_path = state_dir.path().join("on-demand-network-restart.redb");
+        let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
+        let self_id = Uuid::new_v4();
+        let noise_keys = Arc::new(NoiseKeys::from_private_bytes([0x91; 32]));
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+        let local_volume_root = state_dir.path().join("volumes");
+        let runtime_backend = Arc::new(InMemoryRuntimeBackend::default());
+
+        let node = create_restartable_service_node(
+            db.clone(),
+            self_id,
+            HeadlessKeys::new(noise_keys.clone(), signing.clone()),
+            runtime_backend.clone(),
+            local_volume_root.clone(),
+        )
+        .await;
+
+        let network_id = create_restart_recovery_network(&node, "on-demand-restart-recovery").await;
+        assert!(
+            network_peer_nodes_stay_headless(
+                &node,
+                network_id,
+                &HashSet::new(),
+                Duration::from_secs(1),
+            )
+            .await,
+            "accepted on-demand network should stay cold before service demand"
+        );
+
+        let service_name = format!("on-demand-restart-{}", Uuid::new_v4());
+        let service_id = node
+            .service_controller
+            .submit_deployment(
+                Uuid::new_v4(),
+                &service_name,
+                &service_name,
+                vec![demo_networked_backend_task_template(
+                    "backend", 1, network_id,
+                )],
+            )
+            .await
+            .expect("submit restart recovery on-demand deployment");
+
+        assert!(
+            wait_for_service_status(&node.service_controller, service_id, ServiceStatus::Running)
+                .await,
+            "on-demand restart recovery service should reach running before restart"
+        );
+        assert!(
+            wait_for_local_network_ready(&node, network_id, Duration::from_secs(20)).await,
+            "on-demand network should be locally ready before restart"
+        );
+
+        node.shutdown().await.expect("shut down first node");
+
+        let restarted = create_restartable_service_node(
+            db,
+            self_id,
+            HeadlessKeys::new(noise_keys, signing),
+            runtime_backend,
+            local_volume_root,
+        )
+        .await;
+
+        if !wait_for_local_network_ready(&restarted, network_id, Duration::from_secs(30)).await {
+            let spec = restarted
+                .network_registry
+                .get_spec(network_id)
+                .expect("load restart recovery network spec after restart");
+            let peer = restarted
+                .network_registry
+                .get_peer_state(network_id, restarted.id)
+                .expect("load restart recovery peer state after restart");
+            let service = restarted
+                .service_controller
+                .registry()
+                .get(service_id)
+                .expect("load restart recovery service after restart");
+            panic!(
+                "restart should recover local on-demand network realization from durable state; spec={spec:?}; peer={peer:?}; service={service:?}"
+            );
+        }
+        assert!(
+            wait_for_service_status(
+                &restarted.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "restart should preserve the running service that demands the network"
+        );
+
+        remove_service_via_rpc(&restarted.services_client, service_id).await;
+        assert!(
+            wait_for_service_status(
+                &restarted.service_controller,
+                service_id,
+                ServiceStatus::Stopped
+            )
+            .await,
+            "restart recovery service should stop cleanly"
+        );
+        assert!(
+            wait_for_network_peer_nodes_headless(
+                &restarted,
+                network_id,
+                &HashSet::new(),
+                Duration::from_secs(20),
+            )
+            .await,
+            "stopping the recovered service should release the on-demand realization"
+        );
+
+        restarted
+            .shutdown()
+            .await
+            .expect("shut down restarted node");
     }
 );
 
@@ -444,16 +675,24 @@ local_test!(
             .await,
             "service deletion should propagate Stopped before ingress demand is released"
         );
-        assert!(
-            wait_for_network_peer_nodes_all(
-                &cluster,
-                network_id,
-                &empty_peer_set,
-                Duration::from_secs(20)
-            )
-            .await,
-            "service deletion should release ingress-pool and backend network realization"
-        );
+        if !wait_for_network_peer_nodes_all(
+            &cluster,
+            network_id,
+            &empty_peer_set,
+            Duration::from_secs(20),
+        )
+        .await
+        {
+            let task_debug = collect_service_task_count_debug(&cluster, &service_name).await;
+            let peer_debug = collect_network_peer_state_debug(&cluster, network_id);
+            let refs = cluster.iter().collect::<Vec<_>>();
+            let publication_debug =
+                collect_service_attachment_publication_debug(&refs, &service_name, network_id)
+                    .await;
+            panic!(
+                "service deletion should release ingress-pool and backend network realization; tasks={task_debug}; peers={peer_debug}; publication={publication_debug}"
+            );
+        }
     }
 );
 

@@ -62,6 +62,7 @@ struct SyncClientContext {
     trace: Option<SyncTraceContext>,
     gc_progress: SyncGcProgress,
     attachment_sync_notify: Option<Arc<Notify>>,
+    network_demand_sync_notify: Option<Arc<Notify>>,
     master_key_replication_notify: Option<Arc<Notify>>,
 }
 
@@ -75,6 +76,7 @@ pub struct SyncRunner {
     root_schema: RootSchemaState,
     gc_progress: SyncGcProgress,
     attachment_sync_notify: Option<Arc<Notify>>,
+    network_demand_sync_notify: Option<Arc<Notify>>,
     master_key_replication_notify: Option<Arc<Notify>>,
 }
 
@@ -84,6 +86,7 @@ impl SyncRunner {
         stores: SyncStores,
         root_schema: RootSchemaState,
         attachment_sync_notify: Option<Arc<Notify>>,
+        network_demand_sync_notify: Option<Arc<Notify>>,
         master_key_replication_notify: Option<Arc<Notify>>,
     ) -> Self {
         Self {
@@ -91,6 +94,7 @@ impl SyncRunner {
             root_schema,
             gc_progress: SyncGcProgress::new(),
             attachment_sync_notify,
+            network_demand_sync_notify,
             master_key_replication_notify,
         }
     }
@@ -140,6 +144,7 @@ impl SyncRunner {
                 trace,
                 gc_progress: self.gc_progress.clone(),
                 attachment_sync_notify: self.attachment_sync_notify.clone(),
+                network_demand_sync_notify: self.network_demand_sync_notify.clone(),
                 master_key_replication_notify: self.master_key_replication_notify.clone(),
             },
         )
@@ -554,6 +559,14 @@ fn notify_delta_side_effects(delta_requests: &[DomainDeltaRequest], context: &Sy
         // catches up as soon as anti-entropy applies the attachment delta locally.
         notify.notify_one();
     }
+    if should_notify_network_demand_sync(delta_requests)
+        && let Some(notify) = context.network_demand_sync_notify.as_ref()
+    {
+        // These domains feed ingress-pool selection or service public-ingress demand. Wake the
+        // network controller immediately so on-demand realization does not wait for a slow drift
+        // pass after anti-entropy applies the rows locally.
+        notify.notify_one();
+    }
     if should_notify_master_key_replication(delta_requests)
         && let Some(notify) = context.master_key_replication_notify.as_ref()
     {
@@ -580,6 +593,19 @@ fn should_notify_network_attachment_sync(delta_requests: &[DomainDeltaRequest]) 
         .any(|request| request.domain == Domain::NetworkAttachments)
 }
 
+/// Returns true when a completed delta stream changed derived on-demand network demand.
+///
+/// Service rows define which public-ingress networks exist, ingress-pool rows define which nodes
+/// may proxy them, and peer rows carry the labels/readiness used by pool placement.
+fn should_notify_network_demand_sync(delta_requests: &[DomainDeltaRequest]) -> bool {
+    delta_requests.iter().any(|request| {
+        matches!(
+            request.domain,
+            Domain::Services | Domain::IngressPools | Domain::Peers
+        )
+    })
+}
+
 /// Returns true when a completed delta stream included secret master-key grants.
 fn should_notify_master_key_replication(delta_requests: &[DomainDeltaRequest]) -> bool {
     delta_requests
@@ -591,7 +617,7 @@ fn should_notify_master_key_replication(delta_requests: &[DomainDeltaRequest]) -
 mod tests {
     use super::{
         DomainDeltaRequest, should_notify_master_key_replication,
-        should_notify_network_attachment_sync,
+        should_notify_network_attachment_sync, should_notify_network_demand_sync,
     };
     use mantissa_protocol::sync::Domain;
     use mantissa_store::PageDigestRange;
@@ -621,6 +647,27 @@ mod tests {
         ];
 
         assert!(!should_notify_network_attachment_sync(&wants));
+    }
+
+    /// Ingress-pool demand domains should wake on-demand network realization.
+    #[test]
+    fn ingress_demand_domains_request_network_demand_notification() {
+        for domain in [Domain::Services, Domain::IngressPools, Domain::Peers] {
+            let wants = vec![delta_request_for(domain)];
+
+            assert!(should_notify_network_demand_sync(&wants));
+        }
+    }
+
+    /// Unrelated domains must not trigger ingress-pool demand recomputation.
+    #[test]
+    fn unrelated_domains_skip_network_demand_notification() {
+        let wants = vec![
+            delta_request_for(Domain::Workloads),
+            delta_request_for(Domain::NetworkAttachments),
+        ];
+
+        assert!(!should_notify_network_demand_sync(&wants));
     }
 
     /// Master-key deltas should wake the grant reconciler immediately.

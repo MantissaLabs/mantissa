@@ -97,6 +97,7 @@ struct NetworkControllerInner {
     wireguard_retry_scheduled: AsyncMutex<bool>,
     attachments_root: AsyncMutex<Option<String>>,
     attachment_sync_notify: Option<Arc<Notify>>,
+    network_demand_sync_notify: Option<Arc<Notify>>,
     reconcile_drift_interval: Duration,
     attachment_refresh_interval: Duration,
     wake: Notify,
@@ -118,6 +119,7 @@ pub struct NetworkControllerInit {
     pub gossip_tx: Sender<Message>,
     pub forwarding_events: Option<UnboundedReceiver<ForwardingEvent>>,
     pub attachment_sync_notify: Option<Arc<Notify>>,
+    pub network_demand_sync_notify: Option<Arc<Notify>>,
     pub reconcile_drift_interval: Option<Duration>,
     pub attachment_refresh_interval: Option<Duration>,
 }
@@ -153,6 +155,7 @@ impl NetworkController {
             gossip_tx,
             forwarding_events,
             attachment_sync_notify,
+            network_demand_sync_notify,
             reconcile_drift_interval,
             attachment_refresh_interval,
         } = init;
@@ -222,6 +225,7 @@ impl NetworkController {
                 wireguard_retry_scheduled: AsyncMutex::new(false),
                 attachments_root: AsyncMutex::new(None),
                 attachment_sync_notify,
+                network_demand_sync_notify,
                 reconcile_drift_interval,
                 attachment_refresh_interval,
                 wake: Notify::new(),
@@ -382,6 +386,20 @@ impl NetworkController {
         }
 
         Ok(queued)
+    }
+
+    /// Reconcile local on-demand realization after sync applies demand-shaping domains.
+    ///
+    /// Service, ingress-pool, and peer deltas can add or remove derived local demand without going
+    /// through the local service/topology write paths. This keeps anti-entropy convergence prompt
+    /// while preserving the non-durable pending queues as wake/debounce state only.
+    async fn reconcile_synced_network_demand(&self) -> Result<()> {
+        self.reconcile_ingress_pool_store_change().await?;
+        self.reconcile_pending_ingress_pool_inputs().await?;
+        self.queue_missing_local_demand_networks().await?;
+        self.reconcile_pending_specs().await?;
+        self.release_idle_active_networks().await?;
+        Ok(())
     }
 
     /// Realize one network for local use while serializing concurrent callers.
@@ -1333,6 +1351,24 @@ impl NetworkController {
                         warn!(
                             target: "network",
                             "attachment forwarding refresh after sync failed: {err:#}"
+                        );
+                    }
+                }
+                _ = async {
+                    if let Some(notify) = self.inner.network_demand_sync_notify.as_ref() {
+                        notify.notified().await;
+                    } else {
+                        future::pending::<()>().await;
+                    }
+                } => {
+                    // Service, ingress-pool, and peer deltas change derived demand for lazy
+                    // network realization. Recompute from local replicated state immediately
+                    // instead of waiting for the drift loop to notice the new desired set.
+                    if let Err(err) = self.reconcile_synced_network_demand().await {
+                        crate::observability::metrics::record_network_reconcile_failure("network_demand_sync");
+                        warn!(
+                            target: "network",
+                            "network demand reconcile after sync failed: {err:#}"
                         );
                     }
                 }

@@ -482,10 +482,12 @@ async fn build_runtime_components(
         .await
         .map_err(|error| std::io::Error::other(format!("rebuild sync MSTs: {error}")))?;
     let attachment_sync_notify = Arc::new(Notify::new());
+    let network_demand_sync_notify = Arc::new(Notify::new());
     let sync_runner = SyncRunner::new(
         sync_stores.clone(),
         root_schema,
         Some(attachment_sync_notify.clone()),
+        Some(network_demand_sync_notify.clone()),
         Some(secret_master_key_replication_notify.clone()),
     );
     let sync_gc_progress = sync_runner.gc_progress();
@@ -581,6 +583,7 @@ async fn build_runtime_components(
             gossip_tx: gossip_tx.clone(),
             forwarding_events: Some(forwarding_rx),
             attachment_sync_notify: Some(attachment_sync_notify),
+            network_demand_sync_notify: Some(network_demand_sync_notify),
             reconcile_drift_interval: options.network_reconcile_tick,
             attachment_refresh_interval: options.network_attachment_refresh_tick,
         })
