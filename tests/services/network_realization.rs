@@ -458,6 +458,236 @@ local_test!(
 );
 
 local_test!(
+    services_ingress_pool_reselection_moves_on_demand_network_realization,
+    {
+        let _config_guard = ConfigOverrideGuard::control_plane_network_only();
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+
+        let cfg = ClusterConfig {
+            sync_tick_ms: Some(100),
+            gossip_tick_ms: Some(100),
+            gossip_fanout: Some(2),
+            ..ClusterConfig::default()
+        };
+        let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes")
+            .await;
+
+        let first_ingress_node = &cluster[0];
+        let second_ingress_node = &cluster[1];
+        let backend_node = &cluster[2];
+        set_node_labels(
+            &first_ingress_node.topology(),
+            first_ingress_node.id(),
+            &["mantissa.io/ingress=public-web"],
+            true,
+        )
+        .await;
+        set_node_labels(
+            &backend_node.topology(),
+            backend_node.id(),
+            &["mantissa.io/backend=public-web"],
+            true,
+        )
+        .await;
+        assert!(
+            wait_for_node_label_all(
+                &cluster,
+                first_ingress_node.id(),
+                "mantissa.io/ingress",
+                "public-web",
+                Duration::from_secs(10)
+            )
+            .await,
+            "first ingress node label should converge"
+        );
+        assert!(
+            wait_for_node_label_all(
+                &cluster,
+                backend_node.id(),
+                "mantissa.io/backend",
+                "public-web",
+                Duration::from_secs(10)
+            )
+            .await,
+            "backend node label should converge"
+        );
+
+        upsert_ingress_pool_all(&cluster, public_web_ingress_pool()).await;
+
+        let network_id = create_replicated_logical_test_network(
+            &cluster,
+            "on-demand-ingress-pool-reselection",
+            NetworkRealizationPolicy::OnDemand,
+        )
+        .await;
+        let service_name = format!("ingress-pool-reselection-{}", Uuid::new_v4());
+        let mut template = demo_networked_backend_task_template("backend", 1, network_id);
+        template.public_port = Some(8080);
+        template.public_ingress = PublicIngressPolicy::IngressPool {
+            pool: "public-web".to_string(),
+        };
+        template.execution.placement = PlacementPolicy {
+            constraints: vec![
+                PlacementConstraint::eq(
+                    PlacementConstraintSelector::node_label("mantissa.io/backend"),
+                    "public-web",
+                )
+                .expect("valid backend placement constraint"),
+            ],
+            strategy: Default::default(),
+        };
+
+        let service_id = first_ingress_node
+            .node
+            .service_controller
+            .submit_deployment(Uuid::new_v4(), &service_name, &service_name, vec![template])
+            .await
+            .expect("submit ingress-pool reselection deployment");
+
+        if !wait_for_service_status_all(
+            &cluster,
+            service_id,
+            ServiceStatus::Running,
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            let task_debug = collect_service_task_count_debug(&cluster, &service_name).await;
+            let refs = cluster.iter().collect::<Vec<_>>();
+            let publication_debug =
+                collect_service_attachment_publication_debug(&refs, &service_name, network_id)
+                    .await;
+            panic!(
+                "ingress-pool reselection service should converge to running; tasks={task_debug}; publication={publication_debug}"
+            );
+        }
+        assert!(
+            wait_for_service_running_tasks_stable_all(
+                &cluster,
+                &service_name,
+                1,
+                3,
+                Duration::from_secs(30)
+            )
+            .await,
+            "backend task placement should converge before checking initial ingress selection"
+        );
+
+        let initial_peers = HashSet::from([first_ingress_node.id(), backend_node.id()]);
+        assert!(
+            wait_for_network_ready_peer_nodes_all(
+                &cluster,
+                network_id,
+                &initial_peers,
+                Duration::from_secs(20)
+            )
+            .await,
+            "initial ingress-pool selection should realize the first ingress node and backend"
+        );
+
+        set_node_labels(
+            &first_ingress_node.topology(),
+            first_ingress_node.id(),
+            &[],
+            true,
+        )
+        .await;
+        set_node_labels(
+            &second_ingress_node.topology(),
+            second_ingress_node.id(),
+            &["mantissa.io/ingress=public-web"],
+            true,
+        )
+        .await;
+        assert!(
+            wait_for_node_label_absent_all(
+                &cluster,
+                first_ingress_node.id(),
+                "mantissa.io/ingress",
+                Duration::from_secs(10)
+            )
+            .await,
+            "first ingress node label removal should converge before reselection"
+        );
+        assert!(
+            wait_for_node_label_all(
+                &cluster,
+                second_ingress_node.id(),
+                "mantissa.io/ingress",
+                "public-web",
+                Duration::from_secs(10)
+            )
+            .await,
+            "second ingress node label should converge after reselection"
+        );
+
+        let reselected_peers = HashSet::from([second_ingress_node.id(), backend_node.id()]);
+        if !wait_for_network_ready_peer_nodes_all(
+            &cluster,
+            network_id,
+            &reselected_peers,
+            Duration::from_secs(20),
+        )
+        .await
+        {
+            let task_debug = collect_service_task_count_debug(&cluster, &service_name).await;
+            let peer_debug = collect_network_peer_state_debug(&cluster, network_id);
+            panic!(
+                "ingress-pool reselection should move realization to the newly selected ingress node; tasks={task_debug}; peers={peer_debug}"
+            );
+        }
+        assert!(
+            wait_for_network_peer_nodes_all(
+                &cluster,
+                network_id,
+                &reselected_peers,
+                Duration::from_secs(20)
+            )
+            .await,
+            "deselected ingress nodes should release their on-demand network peer rows"
+        );
+
+        remove_service_via_rpc(&first_ingress_node.node.services_client, service_id).await;
+        assert!(
+            wait_for_service_task_count_all(&cluster, &service_name, 0, Duration::from_secs(20))
+                .await,
+            "service deletion should stop every task"
+        );
+        assert!(
+            wait_for_service_status_all(
+                &cluster,
+                service_id,
+                ServiceStatus::Stopped,
+                Duration::from_secs(20)
+            )
+            .await,
+            "service deletion should propagate Stopped before reselected ingress demand is released"
+        );
+        if !wait_for_network_peer_nodes_all(
+            &cluster,
+            network_id,
+            &HashSet::new(),
+            Duration::from_secs(20),
+        )
+        .await
+        {
+            let task_debug = collect_service_task_count_debug(&cluster, &service_name).await;
+            let peer_debug = collect_network_peer_state_debug(&cluster, network_id);
+            let refs = cluster.iter().collect::<Vec<_>>();
+            let publication_debug =
+                collect_service_attachment_publication_debug(&refs, &service_name, network_id)
+                    .await;
+            panic!(
+                "service deletion should release reselected ingress-pool and backend realization; tasks={task_debug}; peers={peer_debug}; publication={publication_debug}"
+            );
+        }
+    }
+);
+
+local_test!(
     services_late_ingress_pool_update_realizes_existing_on_demand_service,
     {
         let _config_guard = ConfigOverrideGuard::control_plane_network_only();

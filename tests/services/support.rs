@@ -401,6 +401,25 @@ pub(crate) async fn wait_for_node_label_all(
     .await
 }
 
+/// Waits until every node has observed that one replicated label key is absent.
+pub(crate) async fn wait_for_node_label_absent_all(
+    cluster: &[TestNode],
+    node_id: Uuid,
+    key: &str,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(100), || async {
+        cluster.iter().all(|node| {
+            node.node
+                .registry
+                .peer_labels(node_id)
+                .and_then(|labels| labels.get(key).map(str::to_string))
+                .is_none()
+        })
+    })
+    .await
+}
+
 /// Waits until every node has accepted the replicated network spec with the requested policy.
 pub(crate) async fn wait_for_logical_network_spec_all(
     cluster: &[TestNode],
@@ -479,6 +498,37 @@ pub(crate) async fn wait_for_network_peer_nodes_all(
         true
     })
     .await
+}
+
+/// Renders per-node network peer rows for assertion failures.
+pub(crate) fn collect_network_peer_state_debug(cluster: &[TestNode], network_id: Uuid) -> String {
+    cluster
+        .iter()
+        .map(|node| {
+            let summary = node
+                .node
+                .network_registry
+                .list_peer_states(Some(network_id))
+                .map(|mut peers| {
+                    peers.sort_by_key(|peer| peer.peer_id);
+                    peers
+                        .into_iter()
+                        .map(|peer| {
+                            format!(
+                                "{}:{:?}:{:?}",
+                                &peer.peer_id.to_string()[..8],
+                                peer.state,
+                                peer.error
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_else(|err| format!("peer_error={err:#}"));
+            format!("node={} peers=[{}]", node.id(), summary)
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 /// Confirms for the full observation window that every node sees the same peer-state row set.
@@ -1101,8 +1151,9 @@ pub(crate) async fn collect_service_task_count_debug(
                     .find(|service| service.service_name == service_name)
                     .map(|service| {
                         format!(
-                            "status={:?} epoch={} phase={} assigned={} compact_segments={} explicit_ids={}",
+                            "status={:?} detail={:?} epoch={} phase={} assigned={} compact_segments={} explicit_ids={}",
                             service.status(),
+                            service.status_detail,
                             service.service_epoch,
                             service.phase_version,
                             service.assigned_replica_count(),

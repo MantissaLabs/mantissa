@@ -311,6 +311,79 @@ impl NetworkController {
         Ok(())
     }
 
+    /// Tear down active local on-demand networks whose demand disappeared out-of-band.
+    ///
+    /// Normal task and service paths call `release_idle_local_networks` directly. This periodic
+    /// safety net covers replicated attachment removals or service status changes that arrive
+    /// through anti-entropy without running the local event-side release hook.
+    async fn release_idle_active_networks(&self) -> Result<usize> {
+        let mut candidates = {
+            let guard = self.inner.active_networks.lock().await;
+            guard.clone()
+        };
+        for peer in self
+            .inner
+            .registry
+            .list_peer_states(None)
+            .context("list local peer rows for idle release")?
+        {
+            if peer.peer_id == self.inner.node_id {
+                candidates.insert(peer.network_id);
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut released = 0usize;
+        let candidates = candidates.into_iter().collect::<Vec<_>>();
+        for network_id in Self::sorted_unique_network_ids(&candidates) {
+            let lock = self.realization_lock(network_id).await;
+            let _guard = lock.lock().await;
+
+            let Some(spec) = self
+                .inner
+                .registry
+                .get_spec(network_id)
+                .with_context(|| format!("load network spec {network_id} for idle release"))?
+            else {
+                self.teardown_local_network_realization(network_id).await?;
+                released = released.saturating_add(1);
+                continue;
+            };
+
+            let local_demand = self.local_network_demand_snapshot().await?;
+            if spec.realizes_on_all_nodes() || local_demand.contains(&network_id) {
+                continue;
+            }
+
+            self.teardown_local_network_realization(network_id).await?;
+            released = released.saturating_add(1);
+        }
+
+        Ok(released)
+    }
+
+    /// Queue demanded local networks that have not reached local Ready state.
+    async fn queue_missing_local_demand_networks(&self) -> Result<usize> {
+        let local_demand = self.local_network_demand_snapshot().await?;
+        if local_demand.is_empty() {
+            return Ok(0);
+        }
+
+        let mut queued = 0usize;
+        let demand = local_demand.into_iter().collect::<Vec<_>>();
+        for network_id in Self::sorted_unique_network_ids(&demand) {
+            if self.local_network_ready(network_id).await? {
+                continue;
+            }
+            self.schedule_spec_change(network_id).await;
+            queued = queued.saturating_add(1);
+        }
+
+        Ok(queued)
+    }
+
     /// Realize one network for local use while serializing concurrent callers.
     async fn ensure_network_ready_for_local_use(&self, network_id: Uuid) -> Result<()> {
         let lock = self.realization_lock(network_id).await;
@@ -942,11 +1015,27 @@ impl NetworkController {
         if active.is_empty() {
             return Ok(());
         }
+        self.queue_immediate_reconcile(active).await?;
+        Ok(())
+    }
 
+    /// Queue network specs for immediate in-process reconcile.
+    ///
+    /// This queue is only a non-durable wake/debounce mechanism. Every queued network must remain
+    /// recoverable from replicated registries, so losing this set during a crash only delays work
+    /// until startup recovery or the periodic drift/refresh paths recompute demand.
+    async fn queue_immediate_reconcile<I>(&self, network_ids: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = Uuid>,
+    {
         let mut pending = self.inner.pending_specs.lock().await;
         let mut inserted = false;
-        for network_id in active {
-            inserted |= pending.insert(network_id);
+        let mut inserted_count = 0usize;
+        for network_id in network_ids {
+            if pending.insert(network_id) {
+                inserted = true;
+                inserted_count = inserted_count.saturating_add(1);
+            }
         }
         drop(pending);
 
@@ -954,7 +1043,7 @@ impl NetworkController {
             self.inner.wake.notify_one();
         }
 
-        Ok(())
+        Ok(inserted_count)
     }
 
     /// Queue all networks whose local demand depends on ingress-pool selection.
@@ -972,20 +1061,7 @@ impl NetworkController {
             return Ok(0);
         }
 
-        let mut pending = self.inner.pending_specs.lock().await;
-        let mut inserted = 0usize;
-        for network_id in network_ids {
-            if pending.insert(network_id) {
-                inserted = inserted.saturating_add(1);
-            }
-        }
-        drop(pending);
-
-        if inserted > 0 {
-            self.inner.wake.notify_one();
-        }
-
-        Ok(inserted)
+        self.queue_immediate_reconcile(network_ids).await
     }
 
     /// Recompute ingress-pool network demand when peer metadata changes selected nodes.
@@ -1167,11 +1243,47 @@ impl NetworkController {
                     }
                 }
                 _ = attachment_refresh.tick() => {
-                    if let Err(err) = self.reconcile_ingress_pool_store_change().await {
-                        crate::observability::metrics::record_network_reconcile_failure("ingress_pool_refresh");
+                    match self.reconcile_ingress_pool_store_change().await {
+                        Ok(_) => {}
+                        Err(err) => {
+                            crate::observability::metrics::record_network_reconcile_failure("ingress_pool_refresh");
+                            warn!(
+                                target: "network",
+                                "ingress-pool network demand refresh failed: {err:#}"
+                            );
+                        }
+                    }
+                    if let Err(err) = self.reconcile_pending_specs().await {
+                        crate::observability::metrics::record_network_reconcile_failure("ingress_pool_refresh_pending_specs");
                         warn!(
                             target: "network",
-                            "ingress-pool network demand refresh failed: {err:#}"
+                            "pending spec reconcile after ingress-pool refresh failed: {err:#}"
+                        );
+                    }
+                    match self.queue_missing_local_demand_networks().await {
+                        Ok(queued) if queued > 0 => {
+                            if let Err(err) = self.reconcile_pending_specs().await {
+                                crate::observability::metrics::record_network_reconcile_failure("missing_demand_pending_specs");
+                                warn!(
+                                    target: "network",
+                                    "pending spec reconcile after missing local demand failed: {err:#}"
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            crate::observability::metrics::record_network_reconcile_failure("missing_demand_refresh");
+                            warn!(
+                                target: "network",
+                                "missing local demand refresh failed: {err:#}"
+                            );
+                        }
+                    }
+                    if let Err(err) = self.release_idle_active_networks().await {
+                        crate::observability::metrics::record_network_reconcile_failure("idle_active_release");
+                        warn!(
+                            target: "network",
+                            "idle active network release failed: {err:#}"
                         );
                     }
                     if let Err(err) = self.refresh_forwarding_from_attachments().await {
@@ -1209,6 +1321,13 @@ impl NetworkController {
                     // attachment refresh would notice them. Refresh forwarding immediately so
                     // first traffic to those newly replicated backends does not wait on the
                     // slow poll cadence.
+                    if let Err(err) = self.release_idle_active_networks().await {
+                        crate::observability::metrics::record_network_reconcile_failure("attachment_sync_idle_release");
+                        warn!(
+                            target: "network",
+                            "idle active network release after attachment sync failed: {err:#}"
+                        );
+                    }
                     if let Err(err) = self.refresh_forwarding_from_attachments().await {
                         crate::observability::metrics::record_network_reconcile_failure("attachment_sync");
                         warn!(
