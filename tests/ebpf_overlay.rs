@@ -18,7 +18,7 @@ use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use mantissa::network::allocator::{OverlayIpFamily, parse_overlay_cidr};
 use mantissa::network::lb::BpfLoadBalancer;
-use mantissa::network::types::NetworkStatus;
+use mantissa::network::types::{NetworkRealizationPolicy, NetworkStatus};
 use mantissa::server::headless::HeadlessNode;
 use mantissa::services::ServiceController;
 use mantissa::services::types::{
@@ -175,6 +175,75 @@ fn overlay_family(subnet: &str) -> OverlayIpFamily {
     parse_overlay_cidr(subnet)
         .expect("test subnet should parse")
         .family
+}
+
+/// Build one ready on-demand VXLAN spec without implying local dataplane realization.
+fn privileged_on_demand_test_network(
+    name_prefix: &str,
+    description: &str,
+    subnet_cidr: &str,
+    mtu: u32,
+) -> mantissa::network::types::NetworkSpecValue {
+    let mut network =
+        privileged_test_network(name_prefix, description, subnet_cidr, mtu, Vec::new());
+    network.realization = NetworkRealizationPolicy::OnDemand;
+    network.set_status(NetworkStatus::Ready);
+    network
+}
+
+/// Return whether one network currently has no local peer row, kernel links, or BPF pins.
+fn privileged_network_state_absent(node: &HeadlessNode, network_id: Uuid) -> bool {
+    let interfaces = privileged_network_interfaces(network_id);
+    let pin_dir = pinned_lb_map_dir(network_id);
+    let peer_rows_absent = node
+        .network_registry
+        .list_peer_states(Some(network_id))
+        .map(|states| states.is_empty())
+        .unwrap_or(false);
+    peer_rows_absent && interfaces.iter().all(|iface| !link_exists(iface)) && !pin_dir.exists()
+}
+
+/// Render local privileged dataplane state for sparse-realization assertion failures.
+async fn privileged_network_state_debug(node: &HeadlessNode, network_id: Uuid) -> String {
+    let interfaces = privileged_network_interfaces(network_id);
+    let pin_dir = pinned_lb_map_dir(network_id);
+    let peer_rows = node
+        .network_registry
+        .list_peer_states(Some(network_id))
+        .map(|states| {
+            states
+                .into_iter()
+                .map(|state| format!("{}:{:?}:{:?}", state.peer_id, state.state, state.error))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|err| vec![format!("peer_state_error={err:#}")]);
+    let mut links = Vec::with_capacity(interfaces.len());
+    for iface in interfaces {
+        links.push(link_summary(&iface).await);
+    }
+    format!(
+        "peers=[{}]; links=[{}]; pin_dir={} exists={}",
+        peer_rows.join(","),
+        links.join("; "),
+        pin_dir.display(),
+        pin_dir.exists()
+    )
+}
+
+/// Confirm for the full observation window that an unused on-demand network remains cold.
+async fn privileged_network_state_stays_absent(
+    node: &HeadlessNode,
+    network_id: Uuid,
+    window: Duration,
+) -> bool {
+    let deadline = Instant::now() + window;
+    while Instant::now() < deadline {
+        if !privileged_network_state_absent(node, network_id) {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    true
 }
 
 /// Builds the canonical service discovery FQDN for one task template.
@@ -867,6 +936,106 @@ local_test!(ebpf_overlay_attaches_programs_and_tears_down_cleanly, {
 
     delete_privileged_network(&node, network.id).await;
 });
+
+local_test!(
+    ebpf_overlay_on_demand_network_stays_cold_until_service_uses_it,
+    {
+        let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {
+            return;
+        };
+
+        let _config = PrivilegedTestGuard::apply(|config| {
+            config.network.wireguard.enabled = false;
+            config.network.wireguard.manage_firewall = false;
+            config.network.bpf.attach = true;
+            artifact_dir.apply_to(config);
+            config.network.nodeport.enabled = false;
+            config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+        });
+
+        let node = create_privileged_node().await;
+        let subnet = privileged_test_subnet();
+        let network = create_privileged_network(
+            &node,
+            privileged_on_demand_test_network(
+                "ebpf-on-demand-cold",
+                "privileged on-demand cold network test",
+                &subnet,
+                1450,
+            ),
+            NetworkStatus::Ready,
+        )
+        .await;
+        let network_id = network.id;
+
+        if !privileged_network_state_stays_absent(&node, network_id, Duration::from_secs(2)).await {
+            let state = privileged_network_state_debug(&node, network_id).await;
+            panic!(
+                "ready on-demand network spec should not create local dataplane state before demand; {state}"
+            );
+        }
+
+        let service_name = format!("ebpf-on-demand-cold-{}", Uuid::new_v4());
+        let service_id = node
+            .service_controller
+            .submit_deployment(
+                Uuid::new_v4(),
+                &service_name,
+                &service_name,
+                vec![privileged_frontend_task_template(network_id)],
+            )
+            .await
+            .expect("submit privileged on-demand cold-start deployment");
+
+        assert!(
+            wait_for_service_status(
+                &node.service_controller,
+                service_id,
+                ServiceStatus::Running,
+                Duration::from_secs(180),
+            )
+            .await,
+            "on-demand network service should reach running state"
+        );
+
+        let realized = common::convergence::wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+            || async {
+                let peer_ready = node
+                    .network_registry
+                    .get_peer_state(network_id, node.id)
+                    .map(|state| state.is_some_and(|state| state.state.is_ready()))
+                    .unwrap_or(false);
+                let interfaces = privileged_network_interfaces(network_id);
+                let pin_dir = pinned_lb_map_dir(network_id);
+                peer_ready && interfaces.iter().all(|iface| link_exists(iface)) && pin_dir.exists()
+            },
+        )
+        .await;
+        if !realized {
+            let state = privileged_network_state_debug(&node, network_id).await;
+            panic!("service demand should realize on-demand network kernel and BPF state; {state}");
+        }
+        assert_lb_maps_present(network_id, overlay_family(&subnet));
+
+        remove_service_via_rpc(&node, service_id).await;
+        if !common::convergence::wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(100),
+            || async { privileged_network_state_absent(&node, network_id) },
+        )
+        .await
+        {
+            let state = privileged_network_state_debug(&node, network_id).await;
+            panic!(
+                "stopping the last on-demand service should remove local dataplane state; {state}"
+            );
+        }
+
+        delete_privileged_network(&node, network_id).await;
+    }
+);
 
 local_test!(ebpf_overlay_programs_runtime_mss_for_small_mtu, {
     let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {
