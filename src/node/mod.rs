@@ -371,3 +371,135 @@ fn nodeport_protocol_label(protocol: NodePortProtocol) -> &'static str {
 fn usize_to_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::discovery::PublicEndpointKey;
+    use std::net::{IpAddr, Ipv6Addr};
+    use uuid::Uuid;
+
+    #[test]
+    /// Encodes public endpoint snapshots into the node-info Cap'n Proto diagnostics.
+    fn node_info_public_endpoint_writer_preserves_endpoint_fields() {
+        let service_id =
+            Uuid::parse_str("4e83fe38-d78a-4e42-8e31-27234ee34a5c").expect("valid service id");
+        let network_id =
+            Uuid::parse_str("c90d44c4-60af-4696-b3de-ef80e4037388").expect("valid network id");
+        let node_id =
+            Uuid::parse_str("0d51da5f-30bf-47c7-99e9-92779b21e5f4").expect("valid node id");
+        let ingress_snapshot = PublicEndpointSnapshot {
+            key: PublicEndpointKey {
+                service_id,
+                template_name: "backend".to_string(),
+                public_port: 443,
+                protocol: NodePortProtocol::Udp,
+                node_id,
+            },
+            network_id,
+            node_ip: Some(IpAddr::V6(Ipv6Addr::new(0xfd42, 0, 0, 0, 0, 0, 0, 0x12))),
+            ingress: PublicEndpointIngressMode::IngressPool {
+                pool: "edge".to_string(),
+            },
+            ready: true,
+            generation: 7,
+            detail: None,
+        };
+        let task_nodes_snapshot = PublicEndpointSnapshot {
+            key: PublicEndpointKey {
+                service_id,
+                template_name: "api".to_string(),
+                public_port: 8080,
+                protocol: NodePortProtocol::Tcp,
+                node_id,
+            },
+            network_id,
+            node_ip: None,
+            ingress: PublicEndpointIngressMode::TaskNodes,
+            ready: false,
+            generation: 8,
+            detail: Some("nodeport unavailable".to_string()),
+        };
+
+        let mut message = Builder::new_default();
+        {
+            let mut system = message.init_root::<SystemInfo::Builder>();
+            let mut endpoints = system.reborrow().init_public_endpoints(2);
+            write_public_endpoint(endpoints.reborrow().get(0), &ingress_snapshot);
+            write_public_endpoint(endpoints.reborrow().get(1), &task_nodes_snapshot);
+        }
+
+        let system = message
+            .get_root::<SystemInfo::Builder>()
+            .expect("read info")
+            .into_reader();
+        let endpoints = system
+            .get_public_endpoints()
+            .expect("read public endpoint list");
+        assert_eq!(endpoints.len(), 2);
+
+        let ingress_endpoint = endpoints.get(0);
+        assert_eq!(
+            text(ingress_endpoint.get_service_id(), "service id"),
+            service_id.to_string()
+        );
+        assert_eq!(
+            text(ingress_endpoint.get_template_name(), "template name"),
+            "backend"
+        );
+        assert_eq!(
+            text(ingress_endpoint.get_network_id(), "network id"),
+            network_id.to_string()
+        );
+        assert_eq!(
+            text(ingress_endpoint.get_node_id(), "node id"),
+            node_id.to_string()
+        );
+        assert_eq!(text(ingress_endpoint.get_node_ip(), "node ip"), "fd42::12");
+        assert_eq!(ingress_endpoint.get_public_port(), 443);
+        assert_eq!(text(ingress_endpoint.get_protocol(), "protocol"), "udp");
+        assert_eq!(
+            text(ingress_endpoint.get_ingress_mode(), "ingress mode"),
+            "ingress_pool"
+        );
+        assert_eq!(
+            text(ingress_endpoint.get_ingress_pool(), "ingress pool"),
+            "edge"
+        );
+        assert!(ingress_endpoint.get_ready());
+        assert_eq!(ingress_endpoint.get_generation(), 7);
+        assert_eq!(text(ingress_endpoint.get_detail(), "detail"), "");
+
+        let task_nodes_endpoint = endpoints.get(1);
+        assert_eq!(
+            text(task_nodes_endpoint.get_template_name(), "template name"),
+            "api"
+        );
+        assert_eq!(task_nodes_endpoint.get_public_port(), 8080);
+        assert_eq!(text(task_nodes_endpoint.get_protocol(), "protocol"), "tcp");
+        assert_eq!(
+            text(task_nodes_endpoint.get_ingress_mode(), "ingress mode"),
+            "task_nodes"
+        );
+        assert_eq!(
+            text(task_nodes_endpoint.get_ingress_pool(), "ingress pool"),
+            ""
+        );
+        assert_eq!(text(task_nodes_endpoint.get_node_ip(), "node ip"), "");
+        assert!(!task_nodes_endpoint.get_ready());
+        assert_eq!(task_nodes_endpoint.get_generation(), 8);
+        assert_eq!(
+            text(task_nodes_endpoint.get_detail(), "detail"),
+            "nodeport unavailable"
+        );
+    }
+
+    /// Reads one Cap'n Proto text field into an owned assertion value.
+    fn text(reader: capnp::Result<capnp::text::Reader<'_>>, field: &str) -> String {
+        reader
+            .unwrap_or_else(|err| panic!("read {field}: {err}"))
+            .to_str()
+            .unwrap_or_else(|err| panic!("decode {field}: {err}"))
+            .to_string()
+    }
+}
