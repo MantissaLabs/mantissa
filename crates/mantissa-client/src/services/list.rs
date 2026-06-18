@@ -1,11 +1,9 @@
 use crate::config::ClientConfig;
 use crate::connection;
 use crate::host_ports::{HostPortView, decode_host_ports};
-use crate::networks;
-use crate::networks::{NetworkAttachment, NetworkAttachmentState, NetworkSummary};
+use crate::nodes::{self, PublicEndpointInfoView};
 use crate::tasks::uuid_from_data;
 use anyhow::Result;
-use blake3::Hasher;
 use capnp::Error as CapnpError;
 use capnp::struct_list;
 use mantissa_protocol::services::{
@@ -16,7 +14,7 @@ use mantissa_protocol::services::{
     task_template,
 };
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use uuid::Uuid;
 
 /// Fetches and decodes service specs from the daemon into client-facing rows.
@@ -262,25 +260,6 @@ fn read_compact_replica_assignment_segments(
     })
 }
 
-/// Derives the stable workload id for one service generation replica slot.
-fn derive_service_replica_id(
-    service_id: Uuid,
-    service_epoch: u64,
-    template_name: &str,
-    replica: u16,
-) -> Uuid {
-    let mut hasher = Hasher::new();
-    hasher.update(b"service-replica-id");
-    hasher.update(service_id.as_bytes());
-    hasher.update(&service_epoch.to_le_bytes());
-    hasher.update(template_name.as_bytes());
-    hasher.update(&replica.to_le_bytes());
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest.as_bytes()[..16]);
-    Uuid::from_bytes(bytes)
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServiceTaskProgressRow {
     pub name: String,
@@ -520,18 +499,6 @@ impl TaskTemplateRow {
             ports: decode_host_ports(reader.get_ports()?)?,
         })
     }
-
-    /// Returns the backend port the host-reachable VIP should be curled on for this template.
-    ///
-    /// The replicated service payload carries both the published NodePort and the controller-visible
-    /// probe metadata. The VIP dataplane only rewrites addresses, not ports, so the curlable host
-    /// VIP endpoint must use the backend service port inferred from readiness first, then
-    /// TCP/HTTP liveness, and finally `public_port` when no more specific signal exists.
-    fn public_target_port(&self) -> Option<u16> {
-        self.readiness_port
-            .or(self.liveness_port)
-            .or(self.public_port)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -623,311 +590,91 @@ impl ServiceRolloutPhaseRow {
     }
 }
 
-/// Best-effort enrichment that computes per-service public VIP endpoints so operators can
-/// `curl` services from the host without issuing manual DNS lookups.
+/// Best-effort enrichment that attaches node-local public endpoint targets to service rows.
 async fn attach_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
-    if !rows.iter().any(|row| {
-        row.task_templates
-            .iter()
-            .any(|template| template.public_port.is_some() && !template.networks.is_empty())
-    }) {
+    if !rows.iter().any(|row| row.has_public_template()) {
         return;
     }
 
-    let network_list = match networks::list(cfg).await {
-        Ok(list) => list,
+    let info = match nodes::info(cfg).await {
+        Ok(info) => info,
         Err(_err) => return,
     };
 
-    let mut by_name: HashMap<String, NetworkSummary> = HashMap::new();
-    for net in network_list {
-        by_name.insert(net.name.to_ascii_lowercase(), net);
+    let mut endpoints_by_service: HashMap<&str, Vec<String>> = HashMap::new();
+    for endpoint in &info.public_endpoints {
+        endpoints_by_service
+            .entry(endpoint.service_id.as_str())
+            .or_default()
+            .push(render_public_endpoint(endpoint));
     }
-
-    let mut attachments_cache: HashMap<Uuid, Vec<NetworkAttachment>> = HashMap::new();
 
     for row in rows.iter_mut() {
-        let template_replica_ids = build_template_replica_ids(row);
-        let mut endpoints = Vec::new();
-
-        for template in &row.task_templates {
-            let Some(public_port) = template.public_port else {
-                continue;
-            };
-            let Some(target_port) = template.public_target_port() else {
-                continue;
-            };
-
-            let network_name = match template.networks.as_slice() {
-                [single] => single,
-                _ => continue,
-            };
-
-            let Some(network) = by_name.get(&network_name.to_ascii_lowercase()) else {
-                continue;
-            };
-
-            let template_ids = match template_replica_ids.get(&template.name.to_ascii_lowercase()) {
-                Some(ids) => ids,
-                None => continue,
-            };
-
-            let attachments = match attachments_cache.get(&network.id) {
-                Some(existing) => existing,
-                None => {
-                    let fetched = match networks::attachments(cfg, &network.id.to_string()).await {
-                        Ok(list) => list,
-                        Err(_err) => continue,
-                    };
-                    attachments_cache.insert(network.id, fetched);
-                    attachments_cache
-                        .get(&network.id)
-                        .expect("inserted network attachments")
-                }
-            };
-
-            let mut backend_ips = HashSet::new();
-            for attachment in attachments {
-                if attachment.state != NetworkAttachmentState::Ready {
-                    continue;
-                }
-                if !attachment.traffic_published {
-                    continue;
-                }
-                if !template_ids.contains(&attachment.task_id) {
-                    continue;
-                }
-                let Some(ip_text) = attachment.assigned_ip.as_deref() else {
-                    continue;
-                };
-                let Ok(ip) = ip_text.parse::<IpAddr>() else {
-                    continue;
-                };
-                backend_ips.insert(ip);
-            }
-
-            if backend_ips.is_empty() {
-                continue;
-            }
-
-            let Some(vip) = compute_service_vip(
-                &network.subnet_cidr,
-                network.id,
-                &row.service_name,
-                &template.name,
-                &backend_ips,
-            ) else {
-                continue;
-            };
-
-            let rendered = if target_port == public_port {
-                format!(
-                    "{}={}",
-                    template.name,
-                    render_socket_endpoint(vip, target_port)
-                )
-            } else {
-                format!(
-                    "{}={} (nodeport {public_port})",
-                    template.name,
-                    render_socket_endpoint(vip, target_port)
-                )
-            };
-            let rendered = match &template.public_ingress {
-                TaskTemplatePublicIngressRow::AllNodes => rendered,
-                TaskTemplatePublicIngressRow::TaskNodes
-                | TaskTemplatePublicIngressRow::IngressPool { .. } => {
-                    format!("{rendered} ({})", template.public_ingress.label())
-                }
-            };
-            endpoints.push(rendered);
-        }
-
+        let Some(endpoints) = endpoints_by_service.get_mut(row.id.as_str()) else {
+            continue;
+        };
         endpoints.sort();
         endpoints.dedup();
-        row.public_endpoints = endpoints;
+        row.public_endpoints = endpoints.clone();
     }
 }
 
-/// Maps template names to replica ids for endpoint attachment.
-///
-/// Service list decoding preserves compact assignment ranges. Endpoint
-/// attachment is the uncommon path that needs concrete task ids to match
-/// network attachments, so derivation stays local to this helper.
-fn build_template_replica_ids(row: &ServiceRow) -> HashMap<String, HashSet<Uuid>> {
-    let mut out: HashMap<String, HashSet<Uuid>> = HashMap::new();
-    if !row.replica_assignments.is_empty() {
-        for segment in &row.replica_assignments {
-            let key = segment.template_name.to_ascii_lowercase();
-            let entry = out.entry(key).or_default();
-            for offset in 0..segment.replica_count {
-                entry.insert(derive_service_replica_id(
-                    row.service_id,
-                    row.service_epoch,
-                    &segment.template_name,
-                    segment.first_replica + offset,
-                ));
-            }
-        }
-        return out;
-    }
+/// Renders one node-local public endpoint target for service-list output.
+fn render_public_endpoint(endpoint: &PublicEndpointInfoView) -> String {
+    let target = endpoint
+        .node_ip
+        .as_deref()
+        .and_then(render_socket_endpoint)
+        .unwrap_or_else(|| "unresolved".to_string());
+    let base = format!(
+        "{}={target}:{}/{}",
+        endpoint.template_name, endpoint.public_port, endpoint.protocol
+    );
 
-    let mut cursor = 0usize;
-
-    for template in &row.task_templates {
-        let key = template.name.to_ascii_lowercase();
-        let entry = out.entry(key).or_default();
-        let count = template.replicas as usize;
-
-        for _ in 0..count {
-            if let Some(replica_id) = row.replica_ids.get(cursor) {
-                entry.insert(*replica_id);
-            }
-            cursor = cursor.saturating_add(1);
-        }
-    }
-
-    out
-}
-
-/// Compute the deterministic per-service VIP used by the Mantissa dataplane, matching the server
-/// implementation so the CLI can surface a stable endpoint for host access.
-fn compute_service_vip(
-    subnet_cidr: &str,
-    network_id: Uuid,
-    service_name: &str,
-    template_name: &str,
-    backend_ips: &HashSet<IpAddr>,
-) -> Option<IpAddr> {
-    let (base_ip, prefix) = parse_overlay_cidr(subnet_cidr)?;
-    let (family, base_ip, address_bits) = match base_ip {
-        IpAddr::V4(ip) => (ServiceIpFamily::Ipv4, u32::from(ip) as u128, 32u8),
-        IpAddr::V6(ip) => (ServiceIpFamily::Ipv6, u128::from(ip), 128u8),
+    let ingress = match endpoint.ingress_mode.as_str() {
+        "ingress_pool" => endpoint
+            .ingress_pool
+            .as_deref()
+            .map(|pool| format!("ingress_pool {pool}"))
+            .unwrap_or_else(|| "ingress_pool".to_string()),
+        other => other.to_string(),
     };
 
-    let host_bits = address_bits.saturating_sub(prefix);
-    if host_bits < 4 {
-        return None;
+    if endpoint.ready {
+        return format!("{base} ({ingress})");
     }
 
-    let digest = {
-        let mut hasher = Hasher::new();
-        hasher.update(network_id.as_bytes());
-        hasher.update(discovery_service_key(service_name, template_name).as_bytes());
-        hasher.finalize()
-    };
-
-    let mut slot_seed = [0u8; 16];
-    slot_seed.copy_from_slice(&digest.as_bytes()[..16]);
-    let slot_seed = u128::from_le_bytes(slot_seed);
-
-    // Constrain VIPs to the `0 mod 4` overlay offsets so they cannot collide with resolver
-    // addresses (`1 mod 2`) or automatically assigned task attachments (`2 mod 4`).
-    let max_hosts = match (family, host_bits) {
-        (ServiceIpFamily::Ipv4, 32) => u32::MAX as u128 + 1,
-        (ServiceIpFamily::Ipv6, 128) => return None,
-        _ => 1u128 << host_bits,
-    };
-    let available_vips = max_hosts.saturating_sub(16) / 4;
-    if available_vips == 0 {
-        return None;
+    match endpoint
+        .detail
+        .as_deref()
+        .filter(|detail| !detail.is_empty())
+    {
+        Some(detail) => format!("{base} ({ingress}, not_ready: {detail})"),
+        None => format!("{base} ({ingress}, not_ready)"),
     }
-
-    let normalized_backend_ips: HashSet<u128> = backend_ips
-        .iter()
-        .filter_map(|backend_ip| match (family, backend_ip) {
-            (ServiceIpFamily::Ipv4, IpAddr::V4(ip)) => Some(u32::from(*ip) as u128),
-            (ServiceIpFamily::Ipv6, IpAddr::V6(ip)) => Some(u128::from(*ip)),
-            _ => None,
-        })
-        .collect();
-    if normalized_backend_ips.len() != backend_ips.len() {
-        return None;
-    }
-
-    let mut slot = (slot_seed % available_vips) * 4 + 8;
-    for _ in 0..available_vips.min(16) as usize {
-        let candidate = base_ip.saturating_add(slot);
-        if !normalized_backend_ips.contains(&candidate) {
-            return Some(match family {
-                ServiceIpFamily::Ipv4 => IpAddr::V4(Ipv4Addr::from(candidate as u32)),
-                ServiceIpFamily::Ipv6 => IpAddr::V6(Ipv6Addr::from(candidate)),
-            });
-        }
-
-        // Walk forward to the next VIP slot if a nonstandard backend already uses this address.
-        slot = slot.wrapping_add(4) % (available_vips * 4);
-        if slot < 8 {
-            slot = 8;
-        }
-    }
-
-    None
 }
 
-/// Build the canonical DNS catalog key for one service template.
-fn discovery_service_key(service_name: &str, template_name: &str) -> String {
-    format!(
-        "{}.{}",
-        template_name.to_ascii_lowercase(),
-        service_name.to_ascii_lowercase()
-    )
+/// Renders one host address in socket syntax, bracket-wrapping IPv6 addresses.
+fn render_socket_endpoint(ip_text: &str) -> Option<String> {
+    let ip = ip_text.parse::<IpAddr>().ok()?;
+    Some(match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    })
 }
 
-/// Supported address families for client-side public endpoint rendering.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ServiceIpFamily {
-    Ipv4,
-    Ipv6,
-}
-
-/// Parse an overlay CIDR string into its base address and prefix length.
-fn parse_overlay_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
-    let (base_text, prefix_text) = cidr.split_once('/')?;
-    let prefix: u8 = prefix_text.parse().ok()?;
-    let base_ip: IpAddr = base_text.parse().ok()?;
-    let max_prefix = match base_ip {
-        IpAddr::V4(_) => 32,
-        IpAddr::V6(_) => 128,
-    };
-    if prefix > max_prefix {
-        return None;
-    }
-    Some((base_ip, prefix))
-}
-
-/// Render one host-reachable VIP endpoint, bracket-wrapping IPv6 addresses for socket syntax.
-fn render_socket_endpoint(ip: IpAddr, port: u16) -> String {
-    match ip {
-        IpAddr::V4(ip) => format!("{ip}:{port}"),
-        IpAddr::V6(ip) => format!("[{ip}]:{port}"),
+impl ServiceRow {
+    /// Returns true when this service declares at least one public ingress template.
+    fn has_public_template(&self) -> bool {
+        self.task_templates
+            .iter()
+            .any(|template| template.public_port.is_some())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Builds a minimal template row so endpoint rendering heuristics can be tested directly.
-    fn test_template(
-        public_port: Option<u16>,
-        readiness_port: Option<u16>,
-        liveness_port: Option<u16>,
-    ) -> TaskTemplateRow {
-        TaskTemplateRow {
-            name: "backend".to_string(),
-            image: "hashicorp/http-echo:1.0.0".to_string(),
-            command: Vec::new(),
-            replicas: 1,
-            autoscale: None,
-            networks: vec!["default".to_string()],
-            public_port,
-            public_ingress: Default::default(),
-            readiness_port,
-            liveness_port,
-            ports: Vec::new(),
-        }
-    }
 
     #[test]
     /// Decodes compact service-list replica assignments without expanding the row eagerly.
@@ -1021,126 +768,63 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(
-            build_template_replica_ids(&row)
-                .remove("backend")
-                .expect("backend ids"),
-            HashSet::from([
-                derive_service_replica_id(service_id, service_epoch, "backend", 1),
-                derive_service_replica_id(service_id, service_epoch, "backend", 2),
-            ])
-        );
     }
 
     #[test]
-    /// Keeps the CLI's rendered IPv4 VIPs aligned with the server-side 128-bit hash selection.
-    fn compute_service_vip_matches_current_server_hash() {
-        let vip = compute_service_vip(
-            "10.34.16.0/20",
-            Uuid::parse_str("21523dac-bdaa-6cf5-359f-57139c6464a8").expect("valid network id"),
-            "demo-service",
-            "backend",
-            &HashSet::new(),
-        )
-        .expect("vip");
-
-        assert_eq!(vip, IpAddr::V4(Ipv4Addr::new(10, 34, 21, 0)));
-    }
-
-    #[test]
-    /// Ensures distinct overlays keep rendering the correct host-reachable VIPs for the same template name.
-    fn compute_service_vip_keeps_template_names_isolated_by_network() {
-        let vip = compute_service_vip(
-            "10.146.112.0/20",
-            Uuid::parse_str("278974fb-d8a0-07a9-590c-9908d5b33462").expect("valid network id"),
-            "demo-service",
-            "backend",
-            &HashSet::new(),
-        )
-        .expect("vip");
-
-        assert_eq!(vip, IpAddr::V4(Ipv4Addr::new(10, 146, 113, 52)));
-    }
-
-    #[test]
-    /// Ensures same-template services render distinct host-reachable VIPs on one network.
-    fn compute_service_vip_keeps_same_template_names_isolated_by_service() {
-        let network_id =
-            Uuid::parse_str("278974fb-d8a0-07a9-590c-9908d5b33462").expect("valid network id");
-        let payments = compute_service_vip(
-            "10.146.112.0/20",
-            network_id,
-            "payments",
-            "backend",
-            &HashSet::new(),
-        )
-        .expect("payments vip");
-        let billing = compute_service_vip(
-            "10.146.112.0/20",
-            network_id,
-            "billing",
-            "backend",
-            &HashSet::new(),
-        )
-        .expect("billing vip");
-
-        assert_ne!(payments, billing);
-    }
-
-    #[test]
-    /// Keeps the CLI's rendered IPv6 VIPs aligned with the server-side family-generic hash path.
-    fn compute_service_vip_supports_ipv6_overlays() {
-        let vip = compute_service_vip(
-            "fd42:1234:5678::/64",
-            Uuid::parse_str("278974fb-d8a0-07a9-590c-9908d5b33462").expect("valid network id"),
-            "demo-service",
-            "backend",
-            &HashSet::new(),
-        )
-        .expect("vip");
+    /// Renders a ready public endpoint as a host-reachable node target.
+    fn render_public_endpoint_shows_ready_node_target() {
+        let endpoint = test_public_endpoint("10.0.0.12", "ingress_pool", Some("edge"), true, None);
 
         assert_eq!(
-            vip,
-            IpAddr::V6(Ipv6Addr::new(
-                0xfd42, 0x1234, 0x5678, 0, 0xcf92, 0x7f76, 0xe40d, 0x7944,
-            ))
+            render_public_endpoint(&endpoint),
+            "backend=10.0.0.12:443/tcp (ingress_pool edge)"
         );
     }
 
     #[test]
-    /// Prefers the readiness port when rendering the curlable host VIP endpoint.
-    fn public_target_port_prefers_readiness_port() {
-        let template = test_template(Some(8001), Some(8000), Some(9000));
+    /// Bracket-wraps IPv6 node targets in service-list public endpoints.
+    fn render_public_endpoint_brackets_ipv6_target() {
+        let endpoint = test_public_endpoint("fd42:1234::12", "all_nodes", None, true, None);
 
-        assert_eq!(template.public_target_port(), Some(8000));
-    }
-
-    #[test]
-    /// Falls back to the network liveness port when readiness is absent.
-    fn public_target_port_falls_back_to_liveness_port() {
-        let template = test_template(Some(8001), None, Some(8000));
-
-        assert_eq!(template.public_target_port(), Some(8000));
-    }
-
-    #[test]
-    /// Preserves the published port when no probe exposes a more specific backend service port.
-    fn public_target_port_falls_back_to_public_port() {
-        let template = test_template(Some(8001), None, None);
-
-        assert_eq!(template.public_target_port(), Some(8001));
-    }
-
-    #[test]
-    /// Ensures IPv6 public endpoints render in valid socket syntax for copy-paste curls.
-    fn render_socket_endpoint_brackets_ipv6() {
-        let rendered = render_socket_endpoint(
-            IpAddr::V6(Ipv6Addr::new(
-                0xfd42, 0x1234, 0x5678, 0, 0x4494, 0xcfb4, 0xd0a4, 0x5582,
-            )),
-            8000,
+        assert_eq!(
+            render_public_endpoint(&endpoint),
+            "backend=[fd42:1234::12]:443/tcp (all_nodes)"
         );
+    }
 
-        assert_eq!(rendered, "[fd42:1234:5678:0:4494:cfb4:d0a4:5582]:8000");
+    #[test]
+    /// Preserves not-ready detail when the dataplane cannot publish an endpoint yet.
+    fn render_public_endpoint_shows_not_ready_detail() {
+        let endpoint =
+            test_public_endpoint("", "task_nodes", None, false, Some("nodeport unavailable"));
+
+        assert_eq!(
+            render_public_endpoint(&endpoint),
+            "backend=unresolved:443/tcp (task_nodes, not_ready: nodeport unavailable)"
+        );
+    }
+
+    /// Builds one public endpoint row for service-list rendering tests.
+    fn test_public_endpoint(
+        node_ip: &str,
+        ingress_mode: &str,
+        ingress_pool: Option<&str>,
+        ready: bool,
+        detail: Option<&str>,
+    ) -> PublicEndpointInfoView {
+        PublicEndpointInfoView {
+            service_id: Uuid::new_v4().to_string(),
+            template_name: "backend".to_string(),
+            network_id: Uuid::new_v4().to_string(),
+            node_id: Uuid::new_v4().to_string(),
+            node_ip: (!node_ip.is_empty()).then(|| node_ip.to_string()),
+            public_port: 443,
+            protocol: "tcp".to_string(),
+            ingress_mode: ingress_mode.to_string(),
+            ingress_pool: ingress_pool.map(str::to_string),
+            ready,
+            generation: 7,
+            detail: detail.map(str::to_string),
+        }
     }
 }
