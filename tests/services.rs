@@ -11,6 +11,8 @@ mod deployment;
 mod drain;
 #[path = "services/gang.rs"]
 mod gang;
+#[path = "services/network_realization.rs"]
+mod network_realization;
 #[path = "services/partition.rs"]
 mod partition;
 #[path = "services/placement.rs"]

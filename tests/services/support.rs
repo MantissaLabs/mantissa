@@ -14,8 +14,8 @@ pub(crate) use mantissa::config::{
     set_global_config_with_source,
 };
 pub(crate) use mantissa::network::types::{
-    NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver, NetworkSpecDraft,
-    NetworkSpecValue, NetworkStatus,
+    NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver, NetworkRealizationPolicy,
+    NetworkSpecDraft, NetworkSpecValue, NetworkStatus,
 };
 pub(crate) use mantissa::node::id::set_node_id;
 pub(crate) use mantissa::runtime::set::RuntimeSet;
@@ -285,6 +285,166 @@ pub(crate) async fn create_logical_test_network(cluster: &[TestNode], name: &str
         network.id
     );
     network.id
+}
+
+/// Creates one replicated logical network through the client-facing RPC surface and waits only for
+/// the accepted spec to converge across the cluster.
+pub(crate) async fn create_replicated_logical_test_network(
+    cluster: &[TestNode],
+    name: &str,
+    realization: NetworkRealizationPolicy,
+) -> Uuid {
+    let node = cluster.first().expect("network test cluster is non-empty");
+    let mut request = node.node.networks_client.create_request();
+    {
+        let mut spec = request.get().init_spec();
+        spec.set_name(name);
+        spec.set_description("replicated logical network test");
+        spec.set_driver(NetworkDriver::Vxlan.to_proto());
+        spec.set_subnet_cidr("");
+        spec.set_vni(0);
+        spec.set_mtu(0);
+        spec.set_sealed(false);
+        spec.set_realization(realization.to_selection_proto());
+    }
+
+    let response = request
+        .send()
+        .promise
+        .await
+        .expect("network create RPC should succeed");
+    let network_id = Uuid::from_slice(
+        response
+            .get()
+            .expect("network create response should decode")
+            .get_network_id()
+            .expect("network create response should contain id"),
+    )
+    .expect("network create response id should be a UUID");
+
+    assert!(
+        wait_for_logical_network_spec_all(
+            cluster,
+            network_id,
+            realization,
+            Duration::from_secs(10)
+        )
+        .await,
+        "network spec {} should replicate with realization {}",
+        network_id,
+        realization
+    );
+
+    network_id
+}
+
+/// Waits until every node has accepted the replicated network spec with the requested policy.
+pub(crate) async fn wait_for_logical_network_spec_all(
+    cluster: &[TestNode],
+    network_id: Uuid,
+    realization: NetworkRealizationPolicy,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(50), || async {
+        for node in cluster {
+            let Ok(Some(spec)) = node.node.network_registry.get_spec(network_id) else {
+                return false;
+            };
+            if spec.status != NetworkStatus::Ready || spec.realization != realization {
+                return false;
+            }
+        }
+
+        true
+    })
+    .await
+}
+
+/// Waits until every node sees exactly the requested Ready peer set for one network.
+pub(crate) async fn wait_for_network_ready_peer_nodes_all(
+    cluster: &[TestNode],
+    network_id: Uuid,
+    expected: &HashSet<Uuid>,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(50), || async {
+        for node in cluster {
+            let Ok(peers) = node
+                .node
+                .network_registry
+                .list_peer_states(Some(network_id))
+            else {
+                return false;
+            };
+            let ready: HashSet<Uuid> = peers
+                .into_iter()
+                .filter(|peer| peer.state.is_ready())
+                .map(|peer| peer.peer_id)
+                .collect();
+            if &ready != expected {
+                return false;
+            }
+        }
+
+        true
+    })
+    .await
+}
+
+/// Waits until every node sees exactly the requested peer-state rows for one network.
+pub(crate) async fn wait_for_network_peer_nodes_all(
+    cluster: &[TestNode],
+    network_id: Uuid,
+    expected: &HashSet<Uuid>,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(50), || async {
+        for node in cluster {
+            let Ok(peers) = node
+                .node
+                .network_registry
+                .list_peer_states(Some(network_id))
+            else {
+                return false;
+            };
+            let peer_ids: HashSet<Uuid> = peers.into_iter().map(|peer| peer.peer_id).collect();
+            if &peer_ids != expected {
+                return false;
+            }
+        }
+
+        true
+    })
+    .await
+}
+
+/// Confirms for the full observation window that every node sees the same peer-state row set.
+pub(crate) async fn network_peer_nodes_stay_all(
+    cluster: &[TestNode],
+    network_id: Uuid,
+    expected: &HashSet<Uuid>,
+    window: Duration,
+) -> bool {
+    let deadline = Instant::now() + window;
+    while Instant::now() < deadline {
+        for node in cluster {
+            let Ok(peers) = node
+                .node
+                .network_registry
+                .list_peer_states(Some(network_id))
+            else {
+                return false;
+            };
+            let peer_ids: HashSet<Uuid> = peers.into_iter().map(|peer| peer.peer_id).collect();
+            if &peer_ids != expected {
+                return false;
+            }
+        }
+
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    true
 }
 
 /// Waits until every node reports the logical network as ready with controller-driven peer

@@ -176,8 +176,12 @@ impl WorkloadNetworkPrerequisites {
         let Some(spec) = self.network_registry.get_spec(network_id)? else {
             return Ok(false);
         };
-        if spec.is_deleted() {
+        if spec.is_deleted() || spec.status != NetworkStatus::Ready {
             return Ok(false);
+        }
+        if spec.realization == NetworkRealizationPolicy::OnDemand {
+            // Lazy networks are made ready by scheduler/runtime admission on the selected node.
+            return Ok(true);
         }
         Ok(self
             .network_registry
@@ -190,8 +194,12 @@ impl WorkloadNetworkPrerequisites {
         let Some(spec) = self.network_registry.get_spec(network_id)? else {
             return Ok(false);
         };
-        if spec.is_deleted() {
+        if spec.is_deleted() || spec.status != NetworkStatus::Ready {
             return Ok(false);
+        }
+        if spec.realization == NetworkRealizationPolicy::OnDemand {
+            // Lazy networks are made ready by scheduler/runtime admission on the selected node.
+            return Ok(true);
         }
         for state in self.network_registry.list_peer_states(Some(network_id))? {
             if state.state.is_ready() && self.cluster_registry.peer_schedulable(state.peer_id) {
