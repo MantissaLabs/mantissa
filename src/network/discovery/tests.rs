@@ -166,6 +166,89 @@ fn public_endpoint_snapshot_carries_lb_target_identity() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+/// Replaces this network's public endpoint rows without disturbing other networks.
+async fn public_endpoint_snapshot_replacement_removes_stale_network_targets() {
+    let harness = setup_catalog_harness().await;
+    let service_id = Uuid::new_v4();
+    let other_network_id = Uuid::new_v4();
+    let old_observation = PublicEndpointObservation {
+        service_id,
+        service_epoch: 1,
+        template_name: "api".to_string(),
+        network_id: harness.network.id,
+        node_id: harness.local_node_id,
+        port: 8443,
+        protocols: vec![NodePortProtocol::Tcp, NodePortProtocol::Udp],
+        ingress: PublicEndpointIngressMode::TaskNodes,
+        ready: true,
+        node_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
+        detail: None,
+    };
+    let other_network_observation = PublicEndpointObservation {
+        service_id: Uuid::new_v4(),
+        service_epoch: 1,
+        template_name: "metrics".to_string(),
+        network_id: other_network_id,
+        node_id: Uuid::new_v4(),
+        port: 9443,
+        protocols: vec![NodePortProtocol::Tcp],
+        ingress: PublicEndpointIngressMode::AllNodes,
+        ready: true,
+        node_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20))),
+        detail: None,
+    };
+
+    replace_public_endpoint_snapshots(&harness.runtime, std::slice::from_ref(&old_observation))
+        .await;
+    {
+        let mut guard = harness.runtime.public_endpoints.lock().await;
+        let other_snapshot = public_endpoint_snapshot_for_protocol(
+            &other_network_observation,
+            NodePortProtocol::Tcp,
+        );
+        guard.insert(other_snapshot.key.clone(), other_snapshot);
+    }
+
+    let new_observation = PublicEndpointObservation {
+        service_epoch: 2,
+        node_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))),
+        protocols: vec![NodePortProtocol::Tcp],
+        ..old_observation
+    };
+    replace_public_endpoint_snapshots(&harness.runtime, &[new_observation]).await;
+
+    let guard = harness.runtime.public_endpoints.lock().await;
+    let this_network_snapshots = guard
+        .values()
+        .filter(|snapshot| snapshot.network_id == harness.network.id)
+        .collect::<Vec<_>>();
+    let other_network_snapshots = guard
+        .values()
+        .filter(|snapshot| snapshot.network_id == other_network_id)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        this_network_snapshots.len(),
+        1,
+        "refresh should replace stale endpoint targets for the local network"
+    );
+    assert_eq!(
+        this_network_snapshots[0].key.protocol,
+        NodePortProtocol::Tcp
+    );
+    assert_eq!(this_network_snapshots[0].generation, 2);
+    assert_eq!(
+        this_network_snapshots[0].node_ip,
+        Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)))
+    );
+    assert_eq!(
+        other_network_snapshots.len(),
+        1,
+        "replacement must only clear rows owned by the refreshed network"
+    );
+}
+
 #[test]
 fn filter_cached_backends_excludes_stale_unhealthy_when_alternative_exists() {
     let network_id = Uuid::new_v4();
