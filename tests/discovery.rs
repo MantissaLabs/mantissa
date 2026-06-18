@@ -6,7 +6,10 @@ use ed25519_dalek::SigningKey;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use mantissa::ingress::registry::IngressPoolRegistry;
-use mantissa::network::discovery::ServiceDiscovery;
+use mantissa::network::discovery::{
+    PublicEndpointIngressMode, PublicEndpointSnapshot, ServiceDiscovery,
+};
+use mantissa::network::nodeport::NodePortProtocol;
 use mantissa::network::registry::NetworkRegistry;
 use mantissa::network::types::{
     NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver,
@@ -15,8 +18,8 @@ use mantissa::network::types::{
 use mantissa::registry::Registry;
 use mantissa::services::registry::ServiceRegistry;
 use mantissa::services::types::{
-    ServiceReadinessProbe, ServiceReadinessProbeKind, ServiceSpecValue,
-    TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
+    PublicIngressPolicy, ServicePortProtocol, ServiceReadinessProbe, ServiceReadinessProbeKind,
+    ServiceSpecValue, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
 };
 use mantissa::store::local::LocalSessionStore;
 use mantissa::store::replicated::ingress::open_ingress_pool_store;
@@ -47,6 +50,7 @@ struct DiscoveryHarness {
     services: ServiceRegistry,
     discovery: ServiceDiscovery,
     network: NetworkSpecValue,
+    local_node_id: Uuid,
 }
 
 /// Builds an unprivileged discovery harness with isolated stores and a high DNS bind port.
@@ -140,6 +144,7 @@ async fn setup_discovery_harness_with_subnet(dns_port: u16, subnet_cidr: &str) -
         services,
         discovery,
         network,
+        local_node_id: actor,
     }
 }
 
@@ -351,6 +356,74 @@ async fn upsert_service_with_readiness(
     services.upsert(service).await.expect("upsert service");
 }
 
+/// Upserts one public service spec and returns its stable replicated service id.
+async fn upsert_public_service(
+    services: &ServiceRegistry,
+    service_name: &str,
+    network_id: Uuid,
+    replica_ids: Vec<Uuid>,
+    public_port: u16,
+    public_ingress: PublicIngressPolicy,
+) -> Uuid {
+    let service = ServiceSpecValue::new(
+        Uuid::new_v4(),
+        "dns-test-manifest",
+        service_name,
+        vec![TaskTemplateSpecValue {
+            name: "backend".to_string(),
+            execution: ExecutionSpec {
+                image: "hashicorp/http-echo:1.0.0".to_string(),
+                command: Vec::new(),
+                tty: false,
+                cpu_millis: 100,
+                memory_bytes: 64 * 1024 * 1024,
+                gpu_count: 0,
+                restart_policy: None,
+                termination_grace_period_secs: None,
+                pre_stop_command: None,
+                liveness: None,
+                env: Vec::new(),
+                secret_files: Vec::new(),
+                volumes: Vec::new(),
+                networks: vec![TaskTemplateNetworkRequirement::new("default", network_id)],
+                ports: Vec::new(),
+                placement: Default::default(),
+            },
+            depends_on: Vec::new(),
+            replicas: replica_ids.len() as u16,
+            readiness: None,
+            public_port: Some(public_port),
+            public_protocol: Some(ServicePortProtocol::Tcp),
+            public_ingress,
+            placement_preferences: Vec::new(),
+            autoscale: None,
+        }],
+        replica_ids,
+    );
+    let service_id = service.id;
+    services
+        .upsert(service)
+        .await
+        .expect("upsert public service");
+    service_id
+}
+
+/// Polls the node-local public endpoint view until it reaches the expected size.
+async fn wait_for_public_endpoint_snapshots(
+    discovery: &ServiceDiscovery,
+    expected_count: usize,
+    timeout: Duration,
+) -> Vec<PublicEndpointSnapshot> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshots = discovery.public_endpoint_snapshots().await;
+        if snapshots.len() == expected_count || Instant::now() >= deadline {
+            return snapshots;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Spawn one tiny loopback-bound HTTP responder so discovery can run real readiness probes.
 fn spawn_http_ready_server(
     ip: Ipv4Addr,
@@ -521,6 +594,145 @@ async fn wait_for_aaaa_answer_count(
         sleep(Duration::from_millis(100)).await;
     }
 }
+
+local_test!(discovery_public_endpoint_view_reports_ingress_modes, {
+    let dns_port = 10536;
+    let task_nodes_service = "task-nodes-public";
+    let ingress_pool_service = "pool-public";
+    let ingress_pool_name = "public-web";
+    let harness = setup_discovery_harness(dns_port).await;
+    let network_id = harness.network.id;
+    let local_node = harness.local_node_id;
+
+    let task_nodes_task = Uuid::new_v4();
+    let ingress_pool_task = Uuid::new_v4();
+    let task_nodes_service_id = upsert_public_service(
+        &harness.services,
+        task_nodes_service,
+        network_id,
+        vec![task_nodes_task],
+        18080,
+        PublicIngressPolicy::TaskNodes,
+    )
+    .await;
+    let ingress_pool_service_id = upsert_public_service(
+        &harness.services,
+        ingress_pool_service,
+        network_id,
+        vec![ingress_pool_task],
+        18081,
+        PublicIngressPolicy::IngressPool {
+            pool: ingress_pool_name.to_string(),
+        },
+    )
+    .await;
+
+    for (task_id, service_name, backend_ip) in [
+        (
+            task_nodes_task,
+            task_nodes_service,
+            Ipv4Addr::new(10, 42, 4, 10),
+        ),
+        (
+            ingress_pool_task,
+            ingress_pool_service,
+            Ipv4Addr::new(10, 42, 4, 11),
+        ),
+    ] {
+        harness
+            .workloads
+            .upsert(
+                &UuidKey::from(task_id),
+                running_task(task_id, local_node, service_name, network_id).into(),
+            )
+            .await
+            .expect("upsert public endpoint task");
+        harness
+            .registry
+            .upsert_attachment(ready_attachment(
+                task_id,
+                local_node,
+                network_id,
+                backend_ip,
+                service_name,
+            ))
+            .await
+            .expect("upsert public endpoint attachment");
+    }
+    harness
+        .registry
+        .upsert_peer_state(ready_peer_state(network_id, local_node))
+        .await
+        .expect("upsert local ready peer state");
+
+    harness
+        .discovery
+        .ensure_network(&harness.network, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)))
+        .await
+        .expect("start public endpoint discovery");
+
+    let snapshots =
+        wait_for_public_endpoint_snapshots(&harness.discovery, 2, Duration::from_secs(5)).await;
+    assert_eq!(
+        snapshots.len(),
+        2,
+        "public endpoint snapshots should converge for both public services: {snapshots:?}"
+    );
+    let snapshots_by_service = snapshots
+        .into_iter()
+        .map(|snapshot| (snapshot.key.service_id, snapshot))
+        .collect::<HashMap<_, _>>();
+
+    let task_nodes = snapshots_by_service
+        .get(&task_nodes_service_id)
+        .expect("task_nodes endpoint snapshot");
+    assert_eq!(task_nodes.key.template_name, "backend");
+    assert_eq!(task_nodes.key.public_port, 18080);
+    assert_eq!(task_nodes.key.protocol, NodePortProtocol::Tcp);
+    assert_eq!(task_nodes.key.node_id, local_node);
+    assert_eq!(task_nodes.network_id, network_id);
+    assert_eq!(task_nodes.ingress, PublicEndpointIngressMode::TaskNodes);
+    assert!(
+        !task_nodes.ready,
+        "unprivileged discovery should expose the row without claiming BPF readiness"
+    );
+    assert!(
+        task_nodes
+            .detail
+            .as_ref()
+            .is_some_and(|detail| !detail.is_empty()),
+        "unprivileged task_nodes endpoint should explain why publication is not ready"
+    );
+
+    let ingress_pool = snapshots_by_service
+        .get(&ingress_pool_service_id)
+        .expect("ingress_pool endpoint snapshot");
+    assert_eq!(ingress_pool.key.template_name, "backend");
+    assert_eq!(ingress_pool.key.public_port, 18081);
+    assert_eq!(ingress_pool.key.protocol, NodePortProtocol::Tcp);
+    assert_eq!(ingress_pool.key.node_id, local_node);
+    assert_eq!(ingress_pool.network_id, network_id);
+    assert_eq!(
+        ingress_pool.ingress,
+        PublicEndpointIngressMode::IngressPool {
+            pool: ingress_pool_name.to_string()
+        }
+    );
+    assert!(!ingress_pool.ready);
+    assert!(
+        ingress_pool
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("not defined")),
+        "missing ingress pool should surface a precise operator detail: {ingress_pool:?}"
+    );
+
+    harness
+        .discovery
+        .teardown_network(network_id)
+        .await
+        .expect("teardown public endpoint discovery");
+});
 
 local_test!(discovery_dns_reflects_backend_changes_unprivileged, {
     let dns_port = 10530;
