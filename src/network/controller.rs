@@ -23,6 +23,7 @@ use crate::scheduler::placement::PlacementNode;
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{PublicIngressPolicy, ServiceSpecValue, ServiceStatus};
 use crate::store::replicated::workloads::WorkloadStore;
+use crate::topology::peers::PeerValue;
 use anyhow::{Context, Result, anyhow};
 use async_channel::Sender;
 #[cfg(target_os = "linux")]
@@ -679,10 +680,94 @@ impl NetworkController {
             return Ok(HashSet::new());
         }
 
-        self.inner
+        let mut peers = self
+            .inner
             .registry
             .wireguard_scope_peers(self.inner.node_id)
-            .context("derive scoped wireguard peers")
+            .context("derive scoped wireguard peers")?;
+        let specs = self
+            .inner
+            .registry
+            .list_specs()
+            .context("list network specs for all-nodes wireguard scope")?;
+        let peer_snapshot = self
+            .inner
+            .cluster_registry
+            .peer_values_snapshot()
+            .context("load peer metadata for all-nodes wireguard scope")?;
+        peers.extend(Self::all_nodes_wireguard_scope_peers(
+            &specs,
+            &peer_snapshot,
+            self.inner.node_id,
+        ));
+        Ok(peers)
+    }
+
+    /// Return visible peers that must join WireGuard because an all-nodes VXLAN exists.
+    fn all_nodes_wireguard_scope_peers(
+        specs: &[NetworkSpecValue],
+        peers: &[(Uuid, PeerValue)],
+        local_node_id: Uuid,
+    ) -> HashSet<Uuid> {
+        let has_all_nodes_vxlan = specs.iter().any(|spec| {
+            !spec.is_deleted()
+                && spec.realizes_on_all_nodes()
+                && spec.driver.requires_wireguard_underlay()
+        });
+        if !has_all_nodes_vxlan {
+            return HashSet::new();
+        }
+
+        peers
+            .iter()
+            .filter(|(peer_id, peer)| {
+                *peer_id != local_node_id && peer.is_active() && peer.readiness.is_ready()
+            })
+            .map(|(peer_id, _)| *peer_id)
+            .collect()
+    }
+
+    /// Ensure local VXLAN demand is visible before deriving peer-state based WireGuard scope.
+    async fn mark_vxlan_scope_participation(
+        &self,
+        specs: &[NetworkSpecValue],
+        local_demand: &HashSet<Uuid>,
+    ) -> Result<()> {
+        for spec in specs {
+            if !spec.driver.requires_wireguard_underlay()
+                || !Self::spec_has_local_realization_demand(spec, local_demand)
+            {
+                continue;
+            }
+            let participates = self
+                .inner
+                .registry
+                .get_peer_state(spec.id, self.inner.node_id)?
+                .is_some_and(|state| state.state.is_participating() && state.error.is_none());
+            if !participates {
+                let _ = self.mark_peer_configuring(spec.id).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Refresh the cached WireGuard gate when kernel reconciliation is debounce-skipped.
+    async fn refresh_debounced_wireguard_gate(&self, desired_peer_ids: &HashSet<Uuid>) -> bool {
+        let mut guard = self.inner.wireguard.lock().await;
+        let desired_count = desired_peer_ids.len();
+        let scope_changed = guard.required_peer_count != desired_count
+            || guard.configured_peer_ids != *desired_peer_ids;
+        if !scope_changed {
+            return false;
+        }
+
+        guard.required_peer_count = desired_count;
+        guard
+            .configured_peer_ids
+            .retain(|peer| desired_peer_ids.contains(peer));
+        guard.underlay_active = false;
+        true
     }
 
     /// Reset cached underlay state and mark active networks as blocked by WireGuard.
@@ -709,6 +794,15 @@ impl NetworkController {
     /// underlay is available. Any failure here is surfaced through per-network error state instead
     /// of silently falling back to plaintext.
     async fn reconcile_wireguard_underlay(&self) -> Result<bool> {
+        let desired_peer_ids = match self.desired_wireguard_peers().await {
+            Ok(peers) => peers,
+            Err(err) => {
+                let message = format!("failed to derive mandatory wireguard peer scope: {err:#}");
+                self.fail_wireguard_reconcile(&message).await?;
+                return Err(err.context("derive mandatory wireguard peer scope"));
+            }
+        };
+
         // WireGuard provisioning is expensive (it rewrites interface + routes). The main network
         // reconciliation loop can invoke this helper multiple times per tick (pending specs,
         // pending forwarding, periodic sweep). Debounce here so we only touch kernel WireGuard once
@@ -721,19 +815,12 @@ impl NetworkController {
                     WIREGUARD_RECONCILE_DEBOUNCE.checked_sub(now.saturating_duration_since(last))
             {
                 self.schedule_wireguard_retry(remaining).await;
-                return Ok(false);
+                return Ok(self
+                    .refresh_debounced_wireguard_gate(&desired_peer_ids)
+                    .await);
             }
             *guard = Some(now);
         }
-
-        let desired_peer_ids = match self.desired_wireguard_peers().await {
-            Ok(peers) => peers,
-            Err(err) => {
-                let message = format!("failed to derive mandatory wireguard peer scope: {err:#}");
-                self.fail_wireguard_reconcile(&message).await?;
-                return Err(err.context("derive mandatory wireguard peer scope"));
-            }
-        };
 
         let previous = { self.inner.wireguard.lock().await.clone() };
         match wireguard::ensure_wireguard_underlay(
@@ -1088,38 +1175,11 @@ impl NetworkController {
             return Ok(());
         }
 
-        let _ = self.reconcile_wireguard_underlay().await?;
         let local_demand = self.local_network_demand_snapshot().await?;
-
-        for network_id in queued {
-            match self.inner.registry.get_spec(network_id) {
-                Ok(Some(spec)) => {
-                    if spec.is_deleted() {
-                        if let Err(err) = self.teardown_deleted_network(&spec).await {
-                            warn!(
-                                target: "network",
-                                network = %network_id,
-                                "teardown after gossip failed: {err:#}"
-                            );
-                        }
-                    } else if Self::spec_has_local_realization_demand(&spec, &local_demand) {
-                        if let Err(err) = self.reconcile_network(spec.clone()).await {
-                            warn!(
-                                target: "network",
-                                network = %network_id,
-                                "immediate reconcile failed: {err:#}"
-                            );
-                            self.update_peer_state_error(network_id, format!("{err:#}"))
-                                .await?;
-                        }
-                    } else {
-                        debug!(
-                            target: "network",
-                            network = %network_id,
-                            "skipping queued network reconcile because local demand is absent"
-                        );
-                    }
-                }
+        let mut queued_specs = Vec::new();
+        for network_id in &queued {
+            match self.inner.registry.get_spec(*network_id) {
+                Ok(Some(spec)) => queued_specs.push(spec),
                 Ok(None) => {}
                 Err(err) => {
                     warn!(
@@ -1128,6 +1188,38 @@ impl NetworkController {
                         "failed to load spec for immediate reconcile: {err:#}"
                     );
                 }
+            }
+        }
+        self.mark_vxlan_scope_participation(&queued_specs, &local_demand)
+            .await?;
+        let _ = self.reconcile_wireguard_underlay().await?;
+
+        for spec in queued_specs {
+            let network_id = spec.id;
+            if spec.is_deleted() {
+                if let Err(err) = self.teardown_deleted_network(&spec).await {
+                    warn!(
+                        target: "network",
+                        network = %network_id,
+                        "teardown after gossip failed: {err:#}"
+                    );
+                }
+            } else if Self::spec_has_local_realization_demand(&spec, &local_demand) {
+                if let Err(err) = self.reconcile_network(spec.clone()).await {
+                    warn!(
+                        target: "network",
+                        network = %network_id,
+                        "immediate reconcile failed: {err:#}"
+                    );
+                    self.update_peer_state_error(network_id, format!("{err:#}"))
+                        .await?;
+                }
+            } else {
+                debug!(
+                    target: "network",
+                    network = %network_id,
+                    "skipping queued network reconcile because local demand is absent"
+                );
             }
         }
 
@@ -1234,14 +1326,15 @@ impl NetworkController {
 
     /// Run one full drift reconcile across all known network specs and stale active networks.
     async fn reconcile_once(&self) -> Result<()> {
-        let _ = self.reconcile_wireguard_underlay().await?;
-
         let specs = self
             .inner
             .registry
             .list_specs()
             .context("list network specifications")?;
         let local_demand = self.local_network_demand_snapshot().await?;
+        self.mark_vxlan_scope_participation(&specs, &local_demand)
+            .await?;
+        let _ = self.reconcile_wireguard_underlay().await?;
 
         let desired: HashSet<Uuid> = specs
             .iter()

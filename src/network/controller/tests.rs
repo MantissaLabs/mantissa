@@ -3,6 +3,7 @@ use crate::ingress::types::IngressPoolSpecDraft;
 use crate::network::types::{
     NetworkDriver, NetworkRealizationPolicy, NetworkSpecDraft, NetworkSpecValue, NetworkStatus,
 };
+use crate::runtime::types::RuntimeSupportProfile;
 use crate::scheduler::placement::{
     PlacementConstraint, PlacementConstraintSelector, PlacementNode, PlacementPolicy,
     PlacementStrategy,
@@ -11,7 +12,9 @@ use crate::services::types::{
     PublicIngressPolicy, ServiceSpecValue, ServiceStatus, TaskTemplateNetworkRequirement,
     TaskTemplateSpecValue,
 };
-use crate::topology::peers::PeerLabel;
+use crate::topology::peers::{
+    NodeReadiness, PeerLabel, PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue,
+};
 use crate::workload::types::ExecutionSpec;
 use anyhow::Context;
 use aya::{programs::ProgramError, sys::SyscallError};
@@ -71,6 +74,43 @@ fn test_placement_node(node_id: Uuid, hostname: &str, ingress_pool: &str) -> Pla
             key: "mantissa.io/ingress".to_string(),
             value: ingress_pool.to_string(),
         }],
+    )
+}
+
+fn test_peer_value(
+    peer_id: Uuid,
+    schedulable: bool,
+    ready: bool,
+    active: bool,
+) -> (Uuid, PeerValue) {
+    let mut scheduling = PeerSchedulingState::schedulable_default(peer_id);
+    scheduling.schedulable = schedulable;
+    (
+        peer_id,
+        PeerValue {
+            address: format!("inproc://{peer_id}"),
+            hostname: format!("node-{peer_id}"),
+            platform_os: "linux".to_string(),
+            platform_arch: "amd64".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: None,
+            scheduling,
+            readiness: if ready {
+                NodeReadiness::ready(peer_id, 1)
+            } else {
+                NodeReadiness::syncing(peer_id, 1)
+            },
+            labels: PeerLabelState::default(),
+            runtime_support: RuntimeSupportProfile::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
+            membership: if active {
+                PeerMembership::active(1)
+            } else {
+                PeerMembership::left(2)
+            },
+        },
     )
 }
 
@@ -166,6 +206,33 @@ fn successful_reconcile_preserves_non_pending_spec_status() {
         &mut deleted
     ));
     assert_eq!(deleted.status, NetworkStatus::Deleted);
+}
+
+#[test]
+fn all_nodes_wireguard_scope_includes_visible_ready_peers() {
+    let local_node_id = Uuid::new_v4();
+    let ready_peer = Uuid::new_v4();
+    let syncing_peer = Uuid::new_v4();
+    let drained_peer = Uuid::new_v4();
+    let left_peer = Uuid::new_v4();
+    let all_nodes = test_network_spec("all-nodes", NetworkRealizationPolicy::AllNodes);
+    let on_demand = test_network_spec("on-demand", NetworkRealizationPolicy::OnDemand);
+    let peers = vec![
+        test_peer_value(local_node_id, true, true, true),
+        test_peer_value(ready_peer, true, true, true),
+        test_peer_value(syncing_peer, true, false, true),
+        test_peer_value(drained_peer, false, true, true),
+        test_peer_value(left_peer, true, true, false),
+    ];
+
+    let scope =
+        NetworkController::all_nodes_wireguard_scope_peers(&[all_nodes], &peers, local_node_id);
+
+    assert_eq!(scope, HashSet::from([ready_peer, drained_peer]));
+    assert!(
+        NetworkController::all_nodes_wireguard_scope_peers(&[on_demand], &peers, local_node_id)
+            .is_empty()
+    );
 }
 
 #[test]
