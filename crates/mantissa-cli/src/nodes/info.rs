@@ -3,7 +3,7 @@ use mantissa_client::config::ClientConfig;
 use mantissa_client::nodes::info::PacketCountersView;
 use mantissa_client::nodes::{
     LoadBalancerFlowDiagnosticsView, NodeInfoView, NodePortFlowDiagnosticsView,
-    NodePortIngressDropReasonsView,
+    NodePortIngressDropReasonsView, PublicEndpointInfoView,
 };
 use std::fmt::{Display, Write as _};
 
@@ -287,6 +287,15 @@ fn render_info(info: &NodeInfoView) -> String {
         info.nodeport.stats_error.as_deref(),
     );
 
+    let _ = writeln!(rendered, "  Public Endpoints:");
+    if info.public_endpoints.is_empty() {
+        let _ = writeln!(rendered, "    none");
+    } else {
+        for endpoint in &info.public_endpoints {
+            push_public_endpoint(&mut rendered, endpoint);
+        }
+    }
+
     let _ = writeln!(rendered, "  Load Balancer:");
     push_field(
         &mut rendered,
@@ -357,6 +366,42 @@ fn push_field(rendered: &mut String, indent: &str, label: &str, value: impl Disp
 fn push_optional_field(rendered: &mut String, indent: &str, label: &str, value: Option<&str>) {
     if let Some(value) = value {
         push_field(rendered, indent, label, value);
+    }
+}
+
+/// Appends one node-local public endpoint row to the network diagnostics report.
+fn push_public_endpoint(rendered: &mut String, endpoint: &PublicEndpointInfoView) {
+    let target = endpoint
+        .node_ip
+        .as_deref()
+        .map(|ip| format!("{}:{}", format_endpoint_ip(ip), endpoint.public_port))
+        .unwrap_or_else(|| format!("unresolved:{}", endpoint.public_port));
+    let status = if endpoint.ready { "ready" } else { "not_ready" };
+    let _ = writeln!(
+        rendered,
+        "    - {} {}/{} {}",
+        endpoint.template_name, target, endpoint.protocol, status
+    );
+    push_field(rendered, "      ", "service_id", &endpoint.service_id);
+    push_field(rendered, "      ", "network_id", &endpoint.network_id);
+    push_field(rendered, "      ", "node_id", &endpoint.node_id);
+    push_field(rendered, "      ", "ingress_mode", &endpoint.ingress_mode);
+    push_optional_field(
+        rendered,
+        "      ",
+        "ingress_pool",
+        endpoint.ingress_pool.as_deref(),
+    );
+    push_field(rendered, "      ", "generation", endpoint.generation);
+    push_optional_field(rendered, "      ", "detail", endpoint.detail.as_deref());
+}
+
+/// Bracket IPv6 endpoint addresses while keeping IPv4 and host labels unchanged.
+fn format_endpoint_ip(ip: &str) -> String {
+    if ip.contains(':') && !ip.starts_with('[') {
+        format!("[{ip}]")
+    } else {
+        ip.to_string()
     }
 }
 
@@ -495,7 +540,7 @@ mod tests {
     use super::*;
     use mantissa_client::nodes::info::{
         CpuInfoView, DiskInfoView, GpuInfoView, LoadAverageView, LoadBalancerInfoView,
-        MemoryInfoView, NodePortInfoView, OsInfoView, PacketCountersView,
+        MemoryInfoView, NodePortInfoView, OsInfoView, PacketCountersView, PublicEndpointInfoView,
     };
 
     /// Builds a representative node-info view for CLI rendering tests.
@@ -597,6 +642,20 @@ mod tests {
                 },
                 stats_error: None,
             },
+            public_endpoints: vec![PublicEndpointInfoView {
+                service_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                template_name: "api".to_string(),
+                network_id: "22222222-2222-2222-2222-222222222222".to_string(),
+                node_id: "33333333-3333-3333-3333-333333333333".to_string(),
+                node_ip: Some("2001:db8::10".to_string()),
+                public_port: 8443,
+                protocol: "tcp".to_string(),
+                ingress_mode: "ingress_pool".to_string(),
+                ingress_pool: Some("public-web".to_string()),
+                ready: true,
+                generation: 7,
+                detail: None,
+            }],
         }
     }
 
@@ -636,6 +695,7 @@ mod tests {
         let rendered = render_info(&sample_info());
 
         assert!(rendered.contains("Network:\n  NodePort:\n"));
+        assert!(rendered.contains("  Public Endpoints:\n"));
         assert!(rendered.contains("  Load Balancer:\n"));
         assert!(!rendered.contains("\nNodePort:\n"));
         assert!(!rendered.contains("\nLoad Balancer:\n"));
@@ -644,5 +704,16 @@ mod tests {
         assert!(rendered.contains("    flow_diagnostics:\n      flow_pairs: 3\n"));
         assert!(rendered.contains("      return_path_bypass_packets: 9\n"));
         assert!(!rendered.contains("flow_diagnostics: flow_pairs="));
+    }
+
+    /// Verifies public endpoint rows show the load-balancer target socket and policy.
+    #[test]
+    fn render_info_shows_public_endpoint_targets() {
+        let rendered = render_info(&sample_info());
+
+        assert!(rendered.contains("    - api [2001:db8::10]:8443/tcp ready\n"));
+        assert!(rendered.contains("      ingress_mode: ingress_pool\n"));
+        assert!(rendered.contains("      ingress_pool: public-web\n"));
+        assert!(rendered.contains("      generation: 7\n"));
     }
 }

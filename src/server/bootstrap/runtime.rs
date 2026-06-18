@@ -588,6 +588,7 @@ async fn build_runtime_components(
         })?;
     ctx.node
         .set_nodeport_manager(network_controller.nodeport_manager());
+    ctx.node.set_network_controller(network_controller.clone());
     let network_gossiper = NetworkGossiper::new(
         network_registry.clone(),
         network_controller.clone(),

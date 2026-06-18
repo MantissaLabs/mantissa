@@ -27,6 +27,9 @@ struct Info {
 
   loadBalancer @8 :LoadBalancerInfo;
   # Local overlay VIP load-balancer state and dataplane counters.
+
+  publicEndpoints @9 :List(PublicEndpointInfo);
+  # Node-local public endpoint rows currently derived from service discovery.
 }
 
 struct Cpu {
@@ -294,4 +297,42 @@ struct LoadBalancerFlowDiagnostics {
 
   ipv6FlowPairs @1 :UInt32;
   # Number of live IPv6 forward flow entries currently cached in the overlay VIP dataplane.
+}
+
+struct PublicEndpointInfo {
+  serviceId @0 :Text;
+  # Service UUID that owns the published endpoint.
+
+  templateName @1 :Text;
+  # Service template that declares the public endpoint.
+
+  networkId @2 :Text;
+  # Overlay network UUID whose local dataplane publishes the endpoint.
+
+  nodeId @3 :Text;
+  # Node UUID that owns this local endpoint row.
+
+  nodeIp @4 :Text;
+  # External node IP that a load balancer should target when ready.
+
+  publicPort @5 :UInt16;
+  # Host-facing NodePort exposed on nodeIp.
+
+  protocol @6 :Text;
+  # Transport protocol exposed by this endpoint, such as tcp or udp.
+
+  ingressMode @7 :Text;
+  # Public ingress policy that selected this endpoint.
+
+  ingressPool @8 :Text;
+  # Ingress pool name when ingressMode is ingress_pool.
+
+  ready @9 :Bool;
+  # Whether this node currently has the VIP and NodePort path programmed.
+
+  generation @10 :UInt64;
+  # Service generation used to derive this endpoint row.
+
+  detail @11 :Text;
+  # Empty when ready, otherwise the local reason this endpoint is not ready.
 }

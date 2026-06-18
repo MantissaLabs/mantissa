@@ -1,6 +1,8 @@
 use crate::info_capnp::info as SystemInfo;
+use crate::network::controller::NetworkController;
+use crate::network::discovery::{PublicEndpointIngressMode, PublicEndpointSnapshot};
 use crate::network::lb::BpfLoadBalancer;
-use crate::network::nodeport::NodePortManager;
+use crate::network::nodeport::{NodePortManager, NodePortProtocol};
 use crate::node::id::new_node_id_v7;
 use crate::node::info::NodeInfo;
 use capnp::Error;
@@ -24,6 +26,7 @@ pub struct Node {
     pub id: NodeId,
     pub system_info: NodeInfo,
     nodeport: Rc<RefCell<Option<NodePortManager>>>,
+    network_controller: Rc<RefCell<Option<NetworkController>>>,
     // engine: Rc<Engine>,
 }
 
@@ -43,6 +46,7 @@ impl Default for Node {
             id: new_node_id_v7(),
             system_info: NodeInfo::new(),
             nodeport: Rc::new(RefCell::new(None)),
+            network_controller: Rc::new(RefCell::new(None)),
         }
     }
 }
@@ -62,6 +66,11 @@ impl Node {
     /// Store the live NodePort manager so node-local diagnostics can report public ingress state.
     pub fn set_nodeport_manager(&self, nodeport: NodePortManager) {
         *self.nodeport.borrow_mut() = Some(nodeport);
+    }
+
+    /// Store the network controller so node info can expose local public endpoint rows.
+    pub fn set_network_controller(&self, controller: NetworkController) {
+        *self.network_controller.borrow_mut() = Some(controller);
     }
 }
 
@@ -84,6 +93,11 @@ impl node::Server for Node {
         let nodeport_status = match nodeport {
             Some(manager) => Some(manager.status().await),
             None => None,
+        };
+        let network_controller = self.network_controller.borrow().clone();
+        let public_endpoints = match network_controller {
+            Some(controller) => controller.public_endpoint_snapshots().await,
+            None => Vec::new(),
         };
         let load_balancer_status = BpfLoadBalancer::new().status();
 
@@ -282,6 +296,17 @@ impl node::Server for Node {
                     flow_diagnostics.set_ipv6_flow_pairs(usize_to_u32(diagnostics.ipv6_flow_pairs));
                 }
             }
+
+            // Public endpoints
+            {
+                let mut endpoints = system
+                    .reborrow()
+                    .init_public_endpoints(usize_to_u32(public_endpoints.len()));
+                for (idx, snapshot) in public_endpoints.iter().enumerate() {
+                    let mut endpoint = endpoints.reborrow().get(usize_to_u32(idx));
+                    write_public_endpoint(endpoint.reborrow(), snapshot);
+                }
+            }
         }
 
         match builder.get_root::<SystemInfo::Builder>() {
@@ -291,6 +316,49 @@ impl node::Server for Node {
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Encodes one local public endpoint snapshot into node-info diagnostics.
+fn write_public_endpoint(
+    mut endpoint: mantissa_protocol::info_capnp::public_endpoint_info::Builder<'_>,
+    snapshot: &PublicEndpointSnapshot,
+) {
+    endpoint.set_service_id(&snapshot.key.service_id.to_string());
+    endpoint.set_template_name(&snapshot.key.template_name);
+    endpoint.set_network_id(&snapshot.network_id.to_string());
+    endpoint.set_node_id(&snapshot.key.node_id.to_string());
+    let node_ip = snapshot
+        .node_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
+    endpoint.set_node_ip(&node_ip);
+    endpoint.set_public_port(snapshot.key.public_port);
+    endpoint.set_protocol(nodeport_protocol_label(snapshot.key.protocol));
+    let (ingress_mode, ingress_pool) = public_endpoint_ingress_labels(&snapshot.ingress);
+    endpoint.set_ingress_mode(ingress_mode);
+    endpoint.set_ingress_pool(ingress_pool.unwrap_or(""));
+    endpoint.set_ready(snapshot.ready);
+    endpoint.set_generation(snapshot.generation);
+    endpoint.set_detail(snapshot.detail.as_deref().unwrap_or(""));
+}
+
+/// Returns stable display labels for the public endpoint ingress policy.
+fn public_endpoint_ingress_labels(
+    ingress: &PublicEndpointIngressMode,
+) -> (&'static str, Option<&str>) {
+    match ingress {
+        PublicEndpointIngressMode::AllNodes => ("all_nodes", None),
+        PublicEndpointIngressMode::TaskNodes => ("task_nodes", None),
+        PublicEndpointIngressMode::IngressPool { pool } => ("ingress_pool", Some(pool.as_str())),
+    }
+}
+
+/// Returns the stable protocol label used in node-info public endpoint rows.
+fn nodeport_protocol_label(protocol: NodePortProtocol) -> &'static str {
+    match protocol {
+        NodePortProtocol::Tcp => "tcp",
+        NodePortProtocol::Udp => "udp",
     }
 }
 

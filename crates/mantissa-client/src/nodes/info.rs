@@ -13,6 +13,7 @@ pub struct NodeInfoView {
     pub gpu: GpuInfoView,
     pub nodeport: NodePortInfoView,
     pub load_balancer: LoadBalancerInfoView,
+    pub public_endpoints: Vec<PublicEndpointInfoView>,
 }
 
 /// Operating-system details reported by the local node.
@@ -162,6 +163,23 @@ pub struct LoadBalancerInfoView {
     pub stats_error: Option<String>,
 }
 
+/// One node-local public endpoint row reported by service discovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicEndpointInfoView {
+    pub service_id: String,
+    pub template_name: String,
+    pub network_id: String,
+    pub node_id: String,
+    pub node_ip: Option<String>,
+    pub public_port: u16,
+    pub protocol: String,
+    pub ingress_mode: String,
+    pub ingress_pool: Option<String>,
+    pub ready: bool,
+    pub generation: u64,
+    pub detail: Option<String>,
+}
+
 /// Fetches local node information from the node RPC capability.
 pub async fn info(cfg: &ClientConfig) -> Result<NodeInfoView> {
     let client = connection::get_local_session(cfg).await?;
@@ -181,6 +199,7 @@ pub async fn info(cfg: &ClientConfig) -> Result<NodeInfoView> {
     let gpu = info.get_gpu()?;
     let nodeport = info.get_nodeport()?;
     let load_balancer = info.get_load_balancer()?;
+    let public_endpoints = info.get_public_endpoints()?;
 
     Ok(NodeInfoView {
         hostname: info.get_hostname()?.to_str()?.to_string(),
@@ -223,6 +242,7 @@ pub async fn info(cfg: &ClientConfig) -> Result<NodeInfoView> {
         gpu: decode_gpu(gpu)?,
         nodeport: decode_nodeport(nodeport)?,
         load_balancer: decode_load_balancer(load_balancer)?,
+        public_endpoints: decode_public_endpoints(public_endpoints)?,
     })
 }
 
@@ -335,6 +355,32 @@ fn decode_load_balancer(
         },
         stats_error: optional_text(load_balancer.get_stats_error()?),
     })
+}
+
+/// Decodes node-local public endpoint rows into owned client data.
+fn decode_public_endpoints(
+    endpoints: capnp::struct_list::Reader<
+        mantissa_protocol::info_capnp::public_endpoint_info::Owned,
+    >,
+) -> Result<Vec<PublicEndpointInfoView>> {
+    let mut decoded = Vec::with_capacity(endpoints.len() as usize);
+    for endpoint in endpoints.iter() {
+        decoded.push(PublicEndpointInfoView {
+            service_id: endpoint.get_service_id()?.to_str()?.to_string(),
+            template_name: endpoint.get_template_name()?.to_str()?.to_string(),
+            network_id: endpoint.get_network_id()?.to_str()?.to_string(),
+            node_id: endpoint.get_node_id()?.to_str()?.to_string(),
+            node_ip: optional_text(endpoint.get_node_ip()?),
+            public_port: endpoint.get_public_port(),
+            protocol: endpoint.get_protocol()?.to_str()?.to_string(),
+            ingress_mode: endpoint.get_ingress_mode()?.to_str()?.to_string(),
+            ingress_pool: optional_text(endpoint.get_ingress_pool()?),
+            ready: endpoint.get_ready(),
+            generation: endpoint.get_generation(),
+            detail: optional_text(endpoint.get_detail()?),
+        });
+    }
+    Ok(decoded)
 }
 
 /// Converts one protocol text field into an optional owned string after trimming.

@@ -12,7 +12,7 @@ pub use self::drain::{DrainOperation, DrainResult, drain, request_drain, request
 pub use self::evict::evict;
 pub use self::info::{
     LoadBalancerFlowDiagnosticsView, NodeInfoView, NodePortFlowDiagnosticsView,
-    NodePortIngressDropReasonsView, info,
+    NodePortIngressDropReasonsView, PublicEndpointInfoView, info,
 };
 pub use self::join::join;
 pub use self::labels::{NodeLabelsResult, labels};
