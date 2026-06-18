@@ -281,7 +281,8 @@ impl NetworkController {
                 continue;
             };
 
-            if spec.realizes_on_all_nodes() || self.has_local_attachment_demand(network_id)? {
+            let local_demand = self.local_network_demand_snapshot().await?;
+            if spec.realizes_on_all_nodes() || local_demand.contains(&network_id) {
                 continue;
             }
 
@@ -1218,8 +1219,17 @@ impl NetworkController {
                 debug!(
                     target: "network",
                     network = %network_id,
-                    "skipping queued network reconcile because local demand is absent"
+                    "tearing down queued network realization because local demand is absent"
                 );
+                let lock = self.realization_lock(network_id).await;
+                let _guard = lock.lock().await;
+                if let Err(err) = self.teardown_local_network_realization(network_id).await {
+                    warn!(
+                        target: "network",
+                        network = %network_id,
+                        "teardown after local demand removal failed: {err:#}"
+                    );
+                }
             }
         }
 

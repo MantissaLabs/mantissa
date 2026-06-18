@@ -13,6 +13,7 @@ pub(crate) use mantissa::config::{
     Config, ConfigSource, RuntimeHealthConfig, global_config, global_config_source,
     set_global_config_with_source,
 };
+pub(crate) use mantissa::ingress::types::{IngressPoolSpecDraft, IngressPoolSpecValue};
 pub(crate) use mantissa::network::types::{
     NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver, NetworkRealizationPolicy,
     NetworkSpecDraft, NetworkSpecValue, NetworkStatus,
@@ -26,6 +27,9 @@ pub(crate) use mantissa::runtime::types::{
 };
 pub(crate) use mantissa::scheduler::SlotReservationRequest;
 pub(crate) use mantissa::scheduler::SlotState;
+pub(crate) use mantissa::scheduler::placement::{
+    PlacementConstraint, PlacementConstraintSelector, PlacementPolicy,
+};
 pub(crate) use mantissa::server::headless::{
     HeadlessConfig, HeadlessKeys, HeadlessNode, HeadlessTransport,
 };
@@ -34,9 +38,9 @@ pub(crate) use mantissa::services::manager::{
     ServiceControllerTiming, ServiceDeploymentOptions, ServiceDeploymentOutcome,
 };
 pub(crate) use mantissa::services::types::{
-    ServiceDeploymentPolicy, ServiceRollingUpdatePolicy, ServiceRolloutOrder, ServiceRolloutPhase,
-    ServiceRolloutState, ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy,
-    TaskTemplateAutoscaleMetricKindValue, TaskTemplateAutoscaleMetricValue,
+    PublicIngressPolicy, ServiceDeploymentPolicy, ServiceRollingUpdatePolicy, ServiceRolloutOrder,
+    ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue, ServiceStatus,
+    ServiceUpdateStrategy, TaskTemplateAutoscaleMetricKindValue, TaskTemplateAutoscaleMetricValue,
     TaskTemplateAutoscalePolicyValue, TaskTemplateNetworkRequirement, TaskTemplateRestartPolicy,
     TaskTemplateRestartPolicyKind, TaskTemplateSpecValue,
 };
@@ -336,6 +340,65 @@ pub(crate) async fn create_replicated_logical_test_network(
     );
 
     network_id
+}
+
+/// Upserts one ingress pool fixture into every node's replicated ingress-pool registry.
+pub(crate) async fn upsert_ingress_pool_all(cluster: &[TestNode], pool: IngressPoolSpecValue) {
+    for node in cluster {
+        node.node
+            .ingress_pool_registry
+            .upsert(pool.clone())
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "upsert ingress pool '{}' on node {} failed: {err:#}",
+                    pool.name,
+                    node.id()
+                )
+            });
+    }
+}
+
+/// Applies node labels through the topology RPC so service tests use replicated metadata.
+pub(crate) async fn set_node_labels(
+    topology: &topology::Client,
+    node_id: Uuid,
+    labels: &[&str],
+    replace: bool,
+) {
+    let mut request = topology.set_labels_request();
+    {
+        let mut params = request.get();
+        set_node_id(params.reborrow().init_node_id(), &node_id);
+        let mut entries = params.reborrow().init_labels(labels.len() as u32);
+        for (idx, label) in labels.iter().enumerate() {
+            entries.set(idx as u32, label);
+        }
+        params.reborrow().init_remove_keys(0);
+        params.set_replace(replace);
+    }
+    request.send().promise.await.expect("setLabels send");
+}
+
+/// Waits until every node has observed one replicated label value for the target peer.
+pub(crate) async fn wait_for_node_label_all(
+    cluster: &[TestNode],
+    node_id: Uuid,
+    key: &str,
+    expected: &str,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(100), || async {
+        cluster.iter().all(|node| {
+            node.node
+                .registry
+                .peer_labels(node_id)
+                .and_then(|labels| labels.get(key).map(str::to_string))
+                .as_deref()
+                == Some(expected)
+        })
+    })
+    .await
 }
 
 /// Waits until every node has accepted the replicated network spec with the requested policy.

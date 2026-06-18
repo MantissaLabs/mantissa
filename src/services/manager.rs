@@ -1,4 +1,5 @@
 use crate::gossip::Message;
+use crate::network::controller::NetworkController;
 use crate::network::registry::NetworkRegistry;
 use crate::registry::Registry;
 use crate::scheduler::placement::{PlacementNode, PlacementPreferenceInventory};
@@ -9,9 +10,10 @@ use crate::services::reconcile::{
 };
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{
-    ServiceDeploymentPolicy, ServiceEvent, ServicePortProtocol, ServicePreviousGeneration,
-    ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue, ServiceStatus,
-    ServiceUpdateStrategy, TaskTemplateSpecValue, compute_service_id,
+    PublicIngressPolicy, ServiceDeploymentPolicy, ServiceEvent, ServicePortProtocol,
+    ServicePreviousGeneration, ServiceRolloutOrder, ServiceRolloutPhase, ServiceRolloutState,
+    ServiceSpecValue, ServiceStatus, ServiceUpdateStrategy, TaskTemplateSpecValue,
+    compute_service_id,
 };
 use crate::task::types::TaskStateFilter;
 use crate::volumes::types::VolumeDriver;
@@ -263,6 +265,7 @@ pub struct ServiceController {
     workload_manager: WorkloadManager,
     cluster_registry: Registry,
     network_registry: NetworkRegistry,
+    network_controller: Option<NetworkController>,
     network_prerequisites: WorkloadNetworkPrerequisites,
     volume_registry: VolumeRegistry,
     gossip_tx: Sender<Message>,
@@ -316,6 +319,7 @@ pub struct ServiceControllerConfig {
     pub workload_manager: WorkloadManager,
     pub cluster_registry: Registry,
     pub network_registry: NetworkRegistry,
+    pub network_controller: Option<NetworkController>,
     pub network_prerequisites: WorkloadNetworkPrerequisites,
     pub volume_registry: VolumeRegistry,
     pub gossip_tx: Sender<Message>,
@@ -333,6 +337,7 @@ impl ServiceController {
             workload_manager,
             cluster_registry,
             network_registry,
+            network_controller,
             network_prerequisites,
             volume_registry,
             gossip_tx,
@@ -346,6 +351,7 @@ impl ServiceController {
             workload_manager,
             cluster_registry,
             network_registry,
+            network_controller,
             network_prerequisites,
             volume_registry,
             gossip_tx,
@@ -793,6 +799,8 @@ impl ServiceController {
         let spec_clone = spec.clone();
 
         self.registry.upsert(spec).await?;
+        self.schedule_ingress_pool_network_reconcile(current.as_ref(), &spec_clone)
+            .await;
 
         if should_stop {
             let controller = self.clone();
@@ -802,6 +810,47 @@ impl ServiceController {
         }
 
         Ok(())
+    }
+
+    /// Queue network reconciliation for ingress-pool public endpoints affected by a service row.
+    async fn schedule_ingress_pool_network_reconcile(
+        &self,
+        previous: Option<&ServiceSpecValue>,
+        next: &ServiceSpecValue,
+    ) {
+        let Some(controller) = &self.network_controller else {
+            return;
+        };
+
+        let mut network_ids = previous
+            .into_iter()
+            .flat_map(Self::service_ingress_pool_network_ids)
+            .chain(Self::service_ingress_pool_network_ids(next))
+            .collect::<Vec<_>>();
+        network_ids.sort_unstable();
+        network_ids.dedup();
+
+        for network_id in network_ids {
+            controller.schedule_spec_change(network_id).await;
+        }
+    }
+
+    /// Return service networks whose public ingress policy needs an ingress-pool participant.
+    fn service_ingress_pool_network_ids(spec: &ServiceSpecValue) -> Vec<Uuid> {
+        let mut network_ids = Vec::new();
+        for template in &spec.task_templates {
+            if template.public_port().is_none() {
+                continue;
+            }
+            if !matches!(
+                template.public_ingress,
+                PublicIngressPolicy::IngressPool { .. }
+            ) {
+                continue;
+            }
+            network_ids.extend(template.networks.iter().map(|network| network.network_id));
+        }
+        network_ids
     }
 
     async fn stop_tasks(&self, spec: &ServiceSpecValue) {
