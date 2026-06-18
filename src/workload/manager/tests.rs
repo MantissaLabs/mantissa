@@ -6967,6 +6967,57 @@ async fn remove_event_purges_remote_attachment_without_local_spec() {
 }
 
 #[tokio::test]
+async fn teardown_published_local_attachment_emits_publication_refresh() {
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (manager, _scheduler, _mock_cm, network_registry) =
+        setup_manager_with_forwarding(Some(event_tx), None).await;
+
+    let task_id = Uuid::new_v4();
+    let network_id = Uuid::new_v4();
+    let attachment = NetworkAttachmentValue::new(NetworkAttachmentDraft {
+        id: crate::network::types::compute_network_attachment_id(task_id, network_id),
+        task_id,
+        node_id: manager.local_node_id,
+        instance_id: format!("mantissa-{task_id}"),
+        network_id,
+        task_updated_at: Some(Utc::now().to_rfc3339()),
+        requested_ip: Some("10.77.0.2".to_string()),
+        assigned_ip: Some("10.77.0.2".to_string()),
+        mac: Some("02:11:22:33:44:55".to_string()),
+        state: NetworkAttachmentState::Ready,
+        error: None,
+        traffic_published: true,
+        service_name: Some("svc".to_string()),
+        template_name: Some("backend".to_string()),
+    });
+
+    network_registry
+        .upsert_attachment(attachment)
+        .await
+        .expect("insert local published attachment");
+
+    manager
+        .teardown_runtime_attachments(task_id, HashSet::new(), true)
+        .await
+        .expect("force teardown for published task");
+
+    let event = event_rx
+        .recv()
+        .await
+        .expect("publication refresh event should be emitted");
+    match event {
+        ForwardingEvent::TrafficPublicationChanged {
+            network_id: observed,
+        } => {
+            assert_eq!(observed, network_id)
+        }
+        ForwardingEvent::AttachmentReady { network_id } => panic!(
+            "attachment removal should emit publication refresh, not attachment-ready event: {network_id}"
+        ),
+    }
+}
+
+#[tokio::test]
 async fn duplicate_remove_event_does_not_poison_future_epoch_upsert() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 

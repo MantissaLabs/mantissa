@@ -102,16 +102,19 @@ async fn program_service_vip(
         .sync_vip(runtime.network_id, vip, vip_mac, backends)
     {
         Ok(()) => {
-            if expose_to_host
-                && let Err(err) = ensure_host_vip_neighbor(runtime.network_id, vip, vip_mac).await
-            {
-                debug!(
-                    target: "network",
-                    network = %runtime.network_id,
-                    service = %discovery_name,
-                    vip = %vip,
-                    "failed to program host neighbour for vip (continuing): {err:#}"
-                );
+            if expose_to_host {
+                match ensure_managed_host_vip_neighbor(runtime, vip, vip_mac).await {
+                    Ok(()) => {}
+                    Err(err) => {
+                        debug!(
+                            target: "network",
+                            network = %runtime.network_id,
+                            service = %discovery_name,
+                            vip = %vip,
+                            "failed to program host neighbour for vip (continuing): {err:#}"
+                        );
+                    }
+                }
             }
             let mut guard = runtime.missing_lb_maps.lock().await;
             guard.remove(&runtime.network_id);
@@ -126,17 +129,19 @@ async fn program_service_vip(
                     .sync_vip(runtime.network_id, vip, vip_mac, backends)
                     .is_ok()
             {
-                if expose_to_host
-                    && let Err(err) =
-                        ensure_host_vip_neighbor(runtime.network_id, vip, vip_mac).await
-                {
-                    debug!(
-                        target: "network",
-                        network = %runtime.network_id,
-                        service = %discovery_name,
-                        vip = %vip,
-                        "failed to program host neighbour for vip after healing (continuing): {err:#}"
-                    );
+                if expose_to_host {
+                    match ensure_managed_host_vip_neighbor(runtime, vip, vip_mac).await {
+                        Ok(()) => {}
+                        Err(err) => {
+                            debug!(
+                                target: "network",
+                                network = %runtime.network_id,
+                                service = %discovery_name,
+                                vip = %vip,
+                                "failed to program host neighbour for vip after healing (continuing): {err:#}"
+                            );
+                        }
+                    }
                 }
                 let mut guard = runtime.missing_lb_maps.lock().await;
                 guard.remove(&runtime.network_id);
@@ -155,6 +160,18 @@ async fn program_service_vip(
             false
         }
     }
+}
+
+/// Program and remember one host VIP neighbour owned by this discovery runtime.
+async fn ensure_managed_host_vip_neighbor(
+    runtime: &DiscoveryRuntime,
+    vip: IpAddr,
+    vip_mac: [u8; 6],
+) -> Result<()> {
+    ensure_host_vip_neighbor(runtime.network_id, vip, vip_mac).await?;
+    let mut guard = runtime.host_vip_neighbors.lock().await;
+    guard.insert(vip);
+    Ok(())
 }
 
 /// Ensure the local host has a stable neighbour entry for a service VIP.
@@ -219,25 +236,25 @@ async fn ensure_host_vip_neighbor(network_id: Uuid, vip: IpAddr, vip_mac: [u8; 6
     }
 }
 
-/// Remove stale permanent host VIP neighbours that no longer belong to any published service.
+/// Remove stale host VIP neighbours that no longer belong to any published service.
 pub(super) async fn reconcile_host_vip_neighbors(
     network_id: Uuid,
     desired_vips: &HashSet<IpAddr>,
+    managed_vips: &HashSet<IpAddr>,
 ) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (network_id, desired_vips);
+        let _ = (network_id, desired_vips, managed_vips);
         return Ok(());
     }
 
     #[cfg(target_os = "linux")]
     {
-        use futures::{StreamExt, TryStreamExt};
-        use rtnetlink::packet_core::{NLM_F_ACK, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload};
+        use futures::TryStreamExt;
+        use rtnetlink::packet_route::AddressFamily;
         use rtnetlink::packet_route::neighbour::{
-            NeighbourAddress, NeighbourAttribute, NeighbourMessage, NeighbourState,
+            NeighbourAddress, NeighbourAttribute, NeighbourMessage,
         };
-        use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
 
         let (conn, handle, _) = rtnetlink::new_connection()
             .context("open rtnetlink connection for vip neighbour gc")?;
@@ -261,10 +278,12 @@ pub(super) async fn reconcile_host_vip_neighbors(
             }
         };
 
-        let mut stale_vips = Vec::new();
+        let mut stale_vips = HashSet::new();
         let mut neighs = handle.neighbours().get().execute();
-        while let Ok(Some(msg)) = neighs.try_next().await {
-            if msg.header.ifindex != host_index || msg.header.state != NeighbourState::Permanent {
+        while let Some(msg) = neighs.try_next().await.with_context(|| {
+            format!("enumerate neighbours on host access interface {host_ifname}")
+        })? {
+            if msg.header.ifindex != host_index {
                 continue;
             }
 
@@ -278,9 +297,10 @@ pub(super) async fn reconcile_host_vip_neighbors(
                 _ => None,
             });
             if let Some(vip) = vip
+                && managed_vips.contains(&vip)
                 && !desired_vips.contains(&vip)
             {
-                stale_vips.push(vip);
+                stale_vips.insert(vip);
             }
         }
 
@@ -299,18 +319,14 @@ pub(super) async fn reconcile_host_vip_neighbors(
                 .attributes
                 .push(NeighbourAttribute::Destination(destination));
 
-            let mut request = NetlinkMessage::from(RouteNetlinkMessage::DelNeighbour(message));
-            request.header.flags = NLM_F_REQUEST | NLM_F_ACK;
-            let mut responses = handle.clone().request(request).with_context(|| {
-                format!("submit vip neighbour delete for {vip} on {host_ifname}")
-            })?;
-            while let Some(message) = responses.next().await {
-                if let NetlinkPayload::Error(err) = message.payload {
-                    return Err(rtnetlink::Error::NetlinkError(err)).with_context(|| {
-                        format!("delete stale host vip neighbour {vip} on {host_ifname}")
-                    });
-                }
-            }
+            handle
+                .neighbours()
+                .del(message)
+                .execute()
+                .await
+                .with_context(|| {
+                    format!("delete stale host vip neighbour {vip} on {host_ifname}")
+                })?;
         }
 
         Ok(())

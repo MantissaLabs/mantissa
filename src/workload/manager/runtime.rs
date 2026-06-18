@@ -1452,6 +1452,7 @@ impl WorkloadManager {
             .list_attachments_for_task(task_id)
             .context("failed to list task attachments for teardown")?;
         let mut released_networks = Vec::new();
+        let mut publication_changed_networks = HashSet::new();
 
         for attachment in attachments {
             if !keep.is_empty() && keep.contains(&attachment.network_id) {
@@ -1493,6 +1494,9 @@ impl WorkloadManager {
             {
                 Ok(()) if attachment.node_id == self.local_node_id => {
                     released_networks.push(attachment.network_id);
+                    if attachment.traffic_published {
+                        publication_changed_networks.insert(attachment.network_id);
+                    }
                 }
                 Ok(()) => {}
                 Err(err) => {
@@ -1502,6 +1506,12 @@ impl WorkloadManager {
                         "failed to remove attachment record after teardown: {err}"
                     );
                 }
+            }
+        }
+
+        if let Some(sender) = &self.networking.forwarding_events {
+            for network_id in publication_changed_networks {
+                let _ = sender.send(ForwardingEvent::TrafficPublicationChanged { network_id });
             }
         }
 

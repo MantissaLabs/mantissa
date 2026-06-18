@@ -125,6 +125,7 @@ struct DiscoveryRuntime {
     nodeport: NodePortManager,
     missing_lb_maps: Arc<AsyncMutex<HashSet<Uuid>>>,
     public_endpoints: Arc<AsyncMutex<HashMap<PublicEndpointKey, PublicEndpointSnapshot>>>,
+    host_vip_neighbors: Arc<AsyncMutex<HashSet<IpAddr>>>,
 }
 
 /// Stable key for one node-local public endpoint publication row.
@@ -464,6 +465,7 @@ impl ServiceDiscovery {
             nodeport: self.nodeport.clone(),
             missing_lb_maps: self.missing_lb_maps.clone(),
             public_endpoints: self.public_endpoints.clone(),
+            host_vip_neighbors: Arc::new(AsyncMutex::new(HashSet::new())),
         }
     }
 
@@ -533,6 +535,15 @@ impl ServiceDiscovery {
         self.clear_public_endpoint_snapshots(network_id).await;
 
         if let Some(mut handle) = handle {
+            if let Err(err) =
+                reconcile_managed_host_vip_neighbors(&handle.runtime, HashSet::new()).await
+            {
+                warn!(
+                    target: "network",
+                    network = %network_id,
+                    "failed to clear host vip neighbours during discovery teardown: {err:#}"
+                );
+            }
             if let Some(tx) = handle.shutdown.take() {
                 let _ = tx.send(true);
             }
@@ -1281,6 +1292,13 @@ async fn refresh_backend_catalog_if_needed(
     };
     let mut next_services = HashMap::new();
     for spec in &service_specs {
+        if matches!(
+            spec.status(),
+            ServiceStatus::Stopping | ServiceStatus::Stopped
+        ) {
+            continue;
+        }
+
         for template in &spec.task_templates {
             if !template
                 .networks
@@ -1428,7 +1446,7 @@ async fn refresh_network_services(runtime: &DiscoveryRuntime) -> Result<()> {
     }
     annotate_public_endpoint_observations(runtime, &mut public_endpoint_observations).await;
     replace_public_endpoint_snapshots(runtime, public_endpoint_observations.as_slice()).await;
-    if let Err(err) = reconcile_host_vip_neighbors(runtime.network_id, &host_vips).await {
+    if let Err(err) = reconcile_managed_host_vip_neighbors(runtime, host_vips).await {
         warn!(
             target: "network",
             network = %runtime.network_id,
@@ -1438,6 +1456,26 @@ async fn refresh_network_services(runtime: &DiscoveryRuntime) -> Result<()> {
     apply_public_endpoint_observations(&runtime.services, public_endpoint_observations.as_slice())
         .await?;
 
+    Ok(())
+}
+
+/// Reconcile the host VIP neighbours owned by this local discovery runtime.
+async fn reconcile_managed_host_vip_neighbors(
+    runtime: &DiscoveryRuntime,
+    desired_vips: HashSet<IpAddr>,
+) -> Result<()> {
+    let managed_vips = {
+        let guard = runtime.host_vip_neighbors.lock().await;
+        guard
+            .union(&desired_vips)
+            .copied()
+            .collect::<HashSet<IpAddr>>()
+    };
+
+    reconcile_host_vip_neighbors(runtime.network_id, &desired_vips, &managed_vips).await?;
+
+    let mut guard = runtime.host_vip_neighbors.lock().await;
+    *guard = desired_vips;
     Ok(())
 }
 

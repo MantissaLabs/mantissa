@@ -15,7 +15,7 @@ use crate::network::nodeport::NodePortManager;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
     BpfProgramSpec, NetworkAttachmentState, NetworkDriver, NetworkEvent, NetworkPeerState,
-    NetworkPeerStateValue, NetworkSpecValue,
+    NetworkPeerStateValue, NetworkSpecValue, NetworkStatus,
 };
 use crate::network::wireguard::{self, WireGuardUnderlayState};
 use crate::registry::Registry;
@@ -1433,6 +1433,8 @@ impl NetworkController {
             self.clear_forwarding_caches(plan.network_id).await;
         }
         self.mark_peer_ready(plan.network_id).await?;
+        self.mark_spec_ready_after_reconcile(plan.network_id)
+            .await?;
 
         self.refresh_publication(plan.network_id).await;
 
@@ -1984,6 +1986,43 @@ impl NetworkController {
 
         self.send_event(NetworkEvent::PeerUpsert(state)).await;
         Ok(())
+    }
+
+    /// Promote a successfully reconciled network spec from pending intent to accepted state.
+    async fn mark_spec_ready_after_reconcile(&self, network_id: Uuid) -> Result<()> {
+        let Some(mut spec) = self
+            .inner
+            .registry
+            .get_spec(network_id)
+            .context("load network spec before ready promotion")?
+        else {
+            return Ok(());
+        };
+
+        if !Self::promote_spec_status_after_reconcile(&mut spec) {
+            return Ok(());
+        }
+
+        self.inner
+            .registry
+            .upsert_spec(spec.clone())
+            .await
+            .context("persist network spec ready status")?;
+        self.send_event(NetworkEvent::Upsert(spec)).await;
+        Ok(())
+    }
+
+    /// Return whether a successfully reconciled spec needs a global ready-status write.
+    fn promote_spec_status_after_reconcile(spec: &mut NetworkSpecValue) -> bool {
+        if !matches!(
+            spec.status,
+            NetworkStatus::Pending | NetworkStatus::Provisioning
+        ) {
+            return false;
+        }
+
+        spec.set_status(NetworkStatus::Ready);
+        true
     }
 
     /// Persist the local peer as `Configuring` so discovery can withdraw local backends.

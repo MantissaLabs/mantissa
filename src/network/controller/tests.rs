@@ -1,7 +1,7 @@
 use super::{NetworkController, collect_orphaned_network_suffixes, is_managed_overlay_link_name};
 use crate::ingress::types::IngressPoolSpecDraft;
 use crate::network::types::{
-    NetworkDriver, NetworkRealizationPolicy, NetworkSpecDraft, NetworkSpecValue,
+    NetworkDriver, NetworkRealizationPolicy, NetworkSpecDraft, NetworkSpecValue, NetworkStatus,
 };
 use crate::scheduler::placement::{
     PlacementConstraint, PlacementConstraintSelector, PlacementNode, PlacementPolicy,
@@ -139,6 +139,33 @@ fn on_demand_network_specs_require_explicit_local_realization_demand() {
         NetworkController::spec_has_local_realization_demand(&spec, &local_demand),
         "on_demand specs should realize when local workload or ingress demand exists"
     );
+}
+
+#[test]
+fn successful_reconcile_promotes_pending_spec_status_to_ready() {
+    let mut spec = test_network_spec("pending", NetworkRealizationPolicy::AllNodes);
+
+    assert!(NetworkController::promote_spec_status_after_reconcile(
+        &mut spec
+    ));
+    assert_eq!(spec.status, NetworkStatus::Ready);
+}
+
+#[test]
+fn successful_reconcile_preserves_non_pending_spec_status() {
+    let mut ready = test_network_spec("ready", NetworkRealizationPolicy::AllNodes);
+    ready.set_status(NetworkStatus::Ready);
+    let mut deleted = test_network_spec("deleted", NetworkRealizationPolicy::AllNodes);
+    deleted.mark_deleted();
+
+    assert!(!NetworkController::promote_spec_status_after_reconcile(
+        &mut ready
+    ));
+    assert_eq!(ready.status, NetworkStatus::Ready);
+    assert!(!NetworkController::promote_spec_status_after_reconcile(
+        &mut deleted
+    ));
+    assert_eq!(deleted.status, NetworkStatus::Deleted);
 }
 
 #[test]
