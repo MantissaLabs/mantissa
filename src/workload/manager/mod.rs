@@ -2688,8 +2688,10 @@ impl WorkloadManager {
             let peer_ready = self
                 .networking
                 .network_registry
-                .get_peer_state(attachment.network_id, self.local_node_id)
-                .context("load local network peer state while checking task traffic readiness")?
+                .get_peer_state(attachment.network_id, attachment.node_id)
+                .context(
+                    "load attachment node network peer state while checking task traffic readiness",
+                )?
                 .is_some_and(|state| state.state.is_ready());
             if !peer_ready {
                 networks_ready = false;

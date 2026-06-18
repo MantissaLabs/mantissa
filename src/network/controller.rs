@@ -1403,6 +1403,7 @@ impl NetworkController {
                         "attachment-triggered forwarding reconcile failed: {err:#}"
                     );
                 }
+                self.refresh_publication(plan.network_id).await;
             } else {
                 self.clear_forwarding_caches(plan.network_id).await;
                 self.refresh_publication(plan.network_id).await;

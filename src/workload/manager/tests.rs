@@ -6619,6 +6619,141 @@ async fn ensure_task_service_traffic_ready_requires_local_network_readiness() {
 }
 
 #[tokio::test]
+async fn ensure_task_service_traffic_ready_uses_attachment_node_peer_readiness() {
+    let (manager, _scheduler, _mock_cm, network_registry) = setup_manager().await;
+
+    let network = NetworkSpecValue::new(NetworkSpecDraft {
+        name: "remote-service-traffic-ready-net".to_string(),
+        description: "remote service traffic readiness network".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.56.0.0/24".to_string(),
+        vni: 0,
+        mtu: 0,
+        sealed: false,
+        bpf_programs: vec![],
+    });
+    network_registry
+        .upsert_spec(network.clone())
+        .await
+        .expect("upsert network spec");
+
+    let remote_node_id = Uuid::new_v4();
+    network_registry
+        .upsert_peer_state(NetworkPeerStateValue::new(
+            network.id,
+            manager.local_node_id,
+            "local-node",
+            NetworkPeerState::Configuring,
+            None,
+        ))
+        .await
+        .expect("upsert configuring local peer state");
+    network_registry
+        .upsert_peer_state(NetworkPeerStateValue::new(
+            network.id,
+            remote_node_id,
+            "remote-node",
+            NetworkPeerState::Ready,
+            None,
+        ))
+        .await
+        .expect("upsert ready remote peer state");
+
+    let task_id = Uuid::new_v4();
+    let now = Utc::now().to_rfc3339();
+    let value = WorkloadValue::new(WorkloadValueDraft {
+        id: task_id,
+        name: "remote-service-task".to_string(),
+        image: "img".to_string(),
+        execution_platform: ExecutionPlatform::Oci,
+        isolation_mode: crate::workload::model::IsolationMode::Standard,
+        isolation_profile: None,
+        state: WorkloadPhase::Running,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        command: Vec::new(),
+        tty: false,
+        node_id: remote_node_id,
+        node_name: "remote-node".to_string(),
+        slot_ids: vec![1],
+        networks: vec![network.id],
+        cpu_millis: 100,
+        memory_bytes: 64 * 1024 * 1024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        ports: Vec::new(),
+        owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
+            "svc", "backend",
+        ))),
+        lease_id: None,
+        lease_coordinator_node_id: None,
+        task_epoch: 0,
+        phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
+    });
+    manager
+        .core
+        .store
+        .upsert(&UuidKey::from(task_id), value.into())
+        .await
+        .expect("persist remote service task");
+
+    network_registry
+        .upsert_attachment(NetworkAttachmentValue::new(NetworkAttachmentDraft {
+            id: crate::network::types::compute_network_attachment_id(task_id, network.id),
+            task_id,
+            node_id: remote_node_id,
+            instance_id: format!("mantissa-{task_id}"),
+            network_id: network.id,
+            task_updated_at: Some(now),
+            requested_ip: Some("10.56.0.2".to_string()),
+            assigned_ip: Some("10.56.0.2".to_string()),
+            mac: Some("02:11:22:33:44:ac".to_string()),
+            state: NetworkAttachmentState::Ready,
+            error: None,
+            traffic_published: false,
+            service_name: Some("svc".to_string()),
+            template_name: Some("backend".to_string()),
+        }))
+        .await
+        .expect("insert remote ready attachment");
+
+    let republished = manager
+        .ensure_task_service_traffic_ready(task_id)
+        .await
+        .expect("publish remote service traffic using attachment node readiness");
+    assert!(
+        !republished,
+        "the first successful pass should publish and ask callers to recheck"
+    );
+    let attachments = network_registry
+        .list_attachments_for_task(task_id)
+        .expect("list remote attachments after republish");
+    assert!(
+        attachments[0].traffic_published,
+        "remote attachment should publish when its own network peer is ready"
+    );
+
+    let ready = manager
+        .ensure_task_service_traffic_ready(task_id)
+        .await
+        .expect("re-evaluate remote service traffic readiness after republish");
+    assert!(
+        ready,
+        "published remote attachment should be traffic-ready through its own peer state"
+    );
+}
+
+#[tokio::test]
 async fn withdraw_local_service_traffic_publication_only_touches_local_service_rows() {
     let (manager, _scheduler, _mock_cm, network_registry) = setup_manager().await;
 

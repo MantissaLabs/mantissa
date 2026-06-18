@@ -138,6 +138,160 @@ local_test!(
 );
 
 local_test!(
+    services_task_nodes_public_ingress_targets_only_backend_hosts,
+    {
+        let _config_guard = ConfigOverrideGuard::control_plane_network_only();
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+
+        let cluster = TestNode::new_cluster_inproc_with_config(2, ClusterConfig::default())
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes")
+            .await;
+
+        let observer_node = &cluster[0];
+        let backend_node = &cluster[1];
+        set_node_labels(
+            &backend_node.topology(),
+            backend_node.id(),
+            &["mantissa.io/backend=task-nodes"],
+            true,
+        )
+        .await;
+        assert!(
+            wait_for_node_label_all(
+                &cluster,
+                backend_node.id(),
+                "mantissa.io/backend",
+                "task-nodes",
+                Duration::from_secs(10)
+            )
+            .await,
+            "backend node label should converge"
+        );
+
+        let network_id = create_replicated_logical_test_network(
+            &cluster,
+            "on-demand-task-nodes-public-ingress",
+            NetworkRealizationPolicy::OnDemand,
+        )
+        .await;
+        let empty_peer_set = HashSet::new();
+        assert!(
+            network_peer_nodes_stay_all(
+                &cluster,
+                network_id,
+                &empty_peer_set,
+                Duration::from_secs(1)
+            )
+            .await,
+            "task_nodes public ingress must not realize an unused on_demand network"
+        );
+
+        let service_name = format!("task-nodes-network-{}", Uuid::new_v4());
+        let mut template = demo_networked_backend_task_template("backend", 1, network_id);
+        template.public_port = Some(8080);
+        template.public_ingress = PublicIngressPolicy::TaskNodes;
+        template.execution.placement = PlacementPolicy {
+            constraints: vec![
+                PlacementConstraint::eq(
+                    PlacementConstraintSelector::node_label("mantissa.io/backend"),
+                    "task-nodes",
+                )
+                .expect("valid backend placement constraint"),
+            ],
+            strategy: Default::default(),
+        };
+
+        let service_id = observer_node
+            .node
+            .service_controller
+            .submit_deployment(Uuid::new_v4(), &service_name, &service_name, vec![template])
+            .await
+            .expect("submit task_nodes on-demand deployment");
+
+        assert!(
+            wait_for_service_status_all(
+                &cluster,
+                service_id,
+                ServiceStatus::Running,
+                Duration::from_secs(20)
+            )
+            .await,
+            "task_nodes on-demand service should converge to running"
+        );
+        assert!(
+            wait_for_service_running_tasks_stable_all(
+                &cluster,
+                &service_name,
+                1,
+                3,
+                Duration::from_secs(20)
+            )
+            .await,
+            "backend task placement should converge before checking task_nodes publication"
+        );
+        assert!(
+            wait_for_visible_service_attachments_published_refs(
+                &[observer_node, backend_node],
+                &service_name,
+                network_id,
+                1,
+                Duration::from_secs(20)
+            )
+            .await,
+            "task_nodes backend attachment should publish traffic before peer checks"
+        );
+
+        let tasks =
+            list_active_service_tasks(&observer_node.node.workload_manager, &service_name).await;
+        assert_eq!(
+            tasks.first().map(|task| task.node_id),
+            Some(backend_node.id()),
+            "backend placement constraint should keep the public task on the backend node"
+        );
+
+        let expected_peers = HashSet::from([backend_node.id()]);
+        assert!(
+            wait_for_network_ready_peer_nodes_all(
+                &cluster,
+                network_id,
+                &expected_peers,
+                Duration::from_secs(20)
+            )
+            .await,
+            "task_nodes public ingress should only realize the network on backend task hosts"
+        );
+        remove_service_via_rpc(&observer_node.node.services_client, service_id).await;
+        assert!(
+            wait_for_service_task_count_all(&cluster, &service_name, 0, Duration::from_secs(20))
+                .await,
+            "service deletion should stop every task"
+        );
+        assert!(
+            wait_for_service_status_all(
+                &cluster,
+                service_id,
+                ServiceStatus::Stopped,
+                Duration::from_secs(20)
+            )
+            .await,
+            "service deletion should propagate Stopped before task_nodes demand is released"
+        );
+        assert!(
+            wait_for_network_peer_nodes_all(
+                &cluster,
+                network_id,
+                &empty_peer_set,
+                Duration::from_secs(20)
+            )
+            .await,
+            "service deletion should release task_nodes network realization"
+        );
+    }
+);
+
+local_test!(
     services_ingress_pool_realizes_on_demand_network_on_selected_ingress_node,
     {
         let _config_guard = ConfigOverrideGuard::control_plane_network_only();
