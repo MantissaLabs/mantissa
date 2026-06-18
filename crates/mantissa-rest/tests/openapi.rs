@@ -194,6 +194,7 @@ fn documented_operations(value: &Value) -> BTreeSet<(String, String)> {
 fn expected_operations() -> BTreeSet<(String, String)> {
     [
         ("DELETE", "/v1/agents/sessions/{session_id}"),
+        ("DELETE", "/v1/ingress/{name}"),
         ("DELETE", "/v1/jobs/{job_id}"),
         ("DELETE", "/v1/networks/{network_id}"),
         ("DELETE", "/v1/nodes/{node_id}"),
@@ -211,6 +212,9 @@ fn expected_operations() -> BTreeSet<(String, String)> {
         ("GET", "/v1/clusters/views"),
         ("GET", "/v1/clusters/{cluster_id}/split-candidates"),
         ("GET", "/v1/health"),
+        ("GET", "/v1/ingress"),
+        ("GET", "/v1/ingress/endpoints"),
+        ("GET", "/v1/ingress/{name}"),
         ("GET", "/v1/jobs"),
         ("GET", "/v1/jobs/{job_id}"),
         ("GET", "/v1/networks"),
@@ -250,6 +254,7 @@ fn expected_operations() -> BTreeSet<(String, String)> {
         ("POST", "/v1/tasks/{selector}/stop"),
         ("POST", "/v1/volumes"),
         ("POST", "/v1/volumes/import"),
+        ("PUT", "/v1/ingress"),
         ("PUT", "/v1/nodes/{node_id}/labels"),
         ("PUT", "/v1/secrets/{name}"),
     ]

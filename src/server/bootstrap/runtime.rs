@@ -3,6 +3,7 @@ use crate::agents::{AgentController, AgentControllerConfig, AgentRegistry, Agent
 use crate::cluster::{ClusterViewState, RootSchemaState};
 use crate::gossip::{DEFAULT_FANOUT, DedupeStateHandle, Message};
 use crate::ingress::registry::IngressPoolRegistry;
+use crate::ingress::service::IngressRpc;
 use crate::jobs::{JobController, JobControllerConfig, JobRegistry, JobsRpc};
 use crate::network::controller::NetworkController;
 use crate::network::gossip::NetworkGossiper;
@@ -146,6 +147,7 @@ pub struct RuntimeComponents {
     pub services_client: ServicesClient,
     pub secrets_client: SecretsClient,
     pub networks_client: NetworksClient,
+    pub ingress_client: mantissa_protocol::ingress::ingress::Client,
     pub volumes_client: VolumesClient,
     pub network_registry: NetworkRegistry,
     pub ingress_pool_registry: IngressPoolRegistry,
@@ -697,6 +699,14 @@ async fn build_runtime_components(
     );
     let networks_client = capnp_rpc::new_client(networks_service);
 
+    let ingress_service = IngressRpc::new(
+        ingress_pool_registry.clone(),
+        service_registry.clone(),
+        network_controller.clone(),
+        topology.clone(),
+    );
+    let ingress_client = capnp_rpc::new_client(ingress_service);
+
     let secrets_service = crate::secrets::service::SecretsService::new(
         crate::secrets::service::SecretsServiceConfig {
             registry: secret_registry,
@@ -747,6 +757,7 @@ async fn build_runtime_components(
             services_client,
             secrets_client,
             networks_client,
+            ingress_client,
             volumes_client,
             network_registry,
             ingress_pool_registry,
@@ -1062,6 +1073,7 @@ fn build_server(
         services_client: components.services_client.clone(),
         secrets_client: components.secrets_client.clone(),
         networks_client: components.networks_client.clone(),
+        ingress_client: components.ingress_client.clone(),
         volumes_client: components.volumes_client.clone(),
         rest_admin_client: capnp_rpc::new_client(crate::rest::RestAdmin::new(
             stores.rest_token_store.clone(),

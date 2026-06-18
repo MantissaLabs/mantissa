@@ -4,6 +4,7 @@ pub mod agents;
 pub mod clusters;
 pub mod common;
 pub mod health;
+pub mod ingress;
 pub mod jobs;
 pub mod networks;
 pub mod nodes;

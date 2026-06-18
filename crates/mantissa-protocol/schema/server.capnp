@@ -15,6 +15,7 @@ using import "scheduling.capnp".Scheduler;
 using import "secrets.capnp".Secrets;
 using import "secrets.capnp".SecretMasterKeySyncRecord;
 using import "network.capnp".Networks;
+using import "ingress.capnp".Ingress;
 using import "volumes.capnp".Volumes;
 using import "rest.capnp".RestAdmin;
 using import "topology.capnp".ClusterViewId;
@@ -137,6 +138,9 @@ interface ClusterSession {
   getNetworks @10 () -> (networks :Networks);
   # Access the networks interface.
 
+  getIngress @17 () -> (ingress :Ingress);
+  # Access the public ingress interface.
+
   getVolumes @11 () -> (volumes :Volumes);
   # Access the volumes interface.
 
@@ -189,6 +193,9 @@ struct Capabilities {
 
   networks @9 :Networks;
   # Networks interface capability.
+
+  ingress @16 :Ingress;
+  # Public ingress interface capability.
 
   volumes @10 :Volumes;
   # Volumes interface capability.

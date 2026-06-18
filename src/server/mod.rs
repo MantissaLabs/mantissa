@@ -374,6 +374,7 @@ pub struct ServerClients {
     pub services_client: ServicesClient,
     pub secrets_client: SecretsClient,
     pub networks_client: NetworksClient,
+    pub ingress_client: mantissa_protocol::ingress::ingress::Client,
     pub volumes_client: VolumesClient,
     pub rest_admin_client: RestAdminClient,
 }
@@ -397,6 +398,7 @@ impl From<ServerClients> for ClusterSessionServices {
             services: clients.services_client,
             secrets: clients.secrets_client,
             networks: clients.networks_client,
+            ingress: clients.ingress_client,
             volumes: clients.volumes_client,
             rest_admin: clients.rest_admin_client,
         }

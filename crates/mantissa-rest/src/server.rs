@@ -103,6 +103,15 @@ fn documented_router() -> OpenApiRouter<AppState> {
         .routes(openapi_routes!(routes::networks::peers))
         .routes(openapi_routes!(routes::networks::attachments))
         .routes(openapi_routes!(
+            routes::ingress::list,
+            routes::ingress::apply
+        ))
+        .routes(openapi_routes!(routes::ingress::endpoints))
+        .routes(openapi_routes!(
+            routes::ingress::get,
+            routes::ingress::delete
+        ))
+        .routes(openapi_routes!(
             routes::volumes::list,
             routes::volumes::create
         ))

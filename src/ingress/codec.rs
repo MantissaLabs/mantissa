@@ -29,7 +29,7 @@ impl StoreValueCodec for IngressPoolSpecValue {
 }
 
 /// Encodes one ingress pool spec into the shared store schema.
-fn write_ingress_pool_spec(
+pub(crate) fn write_ingress_pool_spec(
     mut builder: ingress_pool_spec::Builder<'_>,
     value: &IngressPoolSpecValue,
 ) -> Result<(), Error> {
@@ -49,7 +49,7 @@ fn write_ingress_pool_spec(
 }
 
 /// Decodes one ingress pool spec from the shared store schema.
-fn read_ingress_pool_spec(
+pub(crate) fn read_ingress_pool_spec(
     reader: ingress_pool_spec::Reader<'_>,
 ) -> Result<IngressPoolSpecValue, Error> {
     let raw_id = reader.get_id()?;
@@ -79,7 +79,7 @@ fn read_ingress_pool_spec(
 }
 
 /// Encodes an optional spread key into the ingress pool store schema.
-fn write_spread_key(
+pub(crate) fn write_spread_key(
     mut builder: ingress_pool_spread_key::Builder<'_>,
     spread_by: Option<&IngressPoolSpreadKey>,
 ) {
@@ -90,7 +90,7 @@ fn write_spread_key(
 }
 
 /// Decodes an optional spread key from the ingress pool store schema.
-fn read_spread_key(
+pub(crate) fn read_spread_key(
     reader: ingress_pool_spread_key::Reader<'_>,
 ) -> Result<Option<IngressPoolSpreadKey>, Error> {
     match reader.which() {

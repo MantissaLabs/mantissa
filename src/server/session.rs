@@ -1,10 +1,10 @@
 use super::Liveness;
 use crate::{cluster::ClusterViewId, topology::Topology};
 use mantissa_protocol::{
-    agents::agents, gossip::gossip, health::health, jobs::jobs, network::networks, node::node,
-    rest::rest_admin, scheduling::scheduler, secrets::secrets, server::cluster_session,
-    services::services, sync::sync, task::task, topology::topology, volumes::volumes,
-    workload::workload,
+    agents::agents, gossip::gossip, health::health, ingress::ingress, jobs::jobs,
+    network::networks, node::node, rest::rest_admin, scheduling::scheduler, secrets::secrets,
+    server::cluster_session, services::services, sync::sync, task::task, topology::topology,
+    volumes::volumes, workload::workload,
 };
 use std::rc::Rc;
 use uuid::Uuid;
@@ -27,6 +27,7 @@ pub struct ClusterSessionServices {
     pub services: services::Client,
     pub secrets: secrets::Client,
     pub networks: networks::Client,
+    pub ingress: ingress::Client,
     pub volumes: volumes::Client,
     pub rest_admin: rest_admin::Client,
 }
@@ -223,6 +224,7 @@ impl cluster_session::Server for ClusterSessionImpl {
         caps.set_services(self.services.services.clone());
         caps.set_secrets(self.services.secrets.clone());
         caps.set_networks(self.services.networks.clone());
+        caps.set_ingress(self.services.ingress.clone());
         caps.set_volumes(self.services.volumes.clone());
         if self.peer_scope.is_none() {
             caps.set_rest_admin(self.services.rest_admin.clone());
@@ -363,6 +365,18 @@ impl cluster_session::Server for ClusterSessionImpl {
         self.ensure_online()?;
 
         results.get().set_networks(self.services.networks.clone());
+        Ok(())
+    }
+
+    /// Returns the ingress capability for public ingress pool and endpoint operations.
+    async fn get_ingress(
+        self: Rc<Self>,
+        _params: cluster_session::GetIngressParams,
+        mut results: cluster_session::GetIngressResults,
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
+
+        results.get().set_ingress(self.services.ingress.clone());
         Ok(())
     }
 

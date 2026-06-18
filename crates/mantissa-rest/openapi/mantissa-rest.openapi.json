@@ -1137,6 +1137,216 @@
         ],
         "type": "object"
       },
+      "IngressEndpoint": {
+        "description": "REST-facing public endpoint target row.",
+        "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ingress_mode": {
+            "type": "string"
+          },
+          "ingress_pool": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "network_id": {
+            "type": "string"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "node_ip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "protocol": {
+            "type": "string"
+          },
+          "public_port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ready": {
+            "type": "boolean"
+          },
+          "service_id": {
+            "type": "string"
+          },
+          "service_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "template_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_id",
+          "template_name",
+          "network_id",
+          "node_id",
+          "public_port",
+          "protocol",
+          "ingress_mode",
+          "ready",
+          "generation"
+        ],
+        "type": "object"
+      },
+      "IngressPoolDeleteResponse": {
+        "description": "REST response returned after deleting an ingress pool.",
+        "properties": {
+          "deleted": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "IngressPoolManifest": {
+        "additionalProperties": false,
+        "description": "RON manifest used by `mantissa ingress apply`.",
+        "properties": {
+          "max_nodes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "min_nodes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "placement": {
+            "$ref": "#/components/schemas/PlacementSpec"
+          },
+          "spread_by": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/IngressPoolSpreadKey"
+              }
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "min_nodes"
+        ],
+        "type": "object"
+      },
+      "IngressPoolSpec": {
+        "description": "REST-facing ingress-pool specification.",
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "max_nodes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "min_nodes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "placement_constraints": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "placement_strategy": {
+            "type": "string"
+          },
+          "spread_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "min_nodes",
+          "placement_strategy",
+          "placement_constraints",
+          "generation",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "IngressPoolSpreadKey": {
+        "description": "Optional spread dimension used while selecting bounded ingress nodes.",
+        "oneOf": [
+          {
+            "properties": {
+              "node_label": {
+                "properties": {
+                  "key": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "key"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "node_label"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "JobAttempt": {
         "description": "REST-facing job attempt detail.",
         "properties": {
@@ -2536,16 +2746,11 @@
         ]
       },
       "PlacementSpec": {
+        "description": "Generic workload placement policy shared by services, jobs, and agents.",
         "properties": {
           "constraints": {
             "items": {
               "$ref": "#/components/schemas/PlacementConstraint"
-            },
-            "type": "array"
-          },
-          "preferences": {
-            "items": {
-              "$ref": "#/components/schemas/ServicePlacementPreference"
             },
             "type": "array"
           },
@@ -6082,6 +6287,506 @@
         "summary": "Health check",
         "tags": [
           "health"
+        ]
+      }
+    },
+    "/v1/ingress": {
+      "get": {
+        "description": "Lists ingress pools visible to the local daemon.",
+        "operationId": "list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/IngressPoolSpec"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Ingress pools visible to the local daemon."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Invalid request syntax, query parameters, or resource selector."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Missing or invalid REST bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Requested resource was not found."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Request conflicts with the current resource state."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Unexpected REST facade or local client failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Local daemon or REST worker is unavailable."
+          }
+        },
+        "summary": "List ingress pools",
+        "tags": [
+          "ingress"
+        ]
+      },
+      "put": {
+        "description": "Creates or replaces one ingress pool through the local daemon.",
+        "operationId": "apply",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IngressPoolManifest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngressPoolSpec"
+                }
+              }
+            },
+            "description": "Applied ingress pool spec."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Invalid request syntax, query parameters, or resource selector."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Missing or invalid REST bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Requested resource was not found."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Request conflicts with the current resource state."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Unexpected REST facade or local client failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Local daemon or REST worker is unavailable."
+          }
+        },
+        "summary": "Apply ingress pool",
+        "tags": [
+          "ingress"
+        ]
+      }
+    },
+    "/v1/ingress/endpoints": {
+      "get": {
+        "description": "Lists public endpoint target rows visible through ingress.",
+        "operationId": "endpoints",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "service",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "path",
+            "name": "template",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "path",
+            "name": "pool",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "path",
+            "name": "port",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "path",
+            "name": "ready",
+            "required": true,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/IngressEndpoint"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Ingress public endpoint target rows."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Invalid request syntax, query parameters, or resource selector."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Missing or invalid REST bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Requested resource was not found."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Request conflicts with the current resource state."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Unexpected REST facade or local client failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Local daemon or REST worker is unavailable."
+          }
+        },
+        "summary": "Ingress endpoints",
+        "tags": [
+          "ingress"
+        ]
+      }
+    },
+    "/v1/ingress/{name}": {
+      "delete": {
+        "description": "Deletes one ingress pool by exact name.",
+        "operationId": "delete",
+        "parameters": [
+          {
+            "description": "Ingress pool name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngressPoolDeleteResponse"
+                }
+              }
+            },
+            "description": "Deleted ingress pool count."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Invalid request syntax, query parameters, or resource selector."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Missing or invalid REST bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Requested resource was not found."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Request conflicts with the current resource state."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Unexpected REST facade or local client failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Local daemon or REST worker is unavailable."
+          }
+        },
+        "summary": "Delete ingress pool",
+        "tags": [
+          "ingress"
+        ]
+      },
+      "get": {
+        "description": "Fetches one ingress pool by exact name.",
+        "operationId": "get",
+        "parameters": [
+          {
+            "description": "Ingress pool name.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngressPoolSpec"
+                }
+              }
+            },
+            "description": "Ingress pool inspection response."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Invalid request syntax, query parameters, or resource selector."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Missing or invalid REST bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Requested resource was not found."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Request conflicts with the current resource state."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Unexpected REST facade or local client failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Local daemon or REST worker is unavailable."
+          }
+        },
+        "summary": "Get ingress pool",
+        "tags": [
+          "ingress"
         ]
       }
     },
@@ -10278,6 +10983,10 @@
     {
       "description": "Overlay network creation, inspection, and deletion.",
       "name": "networks"
+    },
+    {
+      "description": "Public ingress pool configuration and endpoint target discovery.",
+      "name": "ingress"
     },
     {
       "description": "Local volume creation, import, inspection, and deletion.",

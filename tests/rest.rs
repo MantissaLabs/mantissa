@@ -13,6 +13,8 @@ mod clusters;
 mod harness;
 #[path = "rest/health.rs"]
 mod health;
+#[path = "rest/ingress.rs"]
+mod ingress;
 #[path = "rest/jobs.rs"]
 mod jobs;
 #[path = "rest/networks.rs"]

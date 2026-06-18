@@ -212,6 +212,13 @@ pub enum Command {
         cmd: NetworksCommand,
     },
 
+    /// Public ingress pool and endpoint subcommands
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Ingress {
+        #[command(subcommand)]
+        cmd: IngressCommand,
+    },
+
     /// Volume management subcommands
     #[command(
         alias = "vol",
@@ -1445,6 +1452,25 @@ pub enum NetworksCommand {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum IngressCommand {
+    /// Apply an ingress pool from a RON manifest
+    Apply(IngressApplyArgs),
+
+    /// List configured ingress pools
+    #[command(alias = "ls")]
+    List,
+
+    /// Inspect a specific ingress pool
+    Inspect(IngressInspectArgs),
+
+    /// Delete one ingress pool
+    Delete(IngressDeleteArgs),
+
+    /// List public endpoint targets visible through ingress
+    Endpoints(IngressEndpointsArgs),
+}
+
+#[derive(Subcommand, Debug)]
 pub enum VolumesCommand {
     /// Create a managed local volume
     Create(VolumesCreateArgs),
@@ -1534,6 +1560,50 @@ pub struct NetworksAttachmentsArgs {
     /// Network UUID whose attachments should be listed
     #[arg(index = 1, value_name = "ID")]
     pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct IngressApplyArgs {
+    /// RON ingress pool manifest to apply
+    #[arg(index = 1, value_name = "FILE")]
+    pub file: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct IngressInspectArgs {
+    /// Ingress pool name to inspect
+    #[arg(index = 1, value_name = "NAME")]
+    pub name: String,
+}
+
+#[derive(Args, Debug)]
+pub struct IngressDeleteArgs {
+    /// Ingress pool name to delete
+    #[arg(index = 1, value_name = "NAME")]
+    pub name: String,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct IngressEndpointsArgs {
+    /// Service UUID or name filter
+    #[arg(long = "service", value_name = "SERVICE")]
+    pub service: Option<String>,
+
+    /// Service template name filter
+    #[arg(long = "template", value_name = "TEMPLATE")]
+    pub template: Option<String>,
+
+    /// Ingress pool name filter
+    #[arg(long = "pool", value_name = "POOL")]
+    pub pool: Option<String>,
+
+    /// Public port filter
+    #[arg(long = "port", value_name = "PORT")]
+    pub port: Option<u16>,
+
+    /// Only show ready endpoint targets
+    #[arg(long = "ready", action = ArgAction::SetTrue)]
+    pub ready_only: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1947,6 +2017,48 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn ingress_commands_parse_without_pools_subcommand() {
+        let apply = MantissaCli::try_parse_from(["mantissa", "ingress", "apply", "public-web.ron"])
+            .unwrap();
+        assert!(matches!(
+            apply.cmd,
+            Command::Ingress {
+                cmd: IngressCommand::Apply(IngressApplyArgs { file })
+            } if file.as_path() == std::path::Path::new("public-web.ron")
+        ));
+
+        let endpoints = MantissaCli::try_parse_from([
+            "mantissa",
+            "ingress",
+            "endpoints",
+            "--pool",
+            "public-web",
+            "--service",
+            "web",
+            "--template",
+            "api",
+            "--port",
+            "8080",
+            "--ready",
+        ])
+        .unwrap();
+        assert!(matches!(
+            endpoints.cmd,
+            Command::Ingress {
+                cmd: IngressCommand::Endpoints(IngressEndpointsArgs {
+                    pool: Some(pool),
+                    service: Some(service),
+                    template: Some(template),
+                    port: Some(8080),
+                    ready_only: true,
+                })
+            } if pool == "public-web" && service == "web" && template == "api"
+        ));
+
+        assert!(MantissaCli::try_parse_from(["mantissa", "ingress", "pools", "list"]).is_err());
     }
 
     #[test]

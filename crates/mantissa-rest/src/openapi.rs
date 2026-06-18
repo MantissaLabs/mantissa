@@ -223,6 +223,10 @@ fn tags() -> Vec<Tag> {
             "Overlay network creation, inspection, and deletion.",
         ),
         (
+            "ingress",
+            "Public ingress pool configuration and endpoint target discovery.",
+        ),
+        (
             "volumes",
             "Local volume creation, import, inspection, and deletion.",
         ),
@@ -469,6 +473,36 @@ const OPERATION_DOCS: &[OperationDoc] = &[
         "/v1/networks/{network_id}/attachments",
         "Network attachments",
         "Lists workload attachment rows for one overlay network.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/ingress",
+        "List ingress pools",
+        "Lists ingress pools visible to the local daemon.",
+    ),
+    (
+        OperationMethod::Put,
+        "/v1/ingress",
+        "Apply ingress pool",
+        "Creates or replaces one ingress pool through the local daemon.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/ingress/endpoints",
+        "Ingress endpoints",
+        "Lists public endpoint target rows visible through ingress.",
+    ),
+    (
+        OperationMethod::Get,
+        "/v1/ingress/{name}",
+        "Get ingress pool",
+        "Fetches one ingress pool by exact name.",
+    ),
+    (
+        OperationMethod::Delete,
+        "/v1/ingress/{name}",
+        "Delete ingress pool",
+        "Deletes one ingress pool by exact name.",
     ),
     (
         OperationMethod::Get,

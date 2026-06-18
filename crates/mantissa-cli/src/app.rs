@@ -704,6 +704,39 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
         },
 
+        Command::Ingress { cmd } => match cmd {
+            IngressCommand::Apply(args) => {
+                local
+                    .run_until(crate::ingress::apply(&cfg, &args.file))
+                    .await?;
+            }
+            IngressCommand::List => {
+                local.run_until(crate::ingress::list(&cfg)).await?;
+            }
+            IngressCommand::Inspect(args) => {
+                local
+                    .run_until(crate::ingress::inspect(&cfg, &args.name))
+                    .await?;
+            }
+            IngressCommand::Delete(args) => {
+                local
+                    .run_until(crate::ingress::delete(&cfg, &args.name))
+                    .await?;
+            }
+            IngressCommand::Endpoints(args) => {
+                let filter = mantissa_client::ingress::IngressEndpointFilter {
+                    service: args.service.clone(),
+                    template: args.template.clone(),
+                    pool: args.pool.clone(),
+                    port: args.port,
+                    ready_only: args.ready_only,
+                };
+                local
+                    .run_until(crate::ingress::endpoints(&cfg, &filter))
+                    .await?;
+            }
+        },
+
         Command::Volumes { cmd } => match cmd {
             VolumesCommand::Create(args) => {
                 let ownership = resolve_local_volume_ownership(args.uid, args.gid, args.fs_group)?;

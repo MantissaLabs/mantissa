@@ -13,6 +13,10 @@ use crate::types::{
     clusters::{
         ClusterOperation, ClusterSummary, ClusterView, ClusterViewSummary, SplitCandidateList,
     },
+    ingress::{
+        IngressEndpoint, IngressEndpointQuery, IngressPoolApplyRequest, IngressPoolDeleteResponse,
+        IngressPoolSpec,
+    },
     jobs::{JobDetail, JobSubmitRequest, JobSubmitResponse, JobSummary},
     networks::{
         NetworkAttachment, NetworkCreateRequest, NetworkCreateResponse, NetworkDeleteResponse,
@@ -36,7 +40,7 @@ use mantissa_client::{
     config::ClientConfig,
     connection,
     error::{ClientError, ClientErrorKind},
-    jobs, networks, nodes, scheduler, secrets, services, tasks, volumes,
+    ingress, jobs, networks, nodes, scheduler, secrets, services, tasks, volumes,
 };
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -325,6 +329,50 @@ impl ClientWorkerHandle {
             respond_to,
         })
         .await
+    }
+
+    /// Lists ingress pools visible through the local ingress capability.
+    pub async fn list_ingress_pools(&self) -> Result<Vec<IngressPoolSpec>, ClientWorkerError> {
+        self.send(ClientCommand::ListIngressPools).await
+    }
+
+    /// Applies one ingress pool through the local ingress capability.
+    pub async fn apply_ingress_pool(
+        &self,
+        request: IngressPoolApplyRequest,
+    ) -> Result<IngressPoolSpec, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::ApplyIngressPool {
+            request: Box::new(request),
+            respond_to,
+        })
+        .await
+    }
+
+    /// Fetches one ingress pool by exact name.
+    pub async fn get_ingress_pool(
+        &self,
+        name: String,
+    ) -> Result<IngressPoolSpec, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::GetIngressPool { name, respond_to })
+            .await
+    }
+
+    /// Deletes one ingress pool by exact name.
+    pub async fn delete_ingress_pool(
+        &self,
+        name: String,
+    ) -> Result<IngressPoolDeleteResponse, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::DeleteIngressPool { name, respond_to })
+            .await
+    }
+
+    /// Lists public endpoint target rows through the ingress capability.
+    pub async fn list_ingress_endpoints(
+        &self,
+        query: IngressEndpointQuery,
+    ) -> Result<Vec<IngressEndpoint>, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::ListIngressEndpoints { query, respond_to })
+            .await
     }
 
     /// Lists volumes visible through the local volumes capability.
@@ -867,6 +915,23 @@ enum ClientCommand {
         network_id: String,
         respond_to: oneshot::Sender<Result<NetworkDeleteResponse, ClientWorkerError>>,
     },
+    ListIngressPools(oneshot::Sender<Result<Vec<IngressPoolSpec>, ClientWorkerError>>),
+    ApplyIngressPool {
+        request: Box<IngressPoolApplyRequest>,
+        respond_to: oneshot::Sender<Result<IngressPoolSpec, ClientWorkerError>>,
+    },
+    GetIngressPool {
+        name: String,
+        respond_to: oneshot::Sender<Result<IngressPoolSpec, ClientWorkerError>>,
+    },
+    DeleteIngressPool {
+        name: String,
+        respond_to: oneshot::Sender<Result<IngressPoolDeleteResponse, ClientWorkerError>>,
+    },
+    ListIngressEndpoints {
+        query: IngressEndpointQuery,
+        respond_to: oneshot::Sender<Result<Vec<IngressEndpoint>, ClientWorkerError>>,
+    },
     ListVolumes(oneshot::Sender<Result<Vec<VolumeSummary>, ClientWorkerError>>),
     CreateVolume {
         request: Box<VolumeCreateRequest>,
@@ -1133,6 +1198,24 @@ async fn client_worker_loop(config: ClientConfig, mut receiver: mpsc::Receiver<C
                 respond_to,
             } => {
                 let _ignored = respond_to.send(delete_network(&config, network_id).await);
+            }
+            ClientCommand::ListIngressPools(respond_to) => {
+                let _ignored = respond_to.send(list_ingress_pools(&config).await);
+            }
+            ClientCommand::ApplyIngressPool {
+                request,
+                respond_to,
+            } => {
+                let _ignored = respond_to.send(apply_ingress_pool(&config, *request).await);
+            }
+            ClientCommand::GetIngressPool { name, respond_to } => {
+                let _ignored = respond_to.send(get_ingress_pool(&config, &name).await);
+            }
+            ClientCommand::DeleteIngressPool { name, respond_to } => {
+                let _ignored = respond_to.send(delete_ingress_pool(&config, &name).await);
+            }
+            ClientCommand::ListIngressEndpoints { query, respond_to } => {
+                let _ignored = respond_to.send(list_ingress_endpoints(&config, query).await);
             }
             ClientCommand::ListVolumes(respond_to) => {
                 let _ignored = respond_to.send(list_volumes(&config).await);
@@ -1645,6 +1728,62 @@ async fn delete_network(
         .await
         .map(|deleted| NetworkDeleteResponse { deleted })
         .map_err(ClientWorkerError::from)
+}
+
+/// Lists ingress pools through the reusable Mantissa client API.
+async fn list_ingress_pools(
+    config: &ClientConfig,
+) -> Result<Vec<IngressPoolSpec>, ClientWorkerError> {
+    ingress::list(config)
+        .await
+        .map(|pools| pools.into_iter().map(IngressPoolSpec::from).collect())
+        .map_err(operation_failed_error)
+}
+
+/// Applies one ingress pool through the reusable Mantissa client API.
+async fn apply_ingress_pool(
+    config: &ClientConfig,
+    request: IngressPoolApplyRequest,
+) -> Result<IngressPoolSpec, ClientWorkerError> {
+    ingress::apply(config, &request)
+        .await
+        .map(IngressPoolSpec::from)
+        .map_err(invalid_request_error)
+}
+
+/// Fetches one ingress pool through the reusable Mantissa client API.
+async fn get_ingress_pool(
+    config: &ClientConfig,
+    name: &str,
+) -> Result<IngressPoolSpec, ClientWorkerError> {
+    let name = clean_required_name("ingress pool name", name)?;
+    ingress::inspect(config, name)
+        .await
+        .map(IngressPoolSpec::from)
+        .map_err(not_found_error)
+}
+
+/// Deletes one ingress pool through the reusable Mantissa client API.
+async fn delete_ingress_pool(
+    config: &ClientConfig,
+    name: &str,
+) -> Result<IngressPoolDeleteResponse, ClientWorkerError> {
+    let name = clean_required_name("ingress pool name", name)?;
+    ingress::delete(config, name)
+        .await
+        .map(|()| IngressPoolDeleteResponse { deleted: 1 })
+        .map_err(not_found_error)
+}
+
+/// Lists ingress endpoint rows through the reusable Mantissa client API.
+async fn list_ingress_endpoints(
+    config: &ClientConfig,
+    query: IngressEndpointQuery,
+) -> Result<Vec<IngressEndpoint>, ClientWorkerError> {
+    ingress::endpoints(config, &query.into())
+        .await
+        .map(|rows| rows.into_iter().map(IngressEndpoint::from).collect())
+        .map_err(operation_failed_error)
 }
 
 /// Lists volumes through the reusable Mantissa client API.

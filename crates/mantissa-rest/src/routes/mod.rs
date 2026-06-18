@@ -5,6 +5,7 @@ use crate::{client_worker::ClientWorkerError, error::RestError};
 pub mod agents;
 pub mod clusters;
 pub mod health;
+pub mod ingress;
 pub mod jobs;
 pub mod networks;
 pub mod nodes;

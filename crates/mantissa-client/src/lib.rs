@@ -7,6 +7,7 @@ pub mod connection;
 pub mod error;
 mod errors;
 pub mod host_ports;
+pub mod ingress;
 pub mod jobs;
 pub mod networks;
 pub mod nodes;

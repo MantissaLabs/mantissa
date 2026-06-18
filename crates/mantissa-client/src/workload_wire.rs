@@ -8,6 +8,7 @@ use crate::workload_submit::{
     PlacementConstraintOperator, PlacementConstraintSelector, PlacementSpec, PlacementStrategy,
     RequestedNetworkSpec, WorkloadAdmissionMode, WorkloadAdmissionPolicy,
 };
+use capnp::Error as CapnpError;
 use capnp::struct_list;
 use mantissa_protocol::volumes::local_volume_ownership;
 use mantissa_protocol::workload::{
@@ -55,6 +56,28 @@ pub fn write_placement_policy(builder: placement_policy::Builder<'_>, policy: &P
     write_placement_policy_parts(builder, &policy.constraints, policy.strategy);
 }
 
+/// Decodes one generic workload placement policy from the shared wire shape.
+pub fn read_placement_policy(
+    reader: placement_policy::Reader<'_>,
+) -> Result<PlacementSpec, CapnpError> {
+    let mut constraints = Vec::new();
+    if let Ok(entries) = reader.get_constraints() {
+        constraints.reserve(entries.len() as usize);
+        for entry in entries.iter() {
+            constraints.push(read_placement_constraint(entry)?);
+        }
+    }
+    let strategy = match reader.get_strategy() {
+        Ok(mantissa_protocol::workload::PlacementStrategy::Spread) => PlacementStrategy::Spread,
+        Ok(mantissa_protocol::workload::PlacementStrategy::Binpack) => PlacementStrategy::Binpack,
+        Err(_) => PlacementStrategy::Spread,
+    };
+    Ok(PlacementSpec {
+        constraints,
+        strategy,
+    })
+}
+
 /// Encodes generic placement parts for callers with controller-specific placement wrappers.
 pub fn write_placement_policy_parts(
     mut builder: placement_policy::Builder<'_>,
@@ -92,6 +115,27 @@ fn write_placement_constraint(
     builder.set_value(constraint.value.trim());
 }
 
+/// Decodes one placement constraint from the generic workload payload.
+fn read_placement_constraint(
+    reader: placement_constraint::Reader<'_>,
+) -> Result<PlacementConstraint, CapnpError> {
+    let selector = read_placement_constraint_selector(reader.get_selector()?)?;
+    let operator = match reader.get_operator() {
+        Ok(mantissa_protocol::workload::PlacementConstraintOperator::Eq) => {
+            PlacementConstraintOperator::Eq
+        }
+        Ok(mantissa_protocol::workload::PlacementConstraintOperator::Ne) => {
+            PlacementConstraintOperator::Ne
+        }
+        Err(_) => PlacementConstraintOperator::Eq,
+    };
+    Ok(PlacementConstraint {
+        selector,
+        operator,
+        value: reader.get_value()?.to_str()?.to_string(),
+    })
+}
+
 /// Writes one typed placement selector into the generic workload payload.
 fn write_placement_constraint_selector(
     mut builder: placement_constraint_selector::Builder<'_>,
@@ -105,6 +149,34 @@ fn write_placement_constraint_selector(
         PlacementConstraintSelector::NodePlatformOs => builder.set_node_platform_os(()),
         PlacementConstraintSelector::NodePlatformArch => builder.set_node_platform_arch(()),
         PlacementConstraintSelector::NodeLabel { key } => builder.set_node_label(key.trim()),
+    }
+}
+
+/// Decodes one placement selector from the generic workload payload.
+fn read_placement_constraint_selector(
+    reader: placement_constraint_selector::Reader<'_>,
+) -> Result<PlacementConstraintSelector, CapnpError> {
+    match reader.which()? {
+        placement_constraint_selector::Which::NodeId(()) => Ok(PlacementConstraintSelector::NodeId),
+        placement_constraint_selector::Which::NodeHostname(()) => {
+            Ok(PlacementConstraintSelector::NodeHostname)
+        }
+        placement_constraint_selector::Which::NodeIp(()) => Ok(PlacementConstraintSelector::NodeIp),
+        placement_constraint_selector::Which::NodeAddress(()) => {
+            Ok(PlacementConstraintSelector::NodeAddress)
+        }
+        placement_constraint_selector::Which::NodePlatformOs(()) => {
+            Ok(PlacementConstraintSelector::NodePlatformOs)
+        }
+        placement_constraint_selector::Which::NodePlatformArch(()) => {
+            Ok(PlacementConstraintSelector::NodePlatformArch)
+        }
+        placement_constraint_selector::Which::NodeLabel(Ok(key)) => {
+            Ok(PlacementConstraintSelector::NodeLabel {
+                key: key.to_str()?.to_string(),
+            })
+        }
+        placement_constraint_selector::Which::NodeLabel(Err(error)) => Err(error),
     }
 }
 
