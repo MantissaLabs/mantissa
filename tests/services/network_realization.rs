@@ -1,6 +1,27 @@
 use super::support::*;
 use crate::common;
 
+/// Builds the ingress-pool fixture used by on-demand public-ingress realization tests.
+fn public_web_ingress_pool() -> IngressPoolSpecValue {
+    IngressPoolSpecValue::from_draft(IngressPoolSpecDraft {
+        name: "public-web".to_string(),
+        min_nodes: 1,
+        max_nodes: Some(1),
+        placement: PlacementPolicy {
+            constraints: vec![
+                PlacementConstraint::eq(
+                    PlacementConstraintSelector::node_label("mantissa.io/ingress"),
+                    "public-web",
+                )
+                .expect("valid ingress pool constraint"),
+            ],
+            strategy: Default::default(),
+        },
+        spread_by: None,
+    })
+    .expect("valid ingress pool")
+}
+
 local_test!(
     services_on_demand_network_realizes_for_task_hosts_and_releases,
     {
@@ -167,24 +188,7 @@ local_test!(
             "backend node label should converge"
         );
 
-        let pool = IngressPoolSpecValue::from_draft(IngressPoolSpecDraft {
-            name: "public-web".to_string(),
-            min_nodes: 1,
-            max_nodes: Some(1),
-            placement: PlacementPolicy {
-                constraints: vec![
-                    PlacementConstraint::eq(
-                        PlacementConstraintSelector::node_label("mantissa.io/ingress"),
-                        "public-web",
-                    )
-                    .expect("valid ingress pool constraint"),
-                ],
-                strategy: Default::default(),
-            },
-            spread_by: None,
-        })
-        .expect("valid ingress pool");
-        upsert_ingress_pool_all(&cluster, pool).await;
+        upsert_ingress_pool_all(&cluster, public_web_ingress_pool()).await;
 
         let network_id = create_replicated_logical_test_network(
             &cluster,
@@ -295,6 +299,155 @@ local_test!(
             )
             .await,
             "service deletion should release ingress-pool and backend network realization"
+        );
+    }
+);
+
+local_test!(
+    services_late_ingress_pool_update_realizes_existing_on_demand_service,
+    {
+        let _config_guard = ConfigOverrideGuard::control_plane_network_only();
+        let _guard = RuntimeBackendOverrideGuard::install_default();
+
+        let cluster = TestNode::new_cluster_inproc_with_config(2, ClusterConfig::default())
+            .await
+            .expect("cluster should start");
+        TestNode::assert_cluster_size_all(&cluster, 2, "cluster should stabilise to two nodes")
+            .await;
+
+        let ingress_node = &cluster[0];
+        let backend_node = &cluster[1];
+        set_node_labels(
+            &ingress_node.topology(),
+            ingress_node.id(),
+            &["mantissa.io/ingress=public-web"],
+            true,
+        )
+        .await;
+        set_node_labels(
+            &backend_node.topology(),
+            backend_node.id(),
+            &["mantissa.io/backend=public-web"],
+            true,
+        )
+        .await;
+        assert!(
+            wait_for_node_label_all(
+                &cluster,
+                ingress_node.id(),
+                "mantissa.io/ingress",
+                "public-web",
+                Duration::from_secs(10)
+            )
+            .await,
+            "ingress node label should converge"
+        );
+        assert!(
+            wait_for_node_label_all(
+                &cluster,
+                backend_node.id(),
+                "mantissa.io/backend",
+                "public-web",
+                Duration::from_secs(10)
+            )
+            .await,
+            "backend node label should converge"
+        );
+
+        let network_id = create_replicated_logical_test_network(
+            &cluster,
+            "on-demand-late-ingress-pool-realization",
+            NetworkRealizationPolicy::OnDemand,
+        )
+        .await;
+
+        let service_name = format!("late-ingress-pool-network-{}", Uuid::new_v4());
+        let mut template = demo_networked_backend_task_template("backend", 1, network_id);
+        template.public_port = Some(8080);
+        template.public_ingress = PublicIngressPolicy::IngressPool {
+            pool: "public-web".to_string(),
+        };
+        template.execution.placement = PlacementPolicy {
+            constraints: vec![
+                PlacementConstraint::eq(
+                    PlacementConstraintSelector::node_label("mantissa.io/backend"),
+                    "public-web",
+                )
+                .expect("valid backend placement constraint"),
+            ],
+            strategy: Default::default(),
+        };
+
+        let service_id = ingress_node
+            .node
+            .service_controller
+            .submit_deployment(Uuid::new_v4(), &service_name, &service_name, vec![template])
+            .await
+            .expect("submit late ingress-pool on-demand deployment");
+
+        assert!(
+            wait_for_service_running_tasks_stable_all(
+                &cluster,
+                &service_name,
+                1,
+                3,
+                Duration::from_secs(20)
+            )
+            .await,
+            "backend task placement should converge before the ingress pool exists"
+        );
+
+        let backend_only = HashSet::from([backend_node.id()]);
+        assert!(
+            wait_for_network_ready_peer_nodes_all(
+                &cluster,
+                network_id,
+                &backend_only,
+                Duration::from_secs(20)
+            )
+            .await,
+            "before the ingress pool exists, only the backend task host should realize the network"
+        );
+
+        upsert_ingress_pool_all(&cluster, public_web_ingress_pool()).await;
+
+        let expected_peers = HashSet::from([ingress_node.id(), backend_node.id()]);
+        assert!(
+            wait_for_network_ready_peer_nodes_all(
+                &cluster,
+                network_id,
+                &expected_peers,
+                Duration::from_secs(20)
+            )
+            .await,
+            "late ingress-pool creation should wake network realization on the selected ingress node"
+        );
+
+        remove_service_via_rpc(&ingress_node.node.services_client, service_id).await;
+        assert!(
+            wait_for_service_task_count_all(&cluster, &service_name, 0, Duration::from_secs(20))
+                .await,
+            "service deletion should stop every task"
+        );
+        assert!(
+            wait_for_service_status_all(
+                &cluster,
+                service_id,
+                ServiceStatus::Stopped,
+                Duration::from_secs(20)
+            )
+            .await,
+            "service deletion should propagate Stopped before ingress demand is released"
+        );
+        assert!(
+            wait_for_network_peer_nodes_all(
+                &cluster,
+                network_id,
+                &HashSet::new(),
+                Duration::from_secs(20)
+            )
+            .await,
+            "service deletion should release late ingress-pool and backend network realization"
         );
     }
 );

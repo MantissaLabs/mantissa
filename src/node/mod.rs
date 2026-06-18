@@ -72,6 +72,11 @@ impl Node {
     pub fn set_network_controller(&self, controller: NetworkController) {
         *self.network_controller.borrow_mut() = Some(controller);
     }
+
+    /// Returns the live network controller handle when runtime bootstrap has wired it.
+    pub fn network_controller(&self) -> Option<NetworkController> {
+        self.network_controller.borrow().clone()
+    }
 }
 
 impl node::Server for Node {

@@ -7,18 +7,24 @@ use anyhow::{Result, anyhow};
 use mantissa_store::uuid_key::UuidKey;
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::sync::Arc;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 /// Ergonomic access layer over the replicated ingress pool store.
 #[derive(Clone)]
 pub struct IngressPoolRegistry {
     store: IngressPoolStore,
+    change_notify: Arc<Notify>,
 }
 
 impl IngressPoolRegistry {
     /// Builds the registry from the underlying ingress pool store.
     pub fn new(store: IngressPoolStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            change_notify: Arc::new(Notify::new()),
+        }
     }
 
     /// Upserts one ingress pool specification into the replicated store.
@@ -26,7 +32,9 @@ impl IngressPoolRegistry {
         self.store
             .upsert(&UuidKey::from(value.id), value)
             .await
-            .map_err(|error| anyhow!("ingress pool upsert failed: {error}"))
+            .map_err(|error| anyhow!("ingress pool upsert failed: {error}"))?;
+        self.change_notify.notify_one();
+        Ok(())
     }
 
     /// Removes one ingress pool specification from the replicated store.
@@ -35,6 +43,7 @@ impl IngressPoolRegistry {
             .remove(&UuidKey::from(id))
             .await
             .map_err(|error| anyhow!("ingress pool remove failed: {error}"))?;
+        self.change_notify.notify_one();
         Ok(())
     }
 
@@ -77,6 +86,11 @@ impl IngressPoolRegistry {
     /// Returns the ingress pool store change clock for derived-view invalidation.
     pub fn change_clock(&self) -> u64 {
         self.store.change_clock()
+    }
+
+    /// Returns a node-local notifier that fires after direct ingress-pool writes.
+    pub fn change_notifier(&self) -> Arc<Notify> {
+        self.change_notify.clone()
     }
 
     /// Derives the current selected node set for one ingress pool and candidate set.

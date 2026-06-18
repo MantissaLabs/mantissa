@@ -47,6 +47,7 @@ impl Topology {
                     node_id
                 ))
             })?;
+        self.notify_ingress_pool_peer_inputs_changed().await;
         Ok(true)
     }
 
@@ -79,6 +80,7 @@ impl Topology {
                     node_id
                 ))
             })?;
+        self.notify_ingress_pool_peer_inputs_changed().await;
         Ok(true)
     }
 
@@ -142,7 +144,15 @@ impl Topology {
                     node_id
                 ))
             })?;
+        self.notify_ingress_pool_peer_inputs_changed().await;
         Ok(true)
+    }
+
+    /// Notifies networking that peer metadata used by ingress-pool selection has changed.
+    async fn notify_ingress_pool_peer_inputs_changed(&self) {
+        if let Some(controller) = self.local.node.network_controller() {
+            controller.notify_ingress_pool_inputs_changed().await;
+        }
     }
 
     /// Restores the peers MST from durable storage after process startup.

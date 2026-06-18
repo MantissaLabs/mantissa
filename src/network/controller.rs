@@ -89,6 +89,9 @@ struct NetworkControllerInner {
     pending_forwarding: AsyncMutex<HashSet<Uuid>>,
     forwarding_events: AsyncMutex<Option<UnboundedReceiver<ForwardingEvent>>>,
     pending_specs: AsyncMutex<HashSet<Uuid>>,
+    pending_ingress_pool_inputs: AsyncMutex<bool>,
+    ingress_pool_generation: AsyncMutex<u64>,
+    ingress_pool_change_notify: Arc<Notify>,
     wireguard: AsyncMutex<WireGuardUnderlayState>,
     wireguard_last_reconcile: AsyncMutex<Option<std::time::Instant>>,
     wireguard_retry_scheduled: AsyncMutex<bool>,
@@ -176,6 +179,8 @@ impl NetworkController {
             warn!(target: "network", "failed to initialize bpf manager: {err:#}");
             NetworkBpfManager::unavailable()
         });
+        let ingress_pool_generation = ingress_pools.change_clock();
+        let ingress_pool_change_notify = ingress_pools.change_notifier();
 
         let discovery = ServiceDiscovery::new(
             registry.clone(),
@@ -209,6 +214,9 @@ impl NetworkController {
                 pending_forwarding: AsyncMutex::new(HashSet::new()),
                 forwarding_events: AsyncMutex::new(forwarding_events),
                 pending_specs: AsyncMutex::new(HashSet::new()),
+                pending_ingress_pool_inputs: AsyncMutex::new(false),
+                ingress_pool_generation: AsyncMutex::new(ingress_pool_generation),
+                ingress_pool_change_notify,
                 wireguard: AsyncMutex::new(WireGuardUnderlayState::default()),
                 wireguard_last_reconcile: AsyncMutex::new(None),
                 wireguard_retry_scheduled: AsyncMutex::new(false),
@@ -245,6 +253,17 @@ impl NetworkController {
         if inserted {
             self.inner.wake.notify_one();
         }
+    }
+
+    /// Queue a recomputation of ingress-pool network demand after selector inputs change.
+    pub async fn notify_ingress_pool_inputs_changed(&self) {
+        let mut guard = self.inner.pending_ingress_pool_inputs.lock().await;
+        if *guard {
+            return;
+        }
+        *guard = true;
+        drop(guard);
+        self.inner.wake.notify_one();
     }
 
     /// Ensure each network has local dataplane resources before a runtime uses it.
@@ -938,6 +957,74 @@ impl NetworkController {
         Ok(())
     }
 
+    /// Queue all networks whose local demand depends on ingress-pool selection.
+    async fn schedule_referenced_ingress_pool_networks(&self) -> Result<usize> {
+        let services = self
+            .inner
+            .service_registry
+            .list()
+            .context("list services for ingress-pool network reconcile")?;
+        let network_ids = Self::referenced_ingress_pool_networks(&services)
+            .into_values()
+            .flatten()
+            .collect::<HashSet<_>>();
+        if network_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut pending = self.inner.pending_specs.lock().await;
+        let mut inserted = 0usize;
+        for network_id in network_ids {
+            if pending.insert(network_id) {
+                inserted = inserted.saturating_add(1);
+            }
+        }
+        drop(pending);
+
+        if inserted > 0 {
+            self.inner.wake.notify_one();
+        }
+
+        Ok(inserted)
+    }
+
+    /// Recompute ingress-pool network demand when peer metadata changes selected nodes.
+    async fn reconcile_pending_ingress_pool_inputs(&self) -> Result<usize> {
+        let dirty = {
+            let mut guard = self.inner.pending_ingress_pool_inputs.lock().await;
+            if !*guard {
+                false
+            } else {
+                *guard = false;
+                true
+            }
+        };
+        if !dirty {
+            return Ok(0);
+        }
+
+        self.schedule_referenced_ingress_pool_networks().await
+    }
+
+    /// Recompute ingress-pool network demand when the replicated pool store changes.
+    async fn reconcile_ingress_pool_store_change(&self) -> Result<usize> {
+        let current_generation = self.inner.ingress_pools.change_clock();
+        let changed = {
+            let mut guard = self.inner.ingress_pool_generation.lock().await;
+            if *guard == current_generation {
+                false
+            } else {
+                *guard = current_generation;
+                true
+            }
+        };
+        if !changed {
+            return Ok(0);
+        }
+
+        self.schedule_referenced_ingress_pool_networks().await
+    }
+
     /// Spawn the attachment-forwarding event listener that reacts to workload-network changes.
     fn spawn_forwarding_listener(&self) -> tokio::task::JoinHandle<()> {
         let controller = self.clone();
@@ -1080,11 +1167,34 @@ impl NetworkController {
                     }
                 }
                 _ = attachment_refresh.tick() => {
+                    if let Err(err) = self.reconcile_ingress_pool_store_change().await {
+                        crate::observability::metrics::record_network_reconcile_failure("ingress_pool_refresh");
+                        warn!(
+                            target: "network",
+                            "ingress-pool network demand refresh failed: {err:#}"
+                        );
+                    }
                     if let Err(err) = self.refresh_forwarding_from_attachments().await {
                         crate::observability::metrics::record_network_reconcile_failure("attachment_refresh");
                         warn!(
                             target: "network",
                             "attachment forwarding refresh failed: {err:#}"
+                        );
+                    }
+                }
+                _ = self.inner.ingress_pool_change_notify.notified() => {
+                    if let Err(err) = self.reconcile_ingress_pool_store_change().await {
+                        crate::observability::metrics::record_network_reconcile_failure("ingress_pool_change");
+                        warn!(
+                            target: "network",
+                            "ingress-pool network demand refresh after pool change failed: {err:#}"
+                        );
+                    }
+                    if let Err(err) = self.reconcile_pending_specs().await {
+                        crate::observability::metrics::record_network_reconcile_failure("ingress_pool_pending_specs");
+                        warn!(
+                            target: "network",
+                            "pending spec reconcile after ingress-pool change failed: {err:#}"
                         );
                     }
                 }
@@ -1113,6 +1223,13 @@ impl NetworkController {
                         warn!(
                             target: "network",
                             "pending forwarding reconcile failed: {err:#}"
+                        );
+                    }
+                    if let Err(err) = self.reconcile_pending_ingress_pool_inputs().await {
+                        crate::observability::metrics::record_network_reconcile_failure("pending_ingress_pool_inputs");
+                        warn!(
+                            target: "network",
+                            "pending ingress-pool network demand refresh failed: {err:#}"
                         );
                     }
                     if let Err(err) = self.reconcile_pending_specs().await {
