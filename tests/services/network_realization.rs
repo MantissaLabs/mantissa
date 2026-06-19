@@ -753,6 +753,21 @@ local_test!(
             .await,
             "ingress_pool should realize the network on the selected ingress node and backend node"
         );
+        let expected_endpoint_nodes = HashSet::from([ingress_node.id()]);
+        if !wait_for_ingress_endpoint_nodes(
+            backend_node,
+            &service_name,
+            &expected_endpoint_nodes,
+            Duration::from_secs(20),
+        )
+        .await
+        {
+            let rows = list_ingress_endpoints_for_service(backend_node, &service_name).await;
+            panic!(
+                "backend observer should see only the selected ingress-pool endpoint target; rows={}",
+                format_ingress_endpoint_rows(&rows)
+            );
+        }
 
         remove_service_via_rpc(&ingress_node.node.services_client, service_id).await;
         assert!(
@@ -770,6 +785,20 @@ local_test!(
             .await,
             "service deletion should propagate Stopped before ingress demand is released"
         );
+        if !wait_for_ingress_endpoint_nodes(
+            backend_node,
+            &service_name,
+            &HashSet::new(),
+            Duration::from_secs(20),
+        )
+        .await
+        {
+            let rows = list_ingress_endpoints_for_service(backend_node, &service_name).await;
+            panic!(
+                "service deletion should remove ingress-pool endpoint targets; rows={}",
+                format_ingress_endpoint_rows(&rows)
+            );
+        }
         if !wait_for_network_peer_nodes_all(
             &cluster,
             network_id,
@@ -921,6 +950,21 @@ local_test!(
             .await,
             "initial ingress-pool selection should realize the first ingress node and backend"
         );
+        let initial_endpoint_nodes = HashSet::from([first_ingress_node.id()]);
+        if !wait_for_ingress_endpoint_nodes(
+            backend_node,
+            &service_name,
+            &initial_endpoint_nodes,
+            Duration::from_secs(20),
+        )
+        .await
+        {
+            let rows = list_ingress_endpoints_for_service(backend_node, &service_name).await;
+            panic!(
+                "initial ingress-pool endpoint target should be the first ingress node; rows={}",
+                format_ingress_endpoint_rows(&rows)
+            );
+        }
 
         set_node_labels(
             &first_ingress_node.topology(),
@@ -983,6 +1027,21 @@ local_test!(
             .await,
             "deselected ingress nodes should release their on-demand network peer rows"
         );
+        let reselected_endpoint_nodes = HashSet::from([second_ingress_node.id()]);
+        if !wait_for_ingress_endpoint_nodes(
+            first_ingress_node,
+            &service_name,
+            &reselected_endpoint_nodes,
+            Duration::from_secs(20),
+        )
+        .await
+        {
+            let rows = list_ingress_endpoints_for_service(first_ingress_node, &service_name).await;
+            panic!(
+                "ingress-pool endpoint target should move to the reselected ingress node; rows={}",
+                format_ingress_endpoint_rows(&rows)
+            );
+        }
 
         remove_service_via_rpc(&first_ingress_node.node.services_client, service_id).await;
         assert!(
@@ -1000,6 +1059,20 @@ local_test!(
             .await,
             "service deletion should propagate Stopped before reselected ingress demand is released"
         );
+        if !wait_for_ingress_endpoint_nodes(
+            first_ingress_node,
+            &service_name,
+            &HashSet::new(),
+            Duration::from_secs(20),
+        )
+        .await
+        {
+            let rows = list_ingress_endpoints_for_service(first_ingress_node, &service_name).await;
+            panic!(
+                "service deletion should remove reselected ingress-pool endpoint target; rows={}",
+                format_ingress_endpoint_rows(&rows)
+            );
+        }
         if !wait_for_network_peer_nodes_all(
             &cluster,
             network_id,
