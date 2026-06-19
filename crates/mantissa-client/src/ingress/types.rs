@@ -296,7 +296,9 @@ fn optional_text(text: capnp::text::Reader<'_>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mantissa_protocol::ingress::{ingress_endpoint_filter, ingress_pool_spec};
+    use mantissa_protocol::ingress::{
+        ingress_endpoint, ingress_endpoint_filter, ingress_pool_spec,
+    };
 
     #[test]
     fn ron_manifest_parses_flat_ingress_pool() {
@@ -403,5 +405,52 @@ mod tests {
         assert_eq!(reader.get_pool().unwrap().to_str().unwrap(), "edge");
         assert_eq!(reader.get_port(), 8080);
         assert!(reader.get_ready_only());
+    }
+
+    #[test]
+    fn endpoint_decoder_preserves_readiness_and_detail() {
+        let service_id = Uuid::new_v4();
+        let network_id = Uuid::new_v4();
+        let node_id = Uuid::new_v4();
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut builder = message.init_root::<ingress_endpoint::Builder<'_>>();
+            builder.set_service_id(service_id.as_bytes());
+            builder.set_service_name("web");
+            builder.set_template_name("api");
+            builder.set_network_id(network_id.as_bytes());
+            builder.set_node_id(node_id.as_bytes());
+            builder.set_node_ip("10.0.0.7");
+            builder.set_public_port(8080);
+            builder.set_protocol("tcp");
+            builder.set_ingress_mode("ingress_pool");
+            builder.set_ingress_pool("public-web");
+            builder.set_ready(false);
+            builder.set_generation(42);
+            builder.set_detail("endpoint has not been reported by the source node");
+        }
+
+        let reader = message
+            .get_root::<ingress_endpoint::Builder<'_>>()
+            .expect("read endpoint")
+            .into_reader();
+        let decoded = IngressEndpoint::from_reader(reader).expect("decode endpoint");
+
+        assert_eq!(decoded.service_id, service_id);
+        assert_eq!(decoded.service_name.as_deref(), Some("web"));
+        assert_eq!(decoded.template_name, "api");
+        assert_eq!(decoded.network_id, network_id);
+        assert_eq!(decoded.node_id, node_id);
+        assert_eq!(decoded.node_ip.as_deref(), Some("10.0.0.7"));
+        assert_eq!(decoded.public_port, 8080);
+        assert_eq!(decoded.protocol, "tcp");
+        assert_eq!(decoded.ingress_mode, "ingress_pool");
+        assert_eq!(decoded.ingress_pool.as_deref(), Some("public-web"));
+        assert!(!decoded.ready);
+        assert_eq!(decoded.generation, 42);
+        assert_eq!(
+            decoded.detail.as_deref(),
+            Some("endpoint has not been reported by the source node")
+        );
     }
 }
