@@ -734,7 +734,7 @@ impl AgentController {
 
         if let Some(detail) = self
             .network_prerequisites
-            .launch_readiness_detail(std::slice::from_ref(&request))?
+            .admission_readiness_detail(std::slice::from_ref(&request))?
         {
             let mut pending = run.clone();
             if pending.status_detail.as_deref() != Some(detail.as_str()) {

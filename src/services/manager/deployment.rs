@@ -650,7 +650,7 @@ impl ServiceController {
 
         if let Some(detail) = self
             .network_prerequisites
-            .launch_readiness_detail(&requests)?
+            .admission_readiness_detail(&requests)?
         {
             self.update_service_status_detail_if_current(service_id, manifest_id, Some(detail))
                 .await;
@@ -890,7 +890,7 @@ impl ServiceController {
 
             if let Some(detail) = self
                 .network_prerequisites
-                .launch_readiness_detail(&requests)?
+                .admission_readiness_detail(&requests)?
             {
                 self.update_service_status_detail_if_current(service_id, manifest_id, Some(detail))
                     .await;
@@ -1060,7 +1060,7 @@ impl ServiceController {
 
             if let Some(detail) = self
                 .network_prerequisites
-                .launch_readiness_detail(&requests)?
+                .admission_readiness_detail(&requests)?
             {
                 self.update_service_status_detail_if_current(
                     service_id,

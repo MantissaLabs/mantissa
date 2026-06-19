@@ -6,8 +6,8 @@ use crate::network::defaults::{
 };
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
-    NetworkDriver, NetworkEvent, NetworkRealizationPolicy, NetworkSpecDraft, NetworkSpecUpdate,
-    NetworkSpecValue, NetworkStatus,
+    NetworkDriver, NetworkEvent, NetworkPeerStateValue, NetworkRealizationPolicy, NetworkSpecDraft,
+    NetworkSpecUpdate, NetworkSpecValue, NetworkStatus,
 };
 use crate::registry::Registry;
 use crate::workload::manager::WorkloadStartRequest;
@@ -40,6 +40,13 @@ pub struct WorkloadNetworkPrerequisites {
     network_controller: NetworkController,
     cluster_registry: Registry,
     gossip_tx: Sender<Message>,
+}
+
+/// Readiness phase selected by workload network prerequisite gates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NetworkReadinessPurpose {
+    Admission,
+    TargetRealization,
 }
 
 impl WorkloadNetworkPrerequisites {
@@ -131,32 +138,67 @@ impl WorkloadNetworkPrerequisites {
         Ok(())
     }
 
-    /// Builds a human-readable blocker when target nodes lack required network readiness.
-    pub fn launch_readiness_detail(
+    /// Builds a human-readable blocker when required networks are not admissible for placement.
+    ///
+    /// For on-demand networks this only requires an observed Ready spec. Target-side scheduler
+    /// admission is responsible for realizing the local dataplane before any task is accepted.
+    pub fn admission_readiness_detail(
         &self,
         requests: &[WorkloadStartRequest],
+    ) -> Result<Option<String>> {
+        self.readiness_detail(requests, NetworkReadinessPurpose::Admission)
+    }
+
+    /// Builds a human-readable blocker when selected target nodes lack realized network dataplane.
+    ///
+    /// This is stricter than placement admission: every targeted request must have a Ready peer row
+    /// for the exact selected node, including on-demand networks.
+    pub fn target_realization_readiness_detail(
+        &self,
+        requests: &[WorkloadStartRequest],
+    ) -> Result<Option<String>> {
+        self.readiness_detail(requests, NetworkReadinessPurpose::TargetRealization)
+    }
+
+    /// Builds the status detail for either pre-demand admission or post-demand realization checks.
+    fn readiness_detail(
+        &self,
+        requests: &[WorkloadStartRequest],
+        purpose: NetworkReadinessPurpose,
     ) -> Result<Option<String>> {
         let mut blockers = BTreeSet::new();
         for request in requests {
             for network_id in &request.networks {
                 match request.target_node {
                     Some(node_id) => {
-                        if !self.network_ready_on_node(*network_id, node_id)? {
+                        if !self.network_satisfies_target(*network_id, node_id, purpose)? {
                             blockers.insert(format!(
-                                "network '{}' not ready on node '{}'",
+                                "network '{}' {} on node '{}'",
                                 self.network_label(*network_id)?,
+                                match purpose {
+                                    NetworkReadinessPurpose::Admission => "not admissible",
+                                    NetworkReadinessPurpose::TargetRealization => "not ready",
+                                },
                                 self.node_label(node_id)
                             ));
                         }
                     }
-                    None => {
-                        if !self.network_ready_on_any_peer(*network_id)? {
+                    None => match purpose {
+                        NetworkReadinessPurpose::Admission => {
+                            if !self.network_admissible_on_any_peer(*network_id)? {
+                                blockers.insert(format!(
+                                    "network '{}' has no ready schedulable peer",
+                                    self.network_label(*network_id)?
+                                ));
+                            }
+                        }
+                        NetworkReadinessPurpose::TargetRealization => {
                             blockers.insert(format!(
-                                "network '{}' has no ready schedulable peer",
+                                "network '{}' has no selected target node",
                                 self.network_label(*network_id)?
                             ));
                         }
-                    }
+                    },
                 }
             }
         }
@@ -165,48 +207,91 @@ impl WorkloadNetworkPrerequisites {
             Ok(None)
         } else {
             Ok(Some(format!(
-                "waiting for network readiness: {}",
+                "{}: {}",
+                match purpose {
+                    NetworkReadinessPurpose::Admission => "waiting for network readiness",
+                    NetworkReadinessPurpose::TargetRealization => "waiting for network realization",
+                },
                 format_network_readiness_blockers(&blockers)
             )))
         }
     }
 
-    /// Returns true once the given peer has reconciled the requested network locally.
-    fn network_ready_on_node(&self, network_id: Uuid, node_id: Uuid) -> Result<bool> {
+    /// Returns true when the requested target node satisfies the selected readiness purpose.
+    fn network_satisfies_target(
+        &self,
+        network_id: Uuid,
+        node_id: Uuid,
+        purpose: NetworkReadinessPurpose,
+    ) -> Result<bool> {
         let Some(spec) = self.network_registry.get_spec(network_id)? else {
             return Ok(false);
         };
-        if spec.is_deleted() || spec.status != NetworkStatus::Ready {
-            return Ok(false);
-        }
-        if spec.realization == NetworkRealizationPolicy::OnDemand {
-            // Lazy networks are made ready by scheduler/runtime admission on the selected node.
-            return Ok(true);
-        }
-        Ok(self
-            .network_registry
-            .get_peer_state(network_id, node_id)?
-            .is_some_and(|state| state.state.is_ready()))
+
+        let peer_state = self.network_registry.get_peer_state(network_id, node_id)?;
+        Ok(match purpose {
+            NetworkReadinessPurpose::Admission => {
+                Self::network_state_admissible_for_target(&spec, peer_state.as_ref())
+            }
+            NetworkReadinessPurpose::TargetRealization => {
+                Self::network_state_realized_for_target(&spec, peer_state.as_ref())
+            }
+        })
     }
 
-    /// Returns true once any schedulable peer can host workloads for the requested network.
-    fn network_ready_on_any_peer(&self, network_id: Uuid) -> Result<bool> {
+    /// Returns true once any schedulable peer can admit workloads for the requested network.
+    fn network_admissible_on_any_peer(&self, network_id: Uuid) -> Result<bool> {
         let Some(spec) = self.network_registry.get_spec(network_id)? else {
             return Ok(false);
         };
-        if spec.is_deleted() || spec.status != NetworkStatus::Ready {
+        if !Self::network_spec_admissible_for_workload(&spec) {
             return Ok(false);
         }
         if spec.realization == NetworkRealizationPolicy::OnDemand {
-            // Lazy networks are made ready by scheduler/runtime admission on the selected node.
             return Ok(true);
         }
         for state in self.network_registry.list_peer_states(Some(network_id))? {
-            if state.state.is_ready() && self.cluster_registry.peer_schedulable(state.peer_id) {
+            if Self::network_peer_state_ready(&state)
+                && self.cluster_registry.peer_schedulable(state.peer_id)
+            {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// Returns true when a spec is available enough to enter workload placement.
+    fn network_spec_admissible_for_workload(spec: &NetworkSpecValue) -> bool {
+        !spec.is_deleted() && spec.status == NetworkStatus::Ready
+    }
+
+    /// Returns true when a target node can enter placement for the requested network.
+    fn network_state_admissible_for_target(
+        spec: &NetworkSpecValue,
+        peer_state: Option<&NetworkPeerStateValue>,
+    ) -> bool {
+        if !Self::network_spec_admissible_for_workload(spec) {
+            return false;
+        }
+        if spec.realization == NetworkRealizationPolicy::OnDemand {
+            return true;
+        }
+
+        peer_state.is_some_and(Self::network_peer_state_ready)
+    }
+
+    /// Returns true when a target node has fully realized the requested network.
+    fn network_state_realized_for_target(
+        spec: &NetworkSpecValue,
+        peer_state: Option<&NetworkPeerStateValue>,
+    ) -> bool {
+        Self::network_spec_admissible_for_workload(spec)
+            && peer_state.is_some_and(Self::network_peer_state_ready)
+    }
+
+    /// Returns true when a replicated peer row reports successful network reconciliation.
+    fn network_peer_state_ready(peer_state: &NetworkPeerStateValue) -> bool {
+        peer_state.error.is_none() && peer_state.state.is_ready()
     }
 
     /// Renders one network id as a stable operator-facing label for status details.
@@ -393,6 +478,29 @@ fn short_uuid(id: Uuid) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::types::NetworkPeerState;
+
+    /// Builds a network spec in the requested realization policy and lifecycle status.
+    fn readiness_test_spec(
+        realization: NetworkRealizationPolicy,
+        status: NetworkStatus,
+    ) -> NetworkSpecValue {
+        let mut spec = NetworkSpecValue::new_with_realization(
+            NetworkSpecDraft {
+                name: format!("network-{realization}"),
+                description: String::new(),
+                driver: NetworkDriver::Vxlan,
+                subnet_cidr: "10.41.0.0/24".to_string(),
+                vni: 0,
+                mtu: 0,
+                sealed: false,
+                bpf_programs: Vec::new(),
+            },
+            realization,
+        );
+        spec.set_status(status);
+        spec
+    }
 
     #[test]
     /// Required network normalization rejects driver conflicts for the same network name.
@@ -447,6 +555,109 @@ mod tests {
         assert!(
             err.to_string().contains("conflicting realization"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    /// On-demand admission only needs a Ready spec because target admission creates demand.
+    fn readiness_admission_allows_on_demand_ready_spec_without_peer_state() {
+        let spec = readiness_test_spec(NetworkRealizationPolicy::OnDemand, NetworkStatus::Ready);
+
+        assert!(
+            WorkloadNetworkPrerequisites::network_state_admissible_for_target(&spec, None),
+            "on-demand placement admission should not require a pre-existing peer row"
+        );
+        assert!(
+            !WorkloadNetworkPrerequisites::network_state_realized_for_target(&spec, None),
+            "target realization still requires an exact-node ready peer row"
+        );
+    }
+
+    #[test]
+    /// All-nodes admission still requires the selected target node to be already ready.
+    fn readiness_admission_blocks_all_nodes_spec_without_peer_state() {
+        let spec = readiness_test_spec(NetworkRealizationPolicy::AllNodes, NetworkStatus::Ready);
+
+        assert!(
+            !WorkloadNetworkPrerequisites::network_state_admissible_for_target(&spec, None),
+            "all-nodes placement admission must keep waiting for the target peer row"
+        );
+        assert!(
+            !WorkloadNetworkPrerequisites::network_state_realized_for_target(&spec, None),
+            "realization cannot pass without an exact-node peer row"
+        );
+    }
+
+    #[test]
+    /// Ready peer rows satisfy both admission and realization for the exact target node.
+    fn readiness_realization_accepts_ready_peer_state() {
+        let spec = readiness_test_spec(NetworkRealizationPolicy::OnDemand, NetworkStatus::Ready);
+        let peer_state = NetworkPeerStateValue::new(
+            spec.id,
+            Uuid::new_v4(),
+            "node-a",
+            NetworkPeerState::Ready,
+            None,
+        );
+
+        assert!(
+            WorkloadNetworkPrerequisites::network_state_admissible_for_target(
+                &spec,
+                Some(&peer_state)
+            ),
+            "ready on-demand specs remain admissible"
+        );
+        assert!(
+            WorkloadNetworkPrerequisites::network_state_realized_for_target(
+                &spec,
+                Some(&peer_state)
+            ),
+            "ready peer row should satisfy exact-node realization"
+        );
+    }
+
+    #[test]
+    /// Non-ready specs block both placement admission and target realization.
+    fn readiness_blocks_pending_spec_even_with_ready_peer_state() {
+        let spec = readiness_test_spec(NetworkRealizationPolicy::OnDemand, NetworkStatus::Pending);
+        let peer_state = NetworkPeerStateValue::new(
+            spec.id,
+            Uuid::new_v4(),
+            "node-a",
+            NetworkPeerState::Ready,
+            None,
+        );
+
+        assert!(
+            !WorkloadNetworkPrerequisites::network_state_admissible_for_target(
+                &spec,
+                Some(&peer_state)
+            ),
+            "pending specs must not enter placement admission"
+        );
+        assert!(
+            !WorkloadNetworkPrerequisites::network_state_realized_for_target(
+                &spec,
+                Some(&peer_state)
+            ),
+            "pending specs must not be treated as target-realized"
+        );
+    }
+
+    #[test]
+    /// Peer rows carrying an error are not treated as realized even if the state is Ready.
+    fn readiness_blocks_peer_state_with_error() {
+        let peer_state = NetworkPeerStateValue::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "node-a",
+            NetworkPeerState::Ready,
+            Some("failed after readiness".to_string()),
+        );
+
+        assert!(
+            !WorkloadNetworkPrerequisites::network_peer_state_ready(&peer_state),
+            "peer errors must keep readiness predicates blocked"
         );
     }
 }
