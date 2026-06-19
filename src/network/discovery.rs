@@ -536,7 +536,11 @@ impl ServiceDiscovery {
                 .map(|server| server.runtime.clone())
         };
         let Some(runtime) = runtime else {
-            return Ok(false);
+            return service_dependency_ready_from_replicated_state(
+                &self.registry,
+                &self.workloads,
+                requirement,
+            );
         };
 
         runtime_service_dependency_ready(&runtime, requirement).await
@@ -891,6 +895,58 @@ fn load_task(workloads: &WorkloadStore, id: Uuid) -> Option<WorkloadValue> {
     let key = UuidKey::from(id);
     let snapshot = workloads.get_snapshot(&key).ok()??;
     select_best_workload_value(snapshot.as_slice())
+}
+
+/// Evaluate dependency readiness from replicated control-plane state when no DNS runtime exists.
+///
+/// Non-privileged tests and unsupported platforms cannot bind the per-network resolver address, but
+/// they can still validate the ordering contract that target admission relies on: the dependency task
+/// is running, its attachment is ready and traffic-published, and the attachment node's network peer
+/// row is ready. Kernel-backed nodes use the real discovery catalog instead.
+fn service_dependency_ready_from_replicated_state(
+    registry: &NetworkRegistry,
+    workloads: &WorkloadStore,
+    requirement: &NetworkServiceDependencyRequirement,
+) -> Result<bool> {
+    let ready_peers = registry
+        .list_peer_states(Some(requirement.network_id))?
+        .into_iter()
+        .filter(|state| state.state.is_ready())
+        .map(|state| state.peer_id)
+        .collect::<HashSet<_>>();
+    let attachments = registry
+        .list_attachments(Some(requirement.network_id))
+        .context("list attachments for dependency admission fallback")?;
+
+    for attachment in attachments {
+        if !ready_peers.contains(&attachment.node_id)
+            || attachment.state != NetworkAttachmentState::Ready
+            || !attachment.traffic_published
+        {
+            continue;
+        }
+
+        let Some(task) = load_task(workloads, attachment.task_id) else {
+            continue;
+        };
+        if task.node_id != attachment.node_id
+            || task.state != WorkloadPhase::Running
+            || !task.service_owner().is_some_and(|owner| {
+                owner
+                    .service_name
+                    .eq_ignore_ascii_case(&requirement.service_name)
+                    && owner
+                        .template
+                        .eq_ignore_ascii_case(&requirement.template_name)
+            })
+        {
+            continue;
+        }
+
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 /// Decide whether an attachment should be trusted over a stale task record during convergence.

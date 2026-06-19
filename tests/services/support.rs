@@ -16,7 +16,7 @@ pub(crate) use mantissa::config::{
 pub(crate) use mantissa::ingress::types::{IngressPoolSpecDraft, IngressPoolSpecValue};
 pub(crate) use mantissa::network::types::{
     NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver, NetworkRealizationPolicy,
-    NetworkSpecDraft, NetworkSpecValue, NetworkStatus,
+    NetworkServiceDependencyRequirement, NetworkSpecDraft, NetworkSpecValue, NetworkStatus,
 };
 pub(crate) use mantissa::node::id::set_node_id;
 pub(crate) use mantissa::runtime::set::RuntimeSet;

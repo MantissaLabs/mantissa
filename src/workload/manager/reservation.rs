@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use chrono::Utc;
@@ -10,6 +10,8 @@ use mantissa_protocol::server::cluster_session;
 use mantissa_protocol::workload::workload as workload_rpc;
 use tracing::warn;
 use uuid::Uuid;
+
+use tokio::time::sleep;
 
 use crate::network::types::NetworkServiceDependencyRequirement;
 use crate::scheduler::digest::{SchedulerDigestValue, read_scheduler_digest};
@@ -335,6 +337,9 @@ impl WorkloadManager {
         &self,
         plans: &[BatchStartPlan],
     ) -> Result<(), ExecutionError> {
+        const DEPENDENCY_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+        const DEPENDENCY_ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
         let Some(controller) = &self.networking.network_controller else {
             return Ok(());
         };
@@ -352,14 +357,24 @@ impl WorkloadManager {
             return Ok(());
         }
 
-        match controller.service_dependencies_ready(&requirements).await {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(ExecutionError::Retry(anyhow::anyhow!(
-                "service dependency discovery unavailable on local target"
-            ))),
-            Err(err) => Err(ExecutionError::Retry(
-                err.context("check local service dependency discovery"),
-            )),
+        let deadline = Instant::now() + DEPENDENCY_ADMISSION_TIMEOUT;
+        loop {
+            match controller.service_dependencies_ready(&requirements).await {
+                Ok(true) => return Ok(()),
+                Ok(false) if Instant::now() < deadline => {
+                    sleep(DEPENDENCY_ADMISSION_POLL_INTERVAL).await;
+                }
+                Ok(false) => {
+                    return Err(ExecutionError::Retry(anyhow::anyhow!(
+                        "service dependency discovery unavailable on local target"
+                    )));
+                }
+                Err(err) => {
+                    return Err(ExecutionError::Retry(
+                        err.context("check local service dependency discovery"),
+                    ));
+                }
+            }
         }
     }
 

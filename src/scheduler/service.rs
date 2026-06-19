@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mantissa_protocol::scheduling::{self, scheduler};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -149,6 +149,7 @@ impl SchedulerService {
         requirements: &[NetworkServiceDependencyRequirement],
     ) -> Result<(), SchedulerDigestValue> {
         const DEPENDENCY_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+        const DEPENDENCY_ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
         if requirements.is_empty() {
             return Ok(());
@@ -170,33 +171,30 @@ impl SchedulerService {
             }
         }
 
-        match timeout(
-            DEPENDENCY_ADMISSION_TIMEOUT,
-            controller.service_dependencies_ready(&unique_requirements),
-        )
-        .await
-        {
-            Ok(Ok(true)) => Ok(()),
-            Ok(Ok(false)) => {
-                warn!(
-                    target: "scheduler",
-                    "dependency admission failed before lease prepare: service discovery has no routable dependency backends"
-                );
-                Err(self.current_prepare_rejection_digest().await)
-            }
-            Ok(Err(err)) => {
-                warn!(
-                    target: "scheduler",
-                    "dependency admission failed before lease prepare: {err}"
-                );
-                Err(self.current_prepare_rejection_digest().await)
-            }
-            Err(_) => {
-                warn!(
-                    target: "scheduler",
-                    "dependency admission timed out before lease prepare"
-                );
-                Err(self.current_prepare_rejection_digest().await)
+        let deadline = Instant::now() + DEPENDENCY_ADMISSION_TIMEOUT;
+        loop {
+            match controller
+                .service_dependencies_ready(&unique_requirements)
+                .await
+            {
+                Ok(true) => return Ok(()),
+                Ok(false) if Instant::now() < deadline => {
+                    sleep(DEPENDENCY_ADMISSION_POLL_INTERVAL).await;
+                }
+                Ok(false) => {
+                    warn!(
+                        target: "scheduler",
+                        "dependency admission failed before lease prepare: service discovery has no routable dependency backends"
+                    );
+                    return Err(self.current_prepare_rejection_digest().await);
+                }
+                Err(err) => {
+                    warn!(
+                        target: "scheduler",
+                        "dependency admission failed before lease prepare: {err}"
+                    );
+                    return Err(self.current_prepare_rejection_digest().await);
+                }
             }
         }
     }
