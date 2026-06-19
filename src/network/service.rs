@@ -745,6 +745,11 @@ impl networks::Server for NetworksRpc {
             .copied()
             .and_then(|count| u32::try_from(count).ok())
             .unwrap_or(0);
+        let local_realization_state = self
+            .controller
+            .local_realization_state(id)
+            .await
+            .map_err(to_capnp)?;
 
         let mut builder = results.get().init_network();
         {
@@ -759,6 +764,7 @@ impl networks::Server for NetworksRpc {
         }
 
         builder.set_attachment_count(attachment_count);
+        builder.set_local_realization_state(local_realization_state.to_proto());
         Ok(())
     }
 

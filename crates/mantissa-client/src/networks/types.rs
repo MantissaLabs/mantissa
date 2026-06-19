@@ -1,6 +1,7 @@
 use capnp::Error as CapnpError;
 use mantissa_protocol::network::{
     AttachmentState as ProtoAttachmentState, NetworkDriver as ProtoNetworkDriver,
+    NetworkLocalRealizationState as ProtoNetworkLocalRealizationState,
     NetworkRealizationPolicy as ProtoNetworkRealizationPolicy,
     NetworkRealizationSelection as ProtoNetworkRealizationSelection,
     NetworkStatus as ProtoNetworkStatus, PeerState as ProtoPeerState, network_attachment_spec,
@@ -165,6 +166,50 @@ impl From<ProtoPeerState> for NetworkPeerState {
     }
 }
 
+/// Derived network dataplane state on the daemon answering an inspect request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkLocalRealizationState {
+    MissingSpec,
+    Observed,
+    Configuring,
+    Ready,
+    Error,
+    Removing,
+}
+
+impl std::fmt::Display for NetworkLocalRealizationState {
+    /// Renders the local realization state as the stable operator-facing token.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            NetworkLocalRealizationState::MissingSpec => "missing_spec",
+            NetworkLocalRealizationState::Observed => "observed",
+            NetworkLocalRealizationState::Configuring => "configuring",
+            NetworkLocalRealizationState::Ready => "ready",
+            NetworkLocalRealizationState::Error => "error",
+            NetworkLocalRealizationState::Removing => "removing",
+        };
+        write!(f, "{label}")
+    }
+}
+
+impl From<ProtoNetworkLocalRealizationState> for NetworkLocalRealizationState {
+    /// Converts the protocol enum into the client inspect view enum.
+    fn from(value: ProtoNetworkLocalRealizationState) -> Self {
+        match value {
+            ProtoNetworkLocalRealizationState::MissingSpec => {
+                NetworkLocalRealizationState::MissingSpec
+            }
+            ProtoNetworkLocalRealizationState::Observed => NetworkLocalRealizationState::Observed,
+            ProtoNetworkLocalRealizationState::Configuring => {
+                NetworkLocalRealizationState::Configuring
+            }
+            ProtoNetworkLocalRealizationState::Ready => NetworkLocalRealizationState::Ready,
+            ProtoNetworkLocalRealizationState::Error => NetworkLocalRealizationState::Error,
+            ProtoNetworkLocalRealizationState::Removing => NetworkLocalRealizationState::Removing,
+        }
+    }
+}
+
 /// Reconciliation state for a specific attachment to a network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkAttachmentState {
@@ -308,6 +353,7 @@ pub struct NetworkInspect {
     pub spec: NetworkSpec,
     pub peers: Vec<NetworkPeerStatus>,
     pub attachment_count: u32,
+    pub local_realization_state: NetworkLocalRealizationState,
 }
 
 impl NetworkInspect {
@@ -324,6 +370,7 @@ impl NetworkInspect {
             spec,
             peers,
             attachment_count: reader.get_attachment_count(),
+            local_realization_state: reader.get_local_realization_state()?.into(),
         })
     }
 }
@@ -384,5 +431,48 @@ fn optional_text(reader: capnp::text::Reader<'_>) -> Result<Option<String>, Capn
         Ok(None)
     } else {
         Ok(Some(value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use capnp::message::Builder;
+
+    /// Builds a minimal inspect response and verifies local realization state decoding.
+    #[test]
+    fn network_inspect_decodes_local_realization_state() {
+        let mut message = Builder::new_default();
+        {
+            let mut inspect = message.init_root::<network_inspect::Builder<'_>>();
+            let mut spec = inspect.reborrow().init_spec();
+            spec.set_id(Uuid::nil().as_bytes());
+            spec.set_name("lazy-net");
+            spec.set_description("");
+            spec.set_driver(ProtoNetworkDriver::Vxlan);
+            spec.set_subnet_cidr("10.42.0.0/24");
+            spec.set_vni(42);
+            spec.set_mtu(1450);
+            spec.set_created_at("2026-06-19T00:00:00Z");
+            spec.set_updated_at("2026-06-19T00:00:00Z");
+            spec.set_status(ProtoNetworkStatus::Ready);
+            spec.set_sealed(false);
+            spec.set_realization(ProtoNetworkRealizationPolicy::OnDemand);
+            spec.init_bpf_programs(0);
+
+            inspect.reborrow().init_peers(0);
+            inspect.set_attachment_count(0);
+            inspect.set_local_realization_state(ProtoNetworkLocalRealizationState::Observed);
+        }
+
+        let reader = message
+            .get_root::<network_inspect::Builder<'_>>()
+            .expect("read inspect payload")
+            .into_reader();
+        let decoded = NetworkInspect::from_reader(reader).expect("decode inspect payload");
+        assert_eq!(
+            decoded.local_realization_state,
+            NetworkLocalRealizationState::Observed
+        );
     }
 }

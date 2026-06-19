@@ -29,6 +29,27 @@ async fn create_network(harness: &RestTestHarness, name: &str) -> String {
         .to_string()
 }
 
+/// Creates one on-demand network and returns its id.
+async fn create_on_demand_network(harness: &RestTestHarness, name: &str) -> String {
+    let (status, value) = harness
+        .json_request(
+            Method::POST,
+            "/v1/networks",
+            true,
+            Some(json!({
+                "name": name,
+                "driver": "vxlan",
+                "realization": "on_demand"
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    value["network_id"]
+        .as_str()
+        .expect("network create returns id")
+        .to_string()
+}
+
 /// Seeds one replicated attachment row for the selected network.
 async fn seed_network_attachment(harness: &RestTestHarness, network_id: &str) {
     let network_id = Uuid::parse_str(network_id).expect("network id uuid");
@@ -108,6 +129,23 @@ local_test!(rest_networks_inspect_peers_and_attachments, {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert!(value.as_array().is_some());
+});
+
+local_test!(rest_networks_inspect_reports_local_realization_state, {
+    let harness = RestTestHarness::new().await;
+    let network_id = create_on_demand_network(&harness, "rest-network-local-state").await;
+
+    let (status, value) = harness
+        .json_request(
+            Method::GET,
+            &format!("/v1/networks/{network_id}"),
+            true,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["spec"]["realization"], "on_demand");
+    assert_eq!(value["local_realization_state"], "observed");
 });
 
 local_test!(rest_networks_delete_overlay_network, {

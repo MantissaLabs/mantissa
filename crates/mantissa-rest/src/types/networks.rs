@@ -199,6 +199,7 @@ impl From<ClientNetworkAttachment> for NetworkAttachment {
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct NetworkInspect {
     pub spec: NetworkSpec,
+    pub local_realization_state: String,
     pub peers: Vec<NetworkPeerStatus>,
     pub attachment_count: u32,
 }
@@ -208,6 +209,7 @@ impl From<ClientNetworkInspect> for NetworkInspect {
     fn from(value: ClientNetworkInspect) -> Self {
         Self {
             spec: value.spec.into(),
+            local_realization_state: value.local_realization_state.to_string(),
             peers: value
                 .peers
                 .into_iter()

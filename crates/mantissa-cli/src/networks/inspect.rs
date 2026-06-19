@@ -19,6 +19,10 @@ fn render_inspect(info: &NetworkInspect) {
         info.spec.driver, info.spec.vni, info.spec.mtu
     ));
     output::emit_line(format!("  realization: {}", info.spec.realization));
+    output::emit_line(format!(
+        "  local realization: {}",
+        info.local_realization_state
+    ));
     output::emit_line(format!("  subnet: {}", info.spec.subnet_cidr));
     if !info.spec.description.is_empty() {
         output::emit_line(format!("  description: {}", info.spec.description));

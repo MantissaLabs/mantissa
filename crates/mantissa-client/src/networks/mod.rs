@@ -13,6 +13,7 @@ pub use inspect::{inspect, inspect_by_id};
 pub use list::list;
 pub use status::peer_status;
 pub use types::{
-    NetworkAttachment, NetworkAttachmentState, NetworkDriver, NetworkInspect, NetworkPeerState,
-    NetworkPeerStatus, NetworkRealizationPolicy, NetworkSpec, NetworkStatus, NetworkSummary,
+    NetworkAttachment, NetworkAttachmentState, NetworkDriver, NetworkInspect,
+    NetworkLocalRealizationState, NetworkPeerState, NetworkPeerStatus, NetworkRealizationPolicy,
+    NetworkSpec, NetworkStatus, NetworkSummary,
 };

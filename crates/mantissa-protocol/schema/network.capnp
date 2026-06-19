@@ -84,6 +84,26 @@ enum PeerState {
   # Peer is detaching from the network.
 }
 
+enum NetworkLocalRealizationState {
+  missingSpec @0;
+  # The local node cannot see a live network spec.
+
+  observed @1;
+  # The local node has the spec but no local dataplane demand or peer row.
+
+  configuring @2;
+  # The local node has demand and is still configuring the dataplane.
+
+  ready @3;
+  # The local node has active dataplane state for this network.
+
+  error @4;
+  # The local node has a local realization error.
+
+  removing @5;
+  # The local node is removing local dataplane state.
+}
+
 enum AttachmentState {
   pending @0;
   # Attachment requested but not configured.
@@ -232,6 +252,9 @@ struct NetworkInspect {
 
   attachmentCount @2 :UInt32;
   # Total attachment count across peers.
+
+  localRealizationState @3 :NetworkLocalRealizationState;
+  # Derived node-local dataplane state for the responding daemon.
 }
 
 struct NetworkAttachmentSpec {

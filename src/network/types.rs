@@ -272,6 +272,32 @@ impl fmt::Display for NetworkLocalRealizationState {
     }
 }
 
+impl NetworkLocalRealizationState {
+    /// Convert the local-only realization state into the network inspect protocol enum.
+    pub fn to_proto(self) -> mantissa_protocol::network::NetworkLocalRealizationState {
+        match self {
+            NetworkLocalRealizationState::MissingSpec => {
+                mantissa_protocol::network::NetworkLocalRealizationState::MissingSpec
+            }
+            NetworkLocalRealizationState::Observed => {
+                mantissa_protocol::network::NetworkLocalRealizationState::Observed
+            }
+            NetworkLocalRealizationState::Configuring => {
+                mantissa_protocol::network::NetworkLocalRealizationState::Configuring
+            }
+            NetworkLocalRealizationState::Ready => {
+                mantissa_protocol::network::NetworkLocalRealizationState::Ready
+            }
+            NetworkLocalRealizationState::Error => {
+                mantissa_protocol::network::NetworkLocalRealizationState::Error
+            }
+            NetworkLocalRealizationState::Removing => {
+                mantissa_protocol::network::NetworkLocalRealizationState::Removing
+            }
+        }
+    }
+}
+
 /// Declarative description of an eBPF program that should back a network.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BpfProgramSpec {
