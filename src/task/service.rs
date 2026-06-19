@@ -1113,6 +1113,7 @@ fn read_task_start_request(
         id,
         slot_ids,
         owner: None,
+        dependency_requirements: Vec::new(),
         service_placement_preferences: Vec::new(),
         target_node: None,
     })

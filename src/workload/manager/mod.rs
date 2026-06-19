@@ -3,6 +3,7 @@ use crate::network::attachment::{AttachmentProvisioner, AttachmentProvisionerApi
 use crate::network::controller::NetworkController;
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
+use crate::network::types::NetworkServiceDependencyRequirement;
 use crate::network::types::{NetworkAttachmentState, NetworkStatus};
 use crate::registry::Registry;
 use crate::runtime::set::RuntimeSet;
@@ -585,6 +586,8 @@ pub struct WorkloadStartRequest {
     pub slot_ids: Vec<SlotId>,
     /// Optional exclusive controller owner for this workload row.
     pub owner: Option<WorkloadOwner>,
+    /// Service-template backends this workload must see locally before target admission succeeds.
+    pub dependency_requirements: Vec<NetworkServiceDependencyRequirement>,
     /// Service-only soft placement preferences applied before the generic strategy.
     pub service_placement_preferences: Vec<ServicePlacementPreference>,
     /// Placement hint used by the scheduler when a task must land on a specific node.
@@ -1022,6 +1025,7 @@ impl WorkloadManager {
             id: None,
             slot_ids: Vec::new(),
             owner: None,
+            dependency_requirements: Vec::new(),
             service_placement_preferences: Vec::new(),
             target_node: None,
         };

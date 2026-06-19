@@ -1,3 +1,4 @@
+use crate::network::types::NetworkServiceDependencyRequirement;
 use crate::workload::capnp_codec::{
     decode_env_vars, decode_placement_policy, decode_port_bindings, decode_secret_files,
     decode_task_liveness_probe, decode_task_restart_policy, decode_volume_mounts, encode_env_vars,
@@ -24,9 +25,9 @@ use mantissa_protocol::workload::{
     AdmissionGroupPhase as ProtoAdmissionGroupPhase,
     ServiceShardAssignmentFailureKind as ProtoServiceShardAssignmentFailureKind,
     WorkloadStateFilter as ProtoWorkloadStateFilter, admission_group_record,
-    service_generation_progress_record, service_shard_assignment_request, workload,
-    workload_assignment_batch_request, workload_event, workload_list_request, workload_spec,
-    workload_start_request, workload_status,
+    service_dependency_requirement, service_generation_progress_record,
+    service_shard_assignment_request, workload, workload_assignment_batch_request, workload_event,
+    workload_list_request, workload_spec, workload_start_request, workload_status,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::io::Cursor;
@@ -790,6 +791,11 @@ pub(crate) fn write_start_request(
         networks.set(index as u32, network_id.as_bytes());
     }
 
+    let mut dependencies = builder
+        .reborrow()
+        .init_dependencies(request.dependency_requirements.len() as u32);
+    encode_dependency_requirements(&mut dependencies, &request.dependency_requirements);
+
     let mut volumes = builder
         .reborrow()
         .init_volumes(request.execution.volumes.len() as u32);
@@ -819,6 +825,34 @@ pub(crate) fn write_start_request(
     write_owner(builder.reborrow().init_owner(), request.owner.as_ref());
 }
 
+/// Encodes service dependency requirements used by target-side scheduler admission.
+fn encode_dependency_requirements(
+    builder: &mut capnp::struct_list::Builder<service_dependency_requirement::Owned>,
+    requirements: &[NetworkServiceDependencyRequirement],
+) {
+    for (index, requirement) in requirements.iter().enumerate() {
+        let mut entry = builder.reborrow().get(index as u32);
+        entry.set_network_id(requirement.network_id.as_bytes());
+        entry.set_service_name(&requirement.service_name);
+        entry.set_template_name(&requirement.template_name);
+    }
+}
+
+/// Decodes service dependency requirements from a service-shard start request.
+fn decode_dependency_requirements(
+    reader: capnp::struct_list::Reader<service_dependency_requirement::Owned>,
+) -> Result<Vec<NetworkServiceDependencyRequirement>, Error> {
+    let mut requirements = Vec::with_capacity(reader.len() as usize);
+    for entry in reader.iter() {
+        requirements.push(NetworkServiceDependencyRequirement {
+            network_id: read_id_from_data(entry.get_network_id()?)?,
+            service_name: entry.get_service_name()?.to_str()?.to_string(),
+            template_name: entry.get_template_name()?.to_str()?.to_string(),
+        });
+    }
+    Ok(requirements)
+}
+
 /// Decodes one workload start request from a service-shard coordinator payload.
 fn read_start_request(
     reader: workload_start_request::Reader<'_>,
@@ -842,6 +876,7 @@ fn read_start_request(
     for entry in reader.get_networks()?.iter() {
         networks.push(read_id_from_data(entry?)?);
     }
+    let dependency_requirements = decode_dependency_requirements(reader.get_dependencies()?)?;
 
     let mut pre_stop_command = Vec::new();
     for arg in reader.get_pre_stop_command()?.iter() {
@@ -889,6 +924,7 @@ fn read_start_request(
         id: read_optional_id_from_data(reader.get_id()?)?,
         slot_ids,
         owner: read_owner(reader.get_owner()?)?,
+        dependency_requirements,
         service_placement_preferences: Vec::new(),
         target_node: read_optional_id_from_data(reader.get_target_node_id()?)?,
     })

@@ -515,6 +515,7 @@ mod tests {
             owner: Some(WorkloadOwner::ServiceReplica(
                 WorkloadServiceMetadata::new(service_name, "web").with_service_epoch(service_epoch),
             )),
+            dependency_requirements: Vec::new(),
             service_placement_preferences: Vec::new(),
             target_node: Some(target_node),
         }

@@ -881,6 +881,7 @@ impl ServiceController {
                 service_id,
                 service_epoch,
                 &template,
+                &task_templates,
                 &assignments,
                 &slot_targets,
             );
@@ -1049,6 +1050,7 @@ impl ServiceController {
                     service_id,
                     deployment.service_epoch,
                     template,
+                    deployment.task_templates,
                     assignments,
                     slot_targets,
                 ));

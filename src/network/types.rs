@@ -4,6 +4,18 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use uuid::Uuid;
 
+/// Admission-time requirement for a service dependency visible on one local network.
+///
+/// This is transient launch metadata rather than replicated network state. It lets a target node
+/// realize the network first, refresh local service discovery, and only then accept a dependent
+/// workload whose startup assumes the upstream service name already resolves.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct NetworkServiceDependencyRequirement {
+    pub network_id: Uuid,
+    pub service_name: String,
+    pub template_name: String,
+}
+
 /// Supported driver for network provisioning.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]

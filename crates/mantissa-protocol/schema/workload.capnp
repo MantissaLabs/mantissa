@@ -617,6 +617,20 @@ struct WorkloadStartRequest {
 
   placement @24 :PlacementPolicy;
   # Hard placement policy retained so pinned targets still validate constraints.
+
+  dependencies @25 :List(ServiceDependencyRequirement);
+  # Service-template backends this workload must see locally before target admission succeeds.
+}
+
+struct ServiceDependencyRequirement {
+  networkId @0 :Data;
+  # 16-byte network UUID where the dependency must be routable.
+
+  serviceName @1 :Text;
+  # Owning service name used by service discovery.
+
+  templateName @2 :Text;
+  # Upstream task template name used by service discovery.
 }
 
 struct ServiceShardAssignmentRequest {

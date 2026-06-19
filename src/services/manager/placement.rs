@@ -1,5 +1,5 @@
 use super::*;
-use crate::network::types::NetworkDriver;
+use crate::network::types::{NetworkDriver, NetworkServiceDependencyRequirement};
 
 /// Immutable inputs used to derive deterministic service slot targets.
 pub(super) struct SlotTargetContext<'a> {
@@ -31,13 +31,19 @@ pub(super) fn build_start_requests(
             );
             let key = SlotKey::new(context.service_id, &template.name, replica_number);
             let target_node = slot_targets.get(&key).copied();
-            requests.push(template.replica_start_request(
+            let mut request = template.replica_start_request(
                 context.service_name,
                 context.service_epoch,
                 replica_number,
                 desired_id,
                 target_node,
-            ));
+            );
+            request.dependency_requirements = dependency_requirements_for_template(
+                context.service_name,
+                template,
+                context.task_templates,
+            );
+            requests.push(request);
         }
     }
     Ok(requests)
@@ -49,6 +55,7 @@ pub(super) fn build_missing_template_requests(
     service_id: Uuid,
     service_epoch: u64,
     template: &TaskTemplateSpecValue,
+    task_templates: &[TaskTemplateSpecValue],
     assignments: &BTreeMap<(String, u16), Uuid>,
     slot_targets: &HashMap<SlotKey, Uuid>,
 ) -> Vec<WorkloadStartRequest> {
@@ -66,15 +73,64 @@ pub(super) fn build_missing_template_requests(
         );
         let key = SlotKey::new(service_id, &template.name, replica);
         let target_node = slot_targets.get(&key).copied();
-        requests.push(template.replica_start_request(
+        let mut request = template.replica_start_request(
             service_name,
             service_epoch,
             replica,
             desired_id,
             target_node,
-        ));
+        );
+        request.dependency_requirements =
+            dependency_requirements_for_template(service_name, template, task_templates);
+        requests.push(request);
     }
     requests
+}
+
+/// Builds target-admission dependency checks for upstream templates that share a network.
+fn dependency_requirements_for_template(
+    service_name: &str,
+    template: &TaskTemplateSpecValue,
+    task_templates: &[TaskTemplateSpecValue],
+) -> Vec<NetworkServiceDependencyRequirement> {
+    if template.depends_on.is_empty() || template.execution.networks.is_empty() {
+        return Vec::new();
+    }
+
+    let downstream_networks = template
+        .execution
+        .networks
+        .iter()
+        .map(|network| network.network_id)
+        .collect::<HashSet<_>>();
+    let templates_by_name = task_templates
+        .iter()
+        .map(|candidate| (candidate.name.as_str(), candidate))
+        .collect::<HashMap<_, _>>();
+    let mut requirements = Vec::new();
+    for dependency_name in &template.depends_on {
+        let Some(dependency) = templates_by_name.get(dependency_name.as_str()) else {
+            continue;
+        };
+        for network in &dependency.execution.networks {
+            if downstream_networks.contains(&network.network_id) {
+                requirements.push(NetworkServiceDependencyRequirement {
+                    network_id: network.network_id,
+                    service_name: service_name.to_string(),
+                    template_name: dependency.name.clone(),
+                });
+            }
+        }
+    }
+
+    requirements.sort_by(|left, right| {
+        left.network_id
+            .cmp(&right.network_id)
+            .then_with(|| left.service_name.cmp(&right.service_name))
+            .then_with(|| left.template_name.cmp(&right.template_name))
+    });
+    requirements.dedup();
+    requirements
 }
 
 /// Computes effective slot targets after applying any hard local-volume locality overrides.

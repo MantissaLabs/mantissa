@@ -22,7 +22,7 @@ use crate::workload::model::{
     ExecutionPlatform, WorkloadAdmissionState, WorkloadOwner, WorkloadServiceMetadata,
 };
 use crate::workload::types::{ExecutionSpec, ResolvedExecutionSpec};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -213,6 +213,40 @@ async fn network_contracts_reject_public_port_on_bridge_network() {
     assert!(err.to_string().contains("cannot set public_port on bridge"));
 }
 
+/// Dependency-ordered service replicas carry target-admission checks for shared networks only.
+#[test]
+fn missing_template_requests_include_shared_network_dependency_requirements() {
+    let service_id = Uuid::new_v4();
+    let shared_network = Uuid::new_v4();
+    let isolated_network = Uuid::new_v4();
+    let mut backend = make_public_template("backend", 0, None, None);
+    backend.execution.networks = vec![make_template_network("shared", shared_network)];
+    let mut frontend = make_public_template("frontend", 0, None, None);
+    frontend.depends_on = vec!["backend".to_string()];
+    frontend.execution.networks = vec![
+        make_template_network("shared", shared_network),
+        make_template_network("isolated", isolated_network),
+    ];
+    let templates = vec![backend, frontend.clone()];
+
+    let requests = build_missing_template_requests(
+        "demo",
+        service_id,
+        7,
+        &frontend,
+        &templates,
+        &BTreeMap::new(),
+        &HashMap::new(),
+    );
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].dependency_requirements.len(), 1);
+    let requirement = &requests[0].dependency_requirements[0];
+    assert_eq!(requirement.network_id, shared_network);
+    assert_eq!(requirement.service_name, "demo");
+    assert_eq!(requirement.template_name, "backend");
+}
+
 /// Services in non-terminal states should keep exclusive ownership of their declared ports.
 #[test]
 fn service_reserves_public_ports_until_stop_finishes() {
@@ -329,6 +363,7 @@ fn make_volume_request(
         id: Some(Uuid::new_v4()),
         slot_ids: Vec::new(),
         owner: None,
+        dependency_requirements: Vec::new(),
         service_placement_preferences: Vec::new(),
         target_node,
     }
@@ -346,6 +381,7 @@ fn make_request(target_node: Option<Uuid>) -> WorkloadStartRequest {
         id: Some(Uuid::new_v4()),
         slot_ids: Vec::new(),
         owner: None,
+        dependency_requirements: Vec::new(),
         service_placement_preferences: Vec::new(),
         target_node,
     }

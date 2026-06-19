@@ -6,7 +6,9 @@ use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
 use crate::network::lb::{BackendAddress, BpfLoadBalancer};
 use crate::network::nodeport::{NodePortManager, NodePortMapping, NodePortProtocol};
 use crate::network::registry::NetworkRegistry;
-use crate::network::types::{NetworkAttachmentState, NetworkDriver, NetworkSpecValue};
+use crate::network::types::{
+    NetworkAttachmentState, NetworkDriver, NetworkServiceDependencyRequirement, NetworkSpecValue,
+};
 use crate::registry::Registry;
 use crate::scheduler::placement::PlacementNode;
 use crate::services::registry::ServiceRegistry;
@@ -516,6 +518,28 @@ impl ServiceDiscovery {
         };
 
         refresh_network_services(&runtime).await
+    }
+
+    /// Refresh local discovery and return whether one service dependency has routable backends.
+    ///
+    /// Target-side scheduler admission calls this after network realization. Returning false means
+    /// either the local resolver runtime is not started yet or its current catalog cannot serve at
+    /// least one backend for the requested service template.
+    pub async fn service_dependency_ready(
+        &self,
+        requirement: &NetworkServiceDependencyRequirement,
+    ) -> Result<bool> {
+        let runtime = {
+            let guard = self.servers.lock().await;
+            guard
+                .get(&requirement.network_id)
+                .map(|server| server.runtime.clone())
+        };
+        let Some(runtime) = runtime else {
+            return Ok(false);
+        };
+
+        runtime_service_dependency_ready(&runtime, requirement).await
     }
 
     /// Stop DNS serving and withdraw NodePort mappings for one overlay network.
@@ -1457,6 +1481,43 @@ async fn refresh_network_services(runtime: &DiscoveryRuntime) -> Result<()> {
         .await?;
 
     Ok(())
+}
+
+/// Refresh one discovery runtime and check whether a dependency has selected backends.
+async fn runtime_service_dependency_ready(
+    runtime: &DiscoveryRuntime,
+    requirement: &NetworkServiceDependencyRequirement,
+) -> Result<bool> {
+    refresh_network_services(runtime).await?;
+    let catalog_key = discovery_service_key(&requirement.service_name, &requirement.template_name);
+    let entry = {
+        let guard = runtime.backend_catalog.lock().await;
+        guard.services.get(&catalog_key).cloned()
+    };
+    let Some(entry) = entry else {
+        return Ok(false);
+    };
+
+    let backends = if entry.readiness.is_some() {
+        let guard = runtime.health.lock().await;
+        filter_cached_backends(
+            &guard,
+            requirement.network_id,
+            &entry.discovery_name,
+            entry.candidates.clone(),
+        )
+    } else {
+        entry.candidates.clone()
+    };
+    let selected = normalize_backend_selection(
+        requirement.network_id,
+        &entry.discovery_name,
+        entry.candidates,
+        backends,
+        entry.readiness.is_some(),
+        "dependency-admission",
+    );
+    Ok(!selected.is_empty())
 }
 
 /// Reconcile the host VIP neighbours owned by this local discovery runtime.

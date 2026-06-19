@@ -11,6 +11,7 @@ use mantissa_protocol::workload::workload as workload_rpc;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::network::types::NetworkServiceDependencyRequirement;
 use crate::scheduler::digest::{SchedulerDigestValue, read_scheduler_digest};
 use crate::scheduler::{
     ExactTaskLeaseIntent, GpuReservationRequest, PreparedTaskLease, PreparedTaskLeaseBatch,
@@ -289,6 +290,19 @@ fn write_prepared_leases_for_request(
     }
 }
 
+/// Encodes service dependency requirements carried by one scheduler lease intent.
+fn write_service_dependency_requirements(
+    mut builder: capnp::struct_list::Builder<scheduling::service_dependency_requirement::Owned>,
+    requirements: &[NetworkServiceDependencyRequirement],
+) {
+    for (idx, requirement) in requirements.iter().enumerate() {
+        let mut entry = builder.reborrow().get(idx as u32);
+        entry.set_network_id(requirement.network_id.as_bytes());
+        entry.set_service_name(&requirement.service_name);
+        entry.set_template_name(&requirement.template_name);
+    }
+}
+
 impl WorkloadManager {
     /// Realizes every network needed by local start plans before local scheduler admission.
     async fn ensure_local_networks_ready_for_plans(
@@ -314,6 +328,39 @@ impl WorkloadManager {
             .await
             .context("realize local networks before scheduler admission")
             .map_err(ExecutionError::Retry)
+    }
+
+    /// Verifies local service-discovery dependencies after local network admission has succeeded.
+    async fn ensure_local_dependencies_ready_for_plans(
+        &self,
+        plans: &[BatchStartPlan],
+    ) -> Result<(), ExecutionError> {
+        let Some(controller) = &self.networking.network_controller else {
+            return Ok(());
+        };
+
+        let mut seen = HashSet::new();
+        let mut requirements = Vec::new();
+        for plan in plans {
+            for requirement in &plan.dependency_requirements {
+                if seen.insert(requirement.clone()) {
+                    requirements.push(requirement.clone());
+                }
+            }
+        }
+        if requirements.is_empty() {
+            return Ok(());
+        }
+
+        match controller.service_dependencies_ready(&requirements).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ExecutionError::Retry(anyhow::anyhow!(
+                "service dependency discovery unavailable on local target"
+            ))),
+            Err(err) => Err(ExecutionError::Retry(
+                err.context("check local service dependency discovery"),
+            )),
+        }
     }
 
     /// Applies one structured remote prepare rejection so the next shortlist uses fresher peer state.
@@ -382,6 +429,8 @@ impl WorkloadManager {
         }
 
         self.ensure_local_networks_ready_for_plans(plans).await?;
+        self.ensure_local_dependencies_ready_for_plans(plans)
+            .await?;
 
         let mut slot_requests = Vec::new();
         let mut gpu_requests = Vec::new();
@@ -517,6 +566,8 @@ impl WorkloadManager {
         }
 
         self.ensure_local_networks_ready_for_plans(plans).await?;
+        self.ensure_local_dependencies_ready_for_plans(plans)
+            .await?;
 
         let mut intents = Vec::with_capacity(plans.len());
         for plan in plans {
@@ -944,6 +995,10 @@ impl WorkloadManager {
                 for (network_idx, network_id) in plan.networks.iter().enumerate() {
                     networks.set(network_idx as u32, network_id.as_bytes());
                 }
+                let dependencies = entry
+                    .reborrow()
+                    .init_dependencies(plan.dependency_requirements.len() as u32);
+                write_service_dependency_requirements(dependencies, &plan.dependency_requirements);
             }
         }
 
@@ -986,6 +1041,10 @@ impl WorkloadManager {
                 for (network_idx, network_id) in plan.networks.iter().enumerate() {
                     networks.set(network_idx as u32, network_id.as_bytes());
                 }
+                let dependencies = entry
+                    .reborrow()
+                    .init_dependencies(plan.dependency_requirements.len() as u32);
+                write_service_dependency_requirements(dependencies, &plan.dependency_requirements);
             }
         }
 

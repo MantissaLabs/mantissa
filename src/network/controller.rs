@@ -15,8 +15,8 @@ use crate::network::nodeport::NodePortManager;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
     BpfProgramSpec, NetworkAttachmentState, NetworkDriver, NetworkEvent,
-    NetworkLocalRealizationState, NetworkPeerState, NetworkPeerStateValue, NetworkSpecValue,
-    NetworkStatus,
+    NetworkLocalRealizationState, NetworkPeerState, NetworkPeerStateValue,
+    NetworkServiceDependencyRequirement, NetworkSpecValue, NetworkStatus,
 };
 use crate::network::wireguard::{self, WireGuardUnderlayState};
 use crate::registry::Registry;
@@ -530,6 +530,28 @@ impl NetworkController {
                 "publication refresh failed: {err:#}"
             );
         }
+    }
+
+    /// Return whether all dependency backends are visible through local service discovery.
+    ///
+    /// Scheduler admission invokes this only after local network realization succeeds. Keeping the
+    /// check in the controller lets the target node use the same discovery catalog that answers DNS
+    /// and programs VIP/NodePort state.
+    pub async fn service_dependencies_ready(
+        &self,
+        requirements: &[NetworkServiceDependencyRequirement],
+    ) -> Result<bool> {
+        for requirement in requirements {
+            if !self
+                .inner
+                .discovery
+                .service_dependency_ready(requirement)
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Return the local NodePort manager used by network discovery and public-service publication.

@@ -1539,6 +1539,7 @@ fn demo_binpack_workload_request(name: &str) -> WorkloadStartRequest {
         id: None,
         slot_ids: Vec::new(),
         owner: None,
+        dependency_requirements: Vec::new(),
         service_placement_preferences: Vec::new(),
         target_node: None,
     }
@@ -1578,6 +1579,7 @@ fn demo_owned_preference_workload_request(
             service_name,
             template_name,
         ))),
+        dependency_requirements: Vec::new(),
         service_placement_preferences: preferences,
         target_node: None,
     }

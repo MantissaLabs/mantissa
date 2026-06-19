@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -7,6 +8,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::network::controller::NetworkController;
+use crate::network::types::NetworkServiceDependencyRequirement;
 
 use super::digest::{SchedulerDigestValue, write_scheduler_digest};
 use super::summary::SchedulerSummary;
@@ -54,6 +56,22 @@ impl SchedulerService {
         let mut values = Vec::with_capacity(list.len() as usize);
         for bytes in list.iter() {
             values.push(Self::parse_uuid(bytes?)?);
+        }
+
+        Ok(values)
+    }
+
+    /// Decodes service-template dependency requirements from one scheduler lease intent.
+    fn parse_dependency_requirements(
+        list: capnp::struct_list::Reader<scheduling::service_dependency_requirement::Owned>,
+    ) -> Result<Vec<NetworkServiceDependencyRequirement>, capnp::Error> {
+        let mut values = Vec::with_capacity(list.len() as usize);
+        for entry in list.iter() {
+            values.push(NetworkServiceDependencyRequirement {
+                network_id: Self::parse_uuid(entry.get_network_id()?)?,
+                service_name: entry.get_service_name()?.to_str()?.to_string(),
+                template_name: entry.get_template_name()?.to_str()?.to_string(),
+            });
         }
 
         Ok(values)
@@ -119,6 +137,64 @@ impl SchedulerService {
                 warn!(
                     target: "scheduler",
                     "network admission timed out before lease prepare"
+                );
+                Err(self.current_prepare_rejection_digest().await)
+            }
+        }
+    }
+
+    /// Verifies dependency backends are visible through target-local discovery before prepare.
+    async fn ensure_dependency_admission(
+        &self,
+        requirements: &[NetworkServiceDependencyRequirement],
+    ) -> Result<(), SchedulerDigestValue> {
+        const DEPENDENCY_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+        if requirements.is_empty() {
+            return Ok(());
+        }
+
+        let Some(controller) = &self.network_controller else {
+            warn!(
+                target: "scheduler",
+                "dependency admission failed before lease prepare: network controller unavailable"
+            );
+            return Err(self.current_prepare_rejection_digest().await);
+        };
+
+        let mut seen = HashSet::new();
+        let mut unique_requirements = Vec::new();
+        for requirement in requirements {
+            if seen.insert(requirement.clone()) {
+                unique_requirements.push(requirement.clone());
+            }
+        }
+
+        match timeout(
+            DEPENDENCY_ADMISSION_TIMEOUT,
+            controller.service_dependencies_ready(&unique_requirements),
+        )
+        .await
+        {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) => {
+                warn!(
+                    target: "scheduler",
+                    "dependency admission failed before lease prepare: service discovery has no routable dependency backends"
+                );
+                Err(self.current_prepare_rejection_digest().await)
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    target: "scheduler",
+                    "dependency admission failed before lease prepare: {err}"
+                );
+                Err(self.current_prepare_rejection_digest().await)
+            }
+            Err(_) => {
+                warn!(
+                    target: "scheduler",
+                    "dependency admission timed out before lease prepare"
                 );
                 Err(self.current_prepare_rejection_digest().await)
             }
@@ -263,9 +339,13 @@ impl scheduler::Server for SchedulerService {
 
         let mut reservations = Vec::with_capacity(intents.len() as usize);
         let mut required_networks = Vec::new();
+        let mut dependency_requirements = Vec::new();
         for intent in intents.iter() {
             let task_id = Self::parse_uuid(intent.get_task_id()?)?;
             required_networks.extend(Self::parse_uuid_list(intent.get_networks()?)?);
+            dependency_requirements.extend(Self::parse_dependency_requirements(
+                intent.get_dependencies()?,
+            )?);
             reservations.push(TaskLeaseIntent {
                 task_id,
                 cpu_millis: intent.get_cpu_millis(),
@@ -276,6 +356,17 @@ impl scheduler::Server for SchedulerService {
 
         let mut response = results.get().init_response();
         if let Err(digest) = self.ensure_network_admission(&required_networks).await {
+            Self::write_prepare_rejection(
+                scheduling::PrepareLeasesRejectionReason::NetworkUnavailable,
+                &digest,
+                response.reborrow(),
+            );
+            return Ok(());
+        }
+        if let Err(digest) = self
+            .ensure_dependency_admission(&dependency_requirements)
+            .await
+        {
             Self::write_prepare_rejection(
                 scheduling::PrepareLeasesRejectionReason::NetworkUnavailable,
                 &digest,
@@ -339,9 +430,13 @@ impl scheduler::Server for SchedulerService {
 
         let mut reservations = Vec::with_capacity(intents.len() as usize);
         let mut required_networks = Vec::new();
+        let mut dependency_requirements = Vec::new();
         for intent in intents.iter() {
             let task_id = Self::parse_uuid(intent.get_task_id()?)?;
             required_networks.extend(Self::parse_uuid_list(intent.get_networks()?)?);
+            dependency_requirements.extend(Self::parse_dependency_requirements(
+                intent.get_dependencies()?,
+            )?);
             reservations.push(TaskLeaseIntent {
                 task_id,
                 cpu_millis: intent.get_cpu_millis(),
@@ -352,6 +447,17 @@ impl scheduler::Server for SchedulerService {
 
         let mut response = results.get().init_response();
         if let Err(digest) = self.ensure_network_admission(&required_networks).await {
+            Self::write_prepare_rejection(
+                scheduling::PrepareLeasesRejectionReason::NetworkUnavailable,
+                &digest,
+                response.reborrow(),
+            );
+            return Ok(());
+        }
+        if let Err(digest) = self
+            .ensure_dependency_admission(&dependency_requirements)
+            .await
+        {
             Self::write_prepare_rejection(
                 scheduling::PrepareLeasesRejectionReason::NetworkUnavailable,
                 &digest,

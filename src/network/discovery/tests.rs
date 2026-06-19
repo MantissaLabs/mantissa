@@ -4,7 +4,8 @@ use crate::network::allocator::allocate_overlay_address;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
     NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver,
-    NetworkPeerState, NetworkPeerStateValue, NetworkSpecDraft, NetworkSpecValue,
+    NetworkPeerState, NetworkPeerStateValue, NetworkServiceDependencyRequirement, NetworkSpecDraft,
+    NetworkSpecValue,
 };
 use crate::registry::Registry;
 use crate::services::registry::ServiceRegistry;
@@ -1067,6 +1068,72 @@ async fn backend_catalog_refresh_invalidates_on_peer_change_clock() {
             .unwrap_or_default(),
         1,
         "ready peer state should re-admit the backend into discovery"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn service_dependency_ready_tracks_routable_backend_catalog() {
+    let harness = setup_catalog_harness().await;
+    let service_name = "backend-service";
+    let node_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    upsert_catalog_service(
+        &harness.services,
+        service_name,
+        harness.network.id,
+        vec![task_id],
+    )
+    .await;
+
+    harness
+        .workloads
+        .upsert(
+            &UuidKey::from(task_id),
+            catalog_task(task_id, node_id, service_name, harness.network.id).into(),
+        )
+        .await
+        .expect("upsert running task");
+    harness
+        .registry
+        .upsert_attachment(catalog_attachment(
+            task_id,
+            node_id,
+            harness.network.id,
+            Ipv4Addr::new(10, 88, 1, 10),
+            service_name,
+        ))
+        .await
+        .expect("upsert ready attachment");
+
+    let requirement = NetworkServiceDependencyRequirement {
+        network_id: harness.network.id,
+        service_name: service_name.to_string(),
+        template_name: "backend".to_string(),
+    };
+    assert!(
+        !runtime_service_dependency_ready(&harness.runtime, &requirement)
+            .await
+            .expect("check dependency before peer readiness"),
+        "dependency admission should reject until discovery has a routable backend"
+    );
+
+    harness
+        .registry
+        .upsert_peer_state(NetworkPeerStateValue::new(
+            harness.network.id,
+            node_id,
+            "backend-node",
+            NetworkPeerState::Ready,
+            None,
+        ))
+        .await
+        .expect("upsert ready peer state");
+
+    assert!(
+        runtime_service_dependency_ready(&harness.runtime, &requirement)
+            .await
+            .expect("check dependency after peer readiness"),
+        "dependency admission should pass once the target catalog has a routable backend"
     );
 }
 

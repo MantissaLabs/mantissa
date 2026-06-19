@@ -307,6 +307,20 @@ struct LeaseIntent {
 
   networks @4 :List(Data);
   # Required 16-byte network UUIDs that must be locally realized before prepare succeeds.
+
+  dependencies @5 :List(ServiceDependencyRequirement);
+  # Service-template backends that must be visible through local discovery after network admission.
+}
+
+struct ServiceDependencyRequirement {
+  networkId @0 :Data;
+  # 16-byte network UUID where the dependency must be routable.
+
+  serviceName @1 :Text;
+  # Owning service name used by service discovery.
+
+  templateName @2 :Text;
+  # Upstream task template name used by service discovery.
 }
 
 struct PreparedLease {

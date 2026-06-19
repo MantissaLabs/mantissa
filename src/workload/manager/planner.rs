@@ -12,6 +12,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::gpu::gpu_runtime_status;
+use crate::network::types::NetworkServiceDependencyRequirement;
 use crate::runtime::types::{RuntimeInstanceRef, RuntimeSupportProfile};
 use crate::scheduler::digest::SchedulerDigestValue;
 use crate::scheduler::placement::{
@@ -144,6 +145,7 @@ pub(super) struct BatchStartPlan {
     pub(super) networks: Vec<Uuid>,
     pub(super) ports: Vec<WorkloadPortBinding>,
     pub(super) owner: Option<WorkloadOwner>,
+    pub(super) dependency_requirements: Vec<NetworkServiceDependencyRequirement>,
 }
 
 impl BatchStartPlan {
@@ -184,6 +186,7 @@ pub(super) struct StartIntent {
     pub(super) placement: PlacementPolicy,
     pub(super) service_placement_preferences: Vec<ServicePlacementPreference>,
     pub(super) owner: Option<WorkloadOwner>,
+    pub(super) dependency_requirements: Vec<NetworkServiceDependencyRequirement>,
     pub(super) target_node: Option<Uuid>,
 }
 
@@ -1140,6 +1143,7 @@ pub(super) struct RemoteStartPlan {
     pub(super) networks: Vec<Uuid>,
     pub(super) ports: Vec<WorkloadPortBinding>,
     pub(super) owner: Option<WorkloadOwner>,
+    pub(super) dependency_requirements: Vec<NetworkServiceDependencyRequirement>,
 }
 
 #[derive(Clone)]
@@ -1263,6 +1267,7 @@ impl WorkloadManager {
                 owner,
                 service_placement_preferences,
                 target_node,
+                dependency_requirements,
             } = request;
             validate_execution_resource_request(
                 &format!("workload '{name}'"),
@@ -1336,6 +1341,7 @@ impl WorkloadManager {
                 placement: execution.placement,
                 service_placement_preferences,
                 owner,
+                dependency_requirements,
                 target_node,
             });
         }
@@ -1664,6 +1670,7 @@ impl WorkloadManager {
                 networks: intent.networks.clone(),
                 ports: intent.ports.clone(),
                 owner: intent.owner.clone(),
+                dependency_requirements: intent.dependency_requirements.clone(),
             });
         }
 
@@ -2281,6 +2288,7 @@ impl WorkloadManager {
                     networks: intent.networks.clone(),
                     ports: intent.ports.clone(),
                     owner: intent.owner.clone(),
+                    dependency_requirements: intent.dependency_requirements.clone(),
                 });
             }
             CandidateLocation::Remote { peer_id } => {
@@ -2308,6 +2316,7 @@ impl WorkloadManager {
                     networks: intent.networks.clone(),
                     ports: intent.ports.clone(),
                     owner: intent.owner.clone(),
+                    dependency_requirements: intent.dependency_requirements.clone(),
                 });
             }
         }
@@ -2413,6 +2422,7 @@ mod tests {
             ports: Vec::new(),
             placement: Default::default(),
             owner: None,
+            dependency_requirements: Vec::new(),
             service_placement_preferences: Vec::new(),
             target_node: None,
         };
@@ -2489,6 +2499,7 @@ mod tests {
             ports: Vec::new(),
             placement: Default::default(),
             owner: None,
+            dependency_requirements: Vec::new(),
             service_placement_preferences: Vec::new(),
             target_node: None,
         };

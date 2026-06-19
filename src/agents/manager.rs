@@ -728,6 +728,7 @@ impl AgentController {
                 session.name.clone(),
                 run.id,
             ))),
+            dependency_requirements: Vec::new(),
             service_placement_preferences: Vec::new(),
             target_node: None,
         };

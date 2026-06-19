@@ -782,6 +782,7 @@ impl TaskTemplateSpecValue {
                 WorkloadServiceMetadata::new(service_name, &self.name)
                     .with_service_epoch(service_epoch),
             )),
+            dependency_requirements: Vec::new(),
             service_placement_preferences: self.placement_preferences.clone(),
             target_node,
         }

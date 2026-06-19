@@ -560,6 +560,7 @@ impl JobController {
                 latest.id,
                 latest.name.clone(),
             ))),
+            dependency_requirements: Vec::new(),
             service_placement_preferences: Vec::new(),
             target_node: None,
         };
