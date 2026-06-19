@@ -35,8 +35,8 @@ use std::future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc::UnboundedReceiver};
-use tokio::time::Duration;
-use tracing::{debug, warn};
+use tokio::time::{Duration, sleep};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Default periodic reconciliation interval for drift detection when no events are pending.
@@ -64,6 +64,10 @@ const LINK_STATE_SETTLE_ATTEMPTS: usize = 10;
 const LINK_STATE_SETTLE_DELAY: Duration = Duration::from_millis(20);
 /// Number of netlink update retries after a transient link-state failure.
 const LINK_STATE_UPDATE_RETRIES: usize = 2;
+/// Maximum time one local-use admission may wait for on-demand realization to converge.
+const LOCAL_REALIZATION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Short delay between local-use realization retries while admission is waiting.
+const LOCAL_REALIZATION_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub struct NetworkController {
@@ -445,6 +449,63 @@ impl NetworkController {
             return Ok(());
         }
 
+        self.add_explicit_local_demand(network_id).await;
+        self.schedule_spec_change(network_id).await;
+        info!(
+            target: "network",
+            network = %network_id,
+            timeout_ms = LOCAL_REALIZATION_ADMISSION_TIMEOUT.as_millis() as u64,
+            "waiting for local network realization before workload admission"
+        );
+
+        let deadline = std::time::Instant::now() + LOCAL_REALIZATION_ADMISSION_TIMEOUT;
+        let mut attempts = 0usize;
+        let last_error = loop {
+            if self.local_network_ready(network_id).await? {
+                return Ok(());
+            }
+
+            attempts = attempts.saturating_add(1);
+            let attempt_error = match self.realize_network_once_for_local_use(network_id).await {
+                Ok(()) => {
+                    if self.local_network_ready(network_id).await? {
+                        return Ok(());
+                    }
+                    anyhow!(
+                        "network {network_id} reconciliation completed without local ready state"
+                    )
+                }
+                Err(err) => err,
+            };
+
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break attempt_error;
+            }
+
+            self.schedule_spec_change(network_id).await;
+            let remaining = deadline.saturating_duration_since(now);
+            let delay = if remaining < LOCAL_REALIZATION_RETRY_INTERVAL {
+                remaining
+            } else {
+                LOCAL_REALIZATION_RETRY_INTERVAL
+            };
+            sleep(delay).await;
+        };
+
+        if !self.has_local_attachment_demand(network_id)? {
+            self.remove_explicit_local_demand(network_id).await;
+        }
+
+        self.update_peer_state_error(network_id, format!("{last_error:#}"))
+            .await?;
+        Err(last_error.context(format!(
+            "timed out waiting for local network {network_id} realization after {attempts} attempt(s)"
+        )))
+    }
+
+    /// Perform one local realization attempt for a network already demanded by admission.
+    async fn realize_network_once_for_local_use(&self, network_id: Uuid) -> Result<()> {
         let spec = self
             .inner
             .registry
@@ -455,24 +516,9 @@ impl NetworkController {
             anyhow::bail!("network {network_id} is deleted");
         }
 
-        self.add_explicit_local_demand(network_id).await;
-        let result = async {
-            let _ = self.mark_peer_configuring(network_id).await?;
-            let _ = self.reconcile_wireguard_underlay().await?;
-            self.reconcile_network(spec).await
-        }
-        .await;
-
-        if let Err(err) = result {
-            let message = format!("{err:#}");
-            self.update_peer_state_error(network_id, message).await?;
-            if !self.has_local_attachment_demand(network_id)? {
-                self.remove_explicit_local_demand(network_id).await;
-            }
-            return Err(err.context(format!("realize network {network_id} for local use")));
-        }
-
-        Ok(())
+        let _ = self.mark_peer_configuring(network_id).await?;
+        let _ = self.reconcile_wireguard_underlay().await?;
+        self.reconcile_network(spec).await
     }
 
     /// Return a stable per-network lock used to serialize local realization/teardown.

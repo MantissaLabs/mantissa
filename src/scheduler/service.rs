@@ -106,7 +106,7 @@ impl SchedulerService {
         &self,
         networks: &[Uuid],
     ) -> Result<(), SchedulerDigestValue> {
-        const NETWORK_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+        const NETWORK_ADMISSION_TIMEOUT: Duration = Duration::from_secs(65);
 
         let Some(controller) = &self.network_controller else {
             return Ok(());
@@ -129,7 +129,7 @@ impl SchedulerService {
             Ok(Err(err)) => {
                 warn!(
                     target: "scheduler",
-                    "network admission failed before lease prepare: {err}"
+                    "network admission failed before lease prepare: {err:#}"
                 );
                 Err(self.current_prepare_rejection_digest().await)
             }
