@@ -14,8 +14,9 @@ use crate::network::naming::{
 use crate::network::nodeport::NodePortManager;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
-    BpfProgramSpec, NetworkAttachmentState, NetworkDriver, NetworkEvent, NetworkPeerState,
-    NetworkPeerStateValue, NetworkSpecValue, NetworkStatus,
+    BpfProgramSpec, NetworkAttachmentState, NetworkDriver, NetworkEvent,
+    NetworkLocalRealizationState, NetworkPeerState, NetworkPeerStateValue, NetworkSpecValue,
+    NetworkStatus,
 };
 use crate::network::wireguard::{self, WireGuardUnderlayState};
 use crate::registry::Registry;
@@ -282,6 +283,39 @@ impl NetworkController {
         }
 
         Ok(())
+    }
+
+    /// Return the local node's effective network realization state without writing replicated rows.
+    pub async fn local_realization_state(
+        &self,
+        network_id: Uuid,
+    ) -> Result<NetworkLocalRealizationState> {
+        let spec = self
+            .inner
+            .registry
+            .get_spec(network_id)
+            .with_context(|| format!("load network spec {network_id} for local state"))?;
+        let spec_observed = spec.as_ref().is_some_and(|spec| !spec.is_deleted());
+        let local_demand = self.local_network_demand_snapshot().await?;
+        let has_local_demand = spec
+            .as_ref()
+            .is_some_and(|spec| Self::spec_has_local_realization_demand(spec, &local_demand));
+        let peer_state = self
+            .inner
+            .registry
+            .get_peer_state(network_id, self.inner.node_id)
+            .with_context(|| format!("load local peer state for network {network_id}"))?;
+        let active = {
+            let guard = self.inner.active_networks.lock().await;
+            guard.contains(&network_id)
+        };
+
+        Ok(Self::derive_local_realization_state(
+            spec_observed,
+            peer_state.as_ref(),
+            has_local_demand,
+            active,
+        ))
     }
 
     /// Release local on-demand network realization once all local references are gone.
@@ -697,6 +731,43 @@ impl NetworkController {
         local_demand: &HashSet<Uuid>,
     ) -> bool {
         !spec.is_deleted() && (spec.realizes_on_all_nodes() || local_demand.contains(&spec.id))
+    }
+
+    /// Derive the local realization state from spec visibility, demand, peer state, and activity.
+    fn derive_local_realization_state(
+        spec_observed: bool,
+        peer_state: Option<&NetworkPeerStateValue>,
+        has_local_demand: bool,
+        active: bool,
+    ) -> NetworkLocalRealizationState {
+        if !spec_observed {
+            return match peer_state.map(|state| state.state) {
+                Some(NetworkPeerState::Error) => NetworkLocalRealizationState::Error,
+                Some(NetworkPeerState::Removing) => NetworkLocalRealizationState::Removing,
+                _ => NetworkLocalRealizationState::MissingSpec,
+            };
+        }
+
+        let Some(peer_state) = peer_state else {
+            return if has_local_demand {
+                NetworkLocalRealizationState::Configuring
+            } else {
+                NetworkLocalRealizationState::Observed
+            };
+        };
+
+        if peer_state.error.is_some() || peer_state.state == NetworkPeerState::Error {
+            return NetworkLocalRealizationState::Error;
+        }
+
+        match peer_state.state {
+            NetworkPeerState::Ready if active => NetworkLocalRealizationState::Ready,
+            NetworkPeerState::Ready
+            | NetworkPeerState::Configuring
+            | NetworkPeerState::AwaitingSpec => NetworkLocalRealizationState::Configuring,
+            NetworkPeerState::Error => NetworkLocalRealizationState::Error,
+            NetworkPeerState::Removing => NetworkLocalRealizationState::Removing,
+        }
     }
 
     /// List every non-deleted network that currently expects a local dataplane reconcile.

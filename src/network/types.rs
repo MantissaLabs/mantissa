@@ -229,6 +229,37 @@ impl NetworkPeerState {
     }
 }
 
+/// Local, derived view of a network's realization state on one node.
+///
+/// This is intentionally not replicated. `Observed` means the local node has the
+/// network spec but has no current local demand or peer-state row, so no bridge,
+/// VXLAN, BPF, DNS, or forwarding state should be expected yet.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkLocalRealizationState {
+    MissingSpec,
+    Observed,
+    Configuring,
+    Ready,
+    Error,
+    Removing,
+}
+
+impl fmt::Display for NetworkLocalRealizationState {
+    /// Render the local realization state as the stable operator-facing token.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            NetworkLocalRealizationState::MissingSpec => "missing_spec",
+            NetworkLocalRealizationState::Observed => "observed",
+            NetworkLocalRealizationState::Configuring => "configuring",
+            NetworkLocalRealizationState::Ready => "ready",
+            NetworkLocalRealizationState::Error => "error",
+            NetworkLocalRealizationState::Removing => "removing",
+        };
+        f.write_str(label)
+    }
+}
+
 /// Declarative description of an eBPF program that should back a network.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BpfProgramSpec {

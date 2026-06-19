@@ -1,7 +1,8 @@
 use super::{NetworkController, collect_orphaned_network_suffixes, is_managed_overlay_link_name};
 use crate::ingress::types::IngressPoolSpecDraft;
 use crate::network::types::{
-    NetworkDriver, NetworkRealizationPolicy, NetworkSpecDraft, NetworkSpecValue, NetworkStatus,
+    NetworkDriver, NetworkLocalRealizationState, NetworkPeerState, NetworkPeerStateValue,
+    NetworkRealizationPolicy, NetworkSpecDraft, NetworkSpecValue, NetworkStatus,
 };
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::scheduler::placement::{
@@ -178,6 +179,70 @@ fn on_demand_network_specs_require_explicit_local_realization_demand() {
     assert!(
         NetworkController::spec_has_local_realization_demand(&spec, &local_demand),
         "on_demand specs should realize when local workload or ingress demand exists"
+    );
+}
+
+#[test]
+fn local_realization_state_observes_cold_on_demand_spec_without_writing_peer_row() {
+    let spec = test_network_spec("observed", NetworkRealizationPolicy::OnDemand);
+
+    let state = NetworkController::derive_local_realization_state(true, None, false, false);
+
+    assert_eq!(state, NetworkLocalRealizationState::Observed);
+    assert!(
+        !NetworkController::spec_has_local_realization_demand(&spec, &HashSet::new()),
+        "cold on_demand specs should remain observed-only until local demand exists"
+    );
+}
+
+#[test]
+fn local_realization_state_configures_when_demand_exists_before_peer_row() {
+    let state = NetworkController::derive_local_realization_state(true, None, true, false);
+
+    assert_eq!(state, NetworkLocalRealizationState::Configuring);
+}
+
+#[test]
+fn local_realization_state_requires_active_dataplane_for_ready() {
+    let network_id = Uuid::new_v4();
+    let peer_id = Uuid::new_v4();
+    let peer =
+        NetworkPeerStateValue::new(network_id, peer_id, "local", NetworkPeerState::Ready, None);
+
+    assert_eq!(
+        NetworkController::derive_local_realization_state(true, Some(&peer), true, false),
+        NetworkLocalRealizationState::Configuring,
+        "a stale ready peer row without active local dataplane should not be treated as ready"
+    );
+    assert_eq!(
+        NetworkController::derive_local_realization_state(true, Some(&peer), true, true),
+        NetworkLocalRealizationState::Ready
+    );
+}
+
+#[test]
+fn local_realization_state_reports_missing_spec_without_observed_row() {
+    assert_eq!(
+        NetworkController::derive_local_realization_state(false, None, false, false),
+        NetworkLocalRealizationState::MissingSpec
+    );
+}
+
+#[test]
+fn local_realization_state_preserves_peer_error() {
+    let network_id = Uuid::new_v4();
+    let peer_id = Uuid::new_v4();
+    let peer = NetworkPeerStateValue::new(
+        network_id,
+        peer_id,
+        "local",
+        NetworkPeerState::Configuring,
+        Some("wireguard underlay not ready".to_string()),
+    );
+
+    assert_eq!(
+        NetworkController::derive_local_realization_state(true, Some(&peer), true, false),
+        NetworkLocalRealizationState::Error
     );
 }
 
