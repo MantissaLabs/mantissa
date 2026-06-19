@@ -75,43 +75,43 @@ pub async fn endpoints(
         .map_err(worker_error_to_rest)
 }
 
-/// Fetches one ingress pool by exact name.
+/// Fetches one ingress pool by exact UUID or exact name.
 #[utoipa::path(
     get,
-    path = "/v1/ingress/{name}",
+    path = "/v1/ingress/{selector}",
     tag = "ingress",
-    params(("name" = String, Path, description = "Ingress pool name.")),
+    params(("selector" = String, Path, description = "Ingress pool name or UUID.")),
     responses((status = 200, description = "Ingress pool inspection response.", body = IngressPoolSpec))
 )]
 pub async fn get(
     State(state): State<AppState>,
     _auth: RestAuth,
-    Path(name): Path<String>,
+    Path(selector): Path<String>,
 ) -> Result<Json<IngressPoolSpec>, RestError> {
     state
         .client()
-        .get_ingress_pool(name)
+        .get_ingress_pool(selector)
         .await
         .map(Json)
         .map_err(worker_error_to_rest)
 }
 
-/// Deletes one ingress pool by exact name.
+/// Deletes one ingress pool by exact UUID or exact name.
 #[utoipa::path(
     delete,
-    path = "/v1/ingress/{name}",
+    path = "/v1/ingress/{selector}",
     tag = "ingress",
-    params(("name" = String, Path, description = "Ingress pool name.")),
+    params(("selector" = String, Path, description = "Ingress pool name or UUID.")),
     responses((status = 200, description = "Deleted ingress pool count.", body = IngressPoolDeleteResponse))
 )]
 pub async fn delete(
     State(state): State<AppState>,
     _auth: RestAuth,
-    Path(name): Path<String>,
+    Path(selector): Path<String>,
 ) -> Result<Json<IngressPoolDeleteResponse>, RestError> {
     state
         .client()
-        .delete_ingress_pool(name)
+        .delete_ingress_pool(selector)
         .await
         .map(Json)
         .map_err(worker_error_to_rest)

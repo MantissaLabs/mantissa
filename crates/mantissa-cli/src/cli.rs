@@ -1571,16 +1571,16 @@ pub struct IngressApplyArgs {
 
 #[derive(Args, Debug)]
 pub struct IngressInspectArgs {
-    /// Ingress pool name to inspect
-    #[arg(index = 1, value_name = "NAME")]
-    pub name: String,
+    /// Ingress pool name or UUID to inspect
+    #[arg(index = 1, value_name = "NAME_OR_ID")]
+    pub selector: String,
 }
 
 #[derive(Args, Debug)]
 pub struct IngressDeleteArgs {
-    /// Ingress pool name to delete
-    #[arg(index = 1, value_name = "NAME")]
-    pub name: String,
+    /// Ingress pool name or UUID to delete
+    #[arg(index = 1, value_name = "NAME_OR_ID")]
+    pub selector: String,
 }
 
 #[derive(Args, Debug, Default)]
@@ -2028,6 +2028,29 @@ mod tests {
             Command::Ingress {
                 cmd: IngressCommand::Apply(IngressApplyArgs { file })
             } if file.as_path() == std::path::Path::new("public-web.ron")
+        ));
+
+        let inspect =
+            MantissaCli::try_parse_from(["mantissa", "ingress", "inspect", "public-web"]).unwrap();
+        assert!(matches!(
+            inspect.cmd,
+            Command::Ingress {
+                cmd: IngressCommand::Inspect(IngressInspectArgs { selector })
+            } if selector == "public-web"
+        ));
+
+        let delete = MantissaCli::try_parse_from([
+            "mantissa",
+            "ingress",
+            "delete",
+            "44d38008-d576-8ef0-70b9-6dd107ea6337",
+        ])
+        .unwrap();
+        assert!(matches!(
+            delete.cmd,
+            Command::Ingress {
+                cmd: IngressCommand::Delete(IngressDeleteArgs { selector })
+            } if selector == "44d38008-d576-8ef0-70b9-6dd107ea6337"
         ));
 
         let endpoints = MantissaCli::try_parse_from([

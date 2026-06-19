@@ -7,13 +7,13 @@ interface Ingress {
   # Create or replace one replicated ingress pool spec.
 
   delete @1 (name :Text);
-  # Delete one ingress pool by exact name.
+  # Delete one ingress pool by exact UUID or exact name.
 
   list @2 () -> (pools :List(IngressPoolSpec));
   # List replicated ingress pools visible to the local node.
 
   inspect @3 (name :Text) -> (pool :IngressPoolSpec);
-  # Fetch one ingress pool by exact name.
+  # Fetch one ingress pool by exact UUID or exact name.
 
   endpoints @4 (filter :IngressEndpointFilter) -> (endpoints :List(IngressEndpoint));
   # List public endpoint target rows from nodes selected by replicated ingress intent.

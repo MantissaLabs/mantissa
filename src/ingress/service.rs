@@ -100,6 +100,17 @@ impl IngressRpc {
         }
         Ok(value)
     }
+
+    /// Resolves an ingress-pool selector as an exact UUID first, then as an exact pool name.
+    fn get_pool_by_selector(&self, selector: &str) -> Result<Option<IngressPoolSpecValue>, Error> {
+        let selector = selector.trim();
+        if let Ok(id) = Uuid::parse_str(selector)
+            && let Some(pool) = self.pools.get(id).map_err(to_capnp)?
+        {
+            return Ok(Some(pool));
+        }
+        self.pools.get_by_name(selector).map_err(to_capnp)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -760,7 +771,7 @@ impl ingress::Server for IngressRpc {
         Ok(())
     }
 
-    /// Deletes one ingress pool by exact name.
+    /// Deletes one ingress pool by exact UUID or exact name.
     async fn delete(
         self: Rc<Self>,
         params: ingress::DeleteParams,
@@ -768,12 +779,11 @@ impl ingress::Server for IngressRpc {
     ) -> Result<(), Error> {
         self.topology
             .ensure_no_active_cluster_operation("delete ingress pool")?;
-        let name = Self::read_non_empty_text(params.get()?.get_name()?, "ingress pool name")?;
+        let selector =
+            Self::read_non_empty_text(params.get()?.get_name()?, "ingress pool selector")?;
         let pool = self
-            .pools
-            .get_by_name(&name)
-            .map_err(to_capnp)?
-            .ok_or_else(|| Error::failed(format!("ingress pool '{name}' not found")))?;
+            .get_pool_by_selector(&selector)?
+            .ok_or_else(|| Error::failed(format!("ingress pool '{selector}' not found")))?;
         self.pools.remove(pool.id).await.map_err(to_capnp)?;
         Ok(())
     }
@@ -792,18 +802,17 @@ impl ingress::Server for IngressRpc {
         Ok(())
     }
 
-    /// Fetches one ingress pool by exact name.
+    /// Fetches one ingress pool by exact UUID or exact name.
     async fn inspect(
         self: Rc<Self>,
         params: ingress::InspectParams,
         mut results: ingress::InspectResults,
     ) -> Result<(), Error> {
-        let name = Self::read_non_empty_text(params.get()?.get_name()?, "ingress pool name")?;
+        let selector =
+            Self::read_non_empty_text(params.get()?.get_name()?, "ingress pool selector")?;
         let pool = self
-            .pools
-            .get_by_name(&name)
-            .map_err(to_capnp)?
-            .ok_or_else(|| Error::failed(format!("ingress pool '{name}' not found")))?;
+            .get_pool_by_selector(&selector)?
+            .ok_or_else(|| Error::failed(format!("ingress pool '{selector}' not found")))?;
         write_ingress_pool_spec(results.get().init_pool(), &pool)?;
         Ok(())
     }

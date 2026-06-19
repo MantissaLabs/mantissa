@@ -715,12 +715,12 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
             IngressCommand::Inspect(args) => {
                 local
-                    .run_until(crate::ingress::inspect(&cfg, &args.name))
+                    .run_until(crate::ingress::inspect(&cfg, &args.selector))
                     .await?;
             }
             IngressCommand::Delete(args) => {
                 local
-                    .run_until(crate::ingress::delete(&cfg, &args.name))
+                    .run_until(crate::ingress::delete(&cfg, &args.selector))
                     .await?;
             }
             IngressCommand::Endpoints(args) => {

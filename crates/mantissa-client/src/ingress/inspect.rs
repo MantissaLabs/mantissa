@@ -3,13 +3,13 @@ use crate::config::ClientConfig;
 use crate::connection;
 use anyhow::{Context, Result, anyhow};
 
-/// Fetches one ingress pool by exact name.
-pub async fn inspect(cfg: &ClientConfig, name: &str) -> Result<IngressPoolSpec> {
+/// Fetches one ingress pool by exact UUID or exact name.
+pub async fn inspect(cfg: &ClientConfig, selector: &str) -> Result<IngressPoolSpec> {
     let client = connection::get_local_session(cfg).await?;
     let request = client.get_ingress_request();
     let ingress = request.send().pipeline.get_ingress();
     let mut inspect = ingress.inspect_request();
-    inspect.get().set_name(name.trim());
+    inspect.get().set_name(selector.trim());
 
     let response = inspect
         .send()

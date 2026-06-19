@@ -7,9 +7,9 @@ use mantissa_client::ingress::{
     IngressPoolSpec,
 };
 
-/// Fetches one ingress pool and renders its full replicated spec.
-pub async fn inspect(cfg: &ClientConfig, name: &str) -> Result<()> {
-    let pool = mantissa_client::ingress::inspect(cfg, name).await?;
+/// Fetches one ingress pool by exact UUID or exact name and renders its full replicated spec.
+pub async fn inspect(cfg: &ClientConfig, selector: &str) -> Result<()> {
+    let pool = mantissa_client::ingress::inspect(cfg, selector).await?;
     render_pool(&pool);
     Ok(())
 }

@@ -42,6 +42,10 @@ local_test!(rest_ingress_pool_crud_and_empty_endpoints, {
     assert_eq!(value["min_nodes"], 1);
     assert_eq!(value["max_nodes"], 2);
     assert_eq!(value["placement_strategy"], "spread");
+    let pool_id = value["id"]
+        .as_str()
+        .expect("apply response includes pool id")
+        .to_string();
 
     let (status, value) = harness
         .json_request(Method::GET, "/v1/ingress", true, None)
@@ -61,6 +65,14 @@ local_test!(rest_ingress_pool_crud_and_empty_endpoints, {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["name"], "public-web");
 
+    let by_id_uri = format!("/v1/ingress/{pool_id}");
+    let (status, value) = harness
+        .json_request(Method::GET, by_id_uri.as_str(), true, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["name"], "public-web");
+    assert_eq!(value["id"], pool_id);
+
     let (status, value) = harness
         .json_request(
             Method::GET,
@@ -78,7 +90,7 @@ local_test!(rest_ingress_pool_crud_and_empty_endpoints, {
     );
 
     let (status, value) = harness
-        .json_request(Method::DELETE, "/v1/ingress/public-web", true, None)
+        .json_request(Method::DELETE, by_id_uri.as_str(), true, None)
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["deleted"], 1);
