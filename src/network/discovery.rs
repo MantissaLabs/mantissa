@@ -86,7 +86,12 @@ pub struct ServiceDiscovery {
     bpf: NetworkBpfManager,
     health_monitor: Arc<HealthMonitor>,
     local_node_id: Uuid,
-    servers: Arc<AsyncMutex<HashMap<Uuid, DnsServerHandle>>>,
+    /// LocalSet-bound DNS server handles keyed by network id.
+    ///
+    /// Discovery server tasks are spawned with `spawn_local` because the store-backed refresh path
+    /// is intentionally local-executor-bound. The `Arc` lets cloned `ServiceDiscovery` values share
+    /// one runtime map; it is not used to move the handles across worker threads.
+    servers: DnsServerMap,
     load_balancer: Arc<AsyncMutex<ServiceLoadBalancer>>,
     health: Arc<AsyncMutex<BackendHealth>>,
     dns_port: u16,
@@ -94,6 +99,26 @@ pub struct ServiceDiscovery {
     nodeport: NodePortManager,
     missing_lb_maps: Arc<AsyncMutex<HashSet<Uuid>>>,
     public_endpoints: Arc<AsyncMutex<HashMap<PublicEndpointKey, PublicEndpointSnapshot>>>,
+}
+
+type DnsServerMap = Arc<AsyncMutex<HashMap<Uuid, DnsServerHandle>>>;
+
+/// Build the shared local DNS runtime map used by cloned discovery handles.
+#[allow(clippy::arc_with_non_send_sync)]
+fn new_dns_server_map() -> DnsServerMap {
+    Arc::new(AsyncMutex::new(HashMap::new()))
+}
+
+/// Construction inputs shared by production and tests for service discovery.
+pub struct ServiceDiscoveryInit {
+    pub registry: NetworkRegistry,
+    pub cluster_registry: Registry,
+    pub ingress_pools: IngressPoolRegistry,
+    pub workloads: WorkloadStore,
+    pub services: ServiceRegistry,
+    pub bpf: NetworkBpfManager,
+    pub health_monitor: Arc<HealthMonitor>,
+    pub local_node_id: Uuid,
 }
 
 struct DnsServerHandle {
@@ -372,17 +397,15 @@ struct ResolvedServiceBackends {
 
 impl ServiceDiscovery {
     /// Build service discovery with the default DNS bind port (53).
-    pub fn new(
-        registry: NetworkRegistry,
-        cluster_registry: Registry,
-        ingress_pools: IngressPoolRegistry,
-        workloads: WorkloadStore,
-        services: ServiceRegistry,
-        bpf: NetworkBpfManager,
-        health_monitor: Arc<HealthMonitor>,
-        local_node_id: Uuid,
-    ) -> Self {
-        Self::new_with_dns_port(
+    pub fn new(init: ServiceDiscoveryInit) -> Self {
+        Self::new_with_dns_port(init, 53)
+    }
+
+    /// Build service discovery with an explicit DNS bind port.
+    ///
+    /// Tests use this to run DNS flows unprivileged on high ports while production keeps 53.
+    pub fn new_with_dns_port(init: ServiceDiscoveryInit, dns_port: u16) -> Self {
+        let ServiceDiscoveryInit {
             registry,
             cluster_registry,
             ingress_pools,
@@ -391,24 +414,7 @@ impl ServiceDiscovery {
             bpf,
             health_monitor,
             local_node_id,
-            53,
-        )
-    }
-
-    /// Build service discovery with an explicit DNS bind port.
-    ///
-    /// Tests use this to run DNS flows unprivileged on high ports while production keeps 53.
-    pub fn new_with_dns_port(
-        registry: NetworkRegistry,
-        cluster_registry: Registry,
-        ingress_pools: IngressPoolRegistry,
-        workloads: WorkloadStore,
-        services: ServiceRegistry,
-        bpf: NetworkBpfManager,
-        health_monitor: Arc<HealthMonitor>,
-        local_node_id: Uuid,
-        dns_port: u16,
-    ) -> Self {
+        } = init;
         Self {
             registry,
             cluster_registry,
@@ -418,7 +424,7 @@ impl ServiceDiscovery {
             bpf,
             health_monitor,
             local_node_id,
-            servers: Arc::new(AsyncMutex::new(HashMap::new())),
+            servers: new_dns_server_map(),
             load_balancer: Arc::new(AsyncMutex::new(ServiceLoadBalancer::default())),
             health: Arc::new(AsyncMutex::new(BackendHealth::default())),
             dns_port,

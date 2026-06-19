@@ -185,6 +185,15 @@ struct EndpointRowKey {
     protocol: NodePortProtocol,
 }
 
+struct ExpectedEndpointTemplate<'a> {
+    service: &'a ServiceSpecValue,
+    template_name: &'a str,
+    network_ids: &'a [Uuid],
+    public_port: u16,
+    protocols: &'a [NodePortProtocol],
+    ingress: PublicEndpointIngressMode,
+}
+
 /// Converts local errors into Cap'n Proto RPC errors at the ingress boundary.
 fn to_capnp<E: std::fmt::Display>(error: E) -> Error {
     Error::failed(error.to_string())
@@ -482,25 +491,20 @@ impl IngressRpc {
 
     /// Adds expected not-ready rows for node/network combinations selected by ingress intent.
     fn add_expected_endpoint_rows(
-        service: &ServiceSpecValue,
-        template_name: &str,
-        network_ids: &[Uuid],
-        public_port: u16,
-        protocols: &[NodePortProtocol],
-        ingress: PublicEndpointIngressMode,
+        endpoint: ExpectedEndpointTemplate<'_>,
         node_ids: impl IntoIterator<Item = Uuid>,
         rows: &mut Vec<EndpointRow>,
     ) {
         let mut seen = HashSet::new();
         for node_id in node_ids {
-            for network_id in network_ids {
-                for protocol in protocols.iter().copied() {
+            for network_id in endpoint.network_ids {
+                for protocol in endpoint.protocols.iter().copied() {
                     let key = EndpointRowKey {
-                        service_id: service.id,
-                        template_name: template_name.to_string(),
+                        service_id: endpoint.service.id,
+                        template_name: endpoint.template_name.to_string(),
                         network_id: *network_id,
                         node_id,
-                        public_port,
+                        public_port: endpoint.public_port,
                         protocol,
                     };
                     if !seen.insert(key) {
@@ -509,22 +513,22 @@ impl IngressRpc {
                     rows.push(EndpointRow {
                         snapshot: PublicEndpointSnapshot {
                             key: PublicEndpointKey {
-                                service_id: service.id,
-                                template_name: template_name.to_string(),
-                                public_port,
+                                service_id: endpoint.service.id,
+                                template_name: endpoint.template_name.to_string(),
+                                public_port: endpoint.public_port,
                                 protocol,
                                 node_id,
                             },
                             network_id: *network_id,
                             node_ip: None,
-                            ingress: ingress.clone(),
+                            ingress: endpoint.ingress.clone(),
                             ready: false,
-                            generation: service.service_epoch,
+                            generation: endpoint.service.service_epoch,
                             detail: Some(
                                 "endpoint has not been reported by the source node".to_string(),
                             ),
                         },
-                        service_name: Some(service.service_name.clone()),
+                        service_name: Some(endpoint.service.service_name.clone()),
                     });
                 }
             }
@@ -571,12 +575,14 @@ impl IngressRpc {
                 match &template.public_ingress {
                     PublicIngressPolicy::AllNodes => {
                         Self::add_expected_endpoint_rows(
-                            service,
-                            &template.name,
-                            &network_ids,
-                            public_port,
-                            &protocols,
-                            PublicEndpointIngressMode::AllNodes,
+                            ExpectedEndpointTemplate {
+                                service,
+                                template_name: &template.name,
+                                network_ids: &network_ids,
+                                public_port,
+                                protocols: &protocols,
+                                ingress: PublicEndpointIngressMode::AllNodes,
+                            },
                             active_node_ids.iter().copied(),
                             &mut rows,
                         );
@@ -595,12 +601,14 @@ impl IngressRpc {
                         )?;
                         for (network_id, node_id) in sources {
                             Self::add_expected_endpoint_rows(
-                                service,
-                                &template.name,
-                                &[network_id],
-                                public_port,
-                                &protocols,
-                                PublicEndpointIngressMode::TaskNodes,
+                                ExpectedEndpointTemplate {
+                                    service,
+                                    template_name: &template.name,
+                                    network_ids: &[network_id],
+                                    public_port,
+                                    protocols: &protocols,
+                                    ingress: PublicEndpointIngressMode::TaskNodes,
+                                },
                                 [node_id],
                                 &mut rows,
                             );
@@ -616,13 +624,15 @@ impl IngressRpc {
                         let selection = self.pools.select_nodes(&pool_spec, &ingress_candidates);
                         if selection.is_ready() {
                             Self::add_expected_endpoint_rows(
-                                service,
-                                &template.name,
-                                &network_ids,
-                                public_port,
-                                &protocols,
-                                PublicEndpointIngressMode::IngressPool {
-                                    pool: pool_name.to_string(),
+                                ExpectedEndpointTemplate {
+                                    service,
+                                    template_name: &template.name,
+                                    network_ids: &network_ids,
+                                    public_port,
+                                    protocols: &protocols,
+                                    ingress: PublicEndpointIngressMode::IngressPool {
+                                        pool: pool_name.to_string(),
+                                    },
                                 },
                                 selection
                                     .selected_nodes

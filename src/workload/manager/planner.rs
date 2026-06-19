@@ -695,6 +695,14 @@ fn prefers_binpack_score(left: BinpackScore, right: BinpackScore) -> bool {
     false
 }
 
+#[derive(Clone, Copy)]
+struct SpreadCandidateTiebreakers {
+    workload_count: usize,
+    ready_network_count: usize,
+    ring_index: usize,
+    node_id: Uuid,
+}
+
 /// Returns true when a spread candidate should replace the current best untargeted choice.
 ///
 /// Operator-declared preferences win first. When preferences tie, the node with fewer active
@@ -702,14 +710,8 @@ fn prefers_binpack_score(left: BinpackScore, right: BinpackScore) -> bool {
 /// networks only break equal-load choices before queue position keeps batch-local rotation stable.
 fn prefers_spread_candidate(
     preference_cmp: Ordering,
-    candidate_workload_count: usize,
-    best_workload_count: usize,
-    candidate_ready_network_count: usize,
-    best_ready_network_count: usize,
-    candidate_index: usize,
-    best_index: usize,
-    candidate_node_id: Uuid,
-    best_node_id: Uuid,
+    candidate: SpreadCandidateTiebreakers,
+    best: SpreadCandidateTiebreakers,
 ) -> bool {
     let has_better_preferences = preference_cmp.is_gt();
     if has_better_preferences {
@@ -721,27 +723,27 @@ fn prefers_spread_candidate(
         return false;
     }
 
-    let load_comparison = candidate_workload_count.cmp(&best_workload_count);
+    let load_comparison = candidate.workload_count.cmp(&best.workload_count);
     if load_comparison != Ordering::Equal {
         return load_comparison.is_lt();
     }
 
-    let ready_network_comparison = candidate_ready_network_count.cmp(&best_ready_network_count);
+    let ready_network_comparison = candidate.ready_network_count.cmp(&best.ready_network_count);
     if ready_network_comparison != Ordering::Equal {
         return ready_network_comparison.is_gt();
     }
 
-    let appears_earlier_in_ring = candidate_index < best_index;
+    let appears_earlier_in_ring = candidate.ring_index < best.ring_index;
     if appears_earlier_in_ring {
         return true;
     }
 
-    let shares_same_ring_position = candidate_index == best_index;
+    let shares_same_ring_position = candidate.ring_index == best.ring_index;
     if !shares_same_ring_position {
         return false;
     }
 
-    candidate_node_id < best_node_id
+    candidate.node_id < best.node_id
 }
 
 /// Returns true when a binpack candidate should replace the current best untargeted choice.
@@ -2087,14 +2089,18 @@ impl WorkloadManager {
                     );
                     if prefers_spread_candidate(
                         preference_cmp,
-                        workload_count,
-                        best_workload_count,
-                        ready_network_count,
-                        best_ready_network_count,
-                        idx,
-                        current_best_index,
-                        node_id,
-                        best_node_id,
+                        SpreadCandidateTiebreakers {
+                            workload_count,
+                            ready_network_count,
+                            ring_index: idx,
+                            node_id,
+                        },
+                        SpreadCandidateTiebreakers {
+                            workload_count: best_workload_count,
+                            ready_network_count: best_ready_network_count,
+                            ring_index: current_best_index,
+                            node_id: best_node_id,
+                        },
                     ) {
                         best_index = Some(idx);
                         best_node_id = node_id;

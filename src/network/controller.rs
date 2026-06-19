@@ -6,7 +6,7 @@ use crate::network::allocator::{parse_overlay_cidr, resolver_ip_address};
 use crate::network::attachment::{PlatformAttachmentProvisioner, host_iface_name};
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext, overlay_bpf_program_specs};
 use crate::network::defaults::merge_default_bpf_programs;
-use crate::network::discovery::{PublicEndpointSnapshot, ServiceDiscovery};
+use crate::network::discovery::{PublicEndpointSnapshot, ServiceDiscovery, ServiceDiscoveryInit};
 use crate::network::events::ForwardingEvent;
 use crate::network::naming::{
     collect_orphaned_network_suffixes, is_managed_overlay_link_name, managed_interface_suffix,
@@ -186,16 +186,16 @@ impl NetworkController {
         let ingress_pool_generation = ingress_pools.change_clock();
         let ingress_pool_change_notify = ingress_pools.change_notifier();
 
-        let discovery = ServiceDiscovery::new(
-            registry.clone(),
-            cluster_registry.clone(),
-            ingress_pools.clone(),
-            workload_store,
-            service_registry.clone(),
-            bpf.clone(),
-            cluster_registry.health_monitor(),
-            node_id,
-        );
+        let discovery = ServiceDiscovery::new(ServiceDiscoveryInit {
+            registry: registry.clone(),
+            cluster_registry: cluster_registry.clone(),
+            ingress_pools: ingress_pools.clone(),
+            workloads: workload_store,
+            services: service_registry.clone(),
+            bpf: bpf.clone(),
+            health_monitor: cluster_registry.health_monitor(),
+            local_node_id: node_id,
+        });
 
         Ok(Self {
             inner: Arc::new(NetworkControllerInner {

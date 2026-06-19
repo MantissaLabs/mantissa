@@ -7,7 +7,7 @@ use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use mantissa::ingress::registry::IngressPoolRegistry;
 use mantissa::network::discovery::{
-    PublicEndpointIngressMode, PublicEndpointSnapshot, ServiceDiscovery,
+    PublicEndpointIngressMode, PublicEndpointSnapshot, ServiceDiscovery, ServiceDiscoveryInit,
 };
 use mantissa::network::nodeport::NodePortProtocol;
 use mantissa::network::registry::NetworkRegistry;
@@ -112,14 +112,16 @@ async fn setup_discovery_harness_with_subnet(dns_port: u16, subnet_cidr: &str) -
 
     let registry = NetworkRegistry::new(spec_store, peer_store, attachment_store);
     let discovery = ServiceDiscovery::new_with_dns_port(
-        registry.clone(),
-        test_cluster_registry(actor).await,
-        test_ingress_pool_registry(actor).await,
-        workloads.clone(),
-        services.clone(),
-        mantissa::network::bpf::NetworkBpfManager::unavailable(),
-        mantissa_health::HealthMonitor::new(Uuid::nil()),
-        actor,
+        ServiceDiscoveryInit {
+            registry: registry.clone(),
+            cluster_registry: test_cluster_registry(actor).await,
+            ingress_pools: test_ingress_pool_registry(actor).await,
+            workloads: workloads.clone(),
+            services: services.clone(),
+            bpf: mantissa::network::bpf::NetworkBpfManager::unavailable(),
+            health_monitor: mantissa_health::HealthMonitor::new(Uuid::nil()),
+            local_node_id: actor,
+        },
         dns_port,
     );
 

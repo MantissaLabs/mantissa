@@ -329,10 +329,10 @@ fn write_public_endpoint(
     mut endpoint: mantissa_protocol::info_capnp::public_endpoint_info::Builder<'_>,
     snapshot: &PublicEndpointSnapshot,
 ) {
-    endpoint.set_service_id(&snapshot.key.service_id.to_string());
-    endpoint.set_template_name(&snapshot.key.template_name);
-    endpoint.set_network_id(&snapshot.network_id.to_string());
-    endpoint.set_node_id(&snapshot.key.node_id.to_string());
+    endpoint.set_service_id(snapshot.key.service_id.to_string());
+    endpoint.set_template_name(snapshot.key.template_name.as_str());
+    endpoint.set_network_id(snapshot.network_id.to_string());
+    endpoint.set_node_id(snapshot.key.node_id.to_string());
     let node_ip = snapshot
         .node_ip
         .map(|ip| ip.to_string())

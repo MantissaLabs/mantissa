@@ -470,28 +470,35 @@ async fn prune_wireguard_tunnel_routes(
     }
 }
 
-/// Build the controller-facing underlay state snapshot from the latest reconcile results.
+/// Inputs used to derive one controller-facing WireGuard underlay snapshot.
 #[cfg(target_os = "linux")]
-fn build_wireguard_underlay_state(
+struct WireGuardUnderlayStateInput<'a> {
     ifname: String,
     tunnel_ip: IpAddr,
     config_hash: u64,
     last_configured_at: Option<Instant>,
     published: bool,
-    peer_plan: &WireGuardPeerPlan,
+    peer_plan: &'a WireGuardPeerPlan,
     scoped_ready_for_encryption: bool,
     prefer_underlay: bool,
+}
+
+/// Build the controller-facing underlay state snapshot from the latest reconcile results.
+#[cfg(target_os = "linux")]
+fn build_wireguard_underlay_state(
+    input: WireGuardUnderlayStateInput<'_>,
 ) -> WireGuardUnderlayState {
     WireGuardUnderlayState {
-        underlay_active: published
-            && scoped_ready_for_encryption
-            && (peer_plan.desired_peer_count > 0 || prefer_underlay),
-        required_peer_count: peer_plan.desired_peer_count,
-        ifname,
-        tunnel_ip: Some(tunnel_ip),
-        config_hash: Some(config_hash),
-        last_configured_at,
-        configured_peer_ids: peer_plan
+        underlay_active: input.published
+            && input.scoped_ready_for_encryption
+            && (input.peer_plan.desired_peer_count > 0 || input.prefer_underlay),
+        required_peer_count: input.peer_plan.desired_peer_count,
+        ifname: input.ifname,
+        tunnel_ip: Some(input.tunnel_ip),
+        config_hash: Some(input.config_hash),
+        last_configured_at: input.last_configured_at,
+        configured_peer_ids: input
+            .peer_plan
             .peer_configs
             .iter()
             .map(|peer| peer.peer_id)
@@ -566,14 +573,16 @@ pub async fn ensure_wireguard_underlay(
     prune_wireguard_tunnel_routes(&local, &peer_plan).await;
 
     Ok(build_wireguard_underlay_state(
-        local.ifname,
-        local.tunnel_ip,
-        config_hash,
-        last_configured_at,
-        published,
-        &peer_plan,
-        scoped_ready_for_encryption,
-        local.prefer_underlay,
+        WireGuardUnderlayStateInput {
+            ifname: local.ifname,
+            tunnel_ip: local.tunnel_ip,
+            config_hash,
+            last_configured_at,
+            published,
+            peer_plan: &peer_plan,
+            scoped_ready_for_encryption,
+            prefer_underlay: local.prefer_underlay,
+        },
     ))
 }
 
@@ -872,8 +881,8 @@ fn ip6tables_insert_rule(chain: &str, spec: &[&str]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        WireGuardPeerPlan, build_wireguard_peer_plan, build_wireguard_underlay_state,
-        scoped_wireguard_peers_ready,
+        WireGuardPeerPlan, WireGuardUnderlayStateInput, build_wireguard_peer_plan,
+        build_wireguard_underlay_state, scoped_wireguard_peers_ready,
     };
     use crate::runtime::types::RuntimeSupportProfile;
     use crate::topology::peers::{
@@ -1000,18 +1009,18 @@ mod tests {
             all_desired_peers_enabled: true,
         };
 
-        let state = build_wireguard_underlay_state(
-            super::MANTISSA_WIREGUARD_IFNAME.to_string(),
-            "fd42:6d61:6e74:6973::1"
+        let state = build_wireguard_underlay_state(WireGuardUnderlayStateInput {
+            ifname: super::MANTISSA_WIREGUARD_IFNAME.to_string(),
+            tunnel_ip: "fd42:6d61:6e74:6973::1"
                 .parse()
                 .expect("valid test tunnel ip"),
-            7,
-            None,
-            true,
-            &plan,
-            scoped_wireguard_peers_ready(&plan),
-            true,
-        );
+            config_hash: 7,
+            last_configured_at: None,
+            published: true,
+            peer_plan: &plan,
+            scoped_ready_for_encryption: scoped_wireguard_peers_ready(&plan),
+            prefer_underlay: true,
+        });
 
         assert!(
             state.underlay_active,

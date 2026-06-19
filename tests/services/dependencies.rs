@@ -222,7 +222,6 @@ local_test!(
             template_name: "backend".to_string(),
         };
         let ordered = wait_until(Duration::from_secs(40), Duration::from_millis(100), || {
-            let frontend_node = frontend_node;
             let service_name = service_name.clone();
             let dependency_requirement = dependency_requirement.clone();
             async move {

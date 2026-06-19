@@ -653,14 +653,16 @@ async fn setup_catalog_harness_with_driver(driver: NetworkDriver) -> CatalogHarn
         .expect("upsert network spec");
 
     let discovery = ServiceDiscovery::new_with_dns_port(
-        registry.clone(),
-        test_cluster_registry(actor).await,
-        test_ingress_pool_registry(actor).await,
-        workloads.clone(),
-        services.clone(),
-        NetworkBpfManager::unavailable(),
-        HealthMonitor::new(actor),
-        actor,
+        ServiceDiscoveryInit {
+            registry: registry.clone(),
+            cluster_registry: test_cluster_registry(actor).await,
+            ingress_pools: test_ingress_pool_registry(actor).await,
+            workloads: workloads.clone(),
+            services: services.clone(),
+            bpf: NetworkBpfManager::unavailable(),
+            health_monitor: HealthMonitor::new(actor),
+            local_node_id: actor,
+        },
         5_353,
     );
     let runtime = discovery.build_runtime(
