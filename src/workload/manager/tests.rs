@@ -33,6 +33,10 @@ use crate::scheduler::{
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
 use crate::services::registry::ServiceRegistry;
+use crate::services::types::{
+    PublicIngressPolicy, ServicePortProtocol, ServiceSpecValue, TaskTemplateNetworkRequirement,
+    TaskTemplateSpecValue,
+};
 use crate::store::local::{LocalSessionStore, SecretMasterStore};
 use crate::store::replicated::networks::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
@@ -59,7 +63,7 @@ use crate::workload::model::{
     WorkloadStatus, WorkloadValue, WorkloadValueDraft,
 };
 use crate::workload::types::{
-    ResolvedExecutionSpec, WorkloadLivenessProbe, WorkloadLivenessProbeKind,
+    ExecutionSpec, ResolvedExecutionSpec, WorkloadLivenessProbe, WorkloadLivenessProbeKind,
     WorkloadRestartPolicyKind,
 };
 use ::mantissa_health::HealthMonitor;
@@ -1479,6 +1483,39 @@ fn empty_resolved_execution(image: &str) -> ResolvedExecutionSpec {
         networks: Vec::new(),
         ports: Vec::new(),
         placement: Default::default(),
+    }
+}
+
+/// Builds one service task template with a single required overlay network.
+fn networked_service_template(name: &str, network_id: Uuid) -> TaskTemplateSpecValue {
+    TaskTemplateSpecValue {
+        name: name.to_string(),
+        execution: ExecutionSpec {
+            image: "img".to_string(),
+            command: Vec::new(),
+            tty: false,
+            cpu_millis: 200,
+            memory_bytes: 64 * 1_024 * 1_024,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: vec![TaskTemplateNetworkRequirement::new("default", network_id)],
+            ports: Vec::new(),
+            placement: Default::default(),
+        },
+        depends_on: Vec::new(),
+        replicas: 1,
+        readiness: None,
+        public_port: None,
+        public_protocol: Some(ServicePortProtocol::Tcp),
+        public_ingress: PublicIngressPolicy::AllNodes,
+        placement_preferences: Vec::new(),
+        autoscale: None,
     }
 }
 
@@ -6615,6 +6652,165 @@ async fn ensure_task_service_traffic_ready_requires_local_network_readiness() {
     assert!(
         ready,
         "published ready attachments on a ready network should be routable"
+    );
+}
+
+#[tokio::test]
+async fn ensure_service_generation_traffic_ready_publishes_ready_networked_tasks() {
+    let (manager, _scheduler, _mock_cm, network_registry) = setup_manager().await;
+
+    let network = NetworkSpecValue::new(NetworkSpecDraft {
+        name: "service-generation-ready-net".to_string(),
+        description: "service generation traffic readiness network".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.57.0.0/24".to_string(),
+        vni: 0,
+        mtu: 0,
+        sealed: false,
+        bpf_programs: vec![],
+    });
+    network_registry
+        .upsert_spec(network.clone())
+        .await
+        .expect("upsert network spec");
+    network_registry
+        .upsert_peer_state(NetworkPeerStateValue::new(
+            network.id,
+            manager.local_node_id,
+            "local-node",
+            NetworkPeerState::Ready,
+            None,
+        ))
+        .await
+        .expect("upsert ready peer state");
+
+    let task_id = Uuid::new_v4();
+    let service = ServiceSpecValue::new(
+        Uuid::new_v4(),
+        "manifest",
+        "svc-generation-ready",
+        vec![networked_service_template("backend", network.id)],
+        vec![task_id],
+    );
+    let now = Utc::now().to_rfc3339();
+    network_registry
+        .upsert_attachment(NetworkAttachmentValue::new(NetworkAttachmentDraft {
+            id: crate::network::types::compute_network_attachment_id(task_id, network.id),
+            task_id,
+            node_id: manager.local_node_id,
+            instance_id: format!("mantissa-{task_id}"),
+            network_id: network.id,
+            task_updated_at: Some(now),
+            requested_ip: Some("10.57.0.2".to_string()),
+            assigned_ip: Some("10.57.0.2".to_string()),
+            mac: Some("02:11:22:33:44:ad".to_string()),
+            state: NetworkAttachmentState::Ready,
+            error: None,
+            traffic_published: false,
+            service_name: Some(service.service_name.clone()),
+            template_name: Some("backend".to_string()),
+        }))
+        .await
+        .expect("insert unpublished ready attachment");
+
+    let first_pass = manager
+        .ensure_service_generation_traffic_ready(&service)
+        .await
+        .expect("publish service generation traffic");
+    assert!(
+        !first_pass,
+        "first pass should publish rows and require one stable recheck"
+    );
+    let attachments = network_registry
+        .list_attachments_for_task(task_id)
+        .expect("list attachments after generation publish");
+    assert!(
+        attachments[0].traffic_published,
+        "ready generation attachment should be published"
+    );
+
+    let second_pass = manager
+        .ensure_service_generation_traffic_ready(&service)
+        .await
+        .expect("recheck service generation traffic");
+    assert!(
+        second_pass,
+        "already-published ready generation attachments should pass"
+    );
+}
+
+#[tokio::test]
+async fn ensure_service_generation_traffic_ready_withdraws_stale_peer_unready_publication() {
+    let (manager, _scheduler, _mock_cm, network_registry) = setup_manager().await;
+
+    let network = NetworkSpecValue::new(NetworkSpecDraft {
+        name: "service-generation-withdraw-net".to_string(),
+        description: "service generation withdrawal network".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.58.0.0/24".to_string(),
+        vni: 0,
+        mtu: 0,
+        sealed: false,
+        bpf_programs: vec![],
+    });
+    network_registry
+        .upsert_spec(network.clone())
+        .await
+        .expect("upsert network spec");
+    network_registry
+        .upsert_peer_state(NetworkPeerStateValue::new(
+            network.id,
+            manager.local_node_id,
+            "local-node",
+            NetworkPeerState::Configuring,
+            None,
+        ))
+        .await
+        .expect("upsert configuring peer state");
+
+    let task_id = Uuid::new_v4();
+    let service = ServiceSpecValue::new(
+        Uuid::new_v4(),
+        "manifest",
+        "svc-generation-withdraw",
+        vec![networked_service_template("backend", network.id)],
+        vec![task_id],
+    );
+    let now = Utc::now().to_rfc3339();
+    network_registry
+        .upsert_attachment(NetworkAttachmentValue::new(NetworkAttachmentDraft {
+            id: crate::network::types::compute_network_attachment_id(task_id, network.id),
+            task_id,
+            node_id: manager.local_node_id,
+            instance_id: format!("mantissa-{task_id}"),
+            network_id: network.id,
+            task_updated_at: Some(now),
+            requested_ip: Some("10.58.0.2".to_string()),
+            assigned_ip: Some("10.58.0.2".to_string()),
+            mac: Some("02:11:22:33:44:ae".to_string()),
+            state: NetworkAttachmentState::Ready,
+            error: None,
+            traffic_published: true,
+            service_name: Some(service.service_name.clone()),
+            template_name: Some("backend".to_string()),
+        }))
+        .await
+        .expect("insert stale published attachment");
+
+    let ready = manager
+        .ensure_service_generation_traffic_ready(&service)
+        .await
+        .expect("withdraw stale service generation traffic");
+    assert!(
+        !ready,
+        "generation readiness must wait while attachment peer state is not ready"
+    );
+    let attachments = network_registry
+        .list_attachments_for_task(task_id)
+        .expect("list attachments after generation withdrawal");
+    assert!(
+        !attachments[0].traffic_published,
+        "stale generation publication should be withdrawn"
     );
 }
 

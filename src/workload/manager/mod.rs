@@ -3,7 +3,7 @@ use crate::network::attachment::{AttachmentProvisioner, AttachmentProvisionerApi
 use crate::network::controller::NetworkController;
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
-use crate::network::types::NetworkStatus;
+use crate::network::types::{NetworkAttachmentState, NetworkStatus};
 use crate::registry::Registry;
 use crate::runtime::set::RuntimeSet;
 use crate::runtime::types::{
@@ -16,7 +16,7 @@ use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
 use crate::services::ownership::select_generation_repair_peers;
 use crate::services::registry::ServiceRegistry;
-use crate::services::types::compute_service_id;
+use crate::services::types::{ServiceSpecValue, compute_service_id};
 use crate::store::replicated::workloads::WorkloadStore;
 use crate::topology::Topology;
 use crate::volumes::VolumeRegistry;
@@ -2716,6 +2716,141 @@ impl WorkloadManager {
         }
 
         Ok(publishable)
+    }
+
+    /// Ensures every networked task in one service generation is ready for service traffic.
+    ///
+    /// Deployment readiness uses this batch path after workload phases have reached `Running`.
+    /// It checks attachment and peer readiness from cached network projections, publishes rows that
+    /// have become routable, withdraws stale published rows, and returns true only after a later pass
+    /// observes all expected networked replicas as already published.
+    pub async fn ensure_service_generation_traffic_ready(
+        &self,
+        service: &ServiceSpecValue,
+    ) -> Result<bool, anyhow::Error> {
+        let (expected_by_task, expected_networked_slots) =
+            Self::service_network_attachment_expectations(service);
+        if expected_networked_slots == 0 {
+            return Ok(true);
+        }
+        if expected_by_task.len() != expected_networked_slots {
+            return Ok(false);
+        }
+
+        let task_ids = expected_by_task.keys().copied().collect::<HashSet<_>>();
+        let attachments_by_task = self
+            .networking
+            .network_registry
+            .list_attachments_for_tasks(&task_ids)
+            .context("list service generation attachments while checking traffic readiness")?;
+
+        let mut peer_ready_cache: HashMap<(Uuid, Uuid), bool> = HashMap::new();
+        let mut publish_tasks = Vec::new();
+        let mut withdraw_tasks = Vec::new();
+        let mut all_ready = true;
+
+        for (task_id, expected_networks) in expected_by_task {
+            let attachments = attachments_by_task
+                .get(&task_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mut matched_attachments = 0usize;
+            let mut attachments_ready = true;
+            let mut peers_ready = true;
+            let mut published = true;
+            for attachment in attachments {
+                if !expected_networks.contains(&attachment.network_id) {
+                    continue;
+                }
+
+                matched_attachments = matched_attachments.saturating_add(1);
+                if attachment.state != NetworkAttachmentState::Ready || attachment.error.is_some() {
+                    attachments_ready = false;
+                }
+                published &= attachment.traffic_published;
+
+                let key = (attachment.network_id, attachment.node_id);
+                let peer_ready = match peer_ready_cache.get(&key) {
+                    Some(ready) => *ready,
+                    None => {
+                        let ready = self
+                            .networking
+                            .network_registry
+                            .get_peer_state(attachment.network_id, attachment.node_id)
+                            .with_context(|| {
+                                format!(
+                                    "load network peer state for task {task_id} attachment {}",
+                                    attachment.network_id
+                                )
+                            })?
+                            .is_some_and(|state| state.error.is_none() && state.state.is_ready());
+                        peer_ready_cache.insert(key, ready);
+                        ready
+                    }
+                };
+                if !peer_ready {
+                    peers_ready = false;
+                }
+            }
+            if matched_attachments < expected_networks.len() {
+                all_ready = false;
+                continue;
+            }
+
+            let publishable = attachments_ready && peers_ready;
+            match (published, publishable) {
+                (true, true) => {}
+                (true, false) => {
+                    all_ready = false;
+                    withdraw_tasks.push(task_id);
+                }
+                (false, true) => {
+                    all_ready = false;
+                    publish_tasks.push(task_id);
+                }
+                (false, false) => {
+                    all_ready = false;
+                }
+            }
+        }
+
+        for task_id in withdraw_tasks {
+            self.set_task_traffic_published(task_id, false).await?;
+        }
+        for task_id in publish_tasks {
+            self.set_task_traffic_published(task_id, true).await?;
+        }
+
+        Ok(all_ready)
+    }
+
+    /// Builds the expected network set for each assigned networked task in a service.
+    fn service_network_attachment_expectations(
+        service: &ServiceSpecValue,
+    ) -> (HashMap<Uuid, HashSet<Uuid>>, usize) {
+        let mut expected_by_task = HashMap::new();
+        let mut expected_networked_slots = 0usize;
+        let mut slot_index = 0usize;
+
+        for template in &service.task_templates {
+            let networks = template
+                .execution
+                .networks
+                .iter()
+                .map(|network| network.network_id)
+                .collect::<HashSet<_>>();
+            for _ in 0..template.replicas {
+                if !networks.is_empty() {
+                    expected_networked_slots = expected_networked_slots.saturating_add(1);
+                    if let Some(task_id) = service.assigned_replica_id(slot_index) {
+                        expected_by_task.insert(task_id, networks.clone());
+                    }
+                }
+                slot_index = slot_index.saturating_add(1);
+            }
+        }
+
+        (expected_by_task, expected_networked_slots)
     }
 
     async fn ensure_remote_secret_availability(

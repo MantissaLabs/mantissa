@@ -652,6 +652,22 @@ impl NetworkRegistry {
             .unwrap_or_default())
     }
 
+    /// List attachment rows for a bounded set of task identifiers with one cache refresh.
+    pub fn list_attachments_for_tasks(
+        &self,
+        task_ids: &HashSet<Uuid>,
+    ) -> Result<HashMap<Uuid, Vec<NetworkAttachmentValue>>> {
+        self.refresh_attachment_cache_if_needed()?;
+        let cache = self.cache_read();
+        let mut attachments = HashMap::with_capacity(task_ids.len());
+        for task_id in task_ids {
+            if let Some(rows) = cache.attachments_by_task.get(task_id) {
+                attachments.insert(*task_id, rows.clone());
+            }
+        }
+        Ok(attachments)
+    }
+
     /// Compute attachment counts grouped by network identifier.
     pub fn attachment_counts(&self) -> Result<HashMap<Uuid, usize>> {
         self.refresh_attachment_cache_if_needed()?;

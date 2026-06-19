@@ -430,7 +430,10 @@ async fn poll_service_attempt(
                     match projection.class {
                         ReadinessClass::AllRunning => {
                             last_states.clear();
-                            return ReadinessOutcome::Success(current);
+                            return service_generation_traffic_readiness_outcome(
+                                controller, current,
+                            )
+                            .await;
                         }
                         ReadinessClass::Inflight => {
                             progress_running_hint = Some(projection.running_count);
@@ -507,7 +510,9 @@ async fn poll_service_attempt(
         }
 
         match classify_readiness_states(last_states) {
-            ReadinessClass::AllRunning => return ReadinessOutcome::Success(current),
+            ReadinessClass::AllRunning => {
+                return service_generation_traffic_readiness_outcome(controller, current).await;
+            }
             ReadinessClass::Inflight => {}
             ReadinessClass::Degraded => {
                 tracing::debug!(
@@ -531,7 +536,9 @@ async fn poll_service_attempt(
 
         if Instant::now() >= deadline {
             match classify_readiness_states(last_states) {
-                ReadinessClass::AllRunning => return ReadinessOutcome::Success(current),
+                ReadinessClass::AllRunning => {
+                    return service_generation_traffic_readiness_outcome(controller, current).await;
+                }
                 ReadinessClass::Inflight => {
                     tracing::debug!(
                         target: "services",
@@ -566,6 +573,27 @@ async fn poll_service_attempt(
         }
 
         sleep(Duration::from_millis(SERVICE_READY_POLL_INTERVAL_MS)).await;
+    }
+}
+
+/// Converts service traffic publication state into the readiness outcome after tasks are running.
+async fn service_generation_traffic_readiness_outcome(
+    controller: &ServiceController,
+    current: ServiceSpecValue,
+) -> ReadinessOutcome {
+    match controller
+        .workload_manager
+        .ensure_service_generation_traffic_ready(&current)
+        .await
+    {
+        Ok(true) => ReadinessOutcome::Success(current),
+        Ok(false) => ReadinessOutcome::Pending {
+            running_count: current.assigned_replica_count(),
+        },
+        Err(err) => ReadinessOutcome::FailureDetail(
+            current,
+            format!("service traffic readiness check failed: {err:#}"),
+        ),
     }
 }
 
