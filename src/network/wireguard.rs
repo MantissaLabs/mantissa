@@ -42,6 +42,10 @@ const MANTISSA_VXLAN_UDP_PORT: u16 = 4789;
 #[derive(Clone, Debug, Default)]
 pub struct WireGuardUnderlayState {
     /// Whether the controller should use WireGuard for the VXLAN underlay on this node.
+    ///
+    /// Once a node has successfully activated WireGuard for VXLAN, this may remain true even when
+    /// the current scoped peer set is empty. Keeping the selected underlay sticky avoids expensive
+    /// plaintext/WireGuard VXLAN rebuilds during lazy peer-scope churn.
     pub underlay_active: bool,
 
     /// Number of remote peers that currently require an encrypted VXLAN underlay on this node.
@@ -416,7 +420,7 @@ fn log_unready_wireguard_preference(
         tracing::debug!(
             target: "network",
             peers = peer_plan.desired_peer_count,
-            "wireguard underlay preference set but scoped peers are not ready yet; keeping plaintext underlay"
+            "wireguard underlay preference set but scoped peers are not ready yet; blocking vxlan underlay activation"
         );
     }
 }
@@ -476,11 +480,12 @@ fn build_wireguard_underlay_state(
     published: bool,
     peer_plan: &WireGuardPeerPlan,
     scoped_ready_for_encryption: bool,
+    prefer_underlay: bool,
 ) -> WireGuardUnderlayState {
     WireGuardUnderlayState {
         underlay_active: published
-            && peer_plan.desired_peer_count > 0
-            && scoped_ready_for_encryption,
+            && scoped_ready_for_encryption
+            && (peer_plan.desired_peer_count > 0 || prefer_underlay),
         required_peer_count: peer_plan.desired_peer_count,
         ifname,
         tunnel_ip: Some(tunnel_ip),
@@ -568,6 +573,7 @@ pub async fn ensure_wireguard_underlay(
         published,
         &peer_plan,
         scoped_ready_for_encryption,
+        local.prefer_underlay,
     ))
 }
 
@@ -865,7 +871,10 @@ fn ip6tables_insert_rule(chain: &str, spec: &[&str]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WireGuardPeerPlan, build_wireguard_peer_plan};
+    use super::{
+        WireGuardPeerPlan, build_wireguard_peer_plan, build_wireguard_underlay_state,
+        scoped_wireguard_peers_ready,
+    };
     use crate::runtime::types::RuntimeSupportProfile;
     use crate::topology::peers::{
         PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue,
@@ -979,5 +988,36 @@ mod tests {
         assert_eq!(planned_peer_ids(&plan), vec![ready_peer]);
         assert!(!plan.all_desired_peers_advertised);
         assert!(!plan.all_desired_peers_enabled);
+    }
+
+    /// Keep WireGuard selected after activation even when the current scoped peer set is empty.
+    #[test]
+    fn underlay_state_honors_persisted_wireguard_preference_without_peers() {
+        let plan = WireGuardPeerPlan {
+            peer_configs: Vec::new(),
+            desired_peer_count: 0,
+            all_desired_peers_advertised: true,
+            all_desired_peers_enabled: true,
+        };
+
+        let state = build_wireguard_underlay_state(
+            super::MANTISSA_WIREGUARD_IFNAME.to_string(),
+            "fd42:6d61:6e74:6973::1"
+                .parse()
+                .expect("valid test tunnel ip"),
+            7,
+            None,
+            true,
+            &plan,
+            scoped_wireguard_peers_ready(&plan),
+            true,
+        );
+
+        assert!(
+            state.underlay_active,
+            "a persisted WireGuard underlay preference should prevent fallback to plaintext"
+        );
+        assert_eq!(state.required_peer_count, 0);
+        assert!(state.configured_peer_ids.is_empty());
     }
 }

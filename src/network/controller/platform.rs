@@ -1093,17 +1093,6 @@ mod linux {
                             );
                         }
                     }
-                } else if let Some(wg_index) = self.find_link(MANTISSA_WIREGUARD_IFNAME).await? {
-                    let current = self.link_lower_index(index).await?;
-                    if current == Some(wg_index) {
-                        warn!(
-                            target: "network",
-                            vxlan = %plan.vxlan_name,
-                            vxlan_index = index,
-                            "wireguard underlay no longer requested; recreating vxlan on detected underlay"
-                        );
-                        recreate = true;
-                    }
                 }
 
                 if recreate {
@@ -1137,24 +1126,13 @@ mod linux {
                 let resolved_underlay = if let (Some(ifname), Some(ip)) =
                     (plan.underlay_iface.as_deref(), plan.underlay_ip)
                 {
-                    match self.explicit_underlay_by_name(ifname, ip).await {
-                        Ok(info) => info,
-                        Err(err) => {
-                            warn!(
-                                target: "network",
-                                attempt,
-                                underlay = ifname,
-                                error = %err,
-                                "requested explicit underlay is unavailable; refreshing detected underlay"
-                            );
-                            let mut guard = self.underlay.lock().await;
-                            *guard = None;
-                            drop(guard);
-                            self.underlay_info()
-                                .await
-                                .context("resolve detected underlay for vxlan")?
-                        }
-                    }
+                    self.explicit_underlay_by_name(ifname, ip)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "resolve explicit underlay {ifname} with address {ip} for vxlan"
+                            )
+                        })?
                 } else {
                     self.underlay_info()
                         .await

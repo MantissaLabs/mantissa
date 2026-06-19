@@ -957,6 +957,10 @@ impl NetworkController {
     }
 
     /// Refresh the cached WireGuard gate when kernel reconciliation is debounce-skipped.
+    ///
+    /// Scope growth blocks network readiness until the next kernel reconcile can program and verify
+    /// the full peer set. Scope shrink to zero keeps an already-active WireGuard underlay selected so
+    /// VXLAN devices do not bounce back to plaintext during lazy realization churn.
     async fn refresh_debounced_wireguard_gate(&self, desired_peer_ids: &HashSet<Uuid>) -> bool {
         let mut guard = self.inner.wireguard.lock().await;
         let desired_count = desired_peer_ids.len();
@@ -970,7 +974,9 @@ impl NetworkController {
         guard
             .configured_peer_ids
             .retain(|peer| desired_peer_ids.contains(peer));
-        guard.underlay_active = false;
+        if desired_count > 0 || !guard.underlay_active {
+            guard.underlay_active = false;
+        }
         true
     }
 
