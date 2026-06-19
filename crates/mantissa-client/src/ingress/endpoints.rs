@@ -3,7 +3,7 @@ use crate::config::ClientConfig;
 use crate::connection;
 use anyhow::{Context, Result, anyhow};
 
-/// Lists public endpoint target rows visible through the ingress capability.
+/// Lists public endpoint target rows from the ingress cluster view.
 pub async fn endpoints(
     cfg: &ClientConfig,
     filter: &IngressEndpointFilter,

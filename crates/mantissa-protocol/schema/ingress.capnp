@@ -16,7 +16,7 @@ interface Ingress {
   # Fetch one ingress pool by exact name.
 
   endpoints @4 (filter :IngressEndpointFilter) -> (endpoints :List(IngressEndpoint));
-  # List public endpoint target rows visible to the local node.
+  # List public endpoint target rows from nodes selected by replicated ingress intent.
 }
 
 struct IngressPoolApplySpec {

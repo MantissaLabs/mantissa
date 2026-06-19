@@ -702,6 +702,8 @@ async fn build_runtime_components(
     let ingress_service = IngressRpc::new(
         ingress_pool_registry.clone(),
         service_registry.clone(),
+        network_registry.clone(),
+        registry.clone(),
         network_controller.clone(),
         topology.clone(),
     );

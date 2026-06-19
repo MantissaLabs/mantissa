@@ -127,6 +127,86 @@ async fn network_peer_nodes_stay_headless(
     true
 }
 
+#[derive(Clone, Debug)]
+struct IngressEndpointTestRow {
+    node_id: Uuid,
+    ready: bool,
+    detail: Option<String>,
+}
+
+/// Reads ingress endpoint rows through the public ingress RPC for one service name.
+async fn list_ingress_endpoints_for_service(
+    node: &TestNode,
+    service_name: &str,
+) -> Vec<IngressEndpointTestRow> {
+    let mut request = node.node.ingress_client.endpoints_request();
+    {
+        let mut filter = request.get().init_filter();
+        filter.set_service(service_name);
+    }
+
+    let response = request
+        .send()
+        .promise
+        .await
+        .expect("ingress endpoints RPC should succeed");
+    let endpoints = response
+        .get()
+        .expect("ingress endpoints response should decode")
+        .get_endpoints()
+        .expect("ingress endpoints response should contain rows");
+    let mut rows = Vec::with_capacity(endpoints.len() as usize);
+    for endpoint in endpoints.iter() {
+        rows.push(IngressEndpointTestRow {
+            node_id: Uuid::from_slice(
+                endpoint
+                    .get_node_id()
+                    .expect("endpoint row should contain node id"),
+            )
+            .expect("endpoint node id should be a UUID"),
+            ready: endpoint.get_ready(),
+            detail: endpoint
+                .get_detail()
+                .ok()
+                .and_then(|detail| detail.to_str().ok())
+                .map(str::trim)
+                .filter(|detail| !detail.is_empty())
+                .map(str::to_string),
+        });
+    }
+    rows
+}
+
+/// Waits until one observer sees exactly the expected endpoint target nodes.
+async fn wait_for_ingress_endpoint_nodes(
+    node: &TestNode,
+    service_name: &str,
+    expected: &HashSet<Uuid>,
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, Duration::from_millis(100), || async {
+        let rows = list_ingress_endpoints_for_service(node, service_name).await;
+        let observed = rows.iter().map(|row| row.node_id).collect::<HashSet<_>>();
+        &observed == expected
+    })
+    .await
+}
+
+/// Renders endpoint rows with readiness detail for assertion failures.
+fn format_ingress_endpoint_rows(rows: &[IngressEndpointTestRow]) -> String {
+    rows.iter()
+        .map(|row| {
+            format!(
+                "node={} ready={} detail={}",
+                row.node_id,
+                row.ready,
+                row.detail.as_deref().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 local_test!(
     services_on_demand_network_realizes_for_task_hosts_and_releases,
     {
@@ -493,6 +573,21 @@ local_test!(
             .await,
             "task_nodes public ingress should only realize the network on backend task hosts"
         );
+        if !wait_for_ingress_endpoint_nodes(
+            observer_node,
+            &service_name,
+            &expected_peers,
+            Duration::from_secs(20),
+        )
+        .await
+        {
+            let rows = list_ingress_endpoints_for_service(observer_node, &service_name).await;
+            panic!(
+                "observer should see backend task-node ingress endpoint through the cluster view; rows={}",
+                format_ingress_endpoint_rows(&rows)
+            );
+        }
+
         remove_service_via_rpc(&observer_node.node.services_client, service_id).await;
         assert!(
             wait_for_service_task_count_all(&cluster, &service_name, 0, Duration::from_secs(20))
