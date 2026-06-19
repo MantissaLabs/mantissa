@@ -1,0 +1,21 @@
+// Ingress pool used by `examples/ingress_service_discovery_demo.ron`.
+//
+// Label the node that should accept public traffic before applying this pool:
+//
+//   mantissa nodes labels <INGRESS_NODE_ID> --label mantissa.io/ingress=public-web
+(
+    name: "public-web",
+    min_nodes: 1,
+    max_nodes: Some(1),
+    placement: (
+        constraints: [
+            (
+                selector: node_label(key: "mantissa.io/ingress"),
+                operator: eq,
+                value: "public-web",
+            ),
+        ],
+        strategy: spread,
+    ),
+    spread_by: None,
+)

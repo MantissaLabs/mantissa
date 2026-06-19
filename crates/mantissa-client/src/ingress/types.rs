@@ -336,6 +336,26 @@ mod tests {
     }
 
     #[test]
+    fn repository_ingress_pool_example_parses() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples")
+            .join("ingress_public_web_pool.ron");
+        let manifest = IngressPoolManifest::load_from_path(&path)
+            .unwrap_or_else(|error| panic!("failed to parse {}: {error:#}", path.display()));
+
+        assert_eq!(manifest.name, "public-web");
+        assert_eq!(manifest.min_nodes, 1);
+        assert_eq!(manifest.max_nodes, Some(1));
+        assert_eq!(manifest.placement.constraints.len(), 1);
+        assert_eq!(
+            manifest.placement.constraints[0].selector,
+            PlacementConstraintSelector::node_label("mantissa.io/ingress")
+        );
+        assert_eq!(manifest.placement.constraints[0].value, "public-web");
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
     fn pool_spec_decoder_preserves_placement_and_spread_key() {
         let pool_id = Uuid::new_v4();
         let mut message = capnp::message::Builder::new_default();

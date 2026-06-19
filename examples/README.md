@@ -85,6 +85,56 @@ template column, for example `api (3x, auto 2-8)`.
 See `docs/service-autoscaling.md` for the policy fields and distributed owner
 model.
 
+## Manually test an ingress pool
+
+The ingress demo is meant for a three-node cluster. It keeps the backend, the
+internal curl client, and the public ingress node separate so you can verify
+service discovery and NodePort ingress independently.
+
+Pick three node ids from:
+
+```sh
+mantissa nodes list
+```
+
+Label one node for the backend, one for the internal curl client, and one for
+public ingress:
+
+```sh
+mantissa nodes labels <BACKEND_NODE_ID> --label mantissa.io/demo-role=backend
+mantissa nodes labels <FRONTEND_NODE_ID> --label mantissa.io/demo-role=client
+mantissa nodes labels <INGRESS_NODE_ID> --label mantissa.io/ingress=public-web
+```
+
+Apply the ingress pool and deploy the service:
+
+```sh
+mantissa ingress apply examples/ingress_public_web_pool.ron
+mantissa services run examples/ingress_service_discovery_demo.ron
+```
+
+The service creates one `on_demand` VXLAN network, one backend replica, and one
+frontend curl replica. The backend publishes port `8000` through the
+`public-web` ingress pool, so only the labeled ingress node should become a
+public target.
+
+Inspect the public endpoint target:
+
+```sh
+mantissa ingress endpoints --service ingress-discovery-demo --pool public-web
+```
+
+When the endpoint is `ready`, curl the `TARGET` shown in that table from your
+workstation or directly on the ingress node:
+
+```sh
+curl http://<INGRESS_NODE_IP>:8000/
+```
+
+The response should be the backend container hostname. The frontend task logs
+should also show repeated successful curls against
+`backend.ingress-discovery-demo.ingress-demo-network.svc.mantissa:8000`.
+
 ## Submit a simple finite job
 
 ```sh

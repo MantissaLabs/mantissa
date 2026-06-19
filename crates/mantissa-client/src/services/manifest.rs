@@ -1890,6 +1890,56 @@ mod tests {
     }
 
     #[test]
+    fn ingress_discovery_example_manifest_declares_pool_and_placement() {
+        let manifest =
+            load_manifest_from_path(&example_manifest("ingress_service_discovery_demo.ron"))
+                .expect("manifest");
+
+        assert_eq!(manifest.name, "ingress-discovery-demo");
+        assert_eq!(manifest.networks.len(), 1);
+        assert_eq!(manifest.networks[0].name, "ingress-demo-network");
+        assert_eq!(
+            manifest.networks[0].realization,
+            Some(crate::networks::NetworkRealizationPolicy::OnDemand)
+        );
+
+        let backend = manifest
+            .task_templates
+            .iter()
+            .find(|template| template.name == "backend")
+            .expect("backend template");
+        assert_eq!(backend.replicas, 1);
+        assert_eq!(backend.public_port, Some(8000));
+        assert_eq!(
+            backend.public_ingress,
+            PublicIngressPolicySpec::IngressPool {
+                pool: "public-web".to_string()
+            }
+        );
+        assert_eq!(
+            backend.placement.constraints,
+            vec![PlacementConstraint::eq(
+                PlacementConstraintSelector::node_label("mantissa.io/demo-role"),
+                "backend",
+            )]
+        );
+
+        let frontend = manifest
+            .task_templates
+            .iter()
+            .find(|template| template.name == "frontend")
+            .expect("frontend template");
+        assert_eq!(frontend.depends_on, vec!["backend"]);
+        assert_eq!(
+            frontend.placement.constraints,
+            vec![PlacementConstraint::eq(
+                PlacementConstraintSelector::node_label("mantissa.io/demo-role"),
+                "client",
+            )]
+        );
+    }
+
+    #[test]
     fn manifest_parses_static_host_port_bindings() {
         let raw = r#"(
             name: "demo",
