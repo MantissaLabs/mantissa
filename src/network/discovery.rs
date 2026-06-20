@@ -526,6 +526,14 @@ impl ServiceDiscovery {
         refresh_network_services(&runtime).await
     }
 
+    /// Return whether this node has an active local resolver runtime for one network.
+    pub async fn has_network_runtime(&self, network_id: Uuid) -> bool {
+        let guard = self.servers.lock().await;
+        guard
+            .get(&network_id)
+            .is_some_and(|server| !server.task.is_finished())
+    }
+
     /// Refresh local discovery and return whether one service dependency has routable backends.
     ///
     /// Target-side scheduler admission calls this after network realization. Returning false means
@@ -534,14 +542,26 @@ impl ServiceDiscovery {
     pub async fn service_dependency_ready(
         &self,
         requirement: &NetworkServiceDependencyRequirement,
+        require_local_runtime: bool,
     ) -> Result<bool> {
         let runtime = {
             let guard = self.servers.lock().await;
             guard
                 .get(&requirement.network_id)
+                .filter(|server| !server.task.is_finished())
                 .map(|server| server.runtime.clone())
         };
         let Some(runtime) = runtime else {
+            if require_local_runtime {
+                debug!(
+                    target: "network",
+                    network = %requirement.network_id,
+                    service = %requirement.service_name,
+                    template = %requirement.template_name,
+                    "dependency admission waiting for local discovery runtime"
+                );
+                return Ok(false);
+            }
             return service_dependency_ready_from_replicated_state(
                 &self.registry,
                 &self.workloads,

@@ -550,7 +550,7 @@ impl NetworkController {
         guard.remove(&network_id);
     }
 
-    /// Return whether the local dataplane is already active and advertised as ready.
+    /// Return whether the local dataplane and resolver runtime are already ready.
     async fn local_network_ready(&self, network_id: Uuid) -> Result<bool> {
         let active = {
             let guard = self.inner.active_networks.lock().await;
@@ -560,11 +560,22 @@ impl NetworkController {
             return Ok(false);
         }
 
-        Ok(self
+        let peer_ready = self
             .inner
             .registry
             .get_peer_state(network_id, self.inner.node_id)?
-            .is_some_and(|state| state.state.is_ready() && state.error.is_none()))
+            .is_some_and(|state| state.state.is_ready() && state.error.is_none());
+        if !peer_ready {
+            return Ok(false);
+        }
+
+        if self.inner.provisioner.supports_resolver_bind()
+            && !self.inner.discovery.has_network_runtime(network_id).await
+        {
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 
     /// Refresh discovery-derived VIP and NodePort publication for one network immediately.
@@ -591,7 +602,10 @@ impl NetworkController {
             if !self
                 .inner
                 .discovery
-                .service_dependency_ready(requirement)
+                .service_dependency_ready(
+                    requirement,
+                    self.inner.provisioner.supports_resolver_bind(),
+                )
                 .await?
             {
                 return Ok(false);
@@ -1920,19 +1934,27 @@ impl NetworkController {
         }
 
         if self.inner.provisioner.supports_resolver_bind() {
-            if let Err(err) = self.ensure_service_discovery(&spec, plan.resolver_ip).await {
-                warn!(
-                    target: "network",
-                    network = %plan.network_id,
-                    "failed to ensure service discovery: {err:#}"
-                );
-            } else if let Err(err) = self.inner.discovery.refresh_network(plan.network_id).await {
-                warn!(
-                    target: "network",
-                    network = %plan.network_id,
-                    "failed to refresh service discovery state after startup: {err:#}"
-                );
-            }
+            let resolver_ip = plan.resolver_ip.ok_or_else(|| {
+                anyhow!(
+                    "network {} has no resolver address for local discovery",
+                    plan.network_id
+                )
+            })?;
+            self.ensure_service_discovery(&spec, Some(resolver_ip))
+                .await
+                .with_context(|| {
+                    format!("ensure service discovery for network {}", plan.network_id)
+                })?;
+            self.inner
+                .discovery
+                .refresh_network(plan.network_id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "refresh service discovery state after startup for network {}",
+                        plan.network_id
+                    )
+                })?;
         } else {
             if let Err(err) = self.inner.discovery.teardown_network(spec.id).await {
                 warn!(
