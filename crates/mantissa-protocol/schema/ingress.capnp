@@ -63,6 +63,9 @@ struct IngressPoolSpec {
 
   updatedAt @8 :Text;
   # RFC3339 timestamp when the pool was last changed.
+
+  deleted @9 :Bool;
+  # True when this row is a delete marker that must beat stale active pool specs.
 }
 
 struct IngressPoolSpreadKey {

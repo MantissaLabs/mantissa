@@ -92,9 +92,15 @@ impl IngressRpc {
             spread_by: read_spread_key(reader.get_spread_by()?)?,
         };
         let mut value = IngressPoolSpecValue::from_draft(draft).map_err(Error::failed)?;
-        if let Some(current) = self.pools.get_by_name(&name).map_err(to_capnp)? {
+        if let Some(current) = self
+            .pools
+            .get_by_name_including_deleted(&name)
+            .map_err(to_capnp)?
+        {
             value.id = current.id;
-            value.created_at = current.created_at;
+            if !current.is_deleted() {
+                value.created_at = current.created_at;
+            }
             value.generation = current.generation.saturating_add(1);
             value.updated_at = current_timestamp();
         }

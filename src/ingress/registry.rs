@@ -39,8 +39,15 @@ impl IngressPoolRegistry {
 
     /// Removes one ingress pool specification from the replicated store.
     pub async fn remove(&self, id: Uuid) -> Result<()> {
+        let mut value = self
+            .get_including_deleted(id)?
+            .ok_or_else(|| anyhow!("ingress pool '{id}' not found for delete marker"))?;
+        if value.is_deleted() {
+            return Ok(());
+        }
+        value.mark_deleted();
         self.store
-            .remove(&UuidKey::from(id))
+            .upsert(&UuidKey::from(value.id), value)
             .await
             .map_err(|error| anyhow!("ingress pool remove failed: {error}"))?;
         self.change_notify.notify_one();
@@ -56,9 +63,26 @@ impl IngressPoolRegistry {
         Ok(snapshot.and_then(|snap| select_best_ingress_pool(snap.as_slice())))
     }
 
+    /// Reads the canonical ingress pool row, including delete markers.
+    pub fn get_including_deleted(&self, id: Uuid) -> Result<Option<IngressPoolSpecValue>> {
+        let snapshot = self
+            .store
+            .get_snapshot(&UuidKey::from(id))
+            .map_err(|error| anyhow!("ingress pool lookup failed: {error}"))?;
+        Ok(snapshot.and_then(|snap| select_canonical_ingress_pool(snap.as_slice())))
+    }
+
     /// Reads the canonical ingress pool specification for one pool name.
     pub fn get_by_name(&self, name: &str) -> Result<Option<IngressPoolSpecValue>> {
         self.get(compute_ingress_pool_id(name))
+    }
+
+    /// Reads the canonical ingress pool row for one pool name, including delete markers.
+    pub fn get_by_name_including_deleted(
+        &self,
+        name: &str,
+    ) -> Result<Option<IngressPoolSpecValue>> {
+        self.get_including_deleted(compute_ingress_pool_id(name))
     }
 
     /// Lists canonical ingress pool specifications sorted by name.
@@ -105,6 +129,11 @@ impl IngressPoolRegistry {
 
 /// Selects the canonical MVReg winner for one ingress pool specification row.
 pub fn select_best_ingress_pool(values: &[IngressPoolSpecValue]) -> Option<IngressPoolSpecValue> {
+    select_canonical_ingress_pool(values).filter(|value| !value.is_deleted())
+}
+
+/// Selects the canonical MVReg winner, including delete markers.
+fn select_canonical_ingress_pool(values: &[IngressPoolSpecValue]) -> Option<IngressPoolSpecValue> {
     let mut best: Option<&IngressPoolSpecValue> = None;
     for value in values {
         match best {
@@ -120,9 +149,14 @@ pub fn select_best_ingress_pool(values: &[IngressPoolSpecValue]) -> Option<Ingre
 }
 
 /// Compares two concurrent ingress pool specs to choose a deterministic canonical value.
+///
+/// Deletes must outrank every active concurrent value. A later explicit apply
+/// still recreates the pool because its MVReg write observes and dominates the
+/// delete marker instead of merely competing with it.
 fn compare_ingress_pools(left: &IngressPoolSpecValue, right: &IngressPoolSpecValue) -> Ordering {
-    left.generation
-        .cmp(&right.generation)
+    left.deleted
+        .cmp(&right.deleted)
+        .then(left.generation.cmp(&right.generation))
         .then(left.updated_at.cmp(&right.updated_at))
         .then(left.name.cmp(&right.name))
         .then(left.min_nodes.cmp(&right.min_nodes))
@@ -142,7 +176,7 @@ mod tests {
     use crate::scheduler::placement::{
         PlacementConstraint, PlacementConstraintSelector, PlacementPolicy, PlacementStrategy,
     };
-    use crate::store::replicated::ingress::open_ingress_pool_store;
+    use crate::store::replicated::ingress::{IngressPoolStore, open_ingress_pool_store};
     use crate::topology::peers::PeerLabel;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -191,6 +225,25 @@ mod tests {
         .expect("valid ingress pool")
     }
 
+    /// Opens one isolated ingress pool store for a specific CRDT actor.
+    fn temp_store(actor: Uuid) -> (tempfile::TempDir, IngressPoolStore) {
+        let dir = tempdir().expect("tempdir");
+        let db = redb::Database::create(dir.path().join("ingress.redb")).expect("create db");
+        let store = open_ingress_pool_store(Arc::new(db), actor).expect("open ingress pool store");
+        (dir, store)
+    }
+
+    /// Replicates all raw ingress pool registers and tombstones from one store to another.
+    async fn replicate_ingress_pool_store(source: &IngressPoolStore, target: &IngressPoolStore) {
+        let (registers, tombstones) = source
+            .load_all_regs()
+            .expect("load ingress pool store rows");
+        target
+            .apply_delta_chunk_update_mst(registers, tombstones)
+            .await
+            .expect("apply ingress pool store delta");
+    }
+
     #[tokio::test]
     async fn registry_round_trips_ingress_pool_specs() {
         let dir = tempdir().expect("tempdir");
@@ -210,6 +263,98 @@ mod tests {
             spec
         );
         assert_eq!(registry.list().expect("list pools"), vec![spec]);
+    }
+
+    #[tokio::test]
+    async fn deleted_pool_wins_over_stale_replicated_active_register() {
+        let (_dir_a, store_a) = temp_store(Uuid::new_v4());
+        let (_dir_b, store_b) = temp_store(Uuid::new_v4());
+        let registry_a = IngressPoolRegistry::new(store_a.clone());
+        let registry_b = IngressPoolRegistry::new(store_b.clone());
+        let spec = pool("public-web", 1, Some(1));
+
+        registry_a.upsert(spec.clone()).await.expect("upsert pool");
+        replicate_ingress_pool_store(&store_a, &store_b).await;
+
+        let mut stale_active = spec.clone();
+        stale_active.generation = stale_active.generation.saturating_add(10);
+        stale_active.touch();
+        registry_b
+            .upsert(stale_active)
+            .await
+            .expect("upsert concurrent active pool");
+        registry_a.remove(spec.id).await.expect("delete pool");
+
+        replicate_ingress_pool_store(&store_b, &store_a).await;
+        replicate_ingress_pool_store(&store_a, &store_b).await;
+
+        assert!(
+            registry_a
+                .get_by_name("public-web")
+                .expect("lookup deleted pool on A")
+                .is_none(),
+            "deleted pool should hide a stale higher-generation active register on A"
+        );
+        assert!(
+            registry_b
+                .get_by_name("public-web")
+                .expect("lookup deleted pool on B")
+                .is_none(),
+            "deleted pool should hide a stale higher-generation active register on B"
+        );
+        assert!(
+            registry_a.list().expect("list pools on A").is_empty(),
+            "deleted pool should not appear in A list"
+        );
+        assert!(
+            registry_b.list().expect("list pools on B").is_empty(),
+            "deleted pool should not appear in B list"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_after_observed_delete_recreates_pool() {
+        let (_dir, store) = temp_store(Uuid::new_v4());
+        let registry = IngressPoolRegistry::new(store);
+        let spec = pool("public-web", 1, Some(1));
+
+        registry.upsert(spec.clone()).await.expect("upsert pool");
+        registry.remove(spec.id).await.expect("delete pool");
+
+        assert!(
+            registry
+                .get_by_name("public-web")
+                .expect("lookup deleted pool")
+                .is_none(),
+            "deleted pool should be hidden from active lookups"
+        );
+
+        let deleted = registry
+            .get_by_name_including_deleted("public-web")
+            .expect("lookup delete marker")
+            .expect("delete marker should remain visible to apply path");
+        assert!(deleted.is_deleted());
+
+        let mut recreated = pool("public-web", 2, Some(3));
+        recreated.id = deleted.id;
+        recreated.generation = deleted.generation.saturating_add(1);
+        recreated.touch();
+        registry
+            .upsert(recreated.clone())
+            .await
+            .expect("recreate pool after observing delete");
+
+        assert_eq!(
+            registry
+                .get_by_name("public-web")
+                .expect("lookup recreated pool")
+                .expect("recreated pool should be active"),
+            recreated
+        );
+        assert_eq!(
+            registry.list().expect("list recreated pool"),
+            vec![recreated]
+        );
     }
 
     #[test]

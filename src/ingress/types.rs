@@ -41,6 +41,8 @@ pub struct IngressPoolSpecValue {
     pub generation: u64,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 impl IngressPoolSpecValue {
@@ -52,6 +54,26 @@ impl IngressPoolSpecValue {
     /// Returns whether the selected node count satisfies the pool's lower bound.
     pub fn is_ready_with_selected_count(&self, selected_count: usize) -> bool {
         selected_count >= usize::from(self.min_nodes)
+    }
+
+    /// Returns whether this replicated row is a delete marker.
+    pub fn is_deleted(&self) -> bool {
+        self.deleted
+    }
+
+    /// Refresh the update timestamp after a spec lifecycle mutation.
+    pub fn touch(&mut self) {
+        self.updated_at = current_timestamp();
+    }
+
+    /// Convert this spec into a delete marker that wins over stale active rows.
+    pub fn mark_deleted(&mut self) {
+        if self.deleted {
+            return;
+        }
+        self.deleted = true;
+        self.generation = self.generation.saturating_add(1);
+        self.touch();
     }
 }
 
@@ -101,6 +123,7 @@ impl IngressPoolSpecDraft {
             generation: 1,
             created_at: now.clone(),
             updated_at: now,
+            deleted: false,
         })
     }
 }

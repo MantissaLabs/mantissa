@@ -45,6 +45,7 @@ pub(crate) fn write_ingress_pool_spec(
     builder.set_generation(value.generation);
     builder.set_created_at(&value.created_at);
     builder.set_updated_at(&value.updated_at);
+    builder.set_deleted(value.deleted);
     Ok(())
 }
 
@@ -75,6 +76,7 @@ pub(crate) fn read_ingress_pool_spec(
         generation: reader.get_generation(),
         created_at: reader.get_created_at()?.to_str()?.to_string(),
         updated_at: reader.get_updated_at()?.to_str()?.to_string(),
+        deleted: reader.get_deleted(),
     })
 }
 
