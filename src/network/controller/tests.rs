@@ -4,6 +4,7 @@ use crate::network::types::{
     NetworkDriver, NetworkLocalRealizationState, NetworkPeerState, NetworkPeerStateValue,
     NetworkRealizationPolicy, NetworkSpecDraft, NetworkSpecValue, NetworkStatus,
 };
+use crate::network::wireguard::WireGuardUnderlayState;
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::scheduler::placement::{
     PlacementConstraint, PlacementConstraintSelector, PlacementNode, PlacementPolicy,
@@ -186,7 +187,7 @@ fn on_demand_network_specs_require_explicit_local_realization_demand() {
 fn local_realization_state_observes_cold_on_demand_spec_without_writing_peer_row() {
     let spec = test_network_spec("observed", NetworkRealizationPolicy::OnDemand);
 
-    let state = NetworkController::derive_local_realization_state(true, None, false, false);
+    let state = NetworkController::derive_local_realization_state(true, None, false, false, true);
 
     assert_eq!(state, NetworkLocalRealizationState::Observed);
     assert!(
@@ -197,7 +198,7 @@ fn local_realization_state_observes_cold_on_demand_spec_without_writing_peer_row
 
 #[test]
 fn local_realization_state_configures_when_demand_exists_before_peer_row() {
-    let state = NetworkController::derive_local_realization_state(true, None, true, false);
+    let state = NetworkController::derive_local_realization_state(true, None, true, false, true);
 
     assert_eq!(state, NetworkLocalRealizationState::Configuring);
 }
@@ -210,20 +211,34 @@ fn local_realization_state_requires_active_dataplane_for_ready() {
         NetworkPeerStateValue::new(network_id, peer_id, "local", NetworkPeerState::Ready, None);
 
     assert_eq!(
-        NetworkController::derive_local_realization_state(true, Some(&peer), true, false),
+        NetworkController::derive_local_realization_state(true, Some(&peer), true, false, true),
         NetworkLocalRealizationState::Configuring,
         "a stale ready peer row without active local dataplane should not be treated as ready"
     );
     assert_eq!(
-        NetworkController::derive_local_realization_state(true, Some(&peer), true, true),
+        NetworkController::derive_local_realization_state(true, Some(&peer), true, true, true),
         NetworkLocalRealizationState::Ready
+    );
+}
+
+#[test]
+fn local_realization_state_requires_wireguard_gate_for_ready() {
+    let network_id = Uuid::new_v4();
+    let peer_id = Uuid::new_v4();
+    let peer =
+        NetworkPeerStateValue::new(network_id, peer_id, "local", NetworkPeerState::Ready, None);
+
+    assert_eq!(
+        NetworkController::derive_local_realization_state(true, Some(&peer), true, true, false),
+        NetworkLocalRealizationState::Configuring,
+        "a ready peer row should not report ready while local WireGuard still blocks admission"
     );
 }
 
 #[test]
 fn local_realization_state_reports_missing_spec_without_observed_row() {
     assert_eq!(
-        NetworkController::derive_local_realization_state(false, None, false, false),
+        NetworkController::derive_local_realization_state(false, None, false, false, true),
         NetworkLocalRealizationState::MissingSpec
     );
 }
@@ -241,9 +256,45 @@ fn local_realization_state_preserves_peer_error() {
     );
 
     assert_eq!(
-        NetworkController::derive_local_realization_state(true, Some(&peer), true, false),
+        NetworkController::derive_local_realization_state(true, Some(&peer), true, false, true),
         NetworkLocalRealizationState::Error
     );
+}
+
+#[test]
+fn wireguard_gate_blocks_ready_for_required_inactive_underlay() {
+    let spec = test_network_spec("wireguard-gate", NetworkRealizationPolicy::OnDemand);
+    let blocked = WireGuardUnderlayState {
+        required_peer_count: 1,
+        underlay_active: false,
+        ..Default::default()
+    };
+    let ready = WireGuardUnderlayState {
+        required_peer_count: 1,
+        underlay_active: true,
+        ..Default::default()
+    };
+
+    assert!(
+        !NetworkController::wireguard_gate_allows_local_ready_with_config(&spec, &blocked, true)
+    );
+    assert!(NetworkController::wireguard_gate_allows_local_ready_with_config(&spec, &ready, true));
+    assert!(
+        NetworkController::wireguard_gate_allows_local_ready_with_config(&spec, &blocked, false)
+    );
+}
+
+#[test]
+fn wireguard_underlay_not_ready_error_is_configuring_not_failure() {
+    let waiting =
+        anyhow::anyhow!("wireguard underlay required for 2 scoped peers but is not ready yet");
+    let wrapped = waiting.context("ensure bpf programs after underlay selection");
+    let real_failure = anyhow::anyhow!("wireguard underlay reconcile failed: permission denied");
+
+    assert!(NetworkController::is_wireguard_underlay_not_ready(&wrapped));
+    assert!(!NetworkController::is_wireguard_underlay_not_ready(
+        &real_failure
+    ));
 }
 
 #[test]

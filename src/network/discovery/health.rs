@@ -453,20 +453,45 @@ async fn resolve_neighbor_mac(network_id: Uuid, ip: IpAddr) -> Option<[u8; 6]> {
         return None;
     }
 
-    let mut neighs = handle.neighbours().get().execute();
+    for ifindex in [bridge_index, vxlan_index].into_iter().flatten() {
+        if let Some(mac) = resolve_neighbor_mac_on_link(&handle, ifindex, ip).await {
+            return Some(mac);
+        }
+    }
+    None
+}
+
+/// Resolve one backend MAC by draining a single interface-scoped neighbour dump.
+///
+/// The stream must be consumed to completion before returning. Dropping an active rtnetlink dump
+/// after the first matching neighbour leaves the connection task with kernel responses that no
+/// request handle is still receiving, which `netlink-proto` reports as
+/// `failed to forward response back to the handle`.
+#[cfg(target_os = "linux")]
+async fn resolve_neighbor_mac_on_link(
+    handle: &rtnetlink::Handle,
+    ifindex: u32,
+    ip: IpAddr,
+) -> Option<[u8; 6]> {
+    use futures::TryStreamExt;
+    use rtnetlink::IpVersion;
+
+    let ip_version = match ip {
+        IpAddr::V4(_) => IpVersion::V4,
+        IpAddr::V6(_) => IpVersion::V6,
+    };
+    let mut request = handle.neighbours().get().set_family(ip_version);
+    request.message_mut().header.ifindex = ifindex;
+
+    let mut found_mac = None;
+    let mut neighs = request.execute();
     while let Ok(Some(msg)) = neighs.try_next().await {
-        let on_bridge = bridge_index
-            .map(|idx| idx == msg.header.ifindex)
-            .unwrap_or(false);
-        let on_vxlan = vxlan_index
-            .map(|idx| idx == msg.header.ifindex)
-            .unwrap_or(false);
-        if !on_bridge && !on_vxlan {
+        if msg.header.ifindex != ifindex {
             continue;
         }
 
         let mut found_ip = false;
-        let mut found_mac: Option<[u8; 6]> = None;
+        let mut message_mac: Option<[u8; 6]> = None;
         for nla in &msg.attributes {
             use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
             match nla {
@@ -483,17 +508,17 @@ async fn resolve_neighbor_mac(network_id: Uuid, ip: IpAddr) -> Option<[u8; 6]> {
                 NeighbourAttribute::LinkLocalAddress(ll) if ll.len() == 6 => {
                     let mut mac = [0u8; 6];
                     mac.copy_from_slice(ll);
-                    found_mac = Some(mac);
+                    message_mac = Some(mac);
                 }
                 _ => {}
             }
         }
 
-        if found_ip && let Some(mac) = found_mac {
-            return Some(mac);
+        if found_ip && let Some(mac) = message_mac {
+            found_mac = Some(mac);
         }
     }
-    None
+    found_mac
 }
 
 #[cfg(not(target_os = "linux"))]

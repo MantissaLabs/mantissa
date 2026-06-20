@@ -58,6 +58,8 @@ const VXLAN_PORT: u16 = 4789;
 const WIREGUARD_RECONCILE_DEBOUNCE: Duration = Duration::from_secs(1);
 /// Number of short retries scheduled after WireGuard reconciliation is debounce-skipped.
 const WIREGUARD_RECONCILE_RETRY_LIMIT: usize = 3;
+/// Error prefix used for the expected encrypted-underlay convergence gate.
+const WIREGUARD_UNDERLAY_NOT_READY_ERROR_PREFIX: &str = "wireguard underlay required for ";
 /// Number of checks used when waiting for netlink link state to converge.
 const LINK_STATE_SETTLE_ATTEMPTS: usize = 10;
 /// Delay between netlink link-state convergence checks.
@@ -314,11 +316,20 @@ impl NetworkController {
             guard.contains(&network_id)
         };
 
+        let wireguard_ready = match spec.as_ref() {
+            Some(spec) => {
+                let state = self.inner.wireguard.lock().await;
+                Self::wireguard_gate_allows_local_ready(spec, &state)
+            }
+            None => true,
+        };
+
         Ok(Self::derive_local_realization_state(
             spec_observed,
             peer_state.as_ref(),
             has_local_demand,
             active,
+            wireguard_ready,
         ))
     }
 
@@ -445,6 +456,12 @@ impl NetworkController {
         let lock = self.realization_lock(network_id).await;
         let _guard = lock.lock().await;
 
+        if self.refresh_admission_readiness_gate(network_id).await?
+            && self.local_network_ready(network_id).await?
+        {
+            return Ok(());
+        }
+
         if self.local_network_ready(network_id).await? {
             return Ok(());
         }
@@ -521,6 +538,36 @@ impl NetworkController {
         self.reconcile_network(spec).await
     }
 
+    /// Refresh local-only gates that can invalidate a previously ready dataplane.
+    ///
+    /// Admission normally hits an already-active network and would otherwise trust the last
+    /// replicated peer row. WireGuard scope changes are node-local runtime state, so refresh them
+    /// before accepting a workload onto an existing VXLAN network. When the gate changes, force the
+    /// normal realization path to rebuild or revalidate the dataplane before the task starts.
+    async fn refresh_admission_readiness_gate(&self, network_id: Uuid) -> Result<bool> {
+        let Some(spec) = self
+            .inner
+            .registry
+            .get_spec(network_id)
+            .with_context(|| format!("load network spec {network_id} for admission gate"))?
+        else {
+            return Ok(false);
+        };
+        if spec.is_deleted() {
+            return Ok(false);
+        }
+        if !spec.driver.requires_wireguard_underlay() {
+            return Ok(true);
+        }
+
+        if self.reconcile_wireguard_underlay().await? {
+            self.prepare_for_dataplane_rebuild(network_id).await?;
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
     /// Return a stable per-network lock used to serialize local realization/teardown.
     async fn realization_lock(&self, network_id: Uuid) -> Arc<AsyncMutex<()>> {
         let mut guard = self.inner.realization_locks.lock().await;
@@ -560,6 +607,25 @@ impl NetworkController {
             return Ok(false);
         }
 
+        let Some(spec) = self
+            .inner
+            .registry
+            .get_spec(network_id)
+            .with_context(|| format!("load network spec {network_id} for local readiness"))?
+        else {
+            return Ok(false);
+        };
+        if spec.is_deleted() {
+            return Ok(false);
+        }
+
+        {
+            let state = self.inner.wireguard.lock().await;
+            if !Self::wireguard_gate_allows_local_ready(&spec, &state) {
+                return Ok(false);
+            }
+        }
+
         let peer_ready = self
             .inner
             .registry
@@ -576,6 +642,30 @@ impl NetworkController {
         }
 
         Ok(true)
+    }
+
+    /// Return whether local WireGuard state permits a network to be treated as ready.
+    fn wireguard_gate_allows_local_ready(
+        spec: &NetworkSpecValue,
+        state: &WireGuardUnderlayState,
+    ) -> bool {
+        Self::wireguard_gate_allows_local_ready_with_config(
+            spec,
+            state,
+            config::wireguard_enabled(),
+        )
+    }
+
+    /// Return whether a VXLAN network is blocked by mandatory encrypted underlay readiness.
+    fn wireguard_gate_allows_local_ready_with_config(
+        spec: &NetworkSpecValue,
+        state: &WireGuardUnderlayState,
+        wireguard_enabled: bool,
+    ) -> bool {
+        !wireguard_enabled
+            || !spec.driver.requires_wireguard_underlay()
+            || state.required_peer_count == 0
+            || state.underlay_active
     }
 
     /// Refresh discovery-derived VIP and NodePort publication for one network immediately.
@@ -821,6 +911,7 @@ impl NetworkController {
         peer_state: Option<&NetworkPeerStateValue>,
         has_local_demand: bool,
         active: bool,
+        wireguard_ready: bool,
     ) -> NetworkLocalRealizationState {
         if !spec_observed {
             return match peer_state.map(|state| state.state) {
@@ -843,7 +934,9 @@ impl NetworkController {
         }
 
         match peer_state.state {
-            NetworkPeerState::Ready if active => NetworkLocalRealizationState::Ready,
+            NetworkPeerState::Ready if active && wireguard_ready => {
+                NetworkLocalRealizationState::Ready
+            }
             NetworkPeerState::Ready
             | NetworkPeerState::Configuring
             | NetworkPeerState::AwaitingSpec => NetworkLocalRealizationState::Configuring,
@@ -1584,12 +1677,7 @@ impl NetworkController {
             }
 
             if let Err(err) = self.reconcile_network(spec).await {
-                warn!(
-                    target: "network",
-                    network = %network_id,
-                    "event-triggered network reconcile failed: {err:#}"
-                );
-                self.update_peer_state_error(network_id, format!("{err:#}"))
+                self.record_reconcile_failure(network_id, "event-triggered", err)
                     .await?;
             }
         }
@@ -1638,12 +1726,7 @@ impl NetworkController {
                 }
             } else if Self::spec_has_local_realization_demand(&spec, &local_demand) {
                 if let Err(err) = self.reconcile_network(spec.clone()).await {
-                    warn!(
-                        target: "network",
-                        network = %network_id,
-                        "immediate reconcile failed: {err:#}"
-                    );
-                    self.update_peer_state_error(network_id, format!("{err:#}"))
+                    self.record_reconcile_failure(network_id, "immediate", err)
                         .await?;
                 }
             } else {
@@ -1814,13 +1897,7 @@ impl NetworkController {
             }
 
             if let Err(err) = self.reconcile_network(spec.clone()).await {
-                warn!(
-                    target: "network",
-                    "failed to reconcile network {} ({}): {err:#}",
-                    spec.name,
-                    spec.id
-                );
-                self.update_peer_state_error(spec.id, format!("{err:#}"))
+                self.record_reconcile_failure(spec.id, "periodic", err)
                     .await?;
             }
         }
@@ -2600,6 +2677,47 @@ impl NetworkController {
             .context("persist peer state configuring")?;
         self.send_event(NetworkEvent::PeerUpsert(state)).await;
         Ok(true)
+    }
+
+    /// Record a reconcile failure without turning expected WireGuard convergence into Error.
+    ///
+    /// A local node waiting for scoped WireGuard peers is still a network participant. Keeping that
+    /// state as `Configuring` prevents other peers from removing it from their derived WireGuard
+    /// scope and then adding it back on the next retry.
+    async fn record_reconcile_failure(
+        &self,
+        network_id: Uuid,
+        phase: &'static str,
+        err: anyhow::Error,
+    ) -> Result<()> {
+        if Self::is_wireguard_underlay_not_ready(&err) {
+            debug!(
+                target: "network",
+                network = %network_id,
+                phase,
+                "network reconcile waiting for wireguard underlay: {err:#}"
+            );
+            let _ = self.mark_peer_configuring(network_id).await?;
+            return Ok(());
+        }
+
+        warn!(
+            target: "network",
+            network = %network_id,
+            phase,
+            "network reconcile failed: {err:#}"
+        );
+        self.update_peer_state_error(network_id, format!("{err:#}"))
+            .await
+    }
+
+    /// Return whether an error only means the scoped WireGuard underlay is still converging.
+    fn is_wireguard_underlay_not_ready(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            cause
+                .to_string()
+                .starts_with(WIREGUARD_UNDERLAY_NOT_READY_ERROR_PREFIX)
+        })
     }
 
     /// Persist the local peer as `Removing` while local dataplane state is being withdrawn.
