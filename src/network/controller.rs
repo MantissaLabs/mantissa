@@ -388,6 +388,10 @@ impl NetworkController {
             return Ok(0);
         }
 
+        // Cache only ingress-derived demand for the batch. Local workload demand is re-read per
+        // candidate below because task teardown can remove the last attachment while this sweep is
+        // in flight. A stale local positive would otherwise suppress the required release.
+        let ingress_pool_demand = self.ingress_pool_network_demand_snapshot()?;
         let mut released = 0usize;
         let candidates = candidates.into_iter().collect::<Vec<_>>();
         for network_id in Self::sorted_unique_network_ids(&candidates) {
@@ -405,8 +409,10 @@ impl NetworkController {
                 continue;
             };
 
-            let local_demand = self.local_network_demand_snapshot().await?;
-            if spec.realizes_on_all_nodes() || local_demand.contains(&network_id) {
+            if spec.realizes_on_all_nodes()
+                || ingress_pool_demand.contains(&network_id)
+                || self.has_current_local_workload_demand(network_id).await?
+            {
                 continue;
             }
 
@@ -739,6 +745,18 @@ impl NetworkController {
                 attachment.node_id == self.inner.node_id
                     && !matches!(attachment.state, NetworkAttachmentState::Removing)
             }))
+    }
+
+    /// Return true when current in-flight starts or durable local attachments demand a network.
+    async fn has_current_local_workload_demand(&self, network_id: Uuid) -> Result<bool> {
+        {
+            let guard = self.inner.local_demand.lock().await;
+            if guard.contains(&network_id) {
+                return Ok(true);
+            }
+        }
+
+        self.has_local_attachment_demand(network_id)
     }
 
     /// Collect local demand from in-flight starts and durable local attachment rows.
