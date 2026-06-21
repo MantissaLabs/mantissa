@@ -473,31 +473,41 @@ impl AttachmentProvisioner {
     /// Returns the host-side link index together with its current controller/master when the
     /// interface still exists in the host namespace.
     async fn link_state(&self, handle: &Handle, name: &str) -> Result<Option<LinkState>> {
+        // Capture the first matching link but continue polling until the dump ends.
+        // Dropping rtnetlink dump streams early leaves later kernel responses with no
+        // request receiver, which netlink-proto reports as a forwarding warning.
         let mut stream = handle.link().get().match_name(name.to_string()).execute();
+        let mut state = None;
 
-        match stream.try_next().await {
-            Ok(Some(msg)) => Ok(Some(LinkState {
-                index: msg.header.index,
-                controller: link_controller(msg.attributes.iter()),
-            })),
-            Ok(None) => Ok(None),
-            Err(rtnetlink::Error::NetlinkError(message)) => {
-                let raw = message.raw_code();
-                let errno = raw.abs();
-                if errno == libc::ENODEV || errno == libc::ENOENT {
-                    debug!(
-                        target: "task",
-                        link = name,
-                        errno,
-                        raw_code = raw,
-                        "link lookup returned ENODEV/ENOENT; treating as absent"
-                    );
-                    Ok(None)
-                } else {
-                    Err(rtnetlink::Error::NetlinkError(message)).context("query link state")
+        loop {
+            match stream.try_next().await {
+                Ok(Some(msg)) => {
+                    if state.is_none() {
+                        state = Some(LinkState {
+                            index: msg.header.index,
+                            controller: link_controller(msg.attributes.iter()),
+                        });
+                    }
                 }
+                Ok(None) => return Ok(state),
+                Err(rtnetlink::Error::NetlinkError(message)) => {
+                    let raw = message.raw_code();
+                    let errno = raw.abs();
+                    if errno == libc::ENODEV || errno == libc::ENOENT {
+                        debug!(
+                            target: "task",
+                            link = name,
+                            errno,
+                            raw_code = raw,
+                            "link lookup returned ENODEV/ENOENT; treating as absent"
+                        );
+                        return Ok(None);
+                    }
+                    return Err(rtnetlink::Error::NetlinkError(message))
+                        .context("query link state");
+                }
+                Err(err) => return Err(err).context("query link state"),
             }
-            Err(err) => Err(err).context("query link state"),
         }
     }
 
@@ -767,14 +777,20 @@ fn configure_interface_in_current_ns(
             .context("open rtnetlink connection in runtime namespace")?;
         tokio::spawn(connection);
 
+        // The runtime namespace lookup should also drain the link dump. There is only
+        // one expected interface name, but rtnetlink still delivers it through a stream.
         let mut links = handle.link().get().match_name(iface.to_string()).execute();
-
-        let link = links
+        let mut index = None;
+        while let Some(link) = links
             .try_next()
             .await
             .context("query runtime interface state")?
-            .context("runtime interface missing after namespace move")?;
-        let index = link.header.index;
+        {
+            if index.is_none() {
+                index = Some(link.header.index);
+            }
+        }
+        let index = index.context("runtime interface missing after namespace move")?;
 
         if mtu > 0 {
             handle

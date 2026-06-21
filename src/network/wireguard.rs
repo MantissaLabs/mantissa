@@ -741,13 +741,22 @@ async fn prune_stale_wireguard_routes(
         new_connection().context("open rtnetlink connection for wireguard route pruning")?;
     tokio::spawn(connection);
 
+    // Rtnetlink link lookups are dump streams. Keep the first match but drain the
+    // stream to completion so the connection task has a receiver for every kernel
+    // response and does not emit "failed to forward response back to the handle".
     let mut links = handle.link().get().match_name(ifname.to_string()).execute();
-    let link = links
+    let mut ifindex = None;
+    while let Some(link) = links
         .try_next()
         .await
         .with_context(|| format!("lookup link index for {ifname}"))?
+    {
+        if ifindex.is_none() {
+            ifindex = Some(link.header.index);
+        }
+    }
+    let ifindex = ifindex
         .ok_or_else(|| anyhow::anyhow!("link {ifname} missing while pruning wireguard routes"))?;
-    let ifindex = link.header.index;
 
     let mut routes = handle
         .route()

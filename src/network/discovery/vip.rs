@@ -197,29 +197,30 @@ async fn ensure_host_vip_neighbor(network_id: Uuid, vip: IpAddr, vip_mac: [u8; 6
         tokio::spawn(conn);
 
         let host_ifname = host_access_host_iface_name(network_id);
-        let host_index = match handle
+        // Keep the first matching host-access link but drain the lookup stream. These
+        // VIP neighbour paths run in discovery refreshes, so early stream drops would
+        // turn normal publication churn into repeated netlink-proto warnings.
+        let mut links = handle
             .link()
             .get()
             .match_name(host_ifname.clone())
-            .execute()
-            .try_next()
-            .await
-        {
-            Ok(Some(msg)) => msg.header.index,
-            Ok(None) => {
-                debug!(
-                    target: "network",
-                    network = %network_id,
-                    iface = %host_ifname,
-                    "host access interface missing while programming vip neighbour"
-                );
-                return Ok(());
+            .execute();
+        let mut host_index = None;
+        while let Some(msg) = links.try_next().await.with_context(|| {
+            format!("lookup host access interface {host_ifname} for vip neighbour")
+        })? {
+            if host_index.is_none() {
+                host_index = Some(msg.header.index);
             }
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("lookup host access interface {host_ifname} for vip neighbour")
-                });
-            }
+        }
+        let Some(host_index) = host_index else {
+            debug!(
+                target: "network",
+                network = %network_id,
+                iface = %host_ifname,
+                "host access interface missing while programming vip neighbour"
+            );
+            return Ok(());
         };
 
         handle
@@ -261,21 +262,23 @@ pub(super) async fn reconcile_host_vip_neighbors(
         tokio::spawn(conn);
 
         let host_ifname = host_access_host_iface_name(network_id);
-        let host_index = match handle
+        // The GC path uses the same stream-drain pattern as programming: the result is
+        // a single link index, but rtnetlink still completes the request asynchronously.
+        let mut links = handle
             .link()
             .get()
             .match_name(host_ifname.clone())
-            .execute()
-            .try_next()
-            .await
-        {
-            Ok(Some(msg)) => msg.header.index,
-            Ok(None) => return Ok(()),
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("lookup host access interface {host_ifname} for vip neighbour gc")
-                });
+            .execute();
+        let mut host_index = None;
+        while let Some(msg) = links.try_next().await.with_context(|| {
+            format!("lookup host access interface {host_ifname} for vip neighbour gc")
+        })? {
+            if host_index.is_none() {
+                host_index = Some(msg.header.index);
             }
+        }
+        let Some(host_index) = host_index else {
+            return Ok(());
         };
 
         let mut stale_vips = HashSet::new();

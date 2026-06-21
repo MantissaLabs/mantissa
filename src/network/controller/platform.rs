@@ -1883,15 +1883,22 @@ mod linux {
                 return Ok(None);
             };
 
+            // These link-attribute helpers intentionally drain the rtnetlink dump even
+            // after finding the desired attribute. Otherwise late responses for the same
+            // request can outlive the stream receiver and trigger netlink-proto warnings.
             let mut links = handle.link().get().match_index(index).execute();
+            let mut controller = None;
             while let Some(link) = links.try_next().await? {
-                for nla in link.attributes.into_iter() {
-                    if let LinkAttribute::Controller(controller) = nla {
-                        return Ok(Some(controller));
+                if controller.is_none() {
+                    for nla in link.attributes.into_iter() {
+                        if let LinkAttribute::Controller(value) = nla {
+                            controller = Some(value);
+                            break;
+                        }
                     }
                 }
             }
-            Ok(None)
+            Ok(controller)
         }
 
         /// Return the current MTU for one link when the kernel still resolves the interface.
@@ -1904,15 +1911,21 @@ mod linux {
                 return Ok(None);
             };
 
+            // Preserve the first observed MTU while consuming the full link dump; see
+            // `link_controller_index` for why these simple lookups do not return early.
             let mut links = handle.link().get().match_index(index).execute();
+            let mut mtu = None;
             while let Some(link) = links.try_next().await? {
-                for nla in link.attributes.into_iter() {
-                    if let LinkAttribute::Mtu(mtu) = nla {
-                        return Ok(Some(mtu));
+                if mtu.is_none() {
+                    for nla in link.attributes.into_iter() {
+                        if let LinkAttribute::Mtu(value) = nla {
+                            mtu = Some(value);
+                            break;
+                        }
                     }
                 }
             }
-            Ok(None)
+            Ok(mtu)
         }
 
         /// Resolve the kernel interface index for the provided link name.
@@ -1929,28 +1942,36 @@ mod linux {
                 return Ok(None);
             };
 
+            // Link name lookup is still a dump stream. Keep the first match and wait
+            // for completion so the shared netlink connection drains cleanly.
             let mut stream = handle.link().get().match_name(name.to_string()).execute();
+            let mut index = None;
 
-            match stream.try_next().await {
-                Ok(Some(link)) => Ok(Some(link.header.index)),
-                Ok(None) => Ok(None),
-                Err(RtnetlinkError::NetlinkError(msg)) => {
-                    let raw = msg.raw_code();
-                    let errno = raw.abs();
-                    if errno == libc::ENODEV || errno == libc::ENOENT {
-                        debug!(
-                            target: "network",
-                            link = name,
-                            errno,
-                            raw_code = raw,
-                            "link lookup returned ENODEV/ENOENT; treating as absent"
-                        );
-                        Ok(None)
-                    } else {
-                        Err(RtnetlinkError::NetlinkError(msg).into())
+            loop {
+                match stream.try_next().await {
+                    Ok(Some(link)) => {
+                        if index.is_none() {
+                            index = Some(link.header.index);
+                        }
                     }
+                    Ok(None) => return Ok(index),
+                    Err(RtnetlinkError::NetlinkError(msg)) => {
+                        let raw = msg.raw_code();
+                        let errno = raw.abs();
+                        if errno == libc::ENODEV || errno == libc::ENOENT {
+                            debug!(
+                                target: "network",
+                                link = name,
+                                errno,
+                                raw_code = raw,
+                                "link lookup returned ENODEV/ENOENT; treating as absent"
+                            );
+                            return Ok(None);
+                        }
+                        return Err(RtnetlinkError::NetlinkError(msg).into());
+                    }
+                    Err(err) => return Err(err.into()),
                 }
-                Err(err) => Err(err.into()),
             }
         }
 
@@ -2141,6 +2162,7 @@ mod linux {
                 .get()
                 .set_link_index_filter(index)
                 .execute();
+            let mut found = false;
             while let Some(message) = addresses.try_next().await.context("enumerate addresses")? {
                 if message.header.family != family {
                     continue;
@@ -2149,11 +2171,11 @@ mod linux {
                     if let AddressAttribute::Address(ip) | AddressAttribute::Local(ip) = attribute
                         && ip == desired_ip
                     {
-                        return Ok(true);
+                        found = true;
                     }
                 }
             }
-            Ok(false)
+            Ok(found)
         }
 
         /// Resolve the kernel-selected default-route interface for one IP family.
@@ -2174,28 +2196,38 @@ mod linux {
                         .route()
                         .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
                         .execute();
+                    // Keep the first usable default route but finish reading the route
+                    // dump before returning, matching the link-dump drain pattern.
+                    let mut selected = None;
                     while let Some(route) = routes.try_next().await.context("list ipv4 routes")? {
-                        if let Some(info) = self
-                            .route_underlay_from_message(route.header, route.attributes)
-                            .await?
+                        if selected.is_none()
+                            && let Some(info) = self
+                                .route_underlay_from_message(route.header, route.attributes)
+                                .await?
                         {
-                            return Ok(Some(info));
+                            selected = Some(info);
                         }
                     }
+                    return Ok(selected);
                 }
                 AddressFamily::Inet6 => {
                     let mut routes = handle
                         .route()
                         .get(RouteMessageBuilder::<Ipv6Addr>::new().build())
                         .execute();
+                    // IPv6 route dumps can also contain multiple rows; record the
+                    // selected one and drain the rest for netlink stream hygiene.
+                    let mut selected = None;
                     while let Some(route) = routes.try_next().await.context("list ipv6 routes")? {
-                        if let Some(info) = self
-                            .route_underlay_from_message(route.header, route.attributes)
-                            .await?
+                        if selected.is_none()
+                            && let Some(info) = self
+                                .route_underlay_from_message(route.header, route.attributes)
+                                .await?
                         {
-                            return Ok(Some(info));
+                            selected = Some(info);
                         }
                     }
+                    return Ok(selected);
                 }
                 _ => {}
             }
@@ -2260,8 +2292,16 @@ mod linux {
                 return Err(anyhow!("rtnetlink handle unavailable"));
             };
 
+            // A route only points at one output interface, but the link query is still
+            // delivered as a stream. Drain it before deciding whether the link is usable.
             let mut links = handle.link().get().match_index(index).execute();
-            let Some(link) = links.try_next().await.context("resolve route interface")? else {
+            let mut route_link = None;
+            while let Some(link) = links.try_next().await.context("resolve route interface")? {
+                if route_link.is_none() {
+                    route_link = Some(link);
+                }
+            }
+            let Some(link) = route_link else {
                 return Ok(None);
             };
             let name = link
@@ -2311,11 +2351,14 @@ mod linux {
                 return Ok(None);
             };
 
+            // Preserve IPv4 preference without returning early. Address dumps must be
+            // drained just like link and route dumps.
             let mut addresses = handle
                 .address()
                 .get()
                 .set_link_index_filter(index)
                 .execute();
+            let mut ipv4_candidate = None;
             let mut ipv6_candidate = None;
             while let Some(message) = addresses.try_next().await.context("enumerate addresses")? {
                 if family != AddressFamily::Unspec && message.header.family != family {
@@ -2329,7 +2372,11 @@ mod linux {
                             continue;
                         }
                         match ip {
-                            IpAddr::V4(_) => return Ok(Some(ip)),
+                            IpAddr::V4(_) => {
+                                if ipv4_candidate.is_none() {
+                                    ipv4_candidate = Some(ip);
+                                }
+                            }
                             IpAddr::V6(_) => {
                                 if ipv6_candidate.is_none() {
                                     ipv6_candidate = Some(ip);
@@ -2339,7 +2386,7 @@ mod linux {
                     }
                 }
             }
-            Ok(ipv6_candidate)
+            Ok(ipv4_candidate.or(ipv6_candidate))
         }
 
         /// Scan links as a last-resort fallback when no explicit advertise or default route wins.
@@ -2352,12 +2399,19 @@ mod linux {
                 return Err(anyhow!("rtnetlink handle unavailable"));
             };
 
+            // Select the first usable fallback interface but keep scanning to the end
+            // so the full link inventory response is consumed.
             let mut link_stream = handle.link().get().execute();
+            let mut selected = None;
             while let Some(link) = link_stream
                 .try_next()
                 .await
                 .context("enumerate link devices via rtnetlink")?
             {
+                if selected.is_some() {
+                    continue;
+                }
+
                 let index = link.header.index;
                 let name = link
                     .attributes
@@ -2394,13 +2448,13 @@ mod linux {
                         underlay_mtu = info.mtu,
                         "selected underlay from fallback link scan"
                     );
-                    return Ok(info);
+                    selected = Some(info);
                 }
             }
 
-            Err(anyhow!(
-                "unable to locate a usable local interface for vxlan underlay"
-            ))
+            selected.ok_or_else(|| {
+                anyhow!("unable to locate a usable local interface for vxlan underlay")
+            })
         }
 
         /// Resolve and apply the effective underlay contract for one network plan.
@@ -2475,15 +2529,21 @@ mod linux {
                 return Ok(None);
             };
 
+            // The following VXLAN/link attribute helpers use the same first-match plus
+            // drain pattern to avoid dropping active rtnetlink dump streams.
             let mut links = handle.link().get().match_index(index).execute();
+            let mut name = None;
             while let Some(link) = links.try_next().await? {
-                for nla in link.attributes.into_iter() {
-                    if let LinkAttribute::IfName(name) = nla {
-                        return Ok(Some(name));
+                if name.is_none() {
+                    for nla in link.attributes.into_iter() {
+                        if let LinkAttribute::IfName(value) = nla {
+                            name = Some(value);
+                            break;
+                        }
                     }
                 }
             }
-            Ok(None)
+            Ok(name)
         }
 
         /// Resolve the current MAC address for a link so MAC updates remain idempotent.
@@ -2495,15 +2555,20 @@ mod linux {
                 return Ok(None);
             };
 
+            // Keep the first MAC address and consume the remaining dump messages.
             let mut links = handle.link().get().match_index(index).execute();
+            let mut address = None;
             while let Some(link) = links.try_next().await? {
-                for nla in link.attributes.into_iter() {
-                    if let LinkAttribute::Address(addr) = nla {
-                        return Ok(Some(addr));
+                if address.is_none() {
+                    for nla in link.attributes.into_iter() {
+                        if let LinkAttribute::Address(value) = nla {
+                            address = Some(value);
+                            break;
+                        }
                     }
                 }
             }
-            Ok(None)
+            Ok(address)
         }
 
         /// Return the "lower" (underlay) link index for the provided interface, when available.
@@ -2520,8 +2585,14 @@ mod linux {
                 return Ok(None);
             };
 
+            // Detect the VXLAN lower link from the first matching attribute, then drain
+            // the rest of the response before returning it to the caller.
             let mut links = handle.link().get().match_index(index).execute();
+            let mut lower_index = None;
             while let Some(link) = links.try_next().await? {
+                if lower_index.is_some() {
+                    continue;
+                }
                 for nla in link.attributes.into_iter() {
                     match nla {
                         LinkAttribute::LinkInfo(infos) => {
@@ -2529,20 +2600,27 @@ mod linux {
                                 if let LinkInfo::Data(InfoData::Vxlan(entries)) = info {
                                     for entry in entries {
                                         if let InfoVxlan::Link(lower) = entry {
-                                            return Ok(Some(lower));
+                                            lower_index = Some(lower);
+                                            break;
                                         }
                                     }
+                                }
+                                if lower_index.is_some() {
+                                    break;
                                 }
                             }
                         }
                         LinkAttribute::Link(lower) => {
-                            return Ok(Some(lower));
+                            lower_index = Some(lower);
                         }
                         _ => {}
                     }
+                    if lower_index.is_some() {
+                        break;
+                    }
                 }
             }
-            Ok(None)
+            Ok(lower_index)
         }
 
         /// Collect a compact link inventory string list used in VXLAN creation diagnostics.

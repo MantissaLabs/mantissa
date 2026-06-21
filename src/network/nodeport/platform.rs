@@ -1557,23 +1557,29 @@ async fn iface_owns_ip(iface: &str, node_ip: IpAddr) -> Result<bool> {
         .context("open rtnetlink connection for nodeport interface address validation")?;
     tokio::spawn(conn);
 
-    let Some(link) = handle
-        .link()
-        .get()
-        .match_name(iface.to_string())
-        .execute()
+    // Interface validation only needs one link index, but the match-name request is
+    // still a rtnetlink stream. Drain it before moving on to address validation.
+    let mut links = handle.link().get().match_name(iface.to_string()).execute();
+    let mut link_index = None;
+    while let Some(link) = links
         .try_next()
         .await
         .context("fetch nodeport interface for address validation")?
-    else {
+    {
+        if link_index.is_none() {
+            link_index = Some(link.header.index);
+        }
+    }
+    let Some(link_index) = link_index else {
         return Ok(false);
     };
 
     let mut addr_stream = handle
         .address()
         .get()
-        .set_link_index_filter(link.header.index)
+        .set_link_index_filter(link_index)
         .execute();
+    let mut owns_ip = false;
 
     while let Some(msg) = addr_stream
         .try_next()
@@ -1581,11 +1587,11 @@ async fn iface_owns_ip(iface: &str, node_ip: IpAddr) -> Result<bool> {
         .context("enumerate nodeport interface addresses for validation")?
     {
         if address_attrs_contain_ip(&msg.attributes, node_ip) {
-            return Ok(true);
+            owns_ip = true;
         }
     }
 
-    Ok(false)
+    Ok(owns_ip)
 }
 
 /// Filter out addresses that should never become a published NodePort identity.
@@ -1638,12 +1644,19 @@ async fn detect_iface_for_ip(node_ip: IpAddr) -> Result<Option<String>> {
         IpAddr::V6(ip) => ip.is_loopback(),
     };
 
+    // Keep the first owner we find but finish the link scan. This avoids leaving
+    // unread link responses behind when NodePort validates an explicit address.
     let mut link_stream = handle.link().get().execute();
+    let mut owner = None;
     while let Some(link) = link_stream
         .try_next()
         .await
         .context("enumerate links for nodeport iface lookup")?
     {
+        if owner.is_some() {
+            continue;
+        }
+
         let index = link.header.index;
         let name = link_name_from_attrs(&link.attributes, index);
 
@@ -1669,12 +1682,12 @@ async fn detect_iface_for_ip(node_ip: IpAddr) -> Result<Option<String>> {
             .context("enumerate nodeport iface addresses")?
         {
             if address_attrs_contain_ip(&msg.attributes, node_ip) {
-                return Ok(Some(name.clone()));
+                owner = Some(name.clone());
             }
         }
     }
 
-    Ok(None)
+    Ok(owner)
 }
 
 /// Confirm that the selected publication interface currently owns the requested NodePort IP.
@@ -1724,35 +1737,43 @@ async fn detect_iface_ip(
         new_connection().context("open rtnetlink connection for nodeport iface ip lookup")?;
     tokio::spawn(conn);
 
-    let Some(link) = handle
-        .link()
-        .get()
-        .match_name(iface.to_string())
-        .execute()
+    // Capture the interface index and drain the link stream before reading addresses.
+    // This keeps the netlink connection clean even though interface names are unique.
+    let mut links = handle.link().get().match_name(iface.to_string()).execute();
+    let mut link_index = None;
+    while let Some(link) = links
         .try_next()
         .await
         .context("fetch nodeport interface link")?
-    else {
+    {
+        if link_index.is_none() {
+            link_index = Some(link.header.index);
+        }
+    }
+    let Some(link_index) = link_index else {
         return Ok(None);
     };
 
     let mut addr_stream = handle
         .address()
         .get()
-        .set_link_index_filter(link.header.index)
+        .set_link_index_filter(link_index)
         .execute();
+    let mut selected = None;
 
     while let Some(msg) = addr_stream
         .try_next()
         .await
         .context("enumerate nodeport interface addresses")?
     {
-        if let Some(ip) = first_ip_from_address_attrs(&msg.attributes, preferred_family) {
-            return Ok(Some(ip));
+        if selected.is_none()
+            && let Some(ip) = first_ip_from_address_attrs(&msg.attributes, preferred_family)
+        {
+            selected = Some(ip);
         }
     }
 
-    Ok(None)
+    Ok(selected)
 }
 
 /// Pick the first up, non-loopback interface that has a usable NodePort address.
@@ -1767,12 +1788,19 @@ async fn detect_default_iface(
         new_connection().context("open rtnetlink connection for nodeport autodetect")?;
     tokio::spawn(conn);
 
+    // Autodetect chooses the first usable interface, but it still consumes the full
+    // link dump so later messages do not outlive the request receiver.
     let mut link_stream = handle.link().get().execute();
+    let mut selected = None;
     while let Some(link) = link_stream
         .try_next()
         .await
         .context("enumerate links for nodeport autodetect")?
     {
+        if selected.is_some() {
+            continue;
+        }
+
         let index = link.header.index;
         let name = link_name_from_attrs(&link.attributes, index);
 
@@ -1796,12 +1824,12 @@ async fn detect_default_iface(
             .context("enumerate nodeport autodetect addresses")?
         {
             if let Some(ip) = first_ip_from_address_attrs(&msg.attributes, preferred_family) {
-                return Ok(Some((name.clone(), ip)));
+                selected = Some((name.clone(), ip));
             }
         }
     }
 
-    Ok(None)
+    Ok(selected)
 }
 
 /// Resolve a kernel ifindex for a given interface name so tc programs can attach.
@@ -1867,32 +1895,44 @@ async fn host_access_ip(network_id: Uuid, family: NodePortIpFamily) -> Result<Ip
         new_connection().context("open rtnetlink connection for nodeport ip lookup")?;
     tokio::spawn(conn);
 
-    let Some(link) = handle
-        .link()
-        .get()
-        .match_name(ifname.clone())
-        .execute()
+    // Host-access lookups run during publication refreshes; drain the link response
+    // before using the first matching interface index for address lookup.
+    let mut links = handle.link().get().match_name(ifname.clone()).execute();
+    let mut link_index = None;
+    while let Some(link) = links
         .try_next()
         .await
         .context("fetch nodeport host access link for ip")?
-    else {
+    {
+        if link_index.is_none() {
+            link_index = Some(link.header.index);
+        }
+    }
+    let Some(link_index) = link_index else {
         return Err(anyhow!("host access interface {ifname} not found"));
     };
 
     let mut addr_stream = handle
         .address()
         .get()
-        .set_link_index_filter(link.header.index)
+        .set_link_index_filter(link_index)
         .execute();
+    let mut selected = None;
 
     while let Some(msg) = addr_stream
         .try_next()
         .await
         .context("enumerate host access addresses")?
     {
-        if let Some(ip) = first_ip_from_address_attrs(&msg.attributes, Some(family)) {
-            return Ok(ip);
+        if selected.is_none()
+            && let Some(ip) = first_ip_from_address_attrs(&msg.attributes, Some(family))
+        {
+            selected = Some(ip);
         }
+    }
+
+    if let Some(ip) = selected {
+        return Ok(ip);
     }
 
     let family_label = match family {
@@ -1914,25 +1954,29 @@ async fn host_access_mtu(network_id: Uuid) -> Result<u32> {
         new_connection().context("open rtnetlink connection for nodeport MTU lookup")?;
     tokio::spawn(conn);
 
-    let Some(link) = handle
-        .link()
-        .get()
-        .match_name(ifname.clone())
-        .execute()
+    // MTU lookup is another single-value query over a stream. Track whether the link
+    // existed separately from whether it carried an MTU while draining all responses.
+    let mut links = handle.link().get().match_name(ifname.clone()).execute();
+    let mut found_link = false;
+    let mut mtu = None;
+    while let Some(link) = links
         .try_next()
         .await
         .context("fetch nodeport host access link for MTU")?
-    else {
+    {
+        found_link = true;
+        if mtu.is_none() {
+            mtu = link.attributes.iter().find_map(|attr| match attr {
+                LinkAttribute::Mtu(value) => Some(*value),
+                _ => None,
+            });
+        }
+    }
+    if !found_link {
         return Err(anyhow!("host access interface {ifname} not found"));
-    };
+    }
 
-    link.attributes
-        .iter()
-        .find_map(|attr| match attr {
-            LinkAttribute::Mtu(mtu) => Some(*mtu),
-            _ => None,
-        })
-        .ok_or_else(|| anyhow!("host access interface {ifname} missing MTU"))
+    mtu.ok_or_else(|| anyhow!("host access interface {ifname} missing MTU"))
 }
 
 /// Convert one host-access MTU into the per-family TCP MSS ceiling programmed into BPF maps.
