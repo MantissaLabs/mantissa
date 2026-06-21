@@ -237,11 +237,10 @@ local_test!(wireguard_scoped_peer_gate_blocks_until_peer_enabled, {
             matches!(
                 node.network_registry.get_peer_state(network.id, node.id),
                 Ok(Some(state))
-                    if state.state == NetworkPeerState::Error
-                        && state
-                            .error
-                            .as_deref()
-                            .is_some_and(|error| error.contains("wireguard underlay required"))
+                    if state.state == NetworkPeerState::Configuring && state.error.is_none()
+            ) && matches!(
+                node.network_registry.get_spec(network.id),
+                Ok(Some(spec)) if spec.status == NetworkStatus::Pending
             )
         },
     )
