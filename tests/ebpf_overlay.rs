@@ -855,7 +855,11 @@ async fn wait_for_vip_record_v6(
     }
 }
 
-/// Snapshot the current top-level bpffs pins used by Mantissa so churn tests can detect leaks.
+/// Snapshot the current per-network overlay bpffs pins so churn tests can detect map leaks.
+///
+/// `/sys/fs/bpf/mantissa` can also contain shared runtime directories, such as `nodeport`, that
+/// are not owned by one overlay network. Network churn cleanup is responsible for UUID-scoped
+/// load-balancer directories only, so keep the assertion focused on that ownership boundary.
 fn pinned_map_entries_snapshot() -> BTreeSet<String> {
     let base = PathBuf::from("/sys/fs/bpf/mantissa");
     let Ok(entries) = std::fs::read_dir(&base) else {
@@ -864,6 +868,7 @@ fn pinned_map_entries_snapshot() -> BTreeSet<String> {
     entries
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| Uuid::parse_str(name).is_ok())
         .collect()
 }
 
@@ -1438,20 +1443,44 @@ local_test!(ebpf_overlay_status_reports_programmed_vip_traffic, {
         .expect("discover VIP for overlay status test");
     let vip_addr = format!("{vip}:{EBPF_HTTP_PORT}");
 
+    let neighbour_ready = common::convergence::wait_until(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        || async { permanent_neighbour_exists(&host_ifname, IpAddr::V4(vip)).await },
+    )
+    .await;
     assert!(
-        common::convergence::wait_until(
-            Duration::from_secs(30),
-            Duration::from_millis(100),
-            || async {
-                matches!(
-                    http_get(&vip_addr).await,
-                    Ok(response) if response.contains(EBPF_HTTP_RESPONSE)
-                )
-            },
-        )
-        .await,
-        "overlay status test service should answer through the host-access VIP"
+        neighbour_ready,
+        "overlay status test should program a permanent host-access neighbour before probing VIP traffic: {}",
+        neighbour_summary(&host_ifname, IpAddr::V4(vip)).await
     );
+
+    let vip_ready = common::convergence::wait_until(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        || async {
+            matches!(
+                http_get(&vip_addr).await,
+                Ok(response) if response.contains(EBPF_HTTP_RESPONSE)
+            )
+        },
+    )
+    .await;
+    if !vip_ready {
+        let (last_dns_code, last_dns_answers) = query_a_records(resolver_ip, &fqdn)
+            .await
+            .expect("query dns after overlay status vip timeout");
+        let host_link = link_summary(&host_ifname).await;
+        let host_addr = interface_addresses_summary(&host_ifname).await;
+        let neighbour = neighbour_summary(&host_ifname, IpAddr::V4(vip)).await;
+        let last_http_error = http_get(&vip_addr)
+            .await
+            .map(|response| format!("unexpected response: {response}"))
+            .unwrap_or_else(|err| err.to_string());
+        panic!(
+            "overlay status test service should answer through the host-access VIP; vip={vip}; backend_ips={backend_ips:?}; last_dns_code={last_dns_code:?}; last_dns_answers={last_dns_answers:?}; host_link={host_link:?}; host_addr={host_addr:?}; neighbour={neighbour:?}; last_http_error={last_http_error}"
+        );
+    }
 
     let status_ready = common::convergence::wait_until(
         Duration::from_secs(15),
