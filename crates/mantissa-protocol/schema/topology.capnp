@@ -398,6 +398,15 @@ struct ClusterNodeCountRecord {
 
   actorNodeId @2 :Data;
   # 16-byte node id that authored the update.
+
+  sourceView @3 :ClusterViewId;
+  # Active cluster view that computed this count. Counts are authoritative only
+  # for their own cluster lineage.
+
+  membershipGeneration @4 :UInt64;
+  # Actor-local peer-store generation observed while computing this count. This
+  # breaks same-actor/same-millisecond ties without comparing generations across
+  # different actors.
 }
 
 struct ClusterViewMetadataRecord {

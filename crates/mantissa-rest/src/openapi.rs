@@ -494,15 +494,15 @@ const OPERATION_DOCS: &[OperationDoc] = &[
     ),
     (
         OperationMethod::Get,
-        "/v1/ingress/{name}",
+        "/v1/ingress/{selector}",
         "Get ingress pool",
-        "Fetches one ingress pool by exact name.",
+        "Fetches one ingress pool by UUID string or exact name.",
     ),
     (
         OperationMethod::Delete,
-        "/v1/ingress/{name}",
+        "/v1/ingress/{selector}",
         "Delete ingress pool",
-        "Deletes one ingress pool by exact name.",
+        "Deletes one ingress pool by UUID string or exact name.",
     ),
     (
         OperationMethod::Get,

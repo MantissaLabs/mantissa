@@ -2270,6 +2270,9 @@
             "minimum": 0,
             "type": "integer"
           },
+          "local_realization_state": {
+            "type": "string"
+          },
           "peers": {
             "items": {
               "$ref": "#/components/schemas/NetworkPeerStatus"
@@ -2282,6 +2285,7 @@
         },
         "required": [
           "spec",
+          "local_realization_state",
           "peers",
           "attachment_count"
         ],
@@ -6606,15 +6610,15 @@
         ]
       }
     },
-    "/v1/ingress/{name}": {
+    "/v1/ingress/{selector}": {
       "delete": {
-        "description": "Deletes one ingress pool by exact name.",
+        "description": "Deletes one ingress pool by UUID string or exact name.",
         "operationId": "delete",
         "parameters": [
           {
-            "description": "Ingress pool name.",
+            "description": "Ingress pool name or UUID.",
             "in": "path",
-            "name": "name",
+            "name": "selector",
             "required": true,
             "schema": {
               "type": "string"
@@ -6699,13 +6703,13 @@
         ]
       },
       "get": {
-        "description": "Fetches one ingress pool by exact name.",
+        "description": "Fetches one ingress pool by UUID string or exact name.",
         "operationId": "get",
         "parameters": [
           {
-            "description": "Ingress pool name.",
+            "description": "Ingress pool name or UUID.",
             "in": "path",
-            "name": "name",
+            "name": "selector",
             "required": true,
             "schema": {
               "type": "string"

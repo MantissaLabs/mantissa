@@ -1908,7 +1908,7 @@ mod tests {
             .iter()
             .find(|template| template.name == "backend")
             .expect("backend template");
-        assert_eq!(backend.replicas, 1);
+        assert_eq!(backend.replicas, 3);
         assert_eq!(backend.public_port, Some(8000));
         assert_eq!(
             backend.public_ingress,

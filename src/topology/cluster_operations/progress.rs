@@ -52,8 +52,10 @@ impl Topology {
         let node_count = self.local_cluster_view_member_count().await?;
         let record = ClusterNodeCountRecord {
             node_count,
+            source_view: local_view,
             updated_at_unix_ms: Self::now_unix_ms(),
             actor_node_id: self.local.node.id,
+            membership_generation: self.stores.peers.change_clock(),
         };
         self.upsert_cluster_node_count_record(local_view.cluster_id, &record)
             .await

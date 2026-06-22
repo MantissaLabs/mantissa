@@ -77,19 +77,37 @@ impl ClusterNameRecord {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ClusterNodeCountRecord {
     pub node_count: u32,
+    pub source_view: ClusterViewId,
     pub updated_at_unix_ms: u64,
     pub actor_node_id: Uuid,
+    pub membership_generation: u64,
 }
 
 impl ClusterNodeCountRecord {
-    /// Returns whether this record should replace `current` in deterministic conflict resolution.
-    fn supersedes(&self, current: &Self) -> bool {
-        self.precedence_key() > current.precedence_key()
+    /// Returns whether this record was computed by the cluster lineage it summarizes.
+    fn authoritative_for(&self, cluster_id: ClusterId) -> bool {
+        self.source_view.cluster_id == cluster_id
+    }
+
+    /// Returns whether this record should replace `current` for the target lineage.
+    fn supersedes_for(&self, cluster_id: ClusterId, current: &Self) -> bool {
+        self.precedence_key(cluster_id) > current.precedence_key(cluster_id)
     }
 
     /// Builds the ordering key used for deterministic node-count conflict resolution.
-    fn precedence_key(&self) -> (u64, Uuid, u32) {
-        (self.updated_at_unix_ms, self.actor_node_id, self.node_count)
+    ///
+    /// The authority bit prevents metadata from another split view from replacing the count
+    /// computed by the lineage being summarized. The actor-local membership generation is ordered
+    /// after the actor id on purpose: it only breaks ties between observations from the same node.
+    fn precedence_key(&self, cluster_id: ClusterId) -> (bool, u64, u64, Uuid, u64, u32) {
+        (
+            self.authoritative_for(cluster_id),
+            self.source_view.epoch,
+            self.updated_at_unix_ms,
+            self.actor_node_id,
+            self.membership_generation,
+            self.node_count,
+        )
     }
 }
 
@@ -112,7 +130,7 @@ impl ClusterViewMetadataRecord {
     }
 
     /// Merges two metadata rows by resolving each field independently.
-    fn merge(left: &Self, right: &Self) -> Self {
+    fn merge_for(cluster_id: ClusterId, left: &Self, right: &Self) -> Self {
         let name = match (&left.name, &right.name) {
             (Some(left), Some(right)) => {
                 if right.supersedes(left) {
@@ -127,7 +145,7 @@ impl ClusterViewMetadataRecord {
         };
         let node_count = match (&left.node_count, &right.node_count) {
             (Some(left), Some(right)) => {
-                if right.supersedes(left) {
+                if right.supersedes_for(cluster_id, left) {
                     Some(right.clone())
                 } else {
                     Some(left.clone())
@@ -141,15 +159,29 @@ impl ClusterViewMetadataRecord {
     }
 
     /// Builds one merged metadata winner from a raw MVReg snapshot.
-    fn winner(snapshot: &MvRegSnapshot<Self>) -> Option<Self> {
+    ///
+    /// Non-authoritative node-count rows can still be present after raw sync, but they are hidden
+    /// from the resolved view instead of being allowed to seed an incorrect cluster size.
+    fn winner_for(cluster_id: ClusterId, snapshot: &MvRegSnapshot<Self>) -> Option<Self> {
         let mut merged = None::<Self>;
         for value in snapshot.as_slice() {
             merged = Some(match merged {
-                Some(current) => Self::merge(&current, value),
+                Some(current) => Self::merge_for(cluster_id, &current, value),
                 None => value.clone(),
             });
         }
-        merged.filter(|record| !record.is_empty())
+        merged
+            .map(|mut record| {
+                if record
+                    .node_count
+                    .as_ref()
+                    .is_some_and(|count| !count.authoritative_for(cluster_id))
+                {
+                    record.node_count = None;
+                }
+                record
+            })
+            .filter(|record| !record.is_empty())
     }
 }
 
@@ -236,6 +268,10 @@ fn write_cluster_node_count_record(
     builder.set_node_count(record.node_count);
     builder.set_updated_at_unix_ms(record.updated_at_unix_ms);
     builder.set_actor_node_id(record.actor_node_id.as_bytes());
+    record
+        .source_view
+        .write_capnp(builder.reborrow().init_source_view());
+    builder.set_membership_generation(record.membership_generation);
 }
 
 /// Decodes one cluster node-count record from the store schema.
@@ -244,11 +280,14 @@ fn read_cluster_node_count_record(
 ) -> Result<ClusterNodeCountRecord, capnp::Error> {
     Ok(ClusterNodeCountRecord {
         node_count: reader.get_node_count(),
+        source_view: ClusterViewId::from_capnp(reader.get_source_view()?)
+            .map_err(capnp::Error::failed)?,
         updated_at_unix_ms: reader.get_updated_at_unix_ms(),
         actor_node_id: read_uuid_data(
             reader.get_actor_node_id()?,
             "cluster node-count actor node id",
         )?,
+        membership_generation: reader.get_membership_generation(),
     })
 }
 
@@ -430,7 +469,7 @@ impl ClusterViewStore {
             .map_err(io::Error::other)?;
         Ok(snapshot
             .as_ref()
-            .and_then(ClusterViewMetadataRecord::winner))
+            .and_then(|snapshot| ClusterViewMetadataRecord::winner_for(cluster_id, snapshot)))
     }
 
     /// Applies one conflict-resolved cluster name update and reports whether the row changed.
@@ -468,11 +507,15 @@ impl ClusterViewStore {
         cluster_id: ClusterId,
         incoming: &ClusterNodeCountRecord,
     ) -> io::Result<bool> {
+        if !incoming.authoritative_for(cluster_id) {
+            return Ok(false);
+        }
+
         let current = self
             .winning_cluster_metadata_for(cluster_id)?
             .unwrap_or_default();
         if let Some(existing) = current.node_count.as_ref()
-            && !incoming.supersedes(existing)
+            && !incoming.supersedes_for(cluster_id, existing)
         {
             return Ok(false);
         }
@@ -510,10 +553,11 @@ impl ClusterViewStore {
         let mut out = Vec::with_capacity(actives.len());
 
         for (cluster_key, snapshot) in actives {
-            let Some(record) = ClusterViewMetadataRecord::winner(&snapshot) else {
+            let cluster_id = ClusterId::from_uuid(cluster_key.to_uuid());
+            let Some(record) = ClusterViewMetadataRecord::winner_for(cluster_id, &snapshot) else {
                 continue;
             };
-            out.push((ClusterId::from_uuid(cluster_key.to_uuid()), record));
+            out.push((cluster_id, record));
         }
 
         out.sort_by_key(|(view_id, _)| *view_id);
@@ -534,21 +578,43 @@ impl ClusterViewStore {
 mod tests {
     use super::*;
     use mantissa_store::codec::StoreValueCodec;
+    use mantissa_store::uuid_key::UuidKey;
     use tempfile::tempdir;
+
+    /// Builds one authoritative node-count record for a test cluster lineage.
+    fn count_record(
+        view: ClusterViewId,
+        node_count: u32,
+        updated_at_unix_ms: u64,
+        actor_node_id: Uuid,
+        membership_generation: u64,
+    ) -> ClusterNodeCountRecord {
+        ClusterNodeCountRecord {
+            node_count,
+            source_view: view,
+            updated_at_unix_ms,
+            actor_node_id,
+            membership_generation,
+        }
+    }
 
     /// Builds one metadata row that exercises every cluster-view store field.
     fn sample_metadata_record() -> ClusterViewMetadataRecord {
+        let cluster_id = ClusterId::from_uuid(Uuid::new_v4());
+        let source_view = ClusterViewId::new(cluster_id, 7);
         ClusterViewMetadataRecord {
             name: Some(ClusterNameRecord {
                 name: "production".to_string(),
                 updated_at_unix_ms: 1_776_000_000_001,
                 actor_node_id: Uuid::new_v4(),
             }),
-            node_count: Some(ClusterNodeCountRecord {
-                node_count: 7,
-                updated_at_unix_ms: 1_776_000_000_002,
-                actor_node_id: Uuid::new_v4(),
-            }),
+            node_count: Some(count_record(
+                source_view,
+                7,
+                1_776_000_000_002,
+                Uuid::new_v4(),
+                42,
+            )),
         }
     }
 
@@ -606,11 +672,7 @@ mod tests {
             updated_at_unix_ms: 1_776_000_001_001,
             actor_node_id: actor,
         };
-        let count = ClusterNodeCountRecord {
-            node_count: 5,
-            updated_at_unix_ms: 1_776_000_001_002,
-            actor_node_id: actor,
-        };
+        let count = count_record(active_view, 5, 1_776_000_001_002, actor, 17);
 
         {
             let store = ClusterViewStore::new(db.clone(), actor).expect("open cluster-view store");
@@ -649,6 +711,154 @@ mod tests {
                     node_count: Some(count),
                 },
             )]
+        );
+    }
+
+    /// Same-count updates should still advance the conflict-resolution fence when newer.
+    #[tokio::test]
+    async fn cluster_node_count_upsert_keeps_newer_observation_as_fence() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("cluster-view-count-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let cluster_id = ClusterId::from_uuid(Uuid::new_v4());
+        let source_view = ClusterViewId::new(cluster_id, 1);
+        let store = ClusterViewStore::new(db, actor).expect("open cluster-view store");
+
+        let first = count_record(source_view, 3, 10, actor, 1);
+        let refreshed = count_record(source_view, 3, 20, Uuid::new_v4(), 2);
+        let stale_arrival = count_record(source_view, 2, 15, Uuid::new_v4(), 2);
+        let changed = count_record(source_view, 2, 30, actor, 3);
+
+        assert!(
+            store
+                .upsert_cluster_node_count(cluster_id, &first)
+                .await
+                .expect("insert first count")
+        );
+        assert!(
+            store
+                .upsert_cluster_node_count(cluster_id, &refreshed)
+                .await
+                .expect("refresh same count")
+        );
+        assert_eq!(
+            store
+                .winning_cluster_node_count_for(cluster_id)
+                .expect("read refreshed winning count"),
+            Some(refreshed.clone())
+        );
+
+        assert!(
+            !store
+                .upsert_cluster_node_count(cluster_id, &stale_arrival)
+                .await
+                .expect("reject stale count")
+        );
+        assert_eq!(
+            store
+                .winning_cluster_node_count_for(cluster_id)
+                .expect("read winning count after stale arrival"),
+            Some(refreshed)
+        );
+
+        assert!(
+            store
+                .upsert_cluster_node_count(cluster_id, &changed)
+                .await
+                .expect("replace changed count")
+        );
+        assert_eq!(
+            store
+                .winning_cluster_node_count_for(cluster_id)
+                .expect("read changed winning count"),
+            Some(changed)
+        );
+    }
+
+    /// Node-count metadata from the summarized cluster lineage should beat newer outside guesses.
+    #[tokio::test]
+    async fn authoritative_cluster_node_count_wins_over_cross_view_record() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("cluster-view-authority-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let cluster_id = ClusterId::from_uuid(Uuid::new_v4());
+        let authoritative_view = ClusterViewId::new(cluster_id, 1);
+        let outsider_view = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 1);
+        let store = ClusterViewStore::new(db, actor).expect("open cluster-view store");
+
+        let authoritative = count_record(authoritative_view, 1, 10, actor, 1);
+        let outsider = count_record(outsider_view, 2, 20, Uuid::new_v4(), 1);
+
+        store
+            .cluster_view_domain
+            .upsert(
+                &UuidKey::from(cluster_id.to_uuid()),
+                ClusterViewMetadataRecord {
+                    name: None,
+                    node_count: Some(outsider),
+                },
+            )
+            .await
+            .expect("insert outside count through raw metadata domain");
+        assert_eq!(
+            store
+                .winning_cluster_node_count_for(cluster_id)
+                .expect("outside count should be ignored"),
+            None
+        );
+        assert!(
+            store
+                .upsert_cluster_node_count(cluster_id, &authoritative)
+                .await
+                .expect("authoritative count replaces outside count")
+        );
+        assert_eq!(
+            store
+                .winning_cluster_node_count_for(cluster_id)
+                .expect("read authoritative winning count"),
+            Some(authoritative)
+        );
+    }
+
+    /// Same-node count changes in the same millisecond should still move forward.
+    #[tokio::test]
+    async fn actor_membership_generation_breaks_same_timestamp_count_ties() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("cluster-view-generation-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let cluster_id = ClusterId::from_uuid(Uuid::new_v4());
+        let source_view = ClusterViewId::new(cluster_id, 1);
+        let store = ClusterViewStore::new(db, actor).expect("open cluster-view store");
+
+        let stale = count_record(source_view, 2, 10, actor, 1);
+        let fresh = count_record(source_view, 1, 10, actor, 2);
+
+        assert!(
+            store
+                .upsert_cluster_node_count(cluster_id, &stale)
+                .await
+                .expect("insert stale count")
+        );
+        assert!(
+            store
+                .upsert_cluster_node_count(cluster_id, &fresh)
+                .await
+                .expect("fresh generation replaces stale same-timestamp count")
+        );
+        assert_eq!(
+            store
+                .winning_cluster_node_count_for(cluster_id)
+                .expect("read fresh winning count"),
+            Some(fresh)
         );
     }
 }
