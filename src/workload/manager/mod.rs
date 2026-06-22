@@ -4,7 +4,7 @@ use crate::network::controller::NetworkController;
 use crate::network::events::ForwardingEvent;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::NetworkServiceDependencyRequirement;
-use crate::network::types::{NetworkAttachmentState, NetworkStatus};
+use crate::network::types::NetworkStatus;
 use crate::registry::Registry;
 use crate::runtime::set::RuntimeSet;
 use crate::runtime::types::{
@@ -2735,9 +2735,7 @@ impl WorkloadManager {
             return Ok(false);
         }
 
-        let ready = attachments.iter().all(|attachment| {
-            attachment.state == crate::network::types::NetworkAttachmentState::Ready
-        });
+        let ready = attachments.iter().all(|attachment| attachment.is_ready());
         let mut networks_ready = true;
         for attachment in &attachments {
             let peer_ready = self
@@ -2747,7 +2745,7 @@ impl WorkloadManager {
                 .context(
                     "load attachment node network peer state while checking task traffic readiness",
                 )?
-                .is_some_and(|state| state.state.is_ready());
+                .is_some_and(|state| state.is_ready());
             if !peer_ready {
                 networks_ready = false;
                 break;
@@ -2819,7 +2817,7 @@ impl WorkloadManager {
                 }
 
                 matched_attachments = matched_attachments.saturating_add(1);
-                if attachment.state != NetworkAttachmentState::Ready || attachment.error.is_some() {
+                if !attachment.is_ready() {
                     attachments_ready = false;
                 }
                 published &= attachment.traffic_published;
@@ -2838,7 +2836,7 @@ impl WorkloadManager {
                                     attachment.network_id
                                 )
                             })?
-                            .is_some_and(|state| state.error.is_none() && state.state.is_ready());
+                            .is_some_and(|state| state.is_ready());
                         peer_ready_cache.insert(key, ready);
                         ready
                     }
@@ -3007,7 +3005,7 @@ impl WorkloadManager {
             .map_err(|e| anyhow!("failed to load network peer states: {e}"))?;
 
         for state in states {
-            if state.state.is_ready() {
+            if state.is_ready() {
                 readiness
                     .entry(state.peer_id)
                     .or_default()

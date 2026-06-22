@@ -6,9 +6,7 @@ use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
 use crate::network::lb::{BackendAddress, BpfLoadBalancer};
 use crate::network::nodeport::{NodePortManager, NodePortMapping, NodePortProtocol};
 use crate::network::registry::NetworkRegistry;
-use crate::network::types::{
-    NetworkAttachmentState, NetworkDriver, NetworkServiceDependencyRequirement, NetworkSpecValue,
-};
+use crate::network::types::{NetworkDriver, NetworkServiceDependencyRequirement, NetworkSpecValue};
 use crate::registry::Registry;
 use crate::scheduler::placement::PlacementNode;
 use crate::services::registry::ServiceRegistry;
@@ -663,7 +661,7 @@ impl ServiceBackendResolver<'_> {
             .registry
             .list_peer_states(Some(self.runtime.network_id))?
             .into_iter()
-            .filter(|state| state.state.is_ready())
+            .filter(|state| state.is_ready())
             .map(|state| state.peer_id)
             .collect();
         let attachments = self
@@ -719,7 +717,7 @@ impl ServiceBackendResolver<'_> {
                 );
                 continue;
             }
-            if attachment.state != NetworkAttachmentState::Ready {
+            if !attachment.is_ready() {
                 tracing::trace!(
                     target: "network",
                     network = %self.runtime.network_id,
@@ -937,7 +935,7 @@ fn service_dependency_ready_from_replicated_state(
     let ready_peers = registry
         .list_peer_states(Some(requirement.network_id))?
         .into_iter()
-        .filter(|state| state.state.is_ready())
+        .filter(|state| state.is_ready())
         .map(|state| state.peer_id)
         .collect::<HashSet<_>>();
     let attachments = registry
@@ -946,7 +944,7 @@ fn service_dependency_ready_from_replicated_state(
 
     for attachment in attachments {
         if !ready_peers.contains(&attachment.node_id)
-            || attachment.state != NetworkAttachmentState::Ready
+            || !attachment.is_ready()
             || !attachment.traffic_published
         {
             continue;

@@ -655,7 +655,7 @@ impl NetworkController {
             .inner
             .registry
             .get_peer_state(network_id, self.inner.node_id)?
-            .is_some_and(|state| state.state.is_ready() && state.error.is_none());
+            .is_some_and(|state| state.is_ready());
         if !peer_ready {
             return Ok(false);
         }

@@ -1010,7 +1010,7 @@ local_test!(
                 let peer_ready = node
                     .network_registry
                     .get_peer_state(network_id, node.id)
-                    .map(|state| state.is_some_and(|state| state.state.is_ready()))
+                    .map(|state| state.is_some_and(|state| state.is_ready()))
                     .unwrap_or(false);
                 let interfaces = privileged_network_interfaces(network_id);
                 let pin_dir = pinned_lb_map_dir(network_id);

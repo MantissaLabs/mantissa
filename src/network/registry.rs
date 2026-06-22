@@ -282,7 +282,7 @@ impl NetworkRegistry {
                 .push(state.clone());
             let entry = counts.entry(state.network_id).or_insert((0u32, 0u32));
             entry.0 += 1;
-            if state.state.is_ready() {
+            if state.is_ready() {
                 entry.1 += 1;
             }
         }

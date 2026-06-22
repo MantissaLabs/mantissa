@@ -291,7 +291,7 @@ impl WorkloadNetworkPrerequisites {
 
     /// Returns true when a replicated peer row reports successful network reconciliation.
     fn network_peer_state_ready(peer_state: &NetworkPeerStateValue) -> bool {
-        peer_state.error.is_none() && peer_state.state.is_ready()
+        peer_state.is_ready()
     }
 
     /// Renders one network id as a stable operator-facing label for status details.

@@ -15,7 +15,7 @@ pub(crate) use mantissa::config::{
 };
 pub(crate) use mantissa::ingress::types::{IngressPoolSpecDraft, IngressPoolSpecValue};
 pub(crate) use mantissa::network::types::{
-    NetworkAttachmentState, NetworkAttachmentValue, NetworkDriver, NetworkRealizationPolicy,
+    NetworkAttachmentValue, NetworkDriver, NetworkRealizationPolicy,
     NetworkServiceDependencyRequirement, NetworkSpecDraft, NetworkSpecValue, NetworkStatus,
 };
 pub(crate) use mantissa::node::id::set_node_id;
@@ -460,7 +460,7 @@ pub(crate) async fn wait_for_network_ready_peer_nodes_all(
             };
             let ready: HashSet<Uuid> = peers
                 .into_iter()
-                .filter(|peer| peer.state.is_ready())
+                .filter(|peer| peer.is_ready())
                 .map(|peer| peer.peer_id)
                 .collect();
             if &ready != expected {
@@ -590,7 +590,7 @@ pub(crate) async fn wait_for_logical_network_ready_all(
                 healthy = false;
                 break;
             };
-            if peers.len() != cluster.len() || peers.iter().any(|peer| !peer.state.is_ready()) {
+            if peers.len() != cluster.len() || peers.iter().any(|peer| !peer.is_ready()) {
                 healthy = false;
                 break;
             }
@@ -777,7 +777,7 @@ pub(crate) async fn collect_published_service_attachment_snapshot(
         let attachment = by_task.get(&task.id)?;
 
         if attachment.node_id != task.node_id
-            || attachment.state != NetworkAttachmentState::Ready
+            || !attachment.is_ready()
             || !attachment.traffic_published
         {
             return None;
@@ -813,7 +813,7 @@ pub(crate) async fn count_visible_published_service_attachments(
         .filter(|task| {
             by_task.get(&task.id).is_some_and(|attachment| {
                 attachment.node_id == task.node_id
-                    && attachment.state == NetworkAttachmentState::Ready
+                    && attachment.is_ready()
                     && attachment.traffic_published
             })
         })
@@ -992,9 +992,9 @@ pub(crate) async fn template_attachments_published(
 
     tasks.iter().all(|task| {
         matches!(task.state, WorkloadPhase::Running)
-            && by_task.get(&task.id).is_some_and(|attachment| {
-                attachment.state == NetworkAttachmentState::Ready && attachment.traffic_published
-            })
+            && by_task
+                .get(&task.id)
+                .is_some_and(|attachment| attachment.is_ready() && attachment.traffic_published)
     })
 }
 

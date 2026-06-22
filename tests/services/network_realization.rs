@@ -82,7 +82,7 @@ async fn wait_for_local_network_ready(
         node.network_registry
             .get_peer_state(network_id, node.id)
             .expect("load local network peer state")
-            .is_some_and(|state| state.state.is_ready())
+            .is_some_and(|state| state.is_ready())
     })
     .await
 }

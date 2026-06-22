@@ -589,6 +589,11 @@ impl NetworkPeerStateValue {
         }
     }
 
+    /// Return whether this replicated peer row represents a usable local dataplane.
+    pub fn is_ready(&self) -> bool {
+        self.state.is_ready() && self.error.is_none()
+    }
+
     /// Update the peer state and error context.
     #[allow(dead_code)]
     pub fn set_state(&mut self, state: NetworkPeerState, error: Option<String>) {
@@ -829,6 +834,11 @@ impl NetworkAttachmentValue {
             service_name: draft.service_name,
             template_name: draft.template_name,
         }
+    }
+
+    /// Return whether this attachment row is ready for traffic publication decisions.
+    pub fn is_ready(&self) -> bool {
+        self.state == NetworkAttachmentState::Ready && self.error.is_none()
     }
 
     /// Updates lifecycle state while preserving assignment and traffic-publication metadata.
