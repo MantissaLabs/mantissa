@@ -494,6 +494,42 @@ async fn wait_secret_master_key_roots_equal_all(
     }
 }
 
+/// Returns true when all nodes currently report the same non-empty SecretMasterKeys root.
+async fn secret_master_key_roots_equal_now(cluster: &[TestNode]) -> bool {
+    let mut roots = Vec::with_capacity(cluster.len());
+    for node in cluster {
+        roots.push(secret_master_key_root_hex(node).await);
+    }
+
+    roots.iter().all(|root| !root.is_empty())
+        && roots
+            .first()
+            .is_none_or(|first| roots.iter().all(|root| root == first))
+}
+
+/// Renders SecretMasterKeys roots for convergence failure diagnostics.
+async fn secret_master_key_roots_snapshot(cluster: &[TestNode]) -> String {
+    let mut roots = Vec::with_capacity(cluster.len());
+    for node in cluster {
+        roots.push((node.id(), secret_master_key_root_hex(node).await));
+    }
+    roots
+        .into_iter()
+        .map(|(id, root)| {
+            format!(
+                "{}={}",
+                &id.to_string()[..8],
+                if root.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    root
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MasterKeyRowShape {
     rows: usize,
@@ -534,6 +570,17 @@ fn master_key_row_shape(node: &TestNode) -> MasterKeyRowShape {
         currents,
         tombs: tombs.len(),
     }
+}
+
+/// Returns whether replicated master-key rows have reached the active-key-only shape.
+fn master_key_rows_pruned_to_active(node: &TestNode) -> bool {
+    let shape = master_key_row_shape(node);
+    shape.rows == 12
+        && shape.values == 12
+        && shape.descriptors == 1
+        && shape.grants == 10
+        && shape.currents == 1
+        && shape.tombs == 0
 }
 
 /// Renders non-plaintext master-key row identities for convergence failure diagnostics.
@@ -910,39 +957,29 @@ local_test!(
             .await,
             "all ten nodes should adopt the destination-view current after merge"
         );
-        wait_secret_master_key_roots_equal_all(&cluster, Duration::from_secs(30))
-            .await
-            .expect("secret master-key rows converge across ten nodes after split/merge");
-
-        assert!(
-            wait_until(
-                Duration::from_secs(30),
-                Duration::from_millis(50),
-                || async {
-                    cluster.iter().all(|node| {
-                        let shape = master_key_row_shape(node);
-                        shape.rows == 12
-                            && shape.values == 12
-                            && shape.descriptors == 1
-                            && shape.grants == 10
-                            && shape.currents == 1
-                            && shape.tombs == 0
-                    })
-                },
-            )
-            .await,
-            "runtime GC should prune unused split/merge master-key rows down to the active key"
-        );
-        if let Err(error) =
-            wait_secret_master_key_roots_equal_all(&cluster, Duration::from_secs(30)).await
+        // Store GC is already running here. Once the post-merge rows first converge,
+        // semantic GC can immediately create and prune tombstone waves, so there is
+        // no stable "pre-GC" root to assert. The meaningful invariant is the terminal
+        // state: only active-key rows remain and every node reports the same root.
+        if !wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(50),
+            || async {
+                cluster.iter().all(master_key_rows_pruned_to_active)
+                    && secret_master_key_roots_equal_now(&cluster).await
+            },
+        )
+        .await
         {
+            let roots = secret_master_key_roots_snapshot(&cluster).await;
             let rows = cluster
                 .iter()
                 .map(|node| format!("{}: {}", node.id(), master_key_row_debug(node)))
                 .collect::<Vec<_>>()
                 .join("\n");
             panic!(
-                "secret master-key roots reconverge after semantic master-key GC: {error}\n{rows}"
+                "runtime GC should prune unused split/merge master-key rows down to the active key \
+                 and reconverge roots; roots={roots}\n{rows}"
             );
         }
     }

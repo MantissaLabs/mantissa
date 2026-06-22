@@ -1,3 +1,4 @@
+use capnp::ErrorKind;
 use mantissa::cluster::ClusterViewId;
 use mantissa::config::RuntimeHealthConfig;
 use mantissa_protocol::topology::ClusterOperationStage;
@@ -32,11 +33,20 @@ pub async fn wait_for_operation_stage(
     loop {
         let mut request = topology.get_cluster_operation_request();
         request.get().set_id(operation_id);
-        let response = request
-            .send()
-            .promise
-            .await
-            .expect("getClusterOperation send");
+        let response = match request.send().promise.await {
+            Ok(response) => response,
+            Err(error) if is_cluster_operation_not_found(&error) => {
+                assert!(
+                    Instant::now() <= deadline,
+                    "operation did not become visible before reaching expected stage {:?}: {}",
+                    expected,
+                    error.extra
+                );
+                sleep(Duration::from_millis(25)).await;
+                continue;
+            }
+            Err(error) => panic!("getClusterOperation send: {error:?}"),
+        };
         let operation = response
             .get()
             .expect("getClusterOperation get")
@@ -54,6 +64,11 @@ pub async fn wait_for_operation_stage(
         );
         sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// Return whether `getClusterOperation` is still waiting for local operation propagation.
+fn is_cluster_operation_not_found(error: &capnp::Error) -> bool {
+    error.kind == ErrorKind::Failed && error.extra.starts_with("cluster operation not found:")
 }
 
 /// Wait until topology reports the expected active cluster view.
