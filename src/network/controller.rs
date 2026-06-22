@@ -457,6 +457,25 @@ impl NetworkController {
         Ok(())
     }
 
+    /// Reconcile queued ingress-pool input changes and release demand that disappeared.
+    ///
+    /// Peer labels, readiness, and scheduling state can change which nodes an ingress pool selects.
+    /// `reconcile_pending_specs` handles both newly demanded and newly undemanded queued networks,
+    /// but a stale positive demand snapshot can skip release if it runs before all selector inputs
+    /// have converged locally. Running the idle-release sweep after the queued reconcile gives the
+    /// controller a second, current-state check without waiting for the periodic refresh tick.
+    async fn reconcile_local_ingress_pool_input_change(&self) -> Result<()> {
+        let queued = self.reconcile_pending_ingress_pool_inputs().await?;
+        if queued == 0 {
+            return Ok(());
+        }
+
+        self.queue_missing_local_demand_networks().await?;
+        self.reconcile_pending_specs().await?;
+        self.release_idle_active_networks().await?;
+        Ok(())
+    }
+
     /// Realize one network for local use while serializing concurrent callers.
     async fn ensure_network_ready_for_local_use(&self, network_id: Uuid) -> Result<()> {
         let lock = self.realization_lock(network_id).await;
@@ -1583,18 +1602,11 @@ impl NetworkController {
                     }
                 }
                 _ = self.inner.ingress_pool_change_notify.notified() => {
-                    if let Err(err) = self.reconcile_ingress_pool_store_change().await {
+                    if let Err(err) = self.reconcile_synced_network_demand().await {
                         crate::observability::metrics::record_network_reconcile_failure("ingress_pool_change");
                         warn!(
                             target: "network",
-                            "ingress-pool network demand refresh after pool change failed: {err:#}"
-                        );
-                    }
-                    if let Err(err) = self.reconcile_pending_specs().await {
-                        crate::observability::metrics::record_network_reconcile_failure("ingress_pool_pending_specs");
-                        warn!(
-                            target: "network",
-                            "pending spec reconcile after ingress-pool change failed: {err:#}"
+                            "network demand reconcile after ingress-pool change failed: {err:#}"
                         );
                     }
                 }
@@ -1650,11 +1662,11 @@ impl NetworkController {
                             "pending forwarding reconcile failed: {err:#}"
                         );
                     }
-                    if let Err(err) = self.reconcile_pending_ingress_pool_inputs().await {
+                    if let Err(err) = self.reconcile_local_ingress_pool_input_change().await {
                         crate::observability::metrics::record_network_reconcile_failure("pending_ingress_pool_inputs");
                         warn!(
                             target: "network",
-                            "pending ingress-pool network demand refresh failed: {err:#}"
+                            "pending ingress-pool network demand reconcile failed: {err:#}"
                         );
                     }
                     if let Err(err) = self.reconcile_pending_specs().await {
