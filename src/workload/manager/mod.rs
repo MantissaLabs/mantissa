@@ -38,6 +38,7 @@ use crate::workload::types::{
 use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Utc};
+use mantissa_health::Status as HealthStatus;
 use mantissa_store::uuid_key::UuidKey;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -1045,6 +1046,54 @@ impl WorkloadManager {
             .await
     }
 
+    /// Returns true when host-port placement is blocked by an incomplete remote scheduler view.
+    fn host_port_blocked_waiting_for_scheduler_view(
+        &self,
+        err: &anyhow::Error,
+        intents: &[planner::StartIntent],
+    ) -> bool {
+        if !workload_start_error_contains_host_ports_blocked(err) {
+            return false;
+        }
+        if !intents.iter().any(|intent| !intent.ports.is_empty())
+            || intents.iter().any(|intent| intent.target_node.is_some())
+        {
+            return false;
+        }
+
+        let observed_digests = match self.core.scheduler.observed_scheduler_digests() {
+            Ok(digests) => digests
+                .into_iter()
+                .map(|observed| observed.digest.node_id)
+                .collect::<HashSet<_>>(),
+            Err(err) => {
+                debug!(
+                    target: "task",
+                    "unable to inspect remote scheduler digests after host-port block: {err}"
+                );
+                return false;
+            }
+        };
+        let known_peers = match self.core.registry.known_peers() {
+            Ok(peers) => peers,
+            Err(err) => {
+                debug!(
+                    target: "task",
+                    "unable to inspect known peers after host-port block: {err}"
+                );
+                return false;
+            }
+        };
+        let health_snapshot = self.core.registry.health_monitor().snapshot();
+
+        known_peers.into_iter().any(|peer_id| {
+            peer_id != self.local_node_id
+                && self.core.registry.peer_schedulable(peer_id)
+                && !matches!(health_snapshot.get(&peer_id), Some(HealthStatus::Down))
+                && !observed_digests.contains(&peer_id)
+        })
+    }
+
     /// Starts one controller-owned workload group using the requested admission contract.
     pub async fn start_workloads_with_admission_policy(
         &self,
@@ -1831,7 +1880,9 @@ impl WorkloadManager {
                     plan
                 }
                 Err(err) => {
-                    if is_retryable_scheduling_error(&err) {
+                    if is_retryable_scheduling_error(&err)
+                        || self.host_port_blocked_waiting_for_scheduler_view(&err, &intents)
+                    {
                         scheduling_retry_attempts += 1;
                         if scheduling_retry_attempts >= scheduling_retry_max_attempts {
                             return Err(err.context("failed to compute scheduling plan"));
@@ -3276,6 +3327,13 @@ pub(crate) fn workload_start_error_requires_service_requeue(err: &anyhow::Error)
                     | SchedulingError::LocalNetworksBlocked { .. }
             )
         })
+}
+
+/// Returns true when one workload-start failure contains a host-port placement rejection.
+pub(crate) fn workload_start_error_contains_host_ports_blocked(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<SchedulingError>())
+        .is_some_and(|cause| matches!(cause, SchedulingError::HostPortsBlocked { .. }))
 }
 
 /// Builds a concise service-facing detail for retryable workload start failures.
