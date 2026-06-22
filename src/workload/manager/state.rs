@@ -1060,12 +1060,28 @@ impl WorkloadManager {
             let guard = self.local_state.removed_task_watermarks.lock().await;
             guard.get(&id).map(|tombstone| tombstone.max_epoch)
         };
-        let (watermark, max_epoch) = self
+        let prior_value = self
             .core
             .store
             .get_snapshot(&key)
             .map_err(|e| anyhow::anyhow!("task lookup failed before remove: {e}"))?
-            .and_then(|snapshot| select_best_workload_value(snapshot.as_slice()))
+            .and_then(|snapshot| select_best_workload_value(snapshot.as_slice()));
+
+        if prior_value
+            .as_ref()
+            .is_some_and(|value| value.node_id == self.local_node_id)
+            && let Err(err) = self
+                .teardown_runtime_attachments(id, HashSet::new(), true)
+                .await
+        {
+            warn!(
+                target: "task",
+                task = %id,
+                "failed to remove local network attachments before task removal: {err:#}"
+            );
+        }
+
+        let (watermark, max_epoch) = prior_value
             .map(|value| {
                 (
                     parse_task_timestamp(&value.updated_at, &value.created_at)
@@ -2045,8 +2061,10 @@ impl WorkloadManager {
             );
         }
 
+        // This path is already stopping a locally owned task. Force registry cleanup so a
+        // concurrent task-spec removal cannot make attachment teardown leave stale demand rows.
         if let Err(err) = self
-            .teardown_runtime_attachments(id, HashSet::new(), false)
+            .teardown_runtime_attachments(id, HashSet::new(), true)
             .await
         {
             warn!(
@@ -2221,7 +2239,7 @@ impl WorkloadManager {
         }
 
         if let Err(err) = self
-            .teardown_runtime_attachments(task_id, HashSet::new(), false)
+            .teardown_runtime_attachments(task_id, HashSet::new(), true)
             .await
         {
             warn!(
@@ -2328,7 +2346,7 @@ impl WorkloadManager {
         }
 
         if let Err(err) = self
-            .teardown_runtime_attachments(task_id, HashSet::new(), false)
+            .teardown_runtime_attachments(task_id, HashSet::new(), true)
             .await
         {
             warn!(
@@ -2436,7 +2454,7 @@ impl WorkloadManager {
         }
 
         if let Err(err) = self
-            .teardown_runtime_attachments(task_id, HashSet::new(), false)
+            .teardown_runtime_attachments(task_id, HashSet::new(), true)
             .await
         {
             warn!(
@@ -3168,7 +3186,7 @@ impl WorkloadManager {
                 );
             }
             if let Err(err) = self
-                .teardown_runtime_attachments(spec.id, HashSet::new(), false)
+                .teardown_runtime_attachments(spec.id, HashSet::new(), true)
                 .await
             {
                 warn!(

@@ -1319,6 +1319,10 @@ impl WorkloadManager {
         let mut released_networks = Vec::new();
 
         for attachment in attachments {
+            if attachment.node_id != self.local_node_id {
+                continue;
+            }
+
             let task_value = self
                 .core
                 .store
@@ -1326,6 +1330,7 @@ impl WorkloadManager {
                 .with_context(|| format!("lookup task {}", attachment.task_id))?
                 .and_then(|snap| select_best_workload_value(snap.as_slice()));
             let task_state = task_value.as_ref().map(|value| value.state.clone());
+            let task_missing = task_state.is_none();
             let workload_revision: Option<String> =
                 task_value.as_ref().and_then(task_revision_timestamp);
 
@@ -1341,28 +1346,28 @@ impl WorkloadManager {
                 continue;
             }
 
-            if !attachment_age_exceeds(&attachment, ORPHAN_ATTACHMENT_GRACE_SECS) {
+            // A missing task snapshot means a replicated delete/tombstone already won, so this
+            // local attachment cannot become valid again. Terminal-but-present snapshots keep the
+            // grace window to avoid racing delayed status propagation.
+            if !task_missing && !attachment_age_exceeds(&attachment, ORPHAN_ATTACHMENT_GRACE_SECS) {
                 continue;
             }
 
             if matches!(attachment.state, NetworkAttachmentState::Removing) {
-                if attachment.node_id == self.local_node_id {
-                    let _ = self
-                        .networking
-                        .attachment_provisioner
-                        .teardown_attachment(attachment.id)
-                        .await;
-                }
+                let _ = self
+                    .networking
+                    .attachment_provisioner
+                    .teardown_attachment(attachment.id)
+                    .await;
                 match self
                     .networking
                     .network_registry
                     .remove_attachment(attachment.id)
                     .await
                 {
-                    Ok(()) if attachment.node_id == self.local_node_id => {
+                    Ok(()) => {
                         released_networks.push(attachment.network_id);
                     }
-                    Ok(()) => {}
                     Err(err) => {
                         warn!(
                             target: "task",
@@ -1395,12 +1400,11 @@ impl WorkloadManager {
                 continue;
             }
 
-            if attachment.node_id == self.local_node_id
-                && let Err(err) = self
-                    .networking
-                    .attachment_provisioner
-                    .teardown_attachment(attachment.id)
-                    .await
+            if let Err(err) = self
+                .networking
+                .attachment_provisioner
+                .teardown_attachment(attachment.id)
+                .await
             {
                 warn!(
                     target: "task",
@@ -1409,9 +1413,7 @@ impl WorkloadManager {
                     "failed to teardown orphaned attachment interface"
                 );
             }
-            if attachment.node_id == self.local_node_id {
-                released_networks.push(attachment.network_id);
-            }
+            released_networks.push(attachment.network_id);
         }
 
         self.release_idle_network_realizations(&released_networks)
@@ -1441,6 +1443,9 @@ impl WorkloadManager {
         keep: HashSet<Uuid>,
         force_registry_updates: bool,
     ) -> Result<()> {
+        // Local terminal paths already know they own the task being stopped and must pass
+        // `force_registry_updates=true`; reloading the task here can race with a concurrent
+        // task-spec removal and would leave stale Ready attachment rows behind.
         let allow_registry_updates = force_registry_updates
             || matches!(
                 self.load_spec(task_id).await,

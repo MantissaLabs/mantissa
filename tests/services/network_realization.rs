@@ -104,6 +104,66 @@ async fn wait_for_network_peer_nodes_headless(
     .await
 }
 
+/// Render network peer, attachment, and task rows on every node for release diagnostics.
+async fn network_release_diagnostics(cluster: &[TestNode], network_id: Uuid) -> String {
+    let mut rows = Vec::new();
+    for node in cluster {
+        let peers = node
+            .node
+            .network_registry
+            .list_peer_states(Some(network_id))
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|peer| format!("{}:{}:{:?}", peer.peer_name, peer.peer_id, peer.state))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_else(|err| format!("peer-error={err:#}"));
+        let attachment_rows = node
+            .node
+            .network_registry
+            .list_attachments(Some(network_id))
+            .unwrap_or_default();
+        let attachments = attachment_rows
+            .iter()
+            .map(|attachment| {
+                format!(
+                    "{}:{}:{:?}",
+                    attachment.node_id, attachment.task_id, attachment.state
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let all_tasks = node
+            .node
+            .workload_manager
+            .list_workloads(&TaskStateFilter::all())
+            .await
+            .unwrap_or_default();
+        let task_states = attachment_rows
+            .iter()
+            .map(|attachment| {
+                let state = all_tasks
+                    .iter()
+                    .find(|task| task.id == attachment.task_id)
+                    .map(|task| format!("{:?}", task.state))
+                    .unwrap_or_else(|| "missing".to_string());
+                format!("{}:{}", attachment.task_id, state)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        rows.push(
+            format!(
+                "node={} peers=[{}] attachments=[{}]",
+                node.id(),
+                peers,
+                attachments,
+            ) + &format!(" tasks=[{}]", task_states),
+        );
+    }
+    rows.join(" | ")
+}
+
 /// Confirms for the full observation window that one headless node sees the requested peers.
 async fn network_peer_nodes_stay_headless(
     node: &HeadlessNode,
@@ -309,15 +369,17 @@ local_test!(
                 .await,
             "service deletion should stop every task"
         );
+        let released = wait_for_network_peer_nodes_all(
+            &cluster,
+            network_id,
+            &empty_peer_set,
+            Duration::from_secs(20),
+        )
+        .await;
         assert!(
-            wait_for_network_peer_nodes_all(
-                &cluster,
-                network_id,
-                &empty_peer_set,
-                Duration::from_secs(20)
-            )
-            .await,
-            "last local task removal should release the on_demand network realization"
+            released,
+            "last local task removal should release the on_demand network realization; {}",
+            network_release_diagnostics(&cluster, network_id).await
         );
     }
 );
