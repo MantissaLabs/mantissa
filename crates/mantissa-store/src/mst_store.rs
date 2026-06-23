@@ -1355,74 +1355,9 @@ where
         regs: Registers<C::Key, C::Reg>,
         tombs: Tombstones<C::Key>,
     ) -> io::Result<()> {
-        // Prepare merged registers by reading current values once.
-        let merged_regs = self.prepare_merged_registers(regs, &tombs)?;
-        let merged_tombs = self.prepare_merged_tombstones(tombs, false)?;
-
-        // Track whether anything was written so we only advance the change clock when needed.
+        let (merged_regs, merged_tombs) =
+            self.write_delta_chunk_merged_latest(regs, tombs, false)?;
         let had_changes = !merged_regs.is_empty() || !merged_tombs.is_empty();
-
-        // Single write transaction for everything:
-        let w = self.db.begin_write().map_err(into_err)?;
-        {
-            let mut tv = w.open_table(T::values()).map_err(into_err)?;
-            let mut tt = w.open_table(T::tombs()).map_err(into_err)?;
-            let mut tombs_by_observed = w.open_table(T::tombs_by_observed()).map_err(into_err)?;
-
-            // Apply merged registers first. A live register removes the delete
-            // marker for that key, so clear both tombstone tables before moving
-            // on to tombstones in this same chunk.
-            for (k, reg) in &merged_regs {
-                let kb = Self::encode_key(k);
-                tv.insert(kb.as_slice(), Self::encode_reg(reg)?.as_slice())
-                    .map_err(into_err)?;
-
-                // The old tombstone payload is needed to find its age-index row.
-                let existing = match tt.get(kb.as_slice()).map_err(into_err)? {
-                    Some(row) => Some(Self::decode_tombstone(row.value())?),
-                    None => None,
-                };
-
-                if let Some(record) = existing {
-                    let index_key = tombstone_observed_index_key(kb.as_slice(), &record);
-                    let _ = tombs_by_observed
-                        .remove(index_key.as_slice())
-                        .map_err(into_err)?;
-                }
-
-                let _ = tt.remove(kb.as_slice()).map_err(into_err)?;
-            }
-
-            // Apply tombstones after registers. If the same key appears in both
-            // sections, the tombstone wins, matching the streamed delta order and
-            // ensuring a delete marker removes the register row.
-            for (k, tombstone) in &merged_tombs {
-                let kb = Self::encode_key(k);
-
-                // Remove any previous age-index row before replacing the primary
-                // tombstone record.
-                let existing = match tt.get(kb.as_slice()).map_err(into_err)? {
-                    Some(row) => Some(Self::decode_tombstone(row.value())?),
-                    None => None,
-                };
-
-                if let Some(record) = existing {
-                    let index_key = tombstone_observed_index_key(kb.as_slice(), &record);
-                    let _ = tombs_by_observed
-                        .remove(index_key.as_slice())
-                        .map_err(into_err)?;
-                }
-
-                tt.insert(kb.as_slice(), Self::encode_tombstone(tombstone)?.as_slice())
-                    .map_err(into_err)?;
-                let index_key = tombstone_observed_index_key(kb.as_slice(), tombstone);
-                tombs_by_observed
-                    .insert(index_key.as_slice(), &[] as &[u8])
-                    .map_err(into_err)?;
-                let _ = tv.remove(kb.as_slice()).map_err(into_err)?;
-            }
-        }
-        w.commit().map_err(into_err)?;
 
         if had_changes {
             self.bump_change_clock();
@@ -1438,70 +1373,9 @@ where
         regs: Registers<C::Key, C::Reg>,
         tombs: Tombstones<C::Key>,
     ) -> io::Result<()> {
-        // Prepare merged registers by reading current values once.
-        let merged_regs = self.prepare_merged_registers(regs, &tombs)?;
-        let merged_tombs = self.prepare_merged_tombstones(tombs, true)?;
-
+        let (merged_regs, merged_tombs) =
+            self.write_delta_chunk_merged_latest(regs, tombs, true)?;
         let had_changes = !merged_regs.is_empty() || !merged_tombs.is_empty();
-
-        // Single write transaction for everything:
-        let w = self.db.begin_write().map_err(into_err)?;
-        {
-            let mut tv = w.open_table(T::values()).map_err(into_err)?;
-            let mut tt = w.open_table(T::tombs()).map_err(into_err)?;
-            let mut tombs_by_observed = w.open_table(T::tombs_by_observed()).map_err(into_err)?;
-
-            // This path mirrors apply_delta_chunk(), but it also updates the
-            // in-memory MST after the durable write. Keep the write ordering the
-            // same so both delta application strategies have identical semantics.
-            for (k, reg) in &merged_regs {
-                let kb = Self::encode_key(k);
-                tv.insert(kb.as_slice(), Self::encode_reg(reg)?.as_slice())
-                    .map_err(into_err)?;
-
-                // Register acceptance clears any previous tombstone and its GC index.
-                let existing = match tt.get(kb.as_slice()).map_err(into_err)? {
-                    Some(row) => Some(Self::decode_tombstone(row.value())?),
-                    None => None,
-                };
-
-                if let Some(record) = existing {
-                    let index_key = tombstone_observed_index_key(kb.as_slice(), &record);
-                    let _ = tombs_by_observed
-                        .remove(index_key.as_slice())
-                        .map_err(into_err)?;
-                }
-
-                let _ = tt.remove(kb.as_slice()).map_err(into_err)?;
-            }
-
-            for (k, tombstone) in &merged_tombs {
-                let kb = Self::encode_key(k);
-
-                // Tombstone replacement must first remove the old index key because
-                // it includes the old observed_at_unix_ms value.
-                let existing = match tt.get(kb.as_slice()).map_err(into_err)? {
-                    Some(row) => Some(Self::decode_tombstone(row.value())?),
-                    None => None,
-                };
-
-                if let Some(record) = existing {
-                    let index_key = tombstone_observed_index_key(kb.as_slice(), &record);
-                    let _ = tombs_by_observed
-                        .remove(index_key.as_slice())
-                        .map_err(into_err)?;
-                }
-
-                tt.insert(kb.as_slice(), Self::encode_tombstone(tombstone)?.as_slice())
-                    .map_err(into_err)?;
-                let index_key = tombstone_observed_index_key(kb.as_slice(), tombstone);
-                tombs_by_observed
-                    .insert(index_key.as_slice(), &[] as &[u8])
-                    .map_err(into_err)?;
-                let _ = tv.remove(kb.as_slice()).map_err(into_err)?;
-            }
-        }
-        w.commit().map_err(into_err)?;
 
         // Reflect in MST in the same logical order: regs then tombs.
         {
@@ -1522,153 +1396,143 @@ where
         Ok(())
     }
 
-    /// Normalize inbound tombstones so stale remote deletes cannot downgrade newer local state.
-    fn prepare_merged_tombstones(
+    /// Merges and writes one inbound delta chunk against the latest durable rows.
+    ///
+    /// Delta application is a read-merge-write operation. The merge must happen
+    /// inside the Redb write transaction, not in an earlier read transaction,
+    /// otherwise a stale sync payload prepared before local MVReg compaction can
+    /// commit after that compaction and overwrite the compacted register.
+    fn write_delta_chunk_merged_latest(
         &self,
+        regs: Registers<C::Key, C::Reg>,
         tombs: Tombstones<C::Key>,
-        refresh_existing_for_mst: bool,
-    ) -> io::Result<Tombstones<C::Key>> {
-        if tombs.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let r = self.db.begin_read().map_err(into_err)?;
-        let values = r.open_table(T::values()).map_err(into_err)?;
-        let meta = r.open_table(T::meta()).map_err(into_err)?;
-        let tomb_table = r.open_table(T::tombs()).map_err(into_err)?;
-
-        // All tombstones prepared from one inbound chunk share the same local
-        // observation timestamp. The timestamp is only for local retention/GC,
-        // so it must not be used to decide whether one tombstone dominates another.
-        let observed_at_unix_ms = now_unix_ms();
-        let mut out = Vec::with_capacity(tombs.len());
-        for (k, incoming) in tombs {
-            let frontier_key = tombstone_prune_frontier_key(&incoming.origin_actor);
-            let pruned_sequence = meta
-                .get(frontier_key.as_str())
-                .map_err(into_err)?
-                .map(|row| row.value())
-                .unwrap_or(0);
-
-            // A tombstone at or below the per-origin prune frontier was already
-            // deliberately forgotten by local GC. Dropping it here prevents an
-            // old peer from reintroducing that delete marker during anti-entropy.
-            if pruned_sequence > 0 && incoming.sequence <= pruned_sequence {
-                continue;
-            }
-
-            let kb = Self::encode_key(&k);
-            let current_tomb = match tomb_table.get(kb.as_slice()).map_err(into_err)? {
-                Some(row) => Some(Self::decode_tombstone(row.value())?),
-                None => None,
-            };
-            let value_exists = values.get(kb.as_slice()).map_err(into_err)?.is_some();
-
-            // Wire tombstones leave observed_at_unix_ms unset so each receiver can
-            // index them by local observation time. Existing local tombstones keep
-            // their original timestamp when they win the merge below.
-            let incoming = Self::normalize_incoming_tombstone(incoming, observed_at_unix_ms);
-            let next_tombstone = Self::merge_tombstone_records(current_tomb.clone(), incoming);
-
-            // Skip pure no-ops unless the caller needs the existing tombstone returned
-            // to refresh the MST incrementally. The durable state already contains
-            // the winning tombstone and there is no live value to remove.
-            if current_tomb.as_ref() == Some(&next_tombstone)
-                && !value_exists
-                && !refresh_existing_for_mst
-            {
-                continue;
-            }
-
-            out.push((k, next_tombstone));
-        }
-
-        Ok(out)
-    }
-
-    /// Prepare merged registers honoring the configured tombstone strategy.
-    fn prepare_merged_registers(
-        &self,
-        regs: Registers<C::Key, C::Reg>,
-        tombs: &Tombstones<C::Key>,
-    ) -> io::Result<Registers<C::Key, C::Reg>> {
-        if !self.preserve_local_tombs {
-            return self.merge_registers_unconditional(regs);
-        }
-
-        let tomb_keys_in_chunk: HashSet<C::Key> = if regs.is_empty() {
-            HashSet::new()
+        refresh_existing_tombs_for_mst: bool,
+    ) -> io::Result<RegistersAndTombs<C::Key, C::Reg>> {
+        let tomb_keys_in_chunk: HashSet<C::Key> = if self.preserve_local_tombs && !regs.is_empty() {
+            tombs.iter().map(|(key, _)| key.clone()).collect()
         } else {
-            tombs.iter().map(|(k, _)| k.clone()).collect()
+            HashSet::new()
         };
-        self.merge_registers_guarding_local_tombs(regs, tomb_keys_in_chunk)
-    }
+        let observed_at_unix_ms = now_unix_ms();
+        let mut merged_regs = Vec::with_capacity(regs.len());
+        let mut merged_tombs = Vec::with_capacity(tombs.len());
 
-    /// Merge incoming registers while ensuring local tombstones remain authoritative unless
-    /// the current chunk also carries a tomb for the same key.
-    fn merge_registers_guarding_local_tombs(
-        &self,
-        regs: Registers<C::Key, C::Reg>,
-        tomb_keys_in_chunk: HashSet<C::Key>,
-    ) -> io::Result<Registers<C::Key, C::Reg>> {
-        if regs.is_empty() {
-            return Ok(Vec::new());
-        }
+        let w = self.db.begin_write().map_err(into_err)?;
+        {
+            let mut values = w.open_table(T::values()).map_err(into_err)?;
+            let mut tomb_table = w.open_table(T::tombs()).map_err(into_err)?;
+            let mut tombs_by_observed = w.open_table(T::tombs_by_observed()).map_err(into_err)?;
+            let meta = w.open_table(T::meta()).map_err(into_err)?;
 
-        let r = self.db.begin_read().map_err(into_err)?;
-        let values = r.open_table(T::values()).map_err(into_err)?;
-        let tomb_table = r.open_table(T::tombs()).map_err(into_err)?;
+            for (key, incoming) in regs {
+                let key_bytes = Self::encode_key(&key);
+                // For preserve-local-tomb domains, an inbound register cannot
+                // clear a local tombstone unless this same chunk also carries the
+                // tombstone for that key. The check is performed inside the write
+                // transaction so a concurrent local delete cannot be missed.
+                let skip_due_to_local_tomb =
+                    self.preserve_local_tombs && !tomb_keys_in_chunk.contains(&key) && {
+                        tomb_table
+                            .get(key_bytes.as_slice())
+                            .map_err(into_err)?
+                            .is_some()
+                    };
 
-        let mut out = Vec::with_capacity(regs.len());
-        for (k, incoming) in regs {
-            let kb = Self::encode_key(&k);
-            // For preserve-local-tomb domains, an inbound register cannot clear a
-            // local tombstone unless the same chunk also carries a tombstone for
-            // the key. This keeps locally authored deletes authoritative while
-            // still allowing a full delta page that includes both sides to converge.
-            let skip_due_to_local_tomb = if tomb_keys_in_chunk.contains(&k) {
-                false
-            } else {
-                tomb_table.get(kb.as_slice()).map_err(into_err)?.is_some()
-            };
+                if skip_due_to_local_tomb {
+                    continue;
+                }
 
-            if skip_due_to_local_tomb {
-                continue;
+                let current = match values.get(key_bytes.as_slice()).map_err(into_err)? {
+                    Some(row) => Some(Self::decode_reg(row.value())?),
+                    None => None,
+                };
+                let merged = C::merge_regs(current, incoming);
+                values
+                    .insert(key_bytes.as_slice(), Self::encode_reg(&merged)?.as_slice())
+                    .map_err(into_err)?;
+
+                let existing = match tomb_table.get(key_bytes.as_slice()).map_err(into_err)? {
+                    Some(row) => Some(Self::decode_tombstone(row.value())?),
+                    None => None,
+                };
+
+                if let Some(record) = existing {
+                    let index_key = tombstone_observed_index_key(key_bytes.as_slice(), &record);
+                    let _ = tombs_by_observed
+                        .remove(index_key.as_slice())
+                        .map_err(into_err)?;
+                }
+                let _ = tomb_table.remove(key_bytes.as_slice()).map_err(into_err)?;
+
+                merged_regs.push((key, merged));
             }
 
-            let current = match values.get(kb.as_slice()).map_err(into_err)? {
-                Some(row) => Some(Self::decode_reg(row.value())?),
-                None => None,
-            };
-            out.push((k, C::merge_regs(current, incoming)));
+            for (key, incoming) in tombs {
+                let frontier_key = tombstone_prune_frontier_key(&incoming.origin_actor);
+                let pruned_sequence = meta
+                    .get(frontier_key.as_str())
+                    .map_err(into_err)?
+                    .map(|row| row.value())
+                    .unwrap_or(0);
+
+                // A tombstone at or below the per-origin prune frontier was already
+                // deliberately forgotten by local GC. Dropping it here prevents an
+                // old peer from reintroducing that delete marker during anti-entropy.
+                if pruned_sequence > 0 && incoming.sequence <= pruned_sequence {
+                    continue;
+                }
+
+                let key_bytes = Self::encode_key(&key);
+                let current_tomb = match tomb_table.get(key_bytes.as_slice()).map_err(into_err)? {
+                    Some(row) => Some(Self::decode_tombstone(row.value())?),
+                    None => None,
+                };
+                let value_exists = values
+                    .get(key_bytes.as_slice())
+                    .map_err(into_err)?
+                    .is_some();
+
+                // Wire tombstones leave observed_at_unix_ms unset so each receiver
+                // can index them by local observation time. Existing local
+                // tombstones keep their original timestamp when they win the merge.
+                let incoming = Self::normalize_incoming_tombstone(incoming, observed_at_unix_ms);
+                let next_tombstone = Self::merge_tombstone_records(current_tomb.clone(), incoming);
+
+                // Skip pure no-ops unless the caller needs the existing tombstone
+                // returned to refresh the MST incrementally. The durable state
+                // already contains the winning tombstone and there is no live value.
+                if current_tomb.as_ref() == Some(&next_tombstone)
+                    && !value_exists
+                    && !refresh_existing_tombs_for_mst
+                {
+                    continue;
+                }
+
+                if let Some(record) = current_tomb {
+                    let index_key = tombstone_observed_index_key(key_bytes.as_slice(), &record);
+                    let _ = tombs_by_observed
+                        .remove(index_key.as_slice())
+                        .map_err(into_err)?;
+                }
+
+                tomb_table
+                    .insert(
+                        key_bytes.as_slice(),
+                        Self::encode_tombstone(&next_tombstone)?.as_slice(),
+                    )
+                    .map_err(into_err)?;
+                let index_key = tombstone_observed_index_key(key_bytes.as_slice(), &next_tombstone);
+                tombs_by_observed
+                    .insert(index_key.as_slice(), &[] as &[u8])
+                    .map_err(into_err)?;
+                let _ = values.remove(key_bytes.as_slice()).map_err(into_err)?;
+
+                merged_tombs.push((key, next_tombstone));
+            }
         }
+        w.commit().map_err(into_err)?;
 
-        Ok(out)
-    }
-
-    /// Merge incoming registers without inspecting tombstone state.
-    fn merge_registers_unconditional(
-        &self,
-        regs: Registers<C::Key, C::Reg>,
-    ) -> io::Result<Registers<C::Key, C::Reg>> {
-        if regs.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let r = self.db.begin_read().map_err(into_err)?;
-        let values = r.open_table(T::values()).map_err(into_err)?;
-
-        let mut out = Vec::with_capacity(regs.len());
-        for (k, incoming) in regs {
-            let kb = Self::encode_key(&k);
-            let current = match values.get(kb.as_slice()).map_err(into_err)? {
-                Some(row) => Some(Self::decode_reg(row.value())?),
-                None => None,
-            };
-            out.push((k, C::merge_regs(current, incoming)));
-        }
-
-        Ok(out)
+        Ok((merged_regs, merged_tombs))
     }
 
     /// Rebuild MST once after a sequence of `apply_delta_chunk()` calls.
