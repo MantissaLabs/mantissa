@@ -20,7 +20,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
     let mut tw = TabWriter::new(Vec::new());
     writeln!(
         &mut tw,
-        "SERVICE\tSTATUS\tROLLOUT\tREASON\tTASK TEMPLATES\tPUBLIC\tHOST PORTS\tREPLICAS\tUPDATED\tID"
+        "SERVICE\tID\tSTATUS\tROLLOUT\tREASON\tTASK TEMPLATES\tPUBLIC\tHOST PORTS\tREPLICAS\tUPDATED"
     )?;
 
     for row in rows {
@@ -36,6 +36,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
             &mut tw,
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.service_name,
+            row.id,
             row.status,
             rollout_summary(&row),
             rollout_reason_summary(&row),
@@ -44,7 +45,6 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
             host_ports_summary(&row),
             row.assigned_replica_count(),
             row.updated_at,
-            row.id,
         )?;
     }
 
