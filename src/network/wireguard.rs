@@ -887,7 +887,7 @@ fn ip6tables_insert_rule(chain: &str, spec: &[&str]) -> std::io::Result<()> {
         .map_err(|err| std::io::Error::other(format!("ip6tables insert failed: {err}")))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::{
         WireGuardPeerPlan, WireGuardUnderlayStateInput, build_wireguard_peer_plan,
