@@ -943,41 +943,27 @@ where
 
     /// Insert or update value for key `k`.
     pub async fn upsert(&self, k: &C::Key, v: C::Value) -> crate::Result<()> {
-        // Load current register (if any)
-        let current = {
-            let r = self.db.begin_read().map_err(into_err)?;
-            let t = r.open_table(T::values()).map_err(into_err)?;
-            match t.get(Self::encode_key(k).as_slice()).map_err(into_err)? {
+        let w = self.db.begin_write().map_err(into_err)?;
+        let kb = Self::encode_key(k);
+        let new_reg = {
+            let mut values = w.open_table(T::values()).map_err(into_err)?;
+            let current = match values.get(kb.as_slice()).map_err(into_err)? {
                 Some(row) => Some(Self::decode_reg(row.value())?),
                 None => None,
-            }
-        };
-
-        let new_reg = C::upsert_reg(current, &self.actor, v);
-        let snap = self.snapshot_reg_for_current_version(&new_reg);
-
-        // Persist: write register + clear tombstone.
-        //
-        // A value row makes any existing tombstone obsolete for this key. Clear
-        // both the primary tombstone and its observed-time index entry in the
-        // same transaction so future GC scans do not see a dangling index row.
-        let w = self.db.begin_write().map_err(into_err)?;
-
-        let kb = Self::encode_key(k);
-        {
-            let mut values = w.open_table(T::values()).map_err(into_err)?;
+            };
+            let new_reg = C::upsert_reg(current, &self.actor, v);
             values
                 .insert(kb.as_slice(), Self::encode_reg(&new_reg)?.as_slice())
                 .map_err(into_err)?;
-        }
+            new_reg
+        };
 
         {
+            // A value row makes any existing tombstone obsolete for this key. Clear both
+            // tombstone tables inside the same write transaction that observed the latest
+            // register so a stale read cannot overwrite a concurrent local update.
             let mut tombs = w.open_table(T::tombs()).map_err(into_err)?;
             let mut tombs_by_observed = w.open_table(T::tombs_by_observed()).map_err(into_err)?;
-
-            // Read the current tombstone before removing it so we can reconstruct
-            // the secondary-index key. The index key includes observed_at_unix_ms,
-            // which is stored only in the tombstone payload.
             let existing = match tombs.get(kb.as_slice()).map_err(into_err)? {
                 Some(row) => Some(Self::decode_tombstone(row.value())?),
                 None => None,
@@ -994,8 +980,11 @@ where
         }
         w.commit().map_err(into_err)?;
 
-        // Reflect in MST
+        // Reflect in MST after the durable commit. Readers that need a fully current
+        // semantic view should use the durable tables; the MST is the anti-entropy
+        // index and is refreshed immediately after each successful write.
         let mut t = self.mst.write().await;
+        let snap = self.snapshot_reg_for_current_version(&new_reg);
         t.upsert(k.clone(), &Entry::Active(snap));
 
         self.bump_change_clock();
@@ -1019,38 +1008,25 @@ where
         }
 
         let mut merged: Vec<(C::Key, C::Reg)> = Vec::with_capacity(requested.len());
-        {
-            let r = self.db.begin_read().map_err(into_err)?;
-            let values = r.open_table(T::values()).map_err(into_err)?;
-
-            for (key, value) in requested {
-                let current = match values
-                    .get(Self::encode_key(&key).as_slice())
-                    .map_err(into_err)?
-                {
-                    Some(row) => Some(Self::decode_reg(row.value())?),
-                    None => None,
-                };
-
-                let next = C::upsert_reg(current, &self.actor, value);
-                merged.push((key, next));
-            }
-        }
-
         let w = self.db.begin_write().map_err(into_err)?;
         {
             let mut values = w.open_table(T::values()).map_err(into_err)?;
             let mut tombs = w.open_table(T::tombs()).map_err(into_err)?;
             let mut tombs_by_observed = w.open_table(T::tombs_by_observed()).map_err(into_err)?;
-            for (key, reg) in &merged {
-                let kb = Self::encode_key(key);
+            for (key, value) in requested {
+                let kb = Self::encode_key(&key);
+                let current = match values.get(kb.as_slice()).map_err(into_err)? {
+                    Some(row) => Some(Self::decode_reg(row.value())?),
+                    None => None,
+                };
+                let reg = C::upsert_reg(current, &self.actor, value);
                 values
-                    .insert(kb.as_slice(), Self::encode_reg(reg)?.as_slice())
+                    .insert(kb.as_slice(), Self::encode_reg(&reg)?.as_slice())
                     .map_err(into_err)?;
 
                 // Batch upserts have the same tombstone-clearing semantics as a
-                // single upsert: the register becomes authoritative and any
-                // stale delete marker plus its age-index entry must disappear.
+                // single upsert. The merge happens in this write transaction so
+                // each key observes the latest durable register before writing.
                 let existing = match tombs.get(kb.as_slice()).map_err(into_err)? {
                     Some(row) => Some(Self::decode_tombstone(row.value())?),
                     None => None,
@@ -1064,6 +1040,7 @@ where
                 }
 
                 let _ = tombs.remove(kb.as_slice()).map_err(into_err)?;
+                merged.push((key, reg));
             }
         }
         w.commit().map_err(into_err)?;
@@ -1212,38 +1189,27 @@ where
 
     /// Merge a remote register for key `k` into durable state and MST, clearing any local tombstone.
     pub async fn merge_register(&self, k: &C::Key, incoming: &C::Reg) -> crate::Result<()> {
-        // Read current reg (if any)
-        let current = {
-            let r = self.db.begin_read().map_err(into_err)?;
-            let t = r.open_table(T::values()).map_err(into_err)?;
-            match t.get(Self::encode_key(k).as_slice()).map_err(into_err)? {
-                Some(row) => Some(Self::decode_reg(row.value())?),
-                None => None,
-            }
-        };
-
-        // Merge and persist.
-        //
-        // Accepting a register means the key is live again locally, so any tombstone
-        // metadata for the key has to be removed from both tombstone tables before
-        // the MST is updated to an Active leaf.
-        let merged = C::merge_regs(current, incoming.clone());
-        let snap = self.snapshot_reg_for_current_version(&merged);
-
         let w = self.db.begin_write().map_err(into_err)?;
         let kb = Self::encode_key(k);
-        {
+        let merged = {
             let mut values = w.open_table(T::values()).map_err(into_err)?;
+            let current = match values.get(kb.as_slice()).map_err(into_err)? {
+                Some(row) => Some(Self::decode_reg(row.value())?),
+                None => None,
+            };
+            let merged = C::merge_regs(current, incoming.clone());
             values
                 .insert(kb.as_slice(), Self::encode_reg(&merged)?.as_slice())
                 .map_err(into_err)?;
-        }
+            merged
+        };
+
         {
+            // Accepting a register means the key is live again locally, so any tombstone
+            // metadata for the key has to be removed from both tombstone tables in the
+            // same transaction that observed and merged the latest durable register.
             let mut tombs = w.open_table(T::tombs()).map_err(into_err)?;
             let mut tombs_by_observed = w.open_table(T::tombs_by_observed()).map_err(into_err)?;
-
-            // Load the old tombstone first because deleting the secondary index
-            // requires the observed timestamp embedded in that payload.
             let existing = match tombs.get(kb.as_slice()).map_err(into_err)? {
                 Some(row) => Some(Self::decode_tombstone(row.value())?),
                 None => None,
@@ -1259,8 +1225,8 @@ where
         }
         w.commit().map_err(into_err)?;
 
-        // Update MST
         let mut t = self.mst.write().await;
+        let snap = self.snapshot_reg_for_current_version(&merged);
         t.upsert(k.clone(), &Entry::Active(snap));
         self.bump_change_clock();
         Ok(())
