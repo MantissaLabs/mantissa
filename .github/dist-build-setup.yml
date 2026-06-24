@@ -12,7 +12,8 @@
       git \
       lld \
       llvm \
-      pkg-config
+      pkg-config \
+      zstd
 
 - name: Install Rust nightly for eBPF
   shell: bash
@@ -23,6 +24,19 @@
 - name: Install bpf-linker
   shell: bash
   run: |
-    if ! command -v bpf-linker >/dev/null 2>&1; then
-      cargo install --git https://github.com/aya-rs/bpf-linker bpf-linker
-    fi
+    case "$(uname -m)" in
+      x86_64) bpf_linker_arch="x86_64" ;;
+      aarch64|arm64) bpf_linker_arch="aarch64" ;;
+      *) echo "unsupported bpf-linker host architecture: $(uname -m)" >&2; exit 1 ;;
+    esac
+
+    bpf_linker_version="v0.10.4"
+    bpf_linker_archive="bpf-linker-${bpf_linker_arch}-unknown-linux-musl.tar.zst"
+    bpf_linker_url="https://github.com/aya-rs/bpf-linker/releases/download/${bpf_linker_version}/${bpf_linker_archive}"
+
+    curl --proto '=https' --tlsv1.2 -LsSfO "$bpf_linker_url"
+    mkdir -p "$HOME/.local/bin"
+    tar -xpf "$bpf_linker_archive" -C "$HOME/.local/bin"
+    export PATH="$HOME/.local/bin:$PATH"
+    echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+    bpf-linker --version

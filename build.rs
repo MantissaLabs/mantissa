@@ -409,10 +409,15 @@ fn main() {
 fn ensure_bpf_linker() -> Result<()> {
     let status = Command::new("bpf-linker").arg("--version").status();
     match status {
-        Ok(_) => Ok(()),
-        Err(_) => bail!(
-            "bpf-linker not found in PATH. Install it with `cargo install --git https://github.com/aya-rs/bpf-linker bpf-linker` \
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => bail!(
+            "bpf-linker failed its version check with status {status}. \
+             Install it from https://github.com/aya-rs/bpf-linker/releases \
              or set MANTISSA_SKIP_BPF=1 to bypass eBPF compilation."
+        ),
+        Err(err) => bail!(
+            "bpf-linker not found in PATH. Install it from https://github.com/aya-rs/bpf-linker/releases \
+             or set MANTISSA_SKIP_BPF=1 to bypass eBPF compilation: {err}"
         ),
     }
 }
