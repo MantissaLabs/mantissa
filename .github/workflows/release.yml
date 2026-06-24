@@ -141,6 +141,7 @@ jobs:
             cmake \
             curl \
             git \
+            libcapnp-dev \
             lld \
             llvm \
             pkg-config \
