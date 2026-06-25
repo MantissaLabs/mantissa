@@ -5,7 +5,7 @@ authors = ["Alexandre Beslic"]
 license = "Apache-2.0"
 description = "Distributed scheduler and cluster management"
 homepage = "https://mantissa.io"
-repository = "https://github.com/abronan/mantissa"
+repository = "https://github.com/MantissaLabs/mantissa"
 readme = "README.md"
 edition = "2024"
 
@@ -27,7 +27,7 @@ default-members = [".", "crates/mantissa-cli", "crates/mantissa-sandbox"]
 [workspace.package]
 license = "Apache-2.0"
 homepage = "https://mantissa.io"
-repository = "https://github.com/abronan/mantissa"
+repository = "https://github.com/MantissaLabs/mantissa"
 
 [workspace.dependencies]
 capnp = "0.25"

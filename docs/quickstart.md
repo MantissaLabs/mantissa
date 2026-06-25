@@ -14,7 +14,7 @@ This guide covers the two fastest ways to spin up a Mantissa cluster:
 
 ## Option A: Two Nodes on One Machine
 
-1) Start the first node (blocking):
+1. Start the first node (blocking):
 
 ```bash
 mantissa init
@@ -27,13 +27,13 @@ To keep the daemon in the background, run `mantissa init --detach`; it still
 prompts when attached to a terminal. Use `mantissa status`, `mantissa logs -f`,
 and `mantissa shutdown` for the local process lifecycle.
 
-2) In a second terminal, fetch the join token:
+2. In a second terminal, fetch the join token:
 
 ```bash
 mantissa token show
 ```
 
-3) Join a second node on a different port:
+3. Join a second node on a different port:
 
 ```bash
 mantissa join \
@@ -42,14 +42,14 @@ mantissa join \
   --listen 127.0.0.1:6580
 ```
 
-4) Inspect the cluster:
+4. Inspect the cluster:
 
 ```bash
 mantissa nodes list
 mantissa scheduler slots --details
 ```
 
-5) (Optional) Create an overlay network used by the sample service manifest:
+5. (Optional) Create an overlay network used by the sample service manifest:
 
 ```bash
 mantissa networks create \
@@ -58,7 +58,7 @@ mantissa networks create \
   --subnet 10.240.0.0/16
 ```
 
-6) Deploy the sample service manifest:
+6. Deploy the sample service manifest:
 
 ```bash
 mantissa services run examples/replicated_service.ron
@@ -74,13 +74,13 @@ Stop each node with `Ctrl+C` when finished.
 
 ## Option B: Multi-VM Cluster with Lima
 
-1) Provision VMs and mount the repo inside each guest:
+1. Provision VMs and mount the repo inside each guest:
 
 ```bash
-./setup-dev-cluster.sh -n 2 -r $(pwd)
+./setup-dev-cluster.sh -n 3 -r $(pwd)
 ```
 
-2) Open a shell into each VM with the repo as the working directory:
+2. Open a shell into each VM with the repo as the working directory:
 
 ```bash
 limactl shell --workdir /mantissa mantissa-1
@@ -92,7 +92,7 @@ Then build once inside each VM:
 cargo build
 ```
 
-3) On VM 1:
+3. On VM 1:
 
 ```bash
 mantissa init
@@ -103,7 +103,7 @@ Use the same interactive prompt or passphrase source options described above on
 each VM. The passphrase protects each node's local master-key envelope; joined
 nodes still receive the cluster master key from the anchor during `mantissa join`.
 
-4) On VM 2, join the cluster:
+4. On VM 2, join the cluster:
 
 ```bash
 mantissa join --anchor <vm1-ip>:6578 --join-token <TOKEN>

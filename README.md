@@ -1,10 +1,10 @@
 <p align="center">
-  <a href="https://mantissa.io"><img alt="Mantissa logo" src="logo.png" width=45%"></a>
+  <a href="https://mantissa.io"><img alt="Mantissa logo" src="logo.png" width="45%"></a>
 </p>
 
 ---
 
-Mantissa is a distributed workload orchestration system built for small _and_ large clusters.
+Mantissa is a distributed orchestration system that grows with you and your workloads.
 Every node participates equally in scheduling, state replication, and cluster membership.
 No control-plane masters, and no federation layer required at scale.
 
@@ -98,9 +98,10 @@ mantissa tasks logs <id-task>
 
 6. Play around and bring nodes up/down
 
-See [docs/quickstart.md](docs/quickstart.md) for the full local and multi-VM workflow.
-See [docs/disaster-recovery.md](docs/disaster-recovery.md) for backup and restore workflows.
+---
+
+- See [docs/quickstart.md](docs/quickstart.md) for the full local and multi-VM workflow.
 
 ## Contributing
 
-See [docs/contributing.md](docs/contributing.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md).

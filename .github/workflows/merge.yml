@@ -5,6 +5,9 @@ on:
     branches:
       - master
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -15,11 +18,14 @@ concurrency:
 jobs:
   test:
     name: Rust project - master
+    timeout-minutes: 30
     runs-on:
       group: mantissa
       labels: mantissa-linux-x64-8-core
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
       - run: rustup update stable && rustup default stable
       - name: Install eBPF toolchain
         run: |
@@ -27,7 +33,7 @@ jobs:
           sudo apt-get install -y clang llvm pkg-config libelf-dev zlib1g-dev
           rustup toolchain install nightly --component rust-src --component llvm-tools-preview
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           shared-key: merge-linux-x64
       - name: Install bpf-linker

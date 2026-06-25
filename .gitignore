@@ -1,4 +1,45 @@
-/target
-/target-clippy
-/tmp
+# Rust build outputs
+/target/
+/target-clippy/
+
+# Local scratch space
+/tmp/
+
+# Local environment and secret material
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# Mantissa local runtime state
+*.redb
+*.db
+*.sock
+mantissa-state/
+mantissa-data/
+
+# Local VM/container tooling artifacts
+.lima/
+.docker/
+docker-compose.override.yml
+
+# Editor and OS metadata
 .DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs, coverage, and profiling output
+*.log
+*.profraw
+*.profdata
+coverage/

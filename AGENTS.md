@@ -37,7 +37,7 @@ The system needs to be:
 
 ## Coding Style & Naming Conventions
 
-- Rust 2021 edition. Format with `cargo fmt --all`. Lint with `cargo clippy --all-targets -- -D warnings`.
+- Rust 2024 edition. Format with `cargo fmt --all`. Lint with `cargo clippy --all-targets -- -D warnings`.
 - Naming: modules/files `snake_case`; types/traits `CamelCase`; functions `snake_case`; constants `SCREAMING_SNAKE_CASE`.
 - Errors: prefer `thiserror` for library errors and `anyhow::Result` at the application edges.
 - Logging: use `tracing` (`info!`, `warn!`, `debug!`); enable via `RUST_LOG=mantissa=debug`.
