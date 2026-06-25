@@ -12,7 +12,7 @@ use crate::topology::peers::PeerValue;
 use mantissa_protocol::server::cluster_session;
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 impl Topology {
@@ -149,9 +149,9 @@ impl Topology {
         match stage {
             ClusterOperationStage::Proposed => 0,
             ClusterOperationStage::Prepared => 1,
-            ClusterOperationStage::Committed => 2,
-            ClusterOperationStage::Finalized => 3,
-            ClusterOperationStage::Aborted => 4,
+            ClusterOperationStage::Aborted => 2,
+            ClusterOperationStage::Committed => 3,
+            ClusterOperationStage::Finalized => 4,
         }
     }
 
@@ -593,18 +593,37 @@ impl Topology {
     }
 
     /// Updates an operation stage, appends stage details, and persists the updated record.
+    ///
+    /// Relayed terminal rows can race with an already-running local progress task. Before writing
+    /// the requested stage, re-read the durable row and refuse to overwrite a strictly newer stage.
+    /// This keeps a late stale-precondition abort from replacing a committed/finalized operation.
     async fn update_cluster_operation_stage(
         &self,
         operation: &mut ClusterOperationRecord,
         stage: ClusterOperationStage,
         detail: &str,
-    ) -> Result<(), capnp::Error> {
+    ) -> Result<bool, capnp::Error> {
+        if let Some(current) = self.load_cluster_operation(operation.id)?
+            && Self::stage_rank(current.stage) > Self::stage_rank(stage)
+        {
+            debug!(
+                target: "cluster_view",
+                operation_id = %operation.id,
+                current_stage = ?current.stage,
+                requested_stage = ?stage,
+                "skipping stale cluster operation stage update"
+            );
+            *operation = current;
+            return Ok(false);
+        }
+
         operation.stage = stage;
         operation.updated_at_unix_ms = Self::now_unix_ms();
         if !detail.is_empty() {
             operation.details = format!("{} | {}", operation.details, detail);
         }
-        self.persist_cluster_operation(operation).await
+        self.persist_cluster_operation(operation).await?;
+        Ok(true)
     }
 
     /// Removes old terminal operations so the durable operation table stays bounded over long runtimes.
@@ -769,39 +788,49 @@ impl Topology {
 
         match operation.stage {
             ClusterOperationStage::Proposed => {
-                self.update_cluster_operation_stage(
-                    &mut operation,
-                    ClusterOperationStage::Prepared,
-                    "prepared",
-                )
-                .await?;
+                if !self
+                    .update_cluster_operation_stage(
+                        &mut operation,
+                        ClusterOperationStage::Prepared,
+                        "prepared",
+                    )
+                    .await?
+                    || operation.stage != ClusterOperationStage::Prepared
+                {
+                    return Ok(());
+                }
                 if let Err(err) = self
                     .apply_committed_operation_side_effects(&operation)
                     .await
                 {
                     if Self::is_commit_precondition_failure(&err) {
-                        self.update_cluster_operation_stage(
-                            &mut operation,
-                            ClusterOperationStage::Aborted,
-                            &format!("aborted stale_precondition: {err}"),
-                        )
-                        .await?;
-                        warn!(
-                            target: "cluster_view",
-                            operation_id = %operation.id,
-                            stage = ?operation.stage,
-                            "aborted cluster operation due to commit precondition mismatch: {err}"
-                        );
+                        let updated = self
+                            .update_cluster_operation_stage(
+                                &mut operation,
+                                ClusterOperationStage::Aborted,
+                                &format!("aborted stale_precondition: {err}"),
+                            )
+                            .await?;
+                        if updated && operation.stage == ClusterOperationStage::Aborted {
+                            warn!(
+                                target: "cluster_view",
+                                operation_id = %operation.id,
+                                stage = ?operation.stage,
+                                "aborted cluster operation due to commit precondition mismatch: {err}"
+                            );
+                        }
                     } else {
                         return Err(err);
                     }
-                } else {
-                    self.update_cluster_operation_stage(
+                } else if self
+                    .update_cluster_operation_stage(
                         &mut operation,
                         ClusterOperationStage::Committed,
                         &format!("committed active_view={}", self.active_cluster_view()),
                     )
-                    .await?;
+                    .await?
+                    && operation.stage == ClusterOperationStage::Committed
+                {
                     self.update_cluster_operation_stage(
                         &mut operation,
                         ClusterOperationStage::Finalized,
@@ -816,28 +845,33 @@ impl Topology {
                     .await
                 {
                     if Self::is_commit_precondition_failure(&err) {
-                        self.update_cluster_operation_stage(
-                            &mut operation,
-                            ClusterOperationStage::Aborted,
-                            &format!("aborted stale_precondition: {err}"),
-                        )
-                        .await?;
-                        warn!(
-                            target: "cluster_view",
-                            operation_id = %operation.id,
-                            stage = ?operation.stage,
-                            "aborted cluster operation due to commit precondition mismatch: {err}"
-                        );
+                        let updated = self
+                            .update_cluster_operation_stage(
+                                &mut operation,
+                                ClusterOperationStage::Aborted,
+                                &format!("aborted stale_precondition: {err}"),
+                            )
+                            .await?;
+                        if updated && operation.stage == ClusterOperationStage::Aborted {
+                            warn!(
+                                target: "cluster_view",
+                                operation_id = %operation.id,
+                                stage = ?operation.stage,
+                                "aborted cluster operation due to commit precondition mismatch: {err}"
+                            );
+                        }
                     } else {
                         return Err(err);
                     }
-                } else {
-                    self.update_cluster_operation_stage(
+                } else if self
+                    .update_cluster_operation_stage(
                         &mut operation,
                         ClusterOperationStage::Committed,
                         &format!("committed active_view={}", self.active_cluster_view()),
                     )
-                    .await?;
+                    .await?
+                    && operation.stage == ClusterOperationStage::Committed
+                {
                     self.update_cluster_operation_stage(
                         &mut operation,
                         ClusterOperationStage::Finalized,
@@ -995,5 +1029,27 @@ impl Topology {
         );
 
         Ok(excluded_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ensures committed operations cannot be overwritten by late stale-precondition aborts.
+    #[test]
+    fn cluster_operation_stage_rank_keeps_commit_terminal_over_abort() {
+        assert!(
+            Topology::stage_rank(ClusterOperationStage::Committed)
+                > Topology::stage_rank(ClusterOperationStage::Aborted)
+        );
+        assert!(
+            Topology::stage_rank(ClusterOperationStage::Finalized)
+                > Topology::stage_rank(ClusterOperationStage::Aborted)
+        );
+        assert!(
+            Topology::stage_rank(ClusterOperationStage::Aborted)
+                > Topology::stage_rank(ClusterOperationStage::Prepared)
+        );
     }
 }
