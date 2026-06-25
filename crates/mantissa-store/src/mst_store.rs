@@ -27,7 +27,7 @@ use std::hash::Hasher;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{hash::Hash, io, sync::Arc};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
 
 use crate::adapter::RegAdapter;
@@ -256,6 +256,10 @@ where
     db: Arc<redb::Database>,
     actor: C::Actor,
     mst: SharedInMemoryMerkleSearchTree<C, H>,
+    // Serializes each durable mutation with the MST update/rebuild that makes
+    // the anti-entropy root reflect that durable state. Redb already serializes
+    // write transactions; this gate covers the post-commit in-memory index step.
+    mutation_gate: Mutex<()>,
     root_schema_version: AtomicU32,
     change_clock: AtomicU64,
     preserve_local_tombs: bool,
@@ -287,10 +291,17 @@ where
     }
 
     /// Start a delta-apply session. Apply one or more chunks, then call `commit()`.
-    pub fn begin_delta_apply(&self) -> DeltaApplySession<'_, C, H, T> {
+    ///
+    /// The session holds the store mutation gate for its full lifetime because
+    /// chunk application mutates Redb without updating the MST until commit.
+    /// Without that gate, another writer could rebuild or patch the MST from an
+    /// interleaved durable state and leave the anti-entropy root stale.
+    pub async fn begin_delta_apply(&self) -> DeltaApplySession<'_, C, H, T> {
+        let mutation = self.mutation_gate.lock().await;
         DeltaApplySession {
             store: self,
             finalize: FinalizeStrategy::Rebuild,
+            _mutation: mutation,
         }
     }
 
@@ -374,6 +385,7 @@ where
             return Ok(0);
         }
 
+        let _mutation = self.mutation_gate.lock().await;
         let candidates = {
             let r = self.db.begin_read().map_err(into_err)?;
             let tombs = r.open_table(T::tombs()).map_err(into_err)?;
@@ -427,7 +439,7 @@ where
         w.commit().map_err(into_err)?;
 
         if pruned > 0 {
-            self.rebuild_mst_from_disk().await?;
+            self.rebuild_mst_from_disk_unlocked().await?;
             self.bump_change_clock();
         }
 
@@ -594,15 +606,30 @@ where
         Ok(tree)
     }
 
-    /// Rebuild the in-memory MST from durable registers + tombstones.
-    pub async fn rebuild_mst_from_disk(&self) -> crate::Result<()> {
+    /// Rebuilds the in-memory MST from durable registers and tombstones.
+    ///
+    /// This private helper assumes the caller already holds `mutation_gate`.
+    /// Keeping it separate lets write paths rebuild after their Redb commit
+    /// without re-entering the same async mutex.
+    async fn rebuild_mst_from_disk_unlocked(&self) -> crate::Result<()> {
         let tree = self.build_tree_from_disk_at_version(self.current_root_schema_version())?;
         *self.mst.write().await = tree;
         Ok(())
     }
 
-    /// Rebuilds the in-memory MST using the requested semantic root-schema version.
-    pub async fn rebuild_mst_from_disk_at_version(
+    /// Rebuild the in-memory MST from durable registers + tombstones.
+    pub async fn rebuild_mst_from_disk(&self) -> crate::Result<()> {
+        let _mutation = self.mutation_gate.lock().await;
+        self.rebuild_mst_from_disk_unlocked().await
+    }
+
+    /// Rebuilds the in-memory MST for one semantic root schema version.
+    ///
+    /// This private helper assumes the caller already holds `mutation_gate`.
+    /// It updates the schema marker only after the replacement tree has been
+    /// built, so concurrent writers cannot project new leaves into the wrong
+    /// in-memory root.
+    async fn rebuild_mst_from_disk_at_version_unlocked(
         &self,
         root_schema_version: u32,
     ) -> crate::Result<()> {
@@ -613,12 +640,23 @@ where
         Ok(())
     }
 
+    /// Rebuilds the in-memory MST using the requested semantic root-schema version.
+    pub async fn rebuild_mst_from_disk_at_version(
+        &self,
+        root_schema_version: u32,
+    ) -> crate::Result<()> {
+        let _mutation = self.mutation_gate.lock().await;
+        self.rebuild_mst_from_disk_at_version_unlocked(root_schema_version)
+            .await
+    }
+
     /// Replace the current in-memory MST with one built from given entries.
     pub async fn rebuild_mst<Ia, It>(&self, actives: Ia, tombs: It)
     where
         Ia: IntoIterator<Item = (C::Key, C::Snapshot)>,
         It: IntoIterator<Item = (C::Key, TombstoneRecord)>,
     {
+        let _mutation = self.mutation_gate.lock().await;
         let mut t = Builder::default().with_hasher(H::default()).build();
         for (k, s) in actives {
             t.upsert(k, &Entry::Active(s));
@@ -687,6 +725,7 @@ where
         if policy.tombstone_batch_limit == 0 {
             return Ok(report);
         }
+        let _mutation = self.mutation_gate.lock().await;
         if barrier.root_schema_version != self.current_root_schema_version() {
             return Err(Box::new(Error::Other(format!(
                 "tombstone GC barrier root schema {} does not match current store root schema {}",
@@ -712,7 +751,7 @@ where
             // The MST crate currently supports upsert but not delete. Rebuild
             // once per GC batch instead of trying to emulate removal with a
             // sentinel leaf, which would keep deleted keys in the root.
-            self.rebuild_mst_from_disk().await?;
+            self.rebuild_mst_from_disk_unlocked().await?;
             self.bump_change_clock();
         }
 
@@ -735,6 +774,7 @@ where
             return Ok(report);
         }
 
+        let _mutation = self.mutation_gate.lock().await;
         let candidates = self.collect_register_compaction_candidates(
             max_values,
             policy.mvreg_batch_limit,
@@ -943,6 +983,7 @@ where
 
     /// Insert or update value for key `k`.
     pub async fn upsert(&self, k: &C::Key, v: C::Value) -> crate::Result<()> {
+        let _mutation = self.mutation_gate.lock().await;
         let w = self.db.begin_write().map_err(into_err)?;
         let kb = Self::encode_key(k);
         let new_reg = {
@@ -1007,6 +1048,7 @@ where
             return Ok(());
         }
 
+        let _mutation = self.mutation_gate.lock().await;
         let mut merged: Vec<(C::Key, C::Reg)> = Vec::with_capacity(requested.len());
         let w = self.db.begin_write().map_err(into_err)?;
         {
@@ -1057,6 +1099,7 @@ where
 
     /// Remove key and persist a tombstone with a monotonic sequence.
     pub async fn remove(&self, k: &C::Key) -> crate::Result<u64> {
+        let _mutation = self.mutation_gate.lock().await;
         // First check if tomb already exists; if so, do NOT allocate a new seq.
         //
         // Delete operations are idempotent per key. Re-removing an already deleted
@@ -1152,6 +1195,7 @@ where
     /// This is intended for recovery/testing scenarios where a local store is missing entries
     /// and should accept the next sync payload, not for user-facing delete operations.
     pub async fn purge_local(&self, k: &C::Key) -> crate::Result<()> {
+        let _mutation = self.mutation_gate.lock().await;
         let w = self.db.begin_write().map_err(into_err)?;
         {
             let mut values = w.open_table(T::values()).map_err(into_err)?;
@@ -1182,13 +1226,14 @@ where
         }
         w.commit().map_err(into_err)?;
 
-        self.rebuild_mst_from_disk().await?;
+        self.rebuild_mst_from_disk_unlocked().await?;
         self.bump_change_clock();
         Ok(())
     }
 
     /// Merge a remote register for key `k` into durable state and MST, clearing any local tombstone.
     pub async fn merge_register(&self, k: &C::Key, incoming: &C::Reg) -> crate::Result<()> {
+        let _mutation = self.mutation_gate.lock().await;
         let w = self.db.begin_write().map_err(into_err)?;
         let kb = Self::encode_key(k);
         let merged = {
@@ -1234,6 +1279,7 @@ where
 
     /// Apply an inbound tombstone (idempotent, monotonic).
     pub async fn apply_tombstone(&self, k: &C::Key, ts: u64) -> io::Result<()> {
+        let _mutation = self.mutation_gate.lock().await;
         // This scalar helper is kept for local/test callers that only have a
         // tombstone sequence. Sync delta application uses TombstoneRecord directly
         // so it can preserve the remote origin actor.
@@ -1315,8 +1361,12 @@ where
         Ok(())
     }
 
-    /// Apply one streamed delta chunk (register merges + tombstones). Batches in a single write.
-    pub fn apply_delta_chunk(
+    /// Apply one streamed delta chunk (register merges + tombstones) without updating the MST.
+    ///
+    /// This is used only by `DeltaApplySession`, which holds `mutation_gate`
+    /// until `commit()` rebuilds the MST from disk. Callers that need one-shot
+    /// delta application should use `apply_delta_chunk_update_mst()` instead.
+    fn apply_delta_chunk(
         &self,
         regs: Registers<C::Key, C::Reg>,
         tombs: Tombstones<C::Key>,
@@ -1339,6 +1389,7 @@ where
         regs: Registers<C::Key, C::Reg>,
         tombs: Tombstones<C::Key>,
     ) -> io::Result<()> {
+        let _mutation = self.mutation_gate.lock().await;
         let (merged_regs, merged_tombs) =
             self.write_delta_chunk_merged_latest(regs, tombs, true)?;
         let had_changes = !merged_regs.is_empty() || !merged_tombs.is_empty();
@@ -1503,7 +1554,8 @@ where
 
     /// Rebuild MST once after a sequence of `apply_delta_chunk()` calls.
     pub async fn finalize_after_stream(&self) -> crate::Result<()> {
-        self.rebuild_mst_from_disk().await
+        let _mutation = self.mutation_gate.lock().await;
+        self.rebuild_mst_from_disk_unlocked().await
     }
 
     /// Dump durable (key, snapshot) and (key, tombstone).
@@ -1922,6 +1974,7 @@ where
             db: self.db,
             actor: self.actor,
             mst,
+            mutation_gate: Mutex::new(()),
             root_schema_version: AtomicU32::new(DEFAULT_ROOT_SCHEMA_VERSION),
             change_clock: AtomicU64::new(1),
             preserve_local_tombs: self.preserve_local_tombs,
@@ -1948,6 +2001,7 @@ where
 {
     store: &'a CrdtMstStore<C, H, T>,
     finalize: FinalizeStrategy,
+    _mutation: tokio::sync::MutexGuard<'a, ()>,
 }
 
 impl<'a, C, H, T> DeltaApplySession<'a, C, H, T>
@@ -1975,7 +2029,7 @@ where
     /// Finalize once after all chunks (rebuild MST from disk).
     pub async fn commit(self) -> crate::Result<()> {
         match self.finalize {
-            FinalizeStrategy::Rebuild => self.store.finalize_after_stream().await,
+            FinalizeStrategy::Rebuild => self.store.rebuild_mst_from_disk_unlocked().await,
             FinalizeStrategy::NoOp => Ok(()),
         }
     }
@@ -2931,7 +2985,7 @@ mod tests {
         let (regs, tombs) = src.export_page_ranges_delta(&want).unwrap();
 
         // Apply via session and commit
-        let sess = dst.begin_delta_apply();
+        let sess = dst.begin_delta_apply().await;
         sess.apply_chunk(regs, tombs).unwrap();
         sess.commit().await.unwrap();
 

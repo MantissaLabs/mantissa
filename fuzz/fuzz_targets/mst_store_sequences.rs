@@ -230,7 +230,7 @@ async fn sync_full_delta_session(source: &Store, target: &Store, split_seed: usi
     let first_tombs = tombs[..tomb_split].to_vec();
     let second_tombs = tombs[tomb_split..].to_vec();
 
-    let session = target.begin_delta_apply();
+    let session = target.begin_delta_apply().await;
     session
         .apply_chunk(first_regs, first_tombs)
         .expect("first streamed delta chunk should apply");
