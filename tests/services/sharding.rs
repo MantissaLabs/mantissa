@@ -434,16 +434,17 @@ local_test!(
             .expect("submit initial sharded deployment")
             .service_id;
 
-        assert!(
-            wait_for_service_manifest_running_all(
-                &cluster,
-                service_id,
-                initial_manifest_id,
-                Duration::from_secs(30)
-            )
-            .await,
-            "initial sharded deployment should reach running everywhere"
-        );
+        if !wait_for_service_manifest_running_all(
+            &cluster,
+            service_id,
+            initial_manifest_id,
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            let task_debug = collect_service_task_count_debug(&cluster, service_name).await;
+            panic!("initial sharded deployment should reach running everywhere; {task_debug}");
+        }
         assert!(
             wait_for_sharded_service_running_all(&cluster, service_name, 8).await,
             "initial sharded deployment should converge before redeploy"
@@ -497,16 +498,17 @@ local_test!(
             "redeploy should preserve the stable service id"
         );
 
-        assert!(
-            wait_for_service_manifest_running_all(
-                &cluster,
-                service_id,
-                replacement_manifest_id,
-                Duration::from_secs(60)
-            )
-            .await,
-            "replacement sharded generation should reach running everywhere"
-        );
+        if !wait_for_service_manifest_running_all(
+            &cluster,
+            service_id,
+            replacement_manifest_id,
+            Duration::from_secs(60),
+        )
+        .await
+        {
+            let task_debug = collect_service_task_count_debug(&cluster, service_name).await;
+            panic!("replacement sharded generation should reach running everywhere; {task_debug}");
+        }
 
         let replacement_spec = cluster[0]
             .node

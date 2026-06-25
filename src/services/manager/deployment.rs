@@ -544,6 +544,28 @@ impl ServiceController {
             }
             Some(_) | None => return Ok(()),
         };
+        // Spawn decisions use each node's local peer view, which can differ briefly
+        // after a service upsert. Re-check ownership against the current view before
+        // doing side effects so a stale adopter stands down instead of racing the owner.
+        let eligible_nodes = self.collect_eligible_nodes();
+        let Some(owner_id) =
+            select_generation_owner(current.id, current.service_epoch, &eligible_nodes)
+        else {
+            return Ok(());
+        };
+        if owner_id != self.local_node_id {
+            tracing::debug!(
+                target: "services",
+                service = %current.service_name,
+                manifest = %current.manifest_id,
+                epoch = current.service_epoch,
+                owner = %owner_id,
+                local = %self.local_node_id,
+                "skipping deployment adoption because generation ownership moved before execution"
+            );
+            self.wake_generation_owner(current).await;
+            return Ok(());
+        }
 
         if let Some(previous) = current.previous_generation.as_ref() {
             let job = ServiceRedeploymentJob {
@@ -577,6 +599,25 @@ impl ServiceController {
         self.clone().await_service_readiness(current).await;
         Ok(())
     }
+
+    /// Re-broadcasts a deploying generation after a stale local owner stands down.
+    ///
+    /// Owner selection is intentionally local and eventually consistent. A node can
+    /// win the spawn-time check with an older peer view, then lose the execution-time
+    /// recheck once its view catches up. Re-broadcasting the unchanged service row is
+    /// a cheap wake-up for the current owner; stale rows remain subject to normal
+    /// service ordering and cannot overwrite a newer assigned or terminal phase.
+    async fn wake_generation_owner(&self, spec: ServiceSpecValue) {
+        let service_id = spec.id;
+        if let Err(err) = self.broadcast(ServiceEvent::Upsert(spec)).await {
+            tracing::warn!(
+                target: "services",
+                service = %service_id,
+                "failed to wake deployment generation owner after local stand-down: {err:#}"
+            );
+        }
+    }
+
     /// Executes the deployment workflow in the background by starting tasks via the task manager
     /// and persisting the resulting service specification into the replicated registry.
     async fn execute_deployment(self, job: ServiceDeploymentJob) -> anyhow::Result<()> {
@@ -721,11 +762,11 @@ impl ServiceController {
         spec.manifest_name = manifest_name;
         spec.service_name = service_name.clone();
         spec.task_templates = task_templates;
+        spec.service_epoch = service_epoch;
         spec.set_replica_ids_compact_when_derived(replica_ids);
         spec.update_strategy = update_strategy;
         spec.deployment_policy = deployment_policy;
         spec.admission_policy = admission_policy;
-        spec.service_epoch = service_epoch;
         spec.previous_generation = None;
         spec.set_rollout(ServiceRolloutState::default());
         spec.set_status(ServiceStatus::Deploying);
@@ -1498,6 +1539,7 @@ impl ServiceController {
         spec.manifest_name = deployment.manifest_name.to_string();
         spec.service_name = deployment.service_name.to_string();
         spec.task_templates = deployment.task_templates.to_vec();
+        spec.service_epoch = deployment.service_epoch;
         spec.set_replica_ids_compact_when_derived(replica_ids);
         spec.update_strategy = deployment.update_strategy.clone();
         spec.deployment_policy = deployment.deployment_policy.clone();
@@ -1544,6 +1586,7 @@ impl ServiceController {
         let terminal_launch_error = deployment_launch_error_should_fail_generation(err);
         match self.registry.get(service_id) {
             Ok(Some(mut persisted_spec)) if is_local_volume_unavailable_error(err) => {
+                persisted_spec.service_epoch = deployment.service_epoch;
                 persisted_spec.set_replica_ids_compact_when_derived(desired_task_ids.to_vec());
                 persisted_spec.previous_generation = None;
                 persisted_spec.set_rollout(ServiceRolloutState::default());

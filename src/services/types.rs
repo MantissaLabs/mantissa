@@ -302,12 +302,24 @@ impl ServiceSpecValue {
     }
 
     /// Stores explicit replica ids and clears any compact assignment view.
+    ///
+    /// Assignment is a replicated service phase, not only display data. Advancing the
+    /// phase when it changes keeps an assigned `Deploying` row dominant over stale
+    /// empty `Deploying` rows that can still be delivered by gossip or sync.
     pub fn set_replica_ids(&mut self, replica_ids: Vec<Uuid>) {
+        if self.replica_ids != replica_ids || !self.replica_assignment_segments.is_empty() {
+            self.phase_version = self.phase_version.saturating_add(1);
+            self.touch();
+        }
         self.replica_ids = replica_ids;
         self.replica_assignment_segments.clear();
     }
 
     /// Stores compact deterministic assignments when the provided ids match the generation.
+    ///
+    /// Compact and explicit assignments are equivalent lifecycle evidence. Both
+    /// must advance the service phase when they change so stale unassigned rows
+    /// cannot overwrite the generation after tasks have been reserved.
     pub fn set_replica_ids_compact_when_derived(&mut self, replica_ids: Vec<Uuid>) {
         match compact_service_replica_assignment_segments(
             self.id,
@@ -316,6 +328,10 @@ impl ServiceSpecValue {
             &replica_ids,
         ) {
             Some(segments) if !segments.is_empty() => {
+                if !self.replica_ids.is_empty() || self.replica_assignment_segments != segments {
+                    self.phase_version = self.phase_version.saturating_add(1);
+                    self.touch();
+                }
                 self.replica_ids.clear();
                 self.replica_assignment_segments = segments;
             }
@@ -325,6 +341,10 @@ impl ServiceSpecValue {
 
     /// Clears every assigned replica slot from the service generation.
     pub fn clear_replica_assignments(&mut self) {
+        if !self.replica_ids.is_empty() || !self.replica_assignment_segments.is_empty() {
+            self.phase_version = self.phase_version.saturating_add(1);
+            self.touch();
+        }
         self.replica_ids.clear();
         self.replica_assignment_segments.clear();
     }

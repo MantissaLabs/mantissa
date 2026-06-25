@@ -2055,10 +2055,25 @@ mod tests {
         let decoded =
             ServiceSpecValue::decode_store_value(&encoded).expect("decode compact service spec");
         let mut expected = spec.clone();
-        expected.set_replica_ids_compact_when_derived(spec.replica_ids.clone());
+        expected.replica_assignment_segments =
+            crate::services::types::compact_service_replica_assignment_segments(
+                expected.id,
+                expected.service_epoch,
+                &expected.task_templates,
+                &expected.replica_ids,
+            )
+            .expect("compact current replica ids");
+        expected.replica_ids.clear();
         let mut expected_previous = previous;
-        let expected_previous_ids = expected_previous.replica_ids.clone();
-        expected_previous.set_replica_ids_compact_when_derived(expected_previous_ids);
+        expected_previous.replica_assignment_segments =
+            crate::services::types::compact_service_replica_assignment_segments(
+                expected.id,
+                expected_previous.service_epoch,
+                &expected_previous.task_templates,
+                &expected_previous.replica_ids,
+            )
+            .expect("compact previous replica ids");
+        expected_previous.replica_ids.clear();
         expected.previous_generation =
             Some(ServicePreviousGeneration::from_service(&expected_previous));
         assert_eq!(

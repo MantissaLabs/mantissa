@@ -172,6 +172,7 @@ fn validate_existing_service_shard_assignment(
     shard_index: usize,
     request: &WorkloadStartRequest,
     spec: &WorkloadSpec,
+    require_target_node_match: bool,
 ) -> Result<(), anyhow::Error> {
     validate_service_shard_start_request(service_id, service_epoch, shard_index, request)?;
     let task_id = request
@@ -187,7 +188,11 @@ fn validate_existing_service_shard_assignment(
             spec.id
         ));
     }
-    if spec.node_id != target_node {
+    // The pinned target must be honored for rows produced by this start
+    // attempt. For an already-existing deterministic service replica row, the
+    // target in the request is only the latest placement proposal; the durable
+    // row's identity/owner/execution fields are the idempotency contract.
+    if require_target_node_match && spec.node_id != target_node {
         return Err(anyhow!(
             "service shard {shard_index} task {task_id} targets node {target_node}, but row is on {}",
             spec.node_id
@@ -1164,6 +1169,7 @@ impl WorkloadManager {
                         shard_index,
                         &launch_request,
                         &existing,
+                        false,
                     )?;
                     ordered[index] = Some(existing);
                 }
@@ -1192,6 +1198,7 @@ impl WorkloadManager {
                     shard_index,
                     &launch_request,
                     &spec,
+                    true,
                 )?;
                 ordered[index] = Some(spec);
             }
@@ -1947,6 +1954,7 @@ impl WorkloadManager {
                         target: "task",
                         "local reservation conflicted on attempt {attempt}: {err}"
                     );
+                    sleep(scheduling_retry_backoff(attempt)).await;
                     continue;
                 }
                 Err(ExecutionError::Fatal(err)) => return Err(err),
@@ -1966,6 +1974,7 @@ impl WorkloadManager {
                         self.release_local_resources(&resources).await;
                     }
                     reserved_remote.clear();
+                    sleep(scheduling_retry_backoff(attempt)).await;
                     continue;
                 }
                 Err(ExecutionError::Fatal(err)) => {
@@ -1989,6 +1998,7 @@ impl WorkloadManager {
                     if let Some(resources) = reserved_local_resources.take() {
                         self.release_local_resources(&resources).await;
                     }
+                    sleep(scheduling_retry_backoff(attempt)).await;
                     continue;
                 }
                 Err(ExecutionError::Fatal(err)) => {

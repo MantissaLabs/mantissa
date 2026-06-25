@@ -1190,11 +1190,11 @@ impl ServiceController {
         next_spec.manifest_name = target.manifest_name.to_string();
         next_spec.service_name = service_name.to_string();
         next_spec.task_templates = target.task_templates.to_vec();
+        next_spec.service_epoch = current_spec.service_epoch.saturating_add(1);
         next_spec.set_replica_ids_compact_when_derived(ordered_task_ids);
         next_spec.update_strategy = target.update_strategy.clone();
         next_spec.deployment_policy = target.deployment_policy.clone();
         next_spec.admission_policy = *target.admission_policy;
-        next_spec.service_epoch = current_spec.service_epoch.saturating_add(1);
         next_spec.previous_generation = None;
         next_spec.set_rollout(ServiceRolloutState::default());
         next_spec.set_status(ServiceStatus::Deploying);

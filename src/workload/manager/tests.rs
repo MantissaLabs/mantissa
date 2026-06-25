@@ -1382,6 +1382,70 @@ async fn coordinate_service_shard_assignments_starts_and_reuses_rows() {
 }
 
 #[tokio::test]
+async fn coordinate_service_shard_assignments_reuses_existing_row_on_different_target() {
+    let (manager, _scheduler, mock_cm, _network_registry) = setup_manager().await;
+    let service_name = "svc";
+    let service_epoch = 3;
+    let task_id = Uuid::new_v4();
+    let proposed_target = manager.local_node_id;
+    let existing_target = Uuid::new_v4();
+    let execution = empty_resolved_execution("img");
+    let owner = WorkloadOwner::ServiceReplica(
+        WorkloadServiceMetadata::new(service_name, "api").with_service_epoch(service_epoch),
+    );
+
+    let mut existing = test_task_spec(&manager, "svc-api-1");
+    existing.id = task_id;
+    existing.node_id = existing_target;
+    existing.owner = Some(owner.clone());
+    existing.state = WorkloadPhase::Running;
+    existing.cpu_millis = execution.cpu_millis;
+    existing.memory_bytes = execution.memory_bytes;
+    manager
+        .handle_event(WorkloadEvent::UpsertSpec(Box::new(existing.clone())))
+        .await
+        .expect("persist existing shard row");
+
+    let launch_request = WorkloadStartRequest {
+        name: existing.name.clone(),
+        execution,
+        execution_platform: ExecutionPlatform::Oci,
+        isolation_mode: crate::workload::model::IsolationMode::Standard,
+        isolation_profile: None,
+        gpu_device_ids: Vec::new(),
+        id: Some(task_id),
+        slot_ids: Vec::new(),
+        owner: Some(owner),
+        dependency_requirements: Vec::new(),
+        service_placement_preferences: Vec::new(),
+        target_node: Some(proposed_target),
+    };
+    let shard_request = ServiceShardAssignmentRequest {
+        owner_node_id: Uuid::new_v4(),
+        coordinator_node_id: manager.local_node_id,
+        service_id: crate::services::types::compute_service_id(service_name),
+        service_epoch,
+        shard_index: 0,
+        requests: vec![launch_request],
+    };
+
+    let reused = manager
+        .coordinate_service_shard_assignments(shard_request)
+        .await
+        .expect("coordinate shard with existing row on another target");
+
+    assert_eq!(reused.len(), 1);
+    assert_eq!(reused[0].id, existing.id);
+    assert_eq!(reused[0].node_id, existing.node_id);
+    assert_eq!(reused[0].owner, existing.owner);
+    assert_eq!(reused[0].state, existing.state);
+    assert!(
+        mock_cm.created.lock().await.is_empty(),
+        "existing deterministic row should be reused without starting another instance"
+    );
+}
+
+#[tokio::test]
 async fn coordinate_service_shard_assignments_rejects_wrong_coordinator() {
     let (manager, _scheduler, _runtime, _network_registry) = setup_manager().await;
     let service_name = "svc";
