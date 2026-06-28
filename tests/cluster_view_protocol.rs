@@ -3122,7 +3122,8 @@ local_test!(
         loop {
             let mut anchor_local_count = None::<u32>;
             let mut anchor_remote_count = None::<u32>;
-            for (view, node_count, local_active) in cluster_view_rows(&anchor.topology()).await {
+            let rows = cluster_view_rows(&anchor.topology()).await;
+            for (view, node_count, local_active) in rows.iter().copied() {
                 if view == split_source_view {
                     assert!(
                         local_active,
@@ -3144,7 +3145,9 @@ local_test!(
 
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "cross-view cluster node-count metadata did not converge after split leave"
+                "cross-view cluster node-count metadata did not converge after split leave; last rows={rows:?}; left_peer_on_anchor={}; left_peer_on_survivor={}",
+                peer_membership_debug(&anchor, joiner_b.id()),
+                peer_membership_debug(&joiner_a, joiner_b.id())
             );
             sleep(Duration::from_millis(100)).await;
         }

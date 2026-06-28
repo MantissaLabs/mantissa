@@ -606,9 +606,9 @@ impl Registry {
             })
     }
 
-    /// Returns the converged peer value without applying excluded-peer scoping.
+    /// Returns the converged peer value without applying excluded-peer or active-member filtering.
     pub fn peer_value_unscoped(&self, peer_id: Uuid) -> Option<PeerValue> {
-        self.peer_latest_value_unscoped(peer_id)
+        self.peer_selected_value_unscoped(peer_id)
     }
 
     /// Returns a shared handle to the cluster health monitor.
@@ -1735,6 +1735,7 @@ impl Registry {
         self.peer_latest_value_unscoped(peer_id)
     }
 
+    /// Returns the active selected peer value without applying excluded-peer scoping.
     fn peer_latest_value_unscoped(&self, peer_id: Uuid) -> Option<PeerValue> {
         self.refresh_peer_snapshot_cache_if_needed().ok()?;
         let cache = self.peer_snapshot_cache_read();
@@ -1764,5 +1765,85 @@ impl Registry {
         )
         .await
         .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::replicated::peers::open_peers_store;
+    use crate::topology::peers::{NodeReadiness, PeerMembership, PeerSchedulingState};
+    use tempfile::tempdir;
+
+    /// Builds one synthetic peer value for registry projection tests.
+    fn peer_value(peer_id: Uuid, membership: PeerMembership) -> PeerValue {
+        PeerValue {
+            address: "127.0.0.1:7000".to_string(),
+            hostname: "peer".to_string(),
+            platform_os: "linux".to_string(),
+            platform_arch: "amd64".to_string(),
+            noise_static_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            identity_sig: vec![3u8; 64],
+            wireguard: None,
+            scheduling: PeerSchedulingState::schedulable_default(peer_id),
+            readiness: NodeReadiness::ready(peer_id, 10),
+            labels: Default::default(),
+            runtime_support: RuntimeSupportProfile::default(),
+            root_schema: crate::cluster::RootSchemaInfo::default(),
+            membership,
+        }
+    }
+
+    /// Looking up one peer by id must return left rows so stale active observations cannot resurrect it.
+    #[tokio::test]
+    async fn peer_value_unscoped_returns_left_membership_rows() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("registry-peer-value-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let local_id = Uuid::new_v4();
+        let peer_id = Uuid::new_v4();
+        let peers = open_peers_store(db.clone(), local_id).expect("open peers store");
+        let noise_keys = NoiseKeys::from_private_bytes([0x11; 32]);
+        let sessions = LocalSessionStore::open(db, &noise_keys).expect("open sessions store");
+        let registry = Registry::new(
+            peers.clone(),
+            sessions,
+            SigningKey::from_bytes(&[0xA5; 32]),
+            Arc::new(noise_keys),
+            local_id,
+            HealthMonitor::new(local_id),
+        );
+
+        peers
+            .upsert(
+                &UuidKey::from(peer_id),
+                peer_value(peer_id, PeerMembership::active(7)),
+            )
+            .await
+            .expect("insert active peer");
+        assert_eq!(registry.known_peers().expect("known peers"), vec![peer_id]);
+
+        peers
+            .upsert(
+                &UuidKey::from(peer_id),
+                peer_value(peer_id, PeerMembership::left(8)),
+            )
+            .await
+            .expect("insert left peer");
+
+        let selected = registry
+            .peer_value_unscoped(peer_id)
+            .expect("selected left peer");
+        assert_eq!(selected.membership, PeerMembership::left(8));
+        assert!(
+            registry
+                .known_peers()
+                .expect("known peers after leave")
+                .is_empty(),
+            "active peer cache should still exclude left rows"
+        );
     }
 }
