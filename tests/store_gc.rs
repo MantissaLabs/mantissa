@@ -161,6 +161,19 @@ fn scheduler_digest(node_id: Uuid, snapshot_version: u64) -> SchedulerDigestValu
     }
 }
 
+/// Builds one scheduler-digest register entry concurrent with other one-dot entries.
+fn scheduler_digest_concurrent_register(
+    actor: Uuid,
+    node_id: Uuid,
+    snapshot_version: u64,
+) -> MvReg<SchedulerDigestValue, Uuid> {
+    MvReg::from_entries(vec![mvreg_entry(
+        actor,
+        1,
+        scheduler_digest(node_id, snapshot_version),
+    )])
+}
+
 /// Builds one workload value with deterministic fields for replicated GC tests.
 fn workload_value(id: Uuid, node_id: Uuid, version: u64) -> WorkloadValue {
     WorkloadValue::new(WorkloadValueDraft {
@@ -1398,9 +1411,11 @@ local_test!(
         let node_id = Uuid::from_u128(9_000);
         let key = UuidKey::from(node_id);
         for (index, node) in cluster.iter().enumerate() {
+            let register =
+                scheduler_digest_concurrent_register(node.id(), node_id, index as u64 + 1);
             node.node
                 .scheduler_digests
-                .upsert(&key, scheduler_digest(node_id, index as u64 + 1))
+                .merge_register(&key, &register)
                 .await
                 .expect("write concurrent scheduler digest value");
         }
