@@ -27,6 +27,46 @@ use std::time::Duration;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
+async fn session_cluster_view(
+    session: &mantissa_protocol::server::cluster_session::Client,
+) -> ClusterViewId {
+    let response = session
+        .get_cluster_view_request()
+        .send()
+        .promise
+        .await
+        .expect("getClusterView send");
+    ClusterViewId::from_capnp(
+        response
+            .get()
+            .expect("getClusterView get")
+            .get_view()
+            .expect("session view payload"),
+    )
+    .expect("decode session cluster view")
+}
+
+async fn session_capabilities_cluster_view(
+    session: &mantissa_protocol::server::cluster_session::Client,
+) -> ClusterViewId {
+    let response = session
+        .get_capabilities_request()
+        .send()
+        .promise
+        .await
+        .expect("getCapabilities send");
+    let caps = response
+        .get()
+        .expect("getCapabilities get")
+        .get_caps()
+        .expect("capabilities payload");
+    ClusterViewId::from_capnp(
+        caps.get_active_view()
+            .expect("capabilities active view payload"),
+    )
+    .expect("decode capabilities active view")
+}
+
 async fn submit_cluster_operation_record(
     topology: &mantissa::topology_capnp::topology::Client,
     operation: &ClusterOperationRecord,
@@ -2823,6 +2863,84 @@ local_test!(cluster_view_merge_after_split_reconnects_partitions, {
         "merged cluster should reconnect all split partitions",
     )
     .await;
+});
+
+// Validates cached peer sessions report the node's live cluster view after a transition.
+local_test!(cluster_session_reports_live_view_after_transition, {
+    let anchor = TestNode::new_with_tick_ms(100).await;
+    let joiner = TestNode::new_with_tick_ms(100).await;
+    joiner.join(&anchor).await.expect("join anchor");
+    anchor
+        .assert_cluster_size(2, "anchor cluster after join")
+        .await;
+    joiner
+        .assert_cluster_size(2, "joiner cluster after join")
+        .await;
+
+    let cached_anchor_session = joiner
+        .node
+        .registry
+        .session_for_peer_unscoped(anchor.id())
+        .await
+        .expect("cached anchor session");
+    let source_view = current_cluster_view(&anchor.topology()).await;
+    assert_eq!(
+        session_cluster_view(&cached_anchor_session).await,
+        source_view,
+        "cached session should initially report the source view"
+    );
+
+    let mut split_req = anchor.topology().split_cluster_request();
+    {
+        let mut req = split_req.get().init_req();
+        source_view.write_capnp(req.reborrow().init_source_view());
+
+        let mut targets = req.reborrow().init_targets(1);
+        let mut target = targets.reborrow().get(0);
+        target.set_name("all-nodes");
+        let mut selector = target.reborrow().init_selector();
+        selector.reborrow().init_clauses(0);
+        let mut explicit = selector.reborrow().init_explicit_nodes(2);
+        set_node_id(explicit.reborrow().get(0), &anchor.id());
+        set_node_id(explicit.reborrow().get(1), &joiner.id());
+
+        req.set_dry_run(false);
+    }
+    let split_resp = split_req.send().promise.await.expect("splitCluster send");
+    let split_op = split_resp
+        .get()
+        .expect("splitCluster get")
+        .get_op()
+        .expect("split operation");
+    let split_id = split_op.get_id().expect("split operation id").to_vec();
+    let target_view = ClusterViewId::from_capnp(
+        split_op
+            .get_target_views()
+            .expect("split target views")
+            .get(0),
+    )
+    .expect("decode split target view");
+
+    wait_for_operation_stage(
+        &anchor.topology(),
+        &split_id,
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_cluster_view(&anchor.topology(), target_view, Duration::from_secs(5)).await;
+    wait_for_cluster_view(&joiner.topology(), target_view, Duration::from_secs(5)).await;
+
+    assert_eq!(
+        session_cluster_view(&cached_anchor_session).await,
+        target_view,
+        "cached session getClusterView should follow the anchor's live view"
+    );
+    assert_eq!(
+        session_capabilities_cluster_view(&cached_anchor_session).await,
+        target_view,
+        "cached session capabilities should advertise the anchor's live view"
+    );
 });
 
 // Validates cluster view counts track active members after a split peer leaves.

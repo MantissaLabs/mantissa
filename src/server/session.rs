@@ -1,5 +1,5 @@
 use super::Liveness;
-use crate::{cluster::ClusterViewId, topology::Topology};
+use crate::topology::Topology;
 use mantissa_protocol::{
     agents::agents, gossip::gossip, health::health, ingress::ingress, jobs::jobs,
     network::networks, node::node, rest::rest_admin, scheduling::scheduler, secrets::secrets,
@@ -92,14 +92,13 @@ impl SessionFactory {
 
     /// Creates a new cluster session capability for a connected peer or client.
     ///
-    /// Each session snapshots the active cluster view while sharing the common
-    /// exported service capabilities and liveness state.
+    /// Each session shares the common exported service capabilities and reads
+    /// the live topology view so cached sessions survive cluster transitions.
     fn new_client(&self, peer_scope: Option<PeerSessionScope>) -> cluster_session::Client {
         let session = ClusterSessionImpl::new(
             self.services.clone(),
             self.health_client(),
             self.liveness.clone(),
-            self.topology.active_cluster_view(),
             self.topology.clone(),
             peer_scope,
         );
@@ -123,7 +122,6 @@ pub struct ClusterSessionImpl {
     services: ClusterSessionServices,
     health: health::Client,
     liveness: Liveness,
-    cluster_view: ClusterViewId,
     topology: Topology,
     peer_scope: Option<PeerSessionScope>,
 }
@@ -137,7 +135,6 @@ impl ClusterSessionImpl {
         services: ClusterSessionServices,
         health: health::Client,
         liveness: Liveness,
-        cluster_view: ClusterViewId,
         topology: Topology,
         peer_scope: Option<PeerSessionScope>,
     ) -> Self {
@@ -145,7 +142,6 @@ impl ClusterSessionImpl {
             services,
             health,
             liveness,
-            cluster_view,
             topology,
             peer_scope,
         }
@@ -229,7 +225,8 @@ impl cluster_session::Server for ClusterSessionImpl {
         if self.peer_scope.is_none() {
             caps.set_rest_admin(self.services.rest_admin.clone());
         }
-        self.cluster_view
+        self.topology
+            .active_cluster_view()
             .write_capnp(caps.reborrow().init_active_view());
 
         Ok(())
@@ -392,14 +389,16 @@ impl cluster_session::Server for ClusterSessionImpl {
         Ok(())
     }
 
-    /// Returns the active cluster view associated with this session.
+    /// Returns the node's current active cluster view through this session.
     async fn get_cluster_view(
         self: Rc<Self>,
         _params: cluster_session::GetClusterViewParams,
         mut results: cluster_session::GetClusterViewResults,
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
-        self.cluster_view.write_capnp(results.get().init_view());
+        self.topology
+            .active_cluster_view()
+            .write_capnp(results.get().init_view());
         Ok(())
     }
 
