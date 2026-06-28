@@ -7,12 +7,12 @@ use crate::rest::RestTokenStore;
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::master_key::envelope::PassphraseProvider;
 use crate::server::auth::AuthStore;
-use crate::store::cluster_operations::ClusterOperationStore;
 use crate::store::local::{
     LocalCredentialStore, LocalSessionStore, SecretMasterStore,
     next_root_schema_publication_generation,
 };
 use crate::store::replicated::agents::{AgentStore, open_agent_store};
+use crate::store::replicated::cluster_operations::ClusterOperationStore;
 use crate::store::replicated::cluster_views::ClusterViewStore;
 use crate::store::replicated::ingress::{IngressPoolStore, open_ingress_pool_store};
 use crate::store::replicated::jobs::{JobStore, open_job_store};
@@ -90,9 +90,8 @@ impl BootstrapStores {
         let peers = open_peers_store(ctx.db.clone(), ctx.self_id)?;
         peers.rebuild_mst_from_disk().await?;
 
-        let cluster_operations =
-            ClusterOperationStore::new_replicated(ctx.db.clone(), ctx.self_id)?;
-        cluster_operations.rebuild_replicated_mst().await?;
+        let cluster_operations = ClusterOperationStore::new(ctx.db.clone(), ctx.self_id)?;
+        cluster_operations.rebuild_mst_from_disk().await?;
         let cluster_view = ClusterViewStore::new(ctx.db.clone(), ctx.self_id)?;
         cluster_view.rebuild_cluster_view_domain_mst().await?;
 

@@ -295,7 +295,7 @@ impl Topology {
             if let Some(dependency_id) = merged.depends_on_operation_id {
                 self.trigger_operation_progress(dependency_id, false);
             }
-            let _ = self.garbage_collect_cluster_operations()?;
+            let _ = self.garbage_collect_cluster_operations().await?;
             return Ok(());
         }
 
@@ -342,7 +342,7 @@ impl Topology {
             ClusterOperationStage::Aborted => {}
         }
 
-        let _ = self.garbage_collect_cluster_operations()?;
+        let _ = self.garbage_collect_cluster_operations().await?;
         if let Some(next) = self.active_cluster_operation_excluding(operation_id)? {
             self.trigger_operation_progress(next.id, false);
         }

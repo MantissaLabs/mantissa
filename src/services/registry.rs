@@ -82,7 +82,7 @@ impl ServiceRegistry {
         Ok(values)
     }
 
-    /// Touches running and deploying services so controllers promptly rebalance after merge.
+    /// Touches running services so controllers promptly rebalance after merge.
     pub async fn touch_running_for_merge_rebalance(&self) -> Result<usize> {
         let (actives, _) = self
             .store
@@ -94,10 +94,7 @@ impl ServiceRegistry {
             let Some(current) = select_best_service_spec(snapshot.as_slice()) else {
                 continue;
             };
-            if !matches!(
-                current.status,
-                ServiceStatus::Running | ServiceStatus::Deploying
-            ) {
+            if current.status != ServiceStatus::Running {
                 continue;
             }
 
@@ -270,7 +267,7 @@ mod tests {
         assert_eq!(listed[0].task_templates[0].replicas, 3);
     }
 
-    /// Merge rebalance touch should update only running or deploying service rows.
+    /// Merge rebalance touch should update only running service rows.
     #[tokio::test]
     async fn touch_running_for_merge_rebalance_updates_active_services_only() {
         let store = temp_store();

@@ -646,17 +646,14 @@ impl Topology {
         err.to_string().contains(COMMIT_PRECONDITION_FAILURE_PREFIX)
     }
 
-    /// Persists a cluster operation record in the local durable operation store.
+    /// Persists a cluster operation record in the replicated durable operation store.
     pub(in crate::topology) async fn persist_cluster_operation(
         &self,
         op: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
-        let encoded = op
-            .encode_capnp()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
         self.stores
             .cluster_operations
-            .put_record(op, &encoded)
+            .put_record(op)
             .await
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         if !op.dry_run {
@@ -665,60 +662,25 @@ impl Topology {
         Ok(())
     }
 
-    /// Loads a cluster operation record by id from the local durable operation store.
+    /// Loads a cluster operation record by id from the replicated durable operation store.
     pub(in crate::topology) fn load_cluster_operation(
         &self,
         id: Uuid,
     ) -> Result<Option<ClusterOperationRecord>, capnp::Error> {
-        let bytes = self
-            .stores
+        self.stores
             .cluster_operations
-            .get(id)
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        let Some(bytes) = bytes else {
-            return Ok(None);
-        };
-        let decoded = ClusterOperationRecord::decode_capnp(&bytes)
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        Ok(Some(decoded))
+            .get_record(id)
+            .map_err(|e| capnp::Error::failed(e.to_string()))
     }
 
-    /// Loads all operation records from the local durable store, skipping malformed rows.
+    /// Loads all operation records from the replicated durable operation store.
     pub(in crate::topology) fn load_cluster_operations(
         &self,
     ) -> Result<Vec<ClusterOperationRecord>, capnp::Error> {
-        let encoded_rows = self
-            .stores
+        self.stores
             .cluster_operations
-            .list()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        let mut operations = Vec::with_capacity(encoded_rows.len());
-
-        for (operation_id, payload) in encoded_rows {
-            match ClusterOperationRecord::decode_capnp(&payload) {
-                Ok(operation) => {
-                    if operation.id != operation_id {
-                        warn!(
-                            target: "cluster_view",
-                            key_id = %operation_id,
-                            payload_id = %operation.id,
-                            "skipping cluster operation with mismatched durable key and payload id"
-                        );
-                        continue;
-                    }
-                    operations.push(operation);
-                }
-                Err(err) => {
-                    warn!(
-                        target: "cluster_view",
-                        operation_id = %operation_id,
-                        "skipping malformed cluster operation payload: {err}"
-                    );
-                }
-            }
-        }
-
-        Ok(operations)
+            .list_records()
+            .map_err(|e| capnp::Error::failed(e.to_string()))
     }
 
     /// Parses a cluster operation id from raw RPC bytes, enforcing UUID byte length.
@@ -765,8 +727,8 @@ impl Topology {
         Ok(true)
     }
 
-    /// Removes old terminal operations so the durable operation table stays bounded over long runtimes.
-    pub(in crate::topology) fn garbage_collect_cluster_operations(
+    /// Tombstones old terminal operations so replicated operation history stays bounded.
+    pub(in crate::topology) async fn garbage_collect_cluster_operations(
         &self,
     ) -> Result<usize, capnp::Error> {
         let mut terminal = self
@@ -800,6 +762,7 @@ impl Topology {
             .stores
             .cluster_operations
             .delete_many(&to_delete)
+            .await
             .map_err(|err| capnp::Error::failed(err.to_string()))?;
         if removed > 0 {
             info!(
@@ -1105,7 +1068,7 @@ impl Topology {
             ClusterOperationStage::Finalized | ClusterOperationStage::Aborted => {}
         }
 
-        let _ = self.garbage_collect_cluster_operations()?;
+        let _ = self.garbage_collect_cluster_operations().await?;
         drop(_guard);
 
         if !operation.dry_run {
@@ -1154,7 +1117,7 @@ impl Topology {
             "cluster operation startup replay complete"
         );
 
-        let _ = self.garbage_collect_cluster_operations()?;
+        let _ = self.garbage_collect_cluster_operations().await?;
 
         Ok(replayed)
     }

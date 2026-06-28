@@ -2,6 +2,7 @@ use crate::cluster::ClusterViewId;
 use crate::node::id::set_node_id;
 use capnp::Error as CapnpError;
 use mantissa_store::codec::StoreValueCodec;
+use std::cmp::Ordering;
 use std::io::Cursor;
 use uuid::Uuid;
 
@@ -137,17 +138,18 @@ pub struct ClusterOperationRecord {
 impl ClusterOperationRecord {
     /// Returns whether this row should replace `current` for the same operation id.
     pub fn supersedes(&self, current: &Self) -> bool {
-        self.precedence_key() > current.precedence_key()
+        self.precedence_cmp(current).is_gt()
     }
 
-    /// Builds the deterministic merge key for replicated operation rows.
-    fn precedence_key(&self) -> (u8, u64, Uuid, &str) {
-        (
-            self.stage.rank(),
-            self.updated_at_unix_ms,
-            self.id,
-            self.details.as_str(),
-        )
+    /// Compares two operation rows with the deterministic replicated winner ordering.
+    pub fn precedence_cmp(&self, other: &Self) -> Ordering {
+        self.stage
+            .rank()
+            .cmp(&other.stage.rank())
+            .then(self.updated_at_unix_ms.cmp(&other.updated_at_unix_ms))
+            .then(self.id.cmp(&other.id))
+            .then(self.details.cmp(&other.details))
+            .then_with(|| self.cmp(other))
     }
 
     /// Encodes this operation record into its stable Cap'n Proto durable payload.

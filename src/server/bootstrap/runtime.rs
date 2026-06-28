@@ -827,10 +827,7 @@ fn build_sync_stores(stores: &BootstrapStores) -> SyncStores {
         network_peers: stores.network_peers.clone(),
         network_attachments: stores.network_attachments.clone(),
         cluster_views: stores.cluster_view.cluster_view_domain_store(),
-        cluster_operations: stores
-            .cluster_operations
-            .replicated_domain_store()
-            .expect("bootstrap opens replicated cluster operation store"),
+        cluster_operations: stores.cluster_operations.domain_store(),
         volumes: stores.volumes.clone(),
         volume_nodes: stores.volume_nodes.clone(),
         scheduler_digests: stores.scheduler_digests.clone(),

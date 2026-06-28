@@ -14,7 +14,7 @@ use mantissa::runtime::testing::IN_MEMORY_RUNTIME_BACKEND_KIND;
 use mantissa::runtime::testing::new_in_memory_runtime_backend;
 use mantissa::runtime::types::RuntimeSupportProfile;
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
-use mantissa::store::cluster_operations::ClusterOperationStore;
+use mantissa::store::replicated::cluster_operations::ClusterOperationStore;
 use mantissa::store::replicated::cluster_views::ClusterViewStore;
 use mantissa::store::replicated::peers::open_peers_store;
 use mantissa::sync::VIEW_SCOPED_DOMAIN_COUNT;
@@ -80,6 +80,22 @@ async fn submit_cluster_operation_record(
         .promise
         .await
         .expect("submitClusterOperation send");
+}
+
+/// Opens a replicated cluster-operation store with an isolated test actor.
+fn open_test_operation_store(db: Arc<redb::Database>) -> ClusterOperationStore {
+    ClusterOperationStore::new(db, Uuid::new_v4()).expect("open operation store")
+}
+
+/// Persists one operation fixture into the replicated operation ledger.
+async fn persist_test_operation(
+    operation_store: &ClusterOperationStore,
+    operation: &ClusterOperationRecord,
+) {
+    operation_store
+        .put_record(operation)
+        .await
+        .expect("persist operation");
 }
 
 async fn cluster_operation_dependency_id(
@@ -1183,7 +1199,7 @@ local_test!(cluster_view_replays_pending_operation_on_startup, {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("state.redb");
     let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
-    let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
+    let operation_store = open_test_operation_store(db.clone());
 
     let source_view = ClusterViewId::legacy_default();
     let target_view = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 3);
@@ -1205,10 +1221,7 @@ local_test!(cluster_view_replays_pending_operation_on_startup, {
         details: "replay test operation".to_string(),
     };
 
-    let payload = operation.encode_capnp().expect("encode operation");
-    operation_store
-        .put(operation.id, &payload)
-        .expect("persist operation");
+    persist_test_operation(&operation_store, &operation).await;
 
     let node = HeadlessNode::new_with(
         db,
@@ -1268,7 +1281,7 @@ local_test!(cluster_view_startup_restores_split_peer_scope, {
         .write_active_view(local_view)
         .expect("persist local active view");
 
-    let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
+    let operation_store = open_test_operation_store(db.clone());
     let split = ClusterOperationRecord {
         id: Uuid::new_v4(),
         kind: StoredOperationKind::Split,
@@ -1299,10 +1312,7 @@ local_test!(cluster_view_startup_restores_split_peer_scope, {
         updated_at_unix_ms: 42,
         details: "startup split scope restore".to_string(),
     };
-    let payload = split.encode_capnp().expect("encode split operation");
-    operation_store
-        .put(split.id, &payload)
-        .expect("persist split operation");
+    persist_test_operation(&operation_store, &split).await;
 
     let peers = open_peers_store(db.clone(), self_id).expect("open peers store");
     let peer_value = |address: &str, hostname: &str| PeerValue {
@@ -1556,7 +1566,7 @@ local_test!(cluster_view_startup_replay_skips_dry_run_operation, {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("state.redb");
     let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
-    let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
+    let operation_store = open_test_operation_store(db.clone());
 
     let source_view = ClusterViewId::legacy_default();
     let target_view = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 9);
@@ -1578,10 +1588,7 @@ local_test!(cluster_view_startup_replay_skips_dry_run_operation, {
         details: "dry-run replay test operation".to_string(),
     };
 
-    let payload = operation.encode_capnp().expect("encode operation");
-    operation_store
-        .put(operation.id, &payload)
-        .expect("persist operation");
+    persist_test_operation(&operation_store, &operation).await;
 
     let node = HeadlessNode::new_with(
         db,
@@ -1641,7 +1648,7 @@ local_test!(cluster_view_startup_restores_persisted_active_view, {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("state.redb");
     let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
-    let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
+    let operation_store = open_test_operation_store(db.clone());
     let view_store =
         ClusterViewStore::new(db.clone(), Uuid::new_v4()).expect("open cluster view store");
 
@@ -1665,10 +1672,7 @@ local_test!(cluster_view_startup_restores_persisted_active_view, {
         details: "finalized startup restore operation".to_string(),
     };
 
-    let payload = operation.encode_capnp().expect("encode operation");
-    operation_store
-        .put(operation.id, &payload)
-        .expect("persist finalized operation");
+    persist_test_operation(&operation_store, &operation).await;
     view_store
         .write_active_view(target_view)
         .expect("persist active cluster view");
@@ -1709,7 +1713,7 @@ local_test!(cluster_view_startup_restores_persisted_split_view, {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("state.redb");
     let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
-    let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
+    let operation_store = open_test_operation_store(db.clone());
     let node_id = Uuid::new_v4();
     let view_store = ClusterViewStore::new(db.clone(), node_id).expect("open cluster view store");
     let source_view = ClusterViewId::legacy_default();
@@ -1742,12 +1746,7 @@ local_test!(cluster_view_startup_restores_persisted_split_view, {
         details: "finalized split startup restore operation".to_string(),
     };
 
-    operation_store
-        .put(
-            operation.id,
-            &operation.encode_capnp().expect("encode split operation"),
-        )
-        .expect("persist finalized split operation");
+    persist_test_operation(&operation_store, &operation).await;
     view_store
         .write_active_view(split_target_b)
         .expect("persist split active cluster view");
@@ -1790,7 +1789,7 @@ local_test!(
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let db_path = temp_dir.path().join("state.redb");
         let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
-        let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
+        let operation_store = open_test_operation_store(db.clone());
         let view_store =
             ClusterViewStore::new(db.clone(), Uuid::new_v4()).expect("open cluster view store");
 
@@ -1836,22 +1835,8 @@ local_test!(
             details: "second prepared merge".to_string(),
         };
 
-        operation_store
-            .put(
-                first_operation.id,
-                &first_operation
-                    .encode_capnp()
-                    .expect("encode first operation"),
-            )
-            .expect("persist first operation");
-        operation_store
-            .put(
-                second_operation.id,
-                &second_operation
-                    .encode_capnp()
-                    .expect("encode second operation"),
-            )
-            .expect("persist second operation");
+        persist_test_operation(&operation_store, &first_operation).await;
+        persist_test_operation(&operation_store, &second_operation).await;
 
         let node = HeadlessNode::new_with(
             db,
@@ -1911,7 +1896,7 @@ local_test!(cluster_view_startup_gc_prunes_terminal_operations, {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("state.redb");
     let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
-    let operation_store = ClusterOperationStore::new(db.clone()).expect("open operation store");
+    let operation_store = open_test_operation_store(db.clone());
     let source_view = ClusterViewId::legacy_default();
     let target_view = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 1);
     let total = 640usize;
@@ -1935,12 +1920,7 @@ local_test!(cluster_view_startup_gc_prunes_terminal_operations, {
             updated_at_unix_ms: (index as u64).saturating_add(1),
             details: format!("gc finalized operation {index}"),
         };
-        operation_store
-            .put(
-                operation.id,
-                &operation.encode_capnp().expect("encode gc operation"),
-            )
-            .expect("persist gc operation");
+        persist_test_operation(&operation_store, &operation).await;
     }
 
     let _node = HeadlessNode::new_with(
@@ -1958,7 +1938,7 @@ local_test!(cluster_view_startup_gc_prunes_terminal_operations, {
     sleep(Duration::from_millis(200)).await;
 
     let persisted = operation_store
-        .list()
+        .list_records()
         .expect("list operations after startup gc");
     assert_eq!(
         persisted.len(),
@@ -1967,9 +1947,7 @@ local_test!(cluster_view_startup_gc_prunes_terminal_operations, {
     );
 
     let mut min_updated_at = u64::MAX;
-    for (_, payload) in persisted {
-        let operation =
-            ClusterOperationRecord::decode_capnp(&payload).expect("decode gc-retained operation");
+    for operation in persisted {
         min_updated_at = min_updated_at.min(operation.updated_at_unix_ms);
     }
 
