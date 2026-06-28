@@ -405,40 +405,50 @@ impl Topology {
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
-        let retired = self.retired_views_excluding(operation.id)?;
-        let mut checked_views = operation.source_views.clone();
-        if operation.kind == ClusterOperationKind::Merge {
-            checked_views.extend(operation.target_views.iter().copied());
-        }
-        for view in checked_views {
-            if retired.contains(&view) {
-                return Err(capnp::Error::failed(format!(
-                    "{COMMIT_PRECONDITION_FAILURE_PREFIX}: operation={} kind={:?} view={} already retired",
-                    operation.id, operation.kind, view
-                )));
-            }
+        if let Some(view) = self.operation_view_retired_by_prior_merge(operation)? {
+            return Err(capnp::Error::failed(format!(
+                "{COMMIT_PRECONDITION_FAILURE_PREFIX}: operation={} kind={:?} view={} already retired",
+                operation.id, operation.kind, view
+            )));
         }
         Ok(())
     }
 
-    /// Returns cluster views retired by finalized or committed merge operations.
-    fn retired_views_excluding(
+    /// Returns the operation view already retired by an earlier merge, if any.
+    fn operation_view_retired_by_prior_merge(
         &self,
-        excluded_operation_id: Uuid,
+        operation: &ClusterOperationRecord,
+    ) -> Result<Option<ClusterViewId>, capnp::Error> {
+        let retired = self.retired_views_before(operation)?;
+        let mut checked_views = operation.source_views.clone();
+        if operation.kind == ClusterOperationKind::Merge {
+            checked_views.extend(operation.target_views.iter().copied());
+        }
+        Ok(checked_views
+            .into_iter()
+            .find(|view| retired.contains(view)))
+    }
+
+    /// Returns views retired by merge operations that precede the supplied operation.
+    fn retired_views_before(
+        &self,
+        operation: &ClusterOperationRecord,
     ) -> Result<HashSet<ClusterViewId>, capnp::Error> {
         let mut retired = HashSet::new();
-        for operation in self.load_cluster_operations()? {
-            if operation.id == excluded_operation_id
-                || operation.dry_run
-                || operation.kind != ClusterOperationKind::Merge
+        let operation_key = Self::operation_execution_key(operation);
+        for candidate in self.load_cluster_operations()? {
+            if candidate.id == operation.id
+                || candidate.dry_run
+                || candidate.kind != ClusterOperationKind::Merge
+                || Self::operation_execution_key(&candidate) >= operation_key
             {
                 continue;
             }
             if matches!(
-                operation.stage,
+                candidate.stage,
                 ClusterOperationStage::Committed | ClusterOperationStage::Finalized
             ) {
-                retired.extend(operation.source_views.iter().copied());
+                retired.extend(candidate.source_views.iter().copied());
             }
         }
         Ok(retired)
@@ -502,6 +512,68 @@ impl Topology {
             .iter()
             .chain(right.target_views.iter())
             .any(|view| left_views.contains(view))
+    }
+
+    /// Returns whether a non-terminal operation can advance from this node's active view.
+    fn operation_can_progress_on_local_view(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<bool, capnp::Error> {
+        let active_view = self.active_cluster_view();
+        match operation.kind {
+            ClusterOperationKind::Merge => {
+                if operation.target_views.is_empty() {
+                    return Err(capnp::Error::failed(format!(
+                        "merge operation {} missing target view",
+                        operation.id
+                    )));
+                }
+                Ok(operation.source_views.contains(&active_view)
+                    || operation.target_views.contains(&active_view))
+            }
+            ClusterOperationKind::Split => Ok(operation.source_views.contains(&active_view)),
+        }
+    }
+
+    /// Returns how a finalized operation should affect this node's current lineage view.
+    fn finalized_operation_applies_to_local_view(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<Option<ClusterViewId>, capnp::Error> {
+        let active_view = self.active_cluster_view();
+        match operation.kind {
+            ClusterOperationKind::Merge => {
+                let Some(target_view) = operation.target_views.first().copied() else {
+                    return Err(capnp::Error::failed(format!(
+                        "merge operation {} missing target view",
+                        operation.id
+                    )));
+                };
+                if operation.source_views.contains(&active_view)
+                    || operation.target_views.contains(&active_view)
+                {
+                    Ok(Some(target_view))
+                } else {
+                    Ok(None)
+                }
+            }
+            ClusterOperationKind::Split => {
+                if operation.source_views.contains(&active_view) {
+                    return self.local_target_view_for_operation(operation).map(Some);
+                }
+
+                let Some(target_view) =
+                    self.local_target_view_for_operation_if_assigned(operation)?
+                else {
+                    return Ok(None);
+                };
+                if active_view == target_view {
+                    Ok(Some(target_view))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
     }
 
     /// Selects the latest pending overlapping predecessor for a new or relayed operation.
@@ -599,6 +671,7 @@ impl Topology {
                     | ClusterOperationStage::Prepared
                     | ClusterOperationStage::Committed
             )
+            && self.operation_can_progress_on_local_view(operation)?
             && self.operation_ready_to_progress(operation)?)
     }
 
@@ -823,6 +896,39 @@ impl Topology {
         Ok(())
     }
 
+    /// Applies finalized relay side effects once without rebroadcasting the finalized record.
+    pub(in crate::topology) async fn apply_finalized_operation_side_effects_once(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<(), capnp::Error> {
+        let _guard = self.runtime.cluster_operation_gate.gate.lock().await;
+        let Some(target) = self.finalized_operation_applies_to_local_view(operation)? else {
+            debug!(
+                target: "cluster_view",
+                operation_id = %operation.id,
+                kind = ?operation.kind,
+                active_view = %self.active_cluster_view(),
+                "skipping finalized operation outside local cluster lineage"
+            );
+            return Ok(());
+        };
+        if operation.kind != ClusterOperationKind::Merge && self.active_cluster_view() == target {
+            return Ok(());
+        }
+        if let Err(err) = self.apply_committed_operation_side_effects(operation).await {
+            if Self::is_commit_precondition_failure(&err) {
+                debug!(
+                    target: "cluster_view",
+                    operation_id = %operation.id,
+                    "skipping finalized operation side effects due to commit precondition mismatch: {err}"
+                );
+                return Ok(());
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
     /// Re-runs master-key adoption after a committed transition changes the active view.
     async fn reconcile_secret_master_keys_for_view(&self, view: ClusterViewId) {
         let reconciler = SecretMasterKeyReconciler::new(
@@ -906,8 +1012,18 @@ impl Topology {
                 continue;
             }
 
-            let target = self.local_target_view_for_operation(&operation)?;
-            if self.active_cluster_view() == target {
+            let Some(target) = self.finalized_operation_applies_to_local_view(&operation)? else {
+                debug!(
+                    target: "cluster_view",
+                    operation_id = %operation.id,
+                    kind = ?operation.kind,
+                    active_view = %self.active_cluster_view(),
+                    "skipping synced finalized operation outside local cluster lineage"
+                );
+                continue;
+            };
+            if operation.kind != ClusterOperationKind::Merge && self.active_cluster_view() == target
+            {
                 continue;
             }
 
@@ -916,7 +1032,7 @@ impl Topology {
                 .await
             {
                 if Self::is_commit_precondition_failure(&err) {
-                    warn!(
+                    debug!(
                         target: "cluster_view",
                         operation_id = %operation.id,
                         "skipped synced finalized operation side effects due to commit precondition mismatch: {err}"
@@ -938,6 +1054,41 @@ impl Topology {
         let mut operation = self.load_cluster_operation(operation_id)?.ok_or_else(|| {
             capnp::Error::failed(format!("cluster operation not found: {operation_id}"))
         })?;
+        if !Self::operation_stage_is_terminal(operation.stage)
+            && let Some(retired_view) = self.operation_view_retired_by_prior_merge(&operation)?
+        {
+            let detail = format!(
+                "aborted stale_precondition: {COMMIT_PRECONDITION_FAILURE_PREFIX}: operation={} kind={:?} view={} already retired",
+                operation.id, operation.kind, retired_view
+            );
+            let updated = self
+                .update_cluster_operation_stage(
+                    &mut operation,
+                    ClusterOperationStage::Aborted,
+                    &detail,
+                )
+                .await?;
+            if updated && operation.stage == ClusterOperationStage::Aborted {
+                debug!(
+                    target: "cluster_view",
+                    operation_id = %operation.id,
+                    stage = ?operation.stage,
+                    retired_view = %retired_view,
+                    "aborted stale cluster operation after prior lineage retirement"
+                );
+            }
+            return Ok(());
+        }
+        if !self.operation_can_progress_on_local_view(&operation)? {
+            debug!(
+                target: "cluster_view",
+                operation_id = %operation.id,
+                kind = ?operation.kind,
+                active_view = %self.active_cluster_view(),
+                "cluster operation is outside local cluster lineage"
+            );
+            return Ok(());
+        }
         if self.normalize_cluster_operation_dependency(&mut operation)? {
             self.persist_cluster_operation(&operation).await?;
         }

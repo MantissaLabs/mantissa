@@ -123,6 +123,51 @@ async fn cluster_operation_dependency_id(
     Some(Uuid::from_slice(dependency).expect("dependency uuid"))
 }
 
+/// Reads the persisted stage for one cluster operation through the topology RPC API.
+async fn cluster_operation_stage(
+    topology: &mantissa::topology_capnp::topology::Client,
+    operation_id: Uuid,
+) -> ClusterOperationStage {
+    let mut request = topology.get_cluster_operation_request();
+    request.get().set_id(operation_id.as_bytes());
+    let response = request
+        .send()
+        .promise
+        .await
+        .expect("getClusterOperation send");
+    response
+        .get()
+        .expect("getClusterOperation get")
+        .get_op()
+        .expect("operation payload")
+        .get_stage()
+        .expect("operation stage")
+}
+
+/// Submits a live merge request and returns the accepted operation id bytes.
+async fn request_merge_operation(
+    topology: &mantissa::topology_capnp::topology::Client,
+    source_view: ClusterViewId,
+    destination_view: ClusterViewId,
+) -> Vec<u8> {
+    let mut merge_req = topology.merge_clusters_request();
+    {
+        let mut req = merge_req.get().init_req();
+        source_view.write_capnp(req.reborrow().init_source_view());
+        destination_view.write_capnp(req.reborrow().init_destination_view());
+        req.set_dry_run(false);
+    }
+    let merge_resp = merge_req.send().promise.await.expect("mergeClusters send");
+    merge_resp
+        .get()
+        .expect("mergeClusters get")
+        .get_op()
+        .expect("merge operation")
+        .get_id()
+        .expect("merge operation id")
+        .to_vec()
+}
+
 async fn cluster_name_for_lineage(
     topology: &mantissa::topology_capnp::topology::Client,
     cluster_id: Uuid,
@@ -3524,6 +3569,221 @@ local_test!(cluster_view_chains_back_to_back_overlapping_operations, {
     )
     .await;
 });
+
+// Validates finalized split records from sibling views are retained without local replay errors.
+local_test!(cluster_view_ignores_finalized_sibling_split_operation, {
+    let node = TestNode::new_with_tick_ms(100).await;
+    let active_view = current_cluster_view(&node.topology()).await;
+    let sibling_source = ClusterViewId::new(
+        ClusterId::from_uuid(Uuid::new_v4()),
+        active_view.epoch.saturating_add(1),
+    );
+    let sibling_target = ClusterViewId::new(
+        ClusterId::from_uuid(Uuid::new_v4()),
+        sibling_source.epoch.saturating_add(1),
+    );
+    let operation = ClusterOperationRecord {
+        id: Uuid::new_v4(),
+        kind: StoredOperationKind::Split,
+        stage: StoredOperationStage::Finalized,
+        dry_run: false,
+        created_at_unix_ms: 10,
+        depends_on_operation_id: None,
+        source_views: vec![sibling_source],
+        target_views: vec![sibling_target],
+        target_cluster_names: Vec::new(),
+        split_assignments: vec![SplitNodeAssignment {
+            node_id: Uuid::new_v4(),
+            target_index: 0,
+        }],
+        split_service_policy: Default::default(),
+        split_network_policy: Default::default(),
+        merge_service_policy: Default::default(),
+        updated_at_unix_ms: 10,
+        details: "finalized sibling split operation".to_string(),
+    };
+
+    submit_cluster_operation_record(&node.topology(), &operation).await;
+    wait_for_operation_stage(
+        &node.topology(),
+        operation.id.as_bytes(),
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(2),
+    )
+    .await;
+    sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(
+        current_cluster_view(&node.topology()).await,
+        active_view,
+        "sibling finalized split must not change the local active view"
+    );
+});
+
+// Validates proposed merge records from sibling views do not become active or abort locally.
+local_test!(cluster_view_ignores_proposed_sibling_merge_operation, {
+    let node = TestNode::new_with_tick_ms(100).await;
+    let active_view = current_cluster_view(&node.topology()).await;
+    let sibling_source = ClusterViewId::new(
+        ClusterId::from_uuid(Uuid::new_v4()),
+        active_view.epoch.saturating_add(1),
+    );
+    let sibling_target = ClusterViewId::new(
+        ClusterId::from_uuid(Uuid::new_v4()),
+        sibling_source.epoch.saturating_add(1),
+    );
+    let operation = ClusterOperationRecord {
+        id: Uuid::new_v4(),
+        kind: StoredOperationKind::Merge,
+        stage: StoredOperationStage::Proposed,
+        dry_run: false,
+        created_at_unix_ms: 20,
+        depends_on_operation_id: None,
+        source_views: vec![sibling_source],
+        target_views: vec![sibling_target],
+        target_cluster_names: Vec::new(),
+        split_assignments: Vec::new(),
+        split_service_policy: Default::default(),
+        split_network_policy: Default::default(),
+        merge_service_policy: Default::default(),
+        updated_at_unix_ms: 20,
+        details: "proposed sibling merge operation".to_string(),
+    };
+
+    submit_cluster_operation_record(&node.topology(), &operation).await;
+    wait_for_operation_stage(
+        &node.topology(),
+        operation.id.as_bytes(),
+        ClusterOperationStage::Proposed,
+        Duration::from_secs(2),
+    )
+    .await;
+    sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        cluster_operation_stage(&node.topology(), operation.id).await,
+        ClusterOperationStage::Proposed,
+        "sibling merge must remain proposed instead of being aborted by this node"
+    );
+    assert_eq!(
+        current_cluster_view(&node.topology()).await,
+        active_view,
+        "sibling proposed merge must not change the local active view"
+    );
+});
+
+// Validates independent fast merges and an immediate chained merge converge through local lineages.
+local_test!(
+    cluster_view_converges_fast_independent_and_chained_merges,
+    {
+        let node_a = TestNode::new_with_tick_ms(100).await;
+        let node_b = TestNode::new_with_tick_ms(100).await;
+        let node_c = TestNode::new_with_tick_ms(100).await;
+        let node_d = TestNode::new_with_tick_ms(100).await;
+        node_b.join(&node_a).await.expect("node_b joins");
+        node_c.join(&node_a).await.expect("node_c joins");
+        node_d.join(&node_a).await.expect("node_d joins");
+        let cluster = vec![node_a, node_b, node_c, node_d];
+        TestNode::assert_cluster_size_all(cluster.as_slice(), 4, "initial four-node cluster").await;
+
+        let source_view = current_cluster_view(&cluster[0].topology()).await;
+        let mut split_req = cluster[0].topology().split_cluster_request();
+        {
+            let mut req = split_req.get().init_req();
+            source_view.write_capnp(req.reborrow().init_source_view());
+            let mut targets = req.reborrow().init_targets(4);
+
+            let mut target_a = targets.reborrow().get(0);
+            target_a.set_name("fast-a");
+            let mut selector_a = target_a.reborrow().init_selector();
+            selector_a.reborrow().init_clauses(0);
+            let mut explicit_a = selector_a.reborrow().init_explicit_nodes(1);
+            set_node_id(explicit_a.reborrow().get(0), &cluster[0].id());
+
+            let mut target_b = targets.reborrow().get(1);
+            target_b.set_name("fast-b");
+            let mut selector_b = target_b.reborrow().init_selector();
+            selector_b.reborrow().init_clauses(0);
+            let mut explicit_b = selector_b.reborrow().init_explicit_nodes(1);
+            set_node_id(explicit_b.reborrow().get(0), &cluster[1].id());
+
+            let mut target_c = targets.reborrow().get(2);
+            target_c.set_name("fast-c");
+            let mut selector_c = target_c.reborrow().init_selector();
+            selector_c.reborrow().init_clauses(0);
+            let mut explicit_c = selector_c.reborrow().init_explicit_nodes(1);
+            set_node_id(explicit_c.reborrow().get(0), &cluster[2].id());
+
+            let mut target_d = targets.reborrow().get(3);
+            target_d.set_name("fast-d");
+            let mut selector_d = target_d.reborrow().init_selector();
+            selector_d.reborrow().init_clauses(0);
+            let mut explicit_d = selector_d.reborrow().init_explicit_nodes(1);
+            set_node_id(explicit_d.reborrow().get(0), &cluster[3].id());
+
+            req.set_dry_run(false);
+        }
+        let split_resp = split_req.send().promise.await.expect("splitCluster send");
+        let split_op = split_resp
+            .get()
+            .expect("splitCluster get")
+            .get_op()
+            .expect("split operation");
+        let split_id = split_op.get_id().expect("split operation id").to_vec();
+        let split_targets = split_op.get_target_views().expect("split target views");
+        let view_a = ClusterViewId::from_capnp(split_targets.get(0)).expect("decode view a");
+        let view_b = ClusterViewId::from_capnp(split_targets.get(1)).expect("decode view b");
+        let view_c = ClusterViewId::from_capnp(split_targets.get(2)).expect("decode view c");
+        let view_d = ClusterViewId::from_capnp(split_targets.get(3)).expect("decode view d");
+
+        wait_for_operation_stage(
+            &cluster[0].topology(),
+            &split_id,
+            ClusterOperationStage::Finalized,
+            Duration::from_secs(5),
+        )
+        .await;
+        wait_for_cluster_view(&cluster[0].topology(), view_a, Duration::from_secs(5)).await;
+        wait_for_cluster_view(&cluster[1].topology(), view_b, Duration::from_secs(5)).await;
+        wait_for_cluster_view(&cluster[2].topology(), view_c, Duration::from_secs(5)).await;
+        wait_for_cluster_view(&cluster[3].topology(), view_d, Duration::from_secs(5)).await;
+
+        let merge_ab_client = cluster[0].topology();
+        let merge_cd_client = cluster[2].topology();
+        let (merge_ab_id, merge_cd_id) = tokio::join!(
+            request_merge_operation(&merge_ab_client, view_a, view_b),
+            request_merge_operation(&merge_cd_client, view_c, view_d)
+        );
+        let merge_bd_id = request_merge_operation(&cluster[1].topology(), view_b, view_d).await;
+
+        wait_for_operation_stage(
+            &cluster[0].topology(),
+            &merge_ab_id,
+            ClusterOperationStage::Finalized,
+            Duration::from_secs(10),
+        )
+        .await;
+        wait_for_operation_stage(
+            &cluster[2].topology(),
+            &merge_cd_id,
+            ClusterOperationStage::Finalized,
+            Duration::from_secs(10),
+        )
+        .await;
+        wait_for_operation_stage(
+            &cluster[1].topology(),
+            &merge_bd_id,
+            ClusterOperationStage::Finalized,
+            Duration::from_secs(10),
+        )
+        .await;
+
+        for node in &cluster {
+            wait_for_cluster_view(&node.topology(), view_d, Duration::from_secs(10)).await;
+        }
+        TestNode::assert_cluster_size_all(cluster.as_slice(), 4, "merged fast chain cluster").await;
+    }
+);
 
 // Validates relayed operations are persisted and deferred instead of rejected when another
 // operation is already active on the node.

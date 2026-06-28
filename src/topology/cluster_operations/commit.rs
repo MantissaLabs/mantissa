@@ -684,37 +684,57 @@ impl ClusterTransitionParticipant for MergeServiceParticipant {
 }
 
 impl Topology {
-    /// Resolves the split target index selected for the local node in a split operation.
-    fn local_split_target_index(
-        &self,
-        operation: &ClusterOperationRecord,
-    ) -> Result<usize, capnp::Error> {
-        operation
-            .split_assignments
-            .iter()
-            .find(|assignment| assignment.node_id == self.local.node.id)
-            .map(|assignment| assignment.target_index)
-            .ok_or_else(|| {
-                capnp::Error::failed(format!(
-                    "split operation {} has no assignment for local node {}",
-                    operation.id, self.local.node.id
-                ))
-            })
-    }
-
     /// Resolves the target view this node should activate when committing the operation.
     pub(in crate::topology) fn local_target_view_for_operation(
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<ClusterViewId, capnp::Error> {
-        match operation.kind {
-            ClusterOperationKind::Merge => operation.target_views.first().copied(),
-            ClusterOperationKind::Split => operation
-                .target_views
-                .get(self.local_split_target_index(operation)?)
-                .copied(),
+        if let Some(target) = self.local_target_view_for_operation_if_assigned(operation)? {
+            return Ok(target);
         }
-        .ok_or_else(|| capnp::Error::failed("operation has no target views for commit".to_string()))
+
+        Err(capnp::Error::failed(format!(
+            "split operation {} has no assignment for local node {}",
+            operation.id, self.local.node.id
+        )))
+    }
+
+    /// Resolves this node's target view, returning `None` for split operations outside its lineage.
+    pub(in crate::topology) fn local_target_view_for_operation_if_assigned(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<Option<ClusterViewId>, capnp::Error> {
+        match operation.kind {
+            ClusterOperationKind::Merge => operation
+                .target_views
+                .first()
+                .copied()
+                .map(Some)
+                .ok_or_else(|| {
+                    capnp::Error::failed("operation has no target views for commit".to_string())
+                }),
+            ClusterOperationKind::Split => {
+                let Some(assignment) = operation
+                    .split_assignments
+                    .iter()
+                    .find(|assignment| assignment.node_id == self.local.node.id)
+                else {
+                    return Ok(None);
+                };
+
+                operation
+                    .target_views
+                    .get(assignment.target_index)
+                    .copied()
+                    .map(Some)
+                    .ok_or_else(|| {
+                        capnp::Error::failed(format!(
+                            "split operation {} assignment for local node {} references missing target index {}",
+                            operation.id, self.local.node.id, assignment.target_index
+                        ))
+                    })
+            }
+        }
     }
 
     /// Builds a canonical local transition snapshot from one durable operation record.
