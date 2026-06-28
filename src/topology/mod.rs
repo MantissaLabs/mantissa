@@ -103,7 +103,7 @@ const DEFAULT_WORKLOAD_REPAIR_FANOUT: usize = 1;
 /// Maximum queued peers that can be prioritized by deployment-aware workload repair.
 const DEFAULT_WORKLOAD_REPAIR_HINT_MAX: usize = 256;
 /// Cross-view domains synchronized by the global metadata anti-entropy loop.
-const GLOBAL_METADATA_SYNC_DOMAINS: [Domain; 1] = [Domain::ClusterViews];
+const GLOBAL_METADATA_SYNC_DOMAINS: [Domain; 2] = [Domain::ClusterViews, Domain::ClusterOperations];
 /// Selected domains synchronized by the targeted workload-only repair path.
 const WORKLOAD_REPAIR_SYNC_DOMAINS: [Domain; 1] = [Domain::Workloads];
 

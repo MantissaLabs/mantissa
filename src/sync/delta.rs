@@ -124,7 +124,7 @@ impl SyncRunner {
 
     /// Runs anti-entropy for one caller-selected domain subset against one peer view.
     ///
-    /// This is used by the global metadata loop to sync only `cluster_views` across split
+    /// This is used by the global metadata loop to sync lightweight cluster metadata across split
     /// boundaries while keeping heavy domains view-scoped.
     pub async fn sync_selected_domains(
         &self,

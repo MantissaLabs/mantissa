@@ -1328,8 +1328,6 @@ impl topology::Server for Topology {
         params: topology::MergeClustersParams,
         mut results: topology::MergeClustersResults,
     ) -> Result<(), capnp::Error> {
-        self.ensure_no_active_cluster_operation("start merge operation")?;
-
         let req = params.get()?.get_req()?;
         let source_view =
             ClusterViewId::from_capnp(req.get_source_view()?).map_err(capnp::Error::failed)?;
@@ -1350,13 +1348,13 @@ impl topology::Server for Topology {
             )));
         }
 
-        let operation = self.build_merge_operation_record(
+        let mut operation = self.build_merge_operation_record(
             source_view,
             destination_view,
             dry_run,
             merge_service_policy,
         );
-        self.persist_and_dispatch_operation(&operation).await?;
+        self.persist_and_dispatch_operation(&mut operation).await?;
 
         info!(
             target: "cluster_view",
@@ -1379,8 +1377,6 @@ impl topology::Server for Topology {
         params: topology::SplitClusterParams,
         mut results: topology::SplitClusterResults,
     ) -> Result<(), capnp::Error> {
-        self.ensure_no_active_cluster_operation("start split operation")?;
-
         let req = params.get()?.get_req()?;
         let source_view =
             ClusterViewId::from_capnp(req.get_source_view()?).map_err(capnp::Error::failed)?;
@@ -1401,7 +1397,7 @@ impl topology::Server for Topology {
         let split_assignments = self
             .build_split_assignments(source_view, &target_specs)
             .await?;
-        let operation = self.build_split_operation_record(SplitOperationBuildInput {
+        let mut operation = self.build_split_operation_record(SplitOperationBuildInput {
             source_view,
             dry_run,
             split_service_policy,
@@ -1411,7 +1407,7 @@ impl topology::Server for Topology {
             detail_targets,
             split_assignments,
         });
-        self.persist_and_dispatch_operation(&operation).await?;
+        self.persist_and_dispatch_operation(&mut operation).await?;
 
         info!(
             target: "cluster_view",

@@ -595,9 +595,9 @@ impl Topology {
 
     /// Runs one unscoped metadata anti-entropy exchange against a peer.
     ///
-    /// This intentionally syncs only the `cluster_views` domain while using the peer's active
-    /// view for request validation, so metadata can converge across split boundaries without
-    /// pulling heavy domains (`tasks`, `services`, `networks`) across those boundaries.
+    /// This intentionally syncs only lightweight global metadata domains while using the peer's
+    /// active view for request validation, so split/merge metadata can converge across split
+    /// boundaries without pulling heavy domains (`tasks`, `services`, `networks`) across them.
     async fn sync_metadata_with_peer(&self, entry: &PeerCacheEntry) {
         let peer_id = entry.peer_id;
         let value = entry.value.as_ref();
@@ -658,6 +658,16 @@ impl Topology {
             .await;
         if synced {
             crate::observability::metrics::record_sync_attempt("global_metadata", "success", "ok");
+            if let Err(err) = self
+                .reconcile_cluster_operations_after_metadata_sync()
+                .await
+            {
+                warn!(
+                    target: "cluster_view",
+                    peer = %peer_id,
+                    "failed to reconcile cluster operations after metadata sync: {err}"
+                );
+            }
         } else {
             crate::observability::metrics::record_sync_attempt(
                 "global_metadata",
@@ -701,7 +711,7 @@ impl Topology {
             cluster_view = %self.active_cluster_view(),
             peer_count,
             fanout = sync_fanout,
-            domains = "cluster_views",
+            domains = "cluster_views,cluster_operations",
             plane = "global_metadata",
             "running periodic global metadata sync tick"
         );

@@ -1,6 +1,7 @@
 //! Replicated CRDT/MST-backed stores and sync-domain infrastructure.
 
 pub mod agents;
+pub mod cluster_operations;
 pub mod cluster_views;
 mod compaction;
 pub mod gc;

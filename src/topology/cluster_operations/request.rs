@@ -159,11 +159,14 @@ impl Topology {
         dry_run: bool,
         merge_service_policy: MergeServicePolicy,
     ) -> ClusterOperationRecord {
+        let now = Self::now_unix_ms();
         ClusterOperationRecord {
             id: Uuid::new_v4(),
             kind: ClusterOperationKind::Merge,
             stage: ClusterOperationStage::Proposed,
             dry_run,
+            created_at_unix_ms: now,
+            depends_on_operation_id: None,
             source_views: vec![source_view],
             target_views: vec![destination_view],
             target_cluster_names: Vec::new(),
@@ -171,7 +174,7 @@ impl Topology {
             split_service_policy: SplitServicePolicy::default(),
             split_network_policy: SplitNetworkPolicy::default(),
             merge_service_policy,
-            updated_at_unix_ms: Self::now_unix_ms(),
+            updated_at_unix_ms: now,
             details: format!(
                 "merge proposed: source={source_view}, destination={destination_view}, dry_run={dry_run}, service_policy={merge_service_policy:?}"
             ),
@@ -206,11 +209,14 @@ impl Topology {
             .collect::<Vec<_>>()
             .join(", ");
 
+        let now = Self::now_unix_ms();
         ClusterOperationRecord {
             id: Uuid::new_v4(),
             kind: ClusterOperationKind::Split,
             stage: ClusterOperationStage::Proposed,
             dry_run,
+            created_at_unix_ms: now,
+            depends_on_operation_id: None,
             source_views: vec![source_view],
             target_views,
             target_cluster_names: target_specs
@@ -221,7 +227,7 @@ impl Topology {
             split_service_policy,
             split_network_policy,
             merge_service_policy: MergeServicePolicy::default(),
-            updated_at_unix_ms: Self::now_unix_ms(),
+            updated_at_unix_ms: now,
             details: format!(
                 "split proposed: source={source_view}, dry_run={dry_run}, service_policy={split_service_policy:?}, network_policy={split_network_policy:?}, targets=[{}], assignments=[{}]",
                 detail_targets.join(", "),
@@ -233,13 +239,20 @@ impl Topology {
     /// Persists one operation and triggers broadcast/progression side effects for non-dry-run requests.
     pub(in crate::topology) async fn persist_and_dispatch_operation(
         &self,
-        operation: &ClusterOperationRecord,
+        operation: &mut ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
+        if !operation.dry_run {
+            let _ = self.normalize_cluster_operation_dependency(operation)?;
+        }
         self.persist_cluster_operation(operation).await?;
         if !operation.dry_run {
             let _ = self.broadcast_cluster_operation(operation).await?;
         }
-        self.trigger_operation_progress(operation.id, operation.dry_run);
+        if self.operation_ready_to_progress(operation)? {
+            self.trigger_operation_progress(operation.id, operation.dry_run);
+        } else if let Some(dependency_id) = operation.depends_on_operation_id {
+            self.trigger_operation_progress(dependency_id, false);
+        }
         Ok(())
     }
 
@@ -254,6 +267,9 @@ impl Topology {
         if incoming.updated_at_unix_ms == 0 {
             incoming.updated_at_unix_ms = Self::now_unix_ms();
         }
+        if incoming.created_at_unix_ms == 0 {
+            incoming.created_at_unix_ms = incoming.updated_at_unix_ms;
+        }
         if incoming.id != operation_id {
             return Err(capnp::Error::failed(format!(
                 "relayed operation id mismatch: envelope={operation_id}, payload={}",
@@ -261,12 +277,10 @@ impl Topology {
             )));
         }
 
+        let _ = self.normalize_cluster_operation_dependency(&mut incoming)?;
+
         let merged = match self.load_cluster_operation(operation_id)? {
-            Some(current)
-                if Self::stage_rank(current.stage) >= Self::stage_rank(incoming.stage) =>
-            {
-                current
-            }
+            Some(current) if !incoming.supersedes(&current) => current,
             _ => {
                 self.persist_cluster_operation(&incoming).await?;
                 incoming
@@ -277,7 +291,17 @@ impl Topology {
             return Ok(());
         }
 
-        if let Some(active) = self.active_cluster_operation_excluding(operation_id)? {
+        if !self.operation_ready_to_progress(&merged)? {
+            if let Some(dependency_id) = merged.depends_on_operation_id {
+                self.trigger_operation_progress(dependency_id, false);
+            }
+            let _ = self.garbage_collect_cluster_operations()?;
+            return Ok(());
+        }
+
+        if let Some(active) = self.active_cluster_operation()?
+            && active.id != operation_id
+        {
             warn!(
                 target: "cluster_view",
                 operation_id = %merged.id,

@@ -6,6 +6,7 @@
 //! without repeating large `Domain` match blocks.
 
 use crate::store::replicated::agents::AgentStore;
+use crate::store::replicated::cluster_operations::ClusterOperationDomainStore;
 use crate::store::replicated::cluster_views::ClusterViewDomainStore;
 use crate::store::replicated::ingress::IngressPoolStore;
 use crate::store::replicated::jobs::JobStore;
@@ -56,7 +57,7 @@ type DecodedRegisters<C> = Registers<UuidKey, <C as RegAdapter>::Reg>;
 type DecodedDelta<C> = (DecodedRegisters<C>, Tombstones<UuidKey>);
 
 /// Canonical full-sync domain set shared by all replicated-store callers.
-pub const REPLICATED_DOMAINS: [Domain; 15] = [
+pub const REPLICATED_DOMAINS: [Domain; 16] = [
     Domain::Peers,
     Domain::Workloads,
     Domain::Services,
@@ -72,6 +73,7 @@ pub const REPLICATED_DOMAINS: [Domain; 15] = [
     Domain::SchedulerDigests,
     Domain::SecretMasterKeys,
     Domain::IngressPools,
+    Domain::ClusterOperations,
 ];
 
 /// Returns the debug label associated with one replicated sync domain.
@@ -88,6 +90,7 @@ pub fn domain_label(domain: Domain) -> &'static str {
         Domain::NetworkPeers => "network peers",
         Domain::NetworkAttachments => "network attachments",
         Domain::ClusterViews => "cluster views",
+        Domain::ClusterOperations => "cluster operations",
         Domain::Volumes => "volumes",
         Domain::VolumeNodes => "volume nodes",
         Domain::SchedulerDigests => "scheduler digests",
@@ -113,6 +116,7 @@ pub fn domain_key(domain: Domain) -> u16 {
         Domain::SchedulerDigests => 12,
         Domain::SecretMasterKeys => 13,
         Domain::IngressPools => 14,
+        Domain::ClusterOperations => 15,
     }
 }
 
@@ -438,6 +442,7 @@ pub fn replicated_store_registry(stores: ReplicatedStoreHandles) -> ReplicatedSt
         ReplicatedStoreEntry::new(Domain::SchedulerDigests, stores.scheduler_digests),
         ReplicatedStoreEntry::new(Domain::SecretMasterKeys, stores.secret_master_keys),
         ReplicatedStoreEntry::new(Domain::IngressPools, stores.ingress_pools),
+        ReplicatedStoreEntry::new(Domain::ClusterOperations, stores.cluster_operations),
     ])
 }
 
@@ -454,6 +459,7 @@ pub struct ReplicatedStoreHandles {
     pub network_peers: NetworkPeerStore,
     pub network_attachments: NetworkAttachmentStore,
     pub cluster_views: ClusterViewDomainStore,
+    pub cluster_operations: ClusterOperationDomainStore,
     pub volumes: VolumeSpecStore,
     pub volume_nodes: VolumeNodeStore,
     pub scheduler_digests: SchedulerDigestStore,

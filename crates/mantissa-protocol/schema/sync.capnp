@@ -71,6 +71,9 @@ enum Domain {
 
   ingressPools @14;
   # Replicated public ingress pool intent.
+
+  clusterOperations @15;
+  # Global split/merge operation ledger used to order cluster-view transitions.
 }
 
 struct PageRange {

@@ -540,6 +540,13 @@ struct ClusterOperation {
 
   updatedAtUnixMs @12 :UInt64;
   # Last mutation time used for retention ordering and stale-row eviction.
+
+  dependsOnOperationId @13 :Data;
+  # Optional operation id this operation must wait to finalize before progressing.
+  # Empty means the operation has no explicit causal predecessor.
+
+  createdAtUnixMs @14 :UInt64;
+  # Stable operation creation time used to order overlapping topology changes.
 }
 
 struct SplitNodeAssignment {

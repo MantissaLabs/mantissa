@@ -146,13 +146,7 @@ impl Topology {
 
     /// Maps operation stage values into a monotonic ordering used for conflict resolution.
     pub(in crate::topology) fn stage_rank(stage: ClusterOperationStage) -> u8 {
-        match stage {
-            ClusterOperationStage::Proposed => 0,
-            ClusterOperationStage::Prepared => 1,
-            ClusterOperationStage::Aborted => 2,
-            ClusterOperationStage::Committed => 3,
-            ClusterOperationStage::Finalized => 4,
-        }
+        stage.rank()
     }
 
     /// Returns the current UNIX timestamp in milliseconds for durable operation metadata updates.
@@ -392,7 +386,7 @@ impl Topology {
         let active_view = self.active_cluster_view();
         let allowed_views = Self::commit_precondition_views(operation)?;
         if allowed_views.contains(&active_view) {
-            return Ok(());
+            return self.ensure_operation_views_not_retired(operation);
         }
 
         let allowed_render = allowed_views
@@ -406,62 +400,206 @@ impl Topology {
         )))
     }
 
-    /// Returns the most recently updated non-finalized cluster operation, if any.
+    /// Rejects operations whose source or destination views were already retired by another merge.
+    fn ensure_operation_views_not_retired(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<(), capnp::Error> {
+        let retired = self.retired_views_excluding(operation.id)?;
+        let mut checked_views = operation.source_views.clone();
+        if operation.kind == ClusterOperationKind::Merge {
+            checked_views.extend(operation.target_views.iter().copied());
+        }
+        for view in checked_views {
+            if retired.contains(&view) {
+                return Err(capnp::Error::failed(format!(
+                    "{COMMIT_PRECONDITION_FAILURE_PREFIX}: operation={} kind={:?} view={} already retired",
+                    operation.id, operation.kind, view
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns cluster views retired by finalized or committed merge operations.
+    fn retired_views_excluding(
+        &self,
+        excluded_operation_id: Uuid,
+    ) -> Result<HashSet<ClusterViewId>, capnp::Error> {
+        let mut retired = HashSet::new();
+        for operation in self.load_cluster_operations()? {
+            if operation.id == excluded_operation_id
+                || operation.dry_run
+                || operation.kind != ClusterOperationKind::Merge
+            {
+                continue;
+            }
+            if matches!(
+                operation.stage,
+                ClusterOperationStage::Committed | ClusterOperationStage::Finalized
+            ) {
+                retired.extend(operation.source_views.iter().copied());
+            }
+        }
+        Ok(retired)
+    }
+
+    /// Returns whether an operation dependency is absent or already terminal locally.
+    pub(in crate::topology) fn operation_ready_to_progress(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<bool, capnp::Error> {
+        let Some(dependency_id) = operation.depends_on_operation_id else {
+            return Ok(true);
+        };
+        let Some(dependency) = self.load_cluster_operation(dependency_id)? else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            dependency.stage,
+            ClusterOperationStage::Finalized | ClusterOperationStage::Aborted
+        ))
+    }
+
+    /// Returns whether an operation stage is terminal and no longer participates in the fence.
+    fn operation_stage_is_terminal(stage: ClusterOperationStage) -> bool {
+        matches!(
+            stage,
+            ClusterOperationStage::Finalized | ClusterOperationStage::Aborted
+        )
+    }
+
+    /// Returns the stable creation time used for operation ordering.
+    fn operation_created_at_unix_ms(operation: &ClusterOperationRecord) -> u64 {
+        if operation.created_at_unix_ms == 0 {
+            operation.updated_at_unix_ms
+        } else {
+            operation.created_at_unix_ms
+        }
+    }
+
+    /// Returns the stable operation order used when several ready operations overlap.
+    fn operation_execution_key(operation: &ClusterOperationRecord) -> (u64, Uuid) {
+        (Self::operation_created_at_unix_ms(operation), operation.id)
+    }
+
+    /// Returns every lineage view touched by this operation for overlap fencing.
+    fn operation_lineage_views(operation: &ClusterOperationRecord) -> HashSet<ClusterViewId> {
+        let mut views = operation
+            .source_views
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        views.extend(operation.target_views.iter().copied());
+        views
+    }
+
+    /// Returns true when two operations touch at least one common cluster lineage view.
+    fn operations_overlap(left: &ClusterOperationRecord, right: &ClusterOperationRecord) -> bool {
+        let left_views = Self::operation_lineage_views(left);
+        right
+            .source_views
+            .iter()
+            .chain(right.target_views.iter())
+            .any(|view| left_views.contains(view))
+    }
+
+    /// Selects the latest pending overlapping predecessor for a new or relayed operation.
+    pub(in crate::topology) fn pending_cluster_operation_tail_for(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<Option<ClusterOperationRecord>, capnp::Error> {
+        if operation.dry_run || Self::operation_stage_is_terminal(operation.stage) {
+            return Ok(None);
+        }
+
+        let operation_key = Self::operation_execution_key(operation);
+        let mut predecessors = Vec::new();
+        for candidate in self.load_cluster_operations()? {
+            if candidate.id == operation.id
+                || candidate.dry_run
+                || Self::operation_stage_is_terminal(candidate.stage)
+                || Self::operation_execution_key(&candidate) >= operation_key
+                || !Self::operations_overlap(&candidate, operation)
+            {
+                continue;
+            }
+            predecessors.push(candidate);
+        }
+
+        predecessors.sort_by_key(Self::operation_execution_key);
+        Ok(predecessors.into_iter().next_back())
+    }
+
+    /// Normalizes an operation dependency to the latest pending overlapping predecessor.
+    pub(in crate::topology) fn normalize_cluster_operation_dependency(
+        &self,
+        operation: &mut ClusterOperationRecord,
+    ) -> Result<bool, capnp::Error> {
+        let Some(predecessor) = self.pending_cluster_operation_tail_for(operation)? else {
+            return Ok(false);
+        };
+        if operation.depends_on_operation_id == Some(predecessor.id) {
+            return Ok(false);
+        }
+
+        operation.depends_on_operation_id = Some(predecessor.id);
+        operation.updated_at_unix_ms = Self::now_unix_ms();
+        operation.details = format!(
+            "{} | queued_after predecessor_operation={}",
+            operation.details, predecessor.id
+        );
+        Ok(true)
+    }
+
+    /// Returns the next ready non-finalized cluster operation, if any.
     pub(in crate::topology) fn active_cluster_operation(
         &self,
     ) -> Result<Option<ClusterOperationRecord>, capnp::Error> {
-        let mut active = self
-            .load_cluster_operations()?
-            .into_iter()
-            .filter(|operation| {
-                !operation.dry_run
-                    && matches!(
-                        operation.stage,
-                        ClusterOperationStage::Proposed
-                            | ClusterOperationStage::Prepared
-                            | ClusterOperationStage::Committed
-                    )
-            })
-            .collect::<Vec<_>>();
+        let mut active = Vec::new();
+        for operation in self.load_cluster_operations()? {
+            if self.operation_is_ready_non_terminal(&operation)? {
+                active.push(operation);
+            }
+        }
 
-        active.sort_by(|left, right| {
-            right
-                .updated_at_unix_ms
-                .cmp(&left.updated_at_unix_ms)
-                .then_with(|| right.id.cmp(&left.id))
-        });
+        active.sort_by_key(Self::operation_execution_key);
 
         Ok(active.into_iter().next())
     }
 
-    /// Returns the most recent non-finalized operation excluding one specific id.
+    /// Returns the next ready non-finalized operation excluding one specific id.
     pub(in crate::topology) fn active_cluster_operation_excluding(
         &self,
         excluded_operation_id: Uuid,
     ) -> Result<Option<ClusterOperationRecord>, capnp::Error> {
-        let mut active = self
-            .load_cluster_operations()?
-            .into_iter()
-            .filter(|operation| {
-                operation.id != excluded_operation_id
-                    && !operation.dry_run
-                    && matches!(
-                        operation.stage,
-                        ClusterOperationStage::Proposed
-                            | ClusterOperationStage::Prepared
-                            | ClusterOperationStage::Committed
-                    )
-            })
-            .collect::<Vec<_>>();
+        let mut active = Vec::new();
+        for operation in self.load_cluster_operations()? {
+            if operation.id != excluded_operation_id
+                && self.operation_is_ready_non_terminal(&operation)?
+            {
+                active.push(operation);
+            }
+        }
 
-        active.sort_by(|left, right| {
-            right
-                .updated_at_unix_ms
-                .cmp(&left.updated_at_unix_ms)
-                .then_with(|| right.id.cmp(&left.id))
-        });
+        active.sort_by_key(Self::operation_execution_key);
 
         Ok(active.into_iter().next())
+    }
+
+    /// Returns whether an operation can currently take the local progress gate.
+    fn operation_is_ready_non_terminal(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<bool, capnp::Error> {
+        Ok(!operation.dry_run
+            && matches!(
+                operation.stage,
+                ClusterOperationStage::Proposed
+                    | ClusterOperationStage::Prepared
+                    | ClusterOperationStage::Committed
+            )
+            && self.operation_ready_to_progress(operation)?)
     }
 
     /// Rejects one mutating action while a split/merge operation is still in progress.
@@ -518,7 +656,8 @@ impl Topology {
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         self.stores
             .cluster_operations
-            .put(op.id, &encoded)
+            .put_record(op, &encoded)
+            .await
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         if !op.dry_run {
             self.persist_operation_cluster_name_hints(op).await?;
@@ -778,6 +917,57 @@ impl Topology {
         });
     }
 
+    /// Starts local progression for the next ready queued operation, if one exists.
+    pub(crate) fn trigger_ready_cluster_operation_progress(&self) {
+        match self.active_cluster_operation() {
+            Ok(Some(operation)) => self.trigger_operation_progress(operation.id, operation.dry_run),
+            Ok(None) => {}
+            Err(err) => {
+                warn!(
+                    target: "cluster_view",
+                    "failed to select ready cluster operation after metadata sync: {err}"
+                );
+            }
+        }
+    }
+
+    /// Applies finalized operations learned through metadata anti-entropy and wakes queued work.
+    pub(crate) async fn reconcile_cluster_operations_after_metadata_sync(
+        &self,
+    ) -> Result<(), capnp::Error> {
+        let mut operations = self.load_cluster_operations()?;
+        operations.sort_by_key(Self::operation_execution_key);
+
+        for operation in operations {
+            if operation.dry_run || operation.stage != ClusterOperationStage::Finalized {
+                continue;
+            }
+
+            let target = self.local_target_view_for_operation(&operation)?;
+            if self.active_cluster_view() == target {
+                continue;
+            }
+
+            if let Err(err) = self
+                .apply_committed_operation_side_effects(&operation)
+                .await
+            {
+                if Self::is_commit_precondition_failure(&err) {
+                    warn!(
+                        target: "cluster_view",
+                        operation_id = %operation.id,
+                        "skipped synced finalized operation side effects due to commit precondition mismatch: {err}"
+                    );
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+
+        self.trigger_ready_cluster_operation_progress();
+        Ok(())
+    }
+
     /// Progresses one operation forward based on its current persisted stage.
     async fn progress_cluster_operation(&self, operation_id: Uuid) -> Result<(), capnp::Error> {
         let _guard = self.runtime.cluster_operation_gate.gate.lock().await;
@@ -785,6 +975,30 @@ impl Topology {
         let mut operation = self.load_cluster_operation(operation_id)?.ok_or_else(|| {
             capnp::Error::failed(format!("cluster operation not found: {operation_id}"))
         })?;
+        if self.normalize_cluster_operation_dependency(&mut operation)? {
+            self.persist_cluster_operation(&operation).await?;
+        }
+        if !self.operation_ready_to_progress(&operation)? {
+            debug!(
+                target: "cluster_view",
+                operation_id = %operation.id,
+                dependency = ?operation.depends_on_operation_id,
+                "cluster operation is waiting for dependency"
+            );
+            return Ok(());
+        }
+        if let Some(active) = self.active_cluster_operation()?
+            && active.id != operation.id
+        {
+            debug!(
+                target: "cluster_view",
+                operation_id = %operation.id,
+                active_operation = %active.id,
+                "cluster operation is waiting behind earlier ready operation"
+            );
+            self.trigger_operation_progress(active.id, false);
+            return Ok(());
+        }
 
         match operation.stage {
             ClusterOperationStage::Proposed => {
@@ -908,7 +1122,7 @@ impl Topology {
     /// Replays any non-finalized durable operation records so crashes do not strand topology changes.
     pub(crate) async fn replay_cluster_operations_on_startup(&self) -> Result<usize, capnp::Error> {
         let mut operations = self.load_cluster_operations()?;
-        operations.sort_by_key(|operation| operation.id);
+        operations.sort_by_key(Self::operation_execution_key);
 
         let mut replayed = 0usize;
         for operation in operations {
@@ -954,11 +1168,7 @@ impl Topology {
     ) -> Result<usize, capnp::Error> {
         let active_view = self.active_cluster_view();
         let mut operations = self.load_cluster_operations()?;
-        operations.sort_by(|left, right| {
-            left.updated_at_unix_ms
-                .cmp(&right.updated_at_unix_ms)
-                .then_with(|| left.id.cmp(&right.id))
-        });
+        operations.sort_by_key(Self::operation_execution_key);
 
         let mut excluded = HashSet::<Uuid>::new();
         let mut source_operation = None::<Uuid>;

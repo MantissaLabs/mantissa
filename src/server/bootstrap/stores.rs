@@ -90,7 +90,9 @@ impl BootstrapStores {
         let peers = open_peers_store(ctx.db.clone(), ctx.self_id)?;
         peers.rebuild_mst_from_disk().await?;
 
-        let cluster_operations = ClusterOperationStore::new(ctx.db.clone())?;
+        let cluster_operations =
+            ClusterOperationStore::new_replicated(ctx.db.clone(), ctx.self_id)?;
+        cluster_operations.rebuild_replicated_mst().await?;
         let cluster_view = ClusterViewStore::new(ctx.db.clone(), ctx.self_id)?;
         cluster_view.rebuild_cluster_view_domain_mst().await?;
 

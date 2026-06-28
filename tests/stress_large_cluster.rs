@@ -1535,6 +1535,7 @@ fn domain_label(domain: Domain) -> &'static str {
         Domain::VolumeNodes => "volume_nodes",
         Domain::SchedulerDigests => "scheduler_digests",
         Domain::IngressPools => "ingress_pools",
+        Domain::ClusterOperations => "cluster_operations",
     }
 }
 

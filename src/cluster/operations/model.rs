@@ -1,11 +1,12 @@
 use crate::cluster::ClusterViewId;
 use crate::node::id::set_node_id;
 use capnp::Error as CapnpError;
+use mantissa_store::codec::StoreValueCodec;
 use std::io::Cursor;
 use uuid::Uuid;
 
 /// Supported operation kinds for cluster topology restructuring.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ClusterOperationKind {
     Merge,
     Split,
@@ -30,7 +31,7 @@ impl ClusterOperationKind {
 }
 
 /// Lifecycle stages for merge/split orchestration operations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ClusterOperationStage {
     Proposed,
     Prepared,
@@ -40,7 +41,7 @@ pub enum ClusterOperationStage {
 }
 
 /// Service behavior policy applied when a split operation commits.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
 pub enum SplitServicePolicy {
     /// Keep services active in each resulting partition and prune out-of-scope runtime tasks.
     #[default]
@@ -50,7 +51,7 @@ pub enum SplitServicePolicy {
 }
 
 /// Network behavior policy applied when a split operation commits.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
 pub enum SplitNetworkPolicy {
     /// Isolate overlays per partition by pruning out-of-scope peer and attachment rows.
     #[default]
@@ -60,7 +61,7 @@ pub enum SplitNetworkPolicy {
 }
 
 /// Service behavior policy applied when a merge operation commits.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
 pub enum MergeServicePolicy {
     /// Trigger post-merge service reconciliation so replicas can rebalance across all nodes.
     #[default]
@@ -70,13 +71,24 @@ pub enum MergeServicePolicy {
 }
 
 /// Records the deterministic split target index selected for one node.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct SplitNodeAssignment {
     pub node_id: Uuid,
     pub target_index: usize,
 }
 
 impl ClusterOperationStage {
+    /// Returns the monotonic rank used to merge and replay operation stage updates.
+    pub fn rank(self) -> u8 {
+        match self {
+            ClusterOperationStage::Proposed => 0,
+            ClusterOperationStage::Prepared => 1,
+            ClusterOperationStage::Aborted => 2,
+            ClusterOperationStage::Committed => 3,
+            ClusterOperationStage::Finalized => 4,
+        }
+    }
+
     /// Converts the internal stage value to the Cap'n Proto representation for RPC responses.
     fn to_capnp(self) -> mantissa_protocol::topology::ClusterOperationStage {
         match self {
@@ -101,12 +113,15 @@ impl ClusterOperationStage {
 }
 
 /// Durable operation record used to track merge/split intent and progression.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ClusterOperationRecord {
     pub id: Uuid,
     pub kind: ClusterOperationKind,
     pub stage: ClusterOperationStage,
     pub dry_run: bool,
+    /// Stable creation timestamp used for deterministic execution ordering.
+    pub created_at_unix_ms: u64,
+    pub depends_on_operation_id: Option<Uuid>,
     pub source_views: Vec<ClusterViewId>,
     pub target_views: Vec<ClusterViewId>,
     pub target_cluster_names: Vec<String>,
@@ -120,6 +135,21 @@ pub struct ClusterOperationRecord {
 }
 
 impl ClusterOperationRecord {
+    /// Returns whether this row should replace `current` for the same operation id.
+    pub fn supersedes(&self, current: &Self) -> bool {
+        self.precedence_key() > current.precedence_key()
+    }
+
+    /// Builds the deterministic merge key for replicated operation rows.
+    fn precedence_key(&self) -> (u8, u64, Uuid, &str) {
+        (
+            self.stage.rank(),
+            self.updated_at_unix_ms,
+            self.id,
+            self.details.as_str(),
+        )
+    }
+
     /// Encodes this operation record into its stable Cap'n Proto durable payload.
     pub fn encode_capnp(&self) -> Result<Vec<u8>, CapnpError> {
         let mut message = capnp::message::Builder::new_default();
@@ -153,6 +183,12 @@ impl ClusterOperationRecord {
         builder.set_split_network_policy(split_network_policy_to_capnp(self.split_network_policy));
         builder.set_merge_service_policy(merge_service_policy_to_capnp(self.merge_service_policy));
         builder.set_updated_at_unix_ms(self.updated_at_unix_ms);
+        builder.set_created_at_unix_ms(self.created_at_unix_ms);
+        if let Some(depends_on) = self.depends_on_operation_id {
+            builder.set_depends_on_operation_id(depends_on.as_bytes());
+        } else {
+            builder.set_depends_on_operation_id(&[]);
+        }
 
         let mut sources = builder
             .reborrow()
@@ -203,6 +239,11 @@ impl ClusterOperationRecord {
             kind: ClusterOperationKind::from_capnp(reader.get_kind()?),
             stage: ClusterOperationStage::from_capnp(reader.get_stage()?),
             dry_run: reader.get_dry_run(),
+            created_at_unix_ms: reader.get_created_at_unix_ms(),
+            depends_on_operation_id: read_optional_uuid(
+                reader.get_depends_on_operation_id()?,
+                "cluster operation dependency id",
+            )?,
             source_views,
             target_views,
             target_cluster_names,
@@ -219,6 +260,20 @@ impl ClusterOperationRecord {
             updated_at_unix_ms: reader.get_updated_at_unix_ms(),
             details: reader.get_details()?.to_str()?.to_string(),
         })
+    }
+}
+
+impl StoreValueCodec for ClusterOperationRecord {
+    /// Encodes one operation record for the replicated operation ledger.
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
+        self.encode_capnp()
+            .map_err(|error| Box::new(mantissa_store::error::Error::Other(error.to_string())))
+    }
+
+    /// Decodes one operation record from the replicated operation ledger.
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
+        Self::decode_capnp(bytes)
+            .map_err(|error| Box::new(mantissa_store::error::Error::Other(error.to_string())))
     }
 }
 
@@ -296,6 +351,17 @@ fn uuid_from_data(data: capnp::data::Reader<'_>, field_name: &str) -> Result<Uui
     Uuid::from_slice(data).map_err(|err| CapnpError::failed(err.to_string()))
 }
 
+/// Reads an optional UUID data field encoded as empty bytes when absent.
+fn read_optional_uuid(
+    data: capnp::data::Reader<'_>,
+    field_name: &str,
+) -> Result<Option<Uuid>, CapnpError> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+    uuid_from_data(data, field_name).map(Some)
+}
+
 /// Decodes one cluster-view list from a Cap'n Proto operation payload.
 fn read_cluster_views(
     reader: capnp::struct_list::Reader<'_, mantissa_protocol::topology::cluster_view_id::Owned>,
@@ -353,6 +419,8 @@ mod tests {
             kind: ClusterOperationKind::Split,
             stage: ClusterOperationStage::Committed,
             dry_run: true,
+            created_at_unix_ms: 123_000,
+            depends_on_operation_id: Some(Uuid::from_u128(0x401)),
             source_views: vec![ClusterViewId::new(source_cluster, 7)],
             target_views: vec![
                 ClusterViewId::new(target_cluster_a, 8),
