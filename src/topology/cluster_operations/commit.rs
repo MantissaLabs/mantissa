@@ -525,7 +525,10 @@ impl ClusterTransitionParticipant for PeerScopeParticipant {
         "peer_scope"
     }
 
-    /// Applies split/merge peer-scope side effects so control-plane sessions match the local view.
+    /// Updates peer-session scope for a split or merge transition.
+    ///
+    /// Split commits remove sessions and credentials for peers outside the local target partition.
+    /// Merge commits clear that partition fence so the reunited cluster can reconnect.
     async fn on_commit(
         &self,
         transition: &ClusterTransition,
@@ -737,8 +740,12 @@ impl Topology {
         }
     }
 
-    /// Returns the target view when a finalized operation affects this node's active view.
-    pub(in crate::topology) fn target_view_if_finalized_operation_affects_active_view(
+    /// Returns the target view for a finalized row that this node can locally replay.
+    ///
+    /// Finalized rows can arrive through the replicated operation ledger after another
+    /// participant has advanced the operation. This helper is the replay gate: it only returns a
+    /// target when applying the finalized row would be valid from the node's current local view.
+    pub(in crate::topology) fn finalized_cluster_transition_target(
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<Option<ClusterViewId>, capnp::Error> {
@@ -794,8 +801,8 @@ impl Topology {
         ClusterTransition::from_operation(operation, self.local.node.id, &known_peers)
     }
 
-    /// Runs all registered transition participants for commit-time side effects.
-    pub(in crate::topology) async fn run_transition_commit_hooks(
+    /// Runs every participant that contributes local work to a split/merge commit.
+    pub(in crate::topology) async fn run_cluster_transition_participants(
         &self,
         transition: &ClusterTransition,
     ) -> Result<Vec<ClusterParticipantReport>, capnp::Error> {

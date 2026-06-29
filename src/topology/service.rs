@@ -1335,8 +1335,10 @@ impl topology::Server for Topology {
             ClusterViewId::from_capnp(req.get_destination_view()?).map_err(capnp::Error::failed)?;
         let dry_run = req.get_dry_run();
         let merge_service_policy = Self::merge_service_policy_from_capnp(req.get_service_policy()?);
-        self.catch_up_finalized_cluster_operations("merge request validation")
-            .await?;
+        self.reconcile_finalized_cluster_transitions_for_active_view(
+            "merge request active-view validation",
+        )
+        .await?;
         let active_view = self.active_cluster_view();
 
         if source_view == destination_view {
@@ -1385,8 +1387,10 @@ impl topology::Server for Topology {
         let dry_run = req.get_dry_run();
         let split_service_policy = Self::split_service_policy_from_capnp(req.get_service_policy()?);
         let split_network_policy = Self::split_network_policy_from_capnp(req.get_network_policy()?);
-        self.catch_up_finalized_cluster_operations("split request validation")
-            .await?;
+        self.reconcile_finalized_cluster_transitions_for_active_view(
+            "split request active-view validation",
+        )
+        .await?;
         let active_view = self.active_cluster_view();
         if source_view != active_view {
             return Err(capnp::Error::failed(format!(

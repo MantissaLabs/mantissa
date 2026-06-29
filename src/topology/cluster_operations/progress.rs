@@ -389,8 +389,8 @@ impl Topology {
         Ok(relayed)
     }
 
-    /// Resolves the active-view set accepted for commit-time side effects on this operation.
-    fn commit_precondition_views(
+    /// Returns the local active views from which this split/merge transition may be applied.
+    fn allowed_active_views_for_cluster_transition(
         operation: &ClusterOperationRecord,
     ) -> Result<Vec<ClusterViewId>, capnp::Error> {
         let source_view = operation.source_views.first().copied().ok_or_else(|| {
@@ -407,13 +407,13 @@ impl Topology {
         Ok(allowed_views)
     }
 
-    /// Validates the operation still matches the current local active view before commit effects.
-    fn ensure_commit_precondition(
+    /// Ensures the current node may apply this split/merge transition from its active view.
+    fn ensure_cluster_transition_can_apply(
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
         let active_view = self.active_cluster_view();
-        let allowed_views = Self::commit_precondition_views(operation)?;
+        let allowed_views = Self::allowed_active_views_for_cluster_transition(operation)?;
         if allowed_views.contains(&active_view) {
             return self.ensure_operation_views_not_retired(operation);
         }
@@ -543,8 +543,12 @@ impl Topology {
             .any(|view| left_views.contains(view))
     }
 
-    /// Returns whether a non-terminal operation can advance from this node's active view.
-    fn non_terminal_operation_affects_active_view(
+    /// Returns whether a pending operation is allowed to advance from this node's active view.
+    ///
+    /// Split operations can only be driven by source-view participants. Merge operations can be
+    /// driven by either side because both source and destination partitions must converge on the
+    /// destination view.
+    fn cluster_operation_can_progress_from_active_view(
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<bool, capnp::Error> {
@@ -659,7 +663,7 @@ impl Topology {
                     | ClusterOperationStage::Prepared
                     | ClusterOperationStage::Committed
             )
-            && self.non_terminal_operation_affects_active_view(operation)?
+            && self.cluster_operation_can_progress_from_active_view(operation)?
             && self.operation_ready_to_progress(operation)?)
     }
 
@@ -837,15 +841,17 @@ impl Topology {
         Ok(removed)
     }
 
-    /// Applies local side effects for a committed operation, including active view switch.
-    pub(in crate::topology) async fn apply_committed_operation_side_effects(
+    /// Applies a split/merge cluster transition and installs its target active view.
+    pub(in crate::topology) async fn apply_cluster_transition(
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
-        self.ensure_commit_precondition(operation)?;
+        self.ensure_cluster_transition_can_apply(operation)?;
 
         let transition = self.transition_for_operation(operation)?;
-        let reports = self.run_transition_commit_hooks(&transition).await?;
+        let reports = self
+            .run_cluster_transition_participants(&transition)
+            .await?;
         for report in reports {
             info!(
                 target: "cluster_view",
@@ -869,7 +875,7 @@ impl Topology {
                     target: "cluster_view",
                     operation_id = %transition.operation_id,
                     target_view = %transition.local_target_view,
-                    "failed to publish cluster node count after committed transition: {err}"
+                    "failed to publish cluster node count after cluster transition: {err}"
                 );
             }
         }
@@ -878,14 +884,18 @@ impl Topology {
             operation_id = %transition.operation_id,
             previous_view = %previous,
             target_view = %transition.local_target_view,
-            "applied operation commit side effects"
+            "applied cluster transition"
         );
 
         Ok(())
     }
 
-    /// Returns true when a destination-view merge still needs its first local commit pass.
-    pub(in crate::topology) async fn finalized_merge_needs_target_side_commit(
+    /// Returns whether a finalized merge still has local split scope to clear.
+    ///
+    /// A destination-side participant can already report the merge target view when it learns the
+    /// finalized merge row. If split peer exclusions are still installed, this node has not run the
+    /// merge transition locally and must replay it once to rejoin peer scope.
+    pub(in crate::topology) async fn finalized_merge_requires_cluster_transition_replay(
         &self,
         operation: &ClusterOperationRecord,
     ) -> bool {
@@ -893,8 +903,13 @@ impl Topology {
             && !self.excluded_peers_snapshot().await.is_empty()
     }
 
-    /// Repairs idempotent local effects for a finalized merge already active locally.
-    pub(in crate::topology) async fn repair_finalized_merge_side_effects(
+    /// Refreshes merge metadata when the active view is correct but local counters are stale.
+    ///
+    /// This path avoids replaying all transition participants for merges that are already installed.
+    /// It only reruns idempotent local work needed to make membership-dependent metadata converge:
+    /// durable active-view persistence, master-key reconciliation, session-scope refresh, and
+    /// cluster node-count publication.
+    pub(in crate::topology) async fn refresh_finalized_merge_membership_metadata_if_stale(
         &self,
         operation: &ClusterOperationRecord,
         target_view: ClusterViewId,
@@ -915,7 +930,7 @@ impl Topology {
             target_view = %target_view,
             observed_members = observed,
             expected_members = expected,
-            "repairing finalized merge local side effects"
+            "refreshing finalized merge metadata"
         );
         self.persist_active_cluster_view(target_view)?;
         let previous = self.set_active_cluster_view(target_view);
@@ -930,7 +945,7 @@ impl Topology {
                     target: "cluster_view",
                     operation_id = %operation.id,
                     target_view = %target_view,
-                    "failed to publish cluster node count while repairing finalized merge: {err}"
+                    "failed to publish cluster node count while refreshing finalized merge metadata: {err}"
                 );
             }
         }
@@ -939,7 +954,7 @@ impl Topology {
             operation_id = %operation.id,
             previous_view = %previous,
             target_view = %target_view,
-            "repaired finalized merge local side effects"
+            "refreshed finalized merge metadata"
         );
 
         Ok(())
@@ -1016,25 +1031,29 @@ impl Topology {
         }
     }
 
-    /// Applies local side effects for one finalized operation if this node still needs them.
-    pub(in crate::topology) async fn apply_finalized_operation_side_effects_if_needed(
+    /// Replays one finalized split/merge row when it still changes this node's cluster view.
+    ///
+    /// The replicated operation ledger can expose a terminal row before every participant has
+    /// applied the local cluster transition. This method reconciles that gap for the current node:
+    /// it ignores finalized rows outside the local lineage, applies the transition when the node is
+    /// still on a source view, and refreshes already-target merge metadata without rerunning
+    /// unrelated transition participants.
+    pub(in crate::topology) async fn replay_finalized_cluster_transition_for_active_view(
         &self,
         operation: &ClusterOperationRecord,
-        source: &'static str,
+        replay_context: &'static str,
     ) -> Result<bool, capnp::Error> {
         if operation.dry_run || operation.stage != ClusterOperationStage::Finalized {
             return Ok(false);
         }
 
-        let Some(target) =
-            self.target_view_if_finalized_operation_affects_active_view(operation)?
-        else {
+        let Some(target) = self.finalized_cluster_transition_target(operation)? else {
             debug!(
                 target: "cluster_view",
                 operation_id = %operation.id,
                 kind = ?operation.kind,
                 active_view = %self.active_cluster_view(),
-                source,
+                replay_context,
                 "skipping finalized operation outside local cluster lineage"
             );
             return Ok(false);
@@ -1042,16 +1061,16 @@ impl Topology {
 
         if self.active_cluster_view() == target {
             if self
-                .finalized_merge_needs_target_side_commit(operation)
+                .finalized_merge_requires_cluster_transition_replay(operation)
                 .await
             {
-                if let Err(err) = self.apply_committed_operation_side_effects(operation).await {
+                if let Err(err) = self.apply_cluster_transition(operation).await {
                     if Self::is_commit_precondition_failure(&err) {
                         debug!(
                             target: "cluster_view",
                             operation_id = %operation.id,
-                            source,
-                            "skipped target-side finalized merge side effects due to commit precondition mismatch: {err}"
+                            replay_context,
+                            "skipped finalized merge target-view commit replay due to commit precondition mismatch: {err}"
                         );
                         return Ok(false);
                     }
@@ -1065,21 +1084,21 @@ impl Topology {
                 operation_id = %operation.id,
                 kind = ?operation.kind,
                 active_view = %self.active_cluster_view(),
-                source,
+                replay_context,
                 "finalized operation already matches local active view"
             );
-            self.repair_finalized_merge_side_effects(operation, target)
+            self.refresh_finalized_merge_membership_metadata_if_stale(operation, target)
                 .await?;
             return Ok(false);
         }
 
-        if let Err(err) = self.apply_committed_operation_side_effects(operation).await {
+        if let Err(err) = self.apply_cluster_transition(operation).await {
             if Self::is_commit_precondition_failure(&err) {
                 debug!(
                     target: "cluster_view",
                     operation_id = %operation.id,
-                    source,
-                    "skipped finalized operation side effects due to commit precondition mismatch: {err}"
+                    replay_context,
+                    "skipped finalized operation replay due to commit precondition mismatch: {err}"
                 );
                 return Ok(false);
             }
@@ -1089,29 +1108,35 @@ impl Topology {
         Ok(true)
     }
 
-    /// Replays finalized operation side effects that this node has not locally applied yet.
-    pub(crate) async fn catch_up_finalized_cluster_operations(
+    /// Reconciles all finalized operation rows with this node's current active view.
+    ///
+    /// Call this at boundaries where local code is about to trust `active_cluster_view`.
+    /// It removes the ambiguity between "the operation row is finalized" and "this node has
+    /// applied the finalized transition locally."
+    pub(crate) async fn reconcile_finalized_cluster_transitions_for_active_view(
         &self,
-        source: &'static str,
+        replay_context: &'static str,
     ) -> Result<(), capnp::Error> {
         let mut operations = self.load_cluster_operations()?;
         operations.sort_by_key(Self::operation_execution_key);
 
         for operation in operations {
             let _ = self
-                .apply_finalized_operation_side_effects_if_needed(&operation, source)
+                .replay_finalized_cluster_transition_for_active_view(&operation, replay_context)
                 .await?;
         }
 
         Ok(())
     }
 
-    /// Applies finalized operations learned through metadata anti-entropy and wakes queued work.
+    /// Reconciles finalized operation rows learned through metadata sync and wakes queued work.
     pub(crate) async fn reconcile_cluster_operations_after_metadata_sync(
         &self,
     ) -> Result<(), capnp::Error> {
-        self.catch_up_finalized_cluster_operations("metadata sync")
-            .await?;
+        self.reconcile_finalized_cluster_transitions_for_active_view(
+            "metadata sync reconciliation",
+        )
+        .await?;
         self.trigger_ready_cluster_operation_progress();
         Ok(())
     }
@@ -1148,7 +1173,7 @@ impl Topology {
             }
             return Ok(());
         }
-        if !self.non_terminal_operation_affects_active_view(&operation)? {
+        if !self.cluster_operation_can_progress_from_active_view(&operation)? {
             debug!(
                 target: "cluster_view",
                 operation_id = %operation.id,
@@ -1196,10 +1221,7 @@ impl Topology {
                 {
                     return Ok(());
                 }
-                if let Err(err) = self
-                    .apply_committed_operation_side_effects(&operation)
-                    .await
-                {
+                if let Err(err) = self.apply_cluster_transition(&operation).await {
                     if Self::is_commit_precondition_failure(&err) {
                         let updated = self
                             .update_cluster_operation_stage(
@@ -1237,10 +1259,7 @@ impl Topology {
                 }
             }
             ClusterOperationStage::Prepared => {
-                if let Err(err) = self
-                    .apply_committed_operation_side_effects(&operation)
-                    .await
-                {
+                if let Err(err) = self.apply_cluster_transition(&operation).await {
                     if Self::is_commit_precondition_failure(&err) {
                         let updated = self
                             .update_cluster_operation_stage(
@@ -1287,7 +1306,7 @@ impl Topology {
             }
             ClusterOperationStage::Finalized => {
                 let _ = self
-                    .apply_finalized_operation_side_effects_if_needed(
+                    .replay_finalized_cluster_transition_for_active_view(
                         &operation,
                         "operation progress",
                     )
@@ -1342,7 +1361,7 @@ impl Topology {
         info!(
             target: "cluster_view",
             replayed,
-            "cluster operation startup replay complete"
+            "pending cluster operation startup replay complete"
         );
 
         let _ = self.garbage_collect_cluster_operations().await?;

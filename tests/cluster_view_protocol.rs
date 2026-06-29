@@ -1239,7 +1239,7 @@ local_test!(cluster_view_split_label_selector_assigns_peers, {
     .await;
 });
 
-// Validates startup replay resumes non-finalized durable operations and applies their commit side effects.
+// Validates startup replay resumes non-finalized durable operations and installs their target view.
 local_test!(cluster_view_replays_pending_operation_on_startup, {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("state.redb");
@@ -1827,64 +1827,67 @@ local_test!(cluster_view_startup_restores_persisted_split_view, {
     );
 });
 
-// Validates startup applies finalized split rows when the active-view write was missed.
-local_test!(cluster_view_startup_applies_finalized_split_side_effects, {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let db_path = temp_dir.path().join("state.redb");
-    let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
-    let operation_store = open_test_operation_store(db.clone());
-    let node_id = Uuid::new_v4();
-    let source_view = ClusterViewId::legacy_default();
-    let split_target_a = ClusterViewId::new(
-        mantissa::cluster::ClusterId::from_uuid(Uuid::new_v4()),
-        source_view.epoch + 1,
-    );
-    let split_target_b = ClusterViewId::new(
-        mantissa::cluster::ClusterId::from_uuid(Uuid::new_v4()),
-        source_view.epoch + 1,
-    );
-    let operation = ClusterOperationRecord {
-        id: Uuid::new_v4(),
-        kind: StoredOperationKind::Split,
-        stage: StoredOperationStage::Finalized,
-        dry_run: false,
-        created_at_unix_ms: 23,
-        depends_on_operation_id: None,
-        source_views: vec![source_view],
-        target_views: vec![split_target_a, split_target_b],
-        target_cluster_names: Vec::new(),
-        split_assignments: vec![SplitNodeAssignment {
+// Validates startup replays a finalized split row when the active-view transition was missed.
+local_test!(
+    cluster_view_startup_replays_finalized_split_active_view_transition,
+    {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("state.redb");
+        let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
+        let operation_store = open_test_operation_store(db.clone());
+        let node_id = Uuid::new_v4();
+        let source_view = ClusterViewId::legacy_default();
+        let split_target_a = ClusterViewId::new(
+            mantissa::cluster::ClusterId::from_uuid(Uuid::new_v4()),
+            source_view.epoch + 1,
+        );
+        let split_target_b = ClusterViewId::new(
+            mantissa::cluster::ClusterId::from_uuid(Uuid::new_v4()),
+            source_view.epoch + 1,
+        );
+        let operation = ClusterOperationRecord {
+            id: Uuid::new_v4(),
+            kind: StoredOperationKind::Split,
+            stage: StoredOperationStage::Finalized,
+            dry_run: false,
+            created_at_unix_ms: 23,
+            depends_on_operation_id: None,
+            source_views: vec![source_view],
+            target_views: vec![split_target_a, split_target_b],
+            target_cluster_names: Vec::new(),
+            split_assignments: vec![SplitNodeAssignment {
+                node_id,
+                target_index: 1,
+            }],
+            split_service_policy: Default::default(),
+            split_network_policy: Default::default(),
+            merge_service_policy: Default::default(),
+            updated_at_unix_ms: 23,
+            details: "finalized split startup replay operation".to_string(),
+        };
+
+        persist_test_operation(&operation_store, &operation).await;
+
+        let node = HeadlessNode::new_with(
+            db,
             node_id,
-            target_index: 1,
-        }],
-        split_service_policy: Default::default(),
-        split_network_policy: Default::default(),
-        merge_service_policy: Default::default(),
-        updated_at_unix_ms: 23,
-        details: "finalized split startup catch-up operation".to_string(),
-    };
+            HeadlessKeys::new(
+                Arc::new(NoiseKeys::from_private_bytes([0xB2; 32])),
+                ed25519_dalek::SigningKey::from_bytes(&[0xC2; 32]),
+            ),
+            headless_config_with_in_memory_runtime(),
+        )
+        .await
+        .expect("start split replay node");
 
-    persist_test_operation(&operation_store, &operation).await;
-
-    let node = HeadlessNode::new_with(
-        db,
-        node_id,
-        HeadlessKeys::new(
-            Arc::new(NoiseKeys::from_private_bytes([0xB2; 32])),
-            ed25519_dalek::SigningKey::from_bytes(&[0xC2; 32]),
-        ),
-        headless_config_with_in_memory_runtime(),
-    )
-    .await
-    .expect("start split catch-up node");
-
-    wait_for_cluster_view(
-        &node.topology_client,
-        split_target_b,
-        Duration::from_secs(5),
-    )
-    .await;
-});
+        wait_for_cluster_view(
+            &node.topology_client,
+            split_target_b,
+            Duration::from_secs(5),
+        )
+        .await;
+    }
+);
 
 // Validates stale prepared operations abort when commit preconditions no longer match active view.
 local_test!(
@@ -2816,7 +2819,7 @@ local_test!(cluster_view_split_scopes_listings_to_active_view, {
         "cluster view listing should include both split target cluster ids"
     );
 
-    // Split commit side effects must retain peer metadata for future merges while clearing stale auth state.
+    // Split commits keep peer rows for future merge discovery but remove stale local auth state.
     let (active_peers, _) = anchor
         .node
         .peers

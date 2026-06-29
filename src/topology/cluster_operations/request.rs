@@ -236,7 +236,7 @@ impl Topology {
         }
     }
 
-    /// Persists one operation and triggers broadcast/progression side effects for non-dry-run requests.
+    /// Stores a submitted operation, relays it to peers, and schedules local progression.
     pub(in crate::topology) async fn persist_and_dispatch_operation(
         &self,
         operation: &mut ClusterOperationRecord,
@@ -324,7 +324,10 @@ impl Topology {
             }
             ClusterOperationStage::Finalized => {
                 let _ = self
-                    .apply_finalized_operation_side_effects_if_needed(&merged, "relayed operation")
+                    .replay_finalized_cluster_transition_for_active_view(
+                        &merged,
+                        "relayed finalized operation",
+                    )
                     .await?;
             }
             ClusterOperationStage::Aborted => {}

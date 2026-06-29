@@ -929,8 +929,8 @@ fn build_topology(inputs: TopologyBuildInputs<'_>) -> BootstrapResult<Topology> 
 
 /// Restores topology-derived state before the node begins serving traffic.
 ///
-/// This keeps startup recovery side effects explicit instead of burying them in
-/// the main runtime construction flow.
+/// This keeps durable topology recovery explicit instead of burying it in the
+/// main runtime construction flow.
 async fn restore_topology_derived_state(topology: &Topology) -> BootstrapResult<()> {
     match topology.restore_cluster_names_from_operations().await {
         Ok(restored) if restored > 0 => {
@@ -968,7 +968,9 @@ async fn restore_topology_derived_state(topology: &Topology) -> BootstrapResult<
     }
 
     topology
-        .catch_up_finalized_cluster_operations("startup replay")
+        .reconcile_finalized_cluster_transitions_for_active_view(
+            "startup finalized-row reconciliation",
+        )
         .await?;
 
     if let Err(error) = topology.publish_local_cluster_node_count().await {
@@ -1104,7 +1106,7 @@ fn build_server(
 /// Completes post-construction wiring before listeners are started.
 ///
 /// This is where topology receives the server capability and one-shot startup
-/// side effects such as the network controller spawn are triggered.
+/// tasks, such as the network controller, are started.
 async fn finish_boot(server: &Server, components: &RuntimeComponents) -> BootstrapResult<()> {
     let server_client: ServerClient = capnp_rpc::new_client(server.clone());
     if let Err(handle) = components.topology.set_server_handle(server_client).await {
