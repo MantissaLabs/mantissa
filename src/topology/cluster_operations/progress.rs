@@ -1016,79 +1016,102 @@ impl Topology {
         }
     }
 
-    /// Applies finalized operations learned through metadata anti-entropy and wakes queued work.
-    pub(crate) async fn reconcile_cluster_operations_after_metadata_sync(
+    /// Applies local side effects for one finalized operation if this node still needs them.
+    pub(in crate::topology) async fn apply_finalized_operation_side_effects_if_needed(
         &self,
+        operation: &ClusterOperationRecord,
+        source: &'static str,
+    ) -> Result<bool, capnp::Error> {
+        if operation.dry_run || operation.stage != ClusterOperationStage::Finalized {
+            return Ok(false);
+        }
+
+        let Some(target) =
+            self.target_view_if_finalized_operation_affects_active_view(operation)?
+        else {
+            debug!(
+                target: "cluster_view",
+                operation_id = %operation.id,
+                kind = ?operation.kind,
+                active_view = %self.active_cluster_view(),
+                source,
+                "skipping finalized operation outside local cluster lineage"
+            );
+            return Ok(false);
+        };
+
+        if self.active_cluster_view() == target {
+            if self
+                .finalized_merge_needs_target_side_commit(operation)
+                .await
+            {
+                if let Err(err) = self.apply_committed_operation_side_effects(operation).await {
+                    if Self::is_commit_precondition_failure(&err) {
+                        debug!(
+                            target: "cluster_view",
+                            operation_id = %operation.id,
+                            source,
+                            "skipped target-side finalized merge side effects due to commit precondition mismatch: {err}"
+                        );
+                        return Ok(false);
+                    }
+                    return Err(err);
+                }
+                return Ok(true);
+            }
+
+            debug!(
+                target: "cluster_view",
+                operation_id = %operation.id,
+                kind = ?operation.kind,
+                active_view = %self.active_cluster_view(),
+                source,
+                "finalized operation already matches local active view"
+            );
+            self.repair_finalized_merge_side_effects(operation, target)
+                .await?;
+            return Ok(false);
+        }
+
+        if let Err(err) = self.apply_committed_operation_side_effects(operation).await {
+            if Self::is_commit_precondition_failure(&err) {
+                debug!(
+                    target: "cluster_view",
+                    operation_id = %operation.id,
+                    source,
+                    "skipped finalized operation side effects due to commit precondition mismatch: {err}"
+                );
+                return Ok(false);
+            }
+            return Err(err);
+        }
+
+        Ok(true)
+    }
+
+    /// Replays finalized operation side effects that this node has not locally applied yet.
+    pub(crate) async fn catch_up_finalized_cluster_operations(
+        &self,
+        source: &'static str,
     ) -> Result<(), capnp::Error> {
         let mut operations = self.load_cluster_operations()?;
         operations.sort_by_key(Self::operation_execution_key);
 
         for operation in operations {
-            if operation.dry_run || operation.stage != ClusterOperationStage::Finalized {
-                continue;
-            }
-
-            let Some(target) =
-                self.target_view_if_finalized_operation_affects_active_view(&operation)?
-            else {
-                debug!(
-                    target: "cluster_view",
-                    operation_id = %operation.id,
-                    kind = ?operation.kind,
-                    active_view = %self.active_cluster_view(),
-                    "skipping synced finalized operation outside local cluster lineage"
-                );
-                continue;
-            };
-            if self.active_cluster_view() == target {
-                if self
-                    .finalized_merge_needs_target_side_commit(&operation)
-                    .await
-                {
-                    if let Err(err) = self
-                        .apply_committed_operation_side_effects(&operation)
-                        .await
-                    {
-                        if Self::is_commit_precondition_failure(&err) {
-                            debug!(
-                                target: "cluster_view",
-                                operation_id = %operation.id,
-                                "skipped target-side finalized merge side effects due to commit precondition mismatch: {err}"
-                            );
-                            continue;
-                        }
-                        return Err(err);
-                    }
-                    continue;
-                }
-                debug!(
-                    target: "cluster_view",
-                    operation_id = %operation.id,
-                    kind = ?operation.kind,
-                    active_view = %self.active_cluster_view(),
-                    "skipping synced finalized operation already applied locally"
-                );
-                self.repair_finalized_merge_side_effects(&operation, target)
-                    .await?;
-                continue;
-            }
-
-            if let Err(err) = self
-                .apply_committed_operation_side_effects(&operation)
-                .await
-            {
-                if Self::is_commit_precondition_failure(&err) {
-                    debug!(
-                        target: "cluster_view",
-                        operation_id = %operation.id,
-                        "skipped synced finalized operation side effects due to commit precondition mismatch: {err}"
-                    );
-                    continue;
-                }
-                return Err(err);
-            }
+            let _ = self
+                .apply_finalized_operation_side_effects_if_needed(&operation, source)
+                .await?;
         }
 
+        Ok(())
+    }
+
+    /// Applies finalized operations learned through metadata anti-entropy and wakes queued work.
+    pub(crate) async fn reconcile_cluster_operations_after_metadata_sync(
+        &self,
+    ) -> Result<(), capnp::Error> {
+        self.catch_up_finalized_cluster_operations("metadata sync")
+            .await?;
         self.trigger_ready_cluster_operation_progress();
         Ok(())
     }
@@ -1262,7 +1285,15 @@ impl Topology {
                 )
                 .await?;
             }
-            ClusterOperationStage::Finalized | ClusterOperationStage::Aborted => {}
+            ClusterOperationStage::Finalized => {
+                let _ = self
+                    .apply_finalized_operation_side_effects_if_needed(
+                        &operation,
+                        "operation progress",
+                    )
+                    .await?;
+            }
+            ClusterOperationStage::Aborted => {}
         }
 
         let _ = self.garbage_collect_cluster_operations().await?;

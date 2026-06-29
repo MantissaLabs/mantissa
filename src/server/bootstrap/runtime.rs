@@ -967,6 +967,10 @@ async fn restore_topology_derived_state(topology: &Topology) -> BootstrapResult<
         );
     }
 
+    topology
+        .catch_up_finalized_cluster_operations("startup replay")
+        .await?;
+
     if let Err(error) = topology.publish_local_cluster_node_count().await {
         tracing::warn!(
             target: "cluster_view",

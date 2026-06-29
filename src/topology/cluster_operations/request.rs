@@ -8,7 +8,7 @@ use crate::node::id::read_node_id;
 use crate::topology::Topology;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use tracing::{debug, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 type ParsedSplitTargets = (Vec<SplitTargetSpec>, Vec<ClusterViewId>, Vec<String>);
@@ -323,57 +323,9 @@ impl Topology {
                 self.trigger_operation_progress(merged.id, false);
             }
             ClusterOperationStage::Finalized => {
-                if let Some(target) =
-                    self.target_view_if_finalized_operation_affects_active_view(&merged)?
-                {
-                    if self.active_cluster_view() == target {
-                        if self.finalized_merge_needs_target_side_commit(&merged).await {
-                            if let Err(err) =
-                                self.apply_committed_operation_side_effects(&merged).await
-                            {
-                                if Self::is_commit_precondition_failure(&err) {
-                                    warn!(
-                                        target: "cluster_view",
-                                        operation_id = %merged.id,
-                                        "skipped target-side finalized merge side effects due to commit precondition mismatch: {err}"
-                                    );
-                                } else {
-                                    return Err(err);
-                                }
-                            }
-                            return Ok(());
-                        }
-                        debug!(
-                            target: "cluster_view",
-                            operation_id = %merged.id,
-                            kind = ?merged.kind,
-                            active_view = %self.active_cluster_view(),
-                            "skipping relayed finalized operation already applied locally"
-                        );
-                        self.repair_finalized_merge_side_effects(&merged, target)
-                            .await?;
-                    } else if let Err(err) =
-                        self.apply_committed_operation_side_effects(&merged).await
-                    {
-                        if Self::is_commit_precondition_failure(&err) {
-                            warn!(
-                                target: "cluster_view",
-                                operation_id = %merged.id,
-                                "skipped finalized operation side effects due to commit precondition mismatch: {err}"
-                            );
-                        } else {
-                            return Err(err);
-                        }
-                    }
-                } else {
-                    debug!(
-                        target: "cluster_view",
-                        operation_id = %merged.id,
-                        kind = ?merged.kind,
-                        active_view = %self.active_cluster_view(),
-                        "accepted finalized operation outside local cluster lineage"
-                    );
-                }
+                let _ = self
+                    .apply_finalized_operation_side_effects_if_needed(&merged, "relayed operation")
+                    .await?;
             }
             ClusterOperationStage::Aborted => {}
         }
