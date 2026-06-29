@@ -10,7 +10,7 @@ use async_channel::{Receiver, Sender};
 use mantissa_net::noise::NoiseKeys;
 use mantissa_store::uuid_key::UuidKey;
 use std::sync::Arc;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -29,6 +29,7 @@ pub struct SecretMasterKeyPublisher {
     sync_notify: Arc<Notify>,
     local_node_id: Uuid,
     noise_keys: Arc<NoiseKeys>,
+    publish_gate: Arc<Mutex<()>>,
 }
 
 /// Applies inbound master-key gossip rows into the replicated store.
@@ -54,6 +55,7 @@ impl SecretMasterKeyPublisher {
             sync_notify,
             local_node_id,
             noise_keys,
+            publish_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -63,13 +65,21 @@ impl SecretMasterKeyPublisher {
         record: &MasterKeyRecord,
         recipients: &[SecretMasterKeyGrantRecipient],
     ) -> Result<()> {
-        let mut rows = Vec::with_capacity(recipients.len().saturating_add(2));
-        self.append_missing_key_grants(&mut rows, record, recipients)?;
-        self.append_current_if_missing(&mut rows, &current_from_descriptor(&record.descriptor))?;
-        self.publish_records(rows).await
+        let rows = {
+            let _guard = self.publish_gate.lock().await;
+            let mut rows = Vec::with_capacity(recipients.len().saturating_add(2));
+            self.append_missing_key_grants(&mut rows, record, recipients)?;
+            self.append_current_if_missing(
+                &mut rows,
+                &current_from_descriptor(&record.descriptor),
+            )?;
+            self.persist_and_notify_locked(&rows).await?;
+            rows
+        };
+        self.gossip_records(rows).await
     }
 
-    /// Publishes the current key rows and returns them for latency-sensitive join seeding.
+    /// Ensures current key rows exist and returns rows for latency-sensitive join seeding.
     pub async fn publish_current_key_returning_records(
         &self,
         record: &MasterKeyRecord,
@@ -83,7 +93,7 @@ impl SecretMasterKeyPublisher {
         .await
     }
 
-    /// Publishes all known key grants for recipients and advances the current pointer.
+    /// Ensures all known key grants exist for recipients and advances the current pointer.
     ///
     /// Callers that must make historical ciphertext readable for a recipient
     /// can pass every locally known key. The join fast path intentionally uses
@@ -100,35 +110,52 @@ impl SecretMasterKeyPublisher {
             .map(|_| ())
     }
 
-    /// Publishes current rows and returns the exact records written for immediate seeding.
+    /// Ensures current rows exist and returns usable records for immediate seeding.
     pub async fn publish_current_with_key_grants_returning_records(
         &self,
         current: &MasterKeyRecord,
         records: &[MasterKeyRecord],
         recipients: &[SecretMasterKeyGrantRecipient],
     ) -> Result<Vec<SecretMasterKeySyncRecord>> {
-        let mut rows = Vec::with_capacity(
-            records
+        let (seed_rows, published_rows) = {
+            let _guard = self.publish_gate.lock().await;
+            let capacity = records
                 .len()
                 .saturating_add(1)
                 .saturating_mul(recipients.len().saturating_add(1))
-                .saturating_add(1),
-        );
-        let mut included_current = false;
+                .saturating_add(1);
+            let mut seed_rows = Vec::with_capacity(capacity);
+            let mut published_rows = Vec::with_capacity(capacity);
+            let mut included_current = false;
 
-        for record in records {
-            included_current |= record.key_id() == current.key_id();
-            self.append_key_grants(&mut rows, record, recipients)?;
-        }
-        if !included_current {
-            self.append_key_grants(&mut rows, current, recipients)?;
-        }
+            for record in records {
+                included_current |= record.key_id() == current.key_id();
+                self.append_seed_key_grants(
+                    &mut seed_rows,
+                    &mut published_rows,
+                    record,
+                    recipients,
+                )?;
+            }
+            if !included_current {
+                self.append_seed_key_grants(
+                    &mut seed_rows,
+                    &mut published_rows,
+                    current,
+                    recipients,
+                )?;
+            }
+            self.append_seed_current(
+                &mut seed_rows,
+                &mut published_rows,
+                &current_from_descriptor(&current.descriptor),
+            )?;
 
-        rows.push(SecretMasterKeySyncRecord::Current(current_from_descriptor(
-            &current.descriptor,
-        )));
-        self.publish_records(rows.clone()).await?;
-        Ok(rows)
+            self.persist_and_notify_locked(&published_rows).await?;
+            (seed_rows, published_rows)
+        };
+        self.gossip_records(published_rows).await?;
+        Ok(seed_rows)
     }
 
     /// Publishes descriptor and grant rows for existing keys without changing current metadata.
@@ -141,15 +168,20 @@ impl SecretMasterKeyPublisher {
             return Ok(());
         }
 
-        let mut rows = Vec::with_capacity(
-            records
-                .len()
-                .saturating_mul(recipients.len().saturating_add(1)),
-        );
-        for record in records {
-            self.append_missing_key_grants(&mut rows, record, recipients)?;
-        }
-        self.publish_records(rows).await
+        let rows = {
+            let _guard = self.publish_gate.lock().await;
+            let mut rows = Vec::with_capacity(
+                records
+                    .len()
+                    .saturating_mul(recipients.len().saturating_add(1)),
+            );
+            for record in records {
+                self.append_missing_key_grants(&mut rows, record, recipients)?;
+            }
+            self.persist_and_notify_locked(&rows).await?;
+            rows
+        };
+        self.gossip_records(rows).await
     }
 
     /// Returns true when any descriptor or grant row for this key still needs publication.
@@ -172,22 +204,26 @@ impl SecretMasterKeyPublisher {
         Ok(false)
     }
 
-    /// Persists rows first, then queues gossip as an acceleration hint.
-    async fn publish_records(
-        &self,
-        records: impl IntoIterator<Item = SecretMasterKeySyncRecord>,
-    ) -> Result<()> {
-        let records = records.into_iter().collect::<Vec<_>>();
+    /// Persists rows and wakes local reconcilers while the caller holds `publish_gate`.
+    async fn persist_and_notify_locked(&self, records: &[SecretMasterKeySyncRecord]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
 
-        for record in &records {
+        for record in records {
             upsert_record(&self.sync_store, record.clone())
                 .await
                 .map_err(|error| anyhow!("upsert replicated master-key row: {error}"))?;
         }
         self.sync_notify.notify_waiters();
+        Ok(())
+    }
+
+    /// Queues already-persisted rows for gossip as a convergence acceleration hint.
+    async fn gossip_records(&self, records: Vec<SecretMasterKeySyncRecord>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
 
         for record in records {
             self.gossip_tx
@@ -202,18 +238,43 @@ impl SecretMasterKeyPublisher {
         Ok(())
     }
 
-    /// Appends descriptor and recipient grants for one plaintext key record.
-    fn append_key_grants(
+    /// Appends seed rows and separately tracks rows that are not yet visible locally.
+    fn append_seed_key_grants(
         &self,
-        rows: &mut Vec<SecretMasterKeySyncRecord>,
+        seed_rows: &mut Vec<SecretMasterKeySyncRecord>,
+        published_rows: &mut Vec<SecretMasterKeySyncRecord>,
         record: &MasterKeyRecord,
         recipients: &[SecretMasterKeyGrantRecipient],
     ) -> Result<()> {
-        rows.push(SecretMasterKeySyncRecord::Descriptor(
-            record.descriptor.clone(),
-        ));
+        let descriptor_record = SecretMasterKeySyncRecord::Descriptor(record.descriptor.clone());
+        seed_rows.push(descriptor_record.clone());
+        if !self.record_is_visible(descriptor_row_id(record.key_id()), &descriptor_record)? {
+            published_rows.push(descriptor_record);
+        }
+
         for recipient in recipients {
-            rows.push(self.grant_record(record, *recipient)?);
+            if let Some(grant) = self.visible_grant_record(&record.descriptor, recipient)? {
+                seed_rows.push(grant);
+            } else {
+                let grant = self.grant_record(record, *recipient)?;
+                seed_rows.push(grant.clone());
+                published_rows.push(grant);
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends the current row for seeding and tracks it for publication when missing.
+    fn append_seed_current(
+        &self,
+        seed_rows: &mut Vec<SecretMasterKeySyncRecord>,
+        published_rows: &mut Vec<SecretMasterKeySyncRecord>,
+        current: &SecretMasterKeyCurrent,
+    ) -> Result<()> {
+        let current_record = SecretMasterKeySyncRecord::Current(current.clone());
+        seed_rows.push(current_record.clone());
+        if !self.record_is_visible(current_row_id(current.scope_view), &current_record)? {
+            published_rows.push(current_record);
         }
         Ok(())
     }
@@ -231,7 +292,10 @@ impl SecretMasterKeyPublisher {
         }
 
         for recipient in recipients {
-            if !self.grant_is_visible(&record.descriptor, recipient)? {
+            if self
+                .visible_grant_record(&record.descriptor, recipient)?
+                .is_none()
+            {
                 rows.push(self.grant_record(record, *recipient)?);
             }
         }
@@ -270,6 +334,15 @@ impl SecretMasterKeyPublisher {
         descriptor: &MasterKeyDescriptor,
         recipient: &SecretMasterKeyGrantRecipient,
     ) -> Result<bool> {
+        Ok(self.visible_grant_record(descriptor, recipient)?.is_some())
+    }
+
+    /// Returns the first compatible visible grant for this key and recipient.
+    fn visible_grant_record(
+        &self,
+        descriptor: &MasterKeyDescriptor,
+        recipient: &SecretMasterKeyGrantRecipient,
+    ) -> Result<Option<SecretMasterKeySyncRecord>> {
         let Some(snapshot) = self
             .sync_store
             .get_snapshot(&UuidKey::from(grant_row_id(
@@ -278,18 +351,19 @@ impl SecretMasterKeyPublisher {
             )))
             .map_err(|error| anyhow!("read replicated master-key grant row: {error}"))?
         else {
-            return Ok(false);
+            return Ok(None);
         };
 
-        Ok(snapshot.as_slice().iter().any(|visible| {
+        Ok(snapshot.as_slice().iter().find_map(|visible| {
             let SecretMasterKeySyncRecord::Grant(grant) = visible else {
-                return false;
+                return None;
             };
-            grant.descriptor == *descriptor
+            (grant.descriptor == *descriptor
                 && grant.sender_node_id == self.local_node_id
                 && grant.sender_noise_static_pub == self.noise_keys.public_bytes()
                 && grant.recipient_node_id == recipient.node_id
-                && grant.recipient_noise_static_pub == recipient.noise_static_pub
+                && grant.recipient_noise_static_pub == recipient.noise_static_pub)
+                .then(|| SecretMasterKeySyncRecord::Grant(grant.clone()))
         }))
     }
 

@@ -18,6 +18,9 @@ use mantissa_store::gc::StoreGcPolicy;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// Test sync fanout value that asks each ten-node cluster member to reach every peer.
+const TEN_NODE_SYNC_FANOUT: usize = 10;
+
 /// Creates a secret through the public RPC so encryption uses the node's live keyring.
 async fn create_secret(
     client: &secrets::Client,
@@ -868,6 +871,7 @@ local_test!(ten_node_empty_split_merge_keeps_master_key_rows_linear, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
     let cfg = ClusterConfig {
         sync_tick_ms: Some(100),
+        sync_fanout: Some(TEN_NODE_SYNC_FANOUT),
         gossip_tick_ms: Some(100),
         gossip_fanout: Some(10),
         gossip_channel_capacity: Some(4096),
@@ -926,6 +930,7 @@ local_test!(
         let _guard = RuntimeBackendOverrideGuard::install_default();
         let cfg = ClusterConfig {
             sync_tick_ms: Some(25),
+            sync_fanout: Some(TEN_NODE_SYNC_FANOUT),
             gossip_tick_ms: Some(25),
             gossip_fanout: Some(10),
             gossip_channel_capacity: Some(4096),

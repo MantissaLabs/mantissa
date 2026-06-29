@@ -326,9 +326,34 @@ impl Topology {
                 if let Some(target) =
                     self.target_view_if_finalized_operation_affects_active_view(&merged)?
                 {
-                    if (merged.kind == ClusterOperationKind::Merge
-                        || self.active_cluster_view() != target)
-                        && let Err(err) = self.apply_committed_operation_side_effects(&merged).await
+                    if self.active_cluster_view() == target {
+                        if self.finalized_merge_needs_target_side_commit(&merged).await {
+                            if let Err(err) =
+                                self.apply_committed_operation_side_effects(&merged).await
+                            {
+                                if Self::is_commit_precondition_failure(&err) {
+                                    warn!(
+                                        target: "cluster_view",
+                                        operation_id = %merged.id,
+                                        "skipped target-side finalized merge side effects due to commit precondition mismatch: {err}"
+                                    );
+                                } else {
+                                    return Err(err);
+                                }
+                            }
+                            return Ok(());
+                        }
+                        debug!(
+                            target: "cluster_view",
+                            operation_id = %merged.id,
+                            kind = ?merged.kind,
+                            active_view = %self.active_cluster_view(),
+                            "skipping relayed finalized operation already applied locally"
+                        );
+                        self.repair_finalized_merge_side_effects(&merged, target)
+                            .await?;
+                    } else if let Err(err) =
+                        self.apply_committed_operation_side_effects(&merged).await
                     {
                         if Self::is_commit_precondition_failure(&err) {
                             warn!(

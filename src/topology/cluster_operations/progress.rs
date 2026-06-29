@@ -222,6 +222,35 @@ impl Topology {
         Ok(count)
     }
 
+    /// Counts locally active peer rows without consulting cached peer sessions.
+    async fn local_active_peer_row_member_count(&self) -> Result<u32, capnp::Error> {
+        let excluded_peers = self.excluded_peers_snapshot().await;
+        let (actives, _) = self
+            .stores
+            .peers
+            .load_all_regs()
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+        let mut count = 1u32;
+        for (key, reg) in actives {
+            let peer_id = key.to_uuid();
+            if peer_id == self.local.node.id {
+                continue;
+            }
+            if excluded_peers.contains(&peer_id) {
+                continue;
+            }
+            if PeerValue::select_reg(&reg)
+                .filter(|value| value.is_active())
+                .is_some()
+            {
+                count = count.saturating_add(1);
+            }
+        }
+
+        Ok(count)
+    }
+
     /// Decodes one raw Cap'n Proto cluster lineage identifier into internal `ClusterId` bytes.
     pub(in crate::topology) fn cluster_id_from_capnp(
         reader: mantissa_protocol::topology::cluster_id::Reader<'_>,
@@ -855,6 +884,67 @@ impl Topology {
         Ok(())
     }
 
+    /// Returns true when a destination-view merge still needs its first local commit pass.
+    pub(in crate::topology) async fn finalized_merge_needs_target_side_commit(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> bool {
+        operation.kind == ClusterOperationKind::Merge
+            && !self.excluded_peers_snapshot().await.is_empty()
+    }
+
+    /// Repairs idempotent local effects for a finalized merge already active locally.
+    pub(in crate::topology) async fn repair_finalized_merge_side_effects(
+        &self,
+        operation: &ClusterOperationRecord,
+        target_view: ClusterViewId,
+    ) -> Result<(), capnp::Error> {
+        if operation.kind != ClusterOperationKind::Merge {
+            return Ok(());
+        }
+
+        let observed = self.local_cluster_view_member_count().await?;
+        let expected = self.local_active_peer_row_member_count().await?;
+        if observed == expected {
+            return Ok(());
+        }
+
+        debug!(
+            target: "cluster_view",
+            operation_id = %operation.id,
+            target_view = %target_view,
+            observed_members = observed,
+            expected_members = expected,
+            "repairing finalized merge local side effects"
+        );
+        self.persist_active_cluster_view(target_view)?;
+        let previous = self.set_active_cluster_view(target_view);
+        self.reconcile_secret_master_keys_for_view(target_view)
+            .await;
+        self.deps.registry.clear().await;
+        match self.publish_local_cluster_node_count().await {
+            Ok(true) => self.sync_once_now(),
+            Ok(false) => {}
+            Err(err) => {
+                warn!(
+                    target: "cluster_view",
+                    operation_id = %operation.id,
+                    target_view = %target_view,
+                    "failed to publish cluster node count while repairing finalized merge: {err}"
+                );
+            }
+        }
+        debug!(
+            target: "cluster_view",
+            operation_id = %operation.id,
+            previous_view = %previous,
+            target_view = %target_view,
+            "repaired finalized merge local side effects"
+        );
+
+        Ok(())
+    }
+
     /// Re-runs master-key adoption after a committed transition changes the active view.
     async fn reconcile_secret_master_keys_for_view(&self, view: ClusterViewId) {
         let reconciler = SecretMasterKeyReconciler::new(
@@ -950,8 +1040,36 @@ impl Topology {
                 );
                 continue;
             };
-            if operation.kind != ClusterOperationKind::Merge && self.active_cluster_view() == target
-            {
+            if self.active_cluster_view() == target {
+                if self
+                    .finalized_merge_needs_target_side_commit(&operation)
+                    .await
+                {
+                    if let Err(err) = self
+                        .apply_committed_operation_side_effects(&operation)
+                        .await
+                    {
+                        if Self::is_commit_precondition_failure(&err) {
+                            debug!(
+                                target: "cluster_view",
+                                operation_id = %operation.id,
+                                "skipped target-side finalized merge side effects due to commit precondition mismatch: {err}"
+                            );
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                    continue;
+                }
+                debug!(
+                    target: "cluster_view",
+                    operation_id = %operation.id,
+                    kind = ?operation.kind,
+                    active_view = %self.active_cluster_view(),
+                    "skipping synced finalized operation already applied locally"
+                );
+                self.repair_finalized_merge_side_effects(&operation, target)
+                    .await?;
                 continue;
             }
 
