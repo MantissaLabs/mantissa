@@ -899,7 +899,7 @@ impl WorkloadManager {
         }
 
         if network_ids.is_empty() {
-            warn!(
+            debug!(
                 target: "task",
                 task = %task_id,
                 instance = %instance_id.handle,

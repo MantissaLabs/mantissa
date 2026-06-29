@@ -945,7 +945,7 @@ impl Topology {
             Ok(report)
                 if report.current_waiting_for_descriptor || report.current_waiting_for_key =>
             {
-                warn!(
+                debug!(
                     target: "secrets",
                     cluster_view = %view,
                     waiting_for_descriptor = report.current_waiting_for_descriptor,

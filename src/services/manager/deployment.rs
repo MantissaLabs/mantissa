@@ -20,6 +20,49 @@ use anyhow::Context;
 use thiserror::Error;
 use tokio::time::timeout;
 
+/// Result of trying to claim one service slot for a start-first replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ServiceSlotCutover {
+    Applied,
+    Stale {
+        current_task_id: Option<Uuid>,
+        reason: ServiceSlotCutoverStaleReason,
+    },
+}
+
+/// Reason a start-first replacement no longer owns the right to claim its slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ServiceSlotCutoverStaleReason {
+    ServiceMissing,
+    ManifestAdvanced,
+    SlotMissing,
+    DesiredTaskMissing,
+    SlotAlreadyMoved,
+}
+
+impl ServiceSlotCutoverStaleReason {
+    /// Returns a stable label for structured service reconciliation logs.
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::ServiceMissing => "service missing",
+            Self::ManifestAdvanced => "manifest advanced",
+            Self::SlotMissing => "slot missing",
+            Self::DesiredTaskMissing => "desired task missing",
+            Self::SlotAlreadyMoved => "slot already moved",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceSlotCutoverDecision {
+    Apply,
+    AlreadyApplied,
+    Stale {
+        current_task_id: Option<Uuid>,
+        reason: ServiceSlotCutoverStaleReason,
+    },
+}
+
 impl ServiceController {
     /// Schedules an asynchronous deployment for the provided service manifest and returns
     /// the deterministic service identifier so the caller can track progress separately.
@@ -2028,56 +2071,43 @@ impl ServiceController {
         replica: u16,
         previous_task_id: Uuid,
         replacement_task_id: Uuid,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<ServiceSlotCutover> {
         let Some(mut current) = self.registry.get(service_id)? else {
-            return Err(anyhow!(
-                "service {} disappeared before slot '{}' replica {} could cut over to {}",
-                service_id,
-                template_name,
-                replica,
-                replacement_task_id
-            ));
+            return Ok(ServiceSlotCutover::Stale {
+                current_task_id: None,
+                reason: ServiceSlotCutoverStaleReason::ServiceMissing,
+            });
         };
         if current.manifest_id != manifest_id {
-            return Err(anyhow!(
-                "service '{}' advanced to manifest {} before slot '{}' replica {} could cut over",
-                current.service_name,
-                current.manifest_id,
-                template_name,
-                replica
-            ));
+            return Ok(ServiceSlotCutover::Stale {
+                current_task_id: None,
+                reason: ServiceSlotCutoverStaleReason::ManifestAdvanced,
+            });
         }
 
         let Some(slot_index) = service_slot_index(&current, template_name, replica) else {
-            return Err(anyhow!(
-                "service '{}' no longer declares slot '{}' replica {} during cutover",
-                current.service_name,
-                template_name,
-                replica
-            ));
+            return Ok(ServiceSlotCutover::Stale {
+                current_task_id: None,
+                reason: ServiceSlotCutoverStaleReason::SlotMissing,
+            });
         };
 
-        let Some(current_task_id) = current.assigned_replica_id(slot_index) else {
-            return Err(anyhow!(
-                "service '{}' slot '{}' replica {} lost its desired task id during cutover",
-                current.service_name,
-                template_name,
-                replica
-            ));
-        };
-
-        if current_task_id == replacement_task_id {
-            return Ok(());
-        }
-        if current_task_id != previous_task_id {
-            return Err(anyhow!(
-                "service '{}' slot '{}' replica {} points at {} instead of expected {} during cutover",
-                current.service_name,
-                template_name,
-                replica,
+        match service_slot_cutover_decision(
+            current.assigned_replica_id(slot_index),
+            previous_task_id,
+            replacement_task_id,
+        ) {
+            ServiceSlotCutoverDecision::AlreadyApplied => return Ok(ServiceSlotCutover::Applied),
+            ServiceSlotCutoverDecision::Stale {
                 current_task_id,
-                previous_task_id
-            ));
+                reason,
+            } => {
+                return Ok(ServiceSlotCutover::Stale {
+                    current_task_id,
+                    reason,
+                });
+            }
+            ServiceSlotCutoverDecision::Apply => {}
         }
 
         if !current.replace_assigned_replica_id(slot_index, replacement_task_id) {
@@ -2092,8 +2122,32 @@ impl ServiceController {
         current.touch();
         self.apply_upsert(current.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(current)).await?;
-        Ok(())
+        Ok(ServiceSlotCutover::Applied)
     }
+}
+
+/// Classifies the current slot owner before a replacement mutates service state.
+fn service_slot_cutover_decision(
+    current_task_id: Option<Uuid>,
+    previous_task_id: Uuid,
+    replacement_task_id: Uuid,
+) -> ServiceSlotCutoverDecision {
+    let Some(current_task_id) = current_task_id else {
+        return ServiceSlotCutoverDecision::Stale {
+            current_task_id: None,
+            reason: ServiceSlotCutoverStaleReason::DesiredTaskMissing,
+        };
+    };
+    if current_task_id == replacement_task_id {
+        return ServiceSlotCutoverDecision::AlreadyApplied;
+    }
+    if current_task_id != previous_task_id {
+        return ServiceSlotCutoverDecision::Stale {
+            current_task_id: Some(current_task_id),
+            reason: ServiceSlotCutoverStaleReason::SlotAlreadyMoved,
+        };
+    }
+    ServiceSlotCutoverDecision::Apply
 }
 
 /// Resolves the positional replica-slot index stored in `ServiceSpecValue::replica_ids`.
@@ -2356,6 +2410,58 @@ pub(super) fn order_task_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ensures an unchanged slot can still be claimed by its prepared replacement.
+    #[test]
+    fn service_slot_cutover_decision_accepts_previous_task_owner() {
+        let previous_task_id = Uuid::new_v4();
+        let replacement_task_id = Uuid::new_v4();
+
+        assert_eq!(
+            service_slot_cutover_decision(
+                Some(previous_task_id),
+                previous_task_id,
+                replacement_task_id
+            ),
+            ServiceSlotCutoverDecision::Apply
+        );
+    }
+
+    /// Ensures replaying an already-applied cutover is idempotent.
+    #[test]
+    fn service_slot_cutover_decision_accepts_already_applied_replacement() {
+        let previous_task_id = Uuid::new_v4();
+        let replacement_task_id = Uuid::new_v4();
+
+        assert_eq!(
+            service_slot_cutover_decision(
+                Some(replacement_task_id),
+                previous_task_id,
+                replacement_task_id
+            ),
+            ServiceSlotCutoverDecision::AlreadyApplied
+        );
+    }
+
+    /// Ensures a stale cutover stands down when another reconciliation already moved the slot.
+    #[test]
+    fn service_slot_cutover_decision_rejects_stale_slot_claim() {
+        let current_task_id = Uuid::new_v4();
+        let previous_task_id = Uuid::new_v4();
+        let replacement_task_id = Uuid::new_v4();
+
+        assert_eq!(
+            service_slot_cutover_decision(
+                Some(current_task_id),
+                previous_task_id,
+                replacement_task_id
+            ),
+            ServiceSlotCutoverDecision::Stale {
+                current_task_id: Some(current_task_id),
+                reason: ServiceSlotCutoverStaleReason::SlotAlreadyMoved,
+            }
+        );
+    }
 
     /// Ensures manifest healthy deadline launch expirations fail the active generation.
     #[test]

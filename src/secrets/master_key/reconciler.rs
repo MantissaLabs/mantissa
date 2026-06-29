@@ -12,7 +12,7 @@ use mantissa_net::noise::NoiseKeys;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Outcome counters for one master-key grant reconciliation pass.
@@ -70,10 +70,17 @@ impl SecretMasterKeyReconciler {
         loop {
             notify.notified().await;
             if let Err(error) = self.reconcile_active_view().await {
-                warn!(
-                    target: "secrets",
-                    "failed to reconcile replicated secret master keys: {error:#}"
-                );
+                if secret_master_key_reconcile_error_is_transition_transient(&error) {
+                    debug!(
+                        target: "secrets",
+                        "replicated secret master-key reconciliation deferred during transition: {error:#}"
+                    );
+                } else {
+                    warn!(
+                        target: "secrets",
+                        "failed to reconcile replicated secret master keys: {error:#}"
+                    );
+                }
             }
         }
     }
@@ -299,6 +306,15 @@ impl SecretMasterKeyReconciler {
     }
 }
 
+/// Returns true when a reconciliation failure can be retried after view/key gossip catches up.
+fn secret_master_key_reconcile_error_is_transition_transient(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("conflicting replicated secret master key current rejected")
+    })
+}
+
 /// Returns true when a current pointer is backed by its descriptor row.
 fn current_matches_descriptor(
     current: &SecretMasterKeyCurrent,
@@ -313,7 +329,9 @@ fn current_matches_descriptor(
 
 #[cfg(test)]
 mod tests {
-    use super::SecretMasterKeyReconciler;
+    use super::{
+        SecretMasterKeyReconciler, secret_master_key_reconcile_error_is_transition_transient,
+    };
     use crate::cluster::{ClusterViewId, ClusterViewState};
     use crate::registry::Registry;
     use crate::secrets::crypto::SecretKeyring;
@@ -332,6 +350,18 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::RwLock;
     use uuid::Uuid;
+
+    /// Replicated-current conflicts during view churn are retried by later key gossip.
+    #[test]
+    fn secret_master_key_conflict_error_is_transition_transient() {
+        let error = anyhow::anyhow!(
+            "activate replicated current master key: conflicting replicated secret master key current rejected"
+        );
+
+        assert!(secret_master_key_reconcile_error_is_transition_transient(
+            &error
+        ));
+    }
 
     struct ReconcilerHarness {
         _dir: TempDir,

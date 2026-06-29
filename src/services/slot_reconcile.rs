@@ -1,3 +1,4 @@
+use super::deployment::ServiceSlotCutover;
 use super::inventory::{ServiceReplicaSnapshot, TaskInventory};
 use super::placement::{
     SlotTargetContext, build_placement_preference_inventory, compute_effective_slot_targets,
@@ -48,6 +49,16 @@ fn preferred_slot_node(
     } else {
         Some(desired_node)
     }
+}
+
+/// Returns true for cleanup stop errors that are expected during rapid view transitions.
+fn service_cleanup_stop_error_is_transient(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let detail = cause.to_string();
+        detail.contains("unknown task")
+            || detail.contains("no active session for peer")
+            || detail.contains("cluster view mismatch")
+    })
 }
 
 impl ServiceController {
@@ -198,12 +209,21 @@ impl ServiceController {
             }
 
             if let Err(err) = self.workload_manager.request_workload_stop(task.id).await {
-                tracing::warn!(
-                    target: "services",
-                    "failed to stop excess task {} for '{}': {err}",
-                    task.id,
-                    spec.service_name
-                );
+                if service_cleanup_stop_error_is_transient(&err) {
+                    tracing::debug!(
+                        target: "services",
+                        task = %task.id,
+                        service = %spec.service_name,
+                        "deferred excess task cleanup after transient stop failure: {err:#}"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "services",
+                        "failed to stop excess task {} for '{}': {err:#}",
+                        task.id,
+                        spec.service_name
+                    );
+                }
                 self.retire_down_superseded_service_task_best_effort(
                     &spec.service_name,
                     task.id,
@@ -460,32 +480,20 @@ impl ServiceController {
                         .await;
                         return Err(err);
                     }
-                    if let Err(err) = self
-                        .swap_service_slot_task_id_for_cutover(
-                            spec.id,
-                            spec.manifest_id,
-                            &slot.template.name,
-                            slot.replica,
+                    if !self
+                        .settle_slot_replacement(
+                            spec,
+                            slot,
                             task_id,
                             replacement_task_id,
-                        )
-                        .await
-                    {
-                        self.abort_replacement_task_best_effort(
-                            &spec.service_name,
-                            replacement_task_id,
+                            health_snapshot,
+                            key,
                             "preferred replacement could not claim service slot",
                         )
-                        .await;
-                        return Err(err);
+                        .await?
+                    {
+                        return Ok(());
                     }
-                    self.clear_slot_missing(key).await;
-                    self.withdraw_and_stop_superseded_task_best_effort(
-                        &spec.service_name,
-                        task_id,
-                        health_snapshot,
-                    )
-                    .await;
                     return Ok(());
                 }
                 Err(err) => {
@@ -552,32 +560,20 @@ impl ServiceController {
             .await;
             return Err(err);
         }
-        if let Err(err) = self
-            .swap_service_slot_task_id_for_cutover(
-                spec.id,
-                spec.manifest_id,
-                &slot.template.name,
-                slot.replica,
+        if !self
+            .settle_slot_replacement(
+                spec,
+                slot,
                 task_id,
                 replacement_task_id,
-            )
-            .await
-        {
-            self.abort_replacement_task_best_effort(
-                &spec.service_name,
-                replacement_task_id,
+                health_snapshot,
+                key,
                 "fallback replacement could not claim service slot",
             )
-            .await;
-            return Err(err);
+            .await?
+        {
+            return Ok(());
         }
-        self.clear_slot_missing(key).await;
-        self.withdraw_and_stop_superseded_task_best_effort(
-            &spec.service_name,
-            task_id,
-            health_snapshot,
-        )
-        .await;
         Ok(())
     }
 
@@ -673,31 +669,21 @@ impl ServiceController {
             .await;
             return Err(err);
         }
-        if let Err(err) = self
-            .swap_service_slot_task_id_for_cutover(
-                spec.id,
-                spec.manifest_id,
-                &slot.template.name,
-                slot.replica,
+        if !self
+            .settle_slot_replacement(
+                spec,
+                slot,
                 task.id,
                 replacement_task_id,
-            )
-            .await
-        {
-            self.abort_replacement_task_best_effort(
-                &spec.service_name,
-                replacement_task_id,
+                health_snapshot,
+                key,
                 "rebalance replacement could not claim service slot",
             )
-            .await;
-            return Err(err);
+            .await?
+        {
+            self.set_rebalance_cooldown(key).await;
+            return Ok(());
         }
-        self.withdraw_and_stop_superseded_task_best_effort(
-            &spec.service_name,
-            task.id,
-            health_snapshot,
-        )
-        .await;
         self.set_rebalance_cooldown(key).await;
 
         tracing::debug!(
@@ -715,6 +701,78 @@ impl ServiceController {
         Ok(())
     }
 
+    /// Settles a start-first slot replacement and returns true when this replacement won.
+    async fn settle_slot_replacement(
+        &self,
+        spec: &ServiceSpecValue,
+        slot: &ReplicaSlot,
+        previous_task_id: Uuid,
+        replacement_task_id: Uuid,
+        health_snapshot: &HashMap<Uuid, HealthStatus>,
+        key: &SlotKey,
+        abort_context: &str,
+    ) -> anyhow::Result<bool> {
+        let outcome = match self
+            .swap_service_slot_task_id_for_cutover(
+                spec.id,
+                spec.manifest_id,
+                &slot.template.name,
+                slot.replica,
+                previous_task_id,
+                replacement_task_id,
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.abort_replacement_task_best_effort(
+                    &spec.service_name,
+                    replacement_task_id,
+                    abort_context,
+                )
+                .await;
+                return Err(err);
+            }
+        };
+
+        match outcome {
+            ServiceSlotCutover::Applied => {
+                self.clear_slot_missing(key).await;
+                self.withdraw_and_stop_superseded_task_best_effort(
+                    &spec.service_name,
+                    previous_task_id,
+                    health_snapshot,
+                )
+                .await;
+                Ok(true)
+            }
+            ServiceSlotCutover::Stale {
+                current_task_id,
+                reason,
+            } => {
+                tracing::debug!(
+                    target: "services",
+                    service = %spec.service_name,
+                    template = %slot.template.name,
+                    replica = slot.replica,
+                    previous_task = %previous_task_id,
+                    replacement_task = %replacement_task_id,
+                    current_task = ?current_task_id,
+                    stale_reason = reason.as_str(),
+                    "replacement lost service slot cutover race"
+                );
+                self.abort_replacement_task_best_effort(
+                    &spec.service_name,
+                    replacement_task_id,
+                    "stale replacement lost service slot cutover race",
+                )
+                .await;
+                self.clear_slot_missing(key).await;
+                Ok(false)
+            }
+        }
+    }
+
     /// Stops a failed replacement task that never became the desired slot owner.
     async fn abort_replacement_task_best_effort(
         &self,
@@ -727,12 +785,21 @@ impl ServiceController {
             .request_workload_stop(replacement_task_id)
             .await
         {
-            tracing::warn!(
-                target: "services",
-                service = %service_name,
-                replacement_task = %replacement_task_id,
-                "{context}; failed to stop superseded replacement: {err:#}"
-            );
+            if service_cleanup_stop_error_is_transient(&err) {
+                tracing::debug!(
+                    target: "services",
+                    service = %service_name,
+                    replacement_task = %replacement_task_id,
+                    "{context}; replacement stop deferred after transient cleanup failure: {err:#}"
+                );
+            } else {
+                tracing::warn!(
+                    target: "services",
+                    service = %service_name,
+                    replacement_task = %replacement_task_id,
+                    "{context}; failed to stop superseded replacement: {err:#}"
+                );
+            }
         }
     }
 
@@ -760,12 +827,21 @@ impl ServiceController {
             .request_workload_stop(superseded_task_id)
             .await
         {
-            tracing::warn!(
-                target: "services",
-                service = %service_name,
-                task = %superseded_task_id,
-                "failed to stop superseded task after cutover: {err:#}"
-            );
+            if service_cleanup_stop_error_is_transient(&err) {
+                tracing::debug!(
+                    target: "services",
+                    service = %service_name,
+                    task = %superseded_task_id,
+                    "deferred superseded task cleanup after transient stop failure: {err:#}"
+                );
+            } else {
+                tracing::warn!(
+                    target: "services",
+                    service = %service_name,
+                    task = %superseded_task_id,
+                    "failed to stop superseded task after cutover: {err:#}"
+                );
+            }
             self.retire_down_superseded_service_task_best_effort(
                 service_name,
                 superseded_task_id,
@@ -794,12 +870,21 @@ impl ServiceController {
         {
             Ok(spec) => spec,
             Err(err) => {
-                tracing::warn!(
-                    target: "services",
-                    service = %service_name,
-                    task = %superseded_task_id,
-                    "failed to inspect superseded task after stop failure: {err:#}"
-                );
+                if service_cleanup_stop_error_is_transient(&err) {
+                    tracing::debug!(
+                        target: "services",
+                        service = %service_name,
+                        task = %superseded_task_id,
+                        "superseded task already absent during cleanup inspection: {err:#}"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "services",
+                        service = %service_name,
+                        task = %superseded_task_id,
+                        "failed to inspect superseded task after stop failure: {err:#}"
+                    );
+                }
                 return;
             }
         };
@@ -916,6 +1001,7 @@ impl Drop for SlotGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     /// Preferred placement keeps the deterministic slot target while the node is usable.
     #[test]
@@ -942,5 +1028,29 @@ mod tests {
         let health = HashMap::from([(node, HealthStatus::Down)]);
 
         assert_eq!(preferred_slot_node(node, &health, true), None);
+    }
+
+    /// Missing remote sessions are retryable cleanup noise during view transitions.
+    #[test]
+    fn service_cleanup_stop_error_treats_missing_session_as_transient() {
+        let err = anyhow!("no active session for peer 00000000-0000-0000-0000-000000000001");
+
+        assert!(service_cleanup_stop_error_is_transient(&err));
+    }
+
+    /// Unrelated cleanup errors remain warnable so real storage failures still surface.
+    #[test]
+    fn service_cleanup_stop_error_keeps_unrelated_errors_warnable() {
+        let err = anyhow!("permission denied while updating workload store");
+
+        assert!(!service_cleanup_stop_error_is_transient(&err));
+    }
+
+    /// Generic remote stop failures remain warnable until their cause is known to be benign.
+    #[test]
+    fn service_cleanup_stop_error_keeps_generic_remote_stop_warnable() {
+        let err = anyhow!("stop request failed on peer 00000000-0000-0000-0000-000000000001");
+
+        assert!(!service_cleanup_stop_error_is_transient(&err));
     }
 }
