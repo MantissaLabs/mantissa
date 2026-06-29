@@ -684,12 +684,12 @@ impl ClusterTransitionParticipant for MergeServiceParticipant {
 }
 
 impl Topology {
-    /// Resolves the target view this node should activate when committing the operation.
-    pub(in crate::topology) fn local_target_view_for_operation(
+    /// Resolves the target view for an operation this node is known to participate in.
+    pub(in crate::topology) fn target_view_for_local_participant(
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<ClusterViewId, capnp::Error> {
-        if let Some(target) = self.local_target_view_for_operation_if_assigned(operation)? {
+        if let Some(target) = self.target_view_if_local_participant(operation)? {
             return Ok(target);
         }
 
@@ -699,8 +699,8 @@ impl Topology {
         )))
     }
 
-    /// Resolves this node's target view, returning `None` for split operations outside its lineage.
-    pub(in crate::topology) fn local_target_view_for_operation_if_assigned(
+    /// Resolves this node's target view, returning `None` when a split excludes this node.
+    pub(in crate::topology) fn target_view_if_local_participant(
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<Option<ClusterViewId>, capnp::Error> {
@@ -733,6 +733,45 @@ impl Topology {
                             operation.id, self.local.node.id, assignment.target_index
                         ))
                     })
+            }
+        }
+    }
+
+    /// Returns the target view when a finalized operation affects this node's active view.
+    pub(in crate::topology) fn target_view_if_finalized_operation_affects_active_view(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<Option<ClusterViewId>, capnp::Error> {
+        let active_view = self.active_cluster_view();
+        match operation.kind {
+            ClusterOperationKind::Merge => {
+                let Some(target_view) = operation.target_views.first().copied() else {
+                    return Err(capnp::Error::failed(format!(
+                        "merge operation {} missing target view",
+                        operation.id
+                    )));
+                };
+                if operation.source_views.contains(&active_view)
+                    || operation.target_views.contains(&active_view)
+                {
+                    Ok(Some(target_view))
+                } else {
+                    Ok(None)
+                }
+            }
+            ClusterOperationKind::Split => {
+                if operation.source_views.contains(&active_view) {
+                    return self.target_view_for_local_participant(operation).map(Some);
+                }
+
+                let Some(target_view) = self.target_view_if_local_participant(operation)? else {
+                    return Ok(None);
+                };
+                if active_view == target_view {
+                    Ok(Some(target_view))
+                } else {
+                    Ok(None)
+                }
             }
         }
     }

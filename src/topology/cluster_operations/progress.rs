@@ -515,7 +515,7 @@ impl Topology {
     }
 
     /// Returns whether a non-terminal operation can advance from this node's active view.
-    fn operation_can_progress_on_local_view(
+    fn non_terminal_operation_affects_active_view(
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<bool, capnp::Error> {
@@ -532,47 +532,6 @@ impl Topology {
                     || operation.target_views.contains(&active_view))
             }
             ClusterOperationKind::Split => Ok(operation.source_views.contains(&active_view)),
-        }
-    }
-
-    /// Returns how a finalized operation should affect this node's current lineage view.
-    fn finalized_operation_applies_to_local_view(
-        &self,
-        operation: &ClusterOperationRecord,
-    ) -> Result<Option<ClusterViewId>, capnp::Error> {
-        let active_view = self.active_cluster_view();
-        match operation.kind {
-            ClusterOperationKind::Merge => {
-                let Some(target_view) = operation.target_views.first().copied() else {
-                    return Err(capnp::Error::failed(format!(
-                        "merge operation {} missing target view",
-                        operation.id
-                    )));
-                };
-                if operation.source_views.contains(&active_view)
-                    || operation.target_views.contains(&active_view)
-                {
-                    Ok(Some(target_view))
-                } else {
-                    Ok(None)
-                }
-            }
-            ClusterOperationKind::Split => {
-                if operation.source_views.contains(&active_view) {
-                    return self.local_target_view_for_operation(operation).map(Some);
-                }
-
-                let Some(target_view) =
-                    self.local_target_view_for_operation_if_assigned(operation)?
-                else {
-                    return Ok(None);
-                };
-                if active_view == target_view {
-                    Ok(Some(target_view))
-                } else {
-                    Ok(None)
-                }
-            }
         }
     }
 
@@ -671,7 +630,7 @@ impl Topology {
                     | ClusterOperationStage::Prepared
                     | ClusterOperationStage::Committed
             )
-            && self.operation_can_progress_on_local_view(operation)?
+            && self.non_terminal_operation_affects_active_view(operation)?
             && self.operation_ready_to_progress(operation)?)
     }
 
@@ -896,39 +855,6 @@ impl Topology {
         Ok(())
     }
 
-    /// Applies finalized relay side effects once without rebroadcasting the finalized record.
-    pub(in crate::topology) async fn apply_finalized_operation_side_effects_once(
-        &self,
-        operation: &ClusterOperationRecord,
-    ) -> Result<(), capnp::Error> {
-        let _guard = self.runtime.cluster_operation_gate.gate.lock().await;
-        let Some(target) = self.finalized_operation_applies_to_local_view(operation)? else {
-            debug!(
-                target: "cluster_view",
-                operation_id = %operation.id,
-                kind = ?operation.kind,
-                active_view = %self.active_cluster_view(),
-                "skipping finalized operation outside local cluster lineage"
-            );
-            return Ok(());
-        };
-        if operation.kind != ClusterOperationKind::Merge && self.active_cluster_view() == target {
-            return Ok(());
-        }
-        if let Err(err) = self.apply_committed_operation_side_effects(operation).await {
-            if Self::is_commit_precondition_failure(&err) {
-                debug!(
-                    target: "cluster_view",
-                    operation_id = %operation.id,
-                    "skipping finalized operation side effects due to commit precondition mismatch: {err}"
-                );
-                return Ok(());
-            }
-            return Err(err);
-        }
-        Ok(())
-    }
-
     /// Re-runs master-key adoption after a committed transition changes the active view.
     async fn reconcile_secret_master_keys_for_view(&self, view: ClusterViewId) {
         let reconciler = SecretMasterKeyReconciler::new(
@@ -1012,7 +938,9 @@ impl Topology {
                 continue;
             }
 
-            let Some(target) = self.finalized_operation_applies_to_local_view(&operation)? else {
+            let Some(target) =
+                self.target_view_if_finalized_operation_affects_active_view(&operation)?
+            else {
                 debug!(
                     target: "cluster_view",
                     operation_id = %operation.id,
@@ -1079,7 +1007,7 @@ impl Topology {
             }
             return Ok(());
         }
-        if !self.operation_can_progress_on_local_view(&operation)? {
+        if !self.non_terminal_operation_affects_active_view(&operation)? {
             debug!(
                 target: "cluster_view",
                 operation_id = %operation.id,
@@ -1298,7 +1226,7 @@ impl Topology {
                 continue;
             }
 
-            let local_target_view = match self.local_target_view_for_operation(&operation) {
+            let local_target_view = match self.target_view_for_local_participant(&operation) {
                 Ok(view) => view,
                 Err(err) => {
                     warn!(

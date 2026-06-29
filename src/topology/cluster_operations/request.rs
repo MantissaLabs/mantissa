@@ -8,7 +8,7 @@ use crate::node::id::read_node_id;
 use crate::topology::Topology;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 type ParsedSplitTargets = (Vec<SplitTargetSpec>, Vec<ClusterViewId>, Vec<String>);
@@ -323,20 +323,31 @@ impl Topology {
                 self.trigger_operation_progress(merged.id, false);
             }
             ClusterOperationStage::Finalized => {
-                let target = self.local_target_view_for_operation(&merged)?;
-                if (merged.kind == ClusterOperationKind::Merge
-                    || self.active_cluster_view() != target)
-                    && let Err(err) = self.apply_committed_operation_side_effects(&merged).await
+                if let Some(target) =
+                    self.target_view_if_finalized_operation_affects_active_view(&merged)?
                 {
-                    if Self::is_commit_precondition_failure(&err) {
-                        warn!(
-                            target: "cluster_view",
-                            operation_id = %merged.id,
-                            "skipped finalized operation side effects due to commit precondition mismatch: {err}"
-                        );
-                    } else {
-                        return Err(err);
+                    if (merged.kind == ClusterOperationKind::Merge
+                        || self.active_cluster_view() != target)
+                        && let Err(err) = self.apply_committed_operation_side_effects(&merged).await
+                    {
+                        if Self::is_commit_precondition_failure(&err) {
+                            warn!(
+                                target: "cluster_view",
+                                operation_id = %merged.id,
+                                "skipped finalized operation side effects due to commit precondition mismatch: {err}"
+                            );
+                        } else {
+                            return Err(err);
+                        }
                     }
+                } else {
+                    debug!(
+                        target: "cluster_view",
+                        operation_id = %merged.id,
+                        kind = ?merged.kind,
+                        active_view = %self.active_cluster_view(),
+                        "accepted finalized operation outside local cluster lineage"
+                    );
                 }
             }
             ClusterOperationStage::Aborted => {}
