@@ -4,7 +4,7 @@ use std::io::Cursor;
 
 use capnp::message::ReaderOptions;
 use libfuzzer_sys::fuzz_target;
-use mantissa::network::types::NetworkDriver;
+use mantissa::network::types::{NetworkDriver, NetworkRealizationPolicy};
 use mantissa::scheduler::placement::{
     PlacementConstraint, PlacementConstraintOperator, PlacementConstraintSelector, PlacementPolicy,
     PlacementStrategy,
@@ -354,6 +354,11 @@ impl WorkloadCodecInput {
                 1 => WorkloadNetworkIpFamily::Ipv4,
                 _ => WorkloadNetworkIpFamily::Ipv6,
             },
+            realization: self.flag(8).then_some(if self.flag(9) {
+                NetworkRealizationPolicy::OnDemand
+            } else {
+                NetworkRealizationPolicy::AllNodes
+            }),
         }
     }
 

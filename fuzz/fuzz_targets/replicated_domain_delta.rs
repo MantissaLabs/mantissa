@@ -5,8 +5,10 @@ use std::sync::Arc;
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use mantissa::cluster::SUPPORTED_ROOT_SCHEMA_VERSION;
+use mantissa::store::replicated::cluster_operations::open_cluster_operation_domain_store;
 use mantissa::store::replicated::agents::open_agent_store;
 use mantissa::store::replicated::cluster_views::ClusterViewDomainStoreInner;
+use mantissa::store::replicated::ingress::open_ingress_pool_store;
 use mantissa::store::replicated::jobs::open_job_store;
 use mantissa::store::replicated::networks::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
@@ -185,8 +187,11 @@ async fn open_registry(actor: Uuid) -> (TempDir, ReplicatedStoreRegistry) {
             ClusterViewDomainStoreInner::open(db.clone(), actor)
                 .expect("open cluster view domain store"),
         ),
+        cluster_operations: open_cluster_operation_domain_store(db.clone(), actor)
+            .expect("open cluster operation store"),
         volumes: open_volume_spec_store(db.clone(), actor).expect("open volume specs store"),
         volume_nodes: open_volume_node_store(db.clone(), actor).expect("open volume nodes store"),
+        ingress_pools: open_ingress_pool_store(db.clone(), actor).expect("open ingress pool store"),
         scheduler_digests: open_scheduler_digest_store(db, actor)
             .expect("open scheduler digest store"),
     };

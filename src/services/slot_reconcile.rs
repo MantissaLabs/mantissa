@@ -33,6 +33,12 @@ struct SlotReconcileEnv<'a> {
     service_degraded: bool,
 }
 
+/// Task identities involved in a start-first slot replacement.
+struct SlotReplacementIds {
+    previous_task_id: Uuid,
+    replacement_task_id: Uuid,
+}
+
 /// Returns the preferred slot target only while the target is still eligible.
 ///
 /// Reconciliation computes placement targets from a point-in-time eligible-node snapshot, but drain
@@ -484,8 +490,10 @@ impl ServiceController {
                         .settle_slot_replacement(
                             spec,
                             slot,
-                            task_id,
-                            replacement_task_id,
+                            SlotReplacementIds {
+                                previous_task_id: task_id,
+                                replacement_task_id,
+                            },
                             health_snapshot,
                             key,
                             "preferred replacement could not claim service slot",
@@ -564,8 +572,10 @@ impl ServiceController {
             .settle_slot_replacement(
                 spec,
                 slot,
-                task_id,
-                replacement_task_id,
+                SlotReplacementIds {
+                    previous_task_id: task_id,
+                    replacement_task_id,
+                },
                 health_snapshot,
                 key,
                 "fallback replacement could not claim service slot",
@@ -673,8 +683,10 @@ impl ServiceController {
             .settle_slot_replacement(
                 spec,
                 slot,
-                task.id,
-                replacement_task_id,
+                SlotReplacementIds {
+                    previous_task_id: task.id,
+                    replacement_task_id,
+                },
                 health_snapshot,
                 key,
                 "rebalance replacement could not claim service slot",
@@ -706,8 +718,7 @@ impl ServiceController {
         &self,
         spec: &ServiceSpecValue,
         slot: &ReplicaSlot,
-        previous_task_id: Uuid,
-        replacement_task_id: Uuid,
+        task_ids: SlotReplacementIds,
         health_snapshot: &HashMap<Uuid, HealthStatus>,
         key: &SlotKey,
         abort_context: &str,
@@ -718,8 +729,8 @@ impl ServiceController {
                 spec.manifest_id,
                 &slot.template.name,
                 slot.replica,
-                previous_task_id,
-                replacement_task_id,
+                task_ids.previous_task_id,
+                task_ids.replacement_task_id,
             )
             .await
         {
@@ -727,7 +738,7 @@ impl ServiceController {
             Err(err) => {
                 self.abort_replacement_task_best_effort(
                     &spec.service_name,
-                    replacement_task_id,
+                    task_ids.replacement_task_id,
                     abort_context,
                 )
                 .await;
@@ -740,7 +751,7 @@ impl ServiceController {
                 self.clear_slot_missing(key).await;
                 self.withdraw_and_stop_superseded_task_best_effort(
                     &spec.service_name,
-                    previous_task_id,
+                    task_ids.previous_task_id,
                     health_snapshot,
                 )
                 .await;
@@ -755,15 +766,15 @@ impl ServiceController {
                     service = %spec.service_name,
                     template = %slot.template.name,
                     replica = slot.replica,
-                    previous_task = %previous_task_id,
-                    replacement_task = %replacement_task_id,
+                    previous_task = %task_ids.previous_task_id,
+                    replacement_task = %task_ids.replacement_task_id,
                     current_task = ?current_task_id,
                     stale_reason = reason.as_str(),
                     "replacement lost service slot cutover race"
                 );
                 self.abort_replacement_task_best_effort(
                     &spec.service_name,
-                    replacement_task_id,
+                    task_ids.replacement_task_id,
                     "stale replacement lost service slot cutover race",
                 )
                 .await;

@@ -363,6 +363,19 @@ pub struct TestNode {
     pub node: Box<HeadlessNode>,
 }
 
+/// Optional in-process node settings used by test constructors.
+#[derive(Default)]
+struct InprocConfigOverrides {
+    sync_tick: Option<Duration>,
+    sync_fanout: Option<usize>,
+    gossip_tick: Option<Duration>,
+    gossip_fanout: Option<usize>,
+    gossip_channel_capacity: Option<usize>,
+    task_runtime: Option<WorkloadRuntimeConfig>,
+    service_timing: Option<ServiceControllerTiming>,
+    runtime_health: Option<RuntimeHealthConfig>,
+}
+
 impl TestNode {
     /// Resolves the runtime to inject into the next headless node this test creates.
     fn apply_test_runtime_backend(mut cfg: HeadlessConfig) -> HeadlessConfig {
@@ -373,43 +386,34 @@ impl TestNode {
     }
 
     /// Builds the shared in-process config used by local tests.
-    fn inproc_config(
-        sync_tick: Option<Duration>,
-        sync_fanout: Option<usize>,
-        gossip_tick: Option<Duration>,
-        gossip_fanout: Option<usize>,
-        gossip_channel_capacity: Option<usize>,
-        task_runtime: Option<WorkloadRuntimeConfig>,
-        service_timing: Option<ServiceControllerTiming>,
-        runtime_health: Option<RuntimeHealthConfig>,
-    ) -> HeadlessConfig {
+    fn inproc_config(overrides: InprocConfigOverrides) -> HeadlessConfig {
         HeadlessConfig {
             listen_addr: "127.0.0.1:0".to_string(),
             transport: HeadlessTransport::Inproc,
             root_schema_override: None,
-            sync_tick,
-            sync_fanout,
-            global_metadata_sync_tick: sync_tick,
-            global_metadata_sync_fanout: sync_fanout,
-            gossip_tick,
-            gossip_fanout,
+            sync_tick: overrides.sync_tick,
+            sync_fanout: overrides.sync_fanout,
+            global_metadata_sync_tick: overrides.sync_tick,
+            global_metadata_sync_fanout: overrides.sync_fanout,
+            gossip_tick: overrides.gossip_tick,
+            gossip_fanout: overrides.gossip_fanout,
             network_reconcile_tick: None,
             network_attachment_refresh_tick: None,
-            gossip_channel_capacity,
-            task_runtime,
+            gossip_channel_capacity: overrides.gossip_channel_capacity,
+            task_runtime: overrides.task_runtime,
             runtime_set: None,
             local_volume_root: None,
             master_key_kdf_params: None,
             store_gc_config: None,
-            service_timing,
-            runtime_health,
+            service_timing: overrides.service_timing,
+            runtime_health: overrides.runtime_health,
         }
     }
 
     /// Start a node with in-process transport (fast path).
     pub async fn new() -> Self {
         let node = HeadlessNode::new_with_config(Self::apply_test_runtime_backend(
-            Self::inproc_config(None, None, None, None, None, None, None, None),
+            Self::inproc_config(InprocConfigOverrides::default()),
         ))
         .await
         .expect("headless inproc node");
@@ -420,7 +424,10 @@ impl TestNode {
 
     pub async fn new_with_fanout(fanout: usize) -> Self {
         let node = HeadlessNode::new_with_config(Self::apply_test_runtime_backend(
-            Self::inproc_config(None, None, None, Some(fanout), None, None, None, None),
+            Self::inproc_config(InprocConfigOverrides {
+                gossip_fanout: Some(fanout),
+                ..InprocConfigOverrides::default()
+            }),
         ))
         .await
         .expect("headless inproc node (custom fanout)");
@@ -450,19 +457,14 @@ impl TestNode {
 
     /// Start a node with in-process transport and a custom periodic sync tick.
     pub async fn new_with_tick_ms(ms: u64) -> Self {
-        let node =
-            HeadlessNode::new_with_config(Self::apply_test_runtime_backend(Self::inproc_config(
-                Some(Duration::from_millis(ms)),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )))
-            .await
-            .expect("headless inproc node (with tick)");
+        let node = HeadlessNode::new_with_config(Self::apply_test_runtime_backend(
+            Self::inproc_config(InprocConfigOverrides {
+                sync_tick: Some(Duration::from_millis(ms)),
+                ..InprocConfigOverrides::default()
+            }),
+        ))
+        .await
+        .expect("headless inproc node (with tick)");
         Self {
             node: Box::new(node),
         }
@@ -1119,16 +1121,16 @@ async fn build_inproc_node_with_config(cfg: ClusterConfig) -> HeadlessNode {
     let (sync_tick, sync_fanout, gossip_fanout) = cfg.as_options();
     let gossip_tick = cfg.gossip_tick_ms.map(std::time::Duration::from_millis);
     let gossip_channel_capacity = cfg.gossip_channel_capacity;
-    let headless_cfg = TestNode::inproc_config(
+    let headless_cfg = TestNode::inproc_config(InprocConfigOverrides {
         sync_tick,
         sync_fanout,
         gossip_tick,
         gossip_fanout,
         gossip_channel_capacity,
-        cfg.task_runtime_config(),
-        cfg.service_timing,
-        cfg.runtime_health,
-    );
+        task_runtime: cfg.task_runtime_config(),
+        service_timing: cfg.service_timing,
+        runtime_health: cfg.runtime_health,
+    });
     let headless_cfg = HeadlessConfig {
         master_key_kdf_params: cfg.master_key_kdf_params,
         store_gc_config: cfg.store_gc_config,

@@ -9,7 +9,7 @@ use mantissa::agents::types::{
 use mantissa::jobs::types::{JobRetryPolicy, JobSpecValue};
 use mantissa::scheduler::placement::PlacementPolicy;
 use mantissa::services::types::{
-    ServiceSpecValue, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
+    PublicIngressPolicy, ServiceSpecValue, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
 };
 use mantissa::workload::model::{
     ExecutionPlatform, IsolationMode, ServiceGenerationProgressRecord, WorkloadAdmissionGroupPhase,
@@ -122,6 +122,7 @@ fn assert_services_roundtrip(input: &ControllerInput) {
         readiness: None,
         public_port: None,
         public_protocol: None,
+        public_ingress: PublicIngressPolicy::AllNodes,
         placement_preferences: Vec::new(),
         autoscale: None,
     };

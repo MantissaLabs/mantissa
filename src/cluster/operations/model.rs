@@ -536,7 +536,7 @@ mod tests {
 
         let operation = merge_operation(0x10, Finalized, false, 100, view_a, view_b);
         let invalidating = merge_operation(0x20, Proposed, false, 200, view_b, view_c);
-        let known_operations = vec![
+        let known_operations = [
             operation.clone(),
             merge_operation(0x21, Prepared, false, 300, view_b, view_d),
             merge_operation(0x22, Aborted, false, 150, view_b, view_d),

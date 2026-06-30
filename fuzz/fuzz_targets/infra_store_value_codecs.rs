@@ -2,6 +2,7 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
+use mantissa::cluster::ClusterViewId;
 use mantissa::network::types::{
     BpfAttachPoint, BpfProgramSpec, NetworkAttachmentDraft, NetworkAttachmentState,
     NetworkAttachmentValue, NetworkDriver, NetworkPeerState, NetworkPeerStateValue,
@@ -230,8 +231,10 @@ fn assert_cluster_view_metadata_roundtrips(input: &InfraInput) {
         }),
         node_count: flag(input.flags, 6).then_some(ClusterNodeCountRecord {
             node_count: input.numbers[1] as u32,
+            source_view: ClusterViewId::legacy_default(),
             updated_at_unix_ms: input.numbers[2],
             actor_node_id: uuid(input.other_seed, 31),
+            membership_generation: input.numbers[3],
         }),
     };
 

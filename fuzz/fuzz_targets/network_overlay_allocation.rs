@@ -7,7 +7,9 @@ use mantissa::network::allocator::{
     OverlayAddressAllocator, OverlayIpFamily, ParsedOverlaySubnet, allocate_overlay_address,
     parse_overlay_cidr, resolver_ip_address,
 };
-use mantissa::network::types::{NetworkDriver, NetworkSpecValue, NetworkStatus};
+use mantissa::network::types::{
+    NetworkDriver, NetworkRealizationPolicy, NetworkSpecValue, NetworkStatus,
+};
 use uuid::Uuid;
 
 const MAX_TEXT_BYTES: usize = 256;
@@ -137,6 +139,7 @@ fn network_value(cidr: &str, id: Uuid, salt: u8) -> NetworkSpecValue {
         updated_at: "2026-03-25T00:00:00Z".to_string(),
         status: NetworkStatus::Ready,
         sealed: false,
+        realization: NetworkRealizationPolicy::AllNodes,
         bpf_programs: Vec::new(),
     }
 }
