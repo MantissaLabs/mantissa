@@ -17,7 +17,7 @@
         ),
     ],
     execution: (
-        image: "mantissa/codex-sandbox:0.132.0",
+        image: "mantissa/codex-sandbox:0.142.4",
         resources: (
             cpu_millis: 1000,
             memory_mb: 1024,
