@@ -3816,40 +3816,70 @@ local_test!(
         wait_for_cluster_view(&cluster[2].topology(), view_c, Duration::from_secs(5)).await;
         wait_for_cluster_view(&cluster[3].topology(), view_d, Duration::from_secs(5)).await;
 
-        let merge_ab_client = cluster[0].topology();
-        let merge_cd_client = cluster[2].topology();
-        let (merge_ab_id, merge_cd_id) = tokio::join!(
-            request_merge_operation(&merge_ab_client, view_a, view_b),
-            request_merge_operation(&merge_cd_client, view_c, view_d)
+        let merge_ca_client = cluster[0].topology();
+        let merge_db_client = cluster[1].topology();
+        let (merge_ca_id, merge_db_id) = tokio::join!(
+            request_merge_operation(&merge_ca_client, view_c, view_a),
+            request_merge_operation(&merge_db_client, view_d, view_b)
         );
-        let merge_bd_id = request_merge_operation(&cluster[1].topology(), view_b, view_d).await;
+        let merge_ba_id = request_merge_operation(&cluster[0].topology(), view_b, view_a).await;
 
         wait_for_operation_stage(
             &cluster[0].topology(),
-            &merge_ab_id,
-            ClusterOperationStage::Finalized,
-            Duration::from_secs(10),
-        )
-        .await;
-        wait_for_operation_stage(
-            &cluster[2].topology(),
-            &merge_cd_id,
+            &merge_ca_id,
             ClusterOperationStage::Finalized,
             Duration::from_secs(10),
         )
         .await;
         wait_for_operation_stage(
             &cluster[1].topology(),
-            &merge_bd_id,
+            &merge_db_id,
+            ClusterOperationStage::Finalized,
+            Duration::from_secs(10),
+        )
+        .await;
+        wait_for_operation_stage(
+            &cluster[0].topology(),
+            &merge_ba_id,
             ClusterOperationStage::Finalized,
             Duration::from_secs(10),
         )
         .await;
 
         for node in &cluster {
-            wait_for_cluster_view(&node.topology(), view_d, Duration::from_secs(10)).await;
+            wait_for_cluster_view(&node.topology(), view_a, Duration::from_secs(10)).await;
         }
         TestNode::assert_cluster_size_all(cluster.as_slice(), 4, "merged fast chain cluster").await;
+
+        for _ in 0..5 {
+            for node in &cluster {
+                node.node.sync_once_now();
+            }
+            sleep(Duration::from_millis(150)).await;
+            for node in &cluster {
+                assert_eq!(
+                    current_cluster_view(&node.topology()).await,
+                    view_a,
+                    "forced metadata sync must not resurrect an intermediate merge view"
+                );
+            }
+        }
+
+        for node in &cluster {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+            loop {
+                let rows = cluster_view_rows(&node.topology()).await;
+                if rows.len() == 1 && rows[0].0 == view_a && rows[0].1 == 4 && rows[0].2 {
+                    break;
+                }
+
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "fast chained merge view listing did not settle after forced sync; rows={rows:?}"
+                );
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
     }
 );
 

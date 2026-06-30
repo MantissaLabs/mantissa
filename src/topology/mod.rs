@@ -268,6 +268,15 @@ impl Topology {
     #[allow(dead_code)]
     pub fn set_active_cluster_view(&self, next: ClusterViewId) -> ClusterViewId {
         let previous = self.local.cluster_view.set_active_view(next);
+        if previous == next {
+            debug!(
+                target: "cluster_view",
+                active_view = %next,
+                "active cluster view already current"
+            );
+            return previous;
+        }
+
         info!(
             target: "cluster_view",
             previous = %previous,

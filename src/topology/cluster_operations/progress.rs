@@ -50,6 +50,17 @@ impl Topology {
 
         let local_view = self.active_cluster_view();
         let node_count = self.local_cluster_view_member_count().await?;
+        if let Some(current) = self
+            .stores
+            .cluster_view_store
+            .winning_cluster_node_count_for(local_view.cluster_id)
+            .map_err(|err| capnp::Error::failed(err.to_string()))?
+            && current.source_view == local_view
+            && current.node_count == node_count
+        {
+            return Ok(false);
+        }
+
         let record = ClusterNodeCountRecord {
             node_count,
             source_view: local_view,
@@ -464,12 +475,12 @@ impl Topology {
         operation: &ClusterOperationRecord,
     ) -> Result<HashSet<ClusterViewId>, capnp::Error> {
         let mut retired = HashSet::new();
-        let operation_key = Self::operation_execution_key(operation);
+        let operation_key = operation.lineage_order_key();
         for candidate in self.load_cluster_operations()? {
             if candidate.id == operation.id
                 || candidate.dry_run
                 || candidate.kind != ClusterOperationKind::Merge
-                || Self::operation_execution_key(&candidate) >= operation_key
+                || candidate.lineage_order_key() >= operation_key
             {
                 continue;
             }
@@ -506,20 +517,6 @@ impl Topology {
             stage,
             ClusterOperationStage::Finalized | ClusterOperationStage::Aborted
         )
-    }
-
-    /// Returns the stable creation time used for operation ordering.
-    fn operation_created_at_unix_ms(operation: &ClusterOperationRecord) -> u64 {
-        if operation.created_at_unix_ms == 0 {
-            operation.updated_at_unix_ms
-        } else {
-            operation.created_at_unix_ms
-        }
-    }
-
-    /// Returns the stable operation order used when several ready operations overlap.
-    fn operation_execution_key(operation: &ClusterOperationRecord) -> (u64, Uuid) {
-        (Self::operation_created_at_unix_ms(operation), operation.id)
     }
 
     /// Returns every lineage view touched by this operation for overlap fencing.
@@ -577,13 +574,13 @@ impl Topology {
             return Ok(None);
         }
 
-        let operation_key = Self::operation_execution_key(operation);
+        let operation_key = operation.lineage_order_key();
         let mut predecessors = Vec::new();
         for candidate in self.load_cluster_operations()? {
             if candidate.id == operation.id
                 || candidate.dry_run
                 || Self::operation_stage_is_terminal(candidate.stage)
-                || Self::operation_execution_key(&candidate) >= operation_key
+                || candidate.lineage_order_key() >= operation_key
                 || !Self::operations_overlap(&candidate, operation)
             {
                 continue;
@@ -591,7 +588,7 @@ impl Topology {
             predecessors.push(candidate);
         }
 
-        predecessors.sort_by_key(Self::operation_execution_key);
+        predecessors.sort_by_key(ClusterOperationRecord::lineage_order_key);
         Ok(predecessors.into_iter().next_back())
     }
 
@@ -627,7 +624,7 @@ impl Topology {
             }
         }
 
-        active.sort_by_key(Self::operation_execution_key);
+        active.sort_by_key(ClusterOperationRecord::lineage_order_key);
 
         Ok(active.into_iter().next())
     }
@@ -646,7 +643,7 @@ impl Topology {
             }
         }
 
-        active.sort_by_key(Self::operation_execution_key);
+        active.sort_by_key(ClusterOperationRecord::lineage_order_key);
 
         Ok(active.into_iter().next())
     }
@@ -903,18 +900,30 @@ impl Topology {
             && !self.excluded_peers_snapshot().await.is_empty()
     }
 
-    /// Refreshes merge metadata when the active view is correct but local counters are stale.
+    /// Refreshes merge node-count metadata when the active view is correct but counters are stale.
     ///
-    /// This path avoids replaying all transition participants for merges that are already installed.
-    /// It only reruns idempotent local work needed to make membership-dependent metadata converge:
-    /// durable active-view persistence, master-key reconciliation, session-scope refresh, and
-    /// cluster node-count publication.
+    /// This path intentionally avoids replaying transition participants or rewriting the active
+    /// view. If a later known merge will retire this view, the newer operation owns convergence.
     pub(in crate::topology) async fn refresh_finalized_merge_membership_metadata_if_stale(
         &self,
         operation: &ClusterOperationRecord,
         target_view: ClusterViewId,
     ) -> Result<(), capnp::Error> {
         if operation.kind != ClusterOperationKind::Merge {
+            return Ok(());
+        }
+
+        let known_operations = self.load_cluster_operations()?;
+        if let Some(invalidating_operation_id) =
+            operation.invalidating_later_merge_id_for_view(known_operations.iter(), target_view)
+        {
+            debug!(
+                target: "cluster_view",
+                operation_id = %operation.id,
+                invalidating_operation_id = %invalidating_operation_id,
+                target_view = %target_view,
+                "skipping finalized merge metadata refresh for view invalidated by later merge"
+            );
             return Ok(());
         }
 
@@ -932,14 +941,24 @@ impl Topology {
             expected_members = expected,
             "refreshing finalized merge metadata"
         );
-        self.persist_active_cluster_view(target_view)?;
-        let previous = self.set_active_cluster_view(target_view);
-        self.reconcile_secret_master_keys_for_view(target_view)
-            .await;
-        self.deps.registry.clear().await;
         match self.publish_local_cluster_node_count().await {
-            Ok(true) => self.sync_once_now(),
-            Ok(false) => {}
+            Ok(true) => {
+                self.sync_once_now();
+                debug!(
+                    target: "cluster_view",
+                    operation_id = %operation.id,
+                    target_view = %target_view,
+                    "refreshed finalized merge node-count metadata"
+                );
+            }
+            Ok(false) => {
+                debug!(
+                    target: "cluster_view",
+                    operation_id = %operation.id,
+                    target_view = %target_view,
+                    "finalized merge node-count metadata already current"
+                );
+            }
             Err(err) => {
                 warn!(
                     target: "cluster_view",
@@ -949,13 +968,6 @@ impl Topology {
                 );
             }
         }
-        debug!(
-            target: "cluster_view",
-            operation_id = %operation.id,
-            previous_view = %previous,
-            target_view = %target_view,
-            "refreshed finalized merge metadata"
-        );
 
         Ok(())
     }
@@ -1118,7 +1130,7 @@ impl Topology {
         replay_context: &'static str,
     ) -> Result<(), capnp::Error> {
         let mut operations = self.load_cluster_operations()?;
-        operations.sort_by_key(Self::operation_execution_key);
+        operations.sort_by_key(ClusterOperationRecord::lineage_order_key);
 
         for operation in operations {
             let _ = self
@@ -1332,7 +1344,7 @@ impl Topology {
     /// Replays any non-finalized durable operation records so crashes do not strand topology changes.
     pub(crate) async fn replay_cluster_operations_on_startup(&self) -> Result<usize, capnp::Error> {
         let mut operations = self.load_cluster_operations()?;
-        operations.sort_by_key(Self::operation_execution_key);
+        operations.sort_by_key(ClusterOperationRecord::lineage_order_key);
 
         let mut replayed = 0usize;
         for operation in operations {
@@ -1378,7 +1390,7 @@ impl Topology {
     ) -> Result<usize, capnp::Error> {
         let active_view = self.active_cluster_view();
         let mut operations = self.load_cluster_operations()?;
-        operations.sort_by_key(Self::operation_execution_key);
+        operations.sort_by_key(ClusterOperationRecord::lineage_order_key);
 
         let mut excluded = HashSet::<Uuid>::new();
         let mut source_operation = None::<Uuid>;
