@@ -649,10 +649,7 @@ async fn query_a_records(
     let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
         .await
         .context("bind dns client socket")?;
-    let mut query = Message::new();
-    query.set_id(0x4242);
-    query.set_message_type(MessageType::Query);
-    query.set_op_code(OpCode::Query);
+    let mut query = Message::new(0x4242, MessageType::Query, OpCode::Query);
     query.add_query(Query::query(Name::from_ascii(fqdn)?, RecordType::A));
     let payload = query.to_vec()?;
 
@@ -673,12 +670,12 @@ async fn query_a_records(
         })??;
     let response = Message::from_vec(&buf[..len]).context("decode dns response")?;
     let mut ips = Vec::new();
-    for answer in response.answers() {
-        if let RData::A(ip) = answer.data() {
+    for answer in &response.answers {
+        if let RData::A(ip) = &answer.data {
             ips.push((*ip).into());
         }
     }
-    Ok((response.response_code(), ips))
+    Ok((response.metadata.response_code, ips))
 }
 
 /// Query the per-network DNS resolver for AAAA records for one service label.
@@ -689,10 +686,7 @@ async fn query_aaaa_records(
     let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
         .await
         .context("bind IPv6 dns client socket")?;
-    let mut query = Message::new();
-    query.set_id(0x4343);
-    query.set_message_type(MessageType::Query);
-    query.set_op_code(OpCode::Query);
+    let mut query = Message::new(0x4343, MessageType::Query, OpCode::Query);
     query.add_query(Query::query(Name::from_ascii(fqdn)?, RecordType::AAAA));
     let payload = query.to_vec()?;
 
@@ -717,12 +711,12 @@ async fn query_aaaa_records(
         })??;
     let response = Message::from_vec(&buf[..len]).context("decode IPv6 dns response")?;
     let mut ips = Vec::new();
-    for answer in response.answers() {
-        if let RData::AAAA(ip) = answer.data() {
+    for answer in &response.answers {
+        if let RData::AAAA(ip) = &answer.data {
             ips.push((*ip).into());
         }
     }
-    Ok((response.response_code(), ips))
+    Ok((response.metadata.response_code, ips))
 }
 
 /// Wait for the expected number of published backend attachment IPs for one network.

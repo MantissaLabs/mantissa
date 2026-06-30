@@ -482,10 +482,7 @@ async fn query_records(
     let socket = UdpSocket::bind(SocketAddr::new(client_ip, 0))
         .await
         .context("bind dns client socket")?;
-    let mut query = Message::new();
-    query.set_id(0x4242);
-    query.set_message_type(MessageType::Query);
-    query.set_op_code(OpCode::Query);
+    let mut query = Message::new(0x4242, MessageType::Query, OpCode::Query);
     query.add_query(Query::query(Name::from_ascii(fqdn)?, record_type));
     let payload = query.to_vec()?;
 
@@ -501,8 +498,8 @@ async fn query_records(
         .context("recv dns response")?;
     let response = Message::from_vec(&buf[..len]).context("decode dns response")?;
     let mut ips = Vec::new();
-    for answer in response.answers() {
-        match answer.data() {
+    for answer in &response.answers {
+        match &answer.data {
             RData::A(ip) if record_type == RecordType::A => ips.push(IpAddr::V4((*ip).into())),
             RData::AAAA(ip) if record_type == RecordType::AAAA => {
                 ips.push(IpAddr::V6((*ip).into()))
@@ -510,7 +507,7 @@ async fn query_records(
             _ => {}
         }
     }
-    Ok((response.response_code(), ips))
+    Ok((response.metadata.response_code, ips))
 }
 
 /// Sends one DNS A query and returns response code plus all A answer IPs.

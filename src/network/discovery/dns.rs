@@ -127,7 +127,7 @@ async fn handle_datagram(
     };
 
     let query_names: Vec<String> = request
-        .queries()
+        .queries
         .iter()
         .map(|q| q.name().to_string())
         .collect();
@@ -139,15 +139,16 @@ async fn handle_datagram(
         "received dns query"
     );
 
-    let mut response = Message::new();
-    response.set_id(request.id());
-    response.set_message_type(MessageType::Response);
-    response.set_op_code(request.op_code());
-    response.set_recursion_desired(request.recursion_desired());
-    response.set_recursion_available(false);
-    response.set_authoritative(true);
+    let mut response = Message::new(
+        request.metadata.id,
+        MessageType::Response,
+        request.metadata.op_code,
+    );
+    response.metadata.recursion_desired = request.metadata.recursion_desired;
+    response.metadata.recursion_available = false;
+    response.metadata.authoritative = true;
 
-    for query in request.queries() {
+    for query in &request.queries {
         response.add_query(query.clone());
     }
 
@@ -166,7 +167,7 @@ async fn handle_datagram(
         );
     }
 
-    for query in request.queries() {
+    for query in &request.queries {
         match answer_query(query, runtime).await? {
             LookupOutcome::Records(records) => {
                 for record in records {
@@ -198,7 +199,7 @@ async fn handle_datagram(
     } else {
         ResponseCode::ServFail
     };
-    response.set_response_code(code);
+    response.metadata.response_code = code;
 
     let bytes = response.to_vec().context("encode dns response")?;
     socket

@@ -12,11 +12,12 @@ use axum::{
     response::Response,
 };
 use axum_server::{Handle, tls_rustls::RustlsConfig};
+use pem::PemObject;
 use rustls::{
     DigitallySignedStruct, DistinguishedName, Error as TlsError, RootCertStore, ServerConfig,
     SignatureScheme,
     client::danger::HandshakeSignatureValid,
-    pki_types::{CertificateDer, UnixTime},
+    pki_types::{CertificateDer, PrivateKeyDer, UnixTime, pem},
     server::{
         WebPkiClientVerifier,
         danger::{ClientCertVerified, ClientCertVerifier},
@@ -26,9 +27,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     fmt,
-    fs::File,
     future::Future,
-    io::BufReader,
     net::{SocketAddr, TcpListener},
     path::Path,
     sync::Arc,
@@ -414,17 +413,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Reads one PEM certificate chain used by the REST TLS server.
-fn read_certificate_chain(
-    path: &Path,
-) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, RestServerError> {
-    let file = File::open(path).map_err(|error| {
-        RestServerError::tls(format!(
-            "open REST TLS certificate chain {}: {error}",
-            path.display()
-        ))
-    })?;
-    let mut reader = BufReader::new(file);
-    let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+fn read_certificate_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, RestServerError> {
+    let certs: Vec<_> = CertificateDer::pem_file_iter(path)
+        .map_err(|error| {
+            RestServerError::tls(format!(
+                "open REST TLS certificate chain {}: {error}",
+                path.display()
+            ))
+        })?
         .collect::<Result<_, _>>()
         .map_err(|error| {
             RestServerError::tls(format!(
@@ -442,23 +438,17 @@ fn read_certificate_chain(
 }
 
 /// Reads one PEM private key used by the REST TLS server.
-fn read_private_key(
-    path: &Path,
-) -> Result<rustls::pki_types::PrivateKeyDer<'static>, RestServerError> {
-    let file = File::open(path).map_err(|error| {
-        RestServerError::tls(format!("open REST TLS key {}: {error}", path.display()))
-    })?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|error| {
-            RestServerError::tls(format!("parse REST TLS key {}: {error}", path.display()))
-        })?
-        .ok_or_else(|| {
+fn read_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, RestServerError> {
+    PrivateKeyDer::from_pem_file(path).map_err(|error| {
+        if matches!(error, pem::Error::NoItemsFound) {
             RestServerError::tls(format!(
                 "REST TLS key {} contains no private key",
                 path.display()
             ))
-        })
+        } else {
+            RestServerError::tls(format!("parse REST TLS key {}: {error}", path.display()))
+        }
+    })
 }
 
 /// Reads a strict PEM root store used for REST client certificate validation.

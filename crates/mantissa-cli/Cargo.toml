@@ -18,7 +18,7 @@ base64 = "0.22.1"
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
 clap = { version = "4.5.45", features = ["derive", "cargo"] }
-crossterm = "0.28.1"
+crossterm = "0.29.0"
 mantissa = { path = "../.." }
 mantissa-client = { path = "../mantissa-client" }
 mantissa-net = { path = "../mantissa-net" }
