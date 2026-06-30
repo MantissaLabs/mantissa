@@ -136,7 +136,9 @@ fn select_best_service_spec(values: &[ServiceSpecValue]) -> Option<ServiceSpecVa
 mod tests {
     use super::*;
     use crate::services::types::TaskTemplateSpecValue;
-    use crate::services::types::{ServiceRolloutState, ServiceStatus};
+    use crate::services::types::{
+        ServicePreviousGeneration, ServiceRolloutPhase, ServiceRolloutState, ServiceStatus,
+    };
     use crate::store::replicated::services::open_service_store;
     use crate::workload::types::ExecutionSpec;
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -476,10 +478,90 @@ mod tests {
         assert_eq!(compare_service_specs(&candidate, &current), Ordering::Less);
     }
 
+    /// Ensures rollback history alone cannot block an ordinary fresh deploying generation.
+    #[test]
+    fn deploying_rejects_previous_generation_rollback_history_without_active_rollback() {
+        let now = Utc::now();
+        let mut candidate = build_service_value(
+            Uuid::new_v4(),
+            ServiceStatus::Running,
+            now + ChronoDuration::seconds(4),
+            vec![Uuid::new_v4()],
+        );
+        candidate.service_epoch = 31;
+        candidate.rollout = ServiceRolloutState {
+            total_steps: 1,
+            completed_steps: 0,
+            failed_steps: 1,
+            max_failures: 1,
+            last_error: Some("previous redeploy failed".into()),
+            ..ServiceRolloutState::default()
+        };
+
+        let mut current =
+            build_service_value(Uuid::new_v4(), ServiceStatus::Deploying, now, Vec::new());
+        current.service_epoch = 32;
+        current.previous_generation = Some(ServicePreviousGeneration::from_service(&candidate));
+
+        assert_eq!(compare_service_specs(&candidate, &current), Ordering::Less);
+    }
+
+    /// Ensures a retrying rollout does not accept stale rollback history before rollback starts.
+    #[test]
+    fn rolling_forward_rejects_previous_generation_rollback_history() {
+        let now = Utc::now();
+        let mut candidate = build_service_value(
+            Uuid::new_v4(),
+            ServiceStatus::Running,
+            now + ChronoDuration::seconds(4),
+            vec![Uuid::new_v4()],
+        );
+        candidate.service_epoch = 41;
+        candidate.rollout = ServiceRolloutState {
+            total_steps: 1,
+            completed_steps: 0,
+            failed_steps: 1,
+            max_failures: 1,
+            last_error: Some("previous redeploy failed".into()),
+            ..ServiceRolloutState::default()
+        };
+
+        let mut current =
+            build_service_value(Uuid::new_v4(), ServiceStatus::Deploying, now, Vec::new());
+        current.service_epoch = 42;
+        current.previous_generation = Some(ServicePreviousGeneration::from_service(&candidate));
+        current.rollout = ServiceRolloutState {
+            phase: ServiceRolloutPhase::RollingForward,
+            total_steps: 1,
+            completed_steps: 0,
+            failed_steps: 1,
+            max_failures: 2,
+            last_error: Some("retryable rollout failure".into()),
+        };
+
+        assert_eq!(compare_service_specs(&candidate, &current), Ordering::Less);
+    }
+
     /// Ensures explicit rollback completions beat the immediately newer deploying generation.
     #[test]
     fn deploying_prefers_previous_generation_running_rollback_candidate() {
         let now = Utc::now();
+        let mut candidate = build_service_value(
+            Uuid::new_v4(),
+            ServiceStatus::Running,
+            now,
+            vec![Uuid::new_v4()],
+        );
+        candidate.service_epoch = 11;
+        candidate.rollout = ServiceRolloutState {
+            total_steps: 1,
+            completed_steps: 0,
+            failed_steps: 1,
+            max_failures: 1,
+            last_error: Some("redeploy failed".into()),
+            ..ServiceRolloutState::default()
+        };
+
         let mut current = build_service_value(
             Uuid::new_v4(),
             ServiceStatus::Deploying,
@@ -487,21 +569,14 @@ mod tests {
             Vec::new(),
         );
         current.service_epoch = 12;
-
-        let mut candidate = build_service_value(
-            Uuid::new_v4(),
-            ServiceStatus::Running,
-            now + ChronoDuration::seconds(4),
-            vec![Uuid::new_v4()],
-        );
-        candidate.service_epoch = 11;
-        candidate.rollout = ServiceRolloutState {
+        current.previous_generation = Some(ServicePreviousGeneration::from_service(&candidate));
+        current.rollout = ServiceRolloutState {
+            phase: ServiceRolloutPhase::RollingBack,
             total_steps: 1,
-            completed_steps: 1,
+            completed_steps: 0,
             failed_steps: 1,
             max_failures: 1,
             last_error: Some("redeploy failed".into()),
-            ..ServiceRolloutState::default()
         };
 
         assert_eq!(

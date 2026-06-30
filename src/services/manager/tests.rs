@@ -1115,18 +1115,10 @@ fn deploying_rejects_previous_generation_failed_rollout_history_when_stale() {
 #[test]
 fn deploying_accepts_previous_generation_running_rollback() {
     let now = Utc::now();
-    let mut current = build_service_spec_with_status(
-        Uuid::new_v4(),
-        ServiceStatus::Deploying,
-        now + chrono::Duration::seconds(5),
-        Vec::new(),
-    );
-    current.service_epoch = 11;
-
     let mut incoming = build_service_spec_with_status(
         Uuid::new_v4(),
         ServiceStatus::Running,
-        now + chrono::Duration::seconds(6),
+        now,
         vec![Uuid::new_v4()],
     );
     incoming.service_epoch = 10;
@@ -1137,6 +1129,23 @@ fn deploying_accepts_previous_generation_running_rollback() {
         max_failures: 1,
         last_error: Some("redeploy failed".into()),
         ..ServiceRolloutState::default()
+    };
+
+    let mut current = build_service_spec_with_status(
+        Uuid::new_v4(),
+        ServiceStatus::Deploying,
+        now + chrono::Duration::seconds(5),
+        Vec::new(),
+    );
+    current.service_epoch = 11;
+    current.previous_generation = Some(ServicePreviousGeneration::from_service(&incoming));
+    current.rollout = ServiceRolloutState {
+        phase: ServiceRolloutPhase::RollingBack,
+        total_steps: 1,
+        completed_steps: 0,
+        failed_steps: 1,
+        max_failures: 1,
+        last_error: Some("redeploy failed".into()),
     };
 
     assert!(should_accept_update(Some(&current), &incoming));

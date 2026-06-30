@@ -1,4 +1,6 @@
-use crate::services::types::{ServiceSpecValue, ServiceStatus};
+use crate::services::types::{
+    ServicePreviousGeneration, ServiceRolloutPhase, ServiceSpecValue, ServiceStatus,
+};
 use chrono::{DateTime, Utc};
 use std::cmp::Ordering;
 
@@ -30,10 +32,10 @@ fn compare_manifest_mismatch(left: &ServiceSpecValue, right: &ServiceSpecValue) 
         return ordering;
     }
 
-    if is_immediate_rollback_result(left, right) {
+    if rollback_candidate_matches_previous_generation(left, right) {
         return Ordering::Greater;
     }
-    if is_immediate_rollback_result(right, left) {
+    if rollback_candidate_matches_previous_generation(right, left) {
         return Ordering::Less;
     }
 
@@ -97,22 +99,65 @@ fn status_is_same_generation_terminal(status: ServiceStatus) -> bool {
     )
 }
 
-/// Detects an explicit rollback result that should beat the immediately newer deploying epoch.
+/// Detects the one cross-manifest case where a rollback candidate should win.
 ///
-/// The prior generation must also be timestamp-fresher than the deploying generation so stale
-/// historical values cannot block a fresh deployment bootstrap.
-fn is_immediate_rollback_result(older: &ServiceSpecValue, newer: &ServiceSpecValue) -> bool {
-    older.service_epoch.saturating_add(1) == newer.service_epoch
-        && newer.status == ServiceStatus::Deploying
+/// During rollback, the service row for the failed replacement generation stays visible as
+/// `Deploying` with `rollout.phase == RollingBack`. That row also stores a
+/// `previous_generation` snapshot describing the generation we are trying to restore. If the
+/// replicated store later compares that failed replacement row with the restored generation, the
+/// restored generation must win even though its service epoch is lower.
+///
+/// This is intentionally narrower than "any old row with rollout history wins". A normal fresh
+/// deploy can also carry `previous_generation`, so `rolling_back_generation` must be actively
+/// rolling back and the candidate must match the saved `previous_generation` snapshot exactly.
+fn rollback_candidate_matches_previous_generation(
+    candidate: &ServiceSpecValue,
+    rolling_back_generation: &ServiceSpecValue,
+) -> bool {
+    candidate.service_epoch.saturating_add(1) == rolling_back_generation.service_epoch
+        && rolling_back_generation.status == ServiceStatus::Deploying
+        && rolling_back_generation.rollout.phase == ServiceRolloutPhase::RollingBack
         && matches!(
-            older.status,
+            candidate.status,
             ServiceStatus::Running
                 | ServiceStatus::Stopped
                 | ServiceStatus::Failed
                 | ServiceStatus::VolumeUnavailable
         )
-        && carries_rollout_history(older)
-        && compare_timestamps(&older.updated_at, &newer.updated_at).is_gt()
+        && carries_rollout_history(candidate)
+        && previous_generation_matches(
+            candidate,
+            rolling_back_generation.previous_generation.as_ref(),
+        )
+}
+
+/// Checks whether a service row is exactly the generation selected for rollback.
+///
+/// The `previous` argument comes from `rolling_back_generation.previous_generation`: it is the
+/// snapshot captured before the replacement generation started. Rollback should only prefer the
+/// candidate when it has the same manifest identity, templates, replica layout, placement and
+/// admission policy, service epoch, and status as that snapshot.
+///
+/// The exact comparison prevents stale rows from winning just because they are one epoch behind
+/// and contain rollout history from some earlier failure.
+fn previous_generation_matches(
+    candidate: &ServiceSpecValue,
+    previous: Option<&ServicePreviousGeneration>,
+) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+
+    previous.manifest_id == candidate.manifest_id
+        && previous.manifest_name == candidate.manifest_name
+        && previous.task_templates == candidate.task_templates
+        && previous.replica_ids == candidate.replica_ids
+        && previous.replica_assignment_segments == candidate.replica_assignment_segments
+        && previous.update_strategy == candidate.update_strategy
+        && previous.deployment_policy == candidate.deployment_policy
+        && previous.admission_policy == candidate.admission_policy
+        && previous.service_epoch == candidate.service_epoch
+        && previous.status == candidate.status
 }
 
 /// Blocks cross-manifest reactivation from bypassing a stopped or failed terminal state.

@@ -1,5 +1,6 @@
 use super::support::*;
 use crate::common;
+use mantissa::services::types::ServicePreviousGeneration;
 
 local_test!(
     services_split_merge_rebalance_preserves_replica_convergence,
@@ -622,15 +623,6 @@ local_test!(services_crdt_split_merge_rollback_generation_converges, {
     wait_for_cluster_view(&anchor.topology(), left_view, Duration::from_secs(15)).await;
     wait_for_cluster_view(&joiner.topology(), right_view, Duration::from_secs(15)).await;
 
-    let deploying = service_crdt_spec_at(
-        service_name,
-        "crdt-split-merge-rollback-v2",
-        new_manifest_id,
-        ServiceStatus::Deploying,
-        12,
-        0,
-        base + ChronoDuration::seconds(5),
-    );
     let mut rollback = service_crdt_spec_at(
         service_name,
         "crdt-split-merge-rollback-v1",
@@ -644,6 +636,24 @@ local_test!(services_crdt_split_merge_rollback_generation_converges, {
         phase: ServiceRolloutPhase::Idle,
         total_steps: 1,
         completed_steps: 1,
+        failed_steps: 1,
+        max_failures: 1,
+        last_error: Some("rolling update failed".into()),
+    };
+    let mut deploying = service_crdt_spec_at(
+        service_name,
+        "crdt-split-merge-rollback-v2",
+        new_manifest_id,
+        ServiceStatus::Deploying,
+        12,
+        0,
+        base + ChronoDuration::seconds(5),
+    );
+    deploying.previous_generation = Some(ServicePreviousGeneration::from_service(&rollback));
+    deploying.rollout = ServiceRolloutState {
+        phase: ServiceRolloutPhase::RollingBack,
+        total_steps: 1,
+        completed_steps: 0,
         failed_steps: 1,
         max_failures: 1,
         last_error: Some("rolling update failed".into()),
