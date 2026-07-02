@@ -1330,6 +1330,9 @@ impl Registry {
         if !allow_excluded && self.peer_is_excluded(peer_id) {
             return None;
         }
+        if !self.peer_allows_session_bootstrap(peer_id) {
+            return None;
+        }
 
         if require_existing {
             self.entry_if_present(peer_id).await
@@ -1364,6 +1367,11 @@ impl Registry {
         strategy: SessionStrategy,
         allow_excluded: bool,
     ) -> Option<cluster_session::Client> {
+        if !self.peer_allows_session_bootstrap(peer_id) {
+            self.invalidate_peer(peer_id, entry).await;
+            return None;
+        }
+
         let gate = self.session_gate(peer_id).await;
         let _guard = gate.lock().await;
 
@@ -1516,6 +1524,9 @@ impl Registry {
         Ok(actual_view == expected_view)
     }
 
+    /// # Description:
+    ///
+    /// Tries the configured session bootstrap sequence for one peer.
     async fn session_for_strategy(
         &self,
         client: &server::Client,
@@ -1531,6 +1542,9 @@ impl Registry {
         session
     }
 
+    /// # Description:
+    ///
+    /// Opens a cluster session with a cached ticket, evicting tickets the peer rejects.
     async fn session_via_ticket(
         &self,
         client: &server::Client,
@@ -1547,31 +1561,36 @@ impl Registry {
             Ok(resp) => match resp.get() {
                 Ok(r) => r.get_session().ok(),
                 Err(e) => {
-                    error!(target: "sync", "get_session response error: {e}");
-                    if let Err(remove_err) = self.sessions.remove(peer_id) {
-                        error!(
-                            target: "sync",
-                            "failed to remove rejected session ticket for {peer_id}: {remove_err}"
-                        );
+                    let detail = e.to_string();
+                    if Self::is_transient_session_bootstrap_error(&detail) {
+                        debug!(target: "sync", "get_session transient response error: {e}");
+                    } else {
+                        error!(target: "sync", "get_session response error: {e}");
                     }
-                    self.record_session_failure_telemetry(
-                        peer_id,
-                        "ticket.response",
-                        &e.to_string(),
-                    )
-                    .await;
+                    self.remove_rejected_session_ticket(peer_id, &detail);
+                    self.record_session_failure_telemetry(peer_id, "ticket.response", &detail)
+                        .await;
                     None
                 }
             },
             Err(e) => {
-                error!(target: "sync", "get_session failed: {e}");
-                self.record_session_failure_telemetry(peer_id, "ticket.send", &e.to_string())
+                let detail = e.to_string();
+                if Self::is_transient_session_bootstrap_error(&detail) {
+                    debug!(target: "sync", "get_session transient failure: {e}");
+                } else {
+                    error!(target: "sync", "get_session failed: {e}");
+                }
+                self.remove_rejected_session_ticket(peer_id, &detail);
+                self.record_session_failure_telemetry(peer_id, "ticket.send", &detail)
                     .await;
                 None
             }
         }
     }
 
+    /// # Description:
+    ///
+    /// Opens a cluster session by signing a fresh credential for the remote peer.
     async fn session_via_credential(
         &self,
         client: &server::Client,
@@ -1609,7 +1628,11 @@ impl Registry {
                 let r = match resp.get() {
                     Ok(r) => r,
                     Err(e) => {
-                        error!(target: "sync", "getWithCredential response error: {e}");
+                        if Self::is_transient_session_bootstrap_error(&e.to_string()) {
+                            debug!(target: "sync", "getWithCredential transient response error: {e}");
+                        } else {
+                            error!(target: "sync", "getWithCredential response error: {e}");
+                        }
                         self.record_session_failure_telemetry(
                             peer_id,
                             "credential.response",
@@ -1646,7 +1669,11 @@ impl Registry {
                 r.get_session().ok()
             }
             Err(e) => {
-                error!(target: "sync", "getWithCredential failed: {e}");
+                if Self::is_transient_session_bootstrap_error(&e.to_string()) {
+                    debug!(target: "sync", "getWithCredential transient failure: {e}");
+                } else {
+                    error!(target: "sync", "getWithCredential failed: {e}");
+                }
                 self.record_session_failure_telemetry(peer_id, "credential.send", &e.to_string())
                     .await;
                 None
@@ -1659,6 +1686,51 @@ impl Registry {
     /// Returns true when one telemetry counter sample should emit a diagnostic log.
     fn should_emit_diag_sample(count: u64) -> bool {
         count <= 3 || count.is_power_of_two() || count.is_multiple_of(100)
+    }
+
+    /// # Description:
+    ///
+    /// Returns true when local membership still allows session bootstrap for `peer_id`.
+    fn peer_allows_session_bootstrap(&self, peer_id: Uuid) -> bool {
+        self.peer_selected_value_unscoped(peer_id)
+            .map(|peer| peer.is_active())
+            .unwrap_or(false)
+    }
+
+    /// # Description:
+    ///
+    /// Removes a local session ticket once a remote authority has rejected it.
+    fn remove_rejected_session_ticket(&self, peer_id: Uuid, error: &str) {
+        if !Self::is_rejected_session_ticket_error(error) {
+            return;
+        }
+        if let Err(remove_err) = self.sessions.remove(peer_id) {
+            error!(
+                target: "sync",
+                "failed to remove rejected session ticket for {peer_id}: {remove_err}"
+            );
+        }
+    }
+
+    /// # Description:
+    ///
+    /// Returns true for getSession failures proving the cached ticket cannot be reused.
+    fn is_rejected_session_ticket_error(error: &str) -> bool {
+        error.contains("unknown session ticket")
+            || error.contains("peer not registered")
+            || error.contains("node is not an active cluster member")
+    }
+
+    /// # Description:
+    ///
+    /// Returns true for session bootstrap failures expected during fast membership convergence.
+    fn is_transient_session_bootstrap_error(error: &str) -> bool {
+        error.contains("peer not registered on this node")
+            || error.contains("peer not registered")
+            || error.contains("unknown session ticket")
+            || error.contains("node is not an active cluster member")
+            || error.contains("issuer unknown")
+            || error.contains("issuer unknown (not yet synced)")
     }
 
     /// # Description:
@@ -1716,16 +1788,29 @@ impl Registry {
         let addr = self
             .peer_address(peer_id)
             .unwrap_or_else(|| "<unknown>".to_string());
-        warn!(
-            target: "diag.session.bootstrap",
-            peer = %peer_id,
-            addr = %addr,
-            phase = %phase_key,
-            count,
-            disconnected,
-            error = %error,
-            "session bootstrap failure sampled"
-        );
+        if Self::is_transient_session_bootstrap_error(error) {
+            debug!(
+                target: "diag.session.bootstrap",
+                peer = %peer_id,
+                addr = %addr,
+                phase = %phase_key,
+                count,
+                disconnected,
+                error = %error,
+                "transient session bootstrap failure sampled"
+            );
+        } else {
+            warn!(
+                target: "diag.session.bootstrap",
+                peer = %peer_id,
+                addr = %addr,
+                phase = %phase_key,
+                count,
+                disconnected,
+                error = %error,
+                "session bootstrap failure sampled"
+            );
+        }
     }
 
     fn peer_latest_value(&self, peer_id: Uuid) -> Option<PeerValue> {
@@ -1845,5 +1930,137 @@ mod tests {
                 .is_empty(),
             "active peer cache should still exclude left rows"
         );
+    }
+
+    /// Left peer rows must not be contacted by session entry resolution.
+    #[tokio::test]
+    async fn session_entry_skips_left_peer_membership() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("registry-session-left-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let local_id = Uuid::new_v4();
+        let peer_id = Uuid::new_v4();
+        let peers = open_peers_store(db.clone(), local_id).expect("open peers store");
+        let noise_keys = NoiseKeys::from_private_bytes([0x12; 32]);
+        let sessions = LocalSessionStore::open(db, &noise_keys).expect("open sessions store");
+        let registry = Registry::new(
+            peers.clone(),
+            sessions,
+            SigningKey::from_bytes(&[0xA6; 32]),
+            Arc::new(noise_keys),
+            local_id,
+            HealthMonitor::new(local_id),
+        );
+
+        peers
+            .upsert(
+                &UuidKey::from(peer_id),
+                peer_value(peer_id, PeerMembership::left(4)),
+            )
+            .await
+            .expect("insert left peer");
+
+        assert!(!registry.peer_allows_session_bootstrap(peer_id));
+        assert!(registry.session_entry(peer_id, true, false).await.is_none());
+    }
+
+    /// Direct session bootstrap must also stop once local membership records a leave.
+    #[tokio::test]
+    async fn direct_session_bootstrap_skips_left_peer_membership() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join(format!(
+            "registry-direct-session-left-{}.redb",
+            Uuid::new_v4()
+        ));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let local_id = Uuid::new_v4();
+        let peer_id = Uuid::new_v4();
+        let peers = open_peers_store(db.clone(), local_id).expect("open peers store");
+        let noise_keys = NoiseKeys::from_private_bytes([0x14; 32]);
+        let sessions = LocalSessionStore::open(db, &noise_keys).expect("open sessions store");
+        sessions.put(peer_id, b"stale-ticket").expect("put ticket");
+        let registry = Registry::new(
+            peers.clone(),
+            sessions,
+            SigningKey::from_bytes(&[0xA8; 32]),
+            Arc::new(noise_keys),
+            local_id,
+            HealthMonitor::new(local_id),
+        );
+
+        peers
+            .upsert(
+                &UuidKey::from(peer_id),
+                peer_value(peer_id, PeerMembership::active(3)),
+            )
+            .await
+            .expect("insert active peer");
+        assert!(registry.peer_allows_session_bootstrap(peer_id));
+
+        peers
+            .upsert(
+                &UuidKey::from(peer_id),
+                peer_value(peer_id, PeerMembership::left(4)),
+            )
+            .await
+            .expect("insert left peer");
+        let entry = registry.ensure_entry(peer_id).await;
+
+        assert!(
+            registry
+                .ensure_session_scoped(peer_id, &entry, SessionStrategy::TicketThenCredential, true)
+                .await
+                .is_none()
+        );
+    }
+
+    /// Remote ticket rejection should evict the local ticket so retries can fall back cleanly.
+    #[test]
+    fn rejected_session_ticket_error_removes_local_ticket() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("registry-session-ticket-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let local_id = Uuid::new_v4();
+        let peer_id = Uuid::new_v4();
+        let peers = open_peers_store(db.clone(), local_id).expect("open peers store");
+        let noise_keys = NoiseKeys::from_private_bytes([0x13; 32]);
+        let sessions = LocalSessionStore::open(db, &noise_keys).expect("open sessions store");
+        sessions.put(peer_id, b"stale-ticket").expect("put ticket");
+        let registry = Registry::new(
+            peers,
+            sessions.clone(),
+            SigningKey::from_bytes(&[0xA7; 32]),
+            Arc::new(noise_keys),
+            local_id,
+            HealthMonitor::new(local_id),
+        );
+
+        registry.remove_rejected_session_ticket(
+            peer_id,
+            "Failed: remote exception: unknown session ticket",
+        );
+
+        assert!(
+            sessions.get(peer_id).expect("get ticket").is_none(),
+            "rejected ticket should be evicted"
+        );
+    }
+
+    /// Expected membership races should not emit warning-level session bootstrap diagnostics.
+    #[test]
+    fn session_bootstrap_transient_errors_include_leave_ticket_rejections() {
+        assert!(Registry::is_transient_session_bootstrap_error(
+            "Failed: remote exception: unknown session ticket"
+        ));
+        assert!(Registry::is_transient_session_bootstrap_error(
+            "Failed: remote exception: peer not registered"
+        ));
+        assert!(Registry::is_transient_session_bootstrap_error(
+            "Failed: remote exception: node is not an active cluster member"
+        ));
     }
 }
