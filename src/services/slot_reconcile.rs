@@ -64,7 +64,25 @@ fn service_cleanup_stop_error_is_transient(err: &anyhow::Error) -> bool {
         detail.contains("unknown task")
             || detail.contains("no active session for peer")
             || detail.contains("cluster view mismatch")
+            || detail.contains("peer session revoked")
     })
+}
+
+/// Returns true when the task owner cannot receive remote service cleanup.
+///
+/// SWIM `Down` and explicit cluster leave both make remote workload stop impossible. Unknown
+/// membership is left retryable so temporary peer metadata lag does not retire healthy tasks.
+fn service_task_owner_unavailable_for_cleanup(
+    node_id: Uuid,
+    local_node_id: Uuid,
+    health_snapshot: &HashMap<Uuid, HealthStatus>,
+    owner_active_cluster_member: Option<bool>,
+) -> bool {
+    if node_id == local_node_id {
+        return false;
+    }
+
+    node_is_down(node_id, health_snapshot) || matches!(owner_active_cluster_member, Some(false))
 }
 
 impl ServiceController {
@@ -230,7 +248,7 @@ impl ServiceController {
                         spec.service_name
                     );
                 }
-                self.retire_down_superseded_service_task_best_effort(
+                self.retire_unavailable_service_task_best_effort(
                     &spec.service_name,
                     task.id,
                     health_snapshot,
@@ -853,7 +871,7 @@ impl ServiceController {
                     "failed to stop superseded task after cutover: {err:#}"
                 );
             }
-            self.retire_down_superseded_service_task_best_effort(
+            self.retire_unavailable_service_task_best_effort(
                 service_name,
                 superseded_task_id,
                 health_snapshot,
@@ -862,13 +880,13 @@ impl ServiceController {
         }
     }
 
-    /// Retires one superseded service task directly when its original owner node is already down.
+    /// Retires one superseded service task directly when its original owner is unavailable.
     ///
     /// Fresh task identities keep service handoff correct, but the old workload row can still stay
-    /// visible as `Running` if the original owner is gone and the normal remote stop RPC cannot be
-    /// delivered. Narrow that case to service-owned workloads on nodes already marked `Down` so
-    /// cluster-visible task listings converge on the replacement tasks.
-    async fn retire_down_superseded_service_task_best_effort(
+    /// visible as `Running` if the original owner is down or has left the cluster. Narrow that case
+    /// to service-owned workloads whose owner cannot accept remote cleanup so cluster-visible task
+    /// listings converge on the replacement tasks.
+    async fn retire_unavailable_service_task_best_effort(
         &self,
         service_name: &str,
         superseded_task_id: Uuid,
@@ -907,7 +925,16 @@ impl ServiceController {
         {
             return;
         }
-        if !node_is_down(spec.node_id, health_snapshot) {
+        let owner_active_cluster_member = self
+            .cluster_registry
+            .peer_value_unscoped(spec.node_id)
+            .map(|peer| peer.is_active());
+        if !service_task_owner_unavailable_for_cleanup(
+            spec.node_id,
+            self.local_node_id,
+            health_snapshot,
+            owner_active_cluster_member,
+        ) {
             return;
         }
 
@@ -916,7 +943,7 @@ impl ServiceController {
             .retire_unavailable_service_workload(
                 superseded_task_id,
                 format!(
-                    "service controller retired superseded task after owner node {} went down",
+                    "service controller retired superseded task after owner node {} became unavailable",
                     spec.node_id
                 ),
             )
@@ -1049,6 +1076,17 @@ mod tests {
         assert!(service_cleanup_stop_error_is_transient(&err));
     }
 
+    /// Revoked peer sessions are expected after clean leave revokes stale capabilities.
+    #[test]
+    fn service_cleanup_stop_error_treats_revoked_peer_session_as_transient() {
+        let err = anyhow!(
+            "failed to open workload service with peer 00000000-0000-0000-0000-000000000001: \
+             Failed: remote exception: peer session revoked"
+        );
+
+        assert!(service_cleanup_stop_error_is_transient(&err));
+    }
+
     /// Unrelated cleanup errors remain warnable so real storage failures still surface.
     #[test]
     fn service_cleanup_stop_error_keeps_unrelated_errors_warnable() {
@@ -1063,5 +1101,62 @@ mod tests {
         let err = anyhow!("stop request failed on peer 00000000-0000-0000-0000-000000000001");
 
         assert!(!service_cleanup_stop_error_is_transient(&err));
+    }
+
+    /// Explicit left membership makes remote service cleanup impossible even without SWIM Down.
+    #[test]
+    fn service_task_owner_unavailable_for_cleanup_accepts_left_peer() {
+        let local = Uuid::from_bytes([1u8; 16]);
+        let peer = Uuid::from_bytes([2u8; 16]);
+        let health = HashMap::new();
+
+        assert!(service_task_owner_unavailable_for_cleanup(
+            peer,
+            local,
+            &health,
+            Some(false)
+        ));
+    }
+
+    /// Missing peer metadata remains retryable because workload gossip can outrun peer sync.
+    #[test]
+    fn service_task_owner_unavailable_for_cleanup_keeps_unknown_peer_retryable() {
+        let local = Uuid::from_bytes([1u8; 16]);
+        let peer = Uuid::from_bytes([2u8; 16]);
+        let health = HashMap::new();
+
+        assert!(!service_task_owner_unavailable_for_cleanup(
+            peer, local, &health, None
+        ));
+    }
+
+    /// Active cluster membership keeps cleanup on the normal remote stop path.
+    #[test]
+    fn service_task_owner_unavailable_for_cleanup_keeps_active_peer_retryable() {
+        let local = Uuid::from_bytes([1u8; 16]);
+        let peer = Uuid::from_bytes([2u8; 16]);
+        let health = HashMap::new();
+
+        assert!(!service_task_owner_unavailable_for_cleanup(
+            peer,
+            local,
+            &health,
+            Some(true)
+        ));
+    }
+
+    /// SWIM Down still retires stale service tasks when membership has not observed leave.
+    #[test]
+    fn service_task_owner_unavailable_for_cleanup_accepts_down_peer() {
+        let local = Uuid::from_bytes([1u8; 16]);
+        let peer = Uuid::from_bytes([2u8; 16]);
+        let health = HashMap::from([(peer, HealthStatus::Down)]);
+
+        assert!(service_task_owner_unavailable_for_cleanup(
+            peer,
+            local,
+            &health,
+            Some(true)
+        ));
     }
 }
