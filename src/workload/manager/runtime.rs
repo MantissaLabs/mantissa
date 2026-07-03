@@ -1457,7 +1457,7 @@ impl WorkloadManager {
             .list_attachments_for_task(task_id)
             .context("failed to list task attachments for teardown")?;
         let mut released_networks = Vec::new();
-        let mut publication_changed_networks = HashSet::new();
+        let mut attachment_changed_networks = HashSet::new();
 
         for attachment in attachments {
             if !keep.is_empty() && keep.contains(&attachment.network_id) {
@@ -1497,13 +1497,12 @@ impl WorkloadManager {
                 .remove_attachment(attachment.id)
                 .await
             {
-                Ok(()) if attachment.node_id == self.local_node_id => {
-                    released_networks.push(attachment.network_id);
-                    if attachment.traffic_published {
-                        publication_changed_networks.insert(attachment.network_id);
+                Ok(()) => {
+                    attachment_changed_networks.insert(attachment.network_id);
+                    if attachment.node_id == self.local_node_id {
+                        released_networks.push(attachment.network_id);
                     }
                 }
-                Ok(()) => {}
                 Err(err) => {
                     warn!(
                         target: "task",
@@ -1515,7 +1514,9 @@ impl WorkloadManager {
         }
 
         if let Some(sender) = &self.networking.forwarding_events {
-            for network_id in publication_changed_networks {
+            for network_id in attachment_changed_networks {
+                // The event name is publication-oriented, but attachment withdrawal also changes
+                // remote FDB intent. Wake the controller so stale MACs are removed immediately.
                 let _ = sender.send(ForwardingEvent::TrafficPublicationChanged { network_id });
             }
         }

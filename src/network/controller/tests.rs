@@ -352,6 +352,22 @@ fn all_nodes_wireguard_scope_includes_visible_ready_peers() {
 }
 
 #[test]
+fn all_nodes_wireguard_scope_excludes_peers_when_local_node_left() {
+    let local_node_id = Uuid::new_v4();
+    let ready_peer = Uuid::new_v4();
+    let all_nodes = test_network_spec("all-nodes", NetworkRealizationPolicy::AllNodes);
+    let peers = vec![
+        test_peer_value(local_node_id, true, true, false),
+        test_peer_value(ready_peer, true, true, true),
+    ];
+
+    let scope =
+        NetworkController::all_nodes_wireguard_scope_peers(&[all_nodes], &peers, local_node_id);
+
+    assert!(scope.is_empty());
+}
+
+#[test]
 fn ingress_pool_network_demand_includes_ready_selected_local_node() {
     let network_id = Uuid::new_v4();
     let local_node = Uuid::new_v4();

@@ -305,7 +305,7 @@ impl NetworkController {
         let local_demand = self.local_network_demand_snapshot().await?;
         let has_local_demand = spec
             .as_ref()
-            .is_some_and(|spec| Self::spec_has_local_realization_demand(spec, &local_demand));
+            .is_some_and(|spec| self.spec_has_active_local_realization_demand(spec, &local_demand));
         let peer_state = self
             .inner
             .registry
@@ -354,7 +354,7 @@ impl NetworkController {
             };
 
             let local_demand = self.local_network_demand_snapshot().await?;
-            if spec.realizes_on_all_nodes() || local_demand.contains(&network_id) {
+            if self.spec_has_active_local_realization_demand(&spec, &local_demand) {
                 continue;
             }
 
@@ -392,6 +392,7 @@ impl NetworkController {
         // candidate below because task teardown can remove the last attachment while this sweep is
         // in flight. A stale local positive would otherwise suppress the required release.
         let ingress_pool_demand = self.ingress_pool_network_demand_snapshot()?;
+        let local_node_active = self.local_node_is_active_cluster_member();
         let mut released = 0usize;
         let candidates = candidates.into_iter().collect::<Vec<_>>();
         for network_id in Self::sorted_unique_network_ids(&candidates) {
@@ -409,9 +410,10 @@ impl NetworkController {
                 continue;
             };
 
-            if spec.realizes_on_all_nodes()
-                || ingress_pool_demand.contains(&network_id)
-                || self.has_current_local_workload_demand(network_id).await?
+            if local_node_active
+                && (spec.realizes_on_all_nodes()
+                    || ingress_pool_demand.contains(&network_id)
+                    || self.has_current_local_workload_demand(network_id).await?)
             {
                 continue;
             }
@@ -734,6 +736,76 @@ impl NetworkController {
         self.inner.discovery.nodeport_manager()
     }
 
+    /// Tombstone network runtime rows owned by a peer that left the cluster.
+    pub async fn retire_left_peer_runtime_state(&self, peer_id: Uuid) -> Result<(usize, usize)> {
+        let peer_states = self
+            .inner
+            .registry
+            .list_peer_states(None)
+            .context("list network peer states for left peer cleanup")?;
+        let attachments = self
+            .inner
+            .registry
+            .list_attachments(None)
+            .context("list network attachments for left peer cleanup")?;
+        let mut affected_networks = HashSet::new();
+        let mut removed_peer_states = 0usize;
+        let mut removed_attachments = 0usize;
+
+        for state in peer_states {
+            if state.peer_id != peer_id {
+                continue;
+            }
+
+            // Peer-state rows drive network peer counts and host-access forwarding. Removing them
+            // here keeps `networks list` aligned with topology after a graceful leave.
+            affected_networks.insert(state.network_id);
+            self.inner
+                .registry
+                .remove_peer_state(state.id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "remove network peer state {} for left peer {}",
+                        state.id, peer_id
+                    )
+                })?;
+            self.send_event(NetworkEvent::PeerRemove(state.id)).await;
+            removed_peer_states = removed_peer_states.saturating_add(1);
+        }
+
+        for attachment in attachments {
+            if attachment.node_id != peer_id {
+                continue;
+            }
+
+            // Attachments are workload-scoped rows, but the left peer is the only node that could
+            // ever realize them. Tombstone them so discovery and remote FDB state converge.
+            affected_networks.insert(attachment.network_id);
+            self.inner
+                .registry
+                .remove_attachment(attachment.id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "remove network attachment {} for left peer {}",
+                        attachment.id, peer_id
+                    )
+                })?;
+            removed_attachments = removed_attachments.saturating_add(1);
+        }
+
+        for network_id in affected_networks {
+            // The rows are gone now; force local derived state to observe the deletion instead of
+            // waiting for the slower attachment-root drift sweep.
+            self.schedule_forwarding_refresh(network_id).await;
+            self.refresh_publication(network_id).await;
+        }
+
+        let _ = self.reconcile_wireguard_underlay().await?;
+        Ok((removed_peer_states, removed_attachments))
+    }
+
     /// Return node-local public endpoint snapshots derived by service discovery refreshes.
     pub async fn public_endpoint_snapshots(&self) -> Vec<PublicEndpointSnapshot> {
         self.inner.discovery.public_endpoint_snapshots().await
@@ -942,6 +1014,19 @@ impl NetworkController {
         !spec.is_deleted() && (spec.realizes_on_all_nodes() || local_demand.contains(&spec.id))
     }
 
+    /// Return whether this active node should currently realize a spec locally.
+    fn spec_has_active_local_realization_demand(
+        &self,
+        spec: &NetworkSpecValue,
+        local_demand: &HashSet<Uuid>,
+    ) -> bool {
+        // `all_nodes` means "all active members", not "a daemon that already left but has not
+        // exited yet". Gate every local realization decision on self-membership so a graceful
+        // leave tears down local network state instead of re-creating it on the next drift pass.
+        self.local_node_is_active_cluster_member()
+            && Self::spec_has_local_realization_demand(spec, local_demand)
+    }
+
     /// Derive the local realization state from spec visibility, demand, peer state, and activity.
     fn derive_local_realization_state(
         spec_observed: bool,
@@ -996,7 +1081,7 @@ impl NetworkController {
             .context("list network specs for wireguard scope")?;
         Ok(specs
             .into_iter()
-            .filter(|spec| Self::spec_has_local_realization_demand(spec, &local_demand))
+            .filter(|spec| self.spec_has_active_local_realization_demand(spec, &local_demand))
             .map(|spec| spec.id)
             .collect())
     }
@@ -1111,6 +1196,13 @@ impl NetworkController {
         if !has_all_nodes_vxlan {
             return HashSet::new();
         }
+        // A self-left process can still observe active remote peers in its local store. Do not let
+        // that stale process keep a WireGuard full-mesh scope alive for all-nodes VXLAN networks.
+        if !peers.iter().any(|(peer_id, peer)| {
+            *peer_id == local_node_id && peer.is_active() && peer.readiness.is_ready()
+        }) {
+            return HashSet::new();
+        }
 
         peers
             .iter()
@@ -1129,7 +1221,7 @@ impl NetworkController {
     ) -> Result<()> {
         for spec in specs {
             if !spec.driver.requires_wireguard_underlay()
-                || !Self::spec_has_local_realization_demand(spec, local_demand)
+                || !self.spec_has_active_local_realization_demand(spec, local_demand)
             {
                 continue;
             }
@@ -1446,7 +1538,7 @@ impl NetworkController {
         let mut pending = self.inner.pending_specs.lock().await;
         let mut inserted = 0usize;
         for spec in specs {
-            if !Self::spec_has_local_realization_demand(&spec, &local_demand) {
+            if !self.spec_has_active_local_realization_demand(&spec, &local_demand) {
                 continue;
             }
             if pending.insert(spec.id) {
@@ -1472,7 +1564,7 @@ impl NetworkController {
 
         let mut updated = 0usize;
         for spec in specs {
-            if !Self::spec_has_local_realization_demand(&spec, &local_demand) {
+            if !self.spec_has_active_local_realization_demand(&spec, &local_demand) {
                 continue;
             }
 
@@ -1697,7 +1789,7 @@ impl NetworkController {
                 continue;
             };
 
-            if !Self::spec_has_local_realization_demand(&spec, &local_demand) {
+            if !self.spec_has_active_local_realization_demand(&spec, &local_demand) {
                 debug!(
                     target: "network",
                     network = %network_id,
@@ -1754,7 +1846,7 @@ impl NetworkController {
                         "teardown after gossip failed: {err:#}"
                     );
                 }
-            } else if Self::spec_has_local_realization_demand(&spec, &local_demand) {
+            } else if self.spec_has_active_local_realization_demand(&spec, &local_demand) {
                 if let Err(err) = self.reconcile_network(spec.clone()).await {
                     self.record_reconcile_failure(network_id, "immediate", err)
                         .await?;
@@ -1813,7 +1905,7 @@ impl NetworkController {
         let local_demand = self.local_network_demand_snapshot().await?;
 
         for mut spec in specs {
-            if !Self::spec_has_local_realization_demand(&spec, &local_demand) {
+            if !self.spec_has_active_local_realization_demand(&spec, &local_demand) {
                 continue;
             }
             let (mut plan, _) = self.prepare_plan(&mut spec)?;
@@ -1856,12 +1948,7 @@ impl NetworkController {
                 ForwardingEvent::AttachmentReady { network_id } => {
                     // Mark the network for a targeted reconcile so remote FDB entries
                     // are refreshed immediately after the attachment finished configuring.
-                    let mut guard = self.inner.pending_forwarding.lock().await;
-                    let inserted = guard.insert(network_id);
-                    drop(guard);
-                    if inserted {
-                        self.inner.wake.notify_one();
-                    }
+                    self.schedule_forwarding_refresh(network_id).await;
                     // Discovery-derived VIP and NodePort publication depend on attachment
                     // readiness as well as the publication bit. Refresh immediately so a service
                     // whose publication intent arrived before the attachment became Ready does not
@@ -1869,6 +1956,10 @@ impl NetworkController {
                     self.refresh_publication(network_id).await;
                 }
                 ForwardingEvent::TrafficPublicationChanged { network_id } => {
+                    // Attachment withdrawal changes remote FDB desired state too. Schedule the
+                    // same targeted reconcile used for attachment readiness, then refresh the
+                    // discovery-derived publication view.
+                    self.schedule_forwarding_refresh(network_id).await;
                     // Refresh discovery-derived VIP and NodePort publication immediately after a
                     // service attachment becomes publishable or is withdrawn, so backend
                     // eligibility and operator-facing public endpoint status do not wait for the
@@ -1876,6 +1967,16 @@ impl NetworkController {
                     self.refresh_publication(network_id).await;
                 }
             }
+        }
+    }
+
+    /// Queue a targeted remote-forwarding reconcile for one network.
+    async fn schedule_forwarding_refresh(&self, network_id: Uuid) {
+        let mut guard = self.inner.pending_forwarding.lock().await;
+        let inserted = guard.insert(network_id);
+        drop(guard);
+        if inserted {
+            self.inner.wake.notify_one();
         }
     }
 
@@ -1893,7 +1994,7 @@ impl NetworkController {
 
         let desired: HashSet<Uuid> = specs
             .iter()
-            .filter(|spec| Self::spec_has_local_realization_demand(spec, &local_demand))
+            .filter(|spec| self.spec_has_active_local_realization_demand(spec, &local_demand))
             .map(|spec| spec.id)
             .collect();
 
@@ -1922,7 +2023,7 @@ impl NetworkController {
                 continue;
             }
 
-            if !Self::spec_has_local_realization_demand(&spec, &local_demand) {
+            if !self.spec_has_active_local_realization_demand(&spec, &local_demand) {
                 continue;
             }
 
@@ -2860,6 +2961,12 @@ impl NetworkController {
                 continue;
             }
 
+            // Network attachment rows are replicated independently from topology membership. A
+            // stale Ready attachment for an explicitly left node must not become FDB intent.
+            if !self.peer_is_active_cluster_member(attachment.node_id) {
+                continue;
+            }
+
             if !matches!(attachment.state, NetworkAttachmentState::Ready) {
                 continue;
             }
@@ -2890,6 +2997,12 @@ impl NetworkController {
 
             for state in peer_states {
                 if state.peer_id == self.inner.node_id {
+                    continue;
+                }
+
+                // Host-access MACs are derived from network peer-state rows. Those rows can lag
+                // behind topology leave, so filter explicit non-members before programming FDB.
+                if !self.peer_is_active_cluster_member(state.peer_id) {
                     continue;
                 }
 
@@ -3057,6 +3170,26 @@ impl NetworkController {
         }
 
         Ok(())
+    }
+
+    /// Return whether a peer is still an active topology member in the local view.
+    fn peer_is_active_cluster_member(&self, peer_id: Uuid) -> bool {
+        // Unknown peer metadata is treated as "not fenced" so normal anti-entropy lag does not
+        // drop routable backends. An observed inactive/Left row is the hard exclusion.
+        self.inner
+            .cluster_registry
+            .peer_value_unscoped(peer_id)
+            .is_none_or(|peer| peer.is_active())
+    }
+
+    /// Return whether the local topology row still represents an active cluster member.
+    fn local_node_is_active_cluster_member(&self) -> bool {
+        // During early startup the self row may not be cached yet; allow startup reconciliation in
+        // that case. Once leave writes an inactive self row, network realization must stop.
+        self.inner
+            .cluster_registry
+            .peer_value_unscoped(self.inner.node_id)
+            .is_none_or(|peer| peer.is_active())
     }
 
     /// Resolve and memoize one peer underlay destination during a reconcile pass.

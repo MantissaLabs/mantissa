@@ -266,6 +266,28 @@ impl Topology {
         }
         self.deps.registry.remove_peer(id).await;
         self.deps.health_monitor.remove_peer(id);
+        if let Some(controller) = self.local.node.network_controller() {
+            match controller.retire_left_peer_runtime_state(id).await {
+                Ok((peer_states, attachments)) => {
+                    if peer_states > 0 || attachments > 0 {
+                        tracing::debug!(
+                            target: "topology",
+                            peer_id = %id,
+                            network_peer_states = peer_states,
+                            network_attachments = attachments,
+                            "retired network runtime rows for left peer"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        target: "topology",
+                        peer_id = %id,
+                        "failed to retire network runtime rows for left peer: {err:#}"
+                    );
+                }
+            }
+        }
         if id != self.local.node.id {
             match self.publish_local_cluster_node_count().await {
                 Ok(true) => self.sync_once_now(),

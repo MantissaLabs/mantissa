@@ -7330,7 +7330,9 @@ async fn request_task_stop_cleans_up_after_teardown_failure() {
 
 #[tokio::test]
 async fn remove_event_purges_remote_attachment_without_local_spec() {
-    let (manager, _scheduler, _mock_cm, network_registry) = setup_manager().await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (manager, _scheduler, _mock_cm, network_registry) =
+        setup_manager_with_forwarding(Some(event_tx), None).await;
 
     let task_id = Uuid::new_v4();
     let network_id = Uuid::new_v4();
@@ -7375,6 +7377,92 @@ async fn remove_event_purges_remote_attachment_without_local_spec() {
             .is_empty(),
         "remove event should purge stale replicated attachment rows even without a local spec"
     );
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+        .await
+        .expect("forwarding refresh event should not time out")
+        .expect("forwarding refresh event should be emitted");
+    match event {
+        ForwardingEvent::TrafficPublicationChanged {
+            network_id: observed,
+        } => {
+            assert_eq!(observed, network_id)
+        }
+        ForwardingEvent::AttachmentReady { network_id } => panic!(
+            "attachment removal should emit publication refresh, not attachment-ready event: {network_id}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn retiring_unavailable_service_workload_removes_remote_attachments() {
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (manager, _scheduler, _mock_cm, network_registry) =
+        setup_manager_with_forwarding(Some(event_tx), None).await;
+
+    let remote_node_id = Uuid::new_v4();
+    let network_id = Uuid::new_v4();
+    let mut spec = test_task_spec(&manager, "remote-service-task");
+    spec.state = WorkloadPhase::Running;
+    spec.node_id = remote_node_id;
+    spec.node_name = "remote-node".to_string();
+    spec.owner = Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
+        "svc", "backend",
+    )));
+    manager
+        .persist_spec(&spec)
+        .await
+        .expect("persist remote task");
+
+    let attachment = NetworkAttachmentValue::new(NetworkAttachmentDraft {
+        id: crate::network::types::compute_network_attachment_id(spec.id, network_id),
+        task_id: spec.id,
+        node_id: remote_node_id,
+        instance_id: format!("mantissa-{}", spec.id),
+        network_id,
+        task_updated_at: Some(spec.updated_at.clone()),
+        requested_ip: Some("10.77.0.2".to_string()),
+        assigned_ip: Some("10.77.0.2".to_string()),
+        mac: Some("02:11:22:33:44:55".to_string()),
+        state: NetworkAttachmentState::Ready,
+        error: None,
+        traffic_published: true,
+        service_name: Some("svc".to_string()),
+        template_name: Some("backend".to_string()),
+    });
+    network_registry
+        .upsert_attachment(attachment)
+        .await
+        .expect("insert remote-owned attachment");
+
+    let retired = manager
+        .retire_unavailable_service_workload(spec.id, "owner left")
+        .await
+        .expect("retire unavailable service workload");
+
+    assert_eq!(retired.state, WorkloadPhase::Stopped);
+    assert!(
+        network_registry
+            .list_attachments_for_task(spec.id)
+            .expect("list attachments after retirement")
+            .is_empty(),
+        "retiring an unavailable service task should purge its network attachments"
+    );
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+        .await
+        .expect("forwarding refresh event should not time out")
+        .expect("forwarding refresh event should be emitted");
+    match event {
+        ForwardingEvent::TrafficPublicationChanged {
+            network_id: observed,
+        } => {
+            assert_eq!(observed, network_id)
+        }
+        ForwardingEvent::AttachmentReady { network_id } => panic!(
+            "attachment retirement should emit publication refresh, not attachment-ready event: {network_id}"
+        ),
+    }
 }
 
 #[tokio::test]

@@ -562,6 +562,7 @@ impl ServiceDiscovery {
             }
             return service_dependency_ready_from_replicated_state(
                 &self.registry,
+                &self.cluster_registry,
                 &self.workloads,
                 requirement,
             );
@@ -661,7 +662,16 @@ impl ServiceBackendResolver<'_> {
             .registry
             .list_peer_states(Some(self.runtime.network_id))?
             .into_iter()
-            .filter(|state| state.is_ready())
+            .filter(|state| {
+                state.is_ready()
+                    // Network peer-state can arrive before topology metadata during sync. Keep
+                    // unknown peers eligible, but fence peers once topology explicitly says Left.
+                    && self
+                        .runtime
+                        .cluster_registry
+                        .peer_value_unscoped(state.peer_id)
+                        .is_none_or(|peer| peer.is_active())
+            })
             .map(|state| state.peer_id)
             .collect();
         let attachments = self
@@ -929,13 +939,21 @@ fn load_task(workloads: &WorkloadStore, id: Uuid) -> Option<WorkloadValue> {
 /// row is ready. Kernel-backed nodes use the real discovery catalog instead.
 fn service_dependency_ready_from_replicated_state(
     registry: &NetworkRegistry,
+    cluster_registry: &Registry,
     workloads: &WorkloadStore,
     requirement: &NetworkServiceDependencyRequirement,
 ) -> Result<bool> {
     let ready_peers = registry
         .list_peer_states(Some(requirement.network_id))?
         .into_iter()
-        .filter(|state| state.is_ready())
+        .filter(|state| {
+            state.is_ready()
+                // This fallback runs without a local DNS runtime. Match the catalog path: unknown
+                // topology metadata is tolerated, explicit non-membership is not.
+                && cluster_registry
+                    .peer_value_unscoped(state.peer_id)
+                    .is_none_or(|peer| peer.is_active())
+        })
         .map(|state| state.peer_id)
         .collect::<HashSet<_>>();
     let attachments = registry

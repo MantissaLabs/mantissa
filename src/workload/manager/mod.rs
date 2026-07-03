@@ -2545,10 +2545,10 @@ impl WorkloadManager {
 
     /// Retires one unavailable service-owned workload directly into `Stopped`.
     ///
-    /// Service reconciliation uses this when a superseded service task belongs to a node that is
-    /// already marked `Down`. In that case an RPC stop can never reach the original owner, but the
-    /// replicated workload row still needs to leave the active task set so cluster-visible task
-    /// listings converge on the replacement replicas only.
+    /// Service reconciliation uses this when a superseded service task belongs to a node that
+    /// cannot be asked to stop anymore, such as an explicitly left or health-down peer. The
+    /// replicated workload and attachment rows still need to leave the active views so task,
+    /// discovery, and forwarding state converge on the replacement replicas only.
     pub async fn retire_unavailable_service_workload(
         &self,
         id: Uuid,
@@ -2583,6 +2583,9 @@ impl WorkloadManager {
         updated.phase_progress = None;
         updated.updated_at = Utc::now().to_rfc3339();
         self.persist_spec(&updated).await?;
+        self.teardown_runtime_attachments(id, HashSet::new(), true)
+            .await
+            .with_context(|| format!("retire network attachments for unavailable workload {id}"))?;
         self.enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(updated.clone())))
             .await?;
         Ok(updated)

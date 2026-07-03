@@ -1,6 +1,6 @@
 use uuid::Uuid;
 
-/// Events emitted by attachment provisioning and service publication that require
+/// Events emitted by attachment provisioning, withdrawal, and service publication that require
 /// the network controller to refresh forwarding or discovery-derived dataplane state.
 #[derive(Debug, Clone)]
 pub enum ForwardingEvent {
