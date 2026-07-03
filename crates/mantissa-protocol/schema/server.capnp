@@ -25,13 +25,76 @@ interface Server {
   # First-time join. Adding the node to the trusted set of peers if the token
   # is valid. On failure, returns a capnp error.
 
-  getSession @1 (ticket :Data) -> (session :ClusterSession);
-  # Get a session given a ticket returned by registerNode. Returns a capnp
-  # error on failure (unknown/expired/not-registered).
+  getSession @1 (ticket :Data) -> (result :SessionBootstrapResult);
+  # Get a session given a ticket returned by registerNode. Expected
+  # authentication and membership refusals are returned as typed rejection
+  # codes; transport/decode failures still surface as Cap'n Proto errors.
 
-  getWithCredential @2 (credential :Data) -> (session :ClusterSession, ticket :Data, nodeInfo :NodeInfo, ticketExpiresAtUnixSecs :UInt64);
+  getWithCredential @2 (credential :Data) -> (result :CredentialBootstrapResult);
   # Bootstrap to (re)open a session on this node using a short-lived credential.
   # Used after join to contact other neighbors in the mesh/network.
+}
+
+enum SessionBootstrapRejectionCode {
+  unknownSessionTicket @0;
+  # The presented ticket is not known by this session authority.
+
+  peerNotRegistered @1;
+  # The subject is not an active peer on this node.
+
+  localNodeInactive @2;
+  # This node has left the cluster and will not mint peer sessions.
+
+  credentialInvalid @3;
+  # The credential could not be decoded, verified, or is expired.
+
+  issuerMismatch @4;
+  # The credential issuer does not match the subject's known signing key.
+
+  issuerUnknown @5;
+  # The subject is known, but its signing key has not converged locally yet.
+}
+
+struct SessionBootstrapRejection {
+  code @0 :SessionBootstrapRejectionCode;
+  # Stable machine-readable rejection code.
+
+  detail @1 :Text;
+  # Human-facing diagnostic detail for logs and debugging.
+}
+
+struct SessionBootstrapResult {
+  union {
+    accepted @0 :ClusterSession;
+    # Session accepted and ready to use.
+
+    rejected @1 :SessionBootstrapRejection;
+    # Session bootstrap was refused for a typed, expected reason.
+  }
+}
+
+struct CredentialBootstrapAccepted {
+  session @0 :ClusterSession;
+  # Cluster session capability granted to the credential subject.
+
+  ticket @1 :Data;
+  # Fresh session ticket for future ticket bootstrap.
+
+  nodeInfo @2 :NodeInfo;
+  # Server node metadata the caller should persist locally.
+
+  ticketExpiresAtUnixSecs @3 :UInt64;
+  # Absolute ticket expiry timestamp, 0 when no expiry is available.
+}
+
+struct CredentialBootstrapResult {
+  union {
+    accepted @0 :CredentialBootstrapAccepted;
+    # Credential accepted and exchanged for a session plus fresh ticket.
+
+    rejected @1 :SessionBootstrapRejection;
+    # Credential bootstrap was refused for a typed, expected reason.
+  }
 }
 
 struct RegisterNodeResponse {

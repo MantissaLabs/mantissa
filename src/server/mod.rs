@@ -27,6 +27,7 @@ pub mod credential;
 pub mod headless;
 mod service;
 pub mod session;
+pub(crate) mod session_bootstrap;
 
 /// How to run the exported transports.
 #[derive(Clone, Copy, Debug)]

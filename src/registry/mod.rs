@@ -1,5 +1,6 @@
 use crate::cluster::ClusterViewId;
 use crate::runtime::types::RuntimeSupportProfile;
+use crate::server::session_bootstrap::SessionBootstrapRejection;
 use crate::store::local::LocalSessionStore;
 use crate::store::replicated::peers::PeersStore;
 use crate::topology::peers::{
@@ -33,7 +34,7 @@ type SessionGateMap = Arc<AsyncMutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>>;
 type ReconnectGateMap = Arc<AsyncMutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>>;
 type ReconnectStateMap = Arc<AsyncMutex<HashMap<Uuid, PeerReconnectState>>>;
 type InvalidationStatsMap = Arc<AsyncMutex<HashMap<(Uuid, String), u64>>>;
-type SessionFailureStatsMap = Arc<AsyncMutex<HashMap<(Uuid, String), u64>>>;
+type SessionBootstrapStatsMap = Arc<AsyncMutex<HashMap<(Uuid, String), u64>>>;
 
 /// Cached projections over the peer store keyed by store generation.
 struct PeerStoreSnapshotCache {
@@ -110,7 +111,7 @@ pub struct Registry {
     reconnect_gates: ReconnectGateMap,
     reconnect_state: ReconnectStateMap,
     invalidation_stats: InvalidationStatsMap,
-    session_failure_stats: SessionFailureStatsMap,
+    session_bootstrap_stats: SessionBootstrapStatsMap,
     sessions: LocalSessionStore,
     peers: PeersStore,
     signing_key: Arc<AsyncMutex<SigningKey>>,
@@ -187,7 +188,7 @@ impl Registry {
             reconnect_gates: Arc::new(AsyncMutex::new(HashMap::new())),
             reconnect_state: Arc::new(AsyncMutex::new(HashMap::new())),
             invalidation_stats: Arc::new(AsyncMutex::new(HashMap::new())),
-            session_failure_stats: Arc::new(AsyncMutex::new(HashMap::new())),
+            session_bootstrap_stats: Arc::new(AsyncMutex::new(HashMap::new())),
             sessions,
             peers,
             signing_key: Arc::new(AsyncMutex::new(signing_key)),
@@ -240,7 +241,7 @@ impl Registry {
             .lock()
             .await
             .retain(|(peer, _), _| *peer != id);
-        self.session_failure_stats
+        self.session_bootstrap_stats
             .lock()
             .await
             .retain(|(peer, _), _| *peer != id);
@@ -252,7 +253,7 @@ impl Registry {
         self.reconnect_gates.lock().await.clear();
         self.reconnect_state.lock().await.clear();
         self.invalidation_stats.lock().await.clear();
-        self.session_failure_stats.lock().await.clear();
+        self.session_bootstrap_stats.lock().await.clear();
     }
 
     /// Evicts cached sessions and derived capabilities that remained idle past `max_idle`.
@@ -899,16 +900,41 @@ impl Registry {
                     let mut req = client.get_session_request();
                     req.get().set_ticket(&ticket);
                     match req.send().promise.await {
-                        Ok(resp) => match resp.get().and_then(|r| r.get_session()) {
-                            Ok(session) => {
-                                self.attach_handle_only(peer_id, client.clone()).await;
-                                self.store_session(peer_id, session.clone()).await;
-                                let _ = session.ping_request().send().promise.await.map(|_| {
-                                    let _ = self.health_monitor.record_observation(peer_id);
-                                });
+                        Ok(resp) => match resp.get().and_then(|r| r.get_result()) {
+                            Ok(result) => match result.which() {
+                                Ok(server::session_bootstrap_result::Which::Accepted(Ok(
+                                    session,
+                                ))) => {
+                                    self.attach_handle_only(peer_id, client.clone()).await;
+                                    self.store_session(peer_id, session.clone()).await;
+                                    let _ = session.ping_request().send().promise.await.map(|_| {
+                                        let _ = self.health_monitor.record_observation(peer_id);
+                                    });
 
-                                println!("Session established with peer {peer_id} @ {addr}");
-                            }
+                                    println!("Session established with peer {peer_id} @ {addr}");
+                                }
+                                Ok(server::session_bootstrap_result::Which::Accepted(Err(e)))
+                                | Ok(server::session_bootstrap_result::Which::Rejected(Err(e))) => {
+                                    eprintln!("resume: decode failed for {peer_id}: {e}");
+                                }
+                                Ok(server::session_bootstrap_result::Which::Rejected(Ok(
+                                    rejection_reader,
+                                ))) => match SessionBootstrapRejection::from_wire(rejection_reader)
+                                {
+                                    Ok(rejection) => eprintln!(
+                                        "resume: get_session rejected for {peer_id}: {}",
+                                        rejection.summary()
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "resume: get_session rejection decode failed for {peer_id}: {e}"
+                                    ),
+                                },
+                                Err(e) => {
+                                    eprintln!(
+                                        "resume: get_session result unknown for {peer_id}: {e}"
+                                    );
+                                }
+                            },
                             Err(e) => eprintln!("resume: decode failed for {peer_id}: {e}"),
                         },
                         Err(e) => {
@@ -1558,31 +1584,77 @@ impl Registry {
         let mut req = client.get_session_request();
         req.get().set_ticket(&ticket);
         match req.send().promise.await {
-            Ok(resp) => match resp.get() {
-                Ok(r) => r.get_session().ok(),
-                Err(e) => {
-                    let detail = e.to_string();
-                    if Self::is_transient_session_bootstrap_error(&detail) {
-                        debug!(target: "sync", "get_session transient response error: {e}");
-                    } else {
-                        error!(target: "sync", "get_session response error: {e}");
-                    }
-                    self.remove_rejected_session_ticket(peer_id, &detail);
-                    self.record_session_failure_telemetry(peer_id, "ticket.response", &detail)
+            Ok(resp) => {
+                let result = match resp.get().and_then(|r| r.get_result()) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        self.record_unexpected_session_failure(
+                            peer_id,
+                            "ticket.response",
+                            "get_session response error",
+                            &e,
+                        )
                         .await;
-                    None
+                        return None;
+                    }
+                };
+                match result.which() {
+                    Ok(server::session_bootstrap_result::Which::Accepted(Ok(session))) => {
+                        Some(session)
+                    }
+                    Ok(server::session_bootstrap_result::Which::Accepted(Err(e)))
+                    | Ok(server::session_bootstrap_result::Which::Rejected(Err(e))) => {
+                        self.record_unexpected_session_failure(
+                            peer_id,
+                            "ticket.response",
+                            "get_session response error",
+                            &e,
+                        )
+                        .await;
+                        None
+                    }
+                    Err(e) => {
+                        self.record_unexpected_session_failure(
+                            peer_id,
+                            "ticket.response",
+                            "get_session result unknown",
+                            &e,
+                        )
+                        .await;
+                        None
+                    }
+                    Ok(server::session_bootstrap_result::Which::Rejected(Ok(rejection_reader))) => {
+                        match SessionBootstrapRejection::from_wire(rejection_reader) {
+                            Ok(rejection) => {
+                                self.record_session_bootstrap_rejection(
+                                    peer_id,
+                                    "ticket.rejected",
+                                    &rejection,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                self.record_unexpected_session_failure(
+                                    peer_id,
+                                    "ticket.response",
+                                    "get_session rejection decode error",
+                                    &e,
+                                )
+                                .await;
+                            }
+                        }
+                        None
+                    }
                 }
-            },
+            }
             Err(e) => {
-                let detail = e.to_string();
-                if Self::is_transient_session_bootstrap_error(&detail) {
-                    debug!(target: "sync", "get_session transient failure: {e}");
-                } else {
-                    error!(target: "sync", "get_session failed: {e}");
-                }
-                self.remove_rejected_session_ticket(peer_id, &detail);
-                self.record_session_failure_telemetry(peer_id, "ticket.send", &detail)
-                    .await;
+                self.record_unexpected_session_failure(
+                    peer_id,
+                    "ticket.send",
+                    "get_session failed",
+                    &e,
+                )
+                .await;
                 None
             }
         }
@@ -1625,25 +1697,71 @@ impl Registry {
 
         match req.send().promise.await {
             Ok(resp) => {
-                let r = match resp.get() {
-                    Ok(r) => r,
+                let result = match resp.get().and_then(|r| r.get_result()) {
+                    Ok(result) => result,
                     Err(e) => {
-                        if Self::is_transient_session_bootstrap_error(&e.to_string()) {
-                            debug!(target: "sync", "getWithCredential transient response error: {e}");
-                        } else {
-                            error!(target: "sync", "getWithCredential response error: {e}");
-                        }
-                        self.record_session_failure_telemetry(
+                        self.record_unexpected_session_failure(
                             peer_id,
                             "credential.response",
-                            &e.to_string(),
+                            "getWithCredential response error",
+                            &e,
                         )
                         .await;
                         return None;
                     }
                 };
+                let accepted = match result.which() {
+                    Ok(server::credential_bootstrap_result::Which::Accepted(Ok(accepted))) => {
+                        accepted
+                    }
+                    Ok(server::credential_bootstrap_result::Which::Accepted(Err(e)))
+                    | Ok(server::credential_bootstrap_result::Which::Rejected(Err(e))) => {
+                        self.record_unexpected_session_failure(
+                            peer_id,
+                            "credential.response",
+                            "getWithCredential response error",
+                            &e,
+                        )
+                        .await;
+                        return None;
+                    }
+                    Err(e) => {
+                        self.record_unexpected_session_failure(
+                            peer_id,
+                            "credential.response",
+                            "getWithCredential result unknown",
+                            &e,
+                        )
+                        .await;
+                        return None;
+                    }
+                    Ok(server::credential_bootstrap_result::Which::Rejected(Ok(
+                        rejection_reader,
+                    ))) => {
+                        match SessionBootstrapRejection::from_wire(rejection_reader) {
+                            Ok(rejection) => {
+                                self.record_session_bootstrap_rejection(
+                                    peer_id,
+                                    "credential.rejected",
+                                    &rejection,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                self.record_unexpected_session_failure(
+                                    peer_id,
+                                    "credential.response",
+                                    "getWithCredential rejection decode error",
+                                    &e,
+                                )
+                                .await;
+                            }
+                        }
+                        return None;
+                    }
+                };
 
-                if let Ok(ni) = r.get_node_info()
+                if let Ok(ni) = accepted.get_node_info()
                     && let Ok(observed) = PeerValue::from_node_info(peer_id, ni)
                 {
                     let current = self.peer_selected_value_unscoped(peer_id);
@@ -1653,29 +1771,29 @@ impl Registry {
                     }
                 }
 
-                let ticket_expires_at_unix_secs = match r.get_ticket_expires_at_unix_secs() {
+                let ticket_expires_at_unix_secs = match accepted.get_ticket_expires_at_unix_secs() {
                     0 => None,
                     expires_at => Some(expires_at),
                 };
                 if let Err(e) = self.sessions.put_with_meta(
                     peer_id,
-                    r.get_ticket().ok()?,
+                    accepted.get_ticket().ok()?,
                     ticket_expires_at_unix_secs,
                     None,
                 ) {
                     error!(target: "sync", "ticket persist failed for {peer_id}: {e}");
                 }
 
-                r.get_session().ok()
+                accepted.get_session().ok()
             }
             Err(e) => {
-                if Self::is_transient_session_bootstrap_error(&e.to_string()) {
-                    debug!(target: "sync", "getWithCredential transient failure: {e}");
-                } else {
-                    error!(target: "sync", "getWithCredential failed: {e}");
-                }
-                self.record_session_failure_telemetry(peer_id, "credential.send", &e.to_string())
-                    .await;
+                self.record_unexpected_session_failure(
+                    peer_id,
+                    "credential.send",
+                    "getWithCredential failed",
+                    &e,
+                )
+                .await;
                 None
             }
         }
@@ -1700,8 +1818,8 @@ impl Registry {
     /// # Description:
     ///
     /// Removes a local session ticket once a remote authority has rejected it.
-    fn remove_rejected_session_ticket(&self, peer_id: Uuid, error: &str) {
-        if !Self::is_rejected_session_ticket_error(error) {
+    fn remove_rejected_session_ticket(&self, peer_id: Uuid, rejection: &SessionBootstrapRejection) {
+        if !rejection.rejects_cached_ticket() {
             return;
         }
         if let Err(remove_err) = self.sessions.remove(peer_id) {
@@ -1714,23 +1832,43 @@ impl Registry {
 
     /// # Description:
     ///
-    /// Returns true for getSession failures proving the cached ticket cannot be reused.
-    fn is_rejected_session_ticket_error(error: &str) -> bool {
-        error.contains("unknown session ticket")
-            || error.contains("peer not registered")
-            || error.contains("node is not an active cluster member")
+    /// Records one typed session bootstrap rejection returned by a peer.
+    async fn record_session_bootstrap_rejection(
+        &self,
+        peer_id: Uuid,
+        phase: &str,
+        rejection: &SessionBootstrapRejection,
+    ) {
+        let summary = rejection.summary();
+        if rejection.is_transient_convergence() {
+            debug!(target: "sync", "session bootstrap transient rejection: {summary}");
+        } else {
+            error!(target: "sync", "session bootstrap rejected: {summary}");
+        }
+        self.remove_rejected_session_ticket(peer_id, rejection);
+        self.record_session_bootstrap_telemetry(
+            peer_id,
+            phase,
+            &summary,
+            rejection.is_transient_convergence(),
+        )
+        .await;
     }
 
     /// # Description:
     ///
-    /// Returns true for session bootstrap failures expected during fast membership convergence.
-    fn is_transient_session_bootstrap_error(error: &str) -> bool {
-        error.contains("peer not registered on this node")
-            || error.contains("peer not registered")
-            || error.contains("unknown session ticket")
-            || error.contains("node is not an active cluster member")
-            || error.contains("issuer unknown")
-            || error.contains("issuer unknown (not yet synced)")
+    /// Records one unexpected session bootstrap exception or malformed response.
+    async fn record_unexpected_session_failure(
+        &self,
+        peer_id: Uuid,
+        phase: &str,
+        message: &str,
+        error: &dyn std::fmt::Display,
+    ) {
+        let detail = error.to_string();
+        error!(target: "sync", "{message}: {error}");
+        self.record_session_bootstrap_telemetry(peer_id, phase, &detail, false)
+            .await;
     }
 
     /// # Description:
@@ -1769,12 +1907,18 @@ impl Registry {
 
     /// # Description:
     ///
-    /// Records one session bootstrap failure so operators can correlate repeated ticket/credential
-    /// failures with the same peer and phase.
-    async fn record_session_failure_telemetry(&self, peer_id: Uuid, phase: &str, error: &str) {
+    /// Records one session bootstrap outcome so operators can correlate repeated
+    /// rejections or failures with the same peer and phase.
+    async fn record_session_bootstrap_telemetry(
+        &self,
+        peer_id: Uuid,
+        phase: &str,
+        error: &str,
+        transient: bool,
+    ) {
         let phase_key = phase.to_string();
         let count = {
-            let mut stats = self.session_failure_stats.lock().await;
+            let mut stats = self.session_bootstrap_stats.lock().await;
             let entry = stats.entry((peer_id, phase_key.clone())).or_insert(0);
             *entry = entry.saturating_add(1);
             *entry
@@ -1788,7 +1932,7 @@ impl Registry {
         let addr = self
             .peer_address(peer_id)
             .unwrap_or_else(|| "<unknown>".to_string());
-        if Self::is_transient_session_bootstrap_error(error) {
+        if transient {
             debug!(
                 target: "diag.session.bootstrap",
                 peer = %peer_id,
@@ -1797,7 +1941,7 @@ impl Registry {
                 count,
                 disconnected,
                 error = %error,
-                "transient session bootstrap failure sampled"
+                "transient session bootstrap outcome sampled"
             );
         } else {
             warn!(
@@ -1808,7 +1952,7 @@ impl Registry {
                 count,
                 disconnected,
                 error = %error,
-                "session bootstrap failure sampled"
+                "session bootstrap outcome sampled"
             );
         }
     }
@@ -1856,6 +2000,7 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::session_bootstrap::SessionBootstrapRejectionCode;
     use crate::store::replicated::peers::open_peers_store;
     use crate::topology::peers::{NodeReadiness, PeerMembership, PeerSchedulingState};
     use tempfile::tempdir;
@@ -2018,7 +2163,7 @@ mod tests {
 
     /// Remote ticket rejection should evict the local ticket so retries can fall back cleanly.
     #[test]
-    fn rejected_session_ticket_error_removes_local_ticket() {
+    fn rejected_session_ticket_rejection_removes_local_ticket() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir
             .path()
@@ -2039,10 +2184,10 @@ mod tests {
             HealthMonitor::new(local_id),
         );
 
-        registry.remove_rejected_session_ticket(
-            peer_id,
-            "Failed: remote exception: unknown session ticket",
+        let rejection = SessionBootstrapRejection::with_default_detail(
+            SessionBootstrapRejectionCode::UnknownSessionTicket,
         );
+        registry.remove_rejected_session_ticket(peer_id, &rejection);
 
         assert!(
             sessions.get(peer_id).expect("get ticket").is_none(),
@@ -2052,15 +2197,30 @@ mod tests {
 
     /// Expected membership races should not emit warning-level session bootstrap diagnostics.
     #[test]
-    fn session_bootstrap_transient_errors_include_leave_ticket_rejections() {
-        assert!(Registry::is_transient_session_bootstrap_error(
-            "Failed: remote exception: unknown session ticket"
-        ));
-        assert!(Registry::is_transient_session_bootstrap_error(
-            "Failed: remote exception: peer not registered"
-        ));
-        assert!(Registry::is_transient_session_bootstrap_error(
-            "Failed: remote exception: node is not an active cluster member"
-        ));
+    fn session_bootstrap_transient_codes_include_leave_ticket_rejections() {
+        assert!(
+            SessionBootstrapRejection::with_default_detail(
+                SessionBootstrapRejectionCode::UnknownSessionTicket
+            )
+            .is_transient_convergence()
+        );
+        assert!(
+            SessionBootstrapRejection::with_default_detail(
+                SessionBootstrapRejectionCode::PeerNotRegistered
+            )
+            .is_transient_convergence()
+        );
+        assert!(
+            SessionBootstrapRejection::with_default_detail(
+                SessionBootstrapRejectionCode::LocalNodeInactive
+            )
+            .is_transient_convergence()
+        );
+        assert!(
+            !SessionBootstrapRejection::with_default_detail(
+                SessionBootstrapRejectionCode::IssuerMismatch
+            )
+            .is_transient_convergence()
+        );
     }
 }

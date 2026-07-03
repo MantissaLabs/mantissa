@@ -259,7 +259,8 @@ impl server_proto::Server for UnavailablePeerServer {
     ) -> Result<(), capnp::Error> {
         results
             .get()
-            .set_session(UnavailableClusterSession::client(self.peer_id));
+            .init_result()
+            .set_accepted(UnavailableClusterSession::client(self.peer_id));
         Ok(())
     }
 
@@ -272,7 +273,7 @@ impl server_proto::Server for UnavailablePeerServer {
         _params: server_proto::GetWithCredentialParams,
         mut results: server_proto::GetWithCredentialResults,
     ) -> Result<(), capnp::Error> {
-        let mut out = results.get();
+        let mut out = results.get().init_result().init_accepted();
         out.set_session(UnavailableClusterSession::client(self.peer_id));
         out.set_ticket(b"test-unavailable-peer-session");
         out.set_ticket_expires_at_unix_secs(0);

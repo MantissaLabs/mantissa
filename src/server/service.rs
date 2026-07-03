@@ -3,6 +3,7 @@ use crate::cluster::ClusterViewId;
 use crate::crypto::rand;
 use crate::node::id;
 use crate::server::credential::ClusterCredential;
+use crate::server::session_bootstrap::{SessionBootstrapRejection, SessionBootstrapRejectionCode};
 use crate::store::replicated::secret_key_sync::{
     SecretMasterKeySyncRecord, write_secret_master_key_sync_record,
 };
@@ -261,22 +262,33 @@ impl Server {
         });
     }
 
-    /// Rejects remote cluster-control RPCs once the local node has left the cluster.
+    /// Returns a typed rejection when the local node has left the cluster.
     ///
     /// A left node may stay online for local CLI access, but it must not mint
     /// fresh peer sessions or accept new joins into a cluster it no longer
     /// participates in.
-    fn ensure_local_cluster_membership_active(&self) -> Result<(), capnp::Error> {
+    fn local_cluster_membership_rejection(
+        &self,
+    ) -> Result<Option<SessionBootstrapRejection>, capnp::Error> {
         if self
             .topology
             .peer_exists(self.identity.id)
             .map_err(|error| capnp::Error::failed(error.to_string()))?
         {
-            Ok(())
+            Ok(None)
         } else {
-            Err(capnp::Error::failed(
-                "node is not an active cluster member".to_string(),
-            ))
+            Ok(Some(SessionBootstrapRejection::with_default_detail(
+                SessionBootstrapRejectionCode::LocalNodeInactive,
+            )))
+        }
+    }
+
+    /// Rejects remote cluster-control RPCs once the local node has left the cluster.
+    fn ensure_local_cluster_membership_active(&self) -> Result<(), capnp::Error> {
+        if let Some(rejection) = self.local_cluster_membership_rejection()? {
+            Err(rejection.to_capnp_error())
+        } else {
+            Ok(())
         }
     }
 }
@@ -317,7 +329,10 @@ impl mantissa_protocol::server::Server for Server {
         mut results: mantissa_protocol::server::GetSessionResults,
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
-        self.ensure_local_cluster_membership_active()?;
+        if let Some(rejection) = self.local_cluster_membership_rejection()? {
+            rejection.write_to(results.get().init_result().init_rejected());
+            return Ok(());
+        }
 
         let ticket = params.get()?.get_ticket()?;
         let Some(peer_id) = self
@@ -327,7 +342,11 @@ impl mantissa_protocol::server::Server for Server {
             .map_err(|error| capnp::Error::failed(error.to_string()))?
         else {
             crate::observability::metrics::record_auth_failure("session_ticket", "unknown");
-            return Err(capnp::Error::failed("unknown session ticket".to_string()));
+            SessionBootstrapRejection::with_default_detail(
+                SessionBootstrapRejectionCode::UnknownSessionTicket,
+            )
+            .write_to(results.get().init_result().init_rejected());
+            return Ok(());
         };
 
         if !self
@@ -339,11 +358,16 @@ impl mantissa_protocol::server::Server for Server {
                 "session_ticket",
                 "peer_not_registered",
             );
-            return Err(capnp::Error::failed("peer not registered".to_string()));
+            SessionBootstrapRejection::with_default_detail(
+                SessionBootstrapRejectionCode::PeerNotRegistered,
+            )
+            .write_to(results.get().init_result().init_rejected());
+            return Ok(());
         }
         results
             .get()
-            .set_session(self.sessions.new_peer_client(peer_id, ticket.to_vec()));
+            .init_result()
+            .set_accepted(self.sessions.new_peer_client(peer_id, ticket.to_vec()));
         Ok(())
     }
 
@@ -353,14 +377,22 @@ impl mantissa_protocol::server::Server for Server {
         mut results: mantissa_protocol::server::GetWithCredentialResults,
     ) -> Result<(), capnp::Error> {
         self.ensure_online()?;
-        self.ensure_local_cluster_membership_active()?;
+        if let Some(rejection) = self.local_cluster_membership_rejection()? {
+            rejection.write_to(results.get().init_result().init_rejected());
+            return Ok(());
+        }
 
         let cred_bytes = params.get()?.get_credential()?;
         let cred = match ClusterCredential::from_bytes_verified(cred_bytes) {
             Ok(credential) => credential,
             Err(error) => {
                 crate::observability::metrics::record_auth_failure("credential", "invalid");
-                return Err(capnp::Error::failed(error));
+                SessionBootstrapRejection::new(
+                    SessionBootstrapRejectionCode::CredentialInvalid,
+                    error,
+                )
+                .write_to(results.get().init_result().init_rejected());
+                return Ok(());
             }
         };
 
@@ -370,24 +402,30 @@ impl mantissa_protocol::server::Server for Server {
             .map_err(|error| capnp::Error::failed(error.to_string()))?
         {
             crate::observability::metrics::record_auth_failure("credential", "peer_not_registered");
-            return Err(capnp::Error::failed(
-                "peer not registered on this node".to_string(),
-            ));
+            SessionBootstrapRejection::with_default_detail(
+                SessionBootstrapRejectionCode::PeerNotRegistered,
+            )
+            .write_to(results.get().init_result().init_rejected());
+            return Ok(());
         }
         if let Some(expected_vk) = self.topology.signing_vk_for(cred.subject) {
             if expected_vk != cred.issuer {
                 crate::observability::metrics::record_auth_failure("credential", "issuer_mismatch");
                 debug!(target: "server", subject=%cred.subject, "issuer mismatch for");
-                return Err(capnp::Error::failed(
-                    "issuer mismatch for subject".to_string(),
-                ));
+                SessionBootstrapRejection::with_default_detail(
+                    SessionBootstrapRejectionCode::IssuerMismatch,
+                )
+                .write_to(results.get().init_result().init_rejected());
+                return Ok(());
             }
         } else {
             crate::observability::metrics::record_auth_failure("credential", "issuer_unknown");
             debug!(target: "server", subject=%cred.subject, "issuer unknown (not yet synced)");
-            return Err(capnp::Error::failed(
-                "issuer unknown (not yet synced)".to_string(),
-            ));
+            SessionBootstrapRejection::with_default_detail(
+                SessionBootstrapRejectionCode::IssuerUnknown,
+            )
+            .write_to(results.get().init_result().init_rejected());
+            return Ok(());
         }
 
         debug!(target: "server", "Peer {} authenticated", cred.subject);
@@ -398,7 +436,7 @@ impl mantissa_protocol::server::Server for Server {
             .get_or_issue_ticket(cred.subject)
             .map_err(|error| capnp::Error::failed(error.to_string()))?;
 
-        let mut out = results.get();
+        let mut out = results.get().init_result().init_accepted();
         out.set_session(
             self.sessions
                 .new_peer_client(cred.subject, issued_ticket.ticket.clone()),
