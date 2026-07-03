@@ -340,6 +340,132 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
     );
 });
 
+local_test!(services_node_leave_reschedules_singleton_service, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes").await;
+
+    let service_name = "leave-singleton";
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![demo_backend_task_template("backend", 1)],
+        )
+        .await
+        .expect("submit singleton deployment");
+
+    assert!(
+        wait_for_service_status(
+            &cluster[0].node.service_controller,
+            service_id,
+            ServiceStatus::Running
+        )
+        .await,
+        "singleton service should reach running before leave"
+    );
+
+    let service = cluster[0]
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("load singleton service")
+        .expect("singleton service should exist");
+    let initial_task_id = service
+        .assigned_replica_id(0)
+        .expect("singleton service should have one task id");
+    let initial_task = cluster[0]
+        .node
+        .workload_manager
+        .inspect_workload(initial_task_id)
+        .await
+        .expect("inspect singleton task before leave");
+    let leaving_node_id = initial_task.node_id;
+    let leaving_node = cluster
+        .iter()
+        .find(|node| node.id() == leaving_node_id)
+        .expect("leaving node should belong to cluster");
+
+    leaving_node
+        .leave()
+        .await
+        .expect("service owner node leave ok");
+
+    for survivor in cluster.iter().filter(|node| node.id() != leaving_node_id) {
+        survivor
+            .assert_cluster_size(2, "survivor should observe two nodes after leave")
+            .await;
+    }
+    let survivor = cluster
+        .iter()
+        .find(|node| node.id() != leaving_node_id)
+        .expect("at least one survivor should remain");
+
+    let rescheduled = wait_until(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        || async {
+            let Some(current) = survivor
+                .node
+                .service_controller
+                .registry()
+                .get(service_id)
+                .expect("load singleton service after leave")
+            else {
+                return false;
+            };
+            if current.status() != ServiceStatus::Running || current.assigned_replica_count() != 1 {
+                return false;
+            }
+
+            let Some(replacement_task_id) = current.assigned_replica_id(0) else {
+                return false;
+            };
+            if replacement_task_id == initial_task_id {
+                return false;
+            }
+            let Ok(replacement) = survivor
+                .node
+                .workload_manager
+                .inspect_workload(replacement_task_id)
+                .await
+            else {
+                return false;
+            };
+
+            replacement.node_id != leaving_node_id && replacement.state == WorkloadPhase::Running
+        },
+    )
+    .await;
+    assert!(
+        rescheduled,
+        "surviving nodes should reschedule the singleton service after its owner leaves"
+    );
+    assert!(
+        surviving_nodes_observe_no_active_service_tasks_on_node(
+            &cluster,
+            service_name,
+            leaving_node_id,
+            Duration::from_secs(15),
+        )
+        .await,
+        "surviving nodes should stop listing active service tasks on the left node"
+    );
+});
+
 local_test!(services_node_drain_blocks_on_standalone_task, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;

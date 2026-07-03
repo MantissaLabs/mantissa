@@ -68,7 +68,7 @@ fn service_cleanup_stop_error_is_transient(err: &anyhow::Error) -> bool {
     })
 }
 
-/// Returns true when the task owner cannot receive remote service cleanup.
+/// Returns true when the task owner cannot make progress for service reconciliation.
 ///
 /// SWIM `Down` and explicit cluster leave both make remote workload stop impossible. Unknown
 /// membership is left retryable so temporary peer metadata lag does not retire healthy tasks.
@@ -136,7 +136,18 @@ impl ServiceController {
             let Some(task) = inventory.by_id.get(&task_id) else {
                 return true;
             };
-            node_is_down(task.node_id, health_snapshot) || !task_state_healthy(&task.state)
+            // `None` means the peer row has not converged here yet, so keep it retryable.
+            // `Some(false)` is an explicit leave tombstone and must degrade the service.
+            let owner_active_cluster_member = self
+                .cluster_registry
+                .peer_value_unscoped(task.node_id)
+                .map(|peer| peer.is_active());
+            service_task_owner_unavailable_for_cleanup(
+                task.node_id,
+                self.local_node_id,
+                health_snapshot,
+                owner_active_cluster_member,
+            ) || !task_state_healthy(&task.state)
         });
 
         if spec.status() == ServiceStatus::VolumeUnavailable && !service_degraded {
@@ -295,12 +306,26 @@ impl ServiceController {
         let task_on_draining_node = task
             .map(|task| self.node_drain_requested(task.node_id))
             .unwrap_or(false);
+        let task_owner_unavailable = task
+            .map(|task| {
+                // Health Down and explicit Left both mean a remote stop RPC cannot make progress.
+                // Unknown topology is intentionally not terminal so sync lag does not retire work.
+                let owner_active_cluster_member = self
+                    .cluster_registry
+                    .peer_value_unscoped(task.node_id)
+                    .map(|peer| peer.is_active());
+                service_task_owner_unavailable_for_cleanup(
+                    task.node_id,
+                    self.local_node_id,
+                    env.health_snapshot,
+                    owner_active_cluster_member,
+                )
+            })
+            .unwrap_or(false);
         let missing = match task {
             None => true,
             Some(task) => {
-                task_on_draining_node
-                    || node_is_down(task.node_id, env.health_snapshot)
-                    || !task_state_healthy(&task.state)
+                task_on_draining_node || task_owner_unavailable || !task_state_healthy(&task.state)
             }
         };
 
@@ -313,6 +338,16 @@ impl ServiceController {
                     replica = slot.replica,
                     task = %task_id,
                     "slot task is assigned to a draining node; forcing evacuation"
+                );
+            }
+            if task_owner_unavailable {
+                tracing::debug!(
+                    target: "services",
+                    service = %spec.service_name,
+                    template = %slot.template.name,
+                    replica = slot.replica,
+                    task = %task_id,
+                    "slot task owner is unavailable; forcing replacement"
                 );
             }
             let deployment_visibility_elapsed = if deploying_missing_slot_is_unknown(
