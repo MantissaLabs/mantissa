@@ -215,7 +215,10 @@ impl SecretMasterKeyPublisher {
                 .await
                 .map_err(|error| anyhow!("upsert replicated master-key row: {error}"))?;
         }
-        self.sync_notify.notify_waiters();
+        // Wake the reconciler even if it is already busy with a previous row. Master-key rows often
+        // arrive descriptor/current first and grants later; dropping the later wake can leave the
+        // local current stuck until an unrelated sync delta happens.
+        self.sync_notify.notify_one();
         Ok(())
     }
 
@@ -414,7 +417,9 @@ impl SecretMasterKeyReplicator {
                 );
                 continue;
             }
-            self.sync_notify.notify_waiters();
+            // Wake the reconciler even if it is already busy. Gossip can make anti-entropy a no-op,
+            // so this wake may be the only retry after a prior descriptor/key wait.
+            self.sync_notify.notify_one();
         }
     }
 }
