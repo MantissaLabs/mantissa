@@ -97,8 +97,9 @@ impl ClusterNodeCountRecord {
     /// Builds the ordering key used for deterministic node-count conflict resolution.
     ///
     /// The authority bit prevents metadata from another split view from replacing the count
-    /// computed by the lineage being summarized. The actor-local membership generation is ordered
-    /// after the actor id on purpose: it only breaks ties between observations from the same node.
+    /// computed by the lineage being summarized. Publishers that replace an observed row for the
+    /// same view must write a strictly newer timestamp. Actor id remains only a deterministic
+    /// tie-breaker for truly concurrent rows because membership generation is actor-local.
     fn precedence_key(&self, cluster_id: ClusterId) -> (bool, u64, u64, Uuid, u64, u32) {
         (
             self.authoritative_for(cluster_id),
@@ -108,6 +109,23 @@ impl ClusterNodeCountRecord {
             self.membership_generation,
             self.node_count,
         )
+    }
+
+    /// Returns the timestamp a local publisher should use for its next visible count row.
+    ///
+    /// Node-count updates are often written immediately after a split or leave, so two different
+    /// actors can publish different counts in the same millisecond. If this publisher already
+    /// observed a winning row for the exact same view, the replacement is causally after that row
+    /// and must sort after it before actor-id tie breaking can hide the fresh membership count.
+    pub(crate) fn next_publish_timestamp_after(
+        current: Option<&Self>,
+        local_view: ClusterViewId,
+        now_unix_ms: u64,
+    ) -> u64 {
+        let Some(current) = current.filter(|record| record.source_view == local_view) else {
+            return now_unix_ms;
+        };
+        now_unix_ms.max(current.updated_at_unix_ms.saturating_add(1))
     }
 }
 
@@ -853,6 +871,54 @@ mod tests {
                 .upsert_cluster_node_count(cluster_id, &fresh)
                 .await
                 .expect("fresh generation replaces stale same-timestamp count")
+        );
+        assert_eq!(
+            store
+                .winning_cluster_node_count_for(cluster_id)
+                .expect("read fresh winning count"),
+            Some(fresh)
+        );
+    }
+
+    /// Local replacement timestamps must beat same-millisecond rows from other actors.
+    #[tokio::test]
+    async fn local_publish_timestamp_advances_observed_cross_actor_count() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("cluster-view-cross-actor-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(Database::create(db_path).expect("create db"));
+        let actor_a = Uuid::from_u128(1);
+        let actor_b = Uuid::from_u128(2);
+        let cluster_id = ClusterId::from_uuid(Uuid::new_v4());
+        let source_view = ClusterViewId::new(cluster_id, 1);
+        let store = ClusterViewStore::new(db, actor_a).expect("open cluster-view store");
+
+        let stale = count_record(source_view, 2, 10, actor_b, 1);
+        store
+            .cluster_view_domain
+            .upsert(
+                &UuidKey::from(cluster_id.to_uuid()),
+                ClusterViewMetadataRecord {
+                    name: None,
+                    node_count: Some(stale.clone()),
+                },
+            )
+            .await
+            .expect("insert stale count through raw metadata domain");
+
+        let fresh = count_record(
+            source_view,
+            1,
+            ClusterNodeCountRecord::next_publish_timestamp_after(Some(&stale), source_view, 10),
+            actor_a,
+            2,
+        );
+        assert!(
+            store
+                .upsert_cluster_node_count(cluster_id, &fresh)
+                .await
+                .expect("fresh cross-actor count should replace stale same-timestamp count")
         );
         assert_eq!(
             store

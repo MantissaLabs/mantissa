@@ -50,21 +50,27 @@ impl Topology {
 
         let local_view = self.active_cluster_view();
         let node_count = self.local_cluster_view_member_count().await?;
-        if let Some(current) = self
+        let current = self
             .stores
             .cluster_view_store
             .winning_cluster_node_count_for(local_view.cluster_id)
-            .map_err(|err| capnp::Error::failed(err.to_string()))?
+            .map_err(|err| capnp::Error::failed(err.to_string()))?;
+        if let Some(current) = current.as_ref()
             && current.source_view == local_view
             && current.node_count == node_count
         {
             return Ok(false);
         }
 
+        let updated_at_unix_ms = ClusterNodeCountRecord::next_publish_timestamp_after(
+            current.as_ref(),
+            local_view,
+            Self::now_unix_ms(),
+        );
         let record = ClusterNodeCountRecord {
             node_count,
             source_view: local_view,
-            updated_at_unix_ms: Self::now_unix_ms(),
+            updated_at_unix_ms,
             actor_node_id: self.local.node.id,
             membership_generation: self.stores.peers.change_clock(),
         };
