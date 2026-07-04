@@ -2,8 +2,8 @@ use anyhow::{Context, Result, anyhow};
 use futures::{StreamExt, TryStreamExt};
 use libc;
 use rtnetlink::packet_core::{
-    NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST, NetlinkMessage,
-    NetlinkPayload,
+    NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_DUMP, NLM_F_REPLACE, NLM_F_REQUEST,
+    NetlinkMessage, NetlinkPayload,
 };
 use rtnetlink::packet_route::link::LinkAttribute;
 use rtnetlink::packet_route::neighbour::{
@@ -12,7 +12,7 @@ use rtnetlink::packet_route::neighbour::{
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage, route::RouteType};
 use rtnetlink::{Handle, LinkUnspec, LinkVeth};
 use std::fs::File;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
@@ -361,7 +361,17 @@ impl AttachmentProvisioner {
             .delete_fdb_entry(handle, vxlan_index, &mac_bytes, dst)
             .await
         {
-            warn_unless_not_found(err, || format!("remove fdb entry {mac} -> {dst}"));
+            // A missing entry is already converged: every other netlink error means the stale
+            // forwarding row may still be present and must be surfaced to the reconciler.
+            if let rtnetlink::Error::NetlinkError(ref message) = err
+                && message
+                    .code
+                    .map(|code| code.get() == -libc::ENOENT)
+                    .unwrap_or(false)
+            {
+                return Ok(());
+            }
+            return Err(err).with_context(|| format!("remove fdb entry {mac} -> {dst}"));
         }
 
         Ok(())
@@ -396,10 +406,33 @@ impl AttachmentProvisioner {
             None => return Ok(Vec::new()),
         };
 
-        let mut stream = handle.neighbours().get().execute();
+        // VXLAN forwarding lives in the Linux bridge FDB, not the normal IP neighbour table.
+        // Reconciliation compares the kernel's observed `(mac, underlay-ip)` entries against
+        // Mantissa's desired replicated network state, then deletes observed entries that belong
+        // to left peers. The high-level rtnetlink neighbour dump does not select `AF_BRIDGE`, so
+        // build the bridge-family request directly; otherwise stale VXLAN entries are invisible.
+        let mut message = NeighbourMessage::default();
+        message.header.family = AddressFamily::Bridge;
+        message.header.ifindex = vxlan_index;
+
+        let mut request = NetlinkMessage::from(RouteNetlinkMessage::GetNeighbour(message));
+        request.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
+
+        let mut handle = handle.clone();
+        let mut stream = handle
+            .request(request)
+            .context("start bridge fdb dump request")?;
         let mut entries = Vec::new();
 
-        while let Some(msg) = stream.try_next().await.context("list vxlan fdb entries")? {
+        while let Some(message) = stream.next().await {
+            let msg = match message.payload {
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(msg)) => msg,
+                NetlinkPayload::Error(err) if err.code.is_some() => {
+                    return Err(rtnetlink::Error::NetlinkError(err))
+                        .context("list vxlan fdb entries");
+                }
+                _ => continue,
+            };
             if msg.header.ifindex != vxlan_index {
                 continue;
             }
@@ -416,6 +449,9 @@ impl AttachmentProvisioner {
                     }
                     NeighbourAttribute::Destination(NeighbourAddress::Inet6(addr)) => {
                         dst = Some(IpAddr::V6(addr));
+                    }
+                    NeighbourAttribute::Destination(NeighbourAddress::Other(value)) => {
+                        dst = parse_bridge_fdb_destination(&value);
                     }
                     _ => {}
                 }
@@ -595,6 +631,9 @@ impl AttachmentProvisioner {
         let mut message = NeighbourMessage::default();
         message.header.family = AddressFamily::Bridge;
         message.header.ifindex = vxlan_index;
+        message.header.state = NeighbourState::Permanent;
+        message.header.flags = NeighbourFlags::Own;
+        message.header.kind = RouteType::Unspec;
 
         message
             .attributes
@@ -715,18 +754,25 @@ fn format_mac_bytes(mac: &[u8]) -> Option<String> {
     ))
 }
 
-/// Log a netlink deletion error unless it only reports an entry that is already absent.
-fn warn_unless_not_found(err: rtnetlink::Error, context: impl FnOnce() -> String) {
-    use tracing::warn;
-    if let rtnetlink::Error::NetlinkError(ref message) = err
-        && message
-            .code
-            .map(|code| code.get() == -libc::ENOENT)
-            .unwrap_or(false)
-    {
-        return;
+/// Decode the raw `NDA_DST` payload returned by bridge-family FDB dumps.
+///
+/// In an `AF_BRIDGE` neighbour dump the netlink crate does not know whether `NDA_DST` contains an
+/// IPv4 or IPv6 underlay address, so it exposes the bytes as `NeighbourAddress::Other`. Mantissa
+/// needs the destination IP to identify the exact FDB row to delete, for example
+/// `02:... -> 192.0.2.10` or `00:00:00:00:00:00 -> 192.0.2.10`. Four bytes mean IPv4, sixteen
+/// bytes mean IPv6, and any other payload is not a VXLAN destination Mantissa can reconcile.
+fn parse_bridge_fdb_destination(value: &[u8]) -> Option<IpAddr> {
+    match value.len() {
+        4 => Some(IpAddr::V4(Ipv4Addr::new(
+            value[0], value[1], value[2], value[3],
+        ))),
+        16 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(value);
+            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+        }
+        _ => None,
     }
-    warn!(target: "network", "{}: {err}", context());
 }
 
 /// Enter the runtime network namespace, configure the interface, and restore the host namespace.

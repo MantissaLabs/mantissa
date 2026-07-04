@@ -3097,6 +3097,15 @@ impl NetworkController {
             .into_iter()
             .filter(|(mac, ip)| desired.get(mac) != Some(ip))
             .collect();
+        if !stale_unicast.is_empty() {
+            debug!(
+                target: "network",
+                network = %plan.network_id,
+                vxlan = %plan.vxlan_name,
+                count = stale_unicast.len(),
+                "removing stale remote fdb entries"
+            );
+        }
         for (mac, ip) in stale_unicast {
             if let Err(err) = self
                 .inner
@@ -3142,6 +3151,15 @@ impl NetworkController {
             .into_iter()
             .filter(|ip| !flood_targets.contains_key(ip))
             .collect();
+        if !obsolete_flood.is_empty() {
+            debug!(
+                target: "network",
+                network = %plan.network_id,
+                vxlan = %plan.vxlan_name,
+                count = obsolete_flood.len(),
+                "removing stale vxlan flood entries"
+            );
+        }
         for ip in obsolete_flood {
             if let Err(err) = self
                 .inner

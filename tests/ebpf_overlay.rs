@@ -18,14 +18,22 @@ use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use mantissa::network::allocator::{OverlayIpFamily, parse_overlay_cidr};
 use mantissa::network::lb::BpfLoadBalancer;
-use mantissa::network::types::{NetworkRealizationPolicy, NetworkStatus};
+use mantissa::network::types::{
+    NetworkAttachmentDraft, NetworkAttachmentState, NetworkAttachmentValue, NetworkPeerState,
+    NetworkPeerStateValue, NetworkRealizationPolicy, NetworkStatus, compute_network_attachment_id,
+};
+use mantissa::runtime::types::RuntimeSupportProfile;
 use mantissa::server::headless::HeadlessNode;
 use mantissa::services::ServiceController;
 use mantissa::services::types::{
     ServicePortProtocol, ServiceStatus, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
 };
+use mantissa::topology::peers::{
+    NodeReadiness, PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue,
+};
 use mantissa::workload::model::WorkloadStateFilter;
 use mantissa::workload::types::ExecutionSpec;
+use mantissa_store::uuid_key::UuidKey;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -866,6 +874,456 @@ fn pinned_map_entries_snapshot() -> BTreeSet<String> {
         .collect()
 }
 
+/// Build one active peer row whose advertised address can drive survivor-side VXLAN forwarding.
+fn privileged_remote_peer_value(peer_id: Uuid, address: &str, hostname: &str) -> PeerValue {
+    PeerValue {
+        address: address.to_string(),
+        hostname: hostname.to_string(),
+        platform_os: "linux".to_string(),
+        platform_arch: "amd64".to_string(),
+        noise_static_pub: [0x41; 32],
+        signing_pub: [0x42; 32],
+        identity_sig: vec![0x43; 64],
+        wireguard: None,
+        scheduling: PeerSchedulingState::schedulable_default(peer_id),
+        readiness: NodeReadiness::ready(peer_id, 1),
+        labels: PeerLabelState::default(),
+        runtime_support: RuntimeSupportProfile::default(),
+        root_schema: mantissa::cluster::RootSchemaInfo::default(),
+        membership: PeerMembership::active(1),
+    }
+}
+
+/// Insert one synthetic active peer into the survivor's topology store.
+async fn upsert_privileged_remote_peer(
+    node: &HeadlessNode,
+    peer_id: Uuid,
+    address: &str,
+    hostname: &str,
+) {
+    node.peers
+        .upsert(
+            &UuidKey::from(peer_id),
+            privileged_remote_peer_value(peer_id, address, hostname),
+        )
+        .await
+        .expect("upsert synthetic remote peer");
+}
+
+/// Build one ready remote attachment row so the survivor programs VXLAN unicast forwarding.
+fn privileged_remote_attachment(
+    network_id: Uuid,
+    node_id: Uuid,
+    mac: &str,
+    ip: Ipv4Addr,
+) -> NetworkAttachmentValue {
+    let task_id = Uuid::new_v4();
+    NetworkAttachmentValue::new(NetworkAttachmentDraft {
+        id: compute_network_attachment_id(task_id, network_id),
+        task_id,
+        node_id,
+        instance_id: format!("mantissa-remote-{task_id}"),
+        network_id,
+        task_updated_at: None,
+        requested_ip: Some(ip.to_string()),
+        assigned_ip: Some(ip.to_string()),
+        mac: Some(mac.to_string()),
+        state: NetworkAttachmentState::Ready,
+        error: None,
+        traffic_published: false,
+        service_name: None,
+        template_name: None,
+    })
+}
+
+/// Evict one peer through the topology RPC so the test uses the same leave cleanup hook as gossip.
+async fn evict_privileged_remote_peer(node: &HeadlessNode, peer_id: Uuid) {
+    let mut request = node.topology_client.evict_request();
+    request.get().init_node_id().set_bytes(peer_id.as_bytes());
+    request
+        .send()
+        .promise
+        .await
+        .expect("send privileged remote peer eviction")
+        .get()
+        .expect("privileged remote peer eviction result");
+}
+
+/// Return the current kernel VXLAN FDB dump for one interface.
+fn vxlan_fdb_dump(vxlan_ifname: &str) -> String {
+    command_stdout("bridge", &["fdb", "show", "dev", vxlan_ifname])
+}
+
+/// Return whether one VXLAN FDB dump contains the requested MAC-to-underlay entry.
+fn vxlan_fdb_dump_contains(dump: &str, mac: &str, dst: Ipv4Addr) -> bool {
+    let mac = mac.to_ascii_lowercase();
+    let dst = format!("dst {dst}");
+    dump.lines()
+        .map(str::to_ascii_lowercase)
+        .any(|line| line.contains(&mac) && line.contains(&dst))
+}
+
+/// Render survivor-side leave dataplane state for assertion failures.
+async fn privileged_leave_dataplane_debug(
+    node: &HeadlessNode,
+    network_id: Uuid,
+    vxlan_ifname: &str,
+) -> String {
+    let provisioner_fdb = match mantissa::network::attachment::AttachmentProvisioner::new() {
+        Ok(provisioner) => provisioner
+            .list_remote_fdb(vxlan_ifname)
+            .await
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|(mac, ip)| format!("{mac}->{ip}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|err| format!("provisioner_fdb_error={err:#}")),
+        Err(err) => format!("provisioner_error={err:#}"),
+    };
+    let peer_rows = node
+        .network_registry
+        .list_peer_states(Some(network_id))
+        .map(|states| {
+            states
+                .into_iter()
+                .map(|state| {
+                    format!(
+                        "{}:{}:{:?}:{:?}",
+                        state.peer_name, state.peer_id, state.state, state.error
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|err| format!("peer_state_error={err:#}"));
+    let attachments = node
+        .network_registry
+        .list_attachments(Some(network_id))
+        .map(|attachments| {
+            attachments
+                .into_iter()
+                .map(|attachment| {
+                    format!(
+                        "{}:{}:{:?}:mac={:?}:ip={:?}",
+                        attachment.node_id,
+                        attachment.task_id,
+                        attachment.state,
+                        attachment.mac,
+                        attachment.assigned_ip
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|err| format!("attachment_error={err:#}"));
+    format!(
+        "peers=[{peer_rows}]; attachments=[{attachments}]; provisioner_fdb=[{provisioner_fdb}]; vxlan={}; fdb={}",
+        link_summary(vxlan_ifname).await,
+        vxlan_fdb_dump(vxlan_ifname).trim()
+    )
+}
+
+/// Synthetic remote peer data used to seed survivor-side topology and network rows.
+#[derive(Clone, Copy)]
+struct PrivilegedLeavePeer {
+    id: Uuid,
+    hostname: &'static str,
+    underlay: Ipv4Addr,
+    mac: &'static str,
+    attachment_ip: Ipv4Addr,
+}
+
+/// Real survivor network plus the synthetic remote peers participating in the leave scenario.
+struct PrivilegedLeaveScenario {
+    network_id: Uuid,
+    subnet: String,
+    vxlan_ifname: String,
+    bridge_ifname: String,
+    host_peer_ifname: String,
+    left: PrivilegedLeavePeer,
+    retained: PrivilegedLeavePeer,
+    flood_mac: &'static str,
+}
+
+/// Point-in-time survivor state used by the leave wait predicates.
+struct PrivilegedLeaveState {
+    peer_counts: Option<(u32, u32)>,
+    peer_rows: Vec<NetworkPeerStateValue>,
+    attachments: Vec<NetworkAttachmentValue>,
+    fdb: String,
+}
+
+impl PrivilegedLeaveState {
+    /// Load the replicated network rows and kernel FDB observed by the survivor.
+    fn load(node: &HeadlessNode, scenario: &PrivilegedLeaveScenario) -> Self {
+        Self {
+            peer_counts: node
+                .network_registry
+                .peer_counts()
+                .ok()
+                .and_then(|counts| counts.get(&scenario.network_id).copied()),
+            peer_rows: node
+                .network_registry
+                .list_peer_states(Some(scenario.network_id))
+                .unwrap_or_default(),
+            attachments: node
+                .network_registry
+                .list_attachments(Some(scenario.network_id))
+                .unwrap_or_default(),
+            fdb: vxlan_fdb_dump(&scenario.vxlan_ifname),
+        }
+    }
+
+    /// Return whether the survivor still has a network peer-state row for one peer.
+    fn has_peer_row(&self, peer: PrivilegedLeavePeer) -> bool {
+        self.peer_rows.iter().any(|state| state.peer_id == peer.id)
+    }
+
+    /// Return whether the survivor still has a network attachment row for one peer.
+    fn has_attachment(&self, peer: PrivilegedLeavePeer) -> bool {
+        self.attachments
+            .iter()
+            .any(|attachment| attachment.node_id == peer.id)
+    }
+
+    /// Return whether the survivor has unicast VXLAN forwarding for one peer.
+    fn has_peer_forwarding(&self, peer: PrivilegedLeavePeer) -> bool {
+        vxlan_fdb_dump_contains(&self.fdb, peer.mac, peer.underlay)
+    }
+
+    /// Return whether the survivor floods VXLAN broadcast traffic to one peer.
+    fn has_flood_forwarding(
+        &self,
+        scenario: &PrivilegedLeaveScenario,
+        peer: PrivilegedLeavePeer,
+    ) -> bool {
+        vxlan_fdb_dump_contains(&self.fdb, scenario.flood_mac, peer.underlay)
+    }
+
+    /// Return whether one remote peer is fully represented in replicated rows and kernel FDB.
+    fn peer_is_programmed(
+        &self,
+        scenario: &PrivilegedLeaveScenario,
+        peer: PrivilegedLeavePeer,
+    ) -> bool {
+        self.has_attachment(peer)
+            && self.has_peer_forwarding(peer)
+            && self.has_flood_forwarding(scenario, peer)
+    }
+
+    /// Return whether one left peer has no remaining replicated rows or kernel FDB state.
+    fn peer_is_retired(
+        &self,
+        scenario: &PrivilegedLeaveScenario,
+        peer: PrivilegedLeavePeer,
+    ) -> bool {
+        !self.has_peer_row(peer)
+            && !self.has_attachment(peer)
+            && !self.has_peer_forwarding(peer)
+            && !self.has_flood_forwarding(scenario, peer)
+    }
+
+    /// Return whether one retained peer still has its replicated row and forwarding state.
+    fn peer_is_retained(
+        &self,
+        scenario: &PrivilegedLeaveScenario,
+        peer: PrivilegedLeavePeer,
+    ) -> bool {
+        self.has_peer_row(peer) && self.peer_is_programmed(scenario, peer)
+    }
+
+    /// Return whether both synthetic peers are fully present before the leave event.
+    fn has_initial_forwarding(&self, scenario: &PrivilegedLeaveScenario) -> bool {
+        let peer_counts_include_all_nodes = self.peer_counts == Some((3, 3));
+
+        peer_counts_include_all_nodes
+            && self.peer_is_programmed(scenario, scenario.left)
+            && self.peer_is_programmed(scenario, scenario.retained)
+    }
+
+    /// Return whether only the retained peer remains after the leave cleanup converges.
+    fn retired_left_peer(&self, scenario: &PrivilegedLeaveScenario) -> bool {
+        let peer_counts_exclude_left_node = self.peer_counts == Some((2, 2));
+
+        peer_counts_exclude_left_node
+            && self.peer_is_retired(scenario, scenario.left)
+            && self.peer_is_retained(scenario, scenario.retained)
+    }
+}
+
+/// Build the two remote peers used by the survivor-side leave regression.
+fn privileged_leave_remote_peers() -> (PrivilegedLeavePeer, PrivilegedLeavePeer) {
+    (
+        PrivilegedLeavePeer {
+            id: Uuid::new_v4(),
+            hostname: "left-peer",
+            // Loopback underlay addresses still exercise VXLAN FDB programming, but any topology
+            // broadcast attempted during eviction fails fast instead of hanging on blackholed peers.
+            underlay: Ipv4Addr::new(127, 0, 0, 10),
+            mac: "02:10:00:00:00:0a",
+            attachment_ip: Ipv4Addr::new(10, 244, 0, 10),
+        },
+        PrivilegedLeavePeer {
+            id: Uuid::new_v4(),
+            hostname: "retained-peer",
+            underlay: Ipv4Addr::new(127, 0, 0, 11),
+            mac: "02:10:00:00:00:0b",
+            attachment_ip: Ipv4Addr::new(10, 244, 0, 11),
+        },
+    )
+}
+
+/// Create one real privileged survivor network and attach the synthetic peer fixture to it.
+async fn create_privileged_leave_scenario(node: &HeadlessNode) -> PrivilegedLeaveScenario {
+    let subnet = privileged_test_subnet();
+    let network = create_privileged_network(
+        node,
+        privileged_test_network(
+            "ebpf-leave-survivor",
+            "privileged survivor dataplane leave integration test network",
+            &subnet,
+            1450,
+            Vec::new(),
+        ),
+        NetworkStatus::Ready,
+    )
+    .await;
+    let [vxlan_ifname, bridge_ifname, host_peer_ifname, _host_ifname] =
+        privileged_network_interfaces(network.id);
+    let (left, retained) = privileged_leave_remote_peers();
+
+    PrivilegedLeaveScenario {
+        network_id: network.id,
+        subnet,
+        vxlan_ifname,
+        bridge_ifname,
+        host_peer_ifname,
+        left,
+        retained,
+        flood_mac: "00:00:00:00:00:00",
+    }
+}
+
+/// Assert that the survivor's local eBPF dataplane stays attached around peer leave.
+async fn assert_privileged_survivor_dataplane_attached(
+    scenario: &PrivilegedLeaveScenario,
+    phase: &str,
+) {
+    assert_xdp_attachment(
+        &scenario.vxlan_ifname,
+        &format!("survivor vxlan interface should carry xdp {phase}"),
+    )
+    .await;
+    assert_xdp_attachment(
+        &scenario.bridge_ifname,
+        &format!("survivor bridge interface should carry xdp {phase}"),
+    )
+    .await;
+    assert_tc_attachment(
+        &scenario.vxlan_ifname,
+        "ingress",
+        &format!("survivor vxlan ingress should carry tc {phase}"),
+    );
+    assert_tc_attachment(
+        &scenario.host_peer_ifname,
+        "egress",
+        &format!("survivor host-access peer egress should carry tc {phase}"),
+    );
+    assert_lb_maps_present(scenario.network_id, overlay_family(&scenario.subnet));
+}
+
+/// Insert the remote topology, peer-state, and attachment rows a survivor would learn by gossip.
+async fn install_privileged_remote_leave_state(
+    node: &HeadlessNode,
+    scenario: &PrivilegedLeaveScenario,
+) {
+    for peer in [scenario.left, scenario.retained] {
+        upsert_privileged_remote_peer(
+            node,
+            peer.id,
+            &format!("{}:6578", peer.underlay),
+            peer.hostname,
+        )
+        .await;
+        node.network_registry
+            .upsert_peer_state(NetworkPeerStateValue::new(
+                scenario.network_id,
+                peer.id,
+                peer.hostname,
+                NetworkPeerState::Ready,
+                None,
+            ))
+            .await
+            .expect("upsert synthetic peer network state");
+        node.network_registry
+            .upsert_attachment(privileged_remote_attachment(
+                scenario.network_id,
+                peer.id,
+                peer.mac,
+                peer.attachment_ip,
+            ))
+            .await
+            .expect("upsert synthetic remote attachment");
+    }
+
+    node.network_controller
+        .schedule_spec_change(scenario.network_id)
+        .await;
+}
+
+/// Wait until the survivor has programmed forwarding for both synthetic remote peers.
+async fn wait_for_privileged_initial_forwarding(
+    node: &HeadlessNode,
+    scenario: &PrivilegedLeaveScenario,
+) {
+    let initial_forwarding_ready = common::convergence::wait_until(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        || async { PrivilegedLeaveState::load(node, scenario).has_initial_forwarding(scenario) },
+    )
+    .await;
+    if !initial_forwarding_ready {
+        let state =
+            privileged_leave_dataplane_debug(node, scenario.network_id, &scenario.vxlan_ifname)
+                .await;
+        panic!("survivor should program forwarding for both remote peers before leave; {state}");
+    }
+}
+
+/// Wait until the survivor has retired only the left peer's replicated and kernel dataplane state.
+async fn wait_for_privileged_left_peer_retired(
+    node: &HeadlessNode,
+    scenario: &PrivilegedLeaveScenario,
+) {
+    let left_retired = common::convergence::wait_until(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        || async { PrivilegedLeaveState::load(node, scenario).retired_left_peer(scenario) },
+    )
+    .await;
+    if !left_retired {
+        let state =
+            privileged_leave_dataplane_debug(node, scenario.network_id, &scenario.vxlan_ifname)
+                .await;
+        panic!("survivor should retire only the left peer's dataplane state; {state}");
+    }
+}
+
+/// Assert that topology left an inactive tombstone for the evicted peer identity.
+fn assert_privileged_peer_tombstoned(node: &HeadlessNode, peer_id: Uuid) {
+    let peer_row = node
+        .registry
+        .peer_value_unscoped(peer_id)
+        .expect("left peer tombstone should remain visible");
+    assert!(
+        !peer_row.is_active(),
+        "topology eviction should leave an inactive peer tombstone"
+    );
+}
+
 local_test!(ebpf_overlay_attaches_programs_and_tears_down_cleanly, {
     let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {
         return;
@@ -935,6 +1393,48 @@ local_test!(ebpf_overlay_attaches_programs_and_tears_down_cleanly, {
 
     delete_privileged_network(&node, network.id).await;
 });
+
+// This is intentionally a survivor-side dataplane test, not a literal three-node privileged
+// cluster. The privileged Rust harness runs all nodes in one Linux network namespace, so multiple
+// real eBPF nodes would collide on deterministic links and bpffs pins instead of modeling distinct
+// hosts. We keep one real survivor with kernel VXLAN/BPF state, inject the remote peer and
+// attachment rows it would learn from gossip, then evict one peer through the topology RPC so the
+// assertion covers the same mark-left cleanup path used when a survivor receives a leave event.
+//
+// TODO: Update this test to run a real 3-node privileged cluster harness. It is enough to catch
+// a regression with the ebpf state on leave for now, but not for the full story end to end.
+local_test!(
+    ebpf_overlay_survivor_evict_retires_left_peer_dataplane_state,
+    {
+        let Some(artifact_dir) = privileged_ebpf_artifact_dir() else {
+            return;
+        };
+
+        let _config = PrivilegedTestGuard::apply(|config| {
+            config.network.wireguard.enabled = false;
+            config.network.wireguard.manage_firewall = false;
+            config.network.bpf.attach = true;
+            artifact_dir.apply_to(config);
+            config.network.nodeport.enabled = false;
+            config.network.advertise_addr = Some("127.0.0.1:6578".to_string());
+        });
+
+        let node = create_privileged_node().await;
+        let scenario = create_privileged_leave_scenario(&node).await;
+
+        assert_privileged_survivor_dataplane_attached(&scenario, "before leave").await;
+        install_privileged_remote_leave_state(&node, &scenario).await;
+        wait_for_privileged_initial_forwarding(&node, &scenario).await;
+
+        evict_privileged_remote_peer(&node, scenario.left.id).await;
+
+        wait_for_privileged_left_peer_retired(&node, &scenario).await;
+        assert_privileged_peer_tombstoned(&node, scenario.left.id);
+        assert_privileged_survivor_dataplane_attached(&scenario, "after leave").await;
+
+        delete_privileged_network(&node, scenario.network_id).await;
+    }
+);
 
 local_test!(
     ebpf_overlay_on_demand_network_stays_cold_until_service_uses_it,
