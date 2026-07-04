@@ -466,6 +466,157 @@ local_test!(services_node_leave_reschedules_singleton_service, {
     );
 });
 
+local_test!(services_node_leave_reschedules_multi_template_service, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(2),
+        ..ClusterConfig::default()
+    };
+    let cluster = TestNode::new_cluster_inproc_with_config(3, cfg)
+        .await
+        .expect("cluster should start");
+    TestNode::assert_cluster_size_all(&cluster, 3, "cluster should stabilise to three nodes").await;
+
+    let service_name = "leave-multi-template";
+    let service_id = cluster[0]
+        .node
+        .service_controller
+        .submit_deployment(
+            Uuid::new_v4(),
+            service_name,
+            service_name,
+            vec![
+                demo_backend_task_template("backend", 4),
+                demo_backend_task_template("frontend", 1),
+            ],
+        )
+        .await
+        .expect("submit multi-template deployment");
+
+    for node in &cluster {
+        assert!(
+            wait_for_service_status(
+                &node.node.service_controller,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
+            "node {} should observe running state before multi-template leave",
+            node.id()
+        );
+    }
+    assert!(
+        wait_for_min_local_service_task_count(&cluster, service_name, 1, Duration::from_secs(15))
+            .await,
+        "service should spread at least one replica per node before leave"
+    );
+
+    let leaving_node = &cluster[2];
+    let leaving_node_id = leaving_node.id();
+    let leaving_task_ids: BTreeSet<Uuid> = list_local_active_service_tasks(
+        &leaving_node.node.workload_manager,
+        service_name,
+        leaving_node_id,
+    )
+    .await
+    .into_iter()
+    .map(|task| task.id)
+    .collect();
+    assert!(
+        !leaving_task_ids.is_empty(),
+        "leaving node should own at least one service task before leave"
+    );
+
+    let baseline_spec = cluster[0]
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("load multi-template service before leave")
+        .expect("multi-template service should exist");
+    let baseline_ids: BTreeSet<Uuid> = baseline_spec.assigned_replica_ids().into_iter().collect();
+    let expected_replica_count = baseline_spec.assigned_replica_count();
+
+    leaving_node
+        .leave()
+        .await
+        .expect("multi-template service owner node leave ok");
+
+    for survivor in cluster.iter().filter(|node| node.id() != leaving_node_id) {
+        survivor
+            .assert_cluster_size(2, "survivor should observe two nodes after leave")
+            .await;
+    }
+    let survivor = cluster
+        .iter()
+        .find(|node| node.id() != leaving_node_id)
+        .expect("at least one survivor should remain");
+
+    let rescheduled = wait_until(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        || async {
+            let Some(current) = survivor
+                .node
+                .service_controller
+                .registry()
+                .get(service_id)
+                .expect("load multi-template service after leave")
+            else {
+                return false;
+            };
+            if current.status() != ServiceStatus::Running
+                || current.assigned_replica_count() != expected_replica_count
+            {
+                return false;
+            }
+
+            let current_ids: BTreeSet<Uuid> = current.assigned_replica_ids().into_iter().collect();
+            if !leaving_task_ids.is_disjoint(&current_ids) {
+                return false;
+            }
+            if current_ids.difference(&baseline_ids).count() < leaving_task_ids.len() {
+                return false;
+            }
+
+            for task_id in current_ids {
+                let Ok(task) = survivor
+                    .node
+                    .workload_manager
+                    .inspect_workload(task_id)
+                    .await
+                else {
+                    return false;
+                };
+                if task.node_id == leaving_node_id || task.state != WorkloadPhase::Running {
+                    return false;
+                }
+            }
+
+            true
+        },
+    )
+    .await;
+    assert!(
+        rescheduled,
+        "surviving nodes should replace every multi-template replica from the left node; {}",
+        collect_service_task_count_debug(&cluster, service_name).await
+    );
+    assert!(
+        surviving_nodes_observe_no_active_service_tasks_on_node(
+            &cluster,
+            service_name,
+            leaving_node_id,
+            Duration::from_secs(15),
+        )
+        .await,
+        "surviving nodes should stop listing active multi-template service tasks on the left node"
+    );
+});
+
 local_test!(services_node_drain_blocks_on_standalone_task, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
