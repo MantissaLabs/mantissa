@@ -1,5 +1,7 @@
 use super::ServiceController;
-use crate::services::types::{ServiceEvent, ServiceRolloutState, ServiceSpecValue, ServiceStatus};
+use crate::services::types::{
+    ServiceEvent, ServiceRolloutPhase, ServiceRolloutState, ServiceSpecValue, ServiceStatus,
+};
 use crate::workload::model::{
     ServiceGenerationProgressCounts, ServiceGenerationProgressRecord, WorkloadPhase,
 };
@@ -173,7 +175,7 @@ pub(super) async fn start_readiness_wait(
 
                 let mut running_spec = snapshot.clone();
                 running_spec.previous_generation = None;
-                running_spec.set_rollout(ServiceRolloutState::default());
+                running_spec.set_rollout(rollout_state_after_readiness_success(&snapshot.rollout));
                 running_spec.set_status(ServiceStatus::Running);
                 match controller.apply_upsert(running_spec.clone()).await {
                     Ok(_) => {
@@ -821,6 +823,32 @@ fn deployment_progress_timed_out(now: Instant, progress_deadline: Instant) -> bo
     now >= progress_deadline
 }
 
+/// Builds the rollout state readiness should publish when it marks a service running.
+///
+/// For a normal successful deployment, readiness is the final lifecycle step and can clear rollout
+/// progress back to the default idle state. The exception is failure history that has already been
+/// written by another controller path. Readiness waiters are async tasks, and one can still be
+/// polling an old manifest when a later redeploy fails and rolls back to that same manifest id. If
+/// that stale waiter sees the restored tasks as running again, it must not make the rollback look
+/// like a clean success by dropping `failed_steps` or `last_error`.
+///
+/// Keep the visible phase idle for the running service, but carry the failure counters and last
+/// error forward so operators can still see why the service returned to the old generation.
+fn rollout_state_after_readiness_success(current: &ServiceRolloutState) -> ServiceRolloutState {
+    if current.failed_steps == 0 && current.last_error.is_none() {
+        return ServiceRolloutState::default();
+    }
+
+    ServiceRolloutState {
+        phase: ServiceRolloutPhase::Idle,
+        total_steps: current.total_steps,
+        completed_steps: current.completed_steps,
+        failed_steps: current.failed_steps,
+        max_failures: current.max_failures,
+        last_error: current.last_error.clone(),
+    }
+}
+
 /// Returns a task whose startup phase has exceeded the per-workload healthy window.
 fn deployment_startup_task_timed_out(
     states: &[(Uuid, Option<WorkloadPhase>)],
@@ -1147,6 +1175,46 @@ mod tests {
             )
             .is_none(),
             "a new startup phase after running should start a fresh deadline"
+        );
+    }
+
+    /// Ensures a stale readiness success cannot erase rollback diagnostics.
+    #[test]
+    fn readiness_success_preserves_existing_rollout_failure_history() {
+        let current = ServiceRolloutState {
+            phase: ServiceRolloutPhase::RollingBack,
+            total_steps: 3,
+            completed_steps: 1,
+            failed_steps: 1,
+            max_failures: 1,
+            last_error: Some("gang admission failed for rolling replacement".to_string()),
+        };
+
+        let next = rollout_state_after_readiness_success(&current);
+
+        assert_eq!(next.phase, ServiceRolloutPhase::Idle);
+        assert_eq!(next.total_steps, current.total_steps);
+        assert_eq!(next.completed_steps, current.completed_steps);
+        assert_eq!(next.failed_steps, current.failed_steps);
+        assert_eq!(next.max_failures, current.max_failures);
+        assert_eq!(next.last_error, current.last_error);
+    }
+
+    /// Ensures normal readiness success still clears active rollout progress.
+    #[test]
+    fn readiness_success_clears_clean_rollout_progress() {
+        let current = ServiceRolloutState {
+            phase: ServiceRolloutPhase::RollingForward,
+            total_steps: 3,
+            completed_steps: 2,
+            failed_steps: 0,
+            max_failures: 1,
+            last_error: None,
+        };
+
+        assert_eq!(
+            rollout_state_after_readiness_success(&current),
+            ServiceRolloutState::default()
         );
     }
 
