@@ -174,12 +174,16 @@ impl Topology {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let current = self.deps.registry.peer_value_unscoped(id);
         let value = PeerValue::merge_observed(current.as_ref(), val);
+        let peer_is_active = value.is_active();
         self.stores.peers.upsert(&UuidKey::from(id), value).await?;
-        match handle {
-            Some(handle) => {
+        match (peer_is_active, handle) {
+            (false, _) => {
+                self.deps.registry.remove_peer(id).await;
+            }
+            (true, Some(handle)) => {
                 self.deps.registry.register_peer_handle(id, handle).await;
             }
-            None => {
+            (true, None) => {
                 // If the gossip message did not carry a usable handle, clear any stale capability
                 // cache so later connection attempts fall back to dialing the advertised address.
                 self.deps.registry.invalidate_peer_capabilities(id).await;

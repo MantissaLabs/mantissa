@@ -1,8 +1,6 @@
 use crate::cluster::ClusterViewId;
 use crate::runtime::types::RuntimeSupportProfile;
-use crate::server::session_bootstrap::{
-    SessionBootstrapRejection, SessionBootstrapRejectionCode,
-};
+use crate::server::session_bootstrap::{SessionBootstrapRejection, SessionBootstrapRejectionCode};
 use crate::store::local::LocalSessionStore;
 use crate::store::replicated::peers::PeersStore;
 use crate::topology::peers::{
@@ -43,20 +41,18 @@ type SessionBootstrapStatsMap = Arc<AsyncMutex<HashMap<(Uuid, String), u64>>>;
 struct PeerStoreSnapshotCache {
     generation: u64,
     active_peer_ids: Vec<Uuid>,
-    peer_values: Vec<(Uuid, PeerValue)>,
-    values_by_peer: HashMap<Uuid, PeerValue>,
+    active_peer_values: Vec<(Uuid, PeerValue)>,
+    selected_peer_values: HashMap<Uuid, PeerValue>,
 }
 
 impl PeerStoreSnapshotCache {
-    /// # Description:
-    ///
     /// Builds an empty peer snapshot cache that is populated on first use.
     fn new() -> Self {
         Self {
             generation: 0,
             active_peer_ids: Vec::new(),
-            peer_values: Vec::new(),
-            values_by_peer: HashMap::new(),
+            active_peer_values: Vec::new(),
+            selected_peer_values: HashMap::new(),
         }
     }
 }
@@ -478,7 +474,15 @@ impl Registry {
     }
 
     pub async fn server_handle_for(&self, peer_id: Uuid) -> Option<server::Client> {
+        if !self.local_allows_outbound_peer_connections() {
+            self.clear().await;
+            return None;
+        }
         if self.peer_is_excluded(peer_id) {
+            return None;
+        }
+        if !self.peer_has_active_membership(peer_id) {
+            self.remove_peer(peer_id).await;
             return None;
         }
         let entry = {
@@ -503,7 +507,15 @@ impl Registry {
         peer_id: Uuid,
         allow_excluded: bool,
     ) -> Option<server::Client> {
+        if !self.local_allows_outbound_peer_connections() {
+            self.clear().await;
+            return None;
+        }
         if !allow_excluded && self.peer_is_excluded(peer_id) {
+            return None;
+        }
+        if !self.peer_has_active_membership(peer_id) {
+            self.remove_peer(peer_id).await;
             return None;
         }
         let peer = if allow_excluded {
@@ -735,22 +747,16 @@ impl Registry {
         self.excluded_peers.read().contains(&peer_id)
     }
 
-    /// # Description:
-    ///
     /// Acquires a read guard for peer store projections.
     fn peer_snapshot_cache_read(&self) -> SyncRwLockReadGuard<'_, PeerStoreSnapshotCache> {
         self.peer_snapshot_cache.read()
     }
 
-    /// # Description:
-    ///
     /// Acquires a write guard for peer store projections.
     fn peer_snapshot_cache_write(&self) -> SyncRwLockWriteGuard<'_, PeerStoreSnapshotCache> {
         self.peer_snapshot_cache.write()
     }
 
-    /// # Description:
-    ///
     /// Rebuilds cached peer projections when the peer store generation has advanced.
     fn refresh_peer_snapshot_cache_if_needed(&self) -> AnyResult<()> {
         let generation = self.peers.change_clock();
@@ -766,27 +772,29 @@ impl Registry {
             return Ok(());
         }
 
-        let (actives, _) = self
+        let (peer_regs, _) = self
             .peers
             .load_all_regs()
             .map_err(|e| anyhow!("failed to load peer store: {e}"))?;
 
-        let mut active_peer_ids = Vec::with_capacity(actives.len());
-        let mut peer_values = Vec::with_capacity(actives.len());
-        let mut values_by_peer = HashMap::with_capacity(actives.len());
-        for (key, reg) in actives {
+        let mut active_peer_ids = Vec::with_capacity(peer_regs.len());
+        let mut active_peer_values = Vec::with_capacity(peer_regs.len());
+        let mut selected_peer_values = HashMap::with_capacity(peer_regs.len());
+        for (key, reg) in peer_regs {
             let peer_id = key.to_uuid();
-            if let Some(value) = PeerValue::select_reg(&reg).filter(|value| value.is_active()) {
-                active_peer_ids.push(peer_id);
-                values_by_peer.insert(peer_id, value.clone());
-                peer_values.push((peer_id, value));
+            if let Some(value) = PeerValue::select_reg(&reg) {
+                if value.is_active() {
+                    active_peer_ids.push(peer_id);
+                    active_peer_values.push((peer_id, value.clone()));
+                }
+                selected_peer_values.insert(peer_id, value);
             }
         }
 
         cache.generation = generation;
         cache.active_peer_ids = active_peer_ids;
-        cache.peer_values = peer_values;
-        cache.values_by_peer = values_by_peer;
+        cache.active_peer_values = active_peer_values;
+        cache.selected_peer_values = selected_peer_values;
 
         Ok(())
     }
@@ -799,8 +807,8 @@ impl Registry {
         self.refresh_peer_snapshot_cache_if_needed()?;
         let cache = self.peer_snapshot_cache_read();
 
-        let mut out = Vec::with_capacity(cache.peer_values.len());
-        for (peer_id, value) in &cache.peer_values {
+        let mut out = Vec::with_capacity(cache.active_peer_values.len());
+        for (peer_id, value) in &cache.active_peer_values {
             if self.peer_is_excluded(*peer_id) {
                 continue;
             }
@@ -904,11 +912,7 @@ impl Registry {
 
         let now = Instant::now();
         if !self
-            .session_bootstrap_attempt_allowed(
-                peer_id,
-                now,
-                SessionBootstrapRetryScope::ActiveView,
-            )
+            .session_bootstrap_attempt_allowed(peer_id, now, SessionBootstrapRetryScope::ActiveView)
             .await
         {
             trace!(
@@ -934,6 +938,11 @@ impl Registry {
     }
 
     pub async fn connect_known_peers(&self, allow_credentials: bool) -> Result<(), capnp::Error> {
+        if !self.local_allows_outbound_peer_connections() {
+            self.clear().await;
+            return Ok(());
+        }
+
         let (actives, _tombs) = self
             .peers
             .load_all_regs()
@@ -1113,10 +1122,9 @@ impl Registry {
         peer_id: Uuid,
         expected_view: ClusterViewId,
     ) -> Result<Option<sync::Client>, capnp::Error> {
-        if self.peer_is_excluded(peer_id) {
+        let Some(entry) = self.session_entry(peer_id, false, false).await else {
             return Ok(None);
-        }
-        let entry = self.ensure_entry(peer_id).await;
+        };
 
         if let Some(sync_cap) = {
             let state = entry.lock().await;
@@ -1199,7 +1207,9 @@ impl Registry {
         &self,
         peer_id: Uuid,
     ) -> Result<Option<(sync::Client, ClusterViewId)>, capnp::Error> {
-        let entry = self.ensure_entry(peer_id).await;
+        let Some(entry) = self.session_entry(peer_id, true, false).await else {
+            return Ok(None);
+        };
 
         if let Some(sync_cap) = {
             let state = entry.lock().await;
@@ -1266,10 +1276,9 @@ impl Registry {
         peer_id: Uuid,
         expected_view: ClusterViewId,
     ) -> Result<Option<health::health::Client>, capnp::Error> {
-        if self.peer_is_excluded(peer_id) {
+        let Some(entry) = self.session_entry(peer_id, false, false).await else {
             return Ok(None);
-        }
-        let entry = self.ensure_entry(peer_id).await;
+        };
 
         if let Some(health_cap) = {
             let state = entry.lock().await;
@@ -1348,10 +1357,9 @@ impl Registry {
         peer_id: Uuid,
         expected_view: ClusterViewId,
     ) -> Result<Option<GossipClient>, capnp::Error> {
-        if self.peer_is_excluded(peer_id) {
+        let Some(entry) = self.session_entry(peer_id, false, false).await else {
             return Ok(None);
-        }
-        let entry = self.ensure_entry(peer_id).await;
+        };
 
         if let Some(gossip_cap) = {
             let state = entry.lock().await;
@@ -1433,7 +1441,9 @@ impl Registry {
         &self,
         peer_id: Uuid,
     ) -> Result<Option<GossipClient>, capnp::Error> {
-        let entry = self.ensure_entry(peer_id).await;
+        let Some(entry) = self.session_entry(peer_id, true, false).await else {
+            return Ok(None);
+        };
 
         if let Some(gossip_cap) = {
             let state = entry.lock().await;
@@ -1511,10 +1521,15 @@ impl Registry {
         allow_excluded: bool,
         require_existing: bool,
     ) -> Option<PeerEntry> {
+        if !self.local_allows_outbound_peer_connections() {
+            self.clear().await;
+            return None;
+        }
         if !allow_excluded && self.peer_is_excluded(peer_id) {
             return None;
         }
-        if !self.peer_allows_session_bootstrap(peer_id) {
+        if !self.peer_has_active_membership(peer_id) {
+            self.remove_peer(peer_id).await;
             return None;
         }
 
@@ -1551,8 +1566,8 @@ impl Registry {
         strategy: SessionStrategy,
         allow_excluded: bool,
     ) -> Option<cluster_session::Client> {
-        if !self.peer_allows_session_bootstrap(peer_id) {
-            self.invalidate_peer(peer_id, entry).await;
+        if !self.peer_has_active_membership(peer_id) {
+            self.remove_peer(peer_id).await;
             return None;
         }
 
@@ -2046,10 +2061,15 @@ impl Registry {
         count <= 3 || count.is_power_of_two() || count.is_multiple_of(100)
     }
 
-    /// # Description:
-    ///
-    /// Returns true when local membership still allows session bootstrap for `peer_id`.
-    fn peer_allows_session_bootstrap(&self, peer_id: Uuid) -> bool {
+    /// Returns true when the local peer row still allows outbound peer contact.
+    fn local_allows_outbound_peer_connections(&self) -> bool {
+        self.peer_selected_value_unscoped(self.node_id)
+            .map(|peer| peer.is_active())
+            .unwrap_or(true)
+    }
+
+    /// Returns true when the selected peer row is still active.
+    fn peer_has_active_membership(&self, peer_id: Uuid) -> bool {
         self.peer_selected_value_unscoped(peer_id)
             .map(|peer| peer.is_active())
             .unwrap_or(false)
@@ -2223,18 +2243,15 @@ impl Registry {
 
     /// Returns the active selected peer value without applying excluded-peer scoping.
     fn peer_latest_value_unscoped(&self, peer_id: Uuid) -> Option<PeerValue> {
-        self.refresh_peer_snapshot_cache_if_needed().ok()?;
-        let cache = self.peer_snapshot_cache_read();
-        cache.values_by_peer.get(&peer_id).cloned()
+        self.peer_selected_value_unscoped(peer_id)
+            .filter(|value| value.is_active())
     }
 
     /// Returns the selected peer value without filtering out left membership rows.
     fn peer_selected_value_unscoped(&self, peer_id: Uuid) -> Option<PeerValue> {
-        self.peers
-            .get_reg(&UuidKey::from(peer_id))
-            .ok()
-            .flatten()
-            .and_then(|reg| PeerValue::select_reg(&reg))
+        self.refresh_peer_snapshot_cache_if_needed().ok()?;
+        let cache = self.peer_snapshot_cache_read();
+        cache.selected_peer_values.get(&peer_id).cloned()
     }
 
     /// Dial a peer over authenticated Noise using the current join token.
@@ -2350,6 +2367,14 @@ mod tests {
             .expect("selected left peer");
         assert_eq!(selected.membership, PeerMembership::left(8));
         assert!(
+            registry.peer_latest_value_unscoped(peer_id).is_none(),
+            "active peer lookup should hide selected left rows"
+        );
+        assert!(
+            !registry.peer_has_active_membership(peer_id),
+            "membership guards should read left rows from the snapshot cache"
+        );
+        assert!(
             registry
                 .known_peers()
                 .expect("known peers after leave")
@@ -2388,8 +2413,177 @@ mod tests {
             .await
             .expect("insert left peer");
 
-        assert!(!registry.peer_allows_session_bootstrap(peer_id));
+        assert!(!registry.peer_has_active_membership(peer_id));
         assert!(registry.session_entry(peer_id, true, false).await.is_none());
+    }
+
+    /// Left rows must clear cached peer entries before any capability can be reused.
+    #[tokio::test]
+    async fn session_entry_clears_cached_peer_after_leave() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join(format!(
+            "registry-session-cache-left-{}.redb",
+            Uuid::new_v4()
+        ));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let local_id = Uuid::new_v4();
+        let peer_id = Uuid::new_v4();
+        let peers = open_peers_store(db.clone(), local_id).expect("open peers store");
+        let noise_keys = NoiseKeys::from_private_bytes([0x15; 32]);
+        let sessions = LocalSessionStore::open(db, &noise_keys).expect("open sessions store");
+        let registry = Registry::new(
+            peers.clone(),
+            sessions,
+            SigningKey::from_bytes(&[0xA9; 32]),
+            Arc::new(noise_keys),
+            local_id,
+            HealthMonitor::new(local_id),
+        );
+
+        peers
+            .upsert(
+                &UuidKey::from(peer_id),
+                peer_value(peer_id, PeerMembership::active(3)),
+            )
+            .await
+            .expect("insert active peer");
+        let _entry = registry.ensure_entry(peer_id).await;
+        assert!(
+            registry.entry_if_present(peer_id).await.is_some(),
+            "test setup should install a cached peer entry"
+        );
+
+        peers
+            .upsert(
+                &UuidKey::from(peer_id),
+                peer_value(peer_id, PeerMembership::left(4)),
+            )
+            .await
+            .expect("insert left peer");
+
+        assert!(registry.session_entry(peer_id, true, false).await.is_none());
+        assert!(
+            registry.entry_if_present(peer_id).await.is_none(),
+            "left membership should clear stale cached handles and capabilities"
+        );
+    }
+
+    /// Local left membership should make registry session paths clear cached peer state.
+    #[tokio::test]
+    async fn session_entry_clears_cache_when_local_node_left() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("registry-local-left-cache-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let local_id = Uuid::new_v4();
+        let peer_id = Uuid::new_v4();
+        let peers = open_peers_store(db.clone(), local_id).expect("open peers store");
+        let noise_keys = NoiseKeys::from_private_bytes([0x16; 32]);
+        let sessions = LocalSessionStore::open(db, &noise_keys).expect("open sessions store");
+        let registry = Registry::new(
+            peers.clone(),
+            sessions,
+            SigningKey::from_bytes(&[0xAA; 32]),
+            Arc::new(noise_keys),
+            local_id,
+            HealthMonitor::new(local_id),
+        );
+
+        peers
+            .upsert(
+                &UuidKey::from(local_id),
+                peer_value(local_id, PeerMembership::active(3)),
+            )
+            .await
+            .expect("insert active local peer");
+        peers
+            .upsert(
+                &UuidKey::from(peer_id),
+                peer_value(peer_id, PeerMembership::active(3)),
+            )
+            .await
+            .expect("insert active remote peer");
+        let _entry = registry.ensure_entry(peer_id).await;
+        assert!(
+            registry.entry_if_present(peer_id).await.is_some(),
+            "test setup should install a cached remote peer entry"
+        );
+
+        peers
+            .upsert(
+                &UuidKey::from(local_id),
+                peer_value(local_id, PeerMembership::left(4)),
+            )
+            .await
+            .expect("insert local leave row");
+
+        assert!(registry.session_entry(peer_id, true, false).await.is_none());
+        assert!(
+            registry.entry_if_present(peer_id).await.is_none(),
+            "local leave should clear registry caches before declining session reuse"
+        );
+    }
+
+    /// Direct handle refresh must obey local-left quiescence before dialing peers.
+    #[tokio::test]
+    async fn refresh_peer_handle_clears_cache_when_local_node_left() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join(format!(
+            "registry-local-left-refresh-{}.redb",
+            Uuid::new_v4()
+        ));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let local_id = Uuid::new_v4();
+        let peer_id = Uuid::new_v4();
+        let peers = open_peers_store(db.clone(), local_id).expect("open peers store");
+        let noise_keys = NoiseKeys::from_private_bytes([0x17; 32]);
+        let sessions = LocalSessionStore::open(db, &noise_keys).expect("open sessions store");
+        let registry = Registry::new(
+            peers.clone(),
+            sessions,
+            SigningKey::from_bytes(&[0xAB; 32]),
+            Arc::new(noise_keys),
+            local_id,
+            HealthMonitor::new(local_id),
+        );
+
+        peers
+            .upsert(
+                &UuidKey::from(local_id),
+                peer_value(local_id, PeerMembership::active(3)),
+            )
+            .await
+            .expect("insert active local peer");
+        peers
+            .upsert(
+                &UuidKey::from(peer_id),
+                peer_value(peer_id, PeerMembership::active(3)),
+            )
+            .await
+            .expect("insert active remote peer");
+        let _entry = registry.ensure_entry(peer_id).await;
+        assert!(
+            registry.entry_if_present(peer_id).await.is_some(),
+            "test setup should install a cached remote peer entry"
+        );
+
+        peers
+            .upsert(
+                &UuidKey::from(local_id),
+                peer_value(local_id, PeerMembership::left(4)),
+            )
+            .await
+            .expect("insert local leave row");
+
+        assert!(
+            registry.refresh_peer_handle(peer_id).await.is_none(),
+            "left local membership should refuse direct handle refresh"
+        );
+        assert!(
+            registry.entry_if_present(peer_id).await.is_none(),
+            "direct refresh should clear registry caches before declining"
+        );
     }
 
     /// Direct session bootstrap must also stop once local membership records a leave.
@@ -2423,7 +2617,7 @@ mod tests {
             )
             .await
             .expect("insert active peer");
-        assert!(registry.peer_allows_session_bootstrap(peer_id));
+        assert!(registry.peer_has_active_membership(peer_id));
 
         peers
             .upsert(

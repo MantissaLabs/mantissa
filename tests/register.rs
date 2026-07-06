@@ -534,6 +534,89 @@ local_test!(node_duplicate_leave_tombstones_are_idempotent_inproc, {
     );
 });
 
+local_test!(node_leave_quiesces_cached_peer_contact_paths_inproc, {
+    let cluster = TestNode::new_cluster_inproc_with_config(3, churn_cluster_config())
+        .await
+        .expect("cluster starts");
+    let survivor_a = &cluster[0];
+    let survivor_b = &cluster[1];
+    let leaving = &cluster[2];
+    let leaving_id = leaving.id();
+
+    TestNode::assert_cluster_size_all(&cluster, 3, "initial cluster size should converge").await;
+    TestNode::wait_roots_equal_all(&cluster, Duration::from_secs(5))
+        .await
+        .expect("initial roots equal");
+
+    assert!(
+        survivor_a
+            .node
+            .registry
+            .fetch_sync_capability_unscoped(leaving_id)
+            .await
+            .expect("survivor prewarms sync capability to leaving peer")
+            .is_some(),
+        "test setup should cache survivor-to-leaving sync capability"
+    );
+    assert!(
+        leaving
+            .node
+            .registry
+            .fetch_sync_capability_unscoped(survivor_a.id())
+            .await
+            .expect("leaving node prewarms sync capability to survivor")
+            .is_some(),
+        "test setup should cache leaving-to-survivor sync capability"
+    );
+
+    leaving.leave().await.expect("leave ok");
+    survivor_a
+        .assert_cluster_size(2, "first survivor should exclude left node")
+        .await;
+    survivor_b
+        .assert_cluster_size(2, "second survivor should exclude left node")
+        .await;
+    TestNode::wait_roots_equal(survivor_a, survivor_b, Duration::from_secs(5))
+        .await
+        .expect("survivor roots equal after leave");
+
+    assert!(
+        survivor_a
+            .node
+            .registry
+            .fetch_sync_capability_unscoped(leaving_id)
+            .await
+            .expect("survivor should refuse cached sync capability to left peer")
+            .is_none(),
+        "survivors must drop cached capabilities for peers that converged to left"
+    );
+    assert!(
+        leaving
+            .node
+            .registry
+            .fetch_sync_capability_unscoped(survivor_a.id())
+            .await
+            .expect("left node should refuse cached sync capability to survivor")
+            .is_none(),
+        "left nodes must not keep using cached capabilities to surviving peers"
+    );
+    leaving
+        .node
+        .registry
+        .connect_known_peers(true)
+        .await
+        .expect("left-node reconnect path should quietly no-op");
+    assert!(
+        leaving
+            .node
+            .registry
+            .cached_session_for(survivor_a.id())
+            .await
+            .is_none(),
+        "left-node reconnect no-op must not recreate survivor sessions"
+    );
+});
+
 local_test!(node_evict_stopped_peer_inproc, {
     let anchor = TestNode::new_with_tick_ms(100).await;
     let second = TestNode::new_with_tick_ms(100).await;
