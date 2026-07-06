@@ -137,6 +137,60 @@ impl SyncLoopState {
 }
 
 #[derive(Clone)]
+pub(super) struct ImmediateSyncState {
+    /// Flag telling whether an immediate sync pass is already running.
+    running: Arc<AtomicBool>,
+
+    /// Flag set by callers that request another pass while one is in flight.
+    pending: Arc<AtomicBool>,
+}
+
+impl ImmediateSyncState {
+    /// Creates coalescing state for ad-hoc sync requests outside the periodic loops.
+    pub(super) fn new() -> Self {
+        Self {
+            running: Arc::new(AtomicBool::new(false)),
+            pending: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Marks an immediate sync as running, or coalesces into the active pass.
+    pub(super) fn request_run(&self) -> bool {
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            true
+        } else {
+            self.pending.store(true, Ordering::SeqCst);
+            false
+        }
+    }
+
+    /// Starts one pass by letting the current run cover all previously coalesced requests.
+    pub(super) fn begin_pass(&self) {
+        self.pending.store(false, Ordering::SeqCst);
+    }
+
+    /// Finishes one pass and reports whether a request arrived while it was running.
+    pub(super) fn finish_pass(&self) -> bool {
+        if self.pending.swap(false, Ordering::SeqCst) {
+            return true;
+        }
+
+        self.running.store(false, Ordering::SeqCst);
+        if self.pending.swap(false, Ordering::SeqCst) {
+            self.running
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(super) struct ProbeLoopState {
     /// Interval between health probe ticks.
     interval: Arc<Mutex<Duration>>,
@@ -304,9 +358,26 @@ impl WorkloadRepairHintState {
 
 #[cfg(test)]
 mod tests {
-    use super::WorkloadRepairHintState;
+    use super::{ImmediateSyncState, WorkloadRepairHintState};
     use std::collections::HashSet;
     use uuid::Uuid;
+
+    /// Checks that overlapping immediate sync requests collapse onto bounded passes.
+    #[test]
+    fn immediate_sync_state_coalesces_overlapping_requests() {
+        let state = ImmediateSyncState::new();
+        assert!(state.request_run());
+        assert!(!state.request_run());
+        state.begin_pass();
+        assert!(!state.finish_pass());
+
+        assert!(state.request_run());
+        state.begin_pass();
+        assert!(!state.request_run());
+        assert!(state.finish_pass());
+        state.begin_pass();
+        assert!(!state.finish_pass());
+    }
 
     /// Ensures bounded repair ticks keep queued deployment peers for later workload sync ticks.
     #[test]
@@ -362,6 +433,9 @@ pub(super) struct TopologyRuntime {
 
     /// Peer ids currently excluded from active control-plane loops for the local cluster view.
     pub(super) excluded_peers: Arc<AsyncMutex<HashSet<Uuid>>>,
+
+    /// Coalescing state for immediate sync requests triggered by topology events.
+    pub(super) immediate_sync: ImmediateSyncState,
 
     /// Runtime state for background sync loop management.
     pub(super) sync: SyncLoopState,

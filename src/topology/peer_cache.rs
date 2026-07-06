@@ -15,6 +15,7 @@ pub(super) struct PeerCacheEntry {
 
 /// Immutable snapshot of known peers.
 pub(super) struct PeerSnapshot {
+    pub(super) generation: u64,
     pub(super) entries: Arc<Vec<PeerCacheEntry>>,
 }
 
@@ -43,6 +44,7 @@ impl PeerSnapshotCache {
         let current_generation = store.change_clock();
         if current_generation == self.last_generation {
             return Ok(PeerSnapshot {
+                generation: current_generation,
                 entries: self.entries.clone(),
             });
         }
@@ -63,6 +65,9 @@ impl PeerSnapshotCache {
         self.entries = entries.clone();
         self.last_generation = current_generation;
 
-        Ok(PeerSnapshot { entries })
+        Ok(PeerSnapshot {
+            generation: current_generation,
+            entries,
+        })
     }
 }

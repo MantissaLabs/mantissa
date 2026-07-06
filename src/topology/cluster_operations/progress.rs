@@ -8,7 +8,7 @@ use crate::topology::Topology;
 use crate::topology::cluster_operations::{
     CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT, COMMIT_PRECONDITION_FAILURE_PREFIX,
 };
-use crate::topology::peers::PeerValue;
+use crate::topology::peer_cache::PeerSnapshot;
 use mantissa_protocol::server::cluster_session;
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -49,7 +49,11 @@ impl Topology {
         }
 
         let local_view = self.active_cluster_view();
-        let node_count = self.local_cluster_view_member_count().await?;
+        let snapshot = self.peer_snapshot_or_error().await?;
+        let excluded_peers = self.excluded_peers_snapshot().await;
+        let node_count = self
+            .local_cluster_view_member_count_from_snapshot(&snapshot, &excluded_peers)
+            .await;
         let current = self
             .stores
             .cluster_view_store
@@ -59,6 +63,7 @@ impl Topology {
             target: "cluster_view",
             local_view = %local_view,
             node_count,
+            peer_generation = snapshot.generation,
             current = ?current,
             "publishing local cluster node count"
         );
@@ -70,6 +75,7 @@ impl Topology {
                 target: "cluster_view",
                 local_view = %local_view,
                 node_count,
+                peer_generation = snapshot.generation,
                 "local cluster node count already current"
             );
             return Ok(false);
@@ -85,7 +91,7 @@ impl Topology {
             source_view: local_view,
             updated_at_unix_ms,
             actor_node_id: self.local.node.id,
-            membership_generation: self.stores.peers.change_clock(),
+            membership_generation: snapshot.generation,
         };
         let changed = self
             .upsert_cluster_node_count_record(local_view.cluster_id, &record)
@@ -99,6 +105,13 @@ impl Topology {
             "published local cluster node count"
         );
         Ok(changed)
+    }
+
+    /// Loads the current peer snapshot or converts the storage failure into an RPC error.
+    async fn peer_snapshot_or_error(&self) -> Result<PeerSnapshot, capnp::Error> {
+        self.peer_snapshot()
+            .await
+            .ok_or_else(|| capnp::Error::failed("failed to load peer snapshot".to_string()))
     }
 
     /// Persists split target names carried by one operation record so cluster lineage labels survive restarts.
@@ -227,27 +240,30 @@ impl Topology {
     pub(in crate::topology) async fn local_cluster_view_member_count(
         &self,
     ) -> Result<u32, capnp::Error> {
-        let local_view = self.active_cluster_view();
+        let snapshot = self.peer_snapshot_or_error().await?;
         let excluded_peers = self.excluded_peers_snapshot().await;
-        let (actives, _) = self
-            .stores
-            .peers
-            .load_all_regs()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        Ok(self
+            .local_cluster_view_member_count_from_snapshot(&snapshot, &excluded_peers)
+            .await)
+    }
+
+    /// Counts active peers from a cached snapshot that belong to the local cluster view.
+    async fn local_cluster_view_member_count_from_snapshot(
+        &self,
+        snapshot: &PeerSnapshot,
+        excluded_peers: &HashSet<Uuid>,
+    ) -> u32 {
+        let local_view = self.active_cluster_view();
 
         let mut count = 1u32;
-        for (key, reg) in actives {
-            let peer_id = key.to_uuid();
+        for entry in snapshot.entries.iter() {
+            let peer_id = entry.peer_id;
             if peer_id == self.local.node.id {
                 continue;
             }
             if excluded_peers.contains(&peer_id) {
                 continue;
             }
-            let Some(_selected) = PeerValue::select_reg(&reg).filter(|value| value.is_active())
-            else {
-                continue;
-            };
 
             let view = self
                 .best_known_peer_view(peer_id)
@@ -259,36 +275,35 @@ impl Topology {
             count = count.saturating_add(1);
         }
 
-        Ok(count)
+        count
     }
 
     /// Counts locally active peer rows without consulting cached peer sessions.
     async fn local_active_peer_row_member_count(&self) -> Result<u32, capnp::Error> {
+        let snapshot = self.peer_snapshot_or_error().await?;
         let excluded_peers = self.excluded_peers_snapshot().await;
-        let (actives, _) = self
-            .stores
-            .peers
-            .load_all_regs()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        Ok(self.local_active_peer_row_member_count_from_snapshot(&snapshot, &excluded_peers))
+    }
 
+    /// Counts active peer snapshot rows without opening peer sessions.
+    fn local_active_peer_row_member_count_from_snapshot(
+        &self,
+        snapshot: &PeerSnapshot,
+        excluded_peers: &HashSet<Uuid>,
+    ) -> u32 {
         let mut count = 1u32;
-        for (key, reg) in actives {
-            let peer_id = key.to_uuid();
+        for entry in snapshot.entries.iter() {
+            let peer_id = entry.peer_id;
             if peer_id == self.local.node.id {
                 continue;
             }
             if excluded_peers.contains(&peer_id) {
                 continue;
             }
-            if PeerValue::select_reg(&reg)
-                .filter(|value| value.is_active())
-                .is_some()
-            {
-                count = count.saturating_add(1);
-            }
+            count = count.saturating_add(1);
         }
 
-        Ok(count)
+        count
     }
 
     /// Decodes one raw Cap'n Proto cluster lineage identifier into internal `ClusterId` bytes.

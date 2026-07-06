@@ -738,10 +738,21 @@ impl Topology {
     /// This is used after joins and topology changes to reduce convergence latency before the
     /// next scheduled background tick fires.
     pub fn sync_once_now(&self) {
-        let topo = self.clone();
+        if !self.runtime.immediate_sync.request_run() {
+            trace!(target: "sync", "coalesced immediate sync request into active pass");
+            return;
+        }
+
+        let topology = self.clone();
         tokio::task::spawn_local(async move {
-            topo.periodic_sync_tick().await;
-            topo.periodic_global_metadata_sync_tick().await;
+            loop {
+                topology.runtime.immediate_sync.begin_pass();
+                topology.periodic_sync_tick().await;
+                topology.periodic_global_metadata_sync_tick().await;
+                if !topology.runtime.immediate_sync.finish_pass() {
+                    break;
+                }
+            }
         });
     }
 

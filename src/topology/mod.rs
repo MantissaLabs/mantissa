@@ -51,7 +51,9 @@ use x25519_dalek::PublicKey;
 use self::builders::drain_state_from_scheduling;
 use self::local_state::LocalNodeState;
 use self::peer_cache::{PeerCacheEntry, PeerSnapshot, PeerSnapshotCache};
-use self::runtime::{GossipWarmSetState, TopologyRuntime, WorkloadRepairHintState};
+use self::runtime::{
+    GossipWarmSetState, ImmediateSyncState, TopologyRuntime, WorkloadRepairHintState,
+};
 
 mod builders;
 mod cluster_operations;
@@ -220,6 +222,7 @@ impl Topology {
                 peer_snapshot_cache: Arc::new(tokio::sync::Mutex::new(PeerSnapshotCache::new())),
                 gossip_warm_set: Arc::new(tokio::sync::Mutex::new(GossipWarmSetState::default())),
                 excluded_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+                immediate_sync: ImmediateSyncState::new(),
                 sync: runtime::SyncLoopState::new(DEFAULT_SYNC_INTERVAL, DEFAULT_SYNC_FANOUT),
                 health_probe: runtime::ProbeLoopState::new(probe_interval),
                 workload_repair_fanout: Arc::new(Mutex::new(DEFAULT_WORKLOAD_REPAIR_FANOUT)),
@@ -293,6 +296,9 @@ impl Topology {
 
     /// Replaces the excluded-peer set used to scope active control-plane loops.
     pub async fn set_excluded_peers(&self, excluded: HashSet<Uuid>) {
-        *self.runtime.excluded_peers.lock().await = excluded;
+        let mut guard = self.runtime.excluded_peers.lock().await;
+        if *guard != excluded {
+            *guard = excluded;
+        }
     }
 }
