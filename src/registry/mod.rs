@@ -1,6 +1,8 @@
 use crate::cluster::ClusterViewId;
 use crate::runtime::types::RuntimeSupportProfile;
-use crate::server::session_bootstrap::SessionBootstrapRejection;
+use crate::server::session_bootstrap::{
+    SessionBootstrapRejection, SessionBootstrapRejectionCode,
+};
 use crate::store::local::LocalSessionStore;
 use crate::store::replicated::peers::PeersStore;
 use crate::topology::peers::{
@@ -25,7 +27,7 @@ use std::panic::Location;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
 type PeerEntry = Arc<AsyncMutex<PeerState>>;
@@ -33,6 +35,7 @@ type CapabilityMap = Arc<RwLock<HashMap<Uuid, PeerEntry>>>;
 type SessionGateMap = Arc<AsyncMutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>>;
 type ReconnectGateMap = Arc<AsyncMutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>>;
 type ReconnectStateMap = Arc<AsyncMutex<HashMap<Uuid, PeerReconnectState>>>;
+type SessionBootstrapBackoffMap = Arc<AsyncMutex<HashMap<Uuid, PeerRetryBackoff>>>;
 type InvalidationStatsMap = Arc<AsyncMutex<HashMap<(Uuid, String), u64>>>;
 type SessionBootstrapStatsMap = Arc<AsyncMutex<HashMap<(Uuid, String), u64>>>;
 
@@ -110,6 +113,7 @@ pub struct Registry {
     session_gates: SessionGateMap,
     reconnect_gates: ReconnectGateMap,
     reconnect_state: ReconnectStateMap,
+    session_bootstrap_backoff: SessionBootstrapBackoffMap,
     invalidation_stats: InvalidationStatsMap,
     session_bootstrap_stats: SessionBootstrapStatsMap,
     sessions: LocalSessionStore,
@@ -128,8 +132,73 @@ enum SessionStrategy {
     TicketThenCredential,
 }
 
+enum TicketSessionBootstrapResult {
+    Accepted(cluster_session::Client),
+    TryCredential,
+    Stop,
+}
+
+/// Session bootstrap caller scope used to keep active-view retry dampening
+/// separate from low-rate cross-view metadata and operation handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionBootstrapRetryScope {
+    ActiveView,
+    CrossView,
+}
+
+impl SessionBootstrapRetryScope {
+    /// Selects the retry scope matching one session lookup's split-boundary policy.
+    fn from_allow_excluded(allow_excluded: bool) -> Self {
+        if allow_excluded {
+            Self::CrossView
+        } else {
+            Self::ActiveView
+        }
+    }
+}
+
+/// Classifies session bootstrap backoff by the kind of convergence race it
+/// represents, so cross-view metadata sync is not starved by active-view misses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionBootstrapBackoffKind {
+    PeerMembership,
+    PeerAuthority,
+}
+
+impl SessionBootstrapBackoffKind {
+    /// Converts one typed session-bootstrap rejection into the retry gate it should update.
+    fn from_rejection(rejection: &SessionBootstrapRejection) -> Option<Self> {
+        if !rejection.requires_retry_backoff() {
+            return None;
+        }
+        match rejection.code {
+            SessionBootstrapRejectionCode::UnknownSessionTicket => None,
+            SessionBootstrapRejectionCode::PeerNotRegistered => Some(Self::PeerMembership),
+            SessionBootstrapRejectionCode::LocalNodeInactive
+            | SessionBootstrapRejectionCode::CredentialInvalid
+            | SessionBootstrapRejectionCode::IssuerMismatch
+            | SessionBootstrapRejectionCode::IssuerUnknown => Some(Self::PeerAuthority),
+        }
+    }
+
+    /// Returns whether this retry gate should block a caller from `scope`.
+    fn applies_to(self, scope: SessionBootstrapRetryScope) -> bool {
+        !matches!(
+            (self, scope),
+            (Self::PeerMembership, SessionBootstrapRetryScope::CrossView)
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PeerReconnectState {
+    consecutive_failures: u32,
+    next_attempt_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PeerRetryBackoff {
+    kind: SessionBootstrapBackoffKind,
     consecutive_failures: u32,
     next_attempt_at: Instant,
 }
@@ -153,15 +222,7 @@ impl PeerReconnectState {
             .map(|state| state.consecutive_failures)
             .unwrap_or(0)
             .saturating_add(1);
-        let shift = failures.saturating_sub(1).min(6);
-        let factor = 1u32 << shift;
-        let bounded = RECONNECT_BACKOFF_BASE
-            .saturating_mul(factor)
-            .min(RECONNECT_BACKOFF_MAX);
-        use ::rand::Rng as _;
-        let mut rng = ::rand::rng();
-        let jitter_ms = rng.random_range(0..=RECONNECT_BACKOFF_JITTER_MAX_MS);
-        let delay = bounded.saturating_add(Duration::from_millis(jitter_ms));
+        let delay = peer_retry_delay(failures);
         (
             Self {
                 consecutive_failures: failures,
@@ -170,6 +231,48 @@ impl PeerReconnectState {
             delay,
         )
     }
+}
+
+impl PeerRetryBackoff {
+    /// Builds retry backoff state after one failed peer-scoped operation.
+    fn on_failure(
+        previous: Option<Self>,
+        now: Instant,
+        kind: SessionBootstrapBackoffKind,
+    ) -> (Self, Duration) {
+        let failures = previous
+            .filter(|state| state.kind == kind)
+            .map(|state| state.consecutive_failures)
+            .unwrap_or(0)
+            .saturating_add(1);
+        let delay = peer_retry_delay(failures);
+        (
+            Self {
+                kind,
+                consecutive_failures: failures,
+                next_attempt_at: now + delay,
+            },
+            delay,
+        )
+    }
+
+    /// Returns whether the retry budget allows a new attempt at `now`.
+    fn allows_attempt(self, now: Instant, scope: SessionBootstrapRetryScope) -> bool {
+        !self.kind.applies_to(scope) || now >= self.next_attempt_at
+    }
+}
+
+/// Computes the exponential retry delay shared by peer reconnect and bootstrap backoff.
+fn peer_retry_delay(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(6);
+    let factor = 1u32 << shift;
+    let bounded = RECONNECT_BACKOFF_BASE
+        .saturating_mul(factor)
+        .min(RECONNECT_BACKOFF_MAX);
+    use ::rand::Rng as _;
+    let mut rng = ::rand::rng();
+    let jitter_ms = rng.random_range(0..=RECONNECT_BACKOFF_JITTER_MAX_MS);
+    bounded.saturating_add(Duration::from_millis(jitter_ms))
 }
 
 impl Registry {
@@ -187,6 +290,7 @@ impl Registry {
             session_gates: Arc::new(AsyncMutex::new(HashMap::new())),
             reconnect_gates: Arc::new(AsyncMutex::new(HashMap::new())),
             reconnect_state: Arc::new(AsyncMutex::new(HashMap::new())),
+            session_bootstrap_backoff: Arc::new(AsyncMutex::new(HashMap::new())),
             invalidation_stats: Arc::new(AsyncMutex::new(HashMap::new())),
             session_bootstrap_stats: Arc::new(AsyncMutex::new(HashMap::new())),
             sessions,
@@ -230,6 +334,8 @@ impl Registry {
         let mut state = entry.lock().await;
         state.replace_server(handle);
         state.replace_session(session);
+        drop(state);
+        self.clear_session_bootstrap_backoff(id).await;
     }
 
     pub async fn remove_peer(&self, id: Uuid) {
@@ -237,6 +343,7 @@ impl Registry {
         self.session_gates.lock().await.remove(&id);
         self.reconnect_gates.lock().await.remove(&id);
         self.reconnect_state.lock().await.remove(&id);
+        self.session_bootstrap_backoff.lock().await.remove(&id);
         self.invalidation_stats
             .lock()
             .await
@@ -252,6 +359,7 @@ impl Registry {
         self.session_gates.lock().await.clear();
         self.reconnect_gates.lock().await.clear();
         self.reconnect_state.lock().await.clear();
+        self.session_bootstrap_backoff.lock().await.clear();
         self.invalidation_stats.lock().await.clear();
         self.session_bootstrap_stats.lock().await.clear();
     }
@@ -794,10 +902,33 @@ impl Registry {
             return Some(session);
         }
 
+        let now = Instant::now();
+        if !self
+            .session_bootstrap_attempt_allowed(
+                peer_id,
+                now,
+                SessionBootstrapRetryScope::ActiveView,
+            )
+            .await
+        {
+            trace!(
+                target: "sync",
+                peer = %peer_id,
+                "scheduler session bootstrap suppressed by backoff"
+            );
+            return None;
+        }
+
         let session = self
-            .session_for_strategy(client, peer_id, SessionStrategy::TicketThenCredential)
+            .session_for_strategy(
+                client,
+                peer_id,
+                SessionStrategy::TicketThenCredential,
+                SessionBootstrapRetryScope::ActiveView,
+            )
             .await?;
 
+        self.clear_session_bootstrap_backoff(peer_id).await;
         Self::store_session_in_entry(&entry, session.clone()).await;
         Some(session)
     }
@@ -833,6 +964,24 @@ impl Registry {
             };
             let addr = val.address.clone();
 
+            let now = Instant::now();
+            if !self
+                .session_bootstrap_attempt_allowed(
+                    peer_id,
+                    now,
+                    SessionBootstrapRetryScope::ActiveView,
+                )
+                .await
+            {
+                trace!(
+                    target: "connect",
+                    peer = %peer_id,
+                    addr = %addr,
+                    "connect-known-peers session bootstrap suppressed by backoff"
+                );
+                continue;
+            }
+
             let client = match self.connect_to_peer(&addr, &val.noise_static_pub).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -841,7 +990,15 @@ impl Registry {
                 }
             };
 
-            let Some(session) = self.session_for_strategy(&client, peer_id, strategy).await else {
+            let Some(session) = self
+                .session_for_strategy(
+                    &client,
+                    peer_id,
+                    strategy,
+                    SessionBootstrapRetryScope::ActiveView,
+                )
+                .await
+            else {
                 if !allow_credentials {
                     error!(target: "connect", "no ticket and no signing key; skipping {addr}");
                 }
@@ -1338,6 +1495,7 @@ impl Registry {
     async fn store_session(&self, peer_id: Uuid, session: cluster_session::Client) {
         let entry = self.ensure_entry(peer_id).await;
         Self::store_session_in_entry(&entry, session).await;
+        self.clear_session_bootstrap_backoff(peer_id).await;
     }
 
     /// Stores a ClusterSession in the provided peer entry and clears derived capability caches.
@@ -1405,11 +1563,29 @@ impl Registry {
             return Some(session);
         }
 
+        let now = Instant::now();
+        let retry_scope = SessionBootstrapRetryScope::from_allow_excluded(allow_excluded);
+        if !self
+            .session_bootstrap_attempt_allowed(peer_id, now, retry_scope)
+            .await
+        {
+            trace!(
+                target: "sync",
+                peer = %peer_id,
+                "session bootstrap suppressed by backoff"
+            );
+            return None;
+        }
+
         if let Some(server) = {
             let state = entry.lock().await;
             state.server.clone()
         } {
-            if let Some(session) = self.session_for_strategy(&server, peer_id, strategy).await {
+            if let Some(session) = self
+                .session_for_strategy(&server, peer_id, strategy, retry_scope)
+                .await
+            {
+                self.clear_session_bootstrap_backoff(peer_id).await;
                 Self::store_session_in_entry(entry, session.clone()).await;
                 return Some(session);
             }
@@ -1424,9 +1600,10 @@ impl Registry {
             self.refresh_peer_handle(peer_id).await?
         };
         let session = self
-            .session_for_strategy(&refreshed, peer_id, strategy)
+            .session_for_strategy(&refreshed, peer_id, strategy, retry_scope)
             .await?;
 
+        self.clear_session_bootstrap_backoff(peer_id).await;
         Self::store_session_in_entry(entry, session.clone()).await;
         Some(session)
     }
@@ -1504,6 +1681,44 @@ impl Registry {
         (delay, streak)
     }
 
+    /// Returns whether typed session-bootstrap retry backoff allows a new peer attempt.
+    async fn session_bootstrap_attempt_allowed(
+        &self,
+        peer_id: Uuid,
+        now: Instant,
+        scope: SessionBootstrapRetryScope,
+    ) -> bool {
+        let state = self
+            .session_bootstrap_backoff
+            .lock()
+            .await
+            .get(&peer_id)
+            .copied();
+        state
+            .map(|value| value.allows_attempt(now, scope))
+            .unwrap_or(true)
+    }
+
+    /// Records one rate-limited session-bootstrap rejection for a peer.
+    async fn record_session_bootstrap_backoff(
+        &self,
+        peer_id: Uuid,
+        now: Instant,
+        kind: SessionBootstrapBackoffKind,
+    ) -> (Duration, u32) {
+        let mut states = self.session_bootstrap_backoff.lock().await;
+        let previous = states.get(&peer_id).copied();
+        let (next_state, delay) = PeerRetryBackoff::on_failure(previous, now, kind);
+        let streak = next_state.consecutive_failures;
+        states.insert(peer_id, next_state);
+        (delay, streak)
+    }
+
+    /// Clears session-bootstrap retry backoff after a peer accepts a fresh session.
+    async fn clear_session_bootstrap_backoff(&self, peer_id: Uuid) {
+        self.session_bootstrap_backoff.lock().await.remove(&peer_id);
+    }
+
     /// Fetches the Sync capability from an existing session.
     async fn fetch_sync_from_session(
         session: &cluster_session::Client,
@@ -1558,27 +1773,34 @@ impl Registry {
         client: &server::Client,
         peer_id: Uuid,
         strategy: SessionStrategy,
+        retry_scope: SessionBootstrapRetryScope,
     ) -> Option<cluster_session::Client> {
-        let mut session = self.session_via_ticket(client, peer_id).await;
-
-        if session.is_none() && matches!(strategy, SessionStrategy::TicketThenCredential) {
-            session = self.session_via_credential(client, peer_id).await;
+        match self.session_via_ticket(client, peer_id, retry_scope).await {
+            TicketSessionBootstrapResult::Accepted(session) => Some(session),
+            TicketSessionBootstrapResult::TryCredential
+                if matches!(strategy, SessionStrategy::TicketThenCredential) =>
+            {
+                self.session_via_credential(client, peer_id, retry_scope)
+                    .await
+            }
+            TicketSessionBootstrapResult::TryCredential | TicketSessionBootstrapResult::Stop => {
+                None
+            }
         }
-
-        session
     }
 
     /// # Description:
     ///
-    /// Opens a cluster session with a cached ticket, evicting tickets the peer rejects.
+    /// Opens a cluster session with a cached ticket and reports whether credential fallback is safe.
     async fn session_via_ticket(
         &self,
         client: &server::Client,
         peer_id: Uuid,
-    ) -> Option<cluster_session::Client> {
+        retry_scope: SessionBootstrapRetryScope,
+    ) -> TicketSessionBootstrapResult {
         let ticket = match self.sessions.get(peer_id) {
             Ok(Some(t)) => t,
-            _ => return None,
+            _ => return TicketSessionBootstrapResult::TryCredential,
         };
 
         let mut req = client.get_session_request();
@@ -1595,12 +1817,12 @@ impl Registry {
                             &e,
                         )
                         .await;
-                        return None;
+                        return TicketSessionBootstrapResult::TryCredential;
                     }
                 };
                 match result.which() {
                     Ok(server::session_bootstrap_result::Which::Accepted(Ok(session))) => {
-                        Some(session)
+                        TicketSessionBootstrapResult::Accepted(session)
                     }
                     Ok(server::session_bootstrap_result::Which::Accepted(Err(e)))
                     | Ok(server::session_bootstrap_result::Which::Rejected(Err(e))) => {
@@ -1611,7 +1833,7 @@ impl Registry {
                             &e,
                         )
                         .await;
-                        None
+                        TicketSessionBootstrapResult::TryCredential
                     }
                     Err(e) => {
                         self.record_unexpected_session_failure(
@@ -1621,17 +1843,25 @@ impl Registry {
                             &e,
                         )
                         .await;
-                        None
+                        TicketSessionBootstrapResult::TryCredential
                     }
                     Ok(server::session_bootstrap_result::Which::Rejected(Ok(rejection_reader))) => {
                         match SessionBootstrapRejection::from_wire(rejection_reader) {
                             Ok(rejection) => {
+                                let allow_fallback =
+                                    Self::ticket_rejection_allows_credential_fallback(&rejection);
                                 self.record_session_bootstrap_rejection(
                                     peer_id,
                                     "ticket.rejected",
                                     &rejection,
+                                    retry_scope,
                                 )
                                 .await;
+                                if allow_fallback {
+                                    TicketSessionBootstrapResult::TryCredential
+                                } else {
+                                    TicketSessionBootstrapResult::Stop
+                                }
                             }
                             Err(e) => {
                                 self.record_unexpected_session_failure(
@@ -1641,9 +1871,9 @@ impl Registry {
                                     &e,
                                 )
                                 .await;
+                                TicketSessionBootstrapResult::TryCredential
                             }
                         }
-                        None
                     }
                 }
             }
@@ -1655,9 +1885,17 @@ impl Registry {
                     &e,
                 )
                 .await;
-                None
+                TicketSessionBootstrapResult::TryCredential
             }
         }
+    }
+
+    /// Returns whether a ticket rejection should fall through to credential bootstrap immediately.
+    fn ticket_rejection_allows_credential_fallback(rejection: &SessionBootstrapRejection) -> bool {
+        matches!(
+            rejection.code,
+            SessionBootstrapRejectionCode::UnknownSessionTicket
+        )
     }
 
     /// # Description:
@@ -1667,6 +1905,7 @@ impl Registry {
         &self,
         client: &server::Client,
         peer_id: Uuid,
+        retry_scope: SessionBootstrapRetryScope,
     ) -> Option<cluster_session::Client> {
         let cred_bytes = {
             let sk_guard = self.signing_key.lock().await;
@@ -1744,6 +1983,7 @@ impl Registry {
                                     peer_id,
                                     "credential.rejected",
                                     &rejection,
+                                    retry_scope,
                                 )
                                 .await;
                             }
@@ -1838,6 +2078,7 @@ impl Registry {
         peer_id: Uuid,
         phase: &str,
         rejection: &SessionBootstrapRejection,
+        retry_scope: SessionBootstrapRetryScope,
     ) {
         let summary = rejection.summary();
         if rejection.is_transient_convergence() {
@@ -1846,6 +2087,22 @@ impl Registry {
             error!(target: "sync", "session bootstrap rejected: {summary}");
         }
         self.remove_rejected_session_ticket(peer_id, rejection);
+        if let Some(kind) = SessionBootstrapBackoffKind::from_rejection(rejection)
+            && kind.applies_to(retry_scope)
+        {
+            let (delay, streak) = self
+                .record_session_bootstrap_backoff(peer_id, Instant::now(), kind)
+                .await;
+            if Self::should_emit_diag_sample(streak as u64) {
+                debug!(
+                    target: "diag.session.bootstrap",
+                    peer = %peer_id,
+                    delay_ms = delay.as_millis() as u64,
+                    streak,
+                    "scheduled session bootstrap backoff"
+                );
+            }
+        }
         self.record_session_bootstrap_telemetry(
             peer_id,
             phase,
@@ -2025,6 +2282,30 @@ mod tests {
         }
     }
 
+    /// Builds one registry backed by an isolated temporary peer/session store.
+    fn registry_for_test(seed: u8) -> (Registry, tempfile::TempDir) {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("registry-test-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let local_id = Uuid::new_v4();
+        let peers = open_peers_store(db.clone(), local_id).expect("open peers store");
+        let noise_keys = NoiseKeys::from_private_bytes([seed; 32]);
+        let sessions = LocalSessionStore::open(db, &noise_keys).expect("open sessions store");
+        (
+            Registry::new(
+                peers,
+                sessions,
+                SigningKey::from_bytes(&[seed.wrapping_add(1); 32]),
+                Arc::new(noise_keys),
+                local_id,
+                HealthMonitor::new(local_id),
+            ),
+            dir,
+        )
+    }
+
     /// Looking up one peer by id must return left rows so stale active observations cannot resurrect it.
     #[tokio::test]
     async fn peer_value_unscoped_returns_left_membership_rows() {
@@ -2195,6 +2476,31 @@ mod tests {
         );
     }
 
+    /// Only unknown tickets should continue into credential fallback in the same attempt.
+    #[test]
+    fn ticket_rejection_fallback_only_for_unknown_session_ticket() {
+        let unknown_ticket = SessionBootstrapRejection::with_default_detail(
+            SessionBootstrapRejectionCode::UnknownSessionTicket,
+        );
+        assert!(Registry::ticket_rejection_allows_credential_fallback(
+            &unknown_ticket
+        ));
+
+        for code in [
+            SessionBootstrapRejectionCode::PeerNotRegistered,
+            SessionBootstrapRejectionCode::LocalNodeInactive,
+            SessionBootstrapRejectionCode::CredentialInvalid,
+            SessionBootstrapRejectionCode::IssuerMismatch,
+            SessionBootstrapRejectionCode::IssuerUnknown,
+        ] {
+            let rejection = SessionBootstrapRejection::with_default_detail(code);
+            assert!(
+                !Registry::ticket_rejection_allows_credential_fallback(&rejection),
+                "{code:?} should stop the current bootstrap attempt"
+            );
+        }
+    }
+
     /// Expected membership races should not emit warning-level session bootstrap diagnostics.
     #[test]
     fn session_bootstrap_transient_codes_include_leave_ticket_rejections() {
@@ -2218,9 +2524,190 @@ mod tests {
         );
         assert!(
             !SessionBootstrapRejection::with_default_detail(
+                SessionBootstrapRejectionCode::UnknownSessionTicket
+            )
+            .requires_retry_backoff()
+        );
+        assert!(
+            SessionBootstrapRejection::with_default_detail(
+                SessionBootstrapRejectionCode::PeerNotRegistered
+            )
+            .requires_retry_backoff()
+        );
+        assert!(
+            !SessionBootstrapRejection::with_default_detail(
                 SessionBootstrapRejectionCode::IssuerMismatch
             )
             .is_transient_convergence()
+        );
+    }
+
+    /// Membership rejections should rate-limit repeated peer session bootstrap attempts.
+    #[tokio::test]
+    async fn session_bootstrap_membership_rejection_installs_retry_backoff() {
+        let (registry, _dir) = registry_for_test(0x21);
+        let peer_id = Uuid::new_v4();
+        let rejection = SessionBootstrapRejection::with_default_detail(
+            SessionBootstrapRejectionCode::PeerNotRegistered,
+        );
+
+        assert!(
+            registry
+                .session_bootstrap_attempt_allowed(
+                    peer_id,
+                    Instant::now(),
+                    SessionBootstrapRetryScope::ActiveView,
+                )
+                .await
+        );
+        registry
+            .record_session_bootstrap_rejection(
+                peer_id,
+                "credential.rejected",
+                &rejection,
+                SessionBootstrapRetryScope::ActiveView,
+            )
+            .await;
+
+        assert!(
+            !registry
+                .session_bootstrap_attempt_allowed(
+                    peer_id,
+                    Instant::now(),
+                    SessionBootstrapRetryScope::ActiveView,
+                )
+                .await,
+            "peer-not-registered rejection should cool down immediate retries"
+        );
+    }
+
+    /// Cross-view metadata probes must keep flowing through active-view membership misses.
+    #[tokio::test]
+    async fn peer_membership_backoff_does_not_block_cross_view_metadata_retry() {
+        let (registry, _dir) = registry_for_test(0x24);
+        let peer_id = Uuid::new_v4();
+        let rejection = SessionBootstrapRejection::with_default_detail(
+            SessionBootstrapRejectionCode::PeerNotRegistered,
+        );
+
+        registry
+            .record_session_bootstrap_rejection(
+                peer_id,
+                "credential.rejected",
+                &rejection,
+                SessionBootstrapRetryScope::ActiveView,
+            )
+            .await;
+
+        assert!(
+            registry
+                .session_bootstrap_attempt_allowed(
+                    peer_id,
+                    Instant::now(),
+                    SessionBootstrapRetryScope::CrossView,
+                )
+                .await,
+            "cross-view metadata sync must not wait behind active-view membership backoff"
+        );
+    }
+
+    /// Authority-level bootstrap failures should still cool down every session caller.
+    #[tokio::test]
+    async fn authority_backoff_blocks_cross_view_retry() {
+        let (registry, _dir) = registry_for_test(0x25);
+        let peer_id = Uuid::new_v4();
+        let rejection = SessionBootstrapRejection::with_default_detail(
+            SessionBootstrapRejectionCode::LocalNodeInactive,
+        );
+
+        registry
+            .record_session_bootstrap_rejection(
+                peer_id,
+                "credential.rejected",
+                &rejection,
+                SessionBootstrapRetryScope::CrossView,
+            )
+            .await;
+
+        assert!(
+            !registry
+                .session_bootstrap_attempt_allowed(
+                    peer_id,
+                    Instant::now(),
+                    SessionBootstrapRetryScope::CrossView,
+                )
+                .await,
+            "inactive peers should cool down even unscoped metadata retries"
+        );
+    }
+
+    /// Ticket-only rejections should not block the immediate credential fallback path.
+    #[tokio::test]
+    async fn unknown_session_ticket_does_not_backoff_credential_retry() {
+        let (registry, _dir) = registry_for_test(0x22);
+        let peer_id = Uuid::new_v4();
+        let rejection = SessionBootstrapRejection::with_default_detail(
+            SessionBootstrapRejectionCode::UnknownSessionTicket,
+        );
+
+        registry
+            .record_session_bootstrap_rejection(
+                peer_id,
+                "ticket.rejected",
+                &rejection,
+                SessionBootstrapRetryScope::ActiveView,
+            )
+            .await;
+
+        assert!(
+            registry
+                .session_bootstrap_attempt_allowed(
+                    peer_id,
+                    Instant::now(),
+                    SessionBootstrapRetryScope::ActiveView,
+                )
+                .await,
+            "unknown tickets should allow the next credential attempt"
+        );
+    }
+
+    /// Accepted sessions should clear a previous bootstrap retry backoff for that peer.
+    #[tokio::test]
+    async fn accepted_session_clears_bootstrap_retry_backoff() {
+        let (registry, _dir) = registry_for_test(0x23);
+        let peer_id = Uuid::new_v4();
+        let rejection = SessionBootstrapRejection::with_default_detail(
+            SessionBootstrapRejectionCode::LocalNodeInactive,
+        );
+        registry
+            .record_session_bootstrap_rejection(
+                peer_id,
+                "credential.rejected",
+                &rejection,
+                SessionBootstrapRetryScope::ActiveView,
+            )
+            .await;
+        assert!(
+            !registry
+                .session_bootstrap_attempt_allowed(
+                    peer_id,
+                    Instant::now(),
+                    SessionBootstrapRetryScope::ActiveView,
+                )
+                .await
+        );
+
+        registry.clear_session_bootstrap_backoff(peer_id).await;
+
+        assert!(
+            registry
+                .session_bootstrap_attempt_allowed(
+                    peer_id,
+                    Instant::now(),
+                    SessionBootstrapRetryScope::ActiveView,
+                )
+                .await,
+            "accepted session paths must reopen retries after successful bootstrap"
         );
     }
 }

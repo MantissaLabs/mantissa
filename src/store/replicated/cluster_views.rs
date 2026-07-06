@@ -98,15 +98,16 @@ impl ClusterNodeCountRecord {
     ///
     /// The authority bit prevents metadata from another split view from replacing the count
     /// computed by the lineage being summarized. Publishers that replace an observed row for the
-    /// same view must write a strictly newer timestamp. Actor id remains only a deterministic
-    /// tie-breaker for truly concurrent rows because membership generation is actor-local.
-    fn precedence_key(&self, cluster_id: ClusterId) -> (bool, u64, u64, Uuid, u64, u32) {
+    /// same view must write a strictly newer timestamp. Membership generation resolves
+    /// same-millisecond membership changes before actor id, so a survivor's leave-derived count
+    /// can beat a stale split-time count from the peer that left.
+    fn precedence_key(&self, cluster_id: ClusterId) -> (bool, u64, u64, u64, Uuid, u32) {
         (
             self.authoritative_for(cluster_id),
             self.source_view.epoch,
             self.updated_at_unix_ms,
-            self.actor_node_id,
             self.membership_generation,
+            self.actor_node_id,
             self.node_count,
         )
     }
@@ -924,6 +925,56 @@ mod tests {
             store
                 .winning_cluster_node_count_for(cluster_id)
                 .expect("read fresh winning count"),
+            Some(fresh)
+        );
+    }
+
+    /// Survivor leave counts should beat stale split counts written in the same millisecond.
+    #[tokio::test]
+    async fn survivor_membership_generation_wins_same_millisecond_stale_count() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("cluster-view-leave-count-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(Database::create(db_path).expect("create db"));
+        let survivor_actor = Uuid::from_u128(1);
+        let left_actor = Uuid::from_u128(u128::MAX);
+        let cluster_id = ClusterId::from_uuid(Uuid::new_v4());
+        let source_view = ClusterViewId::new(cluster_id, 1);
+        let survivor_store =
+            ClusterViewStore::new(db.clone(), survivor_actor).expect("open survivor store");
+        let left_store = ClusterViewStore::new(db, left_actor).expect("open left-peer store");
+
+        let stale = count_record(source_view, 2, 10, left_actor, 1);
+        let fresh = count_record(source_view, 1, 10, survivor_actor, 2);
+
+        left_store
+            .cluster_view_domain
+            .upsert(
+                &UuidKey::from(cluster_id.to_uuid()),
+                ClusterViewMetadataRecord {
+                    name: None,
+                    node_count: Some(stale),
+                },
+            )
+            .await
+            .expect("insert stale split count from leaving peer");
+        survivor_store
+            .cluster_view_domain
+            .upsert(
+                &UuidKey::from(cluster_id.to_uuid()),
+                ClusterViewMetadataRecord {
+                    name: None,
+                    node_count: Some(fresh.clone()),
+                },
+            )
+            .await
+            .expect("insert survivor leave count");
+
+        assert_eq!(
+            survivor_store
+                .winning_cluster_node_count_for(cluster_id)
+                .expect("read winning survivor count"),
             Some(fresh)
         );
     }

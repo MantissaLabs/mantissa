@@ -55,10 +55,23 @@ impl Topology {
             .cluster_view_store
             .winning_cluster_node_count_for(local_view.cluster_id)
             .map_err(|err| capnp::Error::failed(err.to_string()))?;
+        debug!(
+            target: "cluster_view",
+            local_view = %local_view,
+            node_count,
+            current = ?current,
+            "publishing local cluster node count"
+        );
         if let Some(current) = current.as_ref()
             && current.source_view == local_view
             && current.node_count == node_count
         {
+            debug!(
+                target: "cluster_view",
+                local_view = %local_view,
+                node_count,
+                "local cluster node count already current"
+            );
             return Ok(false);
         }
 
@@ -74,8 +87,18 @@ impl Topology {
             actor_node_id: self.local.node.id,
             membership_generation: self.stores.peers.change_clock(),
         };
-        self.upsert_cluster_node_count_record(local_view.cluster_id, &record)
-            .await
+        let changed = self
+            .upsert_cluster_node_count_record(local_view.cluster_id, &record)
+            .await?;
+        debug!(
+            target: "cluster_view",
+            local_view = %local_view,
+            node_count,
+            changed,
+            record = ?record,
+            "published local cluster node count"
+        );
+        Ok(changed)
     }
 
     /// Persists split target names carried by one operation record so cluster lineage labels survive restarts.

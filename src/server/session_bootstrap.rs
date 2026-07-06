@@ -65,6 +65,18 @@ impl SessionBootstrapRejectionCode {
         )
     }
 
+    /// Returns whether repeated session bootstrap attempts require retry backoff.
+    pub(crate) fn requires_retry_backoff(self) -> bool {
+        matches!(
+            self,
+            Self::PeerNotRegistered
+                | Self::LocalNodeInactive
+                | Self::CredentialInvalid
+                | Self::IssuerMismatch
+                | Self::IssuerUnknown
+        )
+    }
+
     /// # Description:
     ///
     /// Returns the stable log label for this rejection code.
@@ -124,6 +136,11 @@ impl SessionBootstrapRejection {
     /// Returns true when this rejection should remove the local cached session ticket.
     pub(crate) fn rejects_cached_ticket(&self) -> bool {
         self.code.rejects_cached_ticket()
+    }
+
+    /// Returns true when this rejection should cool down the next bootstrap attempt.
+    pub(crate) fn requires_retry_backoff(&self) -> bool {
+        self.code.requires_retry_backoff()
     }
 
     /// # Description:
