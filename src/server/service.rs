@@ -181,17 +181,14 @@ impl Server {
             .map_err(|error| capnp::Error::failed(error.to_string()))?;
         self.topology
             .swim_record_join(request.joiner_id, request.incarnation);
-        match self.topology.publish_local_cluster_node_count().await {
-            Ok(true) => self.topology.sync_once_now(),
-            Ok(false) => {}
-            Err(err) => {
-                warn!(
-                    target: "cluster_view",
-                    node_id = %request.joiner_id,
-                    "failed to publish cluster node count after join: {err}"
-                );
-            }
+        if let Err(err) = self.topology.publish_local_cluster_node_count().await {
+            warn!(
+                target: "cluster_view",
+                node_id = %request.joiner_id,
+                "failed to publish cluster node count after join: {err}"
+            );
         }
+        self.topology.sync_once_now();
         Ok(())
     }
 

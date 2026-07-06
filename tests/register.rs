@@ -2,7 +2,7 @@
 mod common;
 use std::time::Duration;
 
-use common::testkit::TestNode;
+use common::testkit::{ClusterConfig, TestNode};
 use mantissa::cluster::ClusterViewId;
 use mantissa::topology::peers::NodeReadiness;
 use mantissa::workload::model::{
@@ -51,6 +51,27 @@ async fn split_candidate_ids(node: &TestNode) -> Vec<uuid::Uuid> {
     }
     ids.sort();
     ids
+}
+
+/// Reads stable peer roots from one survivor set for idempotence assertions.
+async fn peer_roots(nodes: &[TestNode]) -> Vec<(Uuid, String)> {
+    let mut roots = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        roots.push((node.id(), node.root_hex().await));
+    }
+    roots.sort_by_key(|(id, _)| *id);
+    roots
+}
+
+/// Builds fast all-peer timing for join/leave churn regression tests.
+fn churn_cluster_config() -> ClusterConfig {
+    ClusterConfig {
+        sync_tick_ms: Some(100),
+        sync_fanout: Some(0),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(0),
+        ..ClusterConfig::default()
+    }
 }
 
 /// Builds one deterministic workload row used to make bootstrap sync observable.
@@ -469,6 +490,48 @@ local_test!(node_leave_tcp, {
     TestNode::wait_roots_equal(&anchor, &joiner1, Duration::from_secs(5))
         .await
         .expect("roots equal after leave");
+});
+
+local_test!(node_duplicate_leave_tombstones_are_idempotent_inproc, {
+    let cluster = TestNode::new_cluster_inproc_with_config(4, churn_cluster_config())
+        .await
+        .expect("cluster starts");
+    let survivors = &cluster[..3];
+    let leaving_id = cluster[3].id();
+
+    TestNode::assert_cluster_size_all(&cluster, 4, "initial cluster size should converge").await;
+    TestNode::wait_roots_equal_all(&cluster, Duration::from_secs(5))
+        .await
+        .expect("initial roots equal");
+
+    cluster[3].leave().await.expect("leave ok");
+    TestNode::assert_cluster_size_all(survivors, 3, "survivors should exclude left node").await;
+    TestNode::wait_roots_equal_all(survivors, Duration::from_secs(5))
+        .await
+        .expect("survivor roots equal after leave");
+    let roots_after_leave = peer_roots(survivors).await;
+
+    for survivor in survivors {
+        survivor
+            .evict(leaving_id)
+            .await
+            .expect("duplicate leave tombstone broadcast ok");
+    }
+
+    TestNode::assert_cluster_size_all(
+        survivors,
+        3,
+        "duplicate leave tombstones should preserve survivor membership",
+    )
+    .await;
+    TestNode::wait_roots_equal_all(survivors, Duration::from_secs(5))
+        .await
+        .expect("survivor roots equal after duplicate tombstones");
+    assert_eq!(
+        peer_roots(survivors).await,
+        roots_after_leave,
+        "duplicate leave tombstones must not rewrite peer MST roots"
+    );
 });
 
 local_test!(node_evict_stopped_peer_inproc, {

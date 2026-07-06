@@ -121,14 +121,26 @@ impl Topology {
                                     "failed to publish cluster node count after join event: {err}"
                                 );
                             }
+                            self.sync_once_now();
                         }
 
                         TopologyEvent::Leave { id, incarnation } => {
-                            info!(target: "topology", "Node left: {id}");
-
-                            if let Err(e) = self.mark_peer_left(id, incarnation).await {
-                                error!("Failed to remove peer: {e}");
-                                continue;
+                            match self.mark_peer_left(id, incarnation).await {
+                                Ok(true) => {
+                                    info!(target: "topology", "Node left: {id}");
+                                }
+                                Ok(false) => {
+                                    tracing::debug!(
+                                        target: "topology",
+                                        peer_id = %id,
+                                        incarnation,
+                                        "ignored duplicate or stale leave event"
+                                    );
+                                }
+                                Err(e) => {
+                                    error!("Failed to remove peer: {e}");
+                                    continue;
+                                }
                             }
                         }
 

@@ -207,18 +207,39 @@ impl Topology {
     }
 
     /// Marks one peer as left without tombstoning the reusable identity row.
+    ///
+    /// Returns `true` when this call advanced local membership state.
+    ///
+    /// Duplicate leave events for the same or older incarnation return `false` so callers can avoid
+    /// re-running shutdown cleanup. They may still repair cluster-size metadata when another peer
+    /// has already advanced the local membership row.
     pub async fn mark_peer_left(
         &self,
         id: Uuid,
         incarnation: u64,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let current = self.deps.registry.peer_value_unscoped(id);
+        let already_left = current
+            .as_ref()
+            .map(|value| {
+                let membership = value.membership;
+                membership.has_applied_leave(incarnation)
+            })
+            .unwrap_or(false);
+        if already_left {
+            self.publish_cluster_node_count_after_peer_leave(id).await;
+            return Ok(false);
+        }
+
         let stale_against_current = current
             .as_ref()
-            .map(|value| value.membership.incarnation > incarnation)
+            .map(|value| {
+                let membership = value.membership;
+                membership.is_active() && membership.incarnation > incarnation
+            })
             .unwrap_or(false);
         if stale_against_current {
-            return Ok(());
+            return Ok(false);
         }
 
         let mut value = current.unwrap_or_else(|| PeerValue {
@@ -288,20 +309,34 @@ impl Topology {
                 }
             }
         }
-        if id != self.local.node.id {
-            match self.publish_local_cluster_node_count().await {
-                Ok(true) => self.sync_once_now(),
-                Ok(false) => {}
-                Err(err) => {
-                    warn!(
-                        target: "cluster_view",
-                        peer_id = %id,
-                        "failed to publish cluster node count after leave event: {err}"
-                    );
-                }
+        let sync_requested = self.publish_cluster_node_count_after_peer_leave(id).await;
+        if id != self.local.node.id && !sync_requested {
+            self.sync_once_now();
+        }
+        Ok(true)
+    }
+
+    /// Publishes the local cluster node count after a remote peer leave is visible.
+    async fn publish_cluster_node_count_after_peer_leave(&self, id: Uuid) -> bool {
+        if id == self.local.node.id {
+            return false;
+        }
+
+        match self.publish_local_cluster_node_count().await {
+            Ok(true) => {
+                self.sync_once_now();
+                true
+            }
+            Ok(false) => false,
+            Err(err) => {
+                warn!(
+                    target: "cluster_view",
+                    peer_id = %id,
+                    "failed to publish cluster node count after leave event: {err}"
+                );
+                false
             }
         }
-        Ok(())
     }
 
     /// Return true if the peer `id` currently exists as an active member.

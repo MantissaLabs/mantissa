@@ -483,6 +483,11 @@ impl PeerMembership {
     pub fn is_active(self) -> bool {
         matches!(self.state, PeerMembershipState::Active)
     }
+
+    /// Returns true when this row already applied this leave incarnation or a newer one.
+    pub fn has_applied_leave(self, incarnation: u64) -> bool {
+        matches!(self.state, PeerMembershipState::Left) && self.incarnation >= incarnation
+    }
 }
 
 /// Returns whether a readiness value can carry into the selected membership row.
@@ -1101,8 +1106,8 @@ fn read_text_list(list: text_list::Reader<'_>) -> Result<Vec<String>, CapnpError
 #[cfg(test)]
 mod tests {
     use super::{
-        NodeReadiness, NodeReadinessState, PeerLabel, PeerLabelState, PeerRootSnapshot,
-        PeerSchedulingState, PeerValue, WireGuardPeerValue,
+        NodeReadiness, NodeReadinessState, PeerLabel, PeerLabelState, PeerMembership,
+        PeerRootSnapshot, PeerSchedulingState, PeerValue, WireGuardPeerValue,
     };
     use crate::runtime::types::RuntimeSupportProfile;
     use uuid::Uuid;
@@ -1118,6 +1123,15 @@ mod tests {
         assert!(scheduling.schedulable);
         assert!(!scheduling.drain_requested);
         assert_eq!(scheduling.actor_node_id, node_id);
+    }
+
+    /// Leave detection should reject duplicate tombstones while allowing newer leave rows.
+    #[test]
+    fn peer_membership_tracks_applied_leave_incarnations() {
+        assert!(PeerMembership::left(7).has_applied_leave(7));
+        assert!(PeerMembership::left(8).has_applied_leave(7));
+        assert!(!PeerMembership::left(6).has_applied_leave(7));
+        assert!(!PeerMembership::active(8).has_applied_leave(7));
     }
 
     /// Later scheduling updates must win peer selection across concurrent values.
