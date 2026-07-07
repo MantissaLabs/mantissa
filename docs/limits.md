@@ -1,9 +1,11 @@
 # Limits and Ongoing Challenges
 
-This document is intentionally honest. Mantissa is trying a different
-orchestration model, but that does not make the normal hard parts disappear.
-The goal here is to explain the trade-offs clearly so people can evaluate the
-project without guessing what is already solved.
+This document is an overview of the current limits encountered during the development
+of Mantissa. Using eventual consistency comes with its own set of challenges, and
+mantissa is trying a slightly different orchestration model.
+
+The goal here is to explain the trade-offs clearly to allow informed decisions to be
+made and evaluate if the project is a good fit for your use case or not.
 
 ## Anti-entropy and scaling
 
@@ -13,6 +15,10 @@ Noise encryption is especially costly at scale. Mantissa limits the number of fa
 nodes, so the cost stays bounded. Still, this is why Mantissa fits best for a cluster
 of large nodes (32/64 vCPU cores) rather than a cluster with small nodes (4/8 vCPU
 cores).
+
+Mantissa may spawn more synchronization rounds than required. Further work on coalescing
+and batching updates needs to be done, especially on the repair/anti-entropy path
+(gossip already coalesces updates).
 
 The anti-entropy also means that a lot of messages are constantly exchanged between
 nodes. Those are mostly cheap (exchanging MST roots) but can quickly become a
@@ -29,10 +35,11 @@ local durable state and then relies on gossip and anti-entropy to spread that
 state. Another node may briefly show an older view, and two nodes can produce
 different `list` output until replication catches up.
 
-This is not a bug in the model, but it is a real user-facing trade-off. If a
-workflow requires a single linearizable API server, globally ordered reads, or
-immediate cluster-wide visibility after every write, Mantissa is not that
-system today.
+It is a real user-facing trade-off. If a workflow requires a single linearizable
+API server, globally ordered reads, or immediate cluster-wide visibility after
+every write, Mantissa won't be that system. The focus is to simplify maintenance
+and reduce the operational complexity and cost, not to offer a fully linearizable
+system.
 
 ## Scheduler semantics
 
@@ -41,28 +48,21 @@ optimizes for distributed ownership, fault-tolerance and convergence. The
 trade-off is that scheduling decisions may be based on slightly stale replicated
 digests, then confirmed by the target node through a resource reservation. A
 bad guess should be cheap to reject, but it is still a retry and not a
-centralized in-memory decision.
+centralized in-memory decision. It is thus still bound to latency and node
+health.
 
-The default scheduler admission mode is still incremental with batch-aware
-placement. A batch is a placement and reservation attempt, not a strict
-all-or-nothing gang, and this remains the default for existing manifests.
-During failures or topology changes, the system may temporarily have too few
-or too many visible replicas while it chooses the safer side of the
-availability trade-off.
+The default scheduler admission mode is incremental with batch-aware placement.
+A batch is a placement and reservation attempt, not a strict all-or-nothing gang,
+and this remains the default for existing manifests. During failures or topology
+changes, the system may temporarily have too few or too many visible replicas
+while it chooses the safer side of the availability trade-off.
 
-Mantissa also has opt-in gang admission through the shared workload
-`admission` policy. For services, the controller derives the gang boundaries:
-one group for a simple service generation, one group per dependency stage, and
-one group per rolling-update replacement chunk. Jobs and agents use the same
-workload admission contract for their current attempt or run; today those are
-single-workload groups, not parallel array jobs or distributed agent swarms.
+Mantissa also supports gang-scheduling. Jobs and agents use the same workload
+admission contract for their current attempt or run.
 
-That should not be read as Kubernetes scheduler feature parity. There is no
-queue-level fair sharing, preemption, pod-group API, gang wait queue, or
-autoscaler integration. Gang admission is a resource-admission barrier around a
-controller-derived workload group. It also deliberately rejects new
-wait-for-first-consumer volume bindings for now, because those bindings need a
-rollback-capable protocol before they can be part of an all-or-nothing commit.
+However, it does not fully match Kubernetes or other orchestrators semantics: there
+is no queue-level fair sharing, preemption, pod-group API, gang wait queue, or
+exhaustive autoscaling integration.
 
 ## Fault-tolerance
 
@@ -78,9 +78,11 @@ temporarily from the desired state.
 ## Cluster views
 
 Cluster split/merge is useful, but it is not a magic zero-cost federation
-layer. A view is a real control-plane boundary: gossip and anti-entropy are
-scoped to the active view, and topology operations have to move nodes, service
-state, network state, secrets and local peer scope consistently.
+layer. It is an heavy operation, safer performed after draining one side of the
+partition, or ensuring the workloads are migrated to a new view beforehand. A view
+is a real control-plane boundary: gossip and anti-entropy are scoped to the active
+view, and topology operations have to move nodes, service state, network state,
+secrets and local peer scope consistently.
 
 Because of that, Mantissa blocks many mutating operations while a non-dry-run
 split or merge is active. That is deliberate. Split/merge should be treated as
@@ -147,15 +149,15 @@ hardening, disk encryption or a mature external KMS story.
 
 ## Volumes
 
-Volumes are perhaps the biggest limitation at the moment: the model is very naive
-and currently doesn't plug into other volume providers.
+Volumes support is currently limited to local volumes.
 
-The current local volume model is honest but limited: the control-plane object
-is replicated, the data path is not. A local volume is bound to one node, drain
-will not pretend it can be evacuated transparently, and failover requires the
-underlying storage to come back on that node. There is no external driver
-support, no read-write-many mode, no live migration and no transparent
-cross-node volume replication yet.
+The control-plane object is replicated, but the volume itself is not. We do not
+support distributed volumes yet. A local volume is bound to one node, and drain will
+not pretend it can be evacuated transparently. Failover requires the underlying
+storage to come back on that node and scheduling will always place a task/job on a
+node that hosts the volume it is bound to. There is no external driver support, no
+read-write-many mode, no snapshotting and live migration and no transparent cross-node
+volume replication yet.
 
 ## GPUs
 
@@ -173,8 +175,8 @@ eras, downgrading after the rollback window, or changing stored row semantics
 still needs an explicit migration or an offline hard cutover.
 
 This is another reason not to run Mantissa as production infrastructure yet:
-the interesting parts are being built, but the operational compatibility story
-is not mature.
+the API contracts are subject to changes and compatibility is not guaranteed
+before reaching a stable v1.0.0. Take that into account.
 
 ## Kubernetes feature parity
 

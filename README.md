@@ -7,7 +7,7 @@
 Mantissa is a distributed orchestration system that grows with you and your workloads.
 Every node participates equally in scheduling, state replication, and cluster membership.
 No control-plane masters, and no federation layer required at scale. The focus of Mantissa
-is convergence and auto-stabilization.
+is convergence and self-stabilization.
 
 Built in Rust with Cap'n Proto RPC, CRDT replication, Merkle Search Trees over Redb, and
 an eBPF driven data path, Mantissa targets low-latency scheduling and fault-tolerant
@@ -25,12 +25,14 @@ The goal is to reduce the operational overhead and complexity, simplifying upgra
 as well as aiming for a highly available and fault-tolerant system. This could be useful to scale
 infrastructures and deploy a large number of AI agents for example.
 
+See [docs.mantissa.io/architecture](https://docs.mantissa.io/architecture) for an overview of
+the architecture and design principles behind Mantissa.
+
 ## Status
 
 **Experimental**. Do not use in production (_yet_).
 
-Take this as a research-focused system, pushing the scalability limits of a completely distributed
-control plane.
+Take this as a research-focused system, pushing the scalability limits of a distributed control plane.
 
 See the [docs/limits.md](docs/limits.md) for more details on the ongoing challenges and limitations.
 
@@ -105,7 +107,7 @@ mantissa tasks logs <id-task>
 
 ---
 
-- See [docs/quickstart.md](docs/quickstart.md) for the full local and multi-VM workflow.
+- See [docs.mantissa.io/quickstart](https://docs.mantissa.io/quickstart) for the full local and multi-VM workflow.
 
 ## Contributing
 
