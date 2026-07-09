@@ -728,18 +728,31 @@ impl WorkloadManager {
                     .and_then(|snapshot| {
                         select_best_service_generation_progress_record(snapshot.as_slice())
                     });
-                if let Some(current) = current.as_ref()
-                    && !should_accept_service_generation_progress_record(current, &record)
-                {
-                    debug!(
-                        target: "task",
-                        progress = %record.id,
-                        service = %record.service_name,
-                        epoch = record.service_epoch,
-                        node = %record.node_id,
-                        "ignoring stale or duplicate service progress update"
-                    );
-                    return Ok(());
+                if let Some(current) = current.as_ref() {
+                    if Self::service_progress_match(current, &record) {
+                        debug!(
+                            target: "task",
+                            progress = %record.id,
+                            service = %record.service_name,
+                            epoch = record.service_epoch,
+                            node = %record.node_id,
+                            "ignoring timestamp-only service progress update"
+                        );
+                        self.remember_service_progress_epoch(&record).await;
+                        return Ok(());
+                    }
+
+                    if !should_accept_service_generation_progress_record(current, &record) {
+                        debug!(
+                            target: "task",
+                            progress = %record.id,
+                            service = %record.service_name,
+                            epoch = record.service_epoch,
+                            node = %record.node_id,
+                            "ignoring stale or duplicate service progress update"
+                        );
+                        return Ok(());
+                    }
                 }
 
                 self.core

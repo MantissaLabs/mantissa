@@ -401,7 +401,7 @@ struct ServiceProgressTracker {
 
 /// Result of applying one local lifecycle event to the compact service progress tracker.
 struct ServiceProgressTrackerUpdate {
-    // New or refreshed compact progress row that should be persisted and replicated.
+    // New or changed compact progress row that should be persisted and replicated.
     record: Option<ServiceGenerationProgressRecord>,
     // Older compact progress rows that are now outside the retained generation window.
     stale_progress_ids: Vec<Uuid>,

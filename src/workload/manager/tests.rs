@@ -56,11 +56,11 @@ use crate::volumes::types::{
     LocalVolumeOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
     VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue, VolumeStatus,
 };
-use crate::workload::model::select_best_workload_value;
 use crate::workload::model::{
-    ExecutionPlatform, WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord,
-    WorkloadAdmissionState, WorkloadAgentRunMetadata, WorkloadOwner, WorkloadServiceMetadata,
-    WorkloadStatus, WorkloadValue, WorkloadValueDraft,
+    ExecutionPlatform, ServiceGenerationProgressRecord, WorkloadAdmissionGroupPhase,
+    WorkloadAdmissionGroupRecord, WorkloadAdmissionState, WorkloadAgentRunMetadata, WorkloadOwner,
+    WorkloadServiceMetadata, WorkloadStatus, WorkloadValue, WorkloadValueDraft,
+    select_best_service_generation_progress_record, select_best_workload_value,
 };
 use crate::workload::types::{
     ExecutionSpec, ResolvedExecutionSpec, WorkloadLivenessProbe, WorkloadLivenessProbeKind,
@@ -8300,6 +8300,161 @@ async fn service_creating_and_running_updates_emit_compact_progress_only() {
         }
         _ => panic!("service running update should only emit progress"),
     }
+}
+
+#[tokio::test]
+async fn duplicate_service_progress_does_not_refresh_timestamp_or_gossip() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let service_name = "svc";
+    let task_id = Uuid::new_v4();
+    let service_owner = Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
+        service_name,
+        "api",
+    )));
+
+    let mut running = build_remote_task_spec(
+        task_id,
+        manager.local_node_id,
+        WorkloadPhase::Running,
+        1,
+        2,
+        Utc::now().to_rfc3339(),
+    );
+    running.owner = service_owner.clone();
+    manager
+        .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(running)))
+        .await
+        .expect("record initial running progress");
+    assert!(
+        manager
+            .flush_dirty_gossip_events()
+            .await
+            .expect("flush initial running progress"),
+        "initial running progress should emit compact progress"
+    );
+    let outbound = manager
+        .core
+        .rx
+        .recv()
+        .await
+        .expect("receive initial compact progress");
+    let progress_id = match outbound {
+        Message::Workload {
+            event: WorkloadEvent::UpsertServiceProgress(progress),
+            ..
+        } => {
+            assert_eq!(progress.service_name, service_name);
+            assert_eq!(progress.counts.running, 1);
+            progress.id
+        }
+        _ => panic!("initial running progress should emit compact progress"),
+    };
+    manager
+        .local_state
+        .dirty_gossip_workloads
+        .lock()
+        .await
+        .clear();
+
+    let before = manager
+        .core
+        .store
+        .get_snapshot(&UuidKey::from(progress_id))
+        .expect("load initial compact progress")
+        .and_then(|snapshot| select_best_service_generation_progress_record(snapshot.as_slice()))
+        .expect("initial compact progress should be stored");
+    let updated_at_before = before.updated_at.clone();
+    let change_clock_before = manager.core.store.change_clock();
+
+    let mut duplicate = build_remote_task_spec(
+        task_id,
+        manager.local_node_id,
+        WorkloadPhase::Running,
+        1,
+        3,
+        (Utc::now() + ChronoDuration::seconds(30)).to_rfc3339(),
+    );
+    duplicate.owner = service_owner;
+    manager
+        .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(duplicate)))
+        .await
+        .expect("record duplicate running progress");
+    assert!(
+        !manager
+            .flush_dirty_gossip_events()
+            .await
+            .expect("flush duplicate running progress"),
+        "duplicate running progress should not emit compact progress"
+    );
+
+    let extra =
+        tokio::time::timeout(std::time::Duration::from_millis(20), manager.core.rx.recv()).await;
+    assert!(
+        extra.is_err(),
+        "duplicate running progress should not enqueue outbound gossip"
+    );
+    let after = manager
+        .core
+        .store
+        .get_snapshot(&UuidKey::from(progress_id))
+        .expect("reload compact progress after duplicate")
+        .and_then(|snapshot| select_best_service_generation_progress_record(snapshot.as_slice()))
+        .expect("compact progress should remain stored");
+
+    assert_eq!(after.updated_at, updated_at_before);
+    assert_eq!(after.counts, before.counts);
+    assert_eq!(manager.core.store.change_clock(), change_clock_before);
+}
+
+#[tokio::test]
+async fn inbound_timestamp_only_service_progress_does_not_move_workload_root() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let service_name = "svc";
+    let service_id = crate::services::types::compute_service_id(service_name);
+
+    let mut progress = ServiceGenerationProgressRecord::new(
+        service_id,
+        service_name,
+        0,
+        manager.local_node_id,
+        "local",
+        Utc::now().to_rfc3339(),
+    );
+    progress.add_phase(&WorkloadPhase::Running);
+    manager
+        .handle_event(WorkloadEvent::UpsertServiceProgress(Box::new(
+            progress.clone(),
+        )))
+        .await
+        .expect("apply initial inbound progress");
+
+    let root_after_initial = manager.core.store.root_digest().await;
+    let clock_after_initial = manager.core.store.change_clock();
+    let stored = manager
+        .core
+        .store
+        .get_snapshot(&UuidKey::from(progress.id))
+        .expect("load initial inbound progress")
+        .and_then(|snapshot| select_best_service_generation_progress_record(snapshot.as_slice()))
+        .expect("initial inbound progress should be stored");
+
+    progress.updated_at = (Utc::now() + ChronoDuration::seconds(30)).to_rfc3339();
+    manager
+        .handle_event(WorkloadEvent::UpsertServiceProgress(Box::new(progress)))
+        .await
+        .expect("apply timestamp-only inbound progress");
+
+    let after = manager
+        .core
+        .store
+        .get_snapshot(&UuidKey::from(stored.id))
+        .expect("reload inbound progress")
+        .and_then(|snapshot| select_best_service_generation_progress_record(snapshot.as_slice()))
+        .expect("inbound progress should remain stored");
+    assert_eq!(after.updated_at, stored.updated_at);
+    assert_eq!(after.counts, stored.counts);
+    assert_eq!(manager.core.store.root_digest().await, root_after_initial);
+    assert_eq!(manager.core.store.change_clock(), clock_after_initial);
 }
 
 #[tokio::test]

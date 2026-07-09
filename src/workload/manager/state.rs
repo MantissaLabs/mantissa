@@ -1412,6 +1412,16 @@ impl WorkloadManager {
             };
         }
 
+        let task_progress_already_recorded = tracker
+            .tasks
+            .get(&progress_event.task_id)
+            .is_some_and(|existing| {
+                existing.progress_id == progress_id && &existing.state == progress_event.state
+            });
+        let previous_record = task_progress_already_recorded
+            .then(|| tracker.records.get(&progress_id).cloned())
+            .flatten();
+
         if let Some(previous) = tracker.tasks.remove(&progress_event.task_id)
             && let Some(record) = tracker.records.get_mut(&previous.progress_id)
         {
@@ -1456,10 +1466,41 @@ impl WorkloadManager {
         let stale_progress_ids =
             Self::prune_stale_service_progress_records(&mut tracker, latest_key, latest_epoch);
 
+        if previous_record
+            .as_ref()
+            .is_some_and(|previous| Self::service_progress_match(previous, &updated))
+        {
+            if let Some(previous) = previous_record {
+                tracker.records.insert(progress_id, previous);
+            }
+            return super::ServiceProgressTrackerUpdate {
+                record: None,
+                stale_progress_ids,
+            };
+        }
+
         super::ServiceProgressTrackerUpdate {
             record: Some(updated),
             stale_progress_ids,
         }
+    }
+
+    /// Returns true when two compact progress rows match after excluding timestamp fields.
+    ///
+    /// Timestamps are excluded so duplicate progress observations do not refresh durable rows,
+    /// change MST roots, and trigger another sync round.
+    pub(super) fn service_progress_match(
+        left: &ServiceGenerationProgressRecord,
+        right: &ServiceGenerationProgressRecord,
+    ) -> bool {
+        left.id == right.id
+            && left.service_id == right.service_id
+            && left.service_name == right.service_name
+            && left.service_epoch == right.service_epoch
+            && left.node_id == right.node_id
+            && left.node_name == right.node_name
+            && left.counts == right.counts
+            && left.detail == right.detail
     }
 
     /// Drops compact progress rows older than the retained generation window.
