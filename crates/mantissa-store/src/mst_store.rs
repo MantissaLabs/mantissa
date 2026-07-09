@@ -71,6 +71,9 @@ pub type SnapshotsAndTombs<K, S> = (Snapshots<K, S>, Tombstones<K>);
 /// Tuple of `(Registers, Tombstones)` returned by delta exporters.
 pub type RegistersAndTombs<K, R> = (Registers<K, R>, Tombstones<K>);
 
+/// Tuple of `(MST update rows, durable state changed)` returned by delta merge helpers.
+type DeltaMergeResult<K, R> = (RegistersAndTombs<K, R>, bool);
+
 /// Candidate tombstone age-index row selected for one GC pass.
 struct TombstoneGcCandidate {
     index_key: Vec<u8>,
@@ -1371,11 +1374,9 @@ where
         regs: Registers<C::Key, C::Reg>,
         tombs: Tombstones<C::Key>,
     ) -> io::Result<()> {
-        let (merged_regs, merged_tombs) =
-            self.write_delta_chunk_merged_latest(regs, tombs, false)?;
-        let had_changes = !merged_regs.is_empty() || !merged_tombs.is_empty();
+        let (_mst_updates, changed) = self.write_delta_chunk_merged_latest(regs, tombs, false)?;
 
-        if had_changes {
+        if changed {
             self.bump_change_clock();
         }
 
@@ -1390,9 +1391,12 @@ where
         tombs: Tombstones<C::Key>,
     ) -> io::Result<()> {
         let _mutation = self.mutation_gate.lock().await;
-        let (merged_regs, merged_tombs) =
-            self.write_delta_chunk_merged_latest(regs, tombs, true)?;
-        let had_changes = !merged_regs.is_empty() || !merged_tombs.is_empty();
+        let refresh_existing_rows_for_mst = {
+            let tree = self.mst.read().await;
+            tree.node_iter().next().is_none()
+        };
+        let ((merged_regs, merged_tombs), changed) =
+            self.write_delta_chunk_merged_latest(regs, tombs, refresh_existing_rows_for_mst)?;
 
         // Reflect in MST in the same logical order: regs then tombs.
         {
@@ -1406,7 +1410,7 @@ where
             }
         }
 
-        if had_changes {
+        if changed {
             self.bump_change_clock();
         }
 
@@ -1423,8 +1427,8 @@ where
         &self,
         regs: Registers<C::Key, C::Reg>,
         tombs: Tombstones<C::Key>,
-        refresh_existing_tombs_for_mst: bool,
-    ) -> io::Result<RegistersAndTombs<C::Key, C::Reg>> {
+        refresh_existing_rows_for_mst: bool,
+    ) -> io::Result<DeltaMergeResult<C::Key, C::Reg>> {
         let tomb_keys_in_chunk: HashSet<C::Key> = if self.preserve_local_tombs && !regs.is_empty() {
             tombs.iter().map(|(key, _)| key.clone()).collect()
         } else {
@@ -1433,6 +1437,7 @@ where
         let observed_at_unix_ms = now_unix_ms();
         let mut merged_regs = Vec::with_capacity(regs.len());
         let mut merged_tombs = Vec::with_capacity(tombs.len());
+        let mut changed = false;
 
         let w = self.db.begin_write().map_err(into_err)?;
         {
@@ -1460,18 +1465,34 @@ where
                 }
 
                 let current = match values.get(key_bytes.as_slice()).map_err(into_err)? {
-                    Some(row) => Some(Self::decode_reg(row.value())?),
+                    Some(row) => {
+                        let bytes = row.value().to_vec();
+                        Some((Self::decode_reg(&bytes)?, bytes))
+                    }
                     None => None,
                 };
-                let merged = C::merge_regs(current, incoming);
-                values
-                    .insert(key_bytes.as_slice(), Self::encode_reg(&merged)?.as_slice())
-                    .map_err(into_err)?;
-
                 let existing = match tomb_table.get(key_bytes.as_slice()).map_err(into_err)? {
                     Some(row) => Some(Self::decode_tombstone(row.value())?),
                     None => None,
                 };
+
+                let merged = C::merge_regs(current.as_ref().map(|(reg, _)| reg.clone()), incoming);
+                let merged_bytes = Self::encode_reg(&merged)?;
+                let register_unchanged = current
+                    .as_ref()
+                    .is_some_and(|(_, bytes)| bytes.as_slice() == merged_bytes.as_slice());
+                if register_unchanged && existing.is_none() {
+                    // A duplicate register may still be useful to seed an empty
+                    // in-memory MST, but it must not be counted as a durable change.
+                    if refresh_existing_rows_for_mst {
+                        merged_regs.push((key, merged));
+                    }
+                    continue;
+                }
+
+                values
+                    .insert(key_bytes.as_slice(), merged_bytes.as_slice())
+                    .map_err(into_err)?;
 
                 if let Some(record) = existing {
                     let index_key = tombstone_observed_index_key(key_bytes.as_slice(), &record);
@@ -1481,6 +1502,7 @@ where
                 }
                 let _ = tomb_table.remove(key_bytes.as_slice()).map_err(into_err)?;
 
+                changed = true;
                 merged_regs.push((key, merged));
             }
 
@@ -1515,41 +1537,45 @@ where
                 let incoming = Self::normalize_incoming_tombstone(incoming, observed_at_unix_ms);
                 let next_tombstone = Self::merge_tombstone_records(current_tomb.clone(), incoming);
 
-                // Skip pure no-ops unless the caller needs the existing tombstone
-                // returned to refresh the MST incrementally. The durable state
-                // already contains the winning tombstone and there is no live value.
-                if current_tomb.as_ref() == Some(&next_tombstone)
-                    && !value_exists
-                    && !refresh_existing_tombs_for_mst
-                {
+                // A duplicate tombstone may still be useful to seed an empty
+                // in-memory MST, but it must not be counted as a durable change.
+                let tombstone_unchanged = current_tomb.as_ref() == Some(&next_tombstone);
+                if tombstone_unchanged && !value_exists {
+                    if refresh_existing_rows_for_mst {
+                        merged_tombs.push((key, next_tombstone));
+                    }
                     continue;
                 }
 
-                if let Some(record) = current_tomb {
+                if let Some(record) = current_tomb.filter(|_| !tombstone_unchanged) {
                     let index_key = tombstone_observed_index_key(key_bytes.as_slice(), &record);
                     let _ = tombs_by_observed
                         .remove(index_key.as_slice())
                         .map_err(into_err)?;
                 }
 
-                tomb_table
-                    .insert(
-                        key_bytes.as_slice(),
-                        Self::encode_tombstone(&next_tombstone)?.as_slice(),
-                    )
-                    .map_err(into_err)?;
-                let index_key = tombstone_observed_index_key(key_bytes.as_slice(), &next_tombstone);
-                tombs_by_observed
-                    .insert(index_key.as_slice(), &[] as &[u8])
-                    .map_err(into_err)?;
+                if !tombstone_unchanged {
+                    tomb_table
+                        .insert(
+                            key_bytes.as_slice(),
+                            Self::encode_tombstone(&next_tombstone)?.as_slice(),
+                        )
+                        .map_err(into_err)?;
+                    let index_key =
+                        tombstone_observed_index_key(key_bytes.as_slice(), &next_tombstone);
+                    tombs_by_observed
+                        .insert(index_key.as_slice(), &[] as &[u8])
+                        .map_err(into_err)?;
+                }
                 let _ = values.remove(key_bytes.as_slice()).map_err(into_err)?;
 
+                changed = true;
                 merged_tombs.push((key, next_tombstone));
             }
         }
         w.commit().map_err(into_err)?;
 
-        Ok((merged_regs, merged_tombs))
+        Ok(((merged_regs, merged_tombs), changed))
     }
 
     /// Rebuild MST once after a sequence of `apply_delta_chunk()` calls.
@@ -2926,6 +2952,80 @@ mod tests {
 
         assert_eq!(local_ts, 2);
         assert_eq!(root_before, root_after);
+    }
+
+    #[tokio::test]
+    async fn apply_delta_chunk_update_mst_skips_duplicate_register_rows() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+        let k = key(1);
+        let reg = concurrent_reg(&[(2, 1, "same")]);
+
+        store
+            .apply_delta_chunk_update_mst(vec![(k, reg.clone())], Vec::new())
+            .await
+            .unwrap();
+
+        let root_before = store.root_hex().await;
+        let change_clock_before = store.change_clock();
+        store
+            .apply_delta_chunk_update_mst(vec![(k, reg)], Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(store.root_hex().await, root_before);
+        assert_eq!(store.change_clock(), change_clock_before);
+    }
+
+    #[tokio::test]
+    async fn apply_delta_chunk_update_mst_skips_duplicate_tombstone_rows() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+        let origin = <Adapter as RegAdapter>::actor_to_bytes(&actor(2));
+        let tombstone = TombstoneRecord::new(3, origin, 0);
+        let k = key(1);
+
+        store
+            .apply_delta_chunk_update_mst(Vec::new(), vec![(k, tombstone.clone())])
+            .await
+            .unwrap();
+
+        let root_before = store.root_hex().await;
+        let change_clock_before = store.change_clock();
+        store
+            .apply_delta_chunk_update_mst(Vec::new(), vec![(k, tombstone)])
+            .await
+            .unwrap();
+
+        assert_eq!(store.root_hex().await, root_before);
+        assert_eq!(store.change_clock(), change_clock_before);
+    }
+
+    #[tokio::test]
+    async fn apply_delta_chunk_update_mst_keeps_register_metadata_changes() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+        let k = key(1);
+
+        store
+            .apply_delta_chunk_update_mst(vec![(k, concurrent_reg(&[(1, 1, "same")]))], Vec::new())
+            .await
+            .unwrap();
+        let root_before = store.root_hex().await;
+        let change_clock_before = store.change_clock();
+
+        store
+            .apply_delta_chunk_update_mst(vec![(k, concurrent_reg(&[(2, 1, "same")]))], Vec::new())
+            .await
+            .unwrap();
+        let reg = store.get_reg(&k).unwrap().unwrap();
+
+        assert_eq!(store.root_hex().await, root_before);
+        assert_eq!(store.change_clock(), change_clock_before + 1);
+        assert_eq!(reg.entries().len(), 2);
     }
 
     #[tokio::test]
