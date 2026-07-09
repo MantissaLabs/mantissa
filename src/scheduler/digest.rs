@@ -138,13 +138,28 @@ impl SchedulerDigestRegistry {
 
     /// Upserts one node-local scheduler digest into the replicated store.
     pub async fn upsert(&self, value: SchedulerDigestValue) -> AnyhowResult<()> {
+        let _ = self.upsert_if_newer(value).await?;
+        Ok(())
+    }
+
+    /// Upserts one scheduler digest when it is newer than the current canonical row.
+    async fn upsert_if_newer(&self, value: SchedulerDigestValue) -> AnyhowResult<bool> {
         let node_id = value.node_id;
+        if let Some(current) = self.get(node_id)?
+            && !compare_scheduler_digest_values(&value, &current).is_gt()
+        {
+            // Repeated or older digest gossip only refreshes local observation time. Writing it
+            // would create another actor-local MVReg version and move the scheduler digest MST.
+            self.record_observed_now(node_id);
+            return Ok(false);
+        }
+
         self.store
             .upsert(&mantissa_store::uuid_key::UuidKey::from(node_id), value)
             .await
             .map_err(|e| anyhow!("scheduler digest upsert failed: {e}"))?;
         self.record_observed_now(node_id);
-        Ok(())
+        Ok(true)
     }
 
     /// Removes one scheduler digest row from the replicated store.
@@ -255,7 +270,9 @@ impl SchedulerDigestPublisher {
     /// Publishes a fresh digest derived from the provided scheduler snapshot.
     pub async fn publish_from_snapshot(&self, snapshot: &SchedulerSnapshot) -> AnyhowResult<()> {
         let digest = SchedulerDigestValue::from_snapshot(self.local_node_id, snapshot);
-        self.registry.upsert(digest.clone()).await?;
+        if !self.registry.upsert_if_newer(digest.clone()).await? {
+            return Ok(());
+        }
 
         self.gossip_tx
             .send(Message::SchedulerDigest {
@@ -580,6 +597,49 @@ mod tests {
         assert!(
             observed.observed_at_unix_ms > observed.digest.updated_at_unix_ms,
             "local ingest time should not reuse the peer-provided digest timestamp"
+        );
+    }
+
+    /// Repeated or older digest observations should not create extra MVReg roots.
+    #[tokio::test]
+    async fn stale_or_duplicate_digest_observation_does_not_move_root() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("scheduler-digest-noop-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let store = open_scheduler_digest_store(db, actor).expect("open digest store");
+        store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild digest store");
+        let registry = SchedulerDigestRegistry::new(store);
+        let node_id = Uuid::new_v4();
+        let current = sample_digest(node_id, 12);
+        let stale = sample_digest(node_id, 11);
+
+        registry
+            .upsert(current.clone())
+            .await
+            .expect("upsert current digest");
+        let root_after_current = registry.store.root_digest().await;
+        let clock_after_current = registry.store.change_clock();
+
+        registry
+            .upsert(current.clone())
+            .await
+            .expect("repeat current digest");
+        assert_eq!(registry.store.root_digest().await, root_after_current);
+        assert_eq!(registry.store.change_clock(), clock_after_current);
+
+        registry.upsert(stale).await.expect("observe stale digest");
+        assert_eq!(registry.store.root_digest().await, root_after_current);
+        assert_eq!(registry.store.change_clock(), clock_after_current);
+        assert_eq!(
+            registry.get(node_id).expect("lookup digest"),
+            Some(current),
+            "stale observation should not replace the canonical digest"
         );
     }
 

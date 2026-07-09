@@ -7567,6 +7567,37 @@ async fn duplicate_remove_event_does_not_poison_future_epoch_upsert() {
 }
 
 #[tokio::test]
+async fn repeated_remove_spec_does_not_move_tombstoned_root() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let original = manager
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+
+    manager
+        .remove_spec(original.id)
+        .await
+        .expect("remove task spec");
+    let root_after_remove = manager.core.store.root_digest().await;
+    let clock_after_remove = manager.core.store.change_clock();
+
+    manager
+        .remove_spec(original.id)
+        .await
+        .expect("repeat task spec remove");
+
+    assert_eq!(manager.core.store.root_digest().await, root_after_remove);
+    assert_eq!(manager.core.store.change_clock(), clock_after_remove);
+}
+
+#[tokio::test]
 async fn next_epoch_after_remove_uses_watermark_increment() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 

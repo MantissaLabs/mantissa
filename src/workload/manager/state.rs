@@ -1066,6 +1066,20 @@ impl WorkloadManager {
             .get_snapshot(&key)
             .map_err(|e| anyhow::anyhow!("task lookup failed before remove: {e}"))?
             .and_then(|snapshot| select_best_workload_value(snapshot.as_slice()));
+        if prior_value.is_none()
+            && self
+                .core
+                .store
+                .has_tombstone(&key)
+                .map_err(|e| anyhow::anyhow!("task tombstone lookup failed before remove: {e}"))?
+        {
+            // The durable tombstone already represents this delete. Refresh only the in-memory
+            // watermark so stale upserts stay suppressed without moving the workload MST root.
+            self.record_remove_watermark(id, Utc::now(), prior_max_epoch.unwrap_or(0))
+                .await;
+            self.evict_cached_spec(id);
+            return Ok(());
+        }
 
         if prior_value
             .as_ref()
