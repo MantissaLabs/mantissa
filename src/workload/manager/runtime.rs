@@ -28,7 +28,7 @@ use crate::workload::model::{
     compare_workload_status_causality as compare_task_status_causality,
     select_best_admission_group_record, select_best_service_generation_progress_record,
     select_best_workload_value, should_accept_admission_group_record,
-    should_accept_service_generation_progress_record,
+    should_accept_service_generation_progress_record, workload_values_match,
 };
 use crate::workload::types::WorkloadRestartPolicyKind;
 
@@ -526,6 +526,21 @@ impl WorkloadManager {
                     .map_err(|e| anyhow::anyhow!("task lookup failed before upsert apply: {e}"))?
                     && let Some(current) = select_best_workload_value(snapshot.as_slice())
                 {
+                    if workload_values_match(&current, &incoming) {
+                        debug!(
+                            target: "task",
+                            task = %spec.id,
+                            current_epoch = current.task_epoch,
+                            current_phase_version = current.phase_version,
+                            incoming_epoch = incoming.task_epoch,
+                            incoming_phase_version = incoming.phase_version,
+                            current_state = ?current.state,
+                            incoming_state = ?incoming.state,
+                            "ignoring timestamp-only task upsert"
+                        );
+                        return Ok(());
+                    }
+
                     let ordering = compare_task_causality(&current, &incoming);
                     if ordering.is_gt() {
                         persisted = incoming;

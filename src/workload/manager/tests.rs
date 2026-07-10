@@ -8489,6 +8489,54 @@ async fn inbound_timestamp_only_service_progress_does_not_move_workload_root() {
 }
 
 #[tokio::test]
+async fn inbound_timestamp_only_task_spec_does_not_move_workload_root() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let remote_node_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    let spec = build_remote_task_spec(
+        task_id,
+        remote_node_id,
+        WorkloadPhase::Running,
+        1,
+        2,
+        Utc::now().to_rfc3339(),
+    );
+
+    manager
+        .handle_event(WorkloadEvent::UpsertSpec(Box::new(spec.clone())))
+        .await
+        .expect("apply initial inbound task spec");
+
+    let root_after_initial = manager.core.store.root_digest().await;
+    let clock_after_initial = manager.core.store.change_clock();
+    let stored = manager
+        .core
+        .store
+        .get_snapshot(&UuidKey::from(task_id))
+        .expect("load initial inbound task spec")
+        .and_then(|snapshot| select_best_workload_value(snapshot.as_slice()))
+        .expect("initial inbound task spec should be stored");
+
+    let mut timestamp_only = spec.clone();
+    timestamp_only.updated_at = (Utc::now() + ChronoDuration::seconds(30)).to_rfc3339();
+    manager
+        .handle_event(WorkloadEvent::UpsertSpec(Box::new(timestamp_only)))
+        .await
+        .expect("apply timestamp-only inbound task spec");
+
+    let after = manager
+        .core
+        .store
+        .get_snapshot(&UuidKey::from(task_id))
+        .expect("reload inbound task spec")
+        .and_then(|snapshot| select_best_workload_value(snapshot.as_slice()))
+        .expect("inbound task spec should remain stored");
+    assert_eq!(after.updated_at, stored.updated_at);
+    assert_eq!(manager.core.store.root_digest().await, root_after_initial);
+    assert_eq!(manager.core.store.change_clock(), clock_after_initial);
+}
+
+#[tokio::test]
 async fn service_progress_cleanup_tombstones_stale_generations() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
     let service_name = "svc";

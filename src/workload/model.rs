@@ -1530,6 +1530,152 @@ pub(crate) fn should_accept_incoming_workload_value(
     compare_workload_causality(current, incoming).is_gt()
 }
 
+/// Borrowed semantic projection of one workload row for timestamp-only no-op checks.
+///
+/// The conversion intentionally destructures `WorkloadValue` without `..`. Adding a new field to
+/// `WorkloadValue` will fail compilation here until we decide whether that field participates in
+/// semantic equality.
+#[derive(PartialEq)]
+struct WorkloadValueMatch<'a> {
+    id: &'a Uuid,
+    name: &'a String,
+    image: &'a String,
+    execution_platform: &'a ExecutionPlatform,
+    isolation_mode: &'a IsolationMode,
+    isolation_profile: &'a Option<String>,
+    state: &'a WorkloadPhase,
+    phase_reason: &'a Option<String>,
+    phase_progress: &'a Option<String>,
+    created_at: &'a String,
+    command: &'a Vec<String>,
+    tty: &'a bool,
+    node_id: &'a Uuid,
+    node_name: &'a String,
+    slot_ids: &'a Vec<u64>,
+    slot_id: &'a Option<u64>,
+    cpu_millis: &'a u64,
+    memory_bytes: &'a u64,
+    gpu_count: &'a u32,
+    gpu_device_ids: &'a Vec<String>,
+    restart_policy: &'a Option<WorkloadRestartPolicy>,
+    termination_grace_period_secs: &'a Option<u32>,
+    pre_stop_command: &'a Option<Vec<String>>,
+    liveness: &'a Option<WorkloadLivenessProbe>,
+    env: &'a Vec<WorkloadEnvironmentVariable>,
+    secret_files: &'a Vec<WorkloadSecretFile>,
+    volumes: &'a Vec<WorkloadVolumeMount>,
+    networks: &'a Vec<Uuid>,
+    ports: &'a Vec<WorkloadPortBinding>,
+    owner: &'a Option<WorkloadOwner>,
+    lease_id: &'a Option<Uuid>,
+    lease_coordinator_node_id: &'a Option<Uuid>,
+    admission_group_id: &'a Option<Uuid>,
+    admission_state: &'a WorkloadAdmissionState,
+    task_epoch: &'a u64,
+    phase_version: &'a u64,
+    launch_attempt: &'a u64,
+    last_terminal_observed_launch: &'a Option<u64>,
+    definition_complete: &'a bool,
+}
+
+impl<'a> From<&'a WorkloadValue> for WorkloadValueMatch<'a> {
+    /// Builds the borrowed semantic projection while explicitly excluding `updated_at`.
+    fn from(value: &'a WorkloadValue) -> Self {
+        let WorkloadValue {
+            id,
+            name,
+            image,
+            execution_platform,
+            isolation_mode,
+            isolation_profile,
+            state,
+            phase_reason,
+            phase_progress,
+            created_at,
+            updated_at: _,
+            command,
+            tty,
+            node_id,
+            node_name,
+            slot_ids,
+            slot_id,
+            cpu_millis,
+            memory_bytes,
+            gpu_count,
+            gpu_device_ids,
+            restart_policy,
+            termination_grace_period_secs,
+            pre_stop_command,
+            liveness,
+            env,
+            secret_files,
+            volumes,
+            networks,
+            ports,
+            owner,
+            lease_id,
+            lease_coordinator_node_id,
+            admission_group_id,
+            admission_state,
+            task_epoch,
+            phase_version,
+            launch_attempt,
+            last_terminal_observed_launch,
+            definition_complete,
+        } = value;
+
+        Self {
+            id,
+            name,
+            image,
+            execution_platform,
+            isolation_mode,
+            isolation_profile,
+            state,
+            phase_reason,
+            phase_progress,
+            created_at,
+            command,
+            tty,
+            node_id,
+            node_name,
+            slot_ids,
+            slot_id,
+            cpu_millis,
+            memory_bytes,
+            gpu_count,
+            gpu_device_ids,
+            restart_policy,
+            termination_grace_period_secs,
+            pre_stop_command,
+            liveness,
+            env,
+            secret_files,
+            volumes,
+            networks,
+            ports,
+            owner,
+            lease_id,
+            lease_coordinator_node_id,
+            admission_group_id,
+            admission_state,
+            task_epoch,
+            phase_version,
+            launch_attempt,
+            last_terminal_observed_launch,
+            definition_complete,
+        }
+    }
+}
+
+/// Returns true when two workload rows carry the same replicated task state.
+///
+/// `updated_at` is excluded so timestamp-only retries do not create a fresh MVReg actor version
+/// and move the workload MST root.
+pub(crate) fn workload_values_match(left: &WorkloadValue, right: &WorkloadValue) -> bool {
+    WorkloadValueMatch::from(left) == WorkloadValueMatch::from(right)
+}
+
 /// Returns true when one candidate workload value should win value-index selection.
 fn should_prefer_workload_value(current: &WorkloadValue, candidate: &WorkloadValue) -> bool {
     if should_accept_incoming_workload_value(current, candidate) {
