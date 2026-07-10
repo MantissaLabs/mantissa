@@ -188,6 +188,11 @@ impl ImmediateSyncState {
             false
         }
     }
+
+    /// Returns whether an immediate sync pass or its coalesced follow-up is currently active.
+    pub(super) fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
 }
 
 #[derive(Clone)]

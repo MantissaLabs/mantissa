@@ -705,6 +705,11 @@ impl HeadlessNode {
         self.topology_runtime.sync_once_now();
     }
 
+    /// Returns whether this node still has split/join-triggered immediate sync work in flight.
+    pub fn immediate_sync_is_running(&self) -> bool {
+        self.topology_runtime.immediate_sync_is_running()
+    }
+
     /// Start (or restart) the listener.
     /// - Inproc: re-register in registry.
     /// - TCP: start listener again on the previously learned bound address.

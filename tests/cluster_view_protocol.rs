@@ -196,6 +196,25 @@ async fn cluster_name_for_lineage(
     None
 }
 
+/// Waits until every provided node has drained split/join-triggered immediate sync work.
+async fn wait_for_immediate_sync_idle(nodes: &[&TestNode], timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if nodes
+            .iter()
+            .all(|node| !node.node.immediate_sync_is_running())
+        {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "immediate sync work did not become idle"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn set_node_labels(
     topology: &mantissa::topology_capnp::topology::Client,
     node_id: Uuid,
@@ -2314,6 +2333,21 @@ local_test!(cluster_view_name_updates_cross_view_after_split, {
     .await;
     wait_for_cluster_view(&joiner_a.topology(), remote_view, Duration::from_secs(15)).await;
     wait_for_cluster_view(&joiner_b.topology(), remote_view, Duration::from_secs(15)).await;
+    wait_for_operation_stage(
+        &joiner_a.topology(),
+        &split_id,
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_operation_stage(
+        &joiner_b.topology(),
+        &split_id,
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_immediate_sync_idle(&[&anchor, &joiner_a, &joiner_b], Duration::from_secs(5)).await;
 
     let anchor_view = current_cluster_view(&anchor.topology()).await;
     let lineage_id = anchor_view.cluster_id.to_uuid();

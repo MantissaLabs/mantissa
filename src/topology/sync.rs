@@ -756,6 +756,11 @@ impl Topology {
         });
     }
 
+    /// Returns whether a one-shot sync runner is active for test convergence checks.
+    pub(crate) fn immediate_sync_is_running(&self) -> bool {
+        self.runtime.immediate_sync.is_running()
+    }
+
     /// Periodically call [`periodic_sync_tick`] every few seconds.
     pub async fn periodic_sync_loop(&self) {
         loop {

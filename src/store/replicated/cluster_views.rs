@@ -71,6 +71,18 @@ impl ClusterNameRecord {
             self.name.as_str(),
         )
     }
+
+    /// Returns the timestamp a local rename should use after observing the current winner.
+    ///
+    /// Local renames are causally newer than the row they replace, even when the wall clock has
+    /// not advanced to the next millisecond. Moving the timestamp forward keeps actor-id ordering
+    /// from rejecting an otherwise valid user rename.
+    fn next_publish_timestamp_after(current: Option<&Self>, now_unix_ms: u64) -> u64 {
+        let Some(current) = current else {
+            return now_unix_ms;
+        };
+        now_unix_ms.max(current.updated_at_unix_ms.saturating_add(1))
+    }
 }
 
 /// Conflict-resolved cluster lineage node-count record.
@@ -491,6 +503,19 @@ impl ClusterViewStore {
             .and_then(|snapshot| ClusterViewMetadataRecord::winner_for(cluster_id, snapshot)))
     }
 
+    /// Returns a timestamp that makes a local rename newer than the observed name winner.
+    pub(crate) fn next_cluster_name_timestamp_for(
+        &self,
+        cluster_id: ClusterId,
+        now_unix_ms: u64,
+    ) -> io::Result<u64> {
+        let current = self.winning_cluster_metadata_for(cluster_id)?;
+        Ok(ClusterNameRecord::next_publish_timestamp_after(
+            current.as_ref().and_then(|record| record.name.as_ref()),
+            now_unix_ms,
+        ))
+    }
+
     /// Applies one conflict-resolved cluster name update and reports whether the row changed.
     pub async fn upsert_cluster_name(
         &self,
@@ -730,6 +755,51 @@ mod tests {
                     node_count: Some(count),
                 },
             )]
+        );
+    }
+
+    /// A local rename should advance past a same-millisecond row from a higher actor id.
+    #[tokio::test]
+    async fn local_name_timestamp_advances_observed_cross_actor_name() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join(format!(
+            "cluster-view-name-cross-actor-{}.redb",
+            Uuid::new_v4()
+        ));
+        let db = Arc::new(Database::create(db_path).expect("create db"));
+        let local_actor = Uuid::from_u128(1);
+        let remote_actor = Uuid::from_u128(2);
+        let cluster_id = ClusterId::from_uuid(Uuid::new_v4());
+        let store = ClusterViewStore::new(db, local_actor).expect("open cluster-view store");
+        let initial = ClusterNameRecord {
+            name: "split-name".to_string(),
+            updated_at_unix_ms: 10,
+            actor_node_id: remote_actor,
+        };
+
+        assert!(
+            store
+                .upsert_cluster_name(cluster_id, &initial)
+                .await
+                .expect("insert split name")
+        );
+
+        let renamed = ClusterNameRecord {
+            name: "manual-name".to_string(),
+            updated_at_unix_ms: store
+                .next_cluster_name_timestamp_for(cluster_id, 10)
+                .expect("select local rename timestamp"),
+            actor_node_id: local_actor,
+        };
+        assert!(
+            store
+                .upsert_cluster_name(cluster_id, &renamed)
+                .await
+                .expect("replace split name")
+        );
+        assert_eq!(
+            store.list_cluster_names().expect("list cluster names"),
+            vec![(cluster_id, renamed)]
         );
     }
 

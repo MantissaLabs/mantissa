@@ -1132,7 +1132,11 @@ impl topology::Server for Topology {
         let request = params.get()?;
         let cluster_id = Self::cluster_id_from_capnp(request.get_cluster_id()?)?;
         let name = request.get_name()?.to_string()?;
-        let updated_at_unix_ms = Self::now_unix_ms();
+        let updated_at_unix_ms = self
+            .stores
+            .cluster_view_store
+            .next_cluster_name_timestamp_for(cluster_id, Self::now_unix_ms())
+            .map_err(|err| capnp::Error::failed(err.to_string()))?;
         let actor_node_id = self.local.node.id;
         let changed = self
             .apply_cluster_name_update(cluster_id, &name, updated_at_unix_ms, actor_node_id)

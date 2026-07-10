@@ -42,6 +42,13 @@ impl Topology {
             .map_err(|err| capnp::Error::failed(err.to_string()))
     }
 
+    /// Returns the immutable timestamp used by cluster-name hints from one operation.
+    ///
+    /// Operation stage updates must not make an unchanged target name newer than a user rename.
+    fn operation_cluster_name_timestamp(operation: &ClusterOperationRecord) -> u64 {
+        operation.created_at_unix_ms
+    }
+
     /// Publishes the local active cluster's current member count into the replicated metadata domain.
     pub(crate) async fn publish_local_cluster_node_count(&self) -> Result<bool, capnp::Error> {
         if !self.local_allows_outbound_cluster_traffic() {
@@ -123,11 +130,7 @@ impl Topology {
             return Ok(());
         }
 
-        let updated_at_unix_ms = if operation.updated_at_unix_ms == 0 {
-            Self::now_unix_ms()
-        } else {
-            operation.updated_at_unix_ms
-        };
+        let updated_at_unix_ms = Self::operation_cluster_name_timestamp(operation);
 
         for (target_view, target_name) in operation
             .target_views
@@ -166,11 +169,7 @@ impl Topology {
                 continue;
             }
 
-            let updated_at_unix_ms = if operation.updated_at_unix_ms == 0 {
-                Self::now_unix_ms()
-            } else {
-                operation.updated_at_unix_ms
-            };
+            let updated_at_unix_ms = Self::operation_cluster_name_timestamp(&operation);
             for (target_view, target_name) in operation
                 .target_views
                 .iter()
@@ -1511,6 +1510,30 @@ impl Topology {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Operation-derived name timestamps must stay fixed while operation stages advance.
+    #[test]
+    fn cluster_name_hint_timestamp_uses_operation_creation_time() {
+        let operation = ClusterOperationRecord {
+            id: Uuid::new_v4(),
+            kind: ClusterOperationKind::Split,
+            stage: ClusterOperationStage::Finalized,
+            dry_run: false,
+            created_at_unix_ms: 10,
+            depends_on_operation_id: None,
+            source_views: Vec::new(),
+            target_views: Vec::new(),
+            target_cluster_names: Vec::new(),
+            split_assignments: Vec::new(),
+            split_service_policy: Default::default(),
+            split_network_policy: Default::default(),
+            merge_service_policy: Default::default(),
+            updated_at_unix_ms: 20,
+            details: String::new(),
+        };
+
+        assert_eq!(Topology::operation_cluster_name_timestamp(&operation), 10);
+    }
 
     /// Ensures committed operations cannot be overwritten by late stale-precondition aborts.
     #[test]
