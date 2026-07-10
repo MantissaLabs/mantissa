@@ -145,13 +145,20 @@ impl SchedulerDigestRegistry {
     /// Upserts one scheduler digest when it is newer than the current canonical row.
     async fn upsert_if_newer(&self, value: SchedulerDigestValue) -> AnyhowResult<bool> {
         let node_id = value.node_id;
-        if let Some(current) = self.get(node_id)?
-            && !compare_scheduler_digest_values(&value, &current).is_gt()
-        {
-            // Repeated or older digest gossip only refreshes local observation time. Writing it
-            // would create another actor-local MVReg version and move the scheduler digest MST.
-            self.record_observed_now(node_id);
-            return Ok(false);
+        if let Some(current) = self.get(node_id)? {
+            if scheduler_digest_state_matches(&value, &current) {
+                // Timestamp-only digest observations only refresh local ingest time. Writing them
+                // would create another actor-local MVReg version and move the digest MST root.
+                self.record_observed_now(node_id);
+                return Ok(false);
+            }
+
+            if !compare_scheduler_digest_values(&value, &current).is_gt() {
+                // Older digest gossip only refreshes local observation time. Writing it would
+                // create another actor-local MVReg version and move the scheduler digest MST.
+                self.record_observed_now(node_id);
+                return Ok(false);
+            }
         }
 
         self.store
@@ -344,7 +351,8 @@ pub fn should_replace_scheduler_digest_event(
         (SchedulerDigestEvent::Upsert(_), SchedulerDigestEvent::Remove(_))
         | (SchedulerDigestEvent::Remove(_), SchedulerDigestEvent::Remove(_)) => true,
         (SchedulerDigestEvent::Upsert(current), SchedulerDigestEvent::Upsert(candidate)) => {
-            compare_scheduler_digest_values(candidate, current).is_gt()
+            !scheduler_digest_state_matches(candidate, current)
+                && compare_scheduler_digest_values(candidate, current).is_gt()
         }
     }
 }
@@ -456,6 +464,65 @@ fn compare_scheduler_digest_values(
         .then(left.node_id.cmp(&right.node_id))
 }
 
+/// Borrowed digest projection used for timestamp-only no-op checks.
+///
+/// The conversion intentionally destructures `SchedulerDigestValue` without `..`. Adding a new
+/// field to `SchedulerDigestValue` will fail compilation here until we decide whether that field
+/// participates in semantic equality.
+#[derive(PartialEq)]
+struct SchedulerDigestState<'a> {
+    node_id: &'a Uuid,
+    snapshot_version: &'a u64,
+    free_slot_count: &'a u32,
+    free_cpu_millis: &'a u64,
+    free_memory_bytes: &'a u64,
+    largest_free_slot_cpu_millis: &'a u64,
+    largest_free_slot_memory_bytes: &'a u64,
+    free_gpu_count: &'a u32,
+    gpu_runtime_ready: &'a bool,
+}
+
+impl<'a> From<&'a SchedulerDigestValue> for SchedulerDigestState<'a> {
+    /// Builds the borrowed semantic projection while explicitly excluding `updated_at_unix_ms`.
+    fn from(value: &'a SchedulerDigestValue) -> Self {
+        let SchedulerDigestValue {
+            node_id,
+            snapshot_version,
+            updated_at_unix_ms: _,
+            free_slot_count,
+            free_cpu_millis,
+            free_memory_bytes,
+            largest_free_slot_cpu_millis,
+            largest_free_slot_memory_bytes,
+            free_gpu_count,
+            gpu_runtime_ready,
+        } = value;
+
+        Self {
+            node_id,
+            snapshot_version,
+            free_slot_count,
+            free_cpu_millis,
+            free_memory_bytes,
+            largest_free_slot_cpu_millis,
+            largest_free_slot_memory_bytes,
+            free_gpu_count,
+            gpu_runtime_ready,
+        }
+    }
+}
+
+/// Returns true when two scheduler digests carry the same capacity/readiness state.
+///
+/// `updated_at_unix_ms` is excluded so timestamp-only refreshes do not create a fresh MVReg actor
+/// version, move the scheduler digest MST root, or publish another digest gossip event.
+fn scheduler_digest_state_matches(
+    left: &SchedulerDigestValue,
+    right: &SchedulerDigestValue,
+) -> bool {
+    SchedulerDigestState::from(left) == SchedulerDigestState::from(right)
+}
+
 /// Decodes one required 16-byte UUID payload from the wire.
 fn read_uuid(bytes: capnp::data::Reader<'_>) -> std::result::Result<Uuid, Error> {
     if bytes.len() != 16 {
@@ -478,9 +545,12 @@ fn current_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        SchedulerDigestEvent, SchedulerDigestRegistry, SchedulerDigestValue,
+        SchedulerDigestEvent, SchedulerDigestPublisher, SchedulerDigestRegistry,
+        SchedulerDigestValue,
         should_replace_scheduler_digest_event,
     };
+    use crate::gossip::Message;
+    use crate::scheduler::{ResourceSlot, SchedulerSnapshot, SlotCapacity, SlotState};
     use crate::store::replicated::scheduler_digests::open_scheduler_digest_store;
     use mantissa_store::codec::StoreValueCodec;
     use std::sync::Arc;
@@ -500,6 +570,19 @@ mod tests {
             largest_free_slot_memory_bytes: 1_024,
             free_gpu_count: 1,
             gpu_runtime_ready: true,
+        }
+    }
+
+    /// Builds one deterministic scheduler snapshot for digest publisher tests.
+    fn sample_snapshot(version: u64) -> SchedulerSnapshot {
+        SchedulerSnapshot {
+            version,
+            slots: vec![ResourceSlot {
+                slot_id: 1,
+                capacity: SlotCapacity::new(1_000, 2_048, 0),
+                state: SlotState::Free,
+            }],
+            gpu_devices: Vec::new(),
         }
     }
 
@@ -554,6 +637,19 @@ mod tests {
         let candidate = SchedulerDigestEvent::Remove(node_id);
 
         assert!(should_replace_scheduler_digest_event(&current, &candidate));
+    }
+
+    /// Timestamp-only digest events should not replace a queued semantic update.
+    #[test]
+    fn timestamp_only_digest_event_does_not_replace_upsert() {
+        let node_id = Uuid::new_v4();
+        let current_digest = sample_digest(node_id, 4);
+        let mut timestamp_only = current_digest.clone();
+        timestamp_only.updated_at_unix_ms = timestamp_only.updated_at_unix_ms.saturating_add(1);
+        let current = SchedulerDigestEvent::Upsert(Box::new(current_digest));
+        let candidate = SchedulerDigestEvent::Upsert(Box::new(timestamp_only));
+
+        assert!(!should_replace_scheduler_digest_event(&current, &candidate));
     }
 
     /// Local digest freshness should track when this node ingested the row, not the peer timestamp.
@@ -640,6 +736,96 @@ mod tests {
             registry.get(node_id).expect("lookup digest"),
             Some(current),
             "stale observation should not replace the canonical digest"
+        );
+    }
+
+    /// Timestamp-only digest observations should not create extra MVReg roots.
+    #[tokio::test]
+    async fn timestamp_only_digest_observation_does_not_move_root() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("scheduler-digest-timestamp-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let store = open_scheduler_digest_store(db, actor).expect("open digest store");
+        store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild digest store");
+        let registry = SchedulerDigestRegistry::new(store);
+        let node_id = Uuid::new_v4();
+        let current = sample_digest(node_id, 12);
+        let mut timestamp_only = current.clone();
+        timestamp_only.updated_at_unix_ms =
+            timestamp_only.updated_at_unix_ms.saturating_add(30_000);
+
+        registry
+            .upsert(current.clone())
+            .await
+            .expect("upsert current digest");
+        let root_after_current = registry.store.root_digest().await;
+        let clock_after_current = registry.store.change_clock();
+
+        registry
+            .upsert(timestamp_only)
+            .await
+            .expect("observe timestamp-only digest");
+
+        assert_eq!(registry.store.root_digest().await, root_after_current);
+        assert_eq!(registry.store.change_clock(), clock_after_current);
+        assert_eq!(
+            registry.get(node_id).expect("lookup digest"),
+            Some(current),
+            "timestamp-only observation should not replace the canonical digest"
+        );
+    }
+
+    /// Republishing the same snapshot should not gossip a timestamp-only digest refresh.
+    #[tokio::test]
+    async fn timestamp_only_digest_publish_does_not_gossip() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join(format!("scheduler-digest-publish-{}.redb", Uuid::new_v4()));
+        let db = Arc::new(redb::Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let store = open_scheduler_digest_store(db, actor).expect("open digest store");
+        store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild digest store");
+        let registry = SchedulerDigestRegistry::new(store);
+        let node_id = Uuid::new_v4();
+        let (gossip_tx, gossip_rx) = async_channel::bounded(2);
+        let publisher = SchedulerDigestPublisher::new(registry, gossip_tx, node_id);
+        let snapshot = sample_snapshot(7);
+
+        publisher
+            .publish_from_snapshot(&snapshot)
+            .await
+            .expect("publish initial digest");
+        let first = gossip_rx.recv().await.expect("receive initial digest");
+        match first {
+            Message::SchedulerDigest {
+                event: SchedulerDigestEvent::Upsert(digest),
+                ..
+            } => {
+                assert_eq!(digest.node_id, node_id);
+                assert_eq!(digest.snapshot_version, snapshot.version);
+            }
+            _ => panic!("initial snapshot publish should gossip digest upsert"),
+        }
+
+        publisher
+            .publish_from_snapshot(&snapshot)
+            .await
+            .expect("publish timestamp-only digest");
+        let extra =
+            tokio::time::timeout(std::time::Duration::from_millis(20), gossip_rx.recv()).await;
+        assert!(
+            extra.is_err(),
+            "timestamp-only snapshot publish should not gossip another digest"
         );
     }
 
