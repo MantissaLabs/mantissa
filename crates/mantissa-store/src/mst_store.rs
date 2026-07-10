@@ -1374,7 +1374,7 @@ where
         regs: Registers<C::Key, C::Reg>,
         tombs: Tombstones<C::Key>,
     ) -> io::Result<()> {
-        let (_mst_updates, changed) = self.write_delta_chunk_merged_latest(regs, tombs, false)?;
+        let (_mst_updates, changed) = self.write_delta_chunk_merged_latest(regs, tombs)?;
 
         if changed {
             self.bump_change_clock();
@@ -1391,12 +1391,20 @@ where
         tombs: Tombstones<C::Key>,
     ) -> io::Result<()> {
         let _mutation = self.mutation_gate.lock().await;
-        let refresh_existing_rows_for_mst = {
+        let mst_is_empty = {
             let tree = self.mst.read().await;
             tree.node_iter().next().is_none()
         };
+
+        // An opened handle starts with an empty MST even when Redb already contains rows.
+        // Rebuild the complete index before applying an incremental chunk so a multi-chunk
+        // stream cannot leave durable rows missing from the in-memory root.
+        if mst_is_empty {
+            self.rebuild_mst_from_disk_unlocked().await?;
+        }
+
         let ((merged_regs, merged_tombs), changed) =
-            self.write_delta_chunk_merged_latest(regs, tombs, refresh_existing_rows_for_mst)?;
+            self.write_delta_chunk_merged_latest(regs, tombs)?;
 
         // Reflect in MST in the same logical order: regs then tombs.
         {
@@ -1427,7 +1435,6 @@ where
         &self,
         regs: Registers<C::Key, C::Reg>,
         tombs: Tombstones<C::Key>,
-        refresh_existing_rows_for_mst: bool,
     ) -> io::Result<DeltaMergeResult<C::Key, C::Reg>> {
         let tomb_keys_in_chunk: HashSet<C::Key> = if self.preserve_local_tombs && !regs.is_empty() {
             tombs.iter().map(|(key, _)| key.clone()).collect()
@@ -1482,11 +1489,6 @@ where
                     .as_ref()
                     .is_some_and(|(_, bytes)| bytes.as_slice() == merged_bytes.as_slice());
                 if register_unchanged && existing.is_none() {
-                    // A duplicate register may still be useful to seed an empty
-                    // in-memory MST, but it must not be counted as a durable change.
-                    if refresh_existing_rows_for_mst {
-                        merged_regs.push((key, merged));
-                    }
                     continue;
                 }
 
@@ -1537,13 +1539,8 @@ where
                 let incoming = Self::normalize_incoming_tombstone(incoming, observed_at_unix_ms);
                 let next_tombstone = Self::merge_tombstone_records(current_tomb.clone(), incoming);
 
-                // A duplicate tombstone may still be useful to seed an empty
-                // in-memory MST, but it must not be counted as a durable change.
                 let tombstone_unchanged = current_tomb.as_ref() == Some(&next_tombstone);
                 if tombstone_unchanged && !value_exists {
-                    if refresh_existing_rows_for_mst {
-                        merged_tombs.push((key, next_tombstone));
-                    }
                     continue;
                 }
 
@@ -3093,8 +3090,9 @@ mod tests {
         assert_eq!(src.root_hex().await, dst.root_hex().await);
     }
 
+    /// An empty MST over populated Redb state should rebuild before duplicate chunks arrive.
     #[tokio::test]
-    async fn apply_delta_chunk_update_mst_keeps_tree_fresh() {
+    async fn apply_delta_chunk_update_mst_rebuilds_before_multiple_duplicate_chunks() {
         let (_dir, db) = temp_db();
         let src: CrdtMstStore<Adapter, XXHash128, TestTables> =
             CrdtMstStore::open(db.clone(), actor(1)).unwrap();
@@ -3108,12 +3106,19 @@ mod tests {
 
         let want = src.page_range_summary().await.unwrap();
         let (regs, tombs) = src.export_page_ranges_delta(&want).unwrap();
+        let change_clock_before = dst.change_clock();
 
-        // Apply and update MST incrementally
-        dst.apply_delta_chunk_update_mst(regs, tombs).await.unwrap();
+        // Apply the already-durable rows in separate chunks to exercise streamed sync.
+        dst.apply_delta_chunk_update_mst(regs, Vec::new())
+            .await
+            .unwrap();
+        dst.apply_delta_chunk_update_mst(Vec::new(), tombs)
+            .await
+            .unwrap();
 
-        // No finalize call; roots should already match
+        // No finalize call is needed, and duplicate rows do not count as durable changes.
         assert_eq!(src.root_hex().await, dst.root_hex().await);
+        assert_eq!(dst.change_clock(), change_clock_before);
     }
 
     #[tokio::test]

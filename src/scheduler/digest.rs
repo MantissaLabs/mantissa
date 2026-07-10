@@ -546,8 +546,7 @@ fn current_unix_ms() -> u64 {
 mod tests {
     use super::{
         SchedulerDigestEvent, SchedulerDigestPublisher, SchedulerDigestRegistry,
-        SchedulerDigestValue,
-        should_replace_scheduler_digest_event,
+        SchedulerDigestValue, should_replace_scheduler_digest_event,
     };
     use crate::gossip::Message;
     use crate::scheduler::{ResourceSlot, SchedulerSnapshot, SlotCapacity, SlotState};
@@ -743,9 +742,10 @@ mod tests {
     #[tokio::test]
     async fn timestamp_only_digest_observation_does_not_move_root() {
         let dir = tempdir().expect("tempdir");
-        let db_path = dir
-            .path()
-            .join(format!("scheduler-digest-timestamp-{}.redb", Uuid::new_v4()));
+        let db_path = dir.path().join(format!(
+            "scheduler-digest-timestamp-{}.redb",
+            Uuid::new_v4()
+        ));
         let db = Arc::new(redb::Database::create(db_path).expect("create db"));
         let actor = Uuid::new_v4();
         let store = open_scheduler_digest_store(db, actor).expect("open digest store");
