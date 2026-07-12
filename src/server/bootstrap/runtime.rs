@@ -30,7 +30,8 @@ use crate::secrets::master_key::replication::{
 use crate::server::config::Config;
 use crate::server::{Server, ServerClients, ServerDependencies};
 use crate::services::{
-    ServiceController, ServiceControllerConfig, ServiceControllerTiming, ServicesRPC,
+    ServiceController, ServiceControllerConfig, ServiceControllerTiming, ServiceReconcileTrigger,
+    ServicesRPC,
 };
 use crate::store::path::default_db_path;
 use crate::store::replicated::gc::{StoreGcRunner, StoreGcRunnerInputs};
@@ -500,6 +501,7 @@ async fn build_runtime_components(
     );
     let workload_registry = WorkloadRegistry::new(stores.workloads.clone());
     let service_registry = services::ServiceRegistry::new(stores.services.clone());
+    let service_reconcile_trigger = ServiceReconcileTrigger::new();
     let volume_registry = VolumeRegistry::new(stores.volumes.clone(), stores.volume_nodes.clone());
     let ingress_pool_registry = IngressPoolRegistry::new(stores.ingress_pools.clone());
     let registry = build_registry(ctx, stores, health_monitor.clone());
@@ -518,6 +520,7 @@ async fn build_runtime_components(
             network_registry: network_registry.clone(),
             workload_registry: workload_registry.clone(),
             service_registry: service_registry.clone(),
+            service_reconcile_trigger: service_reconcile_trigger.clone(),
             volume_registry: volume_registry.clone(),
             scheduler: scheduler.clone(),
             sync: sync_runner.clone(),
@@ -686,6 +689,7 @@ async fn build_runtime_components(
         gossip_rx: service_rx,
         local_node_id: ctx.self_id,
         health_monitor: health_monitor.clone(),
+        reconcile_trigger: service_reconcile_trigger,
         timing: options.service_timing,
     });
     let services_service = ServicesRPC::new(service_controller.clone(), topology.clone());

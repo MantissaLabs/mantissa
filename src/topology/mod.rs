@@ -12,7 +12,7 @@ use crate::scheduler::Scheduler;
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::master_key::replication::SecretMasterKeyPublisher;
 use crate::server::auth::AuthStore;
-use crate::services::ServiceRegistry;
+use crate::services::{ServiceReconcileTrigger, ServiceRegistry};
 use crate::store::local::{LocalCredentialStore, LocalSessionStore, SecretMasterStore};
 use crate::store::replicated::cluster_operations::ClusterOperationStore;
 use crate::store::replicated::cluster_views::ClusterNameRecord;
@@ -179,6 +179,7 @@ pub struct TopologyDependencies {
     pub network_registry: NetworkRegistry,
     pub workload_registry: WorkloadRegistry,
     pub service_registry: ServiceRegistry,
+    pub service_reconcile_trigger: ServiceReconcileTrigger,
     pub volume_registry: VolumeRegistry,
     pub scheduler: Rc<Scheduler>,
     pub sync: SyncRunner,

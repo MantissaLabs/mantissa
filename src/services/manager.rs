@@ -42,7 +42,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use uuid::Uuid;
 
@@ -157,6 +157,29 @@ impl Default for ServiceControllerTiming {
     /// Returns the production service-controller timing profile.
     fn default() -> Self {
         Self::production()
+    }
+}
+
+/// Local signal used to request an immediate service reconciliation pass.
+#[derive(Clone, Default)]
+pub struct ServiceReconcileTrigger {
+    notify: Arc<Notify>,
+}
+
+impl ServiceReconcileTrigger {
+    /// Creates an independent local service reconciliation trigger.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Requests one local reconciliation pass without changing replicated service state.
+    pub fn request_reconcile(&self) {
+        self.notify.notify_one();
+    }
+
+    /// Waits until a local service reconciliation pass is requested.
+    pub(crate) async fn wait_for_reconcile(&self) {
+        self.notify.notified().await;
     }
 }
 
@@ -280,6 +303,7 @@ pub struct ServiceController {
     autoscale_signals: Arc<AsyncMutex<AutoscaleSignalStore>>,
     autoscale_local_samples: Arc<AsyncMutex<AutoscaleLocalSampleStore>>,
     autoscale_inflight: Arc<AtomicBool>,
+    reconcile_trigger: ServiceReconcileTrigger,
     timing: ServiceControllerTiming,
 }
 
@@ -326,6 +350,7 @@ pub struct ServiceControllerConfig {
     pub gossip_rx: Receiver<Message>,
     pub local_node_id: Uuid,
     pub health_monitor: Arc<HealthMonitor>,
+    pub reconcile_trigger: ServiceReconcileTrigger,
     pub timing: ServiceControllerTiming,
 }
 
@@ -344,6 +369,7 @@ impl ServiceController {
             gossip_rx,
             local_node_id,
             health_monitor,
+            reconcile_trigger,
             timing,
         } = config;
         Self {
@@ -368,6 +394,7 @@ impl ServiceController {
                 AsyncMutex::new(AutoscaleLocalSampleStore::default()),
             ),
             autoscale_inflight: Arc::new(AtomicBool::new(false)),
+            reconcile_trigger,
             timing,
         }
     }
@@ -381,6 +408,14 @@ impl ServiceController {
         loop {
             tokio::select! {
                 _ = reschedule_tick.tick() => {
+                    if let Err(err) = self.reconcile_services().await {
+                        tracing::warn!(
+                            target: "services",
+                            "failed to reconcile service replicas: {err}"
+                        );
+                    }
+                }
+                _ = self.reconcile_trigger.wait_for_reconcile() => {
                     if let Err(err) = self.reconcile_services().await {
                         tracing::warn!(
                             target: "services",
