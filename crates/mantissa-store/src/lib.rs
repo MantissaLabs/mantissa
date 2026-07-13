@@ -20,7 +20,7 @@ pub mod table_set;
 pub mod uuid_key;
 
 // Re-exports used by downstreams
-pub use mst_store::{Entry, PageDigestRange, compute_want_from_have};
+pub use mst_store::{Entry, PageDigestRange, RowDigest, compute_want_from_have};
 pub use table_set::TableSet;
 
 pub type Result<T> = std::result::Result<T, Box<error::Error>>;

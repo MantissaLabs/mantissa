@@ -116,7 +116,12 @@ impl SyncService {
 
         let (encoded_registers, encoded_tombstones) = store
             .store
-            .export_delta_encoded(&domain_want.want_ranges)
+            .export_delta_encoded(
+                &domain_want.want_ranges,
+                &domain_want.have_rows,
+                scope.root_schema_version,
+            )
+            .await
             .map_err(to_capnp)?;
         send_chunks(
             store.domain,
@@ -230,8 +235,9 @@ impl sync::Server for SyncService {
 
     /// Handles phase 3 of sync: streaming the rows the caller is missing.
     ///
-    /// The caller already compared roots and ranges. It now sends page ranges and a sink
-    /// capability. This service exports those ranges and pushes back encoded CRDT rows in chunks.
+    /// The caller already compared roots and ranges. It now sends page ranges, semantic digests
+    /// for rows it has, and a sink capability. This service pushes back only missing or different
+    /// CRDT rows in chunks.
     async fn open_delta_for_view(
         self: Rc<Self>,
         params: sync::OpenDeltaForViewParams,

@@ -29,7 +29,7 @@ use mantissa_store::mst_store::{
     CrdtMstStore, Entry, Registers, TombstonePruneFrontiers, Tombstones,
 };
 use mantissa_store::uuid_key::UuidKey;
-use mantissa_store::{PageDigestRange, TableSet};
+use mantissa_store::{PageDigestRange, RowDigest, TableSet};
 use merkle_search_tree::digest::Hasher as MstHasher;
 use std::future::Future;
 use std::pin::Pin;
@@ -134,6 +134,13 @@ pub trait ReplicatedDomainStore: Send + Sync {
         root_schema_version: u32,
     ) -> StoreFuture<'a, mantissa_store::Result<Vec<PageDigestRange>>>;
 
+    /// Reads semantic row digests inside requested page ranges for delta filtering.
+    fn row_digests_for_ranges<'a>(
+        &'a self,
+        want_ranges: &'a [PageDigestRange],
+        root_schema_version: u32,
+    ) -> StoreFuture<'a, mantissa_store::Result<Vec<RowDigest>>>;
+
     /// Rebuilds this store's in-memory MST for the requested semantic root schema.
     fn rebuild_mst_from_disk_at_version<'a>(
         &'a self,
@@ -150,10 +157,12 @@ pub trait ReplicatedDomainStore: Send + Sync {
     ) -> StoreFuture<'a, mantissa_store::Result<usize>>;
 
     /// Exports and encodes deltas for the requested MST page ranges.
-    fn export_delta_encoded(
-        &self,
-        want_ranges: &[PageDigestRange],
-    ) -> mantissa_store::Result<(EncodedRegisters, EncodedTombstones)>;
+    fn export_delta_encoded<'a>(
+        &'a self,
+        want_ranges: &'a [PageDigestRange],
+        have_rows: &'a [RowDigest],
+        root_schema_version: u32,
+    ) -> StoreFuture<'a, mantissa_store::Result<(EncodedRegisters, EncodedTombstones)>>;
 
     /// Decodes and applies one incoming sync delta to this store.
     fn apply_delta_encoded<'a>(
@@ -217,6 +226,18 @@ where
         })
     }
 
+    /// Reads semantic row digests inside requested page ranges for delta filtering.
+    fn row_digests_for_ranges<'a>(
+        &'a self,
+        want_ranges: &'a [PageDigestRange],
+        root_schema_version: u32,
+    ) -> StoreFuture<'a, mantissa_store::Result<Vec<RowDigest>>> {
+        Box::pin(async move {
+            CrdtMstStore::<C, H, T>::row_digests_for_ranges(self, want_ranges, root_schema_version)
+                .await
+        })
+    }
+
     /// Rebuilds this store's in-memory MST for the requested semantic root schema.
     fn rebuild_mst_from_disk_at_version<'a>(
         &'a self,
@@ -244,14 +265,24 @@ where
     }
 
     /// Exports and encodes deltas for the requested MST page ranges.
-    fn export_delta_encoded(
-        &self,
-        want_ranges: &[PageDigestRange],
-    ) -> mantissa_store::Result<(EncodedRegisters, EncodedTombstones)> {
-        let (registers, tombstones) =
-            CrdtMstStore::<C, H, T>::export_page_ranges_delta(self, want_ranges)?;
-        let registers = CrdtMstStore::<C, H, T>::encode_register_delta(self, registers)?;
-        Ok((registers, encode_tombstones(tombstones)))
+    fn export_delta_encoded<'a>(
+        &'a self,
+        want_ranges: &'a [PageDigestRange],
+        have_rows: &'a [RowDigest],
+        root_schema_version: u32,
+    ) -> StoreFuture<'a, mantissa_store::Result<(EncodedRegisters, EncodedTombstones)>> {
+        Box::pin(async move {
+            let (registers, tombstones) =
+                CrdtMstStore::<C, H, T>::export_page_ranges_delta_filtered(
+                    self,
+                    want_ranges,
+                    have_rows,
+                    root_schema_version,
+                )
+                .await?;
+            let registers = CrdtMstStore::<C, H, T>::encode_register_delta(self, registers)?;
+            Ok((registers, encode_tombstones(tombstones)))
+        })
     }
 
     /// Decodes and applies one incoming sync delta to this store.
@@ -394,6 +425,19 @@ impl ReplicatedStoreRegistry {
         self.require(domain)?
             .store
             .page_range_summary_at_version(root_schema_version)
+            .await
+    }
+
+    /// Reads semantic row digests for one domain inside requested page ranges.
+    pub async fn row_digests_for_ranges(
+        &self,
+        domain: Domain,
+        want_ranges: &[PageDigestRange],
+        root_schema_version: u32,
+    ) -> mantissa_store::Result<Vec<RowDigest>> {
+        self.require(domain)?
+            .store
+            .row_digests_for_ranges(want_ranges, root_schema_version)
             .await
     }
 

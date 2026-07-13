@@ -8,8 +8,8 @@ use crate::store::replicated::registry::{
     EncodedRegister, EncodedRegisters, EncodedTombstone, EncodedTombstones,
 };
 use mantissa_protocol::sync::{self, Domain, delta_chunk, delta_sink};
-use mantissa_store::PageDigestRange;
 use mantissa_store::mst_store::TombstonePruneFrontiers;
+use mantissa_store::{PageDigestRange, RowDigest};
 
 /// View and root-schema selector decoded from one sync request.
 pub(crate) struct ViewScope {
@@ -30,16 +30,18 @@ pub(crate) struct RemoteDomainRangeSummary {
     pub(crate) ranges: Vec<PageDigestRange>,
 }
 
-/// Per-domain page ranges this node wants the peer to stream through `DeltaSink`.
+/// Per-domain page ranges and local row digests used to request a filtered delta.
 pub(crate) struct DomainDeltaRequest {
     pub(crate) domain: Domain,
     pub(crate) want_ranges: Vec<PageDigestRange>,
+    pub(crate) have_rows: Vec<RowDigest>,
 }
 
-/// Per-domain page ranges requested by a remote peer in `openDeltaForView`.
+/// Per-domain page ranges and row digests received through `openDeltaForView`.
 pub(crate) struct DomainDeltaWant {
     pub(crate) domain: Domain,
     pub(crate) want_ranges: Vec<PageDigestRange>,
+    pub(crate) have_rows: Vec<RowDigest>,
 }
 
 /// Open-delta stream payload decoded after the request scope has been validated.
@@ -81,6 +83,32 @@ pub(crate) fn page_ranges_from_capnp(
             start: r.get_start()?.to_vec(),
             end: r.get_end()?.to_vec(),
             hash: r.get_hash()?.to_vec(),
+        });
+    }
+    Ok(out)
+}
+
+/// Encodes semantic row digests into one delta request.
+fn capnp_fill_row_digests(
+    rows: &[RowDigest],
+    mut out: capnp::struct_list::Builder<'_, sync::row_digest::Owned>,
+) {
+    for (index, row) in rows.iter().enumerate() {
+        let mut item = out.reborrow().get(index as u32);
+        item.set_key(&row.key);
+        item.set_digest(&row.digest);
+    }
+}
+
+/// Decodes and validates semantic row digests from one delta request.
+fn row_digests_from_capnp(
+    rows: capnp::struct_list::Reader<'_, sync::row_digest::Owned>,
+) -> Result<Vec<RowDigest>, capnp::Error> {
+    let mut out = Vec::with_capacity(rows.len() as usize);
+    for row in rows.iter() {
+        out.push(RowDigest {
+            key: row.get_key()?.to_vec(),
+            digest: read_row_digest(row.get_digest()?)?,
         });
     }
     Ok(out)
@@ -209,9 +237,11 @@ pub(crate) fn decode_domain_want(
         .get_domain()
         .map_err(|_| capnp::Error::failed("unknown sync domain".into()))?;
     let want_ranges = page_ranges_from_capnp(want_reader.get_want()?)?;
+    let have_rows = row_digests_from_capnp(want_reader.get_have()?)?;
     Ok(DomainDeltaWant {
         domain,
         want_ranges,
+        have_rows,
     })
 }
 
@@ -422,6 +452,12 @@ fn encode_domain_want(
         &delta_request.want_ranges,
         want_builder.reborrow().init_want(),
     )?;
+    capnp_fill_row_digests(
+        &delta_request.have_rows,
+        want_builder
+            .reborrow()
+            .init_have(delta_request.have_rows.len() as u32),
+    );
     cluster_view.write_capnp(want_builder.reborrow().init_view());
     want_builder.set_root_schema_version(root_schema_version);
     Ok(())
@@ -492,4 +528,83 @@ fn read_root_digest(bytes: &[u8]) -> Result<[u8; 16], capnp::Error> {
             bytes.len()
         ))
     })
+}
+
+/// Decodes one fixed-width semantic row digest from the sync wire format.
+fn read_row_digest(bytes: &[u8]) -> Result<[u8; 16], capnp::Error> {
+    bytes.try_into().map_err(|_| {
+        capnp::Error::failed(format!(
+            "invalid sync row digest length: expected 16, got {}",
+            bytes.len()
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use capnp::message::Builder;
+
+    /// Domain wants should preserve every row digest used by filtered delta export.
+    #[test]
+    fn domain_want_roundtrips_have_rows() {
+        let view = ClusterViewId::legacy_default();
+        let request = DomainDeltaRequest {
+            domain: Domain::Workloads,
+            want_ranges: vec![PageDigestRange {
+                start: vec![1],
+                end: vec![9],
+                hash: vec![7; 16],
+            }],
+            have_rows: vec![RowDigest {
+                key: vec![3; 16],
+                digest: [5; 16],
+            }],
+        };
+        let mut message = Builder::new_default();
+        encode_domain_want(
+            message.init_root::<sync::domain_want::Builder<'_>>(),
+            view,
+            2,
+            &request,
+        )
+        .unwrap();
+
+        let reader = message
+            .get_root_as_reader::<sync::domain_want::Reader<'_>>()
+            .unwrap();
+        let decoded = decode_domain_want(reader, view, 2).unwrap();
+
+        assert_eq!(decoded.domain, request.domain);
+        assert_eq!(decoded.want_ranges, request.want_ranges);
+        assert_eq!(decoded.have_rows, request.have_rows);
+    }
+
+    /// Invalid digest widths must fail before an untrusted row filter reaches storage.
+    #[test]
+    fn domain_want_rejects_invalid_row_digest_width() {
+        let view = ClusterViewId::legacy_default();
+        let mut message = Builder::new_default();
+        {
+            let mut want = message.init_root::<sync::domain_want::Builder<'_>>();
+            want.set_domain(Domain::Workloads);
+            want.reborrow().init_want();
+            view.write_capnp(want.reborrow().init_view());
+            want.set_root_schema_version(1);
+            let mut rows = want.reborrow().init_have(1);
+            let mut row = rows.reborrow().get(0);
+            row.set_key(&[1; 16]);
+            row.set_digest(&[2; 8]);
+        }
+
+        let reader = message
+            .get_root_as_reader::<sync::domain_want::Reader<'_>>()
+            .unwrap();
+        let error = match decode_domain_want(reader, view, 1) {
+            Ok(_) => panic!("invalid row digest should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("expected 16"));
+    }
 }

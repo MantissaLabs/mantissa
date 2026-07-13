@@ -125,6 +125,22 @@ pub struct PageDigestRange {
     pub hash: Vec<u8>,
 }
 
+/// Semantic digest for one durable row within an MST page range.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct RowDigest {
+    /// Raw encoded row key used to match the same record on another peer.
+    pub key: Vec<u8>,
+    /// Digest of the versioned MST entry, excluding metadata omitted from roots.
+    pub digest: [u8; 16],
+}
+
+/// Returns whether one raw row key is covered by any requested inclusive range.
+fn row_key_is_in_ranges(key: &[u8], ranges: &[PageDigestRange]) -> bool {
+    ranges
+        .iter()
+        .any(|range| range.start.as_slice() <= key && key <= range.end.as_slice())
+}
+
 #[inline]
 fn into_err<E: Into<Error>>(e: E) -> Box<Error> {
     Box::new(e.into())
@@ -258,6 +274,7 @@ where
 {
     db: Arc<redb::Database>,
     actor: C::Actor,
+    hasher: H,
     mst: SharedInMemoryMerkleSearchTree<C, H>,
     // Serializes each durable mutation with the MST update/rebuild that makes
     // the anti-entropy root reflect that durable state. Redb already serializes
@@ -1800,6 +1817,168 @@ where
         let r = self.db.begin_read().map_err(into_err)?;
         let values = r.open_table(T::values()).map_err(into_err)?;
         let tombstones = r.open_table(T::tombs()).map_err(into_err)?;
+        let mut registers_out = Vec::new();
+        let mut tombstones_out = Vec::new();
+        let mut seen_regs = HashSet::new();
+        let mut seen_tombs = HashSet::new();
+
+        for range in want {
+            let start = range.start.as_slice();
+            let end = range.end.as_slice();
+
+            let mut values_iter = values.range(start..=end).map_err(into_err)?;
+            while let Some(Ok((key_guard, value_guard))) = values_iter.next() {
+                let key_bytes = key_guard.value();
+                if !seen_regs.insert(key_bytes.to_vec()) {
+                    continue;
+                }
+                registers_out.push((
+                    Self::decode_key(key_bytes)?,
+                    Self::decode_reg(value_guard.value())?,
+                ));
+            }
+
+            let mut tombstones_iter = tombstones.range(start..=end).map_err(into_err)?;
+            while let Some(Ok((key_guard, tombstone_guard))) = tombstones_iter.next() {
+                let key_bytes = key_guard.value();
+                if !seen_tombs.insert(key_bytes.to_vec()) {
+                    continue;
+                }
+                tombstones_out.push((
+                    Self::decode_key(key_bytes)?,
+                    Self::decode_tombstone(tombstone_guard.value())?,
+                ));
+            }
+        }
+
+        Ok((registers_out, tombstones_out))
+    }
+
+    /// Returns semantic row digests for local entries inside requested page ranges.
+    ///
+    /// The digest uses the same versioned `Entry` projection as MST roots. Callers can therefore
+    /// advertise rows they already have without making node-local timestamps or other excluded
+    /// metadata visible to anti-entropy.
+    pub async fn row_digests_for_ranges(
+        &self,
+        want: &[PageDigestRange],
+        root_schema_version: u32,
+    ) -> crate::Result<Vec<RowDigest>> {
+        if root_schema_version != self.current_root_schema_version() {
+            return self.row_digests_from_disk(want, root_schema_version);
+        }
+
+        let tree = self.mst.read().await;
+        Ok(tree
+            .node_iter()
+            .filter_map(|node| {
+                let key = node.key().as_ref();
+                row_key_is_in_ranges(key, want).then(|| RowDigest {
+                    key: key.to_vec(),
+                    digest: *node.value_hash().as_bytes(),
+                })
+            })
+            .collect())
+    }
+
+    /// Recomputes row digests from durable state for a non-current root schema version.
+    fn row_digests_from_disk(
+        &self,
+        want: &[PageDigestRange],
+        root_schema_version: u32,
+    ) -> crate::Result<Vec<RowDigest>> {
+        let r = self.db.begin_read().map_err(into_err)?;
+        let values = r.open_table(T::values()).map_err(into_err)?;
+        let tombstones = r.open_table(T::tombs()).map_err(into_err)?;
+
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+
+        for range in want {
+            let start = range.start.as_slice();
+            let end = range.end.as_slice();
+
+            let mut values_iter = values.range(start..=end).map_err(into_err)?;
+            while let Some(Ok((key_guard, value_guard))) = values_iter.next() {
+                let key = key_guard.value();
+                if !seen.insert(key.to_vec()) {
+                    continue;
+                }
+                let reg = Self::decode_reg(value_guard.value())?;
+                let entry = Entry::Active(C::snapshot_reg_at_version(&reg, root_schema_version));
+                out.push(RowDigest {
+                    key: key.to_vec(),
+                    digest: self.semantic_entry_digest(&entry),
+                });
+            }
+
+            let mut tombstones_iter = tombstones.range(start..=end).map_err(into_err)?;
+            while let Some(Ok((key_guard, tombstone_guard))) = tombstones_iter.next() {
+                let key = key_guard.value();
+                if !seen.insert(key.to_vec()) {
+                    continue;
+                }
+                let tombstone = Self::decode_tombstone(tombstone_guard.value())?;
+                let entry = Self::deleted_entry(&tombstone);
+                out.push(RowDigest {
+                    key: key.to_vec(),
+                    digest: self.semantic_entry_digest(&entry),
+                });
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Returns sender row keys whose cached semantic digest is absent or different remotely.
+    async fn differing_row_keys(
+        &self,
+        want: &[PageDigestRange],
+        have_rows: &[RowDigest],
+        root_schema_version: u32,
+    ) -> crate::Result<HashSet<Vec<u8>>> {
+        let have_by_key: HashMap<&[u8], &[u8; 16]> = have_rows
+            .iter()
+            .map(|row| (row.key.as_slice(), &row.digest))
+            .collect();
+
+        if root_schema_version != self.current_root_schema_version() {
+            return Ok(self
+                .row_digests_from_disk(want, root_schema_version)?
+                .into_iter()
+                .filter(|row| have_by_key.get(row.key.as_slice()).copied() != Some(&row.digest))
+                .map(|row| row.key)
+                .collect());
+        }
+
+        let tree = self.mst.read().await;
+        Ok(tree
+            .node_iter()
+            .filter_map(|node| {
+                let key = node.key().as_ref();
+                (row_key_is_in_ranges(key, want)
+                    && have_by_key.get(key).copied() != Some(node.value_hash().as_bytes()))
+                .then(|| key.to_vec())
+            })
+            .collect())
+    }
+
+    /// Exports only rows in requested ranges that differ from the requester's semantic digests.
+    ///
+    /// Range scans and overlap deduplication match the regular delta exporter. Filtering happens
+    /// before register encoding so unchanged CRDT rows never enter the streamed payload.
+    pub async fn export_page_ranges_delta_filtered(
+        &self,
+        want: &[PageDigestRange],
+        have_rows: &[RowDigest],
+        root_schema_version: u32,
+    ) -> crate::Result<RegistersAndTombs<C::Key, C::Reg>> {
+        let differing_keys = self
+            .differing_row_keys(want, have_rows, root_schema_version)
+            .await?;
+        let r = self.db.begin_read().map_err(into_err)?;
+        let values = r.open_table(T::values()).map_err(into_err)?;
+        let tombstones = r.open_table(T::tombs()).map_err(into_err)?;
 
         let mut registers_out: Vec<(C::Key, C::Reg)> = Vec::new();
         let mut tombstones_out: Tombstones<C::Key> = Vec::new();
@@ -1808,9 +1987,9 @@ where
         let mut seen_regs: HashSet<Vec<u8>> = HashSet::new();
         let mut seen_tombs: HashSet<Vec<u8>> = HashSet::new();
 
-        for r in want {
-            let start = r.start.as_slice();
-            let end = r.end.as_slice();
+        for range in want {
+            let start = range.start.as_slice();
+            let end = range.end.as_slice();
 
             // Registers in [start, end]
             {
@@ -1820,8 +1999,11 @@ where
                     if !seen_regs.insert(k_bytes.to_vec()) {
                         continue;
                     }
-                    let key = Self::decode_key(k_bytes)?;
+                    if !differing_keys.contains(k_bytes) {
+                        continue;
+                    }
                     let reg = Self::decode_reg(v_g.value())?;
+                    let key = Self::decode_key(k_bytes)?;
                     registers_out.push((key, reg));
                 }
             }
@@ -1838,14 +2020,22 @@ where
                     if !seen_tombs.insert(k_bytes.to_vec()) {
                         continue;
                     }
-                    let key = Self::decode_key(k_bytes)?;
+                    if !differing_keys.contains(k_bytes) {
+                        continue;
+                    }
                     let tombstone = Self::decode_tombstone(tombstone_g.value())?;
+                    let key = Self::decode_key(k_bytes)?;
                     tombstones_out.push((key, tombstone));
                 }
             }
         }
 
         Ok((registers_out, tombstones_out))
+    }
+
+    /// Hashes one semantic MST entry into the fixed-width digest used for row filtering.
+    fn semantic_entry_digest(&self, entry: &Entry<C::Snapshot>) -> [u8; 16] {
+        *self.hasher.hash(entry).as_bytes()
     }
 
     /// Encodes exported register rows into the opaque sync payload representation.
@@ -1992,10 +2182,13 @@ where
         w.commit().map_err(into_err)?;
 
         let hasher = self.hasher.unwrap_or_default();
-        let mst = Arc::new(RwLock::new(Builder::default().with_hasher(hasher).build()));
+        let mst = Arc::new(RwLock::new(
+            Builder::default().with_hasher(hasher.clone()).build(),
+        ));
         Ok(CrdtMstStore {
             db: self.db,
             actor: self.actor,
+            hasher,
             mst,
             mutation_gate: Mutex::new(()),
             root_schema_version: AtomicU32::new(DEFAULT_ROOT_SCHEMA_VERSION),
@@ -3059,6 +3252,115 @@ mod tests {
 
         assert_eq!(reg_keys, vec![key(2), key(4), key(5)]);
         assert_eq!(tmb_keys, vec![key(3)]);
+    }
+
+    /// Filtered exports should omit semantic matches while retaining every required row kind.
+    #[tokio::test]
+    async fn filtered_delta_exports_only_missing_or_different_rows() {
+        let (_source_dir, source_db) = temp_db();
+        let (_requester_dir, requester_db) = temp_db();
+        let source: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(source_db, actor(1)).unwrap();
+        let requester: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(requester_db, actor(2)).unwrap();
+
+        source.upsert(&key(1), "same".into()).await.unwrap();
+        requester.upsert(&key(1), "same".into()).await.unwrap();
+        source.upsert(&key(2), "remote".into()).await.unwrap();
+        requester.upsert(&key(2), "local".into()).await.unwrap();
+        source.upsert(&key(3), "deleted".into()).await.unwrap();
+        source.remove(&key(3)).await.unwrap();
+        source.upsert(&key(4), "missing".into()).await.unwrap();
+        source.upsert(&key(5), "deleted".into()).await.unwrap();
+        source.remove(&key(5)).await.unwrap();
+        requester.upsert(&key(5), "deleted".into()).await.unwrap();
+        requester.remove(&key(5)).await.unwrap();
+
+        let source_ranges = source.page_range_summary().await.unwrap();
+        let (_, source_tombstones) = source.export_page_ranges_delta(&source_ranges).unwrap();
+        let matching_tombstone = source_tombstones
+            .into_iter()
+            .find(|(row_key, _)| *row_key == key(3))
+            .unwrap();
+        requester
+            .apply_delta_chunk_update_mst(Vec::new(), vec![matching_tombstone])
+            .await
+            .unwrap();
+
+        let requester_rows = requester
+            .row_digests_for_ranges(&source_ranges, 1)
+            .await
+            .unwrap();
+        let (registers, tombstones) = source
+            .export_page_ranges_delta_filtered(&source_ranges, &requester_rows, 1)
+            .await
+            .unwrap();
+
+        let mut register_keys: Vec<_> = registers.into_iter().map(|(row_key, _)| row_key).collect();
+        let mut tombstone_keys: Vec<_> =
+            tombstones.into_iter().map(|(row_key, _)| row_key).collect();
+        register_keys.sort();
+        tombstone_keys.sort();
+
+        assert_eq!(register_keys, vec![key(2), key(4)]);
+        assert_eq!(tombstone_keys, vec![key(5)]);
+    }
+
+    /// Row filtering must follow the requested semantic root schema rather than raw register data.
+    #[tokio::test]
+    async fn row_digests_follow_root_schema_projection() {
+        let (_source_dir, source_db) = temp_db();
+        let (_requester_dir, requester_db) = temp_db();
+        let source: CrdtMstStore<VersionedAdapter, XXHash128, TestTables> =
+            CrdtMstStore::open(source_db, actor(1)).unwrap();
+        let requester: CrdtMstStore<VersionedAdapter, XXHash128, TestTables> =
+            CrdtMstStore::open(requester_db, actor(2)).unwrap();
+        let row_key = key(7);
+
+        source
+            .upsert(
+                &row_key,
+                VersionedValue {
+                    name: "shared".to_string(),
+                    alias: "remote".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        requester
+            .upsert(
+                &row_key,
+                VersionedValue {
+                    name: "shared".to_string(),
+                    alias: "local".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let ranges_v1 = source.page_range_summary_at_version(1).await.unwrap();
+        let requester_v1 = requester
+            .row_digests_for_ranges(&ranges_v1, 1)
+            .await
+            .unwrap();
+        let (registers_v1, tombstones_v1) = source
+            .export_page_ranges_delta_filtered(&ranges_v1, &requester_v1, 1)
+            .await
+            .unwrap();
+        assert!(registers_v1.is_empty());
+        assert!(tombstones_v1.is_empty());
+
+        let ranges_v2 = source.page_range_summary_at_version(2).await.unwrap();
+        let requester_v2 = requester
+            .row_digests_for_ranges(&ranges_v2, 2)
+            .await
+            .unwrap();
+        let (registers_v2, tombstones_v2) = source
+            .export_page_ranges_delta_filtered(&ranges_v2, &requester_v2, 2)
+            .await
+            .unwrap();
+        assert_eq!(registers_v2.len(), 1);
+        assert!(tombstones_v2.is_empty());
     }
 
     #[tokio::test]

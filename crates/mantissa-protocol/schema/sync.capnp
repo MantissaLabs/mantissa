@@ -10,9 +10,10 @@ interface Sync {
   # Phase 2 of anti-entropy: fetch digest summaries only for domains whose roots differ.
 
   openDeltaForView @2 (req :ViewOpenDeltaRequest);
-  # Phase 3 of anti-entropy: stream only the ranges the requester proved it is missing.
-  # Client passes per-domain ranges it wants, and a DeltaSink it implements locally.
-  # Server streams domain-tagged chunks into that sink and calls end() when done.
+  # Phase 3 of anti-entropy: stream only rows the requester is missing.
+  # Client passes mismatched ranges, semantic digests for rows it already has,
+  # and a DeltaSink it implements locally. Server streams domain-tagged chunks
+  # containing only missing or different rows, then calls end() when done.
 }
 
 interface DeltaSink {
@@ -152,6 +153,17 @@ struct DomainWant {
 
   rootSchemaVersion @3 :UInt32 = 1;
   # Semantic root schema version expected by the requester.
+
+  have @4 :List(RowDigest);
+  # Semantic row digests already held by the requester inside the desired ranges.
+}
+
+struct RowDigest {
+  key @0 :Data;
+  # Raw encoded row key.
+
+  digest @1 :Data;
+  # Fixed-width digest of the versioned MST entry for this key.
 }
 
 struct RegItem {

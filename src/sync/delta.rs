@@ -508,10 +508,19 @@ async fn compute_delta_want_for_remote_summary(
     if want_ranges.is_empty() {
         return Ok(None);
     }
+    let have_rows = stores
+        .row_digests_for_ranges(
+            remote_summary.domain,
+            &want_ranges,
+            scope.root_schema_version,
+        )
+        .await
+        .map_err(to_capnp)?;
 
     Ok(Some(DomainDeltaRequest {
         domain: remote_summary.domain,
         want_ranges,
+        have_rows,
     }))
 }
 
@@ -627,6 +636,7 @@ mod tests {
         DomainDeltaRequest {
             domain,
             want_ranges: Vec::<PageDigestRange>::new(),
+            have_rows: Vec::new(),
         }
     }
 

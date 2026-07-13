@@ -4,7 +4,7 @@
 //! reconciliation pass:
 //! 1. `get_roots_for_view` compares cheap MST roots per replicated domain.
 //! 2. `get_ranges_for_view` narrows mismatches down to page digest ranges.
-//! 3. `open_delta_for_view` streams only the missing register/tombstone fragments.
+//! 3. `open_delta_for_view` filters mismatched pages by row digest before streaming fragments.
 //!
 //! All sync traffic is scoped to an explicit `ClusterViewId` so anti-entropy stays inside one
 //! control-plane lineage.
