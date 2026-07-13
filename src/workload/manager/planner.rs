@@ -56,6 +56,10 @@ pub(super) enum SchedulingError {
         "scheduler reservation failed: target node {target_node} unavailable for task '{task}'"
     )]
     TargetNodeUnavailable { task: String, target_node: Uuid },
+    #[error(
+        "scheduler reservation failed: scheduler view for target node {target_node} missing for task '{task}'"
+    )]
+    TargetSchedulerViewMissing { task: String, target_node: Uuid },
     #[error("scheduler reservation failed: network specs {networks:?} missing or unavailable")]
     NetworksBlocked { networks: Vec<Uuid> },
     #[error("local node lacks required network specs for task '{task}'")]
@@ -1928,6 +1932,34 @@ impl WorkloadManager {
         Ok(queue)
     }
 
+    /// Returns whether an eligible remote target is still missing from this node's scheduler view.
+    ///
+    /// Membership and scheduler digests replicate independently, so a peer can be known and ready
+    /// for scheduling before its first digest arrives. Unknown, local, or unschedulable targets are
+    /// not convergence gaps and must retain their existing scheduling errors.
+    fn target_scheduler_view_is_missing(&self, target_node: Uuid) -> anyhow::Result<bool> {
+        if target_node == self.local_node_id {
+            return Ok(false);
+        }
+
+        if !self.core.registry.known_peers()?.contains(&target_node) {
+            return Ok(false);
+        }
+
+        if !self.core.registry.peer_schedulable(target_node) {
+            return Ok(false);
+        }
+
+        let target_digest_is_present = self
+            .core
+            .scheduler
+            .observed_scheduler_digests()?
+            .iter()
+            .any(|observed| observed.digest.node_id == target_node);
+
+        Ok(!target_digest_is_present)
+    }
+
     /// Allocates slots for an intent pinned to a specific node while keeping the
     /// shared candidate ring usable for later intents.
     fn allocate_targeted_intent(
@@ -1969,6 +2001,14 @@ impl WorkloadManager {
         }
 
         let Some(mut candidate) = matched else {
+            if self.target_scheduler_view_is_missing(target_node)? {
+                return Err(SchedulingError::TargetSchedulerViewMissing {
+                    task: intent.name.clone(),
+                    target_node,
+                }
+                .into());
+            }
+
             return Err(SchedulingError::TargetNodeUnavailable {
                 task: intent.name.clone(),
                 target_node,

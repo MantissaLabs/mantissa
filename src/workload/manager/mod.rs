@@ -3060,6 +3060,11 @@ fn gang_planning_error_context(cause: &SchedulingError, request_summary: &str) -
                 "target node {target_node} is unavailable while planning gang reservation for task '{task}' ({request_summary})"
             )
         }
+        SchedulingError::TargetSchedulerViewMissing { task, target_node } => {
+            format!(
+                "scheduler view for target node {target_node} is missing while planning gang reservation for task '{task}' ({request_summary})"
+            )
+        }
         SchedulingError::NetworksBlocked { networks } => {
             format!(
                 "required network specs are missing or deleting while planning gang reservation ({request_summary}); missing {}",
@@ -3189,6 +3194,7 @@ fn is_retryable_scheduling_error(err: &anyhow::Error) -> bool {
             matches!(
                 cause,
                 SchedulingError::SnapshotMissing
+                    | SchedulingError::TargetSchedulerViewMissing { .. }
                     | SchedulingError::NetworksBlocked { .. }
                     | SchedulingError::LocalNetworksBlocked { .. }
             )
@@ -3227,6 +3233,7 @@ pub(crate) fn workload_start_error_is_retryable(err: &anyhow::Error) -> bool {
             matches!(
                 cause,
                 SchedulingError::SnapshotMissing
+                    | SchedulingError::TargetSchedulerViewMissing { .. }
                     | SchedulingError::NoCapacityAcrossCluster
                     | SchedulingError::InsufficientCapacityForBatch
                     | SchedulingError::InsufficientCapacityOnTarget { .. }
@@ -3260,6 +3267,7 @@ pub(crate) fn workload_start_error_requires_service_requeue(err: &anyhow::Error)
             matches!(
                 cause,
                 SchedulingError::SnapshotMissing
+                    | SchedulingError::TargetSchedulerViewMissing { .. }
                     | SchedulingError::NetworksBlocked { .. }
                     | SchedulingError::LocalNetworksBlocked { .. }
             )
@@ -3293,6 +3301,9 @@ pub(crate) fn workload_start_retryable_detail(err: &anyhow::Error) -> Option<Str
             SchedulingError::SnapshotMissing => {
                 Some("waiting for scheduler snapshot convergence".to_string())
             }
+            SchedulingError::TargetSchedulerViewMissing { target_node, .. } => Some(format!(
+                "waiting for scheduler view from target node {target_node}"
+            )),
             SchedulingError::NetworksBlocked { networks } => Some(format!(
                 "waiting for required network specs to replicate: {}",
                 format_scheduling_networks(networks)
@@ -3386,6 +3397,7 @@ pub(crate) fn classify_service_shard_assignment_failure(
             matches!(
                 cause,
                 SchedulingError::SnapshotMissing
+                    | SchedulingError::TargetSchedulerViewMissing { .. }
                     | SchedulingError::NetworksBlocked { .. }
                     | SchedulingError::LocalNetworksBlocked { .. }
             )

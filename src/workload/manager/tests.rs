@@ -9679,6 +9679,47 @@ async fn workload_start_attempt_exhaustion_is_retryable_for_service_shards() {
     );
 }
 
+/// A missing target scheduler view should keep the service queued until replication catches up.
+#[test]
+fn missing_target_scheduler_view_requeues_service_launch() {
+    let target_node = Uuid::new_v4();
+    let result = anyhow::Error::new(SchedulingError::TargetSchedulerViewMissing {
+        task: "api".to_string(),
+        target_node,
+    });
+
+    assert!(workload_start_error_is_retryable(&result));
+    assert!(workload_start_error_requires_service_requeue(&result));
+    assert!(!workload_start_error_consumes_service_failure_budget(
+        &result
+    ));
+    assert!(!workload_start_error_is_terminal_service_launch(&result));
+    assert_eq!(
+        classify_service_shard_assignment_failure(&result),
+        ServiceShardAssignmentFailureClass::Retryable
+    );
+}
+
+/// A genuinely unavailable target should retain the existing hard shard failure behavior.
+#[test]
+fn unavailable_target_remains_hard_service_shard_failure() {
+    let result = anyhow::Error::new(SchedulingError::TargetNodeUnavailable {
+        task: "api".to_string(),
+        target_node: Uuid::new_v4(),
+    });
+
+    assert!(workload_start_error_is_retryable(&result));
+    assert!(!workload_start_error_requires_service_requeue(&result));
+    assert!(!workload_start_error_consumes_service_failure_budget(
+        &result
+    ));
+    assert!(!workload_start_error_is_terminal_service_launch(&result));
+    assert_eq!(
+        classify_service_shard_assignment_failure(&result),
+        ServiceShardAssignmentFailureClass::Hard
+    );
+}
+
 #[tokio::test]
 async fn start_tasks_batch_rejects_unsupported_local_execution_platform() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
