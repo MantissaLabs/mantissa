@@ -82,15 +82,15 @@ struct PageRange {
   # Inclusive range start key (raw bytes).
 
   end   @1 :Data;
-  # Exclusive range end key (raw bytes).
+  # Inclusive range end key (raw bytes).
 
   hash  @2 :Data;
-  # Digest of the range contents.
+  # Digest of the range contents, or empty for a requested key interval.
 }
 
 struct PageRangeSummary {
   ranges @0 :List(PageRange);
-  # Summary ranges describing a domain subtree.
+  # Summary ranges describing a domain subtree or requested key intervals.
 }
 
 struct DeltaChunk {

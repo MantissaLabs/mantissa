@@ -18,7 +18,8 @@
 //! two tables in sync before updating the in-memory MST.
 
 // base64 used only in debug helpers/tests; prefer fully-qualified calls to avoid unused imports.
-use merkle_search_tree::digest::Hasher as MstHasher;
+use merkle_search_tree::diff::{PageRange, diff};
+use merkle_search_tree::digest::{Hasher as MstHasher, PageDigest};
 use merkle_search_tree::{MerkleSearchTree, builder::Builder};
 use redb::{ReadableDatabase, ReadableTable, Table};
 use serde::{Deserialize, Serialize};
@@ -117,7 +118,7 @@ where
     }
 }
 
-/// Summary of an MST page: the inclusive [start, end] key bounds (raw bytes) and the page digest.
+/// Inclusive MST key bounds with a page digest for summaries or no digest for requests.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PageDigestRange {
     pub start: Vec<u8>,
@@ -2263,25 +2264,49 @@ pub enum FinalizeStrategy {
     NoOp,
 }
 
-/// Compute what we want from `remote` that is either missing locally or has a different digest.
+/// Rebuilds borrowed MST page ranges after validating their network representation.
+fn page_ranges_for_diff<'a>(
+    ranges: &'a [PageDigestRange],
+) -> crate::Result<Vec<PageRange<'a, Vec<u8>>>> {
+    let mut pages = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if range.start > range.end {
+            return Err(Box::new(Error::Other(
+                "invalid MST page range: start exceeds end".to_string(),
+            )));
+        }
+        let hash = <[u8; 16]>::try_from(range.hash.as_slice()).map_err(|_| {
+            Box::new(Error::Other(format!(
+                "invalid MST page digest width: expected 16 bytes, got {}",
+                range.hash.len()
+            )))
+        })?;
+        pages.push(PageRange::new(
+            &range.start,
+            &range.end,
+            PageDigest::new(hash),
+        ));
+    }
+    Ok(pages)
+}
+
+/// Computes the minimal remote key ranges that are missing or different locally.
 pub fn compute_want_from_have(
     remote: &[PageDigestRange],
     local: &[PageDigestRange],
-) -> Vec<PageDigestRange> {
-    let mut idx: HashMap<(&[u8], &[u8]), &[u8]> = HashMap::with_capacity(local.len());
-    for r in local {
-        idx.insert((r.start.as_slice(), r.end.as_slice()), r.hash.as_slice());
-    }
+) -> crate::Result<Vec<PageDigestRange>> {
+    let remote_pages = page_ranges_for_diff(remote)?;
+    let local_pages = page_ranges_for_diff(local)?;
 
-    let mut out = Vec::with_capacity(remote.len().min(1024));
-    for r in remote {
-        match idx.get(&(r.start.as_slice(), r.end.as_slice())) {
-            None => out.push(r.clone()),
-            Some(h) if *h != r.hash.as_slice() => out.push(r.clone()),
-            _ => {}
-        }
-    }
-    out
+    Ok(diff(local_pages, remote_pages)
+        .into_iter()
+        .map(|range| PageDigestRange {
+            start: range.start().clone(),
+            end: range.end().clone(),
+            // Delta export consumes only the minimal inclusive key bounds.
+            hash: Vec::new(),
+        })
+        .collect())
 }
 
 // HashBytes: collects the byte stream produced by `T: Hash` for debug hashing.
@@ -2691,20 +2716,95 @@ mod tests {
         assert_eq!(tmb_keys, vec![key(3)]);
     }
 
-    #[test]
-    fn want_computation() {
-        let r = |s: u8, e: u8, h: u8| PageDigestRange {
-            start: vec![s],
-            end: vec![e],
-            hash: vec![h],
-        };
-        let remote = vec![r(1, 2, 9), r(3, 4, 8), r(5, 6, 7)];
-        let local = vec![r(1, 2, 9), r(3, 4, 0) /* diff hash */];
+    /// A sparse semantic difference should advertise only the affected MST interval.
+    #[tokio::test]
+    async fn want_computation_minimizes_sparse_difference() {
+        let (_source_dir, source_db) = temp_db();
+        let (_requester_dir, requester_db) = temp_db();
+        let source: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(source_db, actor(1)).unwrap();
+        let requester: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(requester_db, actor(2)).unwrap();
 
-        let want = compute_want_from_have(&remote, &local);
-        assert_eq!(want.len(), 2);
-        assert!(want.iter().any(|w| w.start == vec![3] && w.end == vec![4]));
-        assert!(want.iter().any(|w| w.start == vec![5] && w.end == vec![6]));
+        for n in 1..=200u8 {
+            source.upsert(&key(n), format!("value-{n}")).await.unwrap();
+        }
+        let source_ranges = source.page_range_summary().await.unwrap();
+        let (registers, tombstones) = source.export_page_ranges_delta(&source_ranges).unwrap();
+        requester
+            .apply_delta_chunk_update_mst(registers, tombstones)
+            .await
+            .unwrap();
+        assert_eq!(source.root_hex().await, requester.root_hex().await);
+
+        source
+            .upsert(&key(100), "changed".to_string())
+            .await
+            .unwrap();
+        let remote_ranges = source.page_range_summary().await.unwrap();
+        let local_ranges = requester.page_range_summary().await.unwrap();
+        let want = compute_want_from_have(&remote_ranges, &local_ranges).unwrap();
+        let have_rows = requester.row_digests_for_ranges(&want, 1).await.unwrap();
+
+        assert!(!want.is_empty());
+        assert!(have_rows.len() < 200);
+
+        let (registers, tombstones) = source
+            .export_page_ranges_delta_filtered(&want, &have_rows, 1)
+            .await
+            .unwrap();
+        assert_eq!(registers.len(), 1);
+        assert!(tombstones.is_empty());
+        requester
+            .apply_delta_chunk_update_mst(registers, tombstones)
+            .await
+            .unwrap();
+        assert_eq!(source.root_hex().await, requester.root_hex().await);
+    }
+
+    /// An empty requester should still ask for and converge the complete remote tree.
+    #[tokio::test]
+    async fn want_computation_preserves_empty_store_bootstrap() {
+        let (_source_dir, source_db) = temp_db();
+        let (_requester_dir, requester_db) = temp_db();
+        let source: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(source_db, actor(1)).unwrap();
+        let requester: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(requester_db, actor(2)).unwrap();
+
+        for n in 1..=100u8 {
+            source.upsert(&key(n), format!("value-{n}")).await.unwrap();
+        }
+        let remote_ranges = source.page_range_summary().await.unwrap();
+        let local_ranges = requester.page_range_summary().await.unwrap();
+        let want = compute_want_from_have(&remote_ranges, &local_ranges).unwrap();
+        let have_rows = requester.row_digests_for_ranges(&want, 1).await.unwrap();
+        assert!(have_rows.is_empty());
+
+        let (registers, tombstones) = source
+            .export_page_ranges_delta_filtered(&want, &have_rows, 1)
+            .await
+            .unwrap();
+        assert_eq!(registers.len(), 100);
+        assert!(tombstones.is_empty());
+        requester
+            .apply_delta_chunk_update_mst(registers, tombstones)
+            .await
+            .unwrap();
+        assert_eq!(source.root_hex().await, requester.root_hex().await);
+    }
+
+    /// Malformed page digests should fail before entering the MST diff implementation.
+    #[test]
+    fn want_computation_rejects_invalid_page_digest() {
+        let remote = vec![PageDigestRange {
+            start: vec![1],
+            end: vec![2],
+            hash: vec![0; 15],
+        }];
+
+        let err = compute_want_from_have(&remote, &[]).unwrap_err();
+        assert!(err.to_string().contains("expected 16 bytes"));
     }
 
     #[tokio::test]

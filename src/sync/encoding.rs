@@ -56,7 +56,7 @@ pub(crate) struct DeltaChunkHeader {
     pub(crate) cluster_view: ClusterViewId,
 }
 
-/// Encodes one page-summary slice into the Cap'n Proto representation used by sync RPCs.
+/// Encodes page summaries or requested key ranges into the sync RPC representation.
 pub(crate) fn capnp_fill_ranges(
     ranges: &[PageDigestRange],
     mut out: sync::page_range_summary::Builder<'_>,

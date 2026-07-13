@@ -449,9 +449,9 @@ fn record_equal_domain_root(
     }
 }
 
-/// Fetches remote range summaries and computes the exact local wants.
+/// Fetches remote page summaries and computes the exact local key ranges to repair.
 ///
-/// The result is the list of per-domain page ranges this node wants the remote peer to stream back
+/// The result is the list of per-domain key ranges this node wants the remote peer to stream back
 /// through `DeltaSinkImpl`.
 async fn request_ranges_and_compute_delta_wants(
     stores: &SyncStores,
@@ -472,7 +472,7 @@ async fn request_ranges_and_compute_delta_wants(
         .await
 }
 
-/// Decodes each range summary and computes missing pages in the original response order.
+/// Decodes each range summary and computes differing key ranges in the original response order.
 async fn compute_delta_wants_from_range_response(
     stores: &SyncStores,
     ranges_reader: capnp::struct_list::Reader<'_, sync::domain_range_summary::Owned>,
@@ -494,7 +494,7 @@ async fn compute_delta_wants_from_range_response(
     Ok(delta_requests)
 }
 
-/// Computes the missing local pages for one decoded remote range summary.
+/// Computes the remote key ranges that differ from one local domain.
 async fn compute_delta_want_for_remote_summary(
     stores: &SyncStores,
     scope: SyncAttemptScope,
@@ -504,7 +504,8 @@ async fn compute_delta_want_for_remote_summary(
         .page_range_summary_at_version(remote_summary.domain, scope.root_schema_version)
         .await
         .map_err(to_capnp)?;
-    let want_ranges = compute_want_from_have(&remote_summary.ranges, &local_ranges);
+    let want_ranges =
+        compute_want_from_have(&remote_summary.ranges, &local_ranges).map_err(to_capnp)?;
     if want_ranges.is_empty() {
         return Ok(None);
     }
