@@ -547,34 +547,6 @@ pub(crate) fn select_autoscale_owner(service_id: Uuid, candidates: &[Uuid]) -> O
     best.map(|(node_id, _)| node_id)
 }
 
-/// Selects the deterministic owner plus backup owners for service-generation repair.
-///
-/// Targets send compact progress through the workload store instead of gossiping every routine
-/// task update. Prioritizing sync with the current owner lets readiness converge quickly, while
-/// also prioritizing the next rendezvous-ranked candidates gives a replacement owner a warm
-/// progress view if the current owner leaves before deployment finishes.
-pub(crate) fn select_generation_repair_peers(
-    service_id: Uuid,
-    service_epoch: u64,
-    candidates: &[Uuid],
-    backup_count: usize,
-) -> Vec<Uuid> {
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-
-    let mut ranked = candidates.to_vec();
-    ranked.sort_unstable();
-    ranked.dedup();
-    ranked.sort_by(|left, right| {
-        let left_score = generation_owner_score(service_id, service_epoch, *left);
-        let right_score = generation_owner_score(service_id, service_epoch, *right);
-        right_score.cmp(&left_score).then_with(|| left.cmp(right))
-    });
-    ranked.truncate(backup_count.saturating_add(1));
-    ranked
-}
-
 /// Builds deterministic target-node shards for one service deployment generation.
 ///
 /// The generation owner uses this as the only supported sharding shape for

@@ -3,7 +3,7 @@ use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
 use parking_lot::Mutex;
@@ -270,12 +270,10 @@ pub(super) struct GossipWarmSetState {
 pub(super) struct WorkloadRepairHintState {
     /// Peers to contact first during the next workload-domain MST sync pass.
     ///
-    /// A peer enters this list when the local node already knows that peer is
-    /// part of an active deployment exchange with us: for example an assignment
-    /// target, an assignment coordinator, or a service generation owner waiting
-    /// for compact progress. This state does not send any RPC or gossip message
-    /// on its own; it only changes the order used by the existing low-rate
-    /// workload sync loop.
+    /// A peer enters this list after reporting that it has workload rows the
+    /// local node may be missing. This state does not send any RPC or gossip
+    /// message on its own; it only changes the order used by the existing
+    /// low-rate workload sync loop.
     order: VecDeque<Uuid>,
     /// Fast membership check paired with `order` so repeated events for one peer
     /// do not grow the priority list.
@@ -301,24 +299,13 @@ impl WorkloadRepairHintState {
         }
     }
 
-    /// Adds many peers through the same bounded deduplicating path as `enqueue`.
-    pub(super) fn enqueue_many<I>(&mut self, peer_ids: I, capacity: usize)
-    where
-        I: IntoIterator<Item = Uuid>,
-    {
-        for peer_id in peer_ids {
-            self.enqueue(peer_id, capacity);
-        }
-    }
-
     /// Selects the next repair-hinted peers that one bounded sync tick can actually try.
     ///
-    /// The workload repair loop may have a fanout smaller than the number of deployment peers that
-    /// recently exchanged assignment rows or compact progress. This method consumes only selected
-    /// hints and leaves overflow in the queue for later ticks, so a large deployment does not lose
-    /// repair priority just because the first tick's budget was small. Hints for the local node,
-    /// peers already handled by full-domain sync, and peers missing from the current snapshot are
-    /// dropped because they no longer need or cannot receive this workload-only repair attempt.
+    /// The workload repair loop may have a fanout smaller than the number of peers
+    /// that reported available rows. This method consumes only selected hints and
+    /// leaves overflow for later ticks. Hints for the local node, peers already
+    /// handled by full-domain sync, and peers missing from the current snapshot
+    /// are dropped because they no longer need or cannot receive this attempt.
     pub(super) fn take_for_tick(
         &mut self,
         local_id: Uuid,
@@ -361,10 +348,35 @@ impl WorkloadRepairHintState {
     }
 }
 
+#[derive(Default)]
+pub(super) struct WorkloadRepairSweepState {
+    /// Start time of the most recent deterministic workload-repair sweep.
+    last_started_at: Option<Instant>,
+}
+
+impl WorkloadRepairSweepState {
+    /// Claims one fallback sweep when the configured interval has elapsed.
+    ///
+    /// Immediate topology-triggered sync passes share this wall-clock gate with
+    /// the periodic loop, so split and merge bursts cannot accelerate fallback
+    /// workload scans beyond their intended low rate.
+    pub(super) fn take_if_due(&mut self, now: Instant, interval: Duration) -> bool {
+        if self.last_started_at.is_some_and(|last_started_at| {
+            now.saturating_duration_since(last_started_at) < interval
+        }) {
+            return false;
+        }
+
+        self.last_started_at = Some(now);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ImmediateSyncState, WorkloadRepairHintState};
+    use super::{ImmediateSyncState, WorkloadRepairHintState, WorkloadRepairSweepState};
     use std::collections::HashSet;
+    use std::time::{Duration, Instant};
     use uuid::Uuid;
 
     /// Checks that overlapping immediate sync requests collapse onto bounded passes.
@@ -384,7 +396,7 @@ mod tests {
         assert!(!state.finish_pass());
     }
 
-    /// Ensures bounded repair ticks keep queued deployment peers for later workload sync ticks.
+    /// Ensures bounded repair ticks keep reported source peers for later sync ticks.
     #[test]
     fn workload_repair_hints_preserve_overflow_across_ticks() {
         let local_id = Uuid::from_u128(1);
@@ -393,13 +405,36 @@ mod tests {
         let peer_c = Uuid::from_u128(4);
         let available = HashSet::from([peer_a, peer_b, peer_c]);
         let mut hints = WorkloadRepairHintState::default();
-        hints.enqueue_many([peer_a, peer_b, peer_c], 8);
+        for peer_id in [peer_a, peer_b, peer_c] {
+            hints.enqueue(peer_id, 8);
+        }
 
         let first_tick = hints.take_for_tick(local_id, 2, &HashSet::new(), &available);
         assert_eq!(first_tick, vec![peer_a, peer_b]);
 
         let second_tick = hints.take_for_tick(local_id, 2, &HashSet::new(), &available);
         assert_eq!(second_tick, vec![peer_c]);
+    }
+
+    /// Ensures repeated row-availability notifications queue only one workload pull.
+    #[test]
+    fn workload_repair_hints_deduplicate_repeated_notifications() {
+        let local_id = Uuid::from_u128(10);
+        let source_peer = Uuid::from_u128(11);
+        let available = HashSet::from([source_peer]);
+        let mut hints = WorkloadRepairHintState::default();
+
+        hints.enqueue(source_peer, 8);
+        hints.enqueue(source_peer, 8);
+        hints.enqueue(source_peer, 8);
+
+        let selected = hints.take_for_tick(local_id, 8, &HashSet::new(), &available);
+        assert_eq!(selected, vec![source_peer]);
+        assert!(
+            hints
+                .take_for_tick(local_id, 8, &HashSet::new(), &available)
+                .is_empty()
+        );
     }
 
     /// Ensures stale or already-synced hints do not spend workload repair budget.
@@ -412,7 +447,9 @@ mod tests {
         let available = HashSet::from([already_synced, usable]);
         let already_selected = HashSet::from([already_synced]);
         let mut hints = WorkloadRepairHintState::default();
-        hints.enqueue_many([local_id, already_synced, unavailable, usable], 8);
+        for peer_id in [local_id, already_synced, unavailable, usable] {
+            hints.enqueue(peer_id, 8);
+        }
 
         let selected = hints.take_for_tick(local_id, 2, &already_selected, &available);
         assert_eq!(selected, vec![usable]);
@@ -421,6 +458,18 @@ mod tests {
                 .take_for_tick(local_id, 2, &already_selected, &available)
                 .is_empty()
         );
+    }
+
+    /// Ensures topology bursts cannot run deterministic workload sweeps ahead of schedule.
+    #[test]
+    fn workload_repair_sweep_waits_for_its_interval() {
+        let started_at = Instant::now();
+        let interval = Duration::from_secs(30);
+        let mut sweep = WorkloadRepairSweepState::default();
+
+        assert!(sweep.take_if_due(started_at, interval));
+        assert!(!sweep.take_if_due(started_at + Duration::from_secs(29), interval));
+        assert!(sweep.take_if_due(started_at + interval, interval));
     }
 }
 
@@ -454,12 +503,15 @@ pub(super) struct TopologyRuntime {
     /// Rotating cursor used by workload-only repair to deterministically cover all in-view peers.
     pub(super) workload_repair_cursor: Arc<Mutex<usize>>,
 
-    /// Temporary priority list for peers involved in recent workload deployment exchanges.
+    /// Temporary priority list for peers that reported available workload rows.
     ///
     /// The regular workload-only sync pass drains this list before falling back
-    /// to round-robin coverage, so assignment/progress endpoints converge sooner
-    /// without changing the background anti-entropy model.
+    /// to round-robin coverage, so missing assignment and progress rows converge
+    /// sooner without changing the background anti-entropy model.
     pub(super) workload_repair_hints: Arc<Mutex<WorkloadRepairHintState>>,
+
+    /// Wall-clock gate for the deterministic workload-repair safety sweep.
+    pub(super) workload_repair_sweep: Arc<Mutex<WorkloadRepairSweepState>>,
 
     /// Runtime state for cross-view cluster metadata anti-entropy management.
     pub(super) metadata_sync: SyncLoopState,

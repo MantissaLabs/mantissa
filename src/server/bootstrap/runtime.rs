@@ -637,7 +637,6 @@ async fn build_runtime_components(
         runtime_config: options.task_runtime,
         local_volume_root,
         enforce_local_volume_capacity: config::local_volume_enforce_capacity(),
-        topology: Some(topology.clone()),
     });
     let task_service =
         TaskService::new(workload_manager.clone(), topology.clone(), registry.clone());

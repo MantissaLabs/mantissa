@@ -212,6 +212,11 @@ interface ClusterSession {
 
   getRestAdmin @16 () -> (restAdmin :RestAdmin);
   # Access the node-local REST facade administration interface.
+
+  notifyWorkloadRowsAvailable @18 ();
+  # Tell this node that the authenticated peer has workload rows available.
+  # The receiver prioritizes pulling the workload domain from that peer through
+  # the existing MST sync path.
 }
 
 struct Capabilities {

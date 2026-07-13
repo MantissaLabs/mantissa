@@ -140,6 +140,15 @@ impl server_proto::cluster_session::Server for UnavailableClusterSession {
         Err(self.unavailable_error())
     }
 
+    /// Rejects workload-row availability notifications for the simulated unavailable route.
+    async fn notify_workload_rows_available(
+        self: Rc<Self>,
+        _params: server_proto::cluster_session::NotifyWorkloadRowsAvailableParams,
+        _results: server_proto::cluster_session::NotifyWorkloadRowsAvailableResults,
+    ) -> Result<(), capnp::Error> {
+        Err(self.unavailable_error())
+    }
+
     /// Rejects scheduler service access for the simulated unavailable route.
     async fn get_scheduler(
         self: Rc<Self>,

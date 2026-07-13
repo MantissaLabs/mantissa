@@ -42,7 +42,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
@@ -53,6 +53,7 @@ use self::local_state::LocalNodeState;
 use self::peer_cache::{PeerCacheEntry, PeerSnapshot, PeerSnapshotCache};
 use self::runtime::{
     GossipWarmSetState, ImmediateSyncState, TopologyRuntime, WorkloadRepairHintState,
+    WorkloadRepairSweepState,
 };
 
 mod builders;
@@ -100,10 +101,12 @@ const DEFAULT_GLOBAL_METADATA_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_GLOBAL_METADATA_SYNC_FANOUT: usize = 8;
 /// Default maximum concurrent cross-view metadata sync operations per tick.
 const DEFAULT_GLOBAL_METADATA_SYNC_PARALLELISM: usize = 1;
-/// Number of peers targeted by the low-rate workload-only repair path on each sync tick.
+/// Number of peers targeted by one workload-only repair pass.
 const DEFAULT_WORKLOAD_REPAIR_FANOUT: usize = 1;
 /// Maximum queued peers that can be prioritized by deployment-aware workload repair.
 const DEFAULT_WORKLOAD_REPAIR_HINT_MAX: usize = 256;
+/// Regular sync intervals between deterministic workload-repair safety sweeps.
+const WORKLOAD_REPAIR_SWEEP_INTERVAL_MULTIPLIER: u32 = 6;
 /// Cross-view domains synchronized by the global metadata anti-entropy loop.
 const GLOBAL_METADATA_SYNC_DOMAINS: [Domain; 2] = [Domain::ClusterViews, Domain::ClusterOperations];
 /// Selected domains synchronized by the targeted workload-only repair path.
@@ -229,6 +232,7 @@ impl Topology {
                 workload_repair_fanout: Arc::new(Mutex::new(DEFAULT_WORKLOAD_REPAIR_FANOUT)),
                 workload_repair_cursor: Arc::new(Mutex::new(0)),
                 workload_repair_hints: Arc::new(Mutex::new(WorkloadRepairHintState::default())),
+                workload_repair_sweep: Arc::new(Mutex::new(WorkloadRepairSweepState::default())),
                 metadata_sync: runtime::SyncLoopState::new(
                     DEFAULT_GLOBAL_METADATA_SYNC_INTERVAL,
                     DEFAULT_GLOBAL_METADATA_SYNC_FANOUT,

@@ -15,11 +15,9 @@ use crate::scheduler::placement::ServicePlacementPreference;
 use crate::scheduler::{Scheduler, SchedulerError, SlotId};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::registry::SecretRegistry;
-use crate::services::ownership::select_generation_repair_peers;
 use crate::services::registry::ServiceRegistry;
 use crate::services::types::{ServiceSpecValue, compute_service_id};
 use crate::store::replicated::workloads::WorkloadStore;
-use crate::topology::Topology;
 use crate::volumes::VolumeRegistry;
 use crate::workload::model::{
     ExecutionPlatform, IsolationMode, ServiceGenerationProgressRecord, WorkloadAdmissionGroupPhase,
@@ -90,19 +88,6 @@ const REMOVE_WATERMARK_RETENTION_SECS: i64 = 30 * 60;
 const WORKLOAD_GOSSIP_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// Number of fanout rounds one logical workload update should survive before it ages out.
 const WORKLOAD_GOSSIP_COVERAGE_ROUNDS: usize = 3;
-/// Minimum spacing between owner-sync priority requests for one service generation.
-///
-/// Targets may publish several compact progress rows while a task moves through
-/// pending, creating, and running. We only need to prioritize generation owners
-/// periodically so they can pull the latest compact row through workload MST
-/// sync.
-const SERVICE_PROGRESS_REPAIR_HINT_INTERVAL: Duration = Duration::from_secs(1);
-/// Number of standby service-generation owners that receive compact progress sync priority.
-///
-/// The current owner is enough for steady-state readiness, but a small backup set keeps the next
-/// deterministic owners closer to the target nodes' progress rows without broadcasting every task
-/// lifecycle update cluster-wide.
-const SERVICE_GENERATION_PROGRESS_REPAIR_BACKUPS: usize = 2;
 /// Number of older service generations retained in compact progress storage per node.
 ///
 /// Readiness only consumes the active generation, but retaining a small trailing window avoids
@@ -440,9 +425,6 @@ struct WorkloadManagerCore {
     service_registry: ServiceRegistry,
     // Distributed scheduler handle used for slot snapshots/reservations.
     scheduler: Rc<Scheduler>,
-    // Optional topology handle used to prioritize workload MST sync for peers
-    // involved in direct assignment or compact progress exchanges.
-    topology: Option<Topology>,
 }
 
 #[derive(Clone)]
@@ -465,10 +447,6 @@ struct WorkloadManagerLocalState {
     workload_value_index: Arc<Mutex<Option<CachedWorkloadValueIndex>>>,
     // Compact service-progress aggregates updated from local lifecycle transitions.
     service_progress: Arc<AsyncMutex<ServiceProgressTracker>>,
-    // Per-generation throttle for asking topology to prioritize workload MST sync
-    // with the owner that consumes compact service progress. This prevents routine
-    // status transitions from repeatedly reordering the sync peer queue.
-    service_progress_repair_hints: Arc<Mutex<HashMap<(Uuid, u64), Instant>>>,
     // Per-workload liveness probe bookkeeping used by reconciliation.
     liveness_probes: Arc<AsyncMutex<HashMap<Uuid, LivenessProbeEntry>>>,
     // Short critical section that reserves overlay attachment addresses before provisioning.
@@ -711,7 +689,6 @@ pub struct WorkloadManagerConfig {
     pub runtime_config: Option<WorkloadRuntimeConfig>,
     pub local_volume_root: PathBuf,
     pub enforce_local_volume_capacity: bool,
-    pub topology: Option<Topology>,
 }
 
 impl WorkloadManager {
@@ -736,7 +713,6 @@ impl WorkloadManager {
             runtime_config,
             local_volume_root,
             enforce_local_volume_capacity,
-            topology,
         } = config;
         let secret_runtime_root = resolve_secret_runtime_root(local_node_id);
 
@@ -764,7 +740,6 @@ impl WorkloadManager {
                 registry,
                 service_registry,
                 scheduler,
-                topology,
             },
             runtime: WorkloadManagerRuntime {
                 runtime_set,
@@ -776,7 +751,6 @@ impl WorkloadManager {
                 workload_spec_cache: Arc::new(Mutex::new(HashMap::new())),
                 workload_value_index: Arc::new(Mutex::new(None)),
                 service_progress: Arc::new(AsyncMutex::new(ServiceProgressTracker::default())),
-                service_progress_repair_hints: Arc::new(Mutex::new(HashMap::new())),
                 liveness_probes: Arc::new(AsyncMutex::new(HashMap::new())),
                 attachment_assignment_lock: Arc::new(AsyncMutex::new(())),
                 inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
@@ -805,79 +779,40 @@ impl WorkloadManager {
         }
     }
 
-    /// Tells topology that workload MST sync should contact this peer soon.
+    /// Tells one peer to prioritize pulling workload rows from this node.
     ///
-    /// This is used by the workload hot path when this node and `peer_id` are
-    /// the two endpoints that need to reconcile deployment state. Examples are
-    /// assignment owner-to-target state and target-to-owner progress state. If
-    /// the manager was constructed without topology, tests and standalone paths
-    /// simply keep the normal background sync behavior.
-    pub(crate) fn prioritize_workload_sync_with_peer(&self, peer_id: Uuid) {
-        let Some(topology) = self.core.topology.as_ref() else {
-            return;
-        };
-        topology.hint_workload_repair_peer(peer_id);
-    }
-
-    /// Prioritizes workload sync with owners that may read compact service progress.
-    ///
-    /// Targets publish one compact progress row per service generation instead
-    /// of gossiping every routine lifecycle transition. The current generation
-    /// owner needs those rows for readiness, and the next deterministic owners
-    /// need them if ownership changes after a failure. This method recomputes
-    /// that repair set from the same rendezvous ordering used by deployment,
-    /// then asks workload sync to contact those peers soon.
-    ///
-    /// The request is throttled per `(service_id, service_epoch)` because one
-    /// target can publish many progress updates while containers move through
-    /// pending, creating, and running.
-    pub(super) fn hint_service_generation_owner_repair(
-        &self,
-        service_id: Uuid,
-        service_epoch: u64,
-    ) {
-        if self.core.topology.is_none() {
+    /// The notification carries no row data. The authenticated receiver queues
+    /// this node for its existing workload MST sync pass, so anti-entropy still
+    /// validates and transfers the missing rows. Delivery is best effort because
+    /// the deterministic workload repair sweep remains the convergence fallback.
+    pub(crate) async fn notify_workload_rows_available(&self, peer_id: Uuid) {
+        if peer_id == self.local_node_id {
             return;
         }
 
-        let hint_key = (service_id, service_epoch);
-        let now = Instant::now();
-        {
-            let mut repair_hints = self.local_state.service_progress_repair_hints.lock();
-            repair_hints.retain(|_, next_allowed| *next_allowed > now);
-            if repair_hints
-                .get(&hint_key)
-                .is_some_and(|next_allowed| *next_allowed > now)
-            {
-                return;
-            }
-            repair_hints.insert(hint_key, now + SERVICE_PROGRESS_REPAIR_HINT_INTERVAL);
-        }
-
-        let mut candidates = match self.core.registry.known_peers() {
-            Ok(peers) => peers,
-            Err(err) => {
+        let session = match self.core.registry.session_for_peer(peer_id).await {
+            Some(session) => session,
+            None => {
                 debug!(
                     target: "task",
-                    "failed to load peers for service progress repair hint: {err:#}"
+                    peer = %peer_id,
+                    "could not notify peer about available workload rows: no active session"
                 );
                 return;
             }
         };
-        candidates.push(self.local_node_id);
-        candidates.retain(|peer_id| self.core.registry.peer_schedulable(*peer_id));
-        candidates.sort_unstable();
-        candidates.dedup();
 
-        for peer_id in select_generation_repair_peers(
-            service_id,
-            service_epoch,
-            &candidates,
-            SERVICE_GENERATION_PROGRESS_REPAIR_BACKUPS,
-        ) {
-            if peer_id != self.local_node_id {
-                self.prioritize_workload_sync_with_peer(peer_id);
-            }
+        if let Err(err) = session
+            .notify_workload_rows_available_request()
+            .send()
+            .promise
+            .await
+        {
+            debug!(
+                target: "task",
+                peer = %peer_id,
+                "could not notify peer about available workload rows: {err}"
+            );
         }
     }
 
@@ -1124,7 +1059,7 @@ impl WorkloadManager {
         request: ServiceShardAssignmentRequest,
     ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
         let ServiceShardAssignmentRequest {
-            owner_node_id,
+            owner_node_id: _,
             coordinator_node_id,
             service_id,
             service_epoch,
@@ -1202,10 +1137,6 @@ impl WorkloadManager {
                 )?;
                 ordered[index] = Some(spec);
             }
-        }
-
-        if owner_node_id != self.local_node_id {
-            self.prioritize_workload_sync_with_peer(owner_node_id);
         }
 
         ordered
@@ -2122,11 +2053,6 @@ impl WorkloadManager {
             self.handle_event(WorkloadEvent::UpsertSpec(Box::new(spec)))
                 .await?;
         }
-
-        // The target now has the assignment rows locally. Prioritize workload
-        // sync with the coordinator so both endpoints converge without waiting
-        // for the round-robin workload repair sweep to pick this edge later.
-        self.prioritize_workload_sync_with_peer(coordinator_node_id);
 
         Ok(applied)
     }

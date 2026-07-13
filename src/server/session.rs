@@ -299,6 +299,26 @@ impl cluster_session::Server for ClusterSessionImpl {
         Ok(())
     }
 
+    /// Prioritizes a workload-domain pull from the authenticated peer that sent this notification.
+    async fn notify_workload_rows_available(
+        self: Rc<Self>,
+        _params: cluster_session::NotifyWorkloadRowsAvailableParams,
+        _results: cluster_session::NotifyWorkloadRowsAvailableResults,
+    ) -> Result<(), capnp::Error> {
+        self.ensure_online()?;
+        let source_peer_id = self
+            .peer_scope
+            .as_ref()
+            .map(|scope| scope.peer_id)
+            .ok_or_else(|| {
+                capnp::Error::failed(
+                    "workload row notifications require an authenticated peer session".to_string(),
+                )
+            })?;
+        self.topology.hint_workload_repair_peer(source_peer_id);
+        Ok(())
+    }
+
     async fn get_scheduler(
         self: Rc<Self>,
         _params: cluster_session::GetSchedulerParams,

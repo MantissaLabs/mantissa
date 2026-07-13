@@ -1630,10 +1630,9 @@ impl WorkloadManager {
                     "failed direct assignment delivery; workload MST sync will reconcile these persisted assignment rows if the target misses them: {err:#}"
                 );
                 // The owner already persisted these assignment rows locally.
-                // Prioritize workload sync with the target so the target can
-                // pull the missing rows through MST anti-entropy instead of
-                // waiting for unrelated peer rotation.
-                self.prioritize_workload_sync_with_peer(peer_id);
+                // Ask the target to pull them through MST anti-entropy instead
+                // of waiting for unrelated peer rotation.
+                self.notify_workload_rows_available(peer_id).await;
             }
         }
     }
