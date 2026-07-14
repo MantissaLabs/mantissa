@@ -1,14 +1,13 @@
 use crate::cluster::ClusterViewId;
 use crate::cluster::coordinator::ClusterTransitionCoordinator;
 use crate::cluster::operations::{
-    ClusterOperationKind, ClusterOperationRecord, MergeServicePolicy, SplitServicePolicy,
+    ClusterOperationKind, ClusterOperationRecord, SplitServicePolicy,
 };
 use crate::cluster::participant::{ClusterParticipantReport, ClusterTransitionParticipant};
 use crate::cluster::transition::ClusterTransition;
 use crate::network::transition::SplitNetworkRuntimeParticipant;
 use crate::secrets::master_key::envelope::MasterKeyDescriptor;
 use crate::secrets::master_key::replication::SecretMasterKeyGrantRecipient;
-use crate::services::ServiceReconcileTrigger;
 use crate::store::local::MasterKeyRecord;
 use crate::store::replicated::secret_key_sync::current_for_scope;
 use crate::topology::Topology;
@@ -656,32 +655,6 @@ impl ClusterTransitionParticipant for SplitTaskRuntimeParticipant {
     }
 }
 
-struct MergeServiceParticipant {
-    reconcile_trigger: ServiceReconcileTrigger,
-}
-
-#[async_trait(?Send)]
-impl ClusterTransitionParticipant for MergeServiceParticipant {
-    /// Returns the participant identifier used by transition diagnostics.
-    fn name(&self) -> &'static str {
-        "merge_services"
-    }
-
-    /// Requests local reconciliation after merge so replicas rebalance across the unified view.
-    async fn on_commit(
-        &self,
-        transition: &ClusterTransition,
-    ) -> Result<ClusterParticipantReport, capnp::Error> {
-        let mut report = ClusterParticipantReport::new(self.name());
-        if transition.is_merge() && transition.merge_service_policy == MergeServicePolicy::Rebalance
-        {
-            self.reconcile_trigger.request_reconcile();
-            report = report.add_detail("reconcile_requested", "true");
-        }
-        Ok(report)
-    }
-}
-
 impl Topology {
     /// Resolves the target view for an operation this node is known to participate in.
     pub(in crate::topology) fn target_view_for_local_participant(
@@ -818,82 +791,7 @@ impl Topology {
             Box::new(SplitNetworkRuntimeParticipant::new(
                 self.deps.network_registry.clone(),
             )),
-            Box::new(MergeServiceParticipant {
-                reconcile_trigger: self.deps.service_reconcile_trigger.clone(),
-            }),
         ]);
         coordinator.on_commit(transition).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cluster::operations::SplitNetworkPolicy;
-    use tokio::time::{Duration, timeout};
-    use uuid::Uuid;
-
-    /// Builds a merge transition with the requested service handling policy.
-    fn merge_transition(merge_service_policy: MergeServicePolicy) -> ClusterTransition {
-        ClusterTransition {
-            operation_id: Uuid::new_v4(),
-            kind: ClusterOperationKind::Merge,
-            local_target_view: ClusterViewId::legacy_default(),
-            local_split_target_index: None,
-            retained_node_ids: HashSet::new(),
-            evicted_node_ids: HashSet::new(),
-            split_service_policy: SplitServicePolicy::default(),
-            split_network_policy: SplitNetworkPolicy::default(),
-            merge_service_policy,
-        }
-    }
-
-    /// Rebalance merges should wake local reconciliation without touching service rows.
-    #[tokio::test]
-    async fn merge_rebalance_requests_local_service_reconcile() {
-        let reconcile_trigger = ServiceReconcileTrigger::new();
-        let participant = MergeServiceParticipant {
-            reconcile_trigger: reconcile_trigger.clone(),
-        };
-
-        let report = participant
-            .on_commit(&merge_transition(MergeServicePolicy::Rebalance))
-            .await
-            .expect("commit merge service participant");
-
-        timeout(
-            Duration::from_millis(100),
-            reconcile_trigger.wait_for_reconcile(),
-        )
-        .await
-        .expect("local service reconcile request");
-        assert_eq!(
-            report.details,
-            vec![("reconcile_requested".to_string(), "true".to_string())]
-        );
-    }
-
-    /// Preserve merges should leave the local service controller asleep.
-    #[tokio::test]
-    async fn merge_preserve_does_not_request_service_reconcile() {
-        let reconcile_trigger = ServiceReconcileTrigger::new();
-        let participant = MergeServiceParticipant {
-            reconcile_trigger: reconcile_trigger.clone(),
-        };
-
-        let report = participant
-            .on_commit(&merge_transition(MergeServicePolicy::Preserve))
-            .await
-            .expect("commit merge service participant");
-
-        assert!(report.details.is_empty());
-        assert!(
-            timeout(
-                Duration::from_millis(10),
-                reconcile_trigger.wait_for_reconcile(),
-            )
-            .await
-            .is_err()
-        );
     }
 }

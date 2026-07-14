@@ -1,8 +1,10 @@
 use crate::cluster::operations::{
-    ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage,
+    ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage, MergeServicePolicy,
 };
+use crate::cluster::transition::ClusterTransition;
 use crate::cluster::{ClusterId, ClusterViewId};
 use crate::secrets::master_key::reconciler::SecretMasterKeyReconciler;
+use crate::services::ServiceReconcileTrigger;
 use crate::store::replicated::cluster_views::{ClusterNameRecord, ClusterNodeCountRecord};
 use crate::topology::Topology;
 use crate::topology::cluster_operations::{
@@ -14,6 +16,19 @@ use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+/// Requests local service reconciliation after a completed rebalance merge.
+fn request_post_merge_service_reconcile(
+    transition: &ClusterTransition,
+    trigger: &ServiceReconcileTrigger,
+) -> bool {
+    if !transition.is_merge() || transition.merge_service_policy != MergeServicePolicy::Rebalance {
+        return false;
+    }
+
+    trigger.request_reconcile();
+    true
+}
 
 impl Topology {
     /// Applies one conflict-resolved cluster lineage name update into durable cluster-view storage.
@@ -919,6 +934,16 @@ impl Topology {
                 );
             }
         }
+        // Transition participants run against the source view. Wake service reconciliation only
+        // after the target view, its master key, and the new peer-session scope are installed.
+        if request_post_merge_service_reconcile(&transition, &self.deps.service_reconcile_trigger) {
+            info!(
+                target: "cluster_view",
+                operation_id = %transition.operation_id,
+                target_view = %transition.local_target_view,
+                "requested service reconciliation after merge transition"
+            );
+        }
         info!(
             target: "cluster_view",
             operation_id = %transition.operation_id,
@@ -1510,6 +1535,72 @@ impl Topology {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::operations::{SplitNetworkPolicy, SplitServicePolicy};
+    use tokio::time::{Duration, timeout};
+
+    /// Builds a transition with the requested kind and merge service policy.
+    fn transition(
+        kind: ClusterOperationKind,
+        merge_service_policy: MergeServicePolicy,
+    ) -> ClusterTransition {
+        ClusterTransition {
+            operation_id: Uuid::new_v4(),
+            kind,
+            local_target_view: ClusterViewId::legacy_default(),
+            local_split_target_index: None,
+            retained_node_ids: HashSet::new(),
+            evicted_node_ids: HashSet::new(),
+            split_service_policy: SplitServicePolicy::default(),
+            split_network_policy: SplitNetworkPolicy::default(),
+            merge_service_policy,
+        }
+    }
+
+    /// A completed rebalance merge should wake local service reconciliation.
+    #[tokio::test]
+    async fn post_merge_rebalance_requests_local_service_reconcile() {
+        let trigger = ServiceReconcileTrigger::new();
+
+        assert!(request_post_merge_service_reconcile(
+            &transition(ClusterOperationKind::Merge, MergeServicePolicy::Rebalance),
+            &trigger,
+        ));
+        timeout(Duration::from_millis(100), trigger.wait_for_reconcile())
+            .await
+            .expect("local service reconcile request");
+    }
+
+    /// Preserve merges should leave local service reconciliation on its normal tick.
+    #[tokio::test]
+    async fn post_merge_preserve_does_not_request_service_reconcile() {
+        let trigger = ServiceReconcileTrigger::new();
+
+        assert!(!request_post_merge_service_reconcile(
+            &transition(ClusterOperationKind::Merge, MergeServicePolicy::Preserve),
+            &trigger,
+        ));
+        assert!(
+            timeout(Duration::from_millis(10), trigger.wait_for_reconcile())
+                .await
+                .is_err()
+        );
+    }
+
+    /// Split transitions must not use the merge-specific service wakeup.
+    #[tokio::test]
+    async fn split_does_not_request_post_merge_service_reconcile() {
+        let trigger = ServiceReconcileTrigger::new();
+
+        assert!(!request_post_merge_service_reconcile(
+            &transition(ClusterOperationKind::Split, MergeServicePolicy::Rebalance),
+            &trigger,
+        ));
+        assert!(
+            timeout(Duration::from_millis(10), trigger.wait_for_reconcile())
+                .await
+                .is_err()
+        );
+    }
 
     /// Operation-derived name timestamps must stay fixed while operation stages advance.
     #[test]
