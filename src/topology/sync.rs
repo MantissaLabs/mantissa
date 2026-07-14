@@ -318,41 +318,39 @@ impl Topology {
 
     /// Select peers for one low-rate workload-domain MST sync tick.
     ///
-    /// Peers that reported available rows are tried on the next sync tick. When
-    /// no notification is pending, deterministic round-robin coverage runs at a
-    /// lower cadence so it remains a convergence fallback without doubling the
-    /// workload scan rate. Peers already selected by the full all-domain pass
-    /// are skipped so one tick does not spend both budgets on the same peer.
+    /// Peers that reported available rows are normally tried on the next sync
+    /// tick. A due deterministic round-robin step uses one existing repair tick
+    /// first so a continuous hint stream cannot prevent fallback coverage. Hints
+    /// remain queued for the following tick. Peers already selected by the full
+    /// all-domain pass are skipped so one tick does not spend both budgets on the
+    /// same peer.
     fn select_workload_repair_peers<'a>(
         &self,
         entries: &'a [PeerCacheEntry],
         already_selected: &HashSet<Uuid>,
     ) -> Vec<&'a PeerCacheEntry> {
         let repair_fanout = *self.runtime.workload_repair_fanout.lock();
+        let run_sweep_step = repair_fanout == 0
+            || self.runtime.workload_repair_sweep.lock().take_if_due(
+                Instant::now(),
+                self.runtime
+                    .sync
+                    .interval()
+                    .saturating_mul(WORKLOAD_REPAIR_SWEEP_INTERVAL_MULTIPLIER),
+            );
         let hinted_peer_ids = if repair_fanout == 0 {
             self.runtime.workload_repair_hints.lock().drain();
             Vec::new()
         } else {
-            let available_peer_ids = entries
-                .iter()
-                .map(|entry| entry.peer_id)
-                .collect::<HashSet<_>>();
-            self.runtime.workload_repair_hints.lock().take_for_tick(
+            take_workload_repair_hints_for_tick(
+                &mut self.runtime.workload_repair_hints.lock(),
                 self.local.node.id,
+                entries,
                 repair_fanout,
                 already_selected,
-                &available_peer_ids,
+                run_sweep_step,
             )
         };
-        let run_sweep = repair_fanout == 0
-            || (hinted_peer_ids.is_empty()
-                && self.runtime.workload_repair_sweep.lock().take_if_due(
-                    Instant::now(),
-                    self.runtime
-                        .sync
-                        .interval()
-                        .saturating_mul(WORKLOAD_REPAIR_SWEEP_INTERVAL_MULTIPLIER),
-                ));
         select_workload_repair_peers_for_node(
             self.local.node.id,
             entries,
@@ -360,7 +358,7 @@ impl Topology {
             &self.runtime.workload_repair_cursor,
             already_selected,
             &hinted_peer_ids,
-            run_sweep,
+            run_sweep_step,
         )
     }
 
@@ -958,8 +956,8 @@ fn select_sync_peers_round_robin_for_node<'a>(
 ///
 /// `hinted_peer_ids` are peers that reported workload rows available for this
 /// node to pull. A hinted pass does not fill unused capacity with unrelated
-/// peers. `run_sweep` enables a separate deterministic fallback pass after its
-/// lower-rate wall-clock gate has elapsed.
+/// peers. `run_sweep_step` gives one tick to deterministic fallback coverage
+/// after its lower-rate wall-clock gate has elapsed.
 fn select_workload_repair_peers_for_node<'a>(
     local_id: Uuid,
     entries: &'a [PeerCacheEntry],
@@ -967,9 +965,16 @@ fn select_workload_repair_peers_for_node<'a>(
     cursor: &Arc<Mutex<usize>>,
     already_selected: &HashSet<Uuid>,
     hinted_peer_ids: &[Uuid],
-    run_sweep: bool,
+    run_sweep_step: bool,
 ) -> Vec<&'a PeerCacheEntry> {
     if repair_fanout == 0 {
+        return select_sync_peers_round_robin_for_node(local_id, entries, repair_fanout, cursor)
+            .into_iter()
+            .filter(|entry| !already_selected.contains(&entry.peer_id))
+            .collect();
+    }
+
+    if run_sweep_step {
         return select_sync_peers_round_robin_for_node(local_id, entries, repair_fanout, cursor)
             .into_iter()
             .filter(|entry| !already_selected.contains(&entry.peer_id))
@@ -995,21 +1000,32 @@ fn select_workload_repair_peers_for_node<'a>(
             selected.push(entry);
         }
     }
-
-    if !selected.is_empty() || !run_sweep {
-        return selected;
-    }
-
-    for entry in select_sync_peers_round_robin_for_node(local_id, entries, repair_fanout, cursor) {
-        if selected.len() >= repair_fanout {
-            break;
-        }
-        if already_selected.contains(&entry.peer_id) || !selected_ids.insert(entry.peer_id) {
-            continue;
-        }
-        selected.push(entry);
-    }
     selected
+}
+
+/// Takes bounded repair hints unless deterministic fallback owns the current tick.
+fn take_workload_repair_hints_for_tick(
+    hints: &mut WorkloadRepairHintState,
+    local_id: Uuid,
+    entries: &[PeerCacheEntry],
+    repair_fanout: usize,
+    already_selected: &HashSet<Uuid>,
+    run_sweep_step: bool,
+) -> Vec<Uuid> {
+    if run_sweep_step {
+        return Vec::new();
+    }
+
+    let available_peer_ids = entries
+        .iter()
+        .map(|entry| entry.peer_id)
+        .collect::<HashSet<_>>();
+    hints.take_for_tick(
+        local_id,
+        repair_fanout,
+        already_selected,
+        &available_peer_ids,
+    )
 }
 
 /// Computes the bounded warm-set size used by view-scoped gossip.
@@ -1112,10 +1128,11 @@ mod tests {
         PeerCacheEntry, PeerHandle, PeerSchedulingState, PeerValue, gossip_warm_target,
         negotiated_sync_root_schema_version, rebuild_gossip_warm_set, refill_gossip_warm_set,
         rotate_gossip_warm_set, select_sync_peers_round_robin_for_node,
-        select_workload_repair_peers_for_node,
+        select_workload_repair_peers_for_node, take_workload_repair_hints_for_tick,
     };
     use crate::cluster::RootSchemaInfo;
     use crate::runtime::types::RuntimeSupportProfile;
+    use crate::topology::runtime::WorkloadRepairHintState;
     use parking_lot::Mutex;
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -1278,6 +1295,64 @@ mod tests {
 
         let selected_ids: Vec<Uuid> = selected.iter().map(|entry| entry.peer_id).collect();
         assert_eq!(selected_ids, vec![peer_c, peer_b]);
+    }
+
+    /// A due fallback step should run before hints without changing the next hinted selection.
+    #[test]
+    fn select_workload_repair_peers_runs_due_sweep_before_hints() {
+        let local_id = Uuid::from_u128(1);
+        let sweep_peer = Uuid::from_u128(2);
+        let hinted_peer = Uuid::from_u128(3);
+        let entries = vec![
+            make_entry(local_id, 0),
+            make_entry(sweep_peer, 1),
+            make_entry(hinted_peer, 2),
+        ];
+        let cursor = Arc::new(Mutex::new(0usize));
+        let mut hints = WorkloadRepairHintState::default();
+        hints.enqueue(hinted_peer, 8);
+
+        let postponed_hints = take_workload_repair_hints_for_tick(
+            &mut hints,
+            local_id,
+            &entries,
+            1,
+            &HashSet::new(),
+            true,
+        );
+        assert!(postponed_hints.is_empty());
+
+        let sweep_tick = select_workload_repair_peers_for_node(
+            local_id,
+            &entries,
+            1,
+            &cursor,
+            &HashSet::new(),
+            &postponed_hints,
+            true,
+        );
+        assert_eq!(sweep_tick[0].peer_id, sweep_peer);
+
+        let resumed_hints = take_workload_repair_hints_for_tick(
+            &mut hints,
+            local_id,
+            &entries,
+            1,
+            &HashSet::new(),
+            false,
+        );
+        assert_eq!(resumed_hints, vec![hinted_peer]);
+
+        let following_tick = select_workload_repair_peers_for_node(
+            local_id,
+            &entries,
+            1,
+            &cursor,
+            &HashSet::new(),
+            &resumed_hints,
+            false,
+        );
+        assert_eq!(following_tick[0].peer_id, hinted_peer);
     }
 
     /// Workload repair hints should not duplicate peers selected by the full sync pass.
