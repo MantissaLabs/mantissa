@@ -1660,7 +1660,8 @@ where
     ///
     /// Peer metadata uses this path so operational-only fields can remain
     /// available to topology code without becoming part of the MST snapshot
-    /// hash contract.
+    /// hash contract. Rows retain Redb's ascending encoded-key order so callers
+    /// can build ordered indexes without sorting the same data again.
     pub fn load_all_regs_into(
         &self,
         actives: &mut Vec<(C::Key, C::Reg)>,
@@ -2625,6 +2626,40 @@ mod tests {
         // Tombstone reflected in MST root
         let root = store.root_hex().await;
         assert!(!root.is_empty());
+    }
+
+    /// Raw register loading should preserve encoded key order for cached indexes.
+    #[tokio::test]
+    async fn load_all_regs_into_preserves_encoded_key_order() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+
+        for n in [3, 1, 2] {
+            store.upsert(&key(n), format!("v{n}")).await.unwrap();
+        }
+        for n in [6, 4, 5] {
+            store.upsert(&key(n), format!("v{n}")).await.unwrap();
+            store.remove(&key(n)).await.unwrap();
+        }
+
+        let mut actives = Vec::new();
+        let mut tombstones = Vec::new();
+        store
+            .load_all_regs_into(&mut actives, &mut tombstones)
+            .unwrap();
+
+        assert_eq!(
+            actives.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            vec![key(1), key(2), key(3)]
+        );
+        assert_eq!(
+            tombstones
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            vec![key(4), key(5), key(6)]
+        );
     }
 
     #[tokio::test]

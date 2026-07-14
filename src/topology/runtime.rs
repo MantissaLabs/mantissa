@@ -311,7 +311,7 @@ impl WorkloadRepairHintState {
         local_id: Uuid,
         capacity: usize,
         already_selected: &HashSet<Uuid>,
-        available_peer_ids: &HashSet<Uuid>,
+        is_available: impl Fn(Uuid) -> bool,
     ) -> Vec<Uuid> {
         if capacity == 0 {
             return Vec::new();
@@ -324,9 +324,7 @@ impl WorkloadRepairHintState {
             };
             self.members.remove(&peer_id);
 
-            if peer_id == local_id
-                || already_selected.contains(&peer_id)
-                || !available_peer_ids.contains(&peer_id)
+            if peer_id == local_id || already_selected.contains(&peer_id) || !is_available(peer_id)
             {
                 continue;
             }
@@ -409,10 +407,14 @@ mod tests {
             hints.enqueue(peer_id, 8);
         }
 
-        let first_tick = hints.take_for_tick(local_id, 2, &HashSet::new(), &available);
+        let first_tick = hints.take_for_tick(local_id, 2, &HashSet::new(), |peer_id| {
+            available.contains(&peer_id)
+        });
         assert_eq!(first_tick, vec![peer_a, peer_b]);
 
-        let second_tick = hints.take_for_tick(local_id, 2, &HashSet::new(), &available);
+        let second_tick = hints.take_for_tick(local_id, 2, &HashSet::new(), |peer_id| {
+            available.contains(&peer_id)
+        });
         assert_eq!(second_tick, vec![peer_c]);
     }
 
@@ -428,11 +430,15 @@ mod tests {
         hints.enqueue(source_peer, 8);
         hints.enqueue(source_peer, 8);
 
-        let selected = hints.take_for_tick(local_id, 8, &HashSet::new(), &available);
+        let selected = hints.take_for_tick(local_id, 8, &HashSet::new(), |peer_id| {
+            available.contains(&peer_id)
+        });
         assert_eq!(selected, vec![source_peer]);
         assert!(
             hints
-                .take_for_tick(local_id, 8, &HashSet::new(), &available)
+                .take_for_tick(local_id, 8, &HashSet::new(), |peer_id| {
+                    available.contains(&peer_id)
+                })
                 .is_empty()
         );
     }
@@ -451,11 +457,15 @@ mod tests {
             hints.enqueue(peer_id, 8);
         }
 
-        let selected = hints.take_for_tick(local_id, 2, &already_selected, &available);
+        let selected = hints.take_for_tick(local_id, 2, &already_selected, |peer_id| {
+            available.contains(&peer_id)
+        });
         assert_eq!(selected, vec![usable]);
         assert!(
             hints
-                .take_for_tick(local_id, 2, &already_selected, &available)
+                .take_for_tick(local_id, 2, &already_selected, |peer_id| {
+                    available.contains(&peer_id)
+                })
                 .is_empty()
         );
     }

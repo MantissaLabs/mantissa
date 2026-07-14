@@ -13,7 +13,7 @@ pub(super) struct PeerCacheEntry {
     pub(super) value: Arc<PeerValue>,
 }
 
-/// Immutable snapshot of known peers.
+/// Immutable snapshot of known peers ordered by encoded UUID bytes.
 pub(super) struct PeerSnapshot {
     pub(super) generation: u64,
     pub(super) entries: Arc<Vec<PeerCacheEntry>>,
@@ -60,6 +60,14 @@ impl PeerSnapshotCache {
                 });
             }
         }
+        // Redb returns encoded keys in ascending order, and peer keys are raw UUID bytes.
+        // Filtering inactive rows preserves that order for direct cursor and binary-search use.
+        debug_assert!(
+            fresh_entries
+                .windows(2)
+                .all(|pair| pair[0].peer_id.as_bytes() < pair[1].peer_id.as_bytes()),
+            "peer snapshot entries must remain ordered by UUID"
+        );
 
         let entries = Arc::new(fresh_entries);
         self.entries = entries.clone();

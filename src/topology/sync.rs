@@ -912,43 +912,63 @@ fn select_sync_peers_for_node(
     selected_entries
 }
 
+/// Finds one peer in the snapshot ordered by encoded UUID bytes.
+fn peer_entry_by_id(entries: &[PeerCacheEntry], peer_id: Uuid) -> Option<&PeerCacheEntry> {
+    entries
+        .binary_search_by(|entry| entry.peer_id.as_bytes().cmp(peer_id.as_bytes()))
+        .ok()
+        .map(|index| &entries[index])
+}
+
 /// Select peers for one deterministic sync sweep while excluding `local_id`.
 ///
-/// The rotating cursor ensures bounded convergence coverage instead of probabilistic sampling.
+/// The rotating cursor addresses the cached UUID byte order directly, so bounded
+/// convergence coverage does not require copying and sorting every peer on each
+/// step.
 fn select_sync_peers_round_robin_for_node<'a>(
     local_id: Uuid,
     entries: &'a [PeerCacheEntry],
     sync_fanout: usize,
     cursor: &Arc<Mutex<usize>>,
 ) -> Vec<&'a PeerCacheEntry> {
-    let mut candidates: Vec<&PeerCacheEntry> = entries
-        .iter()
-        .filter(|entry| entry.peer_id != local_id)
-        .collect();
-    if candidates.is_empty() {
+    let local_index = entries
+        .binary_search_by(|entry| entry.peer_id.as_bytes().cmp(local_id.as_bytes()))
+        .ok();
+    let candidate_count = if local_index.is_some() {
+        entries.len() - 1
+    } else {
+        entries.len()
+    };
+    if candidate_count == 0 {
         *cursor.lock() = 0;
         return Vec::new();
     }
 
-    candidates.sort_by_key(|candidate| candidate.peer_id);
-
     let target = if sync_fanout == 0 {
-        candidates.len()
+        candidate_count
     } else {
-        sync_fanout.min(candidates.len())
+        sync_fanout.min(candidate_count)
     };
-    if target >= candidates.len() {
+    if target >= candidate_count {
         *cursor.lock() = 0;
-        return candidates;
+        return entries
+            .iter()
+            .filter(|entry| entry.peer_id != local_id)
+            .collect();
     }
 
     let mut guard = cursor.lock();
-    let start = *guard % candidates.len();
+    let start = *guard % candidate_count;
     let mut selected = Vec::with_capacity(target);
     for offset in 0..target {
-        selected.push(candidates[(start + offset) % candidates.len()]);
+        let candidate_index = (start + offset) % candidate_count;
+        let entry_index = match local_index {
+            Some(local_index) if candidate_index >= local_index => candidate_index + 1,
+            _ => candidate_index,
+        };
+        selected.push(&entries[entry_index]);
     }
-    *guard = (start + target) % candidates.len();
+    *guard = (start + target) % candidate_count;
     selected
 }
 
@@ -990,10 +1010,7 @@ fn select_workload_repair_peers_for_node<'a>(
         if *hinted_peer_id == local_id || already_selected.contains(hinted_peer_id) {
             continue;
         }
-        let Some(entry) = entries
-            .iter()
-            .find(|entry| entry.peer_id == *hinted_peer_id)
-        else {
+        let Some(entry) = peer_entry_by_id(entries, *hinted_peer_id) else {
             continue;
         };
         if selected_ids.insert(entry.peer_id) {
@@ -1016,16 +1033,9 @@ fn take_workload_repair_hints_for_tick(
         return Vec::new();
     }
 
-    let available_peer_ids = entries
-        .iter()
-        .map(|entry| entry.peer_id)
-        .collect::<HashSet<_>>();
-    hints.take_for_tick(
-        local_id,
-        repair_fanout,
-        already_selected,
-        &available_peer_ids,
-    )
+    hints.take_for_tick(local_id, repair_fanout, already_selected, |peer_id| {
+        peer_entry_by_id(entries, peer_id).is_some()
+    })
 }
 
 /// Computes the bounded warm-set size used by view-scoped gossip.
@@ -1161,6 +1171,12 @@ mod tests {
         }
     }
 
+    /// Orders synthetic entries like the production peer snapshot cache.
+    fn order_entries_by_peer_id(entries: &mut [PeerCacheEntry]) {
+        entries
+            .sort_unstable_by(|left, right| left.peer_id.as_bytes().cmp(right.peer_id.as_bytes()));
+    }
+
     /// Build one synthetic gossip peer handle for warm-set selection tests.
     fn make_peer(peer_id: Uuid, idx: usize) -> PeerHandle {
         PeerHandle {
@@ -1199,6 +1215,7 @@ mod tests {
         for (idx, peer_id) in peer_ids.iter().copied().enumerate() {
             entries.push(make_entry(peer_id, idx + 1));
         }
+        order_entries_by_peer_id(&mut entries);
 
         let cursor = Arc::new(Mutex::new(0usize));
         let selected = select_sync_peers_round_robin_for_node(local_id, &entries, 0, &cursor);
@@ -1218,6 +1235,7 @@ mod tests {
         for idx in 0..32 {
             entries.push(make_entry(Uuid::new_v4(), idx + 1));
         }
+        order_entries_by_peer_id(&mut entries);
 
         let fanout = 8;
         let cursor = Arc::new(Mutex::new(0usize));
@@ -1240,6 +1258,7 @@ mod tests {
         for idx in 0..4 {
             entries.push(make_entry(Uuid::new_v4(), idx + 1));
         }
+        order_entries_by_peer_id(&mut entries);
 
         let cursor = Arc::new(Mutex::new(0usize));
         let selected = select_sync_peers_round_robin_for_node(local_id, &entries, 32, &cursor);
@@ -1255,6 +1274,7 @@ mod tests {
         for idx in 0..5 {
             entries.push(make_entry(Uuid::new_v4(), idx + 1));
         }
+        order_entries_by_peer_id(&mut entries);
 
         let cursor = Arc::new(Mutex::new(0usize));
         let mut seen = HashSet::new();
@@ -1267,6 +1287,34 @@ mod tests {
         }
 
         assert_eq!(seen.len(), 5, "round-robin fanout should cover every peer");
+    }
+
+    /// Round-robin cursor positions should skip self without disturbing UUID order.
+    #[test]
+    fn select_sync_peers_round_robin_skips_local_inside_ordered_snapshot() {
+        let peer_a = Uuid::from_u128(1);
+        let local_id = Uuid::from_u128(2);
+        let peer_b = Uuid::from_u128(3);
+        let peer_c = Uuid::from_u128(4);
+        let entries = vec![
+            make_entry(peer_a, 0),
+            make_entry(local_id, 1),
+            make_entry(peer_b, 2),
+            make_entry(peer_c, 3),
+        ];
+        let cursor = Arc::new(Mutex::new(0usize));
+
+        let first = select_sync_peers_round_robin_for_node(local_id, &entries, 2, &cursor)
+            .into_iter()
+            .map(|entry| entry.peer_id)
+            .collect::<Vec<_>>();
+        assert_eq!(first, vec![peer_a, peer_b]);
+
+        let second = select_sync_peers_round_robin_for_node(local_id, &entries, 2, &cursor)
+            .into_iter()
+            .map(|entry| entry.peer_id)
+            .collect::<Vec<_>>();
+        assert_eq!(second, vec![peer_c, peer_a]);
     }
 
     /// Workload repair should spend its bounded budget only on reported source peers.
@@ -1353,6 +1401,29 @@ mod tests {
             false,
         );
         assert_eq!(following_tick[0].peer_id, hinted_peer);
+    }
+
+    /// Missing peers should be dropped without preventing the next valid hint from running.
+    #[test]
+    fn workload_repair_hints_skip_peers_missing_from_ordered_snapshot() {
+        let local_id = Uuid::from_u128(1);
+        let available_peer = Uuid::from_u128(2);
+        let missing_peer = Uuid::from_u128(3);
+        let entries = vec![make_entry(local_id, 0), make_entry(available_peer, 1)];
+        let mut hints = WorkloadRepairHintState::default();
+        hints.enqueue(missing_peer, 8);
+        hints.enqueue(available_peer, 8);
+
+        let selected = take_workload_repair_hints_for_tick(
+            &mut hints,
+            local_id,
+            &entries,
+            1,
+            &HashSet::new(),
+            false,
+        );
+
+        assert_eq!(selected, vec![available_peer]);
     }
 
     /// Workload repair hints should not duplicate peers selected by the full sync pass.
