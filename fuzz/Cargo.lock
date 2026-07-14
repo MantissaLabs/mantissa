@@ -1911,7 +1911,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1985,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2024,7 +2024,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa-health"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "parking_lot",
  "tracing",
@@ -2033,7 +2033,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa-net"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "capnp",
@@ -2060,7 +2060,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "capnp",
  "capnpc",
@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "capnp",

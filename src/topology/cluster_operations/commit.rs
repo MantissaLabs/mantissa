@@ -739,15 +739,7 @@ impl Topology {
                 if operation.source_views.contains(&active_view) {
                     return self.target_view_for_local_participant(operation).map(Some);
                 }
-
-                let Some(target_view) = self.target_view_if_local_participant(operation)? else {
-                    return Ok(None);
-                };
-                if active_view == target_view {
-                    Ok(Some(target_view))
-                } else {
-                    Ok(None)
-                }
+                self.recoverable_split_target(operation)
             }
         }
     }

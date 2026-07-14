@@ -473,7 +473,7 @@ impl Topology {
                     allowed_views.push(target);
                 }
             }
-        } else if let Some(target) = self.target_view_if_local_participant(operation)?
+        } else if let Some(target) = self.recoverable_split_target(operation)?
             && !allowed_views.contains(&target)
         {
             // This target is valid only for recovery after the local active-view transaction
@@ -481,6 +481,25 @@ impl Topology {
             allowed_views.push(target);
         }
         Ok(allowed_views)
+    }
+
+    /// Returns the local split target only when this operation installed the active view.
+    ///
+    /// Different split operations can assign the same deterministic target. The durable operation
+    /// marker distinguishes a real interrupted commit from an unrelated operation on that target.
+    pub(in crate::topology) fn recoverable_split_target(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<Option<ClusterViewId>, capnp::Error> {
+        let Some(target) = self.target_view_if_local_participant(operation)? else {
+            return Ok(None);
+        };
+        let installed = self
+            .stores
+            .cluster_view_store
+            .active_view_was_installed_by(operation.id, target)
+            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+        Ok(installed.then_some(target))
     }
 
     /// Ensures the current node may apply this split/merge transition from its active view.
@@ -607,9 +626,9 @@ impl Topology {
 
     /// Returns whether a pending operation is allowed to advance from this node's active view.
     ///
-    /// Split operations normally advance from their source view. The assigned target is also
-    /// accepted so startup can finish an operation that crashed after persisting its target view.
-    /// Merge operations can be driven by either side because both partitions must converge.
+    /// Split operations normally advance from their source view. An assigned target is accepted
+    /// only when this operation durably installed it before a crash. Merge operations can be
+    /// driven by either side because both partitions must converge.
     fn cluster_operation_can_progress_from_active_view(
         &self,
         operation: &ClusterOperationRecord,
@@ -630,7 +649,7 @@ impl Topology {
                 if operation.source_views.contains(&active_view) {
                     return Ok(true);
                 }
-                Ok(self.target_view_if_local_participant(operation)? == Some(active_view))
+                Ok(self.recoverable_split_target(operation)? == Some(active_view))
             }
         }
     }
@@ -773,7 +792,7 @@ impl Topology {
     ) -> Result<(), capnp::Error> {
         self.stores
             .cluster_view_store
-            .install_active_view(view, &operation.source_views)
+            .install_cluster_transition(operation.id, view, &operation.source_views)
             .map_err(|err| capnp::Error::failed(err.to_string()))
     }
 

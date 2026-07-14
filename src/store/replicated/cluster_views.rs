@@ -23,6 +23,10 @@ use uuid::Uuid;
 const T_ACTIVE_CLUSTER_VIEW: TableDefinition<&'static str, &'static [u8]> =
     TableDefinition::new("active_cluster_view");
 
+/// Redb table storing the operation that installed the current active cluster view.
+const T_ACTIVE_CLUSTER_TRANSITION: TableDefinition<&'static str, &'static [u8]> =
+    TableDefinition::new("active_cluster_transition");
+
 /// Redb table storing source views whose replicated retirement still needs publication.
 const T_PENDING_VIEW_RETIREMENTS: TableDefinition<&'static [u8], &'static [u8]> =
     TableDefinition::new("pending_cluster_view_retirements");
@@ -402,6 +406,9 @@ impl ClusterViewStore {
     pub fn new(db: Arc<Database>, actor_node_id: Uuid) -> io::Result<Self> {
         with_write_tx(&db, |tx| {
             let _ = tx.open_table(T_ACTIVE_CLUSTER_VIEW).map_err(into_io)?;
+            let _ = tx
+                .open_table(T_ACTIVE_CLUSTER_TRANSITION)
+                .map_err(into_io)?;
             let _ = tx.open_table(T_PENDING_VIEW_RETIREMENTS).map_err(into_io)?;
             Ok(())
         })?;
@@ -508,21 +515,67 @@ impl ClusterViewStore {
         })
     }
 
-    /// Persists the provided active cluster view atomically.
+    /// Persists an active view that was not installed by a cluster transition.
+    ///
+    /// Clearing the operation marker prevents an earlier split from claiming an unrelated view
+    /// installation during crash recovery.
     pub fn write_active_view(&self, view: ClusterViewId) -> io::Result<()> {
-        self.install_active_view(view, &[])
+        self.write_active_view_state(view, &[], None)
     }
 
-    /// Persists an active view and the source views it retires in one transaction.
+    /// Persists a transition's active view, operation identity, and retired sources atomically.
     ///
-    /// The pending rows close the crash window between installing the target view and publishing
-    /// replicated retirement facts. Startup recovery can finish every publication recorded here.
-    pub fn install_active_view(
+    /// The operation identity proves which split installed the target view. Pending retirement
+    /// rows close the separate crash window before replicated retirement publication completes.
+    pub fn install_cluster_transition(
         &self,
+        operation_id: Uuid,
         view: ClusterViewId,
         retired_views: &[ClusterViewId],
     ) -> io::Result<()> {
+        self.write_active_view_state(view, retired_views, Some(operation_id))
+    }
+
+    /// Returns whether one operation atomically installed the current active view.
+    pub fn active_view_was_installed_by(
+        &self,
+        operation_id: Uuid,
+        view: ClusterViewId,
+    ) -> io::Result<bool> {
+        with_read_tx(&self.db, |tx| {
+            let active_views = tx.open_table(T_ACTIVE_CLUSTER_VIEW).map_err(into_io)?;
+            let Some(active_view) = active_views.get(ACTIVE_VIEW_KEY).map_err(into_io)? else {
+                return Ok(false);
+            };
+            if decode_active_cluster_view(active_view.value())? != view {
+                return Ok(false);
+            }
+
+            let transitions = tx
+                .open_table(T_ACTIVE_CLUSTER_TRANSITION)
+                .map_err(into_io)?;
+            let Some(installed_by) = transitions.get(ACTIVE_VIEW_KEY).map_err(into_io)? else {
+                return Ok(false);
+            };
+            let installed_by = Uuid::from_slice(installed_by.value()).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid active cluster transition id: {error}"),
+                )
+            })?;
+            Ok(installed_by == operation_id)
+        })
+    }
+
+    /// Writes local active-view recovery state in one Redb transaction.
+    fn write_active_view_state(
+        &self,
+        view: ClusterViewId,
+        retired_views: &[ClusterViewId],
+        operation_id: Option<Uuid>,
+    ) -> io::Result<()> {
         let payload = encode_active_cluster_view(view)?;
+        let operation_payload = operation_id.map(|id| id.as_bytes().to_vec());
         let mut retirement_payloads = retired_views
             .iter()
             .copied()
@@ -538,6 +591,18 @@ impl ClusterViewStore {
                 table
                     .insert(ACTIVE_VIEW_KEY, payload.as_slice())
                     .map_err(into_io)?;
+            }
+            {
+                let mut transition = tx
+                    .open_table(T_ACTIVE_CLUSTER_TRANSITION)
+                    .map_err(into_io)?;
+                if let Some(operation_payload) = operation_payload.as_ref() {
+                    transition
+                        .insert(ACTIVE_VIEW_KEY, operation_payload.as_slice())
+                        .map_err(into_io)?;
+                } else {
+                    let _ = transition.remove(ACTIVE_VIEW_KEY).map_err(into_io)?;
+                }
             }
             {
                 let mut pending = tx.open_table(T_PENDING_VIEW_RETIREMENTS).map_err(into_io)?;
@@ -879,6 +944,7 @@ mod tests {
         let db_path = dir.path().join("cluster-view-retirements.redb");
         let db = Arc::new(Database::create(db_path).expect("create db"));
         let actor = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
         let source_a = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 1);
         let source_b = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 2);
         let target = source_b;
@@ -886,7 +952,7 @@ mod tests {
         {
             let store = ClusterViewStore::new(db.clone(), actor).expect("open cluster-view store");
             store
-                .install_active_view(target, &[source_a, source_b, source_a])
+                .install_cluster_transition(operation_id, target, &[source_a, source_b, source_a])
                 .expect("install active view");
         }
 
@@ -895,12 +961,31 @@ mod tests {
             store.read_active_view().expect("read active view"),
             Some(target)
         );
+        assert!(
+            store
+                .active_view_was_installed_by(operation_id, target)
+                .expect("read active transition")
+        );
+        assert!(
+            !store
+                .active_view_was_installed_by(Uuid::new_v4(), target)
+                .expect("reject another transition")
+        );
         assert_eq!(
             store
                 .pending_view_retirements()
                 .expect("read pending retirements"),
             vec![source_a],
             "the target view must never be recorded for retirement"
+        );
+
+        store
+            .write_active_view(target)
+            .expect("rewrite active view outside a transition");
+        assert!(
+            !store
+                .active_view_was_installed_by(operation_id, target)
+                .expect("read cleared transition")
         );
 
         store

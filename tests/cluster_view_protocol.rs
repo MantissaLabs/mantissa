@@ -1812,7 +1812,7 @@ local_test!(cluster_view_startup_finishes_persisted_split_transition, {
 
     persist_test_operation(&operation_store, &operation).await;
     view_store
-        .install_active_view(split_target_b, &[source_view])
+        .install_cluster_transition(operation.id, split_target_b, &[source_view])
         .expect("persist split target and pending source retirement");
 
     let node = HeadlessNode::new_with(
@@ -1863,6 +1863,69 @@ local_test!(cluster_view_startup_finishes_persisted_split_transition, {
             .expect("read recovered pending retirements")
             .is_empty(),
         "startup must clear retirement work only after publication"
+    );
+});
+
+// Validates a split cannot recover from a target installed by another operation.
+local_test!(cluster_view_startup_rejects_unrelated_split_target, {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("state.redb");
+    let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
+    let operation_store = open_test_operation_store(db.clone());
+    let node_id = Uuid::new_v4();
+    let view_store = ClusterViewStore::new(db.clone(), node_id).expect("open cluster view store");
+    let source_view = ClusterViewId::legacy_default();
+    let target_view = ClusterViewId::new(
+        mantissa::cluster::ClusterId::from_uuid(Uuid::new_v4()),
+        source_view.epoch + 1,
+    );
+    let operation = ClusterOperationRecord {
+        id: Uuid::new_v4(),
+        kind: StoredOperationKind::Split,
+        stage: StoredOperationStage::Prepared,
+        dry_run: false,
+        created_at_unix_ms: 23,
+        depends_on_operation_id: None,
+        source_views: vec![source_view],
+        target_views: vec![target_view],
+        target_cluster_names: Vec::new(),
+        split_assignments: vec![SplitNodeAssignment {
+            node_id,
+            target_index: 0,
+        }],
+        split_service_policy: Default::default(),
+        split_network_policy: Default::default(),
+        merge_service_policy: Default::default(),
+        updated_at_unix_ms: 23,
+        details: "prepared split with unrelated target installation".to_string(),
+    };
+
+    persist_test_operation(&operation_store, &operation).await;
+    view_store
+        .install_cluster_transition(Uuid::new_v4(), target_view, &[source_view])
+        .expect("persist target for another operation");
+
+    let node = HeadlessNode::new_with(
+        db,
+        node_id,
+        HeadlessKeys::new(
+            Arc::new(NoiseKeys::from_private_bytes([0xB3; 32])),
+            ed25519_dalek::SigningKey::from_bytes(&[0xC3; 32]),
+        ),
+        headless_config_with_in_memory_runtime(),
+    )
+    .await
+    .expect("start split recovery node");
+
+    assert_eq!(
+        current_cluster_view(&node.topology_client).await,
+        target_view,
+        "startup must restore the independently installed active view"
+    );
+    assert_eq!(
+        cluster_operation_stage(&node.topology_client, operation.id).await,
+        ClusterOperationStage::Prepared,
+        "an unrelated view installation must not advance the split"
     );
 });
 

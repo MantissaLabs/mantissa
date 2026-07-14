@@ -236,6 +236,7 @@ fn assert_cluster_view_metadata_roundtrips(input: &InfraInput) {
             actor_node_id: uuid(input.other_seed, 31),
             membership_generation: input.numbers[3],
         }),
+        retired_through_epoch: flag(input.flags, 7).then_some(input.numbers[4]),
     };
 
     assert_roundtrips(record);
