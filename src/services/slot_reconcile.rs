@@ -20,7 +20,7 @@ use crate::services::types::{ServiceSpecValue, ServiceStatus};
 use crate::workload::model::{WorkloadPhase, WorkloadSpec};
 use anyhow::anyhow;
 use mantissa_health::Status as HealthStatus;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
@@ -219,6 +219,7 @@ impl ServiceController {
         eligible_nodes: &[Uuid],
         health_snapshot: &HashMap<Uuid, HealthStatus>,
     ) {
+        let mut remote_cleanup_owners = BTreeSet::new();
         for task in service_tasks.observed_tasks() {
             if service_tasks.is_desired(task.id) {
                 continue;
@@ -237,9 +238,9 @@ impl ServiceController {
                 // owner may not have learned that row yet because routine workload gossip is
                 // suppressed for large deployments. Ask that owner to pull workload rows from
                 // this node so its next cleanup pass can observe and stop the same extra task.
-                self.workload_manager
-                    .notify_workload_rows_available(owner)
-                    .await;
+                // Several extra tasks can select the same owner, so notify each peer once after
+                // local cleanup work has been processed.
+                remote_cleanup_owners.insert(owner);
                 continue;
             }
 
@@ -266,6 +267,12 @@ impl ServiceController {
                 )
                 .await;
             }
+        }
+
+        for owner in remote_cleanup_owners {
+            self.workload_manager
+                .notify_workload_rows_available(owner)
+                .await;
         }
     }
 

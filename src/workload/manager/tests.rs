@@ -70,9 +70,12 @@ use ::mantissa_health::HealthMonitor;
 use anyhow::{Result, anyhow};
 use async_channel::bounded;
 use async_trait::async_trait;
+use capnp_rpc::new_client;
 use chrono::{Duration as ChronoDuration, Utc};
 use ed25519_dalek::SigningKey;
 use mantissa_net::noise::NoiseKeys;
+use mantissa_protocol::server::cluster_session;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::rc::Rc;
@@ -85,6 +88,58 @@ type ExecCall = (String, Vec<String>, Option<std::time::Duration>);
 type AttachCall = (String, RuntimeAttachOptions);
 type ExecStreamCall = (String, RuntimeExecOptions);
 type LogCall = (String, RuntimeLogsOptions);
+
+/// Test session that either accepts workload repair hints or deliberately never responds.
+struct WorkloadRepairHintSession {
+    call_count: Rc<Cell<usize>>,
+    respond: bool,
+}
+
+impl cluster_session::Server for WorkloadRepairHintSession {
+    /// Records the hint and optionally leaves the RPC pending to exercise the sender timeout.
+    async fn notify_workload_rows_available(
+        self: Rc<Self>,
+        _params: cluster_session::NotifyWorkloadRowsAvailableParams,
+        _results: cluster_session::NotifyWorkloadRowsAvailableResults,
+    ) -> Result<(), capnp::Error> {
+        self.call_count.set(self.call_count.get().saturating_add(1));
+        if self.respond {
+            Ok(())
+        } else {
+            std::future::pending().await
+        }
+    }
+}
+
+/// A responsive peer should receive the best-effort workload repair hint normally.
+#[tokio::test(flavor = "current_thread")]
+async fn workload_repair_hint_completes_for_responsive_peer() {
+    let call_count = Rc::new(Cell::new(0usize));
+    let session: cluster_session::Client = new_client(WorkloadRepairHintSession {
+        call_count: call_count.clone(),
+        respond: true,
+    });
+
+    let result = send_workload_repair_hint(&session, Duration::from_millis(20)).await;
+
+    assert!(result.is_ok());
+    assert_eq!(call_count.get(), 1);
+}
+
+/// An unresponsive peer should release its caller when the repair-hint budget expires.
+#[tokio::test(flavor = "current_thread")]
+async fn workload_repair_hint_times_out_for_unresponsive_peer() {
+    let call_count = Rc::new(Cell::new(0usize));
+    let session: cluster_session::Client = new_client(WorkloadRepairHintSession {
+        call_count: call_count.clone(),
+        respond: false,
+    });
+
+    let result = send_workload_repair_hint(&session, Duration::from_millis(20)).await;
+
+    assert!(matches!(result, Err(WorkloadRepairHintSendError::TimedOut)));
+    assert_eq!(call_count.get(), 1);
+}
 
 #[derive(Clone, Default)]
 struct MockRuntimeBackend {

@@ -37,6 +37,7 @@ use anyhow::{Context, anyhow};
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Utc};
 use mantissa_health::Status as HealthStatus;
+use mantissa_protocol::server::cluster_session;
 use mantissa_store::uuid_key::UuidKey;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -50,7 +51,7 @@ use tokio::sync::{
     Mutex as AsyncMutex, Notify, RwLock, Semaphore,
     mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender},
 };
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::{Duration, Instant, sleep, timeout};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -88,6 +89,8 @@ const REMOVE_WATERMARK_RETENTION_SECS: i64 = 30 * 60;
 const WORKLOAD_GOSSIP_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// Number of fanout rounds one logical workload update should survive before it ages out.
 const WORKLOAD_GOSSIP_COVERAGE_ROUNDS: usize = 3;
+/// Maximum time a caller may wait for one best-effort workload repair hint.
+const WORKLOAD_REPAIR_HINT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Number of older service generations retained in compact progress storage per node.
 ///
 /// Readiness only consumes the active generation, but retaining a small trailing window avoids
@@ -95,6 +98,33 @@ const WORKLOAD_GOSSIP_COVERAGE_ROUNDS: usize = 3;
 /// starts. Rows older than this window are tombstoned locally and removed from the in-memory
 /// aggregate so frequent service updates do not leave one durable progress row per generation.
 const SERVICE_PROGRESS_RETAIN_GENERATIONS: u64 = 2;
+
+/// Failure observed while sending one best-effort workload repair hint.
+#[derive(Debug)]
+enum WorkloadRepairHintSendError {
+    Rpc(capnp::Error),
+    TimedOut,
+}
+
+/// Sends one workload repair hint without allowing a slow peer to block its caller indefinitely.
+async fn send_workload_repair_hint(
+    session: &cluster_session::Client,
+    timeout_budget: Duration,
+) -> Result<(), WorkloadRepairHintSendError> {
+    match timeout(
+        timeout_budget,
+        session
+            .notify_workload_rows_available_request()
+            .send()
+            .promise,
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(WorkloadRepairHintSendError::Rpc(error)),
+        Err(_) => Err(WorkloadRepairHintSendError::TimedOut),
+    }
+}
 
 /// Converts a UTC timestamp into a non-negative Unix millisecond value.
 fn unix_ms(time: DateTime<Utc>) -> u64 {
@@ -785,34 +815,37 @@ impl WorkloadManager {
     /// this node for its existing workload MST sync pass, so anti-entropy still
     /// validates and transfers the missing rows. Delivery is best effort because
     /// the deterministic workload repair sweep remains the convergence fallback.
+    /// Only an existing session is used so this hint cannot start connection setup.
     pub(crate) async fn notify_workload_rows_available(&self, peer_id: Uuid) {
         if peer_id == self.local_node_id {
             return;
         }
 
-        let session = match self.core.registry.session_for_peer(peer_id).await {
+        let session = match self.core.registry.cached_session_for(peer_id).await {
             Some(session) => session,
             None => {
                 debug!(
                     target: "task",
                     peer = %peer_id,
-                    "could not notify peer about available workload rows: no active session"
+                    "could not notify peer about available workload rows: no cached session"
                 );
                 return;
             }
         };
 
-        if let Err(err) = session
-            .notify_workload_rows_available_request()
-            .send()
-            .promise
-            .await
-        {
-            debug!(
+        match send_workload_repair_hint(&session, WORKLOAD_REPAIR_HINT_TIMEOUT).await {
+            Ok(()) => {}
+            Err(WorkloadRepairHintSendError::Rpc(error)) => debug!(
                 target: "task",
                 peer = %peer_id,
-                "could not notify peer about available workload rows: {err}"
-            );
+                "could not notify peer about available workload rows: {error}"
+            ),
+            Err(WorkloadRepairHintSendError::TimedOut) => debug!(
+                target: "task",
+                peer = %peer_id,
+                timeout_ms = WORKLOAD_REPAIR_HINT_TIMEOUT.as_millis(),
+                "timed out notifying peer about available workload rows"
+            ),
         }
     }
 
