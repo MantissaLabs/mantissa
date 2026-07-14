@@ -1254,6 +1254,7 @@ async fn spawn_runtime_tasks(
         registry: components.registry.clone(),
         progress: components.sync_gc_progress.clone(),
         cluster_view: components.cluster_view.clone(),
+        cluster_operations: stores.cluster_operations.clone(),
         root_schema: components.root_schema,
         local_node_id,
         secrets: stores.secrets.clone(),
