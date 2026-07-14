@@ -1772,8 +1772,8 @@ local_test!(cluster_view_startup_restores_persisted_active_view, {
     );
 });
 
-// Validates startup restores a persisted split target view after a finalized split operation.
-local_test!(cluster_view_startup_restores_persisted_split_view, {
+// Validates startup finishes a split that persisted its target before its stage update.
+local_test!(cluster_view_startup_finishes_persisted_split_transition, {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("state.redb");
     let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
@@ -1792,7 +1792,7 @@ local_test!(cluster_view_startup_restores_persisted_split_view, {
     let operation = ClusterOperationRecord {
         id: Uuid::new_v4(),
         kind: StoredOperationKind::Split,
-        stage: StoredOperationStage::Finalized,
+        stage: StoredOperationStage::Prepared,
         dry_run: false,
         created_at_unix_ms: 22,
         depends_on_operation_id: None,
@@ -1807,13 +1807,13 @@ local_test!(cluster_view_startup_restores_persisted_split_view, {
         split_network_policy: Default::default(),
         merge_service_policy: Default::default(),
         updated_at_unix_ms: 22,
-        details: "finalized split startup restore operation".to_string(),
+        details: "prepared split with installed target view".to_string(),
     };
 
     persist_test_operation(&operation_store, &operation).await;
     view_store
-        .write_active_view(split_target_b)
-        .expect("persist split active cluster view");
+        .install_active_view(split_target_b, &[source_view])
+        .expect("persist split target and pending source retirement");
 
     let node = HeadlessNode::new_with(
         db,
@@ -1843,6 +1843,26 @@ local_test!(cluster_view_startup_restores_persisted_split_view, {
     assert_eq!(
         active_view, split_target_b,
         "startup must restore persisted split target view"
+    );
+    wait_for_operation_stage(
+        &node.topology_client,
+        operation.id.as_bytes(),
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        view_store
+            .view_is_retired(source_view)
+            .expect("read recovered source retirement"),
+        "startup must publish the retirement recorded with the target view"
+    );
+    assert!(
+        view_store
+            .pending_view_retirements()
+            .expect("read recovered pending retirements")
+            .is_empty(),
+        "startup must clear retirement work only after publication"
     );
 });
 

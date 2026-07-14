@@ -935,6 +935,15 @@ fn build_topology(inputs: TopologyBuildInputs<'_>) -> BootstrapResult<Topology> 
 /// This keeps durable topology recovery explicit instead of burying it in the
 /// main runtime construction flow.
 async fn restore_topology_derived_state(topology: &Topology) -> BootstrapResult<()> {
+    let completed_retirements = topology.publish_pending_view_retirements().await?;
+    if completed_retirements > 0 {
+        info!(
+            target: "cluster_view",
+            completed_retirements,
+            "completed pending source cluster view retirements during startup"
+        );
+    }
+
     match topology.restore_cluster_names_from_operations().await {
         Ok(restored) if restored > 0 => {
             info!(
@@ -1254,9 +1263,9 @@ async fn spawn_runtime_tasks(
         registry: components.registry.clone(),
         progress: components.sync_gc_progress.clone(),
         cluster_view: components.cluster_view.clone(),
-        cluster_operations: stores.cluster_operations.clone(),
         root_schema: components.root_schema,
         local_node_id,
+        cluster_view_store: stores.cluster_view.clone(),
         secrets: stores.secrets.clone(),
         secret_master_keys: stores.secret_master_keys.clone(),
         config: store_gc_config.unwrap_or_else(config::store_gc_runtime_config),

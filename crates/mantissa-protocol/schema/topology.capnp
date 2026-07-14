@@ -415,6 +415,14 @@ struct ClusterViewMetadataRecord {
 
   nodeCount @1 :ClusterNodeCountRecord;
   # Optional member-count metadata for the cluster lineage.
+
+  retirement @2 :ClusterViewRetirement;
+  # Optional monotonic retirement boundary for this cluster lineage.
+}
+
+struct ClusterViewRetirement {
+  throughEpoch @0 :UInt64;
+  # Every view at or below this epoch is permanently retired.
 }
 
 struct SplitCandidate {

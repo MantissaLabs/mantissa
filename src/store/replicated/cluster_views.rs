@@ -23,6 +23,10 @@ use uuid::Uuid;
 const T_ACTIVE_CLUSTER_VIEW: TableDefinition<&'static str, &'static [u8]> =
     TableDefinition::new("active_cluster_view");
 
+/// Redb table storing source views whose replicated retirement still needs publication.
+const T_PENDING_VIEW_RETIREMENTS: TableDefinition<&'static [u8], &'static [u8]> =
+    TableDefinition::new("pending_cluster_view_retirements");
+
 /// Stable key used for the single active-view row.
 const ACTIVE_VIEW_KEY: &str = "active";
 
@@ -152,12 +156,14 @@ pub struct ClusterViewMetadataRecord {
     pub name: Option<ClusterNameRecord>,
     #[serde(default)]
     pub node_count: Option<ClusterNodeCountRecord>,
+    #[serde(default)]
+    pub retired_through_epoch: Option<u64>,
 }
 
 impl ClusterViewMetadataRecord {
     /// Returns true when this metadata row carries no fields.
     fn is_empty(&self) -> bool {
-        self.name.is_none() && self.node_count.is_none()
+        self.name.is_none() && self.node_count.is_none() && self.retired_through_epoch.is_none()
     }
 
     /// Merges two metadata rows by resolving each field independently.
@@ -186,7 +192,17 @@ impl ClusterViewMetadataRecord {
             (None, Some(right)) => Some(right.clone()),
             (None, None) => None,
         };
-        Self { name, node_count }
+        let retired_through_epoch = match (left.retired_through_epoch, right.retired_through_epoch)
+        {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (Some(epoch), None) | (None, Some(epoch)) => Some(epoch),
+            (None, None) => None,
+        };
+        Self {
+            name,
+            node_count,
+            retired_through_epoch,
+        }
     }
 
     /// Builds one merged metadata winner from a raw MVReg snapshot.
@@ -251,6 +267,12 @@ fn write_cluster_view_metadata_record(
     if let Some(node_count) = record.node_count.as_ref() {
         write_cluster_node_count_record(builder.reborrow().init_node_count(), node_count);
     }
+    if let Some(retired_through_epoch) = record.retired_through_epoch {
+        builder
+            .reborrow()
+            .init_retirement()
+            .set_through_epoch(retired_through_epoch);
+    }
 }
 
 /// Decodes one cluster-view metadata row from the store schema.
@@ -267,7 +289,16 @@ fn read_cluster_view_metadata_record(
     } else {
         None
     };
-    Ok(ClusterViewMetadataRecord { name, node_count })
+    let retired_through_epoch = if reader.has_retirement() {
+        Some(reader.get_retirement()?.get_through_epoch())
+    } else {
+        None
+    };
+    Ok(ClusterViewMetadataRecord {
+        name,
+        node_count,
+        retired_through_epoch,
+    })
 }
 
 /// Encodes one cluster name record into the store schema.
@@ -371,6 +402,7 @@ impl ClusterViewStore {
     pub fn new(db: Arc<Database>, actor_node_id: Uuid) -> io::Result<Self> {
         with_write_tx(&db, |tx| {
             let _ = tx.open_table(T_ACTIVE_CLUSTER_VIEW).map_err(into_io)?;
+            let _ = tx.open_table(T_PENDING_VIEW_RETIREMENTS).map_err(into_io)?;
             Ok(())
         })?;
 
@@ -478,12 +510,71 @@ impl ClusterViewStore {
 
     /// Persists the provided active cluster view atomically.
     pub fn write_active_view(&self, view: ClusterViewId) -> io::Result<()> {
+        self.install_active_view(view, &[])
+    }
+
+    /// Persists an active view and the source views it retires in one transaction.
+    ///
+    /// The pending rows close the crash window between installing the target view and publishing
+    /// replicated retirement facts. Startup recovery can finish every publication recorded here.
+    pub fn install_active_view(
+        &self,
+        view: ClusterViewId,
+        retired_views: &[ClusterViewId],
+    ) -> io::Result<()> {
         let payload = encode_active_cluster_view(view)?;
+        let mut retirement_payloads = retired_views
+            .iter()
+            .copied()
+            .filter(|retired_view| *retired_view != view)
+            .map(encode_active_cluster_view)
+            .collect::<io::Result<Vec<_>>>()?;
+        retirement_payloads.sort();
+        retirement_payloads.dedup();
+
         with_write_tx(&self.db, |tx| {
-            let mut table = tx.open_table(T_ACTIVE_CLUSTER_VIEW).map_err(into_io)?;
-            table
-                .insert(ACTIVE_VIEW_KEY, payload.as_slice())
-                .map_err(into_io)?;
+            {
+                let mut table = tx.open_table(T_ACTIVE_CLUSTER_VIEW).map_err(into_io)?;
+                table
+                    .insert(ACTIVE_VIEW_KEY, payload.as_slice())
+                    .map_err(into_io)?;
+            }
+            {
+                let mut pending = tx.open_table(T_PENDING_VIEW_RETIREMENTS).map_err(into_io)?;
+                for retirement in &retirement_payloads {
+                    pending
+                        .insert(retirement.as_slice(), retirement.as_slice())
+                        .map_err(into_io)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Lists source views whose replicated retirement publication is still pending locally.
+    pub fn pending_view_retirements(&self) -> io::Result<Vec<ClusterViewId>> {
+        with_read_tx(&self.db, |tx| {
+            let table = tx.open_table(T_PENDING_VIEW_RETIREMENTS).map_err(into_io)?;
+            let mut views = table
+                .iter()
+                .map_err(into_io)?
+                .map(|entry| {
+                    let (_, value) = entry.map_err(into_io)?;
+                    decode_active_cluster_view(value.value())
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            views.sort();
+            views.dedup();
+            Ok(views)
+        })
+    }
+
+    /// Clears one pending retirement after its replicated fact is durably visible locally.
+    pub fn complete_view_retirement(&self, retired_view: ClusterViewId) -> io::Result<()> {
+        let payload = encode_active_cluster_view(retired_view)?;
+        with_write_tx(&self.db, |tx| {
+            let mut pending = tx.open_table(T_PENDING_VIEW_RETIREMENTS).map_err(into_io)?;
+            let _ = pending.remove(payload.as_slice()).map_err(into_io)?;
             Ok(())
         })
     }
@@ -522,27 +613,29 @@ impl ClusterViewStore {
         cluster_id: ClusterId,
         incoming: &ClusterNameRecord,
     ) -> io::Result<bool> {
-        let current = self
-            .winning_cluster_metadata_for(cluster_id)?
-            .unwrap_or_default();
-        if let Some(existing) = current.name.as_ref()
-            && !incoming.supersedes(existing)
-        {
-            return Ok(false);
-        }
-
         let key = UuidKey::from(cluster_id.to_uuid());
         self.cluster_view_domain
-            .upsert(
-                &key,
-                ClusterViewMetadataRecord {
+            .update_value(&key, |snapshot| {
+                let current = snapshot
+                    .and_then(|snapshot| {
+                        ClusterViewMetadataRecord::winner_for(cluster_id, snapshot)
+                    })
+                    .unwrap_or_default();
+                if current
+                    .name
+                    .as_ref()
+                    .is_some_and(|existing| !incoming.supersedes(existing))
+                {
+                    return None;
+                }
+                Some(ClusterViewMetadataRecord {
                     name: Some(incoming.clone()),
                     node_count: current.node_count,
-                },
-            )
+                    retired_through_epoch: current.retired_through_epoch,
+                })
+            })
             .await
-            .map_err(io::Error::other)?;
-        Ok(true)
+            .map_err(io::Error::other)
     }
 
     /// Applies one conflict-resolved cluster lineage node-count update and reports whether the row changed.
@@ -555,27 +648,29 @@ impl ClusterViewStore {
             return Ok(false);
         }
 
-        let current = self
-            .winning_cluster_metadata_for(cluster_id)?
-            .unwrap_or_default();
-        if let Some(existing) = current.node_count.as_ref()
-            && !incoming.supersedes_for(cluster_id, existing)
-        {
-            return Ok(false);
-        }
-
         let key = UuidKey::from(cluster_id.to_uuid());
         self.cluster_view_domain
-            .upsert(
-                &key,
-                ClusterViewMetadataRecord {
+            .update_value(&key, |snapshot| {
+                let current = snapshot
+                    .and_then(|snapshot| {
+                        ClusterViewMetadataRecord::winner_for(cluster_id, snapshot)
+                    })
+                    .unwrap_or_default();
+                if current
+                    .node_count
+                    .as_ref()
+                    .is_some_and(|existing| !incoming.supersedes_for(cluster_id, existing))
+                {
+                    return None;
+                }
+                Some(ClusterViewMetadataRecord {
                     name: current.name,
                     node_count: Some(incoming.clone()),
-                },
-            )
+                    retired_through_epoch: current.retired_through_epoch,
+                })
+            })
             .await
-            .map_err(io::Error::other)?;
-        Ok(true)
+            .map_err(io::Error::other)
     }
 
     /// Reads the deterministic winning node-count record currently visible for one cluster lineage.
@@ -586,6 +681,49 @@ impl ClusterViewStore {
         Ok(self
             .winning_cluster_metadata_for(cluster_id)?
             .and_then(|record| record.node_count))
+    }
+
+    /// Publishes that this view and every earlier epoch in its lineage are retired.
+    ///
+    /// The maximum epoch is a monotonic topology fact, so transition replay becomes a no-op after
+    /// the first publication while later epochs of the same lineage remain independently usable.
+    pub async fn retire_view(&self, view: ClusterViewId) -> io::Result<bool> {
+        let key = UuidKey::from(view.cluster_id.to_uuid());
+        self.cluster_view_domain
+            .update_value(&key, |snapshot| {
+                let current = snapshot
+                    .and_then(|snapshot| {
+                        ClusterViewMetadataRecord::winner_for(view.cluster_id, snapshot)
+                    })
+                    .unwrap_or_default();
+                if current
+                    .retired_through_epoch
+                    .is_some_and(|retired_epoch| retired_epoch >= view.epoch)
+                {
+                    return None;
+                }
+                Some(ClusterViewMetadataRecord {
+                    name: current.name,
+                    node_count: current.node_count,
+                    retired_through_epoch: Some(view.epoch),
+                })
+            })
+            .await
+            .map_err(io::Error::other)
+    }
+
+    /// Returns whether topology has permanently retired the provided cluster view.
+    pub fn view_is_retired(&self, view: ClusterViewId) -> io::Result<bool> {
+        Ok(self
+            .retired_through_epoch_for(view.cluster_id)?
+            .is_some_and(|retired_epoch| retired_epoch >= view.epoch))
+    }
+
+    /// Returns the highest retired epoch visible for one cluster lineage.
+    pub fn retired_through_epoch_for(&self, cluster_id: ClusterId) -> io::Result<Option<u64>> {
+        Ok(self
+            .winning_cluster_metadata_for(cluster_id)?
+            .and_then(|record| record.retired_through_epoch))
     }
 
     /// Lists all persisted cluster lineage metadata rows as `(cluster_id, record)` tuples.
@@ -659,6 +797,7 @@ mod tests {
                 Uuid::new_v4(),
                 42,
             )),
+            retired_through_epoch: Some(6),
         }
     }
 
@@ -691,6 +830,39 @@ mod tests {
         assert_eq!(decoded, empty);
     }
 
+    /// Independent metadata writes must preserve the highest visible retirement boundary.
+    #[test]
+    fn cluster_view_metadata_merge_preserves_retirement() {
+        let cluster_id = ClusterId::from_uuid(Uuid::new_v4());
+        let name = ClusterNameRecord {
+            name: "merged-lineage".to_string(),
+            updated_at_unix_ms: 10,
+            actor_node_id: Uuid::new_v4(),
+        };
+        let named = ClusterViewMetadataRecord {
+            name: Some(name.clone()),
+            ..ClusterViewMetadataRecord::default()
+        };
+        let retired = ClusterViewMetadataRecord {
+            retired_through_epoch: Some(3),
+            ..ClusterViewMetadataRecord::default()
+        };
+
+        let merged = ClusterViewMetadataRecord::merge_for(cluster_id, &named, &retired);
+        assert_eq!(merged.name, Some(name));
+        assert_eq!(merged.retired_through_epoch, Some(3));
+
+        let advanced = ClusterViewMetadataRecord {
+            retired_through_epoch: Some(5),
+            ..ClusterViewMetadataRecord::default()
+        };
+        assert_eq!(
+            ClusterViewMetadataRecord::merge_for(cluster_id, &merged, &advanced)
+                .retired_through_epoch,
+            Some(5)
+        );
+    }
+
     /// The local active-view singleton should use the existing Cap'n Proto view id schema.
     #[test]
     fn active_cluster_view_codec_roundtrips_view_ids() {
@@ -698,6 +870,148 @@ mod tests {
         let encoded = encode_active_cluster_view(view).expect("encode active cluster view");
         let decoded = decode_active_cluster_view(&encoded).expect("decode active cluster view");
         assert_eq!(decoded, view);
+    }
+
+    /// Active-view installation must durably preserve unfinished view retirement work.
+    #[test]
+    fn active_view_installation_persists_pending_view_retirements() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("cluster-view-retirements.redb");
+        let db = Arc::new(Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let source_a = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 1);
+        let source_b = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 2);
+        let target = source_b;
+
+        {
+            let store = ClusterViewStore::new(db.clone(), actor).expect("open cluster-view store");
+            store
+                .install_active_view(target, &[source_a, source_b, source_a])
+                .expect("install active view");
+        }
+
+        let store = ClusterViewStore::new(db, actor).expect("reopen cluster-view store");
+        assert_eq!(
+            store.read_active_view().expect("read active view"),
+            Some(target)
+        );
+        assert_eq!(
+            store
+                .pending_view_retirements()
+                .expect("read pending retirements"),
+            vec![source_a],
+            "the target view must never be recorded for retirement"
+        );
+
+        store
+            .complete_view_retirement(source_a)
+            .expect("complete retirement");
+        assert!(
+            store
+                .pending_view_retirements()
+                .expect("read completed retirements")
+                .is_empty()
+        );
+    }
+
+    /// View retirement must move forward monotonically without changing unrelated metadata.
+    #[tokio::test]
+    async fn cluster_view_retirement_is_monotonic() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("cluster-view-retirement-metadata.redb");
+        let db = Arc::new(Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let cluster_id = ClusterId::from_uuid(Uuid::new_v4());
+        let store = ClusterViewStore::new(db, actor).expect("open cluster-view store");
+        let name = ClusterNameRecord {
+            name: "retired-lineage".to_string(),
+            updated_at_unix_ms: 10,
+            actor_node_id: actor,
+        };
+        store
+            .upsert_cluster_name(cluster_id, &name)
+            .await
+            .expect("publish cluster name");
+
+        let retired = ClusterViewId::new(cluster_id, 3);
+        assert!(store.retire_view(retired).await.expect("retire view"));
+        let first_root = store.cluster_view_domain.root_digest().await;
+        assert!(store.view_is_retired(retired).expect("read retirement"));
+        assert!(
+            store
+                .view_is_retired(ClusterViewId::new(cluster_id, 2))
+                .expect("read earlier retirement")
+        );
+        assert!(
+            !store
+                .view_is_retired(ClusterViewId::new(cluster_id, 4))
+                .expect("read later view")
+        );
+
+        assert!(
+            !store
+                .retire_view(ClusterViewId::new(cluster_id, 2))
+                .await
+                .expect("replay older retirement")
+        );
+        assert_eq!(store.cluster_view_domain.root_digest().await, first_root);
+
+        let (lower, higher) = tokio::join!(
+            store.retire_view(ClusterViewId::new(cluster_id, 4)),
+            store.retire_view(ClusterViewId::new(cluster_id, 5)),
+        );
+        lower.expect("publish lower concurrent retirement");
+        assert!(higher.expect("publish higher concurrent retirement"));
+        assert_eq!(
+            store
+                .retired_through_epoch_for(cluster_id)
+                .expect("read concurrent retirement boundary"),
+            Some(5)
+        );
+        assert_eq!(
+            store.list_cluster_names().expect("list cluster names"),
+            vec![(cluster_id, name)]
+        );
+    }
+
+    /// Updating one metadata field must retain fields written by other topology paths.
+    #[tokio::test]
+    async fn cluster_view_metadata_updates_preserve_other_fields() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("cluster-view-metadata-fields.redb");
+        let db = Arc::new(Database::create(db_path).expect("create db"));
+        let actor = Uuid::new_v4();
+        let cluster_id = ClusterId::from_uuid(Uuid::new_v4());
+        let view = ClusterViewId::new(cluster_id, 5);
+        let store = ClusterViewStore::new(db, actor).expect("open cluster-view store");
+        let name = ClusterNameRecord {
+            name: "preserved-lineage".to_string(),
+            updated_at_unix_ms: 10,
+            actor_node_id: actor,
+        };
+        let node_count = count_record(view, 4, 11, actor, 2);
+
+        assert!(
+            store
+                .upsert_cluster_name(cluster_id, &name)
+                .await
+                .expect("publish cluster name")
+        );
+        assert!(store.retire_view(view).await.expect("retire cluster view"));
+        assert!(
+            store
+                .upsert_cluster_node_count(cluster_id, &node_count)
+                .await
+                .expect("publish cluster node count")
+        );
+
+        let metadata = store
+            .winning_cluster_metadata_for(cluster_id)
+            .expect("read cluster metadata")
+            .expect("cluster metadata row");
+        assert_eq!(metadata.name, Some(name));
+        assert_eq!(metadata.node_count, Some(node_count));
+        assert_eq!(metadata.retired_through_epoch, Some(view.epoch));
     }
 
     /// Reopening the cluster-view store should decode Cap'n Proto rows from Redb.
@@ -753,6 +1067,7 @@ mod tests {
                 ClusterViewMetadataRecord {
                     name: Some(name),
                     node_count: Some(count),
+                    retired_through_epoch: None,
                 },
             )]
         );
@@ -891,6 +1206,7 @@ mod tests {
                 ClusterViewMetadataRecord {
                     name: None,
                     node_count: Some(outsider),
+                    retired_through_epoch: None,
                 },
             )
             .await
@@ -973,6 +1289,7 @@ mod tests {
                 ClusterViewMetadataRecord {
                     name: None,
                     node_count: Some(stale.clone()),
+                    retired_through_epoch: None,
                 },
             )
             .await
@@ -1025,6 +1342,7 @@ mod tests {
                 ClusterViewMetadataRecord {
                     name: None,
                     node_count: Some(stale),
+                    retired_through_epoch: None,
                 },
             )
             .await
@@ -1036,6 +1354,7 @@ mod tests {
                 ClusterViewMetadataRecord {
                     name: None,
                     node_count: Some(fresh.clone()),
+                    retired_through_epoch: None,
                 },
             )
             .await

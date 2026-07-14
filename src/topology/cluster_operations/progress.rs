@@ -460,6 +460,7 @@ impl Topology {
 
     /// Returns the local active views from which this split/merge transition may be applied.
     fn allowed_active_views_for_cluster_transition(
+        &self,
         operation: &ClusterOperationRecord,
     ) -> Result<Vec<ClusterViewId>, capnp::Error> {
         let source_view = operation.source_views.first().copied().ok_or_else(|| {
@@ -472,6 +473,12 @@ impl Topology {
                     allowed_views.push(target);
                 }
             }
+        } else if let Some(target) = self.target_view_if_local_participant(operation)?
+            && !allowed_views.contains(&target)
+        {
+            // This target is valid only for recovery after the local active-view transaction
+            // committed but the operation stage update had not yet reached durable storage.
+            allowed_views.push(target);
         }
         Ok(allowed_views)
     }
@@ -482,7 +489,7 @@ impl Topology {
         operation: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
         let active_view = self.active_cluster_view();
-        let allowed_views = Self::allowed_active_views_for_cluster_transition(operation)?;
+        let allowed_views = self.allowed_active_views_for_cluster_transition(operation)?;
         if allowed_views.contains(&active_view) {
             return self.ensure_operation_views_not_retired(operation);
         }
@@ -600,9 +607,9 @@ impl Topology {
 
     /// Returns whether a pending operation is allowed to advance from this node's active view.
     ///
-    /// Split operations can only be driven by source-view participants. Merge operations can be
-    /// driven by either side because both source and destination partitions must converge on the
-    /// destination view.
+    /// Split operations normally advance from their source view. The assigned target is also
+    /// accepted so startup can finish an operation that crashed after persisting its target view.
+    /// Merge operations can be driven by either side because both partitions must converge.
     fn cluster_operation_can_progress_from_active_view(
         &self,
         operation: &ClusterOperationRecord,
@@ -619,7 +626,12 @@ impl Topology {
                 Ok(operation.source_views.contains(&active_view)
                     || operation.target_views.contains(&active_view))
             }
-            ClusterOperationKind::Split => Ok(operation.source_views.contains(&active_view)),
+            ClusterOperationKind::Split => {
+                if operation.source_views.contains(&active_view) {
+                    return Ok(true);
+                }
+                Ok(self.target_view_if_local_participant(operation)? == Some(active_view))
+            }
         }
     }
 
@@ -753,12 +765,52 @@ impl Topology {
         Ok(())
     }
 
-    /// Persists the active cluster view durably so finalized operations survive process restarts.
-    fn persist_active_cluster_view(&self, view: ClusterViewId) -> Result<(), capnp::Error> {
+    /// Persists a target view and its source-view retirement work in one local transaction.
+    fn persist_cluster_transition_view(
+        &self,
+        operation: &ClusterOperationRecord,
+        view: ClusterViewId,
+    ) -> Result<(), capnp::Error> {
         self.stores
             .cluster_view_store
-            .write_active_view(view)
+            .install_active_view(view, &operation.source_views)
             .map_err(|err| capnp::Error::failed(err.to_string()))
+    }
+
+    /// Publishes every locally pending view retirement and clears completed local work.
+    ///
+    /// The active-view transaction records this work before the process changes views. Repeating
+    /// the publication after a crash is safe because retirement only moves to a higher epoch.
+    pub(crate) async fn publish_pending_view_retirements(&self) -> Result<usize, capnp::Error> {
+        let pending = self
+            .stores
+            .cluster_view_store
+            .pending_view_retirements()
+            .map_err(|err| capnp::Error::failed(err.to_string()))?;
+        let mut completed = 0usize;
+
+        for retired_view in pending {
+            self.stores
+                .cluster_view_store
+                .retire_view(retired_view)
+                .await
+                .map_err(|err| {
+                    capnp::Error::failed(format!(
+                        "publish cluster view retirement for {retired_view}: {err}"
+                    ))
+                })?;
+            self.stores
+                .cluster_view_store
+                .complete_view_retirement(retired_view)
+                .map_err(|err| {
+                    capnp::Error::failed(format!(
+                        "complete cluster view retirement for {retired_view}: {err}"
+                    ))
+                })?;
+            completed = completed.saturating_add(1);
+        }
+
+        Ok(completed)
     }
 
     /// Returns true when an error represents a stale commit precondition mismatch.
@@ -917,8 +969,28 @@ impl Topology {
             );
         }
 
-        self.persist_active_cluster_view(transition.local_target_view)?;
+        self.persist_cluster_transition_view(operation, transition.local_target_view)?;
         let previous = self.set_active_cluster_view(transition.local_target_view);
+        match self.publish_pending_view_retirements().await {
+            Ok(completed) if completed > 0 => {
+                info!(
+                    target: "cluster_view",
+                    operation_id = %transition.operation_id,
+                    completed,
+                    "published source cluster view retirements"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // The active-view transaction keeps this work pending for startup and metadata
+                // reconciliation. Failing closed here retains old keys until publication succeeds.
+                warn!(
+                    target: "cluster_view",
+                    operation_id = %transition.operation_id,
+                    "deferred source cluster view retirement publication: {error}"
+                );
+            }
+        }
         self.reconcile_secret_master_keys_for_view(transition.local_target_view)
             .await;
         self.deps.registry.clear().await;
@@ -1197,6 +1269,16 @@ impl Topology {
         &self,
         replay_context: &'static str,
     ) -> Result<(), capnp::Error> {
+        let completed = self.publish_pending_view_retirements().await?;
+        if completed > 0 {
+            info!(
+                target: "cluster_view",
+                completed,
+                replay_context,
+                "completed pending source cluster view retirements"
+            );
+        }
+
         let mut operations = self.load_cluster_operations()?;
         operations.sort_by_key(ClusterOperationRecord::lineage_order_key);
 

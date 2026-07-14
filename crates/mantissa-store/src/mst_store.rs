@@ -1004,6 +1004,19 @@ where
 
     /// Insert or update value for key `k`.
     pub async fn upsert(&self, k: &C::Key, v: C::Value) -> crate::Result<()> {
+        let _ = self.update_value(k, |_| Some(v)).await?;
+        Ok(())
+    }
+
+    /// Atomically derives and writes a value from the latest durable register snapshot.
+    ///
+    /// Domain stores use this for read-modify-write operations whose fields must survive
+    /// concurrent local writes and inbound delta application under the shared mutation gate.
+    /// Returning `None` leaves the row and its MST root unchanged.
+    pub async fn update_value<F>(&self, k: &C::Key, update: F) -> crate::Result<bool>
+    where
+        F: FnOnce(Option<&C::Snapshot>) -> Option<C::Value>,
+    {
         let _mutation = self.mutation_gate.lock().await;
         let w = self.db.begin_write().map_err(into_err)?;
         let kb = Self::encode_key(k);
@@ -1013,7 +1026,11 @@ where
                 Some(row) => Some(Self::decode_reg(row.value())?),
                 None => None,
             };
-            let new_reg = C::upsert_reg(current, &self.actor, v);
+            let snapshot = current.as_ref().map(C::snapshot_reg);
+            let Some(value) = update(snapshot.as_ref()) else {
+                return Ok(false);
+            };
+            let new_reg = C::upsert_reg(current, &self.actor, value);
             values
                 .insert(kb.as_slice(), Self::encode_reg(&new_reg)?.as_slice())
                 .map_err(into_err)?;
@@ -1051,7 +1068,7 @@ where
 
         self.bump_change_clock();
 
-        Ok(())
+        Ok(true)
     }
 
     /// Inserts or updates a batch of key/value pairs in a single durable transaction.
@@ -2626,6 +2643,46 @@ mod tests {
         // Tombstone reflected in MST root
         let root = store.root_hex().await;
         assert!(!root.is_empty());
+    }
+
+    /// Conditional updates must read the latest value and leave no trace when skipped.
+    #[tokio::test]
+    async fn update_value_uses_latest_snapshot_and_skips_noop() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+        let row_key = key(1);
+        store.upsert(&row_key, "first".to_string()).await.unwrap();
+        let initial_root = store.root_digest().await;
+
+        let changed = store
+            .update_value(&row_key, |snapshot| {
+                assert_eq!(snapshot.expect("current snapshot").as_slice(), &["first"]);
+                None
+            })
+            .await
+            .unwrap();
+        assert!(!changed);
+        assert_eq!(store.root_digest().await, initial_root);
+
+        let changed = store
+            .update_value(&row_key, |snapshot| {
+                let current = snapshot
+                    .and_then(|snapshot| snapshot.as_slice().first())
+                    .expect("current value");
+                Some(format!("{current}-updated"))
+            })
+            .await
+            .unwrap();
+        assert!(changed);
+        assert_eq!(
+            store
+                .get_snapshot(&row_key)
+                .unwrap()
+                .expect("updated snapshot")
+                .as_slice(),
+            &["first-updated"]
+        );
     }
 
     /// Raw register loading should preserve encoded key order for cached indexes.

@@ -30,7 +30,7 @@ use ed25519_dalek::VerifyingKey;
 use mantissa_protocol::server::{self, cluster_session};
 use mantissa_protocol::topology::{topology, topology_event};
 use mantissa_store::uuid_key::UuidKey;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -1474,24 +1474,24 @@ impl topology::Server for Topology {
         let excluded_peers = self.excluded_peers_snapshot().await;
         let operations = self.load_cluster_operations()?;
         let local_node_count = self.local_cluster_view_member_count().await?;
-        let mut retired_views = HashSet::<ClusterViewId>::new();
-        for operation in operations.iter() {
-            if operation.kind != ClusterOperationKind::Merge
-                || operation.dry_run
-                || operation.stage == ClusterOperationStage::Aborted
-            {
-                continue;
-            }
-            if !matches!(
-                operation.stage,
-                ClusterOperationStage::Committed | ClusterOperationStage::Finalized
-            ) {
-                continue;
-            }
-            for source_view in operation.source_views.iter().copied() {
-                retired_views.insert(source_view);
-            }
-        }
+        let cluster_metadata_rows = self
+            .stores
+            .cluster_view_store
+            .list_cluster_metadata()
+            .map_err(|err| capnp::Error::failed(err.to_string()))?;
+        let retired_through_epoch = cluster_metadata_rows
+            .iter()
+            .filter_map(|(cluster_id, record)| {
+                record
+                    .retired_through_epoch
+                    .map(|epoch| (*cluster_id, epoch))
+            })
+            .collect::<HashMap<_, _>>();
+        let view_is_retired = |view: ClusterViewId| {
+            retired_through_epoch
+                .get(&view.cluster_id)
+                .is_some_and(|epoch| view.epoch <= *epoch)
+        };
 
         let mut counts = HashMap::<ClusterViewId, u32>::new();
         counts.insert(local_view, local_node_count);
@@ -1523,7 +1523,7 @@ impl topology::Server for Topology {
             if view == local_view {
                 continue;
             }
-            if retired_views.contains(&view) {
+            if view_is_retired(view) {
                 continue;
             }
             let entry = counts.entry(view).or_insert(0);
@@ -1551,7 +1551,7 @@ impl topology::Server for Topology {
             }
 
             for (idx, view) in operation.target_views.iter().copied().enumerate() {
-                if retired_views.contains(&view) {
+                if view_is_retired(view) {
                     continue;
                 }
                 if view == local_view {
@@ -1568,11 +1568,6 @@ impl topology::Server for Topology {
             }
         }
 
-        let cluster_metadata_rows = self
-            .stores
-            .cluster_view_store
-            .list_cluster_metadata()
-            .map_err(|err| capnp::Error::failed(err.to_string()))?;
         let cluster_names = cluster_metadata_rows
             .iter()
             .filter_map(|(cluster_id, record)| {
@@ -1583,11 +1578,12 @@ impl topology::Server for Topology {
             })
             .collect::<HashMap<_, _>>();
         let cluster_node_counts = cluster_metadata_rows
-            .into_iter()
+            .iter()
             .filter_map(|(cluster_id, record)| {
                 record
                     .node_count
-                    .map(|node_count| (cluster_id, node_count.node_count))
+                    .as_ref()
+                    .map(|node_count| (*cluster_id, node_count.node_count))
             })
             .collect::<HashMap<_, _>>();
 
@@ -1602,7 +1598,7 @@ impl topology::Server for Topology {
                         .copied()
                         .unwrap_or(node_count)
                 };
-                if resolved_count == 0 || (view != local_view && retired_views.contains(&view)) {
+                if resolved_count == 0 || (view != local_view && view_is_retired(view)) {
                     return None;
                 }
                 Some(ClusterViewSummaryRow {

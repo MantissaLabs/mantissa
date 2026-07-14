@@ -5,11 +5,10 @@
 //! and the current active peer set into those barriers, then applies bounded
 //! store-local GC one replicated domain at a time.
 
-use crate::cluster::operations::{ClusterOperationRecord, ClusterOperationStage};
 use crate::cluster::{ClusterViewState, RootSchemaState};
 use crate::config::RuntimeStoreGcConfig;
 use crate::registry::Registry;
-use crate::store::replicated::cluster_operations::ClusterOperationStore;
+use crate::store::replicated::cluster_views::ClusterViewStore;
 use crate::store::replicated::registry::ReplicatedStoreEntry;
 use crate::store::replicated::secret_key_sync::{
     SecretMasterKeyStore, SecretMasterKeySyncRecord, current_for_scope,
@@ -18,7 +17,7 @@ use crate::store::replicated::secrets::SecretStore;
 use crate::sync::{SyncGcProgress, SyncStores};
 use mantissa_protocol::sync::Domain;
 use mantissa_store::gc::{GcBarrier, StoreGcReport};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
@@ -31,9 +30,9 @@ pub struct StoreGcRunner {
     registry: Registry,
     progress: SyncGcProgress,
     cluster_view: ClusterViewState,
-    cluster_operations: ClusterOperationStore,
     root_schema: RootSchemaState,
     local_node_id: uuid::Uuid,
+    cluster_view_store: ClusterViewStore,
     secrets: SecretStore,
     secret_master_keys: SecretMasterKeyStore,
     config: RuntimeStoreGcConfig,
@@ -45,9 +44,9 @@ pub struct StoreGcRunnerInputs {
     pub registry: Registry,
     pub progress: SyncGcProgress,
     pub cluster_view: ClusterViewState,
-    pub cluster_operations: ClusterOperationStore,
     pub root_schema: RootSchemaState,
     pub local_node_id: uuid::Uuid,
+    pub cluster_view_store: ClusterViewStore,
     pub secrets: SecretStore,
     pub secret_master_keys: SecretMasterKeyStore,
     pub config: RuntimeStoreGcConfig,
@@ -61,9 +60,9 @@ impl StoreGcRunner {
             registry: inputs.registry,
             progress: inputs.progress,
             cluster_view: inputs.cluster_view,
-            cluster_operations: inputs.cluster_operations,
             root_schema: inputs.root_schema,
             local_node_id: inputs.local_node_id,
+            cluster_view_store: inputs.cluster_view_store,
             secrets: inputs.secrets,
             secret_master_keys: inputs.secret_master_keys,
             config: inputs.config,
@@ -210,47 +209,34 @@ impl StoreGcRunner {
                 active_remote_peers,
             );
             if owner == Some(self.local_node_id) {
-                let operations = match self.cluster_operations.list_records() {
-                    Ok(operations) => Some(operations),
+                match prune_unreferenced_secret_master_key_rows(
+                    &self.secrets,
+                    &self.secret_master_keys,
+                    SecretMasterKeyGcContext {
+                        progress: &self.progress,
+                        active_remote_peers,
+                        cluster_view,
+                        root_schema_version,
+                        now_unix_ms,
+                        cluster_view_store: &self.cluster_view_store,
+                    },
+                )
+                .await
+                {
+                    Ok(pruned) if pruned > 0 => {
+                        debug!(
+                            target: "store.gc",
+                            pruned,
+                            "pruned unreferenced secret master-key rows"
+                        );
+                    }
+                    Ok(_) => {}
                     Err(error) => {
                         pass_failed = true;
                         error!(
                             target: "store.gc",
-                            "failed to load cluster operations for secret master-key GC: {error}"
+                            "secret master-key semantic GC failed: {error}"
                         );
-                        None
-                    }
-                };
-                if let Some(operations) = operations {
-                    match prune_unreferenced_secret_master_key_rows(
-                        &self.secrets,
-                        &self.secret_master_keys,
-                        SecretMasterKeyGcContext {
-                            progress: &self.progress,
-                            cluster_operations: &operations,
-                            active_remote_peers,
-                            cluster_view,
-                            root_schema_version,
-                            now_unix_ms,
-                        },
-                    )
-                    .await
-                    {
-                        Ok(pruned) if pruned > 0 => {
-                            debug!(
-                                target: "store.gc",
-                                pruned,
-                                "pruned unreferenced secret master-key rows"
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            pass_failed = true;
-                            error!(
-                                target: "store.gc",
-                                "secret master-key semantic GC failed: {error}"
-                            );
-                        }
                     }
                 }
             } else if let Some(owner) = owner {
@@ -373,11 +359,11 @@ fn secret_master_key_gc_owner_score(
 /// Convergence proof and active scope used by one semantic master-key GC pass.
 struct SecretMasterKeyGcContext<'a> {
     progress: &'a SyncGcProgress,
-    cluster_operations: &'a [ClusterOperationRecord],
     active_remote_peers: &'a [uuid::Uuid],
     cluster_view: crate::cluster::ClusterViewId,
     root_schema_version: u32,
     now_unix_ms: u64,
+    cluster_view_store: &'a ClusterViewStore,
 }
 
 /// Tombstones secret-master-key rows that no converged secret or active current uses.
@@ -388,24 +374,12 @@ async fn prune_unreferenced_secret_master_key_rows(
 ) -> mantissa_store::Result<usize> {
     let SecretMasterKeyGcContext {
         progress,
-        cluster_operations,
         active_remote_peers,
         cluster_view,
         root_schema_version,
         now_unix_ms,
+        cluster_view_store,
     } = context;
-    if let Some(operation) = unapplied_transition_from_view(cluster_operations, cluster_view) {
-        trace!(
-            target: "store.gc",
-            operation_id = %operation.id,
-            operation_kind = ?operation.kind,
-            operation_stage = ?operation.stage,
-            %cluster_view,
-            "skipping secret master-key GC until the local cluster transition is applied"
-        );
-        return Ok(0);
-    }
-
     let secrets_root_digest = secrets.root_digest_at_version(root_schema_version).await?;
     let Some(_secrets_barrier) = progress.barrier_for_domain(
         active_remote_peers.iter().copied(),
@@ -435,10 +409,94 @@ async fn prune_unreferenced_secret_master_key_rows(
         return Ok(0);
     };
 
-    let mut referenced_key_ids = referenced_secret_master_key_ids(secrets)?;
-    referenced_key_ids.insert(active_current.key_id);
-
     let (rows, _) = secret_master_keys.load_all()?;
+    let mut current_generation_by_scope = HashMap::new();
+    let mut scope_cluster_ids = HashSet::new();
+
+    // Collect visible scopes and their latest current generations first. Rows can arrive in any
+    // order, so the retention decision below must use the complete visible snapshot.
+    for (_, snapshot) in &rows {
+        for record in snapshot.as_slice() {
+            match record {
+                SecretMasterKeySyncRecord::Descriptor(descriptor) => {
+                    scope_cluster_ids.insert(descriptor.scope_view.cluster_id);
+                }
+                SecretMasterKeySyncRecord::Grant(grant) => {
+                    scope_cluster_ids.insert(grant.descriptor.scope_view.cluster_id);
+                }
+                SecretMasterKeySyncRecord::Current(current) => {
+                    scope_cluster_ids.insert(current.scope_view.cluster_id);
+                    current_generation_by_scope
+                        .entry(current.scope_view)
+                        .and_modify(|generation: &mut u64| {
+                            *generation = (*generation).max(current.generation);
+                        })
+                        .or_insert(current.generation);
+                }
+            }
+        }
+    }
+
+    // Query only lineages represented in the master-key snapshot. The topology metadata domain
+    // may contain a much longer cluster history than the keys still visible on this node.
+    let mut retired_through_epoch_by_cluster = HashMap::with_capacity(scope_cluster_ids.len());
+    for cluster_id in scope_cluster_ids {
+        let retired_through_epoch = cluster_view_store
+            .retired_through_epoch_for(cluster_id)
+            .map_err(|error| Box::new(mantissa_store::error::Error::Io(error)))?;
+        if let Some(retired_through_epoch) = retired_through_epoch {
+            retired_through_epoch_by_cluster.insert(cluster_id, retired_through_epoch);
+        }
+    }
+
+    let scope_can_still_be_used = |scope_view: crate::cluster::ClusterViewId| {
+        scope_view == cluster_view
+            || retired_through_epoch_by_cluster
+                .get(&scope_view.cluster_id)
+                .is_none_or(|retired_epoch| scope_view.epoch > *retired_epoch)
+    };
+    let mut retained_key_ids = referenced_secret_master_key_ids(secrets)?;
+    retained_key_ids.insert(active_current.key_id);
+
+    // Every current in an active or not-yet-retired scope is a root. Descriptor and grant rows at
+    // or above the latest visible generation are also roots because publication intentionally
+    // sends them before the corresponding current pointer.
+    for (_, snapshot) in &rows {
+        for record in snapshot.as_slice() {
+            match record {
+                SecretMasterKeySyncRecord::Descriptor(descriptor) => {
+                    let current_generation = current_generation_by_scope
+                        .get(&descriptor.scope_view)
+                        .copied();
+                    if scope_can_still_be_used(descriptor.scope_view)
+                        && current_generation
+                            .is_none_or(|generation| descriptor.generation >= generation)
+                    {
+                        retained_key_ids.insert(descriptor.key_id);
+                    }
+                }
+                SecretMasterKeySyncRecord::Grant(grant) => {
+                    let descriptor = &grant.descriptor;
+                    let current_generation = current_generation_by_scope
+                        .get(&descriptor.scope_view)
+                        .copied();
+                    if scope_can_still_be_used(descriptor.scope_view)
+                        && current_generation
+                            .is_none_or(|generation| descriptor.generation >= generation)
+                    {
+                        retained_key_ids.insert(descriptor.key_id);
+                    }
+                }
+                SecretMasterKeySyncRecord::Current(current)
+                    if scope_can_still_be_used(current.scope_view) =>
+                {
+                    retained_key_ids.insert(current.key_id);
+                }
+                SecretMasterKeySyncRecord::Current(_) => {}
+            }
+        }
+    }
+
     let mut prune_rows = Vec::new();
     for (row_id, snapshot) in rows {
         let mut has_prunable_record = false;
@@ -446,22 +504,21 @@ async fn prune_unreferenced_secret_master_key_rows(
         for record in snapshot.as_slice() {
             match record {
                 SecretMasterKeySyncRecord::Descriptor(descriptor) => {
-                    if referenced_key_ids.contains(&descriptor.key_id) {
+                    if retained_key_ids.contains(&descriptor.key_id) {
                         has_retained_record = true;
                     } else {
                         has_prunable_record = true;
                     }
                 }
                 SecretMasterKeySyncRecord::Grant(grant) => {
-                    if referenced_key_ids.contains(&grant.descriptor.key_id) {
+                    if retained_key_ids.contains(&grant.descriptor.key_id) {
                         has_retained_record = true;
                     } else {
                         has_prunable_record = true;
                     }
                 }
                 SecretMasterKeySyncRecord::Current(current) => {
-                    if current.scope_view == cluster_view && current.key_id == active_current.key_id
-                    {
+                    if scope_can_still_be_used(current.scope_view) {
                         has_retained_record = true;
                     } else {
                         has_prunable_record = true;
@@ -481,22 +538,6 @@ async fn prune_unreferenced_secret_master_key_rows(
         pruned = pruned.saturating_add(1);
     }
     Ok(pruned)
-}
-
-/// Finds a live cluster operation that still needs to move this node out of its active view.
-///
-/// Transition participants publish target-view master-key rows before the active view changes.
-/// Those rows are required by the transition and must not be classified as stale in that window.
-fn unapplied_transition_from_view(
-    operations: &[ClusterOperationRecord],
-    active_view: crate::cluster::ClusterViewId,
-) -> Option<&ClusterOperationRecord> {
-    operations.iter().find(|operation| {
-        !operation.dry_run
-            && operation.stage != ClusterOperationStage::Aborted
-            && operation.source_views.contains(&active_view)
-            && !operation.target_views.contains(&active_view)
-    })
 }
 
 /// Returns master-key ids referenced by the converged visible secret set.
@@ -534,12 +575,12 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::operations::ClusterOperationKind;
     use crate::cluster::{ClusterId, ClusterViewId};
     use crate::secrets::master_key::envelope::{
         MasterKeyDescriptor, MasterKeyPlaintext, MasterKeyTransfer,
     };
     use crate::secrets::types::{SecretCiphertext, SecretMetadata, SecretValue, SecretVersion};
+    use crate::store::replicated::cluster_views::ClusterViewStore;
     use crate::store::replicated::secret_key_sync::{
         current_from_descriptor, current_row_id, descriptor_row_id, grant_row_id,
         open_secret_master_key_store, upsert_record,
@@ -623,14 +664,15 @@ mod tests {
         assert!(remaining.contains(&next));
     }
 
-    /// Semantic master-key GC must retain target-view rows until the local view transition runs.
+    /// Semantic master-key GC must not guess that an unknown non-active scope is obsolete.
     #[tokio::test]
-    async fn semantic_master_key_gc_waits_for_local_cluster_transition() {
+    async fn semantic_master_key_gc_requires_view_retirement() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Arc::new(redb::Database::create(dir.path().join("gc.redb")).expect("db"));
         let actor = uuid::Uuid::from_u128(1);
         let peer = uuid::Uuid::from_u128(2);
         let secrets = open_secret_store(db.clone(), actor).expect("secret store");
+        let cluster_views = ClusterViewStore::new(db.clone(), actor).expect("cluster-view store");
         let master_keys = open_secret_master_key_store(db, actor).expect("master-key store");
         let progress = SyncGcProgress::new();
         let source_view = ClusterViewId::new(ClusterId::from_uuid(uuid::Uuid::from_u128(100)), 2);
@@ -643,14 +685,12 @@ mod tests {
             SecretMasterKeySyncRecord::Descriptor(source.clone()),
             SecretMasterKeySyncRecord::Current(current_from_descriptor(&source)),
             SecretMasterKeySyncRecord::Descriptor(destination.clone()),
-            SecretMasterKeySyncRecord::Current(current_from_descriptor(&destination)),
             grant_record(&destination),
         ] {
             upsert_record(&master_keys, record)
                 .await
                 .expect("upsert master-key row");
         }
-
         let secrets_root = secrets
             .root_digest_at_version(1)
             .await
@@ -669,49 +709,23 @@ mod tests {
             10,
         );
 
-        let merge = ClusterOperationRecord {
-            id: uuid::Uuid::from_u128(300),
-            kind: ClusterOperationKind::Merge,
-            stage: ClusterOperationStage::Finalized,
-            dry_run: false,
-            created_at_unix_ms: 1,
-            depends_on_operation_id: None,
-            source_views: vec![source_view, destination_view],
-            target_views: vec![destination_view],
-            target_cluster_names: Vec::new(),
-            split_assignments: Vec::new(),
-            split_service_policy: Default::default(),
-            split_network_policy: Default::default(),
-            merge_service_policy: Default::default(),
-            updated_at_unix_ms: 2,
-            details: String::new(),
-        };
-        assert!(
-            unapplied_transition_from_view(std::slice::from_ref(&merge), source_view).is_some()
-        );
-        assert!(
-            unapplied_transition_from_view(std::slice::from_ref(&merge), destination_view)
-                .is_none()
-        );
-
         let pruned = prune_unreferenced_secret_master_key_rows(
             &secrets,
             &master_keys,
             SecretMasterKeyGcContext {
                 progress: &progress,
-                cluster_operations: &[merge],
                 active_remote_peers: &[peer],
                 cluster_view: source_view,
                 root_schema_version: 1,
                 now_unix_ms: 20,
+                cluster_view_store: &cluster_views,
             },
         )
         .await
-        .expect("skip semantic GC during merge transition");
+        .expect("retain rows from unknown scope");
         assert_eq!(pruned, 0);
         for row_id in [
             descriptor_row_id(destination.key_id),
-            current_row_id(destination_view),
             grant_row_id(destination.key_id, uuid::Uuid::from_u128(21)),
         ] {
             let row_id = UuidKey::from(row_id);
@@ -728,23 +742,90 @@ mod tests {
             );
         }
 
-        // With no transition in flight, the same complete barriers authorize pruning all three
-        // unreferenced destination rows. This confirms that the operation guard caused the skip.
+        upsert_record(
+            &master_keys,
+            SecretMasterKeySyncRecord::Current(current_from_descriptor(&destination)),
+        )
+        .await
+        .expect("publish destination current after its key rows");
+        let complete_destination_root = master_keys
+            .root_digest_at_version(1)
+            .await
+            .expect("complete destination root");
+        progress.record_equal_root(
+            peer,
+            Domain::SecretMasterKeys,
+            source_view,
+            1,
+            complete_destination_root,
+            15,
+        );
         let pruned = prune_unreferenced_secret_master_key_rows(
             &secrets,
             &master_keys,
             SecretMasterKeyGcContext {
                 progress: &progress,
-                cluster_operations: &[],
                 active_remote_peers: &[peer],
                 cluster_view: source_view,
                 root_schema_version: 1,
                 now_unix_ms: 20,
+                cluster_view_store: &cluster_views,
             },
         )
         .await
-        .expect("prune after transition guard clears");
+        .expect("retain completed unknown destination scope");
+        assert_eq!(pruned, 0);
+
+        cluster_views
+            .retire_view(destination_view)
+            .await
+            .expect("retire destination view");
+        let retired_root = master_keys
+            .root_digest_at_version(1)
+            .await
+            .expect("retired master-key root");
+        progress.record_equal_root(
+            peer,
+            Domain::SecretMasterKeys,
+            source_view,
+            1,
+            retired_root,
+            20,
+        );
+
+        let pruned = prune_unreferenced_secret_master_key_rows(
+            &secrets,
+            &master_keys,
+            SecretMasterKeyGcContext {
+                progress: &progress,
+                active_remote_peers: &[peer],
+                cluster_view: source_view,
+                root_schema_version: 1,
+                now_unix_ms: 20,
+                cluster_view_store: &cluster_views,
+            },
+        )
+        .await
+        .expect("prune after durable view retirement");
         assert_eq!(pruned, 3);
+        assert!(
+            cluster_views
+                .view_is_retired(destination_view)
+                .expect("read destination retirement"),
+            "view retirement must remain as durable deletion permission"
+        );
+        for row_id in [
+            descriptor_row_id(source.key_id),
+            current_row_id(source_view),
+        ] {
+            assert!(
+                master_keys
+                    .get_snapshot(&UuidKey::from(row_id))
+                    .expect("active source row snapshot")
+                    .is_some(),
+                "active scope must remain usable even when its retirement is visible"
+            );
+        }
     }
 
     /// Builds one encrypted grant row for the provided master-key descriptor.
@@ -774,6 +855,7 @@ mod tests {
         let actor = uuid::Uuid::from_u128(1);
         let peer = uuid::Uuid::from_u128(2);
         let secrets = open_secret_store(db.clone(), actor).expect("secret store");
+        let cluster_views = ClusterViewStore::new(db.clone(), actor).expect("cluster-view store");
         let master_keys = open_secret_master_key_store(db, actor).expect("secret master-key store");
         let progress = SyncGcProgress::new();
         let active_view = ClusterViewId::new(ClusterId::from_uuid(uuid::Uuid::from_u128(100)), 3);
@@ -785,9 +867,12 @@ mod tests {
         let active_key = uuid::Uuid::from_u128(1_000);
         let referenced_key = uuid::Uuid::from_u128(1_001);
         let unreferenced_key = uuid::Uuid::from_u128(1_002);
-        let active = descriptor(active_key, 3, active_view);
+        let mut active = descriptor(active_key, 3, active_view);
         let referenced = descriptor(referenced_key, 2, referenced_view);
         let unreferenced = descriptor(unreferenced_key, 2, unreferenced_view);
+        // Parent ids prove key lineage but do not make replicated parent key material live. Once
+        // the child is current and no secret references its retired parent, GC may remove it.
+        active.parent_key_ids = vec![unreferenced_key];
 
         for record in [
             SecretMasterKeySyncRecord::Descriptor(active.clone()),
@@ -802,6 +887,14 @@ mod tests {
                 .await
                 .expect("upsert master-key row");
         }
+        cluster_views
+            .retire_view(referenced_view)
+            .await
+            .expect("retire referenced view");
+        cluster_views
+            .retire_view(unreferenced_view)
+            .await
+            .expect("retire unreferenced view");
 
         let secret = secret_value("referenced-key-secret", referenced_key, 2);
         secrets
@@ -826,11 +919,11 @@ mod tests {
             &master_keys,
             SecretMasterKeyGcContext {
                 progress: &progress,
-                cluster_operations: &[],
                 active_remote_peers: &[peer],
                 cluster_view: active_view,
                 root_schema_version: 1,
                 now_unix_ms: 20,
+                cluster_view_store: &cluster_views,
             },
         )
         .await
@@ -854,11 +947,11 @@ mod tests {
             &master_keys,
             SecretMasterKeyGcContext {
                 progress: &progress,
-                cluster_operations: &[],
                 active_remote_peers: &[peer],
                 cluster_view: active_view,
                 root_schema_version: 1,
                 now_unix_ms: 20,
+                cluster_view_store: &cluster_views,
             },
         )
         .await
@@ -915,6 +1008,7 @@ mod tests {
         let actor = uuid::Uuid::from_u128(1);
         let peer = uuid::Uuid::from_u128(2);
         let secrets = open_secret_store(db.clone(), actor).expect("secret store");
+        let cluster_views = ClusterViewStore::new(db.clone(), actor).expect("cluster-view store");
         let master_keys = open_secret_master_key_store(db, actor).expect("secret master-key store");
         let progress = SyncGcProgress::new();
         let active_view = ClusterViewId::new(ClusterId::from_uuid(uuid::Uuid::from_u128(100)), 3);
@@ -969,11 +1063,11 @@ mod tests {
             &master_keys,
             SecretMasterKeyGcContext {
                 progress: &progress,
-                cluster_operations: &[],
                 active_remote_peers: &[peer],
                 cluster_view: active_view,
                 root_schema_version: 1,
                 now_unix_ms: 20,
+                cluster_view_store: &cluster_views,
             },
         )
         .await
