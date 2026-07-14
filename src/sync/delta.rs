@@ -361,9 +361,9 @@ async fn run_selected_domain_sync(
         return Ok(());
     }
 
-    // Phase 3: open a local sink, let the remote peer stream missing rows into it, then wake
-    // reconcilers that depend on newly applied domains.
-    open_remote_delta_stream(
+    // Phase 3: open one local sink per bounded request, let the remote peer stream missing rows
+    // into it, then wake reconcilers that depend on newly applied domains.
+    open_remote_delta_streams(
         stores,
         sync_cap,
         scope,
@@ -671,19 +671,45 @@ fn delta_request_batches(
     batches
 }
 
-/// Opens the selective delta stream and feeds remote chunks into a local sink.
-async fn open_remote_delta_stream(
+/// Opens the selective delta streams and feeds remote chunks into independent local sinks.
+async fn open_remote_delta_streams(
     stores: &SyncStores,
     sync_cap: &sync::Client,
     scope: SyncAttemptScope,
     requested_domain_count: usize,
     delta_requests: &[DomainDeltaRequest],
 ) -> Result<(), capnp::Error> {
-    let sink_client: delta_sink::Client = new_client(DeltaSinkImpl::new(
-        stores.clone(),
-        scope.cluster_view,
-        scope.root_schema_version,
-    ));
+    run_delta_request_batches(
+        sync_cap,
+        scope,
+        requested_domain_count,
+        delta_requests,
+        || {
+            new_client(DeltaSinkImpl::new(
+                stores.clone(),
+                scope.cluster_view,
+                scope.root_schema_version,
+            ))
+        },
+    )
+    .await
+}
+
+/// Sends bounded phase-three requests with an independent sink for every request batch.
+///
+/// `DeltaSink::end()` closes one stream, so a sink cannot be reused by a later
+/// `openDeltaForView` call. The factory keeps that lifecycle rule explicit and gives tests a way
+/// to verify it without constructing every replicated store.
+async fn run_delta_request_batches<F>(
+    sync_cap: &sync::Client,
+    scope: SyncAttemptScope,
+    requested_domain_count: usize,
+    delta_requests: &[DomainDeltaRequest],
+    create_sink: F,
+) -> Result<(), capnp::Error>
+where
+    F: Fn() -> delta_sink::Client,
+{
     let batches = delta_request_batches(
         delta_requests,
         DELTA_REQUEST_MAX_ROW_DIGESTS,
@@ -695,17 +721,20 @@ async fn open_remote_delta_stream(
         domains_requested = requested_domain_count,
         delta_wants = delta_requests.len(),
         request_batches = batches.len(),
-        "opening selective delta stream"
+        "opening selective delta streams"
     );
 
     for batch in batches {
+        // Each RPC is one complete stream. Its server calls `end()` before the request resolves,
+        // so the next batch must receive a newly created sink capability.
+        let sink_client = create_sink();
         let mut open_delta_request = sync_cap.open_delta_for_view_request();
         encoding::encode_open_delta_request(
             open_delta_request.get().init_req(),
             scope.cluster_view,
             scope.root_schema_version,
             &delta_requests[batch],
-            sink_client.clone(),
+            sink_client,
         )?;
         open_delta_request.send().promise.await?;
     }
@@ -779,12 +808,73 @@ fn should_notify_master_key_replication(delta_requests: &[DomainDeltaRequest]) -
 #[cfg(test)]
 mod tests {
     use super::{
-        DomainDeltaRequest, bounded_domain_delta_requests, delta_request_batches,
+        DELTA_REQUEST_MAX_WANTS, DomainDeltaRequest, SyncAttemptScope,
+        bounded_domain_delta_requests, delta_request_batches, run_delta_request_batches,
         should_notify_master_key_replication, should_notify_network_attachment_sync,
         should_notify_network_demand_sync,
     };
-    use mantissa_protocol::sync::Domain;
+    use crate::cluster::ClusterViewId;
+    use capnp_rpc::new_client;
+    use mantissa_protocol::sync::{Domain, delta_sink, sync};
     use mantissa_store::{PageDigestRange, RowDigest};
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    /// Test sink that records completion of one phase-three stream.
+    struct TrackedDeltaSink {
+        push_count: Rc<Cell<usize>>,
+        end_count: Rc<Cell<usize>>,
+    }
+
+    impl delta_sink::Server for TrackedDeltaSink {
+        /// Records delivery of the synthetic empty chunk used by the lifecycle test.
+        async fn push_chunk(
+            self: Rc<Self>,
+            _params: delta_sink::PushChunkParams,
+        ) -> Result<(), capnp::Error> {
+            self.push_count.set(self.push_count.get().saturating_add(1));
+            Ok(())
+        }
+
+        /// Records that the server closed this sink's stream.
+        async fn end(
+            self: Rc<Self>,
+            _params: delta_sink::EndParams,
+            _results: delta_sink::EndResults,
+        ) -> Result<(), capnp::Error> {
+            self.end_count.set(self.end_count.get().saturating_add(1));
+            Ok(())
+        }
+    }
+
+    /// Test sync server that records the sink capability received by each phase-three request.
+    struct RecordingSyncService {
+        sinks: Rc<RefCell<Vec<delta_sink::Client>>>,
+        want_counts: Rc<RefCell<Vec<u32>>>,
+    }
+
+    impl sync::Server for RecordingSyncService {
+        /// Closes each received stream after recording its capability and request size.
+        async fn open_delta_for_view(
+            self: Rc<Self>,
+            params: sync::OpenDeltaForViewParams,
+            _results: sync::OpenDeltaForViewResults,
+        ) -> Result<(), capnp::Error> {
+            let (sink, want_count) = {
+                let request = params.get()?.get_req()?;
+                (request.get_sink()?, request.get_wants()?.len())
+            };
+            // Retain the capabilities until the test compares them. Otherwise the allocator may
+            // reuse the first sink's address after its request completes.
+            self.sinks.borrow_mut().push(sink.clone());
+            self.want_counts.borrow_mut().push(want_count);
+            let mut push_request = sink.push_chunk_request();
+            push_request.get().init_chunk();
+            push_request.send().await?;
+            sink.end_request().send().promise.await?;
+            Ok(())
+        }
+    }
 
     /// Builds a test delta request for notification predicate coverage.
     fn delta_request_for(domain: Domain) -> DomainDeltaRequest {
@@ -882,6 +972,50 @@ mod tests {
         let batches = delta_request_batches(&requests, 8192, 256);
 
         assert_eq!(batches, vec![0..3]);
+    }
+
+    /// Every phase-three RPC should own a distinct sink that the server closes exactly once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn multiple_delta_request_batches_use_independent_sinks() {
+        let requests = (0..=DELTA_REQUEST_MAX_WANTS)
+            .map(|_| delta_request_for(Domain::Workloads))
+            .collect::<Vec<_>>();
+        let sinks = Rc::new(RefCell::new(Vec::new()));
+        let want_counts = Rc::new(RefCell::new(Vec::new()));
+        let push_count = Rc::new(Cell::new(0usize));
+        let end_count = Rc::new(Cell::new(0usize));
+        let created_sink_count = Rc::new(Cell::new(0usize));
+        let sync_client: sync::Client = new_client(RecordingSyncService {
+            sinks: sinks.clone(),
+            want_counts: want_counts.clone(),
+        });
+
+        run_delta_request_batches(
+            &sync_client,
+            SyncAttemptScope::new(ClusterViewId::legacy_default(), 1),
+            1,
+            &requests,
+            || {
+                created_sink_count.set(created_sink_count.get().saturating_add(1));
+                new_client(TrackedDeltaSink {
+                    push_count: push_count.clone(),
+                    end_count: end_count.clone(),
+                })
+            },
+        )
+        .await
+        .expect("send multiple delta request batches");
+
+        assert_eq!(want_counts.borrow().as_slice(), &[256, 1]);
+        assert_eq!(created_sink_count.get(), 2);
+        assert_eq!(push_count.get(), 2);
+        assert_eq!(end_count.get(), 2);
+        let sinks = sinks.borrow();
+        assert_eq!(sinks.len(), 2);
+        assert_ne!(
+            sinks[0].client.hook.get_ptr(),
+            sinks[1].client.hook.get_ptr()
+        );
     }
 
     /// Attachment deltas should wake the network controller on the receiving node immediately.
