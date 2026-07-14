@@ -11,11 +11,20 @@ use crate::store::replicated::registry::{EncodedRegisters, EncodedTombstones};
 use crate::sync::gc_progress::SyncGcProgress;
 use capnp_rpc::new_client;
 use mantissa_protocol::sync::{self, Domain, delta_sink};
-use mantissa_store::compute_want_from_have;
+use mantissa_store::{PageDigestRange, RowDigest, compute_want_from_have};
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tracing::{debug, warn};
+
+/// Maximum semantic row digests carried by one phase-three request.
+///
+/// Replicated row keys and digests are both 16 bytes. This keeps the digest payload well below the
+/// Cap'n Proto message limit while matching the existing maximum delta rows per response chunk.
+const DELTA_REQUEST_MAX_ROW_DIGESTS: usize = 8192;
+/// Maximum per-domain wants carried by one phase-three request.
+const DELTA_REQUEST_MAX_WANTS: usize = 256;
 
 /// View and root schema used for one client-side sync attempt.
 ///
@@ -485,21 +494,18 @@ async fn compute_delta_wants_from_range_response(
             scope.cluster_view,
             scope.root_schema_version,
         )?;
-        if let Some(delta_request) =
-            compute_delta_want_for_remote_summary(stores, scope, remote_summary).await?
-        {
-            delta_requests.push(delta_request);
-        }
+        delta_requests
+            .extend(compute_delta_wants_for_remote_summary(stores, scope, remote_summary).await?);
     }
     Ok(delta_requests)
 }
 
-/// Computes the remote key ranges that differ from one local domain.
-async fn compute_delta_want_for_remote_summary(
+/// Computes bounded remote key-range requests for one differing local domain.
+async fn compute_delta_wants_for_remote_summary(
     stores: &SyncStores,
     scope: SyncAttemptScope,
     remote_summary: RemoteDomainRangeSummary,
-) -> Result<Option<DomainDeltaRequest>, capnp::Error> {
+) -> Result<Vec<DomainDeltaRequest>, capnp::Error> {
     let local_ranges = stores
         .page_range_summary_at_version(remote_summary.domain, scope.root_schema_version)
         .await
@@ -507,7 +513,7 @@ async fn compute_delta_want_for_remote_summary(
     let want_ranges =
         compute_want_from_have(&remote_summary.ranges, &local_ranges).map_err(to_capnp)?;
     if want_ranges.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let have_rows = stores
         .row_digests_for_ranges(
@@ -518,11 +524,151 @@ async fn compute_delta_want_for_remote_summary(
         .await
         .map_err(to_capnp)?;
 
-    Ok(Some(DomainDeltaRequest {
-        domain: remote_summary.domain,
+    bounded_domain_delta_requests(
+        remote_summary.domain,
         want_ranges,
         have_rows,
-    }))
+        DELTA_REQUEST_MAX_ROW_DIGESTS,
+    )
+}
+
+/// Splits one domain want into requests whose row digests fit the phase-three count limit.
+///
+/// Every replicated domain uses fixed-width UUID row keys. Splitting immediately after the last
+/// advertised key therefore creates disjoint inclusive ranges without losing remote-only keys
+/// between two local rows.
+fn bounded_domain_delta_requests(
+    domain: Domain,
+    mut want_ranges: Vec<PageDigestRange>,
+    mut have_rows: Vec<RowDigest>,
+    max_row_digests: usize,
+) -> Result<Vec<DomainDeltaRequest>, capnp::Error> {
+    if max_row_digests == 0 {
+        return Err(capnp::Error::failed(
+            "delta request row-digest limit must be greater than zero".to_string(),
+        ));
+    }
+
+    // `diff()` returns non-overlapping ranges. Sorting both inputs lets one linear pass move each
+    // local digest into its requested interval without cloning it.
+    want_ranges.sort_by(|left, right| left.start.cmp(&right.start).then(left.end.cmp(&right.end)));
+    have_rows.sort_by(|left, right| left.key.cmp(&right.key));
+    have_rows.dedup_by(|left, right| left.key == right.key);
+
+    let mut rows = have_rows.into_iter().peekable();
+    let mut requests = Vec::new();
+    for mut range in want_ranges {
+        if range.start > range.end {
+            return Err(capnp::Error::failed(
+                "invalid delta request range: start exceeds end".to_string(),
+            ));
+        }
+        range.hash.clear();
+        while rows.peek().is_some_and(|row| row.key < range.start) {
+            rows.next();
+        }
+
+        let mut range_rows = Vec::new();
+        while rows.peek().is_some_and(|row| row.key <= range.end) {
+            if let Some(row) = rows.next() {
+                range_rows.push(row);
+            }
+        }
+        split_range_by_digest_limit(domain, range, range_rows, max_row_digests, &mut requests)?;
+    }
+    Ok(requests)
+}
+
+/// Divides one inclusive key range without exceeding the row-digest count limit.
+fn split_range_by_digest_limit(
+    domain: Domain,
+    range: PageDigestRange,
+    rows: Vec<RowDigest>,
+    max_row_digests: usize,
+    requests: &mut Vec<DomainDeltaRequest>,
+) -> Result<(), capnp::Error> {
+    if rows.is_empty() {
+        requests.push(DomainDeltaRequest {
+            domain,
+            want_ranges: vec![range],
+            have_rows: Vec::new(),
+        });
+        return Ok(());
+    }
+
+    let range_end = range.end;
+    let mut fragment_start = range.start;
+    let mut rows = rows.into_iter().peekable();
+    while rows.peek().is_some() {
+        let fragment_rows = rows.by_ref().take(max_row_digests).collect::<Vec<_>>();
+
+        let fragment_end = if rows.peek().is_some() {
+            fragment_rows
+                .last()
+                .map(|row| row.key.clone())
+                .ok_or_else(|| capnp::Error::failed("empty delta request fragment".to_string()))?
+        } else {
+            range_end.clone()
+        };
+        requests.push(DomainDeltaRequest {
+            domain,
+            want_ranges: vec![PageDigestRange {
+                start: fragment_start.clone(),
+                end: fragment_end.clone(),
+                hash: Vec::new(),
+            }],
+            have_rows: fragment_rows,
+        });
+
+        if rows.peek().is_some() {
+            fragment_start = next_fixed_width_key(&fragment_end).ok_or_else(|| {
+                capnp::Error::failed("delta request key range cannot advance".to_string())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Returns the next key in the fixed-width big-endian ordering used by replicated UUID rows.
+fn next_fixed_width_key(key: &[u8]) -> Option<Vec<u8>> {
+    let mut next = key.to_vec();
+    for index in (0..next.len()).rev() {
+        if next[index] == u8::MAX {
+            next[index] = 0;
+            continue;
+        }
+        next[index] = next[index].saturating_add(1);
+        return Some(next);
+    }
+    None
+}
+
+/// Groups bounded domain wants into phase-three RPC slices under the count limits.
+fn delta_request_batches(
+    requests: &[DomainDeltaRequest],
+    max_row_digests: usize,
+    max_wants: usize,
+) -> Vec<Range<usize>> {
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    while start < requests.len() {
+        let mut end = start;
+        let mut row_digests = 0usize;
+        while end < requests.len() {
+            let next_row_digests = requests[end].have_rows.len();
+            if end > start
+                && (end.saturating_sub(start) >= max_wants
+                    || row_digests.saturating_add(next_row_digests) > max_row_digests)
+            {
+                break;
+            }
+            row_digests = row_digests.saturating_add(next_row_digests);
+            end = end.saturating_add(1);
+        }
+        batches.push(start..end);
+        start = end;
+    }
+    batches
 }
 
 /// Opens the selective delta stream and feeds remote chunks into a local sink.
@@ -533,29 +679,36 @@ async fn open_remote_delta_stream(
     requested_domain_count: usize,
     delta_requests: &[DomainDeltaRequest],
 ) -> Result<(), capnp::Error> {
-    let sink_client = new_client(DeltaSinkImpl::new(
+    let sink_client: delta_sink::Client = new_client(DeltaSinkImpl::new(
         stores.clone(),
         scope.cluster_view,
         scope.root_schema_version,
     ));
-
-    let mut open_delta_request = sync_cap.open_delta_for_view_request();
-    encoding::encode_open_delta_request(
-        open_delta_request.get().init_req(),
-        scope.cluster_view,
-        scope.root_schema_version,
+    let batches = delta_request_batches(
         delta_requests,
-        sink_client,
-    )?;
-
+        DELTA_REQUEST_MAX_ROW_DIGESTS,
+        DELTA_REQUEST_MAX_WANTS,
+    );
     debug!(
         target: "sync",
         cluster_view = %scope.cluster_view,
         domains_requested = requested_domain_count,
-        domains_with_delta = delta_requests.len(),
+        delta_wants = delta_requests.len(),
+        request_batches = batches.len(),
         "opening selective delta stream"
     );
-    open_delta_request.send().promise.await?;
+
+    for batch in batches {
+        let mut open_delta_request = sync_cap.open_delta_for_view_request();
+        encoding::encode_open_delta_request(
+            open_delta_request.get().init_req(),
+            scope.cluster_view,
+            scope.root_schema_version,
+            &delta_requests[batch],
+            sink_client.clone(),
+        )?;
+        open_delta_request.send().promise.await?;
+    }
     Ok(())
 }
 
@@ -626,11 +779,12 @@ fn should_notify_master_key_replication(delta_requests: &[DomainDeltaRequest]) -
 #[cfg(test)]
 mod tests {
     use super::{
-        DomainDeltaRequest, should_notify_master_key_replication,
-        should_notify_network_attachment_sync, should_notify_network_demand_sync,
+        DomainDeltaRequest, bounded_domain_delta_requests, delta_request_batches,
+        should_notify_master_key_replication, should_notify_network_attachment_sync,
+        should_notify_network_demand_sync,
     };
     use mantissa_protocol::sync::Domain;
-    use mantissa_store::PageDigestRange;
+    use mantissa_store::{PageDigestRange, RowDigest};
 
     /// Builds a test delta request for notification predicate coverage.
     fn delta_request_for(domain: Domain) -> DomainDeltaRequest {
@@ -639,6 +793,95 @@ mod tests {
             want_ranges: Vec::<PageDigestRange>::new(),
             have_rows: Vec::new(),
         }
+    }
+
+    /// Large row-digest lists should become bounded, disjoint requests with complete key coverage.
+    #[test]
+    fn row_digest_requests_are_split_without_range_gaps() {
+        let max_row_digests = 3;
+        let range = PageDigestRange {
+            start: vec![0],
+            end: vec![u8::MAX],
+            hash: Vec::new(),
+        };
+        let rows = (1..=20u8)
+            .map(|key| RowDigest {
+                key: vec![key],
+                digest: [key; 16],
+            })
+            .collect();
+
+        let requests =
+            bounded_domain_delta_requests(Domain::Workloads, vec![range], rows, max_row_digests)
+                .expect("bounded delta requests");
+
+        assert!(requests.len() > 1);
+        let mut previous_end = None;
+        let mut advertised_keys = Vec::new();
+        for request in &requests {
+            assert_eq!(request.want_ranges.len(), 1);
+            assert!(request.have_rows.len() <= max_row_digests);
+            let range = &request.want_ranges[0];
+            if let Some(previous_end) = previous_end {
+                assert_eq!(range.start, vec![previous_end + 1]);
+            } else {
+                assert_eq!(range.start, vec![0]);
+            }
+            previous_end = range.end.first().copied();
+            advertised_keys.extend(request.have_rows.iter().map(|row| row.key.clone()));
+        }
+        assert_eq!(previous_end, Some(u8::MAX));
+        assert_eq!(
+            advertised_keys,
+            (1..=20u8).map(|key| vec![key]).collect::<Vec<_>>()
+        );
+
+        for batch in delta_request_batches(&requests, max_row_digests, 256) {
+            let digest_count = requests[batch]
+                .iter()
+                .map(|request| request.have_rows.len())
+                .sum::<usize>();
+            assert!(digest_count <= max_row_digests);
+        }
+    }
+
+    /// Range splitting should carry into the previous byte without leaving a key gap.
+    #[test]
+    fn fixed_width_key_increment_carries() {
+        assert_eq!(super::next_fixed_width_key(&[1, u8::MAX]), Some(vec![2, 0]));
+        assert_eq!(super::next_fixed_width_key(&[u8::MAX, u8::MAX]), None);
+    }
+
+    /// An empty requester should keep the complete differing range and send no row digests.
+    #[test]
+    fn empty_requester_keeps_complete_delta_range() {
+        let range = PageDigestRange {
+            start: vec![1],
+            end: vec![200],
+            hash: Vec::new(),
+        };
+
+        let requests =
+            bounded_domain_delta_requests(Domain::Services, vec![range.clone()], Vec::new(), 3)
+                .expect("empty requester delta request");
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].want_ranges, vec![range]);
+        assert!(requests[0].have_rows.is_empty());
+    }
+
+    /// Small per-domain wants should continue sharing one phase-three RPC.
+    #[test]
+    fn small_delta_wants_share_one_request_batch() {
+        let requests = vec![
+            delta_request_for(Domain::Workloads),
+            delta_request_for(Domain::Services),
+            delta_request_for(Domain::Peers),
+        ];
+
+        let batches = delta_request_batches(&requests, 8192, 256);
+
+        assert_eq!(batches, vec![0..3]);
     }
 
     /// Attachment deltas should wake the network controller on the receiving node immediately.
