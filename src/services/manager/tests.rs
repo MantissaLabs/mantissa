@@ -430,6 +430,7 @@ fn make_task(
         owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
             service_name,
             template,
+            1,
         ))),
         lease_id: None,
         lease_coordinator_node_id: None,
@@ -469,6 +470,49 @@ fn replica_request_preserves_termination_grace_period() {
     assert_eq!(
         request.pre_stop_command,
         Some(vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()])
+    );
+}
+
+/// Ensures start-first replica requests carry structured slot and handoff provenance.
+#[test]
+fn replica_handoff_request_records_source_slot() {
+    let previous_task_id = Uuid::new_v4();
+    let desired_id = Uuid::new_v4();
+    let template = TaskTemplateSpecValue {
+        name: "api".into(),
+        execution: empty_service_execution("ghcr.io/demo/api:latest"),
+        depends_on: Vec::new(),
+        replicas: 3,
+        readiness: None,
+        public_port: None,
+        public_protocol: None,
+        public_ingress: Default::default(),
+        placement_preferences: Vec::new(),
+        autoscale: None,
+    };
+
+    let request = template.replica_handoff_start_request(
+        "demo-service",
+        4,
+        2,
+        previous_task_id,
+        desired_id,
+        None,
+    );
+    let metadata = request
+        .owner
+        .as_ref()
+        .and_then(WorkloadOwner::as_service_replica)
+        .expect("service ownership metadata");
+
+    assert_eq!(metadata.service_epoch, 4);
+    assert_eq!(metadata.replica, 2);
+    assert_eq!(
+        metadata
+            .handoff
+            .as_ref()
+            .map(|handoff| handoff.previous_task_id),
+        Some(previous_task_id)
     );
 }
 

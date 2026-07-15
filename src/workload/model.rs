@@ -461,21 +461,37 @@ pub struct WorkloadServiceMetadata {
     pub template: String,
     #[serde(default)]
     pub service_epoch: u64,
+    pub replica: u16,
+    pub handoff: Option<WorkloadServiceHandoff>,
+}
+
+/// Immutable provenance for a service replica created by a start-first handoff.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorkloadServiceHandoff {
+    pub previous_task_id: Uuid,
 }
 
 impl WorkloadServiceMetadata {
     /// Builds one service-replica ownership marker from controller identifiers.
-    pub fn new(service_name: impl Into<String>, template: impl Into<String>) -> Self {
+    pub fn new(service_name: impl Into<String>, template: impl Into<String>, replica: u16) -> Self {
         Self {
             service_name: service_name.into(),
             template: template.into(),
             service_epoch: 0,
+            replica,
+            handoff: None,
         }
     }
 
     /// Returns this ownership marker with the service generation set.
     pub fn with_service_epoch(mut self, service_epoch: u64) -> Self {
         self.service_epoch = service_epoch;
+        self
+    }
+
+    /// Returns this ownership marker with start-first handoff provenance attached.
+    pub fn with_handoff(mut self, previous_task_id: Uuid) -> Self {
+        self.handoff = Some(WorkloadServiceHandoff { previous_task_id });
         self
     }
 }
@@ -1985,7 +2001,7 @@ mod tests {
         let spec = test_workload_spec(
             WorkloadPhase::Pending,
             Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
-                "svc", "main",
+                "svc", "main", 1,
             ))),
         );
         assert_eq!(
@@ -2047,7 +2063,7 @@ mod tests {
         let running = test_workload_status(
             WorkloadPhase::Running,
             Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
-                "svc", "main",
+                "svc", "main", 1,
             ))),
         );
         assert_eq!(
@@ -2058,7 +2074,7 @@ mod tests {
         let pulling = test_workload_status(
             WorkloadPhase::Pulling,
             Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
-                "svc", "main",
+                "svc", "main", 1,
             ))),
         );
         assert_eq!(
@@ -2079,7 +2095,7 @@ mod tests {
         let failed = test_workload_spec(
             WorkloadPhase::Failed,
             Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
-                "svc", "main",
+                "svc", "main", 1,
             ))),
         );
         assert_eq!(
@@ -2090,7 +2106,7 @@ mod tests {
         let stopping = test_workload_spec(
             WorkloadPhase::Stopping,
             Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
-                "svc", "main",
+                "svc", "main", 1,
             ))),
         );
         assert_eq!(

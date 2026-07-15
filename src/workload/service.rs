@@ -1161,6 +1161,13 @@ fn write_service_metadata(
     builder.set_service_name(&metadata.service_name);
     builder.set_template_name(&metadata.template);
     builder.set_service_epoch(metadata.service_epoch);
+    builder.set_replica(metadata.replica);
+    if let Some(handoff) = metadata.handoff.as_ref() {
+        builder
+            .reborrow()
+            .init_handoff()
+            .set_previous_task_id(handoff.previous_task_id.as_bytes());
+    }
 }
 
 /// Decodes service ownership metadata from a workload wire payload.
@@ -1174,9 +1181,29 @@ fn read_service_metadata(
             "invalid workload owner: missing service replica metadata".to_string(),
         ));
     }
+    let replica = reader.get_replica();
+    if replica == 0 {
+        return Err(Error::failed(
+            "invalid workload owner: service replica number must be greater than zero".to_string(),
+        ));
+    }
 
-    Ok(WorkloadServiceMetadata::new(service_name, template)
-        .with_service_epoch(reader.get_service_epoch()))
+    let mut metadata = WorkloadServiceMetadata::new(service_name, template, replica)
+        .with_service_epoch(reader.get_service_epoch());
+    if reader.has_handoff() {
+        let handoff = reader.get_handoff()?;
+        let previous_task_id = match handoff.get_previous_task_id() {
+            Ok(bytes) if bytes.len() == 16 => read_id_from_data(bytes)?,
+            _ => {
+                return Err(Error::failed(
+                    "invalid workload owner: missing handoff previous task id".to_string(),
+                ));
+            }
+        };
+        metadata = metadata.with_handoff(previous_task_id);
+    }
+
+    Ok(metadata)
 }
 
 /// Encodes job ownership metadata into a workload wire payload.
@@ -1548,6 +1575,26 @@ mod tests {
             .expect("decode status-only workload store value");
         assert_eq!(decoded, status_only);
         assert!(!decoded.definition_complete);
+    }
+
+    /// Service replica slot and handoff provenance survive the workload store codec.
+    #[test]
+    fn store_value_codec_roundtrips_service_handoff_metadata() {
+        let mut workload = sample_complete_workload_value();
+        let previous_task_id = Uuid::new_v4();
+        workload.owner = Some(WorkloadOwner::ServiceReplica(
+            WorkloadServiceMetadata::new("demo", "api", 3)
+                .with_service_epoch(9)
+                .with_handoff(previous_task_id),
+        ));
+
+        let encoded = workload
+            .encode_store_value()
+            .expect("encode service handoff workload");
+        let decoded =
+            WorkloadValue::decode_store_value(&encoded).expect("decode service handoff workload");
+
+        assert_eq!(decoded, workload);
     }
 
     /// Admission group records should round-trip through the workload-domain store codec.

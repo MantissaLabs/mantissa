@@ -513,7 +513,8 @@ mod tests {
             id: Some(Uuid::from_u128(10_000 + replica_index as u128)),
             slot_ids: Vec::new(),
             owner: Some(WorkloadOwner::ServiceReplica(
-                WorkloadServiceMetadata::new(service_name, "web").with_service_epoch(service_epoch),
+                WorkloadServiceMetadata::new(service_name, "web", 1)
+                    .with_service_epoch(service_epoch),
             )),
             dependency_requirements: Vec::new(),
             service_placement_preferences: Vec::new(),

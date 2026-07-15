@@ -1578,6 +1578,7 @@ fn demo_owned_preference_workload_request(
         owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
             service_name,
             template_name,
+            1,
         ))),
         dependency_requirements: Vec::new(),
         service_placement_preferences: preferences,

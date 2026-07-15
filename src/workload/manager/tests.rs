@@ -1393,7 +1393,7 @@ async fn coordinate_service_shard_assignments_starts_and_reuses_rows() {
         id: Some(task_id),
         slot_ids: Vec::new(),
         owner: Some(WorkloadOwner::ServiceReplica(
-            WorkloadServiceMetadata::new(service_name, "api").with_service_epoch(service_epoch),
+            WorkloadServiceMetadata::new(service_name, "api", 1).with_service_epoch(service_epoch),
         )),
         dependency_requirements: Vec::new(),
         service_placement_preferences: Vec::new(),
@@ -1445,7 +1445,7 @@ async fn coordinate_service_shard_assignments_reuses_existing_row_on_different_t
     let existing_target = Uuid::new_v4();
     let execution = empty_resolved_execution("img");
     let owner = WorkloadOwner::ServiceReplica(
-        WorkloadServiceMetadata::new(service_name, "api").with_service_epoch(service_epoch),
+        WorkloadServiceMetadata::new(service_name, "api", 1).with_service_epoch(service_epoch),
     );
 
     let mut existing = test_task_spec(&manager, "svc-api-1");
@@ -1773,7 +1773,7 @@ async fn running_service_task_on_draining_node_marks_failed_instead_of_restart_p
         networks: Vec::new(),
         ports: Vec::new(),
         owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
-            "svc", "api",
+            "svc", "api", 1,
         ))),
         lease_id: None,
         lease_coordinator_node_id: None,
@@ -1849,7 +1849,7 @@ async fn pending_service_task_on_draining_node_does_not_launch_locally() {
         networks: Vec::new(),
         ports: Vec::new(),
         owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
-            "svc", "api",
+            "svc", "api", 1,
         ))),
         lease_id: None,
         lease_coordinator_node_id: None,
@@ -6403,7 +6403,7 @@ async fn service_runtime_attachments_start_unpublished_until_controller_publishe
         id: None,
         slot_ids: Vec::new(),
         owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
-            "svc", "backend",
+            "svc", "backend", 1,
         ))),
         dependency_requirements: Vec::new(),
         service_placement_preferences: Vec::new(),
@@ -6472,7 +6472,7 @@ async fn set_task_traffic_published_reports_missing_attachments() {
         volumes: Vec::new(),
         ports: Vec::new(),
         owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
-            "svc", "backend",
+            "svc", "backend", 1,
         ))),
         lease_id: None,
         lease_coordinator_node_id: None,
@@ -6558,7 +6558,7 @@ async fn publish_task_traffic_when_ready_waits_for_ready_late_attachment() {
         volumes: Vec::new(),
         ports: Vec::new(),
         owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
-            "svc", "backend",
+            "svc", "backend", 1,
         ))),
         lease_id: None,
         lease_coordinator_node_id: None,
@@ -6698,7 +6698,7 @@ async fn ensure_task_service_traffic_ready_requires_local_network_readiness() {
         volumes: Vec::new(),
         ports: Vec::new(),
         owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
-            "svc", "backend",
+            "svc", "backend", 1,
         ))),
         lease_id: None,
         lease_coordinator_node_id: None,
@@ -7019,7 +7019,7 @@ async fn ensure_task_service_traffic_ready_uses_attachment_node_peer_readiness()
         volumes: Vec::new(),
         ports: Vec::new(),
         owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
-            "svc", "backend",
+            "svc", "backend", 1,
         ))),
         lease_id: None,
         lease_coordinator_node_id: None,
@@ -7461,7 +7461,7 @@ async fn retiring_unavailable_service_workload_removes_remote_attachments() {
     spec.node_id = remote_node_id;
     spec.node_name = "remote-node".to_string();
     spec.owner = Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
-        "svc", "backend",
+        "svc", "backend", 1,
     )));
     manager
         .persist_spec(&spec)
@@ -8304,7 +8304,7 @@ async fn dirty_gossip_flush_keeps_definition_and_latest_status() {
 async fn service_creating_and_running_updates_emit_compact_progress_only() {
     let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
     let service_owner = Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
-        "svc", "api",
+        "svc", "api", 1,
     )));
 
     let service_task_id = Uuid::new_v4();
@@ -8395,6 +8395,7 @@ async fn duplicate_service_progress_does_not_refresh_timestamp_or_gossip() {
     let service_owner = Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
         service_name,
         "api",
+        1,
     )));
 
     let mut running = build_remote_task_spec(
@@ -8607,7 +8608,7 @@ async fn service_progress_cleanup_tombstones_stale_generations() {
         Utc::now().to_rfc3339(),
     );
     epoch_one.owner = Some(WorkloadOwner::ServiceReplica(
-        WorkloadServiceMetadata::new(service_name, "api").with_service_epoch(1),
+        WorkloadServiceMetadata::new(service_name, "api", 1).with_service_epoch(1),
     ));
     manager
         .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(epoch_one)))
@@ -8645,7 +8646,7 @@ async fn service_progress_cleanup_tombstones_stale_generations() {
         Utc::now().to_rfc3339(),
     );
     epoch_four.owner = Some(WorkloadOwner::ServiceReplica(
-        WorkloadServiceMetadata::new(service_name, "api").with_service_epoch(4),
+        WorkloadServiceMetadata::new(service_name, "api", 1).with_service_epoch(4),
     ));
     manager
         .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(epoch_four)))
@@ -8715,7 +8716,7 @@ async fn service_progress_cleanup_tombstones_stale_generations() {
         Utc::now().to_rfc3339(),
     );
     late_epoch_one.owner = Some(WorkloadOwner::ServiceReplica(
-        WorkloadServiceMetadata::new(service_name, "api").with_service_epoch(1),
+        WorkloadServiceMetadata::new(service_name, "api", 1).with_service_epoch(1),
     ));
     manager
         .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(late_epoch_one)))
@@ -8794,7 +8795,7 @@ async fn service_failure_update_still_enters_workload_gossip() {
         Utc::now().to_rfc3339(),
     );
     failed.owner = Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
-        "svc", "api",
+        "svc", "api", 1,
     )));
 
     manager
@@ -9567,6 +9568,7 @@ async fn scheduling_retry_limit_override_fast_fails_retryable_errors() {
         owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
             "demo-service",
             "api",
+            1,
         ))),
         dependency_requirements: Vec::new(),
         service_placement_preferences: Vec::new(),

@@ -799,13 +799,37 @@ impl TaskTemplateSpecValue {
             id: Some(desired_id),
             slot_ids: Vec::new(),
             owner: Some(WorkloadOwner::ServiceReplica(
-                WorkloadServiceMetadata::new(service_name, &self.name)
+                WorkloadServiceMetadata::new(service_name, &self.name, replica)
                     .with_service_epoch(service_epoch),
             )),
             dependency_requirements: Vec::new(),
             service_placement_preferences: self.placement_preferences.clone(),
             target_node,
         }
+    }
+
+    /// Builds a service replica request that records its start-first handoff precondition.
+    pub fn replica_handoff_start_request(
+        &self,
+        service_name: &str,
+        service_epoch: u64,
+        replica: u16,
+        previous_task_id: Uuid,
+        desired_id: Uuid,
+        target_node: Option<Uuid>,
+    ) -> WorkloadStartRequest {
+        let mut request = self.replica_start_request(
+            service_name,
+            service_epoch,
+            replica,
+            desired_id,
+            target_node,
+        );
+        if let Some(WorkloadOwner::ServiceReplica(metadata)) = request.owner.as_mut() {
+            metadata.handoff =
+                Some(crate::workload::model::WorkloadServiceHandoff { previous_task_id });
+        }
+        request
     }
 
     /// Return the port that should be reachable from the host via the network VIP, if one was

@@ -93,6 +93,8 @@ const SERVICE_REBALANCE_MIN_AGE_SECS: i64 = 20;
 const SERVICE_EXTRA_TASK_CLEANUP_MIN_AGE_SECS: i64 = 20;
 /// Cooldown window between rebalance attempts for the same slot.
 const SERVICE_REBALANCE_COOLDOWN_SECS: u64 = 30;
+/// Hard readiness deadline for one start-first service slot handoff.
+const SERVICE_SLOT_CUTOVER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum time to wait for one rollout task to fully stop before id reuse.
 const SERVICE_ROLLOUT_STOP_TIMEOUT_SECS: u64 = 120;
 /// Poll interval while waiting on rollout task readiness transitions.

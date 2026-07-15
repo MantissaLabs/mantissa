@@ -770,6 +770,7 @@ fn catalog_task(
         owner: Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
             service_name,
             "backend",
+            1,
         ))),
         lease_id: None,
         lease_coordinator_node_id: None,

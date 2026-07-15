@@ -224,6 +224,7 @@ fn running_task(task_id: Uuid, node_id: Uuid, service_name: &str, network_id: Uu
         owner: Some(WorkloadOwner::ServiceReplica(TaskServiceMetadata::new(
             service_name,
             "backend",
+            1,
         ))),
         lease_id: None,
         lease_coordinator_node_id: None,

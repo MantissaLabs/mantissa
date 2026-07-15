@@ -129,6 +129,17 @@ struct ServiceMetadata {
 
   serviceEpoch @2 :UInt64;
   # Service generation that produced this workload replica.
+
+  replica @3 :UInt16;
+  # One-based replica number within the task template.
+
+  handoff @4 :ServiceReplicaHandoff;
+  # Start-first handoff that created this workload, when applicable.
+}
+
+struct ServiceReplicaHandoff {
+  previousTaskId @0 :Data;
+  # UUID of the task that occupied this replica slot when the handoff began.
 }
 
 struct JobMetadata {

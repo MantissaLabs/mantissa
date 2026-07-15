@@ -49,6 +49,7 @@ fn replicated_service_task_value(task_id: Uuid, owner_id: Uuid, owner_name: &str
         owner: Some(WorkloadOwner::ServiceReplica(TaskServiceMetadata::new(
             "demo-service",
             "backend",
+            1,
         ))),
         lease_id: None,
         lease_coordinator_node_id: None,

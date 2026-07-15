@@ -11,7 +11,7 @@ use super::state::{
 };
 use super::{
     SERVICE_DEPLOYING_SLOT_VISIBILITY_GRACE_SECS, SERVICE_ENABLE_PROACTIVE_REBALANCE,
-    SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController,
+    SERVICE_SLOT_CUTOVER_TIMEOUT, SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController,
 };
 use crate::services::ownership::{
     ReplicaSlot, SlotKey, build_replica_slots, select_slot_owner, select_task_owner,
@@ -34,9 +34,45 @@ struct SlotReconcileEnv<'a> {
 }
 
 /// Task identities involved in a start-first slot replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SlotReplacementIds {
     previous_task_id: Uuid,
     replacement_task_id: Uuid,
+}
+
+/// One observed task whose handoff still applies to the current service slot assignment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SlotHandoffCandidate {
+    task_id: Uuid,
+    node_id: Uuid,
+}
+
+/// Returns true when generic cleanup must leave a handoff to service-slot reconciliation.
+fn handoff_requires_slot_reconciliation(spec: &ServiceSpecValue, task: &WorkloadSpec) -> bool {
+    task.service_owner().is_some_and(|metadata| {
+        service_metadata_handoff_requires_slot_reconciliation(spec.service_epoch, metadata)
+    })
+}
+
+/// Returns true while handoff metadata is current or ahead of visible service state.
+fn service_metadata_handoff_requires_slot_reconciliation(
+    service_epoch: u64,
+    metadata: &crate::workload::model::WorkloadServiceMetadata,
+) -> bool {
+    metadata.handoff.is_some() && metadata.service_epoch >= service_epoch
+}
+
+/// Chooses an observed handoff deterministically, preferring the current placement target.
+fn select_slot_handoff_candidate(
+    candidates: &[SlotHandoffCandidate],
+    preferred_node: Option<Uuid>,
+) -> Option<SlotHandoffCandidate> {
+    candidates.iter().copied().min_by_key(|candidate| {
+        (
+            preferred_node.is_none_or(|node_id| node_id != candidate.node_id),
+            candidate.task_id,
+        )
+    })
 }
 
 /// Returns the preferred slot target only while the target is still eligible.
@@ -230,6 +266,25 @@ impl ServiceController {
             if !task_age_allows_cleanup(task, self.timing.cleanup_min_age) {
                 continue;
             }
+            if handoff_requires_slot_reconciliation(spec, task) {
+                let Some(metadata) = task.service_owner() else {
+                    continue;
+                };
+                if metadata.service_epoch == spec.service_epoch
+                    && let Some(owner) = select_slot_owner(
+                        spec.id,
+                        &metadata.template,
+                        metadata.replica,
+                        eligible_nodes,
+                    )
+                    && owner != self.local_node_id
+                {
+                    // The slot owner needs the workload row before it can resume or retire this
+                    // handoff. Ask it to pull the row without making hint delivery authoritative.
+                    remote_cleanup_owners.insert(owner);
+                }
+                continue;
+            }
             let Some(owner) = select_task_owner(task.id, eligible_nodes) else {
                 continue;
             };
@@ -335,8 +390,34 @@ impl ServiceController {
                 task_on_draining_node || task_owner_unavailable || !task_state_healthy(&task.state)
             }
         };
+        let handoff_candidates = self
+            .collect_slot_handoff_candidates(
+                spec,
+                slot,
+                task_id,
+                env.inventory,
+                env.health_snapshot,
+            )
+            .await;
 
         if missing {
+            if let Some(candidate) =
+                select_slot_handoff_candidate(&handoff_candidates, preferred_node)
+            {
+                self.resume_slot_handoff(
+                    spec,
+                    slot,
+                    SlotReplacementIds {
+                        previous_task_id: task_id,
+                        replacement_task_id: candidate.task_id,
+                    },
+                    &handoff_candidates,
+                    env.health_snapshot,
+                    key,
+                )
+                .await?;
+                return Ok(());
+            }
             if task_on_draining_node {
                 tracing::debug!(
                     target: "services",
@@ -443,39 +524,60 @@ impl ServiceController {
                 .await;
         }
 
-        // Deployment reconciliation should heal missing/failed slots, but avoid proactive
-        // rebalancing until the service is fully running to prevent startup churn.
-        if spec.status() != ServiceStatus::Running {
-            return Ok(());
-        }
-
-        if !SERVICE_ENABLE_PROACTIVE_REBALANCE {
-            return Ok(());
-        }
-
-        if slot.template.replicas <= 1 {
-            return Ok(());
-        }
-
-        if env.service_degraded {
-            return Ok(());
-        }
-
-        if !task_state_rebalanceable(&task.state) {
-            return Ok(());
-        }
-        if !task_age_allows_rebalance(task, self.timing.rebalance_min_age) {
-            return Ok(());
-        }
-        if !self.rebalance_allowed(key).await {
-            return Ok(());
-        }
-
-        if node_is_down(desired_node, env.health_snapshot) {
-            return Ok(());
-        }
+        let (target_candidates, misplaced_candidates): (Vec<_>, Vec<_>) = handoff_candidates
+            .into_iter()
+            .partition(|candidate| candidate.node_id == desired_node);
+        self.abort_slot_handoff_candidates(
+            &spec.service_name,
+            &misplaced_candidates,
+            None,
+            "handoff no longer matches the converged slot target",
+        )
+        .await;
 
         if desired_node == task.node_id {
+            self.abort_slot_handoff_candidates(
+                &spec.service_name,
+                &target_candidates,
+                None,
+                "replacement no longer needed for current service slot",
+            )
+            .await;
+            return Ok(());
+        }
+
+        // A visible candidate already records a valid handoff from this slot to the converged
+        // target. Resume it independently of local creation gates such as age and cooldown.
+        if let Some(candidate) =
+            select_slot_handoff_candidate(&target_candidates, Some(desired_node))
+        {
+            self.resume_slot_handoff(
+                spec,
+                slot,
+                SlotReplacementIds {
+                    previous_task_id: task_id,
+                    replacement_task_id: candidate.task_id,
+                },
+                &target_candidates,
+                env.health_snapshot,
+                key,
+            )
+            .await?;
+            self.set_rebalance_cooldown(key).await;
+            return Ok(());
+        }
+
+        // Deployment reconciliation heals missing slots only. A healthy slot is moved after the
+        // service is running and every existing rebalance guard agrees on the current target.
+        let should_rebalance = spec.status() == ServiceStatus::Running
+            && SERVICE_ENABLE_PROACTIVE_REBALANCE
+            && slot.template.replicas > 1
+            && !env.service_degraded
+            && task_state_rebalanceable(&task.state)
+            && task_age_allows_rebalance(task, self.timing.rebalance_min_age)
+            && self.rebalance_allowed(key).await
+            && !node_is_down(desired_node, env.health_snapshot);
+        if !should_rebalance {
             return Ok(());
         }
 
@@ -483,6 +585,137 @@ impl ServiceController {
             .await?;
 
         Ok(())
+    }
+
+    /// Collects applicable handoffs and retires rows superseded by the current service slot.
+    async fn collect_slot_handoff_candidates(
+        &self,
+        spec: &ServiceSpecValue,
+        slot: &ReplicaSlot,
+        current_task_id: Uuid,
+        inventory: &TaskInventory,
+        health_snapshot: &HashMap<Uuid, HealthStatus>,
+    ) -> Vec<SlotHandoffCandidate> {
+        let mut candidates = Vec::new();
+        for task in inventory.service_slot_tasks(
+            &spec.service_name,
+            spec.service_epoch,
+            &slot.template.name,
+            slot.replica,
+        ) {
+            if task.id == current_task_id || !task_state_healthy(&task.state) {
+                continue;
+            }
+            let Some(metadata) = task.service_owner() else {
+                continue;
+            };
+            let Some(handoff) = metadata.handoff.as_ref() else {
+                continue;
+            };
+            if handoff.previous_task_id != current_task_id {
+                self.abort_replacement_task_best_effort(
+                    &spec.service_name,
+                    task.id,
+                    "handoff source no longer owns service slot",
+                )
+                .await;
+                continue;
+            }
+
+            let owner_active_cluster_member = self
+                .cluster_registry
+                .peer_value_unscoped(task.node_id)
+                .map(|peer| peer.is_active());
+            if self.node_drain_requested(task.node_id)
+                || service_task_owner_unavailable_for_cleanup(
+                    task.node_id,
+                    self.local_node_id,
+                    health_snapshot,
+                    owner_active_cluster_member,
+                )
+            {
+                self.abort_replacement_task_best_effort(
+                    &spec.service_name,
+                    task.id,
+                    "handoff target is no longer available",
+                )
+                .await;
+                continue;
+            }
+
+            candidates.push(SlotHandoffCandidate {
+                task_id: task.id,
+                node_id: task.node_id,
+            });
+        }
+        candidates
+    }
+
+    /// Resumes one observed handoff and lets the service slot update settle concurrent candidates.
+    async fn resume_slot_handoff(
+        &self,
+        spec: &ServiceSpecValue,
+        slot: &ReplicaSlot,
+        task_ids: SlotReplacementIds,
+        candidates: &[SlotHandoffCandidate],
+        health_snapshot: &HashMap<Uuid, HealthStatus>,
+        key: &SlotKey,
+    ) -> anyhow::Result<()> {
+        if spec.status() == ServiceStatus::Running
+            && let Err(err) = self
+                .publish_task_traffic_for_cutover(
+                    &spec.service_name,
+                    task_ids.replacement_task_id,
+                    SERVICE_SLOT_CUTOVER_TIMEOUT,
+                )
+                .await
+        {
+            self.abort_replacement_task_best_effort(
+                &spec.service_name,
+                task_ids.replacement_task_id,
+                "adopted replacement never became traffic-ready",
+            )
+            .await;
+            return Err(err);
+        }
+
+        if self
+            .settle_slot_replacement(
+                spec,
+                slot,
+                task_ids,
+                health_snapshot,
+                key,
+                "adopted replacement could not claim service slot",
+            )
+            .await?
+        {
+            self.abort_slot_handoff_candidates(
+                &spec.service_name,
+                candidates,
+                Some(task_ids.replacement_task_id),
+                "concurrent replacement lost service slot cutover",
+            )
+            .await;
+        }
+        Ok(())
+    }
+
+    /// Stops observed handoff candidates other than an optional accepted replacement.
+    async fn abort_slot_handoff_candidates(
+        &self,
+        service_name: &str,
+        candidates: &[SlotHandoffCandidate],
+        accepted_task_id: Option<Uuid>,
+        context: &str,
+    ) {
+        for candidate in candidates {
+            if Some(candidate.task_id) == accepted_task_id {
+                continue;
+            }
+            self.abort_replacement_task_best_effort(service_name, candidate.task_id, context)
+                .await;
+        }
     }
 
     /// Starts or restarts a replica slot on the preferred node, falling back only when safe.
@@ -506,10 +739,11 @@ impl ServiceController {
 
         let replacement_task_id = Uuid::new_v4();
         if let Some(preferred_node) = preferred_node {
-            let request = slot.template.replica_start_request(
+            let request = slot.template.replica_handoff_start_request(
                 &spec.service_name,
                 spec.service_epoch,
                 slot.replica,
+                task_id,
                 replacement_task_id,
                 Some(preferred_node),
             );
@@ -534,7 +768,7 @@ impl ServiceController {
                             .publish_task_traffic_for_cutover(
                                 &spec.service_name,
                                 replacement_task_id,
-                                Duration::from_secs(30),
+                                SERVICE_SLOT_CUTOVER_TIMEOUT,
                             )
                             .await
                     {
@@ -587,10 +821,11 @@ impl ServiceController {
             return Ok(());
         }
 
-        let fallback = slot.template.replica_start_request(
+        let fallback = slot.template.replica_handoff_start_request(
             &spec.service_name,
             spec.service_epoch,
             slot.replica,
+            task_id,
             replacement_task_id,
             None,
         );
@@ -616,7 +851,7 @@ impl ServiceController {
                 .publish_task_traffic_for_cutover(
                     &spec.service_name,
                     replacement_task_id,
-                    Duration::from_secs(30),
+                    SERVICE_SLOT_CUTOVER_TIMEOUT,
                 )
                 .await
         {
@@ -703,10 +938,11 @@ impl ServiceController {
         key: &SlotKey,
     ) -> anyhow::Result<()> {
         let replacement_task_id = Uuid::new_v4();
-        let request = slot.template.replica_start_request(
+        let request = slot.template.replica_handoff_start_request(
             &spec.service_name,
             spec.service_epoch,
             slot.replica,
+            task.id,
             replacement_task_id,
             Some(preferred_node),
         );
@@ -727,7 +963,7 @@ impl ServiceController {
             .publish_task_traffic_for_cutover(
                 &spec.service_name,
                 replacement_task_id,
-                Duration::from_secs(30),
+                SERVICE_SLOT_CUTOVER_TIMEOUT,
             )
             .await
         {
@@ -1081,6 +1317,7 @@ impl Drop for SlotGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workload::model::WorkloadServiceMetadata;
     use anyhow::anyhow;
 
     /// Preferred placement keeps the deterministic slot target while the node is usable.
@@ -1108,6 +1345,85 @@ mod tests {
         let health = HashMap::from([(node, HealthStatus::Down)]);
 
         assert_eq!(preferred_slot_node(node, &health, true), None);
+    }
+
+    /// Current-generation handoffs remain owned by slot reconciliation instead of generic cleanup.
+    #[test]
+    fn current_handoff_requires_slot_reconciliation() {
+        let metadata = WorkloadServiceMetadata::new("demo", "api", 2)
+            .with_service_epoch(7)
+            .with_handoff(Uuid::new_v4());
+
+        assert!(service_metadata_handoff_requires_slot_reconciliation(
+            7, &metadata
+        ));
+    }
+
+    /// A workload row may arrive before its newer service row and must not be cleaned early.
+    #[test]
+    fn future_handoff_waits_for_service_state() {
+        let metadata = WorkloadServiceMetadata::new("demo", "api", 2)
+            .with_service_epoch(8)
+            .with_handoff(Uuid::new_v4());
+
+        assert!(service_metadata_handoff_requires_slot_reconciliation(
+            7, &metadata
+        ));
+    }
+
+    /// Superseded generations return to ordinary excess-task cleanup.
+    #[test]
+    fn old_handoff_does_not_block_generic_cleanup() {
+        let metadata = WorkloadServiceMetadata::new("demo", "api", 2)
+            .with_service_epoch(6)
+            .with_handoff(Uuid::new_v4());
+
+        assert!(!service_metadata_handoff_requires_slot_reconciliation(
+            7, &metadata
+        ));
+    }
+
+    /// Candidate selection prefers the converged placement target before UUID ordering.
+    #[test]
+    fn handoff_candidate_selection_prefers_target_node() {
+        let preferred_node = Uuid::from_bytes([9u8; 16]);
+        let other_node = Uuid::from_bytes([8u8; 16]);
+        let smaller_task = Uuid::from_bytes([1u8; 16]);
+        let preferred_task = Uuid::from_bytes([2u8; 16]);
+        let candidates = [
+            SlotHandoffCandidate {
+                task_id: smaller_task,
+                node_id: other_node,
+            },
+            SlotHandoffCandidate {
+                task_id: preferred_task,
+                node_id: preferred_node,
+            },
+        ];
+
+        assert_eq!(
+            select_slot_handoff_candidate(&candidates, Some(preferred_node)),
+            Some(candidates[1])
+        );
+    }
+
+    /// Equivalent candidates use task UUID ordering so every observer makes the same choice.
+    #[test]
+    fn handoff_candidate_selection_is_deterministic() {
+        let node_id = Uuid::from_bytes([9u8; 16]);
+        let smaller = SlotHandoffCandidate {
+            task_id: Uuid::from_bytes([1u8; 16]),
+            node_id,
+        };
+        let larger = SlotHandoffCandidate {
+            task_id: Uuid::from_bytes([2u8; 16]),
+            node_id,
+        };
+
+        assert_eq!(
+            select_slot_handoff_candidate(&[larger, smaller], Some(node_id)),
+            Some(smaller)
+        );
     }
 
     /// Missing remote sessions are retryable cleanup noise during view transitions.

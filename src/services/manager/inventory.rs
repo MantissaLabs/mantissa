@@ -1,9 +1,22 @@
 use super::*;
+use crate::services::types::{compute_service_id, derive_service_replica_id};
+use crate::workload::model::WorkloadServiceMetadata;
+
+/// Derives the compact inventory key shared by metadata and service-slot lookups.
+fn service_replica_inventory_key(metadata: &WorkloadServiceMetadata) -> Uuid {
+    derive_service_replica_id(
+        compute_service_id(&metadata.service_name),
+        metadata.service_epoch,
+        &metadata.template,
+        metadata.replica,
+    )
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct TaskInventory {
     pub(super) by_id: HashMap<Uuid, WorkloadSpec>,
     pub(super) by_service: HashMap<String, Vec<Uuid>>,
+    by_service_slot: HashMap<Uuid, Vec<Uuid>>,
 }
 
 impl TaskInventory {
@@ -11,6 +24,7 @@ impl TaskInventory {
     pub(super) fn from_specs(specs: Vec<WorkloadSpec>) -> Self {
         let mut by_id = HashMap::with_capacity(specs.len());
         let mut by_service: HashMap<String, Vec<Uuid>> = HashMap::new();
+        let mut by_service_slot: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
 
         for spec in specs {
             let task_id = spec.id;
@@ -19,11 +33,44 @@ impl TaskInventory {
                     .entry(meta.service_name.clone())
                     .or_default()
                     .push(task_id);
+                by_service_slot
+                    .entry(service_replica_inventory_key(meta))
+                    .or_default()
+                    .push(task_id);
             }
             by_id.insert(task_id, spec);
         }
 
-        Self { by_id, by_service }
+        for task_ids in by_service_slot.values_mut() {
+            task_ids.sort_unstable();
+        }
+
+        Self {
+            by_id,
+            by_service,
+            by_service_slot,
+        }
+    }
+
+    /// Iterates tasks observed for one exact service replica slot and generation.
+    pub(super) fn service_slot_tasks(
+        &self,
+        service_name: &str,
+        service_epoch: u64,
+        template: &str,
+        replica: u16,
+    ) -> impl Iterator<Item = &WorkloadSpec> {
+        let key = derive_service_replica_id(
+            compute_service_id(service_name),
+            service_epoch,
+            template,
+            replica,
+        );
+        self.by_service_slot
+            .get(&key)
+            .into_iter()
+            .flat_map(|task_ids| task_ids.iter())
+            .filter_map(|task_id| self.by_id.get(task_id))
     }
 
     /// Builds a reusable, service-scoped task view combining desired and observed task ids.

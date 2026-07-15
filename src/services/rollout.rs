@@ -344,13 +344,23 @@ fn build_replacement_requests(
                 replacement.replica,
             );
             let target_node = slot_targets.get(&key).copied();
-            replacement.template.replica_start_request(
-                context.service_name,
-                context.service_epoch,
-                replacement.replica,
-                replacement.desired_id,
-                target_node,
-            )
+            match replacement.previous.as_ref() {
+                Some(previous) => replacement.template.replica_handoff_start_request(
+                    context.service_name,
+                    context.service_epoch,
+                    replacement.replica,
+                    previous.task_id,
+                    replacement.desired_id,
+                    target_node,
+                ),
+                None => replacement.template.replica_start_request(
+                    context.service_name,
+                    context.service_epoch,
+                    replacement.replica,
+                    replacement.desired_id,
+                    target_node,
+                ),
+            }
         })
         .collect())
 }
