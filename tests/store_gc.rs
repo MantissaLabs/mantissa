@@ -403,6 +403,7 @@ fn volume_node_value(
         Some("/tmp/mantissa-volume".to_string()),
         state,
         Some(1024),
+        0,
     );
     value.updated_at = "2026-04-27T00:10:00Z".to_string();
     value

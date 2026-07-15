@@ -340,6 +340,7 @@ pub struct VolumeNodeStatus {
     pub published_task_ids: Vec<String>,
     pub updated_at: String,
     pub last_error: Option<String>,
+    pub volume_epoch: u64,
 }
 
 impl From<ClientVolumeNodeStatus> for VolumeNodeStatus {
@@ -361,6 +362,7 @@ impl From<ClientVolumeNodeStatus> for VolumeNodeStatus {
                 .collect(),
             updated_at: value.updated_at,
             last_error: value.last_error,
+            volume_epoch: value.volume_epoch,
         }
     }
 }

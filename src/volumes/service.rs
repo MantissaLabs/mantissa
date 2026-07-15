@@ -78,6 +78,46 @@ impl VolumesRpc {
             .ok_or_else(|| Error::failed(format!("unknown volume {selector}")))
     }
 
+    /// Resolves a selector while retaining access to an in-progress or completed delete marker.
+    fn resolve_spec_by_selector_including_deleting(
+        &self,
+        selector: &str,
+    ) -> Result<VolumeSpecValue, Error> {
+        if let Ok(id) = Uuid::parse_str(selector)
+            && let Some(value) = self
+                .registry
+                .get_spec_including_deleting(id)
+                .map_err(to_capnp)?
+        {
+            return Ok(value);
+        }
+
+        self.registry
+            .get_spec_by_name_including_deleting(selector)
+            .map_err(to_capnp)?
+            .ok_or_else(|| Error::failed(format!("unknown volume {selector}")))
+    }
+
+    /// Returns the completed generation a create may supersede, rejecting live or deleting rows.
+    fn deleted_generation_for_recreate(
+        &self,
+        name: &str,
+    ) -> Result<Option<VolumeSpecValue>, Error> {
+        match self
+            .registry
+            .get_spec_by_name_including_deleting(name)
+            .map_err(to_capnp)?
+        {
+            Some(spec) if spec.is_deleted() => Ok(Some(spec)),
+            Some(spec) if spec.is_deleting() => Err(Error::failed(format!(
+                "volume '{}' deletion is still in progress",
+                spec.name
+            ))),
+            Some(_) => Err(Error::failed(format!("volume '{name}' already exists"))),
+            None => Ok(None),
+        }
+    }
+
     /// Resolves one bound-node identifier into the canonical node id and hostname.
     fn resolve_bound_node(&self, node_id: Uuid) -> Result<(Uuid, String), Error> {
         let peer = self
@@ -366,6 +406,7 @@ fn write_volume_node_status(
     }
     builder.set_updated_at(&value.updated_at);
     builder.set_last_error(value.last_error.as_deref().unwrap_or(""));
+    builder.set_volume_epoch(value.volume_epoch);
 }
 
 /// Deserializes one node-local volume state row from the Cap'n Proto wire representation.
@@ -389,6 +430,7 @@ fn read_volume_node_status(
         published_task_ids,
         updated_at: reader.get_updated_at()?.to_str()?.to_string(),
         last_error: empty_means_none(reader.get_last_error()?.to_str()?.trim()),
+        volume_epoch: reader.get_volume_epoch(),
     })
 }
 
@@ -477,10 +519,6 @@ pub(crate) fn write_volume_event(
             builder.set_event(volume_event::EventType::Upsert);
             write_volume_spec(builder.reborrow().init_spec(), value);
         }
-        VolumeEvent::Remove(id) => {
-            builder.set_event(volume_event::EventType::Remove);
-            builder.set_volume_id(id.as_bytes());
-        }
         VolumeEvent::NodeUpsert(value) => {
             builder.set_event(volume_event::EventType::NodeUpsert);
             write_volume_node_status(builder.reborrow().init_node_state(), value);
@@ -499,10 +537,6 @@ pub(crate) fn read_volume_event(reader: volume_event::Reader<'_>) -> Result<Volu
         volume_event::EventType::Upsert => Ok(VolumeEvent::Upsert(Box::new(read_volume_spec(
             reader.get_spec()?,
         )?))),
-        volume_event::EventType::Remove => Ok(VolumeEvent::Remove(read_uuid(
-            reader.get_volume_id()?,
-            "volume id",
-        )?)),
         volume_event::EventType::NodeUpsert => Ok(VolumeEvent::NodeUpsert(Box::new(
             read_volume_node_status(reader.get_node_state()?)?,
         ))),
@@ -538,14 +572,7 @@ impl volumes::Server for VolumesRpc {
 
         let request = params.get()?.get_request()?;
         let name = Self::read_non_empty_text(request.get_name()?, "name")?;
-        if self
-            .registry
-            .get_spec_by_name(&name)
-            .map_err(to_capnp)?
-            .is_some()
-        {
-            return Err(Error::failed(format!("volume '{name}' already exists")));
-        }
+        let deleted_generation = self.deleted_generation_for_recreate(&name)?;
 
         let driver = read_volume_driver(request.get_driver()?)?;
         match &driver {
@@ -589,7 +616,7 @@ impl volumes::Server for VolumesRpc {
             (None, None)
         };
 
-        let spec = VolumeSpecValue::new(VolumeSpecDraft {
+        let mut spec = VolumeSpecValue::new(VolumeSpecDraft {
             name,
             driver,
             access_mode,
@@ -600,6 +627,9 @@ impl volumes::Server for VolumesRpc {
             bound_node_id: resolved_node_id,
             bound_node_name: resolved_node_name.clone(),
         });
+        if let Some(previous) = deleted_generation.as_ref() {
+            spec.recreate_after(previous);
+        }
         self.registry
             .upsert_spec(spec.clone())
             .await
@@ -617,6 +647,7 @@ impl volumes::Server for VolumesRpc {
                 None,
                 VolumeNodeState::Pending,
                 spec.requested_bytes,
+                spec.volume_epoch,
             );
             self.registry
                 .upsert_node_state(state.clone())
@@ -645,14 +676,7 @@ impl volumes::Server for VolumesRpc {
 
         let request = params.get()?.get_request()?;
         let name = Self::read_non_empty_text(request.get_name()?, "name")?;
-        if self
-            .registry
-            .get_spec_by_name(&name)
-            .map_err(to_capnp)?
-            .is_some()
-        {
-            return Err(Error::failed(format!("volume '{name}' already exists")));
-        }
+        let deleted_generation = self.deleted_generation_for_recreate(&name)?;
 
         let node_id = read_uuid(request.get_node_id()?, "node id")?;
         let (node_id, node_name) = self.resolve_bound_node(node_id)?;
@@ -690,6 +714,9 @@ impl volumes::Server for VolumesRpc {
             bound_node_id: Some(node_id),
             bound_node_name: Some(node_name.clone()),
         });
+        if let Some(previous) = deleted_generation.as_ref() {
+            spec.recreate_after(previous);
+        }
         spec.status = crate::volumes::types::VolumeStatus::Ready;
         self.registry
             .upsert_spec(spec.clone())
@@ -707,6 +734,7 @@ impl volumes::Server for VolumesRpc {
             Some(path),
             VolumeNodeState::Ready,
             spec.requested_bytes,
+            spec.volume_epoch,
         );
         self.registry
             .upsert_node_state(state.clone())
@@ -733,11 +761,18 @@ impl volumes::Server for VolumesRpc {
         self.ensure_mutation_allowed("delete volumes")?;
 
         let selector = Self::read_non_empty_text(params.get()?.get_selector()?, "selector")?;
-        let spec = self.resolve_spec_by_selector(&selector)?;
+        let mut spec = self.resolve_spec_by_selector_including_deleting(&selector)?;
         let node_states = self
             .registry
             .list_node_states_for_volume(spec.id)
             .map_err(to_capnp)?;
+        if spec.is_deleted() {
+            let mut result = results.get().init_result();
+            result.set_preserved_path("");
+            result.set_deleted_data(false);
+            return Ok(());
+        }
+
         if let Some(blocker) = node_states
             .iter()
             .find(|state| !state.published_task_ids.is_empty())
@@ -756,16 +791,26 @@ impl volumes::Server for VolumesRpc {
             )
         ) {
             let local_node_id = self.topology.self_id();
-            if let Some(owner) = node_states
-                .iter()
-                .find(|state| state.node_id != local_node_id)
-            {
+            if let Some(owner_id) = spec.bound_node_id.filter(|id| *id != local_node_id) {
+                let owner_name = spec.bound_node_name.as_deref().unwrap_or("unknown");
                 return Err(Error::failed(format!(
                     "destructive delete for managed local volume '{}' must be executed on owning node {} ({})",
-                    spec.name, owner.node_name, owner.node_id
+                    spec.name, owner_name, owner_id
                 )));
             }
         }
+
+        if !spec.is_deleting() {
+            spec.mark_deleting();
+            self.registry
+                .upsert_spec(spec.clone())
+                .await
+                .map_err(to_capnp)?;
+        }
+        self.replicator
+            .broadcast(VolumeEvent::Upsert(Box::new(spec.clone())))
+            .await
+            .map_err(to_capnp)?;
 
         let mut deleted_data = false;
         let mut preserved_path = None;
@@ -776,9 +821,13 @@ impl volumes::Server for VolumesRpc {
                         VolumeDriver::Local(LocalVolumeSpec::Managed { .. }),
                         VolumeReclaimPolicy::Delete,
                     ) => {
-                        if Path::new(path).exists() {
-                            fs::remove_dir_all(path).map_err(to_capnp)?;
-                            deleted_data = true;
+                        match fs::remove_dir_all(path) {
+                            Ok(()) => deleted_data = true,
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                                // Cleanup is idempotent so retries can finish a persisted delete.
+                                deleted_data = true;
+                            }
+                            Err(err) => return Err(to_capnp(err)),
                         }
                     }
                     _ => {
@@ -798,9 +847,13 @@ impl volumes::Server for VolumesRpc {
                 .await
                 .map_err(to_capnp)?;
         }
-        self.registry.remove_spec(spec.id).await.map_err(to_capnp)?;
+        spec.mark_deleted();
+        self.registry
+            .upsert_spec(spec.clone())
+            .await
+            .map_err(to_capnp)?;
         self.replicator
-            .broadcast(VolumeEvent::Remove(spec.id))
+            .broadcast(VolumeEvent::Upsert(Box::new(spec)))
             .await
             .map_err(to_capnp)?;
 
@@ -901,8 +954,13 @@ mod tests {
     /// Builds one deterministic volume node-state row used by store codec tests.
     fn sample_volume_node_state(volume_id: Uuid) -> VolumeNodeStateValue {
         let node_id = Uuid::new_v4();
+        let volume_epoch = 3;
         VolumeNodeStateValue {
-            id: crate::volumes::types::compute_volume_node_state_id(volume_id, node_id),
+            id: crate::volumes::types::compute_volume_node_state_id(
+                volume_id,
+                node_id,
+                volume_epoch,
+            ),
             volume_id,
             node_id,
             node_name: "node-a".to_string(),
@@ -913,6 +971,7 @@ mod tests {
             published_task_ids: vec![Uuid::new_v4()],
             updated_at: "2026-03-25T12:02:00Z".to_string(),
             last_error: None,
+            volume_epoch,
         }
     }
 

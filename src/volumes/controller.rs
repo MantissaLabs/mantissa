@@ -78,6 +78,17 @@ impl VolumeController {
 
     /// Materializes one local-driver volume and reports readiness or error through the node-state row.
     async fn reconcile_one_local_volume(&self, mut spec: VolumeSpecValue) -> Result<()> {
+        let Some(current_spec) = self.registry.get_spec_including_deleting(spec.id)? else {
+            return Ok(());
+        };
+        if current_spec.is_delete_marker()
+            || current_spec.volume_epoch != spec.volume_epoch
+            || current_spec.bound_node_id != Some(self.local_node_id)
+        {
+            return Ok(());
+        }
+        spec = current_spec;
+
         let current = self
             .registry
             .get_node_state(spec.id, self.local_node_id)?
@@ -89,6 +100,7 @@ impl VolumeController {
                     None,
                     VolumeNodeState::Pending,
                     spec.requested_bytes,
+                    spec.volume_epoch,
                 )
             });
 
@@ -123,6 +135,7 @@ impl VolumeController {
                         || spec.message.as_deref() != Some(message.as_str())
                     {
                         spec.status = VolumeStatus::Failed;
+                        spec.phase_version = spec.phase_version.saturating_add(1);
                         spec.reason = Some("capacity_exceeded".to_string());
                         spec.message = Some(message);
                         spec.updated_at = Utc::now().to_rfc3339();
@@ -146,6 +159,7 @@ impl VolumeController {
                     VolumeStatus::Pending | VolumeStatus::Bound | VolumeStatus::Failed
                 ) {
                     spec.status = VolumeStatus::Ready;
+                    spec.phase_version = spec.phase_version.saturating_add(1);
                     spec.reason = None;
                     spec.message = Some("local volume realized".to_string());
                     spec.updated_at = Utc::now().to_rfc3339();
@@ -163,6 +177,7 @@ impl VolumeController {
                     || spec.reason.as_deref() != Some("local_realization_failed")
                 {
                     spec.status = VolumeStatus::Failed;
+                    spec.phase_version = spec.phase_version.saturating_add(1);
                     spec.reason = Some("local_realization_failed".to_string());
                     spec.message = Some(err.to_string());
                     spec.updated_at = Utc::now().to_rfc3339();

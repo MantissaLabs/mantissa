@@ -59,6 +59,9 @@ enum VolumeStatus {
 
   failed @5;
   # Volume encountered an unrecoverable control-plane error.
+
+  deleted @6;
+  # Volume deletion completed. Retained as replicated lifecycle evidence.
 }
 
 enum VolumeNodeState {
@@ -231,6 +234,9 @@ struct VolumeNodeStatus {
 
   lastError @10 :Text;
   # Last node-local error, empty when none.
+
+  volumeEpoch @11 :UInt64;
+  # Parent volume generation this node-status row belongs to.
 }
 
 struct VolumeSummary {
@@ -343,23 +349,17 @@ struct VolumeEvent {
   nodeState @2 :VolumeNodeStatus;
   # Volume node-state payload for upserts.
 
-  volumeId @3 :Data;
-  # 16-byte UUID of the volume for spec removals.
-
-  nodeStateId @4 :Data;
+  nodeStateId @3 :Data;
   # 16-byte UUID of the node-state row for removals.
 
   enum EventType {
     upsert @0;
     # Volume object upsert.
 
-    remove @1;
-    # Volume object removal.
-
-    nodeUpsert @2;
+    nodeUpsert @1;
     # Node-state row upsert.
 
-    nodeRemove @3;
+    nodeRemove @2;
     # Node-state row removal.
   }
 }

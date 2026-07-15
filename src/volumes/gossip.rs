@@ -54,7 +54,6 @@ impl VolumeReplicator {
     async fn apply_event(&self, event: VolumeEvent) -> Result<()> {
         match event {
             VolumeEvent::Upsert(value) => self.registry.upsert_spec(*value).await?,
-            VolumeEvent::Remove(id) => self.registry.remove_spec(id).await?,
             VolumeEvent::NodeUpsert(value) => self.registry.upsert_node_state(*value).await?,
             VolumeEvent::NodeRemove(id) => self.registry.remove_node_state(id).await?,
         }

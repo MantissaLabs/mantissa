@@ -149,6 +149,7 @@ pub enum VolumeStatus {
     InUse,
     Deleting,
     Failed,
+    Deleted,
 }
 
 impl VolumeStatus {
@@ -161,6 +162,7 @@ impl VolumeStatus {
             ProtoVolumeStatus::InUse => Self::InUse,
             ProtoVolumeStatus::Deleting => Self::Deleting,
             ProtoVolumeStatus::Failed => Self::Failed,
+            ProtoVolumeStatus::Deleted => Self::Deleted,
         }
     }
 }
@@ -175,6 +177,7 @@ impl fmt::Display for VolumeStatus {
             Self::InUse => f.write_str("in_use"),
             Self::Deleting => f.write_str("deleting"),
             Self::Failed => f.write_str("failed"),
+            Self::Deleted => f.write_str("deleted"),
         }
     }
 }
@@ -274,6 +277,7 @@ pub struct VolumeNodeStatus {
     pub published_task_ids: Vec<Uuid>,
     pub updated_at: String,
     pub last_error: Option<String>,
+    pub volume_epoch: u64,
 }
 
 /// Client-side inspect payload returned by `get` and `getStatus`.
@@ -369,6 +373,7 @@ impl VolumeNodeStatus {
             published_task_ids,
             updated_at: reader.get_updated_at()?.to_str()?.to_string(),
             last_error: empty_text(reader.get_last_error()?.to_str()?),
+            volume_epoch: reader.get_volume_epoch(),
         })
     }
 }

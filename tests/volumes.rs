@@ -1158,6 +1158,13 @@ local_test!(volume_delete_delete_requires_owning_node, {
         "owning node should realize managed local path before delete"
     );
 
+    let mut stale_controller_spec = cluster[1]
+        .node
+        .volume_registry
+        .get_spec(volume_id)
+        .expect("load live volume before delete")
+        .expect("live volume should exist before delete");
+
     let mut request = cluster[0].node.volumes_client.delete_request();
     request.get().set_selector("remote-delete");
     let err = match request.send().promise.await {
@@ -1201,6 +1208,60 @@ local_test!(volume_delete_delete_requires_owning_node, {
         )
         .await,
         "owning node delete should remove the volume object cluster-wide"
+    );
+
+    for node in &cluster {
+        let marker = node
+            .node
+            .volume_registry
+            .get_spec_including_deleting(volume_id)
+            .expect("load retained volume deletion marker")
+            .expect("volume deletion marker should converge");
+        assert!(marker.is_deleted(), "volume cleanup should be complete");
+    }
+
+    stale_controller_spec.phase_version = u64::MAX;
+    stale_controller_spec.updated_at = "9999-12-31T23:59:59Z".to_string();
+    for node in &cluster {
+        node.node
+            .volume_registry
+            .upsert_spec(stale_controller_spec.clone())
+            .await
+            .expect("attempt stale post-delete controller write");
+        assert!(
+            node.node
+                .volume_registry
+                .get_spec(volume_id)
+                .expect("lookup after stale controller write")
+                .is_none(),
+            "a stale controller write must not resurrect a deleted volume"
+        );
+    }
+
+    let recreated_id = create_immediate_managed_volume_on_node(
+        &cluster[0].node.volumes_client,
+        "remote-delete",
+        cluster[1].id(),
+        mantissa_protocol::volumes::VolumeReclaimPolicy::Delete,
+    )
+    .await;
+    assert_eq!(recreated_id, volume_id, "volume names keep stable ids");
+    assert!(
+        wait_until(
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+            || async {
+                cluster.iter().all(|node| {
+                    node.node
+                        .volume_registry
+                        .get_spec(volume_id)
+                        .expect("lookup recreated volume")
+                        .is_some_and(|spec| spec.volume_epoch == 1)
+                })
+            }
+        )
+        .await,
+        "recreation should converge as a new volume generation"
     );
 });
 

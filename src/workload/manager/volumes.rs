@@ -162,6 +162,7 @@ impl WorkloadManager {
                         None,
                         VolumeNodeState::Pending,
                         spec.requested_bytes,
+                        spec.volume_epoch,
                     );
                     self.upsert_volume_node_state(state).await?;
                 }
@@ -309,6 +310,7 @@ impl WorkloadManager {
                     None,
                     VolumeNodeState::Pending,
                     spec.requested_bytes,
+                    spec.volume_epoch,
                 )
             });
         if matches!(current.state, VolumeNodeState::Error) {
