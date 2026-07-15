@@ -1,6 +1,6 @@
 use crate::agents::types::{
-    AgentRecordValue, AgentRunSpecValue, AgentRunStatus, AgentSessionSpecValue, AgentSessionStatus,
-    parse_timestamp,
+    AgentRecordValue, AgentRunSpecValue, AgentRunStatusRank, AgentSessionSpecValue,
+    AgentSessionStatusRank, parse_timestamp,
 };
 use crate::store::replicated::open::open_arc_store;
 use chrono::{DateTime, Utc};
@@ -28,22 +28,30 @@ impl TableSet for AgentTables {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum AgentRecordCompactionRank {
     /// Rank for durable session control-plane records.
-    Session(
-        u64,
-        u64,
-        u8,
-        Option<DateTime<Utc>>,
-        Uuid,
-        Box<Reverse<AgentSessionSpecValue>>,
-    ),
+    Session(AgentSessionCompactionRankValue),
     /// Rank for durable run records launched from agent sessions.
-    Run(
-        u64,
-        u8,
-        Option<DateTime<Utc>>,
-        Uuid,
-        Box<Reverse<AgentRunSpecValue>>,
-    ),
+    Run(AgentRunCompactionRankValue),
+}
+
+/// Ordering fields for replicated agent session rows.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct AgentSessionCompactionRankValue {
+    event_sequence: u64,
+    phase_version: u64,
+    status: AgentSessionStatusRank,
+    updated_at: Option<DateTime<Utc>>,
+    id: Uuid,
+    tie_breaker: Box<Reverse<AgentSessionSpecValue>>,
+}
+
+/// Ordering fields for replicated agent run rows.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct AgentRunCompactionRankValue {
+    phase_version: u64,
+    status: AgentRunStatusRank,
+    updated_at: Option<DateTime<Utc>>,
+    id: Uuid,
+    tie_breaker: Box<Reverse<AgentRunSpecValue>>,
 }
 
 /// Agent compaction ranker used by the generic MVReg adapter.
@@ -55,45 +63,26 @@ impl MvRegCompactionRanker<AgentRecordValue, Uuid> for AgentCompactionRank {
     /// Ranks one agent record using the same lifecycle fields as the registry selector.
     fn rank(entry: &MvRegEntry<AgentRecordValue, Uuid>) -> Self::Rank {
         match entry.value() {
-            AgentRecordValue::Session(value) => AgentRecordCompactionRank::Session(
-                value.event_sequence,
-                value.phase_version,
-                agent_session_status_rank(value.status),
-                parse_timestamp(&value.updated_at),
-                value.id,
-                Box::new(Reverse(value.as_ref().clone())),
-            ),
-            AgentRecordValue::Run(value) => AgentRecordCompactionRank::Run(
-                value.phase_version,
-                agent_run_status_rank(value.status),
-                parse_timestamp(&value.updated_at),
-                value.id,
-                Box::new(Reverse(value.as_ref().clone())),
-            ),
+            AgentRecordValue::Session(value) => {
+                AgentRecordCompactionRank::Session(AgentSessionCompactionRankValue {
+                    event_sequence: value.event_sequence,
+                    phase_version: value.phase_version,
+                    status: value.status.precedence_rank(),
+                    updated_at: parse_timestamp(&value.updated_at),
+                    id: value.id,
+                    tie_breaker: Box::new(Reverse(value.as_ref().clone())),
+                })
+            }
+            AgentRecordValue::Run(value) => {
+                AgentRecordCompactionRank::Run(AgentRunCompactionRankValue {
+                    phase_version: value.phase_version,
+                    status: value.status.precedence_rank(),
+                    updated_at: parse_timestamp(&value.updated_at),
+                    id: value.id,
+                    tie_breaker: Box::new(Reverse(value.as_ref().clone())),
+                })
+            }
         }
-    }
-}
-
-/// Returns the stable lifecycle precedence used to compact concurrent session values.
-fn agent_session_status_rank(status: AgentSessionStatus) -> u8 {
-    match status {
-        AgentSessionStatus::Closed => 6,
-        AgentSessionStatus::Closing => 5,
-        AgentSessionStatus::Failed => 4,
-        AgentSessionStatus::Running => 3,
-        AgentSessionStatus::Queued => 2,
-        AgentSessionStatus::WaitingInput => 1,
-    }
-}
-
-/// Returns the stable lifecycle precedence used to compact concurrent run values.
-fn agent_run_status_rank(status: AgentRunStatus) -> u8 {
-    match status {
-        AgentRunStatus::Succeeded => 5,
-        AgentRunStatus::Failed => 4,
-        AgentRunStatus::Cancelled => 3,
-        AgentRunStatus::Running => 2,
-        AgentRunStatus::Pending => 1,
     }
 }
 

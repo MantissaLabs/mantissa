@@ -1,5 +1,6 @@
 use crate::cluster::operations::{
-    ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage, MergeServicePolicy,
+    ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage, ClusterOperationStageRank,
+    MergeServicePolicy,
 };
 use crate::cluster::transition::ClusterTransition;
 use crate::cluster::{ClusterId, ClusterViewId};
@@ -213,7 +214,9 @@ impl Topology {
     }
 
     /// Maps operation stage values into a monotonic ordering used for conflict resolution.
-    pub(in crate::topology) fn stage_rank(stage: ClusterOperationStage) -> u8 {
+    pub(in crate::topology) fn stage_rank(
+        stage: ClusterOperationStage,
+    ) -> ClusterOperationStageRank {
         stage.rank()
     }
 

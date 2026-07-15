@@ -270,6 +270,33 @@ pub enum JobStatus {
     Cancelled,
 }
 
+/// Lifecycle precedence for concurrent job rows within one attempt and phase version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum JobStatusRank {
+    Pending,
+    Retrying,
+    Running,
+    Cancelling,
+    Succeeded,
+    Cancelled,
+    Failed,
+}
+
+impl JobStatus {
+    /// Returns the deterministic lifecycle precedence shared by reads and compaction.
+    pub(crate) fn precedence_rank(self) -> JobStatusRank {
+        match self {
+            Self::Pending => JobStatusRank::Pending,
+            Self::Retrying => JobStatusRank::Retrying,
+            Self::Running => JobStatusRank::Running,
+            Self::Cancelling => JobStatusRank::Cancelling,
+            Self::Succeeded => JobStatusRank::Succeeded,
+            Self::Cancelled => JobStatusRank::Cancelled,
+            Self::Failed => JobStatusRank::Failed,
+        }
+    }
+}
+
 /// Completion strategy for one finite job.
 ///
 /// This is controller policy above the runtime/task layer.

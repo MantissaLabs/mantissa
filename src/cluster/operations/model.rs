@@ -41,6 +41,16 @@ pub enum ClusterOperationStage {
     Aborted,
 }
 
+/// Lifecycle precedence for concurrent split and merge operation rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum ClusterOperationStageRank {
+    Proposed,
+    Prepared,
+    Aborted,
+    Committed,
+    Finalized,
+}
+
 /// Service behavior policy applied when a split operation commits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
 pub enum SplitServicePolicy {
@@ -80,13 +90,13 @@ pub struct SplitNodeAssignment {
 
 impl ClusterOperationStage {
     /// Returns the monotonic rank used to merge and replay operation stage updates.
-    pub fn rank(self) -> u8 {
+    pub(crate) fn rank(self) -> ClusterOperationStageRank {
         match self {
-            ClusterOperationStage::Proposed => 0,
-            ClusterOperationStage::Prepared => 1,
-            ClusterOperationStage::Aborted => 2,
-            ClusterOperationStage::Committed => 3,
-            ClusterOperationStage::Finalized => 4,
+            Self::Proposed => ClusterOperationStageRank::Proposed,
+            Self::Prepared => ClusterOperationStageRank::Prepared,
+            Self::Aborted => ClusterOperationStageRank::Aborted,
+            Self::Committed => ClusterOperationStageRank::Committed,
+            Self::Finalized => ClusterOperationStageRank::Finalized,
         }
     }
 

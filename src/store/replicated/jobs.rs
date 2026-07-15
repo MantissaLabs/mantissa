@@ -1,4 +1,4 @@
-use crate::jobs::types::{JobSpecValue, JobStatus, parse_timestamp};
+use crate::jobs::types::{JobSpecValue, JobStatusRank, parse_timestamp};
 use crate::store::replicated::open::open_arc_store;
 use chrono::{DateTime, Utc};
 use mantissa_store::adapter::{CompactingStoreMvRegAdapterSorted, MvRegCompactionRanker};
@@ -24,40 +24,31 @@ impl TableSet for JobTables {
 /// Job compaction ranker used by the generic MVReg adapter.
 pub struct JobCompactionRank;
 
+/// Total job ordering key matching the registry's canonical selector.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct JobSpecRank {
+    attempts_started: u32,
+    phase_version: u64,
+    status: JobStatusRank,
+    updated_at: Option<DateTime<Utc>>,
+    id: Uuid,
+    tie_breaker: Reverse<JobSpecValue>,
+}
+
 impl MvRegCompactionRanker<JobSpecValue, Uuid> for JobCompactionRank {
-    type Rank = (
-        u32,
-        u64,
-        u8,
-        Option<DateTime<Utc>>,
-        Uuid,
-        Reverse<JobSpecValue>,
-    );
+    type Rank = JobSpecRank;
 
     /// Ranks one job entry using the same order as the registry's canonical job selector.
     fn rank(entry: &MvRegEntry<JobSpecValue, Uuid>) -> Self::Rank {
         let value = entry.value();
-        (
-            value.attempts_started,
-            value.phase_version,
-            job_status_rank(value.status),
-            parse_timestamp(&value.updated_at),
-            value.id,
-            Reverse(value.clone()),
-        )
-    }
-}
-
-/// Returns the stable lifecycle precedence used to compact concurrent job values.
-fn job_status_rank(status: JobStatus) -> u8 {
-    match status {
-        JobStatus::Failed => 7,
-        JobStatus::Cancelled => 6,
-        JobStatus::Succeeded => 5,
-        JobStatus::Cancelling => 4,
-        JobStatus::Running => 3,
-        JobStatus::Retrying => 2,
-        JobStatus::Pending => 1,
+        JobSpecRank {
+            attempts_started: value.attempts_started,
+            phase_version: value.phase_version,
+            status: value.status.precedence_rank(),
+            updated_at: parse_timestamp(&value.updated_at),
+            id: value.id,
+            tie_breaker: Reverse(value.clone()),
+        }
     }
 }
 

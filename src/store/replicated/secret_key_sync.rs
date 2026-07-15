@@ -40,6 +40,24 @@ pub struct SecretMasterKeyCurrent {
     pub parent_key_ids: Vec<Uuid>,
 }
 
+/// Precedence between routine and cluster-operation-created current-key pointers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum SecretMasterKeyCurrentOriginRank {
+    Routine,
+    ClusterOperation,
+}
+
+impl SecretMasterKeyCurrent {
+    /// Returns the current-pointer origin precedence shared by selection and compaction.
+    fn origin_rank(&self) -> SecretMasterKeyCurrentOriginRank {
+        if self.created_by_operation_id.is_some() {
+            SecretMasterKeyCurrentOriginRank::ClusterOperation
+        } else {
+            SecretMasterKeyCurrentOriginRank::Routine
+        }
+    }
+}
+
 /// One row stored in the replicated secret-master-key sync domain.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum SecretMasterKeySyncRecord {
@@ -65,33 +83,62 @@ impl TableSet for SecretMasterKeyTables {
 /// deterministic current selection rule used by `current_for_scope`.
 pub struct SecretMasterKeyCompactionRank;
 
+/// Total master-key row ordering with record kinds represented by enum variants.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum SecretMasterKeyCompactionRankValue {
+    /// Rank for immutable master-key descriptors.
+    Descriptor(SecretMasterKeyFactRank),
+    /// Rank for immutable wrapped-key grants.
+    Grant(SecretMasterKeyFactRank),
+    /// Rank for mutable scope current-key pointers.
+    Current(SecretMasterKeyCurrentRank),
+}
+
+/// Ordering fields shared by immutable descriptor and grant rows.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct SecretMasterKeyFactRank {
+    generation: u64,
+    key_id: Uuid,
+    tie_breaker: SecretMasterKeySyncRecord,
+}
+
+/// Ordering fields used to select one current-key pointer per scope.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct SecretMasterKeyCurrentRank {
+    origin: SecretMasterKeyCurrentOriginRank,
+    generation: u64,
+    key_id: Uuid,
+    tie_breaker: SecretMasterKeySyncRecord,
+}
+
 impl MvRegCompactionRanker<SecretMasterKeySyncRecord, Uuid> for SecretMasterKeyCompactionRank {
-    type Rank = (u8, u8, u64, Uuid, SecretMasterKeySyncRecord);
+    type Rank = SecretMasterKeyCompactionRankValue;
 
     /// Ranks one visible master-key row for deterministic MVReg compaction.
     fn rank(entry: &MvRegEntry<SecretMasterKeySyncRecord, Uuid>) -> Self::Rank {
         match entry.value() {
-            SecretMasterKeySyncRecord::Descriptor(descriptor) => (
-                0,
-                0,
-                descriptor.generation,
-                descriptor.key_id,
-                entry.value().clone(),
-            ),
-            SecretMasterKeySyncRecord::Grant(grant) => (
-                1,
-                0,
-                grant.descriptor.generation,
-                grant.descriptor.key_id,
-                entry.value().clone(),
-            ),
-            SecretMasterKeySyncRecord::Current(current) => (
-                2,
-                u8::from(current.created_by_operation_id.is_some()),
-                current.generation,
-                current.key_id,
-                entry.value().clone(),
-            ),
+            SecretMasterKeySyncRecord::Descriptor(descriptor) => {
+                SecretMasterKeyCompactionRankValue::Descriptor(SecretMasterKeyFactRank {
+                    generation: descriptor.generation,
+                    key_id: descriptor.key_id,
+                    tie_breaker: entry.value().clone(),
+                })
+            }
+            SecretMasterKeySyncRecord::Grant(grant) => {
+                SecretMasterKeyCompactionRankValue::Grant(SecretMasterKeyFactRank {
+                    generation: grant.descriptor.generation,
+                    key_id: grant.descriptor.key_id,
+                    tie_breaker: entry.value().clone(),
+                })
+            }
+            SecretMasterKeySyncRecord::Current(current) => {
+                SecretMasterKeyCompactionRankValue::Current(SecretMasterKeyCurrentRank {
+                    origin: current.origin_rank(),
+                    generation: current.generation,
+                    key_id: current.key_id,
+                    tie_breaker: entry.value().clone(),
+                })
+            }
         }
     }
 }
@@ -285,13 +332,9 @@ fn current_supersedes(
         return candidate.generation > current.generation;
     }
 
-    match (
-        candidate.created_by_operation_id.is_some(),
-        current.created_by_operation_id.is_some(),
-    ) {
-        (true, false) => return true,
-        (false, true) => return false,
-        _ => {}
+    match candidate.origin_rank().cmp(&current.origin_rank()) {
+        std::cmp::Ordering::Equal => {}
+        ordering => return ordering.is_gt(),
     }
 
     (candidate.generation, candidate.key_id) > (current.generation, current.key_id)

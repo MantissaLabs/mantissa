@@ -1,6 +1,7 @@
 mod model;
 mod selector;
 
+pub(crate) use model::ClusterOperationStageRank;
 pub use model::{
     ClusterOperationKind, ClusterOperationRecord, ClusterOperationStage, MergeServicePolicy,
     SplitNetworkPolicy, SplitNodeAssignment, SplitServicePolicy,

@@ -203,6 +203,16 @@ pub enum NetworkPeerState {
     Removing,
 }
 
+/// Lifecycle precedence for concurrent network peer rows with equal timestamps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum NetworkPeerStateRank {
+    Removing,
+    Error,
+    AwaitingSpec,
+    Configuring,
+    Ready,
+}
+
 impl NetworkPeerState {
     /// Convenience predicate to identify the Ready terminal state.
     pub fn is_ready(self) -> bool {
@@ -215,6 +225,17 @@ impl NetworkPeerState {
             self,
             NetworkPeerState::Configuring | NetworkPeerState::Ready
         )
+    }
+
+    /// Returns the deterministic peer-state precedence shared by reads and compaction.
+    pub(crate) fn precedence_rank(self) -> NetworkPeerStateRank {
+        match self {
+            Self::Removing => NetworkPeerStateRank::Removing,
+            Self::Error => NetworkPeerStateRank::Error,
+            Self::AwaitingSpec => NetworkPeerStateRank::AwaitingSpec,
+            Self::Configuring => NetworkPeerStateRank::Configuring,
+            Self::Ready => NetworkPeerStateRank::Ready,
+        }
     }
 
     /// Convert from the protocol enumeration into the internal representation.
@@ -649,7 +670,28 @@ pub enum NetworkAttachmentState {
     Error,
 }
 
+/// Lifecycle precedence for concurrent network attachment rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum NetworkAttachmentStateRank {
+    Pending,
+    Configuring,
+    Ready,
+    Error,
+    Removing,
+}
+
 impl NetworkAttachmentState {
+    /// Returns the deterministic attachment precedence shared by reads and compaction.
+    pub(crate) fn precedence_rank(self) -> NetworkAttachmentStateRank {
+        match self {
+            Self::Pending => NetworkAttachmentStateRank::Pending,
+            Self::Configuring => NetworkAttachmentStateRank::Configuring,
+            Self::Ready => NetworkAttachmentStateRank::Ready,
+            Self::Error => NetworkAttachmentStateRank::Error,
+            Self::Removing => NetworkAttachmentStateRank::Removing,
+        }
+    }
+
     /// Convert the replicated attachment state into its Cap'n Proto enum value.
     pub fn to_proto(self) -> mantissa_protocol::network::AttachmentState {
         match self {

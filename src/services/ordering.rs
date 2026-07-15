@@ -187,7 +187,11 @@ fn compare_causal_tuple(left: &ServiceSpecValue, right: &ServiceSpecValue) -> Or
         .cmp(&right.service_epoch)
         .then_with(|| left.phase_version.cmp(&right.phase_version))
         .then_with(|| compare_timestamps(&left.updated_at, &right.updated_at))
-        .then_with(|| status_rank(left.status).cmp(&status_rank(right.status)))
+        .then_with(|| {
+            left.status
+                .precedence_rank()
+                .cmp(&right.status.precedence_rank())
+        })
 }
 
 /// Parses RFC3339 timestamps for service state comparisons.
@@ -204,16 +208,6 @@ fn compare_timestamps(left: &str, right: &str) -> Ordering {
         (None, Some(_)) => Ordering::Less,
         (Some(_), None) => Ordering::Greater,
         (None, None) => Ordering::Equal,
-    }
-}
-
-/// Ranks service status values for deterministic selection ordering.
-fn status_rank(status: ServiceStatus) -> u8 {
-    match status {
-        ServiceStatus::Deploying | ServiceStatus::Failed | ServiceStatus::VolumeUnavailable => 0,
-        ServiceStatus::Running => 1,
-        ServiceStatus::Stopping => 2,
-        ServiceStatus::Stopped => 3,
     }
 }
 

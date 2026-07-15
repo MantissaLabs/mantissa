@@ -1,4 +1,4 @@
-use crate::cluster::operations::ClusterOperationRecord;
+use crate::cluster::operations::{ClusterOperationRecord, ClusterOperationStageRank};
 use crate::store::replicated::open::open_arc_store;
 use mantissa_store::adapter::RegAdapter;
 use mantissa_store::codec::{MvRegStoreCodec, StoreActorCodec, StoreRegisterCodec};
@@ -209,7 +209,13 @@ pub fn open_cluster_operation_domain_store(
 /// Ranks one active operation register entry for deterministic MVReg compaction.
 fn cluster_operation_entry_rank(
     entry: &MvRegEntry<ClusterOperationRecord, Uuid>,
-) -> (u8, u64, Uuid, String, ClusterOperationRecord) {
+) -> (
+    ClusterOperationStageRank,
+    u64,
+    Uuid,
+    String,
+    ClusterOperationRecord,
+) {
     let operation = entry.value();
     (
         operation.stage.rank(),

@@ -94,24 +94,15 @@ pub fn compare_job_specs(left: &JobSpecValue, right: &JobSpecValue) -> Ordering 
     left.attempts_started
         .cmp(&right.attempts_started)
         .then(left.phase_version.cmp(&right.phase_version))
-        .then_with(|| status_rank(left).cmp(&status_rank(right)))
+        .then_with(|| {
+            left.status
+                .precedence_rank()
+                .cmp(&right.status.precedence_rank())
+        })
         .then_with(|| {
             let left_time = parse_timestamp(&left.updated_at);
             let right_time = parse_timestamp(&right.updated_at);
             left_time.cmp(&right_time)
         })
         .then_with(|| left.id.cmp(&right.id))
-}
-
-/// Returns one stable precedence ranking used to break ties between concurrent job states.
-fn status_rank(value: &JobSpecValue) -> u8 {
-    match value.status {
-        crate::jobs::types::JobStatus::Failed => 7,
-        crate::jobs::types::JobStatus::Cancelled => 6,
-        crate::jobs::types::JobStatus::Succeeded => 5,
-        crate::jobs::types::JobStatus::Cancelling => 4,
-        crate::jobs::types::JobStatus::Running => 3,
-        crate::jobs::types::JobStatus::Retrying => 2,
-        crate::jobs::types::JobStatus::Pending => 1,
-    }
 }

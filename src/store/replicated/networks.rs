@@ -1,6 +1,6 @@
 use crate::network::types::{
-    NetworkAttachmentState, NetworkAttachmentValue, NetworkPeerState, NetworkPeerStateValue,
-    NetworkSpecValue,
+    NetworkAttachmentStateRank, NetworkAttachmentValue, NetworkPeerStateRank,
+    NetworkPeerStateValue, NetworkSpecValue,
 };
 use crate::store::replicated::open::open_arc_store;
 use chrono::{DateTime, Utc};
@@ -59,66 +59,56 @@ impl MvRegCompactionRanker<NetworkSpecValue, Uuid> for NetworkSpecCompactionRank
 /// Network peer-state compaction ranker used by the generic MVReg adapter.
 pub struct NetworkPeerCompactionRank;
 
+/// Total peer-state ordering key matching the registry's canonical selector.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct NetworkPeerRank {
+    updated_at: String,
+    state: NetworkPeerStateRank,
+    tie_breaker: NetworkPeerStateValue,
+}
+
 impl MvRegCompactionRanker<NetworkPeerStateValue, Uuid> for NetworkPeerCompactionRank {
-    type Rank = (String, u8, NetworkPeerStateValue);
+    type Rank = NetworkPeerRank;
 
     /// Ranks one peer-state row using the same timestamp and readiness order as the registry.
     fn rank(entry: &MvRegEntry<NetworkPeerStateValue, Uuid>) -> Self::Rank {
         let value = entry.value();
-        (
-            value.updated_at.clone(),
-            network_peer_state_rank(value.state),
-            value.clone(),
-        )
+        NetworkPeerRank {
+            updated_at: value.updated_at.clone(),
+            state: value.state.precedence_rank(),
+            tie_breaker: value.clone(),
+        }
     }
 }
 
 /// Network attachment compaction ranker used by the generic MVReg adapter.
 pub struct NetworkAttachmentCompactionRank;
 
+/// Total attachment ordering key matching the registry's canonical selector.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct NetworkAttachmentRank {
+    task_updated_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+    state: NetworkAttachmentStateRank,
+    traffic_published: bool,
+    node_id: Uuid,
+    tie_breaker: Reverse<NetworkAttachmentValue>,
+}
+
 impl MvRegCompactionRanker<NetworkAttachmentValue, Uuid> for NetworkAttachmentCompactionRank {
-    type Rank = (
-        Option<DateTime<Utc>>,
-        Option<DateTime<Utc>>,
-        u8,
-        bool,
-        Uuid,
-        Reverse<NetworkAttachmentValue>,
-    );
+    type Rank = NetworkAttachmentRank;
 
     /// Ranks one attachment using task revision, attachment timestamp, and lifecycle state.
     fn rank(entry: &MvRegEntry<NetworkAttachmentValue, Uuid>) -> Self::Rank {
         let value = entry.value();
-        (
-            value.task_updated_at.as_deref().and_then(parse_rfc3339),
-            parse_attachment_timestamp(&value.updated_at, &value.created_at),
-            network_attachment_state_rank(value.state),
-            value.traffic_published,
-            value.node_id,
-            Reverse(value.clone()),
-        )
-    }
-}
-
-/// Ranks peer states so Ready entries win timestamp ties during compaction.
-fn network_peer_state_rank(state: NetworkPeerState) -> u8 {
-    match state {
-        NetworkPeerState::Ready => 5,
-        NetworkPeerState::Configuring => 4,
-        NetworkPeerState::AwaitingSpec => 3,
-        NetworkPeerState::Error => 2,
-        NetworkPeerState::Removing => 1,
-    }
-}
-
-/// Ranks attachment states so terminal or converged rows win timestamp ties.
-fn network_attachment_state_rank(state: NetworkAttachmentState) -> u8 {
-    match state {
-        NetworkAttachmentState::Removing => 5,
-        NetworkAttachmentState::Error => 4,
-        NetworkAttachmentState::Ready => 3,
-        NetworkAttachmentState::Configuring => 2,
-        NetworkAttachmentState::Pending => 1,
+        NetworkAttachmentRank {
+            task_updated_at: value.task_updated_at.as_deref().and_then(parse_rfc3339),
+            updated_at: parse_attachment_timestamp(&value.updated_at, &value.created_at),
+            state: value.state.precedence_rank(),
+            traffic_published: value.traffic_published,
+            node_id: value.node_id,
+            tie_breaker: Reverse(value.clone()),
+        }
     }
 }
 

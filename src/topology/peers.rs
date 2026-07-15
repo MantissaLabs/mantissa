@@ -25,6 +25,13 @@ pub enum NodeReadinessState {
     Syncing,
 }
 
+/// Lifecycle precedence for concurrent replicated peer-readiness rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum NodeReadinessStateRank {
+    Syncing,
+    Ready,
+}
+
 impl Default for NodeReadinessState {
     /// Build the default readiness state used by established or legacy peer rows.
     fn default() -> Self {
@@ -55,10 +62,10 @@ impl NodeReadinessState {
     }
 
     /// Returns the deterministic rank used when timestamp metadata ties exactly.
-    fn precedence_rank(self) -> u8 {
+    fn precedence_rank(self) -> NodeReadinessStateRank {
         match self {
-            Self::Syncing => 0,
-            Self::Ready => 1,
+            Self::Syncing => NodeReadinessStateRank::Syncing,
+            Self::Ready => NodeReadinessStateRank::Ready,
         }
     }
 }
@@ -128,7 +135,7 @@ impl NodeReadiness {
     }
 
     /// Returns the deterministic conflict-resolution key for one readiness update.
-    fn precedence_key(&self) -> (u64, Uuid, u8) {
+    fn precedence_key(&self) -> (u64, Uuid, NodeReadinessStateRank) {
         (
             self.updated_at_unix_ms,
             self.actor_node_id,

@@ -117,6 +117,31 @@ pub enum AgentSessionStatus {
     Closed,
 }
 
+/// Lifecycle precedence for concurrent agent session rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum AgentSessionStatusRank {
+    WaitingInput,
+    Queued,
+    Running,
+    Failed,
+    Closing,
+    Closed,
+}
+
+impl AgentSessionStatus {
+    /// Returns the deterministic session precedence shared by reads and compaction.
+    pub(crate) fn precedence_rank(self) -> AgentSessionStatusRank {
+        match self {
+            Self::WaitingInput => AgentSessionStatusRank::WaitingInput,
+            Self::Queued => AgentSessionStatusRank::Queued,
+            Self::Running => AgentSessionStatusRank::Running,
+            Self::Failed => AgentSessionStatusRank::Failed,
+            Self::Closing => AgentSessionStatusRank::Closing,
+            Self::Closed => AgentSessionStatusRank::Closed,
+        }
+    }
+}
+
 /// Run lifecycle states exposed by the first-class agent controller.
 #[derive(
     Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
@@ -129,6 +154,29 @@ pub enum AgentRunStatus {
     Succeeded,
     Failed,
     Cancelled,
+}
+
+/// Lifecycle precedence for concurrent agent run rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum AgentRunStatusRank {
+    Pending,
+    Running,
+    Cancelled,
+    Failed,
+    Succeeded,
+}
+
+impl AgentRunStatus {
+    /// Returns the deterministic run precedence shared by reads and compaction.
+    pub(crate) fn precedence_rank(self) -> AgentRunStatusRank {
+        match self {
+            Self::Pending => AgentRunStatusRank::Pending,
+            Self::Running => AgentRunStatusRank::Running,
+            Self::Cancelled => AgentRunStatusRank::Cancelled,
+            Self::Failed => AgentRunStatusRank::Failed,
+            Self::Succeeded => AgentRunStatusRank::Succeeded,
+        }
+    }
 }
 
 /// Durable agent session definition and recent structured event history.

@@ -2,8 +2,7 @@ use crate::network::defaults::{
     CidrBlock, CidrOverlapIndex, DefaultNetworkIpFamily, default_network_subnet_with_conflict_check,
 };
 use crate::network::types::{
-    NetworkAttachmentValue, NetworkPeerState, NetworkPeerStateValue, NetworkSpecValue,
-    compute_network_peer_state_id,
+    NetworkAttachmentValue, NetworkPeerStateValue, NetworkSpecValue, compute_network_peer_state_id,
 };
 use crate::store::replicated::networks::{
     NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore,
@@ -696,24 +695,10 @@ impl NetworkRegistry {
         snapshot
             .iter()
             .max_by(|a, b| match a.updated_at.cmp(&b.updated_at) {
-                Ordering::Equal => {
-                    Self::peer_state_priority(a.state).cmp(&Self::peer_state_priority(b.state))
-                }
+                Ordering::Equal => a.state.precedence_rank().cmp(&b.state.precedence_rank()),
                 other => other,
             })
             .cloned()
-    }
-
-    /// Provide a deterministic priority for peer state variants when timestamps match so we retain
-    /// the most operationally useful entry (prefer Ready over Removing, for example).
-    fn peer_state_priority(state: NetworkPeerState) -> u8 {
-        match state {
-            NetworkPeerState::Ready => 5,
-            NetworkPeerState::Configuring => 4,
-            NetworkPeerState::AwaitingSpec => 3,
-            NetworkPeerState::Error => 2,
-            NetworkPeerState::Removing => 1,
-        }
     }
 }
 
@@ -772,8 +757,8 @@ fn should_prefer_attachment(
         (None, None) => {}
     }
 
-    let current_rank = attachment_state_rank(current.state);
-    let candidate_rank = attachment_state_rank(candidate.state);
+    let current_rank = current.state.precedence_rank();
+    let candidate_rank = candidate.state.precedence_rank();
     match candidate_rank.cmp(&current_rank) {
         Ordering::Greater => true,
         Ordering::Less => false,
@@ -805,18 +790,6 @@ fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
     chrono::DateTime::parse_from_rfc3339(raw)
         .map(|dt| dt.with_timezone(&Utc))
         .ok()
-}
-
-/// Rank attachment lifecycle states so more terminal or converged rows win MVReg selection ties.
-fn attachment_state_rank(state: crate::network::types::NetworkAttachmentState) -> u8 {
-    use crate::network::types::NetworkAttachmentState::*;
-    match state {
-        Removing => 5,
-        Error => 4,
-        Ready => 3,
-        Configuring => 2,
-        Pending => 1,
-    }
 }
 
 /// Derive the remote peers that currently share a participating network with `local_peer_id`.
@@ -858,6 +831,7 @@ fn collect_shared_participating_peers(
 mod tests {
     use super::*;
     use crate::network::defaults::{CidrBlock, DefaultNetworkIpFamily, default_network_subnet};
+    use crate::network::types::NetworkPeerState;
     use crate::network::types::{NetworkDriver, NetworkSpecDraft};
     use crate::store::replicated::networks::{
         open_network_attachment_store, open_network_peer_store, open_network_spec_store,

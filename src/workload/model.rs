@@ -127,6 +127,37 @@ pub enum WorkloadPhase {
     Unknown,
 }
 
+/// Lifecycle precedence for concurrent workload rows with equal causal metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum WorkloadPhaseRank {
+    FailedExitedOrUnknown,
+    Paused,
+    Stopped,
+    Stopping,
+    PendingOrVolumeUnavailable,
+    PullingOrCreating,
+    Running,
+}
+
+impl WorkloadPhase {
+    /// Returns the deterministic workload precedence shared by reads and compaction.
+    pub(crate) fn precedence_rank(&self) -> WorkloadPhaseRank {
+        match self {
+            Self::Failed | Self::Exited(_) | Self::Unknown => {
+                WorkloadPhaseRank::FailedExitedOrUnknown
+            }
+            Self::Paused => WorkloadPhaseRank::Paused,
+            Self::Stopped => WorkloadPhaseRank::Stopped,
+            Self::Stopping => WorkloadPhaseRank::Stopping,
+            Self::Pending | Self::VolumeUnavailable => {
+                WorkloadPhaseRank::PendingOrVolumeUnavailable
+            }
+            Self::Pulling | Self::Creating => WorkloadPhaseRank::PullingOrCreating,
+            Self::Running => WorkloadPhaseRank::Running,
+        }
+    }
+}
+
 /// Admission barrier state for workload rows that belong to a grouped start.
 #[derive(
     Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Default,
@@ -152,6 +183,15 @@ pub enum WorkloadAdmissionGroupPhase {
     AbortDecided,
 }
 
+/// Lifecycle precedence for concurrent workload admission decisions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum WorkloadAdmissionGroupPhaseRank {
+    Preparing,
+    CommitDecided,
+    Completed,
+    AbortDecided,
+}
+
 impl WorkloadAdmissionGroupPhase {
     /// Returns true when this decision allows member rows to be adopted locally.
     pub fn allows_adoption(self) -> bool {
@@ -161,6 +201,16 @@ impl WorkloadAdmissionGroupPhase {
     /// Returns true when this decision requires member rows to be torn down.
     pub fn requires_abort(self) -> bool {
         matches!(self, Self::AbortDecided)
+    }
+
+    /// Returns the deterministic admission precedence shared by reads and compaction.
+    pub(crate) fn precedence_rank(self) -> WorkloadAdmissionGroupPhaseRank {
+        match self {
+            Self::Preparing => WorkloadAdmissionGroupPhaseRank::Preparing,
+            Self::CommitDecided => WorkloadAdmissionGroupPhaseRank::CommitDecided,
+            Self::Completed => WorkloadAdmissionGroupPhaseRank::Completed,
+            Self::AbortDecided => WorkloadAdmissionGroupPhaseRank::AbortDecided,
+        }
     }
 }
 
@@ -1195,8 +1245,8 @@ fn compare_workload_causality_record(
         (None, None) => {}
     }
 
-    let current_rank = workload_phase_rank(current.state);
-    let candidate_rank = workload_phase_rank(candidate.state);
+    let current_rank = current.state.precedence_rank();
+    let candidate_rank = candidate.state.precedence_rank();
     candidate_rank.cmp(&current_rank)
 }
 
@@ -1347,38 +1397,15 @@ fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
         .ok()
 }
 
-/// Ranks workload phases by lifecycle progression when causal version fields are tied.
-pub(crate) fn workload_phase_rank(state: &WorkloadPhase) -> u8 {
-    match state {
-        WorkloadPhase::Running => 6,
-        WorkloadPhase::Creating => 5,
-        WorkloadPhase::Pulling => 5,
-        WorkloadPhase::VolumeUnavailable => 4,
-        WorkloadPhase::Pending => 4,
-        WorkloadPhase::Stopping => 3,
-        WorkloadPhase::Stopped => 2,
-        WorkloadPhase::Paused => 1,
-        WorkloadPhase::Failed | WorkloadPhase::Exited(_) | WorkloadPhase::Unknown => 0,
-    }
-}
-
-/// Ranks admission group phases so abort decisions win conflict resolution.
-pub(crate) fn admission_group_phase_rank(phase: WorkloadAdmissionGroupPhase) -> u8 {
-    match phase {
-        WorkloadAdmissionGroupPhase::Preparing => 0,
-        WorkloadAdmissionGroupPhase::CommitDecided => 1,
-        WorkloadAdmissionGroupPhase::Completed => 2,
-        WorkloadAdmissionGroupPhase::AbortDecided => 3,
-    }
-}
-
 /// Returns true when one admission group record should replace the retained record.
 pub(crate) fn should_accept_admission_group_record(
     current: &WorkloadAdmissionGroupRecord,
     candidate: &WorkloadAdmissionGroupRecord,
 ) -> bool {
-    match admission_group_phase_rank(candidate.phase)
-        .cmp(&admission_group_phase_rank(current.phase))
+    match candidate
+        .phase
+        .precedence_rank()
+        .cmp(&current.phase.precedence_rank())
     {
         Ordering::Equal => {}
         order => return order.is_gt(),

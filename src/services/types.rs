@@ -900,6 +900,29 @@ pub enum ServiceStatus {
     Failed,
 }
 
+/// Lifecycle precedence for concurrent replicated service rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum ServiceStatusRank {
+    DeployingFailedOrUnavailable,
+    Running,
+    Stopping,
+    Stopped,
+}
+
+impl ServiceStatus {
+    /// Returns the deterministic service precedence used by canonical replicated reads.
+    pub(crate) fn precedence_rank(self) -> ServiceStatusRank {
+        match self {
+            Self::Deploying | Self::Failed | Self::VolumeUnavailable => {
+                ServiceStatusRank::DeployingFailedOrUnavailable
+            }
+            Self::Running => ServiceStatusRank::Running,
+            Self::Stopping => ServiceStatusRank::Stopping,
+            Self::Stopped => ServiceStatusRank::Stopped,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ServiceRescheduleLock {
     pub holder_id: Uuid,

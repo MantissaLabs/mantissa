@@ -1,6 +1,5 @@
 use crate::agents::types::{
-    AgentRecordValue, AgentRunSpecValue, AgentRunStatus, AgentSessionSpecValue, AgentSessionStatus,
-    parse_timestamp,
+    AgentRecordValue, AgentRunSpecValue, AgentSessionSpecValue, parse_timestamp,
 };
 use crate::store::replicated::agents::AgentStore;
 use anyhow::{Result, anyhow};
@@ -187,7 +186,11 @@ pub fn compare_agent_sessions(
     left.event_sequence
         .cmp(&right.event_sequence)
         .then(left.phase_version.cmp(&right.phase_version))
-        .then_with(|| session_status_rank(left.status).cmp(&session_status_rank(right.status)))
+        .then_with(|| {
+            left.status
+                .precedence_rank()
+                .cmp(&right.status.precedence_rank())
+        })
         .then_with(|| {
             let left_time = parse_timestamp(&left.updated_at);
             let right_time = parse_timestamp(&right.updated_at);
@@ -200,32 +203,15 @@ pub fn compare_agent_sessions(
 pub fn compare_agent_runs(left: &AgentRunSpecValue, right: &AgentRunSpecValue) -> Ordering {
     left.phase_version
         .cmp(&right.phase_version)
-        .then_with(|| run_status_rank(left.status).cmp(&run_status_rank(right.status)))
+        .then_with(|| {
+            left.status
+                .precedence_rank()
+                .cmp(&right.status.precedence_rank())
+        })
         .then_with(|| {
             let left_time = parse_timestamp(&left.updated_at);
             let right_time = parse_timestamp(&right.updated_at);
             left_time.cmp(&right_time)
         })
         .then_with(|| left.id.cmp(&right.id))
-}
-
-fn session_status_rank(status: AgentSessionStatus) -> u8 {
-    match status {
-        AgentSessionStatus::Closed => 6,
-        AgentSessionStatus::Closing => 5,
-        AgentSessionStatus::Failed => 4,
-        AgentSessionStatus::Running => 3,
-        AgentSessionStatus::Queued => 2,
-        AgentSessionStatus::WaitingInput => 1,
-    }
-}
-
-fn run_status_rank(status: AgentRunStatus) -> u8 {
-    match status {
-        AgentRunStatus::Succeeded => 5,
-        AgentRunStatus::Failed => 4,
-        AgentRunStatus::Cancelled => 3,
-        AgentRunStatus::Running => 2,
-        AgentRunStatus::Pending => 1,
-    }
 }
