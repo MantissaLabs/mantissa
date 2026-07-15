@@ -106,6 +106,15 @@ enum WorkloadRepairHintSendError {
     TimedOut,
 }
 
+/// Exact workload state reported by the node queried for local ownership.
+#[derive(Clone, Debug)]
+pub(crate) enum OwnedWorkloadStatus {
+    Missing,
+    Removed,
+    NotOwned(Uuid),
+    Status(Box<WorkloadStatus>),
+}
+
 /// Sends one workload repair hint without allowing a slow peer to block its caller indefinitely.
 async fn send_workload_repair_hint(
     session: &cluster_session::Client,
@@ -2139,6 +2148,44 @@ impl WorkloadManager {
             states.push((*id, state));
         }
         Ok(states)
+    }
+
+    /// Returns the exact persisted status for a workload only when this node owns it.
+    ///
+    /// Service cutover uses this narrow lookup to distinguish delayed replicated status from the
+    /// target node stopping or removing a replacement. A never-seen row remains distinct from a
+    /// durable removal because failed direct assignment delivery may still arrive through MST sync.
+    pub(crate) async fn owned_workload_status(
+        &self,
+        id: Uuid,
+    ) -> Result<OwnedWorkloadStatus, anyhow::Error> {
+        let key = UuidKey::from(id);
+        let snapshot = self
+            .core
+            .store
+            .get_snapshot(&key)
+            .map_err(|e| anyhow!("owned workload status lookup failed: {e}"))?;
+
+        if let Some(value) = snapshot.and_then(|snapshot| {
+            crate::workload::model::select_best_workload_value(snapshot.as_slice())
+        }) {
+            if value.node_id != self.local_node_id {
+                return Ok(OwnedWorkloadStatus::NotOwned(value.node_id));
+            }
+            let spec = value_to_spec(id, value);
+            return Ok(OwnedWorkloadStatus::Status(Box::new(spec_to_status(&spec))));
+        }
+
+        if self
+            .core
+            .store
+            .has_tombstone(&key)
+            .map_err(|e| anyhow!("owned workload tombstone lookup failed: {e}"))?
+        {
+            Ok(OwnedWorkloadStatus::Removed)
+        } else {
+            Ok(OwnedWorkloadStatus::Missing)
+        }
     }
 
     /// Returns compact node progress records for one service generation.

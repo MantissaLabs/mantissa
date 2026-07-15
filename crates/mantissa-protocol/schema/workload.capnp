@@ -18,6 +18,10 @@ interface Workload {
   coordinateServiceShard @3 (request :ServiceShardAssignmentRequest)
       -> (response :ServiceShardAssignmentResponse);
   # Coordinate one deterministic service deployment shard on behalf of its owner.
+
+  getStatus @4 (request :WorkloadStatusRequest)
+      -> (result :WorkloadStatusResult);
+  # Read one workload's exact local status or report that this node does not own it.
 }
 
 struct SecretRef {
@@ -781,6 +785,27 @@ struct WorkloadEvent {
 struct WorkloadStopRequest {
   id @0 :Data;
   # Workload UUID as 16 bytes.
+}
+
+struct WorkloadStatusRequest {
+  id @0 :Data;
+  # Workload UUID as 16 bytes.
+}
+
+struct WorkloadStatusResult {
+  union {
+    missing @0 :Void;
+    # This node has not received the workload row yet.
+
+    removed @1 :Void;
+    # This node has a durable removal marker for the workload row.
+
+    notOwned @2 :Data;
+    # Current owner UUID when the workload row belongs to another node.
+
+    status @3 :WorkloadStatus;
+    # Exact persisted status for a workload owned by this node.
+  }
 }
 
 struct WorkloadListRequest {

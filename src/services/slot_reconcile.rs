@@ -1,4 +1,4 @@
-use super::deployment::ServiceSlotCutover;
+use super::deployment::{ServiceSlotCutover, task_cutover_was_cancelled};
 use super::inventory::{ServiceReplicaSnapshot, TaskInventory};
 use super::placement::{
     SlotTargetContext, build_placement_preference_inventory, compute_effective_slot_targets,
@@ -33,11 +33,12 @@ struct SlotReconcileEnv<'a> {
     service_degraded: bool,
 }
 
-/// Task identities involved in a start-first slot replacement.
+/// Task and target identities involved in a start-first slot replacement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SlotReplacementIds {
+struct SlotReplacement {
     previous_task_id: Uuid,
     replacement_task_id: Uuid,
+    replacement_node_id: Uuid,
 }
 
 /// One observed task whose handoff still applies to the current service slot assignment.
@@ -235,12 +236,21 @@ impl ServiceController {
                 )
                 .await
             {
-                tracing::warn!(
-                    target: "services",
-                    "slot reconciliation failed for '{}' replica {}: {err}",
-                    slot.template.name,
-                    slot.replica
-                );
+                if task_cutover_was_cancelled(&err) {
+                    tracing::debug!(
+                        target: "services",
+                        "slot replacement for '{}' replica {} was canceled: {err}",
+                        slot.template.name,
+                        slot.replica
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "services",
+                        "slot reconciliation failed for '{}' replica {}: {err}",
+                        slot.template.name,
+                        slot.replica
+                    );
+                }
             }
         }
 
@@ -407,9 +417,10 @@ impl ServiceController {
                 self.resume_slot_handoff(
                     spec,
                     slot,
-                    SlotReplacementIds {
+                    SlotReplacement {
                         previous_task_id: task_id,
                         replacement_task_id: candidate.task_id,
+                        replacement_node_id: candidate.node_id,
                     },
                     &handoff_candidates,
                     env.health_snapshot,
@@ -554,9 +565,10 @@ impl ServiceController {
             self.resume_slot_handoff(
                 spec,
                 slot,
-                SlotReplacementIds {
+                SlotReplacement {
                     previous_task_id: task_id,
                     replacement_task_id: candidate.task_id,
+                    replacement_node_id: candidate.node_id,
                 },
                 &target_candidates,
                 env.health_snapshot,
@@ -656,7 +668,7 @@ impl ServiceController {
         &self,
         spec: &ServiceSpecValue,
         slot: &ReplicaSlot,
-        task_ids: SlotReplacementIds,
+        replacement: SlotReplacement,
         candidates: &[SlotHandoffCandidate],
         health_snapshot: &HashMap<Uuid, HealthStatus>,
         key: &SlotKey,
@@ -665,14 +677,15 @@ impl ServiceController {
             && let Err(err) = self
                 .publish_task_traffic_for_cutover(
                     &spec.service_name,
-                    task_ids.replacement_task_id,
+                    replacement.replacement_task_id,
+                    replacement.replacement_node_id,
                     SERVICE_SLOT_CUTOVER_TIMEOUT,
                 )
                 .await
         {
             self.abort_replacement_task_best_effort(
                 &spec.service_name,
-                task_ids.replacement_task_id,
+                replacement.replacement_task_id,
                 "adopted replacement never became traffic-ready",
             )
             .await;
@@ -683,7 +696,7 @@ impl ServiceController {
             .settle_slot_replacement(
                 spec,
                 slot,
-                task_ids,
+                replacement,
                 health_snapshot,
                 key,
                 "adopted replacement could not claim service slot",
@@ -693,7 +706,7 @@ impl ServiceController {
             self.abort_slot_handoff_candidates(
                 &spec.service_name,
                 candidates,
-                Some(task_ids.replacement_task_id),
+                Some(replacement.replacement_task_id),
                 "concurrent replacement lost service slot cutover",
             )
             .await;
@@ -768,6 +781,7 @@ impl ServiceController {
                             .publish_task_traffic_for_cutover(
                                 &spec.service_name,
                                 replacement_task_id,
+                                preferred_node,
                                 SERVICE_SLOT_CUTOVER_TIMEOUT,
                             )
                             .await
@@ -784,9 +798,10 @@ impl ServiceController {
                         .settle_slot_replacement(
                             spec,
                             slot,
-                            SlotReplacementIds {
+                            SlotReplacement {
                                 previous_task_id: task_id,
                                 replacement_task_id,
+                                replacement_node_id: preferred_node,
                             },
                             health_snapshot,
                             key,
@@ -830,27 +845,42 @@ impl ServiceController {
             None,
         );
 
-        self.workload_manager
+        let fallback_specs = self
+            .workload_manager
             .start_workloads_batch(vec![fallback])
             .await
-            .map(|specs| {
-                if specs.len() != 1 {
-                    tracing::warn!(
-                        target: "services",
-                        "fallback placement mismatch for '{}' replica {}: expected 1, got {}",
-                        slot.template.name,
-                        slot.replica,
-                        specs.len()
-                    );
-                }
-            })
             .map_err(|err| anyhow!("fallback placement failed: {err}"))?;
+        if fallback_specs.len() != 1 {
+            tracing::warn!(
+                target: "services",
+                "fallback placement mismatch for '{}' replica {}: expected 1, got {}",
+                slot.template.name,
+                slot.replica,
+                fallback_specs.len()
+            );
+        }
+        let fallback_node_id = fallback_specs
+            .iter()
+            .find(|fallback_spec| fallback_spec.id == replacement_task_id)
+            .map(|fallback_spec| fallback_spec.node_id);
+        let Some(fallback_node_id) = fallback_node_id else {
+            self.abort_replacement_task_best_effort(
+                &spec.service_name,
+                replacement_task_id,
+                "fallback placement returned no matching replacement",
+            )
+            .await;
+            return Err(anyhow!(
+                "fallback placement did not return replacement task {replacement_task_id}"
+            ));
+        };
 
         if spec.status() == ServiceStatus::Running
             && let Err(err) = self
                 .publish_task_traffic_for_cutover(
                     &spec.service_name,
                     replacement_task_id,
+                    fallback_node_id,
                     SERVICE_SLOT_CUTOVER_TIMEOUT,
                 )
                 .await
@@ -867,9 +897,10 @@ impl ServiceController {
             .settle_slot_replacement(
                 spec,
                 slot,
-                SlotReplacementIds {
+                SlotReplacement {
                     previous_task_id: task_id,
                     replacement_task_id,
+                    replacement_node_id: fallback_node_id,
                 },
                 health_snapshot,
                 key,
@@ -963,6 +994,7 @@ impl ServiceController {
             .publish_task_traffic_for_cutover(
                 &spec.service_name,
                 replacement_task_id,
+                preferred_node,
                 SERVICE_SLOT_CUTOVER_TIMEOUT,
             )
             .await
@@ -979,9 +1011,10 @@ impl ServiceController {
             .settle_slot_replacement(
                 spec,
                 slot,
-                SlotReplacementIds {
+                SlotReplacement {
                     previous_task_id: task.id,
                     replacement_task_id,
+                    replacement_node_id: preferred_node,
                 },
                 health_snapshot,
                 key,
@@ -1014,7 +1047,7 @@ impl ServiceController {
         &self,
         spec: &ServiceSpecValue,
         slot: &ReplicaSlot,
-        task_ids: SlotReplacementIds,
+        replacement: SlotReplacement,
         health_snapshot: &HashMap<Uuid, HealthStatus>,
         key: &SlotKey,
         abort_context: &str,
@@ -1025,8 +1058,8 @@ impl ServiceController {
                 spec.manifest_id,
                 &slot.template.name,
                 slot.replica,
-                task_ids.previous_task_id,
-                task_ids.replacement_task_id,
+                replacement.previous_task_id,
+                replacement.replacement_task_id,
             )
             .await
         {
@@ -1034,7 +1067,7 @@ impl ServiceController {
             Err(err) => {
                 self.abort_replacement_task_best_effort(
                     &spec.service_name,
-                    task_ids.replacement_task_id,
+                    replacement.replacement_task_id,
                     abort_context,
                 )
                 .await;
@@ -1047,7 +1080,7 @@ impl ServiceController {
                 self.clear_slot_missing(key).await;
                 self.withdraw_and_stop_superseded_task_best_effort(
                     &spec.service_name,
-                    task_ids.previous_task_id,
+                    replacement.previous_task_id,
                     health_snapshot,
                 )
                 .await;
@@ -1062,15 +1095,15 @@ impl ServiceController {
                     service = %spec.service_name,
                     template = %slot.template.name,
                     replica = slot.replica,
-                    previous_task = %task_ids.previous_task_id,
-                    replacement_task = %task_ids.replacement_task_id,
+                    previous_task = %replacement.previous_task_id,
+                    replacement_task = %replacement.replacement_task_id,
                     current_task = ?current_task_id,
                     stale_reason = reason.as_str(),
                     "replacement lost service slot cutover race"
                 );
                 self.abort_replacement_task_best_effort(
                     &spec.service_name,
-                    task_ids.replacement_task_id,
+                    replacement.replacement_task_id,
                     "stale replacement lost service slot cutover race",
                 )
                 .await;

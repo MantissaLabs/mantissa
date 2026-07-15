@@ -95,6 +95,10 @@ const SERVICE_EXTRA_TASK_CLEANUP_MIN_AGE_SECS: i64 = 20;
 const SERVICE_REBALANCE_COOLDOWN_SECS: u64 = 30;
 /// Hard readiness deadline for one start-first service slot handoff.
 const SERVICE_SLOT_CUTOVER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Minimum delay between exact target-status probes during one service cutover.
+const SERVICE_CUTOVER_STATUS_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+/// Maximum time one exact target-status probe may delay the normal cutover loop.
+const SERVICE_CUTOVER_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Maximum time to wait for one rollout task to fully stop before id reuse.
 const SERVICE_ROLLOUT_STOP_TIMEOUT_SECS: u64 = 120;
 /// Poll interval while waiting on rollout task readiness transitions.

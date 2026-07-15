@@ -856,6 +856,7 @@ impl ServiceController {
             self.publish_task_traffic_for_cutover(
                 service_name,
                 spec.id,
+                spec.node_id,
                 settings.healthy_deadline.max(Duration::from_secs(5)),
             )
             .await?;

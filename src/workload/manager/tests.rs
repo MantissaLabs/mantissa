@@ -62,6 +62,7 @@ use crate::workload::model::{
     WorkloadServiceMetadata, WorkloadStatus, WorkloadValue, WorkloadValueDraft,
     select_best_service_generation_progress_record, select_best_workload_value,
 };
+use crate::workload::service::{WorkloadService, read_owned_workload_status};
 use crate::workload::types::{
     ExecutionSpec, ResolvedExecutionSpec, WorkloadLivenessProbe, WorkloadLivenessProbeKind,
     WorkloadRestartPolicyKind,
@@ -1308,6 +1309,101 @@ fn test_task_spec(manager: &WorkloadManager, name: &str) -> WorkloadSpec {
         phase_version: 0,
         launch_attempt: 0,
         last_terminal_observed_launch: None,
+    }
+}
+
+/// Exact owned-status lookup distinguishes delivery lag, ownership, and durable removal.
+#[tokio::test]
+async fn owned_workload_status_reports_exact_local_state() {
+    let (manager, _scheduler, _runtime, _network_registry) = setup_manager().await;
+
+    assert!(matches!(
+        manager
+            .owned_workload_status(Uuid::new_v4())
+            .await
+            .expect("look up missing workload"),
+        OwnedWorkloadStatus::Missing
+    ));
+
+    let mut local = test_task_spec(&manager, "owned-status-local");
+    local.state = WorkloadPhase::Running;
+    manager
+        .persist_specs_batch(&[local.clone()])
+        .await
+        .expect("persist local workload");
+    match manager
+        .owned_workload_status(local.id)
+        .await
+        .expect("look up local workload")
+    {
+        OwnedWorkloadStatus::Status(status) => {
+            assert_eq!(status.id, local.id);
+            assert_eq!(status.node_id, manager.local_node_id);
+            assert_eq!(status.state, WorkloadPhase::Running);
+        }
+        other => panic!("expected owned status, got {other:?}"),
+    }
+
+    let mut foreign = test_task_spec(&manager, "owned-status-foreign");
+    foreign.node_id = Uuid::new_v4();
+    manager
+        .persist_specs_batch(&[foreign.clone()])
+        .await
+        .expect("persist foreign workload");
+    assert!(matches!(
+        manager
+            .owned_workload_status(foreign.id)
+            .await
+            .expect("look up foreign workload"),
+        OwnedWorkloadStatus::NotOwned(node_id) if node_id == foreign.node_id
+    ));
+
+    manager
+        .remove_spec(foreign.id)
+        .await
+        .expect("remove foreign workload");
+    assert!(matches!(
+        manager
+            .owned_workload_status(foreign.id)
+            .await
+            .expect("look up removed workload"),
+        OwnedWorkloadStatus::Removed
+    ));
+}
+
+/// The workload capability exposes the target node's exact owned status without listing rows.
+#[tokio::test(flavor = "current_thread")]
+async fn owned_workload_status_rpc_returns_local_state() {
+    let (manager, _scheduler, _runtime, _network_registry) = setup_manager().await;
+    let mut spec = test_task_spec(&manager, "owned-status-rpc");
+    spec.state = WorkloadPhase::Creating;
+    manager
+        .persist_specs_batch(&[spec.clone()])
+        .await
+        .expect("persist RPC workload");
+
+    let client: mantissa_protocol::workload::workload::Client =
+        new_client(WorkloadService::new(manager));
+    let mut request = client.get_status_request();
+    request.get().init_request().set_id(spec.id.as_bytes());
+    let response = request
+        .send()
+        .promise
+        .await
+        .expect("request owned workload status");
+    let result = response
+        .get()
+        .expect("read owned workload response")
+        .get_result()
+        .expect("read owned workload result");
+
+    match read_owned_workload_status(result).expect("decode owned workload result") {
+        OwnedWorkloadStatus::Status(status) => {
+            assert_eq!(status.id, spec.id);
+            assert_eq!(status.node_id, spec.node_id);
+            assert_eq!(status.state, WorkloadPhase::Creating);
+        }
+        other => panic!("expected owned status, got {other:?}"),
     }
 }
 

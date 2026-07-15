@@ -6,7 +6,7 @@ use crate::workload::capnp_codec::{
     encode_task_restart_policy, encode_volume_mounts,
 };
 use crate::workload::manager::{
-    ServiceShardAssignmentFailure, ServiceShardAssignmentFailureClass,
+    OwnedWorkloadStatus, ServiceShardAssignmentFailure, ServiceShardAssignmentFailureClass,
     ServiceShardAssignmentRequest, WorkloadManager, WorkloadStartRequest,
     classify_service_shard_assignment_failure,
 };
@@ -28,6 +28,7 @@ use mantissa_protocol::workload::{
     service_dependency_requirement, service_generation_progress_record,
     service_shard_assignment_request, workload, workload_assignment_batch_request, workload_event,
     workload_list_request, workload_spec, workload_start_request, workload_status,
+    workload_status_result,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::io::Cursor;
@@ -126,6 +127,54 @@ impl workload::Server for WorkloadService {
             }
         }
         Ok(())
+    }
+
+    /// Returns exact persisted status only when this node owns the requested workload.
+    async fn get_status(
+        self: Rc<Self>,
+        params: workload::GetStatusParams,
+        mut results: workload::GetStatusResults,
+    ) -> Result<(), Error> {
+        let request = params.get()?.get_request()?;
+        let id = read_id_from_data(request.get_id()?)?;
+        let status = self
+            .manager
+            .owned_workload_status(id)
+            .await
+            .map_err(|err| Error::failed(err.to_string()))?;
+        write_owned_workload_status(results.get().init_result(), &status);
+        Ok(())
+    }
+}
+
+/// Encodes one exact target-owned workload status result for the internal RPC.
+pub(crate) fn write_owned_workload_status(
+    mut builder: workload_status_result::Builder<'_>,
+    status: &OwnedWorkloadStatus,
+) {
+    match status {
+        OwnedWorkloadStatus::Missing => builder.set_missing(()),
+        OwnedWorkloadStatus::Removed => builder.set_removed(()),
+        OwnedWorkloadStatus::NotOwned(node_id) => builder.set_not_owned(node_id.as_bytes()),
+        OwnedWorkloadStatus::Status(status) => {
+            write_status(builder.reborrow().init_status(), status);
+        }
+    }
+}
+
+/// Decodes one exact target-owned workload status result from the internal RPC.
+pub(crate) fn read_owned_workload_status(
+    reader: workload_status_result::Reader<'_>,
+) -> Result<OwnedWorkloadStatus, Error> {
+    match reader.which()? {
+        workload_status_result::Which::Missing(()) => Ok(OwnedWorkloadStatus::Missing),
+        workload_status_result::Which::Removed(()) => Ok(OwnedWorkloadStatus::Removed),
+        workload_status_result::Which::NotOwned(node_id) => {
+            Ok(OwnedWorkloadStatus::NotOwned(read_id_from_data(node_id?)?))
+        }
+        workload_status_result::Which::Status(status) => {
+            Ok(OwnedWorkloadStatus::Status(Box::new(read_status(status?)?)))
+        }
     }
 }
 
@@ -1520,6 +1569,51 @@ mod tests {
         let spec = value_to_spec(complete.id, complete);
         let status = spec_to_status(&spec);
         merge_status_into_value(None, &status)
+    }
+
+    /// Round-trips one exact owned-status response through its Cap'n Proto union.
+    fn roundtrip_owned_status(status: &OwnedWorkloadStatus) -> OwnedWorkloadStatus {
+        let mut message = capnp::message::Builder::new_default();
+        write_owned_workload_status(
+            message.init_root::<workload_status_result::Builder<'_>>(),
+            status,
+        );
+        let reader = message
+            .get_root_as_reader::<workload_status_result::Reader<'_>>()
+            .expect("read owned status root");
+        read_owned_workload_status(reader).expect("decode owned status")
+    }
+
+    /// Exact owned-status results preserve absence, removal, owner, and lifecycle state.
+    #[test]
+    fn owned_workload_status_result_roundtrips_capnp() {
+        assert!(matches!(
+            roundtrip_owned_status(&OwnedWorkloadStatus::Missing),
+            OwnedWorkloadStatus::Missing
+        ));
+        assert!(matches!(
+            roundtrip_owned_status(&OwnedWorkloadStatus::Removed),
+            OwnedWorkloadStatus::Removed
+        ));
+
+        let owner_node_id = Uuid::new_v4();
+        assert!(matches!(
+            roundtrip_owned_status(&OwnedWorkloadStatus::NotOwned(owner_node_id)),
+            OwnedWorkloadStatus::NotOwned(decoded) if decoded == owner_node_id
+        ));
+
+        let value = sample_complete_workload_value();
+        let spec = value_to_spec(value.id, value);
+        let status = spec_to_status(&spec);
+        match roundtrip_owned_status(&OwnedWorkloadStatus::Status(Box::new(status.clone()))) {
+            OwnedWorkloadStatus::Status(decoded) => {
+                assert_eq!(decoded.id, status.id);
+                assert_eq!(decoded.node_id, status.node_id);
+                assert_eq!(decoded.state, status.state);
+                assert_eq!(decoded.phase_version, status.phase_version);
+            }
+            other => panic!("expected owned workload status, got {other:?}"),
+        }
     }
 
     /// Builds one admission group record for store-codec round-trip tests.

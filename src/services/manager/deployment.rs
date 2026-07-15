@@ -16,6 +16,7 @@ use super::sharding::{
 };
 use super::state::deploying_assignment_incomplete;
 use super::*;
+use crate::workload::manager::OwnedWorkloadStatus;
 use anyhow::Context;
 use thiserror::Error;
 use tokio::time::timeout;
@@ -61,6 +62,64 @@ enum ServiceSlotCutoverDecision {
         current_task_id: Option<Uuid>,
         reason: ServiceSlotCutoverStaleReason,
     },
+}
+
+/// Expected cancellation of a replacement before it can claim its service slot.
+#[derive(Debug, Error)]
+#[error(
+    "replacement task {task_id} for service '{service_name}' was canceled before cutover: {reason}"
+)]
+struct ReplacementCutoverCancelled {
+    service_name: String,
+    task_id: Uuid,
+    reason: String,
+}
+
+/// Decision produced from one exact target-owned workload status response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TargetStatusDecision {
+    KeepWaiting,
+    UsePhase(WorkloadPhase),
+    Cancel(String),
+}
+
+/// Converts one target-owned status response into the next cutover action.
+fn target_status_decision(
+    status: OwnedWorkloadStatus,
+    target_observed: bool,
+) -> TargetStatusDecision {
+    match status {
+        OwnedWorkloadStatus::Status(status) => TargetStatusDecision::UsePhase(status.state),
+        OwnedWorkloadStatus::Missing if target_observed => TargetStatusDecision::Cancel(
+            "target removed a previously observed workload row".to_string(),
+        ),
+        OwnedWorkloadStatus::Missing => TargetStatusDecision::KeepWaiting,
+        OwnedWorkloadStatus::Removed => {
+            TargetStatusDecision::Cancel("target has a durable workload removal".to_string())
+        }
+        OwnedWorkloadStatus::NotOwned(owner_node_id) => TargetStatusDecision::Cancel(format!(
+            "target reports that node {owner_node_id} owns the workload"
+        )),
+    }
+}
+
+/// Builds the typed error used when another reconciliation path cancels a replacement.
+fn replacement_cutover_cancelled(
+    service_name: &str,
+    task_id: Uuid,
+    reason: impl Into<String>,
+) -> anyhow::Error {
+    anyhow::Error::new(ReplacementCutoverCancelled {
+        service_name: service_name.to_string(),
+        task_id,
+        reason: reason.into(),
+    })
+}
+
+/// Returns true when service reconciliation lost a replacement to another valid cleanup path.
+pub(super) fn task_cutover_was_cancelled(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.is::<ReplacementCutoverCancelled>())
 }
 
 impl ServiceController {
@@ -1986,15 +2045,14 @@ impl ServiceController {
         &self,
         service_name: &str,
         task_id: Uuid,
+        target_node_id: Uuid,
         timeout: Duration,
     ) -> anyhow::Result<()> {
-        self.wait_for_task_cutover_ready(service_name, task_id, timeout)
+        self.wait_for_task_cutover_ready(service_name, task_id, target_node_id, timeout)
             .await
-            .map_err(|err| {
-                anyhow!(
-                    "failed to publish task {} for service '{}' during traffic cutover: {err}",
-                    task_id,
-                    service_name
+            .with_context(|| {
+                format!(
+                    "failed to publish task {task_id} for service '{service_name}' during traffic cutover"
                 )
             })
     }
@@ -2009,9 +2067,14 @@ impl ServiceController {
         &self,
         service_name: &str,
         task_id: Uuid,
-        timeout: Duration,
+        target_node_id: Uuid,
+        wait_timeout: Duration,
     ) -> anyhow::Result<()> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + wait_timeout;
+        let mut next_status_probe = Instant::now();
+        let mut target_observed = target_node_id == self.local_node_id;
+        let mut probe_failure_reported = false;
+
         loop {
             if Instant::now() >= deadline {
                 return Err(anyhow!(
@@ -2021,13 +2084,80 @@ impl ServiceController {
                 ));
             }
 
-            let state = self
+            let mut state = self
                 .workload_manager
                 .workload_phase_snapshot(&[task_id])
                 .await?
                 .first()
                 .and_then(|(_, state)| state.as_ref())
                 .cloned();
+
+            let waiting_on_replicated_status = matches!(
+                state,
+                Some(WorkloadPhase::Pending)
+                    | Some(WorkloadPhase::Pulling)
+                    | Some(WorkloadPhase::Creating)
+                    | Some(WorkloadPhase::Unknown)
+                    | None
+            );
+            if target_node_id != self.local_node_id
+                && waiting_on_replicated_status
+                && Instant::now() >= next_status_probe
+            {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let probe_timeout = remaining.min(SERVICE_CUTOVER_STATUS_PROBE_TIMEOUT);
+                let probe = timeout(
+                    probe_timeout,
+                    self.workload_manager
+                        .remote_owned_workload_status(target_node_id, task_id),
+                )
+                .await;
+                next_status_probe = Instant::now() + SERVICE_CUTOVER_STATUS_PROBE_INTERVAL;
+
+                match probe {
+                    Ok(Ok(status)) => {
+                        probe_failure_reported = false;
+                        match target_status_decision(status, target_observed) {
+                            TargetStatusDecision::KeepWaiting => {}
+                            TargetStatusDecision::UsePhase(phase) => {
+                                target_observed = true;
+                                state = Some(phase);
+                            }
+                            TargetStatusDecision::Cancel(reason) => {
+                                return Err(replacement_cutover_cancelled(
+                                    service_name,
+                                    task_id,
+                                    reason,
+                                ));
+                            }
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        if !probe_failure_reported {
+                            tracing::debug!(
+                                target: "services",
+                                service = %service_name,
+                                task = %task_id,
+                                target_node = %target_node_id,
+                                "exact target status unavailable during cutover; continuing with replicated state: {err:#}"
+                            );
+                            probe_failure_reported = true;
+                        }
+                    }
+                    Err(_) => {
+                        if !probe_failure_reported {
+                            tracing::debug!(
+                                target: "services",
+                                service = %service_name,
+                                task = %task_id,
+                                target_node = %target_node_id,
+                                "exact target status probe timed out during cutover; continuing with replicated state"
+                            );
+                            probe_failure_reported = true;
+                        }
+                    }
+                }
+            }
 
             match state {
                 Some(WorkloadPhase::Running) => {
@@ -2044,6 +2174,13 @@ impl ServiceController {
                 | Some(WorkloadPhase::Creating)
                 | Some(WorkloadPhase::Unknown)
                 | None => {}
+                Some(phase @ (WorkloadPhase::Stopping | WorkloadPhase::Stopped)) => {
+                    return Err(replacement_cutover_cancelled(
+                        service_name,
+                        task_id,
+                        format!("workload entered {phase:?}"),
+                    ));
+                }
                 Some(other) => {
                     return Err(anyhow!(
                         "replacement task {} for service '{}' entered non-routable state {:?} before cutover",
@@ -2473,5 +2610,39 @@ mod tests {
         });
 
         assert!(deployment_launch_error_should_fail_generation(&err));
+    }
+
+    /// Expected replacement cancellation remains identifiable after publication adds context.
+    #[test]
+    fn replacement_cutover_cancellation_survives_error_context() {
+        let err = replacement_cutover_cancelled("api", Uuid::new_v4(), "workload entered Stopping")
+            .context("failed to publish replacement traffic");
+
+        assert!(task_cutover_was_cancelled(&err));
+        assert!(!task_cutover_was_cancelled(&anyhow!(
+            "replacement runtime failed"
+        )));
+    }
+
+    /// A never-seen target row remains retryable because MST delivery may still be pending.
+    #[test]
+    fn missing_target_status_waits_until_the_target_was_observed() {
+        assert_eq!(
+            target_status_decision(OwnedWorkloadStatus::Missing, false),
+            TargetStatusDecision::KeepWaiting
+        );
+        assert!(matches!(
+            target_status_decision(OwnedWorkloadStatus::Missing, true),
+            TargetStatusDecision::Cancel(_)
+        ));
+    }
+
+    /// A durable target removal ends cutover instead of consuming the full readiness deadline.
+    #[test]
+    fn removed_target_status_cancels_cutover() {
+        assert!(matches!(
+            target_status_decision(OwnedWorkloadStatus::Removed, false),
+            TargetStatusDecision::Cancel(_)
+        ));
     }
 }

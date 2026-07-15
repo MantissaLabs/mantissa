@@ -21,12 +21,12 @@ use crate::scheduler::{
 };
 use crate::workload::model::{WorkloadAdmissionState, WorkloadPhase, WorkloadSpec};
 use crate::workload::service::{
-    read_service_shard_assignment_response, read_spec, write_service_shard_assignment_request,
-    write_spec,
+    read_owned_workload_status, read_service_shard_assignment_response, read_spec,
+    write_service_shard_assignment_request, write_spec,
 };
 
 use super::planner::{BatchStartPlan, PreparedRemoteStartPlan, RemoteStartPlan};
-use super::{ServiceShardAssignmentRequest, WorkloadManager};
+use super::{OwnedWorkloadStatus, ServiceShardAssignmentRequest, WorkloadManager};
 
 /// Default lifetime for prepared scheduler leases while a batch or group admission commits.
 pub(super) const DEFAULT_PREPARED_LEASE_TTL_MS: u64 = 30_000;
@@ -1367,6 +1367,36 @@ impl WorkloadManager {
             .context(format!("invalid workload response from peer {peer_id}"))?
             .get_workload()
             .context(format!("missing workload service for peer {peer_id}"))
+    }
+
+    /// Reads one workload's exact persisted status from the node expected to own it.
+    pub(crate) async fn remote_owned_workload_status(
+        &self,
+        peer_id: Uuid,
+        task_id: Uuid,
+    ) -> Result<OwnedWorkloadStatus, anyhow::Error> {
+        if peer_id == self.local_node_id {
+            return self.owned_workload_status(task_id).await;
+        }
+
+        let workload_client = self.remote_workload_client(peer_id).await?;
+        let mut request = workload_client.get_status_request();
+        request.get().init_request().set_id(task_id.as_bytes());
+        let response = request.send().promise.await.with_context(|| {
+            format!("owned workload status request failed for task {task_id} on peer {peer_id}")
+        })?;
+        let result = response
+            .get()
+            .with_context(|| format!("invalid owned workload status response from peer {peer_id}"))?
+            .get_result()
+            .with_context(|| {
+                format!("missing owned workload status response from peer {peer_id}")
+            })?;
+        read_owned_workload_status(result).map_err(|err| {
+            anyhow::anyhow!(
+                "failed to decode owned workload status for task {task_id} from peer {peer_id}: {err}"
+            )
+        })
     }
 
     /// Sends one deterministic service shard to the remote coordinator chosen by the owner.
