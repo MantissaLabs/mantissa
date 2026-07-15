@@ -2,13 +2,13 @@ use super::Message;
 use crate::topology::TopologyEvent;
 use crate::workload::model::WorkloadPropagationClass;
 use mantissa_protocol::gossip;
-use mantissa_protocol::gossip::gossip_message::Which::Topology;
+use mantissa_protocol::gossip::gossip_message::Which::{SecretMasterKey, Topology};
 
 /// Gossip transport plane selector.
 ///
 /// `ViewScoped` carries regular control-plane events that must stay inside the active
 /// view boundary. `GlobalMetadata` carries low-rate metadata that is allowed to cross
-/// split view boundaries (currently cluster lineage names).
+/// split view boundaries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum GossipPlane {
     ViewScoped,
@@ -34,9 +34,11 @@ impl GossipPlane {
 pub(super) fn gossip_plane_for_message(message: &Message) -> GossipPlane {
     match message {
         Message::Topology {
-            event: TopologyEvent::ClusterNameUpdated { .. },
+            event:
+                TopologyEvent::ClusterNameUpdated { .. } | TopologyEvent::ClusterMetadataChanged { .. },
             ..
         } => GossipPlane::GlobalMetadata,
+        Message::SecretMasterKey { .. } => GossipPlane::GlobalMetadata,
         Message::Workload { event, .. } => workload_gossip_plane(event.propagation_class()),
         _ => GossipPlane::ViewScoped,
     }
@@ -59,8 +61,12 @@ pub(super) fn gossip_plane_for_wire_message(
             Ok(mantissa_protocol::topology::topology_event::EventType::ClusterNameUpdated) => {
                 GossipPlane::GlobalMetadata
             }
+            Ok(mantissa_protocol::topology::topology_event::EventType::ClusterMetadataChanged) => {
+                GossipPlane::GlobalMetadata
+            }
             _ => GossipPlane::ViewScoped,
         },
+        Ok(SecretMasterKey(_)) => GossipPlane::GlobalMetadata,
         _ => GossipPlane::ViewScoped,
     }
 }
@@ -74,4 +80,52 @@ pub(super) fn should_relay_inbound_message(relay_inbound: bool, message: &Messag
     relay_inbound
         || gossip_plane_for_message(message).allows_cross_view()
         || matches!(message, Message::Network { .. })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::ClusterViewId;
+    use crate::store::replicated::secret_key_sync::{
+        SecretMasterKeyCurrent, SecretMasterKeySyncRecord,
+    };
+    use uuid::Uuid;
+
+    /// Transition hints must cross split boundaries and relay even when generic relay is disabled.
+    #[test]
+    fn transition_metadata_hints_use_global_plane() {
+        let message = Message::Topology {
+            id: Uuid::new_v4(),
+            event: TopologyEvent::ClusterMetadataChanged {
+                operation_id: Uuid::new_v4(),
+            },
+        };
+
+        assert_eq!(
+            gossip_plane_for_message(&message),
+            GossipPlane::GlobalMetadata
+        );
+        assert!(should_relay_inbound_message(false, &message));
+    }
+
+    /// Wrapped transition keys use the same cross-view plane as their availability hint.
+    #[test]
+    fn master_key_rows_use_global_plane() {
+        let message = Message::SecretMasterKey {
+            id: Uuid::new_v4(),
+            record: SecretMasterKeySyncRecord::Current(SecretMasterKeyCurrent {
+                scope_view: ClusterViewId::legacy_default(),
+                key_id: Uuid::new_v4(),
+                generation: 1,
+                created_by_operation_id: Some(Uuid::new_v4()),
+                parent_key_ids: Vec::new(),
+            }),
+        };
+
+        assert_eq!(
+            gossip_plane_for_message(&message),
+            GossipPlane::GlobalMetadata
+        );
+        assert!(should_relay_inbound_message(false, &message));
+    }
 }

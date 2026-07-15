@@ -1437,19 +1437,6 @@ impl topology::Server for Topology {
         Ok(())
     }
 
-    /// Accepts a relayed operation record and triggers local progression when appropriate.
-    async fn submit_cluster_operation(
-        self: Rc<Self>,
-        params: topology::SubmitClusterOperationParams,
-        _results: topology::SubmitClusterOperationResults,
-    ) -> Result<(), capnp::Error> {
-        let reader = params.get()?;
-        let operation_id = Self::operation_id_from_data(reader.get_id()?)?;
-        let payload = reader.get_payload()?;
-        self.accept_submitted_cluster_operation(operation_id, payload)
-            .await
-    }
-
     /// Returns the most recent locally persisted operation record for the requested operation id.
     async fn get_cluster_operation(
         self: Rc<Self>,
@@ -1733,6 +1720,11 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
             name: reader.get_cluster_name()?.to_string()?,
             updated_at_unix_ms: reader.get_updated_at_unix_ms(),
             actor_node_id: read_node_id(reader.get_actor_node_id()?)?,
+        },
+        EventType::ClusterMetadataChanged => TopologyEvent::ClusterMetadataChanged {
+            operation_id: Uuid::from_slice(reader.get_operation_id()?).map_err(|err| {
+                capnp::Error::failed(format!("invalid cluster metadata operation id: {err}"))
+            })?,
         },
         EventType::NodeSchedulingUpdated => {
             let node = reader.get_node()?;

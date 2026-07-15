@@ -5,7 +5,7 @@ use crate::cluster::operations::{
 };
 use crate::cluster::{ClusterId, ClusterViewId};
 use crate::node::id::read_node_id;
-use crate::topology::Topology;
+use crate::topology::{Topology, TopologyEvent};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tracing::warn;
@@ -236,17 +236,31 @@ impl Topology {
         }
     }
 
-    /// Stores a submitted operation, relays it to peers, and schedules local progression.
+    /// Stores a submitted operation, announces its MST availability, and schedules local work.
     pub(in crate::topology) async fn persist_and_dispatch_operation(
         &self,
         operation: &mut ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
         if !operation.dry_run {
             let _ = self.normalize_cluster_operation_dependency(operation)?;
+            self.publish_transition_key_material(operation).await?;
         }
         self.persist_cluster_operation(operation).await?;
-        if !operation.dry_run {
-            let _ = self.broadcast_cluster_operation(operation).await?;
+        if !operation.dry_run
+            && let Err(err) = self
+                .gossip_topology_event(TopologyEvent::ClusterMetadataChanged {
+                    operation_id: operation.id,
+                })
+                .await
+        {
+            // The durable MST row remains authoritative and periodic global Sync will repair a
+            // missed hint. Do not report an accepted operation as failed merely because the
+            // latency-optimization channel closed.
+            warn!(
+                target: "cluster_view",
+                operation_id = %operation.id,
+                "failed to enqueue cluster metadata availability hint: {err}"
+            );
         }
         if self.operation_ready_to_progress(operation)? {
             self.trigger_operation_progress(operation.id, operation.dry_run);
@@ -256,28 +270,22 @@ impl Topology {
         Ok(())
     }
 
-    /// Applies one relayed operation payload and triggers local progression when stage requires it.
-    pub(in crate::topology) async fn accept_submitted_cluster_operation(
+    /// Injects one operation record through the production merge/progress path for test fixtures.
+    pub(crate) async fn accept_test_cluster_operation(
         &self,
-        operation_id: Uuid,
-        payload: &[u8],
+        mut incoming: ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
-        let mut incoming: ClusterOperationRecord = ClusterOperationRecord::decode_capnp(payload)
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let operation_id = incoming.id;
         if incoming.updated_at_unix_ms == 0 {
             incoming.updated_at_unix_ms = Self::now_unix_ms();
         }
         if incoming.created_at_unix_ms == 0 {
             incoming.created_at_unix_ms = incoming.updated_at_unix_ms;
         }
-        if incoming.id != operation_id {
-            return Err(capnp::Error::failed(format!(
-                "relayed operation id mismatch: envelope={operation_id}, payload={}",
-                incoming.id
-            )));
-        }
-
         let _ = self.normalize_cluster_operation_dependency(&mut incoming)?;
+        if !incoming.dry_run && incoming.stage == ClusterOperationStage::Proposed {
+            self.publish_transition_key_material(&incoming).await?;
+        }
 
         let merged = match self.load_cluster_operation(operation_id)? {
             Some(current) if !incoming.supersedes(&current) => current,
@@ -310,7 +318,7 @@ impl Topology {
                 active_operation = %active.id,
                 active_kind = ?active.kind,
                 active_stage = ?active.stage,
-                "deferring relayed cluster operation until active operation finalizes"
+                "deferring learned cluster operation until active operation finalizes"
             );
             self.trigger_operation_progress(active.id, false);
             return Ok(());
@@ -326,7 +334,7 @@ impl Topology {
                 let _ = self
                     .replay_finalized_cluster_transition_for_active_view(
                         &merged,
-                        "relayed finalized operation",
+                        "learned finalized operation",
                     )
                     .await?;
             }

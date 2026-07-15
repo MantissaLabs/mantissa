@@ -341,6 +341,10 @@ impl SecretMasterKeyPublisher {
     }
 
     /// Returns the first compatible visible grant for this key and recipient.
+    ///
+    /// Any sender holding the same verified key can produce a usable envelope. Treating only this
+    /// node's envelopes as visible makes transition replay rewrite an already satisfied recipient
+    /// row with a concurrent sender value, so idempotence is defined by descriptor and recipient.
     fn visible_grant_record(
         &self,
         descriptor: &MasterKeyDescriptor,
@@ -362,8 +366,6 @@ impl SecretMasterKeyPublisher {
                 return None;
             };
             (grant.descriptor == *descriptor
-                && grant.sender_node_id == self.local_node_id
-                && grant.sender_noise_static_pub == self.noise_keys.public_bytes()
                 && grant.recipient_node_id == recipient.node_id
                 && grant.recipient_noise_static_pub == recipient.noise_static_pub)
                 .then(|| SecretMasterKeySyncRecord::Grant(grant.clone()))

@@ -88,21 +88,21 @@ Domain wrappers live under `src/store/` such as:
 
 View-scoped sync currently serves these domains in a stable order:
 
-| Domain | Stored data |
-| --- | --- |
-| `Peers` | peer metadata, liveness-adjacent control-plane rows |
-| `Workloads` | generic schedulable workload rows |
-| `Services` | service specs and rollout state |
-| `Jobs` | job controller records |
-| `Agents` | agent session and run records |
-| `Secrets` | replicated secret metadata and payload state |
-| `Networks` | network specs |
-| `NetworkPeers` | overlay peer state |
-| `NetworkAttachments` | runtime attachment rows used for routing and discovery |
-| `ClusterViews` | cluster lineage metadata such as cluster names and per-lineage node counts |
-| `Volumes` | volume specs |
-| `VolumeNodes` | per-node realized volume state |
-| `SchedulerDigests` | coarse scheduling summaries per node |
+| Domain               | Stored data                                                                |
+| -------------------- | -------------------------------------------------------------------------- |
+| `Peers`              | peer metadata, liveness-adjacent control-plane rows                        |
+| `Workloads`          | generic schedulable workload rows                                          |
+| `Services`           | service specs and rollout state                                            |
+| `Jobs`               | job controller records                                                     |
+| `Agents`             | agent session and run records                                              |
+| `Secrets`            | replicated secret metadata and payload state                               |
+| `Networks`           | network specs                                                              |
+| `NetworkPeers`       | overlay peer state                                                         |
+| `NetworkAttachments` | runtime attachment rows used for routing and discovery                     |
+| `ClusterViews`       | cluster lineage metadata such as cluster names and per-lineage node counts |
+| `Volumes`            | volume specs                                                               |
+| `VolumeNodes`        | per-node realized volume state                                             |
+| `SchedulerDigests`   | coarse scheduling summaries per node                                       |
 
 The sync service is defined in:
 
@@ -209,12 +209,20 @@ The generic store owns only local mechanics. It scans Redb rows, applies batch
 limits, updates the in-memory MST, and advances prune frontiers. Distributed
 safety stays outside the store in the sync layer.
 
-Tombstone GC requires a complete sync-derived barrier for each domain. For a
-multi-node cluster, every active remote peer must have an equal-root
-observation for the current cluster view and root schema before that domain can
-prune tombstones. If any active peer is offline, unreachable, or still missing
-an equal-root observation, tombstone GC skips that domain. Single-node clusters
-can build the barrier locally.
+Tombstone GC requires a complete sync-derived barrier for each domain. Ordinary
+domains use active peers in the local view. Cluster-wide domains
+(`ClusterViews`, `Peers`, `ClusterOperations`, and `SecretMasterKeys`) include every
+known active peer even when a split excludes that peer from workload traffic.
+Every peer in the selected population must have an equal-root observation for
+the local view and root schema before that domain can prune tombstones. If any
+required peer is offline, unreachable, or still missing an observation, GC
+skips that domain. Single-node populations can build the barrier locally.
+
+Semantic cleanup uses the same frontier where deleting a live row would remove
+repair state. In particular, old terminal split/merge intents are not
+tombstoned until every known cluster-wide peer has matching `Peers`,
+`ClusterViews`, `SecretMasterKeys`, and `ClusterOperations` roots. Transition
+application remains asynchronous: only cleanup waits for this Sync evidence.
 
 After the barrier exists, the store still applies
 `storage.gc.tombstone_min_retention_ms`. The effective cutoff is the older of:
@@ -309,7 +317,7 @@ Relevant code:
 
 - `src/store/cluster_view_store.rs`
 - `src/store/cluster_operation_store.rs`
-- `src/topology/operation_progress.rs`
+- `src/topology/cluster_operations/progress.rs`
 
 ## Earlier Design Assumptions That No Longer Apply
 

@@ -908,7 +908,7 @@ local_test!(ten_node_empty_split_merge_keeps_master_key_rows_linear, {
         .expect("secret master-key rows converge across ten nodes after split/merge");
 
     let shapes = cluster.iter().map(master_key_row_shape).collect::<Vec<_>>();
-    for shape in &shapes {
+    for (node, shape) in cluster.iter().zip(&shapes) {
         assert_eq!(
             shape.tombs, 0,
             "fresh ten-node split/merge should not tombstone keys"
@@ -919,7 +919,8 @@ local_test!(ten_node_empty_split_merge_keeps_master_key_rows_linear, {
                 && shape.descriptors <= 3
                 && shape.grants <= 24
                 && shape.currents <= 3,
-            "ten-node empty split/merge should stay linear and tightly bounded: {shape:?}"
+            "ten-node empty split/merge should stay linear and tightly bounded: {shape:?}; {}",
+            master_key_row_debug(node)
         );
     }
 });
@@ -1414,6 +1415,168 @@ local_test!(split_merge_grants_partition_keys_for_secret_decryption, {
         .await,
         "all merged nodes should decrypt a post-merge secret"
     );
+});
+
+local_test!(merge_key_grants_survive_an_offline_selected_holder, {
+    let _guard = RuntimeBackendOverrideGuard::install_default();
+    let cfg = ClusterConfig {
+        sync_tick_ms: Some(100),
+        gossip_tick_ms: Some(100),
+        gossip_fanout: Some(4),
+        ..ClusterConfig::default()
+    };
+    let mut cluster = TestNode::new_cluster_inproc_with_config(4, cfg)
+        .await
+        .expect("four-node secrets cluster");
+    TestNode::assert_cluster_size_all(&cluster, 4, "four-node cluster before split").await;
+
+    let (_split_id, left_view, right_view) = split_four_node_cluster(&cluster).await;
+    rotate_master_key(&cluster[2].node.secrets_client)
+        .await
+        .expect("rotate destination partition key");
+    let destination_secret = b"destination secret before holder outage";
+    create_secret(
+        &cluster[2].node.secrets_client,
+        "destination-secret-before-holder-outage",
+        destination_secret,
+    )
+    .await
+    .expect("create destination secret");
+    assert!(
+        wait_for_plaintext(
+            &cluster[3].node.secrets_client,
+            "destination-secret-before-holder-outage",
+            destination_secret,
+            Duration::from_secs(15),
+        )
+        .await,
+        "both destination nodes should hold the rotated key before the outage"
+    );
+
+    rotate_master_key(&cluster[2].node.secrets_client)
+        .await
+        .expect("rotate destination partition key again");
+    let current_destination_secret = b"current destination secret before holder outage";
+    create_secret(
+        &cluster[2].node.secrets_client,
+        "current-destination-secret-before-holder-outage",
+        current_destination_secret,
+    )
+    .await
+    .expect("create current destination secret");
+    assert!(
+        wait_for_plaintext(
+            &cluster[3].node.secrets_client,
+            "current-destination-secret-before-holder-outage",
+            current_destination_secret,
+            Duration::from_secs(15),
+        )
+        .await,
+        "the surviving destination node should hold both historical and current keys"
+    );
+
+    // The node that performs rotation is the descriptor creator and healthy fast-path publisher.
+    let selected_holder_index = 2;
+    let surviving_holder_index = 3;
+    let selected_holder_id = cluster[selected_holder_index].id();
+    let survivor_health = cluster[surviving_holder_index]
+        .node
+        .registry
+        .health_monitor();
+    for _ in 0..3 {
+        let _ = survivor_health.record_probe_failure(
+            selected_holder_id,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+    }
+    assert_eq!(
+        survivor_health.status(selected_holder_id),
+        mantissa_health::Status::Down,
+        "the surviving key holder must exclude the unavailable deterministic publisher"
+    );
+    cluster[selected_holder_index]
+        .node
+        .stop_cluster_background_tasks();
+    cluster[selected_holder_index]
+        .stop()
+        .await
+        .expect("stop selected destination key holder");
+
+    let merge_id = merge_cluster_views(&cluster[0], left_view, right_view).await;
+    for node_index in [0, 1, surviving_holder_index] {
+        wait_for_cluster_view(
+            &cluster[node_index].topology(),
+            right_view,
+            Duration::from_secs(15),
+        )
+        .await;
+        for (name, plaintext) in [
+            (
+                "destination-secret-before-holder-outage",
+                destination_secret.as_slice(),
+            ),
+            (
+                "current-destination-secret-before-holder-outage",
+                current_destination_secret.as_slice(),
+            ),
+        ] {
+            assert!(
+                wait_for_plaintext(
+                    &cluster[node_index].node.secrets_client,
+                    name,
+                    plaintext,
+                    Duration::from_secs(30),
+                )
+                .await,
+                "running merge participant should decrypt {name}"
+            );
+        }
+    }
+
+    cluster[selected_holder_index]
+        .start()
+        .await
+        .expect("restart selected destination key holder");
+    cluster[selected_holder_index]
+        .node
+        .ensure_cluster_background_tasks();
+    cluster[selected_holder_index].node.sync_once_now();
+    cluster[surviving_holder_index].node.sync_once_now();
+    wait_for_operation_stage(
+        &cluster[selected_holder_index].topology(),
+        merge_id.as_bytes(),
+        ClusterOperationStage::Finalized,
+        Duration::from_secs(15),
+    )
+    .await;
+    wait_for_cluster_view(
+        &cluster[selected_holder_index].topology(),
+        right_view,
+        Duration::from_secs(15),
+    )
+    .await;
+    for (name, plaintext) in [
+        (
+            "destination-secret-before-holder-outage",
+            destination_secret.as_slice(),
+        ),
+        (
+            "current-destination-secret-before-holder-outage",
+            current_destination_secret.as_slice(),
+        ),
+    ] {
+        assert!(
+            wait_for_plaintext(
+                &cluster[selected_holder_index].node.secrets_client,
+                name,
+                plaintext,
+                Duration::from_secs(15),
+            )
+            .await,
+            "returning holder should apply the same durable merge intent for {name}"
+        );
+    }
 });
 
 local_test!(

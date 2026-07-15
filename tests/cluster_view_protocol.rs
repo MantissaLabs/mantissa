@@ -13,10 +13,17 @@ use mantissa::runtime::set::RuntimeSet;
 use mantissa::runtime::testing::IN_MEMORY_RUNTIME_BACKEND_KIND;
 use mantissa::runtime::testing::new_in_memory_runtime_backend;
 use mantissa::runtime::types::RuntimeSupportProfile;
+use mantissa::secrets::master_key::envelope::{
+    PassphraseKdfParams, PassphraseProvider, SecretPassphrase,
+};
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
+use mantissa::store::local::SecretMasterStore;
 use mantissa::store::replicated::cluster_operations::ClusterOperationStore;
 use mantissa::store::replicated::cluster_views::ClusterViewStore;
 use mantissa::store::replicated::peers::open_peers_store;
+use mantissa::store::replicated::secret_key_sync::{
+    current_from_descriptor, open_secret_master_key_store, upsert_current, upsert_descriptor,
+};
 use mantissa::sync::VIEW_SCOPED_DOMAIN_COUNT;
 use mantissa::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue};
 use mantissa_net::noise::NoiseKeys;
@@ -67,19 +74,11 @@ async fn session_capabilities_cluster_view(
     .expect("decode capabilities active view")
 }
 
-async fn submit_cluster_operation_record(
-    topology: &mantissa::topology_capnp::topology::Client,
-    operation: &ClusterOperationRecord,
-) {
-    let payload = operation.encode_capnp().expect("encode cluster operation");
-    let mut request = topology.submit_cluster_operation_request();
-    request.get().set_id(operation.id.as_bytes());
-    request.get().set_payload(&payload);
-    request
-        .send()
-        .promise
+async fn submit_cluster_operation_record(node: &TestNode, operation: &ClusterOperationRecord) {
+    node.node
+        .submit_cluster_operation_for_test(operation.clone())
         .await
-        .expect("submitClusterOperation send");
+        .expect("inject cluster operation");
 }
 
 /// Opens a replicated cluster-operation store with an isolated test actor.
@@ -96,6 +95,41 @@ async fn persist_test_operation(
         .put_record(operation)
         .await
         .expect("persist operation");
+}
+
+/// Seeds the target key rows that production persists before a transition operation becomes visible.
+async fn persist_test_transition_key(
+    db: Arc<redb::Database>,
+    node_id: Uuid,
+    operation: &ClusterOperationRecord,
+) {
+    let passphrase = SecretPassphrase::new(b"mantissa-headless-master-key-passphrase".to_vec())
+        .expect("headless test master-key passphrase");
+    let provider = Arc::new(PassphraseProvider::with_params(
+        passphrase,
+        PassphraseKdfParams::test(),
+    ));
+    let master_store =
+        SecretMasterStore::new(db.clone(), provider).expect("open test master-key store");
+    master_store
+        .ensure_current_for_node(ClusterViewId::legacy_default(), node_id)
+        .expect("ensure test source master key");
+    let target_view = operation
+        .target_views
+        .first()
+        .copied()
+        .expect("test operation target view");
+    let target = master_store
+        .prepare_transition_child(target_view, node_id, operation.id)
+        .expect("prepare test transition key");
+    let sync_store =
+        open_secret_master_key_store(db, node_id).expect("open test master-key sync store");
+    upsert_descriptor(&sync_store, target.descriptor.clone())
+        .await
+        .expect("persist test target descriptor");
+    upsert_current(&sync_store, current_from_descriptor(&target.descriptor))
+        .await
+        .expect("persist test target current");
 }
 
 async fn cluster_operation_dependency_id(
@@ -1264,6 +1298,7 @@ local_test!(cluster_view_replays_pending_operation_on_startup, {
     let db_path = temp_dir.path().join("state.redb");
     let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
     let operation_store = open_test_operation_store(db.clone());
+    let node_id = Uuid::new_v4();
 
     let source_view = ClusterViewId::legacy_default();
     let target_view = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 3);
@@ -1285,11 +1320,12 @@ local_test!(cluster_view_replays_pending_operation_on_startup, {
         details: "replay test operation".to_string(),
     };
 
+    persist_test_transition_key(db.clone(), node_id, &operation).await;
     persist_test_operation(&operation_store, &operation).await;
 
     let node = HeadlessNode::new_with(
         db,
-        Uuid::new_v4(),
+        node_id,
         HeadlessKeys::new(
             Arc::new(NoiseKeys::from_private_bytes([0x31; 32])),
             ed25519_dalek::SigningKey::from_bytes(&[0x41; 32]),
@@ -1999,6 +2035,7 @@ local_test!(
         let db_path = temp_dir.path().join("state.redb");
         let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
         let operation_store = open_test_operation_store(db.clone());
+        let node_id = Uuid::new_v4();
         let view_store =
             ClusterViewStore::new(db.clone(), Uuid::new_v4()).expect("open cluster view store");
 
@@ -2044,12 +2081,14 @@ local_test!(
             details: "second prepared merge".to_string(),
         };
 
+        persist_test_transition_key(db.clone(), node_id, &first_operation).await;
+        persist_test_transition_key(db.clone(), node_id, &second_operation).await;
         persist_test_operation(&operation_store, &first_operation).await;
         persist_test_operation(&operation_store, &second_operation).await;
 
         let node = HeadlessNode::new_with(
             db,
-            Uuid::new_v4(),
+            node_id,
             HeadlessKeys::new(
                 Arc::new(NoiseKeys::from_private_bytes([0x91; 32])),
                 ed25519_dalek::SigningKey::from_bytes(&[0xA1; 32]),
@@ -2116,7 +2155,7 @@ local_test!(cluster_view_startup_gc_prunes_terminal_operations, {
             id: Uuid::new_v4(),
             kind: StoredOperationKind::Merge,
             stage: StoredOperationStage::Finalized,
-            dry_run: false,
+            dry_run: true,
             created_at_unix_ms: (index as u64).saturating_add(1),
             depends_on_operation_id: None,
             source_views: vec![source_view],
@@ -2166,6 +2205,90 @@ local_test!(cluster_view_startup_gc_prunes_terminal_operations, {
         "startup GC should keep the newest finalized operations by update timestamp"
     );
 });
+
+// Validates an offline known peer keeps old terminal intents available for later Sync repair.
+local_test!(
+    cluster_view_startup_gc_preserves_terminal_operations_for_offline_peer,
+    {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("state.redb");
+        let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
+        let self_id = Uuid::new_v4();
+        let offline_peer_id = Uuid::new_v4();
+        let operation_store = open_test_operation_store(db.clone());
+        let source_view = ClusterViewId::legacy_default();
+        let target_view = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 1);
+        let total = 640usize;
+
+        for index in 0..total {
+            let operation = ClusterOperationRecord {
+                id: Uuid::new_v4(),
+                kind: StoredOperationKind::Merge,
+                stage: StoredOperationStage::Finalized,
+                dry_run: true,
+                created_at_unix_ms: (index as u64).saturating_add(1),
+                depends_on_operation_id: None,
+                source_views: vec![source_view],
+                target_views: vec![target_view],
+                target_cluster_names: Vec::new(),
+                split_assignments: Vec::new(),
+                split_service_policy: Default::default(),
+                split_network_policy: Default::default(),
+                merge_service_policy: Default::default(),
+                updated_at_unix_ms: (index as u64).saturating_add(1),
+                details: format!("offline peer GC operation {index}"),
+            };
+            persist_test_operation(&operation_store, &operation).await;
+        }
+
+        let peers = open_peers_store(db.clone(), self_id).expect("open peers store");
+        peers
+            .upsert(
+                &UuidKey::from(offline_peer_id),
+                PeerValue {
+                    address: format!("inproc://{offline_peer_id}"),
+                    hostname: "offline-peer".to_string(),
+                    platform_os: "linux".to_string(),
+                    platform_arch: "amd64".to_string(),
+                    noise_static_pub: [0x21; 32],
+                    signing_pub: [0x22; 32],
+                    identity_sig: vec![0x23; 64],
+                    wireguard: None,
+                    runtime_support: RuntimeSupportProfile::default(),
+                    scheduling: PeerSchedulingState::schedulable_default(offline_peer_id),
+                    readiness: Default::default(),
+                    labels: mantissa::topology::peers::PeerLabelState::default(),
+                    root_schema: mantissa::cluster::RootSchemaInfo::default(),
+                    membership: PeerMembership::active(1),
+                },
+            )
+            .await
+            .expect("persist offline peer");
+
+        let _node = HeadlessNode::new_with(
+            db,
+            self_id,
+            HeadlessKeys::new(
+                Arc::new(NoiseKeys::from_private_bytes([0xD2; 32])),
+                ed25519_dalek::SigningKey::from_bytes(&[0xE2; 32]),
+            ),
+            headless_config_with_in_memory_runtime(),
+        )
+        .await
+        .expect("start offline-peer GC node");
+
+        sleep(Duration::from_millis(200)).await;
+
+        let persisted = operation_store
+            .list_records()
+            .expect("list operations after blocked startup GC");
+        assert_eq!(
+            persisted.len(),
+            total,
+            "offline known peer must block terminal intent deletion"
+        );
+    }
+);
 
 // Validates cluster view listing exposes the local active row and a non-zero member count.
 local_test!(cluster_view_lists_local_active_row, {
@@ -2523,8 +2646,8 @@ local_test!(cluster_view_name_updates_cross_view_via_sync_domain, {
         Duration::from_secs(5),
     )
     .await;
-    wait_for_cluster_view(&joiner_a.topology(), remote_view, Duration::from_secs(5)).await;
-    wait_for_cluster_view(&joiner_b.topology(), remote_view, Duration::from_secs(5)).await;
+    wait_for_cluster_view(&joiner_a.topology(), remote_view, Duration::from_secs(15)).await;
+    wait_for_cluster_view(&joiner_b.topology(), remote_view, Duration::from_secs(15)).await;
 
     let anchor_view = current_cluster_view(&anchor.topology()).await;
     let lineage_id = anchor_view.cluster_id.to_uuid();
@@ -2936,7 +3059,7 @@ local_test!(cluster_view_split_scopes_listings_to_active_view, {
         "cluster view listing should include both split target cluster ids"
     );
 
-    // Split commits keep peer rows for future merge discovery but remove stale local auth state.
+    // Split commits keep peer and authentication rows for cluster-wide transition repair.
     let (active_peers, _) = anchor
         .node
         .peers
@@ -2953,7 +3076,6 @@ local_test!(cluster_view_split_scopes_listings_to_active_view, {
         peer_ids, expected_peer_ids,
         "anchor peer store should retain all known peers across split partitions"
     );
-    // Session/credential cache entries may be recreated by one-shot operation relay paths.
     // Runtime loop scoping is validated by node/cluster listings and merge convergence tests.
 });
 
@@ -3192,9 +3314,9 @@ local_test!(cluster_session_reports_live_view_after_transition, {
     );
 });
 
-// Validates finalized operations missed by direct relay converge through global metadata sync.
+// Validates an offline participant pulls a finalized intent through cluster-wide metadata sync.
 local_test!(
-    cluster_operation_ledger_converges_after_missed_operation_relay,
+    cluster_operation_ledger_converges_after_offline_peer_returns,
     {
         let anchor = TestNode::new_with_tick_ms(100).await;
         let mut joiner = TestNode::new_with_tick_ms(100).await;
@@ -3253,6 +3375,93 @@ local_test!(
             Duration::from_secs(5),
         )
         .await;
+    }
+);
+
+// Validates split intent and prepublished target keys converge for an offline assigned node.
+local_test!(
+    cluster_split_offline_participant_converges_through_global_metadata,
+    {
+        let anchor = TestNode::new_with_tick_ms(100).await;
+        let mut joiner = TestNode::new_with_tick_ms(100).await;
+        joiner.join(&anchor).await.expect("join anchor");
+        anchor
+            .assert_cluster_size(2, "anchor cluster after join")
+            .await;
+        joiner
+            .assert_cluster_size(2, "joiner cluster after join")
+            .await;
+
+        let source_view = current_cluster_view(&anchor.topology()).await;
+        joiner.node.stop_cluster_background_tasks();
+        joiner.stop().await.expect("stop assigned joiner");
+
+        let mut split_req = anchor.topology().split_cluster_request();
+        {
+            let mut req = split_req.get().init_req();
+            source_view.write_capnp(req.reborrow().init_source_view());
+
+            let mut targets = req.reborrow().init_targets(2);
+            let mut anchor_target = targets.reborrow().get(0);
+            anchor_target.set_name("anchor-side");
+            let mut anchor_selector = anchor_target.reborrow().init_selector();
+            anchor_selector.reborrow().init_clauses(0);
+            let mut anchor_nodes = anchor_selector.reborrow().init_explicit_nodes(1);
+            set_node_id(anchor_nodes.reborrow().get(0), &anchor.id());
+
+            let mut joiner_target = targets.reborrow().get(1);
+            joiner_target.set_name("offline-side");
+            let mut joiner_selector = joiner_target.reborrow().init_selector();
+            joiner_selector.reborrow().init_clauses(0);
+            let mut joiner_nodes = joiner_selector.reborrow().init_explicit_nodes(1);
+            set_node_id(joiner_nodes.reborrow().get(0), &joiner.id());
+            req.set_dry_run(false);
+        }
+
+        let split_resp = split_req.send().promise.await.expect("splitCluster send");
+        let split_op = split_resp
+            .get()
+            .expect("splitCluster get")
+            .get_op()
+            .expect("split operation");
+        let split_id = split_op.get_id().expect("split id").to_vec();
+        let target_views = split_op.get_target_views().expect("split target views");
+        let anchor_view =
+            ClusterViewId::from_capnp(target_views.get(0)).expect("decode anchor split target");
+        let joiner_view =
+            ClusterViewId::from_capnp(target_views.get(1)).expect("decode joiner split target");
+
+        wait_for_operation_stage(
+            &anchor.topology(),
+            &split_id,
+            ClusterOperationStage::Finalized,
+            Duration::from_secs(5),
+        )
+        .await;
+        wait_for_cluster_view(&anchor.topology(), anchor_view, Duration::from_secs(5)).await;
+
+        joiner.start().await.expect("restart assigned joiner");
+        joiner.node.ensure_cluster_background_tasks();
+        anchor.node.sync_once_now();
+        joiner.node.sync_once_now();
+        wait_for_cluster_view(&joiner.topology(), joiner_view, Duration::from_secs(10)).await;
+        wait_for_operation_stage(
+            &joiner.topology(),
+            &split_id,
+            ClusterOperationStage::Finalized,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let joiner_current = joiner
+            .node
+            .secret_master_store
+            .current()
+            .expect("offline split participant current key");
+        assert_eq!(
+            joiner_current.descriptor.scope_view, joiner_view,
+            "offline participant must install its deterministic target key before view cutover"
+        );
     }
 );
 
@@ -3586,7 +3795,7 @@ local_test!(cluster_view_queues_concurrent_operation_submission, {
         updated_at_unix_ms: 1,
         details: "malformed split operation for fence validation".to_string(),
     };
-    submit_cluster_operation_record(&node.topology(), &active_operation).await;
+    submit_cluster_operation_record(&node, &active_operation).await;
 
     wait_for_operation_stage(
         &node.topology(),
@@ -3629,7 +3838,7 @@ local_test!(cluster_view_queues_concurrent_operation_submission, {
     aborted_active.stage = StoredOperationStage::Aborted;
     aborted_active.updated_at_unix_ms = 3;
     aborted_active.details = "aborted malformed split to release queued merge".to_string();
-    submit_cluster_operation_record(&node.topology(), &aborted_active).await;
+    submit_cluster_operation_record(&node, &aborted_active).await;
 
     wait_for_operation_stage(
         &node.topology(),
@@ -3670,7 +3879,7 @@ local_test!(cluster_view_chains_back_to_back_overlapping_operations, {
         updated_at_unix_ms: 1,
         details: "malformed split operation for queue-chain validation".to_string(),
     };
-    submit_cluster_operation_record(&node.topology(), &active_operation).await;
+    submit_cluster_operation_record(&node, &active_operation).await;
     wait_for_operation_stage(
         &node.topology(),
         active_operation.id.as_bytes(),
@@ -3713,8 +3922,8 @@ local_test!(cluster_view_chains_back_to_back_overlapping_operations, {
         updated_at_unix_ms: 3,
         details: "second queued merge operation".to_string(),
     };
-    submit_cluster_operation_record(&node.topology(), &first_merge).await;
-    submit_cluster_operation_record(&node.topology(), &second_merge).await;
+    submit_cluster_operation_record(&node, &first_merge).await;
+    submit_cluster_operation_record(&node, &second_merge).await;
 
     assert_eq!(
         cluster_operation_dependency_id(&node.topology(), first_merge.id).await,
@@ -3731,7 +3940,7 @@ local_test!(cluster_view_chains_back_to_back_overlapping_operations, {
     aborted_active.stage = StoredOperationStage::Aborted;
     aborted_active.updated_at_unix_ms = 4;
     aborted_active.details = "aborted malformed split to release merge queue".to_string();
-    submit_cluster_operation_record(&node.topology(), &aborted_active).await;
+    submit_cluster_operation_record(&node, &aborted_active).await;
 
     wait_for_operation_stage(
         &node.topology(),
@@ -3788,7 +3997,7 @@ local_test!(cluster_view_ignores_finalized_sibling_split_operation, {
         details: "finalized sibling split operation".to_string(),
     };
 
-    submit_cluster_operation_record(&node.topology(), &operation).await;
+    submit_cluster_operation_record(&node, &operation).await;
     wait_for_operation_stage(
         &node.topology(),
         operation.id.as_bytes(),
@@ -3835,7 +4044,7 @@ local_test!(cluster_view_ignores_proposed_sibling_merge_operation, {
         details: "proposed sibling merge operation".to_string(),
     };
 
-    submit_cluster_operation_record(&node.topology(), &operation).await;
+    submit_cluster_operation_record(&node, &operation).await;
     wait_for_operation_stage(
         &node.topology(),
         operation.id.as_bytes(),
@@ -4000,9 +4209,9 @@ local_test!(
     }
 );
 
-// Validates relayed operations are persisted and deferred instead of rejected when another
+// Validates converged operations are persisted and deferred instead of rejected when another
 // operation is already active on the node.
-local_test!(cluster_view_defers_relayed_operation_while_other_active, {
+local_test!(cluster_view_defers_learned_operation_while_other_active, {
     let node = TestNode::new_with_tick_ms(100).await;
     let source_view = current_cluster_view(&node.topology()).await;
 
@@ -4025,9 +4234,9 @@ local_test!(cluster_view_defers_relayed_operation_while_other_active, {
         split_network_policy: Default::default(),
         merge_service_policy: Default::default(),
         updated_at_unix_ms: 1,
-        details: "malformed split operation for relay deferral validation".to_string(),
+        details: "malformed split operation for convergence deferral validation".to_string(),
     };
-    submit_cluster_operation_record(&node.topology(), &active_operation).await;
+    submit_cluster_operation_record(&node, &active_operation).await;
 
     wait_for_operation_stage(
         &node.topology(),
@@ -4055,11 +4264,11 @@ local_test!(cluster_view_defers_relayed_operation_while_other_active, {
         split_network_policy: Default::default(),
         merge_service_policy: Default::default(),
         updated_at_unix_ms: 2,
-        details: "relayed merge operation for deferral validation".to_string(),
+        details: "learned merge operation for deferral validation".to_string(),
     };
 
     // This must not fail even though another operation is active.
-    submit_cluster_operation_record(&node.topology(), &deferred_operation).await;
+    submit_cluster_operation_record(&node, &deferred_operation).await;
 
     let mut deferred_lookup = node.topology().get_cluster_operation_request();
     deferred_lookup
@@ -4078,7 +4287,7 @@ local_test!(cluster_view_defers_relayed_operation_while_other_active, {
     assert_eq!(
         deferred.get_stage().expect("deferred stage"),
         ClusterOperationStage::Proposed,
-        "relayed operation should be persisted and remain pending while another op is active"
+        "learned operation should be persisted and remain pending while another op is active"
     );
 
     let mut active_lookup = node.topology().get_cluster_operation_request();
@@ -4127,7 +4336,7 @@ local_test!(cluster_view_rejects_join_while_split_in_progress, {
         updated_at_unix_ms: 1,
         details: "malformed split operation for join admission fence validation".to_string(),
     };
-    submit_cluster_operation_record(&anchor.topology(), &active_split).await;
+    submit_cluster_operation_record(&anchor, &active_split).await;
 
     wait_for_operation_stage(
         &anchor.topology(),

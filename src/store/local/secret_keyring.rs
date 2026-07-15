@@ -187,6 +187,33 @@ impl SecretMasterStore {
     pub fn activate_current(&self, record: &MasterKeyRecord) -> io::Result<()> {
         let _guard = self.policy_guard();
         self.ensure_replicated_current_allowed(record)?;
+        self.activate_current_locked(record)
+    }
+
+    /// Activates the target key selected by an accepted cluster-view transition.
+    ///
+    /// A merge intentionally joins independent rotation branches, so its destination current may
+    /// not descend from this node's source current. The durable merge intent authorizes that one
+    /// scope cutover and ordinary replicated-current reconciliation still uses `activate_current`,
+    /// retaining its stricter lineage check.
+    pub fn activate_transition_current(
+        &self,
+        record: &MasterKeyRecord,
+        target_view: ClusterViewId,
+    ) -> io::Result<()> {
+        if record.descriptor.scope_view != target_view {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transition master key scope does not match target view",
+            ));
+        }
+
+        let _guard = self.policy_guard();
+        self.activate_current_locked(record)
+    }
+
+    /// Persists an already-authorized current-key selection while holding the policy lock.
+    fn activate_current_locked(&self, record: &MasterKeyRecord) -> io::Result<()> {
         // Most replicated-current activations follow an import that already
         // wrapped this key locally. Updating metadata from the descriptor avoids
         // re-running the passphrase KDF just to prove the same envelope decrypts.
@@ -276,8 +303,8 @@ impl SecretMasterStore {
         MasterKeyRecord::new(descriptor, key)
     }
 
-    /// Derives and stores the deterministic split child key without activating it yet.
-    pub fn prepare_split_child(
+    /// Derives and stores a deterministic transition target key without activating it yet.
+    pub fn prepare_transition_child(
         &self,
         scope_view: ClusterViewId,
         created_by_node_id: Uuid,
@@ -297,7 +324,7 @@ impl SecretMasterStore {
             if existing.descriptor != descriptor {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "conflicting deterministic split master key envelope rejected",
+                    "conflicting deterministic transition master key envelope rejected",
                 ));
             }
             return Ok(existing);
@@ -744,6 +771,40 @@ mod tests {
             .expect("current bootstrap remains committed");
         assert_eq!(current.key_id(), bootstrap.key_id());
         assert_eq!(current.key, bootstrap.key);
+    }
+
+    #[test]
+    fn transition_activation_accepts_unrelated_target_scope_current() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let db = Arc::new(Database::create(db_path).unwrap());
+        let store = SecretMasterStore::new(db, test_envelope_provider()).expect("open store");
+
+        let source = store.ensure_current().expect("ensure source key");
+        store
+            .commit_current_for_replication(source.key_id())
+            .expect("commit source key");
+        let target = MasterKeyRecord::new(
+            descriptor(source.generation()),
+            MasterKeyPlaintext::generate().expect("target key"),
+        )
+        .expect("target record");
+
+        store
+            .activate_current(&target)
+            .expect_err("ordinary reconciliation must reject an unrelated branch");
+        let wrong_view = ClusterViewId::new(target.descriptor.scope_view.cluster_id, 1);
+        store
+            .activate_transition_current(&target, wrong_view)
+            .expect_err("transition target scope must match the selected key");
+        store
+            .activate_transition_current(&target, target.descriptor.scope_view)
+            .expect("accepted transition should authorize the target branch");
+
+        assert_eq!(
+            store.current().expect("transition current").key_id(),
+            target.key_id()
+        );
     }
 
     #[test]

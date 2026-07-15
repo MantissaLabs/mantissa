@@ -488,6 +488,13 @@ impl Topology {
 
         if synced {
             crate::observability::metrics::record_sync_attempt("view", "success", "ok");
+            if let Err(err) = self.reconcile_cluster_operations_after_sync().await {
+                warn!(
+                    target: "cluster_view",
+                    peer = %peer_id,
+                    "failed to reconcile cluster operations after view-scoped sync: {err}"
+                );
+            }
             self.promote_local_readiness_after_full_sync().await;
         } else {
             crate::observability::metrics::record_sync_attempt("view", "failure", "sync_failed");
@@ -637,20 +644,17 @@ impl Topology {
         let synced = self
             .deps
             .sync
-            .sync_selected_domains(
+            .sync_cluster_wide_domains(
                 sync_cap,
                 peer_view,
+                self.active_cluster_view(),
                 root_schema_version,
-                &GLOBAL_METADATA_SYNC_DOMAINS,
                 Some(trace),
             )
             .await;
         if synced {
             crate::observability::metrics::record_sync_attempt("global_metadata", "success", "ok");
-            if let Err(err) = self
-                .reconcile_cluster_operations_after_metadata_sync()
-                .await
-            {
+            if let Err(err) = self.reconcile_cluster_operations_after_sync().await {
                 warn!(
                     target: "cluster_view",
                     peer = %peer_id,
@@ -700,7 +704,7 @@ impl Topology {
             cluster_view = %self.active_cluster_view(),
             peer_count,
             fanout = sync_fanout,
-            domains = "cluster_views,cluster_operations",
+            domains = "cluster_views,peers,secret_master_keys,cluster_operations",
             plane = "global_metadata",
             "running periodic global metadata sync tick"
         );

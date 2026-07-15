@@ -443,6 +443,16 @@ impl ClusterViewStore {
         }
     }
 
+    /// Returns the replicated cluster-view root under one negotiated schema projection.
+    pub async fn root_digest_at_version(
+        &self,
+        root_schema_version: u32,
+    ) -> mantissa_store::Result<[u8; 16]> {
+        self.cluster_view_domain
+            .root_digest_at_version(root_schema_version)
+            .await
+    }
+
     /// Purges all replicated cluster-view metadata rows from local storage.
     ///
     /// This provides the hard-cutover path for metadata schema changes: names can be restored

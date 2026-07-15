@@ -81,9 +81,17 @@ The current implementation advances through a compact stage machine:
 If commit preconditions no longer match local state, the operation is marked
 `Aborted`.
 
-This is a durable workflow, not just an in-memory transition. Startup replay
-re-runs any non-finalized operation so a crash does not strand the cluster in a
-half-finished topology change.
+These stages are local crash-recovery bookkeeping, not acknowledgements from
+other nodes and not a distributed commit barrier. The operation's source,
+targets, assignments, and policies are immutable intent. Any node that sees
+that intent applies its own assignment idempotently and an offline node does
+not block other participants: it applies the same intent when it returns.
+
+The requester persists transition key material before new intent whenever it
+can author that material. It then gossips only an availability hint. Receivers
+pull the authoritative operation and key rows through the cluster-wide MST
+Sync domains. Startup replay re-runs local unfinished work, so neither a crash
+nor a missed gossip message strands the topology change.
 
 ```mermaid
 stateDiagram-v2
@@ -97,7 +105,7 @@ stateDiagram-v2
 
 The stage advancement code lives in:
 
-- `src/topology/operation_progress.rs`
+- `src/topology/cluster_operations/progress.rs`
 
 ## Split Behavior
 
@@ -146,9 +154,10 @@ Network policy:
 
 When a split commits locally, Mantissa:
 
-1. computes the local target view,
-2. persists that active view,
-3. excludes evicted peers from normal scoped loops,
+1. installs the deterministic key for the assigned target view,
+2. computes and persists the local target view,
+3. excludes evicted peers from normal scoped loops while retaining credentials
+   for cluster-wide repair,
 4. optionally prunes task runtime rows,
 5. optionally prunes network runtime rows.
 
@@ -171,9 +180,17 @@ The current merge policy only affects services:
 
 When a merge commits locally, Mantissa:
 
-1. switches the local active view to the destination view,
-2. clears any split-era excluded peer set,
-3. optionally nudges services for post-merge rebalance.
+1. imports and activates the destination master key, deferring local apply if
+   its encrypted grant has not converged yet,
+2. switches the local active view to the destination view,
+3. clears any split-era excluded peer set,
+4. optionally nudges services for post-merge rebalance.
+
+No timeout changes an accepted merge into failure. Missing grants or an
+offline destination are transient convergence conditions. Later cluster-wide
+Sync retries the same durable intent. Existing grant rows identify nodes that
+already hold each key and the lowest live holder republishes missing merge grants,
+so an offline original issuer does not become a completion barrier.
 
 ## Transition Participants
 
@@ -220,12 +237,37 @@ Startup performs three recovery steps:
 That means a node restart should come back with the same active view and peer
 scope that the durable topology history implies.
 
+## Master-Key Retention and GC
+
+Master-key deletion uses a convergent frontier rather than operation
+acknowledgements:
+
+1. the retired view must be durably visible,
+2. the `Peers`, `ClusterViews`, and `SecretMasterKeys` roots must match every known
+   cluster-wide peer,
+3. only one non-retired master-key current scope may remain, so split partitions
+   cannot infer global secret references from their local view,
+4. the merged local view's `Secrets` root must match its active-view peers,
+5. no visible secret may reference the key,
+6. the retirement/key snapshot must remain locally observed for the configured
+   retention window.
+
+Restarting forgets the in-memory observation time and therefore extends
+retention conservatively. Local wrapped key envelopes are retained, so a node
+that was offline keeps its source key until it applies the transition. Terminal
+operation intent is retained longer than the key cleanup window so late nodes
+can still repair from the operation MST. Older terminal intents are compacted
+only after the `Peers`, `ClusterViews`, `SecretMasterKeys`, and
+`ClusterOperations` roots match every known cluster-wide peer. This frontier
+proves the repair intent and its prerequisites have spread before deletion.
+It is not an operation-completion acknowledgement.
+
 ## Code Map
 
 - `src/cluster/view.rs`
 - `src/topology/operation.rs`
 - `src/topology/operation_rpc.rs`
-- `src/topology/operation_progress.rs`
+- `src/topology/cluster_operations/progress.rs`
 - `src/topology/service.rs`
 - `crates/mantissa-client/src/clusters/*.rs`
 

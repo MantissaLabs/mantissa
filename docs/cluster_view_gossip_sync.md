@@ -3,7 +3,7 @@
 ## Purpose
 
 This document explains how cluster view scoping works at runtime and how
-cluster metadata (currently cluster lineage names) converges with a
+cluster-wide metadata converges with a
 two-layer replication strategy:
 
 1. Fast propagation through gossip.
@@ -30,11 +30,20 @@ A split creates multiple active views. Runtime loops that manage high-volume
 state (tasks/services/networks/peer liveness) stay scoped to the local active
 view to avoid cross-view amplification and semantic conflicts.
 
-### Cluster metadata
+### Cluster-wide metadata
 
-Cluster lineage metadata is stored in the cluster view domain. Names use
-conflict-resolved `ClusterNameRecord` updates, while per-lineage node counts
-use `ClusterNodeCountRecord` updates published from each cluster's local view.
+The cluster-wide plane contains the small set of rows every split partition
+must eventually observe:
+
+1. cluster lineage and retirement rows (`ClusterViews`),
+2. peer membership and identity rows (`Peers`),
+3. immutable split/merge intent plus local progress (`ClusterOperations`),
+4. encrypted transition key descriptors, grants, and currents
+   (`SecretMasterKeys`).
+
+Cluster names use conflict-resolved `ClusterNameRecord` updates, while
+per-lineage node counts use `ClusterNodeCountRecord` updates published from
+each cluster's local view.
 
 Each metadata field resolves independently with deterministic ordering:
 
@@ -56,10 +65,10 @@ Combining both gives:
 
 ## Replication planes
 
-| Plane | Scope | Current payloads | Goal |
-| --- | --- | --- | --- |
-| View-scoped | Active view only | join/leave/alive/suspect/down, tasks, services, network, secrets | Efficiency and isolation |
-| Global metadata | Cross-view | `TopologyEvent::ClusterNameUpdated`, `Domain::ClusterViews` sync | Cross-boundary metadata convergence |
+| Plane           | Scope            | Current payloads                                                                                                                                          | Goal                                  |
+| --------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| View-scoped     | Active view only | join/leave/alive/suspect/down, tasks, services, network, secrets                                                                                          | Efficiency and isolation              |
+| Global metadata | Cross-view       | cluster-name updates, transition availability hints, encrypted master-key rows; `ClusterViews`, `Peers`, `ClusterOperations`, and `SecretMasterKeys` sync | Cross-boundary transition convergence |
 
 ## High-level topology
 
@@ -81,8 +90,8 @@ flowchart LR
     A1 -.->|global metadata gossip| B1
     B1 -.->|relay| B2
 
-    A2 ==> |global metadata sync\nDomain::ClusterViews only| B2
-    B2 ==> |global metadata sync\nDomain::ClusterViews only| A2
+    A2 ==> |global metadata sync\nviews + peers + operations + keys| B2
+    B2 ==> |global metadata sync\nviews + peers + operations + keys| A2
 ```
 
 ## Layer 1: gossip behavior
@@ -94,7 +103,10 @@ Gossip classifies each message into one plane:
 1. `ViewScoped`
 2. `GlobalMetadata`
 
-`ClusterNameUpdated` is currently the only `GlobalMetadata` event.
+`ClusterNameUpdated`, `ClusterMetadataChanged`, and encrypted
+`SecretMasterKey` rows use `GlobalMetadata`. A transition hint contains only an
+operation id: the operation MST remains authoritative and receivers pull it
+through Sync.
 
 ### Outbound routing
 
@@ -109,7 +121,7 @@ Gossip classifies each message into one plane:
 ### Relay policy
 
 Global metadata is relayed even when generic inbound relay is disabled, so
-cluster name updates continue to spread quickly without enabling broad relay
+cluster transitions continue to spread quickly without enabling broad relay
 for high-volume domains.
 
 ### Gossip pipeline
@@ -142,7 +154,9 @@ Two periodic loops run in topology:
 1. View-scoped loop:
    - syncs all domains with peers in the active view.
 2. Global metadata loop:
-   - syncs only `Domain::ClusterViews` with peers across view boundaries.
+   - syncs `Domain::ClusterViews`, `Domain::Peers`,
+     `Domain::ClusterOperations`, and `Domain::SecretMasterKeys` with peers
+     across view boundaries.
 
 ### Why selective sync for cross-view
 
@@ -166,9 +180,9 @@ sequenceDiagram
     T->>R: fetch_sync_capability_unscoped(peer_id)
     R-->>T: (sync_cap, peer_active_view)
     T->>S: getRootsForView(peer_active_view)
-    T->>S: getRangesForView(peer_active_view, [ClusterViews])
-    T->>S: openDeltaForView(peer_active_view, wants=[ClusterViews])
-    S-->>D: delta chunks (Domain::ClusterViews)
+    T->>S: getRangesForView(peer_active_view, cluster-wide domains)
+    T->>S: openDeltaForView(peer_active_view, cluster-wide wants)
+    S-->>D: delta chunks (views, peers, operations, encrypted keys)
     D->>D: apply CRDT delta
 ```
 
@@ -194,8 +208,8 @@ sequenceDiagram
     C->>C: apply cluster name update
 
     Note over A,C: If gossip was missed/lost:
-    SY->>B: cross-view sync Domain::ClusterViews only
-    SY->>C: cross-view sync Domain::ClusterViews only
+    SY->>B: cross-view sync cluster-wide domains
+    SY->>C: cross-view sync cluster-wide domains
 ```
 
 ## Convergence properties
@@ -224,6 +238,10 @@ This removes "random fanout luck" from coverage.
 2. Only metadata with cross-view semantics should use the global plane.
 3. Workload/runtime domains remain view-scoped by default.
 4. Sync requests still validate against the remote peer's active view.
+5. Split exclusions do not delete session tickets or credentials needed by
+   unscoped metadata repair.
+6. Cluster-wide GC barriers include every known active peer, including peers
+   excluded from the local workload view.
 
 ## Runtime knobs
 
@@ -248,13 +266,16 @@ This removes "random fanout luck" from coverage.
 
 ### Selective anti-entropy
 
-1. `src/sync/delta.rs` (`sync_selected_domains`)
+1. `src/sync/delta.rs` (`sync_cluster_wide_domains`)
 2. `src/topology/mod.rs` (`periodic_global_metadata_sync_tick`)
 3. `src/registry/mod.rs` (`fetch_sync_capability_unscoped`)
 
 ### Cluster metadata storage
 
-1. `src/store/cluster_view_store.rs`
+1. `src/store/replicated/cluster_views.rs`
+2. `src/store/replicated/peers.rs`
+3. `src/store/replicated/cluster_operations.rs`
+4. `src/store/replicated/secret_key_sync.rs`
 
 ## Extending cross-view replication to additional domains
 

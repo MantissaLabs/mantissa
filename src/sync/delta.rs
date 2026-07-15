@@ -70,6 +70,7 @@ impl SyncTraceContext {
 struct SyncClientContext {
     trace: Option<SyncTraceContext>,
     gc_progress: SyncGcProgress,
+    gc_progress_view: ClusterViewId,
     attachment_sync_notify: Option<Arc<Notify>>,
     network_demand_sync_notify: Option<Arc<Notify>>,
     master_key_replication_notify: Option<Arc<Notify>>,
@@ -152,6 +153,38 @@ impl SyncRunner {
             SyncClientContext {
                 trace,
                 gc_progress: self.gc_progress.clone(),
+                gc_progress_view: cluster_view,
+                attachment_sync_notify: self.attachment_sync_notify.clone(),
+                network_demand_sync_notify: self.network_demand_sync_notify.clone(),
+                master_key_replication_notify: self.master_key_replication_notify.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Runs cluster-wide anti-entropy while validating requests against the peer's active view.
+    ///
+    /// The wire view and local GC-progress view are deliberately distinct. A split peer must
+    /// receive requests for its own view, while the caller records convergence against its local
+    /// view so one cluster-wide GC frontier can include peers from every split partition.
+    pub async fn sync_cluster_wide_domains(
+        &self,
+        sync_cap: sync::Client,
+        peer_view: ClusterViewId,
+        local_view: ClusterViewId,
+        root_schema_version: u32,
+        trace: Option<SyncTraceContext>,
+    ) -> bool {
+        sync_selected_domains_with_stores(
+            &self.stores,
+            sync_cap,
+            peer_view,
+            root_schema_version,
+            &super::CLUSTER_WIDE_DOMAINS,
+            SyncClientContext {
+                trace,
+                gc_progress: self.gc_progress.clone(),
+                gc_progress_view: local_view,
                 attachment_sync_notify: self.attachment_sync_notify.clone(),
                 network_demand_sync_notify: self.network_demand_sync_notify.clone(),
                 master_key_replication_notify: self.master_key_replication_notify.clone(),
@@ -451,7 +484,7 @@ fn record_equal_domain_root(
         context.gc_progress.record_equal_root_now(
             trace.peer_id,
             domain,
-            scope.cluster_view,
+            context.gc_progress_view,
             scope.root_schema_version,
             root_digest,
         );
@@ -808,12 +841,13 @@ fn should_notify_master_key_replication(delta_requests: &[DomainDeltaRequest]) -
 #[cfg(test)]
 mod tests {
     use super::{
-        DELTA_REQUEST_MAX_WANTS, DomainDeltaRequest, SyncAttemptScope,
-        bounded_domain_delta_requests, delta_request_batches, run_delta_request_batches,
-        should_notify_master_key_replication, should_notify_network_attachment_sync,
-        should_notify_network_demand_sync,
+        DELTA_REQUEST_MAX_WANTS, DomainDeltaRequest, SyncAttemptScope, SyncClientContext,
+        bounded_domain_delta_requests, delta_request_batches, record_equal_domain_root,
+        run_delta_request_batches, should_notify_master_key_replication,
+        should_notify_network_attachment_sync, should_notify_network_demand_sync,
     };
-    use crate::cluster::ClusterViewId;
+    use crate::cluster::{ClusterId, ClusterViewId};
+    use crate::sync::{SyncGcProgress, SyncTraceContext};
     use capnp_rpc::new_client;
     use mantissa_protocol::sync::{Domain, delta_sink, sync};
     use mantissa_store::{PageDigestRange, RowDigest};
@@ -1072,5 +1106,39 @@ mod tests {
         let wants = vec![delta_request_for(Domain::Secrets)];
 
         assert!(!should_notify_master_key_replication(&wants));
+    }
+
+    /// Cross-view wire validation must record global convergence under the caller's local view.
+    #[test]
+    fn equal_global_root_uses_local_gc_progress_view() {
+        let peer_id = uuid::Uuid::from_u128(1);
+        let peer_view = ClusterViewId::new(ClusterId::from_uuid(uuid::Uuid::from_u128(2)), 3);
+        let local_view = ClusterViewId::new(ClusterId::from_uuid(uuid::Uuid::from_u128(4)), 5);
+        let progress = SyncGcProgress::new();
+        let context = SyncClientContext {
+            trace: Some(SyncTraceContext::peer(peer_id, "inproc", "test")),
+            gc_progress: progress.clone(),
+            gc_progress_view: local_view,
+            attachment_sync_notify: None,
+            network_demand_sync_notify: None,
+            master_key_replication_notify: None,
+        };
+
+        record_equal_domain_root(
+            Domain::SecretMasterKeys,
+            SyncAttemptScope::new(peer_view, 1),
+            [7; 16],
+            &context,
+        );
+
+        assert!(
+            progress
+                .last_equal_at(peer_id, Domain::SecretMasterKeys, local_view, 1)
+                .is_some()
+        );
+        assert_eq!(
+            progress.last_equal_at(peer_id, Domain::SecretMasterKeys, peer_view, 1),
+            None
+        );
     }
 }

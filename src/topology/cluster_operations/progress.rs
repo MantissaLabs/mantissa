@@ -12,6 +12,7 @@ use crate::topology::cluster_operations::{
 };
 use crate::topology::peer_cache::PeerSnapshot;
 use mantissa_protocol::server::cluster_session;
+use mantissa_protocol::sync::Domain;
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
@@ -224,7 +225,7 @@ impl Topology {
             .unwrap_or_default()
     }
 
-    /// Reads the cluster view currently bound to a session for operation relay validation.
+    /// Reads the cluster view currently bound to a session for assignment introspection.
     pub(in crate::topology) async fn session_cluster_view(
         session: &cluster_session::Client,
     ) -> Result<ClusterViewId, capnp::Error> {
@@ -358,104 +359,6 @@ impl Topology {
             actor_node_id,
         };
         self.upsert_cluster_name_record(cluster_id, &record).await
-    }
-
-    /// Best-effort relay of one operation record to peers in the operation's relay scope.
-    pub(in crate::topology) async fn broadcast_cluster_operation(
-        &self,
-        operation: &ClusterOperationRecord,
-    ) -> Result<usize, capnp::Error> {
-        let relay_views = match operation.kind {
-            ClusterOperationKind::Split => {
-                let source_view = operation.source_views.first().copied().ok_or_else(|| {
-                    capnp::Error::failed("split operation missing source view".to_string())
-                })?;
-                HashSet::from([source_view])
-            }
-            ClusterOperationKind::Merge => {
-                let source_view = operation.source_views.first().copied().ok_or_else(|| {
-                    capnp::Error::failed("merge operation missing source view".to_string())
-                })?;
-                let mut views = HashSet::from([source_view]);
-                for target in operation.target_views.iter().copied() {
-                    views.insert(target);
-                }
-                views
-            }
-        };
-        let snapshot = match self.peer_snapshot().await {
-            Some(snapshot) => snapshot,
-            None => return Ok(0),
-        };
-        let payload = operation
-            .encode_capnp()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        let mut relayed = 0usize;
-
-        for entry in snapshot.entries.iter() {
-            let peer_id = entry.peer_id;
-            if peer_id == self.local.node.id {
-                continue;
-            }
-
-            let session = if operation.kind == ClusterOperationKind::Merge {
-                self.deps.registry.session_for_peer_unscoped(peer_id).await
-            } else {
-                self.deps.registry.session_for_peer(peer_id).await
-            };
-            let Some(session) = session else {
-                continue;
-            };
-            let peer_view = match Self::session_cluster_view(&session).await {
-                Ok(view) => view,
-                Err(err) => {
-                    warn!(
-                        target: "cluster_view",
-                        operation_id = %operation.id,
-                        peer_id = %peer_id,
-                        "failed to read peer session view for operation relay: {err}"
-                    );
-                    continue;
-                }
-            };
-            if !relay_views.contains(&peer_view) {
-                continue;
-            }
-
-            let topology = session
-                .get_topology_request()
-                .send()
-                .pipeline
-                .get_topology();
-            let mut relay = topology.submit_cluster_operation_request();
-            relay.get().set_id(operation.id.as_bytes());
-            relay.get().set_payload(&payload);
-            match relay.send().promise.await {
-                Ok(_) => {
-                    relayed = relayed.saturating_add(1);
-                }
-                Err(err) => {
-                    warn!(
-                        target: "cluster_view",
-                        operation_id = %operation.id,
-                        peer_id = %peer_id,
-                        "failed to relay cluster operation: {err}"
-                    );
-                }
-            }
-        }
-
-        if relayed > 0 {
-            info!(
-                target: "cluster_view",
-                operation_id = %operation.id,
-                relayed,
-                relay_view_count = relay_views.len(),
-                "relayed cluster operation to peers"
-            );
-        }
-
-        Ok(relayed)
     }
 
     /// Returns the local active views from which this split/merge transition may be applied.
@@ -654,7 +557,7 @@ impl Topology {
         }
     }
 
-    /// Selects the latest pending overlapping predecessor for a new or relayed operation.
+    /// Selects the latest pending overlapping predecessor for a new or learned operation.
     pub(in crate::topology) fn pending_cluster_operation_tail_for(
         &self,
         operation: &ClusterOperationRecord,
@@ -886,7 +789,7 @@ impl Topology {
 
     /// Updates an operation stage, appends stage details, and persists the updated record.
     ///
-    /// Relayed terminal rows can race with an already-running local progress task. Before writing
+    /// Learned terminal rows can race with an already-running local progress task. Before writing
     /// the requested stage, re-read the durable row and refuse to overwrite a strictly newer stage.
     /// This keeps a late stale-precondition abort from replacing a committed/finalized operation.
     async fn update_cluster_operation_stage(
@@ -944,11 +847,27 @@ impl Topology {
                 .then_with(|| right.id.cmp(&left.id))
         });
 
+        // A terminal row is still an immutable repair intent for a node that was offline during
+        // the transition. Keep it for longer than the key cleanup window before count-based
+        // compaction can tombstone it.
+        let intent_retention_ms = crate::config::store_gc_runtime_config()
+            .policy
+            .tombstone_min_retention_ms
+            .saturating_mul(2);
+        let eligible_before_unix_ms = Self::now_unix_ms().saturating_sub(intent_retention_ms);
         let to_delete = terminal
             .into_iter()
             .skip(CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT)
+            .filter(|operation| operation.updated_at_unix_ms <= eligible_before_unix_ms)
             .map(|operation| operation.id)
             .collect::<Vec<_>>();
+        if to_delete.is_empty()
+            || !self
+                .cluster_operation_gc_has_global_sync_frontier(Self::now_unix_ms())
+                .await?
+        {
+            return Ok(0);
+        }
         let removed = self
             .stores
             .cluster_operations
@@ -965,6 +884,72 @@ impl Topology {
         }
 
         Ok(removed)
+    }
+
+    /// Proves every known cluster-wide peer has the metadata needed before intent deletion.
+    ///
+    /// This frontier is deliberately independent of operation completion. Nodes apply transitions
+    /// without acknowledgements and cleanup waits for ordinary anti-entropy root equality so an
+    /// offline participant cannot lose the only durable copy of its assignment or target key.
+    async fn cluster_operation_gc_has_global_sync_frontier(
+        &self,
+        now_unix_ms: u64,
+    ) -> Result<bool, capnp::Error> {
+        let remote_peers = self
+            .deps
+            .registry
+            .known_peers_unscoped()
+            .map_err(|err| capnp::Error::failed(format!("load operation GC peers: {err}")))?;
+        let cluster_view = self.active_cluster_view();
+        let root_schema_version = self.supported_root_schema_version();
+        let roots = [
+            (
+                Domain::Peers,
+                self.stores
+                    .peers
+                    .root_digest_at_version(root_schema_version)
+                    .await
+                    .map_err(|err| capnp::Error::failed(err.to_string()))?,
+            ),
+            (
+                Domain::ClusterViews,
+                self.stores
+                    .cluster_view_store
+                    .root_digest_at_version(root_schema_version)
+                    .await
+                    .map_err(|err| capnp::Error::failed(err.to_string()))?,
+            ),
+            (
+                Domain::SecretMasterKeys,
+                self.stores
+                    .secret_master_keys
+                    .root_digest_at_version(root_schema_version)
+                    .await
+                    .map_err(|err| capnp::Error::failed(err.to_string()))?,
+            ),
+            (
+                Domain::ClusterOperations,
+                self.stores
+                    .cluster_operations
+                    .domain_store()
+                    .root_digest_at_version(root_schema_version)
+                    .await
+                    .map_err(|err| capnp::Error::failed(err.to_string()))?,
+            ),
+        ];
+        let progress = self.deps.sync.gc_progress();
+        Ok(roots.into_iter().all(|(domain, root_digest)| {
+            progress
+                .barrier_for_domain(
+                    remote_peers.iter().copied(),
+                    domain,
+                    cluster_view,
+                    root_schema_version,
+                    root_digest,
+                    now_unix_ms,
+                )
+                .is_some()
+        }))
     }
 
     /// Applies a split/merge cluster transition and installs its target active view.
@@ -1310,15 +1295,12 @@ impl Topology {
         Ok(())
     }
 
-    /// Reconciles finalized operation rows learned through metadata sync and wakes queued work.
-    pub(crate) async fn reconcile_cluster_operations_after_metadata_sync(
-        &self,
-    ) -> Result<(), capnp::Error> {
-        self.reconcile_finalized_cluster_transitions_for_active_view(
-            "metadata sync reconciliation",
-        )
-        .await?;
+    /// Reconciles operation rows learned through anti-entropy and wakes queued work.
+    pub(crate) async fn reconcile_cluster_operations_after_sync(&self) -> Result<(), capnp::Error> {
+        self.reconcile_finalized_cluster_transitions_for_active_view("sync reconciliation")
+            .await?;
         self.trigger_ready_cluster_operation_progress();
+        let _ = self.garbage_collect_cluster_operations().await?;
         Ok(())
     }
 
@@ -1498,10 +1480,6 @@ impl Topology {
 
         let _ = self.garbage_collect_cluster_operations().await?;
         drop(_guard);
-
-        if !operation.dry_run {
-            let _ = self.broadcast_cluster_operation(&operation).await?;
-        }
 
         if let Some(next) = self.active_cluster_operation_excluding(operation_id)? {
             self.trigger_operation_progress(next.id, false);

@@ -23,6 +23,27 @@ pub use gc_progress::SyncGcProgress;
 pub use mantissa_store::gc::GcBarrier;
 pub use service::SyncService;
 
+/// Replicated domains that must continue converging across split view boundaries.
+///
+/// These rows describe cluster lineage and the key material needed to enter a
+/// target view. Workload and service state remain view-scoped.
+pub const CLUSTER_WIDE_DOMAINS: [mantissa_protocol::sync::Domain; 4] = [
+    mantissa_protocol::sync::Domain::ClusterViews,
+    // Membership remains globally discoverable even though exclusions fence ordinary peer
+    // traffic after a split. It also defines the participant set for the key-GC frontier.
+    mantissa_protocol::sync::Domain::Peers,
+    // Transfer transition key prerequisites before the intent that authorizes local cutover. A
+    // failed partial sync may leave harmless unused keys, but never an operation with keys that
+    // were skipped merely because the same stream disconnected first.
+    mantissa_protocol::sync::Domain::SecretMasterKeys,
+    mantissa_protocol::sync::Domain::ClusterOperations,
+];
+
+/// Returns whether a replicated domain belongs to the cluster-wide metadata plane.
+pub fn is_cluster_wide_domain(domain: mantissa_protocol::sync::Domain) -> bool {
+    CLUSTER_WIDE_DOMAINS.contains(&domain)
+}
+
 /// Number of replicated domains exposed through view-scoped sync RPCs.
 pub const VIEW_SCOPED_DOMAIN_COUNT: usize = ALL_DOMAINS.len();
 /// Default max entries per streamed delta chunk.

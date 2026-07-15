@@ -64,19 +64,16 @@ interface Topology {
   getClusterOperation @13 (id :Data) -> (op :ClusterOperation);
   # Fetches the latest known state for a cluster operation id.
 
-  submitClusterOperation @14 (id :Data, payload :Data) -> ();
-  # Replicates a serialized cluster operation record to this node.
-
-  listClusterViews @15 () -> (views :List(ClusterViewSummary));
+  listClusterViews @14 () -> (views :List(ClusterViewSummary));
   # Lists known cluster views and per-view node counts from this node's control-plane perspective.
 
-  listSplitCandidates @16 (sourceView :ClusterViewId) -> (nodes :List(SplitCandidate));
+  listSplitCandidates @15 (sourceView :ClusterViewId) -> (nodes :List(SplitCandidate));
   # Lists node candidates and host metadata used to prepare interactive split assignments.
 
-  setClusterName @17 (clusterId :ClusterId, name :Text) -> ();
+  setClusterName @16 (clusterId :ClusterId, name :Text) -> ();
   # Sets or updates the friendly name for one cluster lineage identifier.
 
-  submitClusterName @18 (
+  submitClusterName @17 (
     clusterId :ClusterId,
     name :Text,
     updatedAtUnixMs :UInt64,
@@ -174,6 +171,9 @@ struct TopologyEvent {
   actorNodeId @5 :Node.NodeId;
   # Actor node id used for deterministic name conflict resolution.
 
+  operationId @6 :Data;
+  # Durable transition intent advertised by `clusterMetadataChanged`.
+
   enum EventType {
       # Enumerates actions possible on the topology.
 
@@ -186,6 +186,7 @@ struct TopologyEvent {
       nodeSchedulingUpdated @6;
       nodeLabelsUpdated @7;
       nodeReadinessUpdated @8;
+      clusterMetadataChanged @9;
   }
 }
 

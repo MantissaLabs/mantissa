@@ -705,6 +705,17 @@ impl HeadlessNode {
         self.topology_runtime.sync_once_now();
     }
 
+    /// Injects one durable cluster operation through normal local progression for tests.
+    #[doc(hidden)]
+    pub async fn submit_cluster_operation_for_test(
+        &self,
+        operation: crate::cluster::operations::ClusterOperationRecord,
+    ) -> Result<(), capnp::Error> {
+        self.topology_runtime
+            .accept_test_cluster_operation(operation)
+            .await
+    }
+
     /// Returns whether this node still has split/join-triggered immediate sync work in flight.
     pub fn immediate_sync_is_running(&self) -> bool {
         self.topology_runtime.immediate_sync_is_running()

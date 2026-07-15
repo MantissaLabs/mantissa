@@ -98,7 +98,24 @@ impl SecretMasterKeyReconciler {
     ) -> Result<SecretMasterKeyReconcileReport> {
         let snapshot = self.load_sync_snapshot()?;
         let mut report = self.import_local_grants(&snapshot).await?;
-        self.adopt_current(view, &snapshot, &mut report).await?;
+        self.adopt_current(view, &snapshot, &mut report, None)
+            .await?;
+        Ok(report)
+    }
+
+    /// Reconciles a target current authorized by one accepted cluster-view transition.
+    ///
+    /// This differs from ordinary reconciliation only at activation: a merge target can belong to
+    /// an independent rotation branch, while the immutable transition intent explicitly selects
+    /// that target view as the local cutover scope.
+    pub(crate) async fn reconcile_transition_view(
+        &self,
+        view: ClusterViewId,
+    ) -> Result<SecretMasterKeyReconcileReport> {
+        let snapshot = self.load_sync_snapshot()?;
+        let mut report = self.import_local_grants(&snapshot).await?;
+        self.adopt_current(view, &snapshot, &mut report, Some(view))
+            .await?;
         Ok(report)
     }
 
@@ -243,6 +260,7 @@ impl SecretMasterKeyReconciler {
         active_view: ClusterViewId,
         snapshot: &MasterKeySyncSnapshot,
         report: &mut SecretMasterKeyReconcileReport,
+        transition_target: Option<ClusterViewId>,
     ) -> Result<()> {
         let Some(current) =
             current_for_scope(&self.sync_store, active_view).context("load current key row")?
@@ -297,9 +315,16 @@ impl SecretMasterKeyReconciler {
 
         let keyring = self.keyring.write().await;
         let previous_key_id = keyring.current_key_id();
-        self.master_store
-            .activate_current(&record)
-            .context("activate replicated current master key")?;
+        match transition_target {
+            Some(target_view) => self
+                .master_store
+                .activate_transition_current(&record, target_view)
+                .context("activate transition target master key")?,
+            None => self
+                .master_store
+                .activate_current(&record)
+                .context("activate replicated current master key")?,
+        }
         keyring.install_current(&record);
         report.current_adopted = previous_key_id != record.key_id();
         Ok(())

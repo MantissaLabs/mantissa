@@ -594,6 +594,21 @@ impl Registry {
         Ok(ids)
     }
 
+    /// Returns active remote peers without applying the local cluster-view exclusion fence.
+    ///
+    /// Only the low-rate cluster-wide metadata and GC planes should use this population. Normal
+    /// scheduling, health, and workload paths must continue using [`Self::known_peers`].
+    pub fn known_peers_unscoped(&self) -> AnyResult<Vec<Uuid>> {
+        self.refresh_peer_snapshot_cache_if_needed()?;
+        let cache = self.peer_snapshot_cache_read();
+        Ok(cache
+            .active_peer_ids
+            .iter()
+            .copied()
+            .filter(|peer_id| *peer_id != self.node_id)
+            .collect())
+    }
+
     /// Returns the last recorded hostname for the provided `peer_id`, if available.
     pub fn peer_hostname(&self, peer_id: Uuid) -> Option<String> {
         if self.peer_is_excluded(peer_id) {
@@ -890,8 +905,8 @@ impl Registry {
 
     /// Returns a session for a peer while ignoring split-time exclusion scope.
     ///
-    /// This is reserved for topology operation relay flows (for example merge handoff) where
-    /// nodes must briefly talk across split partitions to converge back into one cluster.
+    /// This is reserved for cluster-wide gossip and Sync flows that must repair transition
+    /// metadata across split partitions without reopening ordinary view-scoped traffic.
     pub async fn session_for_peer_unscoped(
         &self,
         peer_id: Uuid,
@@ -2321,6 +2336,28 @@ mod tests {
             ),
             dir,
         )
+    }
+
+    /// View exclusions must not hide peers from the cluster-wide metadata population.
+    #[tokio::test]
+    async fn known_peers_unscoped_retains_split_exclusions() {
+        let (registry, _dir) = registry_for_test(0x31);
+        let peer_id = Uuid::new_v4();
+        registry
+            .peers
+            .upsert(
+                &UuidKey::from(peer_id),
+                peer_value(peer_id, PeerMembership::active(1)),
+            )
+            .await
+            .expect("insert active peer");
+        registry.set_excluded_peers(HashSet::from([peer_id]));
+
+        assert!(registry.known_peers().expect("scoped peers").is_empty());
+        assert_eq!(
+            registry.known_peers_unscoped().expect("unscoped peers"),
+            vec![peer_id]
+        );
     }
 
     /// Looking up one peer by id must return left rows so stale active observations cannot resurrect it.

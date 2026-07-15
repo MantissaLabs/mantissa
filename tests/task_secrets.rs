@@ -963,6 +963,56 @@ local_test!(publish_master_key_rows_skips_visible_grants_and_current, {
     assert_eq!(grant_count, 1);
 });
 
+local_test!(
+    publish_master_key_rows_accepts_a_compatible_grant_from_another_sender,
+    {
+        let first_sender_id = Uuid::new_v4();
+        let local_dir = tempdir().expect("local master key dir");
+        let local_db = Arc::new(
+            redb::Database::create(local_dir.path().join("secret-master.redb"))
+                .expect("create local master key db"),
+        );
+        let secret_master_store = SecretMasterStore::new(
+            local_db,
+            Arc::new(PassphraseProvider::for_test().expect("test passphrase provider")),
+        )
+        .expect("open local master key store");
+        let record = secret_master_store
+            .ensure_current_for_node(ClusterViewId::legacy_default(), first_sender_id)
+            .expect("ensure current master key");
+
+        let (gossip_tx, gossip_rx) = async_channel::unbounded::<Message>();
+        let first_sender_noise = Arc::new(NoiseKeys::from_private_bytes([9u8; 32]));
+        let (_master_key_replication_dir, secret_master_keys, first_publisher) =
+            temp_master_key_replication(first_sender_id, gossip_tx.clone(), first_sender_noise)
+                .await;
+        let recipient = SecretMasterKeyGrantRecipient {
+            node_id: Uuid::new_v4(),
+            noise_static_pub: NoiseKeys::from_private_bytes([11u8; 32]).public_bytes(),
+        };
+
+        first_publisher
+            .publish_key_grants(std::slice::from_ref(&record), &[recipient])
+            .await
+            .expect("publish first sender grant");
+        assert_eq!(drain_master_key_gossip(&gossip_rx), 2);
+
+        let second_publisher = SecretMasterKeyPublisher::new(
+            secret_master_keys,
+            gossip_tx,
+            Arc::new(Notify::new()),
+            Uuid::new_v4(),
+            Arc::new(NoiseKeys::from_private_bytes([13u8; 32])),
+        );
+        second_publisher
+            .publish_key_grants(std::slice::from_ref(&record), &[recipient])
+            .await
+            .expect("observe first sender grant");
+
+        assert_eq!(drain_master_key_gossip(&gossip_rx), 0);
+    }
+);
+
 fn drain_master_key_gossip(gossip_rx: &async_channel::Receiver<Message>) -> usize {
     let mut drained = 0usize;
     while gossip_rx.try_recv().is_ok() {
