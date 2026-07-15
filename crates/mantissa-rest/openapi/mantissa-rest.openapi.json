@@ -4611,6 +4611,11 @@
               "null"
             ]
           },
+          "volume_epoch": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "volume_id": {
             "type": "string"
           }
@@ -4622,7 +4627,8 @@
           "node_name",
           "state",
           "published_task_ids",
-          "updated_at"
+          "updated_at",
+          "volume_epoch"
         ],
         "type": "object"
       },
