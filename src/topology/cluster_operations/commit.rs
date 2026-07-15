@@ -17,7 +17,7 @@ use crate::workload::WorkloadRegistry;
 use async_trait::async_trait;
 use mantissa_health::Status as HealthStatus;
 use mantissa_store::uuid_key::UuidKey;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 struct PeerScopeParticipant {
     topology: Topology,
@@ -36,9 +36,9 @@ impl ClusterTransitionParticipant for SplitSecretMasterKeyParticipant {
 
     /// Installs the deterministic master-key current for this node's split target view.
     ///
-    /// Target grants are published before the operation intent. Applying an already visible
-    /// intent must therefore remain local and must not depend on this node still having every
-    /// participant's peer row.
+    /// Target grants are published before the operation crosses the Prepared frontier. Applying
+    /// an actionable intent must therefore remain local and must not depend on this node still
+    /// having every participant's peer row.
     async fn on_commit(
         &self,
         transition: &ClusterTransition,
@@ -155,21 +155,23 @@ impl SplitSecretMasterKeyParticipant {
 }
 
 impl Topology {
-    /// Publishes locally available transition target keys before making an intent visible.
+    /// Publishes locally available transition target keys before making an intent actionable.
     ///
     /// The requesting node still holds the common source key, so it can derive every deterministic
-    /// child and wrap that child for the assigned nodes. Persisting these rows first means a node
-    /// can discover the immutable operation through anti-entropy without depending on a target
-    /// issuer remaining online afterward.
+    /// child and wrap that child for the assigned nodes. A Proposed operation can replicate first,
+    /// but progression cannot cross into Prepared until these durable prerequisites exist.
     pub(in crate::topology) async fn publish_transition_key_material(
         &self,
         operation: &ClusterOperationRecord,
-    ) -> Result<(), capnp::Error> {
+    ) -> Result<bool, capnp::Error> {
         if operation.dry_run {
-            return Ok(());
+            return Ok(true);
         }
         if operation.kind == ClusterOperationKind::Merge {
             return self.publish_merge_transition_key_material(operation).await;
+        }
+        if !self.local_node_should_prepare_transition_key(operation)? {
+            return Ok(false);
         }
 
         for (target_index, target_view) in operation.target_views.iter().copied().enumerate() {
@@ -210,29 +212,78 @@ impl Topology {
                 })?;
         }
 
-        Ok(())
+        Ok(true)
     }
 
-    /// Publishes an adoptable merge target key before making the merge intent visible.
+    /// Selects the proposal submitter, or one deterministic live replacement after it is down.
     ///
-    /// Existing destination scopes keep their selected current. A requester holding that key can
-    /// prepublish cross-view grants, while another requester lets the destination side do so after
-    /// intent convergence. A merge into a new scope derives one operation-stable child from the
-    /// requester's source key and wraps it for every known active participant before acceptance.
+    /// Ownership only suppresses redundant wrapping work. It is not an acknowledgement or a
+    /// correctness dependency: every eligible source-key holder derives the same key, and a
+    /// replacement can resume idempotently once failure detection marks the submitter down.
+    fn local_node_should_prepare_transition_key(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<bool, capnp::Error> {
+        if operation.submitted_by_node_id == self.local.node.id {
+            return Ok(true);
+        }
+
+        let health = self.deps.health_monitor.snapshot();
+        if !matches!(
+            health.get(&operation.submitted_by_node_id),
+            Some(HealthStatus::Down)
+        ) {
+            return Ok(false);
+        }
+
+        let mut candidates = BTreeSet::new();
+        match operation.kind {
+            ClusterOperationKind::Split => {
+                candidates.extend(
+                    operation
+                        .split_assignments
+                        .iter()
+                        .map(|assignment| assignment.node_id),
+                );
+            }
+            ClusterOperationKind::Merge => {
+                let (peer_regs, _) = self
+                    .stores
+                    .peers
+                    .load_all_regs()
+                    .map_err(|err| capnp::Error::failed(format!("load merge peers: {err}")))?;
+                for (key, reg) in peer_regs {
+                    if PeerValue::select_reg(&reg).is_some_and(|peer| peer.is_active()) {
+                        candidates.insert(key.to_uuid());
+                    }
+                }
+                candidates.insert(self.local.node.id);
+            }
+        }
+        candidates.retain(|node_id| !matches!(health.get(node_id), Some(HealthStatus::Down)));
+        Ok(candidates.first().copied() == Some(self.local.node.id))
+    }
+
+    /// Publishes an adoptable merge target key before making the merge intent actionable.
+    ///
+    /// Existing destination scopes keep their selected current. A holder on that side publishes
+    /// cross-view grants after the Proposed intent converges there. A merge into a new scope
+    /// derives one operation-stable child from the submitter's source key and wraps it for every
+    /// known active participant before advancing the operation to Prepared.
     async fn publish_merge_transition_key_material(
         &self,
         operation: &ClusterOperationRecord,
-    ) -> Result<(), capnp::Error> {
+    ) -> Result<bool, capnp::Error> {
         let target_view = operation.target_views.first().copied().ok_or_else(|| {
             capnp::Error::failed(format!(
                 "merge operation {} has no target view",
                 operation.id
             ))
         })?;
-        let recipients = MergeSecretMasterKeyParticipant {
+        let participant = MergeSecretMasterKeyParticipant {
             topology: self.clone(),
-        }
-        .merge_master_key_recipients()?;
+        };
+        let recipients = participant.merge_master_key_recipients()?;
         let local_current = self
             .stores
             .secret_master_store
@@ -250,27 +301,46 @@ impl Topology {
                 })?
             else {
                 // The destination partition already owns this current and will publish cross-view
-                // grants after it observes the durable merge intent. Acceptance does not wait for
-                // that participant or turn temporary isolation into an operation failure.
-                return Ok(());
+                // grants after it observes the durable merge intent. This node must keep the row
+                // Proposed rather than claiming the target-key preparation frontier itself.
+                return Ok(false);
             };
             record
         } else if local_current.descriptor.scope_view == target_view {
             local_current
         } else {
+            // A merge into another lineage reuses that destination's current. If its metadata has
+            // not arrived yet, wait for the destination side instead of deriving a competing key.
+            if !operation
+                .source_views
+                .iter()
+                .any(|source| source.cluster_id == target_view.cluster_id)
+            {
+                return Ok(false);
+            }
+            if !self.local_node_should_prepare_transition_key(operation)? {
+                return Ok(false);
+            }
             self.stores
                 .secret_master_store
-                .prepare_transition_child(target_view, self.local.node.id, operation.id)
+                .prepare_transition_child(target_view, operation.submitted_by_node_id, operation.id)
                 .map_err(|err| {
                     capnp::Error::failed(format!("derive merge target master key: {err}"))
                 })?
         };
 
+        let grant_publishers = participant.merge_key_grant_publishers(&recipients)?;
+        if !participant.local_node_should_publish_key_grants(&record.descriptor, &grant_publishers)
+        {
+            return Ok(false);
+        }
+
         self.stores
             .secret_master_key_publisher
             .publish_current_key(&record, &recipients)
             .await
-            .map_err(|err| capnp::Error::failed(format!("publish merge target key: {err}")))
+            .map_err(|err| capnp::Error::failed(format!("publish merge target key: {err}")))?;
+        Ok(true)
     }
 }
 

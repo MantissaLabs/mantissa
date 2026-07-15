@@ -1722,6 +1722,10 @@ pub struct MergeArgs {
     #[arg(long = "services", value_enum, default_value = "rebalance")]
     pub services: MergeServicePolicyOpt,
 
+    /// Wait until the local daemon reports the operation finalized or aborted.
+    #[arg(long = "wait", action = ArgAction::SetTrue)]
+    pub wait: bool,
+
     /// Print debug information verbosely
     #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub debug: bool,
@@ -1818,6 +1822,10 @@ pub struct SplitArgs {
     /// Overlay/network behavior policy applied when the split commits.
     #[arg(long = "networks", value_enum, default_value = "isolate")]
     pub networks: SplitNetworkPolicyOpt,
+
+    /// Wait until the local daemon reports the operation finalized or aborted.
+    #[arg(long = "wait", action = ArgAction::SetTrue)]
+    pub wait: bool,
 
     /// Print debug information verbosely
     #[arg(short = 'd', action = ArgAction::SetTrue)]
@@ -2015,6 +2023,40 @@ mod tests {
                 cmd: RestCommand::Token {
                     cmd: RestTokenCommand::Rotate
                 }
+            }
+        ));
+    }
+
+    #[test]
+    fn cluster_transition_wait_flags_parse() {
+        let merge = MantissaCli::try_parse_from([
+            "mantissa",
+            "clusters",
+            "merge",
+            "10000000-0000-0000-0000-000000000001",
+            "20000000-0000-0000-0000-000000000002",
+            "--wait",
+        ])
+        .unwrap();
+        assert!(matches!(
+            merge.cmd,
+            Command::Clusters {
+                cmd: ClustersCommand::Merge(MergeArgs { wait: true, .. })
+            }
+        ));
+
+        let split = MantissaCli::try_parse_from([
+            "mantissa",
+            "clusters",
+            "split",
+            "--interactive",
+            "--wait",
+        ])
+        .unwrap();
+        assert!(matches!(
+            split.cmd,
+            Command::Clusters {
+                cmd: ClustersCommand::Split(SplitArgs { wait: true, .. })
             }
         ));
     }

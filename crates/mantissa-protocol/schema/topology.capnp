@@ -556,6 +556,10 @@ struct ClusterOperation {
 
   createdAtUnixMs @14 :UInt64;
   # Stable operation creation time used to order overlapping topology changes.
+
+  submittedByNodeId @15 :Data;
+  # Node identity selected when the immutable operation intent was created.
+  # Replay uses this stable identity when deriving operation-scoped merge key material.
 }
 
 struct SplitNodeAssignment {

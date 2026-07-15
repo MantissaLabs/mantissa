@@ -106,10 +106,11 @@ pub struct ClusterOperation {
 impl From<ClientClusterOperationSummary> for ClusterOperation {
     /// Converts a client operation summary into the REST JSON shape.
     fn from(value: ClientClusterOperationSummary) -> Self {
+        let stage = enum_label(&value.stage.to_string());
         Self {
             id: value.id.to_string(),
             kind: enum_label(&value.kind),
-            stage: enum_label(&value.stage),
+            stage,
             dry_run: value.dry_run,
             source_views: value
                 .source_views

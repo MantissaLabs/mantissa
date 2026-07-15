@@ -232,6 +232,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     .await?;
             }
             ClustersCommand::Merge(m) => {
+                let wait = m.wait;
                 let service_policy = match m.services {
                     MergeServicePolicyOpt::Rebalance => {
                         mantissa_client::clusters::MergeServicePolicy::Rebalance
@@ -247,13 +248,15 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                         &m.destination_cluster_id,
                         m.dry_run,
                         service_policy,
+                        wait,
                     ))
                     .await?;
             }
             ClustersCommand::Split(s) => {
+                let wait = s.wait;
                 let request: mantissa_client::clusters::SplitCommandRequest = s.into();
                 local
-                    .run_until(crate::clusters::split(&cfg, &request))
+                    .run_until(crate::clusters::split(&cfg, &request, wait))
                     .await?;
             }
         },

@@ -250,6 +250,7 @@ mod tests {
         let source = ClusterViewId::legacy_default();
         ClusterOperationRecord {
             id,
+            submitted_by_node_id: Uuid::from_u128(0x700),
             kind: ClusterOperationKind::Merge,
             stage,
             dry_run: false,

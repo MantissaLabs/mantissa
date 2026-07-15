@@ -1,8 +1,34 @@
 use crate::output;
-use mantissa_client::clusters::ClusterOperationSummary;
+use anyhow::{Result, bail};
+use mantissa_client::clusters::{
+    ClusterOperationStage, ClusterOperationSummary, wait_for_cluster_operation,
+};
+use mantissa_client::config::ClientConfig;
+
+/// Optionally waits for a submitted operation, renders its last state, and reports aborts.
+pub(super) async fn emit_operation_result(
+    cfg: &ClientConfig,
+    summary: ClusterOperationSummary,
+    wait: bool,
+) -> Result<()> {
+    let summary = if wait && !summary.dry_run && !summary.stage.is_terminal() {
+        wait_for_cluster_operation(cfg, summary.id).await?
+    } else {
+        summary
+    };
+    emit_operation_summary(&summary);
+    if summary.stage == ClusterOperationStage::Aborted {
+        bail!(
+            "cluster operation {} aborted: {}",
+            summary.id,
+            summary.details
+        );
+    }
+    Ok(())
+}
 
 /// Renders a cluster operation summary for operator-facing CLI output.
-pub(super) fn emit_operation_summary(summary: &ClusterOperationSummary) {
+fn emit_operation_summary(summary: &ClusterOperationSummary) {
     output::emit_line(format!("operation {}", summary.id));
     output::emit_line(format!("kind: {}", summary.kind));
     output::emit_line(format!("stage: {}", summary.stage));

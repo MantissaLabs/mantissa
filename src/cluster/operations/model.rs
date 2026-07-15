@@ -117,6 +117,8 @@ impl ClusterOperationStage {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ClusterOperationRecord {
     pub id: Uuid,
+    /// Stable submitter used as deterministic transition-key derivation context.
+    pub submitted_by_node_id: Uuid,
     pub kind: ClusterOperationKind,
     pub stage: ClusterOperationStage,
     pub dry_run: bool,
@@ -221,6 +223,7 @@ impl ClusterOperationRecord {
         mut builder: mantissa_protocol::topology::cluster_operation::Builder<'_>,
     ) {
         builder.set_id(self.id.as_bytes());
+        builder.set_submitted_by_node_id(self.submitted_by_node_id.as_bytes());
         builder.set_kind(self.kind.to_capnp());
         builder.set_stage(self.stage.to_capnp());
         builder.set_details(&self.details);
@@ -282,6 +285,10 @@ impl ClusterOperationRecord {
 
         Ok(Self {
             id,
+            submitted_by_node_id: uuid_from_data(
+                reader.get_submitted_by_node_id()?,
+                "cluster operation submitter node id",
+            )?,
             kind: ClusterOperationKind::from_capnp(reader.get_kind()?),
             stage: ClusterOperationStage::from_capnp(reader.get_stage()?),
             dry_run: reader.get_dry_run(),
@@ -465,6 +472,7 @@ mod tests {
     ) -> ClusterOperationRecord {
         ClusterOperationRecord {
             id: Uuid::from_u128(id),
+            submitted_by_node_id: Uuid::from_u128(0x700),
             kind: ClusterOperationKind::Merge,
             stage,
             dry_run,
@@ -490,6 +498,7 @@ mod tests {
         let target_cluster_b = ClusterId::from_uuid(Uuid::from_u128(0x300));
         let operation = ClusterOperationRecord {
             id: Uuid::from_u128(0x400),
+            submitted_by_node_id: Uuid::from_u128(0x700),
             kind: ClusterOperationKind::Split,
             stage: ClusterOperationStage::Committed,
             dry_run: true,

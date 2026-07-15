@@ -3,7 +3,11 @@ use crate::connection;
 use anyhow::{Context, Result, anyhow};
 use mantissa_protocol::topology;
 use std::fmt;
+use std::time::Duration;
+use tokio::time::sleep;
 use uuid::Uuid;
+
+const CLUSTER_OPERATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Parsed cluster view identifier used by client-side cluster orchestration calls.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -56,7 +60,7 @@ impl fmt::Display for ClusterViewSpec {
 pub struct ClusterOperationSummary {
     pub id: Uuid,
     pub kind: String,
-    pub stage: String,
+    pub stage: ClusterOperationStage,
     pub dry_run: bool,
     pub source_views: Vec<ClusterViewSpec>,
     pub target_views: Vec<ClusterViewSpec>,
@@ -67,6 +71,41 @@ pub struct ClusterOperationSummary {
     pub merge_service_policy: String,
     pub updated_at_unix_ms: u64,
     pub details: String,
+}
+
+/// Client-facing lifecycle stage for one durable split or merge operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClusterOperationStage {
+    Proposed,
+    Prepared,
+    Committed,
+    Finalized,
+    Aborted,
+}
+
+impl ClusterOperationStage {
+    /// Decodes the protocol stage without exposing generated Cap'n Proto types to callers.
+    fn from_capnp(value: topology::ClusterOperationStage) -> Self {
+        match value {
+            topology::ClusterOperationStage::Proposed => Self::Proposed,
+            topology::ClusterOperationStage::Prepared => Self::Prepared,
+            topology::ClusterOperationStage::Committed => Self::Committed,
+            topology::ClusterOperationStage::Finalized => Self::Finalized,
+            topology::ClusterOperationStage::Aborted => Self::Aborted,
+        }
+    }
+
+    /// Returns whether the operation will make no further lifecycle progress.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Finalized | Self::Aborted)
+    }
+}
+
+impl fmt::Display for ClusterOperationStage {
+    /// Renders the stage using the protocol's operator-facing names.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
 }
 
 /// Deterministic assignment of one node to one split target.
@@ -147,11 +186,10 @@ impl ClusterOperationSummary {
                     .get_kind()
                     .context("operation kind missing from response")?
             ),
-            stage: format!(
-                "{:?}",
+            stage: ClusterOperationStage::from_capnp(
                 reader
                     .get_stage()
-                    .context("operation stage missing from response")?
+                    .context("operation stage missing from response")?,
             ),
             dry_run: reader.get_dry_run(),
             source_views,
@@ -194,6 +232,32 @@ pub async fn get_cluster_operation(
     let operation_id = Uuid::parse_str(operation_id)
         .with_context(|| format!("invalid cluster operation id: {operation_id}"))?;
     let topology = topology_capability(cfg).await?;
+    get_cluster_operation_from_topology(&topology, operation_id).await
+}
+
+/// Waits until one durable operation reaches Finalized or Aborted on the local daemon.
+///
+/// This only controls client observation. It never times out, aborts, or otherwise mutates the
+/// eventually convergent operation after submission.
+pub async fn wait_for_cluster_operation(
+    cfg: &ClientConfig,
+    operation_id: Uuid,
+) -> Result<ClusterOperationSummary> {
+    let topology = topology_capability(cfg).await?;
+    loop {
+        let operation = get_cluster_operation_from_topology(&topology, operation_id).await?;
+        if operation.dry_run || operation.stage.is_terminal() {
+            return Ok(operation);
+        }
+        sleep(CLUSTER_OPERATION_POLL_INTERVAL).await;
+    }
+}
+
+/// Fetches one operation using an already-open topology capability for efficient polling.
+async fn get_cluster_operation_from_topology(
+    topology: &topology::Client,
+    operation_id: Uuid,
+) -> Result<ClusterOperationSummary> {
     let mut request = topology.get_cluster_operation_request();
     request.get().set_id(operation_id.as_bytes());
 

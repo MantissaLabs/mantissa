@@ -76,7 +76,8 @@ impl SecretMasterKeyPublisher {
             self.persist_and_notify_locked(&rows).await?;
             rows
         };
-        self.gossip_records(rows).await
+        self.gossip_records(rows);
+        Ok(())
     }
 
     /// Ensures current key rows exist and returns rows for latency-sensitive join seeding.
@@ -154,7 +155,7 @@ impl SecretMasterKeyPublisher {
             self.persist_and_notify_locked(&published_rows).await?;
             (seed_rows, published_rows)
         };
-        self.gossip_records(published_rows).await?;
+        self.gossip_records(published_rows);
         Ok(seed_rows)
     }
 
@@ -181,7 +182,8 @@ impl SecretMasterKeyPublisher {
             self.persist_and_notify_locked(&rows).await?;
             rows
         };
-        self.gossip_records(rows).await
+        self.gossip_records(rows);
+        Ok(())
     }
 
     /// Returns true when any descriptor or grant row for this key still needs publication.
@@ -222,23 +224,26 @@ impl SecretMasterKeyPublisher {
         Ok(())
     }
 
-    /// Queues already-persisted rows for gossip as a convergence acceleration hint.
-    async fn gossip_records(&self, records: Vec<SecretMasterKeySyncRecord>) -> Result<()> {
+    /// Best-effort queues already-persisted rows as convergence acceleration hints.
+    fn gossip_records(&self, records: Vec<SecretMasterKeySyncRecord>) {
         if records.is_empty() {
-            return Ok(());
+            return;
         }
 
         for record in records {
-            self.gossip_tx
-                .send(Message::SecretMasterKey {
-                    id: Uuid::new_v4(),
-                    record,
-                })
-                .await
-                .map_err(|error| anyhow!("enqueue master-key gossip: {error}"))?;
+            if let Err(error) = self.gossip_tx.try_send(Message::SecretMasterKey {
+                id: Uuid::new_v4(),
+                record,
+            }) {
+                // The durable SecretMasterKeys MST is authoritative. Dropping the remaining hints
+                // avoids holding transition progress behind a saturated or closed gossip queue.
+                warn!(
+                    target: "secrets",
+                    "failed to enqueue master-key gossip hint; global Sync will repair it: {error}"
+                );
+                break;
+            }
         }
-
-        Ok(())
     }
 
     /// Appends seed rows and separately tracks rows that are not yet visible locally.

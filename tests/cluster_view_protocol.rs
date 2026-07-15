@@ -22,7 +22,8 @@ use mantissa::store::replicated::cluster_operations::ClusterOperationStore;
 use mantissa::store::replicated::cluster_views::ClusterViewStore;
 use mantissa::store::replicated::peers::open_peers_store;
 use mantissa::store::replicated::secret_key_sync::{
-    current_from_descriptor, open_secret_master_key_store, upsert_current, upsert_descriptor,
+    current_for_scope, current_from_descriptor, open_secret_master_key_store, upsert_current,
+    upsert_descriptor,
 };
 use mantissa::sync::VIEW_SCOPED_DOMAIN_COUNT;
 use mantissa::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue};
@@ -768,6 +769,28 @@ local_test!(cluster_view_split_commits_inproc, {
         .to_vec();
     let expected_epoch = active_target.get_epoch();
     let split_id = split_op.get_id().expect("split id").to_vec();
+    let split_uuid = Uuid::from_slice(&split_id).expect("split operation UUID");
+    let expected_view = ClusterViewId::from_capnp(active_target).expect("active split target");
+
+    let prerequisite_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let stage = cluster_operation_stage(&node.topology(), split_uuid).await;
+        if stage != ClusterOperationStage::Proposed {
+            assert!(
+                current_for_scope(&node.node.secret_master_keys, expected_view)
+                    .expect("load split target current")
+                    .is_some(),
+                "split must not cross Prepared before its target current row is durable"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < prerequisite_deadline,
+            "split remained Proposed while preparing target key material"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+
     wait_for_operation_stage(
         &node.topology(),
         &split_id,
@@ -1292,7 +1315,7 @@ local_test!(cluster_view_split_label_selector_assigns_peers, {
     .await;
 });
 
-// Validates startup replay resumes non-finalized durable operations and installs their target view.
+// Validates startup replay prepares an unseeded proposal and installs its target view.
 local_test!(cluster_view_replays_pending_operation_on_startup, {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("state.redb");
@@ -1304,8 +1327,9 @@ local_test!(cluster_view_replays_pending_operation_on_startup, {
     let target_view = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 3);
     let operation = ClusterOperationRecord {
         id: Uuid::new_v4(),
+        submitted_by_node_id: node_id,
         kind: StoredOperationKind::Merge,
-        stage: StoredOperationStage::Prepared,
+        stage: StoredOperationStage::Proposed,
         dry_run: false,
         created_at_unix_ms: 1,
         depends_on_operation_id: None,
@@ -1320,7 +1344,6 @@ local_test!(cluster_view_replays_pending_operation_on_startup, {
         details: "replay test operation".to_string(),
     };
 
-    persist_test_transition_key(db.clone(), node_id, &operation).await;
     persist_test_operation(&operation_store, &operation).await;
 
     let node = HeadlessNode::new_with(
@@ -1384,6 +1407,7 @@ local_test!(cluster_view_startup_restores_split_peer_scope, {
     let operation_store = open_test_operation_store(db.clone());
     let split = ClusterOperationRecord {
         id: Uuid::new_v4(),
+        submitted_by_node_id: self_id,
         kind: StoredOperationKind::Split,
         stage: StoredOperationStage::Finalized,
         dry_run: false,
@@ -1672,6 +1696,7 @@ local_test!(cluster_view_startup_replay_skips_dry_run_operation, {
     let target_view = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 9);
     let operation = ClusterOperationRecord {
         id: Uuid::new_v4(),
+        submitted_by_node_id: Uuid::from_u128(1),
         kind: StoredOperationKind::Merge,
         stage: StoredOperationStage::Proposed,
         dry_run: true,
@@ -1756,6 +1781,7 @@ local_test!(cluster_view_startup_restores_persisted_active_view, {
     let target_view = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 17);
     let operation = ClusterOperationRecord {
         id: Uuid::new_v4(),
+        submitted_by_node_id: Uuid::from_u128(1),
         kind: StoredOperationKind::Merge,
         stage: StoredOperationStage::Finalized,
         dry_run: false,
@@ -1827,6 +1853,7 @@ local_test!(cluster_view_startup_finishes_persisted_split_transition, {
     );
     let operation = ClusterOperationRecord {
         id: Uuid::new_v4(),
+        submitted_by_node_id: node_id,
         kind: StoredOperationKind::Split,
         stage: StoredOperationStage::Prepared,
         dry_run: false,
@@ -1917,6 +1944,7 @@ local_test!(cluster_view_startup_rejects_unrelated_split_target, {
     );
     let operation = ClusterOperationRecord {
         id: Uuid::new_v4(),
+        submitted_by_node_id: node_id,
         kind: StoredOperationKind::Split,
         stage: StoredOperationStage::Prepared,
         dry_run: false,
@@ -1985,6 +2013,7 @@ local_test!(
         );
         let operation = ClusterOperationRecord {
             id: Uuid::new_v4(),
+            submitted_by_node_id: node_id,
             kind: StoredOperationKind::Split,
             stage: StoredOperationStage::Finalized,
             dry_run: false,
@@ -2048,6 +2077,7 @@ local_test!(
         let second_target = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 2);
         let first_operation = ClusterOperationRecord {
             id: Uuid::from_u128(1),
+            submitted_by_node_id: node_id,
             kind: StoredOperationKind::Merge,
             stage: StoredOperationStage::Prepared,
             dry_run: false,
@@ -2065,6 +2095,7 @@ local_test!(
         };
         let second_operation = ClusterOperationRecord {
             id: Uuid::from_u128(2),
+            submitted_by_node_id: node_id,
             kind: StoredOperationKind::Merge,
             stage: StoredOperationStage::Prepared,
             dry_run: false,
@@ -2153,6 +2184,7 @@ local_test!(cluster_view_startup_gc_prunes_terminal_operations, {
     for index in 0..total {
         let operation = ClusterOperationRecord {
             id: Uuid::new_v4(),
+            submitted_by_node_id: Uuid::from_u128(1),
             kind: StoredOperationKind::Merge,
             stage: StoredOperationStage::Finalized,
             dry_run: true,
@@ -2223,6 +2255,7 @@ local_test!(
         for index in 0..total {
             let operation = ClusterOperationRecord {
                 id: Uuid::new_v4(),
+                submitted_by_node_id: self_id,
                 kind: StoredOperationKind::Merge,
                 stage: StoredOperationStage::Finalized,
                 dry_run: true,
@@ -3777,6 +3810,7 @@ local_test!(cluster_view_queues_concurrent_operation_submission, {
     // Intentionally malformed split operation: missing split assignments keeps it stuck in Prepared.
     let active_operation = ClusterOperationRecord {
         id: Uuid::new_v4(),
+        submitted_by_node_id: node.id(),
         kind: StoredOperationKind::Split,
         stage: StoredOperationStage::Proposed,
         dry_run: false,
@@ -3864,6 +3898,7 @@ local_test!(cluster_view_chains_back_to_back_overlapping_operations, {
 
     let active_operation = ClusterOperationRecord {
         id: Uuid::from_u128(0xA11CE),
+        submitted_by_node_id: node.id(),
         kind: StoredOperationKind::Split,
         stage: StoredOperationStage::Proposed,
         dry_run: false,
@@ -3890,6 +3925,7 @@ local_test!(cluster_view_chains_back_to_back_overlapping_operations, {
 
     let first_merge = ClusterOperationRecord {
         id: Uuid::from_u128(0xF11257),
+        submitted_by_node_id: node.id(),
         kind: StoredOperationKind::Merge,
         stage: StoredOperationStage::Proposed,
         dry_run: false,
@@ -3907,6 +3943,7 @@ local_test!(cluster_view_chains_back_to_back_overlapping_operations, {
     };
     let second_merge = ClusterOperationRecord {
         id: Uuid::from_u128(0x5EC0D),
+        submitted_by_node_id: node.id(),
         kind: StoredOperationKind::Merge,
         stage: StoredOperationStage::Proposed,
         dry_run: false,
@@ -3978,6 +4015,7 @@ local_test!(cluster_view_ignores_finalized_sibling_split_operation, {
     );
     let operation = ClusterOperationRecord {
         id: Uuid::new_v4(),
+        submitted_by_node_id: node.id(),
         kind: StoredOperationKind::Split,
         stage: StoredOperationStage::Finalized,
         dry_run: false,
@@ -4028,6 +4066,7 @@ local_test!(cluster_view_ignores_proposed_sibling_merge_operation, {
     );
     let operation = ClusterOperationRecord {
         id: Uuid::new_v4(),
+        submitted_by_node_id: node.id(),
         kind: StoredOperationKind::Merge,
         stage: StoredOperationStage::Proposed,
         dry_run: false,
@@ -4218,6 +4257,7 @@ local_test!(cluster_view_defers_learned_operation_while_other_active, {
     // Intentionally malformed split operation: missing split assignments keeps it stuck in Prepared.
     let active_operation = ClusterOperationRecord {
         id: Uuid::new_v4(),
+        submitted_by_node_id: node.id(),
         kind: StoredOperationKind::Split,
         stage: StoredOperationStage::Proposed,
         dry_run: false,
@@ -4248,6 +4288,7 @@ local_test!(cluster_view_defers_learned_operation_while_other_active, {
 
     let deferred_operation = ClusterOperationRecord {
         id: Uuid::new_v4(),
+        submitted_by_node_id: node.id(),
         kind: StoredOperationKind::Merge,
         stage: StoredOperationStage::Proposed,
         dry_run: false,
@@ -4318,6 +4359,7 @@ local_test!(cluster_view_rejects_join_while_split_in_progress, {
     // Intentionally malformed split operation: missing split assignments keeps it stuck in Prepared.
     let active_split = ClusterOperationRecord {
         id: Uuid::new_v4(),
+        submitted_by_node_id: anchor.id(),
         kind: StoredOperationKind::Split,
         stage: StoredOperationStage::Proposed,
         dry_run: false,

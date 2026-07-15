@@ -1163,6 +1163,9 @@ impl Topology {
 
         let topology = self.clone();
         tokio::task::spawn_local(async move {
+            // Let the submitting RPC flush its durable Proposed result before key wrapping can
+            // occupy this local executor thread for a large participant set.
+            tokio::task::yield_now().await;
             if let Err(err) = topology.progress_cluster_operation(operation_id).await {
                 warn!(
                     target: "cluster_view",
@@ -1373,6 +1376,19 @@ impl Topology {
 
         match operation.stage {
             ClusterOperationStage::Proposed => {
+                // This is the only actionability frontier: a replicated Proposed row is harmless,
+                // while Prepared certifies that this node durably installed every target-key row
+                // it is responsible for publishing. Missing remote rows remain a retryable Sync
+                // condition and never turn into a participant acknowledgement barrier.
+                if !self.publish_transition_key_material(&operation).await? {
+                    debug!(
+                        target: "cluster_view",
+                        operation_id = %operation.id,
+                        submitted_by_node_id = %operation.submitted_by_node_id,
+                        "cluster operation is waiting for its deterministic key publisher"
+                    );
+                    return Ok(());
+                }
                 if !self
                     .update_cluster_operation_stage(
                         &mut operation,
@@ -1686,6 +1702,7 @@ mod tests {
     fn cluster_name_hint_timestamp_uses_operation_creation_time() {
         let operation = ClusterOperationRecord {
             id: Uuid::new_v4(),
+            submitted_by_node_id: Uuid::new_v4(),
             kind: ClusterOperationKind::Split,
             stage: ClusterOperationStage::Finalized,
             dry_run: false,

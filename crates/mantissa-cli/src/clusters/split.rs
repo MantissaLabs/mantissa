@@ -9,7 +9,7 @@ use mantissa_ui::split_interactive::{
     run_split_planner,
 };
 
-use super::operations::emit_operation_summary;
+use super::operations::emit_operation_result;
 
 /// Converts one client split candidate into a UI-facing candidate without coupling the client to UI.
 fn to_ui_candidate(candidate: SplitCandidate) -> UiSplitCandidate {
@@ -50,7 +50,7 @@ fn to_ui_payload(payload: SplitCandidateList) -> UiSplitCandidateList {
 }
 
 /// Resolves split mode and executes interactive or non-interactive split orchestration.
-pub async fn split(cfg: &ClientConfig, request: &SplitCommandRequest) -> Result<()> {
+pub async fn split(cfg: &ClientConfig, request: &SplitCommandRequest, wait: bool) -> Result<()> {
     if request.interactive {
         let payload = mantissa_client::clusters::list_split_candidates(
             cfg,
@@ -86,11 +86,9 @@ pub async fn split(cfg: &ClientConfig, request: &SplitCommandRequest) -> Result<
             request.network_policy,
         )
         .await?;
-        emit_operation_summary(&summary);
-        return Ok(());
+        return emit_operation_result(cfg, summary, wait).await;
     }
 
     let summary = mantissa_client::clusters::split(cfg, request).await?;
-    emit_operation_summary(&summary);
-    Ok(())
+    emit_operation_result(cfg, summary, wait).await
 }

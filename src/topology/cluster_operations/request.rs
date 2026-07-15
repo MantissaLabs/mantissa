@@ -162,6 +162,7 @@ impl Topology {
         let now = Self::now_unix_ms();
         ClusterOperationRecord {
             id: Uuid::new_v4(),
+            submitted_by_node_id: self.local.node.id,
             kind: ClusterOperationKind::Merge,
             stage: ClusterOperationStage::Proposed,
             dry_run,
@@ -212,6 +213,7 @@ impl Topology {
         let now = Self::now_unix_ms();
         ClusterOperationRecord {
             id: Uuid::new_v4(),
+            submitted_by_node_id: self.local.node.id,
             kind: ClusterOperationKind::Split,
             stage: ClusterOperationStage::Proposed,
             dry_run,
@@ -236,38 +238,48 @@ impl Topology {
         }
     }
 
-    /// Stores a submitted operation, announces its MST availability, and schedules local work.
+    /// Durably queues a submitted operation and schedules preparation plus dissemination.
+    ///
+    /// `Proposed` is intentionally non-actionable. Expensive target-key wrapping runs from the
+    /// replayable progress path, while this request boundary returns after the intent itself is
+    /// durable. Gossip is only an availability hint and therefore runs outside the RPC lifetime.
     pub(in crate::topology) async fn persist_and_dispatch_operation(
         &self,
         operation: &mut ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
         if !operation.dry_run {
             let _ = self.normalize_cluster_operation_dependency(operation)?;
-            self.publish_transition_key_material(operation).await?;
         }
         self.persist_cluster_operation(operation).await?;
-        if !operation.dry_run
-            && let Err(err) = self
-                .gossip_topology_event(TopologyEvent::ClusterMetadataChanged {
-                    operation_id: operation.id,
-                })
-                .await
-        {
-            // The durable MST row remains authoritative and periodic global Sync will repair a
-            // missed hint. Do not report an accepted operation as failed merely because the
-            // latency-optimization channel closed.
-            warn!(
-                target: "cluster_view",
-                operation_id = %operation.id,
-                "failed to enqueue cluster metadata availability hint: {err}"
-            );
-        }
+        self.trigger_cluster_metadata_gossip(operation.id, operation.dry_run);
         if self.operation_ready_to_progress(operation)? {
             self.trigger_operation_progress(operation.id, operation.dry_run);
         } else if let Some(dependency_id) = operation.depends_on_operation_id {
             self.trigger_operation_progress(dependency_id, false);
         }
         Ok(())
+    }
+
+    /// Announces a durable operation without holding the submitting RPC behind gossip backpressure.
+    fn trigger_cluster_metadata_gossip(&self, operation_id: Uuid, dry_run: bool) {
+        if dry_run {
+            return;
+        }
+
+        let topology = self.clone();
+        tokio::task::spawn_local(async move {
+            if let Err(err) = topology
+                .gossip_topology_event(TopologyEvent::ClusterMetadataChanged { operation_id })
+                .await
+            {
+                // The operation MST is authoritative. Periodic global Sync repairs a missed hint.
+                warn!(
+                    target: "cluster_view",
+                    operation_id = %operation_id,
+                    "failed to enqueue cluster metadata availability hint: {err}"
+                );
+            }
+        });
     }
 
     /// Injects one operation record through the production merge/progress path for test fixtures.
@@ -283,10 +295,6 @@ impl Topology {
             incoming.created_at_unix_ms = incoming.updated_at_unix_ms;
         }
         let _ = self.normalize_cluster_operation_dependency(&mut incoming)?;
-        if !incoming.dry_run && incoming.stage == ClusterOperationStage::Proposed {
-            self.publish_transition_key_material(&incoming).await?;
-        }
-
         let merged = match self.load_cluster_operation(operation_id)? {
             Some(current) if !incoming.supersedes(&current) => current,
             _ => {
