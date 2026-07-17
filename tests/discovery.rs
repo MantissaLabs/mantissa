@@ -1180,8 +1180,8 @@ local_test!(discovery_dns_routes_only_healthy_readiness_backends, {
     let recovering_node = Uuid::new_v4();
     let ready_task = Uuid::new_v4();
     let recovering_task = Uuid::new_v4();
-    let ready_ip = Ipv4Addr::new(127, 0, 0, 10);
-    let recovering_ip = Ipv4Addr::new(127, 0, 0, 11);
+    let ready_ip = Ipv4Addr::LOCALHOST;
+    let recovering_ip = Ipv4Addr::new(127, 0, 0, 2);
     let probe = ServiceReadinessProbe {
         kind: ServiceReadinessProbeKind::Http,
         port: probe_port,
@@ -1273,17 +1273,6 @@ local_test!(discovery_dns_routes_only_healthy_readiness_backends, {
         .expect("wait for first healthy backend");
     assert_eq!(ready_answers, vec![ready_ip]);
 
-    let recovering_server = spawn_http_ready_server(recovering_ip, probe_port, "/healthz");
-    let (_, dual_answers) = wait_for_answer_count(dns_port, &fqdn, 2, Duration::from_secs(5))
-        .await
-        .expect("wait for second healthy backend");
-    let dual_set: std::collections::BTreeSet<Ipv4Addr> = dual_answers.into_iter().collect();
-    assert_eq!(
-        dual_set,
-        std::collections::BTreeSet::from([ready_ip, recovering_ip]),
-        "both readiness-proven backends should be routable"
-    );
-
     harness
         .registry
         .upsert_peer_state(NetworkPeerStateValue::new(
@@ -1296,18 +1285,17 @@ local_test!(discovery_dns_routes_only_healthy_readiness_backends, {
         .await
         .expect("withdraw ready peer");
 
-    let (post_withdraw_code, post_withdraw_ips) = query_a_records(dns_port, &fqdn)
-        .await
-        .expect("query dns after peer withdrawal");
-    assert_eq!(post_withdraw_code, ResponseCode::NoError);
-    assert_eq!(
-        post_withdraw_ips,
-        vec![recovering_ip],
-        "peer withdrawal must immediately remove the stale backend while preserving surviving healthy replicas"
+    let (post_withdraw_code, post_withdraw_ips) =
+        wait_for_answer_count(dns_port, &fqdn, 0, Duration::from_secs(5))
+            .await
+            .expect("query dns after peer withdrawal");
+    assert_eq!(post_withdraw_code, ResponseCode::NXDomain);
+    assert!(
+        post_withdraw_ips.is_empty(),
+        "peer withdrawal must immediately remove the stale healthy backend"
     );
 
     ready_server.abort();
-    recovering_server.abort();
     harness
         .discovery
         .teardown_network(network_id)

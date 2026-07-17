@@ -16,6 +16,7 @@ local_test!(
                     Duration::from_millis(100),
                     ChronoDuration::seconds(0),
                     Duration::from_millis(100),
+                    Duration::from_millis(100),
                 )
                 .with_cleanup_min_age(ChronoDuration::seconds(5)),
             ),
@@ -66,6 +67,8 @@ local_test!(
         let mut split_req = left_a.topology().split_cluster_request();
         {
             let mut req = split_req.get().init_req();
+            req.set_operation_id(Uuid::new_v4().as_bytes());
+            req.reborrow().init_dependency_operation_ids(0);
             source_view.write_capnp(req.reborrow().init_source_view());
 
             let mut targets = req.reborrow().init_targets(2);
@@ -147,6 +150,8 @@ local_test!(
         let mut merge_req = left_a.topology().merge_clusters_request();
         {
             let mut req = merge_req.get().init_req();
+            req.set_operation_id(Uuid::new_v4().as_bytes());
+            req.reborrow().init_dependency_operation_ids(0);
             left_view.write_capnp(req.reborrow().init_source_view());
             right_view.write_capnp(req.reborrow().init_destination_view());
             req.set_dry_run(false);
@@ -259,6 +264,8 @@ local_test!(
         let mut split_req = left_a.topology().split_cluster_request();
         {
             let mut req = split_req.get().init_req();
+            req.set_operation_id(Uuid::new_v4().as_bytes());
+            req.reborrow().init_dependency_operation_ids(0);
             source_view.write_capnp(req.reborrow().init_source_view());
 
             let mut targets = req.reborrow().init_targets(2);
@@ -312,6 +319,8 @@ local_test!(
         let mut merge_req = left_a.topology().merge_clusters_request();
         {
             let mut req = merge_req.get().init_req();
+            req.set_operation_id(Uuid::new_v4().as_bytes());
+            req.reborrow().init_dependency_operation_ids(0);
             left_view.write_capnp(req.reborrow().init_source_view());
             right_view.write_capnp(req.reborrow().init_destination_view());
             req.set_dry_run(false);
@@ -577,6 +586,8 @@ local_test!(services_crdt_split_merge_rollback_generation_converges, {
     let mut split_req = anchor.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
 
         let mut targets = req.reborrow().init_targets(2);
@@ -706,6 +717,8 @@ local_test!(services_crdt_split_merge_rollback_generation_converges, {
     let mut merge_req = anchor.topology().merge_clusters_request();
     {
         let mut req = merge_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         left_view.write_capnp(req.reborrow().init_source_view());
         right_view.write_capnp(req.reborrow().init_destination_view());
         req.set_dry_run(false);

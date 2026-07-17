@@ -133,6 +133,8 @@ async fn split_two_node_cluster(
     let mut split_req = anchor.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
 
         let mut targets = req.reborrow().init_targets(2);
@@ -189,6 +191,8 @@ async fn split_four_node_cluster(cluster: &[TestNode]) -> (Uuid, ClusterViewId, 
     let mut split_req = left_a.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
 
         let mut targets = req.reborrow().init_targets(2);
@@ -250,6 +254,8 @@ async fn split_three_node_cluster(cluster: &[TestNode]) -> (Uuid, ClusterViewId,
     let mut split_req = left.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
 
         let mut targets = req.reborrow().init_targets(2);
@@ -310,6 +316,8 @@ async fn split_balanced_cluster(cluster: &[TestNode]) -> (Uuid, ClusterViewId, C
     let mut split_req = cluster[0].topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
 
         let mut targets = req.reborrow().init_targets(2);
@@ -388,6 +396,8 @@ async fn merge_cluster_views(
     let mut merge_req = requester.topology().merge_clusters_request();
     {
         let mut req = merge_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
         destination_view.write_capnp(req.reborrow().init_destination_view());
         req.set_dry_run(false);

@@ -133,10 +133,10 @@ async fn persist_test_transition_key(
         .expect("persist test target current");
 }
 
-async fn cluster_operation_dependency_id(
+async fn cluster_operation_dependency_ids(
     topology: &mantissa::topology_capnp::topology::Client,
     operation_id: Uuid,
-) -> Option<Uuid> {
+) -> Vec<Uuid> {
     let mut request = topology.get_cluster_operation_request();
     request.get().set_id(operation_id.as_bytes());
     let response = request
@@ -149,13 +149,13 @@ async fn cluster_operation_dependency_id(
         .expect("getClusterOperation get")
         .get_op()
         .expect("operation payload");
-    let dependency = op
-        .get_depends_on_operation_id()
-        .expect("operation dependency");
-    if dependency.is_empty() {
-        return None;
-    }
-    Some(Uuid::from_slice(dependency).expect("dependency uuid"))
+    op.get_dependency_operation_ids()
+        .expect("operation dependencies")
+        .iter()
+        .map(|dependency| {
+            Uuid::from_slice(dependency.expect("dependency data")).expect("dependency uuid")
+        })
+        .collect()
 }
 
 /// Reads the persisted stage for one cluster operation through the topology RPC API.
@@ -188,6 +188,8 @@ async fn request_merge_operation(
     let mut merge_req = topology.merge_clusters_request();
     {
         let mut req = merge_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
         destination_view.write_capnp(req.reborrow().init_destination_view());
         req.set_dry_run(false);
@@ -483,6 +485,8 @@ local_test!(cluster_view_protocol_strict_inproc, {
     let mut merge_req = node.topology().merge_clusters_request();
     {
         let mut req = merge_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         let mut src = req.reborrow().init_source_view();
         src.reborrow().init_cluster_id().set_value(&cluster_id);
         src.set_epoch(epoch);
@@ -522,6 +526,8 @@ local_test!(cluster_view_protocol_strict_inproc, {
     let mut split_req = node.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         let mut src = req.reborrow().init_source_view();
         src.reborrow().init_cluster_id().set_value(&cluster_id);
         src.set_epoch(epoch);
@@ -625,6 +631,8 @@ local_test!(cluster_view_merge_commits_inproc, {
     let mut merge_req = node.topology().merge_clusters_request();
     {
         let mut req = merge_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         let mut src = req.reborrow().init_source_view();
         src.reborrow().init_cluster_id().set_value(&cluster_id);
         src.set_epoch(epoch);
@@ -728,6 +736,8 @@ local_test!(cluster_view_split_commits_inproc, {
     let mut split_req = node.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         let mut src = req.reborrow().init_source_view();
         src.reborrow().init_cluster_id().set_value(&cluster_id);
         src.set_epoch(epoch);
@@ -863,6 +873,8 @@ local_test!(cluster_view_split_selectors_choose_assigned_target, {
     let mut split_req = joiner.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         let mut src = req.reborrow().init_source_view();
         src.reborrow().init_cluster_id().set_value(&cluster_id);
         src.set_epoch(epoch);
@@ -994,6 +1006,8 @@ local_test!(cluster_view_merge_propagates_to_peer, {
     let mut merge_req = joiner.topology().merge_clusters_request();
     {
         let mut req = merge_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
         destination_view.write_capnp(req.reborrow().init_destination_view());
         req.set_dry_run(false);
@@ -1052,6 +1066,8 @@ local_test!(cluster_view_split_resource_selector_assigns_peers, {
     let mut split_req = joiner.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         let mut src = req.reborrow().init_source_view();
         src.reborrow().init_cluster_id().set_value(&cluster_id);
         src.set_epoch(epoch);
@@ -1228,6 +1244,8 @@ local_test!(cluster_view_split_label_selector_assigns_peers, {
     let mut split_req = joiner.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         let mut src = req.reborrow().init_source_view();
         src.reborrow().init_cluster_id().set_value(&cluster_id);
         src.set_epoch(epoch);
@@ -1332,7 +1350,7 @@ local_test!(cluster_view_replays_pending_operation_on_startup, {
         stage: StoredOperationStage::Proposed,
         dry_run: false,
         created_at_unix_ms: 1,
-        depends_on_operation_id: None,
+        dependency_operation_ids: Vec::new(),
         source_views: vec![source_view],
         target_views: vec![target_view],
         target_cluster_names: Vec::new(),
@@ -1412,7 +1430,7 @@ local_test!(cluster_view_startup_restores_split_peer_scope, {
         stage: StoredOperationStage::Finalized,
         dry_run: false,
         created_at_unix_ms: 42,
-        depends_on_operation_id: None,
+        dependency_operation_ids: Vec::new(),
         source_views: vec![source_view],
         target_views: vec![local_view, remote_view],
         target_cluster_names: vec!["local".to_string(), "remote".to_string()],
@@ -1701,7 +1719,7 @@ local_test!(cluster_view_startup_replay_skips_dry_run_operation, {
         stage: StoredOperationStage::Proposed,
         dry_run: true,
         created_at_unix_ms: 1,
-        depends_on_operation_id: None,
+        dependency_operation_ids: Vec::new(),
         source_views: vec![source_view],
         target_views: vec![target_view],
         target_cluster_names: Vec::new(),
@@ -1786,7 +1804,7 @@ local_test!(cluster_view_startup_restores_persisted_active_view, {
         stage: StoredOperationStage::Finalized,
         dry_run: false,
         created_at_unix_ms: 17,
-        depends_on_operation_id: None,
+        dependency_operation_ids: Vec::new(),
         source_views: vec![source_view],
         target_views: vec![target_view],
         target_cluster_names: Vec::new(),
@@ -1858,7 +1876,7 @@ local_test!(cluster_view_startup_finishes_persisted_split_transition, {
         stage: StoredOperationStage::Prepared,
         dry_run: false,
         created_at_unix_ms: 22,
-        depends_on_operation_id: None,
+        dependency_operation_ids: Vec::new(),
         source_views: vec![source_view],
         target_views: vec![split_target_a, split_target_b],
         target_cluster_names: Vec::new(),
@@ -1949,7 +1967,7 @@ local_test!(cluster_view_startup_rejects_unrelated_split_target, {
         stage: StoredOperationStage::Prepared,
         dry_run: false,
         created_at_unix_ms: 23,
-        depends_on_operation_id: None,
+        dependency_operation_ids: Vec::new(),
         source_views: vec![source_view],
         target_views: vec![target_view],
         target_cluster_names: Vec::new(),
@@ -2018,7 +2036,7 @@ local_test!(
             stage: StoredOperationStage::Finalized,
             dry_run: false,
             created_at_unix_ms: 23,
-            depends_on_operation_id: None,
+            dependency_operation_ids: Vec::new(),
             source_views: vec![source_view],
             target_views: vec![split_target_a, split_target_b],
             target_cluster_names: Vec::new(),
@@ -2082,7 +2100,7 @@ local_test!(
             stage: StoredOperationStage::Prepared,
             dry_run: false,
             created_at_unix_ms: 1,
-            depends_on_operation_id: None,
+            dependency_operation_ids: Vec::new(),
             source_views: vec![source_view],
             target_views: vec![first_target],
             target_cluster_names: Vec::new(),
@@ -2100,7 +2118,7 @@ local_test!(
             stage: StoredOperationStage::Prepared,
             dry_run: false,
             created_at_unix_ms: 2,
-            depends_on_operation_id: None,
+            dependency_operation_ids: Vec::new(),
             source_views: vec![source_view],
             target_views: vec![second_target],
             target_cluster_names: Vec::new(),
@@ -2189,7 +2207,7 @@ local_test!(cluster_view_startup_gc_prunes_terminal_operations, {
             stage: StoredOperationStage::Finalized,
             dry_run: true,
             created_at_unix_ms: (index as u64).saturating_add(1),
-            depends_on_operation_id: None,
+            dependency_operation_ids: Vec::new(),
             source_views: vec![source_view],
             target_views: vec![target_view],
             target_cluster_names: Vec::new(),
@@ -2260,7 +2278,7 @@ local_test!(
                 stage: StoredOperationStage::Finalized,
                 dry_run: true,
                 created_at_unix_ms: (index as u64).saturating_add(1),
-                depends_on_operation_id: None,
+                dependency_operation_ids: Vec::new(),
                 source_views: vec![source_view],
                 target_views: vec![target_view],
                 target_cluster_names: Vec::new(),
@@ -2531,6 +2549,8 @@ local_test!(cluster_view_name_updates_cross_view_after_split, {
     let mut split_req = anchor.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
 
         let mut targets = req.reborrow().init_targets(2);
@@ -2640,6 +2660,8 @@ local_test!(cluster_view_name_updates_cross_view_via_sync_domain, {
     let mut split_req = anchor.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
 
         let mut targets = req.reborrow().init_targets(2);
@@ -2733,6 +2755,8 @@ local_test!(cluster_view_split_persists_target_names, {
     let mut split_req = anchor.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
 
         let mut targets = req.reborrow().init_targets(2);
@@ -2965,6 +2989,8 @@ local_test!(cluster_view_split_scopes_listings_to_active_view, {
     let mut split_req = anchor.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
 
         let mut targets = req.reborrow().init_targets(2);
@@ -3143,6 +3169,8 @@ local_test!(cluster_view_merge_after_split_reconnects_partitions, {
     let mut split_req = anchor.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
 
         let mut targets = req.reborrow().init_targets(2);
@@ -3205,6 +3233,8 @@ local_test!(cluster_view_merge_after_split_reconnects_partitions, {
     let mut merge_req = anchor.topology().merge_clusters_request();
     {
         let mut req = merge_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         split_source_view.write_capnp(req.reborrow().init_source_view());
         split_destination_view.write_capnp(req.reborrow().init_destination_view());
         req.set_dry_run(false);
@@ -3297,6 +3327,8 @@ local_test!(cluster_session_reports_live_view_after_transition, {
     let mut split_req = anchor.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
 
         let mut targets = req.reborrow().init_targets(1);
@@ -3370,6 +3402,8 @@ local_test!(
         let mut merge_req = anchor.topology().merge_clusters_request();
         {
             let mut req = merge_req.get().init_req();
+            req.set_operation_id(Uuid::new_v4().as_bytes());
+            req.reborrow().init_dependency_operation_ids(0);
             source_view.write_capnp(req.reborrow().init_source_view());
             destination_view.write_capnp(req.reborrow().init_destination_view());
             req.set_dry_run(false);
@@ -3432,6 +3466,8 @@ local_test!(
         let mut split_req = anchor.topology().split_cluster_request();
         {
             let mut req = split_req.get().init_req();
+            req.set_operation_id(Uuid::new_v4().as_bytes());
+            req.reborrow().init_dependency_operation_ids(0);
             source_view.write_capnp(req.reborrow().init_source_view());
 
             let mut targets = req.reborrow().init_targets(2);
@@ -3531,6 +3567,8 @@ local_test!(
         let mut split_req = anchor.topology().split_cluster_request();
         {
             let mut req = split_req.get().init_req();
+            req.set_operation_id(Uuid::new_v4().as_bytes());
+            req.reborrow().init_dependency_operation_ids(0);
             source_view.write_capnp(req.reborrow().init_source_view());
 
             let mut targets = req.reborrow().init_targets(2);
@@ -3656,6 +3694,8 @@ local_test!(
         let mut merge_req = anchor.topology().merge_clusters_request();
         {
             let mut req = merge_req.get().init_req();
+            req.set_operation_id(Uuid::new_v4().as_bytes());
+            req.reborrow().init_dependency_operation_ids(0);
             split_source_view.write_capnp(req.reborrow().init_source_view());
             split_destination_view.write_capnp(req.reborrow().init_destination_view());
             req.set_dry_run(false);
@@ -3748,6 +3788,8 @@ local_test!(cluster_view_split_selector_with_fallback_target, {
     let mut split_req = joiner.topology().split_cluster_request();
     {
         let mut req = split_req.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
         let mut targets = req.reborrow().init_targets(2);
 
@@ -3802,8 +3844,8 @@ local_test!(cluster_view_split_selector_with_fallback_target, {
     wait_for_cluster_view(&anchor.topology(), fallback_view, Duration::from_secs(5)).await;
 });
 
-// Validates direct submissions queue behind the active operation and run after it settles.
-local_test!(cluster_view_queues_concurrent_operation_submission, {
+// Validates explicit operation dependencies are durable and abort descendants when they fail.
+local_test!(cluster_view_blocks_operation_after_dependency_aborts, {
     let node = TestNode::new_with_tick_ms(100).await;
     let source_view = current_cluster_view(&node.topology()).await;
 
@@ -3815,7 +3857,7 @@ local_test!(cluster_view_queues_concurrent_operation_submission, {
         stage: StoredOperationStage::Proposed,
         dry_run: false,
         created_at_unix_ms: 1,
-        depends_on_operation_id: None,
+        dependency_operation_ids: Vec::new(),
         source_views: vec![source_view],
         target_views: vec![ClusterViewId::new(
             source_view.cluster_id,
@@ -3841,8 +3883,12 @@ local_test!(cluster_view_queues_concurrent_operation_submission, {
 
     let mut merge_req = node.topology().merge_clusters_request();
     let destination_view = ClusterViewId::new(source_view.cluster_id, source_view.epoch + 2);
+    let merge_operation_id = Uuid::new_v4();
     {
         let mut req = merge_req.get().init_req();
+        req.set_operation_id(merge_operation_id.as_bytes());
+        let mut dependencies = req.reborrow().init_dependency_operation_ids(1);
+        dependencies.set(0, active_operation.id.as_bytes());
         source_view.write_capnp(req.reborrow().init_source_view());
         destination_view.write_capnp(req.reborrow().init_destination_view());
         req.set_dry_run(false);
@@ -3861,10 +3907,8 @@ local_test!(cluster_view_queues_concurrent_operation_submission, {
         "queued merge should stay proposed while dependency is active"
     );
     assert_eq!(
-        merge_op
-            .get_depends_on_operation_id()
-            .expect("queued merge dependency"),
-        active_operation.id.as_bytes(),
+        cluster_operation_dependency_ids(&node.topology(), merge_operation_id).await,
+        vec![active_operation.id],
         "queued merge should record the active operation dependency"
     );
 
@@ -3877,129 +3921,126 @@ local_test!(cluster_view_queues_concurrent_operation_submission, {
     wait_for_operation_stage(
         &node.topology(),
         &merge_id,
-        ClusterOperationStage::Finalized,
+        ClusterOperationStage::Aborted,
         Duration::from_secs(5),
     )
     .await;
-    wait_for_cluster_view(&node.topology(), destination_view, Duration::from_secs(5)).await;
+    assert_eq!(current_cluster_view(&node.topology()).await, source_view);
 });
 
-// Validates pending overlapping operations form a queue chain instead of all waiting on the same
-// active predecessor.
-local_test!(cluster_view_chains_back_to_back_overlapping_operations, {
-    let node = TestNode::new_with_tick_ms(100).await;
-    let source_view = current_cluster_view(&node.topology()).await;
-    let split_target =
-        ClusterViewId::new(source_view.cluster_id, source_view.epoch.saturating_add(1));
-    let first_merge_target =
-        ClusterViewId::new(source_view.cluster_id, source_view.epoch.saturating_add(2));
-    let second_merge_target =
-        ClusterViewId::new(source_view.cluster_id, source_view.epoch.saturating_add(3));
+// Validates an explicitly authored dependency chain remains immutable and fails transitively.
+local_test!(
+    cluster_view_preserves_explicit_operation_dependency_chain,
+    {
+        let node = TestNode::new_with_tick_ms(100).await;
+        let source_view = current_cluster_view(&node.topology()).await;
+        let split_target =
+            ClusterViewId::new(source_view.cluster_id, source_view.epoch.saturating_add(1));
+        let first_merge_target =
+            ClusterViewId::new(source_view.cluster_id, source_view.epoch.saturating_add(2));
+        let second_merge_target =
+            ClusterViewId::new(source_view.cluster_id, source_view.epoch.saturating_add(3));
 
-    let active_operation = ClusterOperationRecord {
-        id: Uuid::from_u128(0xA11CE),
-        submitted_by_node_id: node.id(),
-        kind: StoredOperationKind::Split,
-        stage: StoredOperationStage::Proposed,
-        dry_run: false,
-        created_at_unix_ms: 1,
-        depends_on_operation_id: None,
-        source_views: vec![source_view],
-        target_views: vec![split_target],
-        target_cluster_names: Vec::new(),
-        split_assignments: Vec::new(),
-        split_service_policy: Default::default(),
-        split_network_policy: Default::default(),
-        merge_service_policy: Default::default(),
-        updated_at_unix_ms: 1,
-        details: "malformed split operation for queue-chain validation".to_string(),
-    };
-    submit_cluster_operation_record(&node, &active_operation).await;
-    wait_for_operation_stage(
-        &node.topology(),
-        active_operation.id.as_bytes(),
-        ClusterOperationStage::Prepared,
-        Duration::from_secs(5),
-    )
-    .await;
+        let active_operation = ClusterOperationRecord {
+            id: Uuid::from_u128(0xA11CE),
+            submitted_by_node_id: node.id(),
+            kind: StoredOperationKind::Split,
+            stage: StoredOperationStage::Proposed,
+            dry_run: false,
+            created_at_unix_ms: 1,
+            dependency_operation_ids: Vec::new(),
+            source_views: vec![source_view],
+            target_views: vec![split_target],
+            target_cluster_names: Vec::new(),
+            split_assignments: Vec::new(),
+            split_service_policy: Default::default(),
+            split_network_policy: Default::default(),
+            merge_service_policy: Default::default(),
+            updated_at_unix_ms: 1,
+            details: "malformed split operation for queue-chain validation".to_string(),
+        };
+        submit_cluster_operation_record(&node, &active_operation).await;
+        wait_for_operation_stage(
+            &node.topology(),
+            active_operation.id.as_bytes(),
+            ClusterOperationStage::Prepared,
+            Duration::from_secs(5),
+        )
+        .await;
 
-    let first_merge = ClusterOperationRecord {
-        id: Uuid::from_u128(0xF11257),
-        submitted_by_node_id: node.id(),
-        kind: StoredOperationKind::Merge,
-        stage: StoredOperationStage::Proposed,
-        dry_run: false,
-        created_at_unix_ms: 2,
-        depends_on_operation_id: None,
-        source_views: vec![source_view],
-        target_views: vec![first_merge_target],
-        target_cluster_names: Vec::new(),
-        split_assignments: Vec::new(),
-        split_service_policy: Default::default(),
-        split_network_policy: Default::default(),
-        merge_service_policy: Default::default(),
-        updated_at_unix_ms: 2,
-        details: "first queued merge operation".to_string(),
-    };
-    let second_merge = ClusterOperationRecord {
-        id: Uuid::from_u128(0x5EC0D),
-        submitted_by_node_id: node.id(),
-        kind: StoredOperationKind::Merge,
-        stage: StoredOperationStage::Proposed,
-        dry_run: false,
-        created_at_unix_ms: 3,
-        depends_on_operation_id: None,
-        source_views: vec![first_merge_target],
-        target_views: vec![second_merge_target],
-        target_cluster_names: Vec::new(),
-        split_assignments: Vec::new(),
-        split_service_policy: Default::default(),
-        split_network_policy: Default::default(),
-        merge_service_policy: Default::default(),
-        updated_at_unix_ms: 3,
-        details: "second queued merge operation".to_string(),
-    };
-    submit_cluster_operation_record(&node, &first_merge).await;
-    submit_cluster_operation_record(&node, &second_merge).await;
+        let first_merge = ClusterOperationRecord {
+            id: Uuid::from_u128(0xF11257),
+            submitted_by_node_id: node.id(),
+            kind: StoredOperationKind::Merge,
+            stage: StoredOperationStage::Proposed,
+            dry_run: false,
+            created_at_unix_ms: 2,
+            dependency_operation_ids: vec![active_operation.id],
+            source_views: vec![source_view],
+            target_views: vec![first_merge_target],
+            target_cluster_names: Vec::new(),
+            split_assignments: Vec::new(),
+            split_service_policy: Default::default(),
+            split_network_policy: Default::default(),
+            merge_service_policy: Default::default(),
+            updated_at_unix_ms: 2,
+            details: "first queued merge operation".to_string(),
+        };
+        let second_merge = ClusterOperationRecord {
+            id: Uuid::from_u128(0x5EC0D),
+            submitted_by_node_id: node.id(),
+            kind: StoredOperationKind::Merge,
+            stage: StoredOperationStage::Proposed,
+            dry_run: false,
+            created_at_unix_ms: 3,
+            dependency_operation_ids: vec![first_merge.id],
+            source_views: vec![first_merge_target],
+            target_views: vec![second_merge_target],
+            target_cluster_names: Vec::new(),
+            split_assignments: Vec::new(),
+            split_service_policy: Default::default(),
+            split_network_policy: Default::default(),
+            merge_service_policy: Default::default(),
+            updated_at_unix_ms: 3,
+            details: "second queued merge operation".to_string(),
+        };
+        submit_cluster_operation_record(&node, &first_merge).await;
+        submit_cluster_operation_record(&node, &second_merge).await;
 
-    assert_eq!(
-        cluster_operation_dependency_id(&node.topology(), first_merge.id).await,
-        Some(active_operation.id),
-        "first merge should wait on the active operation"
-    );
-    assert_eq!(
-        cluster_operation_dependency_id(&node.topology(), second_merge.id).await,
-        Some(first_merge.id),
-        "second merge should wait on the preceding overlapping merge"
-    );
+        assert_eq!(
+            cluster_operation_dependency_ids(&node.topology(), first_merge.id).await,
+            vec![active_operation.id],
+            "first merge should wait on the active operation"
+        );
+        assert_eq!(
+            cluster_operation_dependency_ids(&node.topology(), second_merge.id).await,
+            vec![first_merge.id],
+            "second merge should wait on the preceding overlapping merge"
+        );
 
-    let mut aborted_active = active_operation.clone();
-    aborted_active.stage = StoredOperationStage::Aborted;
-    aborted_active.updated_at_unix_ms = 4;
-    aborted_active.details = "aborted malformed split to release merge queue".to_string();
-    submit_cluster_operation_record(&node, &aborted_active).await;
+        let mut aborted_active = active_operation.clone();
+        aborted_active.stage = StoredOperationStage::Aborted;
+        aborted_active.updated_at_unix_ms = 4;
+        aborted_active.details = "aborted malformed split to release merge queue".to_string();
+        submit_cluster_operation_record(&node, &aborted_active).await;
 
-    wait_for_operation_stage(
-        &node.topology(),
-        first_merge.id.as_bytes(),
-        ClusterOperationStage::Finalized,
-        Duration::from_secs(5),
-    )
-    .await;
-    wait_for_operation_stage(
-        &node.topology(),
-        second_merge.id.as_bytes(),
-        ClusterOperationStage::Finalized,
-        Duration::from_secs(5),
-    )
-    .await;
-    wait_for_cluster_view(
-        &node.topology(),
-        second_merge_target,
-        Duration::from_secs(5),
-    )
-    .await;
-});
+        wait_for_operation_stage(
+            &node.topology(),
+            first_merge.id.as_bytes(),
+            ClusterOperationStage::Aborted,
+            Duration::from_secs(5),
+        )
+        .await;
+        wait_for_operation_stage(
+            &node.topology(),
+            second_merge.id.as_bytes(),
+            ClusterOperationStage::Aborted,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(current_cluster_view(&node.topology()).await, source_view);
+    }
+);
 
 // Validates finalized split records from sibling views are retained without local replay errors.
 local_test!(cluster_view_ignores_finalized_sibling_split_operation, {
@@ -4020,7 +4061,7 @@ local_test!(cluster_view_ignores_finalized_sibling_split_operation, {
         stage: StoredOperationStage::Finalized,
         dry_run: false,
         created_at_unix_ms: 10,
-        depends_on_operation_id: None,
+        dependency_operation_ids: Vec::new(),
         source_views: vec![sibling_source],
         target_views: vec![sibling_target],
         target_cluster_names: Vec::new(),
@@ -4071,7 +4112,7 @@ local_test!(cluster_view_ignores_proposed_sibling_merge_operation, {
         stage: StoredOperationStage::Proposed,
         dry_run: false,
         created_at_unix_ms: 20,
-        depends_on_operation_id: None,
+        dependency_operation_ids: Vec::new(),
         source_views: vec![sibling_source],
         target_views: vec![sibling_target],
         target_cluster_names: Vec::new(),
@@ -4123,6 +4164,8 @@ local_test!(
         let mut split_req = cluster[0].topology().split_cluster_request();
         {
             let mut req = split_req.get().init_req();
+            req.set_operation_id(Uuid::new_v4().as_bytes());
+            req.reborrow().init_dependency_operation_ids(0);
             source_view.write_capnp(req.reborrow().init_source_view());
             let mut targets = req.reborrow().init_targets(4);
 
@@ -4262,7 +4305,7 @@ local_test!(cluster_view_defers_learned_operation_while_other_active, {
         stage: StoredOperationStage::Proposed,
         dry_run: false,
         created_at_unix_ms: 1,
-        depends_on_operation_id: None,
+        dependency_operation_ids: Vec::new(),
         source_views: vec![source_view],
         target_views: vec![ClusterViewId::new(
             source_view.cluster_id,
@@ -4293,7 +4336,7 @@ local_test!(cluster_view_defers_learned_operation_while_other_active, {
         stage: StoredOperationStage::Proposed,
         dry_run: false,
         created_at_unix_ms: 2,
-        depends_on_operation_id: None,
+        dependency_operation_ids: Vec::new(),
         source_views: vec![source_view],
         target_views: vec![ClusterViewId::new(
             source_view.cluster_id,
@@ -4364,7 +4407,7 @@ local_test!(cluster_view_rejects_join_while_split_in_progress, {
         stage: StoredOperationStage::Proposed,
         dry_run: false,
         created_at_unix_ms: 1,
-        depends_on_operation_id: None,
+        dependency_operation_ids: Vec::new(),
         source_views: vec![source_view],
         target_views: vec![ClusterViewId::new(
             source_view.cluster_id,

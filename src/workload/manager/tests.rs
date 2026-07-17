@@ -142,6 +142,42 @@ async fn workload_repair_hint_times_out_for_unresponsive_peer() {
     assert_eq!(call_count.get(), 1);
 }
 
+/// Repair hints are admitted once per peer and become eligible again at the deadline.
+#[test]
+fn workload_repair_hint_reservation_is_constant_time_per_peer() {
+    let peer_a = Uuid::new_v4();
+    let peer_b = Uuid::new_v4();
+    let now = Instant::now();
+    let interval = Duration::from_secs(30);
+    let mut next_hints = HashMap::new();
+
+    assert!(reserve_workload_repair_hint(
+        &mut next_hints,
+        peer_a,
+        now,
+        interval
+    ));
+    assert!(!reserve_workload_repair_hint(
+        &mut next_hints,
+        peer_a,
+        now + Duration::from_secs(29),
+        interval
+    ));
+    assert!(reserve_workload_repair_hint(
+        &mut next_hints,
+        peer_b,
+        now + Duration::from_secs(29),
+        interval
+    ));
+    assert!(reserve_workload_repair_hint(
+        &mut next_hints,
+        peer_a,
+        now + interval,
+        interval
+    ));
+    assert_eq!(next_hints.len(), 2);
+}
+
 #[derive(Clone, Default)]
 struct MockRuntimeBackend {
     created: Arc<AsyncMutex<Vec<String>>>,

@@ -452,7 +452,8 @@ local_test!(services_node_leave_reschedules_singleton_service, {
     .await;
     assert!(
         rescheduled,
-        "surviving nodes should reschedule the singleton service after its owner leaves"
+        "surviving nodes should reschedule the singleton service after its owner leaves; {}",
+        collect_service_task_count_debug(&cluster, service_name).await
     );
     assert!(
         surviving_nodes_observe_no_active_service_tasks_on_node(

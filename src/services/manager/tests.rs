@@ -26,6 +26,90 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tempfile::TempDir;
 
+/// Identical periodic inputs skip full placement work until the bounded safety sweep.
+#[test]
+fn service_reconcile_scan_is_change_driven_and_bounded() {
+    let started_at = Instant::now();
+    let inputs = ServiceReconcileInputs {
+        service_clock: 1,
+        workload_clock: 2,
+        peer_clock: 3,
+        eligible_nodes: vec![Uuid::from_bytes([1; 16])],
+    };
+    let mut previous = None;
+
+    assert!(service_reconcile_scan_due(
+        &mut previous,
+        inputs.clone(),
+        started_at,
+        false
+    ));
+    assert!(!service_reconcile_scan_due(
+        &mut previous,
+        inputs.clone(),
+        started_at + Duration::from_secs(1),
+        false
+    ));
+
+    let mut changed = inputs.clone();
+    changed.workload_clock += 1;
+    assert!(service_reconcile_scan_due(
+        &mut previous,
+        changed.clone(),
+        started_at + Duration::from_secs(2),
+        false
+    ));
+    assert!(service_reconcile_scan_due(
+        &mut previous,
+        changed.clone(),
+        started_at + Duration::from_secs(3),
+        true
+    ));
+    assert!(service_reconcile_scan_due(
+        &mut previous,
+        changed,
+        started_at + Duration::from_secs(SERVICE_RECONCILE_SAFETY_SWEEP_SECS + 3),
+        false
+    ));
+}
+
+/// Future cooldowns remain dormant and elapsed cooldowns wake reconciliation exactly once.
+#[test]
+fn elapsed_service_deadlines_are_consumed_once() {
+    let now = Instant::now();
+    let future_key = Uuid::from_bytes([1; 16]);
+    let elapsed_key = Uuid::from_bytes([2; 16]);
+    let mut deadlines = HashMap::from([
+        (future_key, now + Duration::from_secs(60)),
+        (elapsed_key, now - Duration::from_secs(1)),
+    ]);
+
+    assert!(consume_elapsed_deadlines(&mut deadlines, now));
+    assert_eq!(
+        deadlines,
+        HashMap::from([(future_key, now + Duration::from_secs(60))])
+    );
+    assert!(!consume_elapsed_deadlines(&mut deadlines, now));
+}
+
+/// A cluster-view transition must defer new rollout adoption until the view is quiet.
+#[tokio::test(flavor = "current_thread")]
+async fn view_change_cancels_and_defers_generation_adoption() {
+    let trigger = ServiceReconcileTrigger::with_view_change_quiet_period(Duration::from_secs(60));
+    let mut execution = trigger
+        .begin_generation_execution()
+        .expect("initial stable view should allow generation execution");
+
+    trigger.request_view_change_reconcile();
+    assert!(trigger.begin_generation_execution().is_none());
+    assert!(
+        timeout(Duration::from_secs(1), execution.cancelled())
+            .await
+            .is_ok(),
+        "view change should cancel the execution from the previous view"
+    );
+}
+
 /// Builds one template with an optional public endpoint for deploy-admission tests.
 fn make_public_template(
     name: &str,
