@@ -61,6 +61,16 @@ pub(super) struct SlotRebalancePlan {
     pub(super) observed_at: Instant,
 }
 
+impl SlotRebalancePlan {
+    /// Returns whether two observations describe the same proposed slot movement.
+    fn describes_same_move(&self, other: &Self) -> bool {
+        self.task_id == other.task_id
+            && self.current_node_id == other.current_node_id
+            && self.desired_node_id == other.desired_node_id
+            && self.view_revision == other.view_revision
+    }
+}
+
 /// Returns true when generic cleanup must leave a handoff to service-slot reconciliation.
 fn handoff_requires_slot_reconciliation(spec: &ServiceSpecValue, task: &WorkloadSpec) -> bool {
     task.service_owner().is_some_and(|metadata| {
@@ -544,12 +554,14 @@ impl ServiceController {
             }
             let split_pruned =
                 task.is_none() && self.reconcile_trigger.workload_was_split_pruned(task_id);
-            let restart_immediately = task_on_draining_node
-                || task_owner_unavailable
-                || split_pruned
-                || deploying_absent_target_down
-                || deployment_visibility_elapsed
-                || should_restart_missing_slot_immediately(spec.status(), task);
+            let placement_requires_restart = task_on_draining_node || task_owner_unavailable;
+            let missing_task_can_restart =
+                split_pruned || deploying_absent_target_down || deployment_visibility_elapsed;
+            let task_state_requires_restart =
+                should_restart_missing_slot_immediately(spec.status(), task);
+            let restart_immediately = placement_requires_restart
+                || missing_task_can_restart
+                || task_state_requires_restart;
             if restart_immediately || self.slot_missing_elapsed(key).await {
                 self.start_slot_task(
                     spec,
@@ -629,15 +641,20 @@ impl ServiceController {
 
         // Missing slots are healed by their slot owners above. Healthy slots are moved only by the
         // generation owner because each cutover rewrites the shared service assignment row.
-        let should_consider_rebalance = spec.status() == ServiceStatus::Running
+        let service_can_rebalance = spec.status() == ServiceStatus::Running
             && env.owns_rebalance
             && slot.template.replicas > 1
-            && !env.service_degraded
-            && task_state_rebalanceable(&task.state)
-            && task_age_allows_rebalance(task, self.timing.rebalance_min_age)
-            && self.rebalance_allowed(key).await
-            && !node_is_down(desired_node, env.health_snapshot);
-        if !should_consider_rebalance {
+            && !env.service_degraded;
+        let task_can_rebalance = task_state_rebalanceable(&task.state)
+            && task_age_allows_rebalance(task, self.timing.rebalance_min_age);
+        if !service_can_rebalance || !task_can_rebalance {
+            self.clear_rebalance_plan(key).await;
+            return Ok(());
+        }
+
+        let cooldown_elapsed = self.rebalance_allowed(key).await;
+        let target_is_available = !node_is_down(desired_node, env.health_snapshot);
+        if !cooldown_elapsed || !target_is_available {
             self.clear_rebalance_plan(key).await;
             return Ok(());
         }
@@ -1403,12 +1420,7 @@ impl ServiceController {
             observed_at: now,
         };
         match plans.get_mut(key) {
-            Some(current)
-                if current.task_id == plan.task_id
-                    && current.current_node_id == plan.current_node_id
-                    && current.desired_node_id == plan.desired_node_id
-                    && current.view_revision == plan.view_revision =>
-            {
+            Some(current) if current.describes_same_move(&plan) => {
                 now.saturating_duration_since(current.observed_at)
                     >= self.timing.rebalance_plan_stability
             }

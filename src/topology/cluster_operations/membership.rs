@@ -13,11 +13,11 @@ use uuid::Uuid;
 pub(in crate::topology::cluster_operations) fn projected_view_members(
     operations: &[ClusterOperationRecord],
     active_view: ClusterViewId,
-    force_applied_operation: Option<Uuid>,
+    assumed_applied_operation_id: Option<Uuid>,
 ) -> Option<HashSet<Uuid>> {
     let mut applied = operations
         .iter()
-        .filter(|operation| operation_is_applied(operation, force_applied_operation))
+        .filter(|operation| operation_is_applied(operation, assumed_applied_operation_id))
         .collect::<Vec<_>>();
     applied.sort_by_key(|operation| operation.lineage_order_key());
     let applied_ids = applied
@@ -51,13 +51,17 @@ pub(in crate::topology::cluster_operations) fn projected_view_members(
 /// Returns whether an operation has installed local state relevant to membership projection.
 fn operation_is_applied(
     operation: &ClusterOperationRecord,
-    force_applied_operation: Option<Uuid>,
+    assumed_applied_operation_id: Option<Uuid>,
 ) -> bool {
-    !operation.dry_run
-        && (matches!(
-            operation.stage,
-            ClusterOperationStage::Committed | ClusterOperationStage::Finalized
-        ) || force_applied_operation == Some(operation.id))
+    if operation.dry_run {
+        return false;
+    }
+
+    let stage_is_applied = matches!(
+        operation.stage,
+        ClusterOperationStage::Committed | ClusterOperationStage::Finalized
+    );
+    stage_is_applied || assumed_applied_operation_id == Some(operation.id)
 }
 
 /// Returns whether a retained causal predecessor still needs to enter the projection.
@@ -88,19 +92,12 @@ fn apply_split(
     operation: &ClusterOperationRecord,
     views: &mut HashMap<ClusterViewId, HashSet<Uuid>>,
 ) -> bool {
-    if operation
-        .split_assignments
-        .iter()
-        .any(|assignment| assignment.target_index >= operation.target_views.len())
-    {
-        return false;
-    }
-
     let mut targets = vec![HashSet::new(); operation.target_views.len()];
     for assignment in &operation.split_assignments {
-        if let Some(target) = targets.get_mut(assignment.target_index) {
-            target.insert(assignment.node_id);
-        }
+        let Some(target) = targets.get_mut(assignment.target_index) else {
+            return false;
+        };
+        target.insert(assignment.node_id);
     }
     for source in &operation.source_views {
         views.remove(source);
@@ -123,7 +120,7 @@ fn apply_merge(
         .source_views
         .iter()
         .all(|source_view| views.contains_key(source_view));
-    if !views.contains_key(&target_view) || !sources_available {
+    if !sources_available {
         return false;
     }
 

@@ -11,8 +11,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::peer_cache::{PeerCacheEntry, PeerSnapshotCache};
 use super::PeerHandle;
+use super::peer_cache::{PeerCacheEntry, PeerSnapshotCache};
 use crate::cluster::ClusterViewId;
 use crate::gossip::Message;
 
@@ -767,5 +767,4 @@ pub(super) struct TopologyRuntime {
 
     /// Bounded sources named by cluster-metadata availability hints.
     pub(super) cluster_metadata_sync_hints: Arc<Mutex<ClusterMetadataSyncHintState>>,
-
 }
