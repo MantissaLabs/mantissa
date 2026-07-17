@@ -14,6 +14,8 @@ use uuid::Uuid;
 type ParsedSplitTargets = (Vec<SplitTargetSpec>, Vec<ClusterViewId>, Vec<String>);
 
 pub(in crate::topology) struct SplitOperationBuildInput<'a> {
+    pub operation_id: Uuid,
+    pub dependency_operation_ids: Vec<Uuid>,
     pub source_view: ClusterViewId,
     pub dry_run: bool,
     pub split_service_policy: SplitServicePolicy,
@@ -151,9 +153,48 @@ impl Topology {
         Ok((target_specs, target_views, detail_targets))
     }
 
+    /// Builds a complete queued split assignment directly from explicit target membership.
+    ///
+    /// Explicit assignments do not depend on the receiving node having materialized the source
+    /// view yet, which lets a later storyboard operation enter the durable DAG immediately.
+    pub(in crate::topology) fn explicit_split_assignments(
+        target_specs: &[SplitTargetSpec],
+    ) -> Result<Option<Vec<SplitNodeAssignment>>, capnp::Error> {
+        let is_fully_explicit = target_specs
+            .iter()
+            .all(|target| target.clauses.is_empty() && !target.explicit_nodes.is_empty());
+        if !is_fully_explicit {
+            return Ok(None);
+        }
+
+        let assignment_count = target_specs
+            .iter()
+            .map(|target| target.explicit_nodes.len())
+            .sum();
+        let mut assigned_nodes = HashSet::with_capacity(assignment_count);
+        let mut assignments = Vec::with_capacity(assignment_count);
+        for (target_index, target) in target_specs.iter().enumerate() {
+            for node_id in &target.explicit_nodes {
+                if !assigned_nodes.insert(*node_id) {
+                    return Err(capnp::Error::failed(format!(
+                        "split node {node_id} is assigned to more than one target"
+                    )));
+                }
+                assignments.push(SplitNodeAssignment {
+                    node_id: *node_id,
+                    target_index,
+                });
+            }
+        }
+        assignments.sort_unstable();
+        Ok(Some(assignments))
+    }
+
     /// Builds the durable merge operation record after request validation and policy parsing.
     pub(in crate::topology) fn build_merge_operation_record(
         &self,
+        operation_id: Uuid,
+        dependency_operation_ids: Vec<Uuid>,
         source_view: ClusterViewId,
         destination_view: ClusterViewId,
         dry_run: bool,
@@ -161,13 +202,13 @@ impl Topology {
     ) -> ClusterOperationRecord {
         let now = Self::now_unix_ms();
         ClusterOperationRecord {
-            id: Uuid::new_v4(),
+            id: operation_id,
             submitted_by_node_id: self.local.node.id,
             kind: ClusterOperationKind::Merge,
             stage: ClusterOperationStage::Proposed,
             dry_run,
             created_at_unix_ms: now,
-            depends_on_operation_id: None,
+            dependency_operation_ids,
             source_views: vec![source_view],
             target_views: vec![destination_view],
             target_cluster_names: Vec::new(),
@@ -188,6 +229,8 @@ impl Topology {
         input: SplitOperationBuildInput<'_>,
     ) -> ClusterOperationRecord {
         let SplitOperationBuildInput {
+            operation_id,
+            dependency_operation_ids,
             source_view,
             dry_run,
             split_service_policy,
@@ -212,13 +255,13 @@ impl Topology {
 
         let now = Self::now_unix_ms();
         ClusterOperationRecord {
-            id: Uuid::new_v4(),
+            id: operation_id,
             submitted_by_node_id: self.local.node.id,
             kind: ClusterOperationKind::Split,
             stage: ClusterOperationStage::Proposed,
             dry_run,
             created_at_unix_ms: now,
-            depends_on_operation_id: None,
+            dependency_operation_ids,
             source_views: vec![source_view],
             target_views,
             target_cluster_names: target_specs
@@ -247,15 +290,32 @@ impl Topology {
         &self,
         operation: &mut ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
-        if !operation.dry_run {
-            let _ = self.normalize_cluster_operation_dependency(operation)?;
+        operation.dependency_operation_ids.sort_unstable();
+        operation.dependency_operation_ids.dedup();
+        if operation.dependency_operation_ids.contains(&operation.id) {
+            return Err(capnp::Error::failed(format!(
+                "cluster operation {} cannot depend on itself",
+                operation.id
+            )));
+        }
+        if let Some(current) = self.load_cluster_operation(operation.id)? {
+            if !operation.has_same_intent(&current) {
+                return Err(capnp::Error::failed(format!(
+                    "cluster operation id {} already identifies a different intent",
+                    operation.id
+                )));
+            }
+            *operation = current;
+            return Ok(());
         }
         self.persist_cluster_operation(operation).await?;
         self.trigger_cluster_metadata_gossip(operation.id, operation.dry_run);
         if self.operation_ready_to_progress(operation)? {
-            self.trigger_operation_progress(operation.id, operation.dry_run);
-        } else if let Some(dependency_id) = operation.depends_on_operation_id {
-            self.trigger_operation_progress(dependency_id, false);
+            self.trigger_operation_progress(operation.id, operation.dry_run, false);
+        } else {
+            for dependency_id in &operation.dependency_operation_ids {
+                self.trigger_operation_progress(*dependency_id, false, false);
+            }
         }
         Ok(())
     }
@@ -269,7 +329,10 @@ impl Topology {
         let topology = self.clone();
         tokio::task::spawn_local(async move {
             if let Err(err) = topology
-                .gossip_topology_event(TopologyEvent::ClusterMetadataChanged { operation_id })
+                .gossip_topology_event(TopologyEvent::ClusterMetadataChanged {
+                    operation_id,
+                    source_node_id: topology.local.node.id,
+                })
                 .await
             {
                 // The operation MST is authoritative. Periodic global Sync repairs a missed hint.
@@ -294,7 +357,8 @@ impl Topology {
         if incoming.created_at_unix_ms == 0 {
             incoming.created_at_unix_ms = incoming.updated_at_unix_ms;
         }
-        let _ = self.normalize_cluster_operation_dependency(&mut incoming)?;
+        incoming.dependency_operation_ids.sort_unstable();
+        incoming.dependency_operation_ids.dedup();
         let merged = match self.load_cluster_operation(operation_id)? {
             Some(current) if !incoming.supersedes(&current) => current,
             _ => {
@@ -308,8 +372,8 @@ impl Topology {
         }
 
         if !self.operation_ready_to_progress(&merged)? {
-            if let Some(dependency_id) = merged.depends_on_operation_id {
-                self.trigger_operation_progress(dependency_id, false);
+            for dependency_id in &merged.dependency_operation_ids {
+                self.trigger_operation_progress(*dependency_id, false, false);
             }
             let _ = self.garbage_collect_cluster_operations().await?;
             return Ok(());
@@ -328,7 +392,7 @@ impl Topology {
                 active_stage = ?active.stage,
                 "deferring learned cluster operation until active operation finalizes"
             );
-            self.trigger_operation_progress(active.id, false);
+            self.trigger_operation_progress(active.id, false, false);
             return Ok(());
         }
 
@@ -336,7 +400,7 @@ impl Topology {
             ClusterOperationStage::Proposed
             | ClusterOperationStage::Prepared
             | ClusterOperationStage::Committed => {
-                self.trigger_operation_progress(merged.id, false);
+                self.trigger_operation_progress(merged.id, false, false);
             }
             ClusterOperationStage::Finalized => {
                 let _ = self
@@ -351,7 +415,7 @@ impl Topology {
 
         let _ = self.garbage_collect_cluster_operations().await?;
         if let Some(next) = self.active_cluster_operation_excluding(operation_id)? {
-            self.trigger_operation_progress(next.id, false);
+            self.trigger_operation_progress(next.id, false, false);
         }
 
         Ok(())

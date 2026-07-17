@@ -1,5 +1,6 @@
 use crate::config::ClientConfig;
 use anyhow::{Context, Result, anyhow};
+use uuid::Uuid;
 
 use super::list::{list_cluster_views, resolve_view_from_summaries};
 use super::operations::{
@@ -59,6 +60,8 @@ async fn submit_merge_request(
     let mut request = topology.merge_clusters_request();
     {
         let mut req = request.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
         destination_view.write_capnp(req.reborrow().init_destination_view());
         req.set_dry_run(dry_run);

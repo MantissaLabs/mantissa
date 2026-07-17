@@ -91,6 +91,11 @@ const WORKLOAD_GOSSIP_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const WORKLOAD_GOSSIP_COVERAGE_ROUNDS: usize = 3;
 /// Maximum time a caller may wait for one best-effort workload repair hint.
 const WORKLOAD_REPAIR_HINT_TIMEOUT: Duration = Duration::from_secs(1);
+/// Minimum interval between workload repair notifications to the same peer.
+///
+/// A notification only prioritizes an existing anti-entropy pass. Repeating it on every service
+/// reconciliation tick adds RPC and sync work without improving eventual convergence.
+const WORKLOAD_REPAIR_HINT_INTERVAL: Duration = Duration::from_secs(30);
 /// Number of older service generations retained in compact progress storage per node.
 ///
 /// Readiness only consumes the active generation, but retaining a small trailing window avoids
@@ -133,6 +138,24 @@ async fn send_workload_repair_hint(
         Ok(Err(error)) => Err(WorkloadRepairHintSendError::Rpc(error)),
         Err(_) => Err(WorkloadRepairHintSendError::TimedOut),
     }
+}
+
+/// Reserves one per-peer repair-hint interval without scanning unrelated peers.
+fn reserve_workload_repair_hint(
+    next_hints: &mut HashMap<Uuid, Instant>,
+    peer_id: Uuid,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    if next_hints
+        .get(&peer_id)
+        .is_some_and(|next_allowed| *next_allowed > now)
+    {
+        return false;
+    }
+
+    next_hints.insert(peer_id, now + interval);
+    true
 }
 
 /// Converts a UTC timestamp into a non-negative Unix millisecond value.
@@ -486,6 +509,8 @@ struct WorkloadManagerLocalState {
     workload_value_index: Arc<Mutex<Option<CachedWorkloadValueIndex>>>,
     // Compact service-progress aggregates updated from local lifecycle transitions.
     service_progress: Arc<AsyncMutex<ServiceProgressTracker>>,
+    // Next time a best-effort workload repair hint may be sent to each peer.
+    workload_repair_hint_after: Arc<Mutex<HashMap<Uuid, Instant>>>,
     // Per-workload liveness probe bookkeeping used by reconciliation.
     liveness_probes: Arc<AsyncMutex<HashMap<Uuid, LivenessProbeEntry>>>,
     // Short critical section that reserves overlay attachment addresses before provisioning.
@@ -790,6 +815,7 @@ impl WorkloadManager {
                 workload_spec_cache: Arc::new(Mutex::new(HashMap::new())),
                 workload_value_index: Arc::new(Mutex::new(None)),
                 service_progress: Arc::new(AsyncMutex::new(ServiceProgressTracker::default())),
+                workload_repair_hint_after: Arc::new(Mutex::new(HashMap::new())),
                 liveness_probes: Arc::new(AsyncMutex::new(HashMap::new())),
                 attachment_assignment_lock: Arc::new(AsyncMutex::new(())),
                 inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
@@ -828,6 +854,19 @@ impl WorkloadManager {
     pub(crate) async fn notify_workload_rows_available(&self, peer_id: Uuid) {
         if peer_id == self.local_node_id {
             return;
+        }
+
+        let now = Instant::now();
+        {
+            let mut next_hints = self.local_state.workload_repair_hint_after.lock();
+            if !reserve_workload_repair_hint(
+                &mut next_hints,
+                peer_id,
+                now,
+                WORKLOAD_REPAIR_HINT_INTERVAL,
+            ) {
+                return;
+            }
         }
 
         let session = match self.core.registry.cached_session_for(peer_id).await {
@@ -2023,30 +2062,27 @@ impl WorkloadManager {
         )))
     }
 
+    /// Returns the store change clock used to invalidate service inventory projections.
+    pub(crate) fn workload_change_clock(&self) -> u64 {
+        self.core.store.change_clock()
+    }
+
     /// Returns workload specifications filtered according to the provided list policy.
     pub async fn list_workloads(
         &self,
         filter: &WorkloadStateFilter,
     ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
-        let (actives, _) = self
-            .core
-            .store
-            .load_all()
-            .map_err(|e| anyhow::anyhow!("workload store load_all failed: {e}"))?;
-
-        let mut specs = Vec::with_capacity(actives.len());
-        for (k, snap) in actives {
-            let id = k.to_uuid();
-            if let Some(value) = crate::workload::model::select_best_workload_value(snap.as_slice())
-            {
-                let spec = value_to_spec(id, value);
-                let hidden_pending_group = filter.is_active_only()
-                    && matches!(spec.admission_state, WorkloadAdmissionState::PendingGroup);
-                if filter.accepts(&spec.state) && !hidden_pending_group {
-                    specs.push(spec);
-                }
+        let workload_values = self.load_workload_value_index().await?;
+        let mut specs = Vec::with_capacity(workload_values.len());
+        for (id, value) in workload_values.iter() {
+            let spec = value_to_spec(*id, value.clone());
+            let hidden_pending_group = filter.is_active_only()
+                && matches!(spec.admission_state, WorkloadAdmissionState::PendingGroup);
+            if filter.accepts(&spec.state) && !hidden_pending_group {
+                specs.push(spec);
             }
         }
+        specs.sort_unstable_by_key(|spec| spec.id);
         Ok(specs)
     }
 
@@ -3578,7 +3614,7 @@ pub(crate) fn cleanup_secret_runtime_roots_for_node(local_node_id: Uuid) {
     }
 }
 
-/// Removes one node-scoped secret runtime directory and prunes empty parent folders.
+/// Removes one node-scoped secret runtime directory without touching shared parent folders.
 fn cleanup_secret_runtime_root(root: &Path) {
     match fs::remove_dir_all(root) {
         Ok(_) => {}
@@ -3588,32 +3624,6 @@ fn cleanup_secret_runtime_root(root: &Path) {
                 target: "task",
                 "failed to remove secret runtime root {}: {err}",
                 root.display()
-            );
-        }
-    }
-
-    if let Some(parent) = root.parent() {
-        remove_empty_dir_if_possible(parent);
-        if let Some(grand_parent) = parent.parent() {
-            remove_empty_dir_if_possible(grand_parent);
-        }
-    }
-}
-
-/// Removes a directory only when it is empty, ignoring common non-empty and not-found states.
-fn remove_empty_dir_if_possible(path: &Path) {
-    match fs::remove_dir(path) {
-        Ok(_) => {}
-        Err(err)
-            if matches!(
-                err.kind(),
-                ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
-            ) => {}
-        Err(err) => {
-            warn!(
-                target: "task",
-                "failed to prune empty directory {}: {err}",
-                path.display()
             );
         }
     }

@@ -30,9 +30,9 @@ impl WorkloadRegistry {
     ///
     /// Split-time pruning uses this to remove out-of-scope task runtime rows reversibly so later
     /// merge or anti-entropy can restore them from the retained partition.
-    pub async fn purge_local_for_nodes(&self, node_ids: &HashSet<Uuid>) -> Result<usize> {
+    pub async fn purge_local_for_nodes(&self, node_ids: &HashSet<Uuid>) -> Result<Vec<Uuid>> {
         let entries = self.canonical_entries()?;
-        let mut removed = 0usize;
+        let mut removed = Vec::new();
         for (id, value) in entries {
             if !node_ids.contains(&value.node_id) {
                 continue;
@@ -42,9 +42,10 @@ impl WorkloadRegistry {
                 .purge_local(&UuidKey::from(id))
                 .await
                 .map_err(|e| anyhow!("workload purge_local failed: {e}"))?;
-            removed = removed.saturating_add(1);
+            removed.push(id);
         }
 
+        removed.sort_unstable();
         Ok(removed)
     }
 
@@ -182,7 +183,7 @@ mod tests {
             .await
             .expect("purge local workloads");
 
-        assert_eq!(removed, 1);
+        assert_eq!(removed, vec![evicted_task.id]);
         let remaining = registry
             .list_values_on_node(retained)
             .expect("list retained workloads");

@@ -7,17 +7,30 @@ use crate::cluster::{ClusterId, ClusterViewId};
 use crate::secrets::master_key::reconciler::SecretMasterKeyReconciler;
 use crate::services::ServiceReconcileTrigger;
 use crate::store::replicated::cluster_views::{ClusterNameRecord, ClusterNodeCountRecord};
-use crate::topology::Topology;
 use crate::topology::cluster_operations::{
     CLUSTER_OPERATION_FINALIZED_RETENTION_COUNT, COMMIT_PRECONDITION_FAILURE_PREFIX,
+    membership::projected_view_members,
 };
 use crate::topology::peer_cache::PeerSnapshot;
+use crate::topology::runtime::ClusterOperationReconcileFingerprint;
+use crate::topology::{Topology, TopologyEvent};
 use mantissa_protocol::server::cluster_session;
 use mantissa_protocol::sync::Domain;
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClusterOperationDependencyState {
+    Ready,
+    Waiting,
+    Blocked(Uuid),
+    Cycle,
+}
+
+/// Minimum interval between terminal operation-history GC checks on an unchanged ledger.
+const CLUSTER_OPERATION_GC_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Requests local service reconciliation after a completed rebalance merge.
 fn request_post_merge_service_reconcile(
@@ -66,8 +79,55 @@ impl Topology {
         operation.created_at_unix_ms
     }
 
-    /// Publishes the local active cluster's current member count into the replicated metadata domain.
+    /// Counts projected view members that still have an active replicated membership row.
+    fn projected_active_member_count(
+        &self,
+        projected_members: &HashSet<Uuid>,
+        snapshot: &PeerSnapshot,
+    ) -> u32 {
+        let mut active_members = snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.peer_id)
+            .collect::<HashSet<_>>();
+        active_members.insert(self.local.node.id);
+        let count = projected_members
+            .intersection(&active_members)
+            .count()
+            .min(u32::MAX as usize);
+        count as u32
+    }
+
+    /// Counts local view membership without issuing peer RPCs.
+    fn local_view_member_count_from_snapshot(
+        &self,
+        snapshot: &PeerSnapshot,
+        excluded_peers: &HashSet<Uuid>,
+        force_applied_operation: Option<Uuid>,
+    ) -> Result<u32, capnp::Error> {
+        let operations = self.load_cluster_operations()?;
+        if let Some(projected_members) = projected_view_members(
+            &operations,
+            self.active_cluster_view(),
+            force_applied_operation,
+        ) {
+            return Ok(self.projected_active_member_count(&projected_members, snapshot));
+        }
+
+        Ok(self.local_active_peer_row_member_count_from_snapshot(snapshot, excluded_peers))
+    }
+
+    /// Publishes the local active cluster's current member count into replicated metadata.
     pub(crate) async fn publish_local_cluster_node_count(&self) -> Result<bool, capnp::Error> {
+        self.publish_local_cluster_node_count_with_operation(None)
+            .await
+    }
+
+    /// Publishes node count while treating one in-flight transition as locally applied.
+    async fn publish_local_cluster_node_count_with_operation(
+        &self,
+        applied_operation: Option<Uuid>,
+    ) -> Result<bool, capnp::Error> {
         if !self.local_allows_outbound_cluster_traffic() {
             return Ok(false);
         }
@@ -75,9 +135,11 @@ impl Topology {
         let local_view = self.active_cluster_view();
         let snapshot = self.peer_snapshot_or_error().await?;
         let excluded_peers = self.excluded_peers_snapshot().await;
-        let node_count = self
-            .local_cluster_view_member_count_from_snapshot(&snapshot, &excluded_peers)
-            .await;
+        let node_count = self.local_view_member_count_from_snapshot(
+            &snapshot,
+            &excluded_peers,
+            applied_operation,
+        )?;
         let current = self
             .stores
             .cluster_view_store
@@ -252,55 +314,17 @@ impl Topology {
         Self::session_cluster_view(&session).await.ok()
     }
 
-    /// Counts active peers currently believed to belong to the local active cluster view.
+    /// Counts active replicated peer rows inside the locally installed view scope.
     ///
-    /// This is the authoritative local membership count used for replicated cluster metadata.
+    /// Split and merge transitions install `excluded_peers` atomically with the active view. That
+    /// durable membership plus local scope is authoritative here; publishing metadata must never
+    /// turn into an all-peer RPC health check.
     pub(in crate::topology) async fn local_cluster_view_member_count(
         &self,
     ) -> Result<u32, capnp::Error> {
         let snapshot = self.peer_snapshot_or_error().await?;
         let excluded_peers = self.excluded_peers_snapshot().await;
-        Ok(self
-            .local_cluster_view_member_count_from_snapshot(&snapshot, &excluded_peers)
-            .await)
-    }
-
-    /// Counts active peers from a cached snapshot that belong to the local cluster view.
-    async fn local_cluster_view_member_count_from_snapshot(
-        &self,
-        snapshot: &PeerSnapshot,
-        excluded_peers: &HashSet<Uuid>,
-    ) -> u32 {
-        let local_view = self.active_cluster_view();
-
-        let mut count = 1u32;
-        for entry in snapshot.entries.iter() {
-            let peer_id = entry.peer_id;
-            if peer_id == self.local.node.id {
-                continue;
-            }
-            if excluded_peers.contains(&peer_id) {
-                continue;
-            }
-
-            let view = self
-                .best_known_peer_view(peer_id)
-                .await
-                .unwrap_or(local_view);
-            if view != local_view {
-                continue;
-            }
-            count = count.saturating_add(1);
-        }
-
-        count
-    }
-
-    /// Counts locally active peer rows without consulting cached peer sessions.
-    async fn local_active_peer_row_member_count(&self) -> Result<u32, capnp::Error> {
-        let snapshot = self.peer_snapshot_or_error().await?;
-        let excluded_peers = self.excluded_peers_snapshot().await;
-        Ok(self.local_active_peer_row_member_count_from_snapshot(&snapshot, &excluded_peers))
+        self.local_view_member_count_from_snapshot(&snapshot, &excluded_peers, None)
     }
 
     /// Counts active peer snapshot rows without opening peer sessions.
@@ -484,20 +508,69 @@ impl Topology {
         Ok(retired)
     }
 
-    /// Returns whether an operation dependency is absent or already terminal locally.
+    /// Returns the local state of every immutable causal dependency.
+    fn cluster_operation_dependency_state(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<ClusterOperationDependencyState, capnp::Error> {
+        if self.cluster_operation_has_dependency_cycle(operation)? {
+            return Ok(ClusterOperationDependencyState::Cycle);
+        }
+
+        let mut waiting = false;
+        for dependency_id in &operation.dependency_operation_ids {
+            let Some(dependency) = self.load_cluster_operation(*dependency_id)? else {
+                waiting = true;
+                continue;
+            };
+            match dependency.stage {
+                ClusterOperationStage::Finalized => {}
+                ClusterOperationStage::Aborted => {
+                    return Ok(ClusterOperationDependencyState::Blocked(*dependency_id));
+                }
+                ClusterOperationStage::Proposed
+                | ClusterOperationStage::Prepared
+                | ClusterOperationStage::Committed => {
+                    waiting = true;
+                }
+            }
+        }
+        if waiting {
+            Ok(ClusterOperationDependencyState::Waiting)
+        } else {
+            Ok(ClusterOperationDependencyState::Ready)
+        }
+    }
+
+    /// Returns whether the locally known dependency graph reaches the operation itself.
+    fn cluster_operation_has_dependency_cycle(
+        &self,
+        operation: &ClusterOperationRecord,
+    ) -> Result<bool, capnp::Error> {
+        let mut pending = operation.dependency_operation_ids.clone();
+        let mut visited = HashSet::new();
+        while let Some(dependency_id) = pending.pop() {
+            if dependency_id == operation.id {
+                return Ok(true);
+            }
+            if !visited.insert(dependency_id) {
+                continue;
+            }
+            if let Some(dependency) = self.load_cluster_operation(dependency_id)? {
+                pending.extend(dependency.dependency_operation_ids);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Returns whether an operation has no missing or unfinished causal dependency.
     pub(in crate::topology) fn operation_ready_to_progress(
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<bool, capnp::Error> {
-        let Some(dependency_id) = operation.depends_on_operation_id else {
-            return Ok(true);
-        };
-        let Some(dependency) = self.load_cluster_operation(dependency_id)? else {
-            return Ok(false);
-        };
-        Ok(matches!(
-            dependency.stage,
-            ClusterOperationStage::Finalized | ClusterOperationStage::Aborted
+        Ok(!matches!(
+            self.cluster_operation_dependency_state(operation)?,
+            ClusterOperationDependencyState::Waiting
         ))
     }
 
@@ -507,27 +580,6 @@ impl Topology {
             stage,
             ClusterOperationStage::Finalized | ClusterOperationStage::Aborted
         )
-    }
-
-    /// Returns every lineage view touched by this operation for overlap fencing.
-    fn operation_lineage_views(operation: &ClusterOperationRecord) -> HashSet<ClusterViewId> {
-        let mut views = operation
-            .source_views
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>();
-        views.extend(operation.target_views.iter().copied());
-        views
-    }
-
-    /// Returns true when two operations touch at least one common cluster lineage view.
-    fn operations_overlap(left: &ClusterOperationRecord, right: &ClusterOperationRecord) -> bool {
-        let left_views = Self::operation_lineage_views(left);
-        right
-            .source_views
-            .iter()
-            .chain(right.target_views.iter())
-            .any(|view| left_views.contains(view))
     }
 
     /// Returns whether a pending operation is allowed to advance from this node's active view.
@@ -558,54 +610,6 @@ impl Topology {
                 Ok(self.recoverable_split_target(operation)? == Some(active_view))
             }
         }
-    }
-
-    /// Selects the latest pending overlapping predecessor for a new or learned operation.
-    pub(in crate::topology) fn pending_cluster_operation_tail_for(
-        &self,
-        operation: &ClusterOperationRecord,
-    ) -> Result<Option<ClusterOperationRecord>, capnp::Error> {
-        if operation.dry_run || Self::operation_stage_is_terminal(operation.stage) {
-            return Ok(None);
-        }
-
-        let operation_key = operation.lineage_order_key();
-        let mut predecessors = Vec::new();
-        for candidate in self.load_cluster_operations()? {
-            if candidate.id == operation.id
-                || candidate.dry_run
-                || Self::operation_stage_is_terminal(candidate.stage)
-                || candidate.lineage_order_key() >= operation_key
-                || !Self::operations_overlap(&candidate, operation)
-            {
-                continue;
-            }
-            predecessors.push(candidate);
-        }
-
-        predecessors.sort_by_key(ClusterOperationRecord::lineage_order_key);
-        Ok(predecessors.into_iter().next_back())
-    }
-
-    /// Normalizes an operation dependency to the latest pending overlapping predecessor.
-    pub(in crate::topology) fn normalize_cluster_operation_dependency(
-        &self,
-        operation: &mut ClusterOperationRecord,
-    ) -> Result<bool, capnp::Error> {
-        let Some(predecessor) = self.pending_cluster_operation_tail_for(operation)? else {
-            return Ok(false);
-        };
-        if operation.depends_on_operation_id == Some(predecessor.id) {
-            return Ok(false);
-        }
-
-        operation.depends_on_operation_id = Some(predecessor.id);
-        operation.updated_at_unix_ms = Self::now_unix_ms();
-        operation.details = format!(
-            "{} | queued_after predecessor_operation={}",
-            operation.details, predecessor.id
-        );
-        Ok(true)
     }
 
     /// Returns the next ready non-finalized cluster operation, if any.
@@ -648,15 +652,18 @@ impl Topology {
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<bool, capnp::Error> {
-        Ok(!operation.dry_run
-            && matches!(
-                operation.stage,
-                ClusterOperationStage::Proposed
-                    | ClusterOperationStage::Prepared
-                    | ClusterOperationStage::Committed
-            )
-            && self.cluster_operation_can_progress_from_active_view(operation)?
-            && self.operation_ready_to_progress(operation)?)
+        if operation.dry_run || Self::operation_stage_is_terminal(operation.stage) {
+            return Ok(false);
+        }
+
+        match self.cluster_operation_dependency_state(operation)? {
+            ClusterOperationDependencyState::Waiting => Ok(false),
+            ClusterOperationDependencyState::Blocked(_)
+            | ClusterOperationDependencyState::Cycle => Ok(true),
+            ClusterOperationDependencyState::Ready => {
+                self.cluster_operation_can_progress_from_active_view(operation)
+            }
+        }
     }
 
     /// Rejects one mutating action while a split/merge operation is still in progress.
@@ -788,6 +795,19 @@ impl Topology {
             .try_into()
             .map_err(|_| capnp::Error::failed("cluster operation id must be 16 bytes".into()))?;
         Ok(Uuid::from_bytes(id_bytes))
+    }
+
+    /// Parses, sorts, and deduplicates operation ids from an RPC dependency list.
+    pub(in crate::topology) fn operation_ids_from_data_list(
+        reader: capnp::data_list::Reader<'_>,
+    ) -> Result<Vec<Uuid>, capnp::Error> {
+        let mut operation_ids = Vec::with_capacity(reader.len() as usize);
+        for data in reader.iter() {
+            operation_ids.push(Self::operation_id_from_data(data?)?);
+        }
+        operation_ids.sort_unstable();
+        operation_ids.dedup();
+        Ok(operation_ids)
     }
 
     /// Updates an operation stage, appends stage details, and persists the updated record.
@@ -960,6 +980,21 @@ impl Topology {
         &self,
         operation: &ClusterOperationRecord,
     ) -> Result<(), capnp::Error> {
+        if self
+            .stores
+            .cluster_operations
+            .commit_side_effects_applied(operation.id)
+            .map_err(|err| capnp::Error::failed(err.to_string()))?
+        {
+            debug!(
+                target: "cluster_view",
+                operation_id = %operation.id,
+                stage = ?operation.stage,
+                "skipping already-applied operation commit side effects"
+            );
+            return Ok(());
+        }
+
         self.ensure_cluster_transition_can_apply(operation)?;
 
         let transition = self.transition_for_operation(operation)?;
@@ -1001,7 +1036,13 @@ impl Topology {
         self.reconcile_secret_master_keys_for_view(transition.local_target_view)
             .await;
         self.deps.registry.clear().await;
-        match self.publish_local_cluster_node_count().await {
+        self.deps
+            .service_reconcile_trigger
+            .request_view_change_reconcile();
+        match self
+            .publish_local_cluster_node_count_with_operation(Some(operation.id))
+            .await
+        {
             Ok(true) => self.sync_once_now(),
             Ok(false) => {}
             Err(err) => {
@@ -1023,6 +1064,10 @@ impl Topology {
                 "requested service reconciliation after merge transition"
             );
         }
+        self.stores
+            .cluster_operations
+            .mark_commit_side_effects_applied(operation.id)
+            .map_err(|err| capnp::Error::failed(err.to_string()))?;
         info!(
             target: "cluster_view",
             operation_id = %transition.operation_id,
@@ -1047,70 +1092,42 @@ impl Topology {
             && !self.excluded_peers_snapshot().await.is_empty()
     }
 
-    /// Refreshes merge node-count metadata when the active view is correct but counters are stale.
-    ///
-    /// This path intentionally avoids replaying transition participants or rewriting the active
-    /// view. If a later known merge will retire this view, the newer operation owns convergence.
-    pub(in crate::topology) async fn refresh_finalized_merge_membership_metadata_if_stale(
+    /// Refreshes node-count metadata once when finalized history targets the active merge view.
+    async fn refresh_active_merge_membership_metadata(
         &self,
-        operation: &ClusterOperationRecord,
-        target_view: ClusterViewId,
+        operations: &[ClusterOperationRecord],
     ) -> Result<(), capnp::Error> {
-        if operation.kind != ClusterOperationKind::Merge {
+        let active_view = self.active_cluster_view();
+        let has_active_merge = operations.iter().any(|operation| {
+            !operation.dry_run
+                && operation.kind == ClusterOperationKind::Merge
+                && operation.stage == ClusterOperationStage::Finalized
+                && operation.target_views.first() == Some(&active_view)
+        });
+        if !has_active_merge {
             return Ok(());
         }
 
-        let known_operations = self.load_cluster_operations()?;
-        if let Some(invalidating_operation_id) =
-            operation.invalidating_later_merge_id_for_view(known_operations.iter(), target_view)
-        {
-            debug!(
-                target: "cluster_view",
-                operation_id = %operation.id,
-                invalidating_operation_id = %invalidating_operation_id,
-                target_view = %target_view,
-                "skipping finalized merge metadata refresh for view invalidated by later merge"
-            );
-            return Ok(());
-        }
-
-        let observed = self.local_cluster_view_member_count().await?;
-        let expected = self.local_active_peer_row_member_count().await?;
-        if observed == expected {
-            return Ok(());
-        }
-
-        debug!(
-            target: "cluster_view",
-            operation_id = %operation.id,
-            target_view = %target_view,
-            observed_members = observed,
-            expected_members = expected,
-            "refreshing finalized merge metadata"
-        );
         match self.publish_local_cluster_node_count().await {
             Ok(true) => {
                 self.sync_once_now();
                 debug!(
                     target: "cluster_view",
-                    operation_id = %operation.id,
-                    target_view = %target_view,
+                    active_view = %active_view,
                     "refreshed finalized merge node-count metadata"
                 );
             }
             Ok(false) => {
                 debug!(
                     target: "cluster_view",
-                    operation_id = %operation.id,
-                    target_view = %target_view,
+                    active_view = %active_view,
                     "finalized merge node-count metadata already current"
                 );
             }
             Err(err) => {
                 warn!(
                     target: "cluster_view",
-                    operation_id = %operation.id,
-                    target_view = %target_view,
+                    active_view = %active_view,
                     "failed to publish cluster node count while refreshing finalized merge metadata: {err}"
                 );
             }
@@ -1159,6 +1176,7 @@ impl Topology {
         &self,
         operation_id: Uuid,
         dry_run: bool,
+        announce_after_progress: bool,
     ) {
         if dry_run {
             return;
@@ -1169,7 +1187,10 @@ impl Topology {
             // Let the submitting RPC flush its durable Proposed result before key wrapping can
             // occupy this local executor thread for a large participant set.
             tokio::task::yield_now().await;
-            if let Err(err) = topology.progress_cluster_operation(operation_id).await {
+            if let Err(err) = topology
+                .progress_cluster_operation(operation_id, announce_after_progress)
+                .await
+            {
                 warn!(
                     target: "cluster_view",
                     operation_id = %operation_id,
@@ -1182,7 +1203,9 @@ impl Topology {
     /// Starts local progression for the next ready queued operation, if one exists.
     pub(crate) fn trigger_ready_cluster_operation_progress(&self) {
         match self.active_cluster_operation() {
-            Ok(Some(operation)) => self.trigger_operation_progress(operation.id, operation.dry_run),
+            Ok(Some(operation)) => {
+                self.trigger_operation_progress(operation.id, operation.dry_run, false)
+            }
             Ok(None) => {}
             Err(err) => {
                 warn!(
@@ -1249,8 +1272,6 @@ impl Topology {
                 replay_context,
                 "finalized operation already matches local active view"
             );
-            self.refresh_finalized_merge_membership_metadata_if_stale(operation, target)
-                .await?;
             return Ok(false);
         }
 
@@ -1292,31 +1313,105 @@ impl Topology {
         let mut operations = self.load_cluster_operations()?;
         operations.sort_by_key(ClusterOperationRecord::lineage_order_key);
 
-        for operation in operations {
+        for operation in &operations {
             let _ = self
-                .replay_finalized_cluster_transition_for_active_view(&operation, replay_context)
+                .replay_finalized_cluster_transition_for_active_view(operation, replay_context)
                 .await?;
         }
+        self.refresh_active_merge_membership_metadata(&operations)
+            .await?;
 
         Ok(())
     }
 
-    /// Reconciles operation rows learned through anti-entropy and wakes queued work.
+    /// Returns the cheap local state that determines whether sync reconciliation has new work.
+    fn cluster_operation_reconcile_fingerprint(&self) -> ClusterOperationReconcileFingerprint {
+        ClusterOperationReconcileFingerprint {
+            operation_generation: self.stores.cluster_operations.domain_store().change_clock(),
+            active_view: self.active_cluster_view(),
+        }
+    }
+
+    /// Reconciles changed operation rows learned through anti-entropy and wakes queued work.
     pub(crate) async fn reconcile_cluster_operations_after_sync(&self) -> Result<(), capnp::Error> {
+        let _operation_guard = self.runtime.cluster_operation_gate.gate.lock().await;
+        let fingerprint = self.cluster_operation_reconcile_fingerprint();
+        let now = Instant::now();
+        let requires_reconciliation = self
+            .runtime
+            .cluster_operation_reconcile
+            .lock()
+            .requires_reconciliation(fingerprint);
+        if !requires_reconciliation {
+            let run_gc = self
+                .runtime
+                .cluster_operation_reconcile
+                .lock()
+                .take_gc_if_due(now, CLUSTER_OPERATION_GC_CHECK_INTERVAL);
+            if run_gc {
+                let _ = self.garbage_collect_cluster_operations().await?;
+            }
+            return Ok(());
+        }
+
         self.reconcile_finalized_cluster_transitions_for_active_view("sync reconciliation")
             .await?;
         self.trigger_ready_cluster_operation_progress();
         let _ = self.garbage_collect_cluster_operations().await?;
+        let completed = self.cluster_operation_reconcile_fingerprint();
+        self.runtime
+            .cluster_operation_reconcile
+            .lock()
+            .mark_completed(completed, now);
         Ok(())
     }
 
     /// Progresses one operation forward based on its current persisted stage.
-    async fn progress_cluster_operation(&self, operation_id: Uuid) -> Result<(), capnp::Error> {
+    pub(in crate::topology) async fn progress_cluster_operation(
+        &self,
+        operation_id: Uuid,
+        announce_after_progress: bool,
+    ) -> Result<(), capnp::Error> {
         let _guard = self.runtime.cluster_operation_gate.gate.lock().await;
 
         let mut operation = self.load_cluster_operation(operation_id)?.ok_or_else(|| {
             capnp::Error::failed(format!("cluster operation not found: {operation_id}"))
         })?;
+        match self.cluster_operation_dependency_state(&operation)? {
+            ClusterOperationDependencyState::Ready => {}
+            ClusterOperationDependencyState::Waiting => {
+                debug!(
+                    target: "cluster_view",
+                    operation_id = %operation.id,
+                    dependencies = ?operation.dependency_operation_ids,
+                    "cluster operation is waiting for dependencies"
+                );
+                return Ok(());
+            }
+            ClusterOperationDependencyState::Blocked(dependency_id) => {
+                let detail = format!(
+                    "aborted blocked_dependency: dependency operation {dependency_id} aborted"
+                );
+                self.update_cluster_operation_stage(
+                    &mut operation,
+                    ClusterOperationStage::Aborted,
+                    &detail,
+                )
+                .await?;
+                self.trigger_ready_cluster_operation_progress();
+                return Ok(());
+            }
+            ClusterOperationDependencyState::Cycle => {
+                self.update_cluster_operation_stage(
+                    &mut operation,
+                    ClusterOperationStage::Aborted,
+                    "aborted dependency_cycle",
+                )
+                .await?;
+                self.trigger_ready_cluster_operation_progress();
+                return Ok(());
+            }
+        }
         if !Self::operation_stage_is_terminal(operation.stage)
             && let Some(retired_view) = self.operation_view_retired_by_prior_merge(&operation)?
         {
@@ -1352,18 +1447,6 @@ impl Topology {
             );
             return Ok(());
         }
-        if self.normalize_cluster_operation_dependency(&mut operation)? {
-            self.persist_cluster_operation(&operation).await?;
-        }
-        if !self.operation_ready_to_progress(&operation)? {
-            debug!(
-                target: "cluster_view",
-                operation_id = %operation.id,
-                dependency = ?operation.depends_on_operation_id,
-                "cluster operation is waiting for dependency"
-            );
-            return Ok(());
-        }
         if let Some(active) = self.active_cluster_operation()?
             && active.id != operation.id
         {
@@ -1373,7 +1456,7 @@ impl Topology {
                 active_operation = %active.id,
                 "cluster operation is waiting behind earlier ready operation"
             );
-            self.trigger_operation_progress(active.id, false);
+            self.trigger_operation_progress(active.id, false, false);
             return Ok(());
         }
 
@@ -1500,8 +1583,16 @@ impl Topology {
         let _ = self.garbage_collect_cluster_operations().await?;
         drop(_guard);
 
+        if announce_after_progress && !operation.dry_run {
+            self.gossip_topology_event(TopologyEvent::ClusterMetadataChanged {
+                operation_id,
+                source_node_id: self.local.node.id,
+            })
+            .await?;
+        }
+
         if let Some(next) = self.active_cluster_operation_excluding(operation_id)? {
-            self.trigger_operation_progress(next.id, false);
+            self.trigger_operation_progress(next.id, false, false);
         }
 
         Ok(())
@@ -1532,7 +1623,7 @@ impl Topology {
                 "replaying pending cluster operation from durable store"
             );
 
-            self.progress_cluster_operation(operation.id).await?;
+            self.progress_cluster_operation(operation.id, true).await?;
             replayed = replayed.saturating_add(1);
         }
 
@@ -1710,7 +1801,7 @@ mod tests {
             stage: ClusterOperationStage::Finalized,
             dry_run: false,
             created_at_unix_ms: 10,
-            depends_on_operation_id: None,
+            dependency_operation_ids: Vec::new(),
             source_views: Vec::new(),
             target_views: Vec::new(),
             target_cluster_names: Vec::new(),

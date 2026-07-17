@@ -747,6 +747,20 @@ impl Registry {
         self.peer_selected_value_unscoped(peer_id)
     }
 
+    /// Returns whether a peer is an active member of this node's current cluster view.
+    ///
+    /// Split peers remain active in the global metadata plane, but are unavailable to local
+    /// schedulers and runtime cleanup. Preserve `None` for genuinely unknown peers so callers can
+    /// distinguish propagation lag from an explicit leave or local-view exclusion.
+    pub fn peer_active_in_local_view(&self, peer_id: Uuid) -> Option<bool> {
+        if self.peer_is_excluded(peer_id) {
+            return Some(false);
+        }
+
+        self.peer_selected_value_unscoped(peer_id)
+            .map(|peer| peer.is_active())
+    }
+
     /// Returns a shared handle to the cluster health monitor.
     pub fn health_monitor(&self) -> Arc<HealthMonitor> {
         self.health_monitor.clone()
@@ -2354,6 +2368,7 @@ mod tests {
         registry.set_excluded_peers(HashSet::from([peer_id]));
 
         assert!(registry.known_peers().expect("scoped peers").is_empty());
+        assert_eq!(registry.peer_active_in_local_view(peer_id), Some(false));
         assert_eq!(
             registry.known_peers_unscoped().expect("unscoped peers"),
             vec![peer_id]
@@ -2406,6 +2421,11 @@ mod tests {
         assert!(
             registry.peer_latest_value_unscoped(peer_id).is_none(),
             "active peer lookup should hide selected left rows"
+        );
+        assert_eq!(
+            registry.peer_active_in_local_view(peer_id),
+            Some(false),
+            "membership lookup should distinguish a selected left row from an unknown peer"
         );
         assert!(
             !registry.peer_has_active_membership(peer_id),

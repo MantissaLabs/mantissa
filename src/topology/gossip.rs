@@ -190,13 +190,17 @@ impl Topology {
                                 continue;
                             }
                         }
-                        TopologyEvent::ClusterMetadataChanged { operation_id } => {
+                        TopologyEvent::ClusterMetadataChanged {
+                            operation_id,
+                            source_node_id,
+                        } => {
                             debug!(
                                 target: "cluster_view",
                                 %operation_id,
+                                %source_node_id,
                                 "received cluster-wide metadata availability hint"
                             );
-                            self.sync_once_now();
+                            self.sync_metadata_from_peer_now(source_node_id);
                         }
                         TopologyEvent::NodeSchedulingUpdated { id, ref scheduling } => {
                             if let Err(err) = self

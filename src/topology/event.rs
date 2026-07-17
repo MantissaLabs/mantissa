@@ -66,6 +66,7 @@ pub enum TopologyEvent {
     /// Announces that cluster-wide MST metadata is available for anti-entropy pull.
     ClusterMetadataChanged {
         operation_id: Uuid,
+        source_node_id: Uuid,
     },
     NodeSchedulingUpdated {
         id: Uuid,

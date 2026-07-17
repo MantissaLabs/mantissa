@@ -134,7 +134,8 @@ pub struct ClusterOperationRecord {
     pub dry_run: bool,
     /// Stable creation timestamp used for deterministic execution ordering.
     pub created_at_unix_ms: u64,
-    pub depends_on_operation_id: Option<Uuid>,
+    /// Immutable causal predecessors supplied with the operation intent.
+    pub dependency_operation_ids: Vec<Uuid>,
     pub source_views: Vec<ClusterViewId>,
     pub target_views: Vec<ClusterViewId>,
     pub target_cluster_names: Vec<String>,
@@ -148,6 +149,36 @@ pub struct ClusterOperationRecord {
 }
 
 impl ClusterOperationRecord {
+    /// Returns whether two rows describe the same immutable operation intent.
+    pub(crate) fn has_same_intent(&self, other: &Self) -> bool {
+        self.has_same_identity(other)
+            && self.has_same_transition(other)
+            && self.has_same_policies(other)
+    }
+
+    /// Returns whether two rows share the immutable operation identity and causal frontier.
+    fn has_same_identity(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.kind == other.kind
+            && self.dry_run == other.dry_run
+            && self.dependency_operation_ids == other.dependency_operation_ids
+    }
+
+    /// Returns whether two rows describe the same source and target cluster transition.
+    fn has_same_transition(&self, other: &Self) -> bool {
+        self.source_views == other.source_views
+            && self.target_views == other.target_views
+            && self.target_cluster_names == other.target_cluster_names
+            && self.split_assignments == other.split_assignments
+    }
+
+    /// Returns whether two rows carry the same split and merge behavior policies.
+    fn has_same_policies(&self, other: &Self) -> bool {
+        self.split_service_policy == other.split_service_policy
+            && self.split_network_policy == other.split_network_policy
+            && self.merge_service_policy == other.merge_service_policy
+    }
+
     /// Returns whether this row should replace `current` for the same operation id.
     pub fn supersedes(&self, current: &Self) -> bool {
         self.precedence_cmp(current).is_gt()
@@ -174,38 +205,12 @@ impl ClusterOperationRecord {
     }
 
     /// Returns the deterministic ordering key used by lineage operation fences.
-    pub(crate) fn lineage_order_key(&self) -> (u64, Uuid) {
-        (self.lineage_order_timestamp_unix_ms(), self.id)
-    }
-
-    /// Returns the later merge id that invalidates `view` for this operation, if known.
-    ///
-    /// A later live merge invalidates an earlier view when it consumes that view as its source.
-    /// From that point, the later merge owns convergence for the lineage and the older operation
-    /// must not refresh metadata for the retired view.
-    pub(crate) fn invalidating_later_merge_id_for_view<'a>(
-        &self,
-        known_operations: impl IntoIterator<Item = &'a Self>,
-        view: ClusterViewId,
-    ) -> Option<Uuid> {
-        let operation_key = self.lineage_order_key();
-        known_operations
-            .into_iter()
-            .filter(|candidate| {
-                candidate.id != self.id
-                    && candidate.is_live_merge()
-                    && candidate.lineage_order_key() > operation_key
-                    && candidate.source_views.contains(&view)
-            })
-            .min_by_key(|candidate| candidate.lineage_order_key())
-            .map(|operation| operation.id)
-    }
-
-    /// Returns whether this operation is a merge that can still affect lineage state.
-    fn is_live_merge(&self) -> bool {
-        !self.dry_run
-            && self.kind == ClusterOperationKind::Merge
-            && self.stage != ClusterOperationStage::Aborted
+    pub(crate) fn lineage_order_key(&self) -> (u64, Uuid, Uuid) {
+        (
+            self.lineage_order_timestamp_unix_ms(),
+            self.submitted_by_node_id,
+            self.id,
+        )
     }
 
     /// Encodes this operation record into its stable Cap'n Proto durable payload.
@@ -243,10 +248,11 @@ impl ClusterOperationRecord {
         builder.set_merge_service_policy(merge_service_policy_to_capnp(self.merge_service_policy));
         builder.set_updated_at_unix_ms(self.updated_at_unix_ms);
         builder.set_created_at_unix_ms(self.created_at_unix_ms);
-        if let Some(depends_on) = self.depends_on_operation_id {
-            builder.set_depends_on_operation_id(depends_on.as_bytes());
-        } else {
-            builder.set_depends_on_operation_id(&[]);
+        let mut dependencies = builder
+            .reborrow()
+            .init_dependency_operation_ids(self.dependency_operation_ids.len() as u32);
+        for (index, dependency_id) in self.dependency_operation_ids.iter().enumerate() {
+            dependencies.set(index as u32, dependency_id.as_bytes());
         }
 
         let mut sources = builder
@@ -303,8 +309,8 @@ impl ClusterOperationRecord {
             stage: ClusterOperationStage::from_capnp(reader.get_stage()?),
             dry_run: reader.get_dry_run(),
             created_at_unix_ms: reader.get_created_at_unix_ms(),
-            depends_on_operation_id: read_optional_uuid(
-                reader.get_depends_on_operation_id()?,
+            dependency_operation_ids: read_uuid_list(
+                reader.get_dependency_operation_ids()?,
                 "cluster operation dependency id",
             )?,
             source_views,
@@ -414,15 +420,18 @@ fn uuid_from_data(data: capnp::data::Reader<'_>, field_name: &str) -> Result<Uui
     Uuid::from_slice(data).map_err(|err| CapnpError::failed(err.to_string()))
 }
 
-/// Reads an optional UUID data field encoded as empty bytes when absent.
-fn read_optional_uuid(
-    data: capnp::data::Reader<'_>,
+/// Reads and validates a list of UUID data fields.
+fn read_uuid_list(
+    reader: capnp::data_list::Reader<'_>,
     field_name: &str,
-) -> Result<Option<Uuid>, CapnpError> {
-    if data.is_empty() {
-        return Ok(None);
+) -> Result<Vec<Uuid>, CapnpError> {
+    let mut values = Vec::with_capacity(reader.len() as usize);
+    for data in reader.iter() {
+        values.push(uuid_from_data(data?, field_name)?);
     }
-    uuid_from_data(data, field_name).map(Some)
+    values.sort_unstable();
+    values.dedup();
+    Ok(values)
 }
 
 /// Decodes one cluster-view list from a Cap'n Proto operation payload.
@@ -471,35 +480,6 @@ mod tests {
     use super::*;
     use crate::cluster::ClusterId;
 
-    /// Builds one merge operation record with deterministic ids and timestamps for model tests.
-    fn merge_operation(
-        id: u128,
-        stage: ClusterOperationStage,
-        dry_run: bool,
-        created_at_unix_ms: u64,
-        source_view: ClusterViewId,
-        target_view: ClusterViewId,
-    ) -> ClusterOperationRecord {
-        ClusterOperationRecord {
-            id: Uuid::from_u128(id),
-            submitted_by_node_id: Uuid::from_u128(0x700),
-            kind: ClusterOperationKind::Merge,
-            stage,
-            dry_run,
-            created_at_unix_ms,
-            depends_on_operation_id: None,
-            source_views: vec![source_view],
-            target_views: vec![target_view],
-            target_cluster_names: Vec::new(),
-            split_assignments: Vec::new(),
-            split_service_policy: SplitServicePolicy::default(),
-            split_network_policy: SplitNetworkPolicy::default(),
-            merge_service_policy: MergeServicePolicy::default(),
-            updated_at_unix_ms: created_at_unix_ms,
-            details: "test merge".to_string(),
-        }
-    }
-
     /// Ensures durable cluster operation payloads preserve every Cap'n Proto field.
     #[test]
     fn cluster_operation_capnp_round_trip_preserves_durable_fields() {
@@ -513,7 +493,7 @@ mod tests {
             stage: ClusterOperationStage::Committed,
             dry_run: true,
             created_at_unix_ms: 123_000,
-            depends_on_operation_id: Some(Uuid::from_u128(0x401)),
+            dependency_operation_ids: vec![Uuid::from_u128(0x401)],
             source_views: vec![ClusterViewId::new(source_cluster, 7)],
             target_views: vec![
                 ClusterViewId::new(target_cluster_a, 8),
@@ -541,37 +521,5 @@ mod tests {
         let decoded = ClusterOperationRecord::decode_capnp(&payload).expect("decode operation");
 
         assert_eq!(decoded, operation);
-    }
-
-    /// Ensures operation invalidation only selects later live merges that consume the view.
-    #[test]
-    fn cluster_operation_reports_invalidating_later_merge_for_view() {
-        use ClusterOperationStage::{Aborted, Finalized, Prepared, Proposed};
-
-        let view_a = ClusterViewId::new(ClusterId::from_uuid(Uuid::from_u128(0x1000)), 1);
-        let view_b = ClusterViewId::new(ClusterId::from_uuid(Uuid::from_u128(0x2000)), 1);
-        let view_c = ClusterViewId::new(ClusterId::from_uuid(Uuid::from_u128(0x3000)), 1);
-        let view_d = ClusterViewId::new(ClusterId::from_uuid(Uuid::from_u128(0x4000)), 1);
-
-        let operation = merge_operation(0x10, Finalized, false, 100, view_a, view_b);
-        let invalidating = merge_operation(0x20, Proposed, false, 200, view_b, view_c);
-        let known_operations = [
-            operation.clone(),
-            merge_operation(0x21, Prepared, false, 300, view_b, view_d),
-            merge_operation(0x22, Aborted, false, 150, view_b, view_d),
-            merge_operation(0x23, Proposed, true, 175, view_b, view_d),
-            merge_operation(0x24, Finalized, false, 90, view_b, view_d),
-            merge_operation(0x25, Proposed, false, 180, view_c, view_d),
-            invalidating.clone(),
-        ];
-
-        assert_eq!(
-            operation.invalidating_later_merge_id_for_view(known_operations.iter(), view_b),
-            Some(invalidating.id)
-        );
-        assert_eq!(
-            operation.invalidating_later_merge_id_for_view(known_operations.iter(), view_a),
-            None
-        );
     }
 }

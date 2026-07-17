@@ -845,6 +845,12 @@
       "ClusterOperation": {
         "description": "REST-facing cluster operation details.",
         "properties": {
+          "dependency_operation_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "details": {
             "type": "string"
           },
@@ -904,6 +910,7 @@
           "kind",
           "stage",
           "dry_run",
+          "dependency_operation_ids",
           "source_views",
           "target_views",
           "target_cluster_names",

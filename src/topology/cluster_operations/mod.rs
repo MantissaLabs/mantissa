@@ -1,5 +1,6 @@
 mod assignment;
 mod commit;
+mod membership;
 mod progress;
 mod request;
 

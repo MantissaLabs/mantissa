@@ -267,10 +267,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("test clock before epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "mantissa-client-socket-{}-{unique}",
-            std::process::id()
-        ));
+        // Keep the directory name short because macOS limits the complete Unix
+        // socket path, including the system temp-directory prefix, to SUN_LEN.
+        let dir = std::env::temp_dir().join(format!("mc-{}-{unique:x}", std::process::id()));
         fs::create_dir_all(&dir).expect("create test socket dir");
         dir
     }

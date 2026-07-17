@@ -98,6 +98,7 @@ mod tests {
             id: Uuid::new_v4(),
             event: TopologyEvent::ClusterMetadataChanged {
                 operation_id: Uuid::new_v4(),
+                source_node_id: Uuid::new_v4(),
             },
         };
 

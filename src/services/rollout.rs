@@ -1177,7 +1177,7 @@ impl ServiceController {
         None
     }
 
-    /// Publishes the new service generation and starts asynchronous readiness monitoring.
+    /// Publishes the new generation and monitors readiness under its owner execution.
     async fn finalize_successful_redeployment(
         &self,
         target: &ServiceRedeploymentTarget<'_>,
@@ -1213,11 +1213,7 @@ impl ServiceController {
         self.broadcast(ServiceEvent::Upsert(next_spec.clone()))
             .await?;
 
-        let readiness_spec = next_spec.clone();
-        let controller = self.clone();
-        tokio::task::spawn_local(async move {
-            controller.await_service_readiness(readiness_spec).await;
-        });
+        self.clone().await_service_readiness(next_spec).await;
 
         Ok(())
     }

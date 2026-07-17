@@ -9,6 +9,7 @@ use crate::network::transition::SplitNetworkRuntimeParticipant;
 use crate::secrets::master_key::envelope::MasterKeyDescriptor;
 use crate::secrets::master_key::reconciler::SecretMasterKeyReconciler;
 use crate::secrets::master_key::replication::SecretMasterKeyGrantRecipient;
+use crate::services::ServiceReconcileTrigger;
 use crate::store::local::MasterKeyRecord;
 use crate::store::replicated::secret_key_sync::current_for_scope;
 use crate::topology::Topology;
@@ -849,6 +850,7 @@ impl ClusterTransitionParticipant for PeerScopeParticipant {
 
 struct SplitTaskRuntimeParticipant {
     workloads: WorkloadRegistry,
+    service_reconcile_trigger: ServiceReconcileTrigger,
 }
 
 #[async_trait(?Send)]
@@ -864,6 +866,12 @@ impl ClusterTransitionParticipant for SplitTaskRuntimeParticipant {
         transition: &ClusterTransition,
     ) -> Result<ClusterParticipantReport, capnp::Error> {
         let mut report = ClusterParticipantReport::new(self.name());
+        if transition.is_merge() {
+            self.service_reconcile_trigger
+                .clear_split_pruned_workloads();
+            return Ok(report);
+        }
+
         if transition.is_split()
             && transition.split_service_policy == SplitServicePolicy::Partitioned
         {
@@ -872,7 +880,9 @@ impl ClusterTransitionParticipant for SplitTaskRuntimeParticipant {
                 .purge_local_for_nodes(&transition.evicted_node_ids)
                 .await
                 .map_err(|err| capnp::Error::failed(err.to_string()))?;
-            report = report.add_detail("removed_tasks", removed.to_string());
+            self.service_reconcile_trigger
+                .remember_split_pruned_workloads(&removed);
+            report = report.add_detail("removed_tasks", removed.len().to_string());
         }
         Ok(report)
     }
@@ -1002,6 +1012,7 @@ impl Topology {
             }),
             Box::new(SplitTaskRuntimeParticipant {
                 workloads: self.deps.workload_registry.clone(),
+                service_reconcile_trigger: self.deps.service_reconcile_trigger.clone(),
             }),
             Box::new(SplitNetworkRuntimeParticipant::new(
                 self.deps.network_registry.clone(),

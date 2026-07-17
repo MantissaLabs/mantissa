@@ -553,6 +553,9 @@ impl ServiceController {
         if spec.status() != ServiceStatus::Deploying || eligible_nodes.is_empty() {
             return;
         }
+        let Some(mut execution_guard) = self.reconcile_trigger.begin_generation_execution() else {
+            return;
+        };
 
         let Some(owner_id) = select_generation_owner(spec.id, spec.service_epoch, eligible_nodes)
         else {
@@ -563,6 +566,10 @@ impl ServiceController {
         }
 
         let key = ServiceGenerationExecutionKey::from_spec(&spec);
+        if self.generation_retry_pending(&key).await {
+            return;
+        }
+
         let mut inflight = self.inflight_generations.lock().await;
         if !inflight.insert(key) {
             return;
@@ -571,17 +578,37 @@ impl ServiceController {
 
         let controller = self.clone();
         tokio::task::spawn_local(async move {
-            if let Err(err) = controller.adopt_deploying_generation(spec.clone()).await {
-                tracing::warn!(
-                    target: "services",
-                    service = %spec.service_name,
-                    manifest = %spec.manifest_id,
-                    epoch = spec.service_epoch,
-                    "service generation execution failed: {err:#}"
-                );
-                controller
-                    .record_generation_execution_error(&spec, service_error_detail(&err))
-                    .await;
+            let result = tokio::select! {
+                biased;
+                _ = execution_guard.cancelled() => None,
+                result = controller.adopt_deploying_generation(spec.clone()) => Some(result),
+            };
+            match result {
+                Some(Err(err)) => {
+                    tracing::warn!(
+                        target: "services",
+                        service = %spec.service_name,
+                        manifest = %spec.manifest_id,
+                        epoch = spec.service_epoch,
+                        "service generation execution failed: {err:#}"
+                    );
+                    controller
+                        .record_generation_execution_error(&spec, service_error_detail(&err))
+                        .await;
+                    controller.set_generation_retry_cooldown(key).await;
+                }
+                Some(Ok(())) => {
+                    controller.clear_generation_retry_cooldown(&key).await;
+                }
+                None => {
+                    tracing::debug!(
+                        target: "services",
+                        service = %spec.service_name,
+                        manifest = %spec.manifest_id,
+                        epoch = spec.service_epoch,
+                        "cancelled generation execution after cluster view changed"
+                    );
+                }
             }
             controller.finish_generation_execution(key).await;
         });
@@ -632,6 +659,31 @@ impl ServiceController {
     async fn finish_generation_execution(&self, key: ServiceGenerationExecutionKey) {
         let mut inflight = self.inflight_generations.lock().await;
         inflight.remove(&key);
+    }
+
+    /// Returns true while a recently failed generation execution is cooling down.
+    async fn generation_retry_pending(&self, key: &ServiceGenerationExecutionKey) -> bool {
+        let now = Instant::now();
+        let mut retry_after = self.generation_retry_after.lock().await;
+        retry_after.retain(|_, deadline| *deadline > now);
+        retry_after
+            .get(key)
+            .map(|deadline| *deadline > now)
+            .unwrap_or(false)
+    }
+
+    /// Records a short retry cooldown after a generation owner fails to launch.
+    async fn set_generation_retry_cooldown(&self, key: ServiceGenerationExecutionKey) {
+        let cooldown = Duration::from_secs(SERVICE_GENERATION_RETRY_COOLDOWN_SECS)
+            .max(self.timing.reschedule_tick);
+        let mut retry_after = self.generation_retry_after.lock().await;
+        retry_after.insert(key, Instant::now() + cooldown);
+    }
+
+    /// Clears any retry cooldown once the generation execution completes successfully.
+    async fn clear_generation_retry_cooldown(&self, key: &ServiceGenerationExecutionKey) {
+        let mut retry_after = self.generation_retry_after.lock().await;
+        retry_after.remove(key);
     }
 
     /// Adopts the current deploying service generation directly from replicated service state.
@@ -875,15 +927,11 @@ impl ServiceController {
         self.apply_upsert(spec.clone()).await?;
         self.broadcast(ServiceEvent::Upsert(spec.clone())).await?;
 
-        let readiness_spec = spec.clone();
-        let controller = self.clone();
-        tokio::task::spawn_local(async move {
-            controller.await_service_readiness(readiness_spec).await;
-        });
+        self.clone().await_service_readiness(spec).await;
 
         tracing::info!(
             target: "services",
-            "service '{}' deployment submitted; tasks launching asynchronously",
+            "service '{}' deployment readiness finished under generation ownership",
             service_name
         );
 
@@ -1110,14 +1158,11 @@ impl ServiceController {
         self.update_service_status_detail_if_current(service_id, manifest_id, None)
             .await;
 
-        let controller = self.clone();
-        tokio::task::spawn_local(async move {
-            controller.await_service_readiness(readiness_spec).await;
-        });
+        self.clone().await_service_readiness(readiness_spec).await;
 
         tracing::info!(
             target: "services",
-            "service '{}' dependency-ordered deployment submitted; tasks launching asynchronously",
+            "service '{}' dependency-ordered readiness finished under generation ownership",
             service_name
         );
 
@@ -1293,14 +1338,11 @@ impl ServiceController {
         self.update_service_status_detail_if_current(service_id, deployment.manifest_id, None)
             .await;
 
-        let controller = self.clone();
-        tokio::task::spawn_local(async move {
-            controller.await_service_readiness(readiness_spec).await;
-        });
+        self.clone().await_service_readiness(readiness_spec).await;
 
         tracing::info!(
             target: "services",
-            "service '{}' dependency-ordered gang deployment submitted; tasks launching asynchronously",
+            "service '{}' dependency-ordered gang readiness finished under generation ownership",
             deployment.service_name
         );
 
@@ -1668,9 +1710,17 @@ impl ServiceController {
             deployment.service_name
         );
 
+        let service_id = compute_service_id(deployment.service_name);
+        self.set_generation_retry_cooldown(ServiceGenerationExecutionKey {
+            service_id,
+            manifest_id: deployment.manifest_id,
+            service_epoch: deployment.service_epoch,
+        })
+        .await;
+
         if deployment_launch_error_requires_service_requeue(err) {
             self.persist_retryable_deployment_launch_error(
-                compute_service_id(deployment.service_name),
+                service_id,
                 deployment.service_name,
                 err,
             )
@@ -1683,7 +1733,6 @@ impl ServiceController {
             return;
         }
 
-        let service_id = compute_service_id(deployment.service_name);
         let detail = service_error_detail(err);
         let terminal_launch_error = deployment_launch_error_should_fail_generation(err);
         match self.registry.get(service_id) {
@@ -1729,10 +1778,7 @@ impl ServiceController {
                 self.persist_deploying_launch_error(persisted_spec.clone(), detail.clone())
                     .await;
                 if workload_start_error_consumes_service_failure_budget(err) {
-                    let controller = self.clone();
-                    tokio::task::spawn_local(async move {
-                        controller.await_service_readiness(persisted_spec).await;
-                    });
+                    self.clone().await_service_readiness(persisted_spec).await;
                 }
             }
             Ok(None) if is_local_volume_unavailable_error(err) => {

@@ -1,5 +1,6 @@
 use crate::cluster::operations::{ClusterOperationRecord, ClusterOperationStageRank};
 use crate::store::replicated::open::open_arc_store;
+use crate::store::tx::{into_io, with_read_tx, with_write_tx};
 use mantissa_store::adapter::RegAdapter;
 use mantissa_store::codec::{MvRegStoreCodec, StoreActorCodec, StoreRegisterCodec};
 use mantissa_store::hash::XXHash128;
@@ -7,9 +8,17 @@ use mantissa_store::mst_store::CrdtMstStore;
 use mantissa_store::mvreg::{MvReg, MvRegEntry, MvRegSnapshot};
 use mantissa_store::table_set::TableSet;
 use mantissa_store::uuid_key::UuidKey;
+use redb::TableDefinition;
 use std::io;
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Redb table marking operation commit side effects already applied on this node.
+const T_CLUSTER_OPERATION_COMMIT_MARKERS: TableDefinition<[u8; 16], &'static [u8]> =
+    TableDefinition::new("cluster_operation_commit_markers");
+
+/// Payload used for local commit side-effect markers.
+const COMMIT_SIDE_EFFECTS_APPLIED: &[u8] = &[1];
 
 /// Cluster-operation ledger tables replicated through the global metadata plane.
 pub struct ClusterOperationTables;
@@ -119,14 +128,22 @@ pub type ClusterOperationDomainStore = Arc<ClusterOperationDomainStoreInner>;
 /// Topology-facing handle for the replicated split/merge operation ledger.
 #[derive(Clone)]
 pub struct ClusterOperationStore {
+    db: Arc<redb::Database>,
     domain: ClusterOperationDomainStore,
 }
 
 impl ClusterOperationStore {
     /// Opens the replicated split/merge operation ledger for the provided local actor.
     pub fn new(db: Arc<redb::Database>, actor: Uuid) -> io::Result<Self> {
+        with_write_tx(&db, |tx| {
+            let _ = tx
+                .open_table(T_CLUSTER_OPERATION_COMMIT_MARKERS)
+                .map_err(into_io)?;
+            Ok(())
+        })?;
         Ok(Self {
-            domain: open_cluster_operation_domain_store(db, actor)?,
+            domain: open_cluster_operation_domain_store(db.clone(), actor)?,
+            db,
         })
     }
 
@@ -174,6 +191,29 @@ impl ClusterOperationStore {
         Ok(out)
     }
 
+    /// Returns whether this node has already applied commit side effects for an operation.
+    pub fn commit_side_effects_applied(&self, id: Uuid) -> io::Result<bool> {
+        with_read_tx(&self.db, |tx| {
+            let table = tx
+                .open_table(T_CLUSTER_OPERATION_COMMIT_MARKERS)
+                .map_err(into_io)?;
+            Ok(table.get(*id.as_bytes()).map_err(into_io)?.is_some())
+        })
+    }
+
+    /// Marks an operation's commit side effects as already applied on this node.
+    pub fn mark_commit_side_effects_applied(&self, id: Uuid) -> io::Result<()> {
+        with_write_tx(&self.db, |tx| {
+            let mut table = tx
+                .open_table(T_CLUSTER_OPERATION_COMMIT_MARKERS)
+                .map_err(into_io)?;
+            table
+                .insert(*id.as_bytes(), COMMIT_SIDE_EFFECTS_APPLIED)
+                .map_err(into_io)?;
+            Ok(())
+        })
+    }
+
     /// Tombstones multiple operation rows and returns how many live rows were removed.
     pub async fn delete_many(&self, ids: &[Uuid]) -> io::Result<usize> {
         let mut removed = 0usize;
@@ -190,6 +230,15 @@ impl ClusterOperationStore {
             let _sequence = self.domain.remove(&key).await.map_err(io::Error::other)?;
             removed = removed.saturating_add(1);
         }
+        with_write_tx(&self.db, |tx| {
+            let mut markers = tx
+                .open_table(T_CLUSTER_OPERATION_COMMIT_MARKERS)
+                .map_err(into_io)?;
+            for id in ids {
+                let _ = markers.remove(*id.as_bytes()).map_err(into_io)?;
+            }
+            Ok(())
+        })?;
         Ok(removed)
     }
 }
@@ -261,7 +310,7 @@ mod tests {
             stage,
             dry_run: false,
             created_at_unix_ms: 1,
-            depends_on_operation_id: None,
+            dependency_operation_ids: Vec::new(),
             source_views: vec![source],
             target_views: vec![ClusterViewId::new(
                 ClusterId::from_uuid(Uuid::from_u128(0x500)),

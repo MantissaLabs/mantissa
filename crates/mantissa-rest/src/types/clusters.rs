@@ -92,6 +92,7 @@ pub struct ClusterOperation {
     pub kind: String,
     pub stage: String,
     pub dry_run: bool,
+    pub dependency_operation_ids: Vec<String>,
     pub source_views: Vec<ClusterView>,
     pub target_views: Vec<ClusterView>,
     pub target_cluster_names: Vec<String>,
@@ -112,6 +113,11 @@ impl From<ClientClusterOperationSummary> for ClusterOperation {
             kind: enum_label(&value.kind),
             stage,
             dry_run: value.dry_run,
+            dependency_operation_ids: value
+                .dependency_operation_ids
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect(),
             source_views: value
                 .source_views
                 .into_iter()

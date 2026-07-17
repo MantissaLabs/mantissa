@@ -37,12 +37,13 @@ use anyhow::anyhow;
 use async_channel::{Receiver, Sender};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use mantissa_health::{HealthMonitor, Status as HealthStatus};
+use parking_lot::Mutex as SyncMutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::sync::{Mutex as AsyncMutex, Notify, watch};
 use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
 use uuid::Uuid;
 
@@ -70,6 +71,7 @@ pub(crate) use autoscale::{
 use inventory::TaskInventory;
 use placement::build_eligible_nodes;
 use readiness::start_readiness_wait;
+use slot_reconcile::SlotRebalancePlan;
 use state::{
     node_is_down, should_accept_update, should_drain_local_tasks, should_reconcile_status,
     should_stop_tasks,
@@ -77,8 +79,15 @@ use state::{
 
 /// Interval used by the rescheduler loop to evaluate service replica health.
 const SERVICE_RESCHEDULE_TICK_SECS: u64 = 2;
-/// Minimum delay before a missing replica is rescheduled to avoid transient gossip gaps.
-const SERVICE_SLOT_MISSING_GRACE_SECS: u64 = 6;
+/// Maximum interval between unchanged service reconciliation safety sweeps.
+const SERVICE_RECONCILE_SAFETY_SWEEP_SECS: u64 = 20;
+/// Minimum delay before an absent workload row is treated as a missing replica.
+///
+/// A service assignment is much smaller than its workload rows and can therefore arrive first
+/// after a large view merge. Known terminal tasks and unavailable owners bypass this window; an
+/// unknown row waits long enough for ordinary workload anti-entropy instead of spawning a false
+/// replacement wave.
+const SERVICE_SLOT_MISSING_GRACE_SECS: u64 = 20;
 /// Minimum delay before an absent deploying replica row is treated as a real missing slot.
 ///
 /// Large deployments intentionally suppress routine workload gossip and rely on
@@ -93,6 +102,12 @@ const SERVICE_REBALANCE_MIN_AGE_SECS: i64 = 20;
 const SERVICE_EXTRA_TASK_CLEANUP_MIN_AGE_SECS: i64 = 20;
 /// Cooldown window between rebalance attempts for the same slot.
 const SERVICE_REBALANCE_COOLDOWN_SECS: u64 = 30;
+/// Quiet window required before a healthy placement move may mutate shared service state.
+const SERVICE_REBALANCE_PLAN_STABILITY_SECS: u64 = 90;
+/// Quiet window required before a deploying generation is adopted in a new cluster view.
+const SERVICE_GENERATION_VIEW_STABILITY_SECS: u64 = 20;
+/// Minimum cooldown after a deploying generation owner hits a retryable launch failure.
+const SERVICE_GENERATION_RETRY_COOLDOWN_SECS: u64 = 1;
 /// Hard readiness deadline for one start-first service slot handoff.
 const SERVICE_SLOT_CUTOVER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Minimum delay between exact target-status probes during one service cutover.
@@ -105,12 +120,6 @@ const SERVICE_ROLLOUT_STOP_TIMEOUT_SECS: u64 = 120;
 const SERVICE_ROLLOUT_POLL_INTERVAL_MS: u64 = 200;
 /// Fast-fail retry budget for untargeted fallback scheduling inside one rollout attempt.
 const SERVICE_FALLBACK_SCHEDULING_RETRY_MAX_ATTEMPTS: usize = 1;
-/// Proactive slot rebalance keeps long-lived running services aligned with deterministic ownership.
-///
-/// This is required for split/merge convergence so replicas migrate off overloaded partitions once
-/// the unified cluster view is restored.
-const SERVICE_ENABLE_PROACTIVE_REBALANCE: bool = true;
-
 /// Runtime timing knobs used by the service controller reconciliation loop.
 #[derive(Clone, Copy, Debug)]
 pub struct ServiceControllerTiming {
@@ -119,6 +128,7 @@ pub struct ServiceControllerTiming {
     pub rebalance_min_age: ChronoDuration,
     pub cleanup_min_age: ChronoDuration,
     pub rebalance_cooldown: Duration,
+    pub rebalance_plan_stability: Duration,
 }
 
 impl ServiceControllerTiming {
@@ -128,6 +138,7 @@ impl ServiceControllerTiming {
             Duration::from_secs(SERVICE_RESCHEDULE_TICK_SECS),
             ChronoDuration::seconds(SERVICE_REBALANCE_MIN_AGE_SECS),
             Duration::from_secs(SERVICE_REBALANCE_COOLDOWN_SECS),
+            Duration::from_secs(SERVICE_REBALANCE_PLAN_STABILITY_SECS),
         )
     }
 
@@ -136,6 +147,7 @@ impl ServiceControllerTiming {
         reschedule_tick: Duration,
         rebalance_min_age: ChronoDuration,
         rebalance_cooldown: Duration,
+        rebalance_plan_stability: Duration,
     ) -> Self {
         Self {
             reschedule_tick: reschedule_tick.max(Duration::from_millis(1)),
@@ -143,6 +155,7 @@ impl ServiceControllerTiming {
             rebalance_min_age,
             cleanup_min_age: ChronoDuration::seconds(SERVICE_EXTRA_TASK_CLEANUP_MIN_AGE_SECS),
             rebalance_cooldown,
+            rebalance_plan_stability,
         }
     }
 
@@ -167,15 +180,83 @@ impl Default for ServiceControllerTiming {
 }
 
 /// Local signal used to request an immediate service reconciliation pass.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ServiceReconcileTrigger {
     notify: Arc<Notify>,
+    view_change_quiet_period: Duration,
+    generation_adoption_after: Arc<SyncMutex<Option<Instant>>>,
+    split_pruned_workloads: Arc<SyncMutex<HashSet<Uuid>>>,
+    view_revision: watch::Sender<u64>,
+}
+
+/// Cancels one local generation execution when its cluster view becomes obsolete.
+pub(crate) struct GenerationExecutionGuard {
+    view_revision: watch::Receiver<u64>,
+    expected_revision: u64,
+}
+
+/// Cheap input fingerprint used to skip identical periodic service scans.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ServiceReconcileInputs {
+    service_clock: u64,
+    workload_clock: u64,
+    peer_clock: u64,
+    eligible_nodes: Vec<Uuid>,
+}
+
+/// Last full service reconciliation input and the time it was evaluated.
+struct ServiceReconcileScan {
+    inputs: ServiceReconcileInputs,
+    scanned_at: Instant,
+}
+
+/// Returns whether changed inputs, an explicit wake, or the safety interval requires a full scan.
+fn service_reconcile_scan_due(
+    previous: &mut Option<ServiceReconcileScan>,
+    inputs: ServiceReconcileInputs,
+    now: Instant,
+    force: bool,
+) -> bool {
+    let safety_interval = Duration::from_secs(SERVICE_RECONCILE_SAFETY_SWEEP_SECS);
+    let due = force
+        || previous.as_ref().is_none_or(|previous| {
+            previous.inputs != inputs
+                || now.saturating_duration_since(previous.scanned_at) >= safety_interval
+        });
+    if due {
+        *previous = Some(ServiceReconcileScan {
+            inputs,
+            scanned_at: now,
+        });
+    }
+    due
+}
+
+/// Removes elapsed one-shot deadlines and reports whether at least one became due.
+fn consume_elapsed_deadlines<K>(deadlines: &mut HashMap<K, Instant>, now: Instant) -> bool {
+    let elapsed = deadlines.values().any(|deadline| now >= *deadline);
+    deadlines.retain(|_, deadline| now < *deadline);
+    elapsed
 }
 
 impl ServiceReconcileTrigger {
     /// Creates an independent local service reconciliation trigger.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_view_change_quiet_period(Duration::from_secs(
+            SERVICE_GENERATION_VIEW_STABILITY_SECS,
+        ))
+    }
+
+    /// Creates a trigger with an explicit quiet window after cluster-view changes.
+    pub fn with_view_change_quiet_period(view_change_quiet_period: Duration) -> Self {
+        let (view_revision, _) = watch::channel(0);
+        Self {
+            notify: Arc::new(Notify::new()),
+            view_change_quiet_period,
+            generation_adoption_after: Arc::new(SyncMutex::new(None)),
+            split_pruned_workloads: Arc::new(SyncMutex::new(HashSet::new())),
+            view_revision,
+        }
     }
 
     /// Requests one local reconciliation pass without changing replicated service state.
@@ -183,9 +264,83 @@ impl ServiceReconcileTrigger {
         self.notify.notify_one();
     }
 
+    /// Defers new generation adoption while membership and replicated inventory settle.
+    pub(crate) fn request_view_change_reconcile(&self) {
+        let deadline = Instant::now() + self.view_change_quiet_period;
+        let mut current = self.generation_adoption_after.lock();
+        if current.is_none_or(|current| current < deadline) {
+            *current = Some(deadline);
+        }
+        drop(current);
+        self.view_revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        self.request_reconcile();
+    }
+
+    /// Starts a cancellable generation execution after the current view has remained quiet.
+    pub(crate) fn begin_generation_execution(&self) -> Option<GenerationExecutionGuard> {
+        // Subscribe before checking the deadline. A transition after this point either closes the
+        // gate or changes this receiver, so an adopter cannot slip through the boundary unnoticed.
+        let mut view_revision = self.view_revision.subscribe();
+        let expected_revision = *view_revision.borrow_and_update();
+        let now = Instant::now();
+        let mut deadline = self.generation_adoption_after.lock();
+        if deadline.is_some_and(|deadline| deadline > now) {
+            return None;
+        }
+        *deadline = None;
+        Some(GenerationExecutionGuard {
+            view_revision,
+            expected_revision,
+        })
+    }
+
+    /// Returns the local cluster-view revision used to invalidate placement proposals.
+    pub(crate) fn current_view_revision(&self) -> u64 {
+        *self.view_revision.borrow()
+    }
+
+    /// Remembers workload rows deliberately pruned while installing a partitioned split view.
+    pub(crate) fn remember_split_pruned_workloads(&self, task_ids: &[Uuid]) {
+        self.split_pruned_workloads
+            .lock()
+            .extend(task_ids.iter().copied());
+    }
+
+    /// Returns whether a missing workload row was deliberately pruned by a split transition.
+    pub(crate) fn workload_was_split_pruned(&self, task_id: Uuid) -> bool {
+        self.split_pruned_workloads.lock().contains(&task_id)
+    }
+
+    /// Clears split-pruning evidence after the partitions merge back into one workload view.
+    pub(crate) fn clear_split_pruned_workloads(&self) {
+        self.split_pruned_workloads.lock().clear();
+    }
+
     /// Waits until a local service reconciliation pass is requested.
     pub(crate) async fn wait_for_reconcile(&self) {
         self.notify.notified().await;
+    }
+}
+
+impl GenerationExecutionGuard {
+    /// Waits until a cluster transition invalidates the view used by this execution.
+    pub(crate) async fn cancelled(&mut self) {
+        loop {
+            if *self.view_revision.borrow() != self.expected_revision {
+                return;
+            }
+            if self.view_revision.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+impl Default for ServiceReconcileTrigger {
+    /// Creates a trigger with the production post-view-change quiet window.
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -303,9 +458,13 @@ pub struct ServiceController {
     health_monitor: Arc<HealthMonitor>,
     inflight_slots: Arc<AsyncMutex<HashSet<SlotKey>>>,
     inflight_generations: Arc<AsyncMutex<HashSet<ServiceGenerationExecutionKey>>>,
+    generation_retry_after: Arc<AsyncMutex<HashMap<ServiceGenerationExecutionKey, Instant>>>,
+    inflight_reconciles: Arc<AsyncMutex<HashSet<Uuid>>>,
     inflight_traffic_publish_waiters: Arc<AsyncMutex<HashSet<Uuid>>>,
-    slot_missing_since: Arc<AsyncMutex<HashMap<SlotKey, Instant>>>,
+    slot_missing_after: Arc<AsyncMutex<HashMap<SlotKey, Instant>>>,
     slot_rebalance_after: Arc<AsyncMutex<HashMap<SlotKey, Instant>>>,
+    slot_rebalance_plans: Arc<AsyncMutex<HashMap<SlotKey, SlotRebalancePlan>>>,
+    reconcile_scan: Arc<SyncMutex<Option<ServiceReconcileScan>>>,
     autoscale_signals: Arc<AsyncMutex<AutoscaleSignalStore>>,
     autoscale_local_samples: Arc<AsyncMutex<AutoscaleLocalSampleStore>>,
     autoscale_inflight: Arc<AtomicBool>,
@@ -341,6 +500,23 @@ impl Drop for AutoscaleInflightGuard {
     /// Clears the shared autoscale in-flight flag when a spawned tick exits.
     fn drop(&mut self) {
         self.flag.store(false, AtomicOrdering::Release);
+    }
+}
+
+/// Local guard that keeps one service reconciliation pass exclusive per controller.
+struct ServiceReconcileGuard {
+    service_id: Uuid,
+    inflight: Arc<AsyncMutex<HashSet<Uuid>>>,
+}
+
+impl Drop for ServiceReconcileGuard {
+    /// Clears the service in-flight marker once the spawned reconcile task exits.
+    fn drop(&mut self) {
+        let inflight = self.inflight.clone();
+        let service_id = self.service_id;
+        tokio::task::spawn_local(async move {
+            inflight.lock().await.remove(&service_id);
+        });
     }
 }
 
@@ -392,9 +568,13 @@ impl ServiceController {
             health_monitor,
             inflight_slots: Arc::new(AsyncMutex::new(HashSet::new())),
             inflight_generations: Arc::new(AsyncMutex::new(HashSet::new())),
+            generation_retry_after: Arc::new(AsyncMutex::new(HashMap::new())),
+            inflight_reconciles: Arc::new(AsyncMutex::new(HashSet::new())),
             inflight_traffic_publish_waiters: Arc::new(AsyncMutex::new(HashSet::new())),
-            slot_missing_since: Arc::new(AsyncMutex::new(HashMap::new())),
+            slot_missing_after: Arc::new(AsyncMutex::new(HashMap::new())),
             slot_rebalance_after: Arc::new(AsyncMutex::new(HashMap::new())),
+            slot_rebalance_plans: Arc::new(AsyncMutex::new(HashMap::new())),
+            reconcile_scan: Arc::new(SyncMutex::new(None)),
             autoscale_signals: Arc::new(AsyncMutex::new(AutoscaleSignalStore::default())),
             autoscale_local_samples: Arc::new(
                 AsyncMutex::new(AutoscaleLocalSampleStore::default()),
@@ -409,12 +589,13 @@ impl ServiceController {
     pub async fn run(&mut self) {
         let mut reschedule_tick = interval(self.timing.reschedule_tick);
         let mut autoscale_tick = interval(self.timing.autoscale_tick);
+        reschedule_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         autoscale_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
                 _ = reschedule_tick.tick() => {
-                    if let Err(err) = self.reconcile_services().await {
+                    if let Err(err) = self.reconcile_services(false).await {
                         tracing::warn!(
                             target: "services",
                             "failed to reconcile service replicas: {err}"
@@ -422,7 +603,7 @@ impl ServiceController {
                     }
                 }
                 _ = self.reconcile_trigger.wait_for_reconcile() => {
-                    if let Err(err) = self.reconcile_services().await {
+                    if let Err(err) = self.reconcile_services(true).await {
                         tracing::warn!(
                             target: "services",
                             "failed to reconcile service replicas: {err}"
@@ -671,53 +852,140 @@ impl ServiceController {
             .map_err(|e| anyhow::anyhow!("failed to enqueue service gossip: {e}"))
     }
 
-    /// Periodically checks services against task health to reschedule missing replicas.
-    async fn reconcile_services(&self) -> anyhow::Result<()> {
+    /// Checks services when replicated inputs change or the periodic safety sweep becomes due.
+    async fn reconcile_services(&self, force: bool) -> anyhow::Result<()> {
+        let due_reconcile_deadline = self.has_due_reconcile_deadline().await;
+        let health_snapshot = Arc::new(self.health_monitor.snapshot());
+        let eligible_nodes =
+            Arc::new(self.collect_eligible_nodes_from_snapshot(health_snapshot.as_ref()));
+        let inputs = ServiceReconcileInputs {
+            service_clock: self.registry.change_clock(),
+            workload_clock: self.workload_manager.workload_change_clock(),
+            peer_clock: self.cluster_registry.peer_store_change_clock(),
+            eligible_nodes: eligible_nodes.as_ref().clone(),
+        };
+        if !service_reconcile_scan_due(
+            &mut self.reconcile_scan.lock(),
+            inputs,
+            Instant::now(),
+            force || due_reconcile_deadline,
+        ) {
+            return Ok(());
+        }
+
         let specs = self.registry.list()?;
         if specs.is_empty() {
             return Ok(());
         }
 
-        let inventory = Arc::new(self.collect_task_inventory().await?);
-        let health_snapshot = Arc::new(self.health_monitor.snapshot());
-        let eligible_nodes =
-            Arc::new(self.collect_eligible_nodes_from_snapshot(health_snapshot.as_ref()));
+        let mut active_specs = Vec::new();
+        let mut inactive_specs = Vec::new();
 
         for spec in specs {
             self.maybe_spawn_generation_execution(spec.clone(), eligible_nodes.as_ref())
                 .await;
 
             if should_reconcile_status(spec.status()) {
-                let controller = self.clone();
-                let inventory = inventory.clone();
-                let health_snapshot = health_snapshot.clone();
-                let eligible_nodes = eligible_nodes.clone();
-                tokio::task::spawn_local(async move {
-                    if let Err(err) = controller
-                        .reconcile_service(
-                            spec,
-                            inventory.as_ref(),
-                            health_snapshot.as_ref(),
-                            eligible_nodes.as_ref(),
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            target: "services",
-                            "service reconciliation failed: {err}"
-                        );
-                    }
-                });
+                let Some(guard) = self.try_begin_service_reconcile(spec.id).await else {
+                    continue;
+                };
+                active_specs.push((spec, guard));
                 continue;
             }
 
             if should_drain_local_tasks(spec.status()) {
-                self.reconcile_inactive_service(spec, inventory.as_ref())
-                    .await;
+                inactive_specs.push(spec);
             }
         }
 
+        if active_specs.is_empty() && inactive_specs.is_empty() {
+            return Ok(());
+        }
+
+        let inventory = Arc::new(self.collect_task_inventory().await?);
+
+        for (spec, service_guard) in active_specs {
+            let controller = self.clone();
+            let inventory = inventory.clone();
+            let health_snapshot = health_snapshot.clone();
+            let eligible_nodes = eligible_nodes.clone();
+            tokio::task::spawn_local(async move {
+                let _service_guard = service_guard;
+                if let Err(err) = controller
+                    .reconcile_service(
+                        spec,
+                        inventory.as_ref(),
+                        health_snapshot.as_ref(),
+                        eligible_nodes.as_ref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: "services",
+                        "service reconciliation failed: {err}"
+                    );
+                }
+            });
+        }
+
+        for spec in inactive_specs {
+            self.reconcile_inactive_service(spec, inventory.as_ref())
+                .await;
+        }
+
         Ok(())
+    }
+
+    /// Consumes due local retry timers so deferred service work receives one follow-up scan.
+    async fn has_due_reconcile_deadline(&self) -> bool {
+        let now = Instant::now();
+        let mut generation_retries = self.generation_retry_after.lock().await;
+        if consume_elapsed_deadlines(&mut generation_retries, now) {
+            return true;
+        }
+        drop(generation_retries);
+
+        if self
+            .slot_missing_after
+            .lock()
+            .await
+            .values()
+            .any(|deadline| now >= *deadline)
+        {
+            return true;
+        }
+
+        let mut cooldowns = self.slot_rebalance_after.lock().await;
+        let cooldown_elapsed = consume_elapsed_deadlines(&mut cooldowns, now);
+        if cooldown_elapsed {
+            return true;
+        }
+        let cooling_slots = cooldowns.keys().cloned().collect::<HashSet<_>>();
+        drop(cooldowns);
+
+        let plans = self.slot_rebalance_plans.lock().await;
+        plans.iter().any(|(key, plan)| {
+            !cooling_slots.contains(key)
+                && now.saturating_duration_since(plan.observed_at)
+                    >= self.timing.rebalance_plan_stability
+        })
+    }
+
+    /// Claims a local service reconciliation marker so expensive service scans do not overlap.
+    async fn try_begin_service_reconcile(&self, service_id: Uuid) -> Option<ServiceReconcileGuard> {
+        let mut inflight = self.inflight_reconciles.lock().await;
+        if !inflight.insert(service_id) {
+            tracing::debug!(
+                target: "services",
+                service = %service_id,
+                "skipping service reconcile while previous pass is still running"
+            );
+            return None;
+        }
+        Some(ServiceReconcileGuard {
+            service_id,
+            inflight: self.inflight_reconciles.clone(),
+        })
     }
 
     /// Collects a cluster-wide task inventory snapshot to support reconciliation decisions.

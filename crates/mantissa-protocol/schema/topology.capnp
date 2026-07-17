@@ -174,6 +174,9 @@ struct TopologyEvent {
   operationId @6 :Data;
   # Durable transition intent advertised by `clusterMetadataChanged`.
 
+  metadataSourceNodeId @7 :Data;
+  # Node that can immediately serve the advertised cluster metadata through Sync.
+
   enum EventType {
       # Enumerates actions possible on the topology.
 
@@ -550,9 +553,8 @@ struct ClusterOperation {
   updatedAtUnixMs @12 :UInt64;
   # Last mutation time used for retention ordering and stale-row eviction.
 
-  dependsOnOperationId @13 :Data;
-  # Optional operation id this operation must wait to finalize before progressing.
-  # Empty means the operation has no explicit causal predecessor.
+  dependencyOperationIds @13 :List(Data);
+  # Immutable causal predecessors that must finalize before this operation progresses.
 
   createdAtUnixMs @14 :UInt64;
   # Stable operation creation time used to order overlapping topology changes.
@@ -582,6 +584,12 @@ struct MergeRequest {
 
   servicePolicy @3 :MergeServicePolicy;
   # Service behavior policy applied when the merge commits.
+
+  operationId @4 :Data;
+  # Client-generated idempotency id for this immutable operation intent.
+
+  dependencyOperationIds @5 :List(Data);
+  # Causal predecessors that must finalize before this operation progresses.
 }
 
 struct SplitSelectorClause {
@@ -635,4 +643,10 @@ struct SplitRequest {
 
   networkPolicy @4 :SplitNetworkPolicy;
   # Overlay/network behavior policy applied when the split commits.
+
+  operationId @5 :Data;
+  # Client-generated idempotency id for this immutable operation intent.
+
+  dependencyOperationIds @6 :List(Data);
+  # Causal predecessors that must finalize before this operation progresses.
 }

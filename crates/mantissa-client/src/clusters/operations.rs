@@ -62,6 +62,7 @@ pub struct ClusterOperationSummary {
     pub kind: String,
     pub stage: ClusterOperationStage,
     pub dry_run: bool,
+    pub dependency_operation_ids: Vec<Uuid>,
     pub source_views: Vec<ClusterViewSpec>,
     pub target_views: Vec<ClusterViewSpec>,
     pub target_cluster_names: Vec<String>,
@@ -131,6 +132,17 @@ impl ClusterOperationSummary {
             source_views.push(ClusterViewSpec::from_capnp(sources.get(idx))?);
         }
 
+        let dependencies = reader
+            .get_dependency_operation_ids()
+            .context("operation dependencies missing")?;
+        let mut dependency_operation_ids = Vec::with_capacity(dependencies.len() as usize);
+        for dependency in dependencies.iter() {
+            dependency_operation_ids.push(
+                Uuid::from_slice(dependency.context("operation dependency missing")?)
+                    .context("invalid operation dependency id bytes")?,
+            );
+        }
+
         let mut target_views = Vec::new();
         let targets = reader
             .get_target_views()
@@ -192,6 +204,7 @@ impl ClusterOperationSummary {
                     .context("operation stage missing from response")?,
             ),
             dry_run: reader.get_dry_run(),
+            dependency_operation_ids,
             source_views,
             target_views,
             target_cluster_names,

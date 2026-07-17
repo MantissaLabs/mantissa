@@ -378,10 +378,15 @@ fn write_cluster_name_updated_event(
 }
 
 /// Writes one cluster-wide metadata availability hint into a gossip message builder.
-fn write_cluster_metadata_changed_event(msg: gossip_message::Builder<'_>, operation_id: &Uuid) {
+fn write_cluster_metadata_changed_event(
+    msg: gossip_message::Builder<'_>,
+    operation_id: &Uuid,
+    source_node_id: &Uuid,
+) {
     let mut topo = msg.init_topology();
     topo.set_event(topology_event::EventType::ClusterMetadataChanged);
     topo.set_operation_id(operation_id.as_bytes());
+    topo.set_metadata_source_node_id(source_node_id.as_bytes());
 }
 
 /// Writes one scheduling-update event into a gossip message builder.
@@ -486,9 +491,10 @@ pub fn add_event(
             *updated_at_unix_ms,
             actor_node_id,
         ),
-        TopologyEvent::ClusterMetadataChanged { operation_id } => {
-            write_cluster_metadata_changed_event(msg, operation_id)
-        }
+        TopologyEvent::ClusterMetadataChanged {
+            operation_id,
+            source_node_id,
+        } => write_cluster_metadata_changed_event(msg, operation_id, source_node_id),
         TopologyEvent::NodeSchedulingUpdated { id, scheduling } => {
             write_node_scheduling_updated_event(msg, id, scheduling, cluster_view)
         }

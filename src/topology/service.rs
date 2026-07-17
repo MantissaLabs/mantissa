@@ -1339,24 +1339,18 @@ impl topology::Server for Topology {
             ClusterViewId::from_capnp(req.get_destination_view()?).map_err(capnp::Error::failed)?;
         let dry_run = req.get_dry_run();
         let merge_service_policy = Self::merge_service_policy_from_capnp(req.get_service_policy()?);
-        self.reconcile_finalized_cluster_transitions_for_active_view(
-            "merge request active-view validation",
-        )
-        .await?;
-        let active_view = self.active_cluster_view();
+        let operation_id = Self::operation_id_from_data(req.get_operation_id()?)?;
+        let dependency_operation_ids =
+            Self::operation_ids_from_data_list(req.get_dependency_operation_ids()?)?;
 
         if source_view == destination_view {
             return Err(capnp::Error::failed(
                 "merge request source and destination view must differ".into(),
             ));
         }
-        if source_view != active_view && destination_view != active_view {
-            return Err(capnp::Error::failed(format!(
-                "merge request must include local active view {active_view}"
-            )));
-        }
-
         let mut operation = self.build_merge_operation_record(
+            operation_id,
+            dependency_operation_ids,
             source_view,
             destination_view,
             dry_run,
@@ -1391,25 +1385,29 @@ impl topology::Server for Topology {
         let dry_run = req.get_dry_run();
         let split_service_policy = Self::split_service_policy_from_capnp(req.get_service_policy()?);
         let split_network_policy = Self::split_network_policy_from_capnp(req.get_network_policy()?);
-        self.reconcile_finalized_cluster_transitions_for_active_view(
-            "split request active-view validation",
-        )
-        .await?;
-        let active_view = self.active_cluster_view();
-        if source_view != active_view {
-            return Err(capnp::Error::failed(format!(
-                "split request source view must equal local active view {active_view}"
-            )));
-        }
+        let operation_id = Self::operation_id_from_data(req.get_operation_id()?)?;
+        let dependency_operation_ids =
+            Self::operation_ids_from_data_list(req.get_dependency_operation_ids()?)?;
 
         let targets = req.get_targets()?;
         let (target_specs, target_views, detail_targets) =
             self.parse_split_target_specs(source_view, targets)?;
 
-        let split_assignments = self
-            .build_split_assignments(source_view, &target_specs)
-            .await?;
+        let split_assignments = match Self::explicit_split_assignments(&target_specs)? {
+            Some(assignments) => assignments,
+            None if source_view == self.active_cluster_view() => {
+                self.build_split_assignments(source_view, &target_specs)
+                    .await?
+            }
+            None => {
+                return Err(capnp::Error::failed(format!(
+                    "queued split for inactive source view {source_view} requires explicit node assignments"
+                )));
+            }
+        };
         let mut operation = self.build_split_operation_record(SplitOperationBuildInput {
+            operation_id,
+            dependency_operation_ids,
             source_view,
             dry_run,
             split_service_policy,
@@ -1725,6 +1723,9 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
             operation_id: Uuid::from_slice(reader.get_operation_id()?).map_err(|err| {
                 capnp::Error::failed(format!("invalid cluster metadata operation id: {err}"))
             })?,
+            source_node_id: Uuid::from_slice(reader.get_metadata_source_node_id()?).map_err(
+                |err| capnp::Error::failed(format!("invalid metadata source node id: {err}")),
+            )?,
         },
         EventType::NodeSchedulingUpdated => {
             let node = reader.get_node()?;

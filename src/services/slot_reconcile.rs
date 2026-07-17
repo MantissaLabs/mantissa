@@ -10,11 +10,12 @@ use super::state::{
     task_age_allows_rebalance, task_state_healthy, task_state_rebalanceable,
 };
 use super::{
-    SERVICE_DEPLOYING_SLOT_VISIBILITY_GRACE_SECS, SERVICE_ENABLE_PROACTIVE_REBALANCE,
-    SERVICE_SLOT_CUTOVER_TIMEOUT, SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController,
+    SERVICE_DEPLOYING_SLOT_VISIBILITY_GRACE_SECS, SERVICE_SLOT_CUTOVER_TIMEOUT,
+    SERVICE_SLOT_MISSING_GRACE_SECS, ServiceController,
 };
 use crate::services::ownership::{
-    ReplicaSlot, SlotKey, build_replica_slots, select_slot_owner, select_task_owner,
+    ReplicaSlot, SlotKey, build_replica_slots, select_generation_owner, select_slot_owner,
+    select_task_owner,
 };
 use crate::services::types::{ServiceSpecValue, ServiceStatus};
 use crate::workload::model::{WorkloadPhase, WorkloadSpec};
@@ -31,6 +32,8 @@ struct SlotReconcileEnv<'a> {
     health_snapshot: &'a HashMap<Uuid, HealthStatus>,
     slot_targets: &'a HashMap<SlotKey, Uuid>,
     service_degraded: bool,
+    owns_missing_repair: bool,
+    owns_rebalance: bool,
 }
 
 /// Task and target identities involved in a start-first slot replacement.
@@ -46,6 +49,16 @@ struct SlotReplacement {
 struct SlotHandoffCandidate {
     task_id: Uuid,
     node_id: Uuid,
+}
+
+/// One unchanged healthy placement proposal waiting out its stability window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SlotRebalancePlan {
+    task_id: Uuid,
+    current_node_id: Uuid,
+    desired_node_id: Uuid,
+    view_revision: u64,
+    pub(super) observed_at: Instant,
 }
 
 /// Returns true when generic cleanup must leave a handoff to service-slot reconciliation.
@@ -177,8 +190,7 @@ impl ServiceController {
             // `Some(false)` is an explicit leave tombstone and must degrade the service.
             let owner_active_cluster_member = self
                 .cluster_registry
-                .peer_value_unscoped(task.node_id)
-                .map(|peer| peer.is_active());
+                .peer_active_in_local_view(task.node_id);
             service_task_owner_unavailable_for_cleanup(
                 task.node_id,
                 self.local_node_id,
@@ -194,6 +206,11 @@ impl ServiceController {
         self.reconcile_extra_tasks(&spec, &service_tasks, eligible_nodes, health_snapshot)
             .await;
 
+        // Missing replicas remain sharded by slot so independent failures heal in parallel.
+        // Healthy placement moves update the whole service assignment row, so one deterministic
+        // generation owner performs those moves sequentially and avoids lost concurrent updates.
+        let generation_owner = select_generation_owner(spec.id, spec.service_epoch, eligible_nodes);
+
         for slot in slots {
             let Some(task_id) = slot.replica_id else {
                 tracing::warn!(
@@ -206,13 +223,14 @@ impl ServiceController {
                 continue;
             };
 
-            let Some(owner) =
+            let Some(slot_owner) =
                 select_slot_owner(spec.id, &slot.template.name, slot.replica, eligible_nodes)
             else {
                 continue;
             };
-
-            if owner != self.local_node_id {
+            let owns_missing_repair = slot_owner == self.local_node_id;
+            let owns_rebalance = generation_owner == Some(self.local_node_id);
+            if !owns_missing_repair && !owns_rebalance {
                 continue;
             }
 
@@ -231,6 +249,8 @@ impl ServiceController {
                         health_snapshot,
                         slot_targets: &slot_targets,
                         service_degraded,
+                        owns_missing_repair,
+                        owns_rebalance,
                     },
                     &key,
                 )
@@ -281,31 +301,44 @@ impl ServiceController {
                     continue;
                 };
                 if metadata.service_epoch == spec.service_epoch
-                    && let Some(owner) = select_slot_owner(
-                        spec.id,
-                        &metadata.template,
-                        metadata.replica,
-                        eligible_nodes,
-                    )
+                    && let Some(owner) =
+                        select_generation_owner(spec.id, spec.service_epoch, eligible_nodes)
                     && owner != self.local_node_id
+                    && task.node_id == self.local_node_id
                 {
-                    // The slot owner needs the workload row before it can resume or retire this
-                    // handoff. Ask it to pull the row without making hint delivery authoritative.
+                    // Only the runtime owner advertises this row to the generation owner. Every
+                    // node may eventually observe the same handoff through anti-entropy; letting
+                    // every observer send this hint creates all-to-all workload-only sync traffic.
                     remote_cleanup_owners.insert(owner);
                 }
                 continue;
             }
-            let Some(owner) = select_task_owner(task.id, eligible_nodes) else {
+            let owner_active_cluster_member = self
+                .cluster_registry
+                .peer_active_in_local_view(task.node_id);
+            let runtime_owner_unavailable = service_task_owner_unavailable_for_cleanup(
+                task.node_id,
+                self.local_node_id,
+                health_snapshot,
+                owner_active_cluster_member,
+            );
+            let cleanup_owner = if task.node_id == self.local_node_id {
+                // The runtime owner already has the workload row and can stop the task without
+                // making another node pull the entire workload domain first.
+                Some(self.local_node_id)
+            } else if runtime_owner_unavailable {
+                // A departed runtime owner cannot perform local cleanup. Elect one active node to
+                // retire its stale row after anti-entropy makes that row visible there.
+                select_task_owner(task.id, eligible_nodes)
+            } else {
+                None
+            };
+
+            let Some(cleanup_owner) = cleanup_owner else {
                 continue;
             };
-            if owner != self.local_node_id {
-                // This node can see an extra service-owned row, but the deterministic cleanup
-                // owner may not have learned that row yet because routine workload gossip is
-                // suppressed for large deployments. Ask that owner to pull workload rows from
-                // this node so its next cleanup pass can observe and stop the same extra task.
-                // Several extra tasks can select the same owner, so notify each peer once after
-                // local cleanup work has been processed.
-                remote_cleanup_owners.insert(owner);
+            if cleanup_owner != self.local_node_id {
+                remote_cleanup_owners.insert(cleanup_owner);
                 continue;
             }
 
@@ -384,8 +417,7 @@ impl ServiceController {
                 // Unknown topology is intentionally not terminal so sync lag does not retire work.
                 let owner_active_cluster_member = self
                     .cluster_registry
-                    .peer_value_unscoped(task.node_id)
-                    .map(|peer| peer.is_active());
+                    .peer_active_in_local_view(task.node_id);
                 service_task_owner_unavailable_for_cleanup(
                     task.node_id,
                     self.local_node_id,
@@ -411,9 +443,13 @@ impl ServiceController {
             .await;
 
         if missing {
+            self.clear_rebalance_plan(key).await;
             if let Some(candidate) =
                 select_slot_handoff_candidate(&handoff_candidates, preferred_node)
             {
+                if !env.owns_rebalance {
+                    return Ok(());
+                }
                 self.resume_slot_handoff(
                     spec,
                     slot,
@@ -427,6 +463,9 @@ impl ServiceController {
                     key,
                 )
                 .await?;
+                return Ok(());
+            }
+            if !env.owns_missing_repair {
                 return Ok(());
             }
             if task_on_draining_node {
@@ -503,7 +542,11 @@ impl ServiceController {
                     "deployment slot task is absent and its assigned target is down; allowing replacement without visibility grace"
                 );
             }
+            let split_pruned =
+                task.is_none() && self.reconcile_trigger.workload_was_split_pruned(task_id);
             let restart_immediately = task_on_draining_node
+                || task_owner_unavailable
+                || split_pruned
                 || deploying_absent_target_down
                 || deployment_visibility_elapsed
                 || should_restart_missing_slot_immediately(spec.status(), task);
@@ -547,6 +590,7 @@ impl ServiceController {
         .await;
 
         if desired_node == task.node_id {
+            self.clear_rebalance_plan(key).await;
             self.abort_slot_handoff_candidates(
                 &spec.service_name,
                 &target_candidates,
@@ -562,6 +606,10 @@ impl ServiceController {
         if let Some(candidate) =
             select_slot_handoff_candidate(&target_candidates, Some(desired_node))
         {
+            self.clear_rebalance_plan(key).await;
+            if !env.owns_rebalance {
+                return Ok(());
+            }
             self.resume_slot_handoff(
                 spec,
                 slot,
@@ -579,17 +627,21 @@ impl ServiceController {
             return Ok(());
         }
 
-        // Deployment reconciliation heals missing slots only. A healthy slot is moved after the
-        // service is running and every existing rebalance guard agrees on the current target.
-        let should_rebalance = spec.status() == ServiceStatus::Running
-            && SERVICE_ENABLE_PROACTIVE_REBALANCE
+        // Missing slots are healed by their slot owners above. Healthy slots are moved only by the
+        // generation owner because each cutover rewrites the shared service assignment row.
+        let should_consider_rebalance = spec.status() == ServiceStatus::Running
+            && env.owns_rebalance
             && slot.template.replicas > 1
             && !env.service_degraded
             && task_state_rebalanceable(&task.state)
             && task_age_allows_rebalance(task, self.timing.rebalance_min_age)
             && self.rebalance_allowed(key).await
             && !node_is_down(desired_node, env.health_snapshot);
-        if !should_rebalance {
+        if !should_consider_rebalance {
+            self.clear_rebalance_plan(key).await;
+            return Ok(());
+        }
+        if !self.rebalance_plan_is_stable(key, task, desired_node).await {
             return Ok(());
         }
 
@@ -636,8 +688,7 @@ impl ServiceController {
 
             let owner_active_cluster_member = self
                 .cluster_registry
-                .peer_value_unscoped(task.node_id)
-                .map(|peer| peer.is_active());
+                .peer_active_in_local_view(task.node_id);
             if self.node_drain_requested(task.node_id)
                 || service_task_owner_unavailable_for_cleanup(
                     task.node_id,
@@ -1140,6 +1191,13 @@ impl ServiceController {
                     "{context}; failed to stop superseded replacement: {err:#}"
                 );
             }
+            let health_snapshot = self.health_monitor.snapshot();
+            self.retire_unavailable_service_task_best_effort(
+                service_name,
+                replacement_task_id,
+                &health_snapshot,
+            )
+            .await;
         }
     }
 
@@ -1238,8 +1296,7 @@ impl ServiceController {
         }
         let owner_active_cluster_member = self
             .cluster_registry
-            .peer_value_unscoped(spec.node_id)
-            .map(|peer| peer.is_active());
+            .peer_active_in_local_view(spec.node_id);
         if !service_task_owner_unavailable_for_cleanup(
             spec.node_id,
             self.local_node_id,
@@ -1289,7 +1346,7 @@ impl ServiceController {
             .await
     }
 
-    /// Records that a slot appears missing and returns true once the requested grace elapses.
+    /// Records a missing-slot deadline and returns true once its requested grace elapses.
     ///
     /// Slot reconciliation has two different absence windows. Steady-state
     /// repair uses the short grace period, while an absent row during deployment
@@ -1297,11 +1354,11 @@ impl ServiceController {
     /// service spec assignment on large rollouts.
     async fn slot_missing_elapsed_after(&self, key: &SlotKey, grace: Duration) -> bool {
         let now = Instant::now();
-        let mut guard = self.slot_missing_since.lock().await;
+        let mut guard = self.slot_missing_after.lock().await;
         match guard.get(key) {
-            Some(started) => now.duration_since(*started) >= grace,
+            Some(deadline) => now >= *deadline,
             None => {
-                guard.insert(key.clone(), now);
+                guard.insert(key.clone(), now + grace);
                 false
             }
         }
@@ -1309,7 +1366,7 @@ impl ServiceController {
 
     /// Clears any missing marker for a slot once its task is confirmed healthy.
     async fn clear_slot_missing(&self, key: &SlotKey) {
-        let mut guard = self.slot_missing_since.lock().await;
+        let mut guard = self.slot_missing_after.lock().await;
         guard.remove(key);
     }
 
@@ -1327,6 +1384,48 @@ impl ServiceController {
     async fn set_rebalance_cooldown(&self, key: &SlotKey) {
         let mut guard = self.slot_rebalance_after.lock().await;
         guard.insert(key.clone(), Instant::now() + self.timing.rebalance_cooldown);
+    }
+
+    /// Returns true after one exact healthy placement plan remains unchanged for its quiet window.
+    async fn rebalance_plan_is_stable(
+        &self,
+        key: &SlotKey,
+        task: &WorkloadSpec,
+        desired_node_id: Uuid,
+    ) -> bool {
+        let now = Instant::now();
+        let mut plans = self.slot_rebalance_plans.lock().await;
+        let plan = SlotRebalancePlan {
+            task_id: task.id,
+            current_node_id: task.node_id,
+            desired_node_id,
+            view_revision: self.reconcile_trigger.current_view_revision(),
+            observed_at: now,
+        };
+        match plans.get_mut(key) {
+            Some(current)
+                if current.task_id == plan.task_id
+                    && current.current_node_id == plan.current_node_id
+                    && current.desired_node_id == plan.desired_node_id
+                    && current.view_revision == plan.view_revision =>
+            {
+                now.saturating_duration_since(current.observed_at)
+                    >= self.timing.rebalance_plan_stability
+            }
+            Some(current) => {
+                *current = plan;
+                false
+            }
+            None => {
+                plans.insert(key.clone(), plan);
+                false
+            }
+        }
+    }
+
+    /// Drops a stale healthy-placement proposal when the slot no longer needs that exact move.
+    async fn clear_rebalance_plan(&self, key: &SlotKey) {
+        self.slot_rebalance_plans.lock().await.remove(key);
     }
 }
 

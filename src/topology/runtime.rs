@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,9 +11,16 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::PeerHandle;
 use super::peer_cache::{PeerCacheEntry, PeerSnapshotCache};
+use super::PeerHandle;
+use crate::cluster::ClusterViewId;
 use crate::gossip::Message;
+
+/// Maximum age of a best-effort workload repair scheduling hint.
+///
+/// Full-domain anti-entropy remains the convergence mechanism. Expiring hints prevents a burst of
+/// stale placement notifications from keeping the extra workload-only sync lane busy for minutes.
+const WORKLOAD_REPAIR_HINT_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(super) struct GossipState {
@@ -258,6 +265,96 @@ impl ClusterOperationGate {
     }
 }
 
+/// Durable-state fingerprint for deciding whether sync learned actionable operation state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ClusterOperationReconcileFingerprint {
+    pub(super) operation_generation: u64,
+    pub(super) active_view: ClusterViewId,
+}
+
+/// Tracks completed operation reconciliation and rate-limits history garbage collection.
+#[derive(Default)]
+pub(super) struct ClusterOperationReconcileState {
+    last_completed: Option<ClusterOperationReconcileFingerprint>,
+    last_gc_started_at: Option<Instant>,
+}
+
+impl ClusterOperationReconcileState {
+    /// Returns whether replicated operation state or the local active view changed.
+    pub(super) fn requires_reconciliation(
+        &self,
+        fingerprint: ClusterOperationReconcileFingerprint,
+    ) -> bool {
+        self.last_completed != Some(fingerprint)
+    }
+
+    /// Records the stable fingerprint reached by a successful reconciliation pass.
+    pub(super) fn mark_completed(
+        &mut self,
+        fingerprint: ClusterOperationReconcileFingerprint,
+        now: Instant,
+    ) {
+        self.last_completed = Some(fingerprint);
+        self.last_gc_started_at = Some(now);
+    }
+
+    /// Claims one low-rate terminal-history GC check when its interval elapsed.
+    pub(super) fn take_gc_if_due(&mut self, now: Instant, interval: Duration) -> bool {
+        if self.last_gc_started_at.is_some_and(|last_started_at| {
+            now.saturating_duration_since(last_started_at) < interval
+        }) {
+            return false;
+        }
+
+        self.last_gc_started_at = Some(now);
+        true
+    }
+}
+
+/// Coalesces cluster-metadata hints into one bounded targeted-sync runner.
+#[derive(Default)]
+pub(super) struct ClusterMetadataSyncHintState {
+    running: bool,
+    order: VecDeque<Uuid>,
+    members: HashSet<Uuid>,
+}
+
+impl ClusterMetadataSyncHintState {
+    /// Queues one source peer and reports whether the caller must start the runner.
+    pub(super) fn enqueue(&mut self, peer_id: Uuid, capacity: usize) -> bool {
+        if capacity == 0 {
+            return false;
+        }
+
+        if self.members.insert(peer_id) {
+            self.order.push_back(peer_id);
+            while self.order.len() > capacity {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.members.remove(&evicted);
+                }
+            }
+        }
+
+        if self.running {
+            return false;
+        }
+        self.running = true;
+        true
+    }
+
+    /// Returns the next queued source or marks the targeted-sync runner idle.
+    pub(super) fn take_next(&mut self) -> Option<Uuid> {
+        let next = self.order.pop_front();
+        if let Some(peer_id) = next {
+            self.members.remove(&peer_id);
+            return Some(peer_id);
+        }
+
+        self.running = false;
+        None
+    }
+}
+
 #[derive(Default)]
 pub(super) struct GossipWarmSetState {
     pub(super) source_entries: Option<Arc<Vec<PeerCacheEntry>>>,
@@ -275,9 +372,10 @@ pub(super) struct WorkloadRepairHintState {
     /// message on its own; it only changes the order used by the existing
     /// low-rate workload sync loop.
     order: VecDeque<Uuid>,
-    /// Fast membership check paired with `order` so repeated events for one peer
-    /// do not grow the priority list.
-    members: HashSet<Uuid>,
+    /// Expiration deadline paired with each queued peer.
+    ///
+    /// Repeated notifications refresh the deadline without duplicating the peer in `order`.
+    members: HashMap<Uuid, Instant>,
 }
 
 impl WorkloadRepairHintState {
@@ -287,10 +385,21 @@ impl WorkloadRepairHintState {
     /// bursts bounded: a large service may touch many targets, but the sync loop
     /// still spends only its configured workload repair fanout on each tick.
     pub(super) fn enqueue(&mut self, peer_id: Uuid, capacity: usize) {
-        if capacity == 0 || !self.members.insert(peer_id) {
+        self.enqueue_at(peer_id, capacity, Instant::now(), WORKLOAD_REPAIR_HINT_TTL);
+    }
+
+    /// Adds or refreshes one hint using an explicit clock for deterministic tests.
+    fn enqueue_at(&mut self, peer_id: Uuid, capacity: usize, now: Instant, ttl: Duration) {
+        if capacity == 0 {
+            return;
+        }
+        let expires_at = now.checked_add(ttl).unwrap_or(now);
+        if let Some(current_expiry) = self.members.get_mut(&peer_id) {
+            *current_expiry = expires_at;
             return;
         }
 
+        self.members.insert(peer_id, expires_at);
         self.order.push_back(peer_id);
         while self.order.len() > capacity {
             if let Some(evicted) = self.order.pop_front() {
@@ -313,9 +422,43 @@ impl WorkloadRepairHintState {
         already_selected: &HashSet<Uuid>,
         is_available: impl Fn(Uuid) -> bool,
     ) -> Vec<Uuid> {
+        self.take_for_tick_at(
+            local_id,
+            capacity,
+            already_selected,
+            is_available,
+            Instant::now(),
+        )
+    }
+
+    /// Selects fresh usable hints using an explicit clock for deterministic tests.
+    fn take_for_tick_at(
+        &mut self,
+        local_id: Uuid,
+        capacity: usize,
+        already_selected: &HashSet<Uuid>,
+        is_available: impl Fn(Uuid) -> bool,
+        now: Instant,
+    ) -> Vec<Uuid> {
         if capacity == 0 {
             return Vec::new();
         }
+
+        let order = &mut self.order;
+        let members = &mut self.members;
+        order.retain(|peer_id| {
+            let fresh = members
+                .get(peer_id)
+                .is_some_and(|expires_at| *expires_at > now);
+            let usable = fresh
+                && *peer_id != local_id
+                && !already_selected.contains(peer_id)
+                && is_available(*peer_id);
+            if !usable {
+                members.remove(peer_id);
+            }
+            usable
+        });
 
         let mut selected = Vec::with_capacity(capacity);
         while selected.len() < capacity {
@@ -323,11 +466,6 @@ impl WorkloadRepairHintState {
                 break;
             };
             self.members.remove(&peer_id);
-
-            if peer_id == local_id || already_selected.contains(&peer_id) || !is_available(peer_id)
-            {
-                continue;
-            }
 
             selected.push(peer_id);
         }
@@ -343,6 +481,12 @@ impl WorkloadRepairHintState {
     pub(super) fn drain(&mut self) -> Vec<Uuid> {
         self.members.clear();
         self.order.drain(..).collect()
+    }
+
+    /// Returns the number of fresh-or-pending hints before the next pruning pass.
+    #[cfg(any(test, feature = "testkit"))]
+    pub(super) fn len(&self) -> usize {
+        self.order.len()
     }
 }
 
@@ -372,7 +516,12 @@ impl WorkloadRepairSweepState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImmediateSyncState, WorkloadRepairHintState, WorkloadRepairSweepState};
+    use super::{
+        ClusterMetadataSyncHintState, ClusterOperationReconcileFingerprint,
+        ClusterOperationReconcileState, ImmediateSyncState, WorkloadRepairHintState,
+        WorkloadRepairSweepState,
+    };
+    use crate::cluster::{ClusterId, ClusterViewId};
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
@@ -443,6 +592,27 @@ mod tests {
         );
     }
 
+    /// Ensures a placement burst cannot leave workload-only sync work queued indefinitely.
+    #[test]
+    fn workload_repair_hints_expire_before_spending_sync_budget() {
+        let local_id = Uuid::from_u128(10);
+        let source_peer = Uuid::from_u128(11);
+        let started_at = Instant::now();
+        let mut hints = WorkloadRepairHintState::default();
+        hints.enqueue_at(source_peer, 8, started_at, Duration::from_secs(5));
+
+        let selected = hints.take_for_tick_at(
+            local_id,
+            1,
+            &HashSet::new(),
+            |_| true,
+            started_at + Duration::from_secs(6),
+        );
+
+        assert!(selected.is_empty());
+        assert_eq!(hints.len(), 0);
+    }
+
     /// Ensures stale or already-synced hints do not spend workload repair budget.
     #[test]
     fn workload_repair_hints_drop_unusable_peers() {
@@ -481,6 +651,63 @@ mod tests {
         assert!(!sweep.take_if_due(started_at + Duration::from_secs(29), interval));
         assert!(sweep.take_if_due(started_at + interval, interval));
     }
+
+    /// Ensures unchanged sync completions cannot repeat operation reconciliation work.
+    #[test]
+    fn cluster_operation_reconciliation_runs_only_for_changed_state() {
+        let started_at = Instant::now();
+        let initial = ClusterOperationReconcileFingerprint {
+            operation_generation: 7,
+            active_view: ClusterViewId::legacy_default(),
+        };
+        let mut state = ClusterOperationReconcileState::default();
+
+        assert!(state.requires_reconciliation(initial));
+        state.mark_completed(initial, started_at);
+        assert!(!state.requires_reconciliation(initial));
+
+        let next_generation = ClusterOperationReconcileFingerprint {
+            operation_generation: 8,
+            ..initial
+        };
+        assert!(state.requires_reconciliation(next_generation));
+
+        let next_view = ClusterOperationReconcileFingerprint {
+            active_view: ClusterViewId::new(ClusterId::from_uuid(Uuid::from_u128(9)), 1),
+            ..initial
+        };
+        assert!(state.requires_reconciliation(next_view));
+    }
+
+    /// Ensures terminal operation GC checks stay off the ordinary sync hot path.
+    #[test]
+    fn cluster_operation_gc_checks_are_rate_limited() {
+        let started_at = Instant::now();
+        let interval = Duration::from_secs(60);
+        let mut state = ClusterOperationReconcileState::default();
+
+        assert!(state.take_gc_if_due(started_at, interval));
+        assert!(!state.take_gc_if_due(started_at + Duration::from_secs(59), interval));
+        assert!(state.take_gc_if_due(started_at + interval, interval));
+    }
+
+    /// Ensures repeated metadata hints use one bounded targeted-sync runner.
+    #[test]
+    fn cluster_metadata_sync_hints_are_bounded_and_coalesced() {
+        let peer_a = Uuid::from_u128(1);
+        let peer_b = Uuid::from_u128(2);
+        let peer_c = Uuid::from_u128(3);
+        let mut hints = ClusterMetadataSyncHintState::default();
+
+        assert!(hints.enqueue(peer_a, 2));
+        assert!(!hints.enqueue(peer_a, 2));
+        assert!(!hints.enqueue(peer_b, 2));
+        assert!(!hints.enqueue(peer_c, 2));
+        assert_eq!(hints.take_next(), Some(peer_b));
+        assert_eq!(hints.take_next(), Some(peer_c));
+        assert_eq!(hints.take_next(), None);
+        assert!(hints.enqueue(peer_a, 2));
+    }
 }
 
 /// Groups mutable runtime state used by background topology loops.
@@ -503,6 +730,9 @@ pub(super) struct TopologyRuntime {
 
     /// Runtime state for background sync loop management.
     pub(super) sync: SyncLoopState,
+
+    /// Rotating cursor used by full-domain sync to cover every in-view peer.
+    pub(super) sync_cursor: Arc<Mutex<usize>>,
 
     /// Runtime state for the active health probe loop.
     pub(super) health_probe: ProbeLoopState,
@@ -531,4 +761,11 @@ pub(super) struct TopologyRuntime {
 
     /// Runtime state for merge/split operation progression.
     pub(super) cluster_operation_gate: ClusterOperationGate,
+
+    /// Last stable operation state reconciled after anti-entropy.
+    pub(super) cluster_operation_reconcile: Arc<Mutex<ClusterOperationReconcileState>>,
+
+    /// Bounded sources named by cluster-metadata availability hints.
+    pub(super) cluster_metadata_sync_hints: Arc<Mutex<ClusterMetadataSyncHintState>>,
+
 }

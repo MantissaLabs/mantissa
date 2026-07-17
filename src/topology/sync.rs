@@ -306,14 +306,19 @@ impl Topology {
 
     /// Select peers to target during one view-scoped anti-entropy tick.
     ///
-    /// This keeps periodic sync efficient by sampling in `O(k)` expected time where `k` is
-    /// `sync_fanout`, while preserving `sync_fanout = 0` as "sync with all peers".
+    /// This keeps each tick at `O(k)` while guaranteeing complete peer coverage within
+    /// `ceil(peer_count / sync_fanout)` ticks. Fanout zero still means all peers.
     fn select_sync_peers<'a>(
         &self,
         entries: &'a [PeerCacheEntry],
         sync_fanout: usize,
     ) -> Vec<&'a PeerCacheEntry> {
-        select_sync_peers_for_node(self.local.node.id, entries, sync_fanout)
+        select_sync_peers_round_robin_for_node(
+            self.local.node.id,
+            entries,
+            sync_fanout,
+            &self.runtime.sync_cursor,
+        )
     }
 
     /// Select peers for one low-rate workload-domain MST sync tick.
@@ -670,6 +675,51 @@ impl Topology {
         }
     }
 
+    /// Queues a bounded targeted metadata pull from a gossip availability source.
+    ///
+    /// One runner drains distinct sources serially. Repeated hints coalesce while ordinary
+    /// rotating anti-entropy remains responsible for eventual repair beyond the bounded queue.
+    pub(crate) fn sync_metadata_from_peer_now(&self, peer_id: Uuid) {
+        if peer_id == self.local.node.id {
+            return;
+        }
+
+        let start_runner = self
+            .runtime
+            .cluster_metadata_sync_hints
+            .lock()
+            .enqueue(peer_id, DEFAULT_CLUSTER_METADATA_SYNC_HINT_MAX);
+        if !start_runner {
+            return;
+        }
+
+        let topology = self.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                let next_peer = topology
+                    .runtime
+                    .cluster_metadata_sync_hints
+                    .lock()
+                    .take_next();
+                let Some(next_peer) = next_peer else {
+                    break;
+                };
+
+                let entry = topology.peer_snapshot().await.and_then(|snapshot| {
+                    snapshot
+                        .entries
+                        .iter()
+                        .find(|entry| entry.peer_id == next_peer)
+                        .cloned()
+                });
+                match entry {
+                    Some(entry) => topology.sync_metadata_with_peer(&entry).await,
+                    None => topology.sync_once_now(),
+                }
+            }
+        });
+    }
+
     /// Run one cross-view metadata sync tick.
     ///
     /// This loop uses unscoped sessions and deterministic fanout sweep to guarantee every known
@@ -865,55 +915,6 @@ impl GossipContext for Topology {
             .invalidate_peer_capabilities(peer.id)
             .await;
     }
-}
-
-/// Select peers for one deterministic sync sweep while excluding `local_id`.
-///
-/// The rotating cursor ensures bounded convergence coverage instead of probabilistic sampling.
-fn select_sync_peers_for_node(
-    local_id: Uuid,
-    entries: &[PeerCacheEntry],
-    sync_fanout: usize,
-) -> Vec<&PeerCacheEntry> {
-    if sync_fanout == 0 {
-        return entries
-            .iter()
-            .filter(|entry| entry.peer_id != local_id)
-            .collect();
-    }
-
-    use ::rand::Rng as _;
-    use ::rand::seq::index;
-
-    let target = sync_fanout.min(entries.len());
-    if target == 0 {
-        return Vec::new();
-    }
-
-    let mut rng = ::rand::rng();
-    let mut selected_indices: HashSet<usize> = HashSet::with_capacity(target * 2);
-    let mut selected_entries = Vec::with_capacity(target);
-
-    for idx in index::sample(&mut rng, entries.len(), target).into_vec() {
-        selected_indices.insert(idx);
-        let entry = &entries[idx];
-        if entry.peer_id != local_id {
-            selected_entries.push(entry);
-        }
-    }
-
-    while selected_entries.len() < target && selected_indices.len() < entries.len() {
-        let idx = rng.random_range(0..entries.len());
-        if !selected_indices.insert(idx) {
-            continue;
-        }
-        let entry = &entries[idx];
-        if entry.peer_id != local_id {
-            selected_entries.push(entry);
-        }
-    }
-
-    selected_entries
 }
 
 /// Finds one peer in the snapshot ordered by encoded UUID bytes.

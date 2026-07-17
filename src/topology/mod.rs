@@ -15,8 +15,7 @@ use crate::server::auth::AuthStore;
 use crate::services::{ServiceReconcileTrigger, ServiceRegistry};
 use crate::store::local::{LocalCredentialStore, LocalSessionStore, SecretMasterStore};
 use crate::store::replicated::cluster_operations::ClusterOperationStore;
-use crate::store::replicated::cluster_views::ClusterNameRecord;
-use crate::store::replicated::cluster_views::ClusterViewStore;
+use crate::store::replicated::cluster_views::{ClusterNameRecord, ClusterViewStore};
 use crate::store::replicated::peers::PeersStore;
 use crate::store::replicated::secret_key_sync::SecretMasterKeyStore;
 use crate::store::replicated::secrets::SecretStore;
@@ -105,6 +104,8 @@ const DEFAULT_GLOBAL_METADATA_SYNC_PARALLELISM: usize = 1;
 const DEFAULT_WORKLOAD_REPAIR_FANOUT: usize = 1;
 /// Maximum queued peers that can be prioritized by deployment-aware workload repair.
 const DEFAULT_WORKLOAD_REPAIR_HINT_MAX: usize = 256;
+/// Maximum distinct cluster-metadata sources queued for targeted repair on one node.
+const DEFAULT_CLUSTER_METADATA_SYNC_HINT_MAX: usize = 64;
 /// Regular sync intervals between deterministic workload-repair safety sweeps.
 const WORKLOAD_REPAIR_SWEEP_INTERVAL_MULTIPLIER: u32 = 6;
 /// Selected domains synchronized by the targeted workload-only repair path.
@@ -226,6 +227,7 @@ impl Topology {
                 excluded_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
                 immediate_sync: ImmediateSyncState::new(),
                 sync: runtime::SyncLoopState::new(DEFAULT_SYNC_INTERVAL, DEFAULT_SYNC_FANOUT),
+                sync_cursor: Arc::new(Mutex::new(0)),
                 health_probe: runtime::ProbeLoopState::new(probe_interval),
                 workload_repair_fanout: Arc::new(Mutex::new(DEFAULT_WORKLOAD_REPAIR_FANOUT)),
                 workload_repair_cursor: Arc::new(Mutex::new(0)),
@@ -237,6 +239,12 @@ impl Topology {
                 ),
                 metadata_sync_cursor: Arc::new(Mutex::new(0)),
                 cluster_operation_gate: runtime::ClusterOperationGate::new(),
+                cluster_operation_reconcile: Arc::new(Mutex::new(
+                    runtime::ClusterOperationReconcileState::default(),
+                )),
+                cluster_metadata_sync_hints: Arc::new(Mutex::new(
+                    runtime::ClusterMetadataSyncHintState::default(),
+                )),
             },
             deps,
         };

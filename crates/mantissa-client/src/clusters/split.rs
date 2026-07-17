@@ -516,6 +516,8 @@ async fn submit_split_request(
     let mut request = topology.split_cluster_request();
     {
         let mut req = request.get().init_req();
+        req.set_operation_id(Uuid::new_v4().as_bytes());
+        req.reborrow().init_dependency_operation_ids(0);
         source_view.write_capnp(req.reborrow().init_source_view());
 
         let mut target_list = req.reborrow().init_targets(targets.len() as u32);
