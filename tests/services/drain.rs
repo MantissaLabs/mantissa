@@ -266,6 +266,15 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
     );
 
     let down_node_id = cluster[2].id();
+    let baseline_spec = cluster[0]
+        .node
+        .service_controller
+        .registry()
+        .get(service_id)
+        .expect("load service before node failure")
+        .expect("service should exist before node failure");
+    let baseline_ids: BTreeSet<Uuid> = baseline_spec.assigned_replica_ids().into_iter().collect();
+
     cluster[2].stop().await.expect("stop failed node");
 
     cluster[0]
@@ -276,14 +285,6 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
         )
         .await
         .expect("cluster should mark failed node as down");
-    let baseline_spec = cluster[0]
-        .node
-        .service_controller
-        .registry()
-        .get(service_id)
-        .expect("load baseline service before node-down reschedule")
-        .expect("baseline service should exist");
-    let baseline_ids: BTreeSet<Uuid> = baseline_spec.assigned_replica_ids().into_iter().collect();
 
     let rescheduled = wait_until(
         Duration::from_secs(30),
