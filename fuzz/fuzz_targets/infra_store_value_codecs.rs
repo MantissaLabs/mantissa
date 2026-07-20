@@ -105,7 +105,11 @@ fn assert_network_values_roundtrip(input: &InfraInput) {
         instance_id: token("instance", &input.text),
         network_id: spec.id,
         task_updated_at: optional_text(input.flags, 4, "2026-03-25T12:00:00Z", &input.text),
-        requested_ip: Some(format!("10.{}.{}.10", input.numbers[0] % 255, input.numbers[1] % 255)),
+        requested_ip: Some(format!(
+            "10.{}.{}.10",
+            input.numbers[0] % 255,
+            input.numbers[1] % 255
+        )),
         assigned_ip: optional_text(input.flags, 5, "10.1.1.20", &input.other_text),
         mac: Some(format!(
             "02:00:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -162,10 +166,7 @@ fn assert_secret_value_roundtrips(input: &InfraInput) {
 /// Verifies generated volume store values survive their Cap'n Proto codecs.
 fn assert_volume_values_roundtrip(input: &InfraInput) {
     let local_spec = if flag(input.flags, 12) {
-        LocalVolumeSpec::imported_path(format!(
-            "/var/lib/mantissa/{}",
-            token("vol", &input.text)
-        ))
+        LocalVolumeSpec::imported_path(format!("/var/lib/mantissa/{}", token("vol", &input.text)))
     } else if flag(input.flags, 13) {
         LocalVolumeSpec::managed(LocalVolumeOwnership::FsGroup {
             gid: input.numbers[0] as u32,
@@ -211,6 +212,7 @@ fn assert_volume_values_roundtrip(input: &InfraInput) {
         Some(format!("/mnt/{}", token("volume", &input.text))),
         volume_node_state(input.flags),
         Some(nonzero(input.numbers[6])),
+        spec.volume_epoch,
     );
     state.used_bytes = Some(nonzero(input.numbers[7]));
     state.published_task_ids = vec![uuid(input.seed, 22)];
