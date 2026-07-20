@@ -1,6 +1,6 @@
 [package]
 name = "mantissa"
-version = "0.2.0"
+version = "0.3.0"
 description = "Distributed scheduler and cluster management"
 license = "Apache-2.0"
 repository = "https://github.com/MantissaLabs/mantissa"
