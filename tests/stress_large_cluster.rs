@@ -162,30 +162,19 @@ fn target_mantissa_bin_path() -> PathBuf {
         .join(format!("mantissa{}", std::env::consts::EXE_SUFFIX))
 }
 
-/// Builds the daemon binary used by stress subprocesses from the current checkout.
-fn build_mantissa_bin() -> Result<PathBuf> {
-    let path = target_mantissa_bin_path();
-    let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .args(["build", "-p", "mantissa-cli", "--bin", "mantissa"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .status()
-        .context("build mantissa daemon binary for stress test")?;
-
-    if !status.success() {
-        bail!("cargo build -p mantissa-cli --bin mantissa failed with status {status}");
-    }
-    if !path.exists() {
+/// Resolves the Mantissa binary path used to spawn subprocess-backed stress nodes.
+fn mantissa_bin_path() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("MANTISSA_STRESS_BIN") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
         bail!(
-            "mantissa daemon binary was not produced at {} after cargo build",
+            "MANTISSA_STRESS_BIN does not point to a Mantissa daemon binary: {}",
             path.display()
         );
     }
 
-    Ok(path)
-}
-
-/// Resolves the Mantissa binary path used to spawn subprocess-backed stress nodes.
-fn mantissa_bin_path() -> Result<PathBuf> {
     if let Some(path) = option_env!("CARGO_BIN_EXE_mantissa") {
         return Ok(PathBuf::from(path));
     }
@@ -194,7 +183,15 @@ fn mantissa_bin_path() -> Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
 
-    build_mantissa_bin()
+    let path = target_mantissa_bin_path();
+    if path.is_file() {
+        return Ok(path);
+    }
+
+    bail!(
+        "Mantissa daemon binary not found at {}; build it first with `cargo build -p mantissa-cli --bin mantissa` or set MANTISSA_STRESS_BIN",
+        path.display()
+    )
 }
 
 /// Picks one ephemeral localhost TCP port for a daemon listen address.

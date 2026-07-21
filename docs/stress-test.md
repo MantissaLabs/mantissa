@@ -16,6 +16,16 @@ root convergence).
 The test is ignored by default and only runs when `MANTISSA_RUN_STRESS=1` is
 set.
 
+Build the daemon binary once before starting the stress harness:
+
+```bash
+cargo build -p mantissa-cli --bin mantissa
+```
+
+Rebuild the daemon after source changes before starting another stress run.
+
+Then run the stress test with:
+
 ```bash
 MANTISSA_RUN_STRESS=1 \
 cargo test --test stress_large_cluster -- --ignored --nocapture
@@ -43,6 +53,9 @@ cargo test --test stress_large_cluster -- --ignored --nocapture
 
 - `MANTISSA_RUN_STRESS`
   - Required gate to actually run the test.
+- `MANTISSA_STRESS_BIN`
+  - Optional exact path to a prebuilt `mantissa` daemon binary.
+  - Defaults to `target/debug/mantissa` under the active Cargo target directory.
 - `MANTISSA_STRESS_NODE_COUNT`
   - Number of daemon subprocesses.
   - Default: `100`.
